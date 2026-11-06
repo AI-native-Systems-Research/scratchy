@@ -60,10 +60,10 @@ use crate::quantized::{
 use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
-    Binding, DecodePartials, DispatchShape, Fence, GatedCommand, Gemm, GemmDims, GemmWeight,
-    IntoBaked, KernelId, LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis,
-    MScaling, MetalDtype, PlayLive, RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps,
-    WeightTensor, baked, baked_commands,
+    Activation, Binding, DecodePartials, DispatchShape, Fence, GatedCommand, Gemm, GemmDims,
+    GemmWeight, IntoBaked, KernelId, LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError,
+    MScaleAxis, MScaling, MetalDtype, PlayLive, RowTile, RuntimeBindingKind, RuntimeGate, SetAxis,
+    SplitSteps, TapeCommand, WeightTensor, baked, baked_commands,
 };
 
 /// Where one bucket's tape is baked: the bucket, its two halves' tape
@@ -222,16 +222,17 @@ pub fn lower_subtile_tape_to_metal(
 /// ([`ATTN_FOLD`]) — binding `kind`. A query-only rope binds no cache: a drafter reading its
 /// target's packed stores writes none, so has none to encode.
 fn writer_binds(c: &GatedCommand, kind: fn(&RuntimeBindingKind) -> bool) -> bool {
-    let writes = match c.command.kernel {
+    let Some(c) = c.dispatch() else {
+        return false;
+    };
+    let writes = match c.kernel {
         KernelId::RopeAppend | KernelId::RopeAppendNormed | KernelId::KvAppend => true,
         KernelId::AttentionViaCacheTq | KernelId::AttentionDecodeGqaTq => {
-            c.command.constants.iter().any(|k| k.index == ATTN_FOLD.0)
+            c.constants.iter().any(|k| k.index == ATTN_FOLD.0)
         }
         _ => false,
     };
-    writes
-        && (c.command.bindings.iter())
-            .any(|b| matches!(b, Binding::Runtime { kind: k, .. } if kind(k)))
+    writes && (c.bindings.iter()).any(|b| matches!(b, Binding::Runtime { kind: k, .. } if kind(k)))
 }
 
 /// Whether `c` writes a cache its forward outlives: a KV writer binding the KV pool or its
@@ -257,7 +258,7 @@ fn writes_cache(c: &GatedCommand) -> bool {
             }
         )
     };
-    writer_binds(c, kv) || c.command.bindings.iter().any(recurrent)
+    writer_binds(c, kv) || c.command.bindings().any(|b| recurrent(&b))
 }
 
 /// A sample-rows step at this bake point, from its matmul's plain lowering `plain` (with its
@@ -353,20 +354,22 @@ fn sample_rows(
 /// has no tile in the table, scales no row axis, sets one, or tiles otherwise.
 fn rows_written(commands: &[GatedCommand], slot: Slot) -> LogitsRows {
     let binds = |c: &&GatedCommand| {
-        (c.command.bindings.iter())
-            .any(|b| matches!(*b, Binding::ArenaSlot { slot: s, .. } if s == slot.get()))
+        (c.command.bindings())
+            .any(|b| matches!(b, Binding::ArenaSlot { slot: s, .. } if s == slot.get()))
     };
+    // A GEMM's grid is the worker's pick: it has no tile here.
     let tiles = commands.iter().filter(binds).map(|c| {
-        let tile = RowTile::of(c.command.kernel)?;
+        let c = c.dispatch()?;
+        let tile = RowTile::of(c.kernel)?;
         let Some(MScaling {
             axis,
             bucket_m,
             set_axis: None,
-        }) = c.command.dispatch.m_scaling
+        }) = c.dispatch.m_scaling
         else {
             return None;
         };
-        let (x, y, z) = c.command.dispatch.threadgroups;
+        let (x, y, z) = c.dispatch.threadgroups;
         let groups = match axis {
             MScaleAxis::X => x,
             MScaleAxis::Y => y,
@@ -437,12 +440,14 @@ pub(crate) enum Planes {
 /// one qmm_t command, or the W4A8 pre-pass + GEMM pair — not qmv (a small bucket), not SplitK's
 /// pair, not a small-M twin.
 fn slices(plain: &[GatedCommand], bucket_m: u32) -> bool {
-    let kernels: Vec<KernelId> = plain.iter().map(|c| c.command.kernel).collect();
+    let kernels: Option<Vec<KernelId>> = plain.iter().map(|c| c.command.kernel()).collect();
     bucket_m > 1
         && matches!(
-            kernels.as_slice(),
-            [KernelId::AffineQmmT | KernelId::AffineQmmTNax]
-                | [KernelId::AffineW4a8Quant, KernelId::AffineQmmW4a8]
+            kernels.as_deref(),
+            Some(
+                [KernelId::AffineQmmT | KernelId::AffineQmmTNax]
+                    | [KernelId::AffineW4a8Quant, KernelId::AffineQmmW4a8]
+            )
         )
 }
 
@@ -549,7 +554,6 @@ fn affine_qmv_command(
             m_scaling,
         },
         bindings: baked(bindings),
-        gemm: None,
     }
 }
 
@@ -645,7 +649,6 @@ fn sample_slice_command(
                 binding_index: 2,
             },
         ]),
-        gemm: None,
     }
 }
 
@@ -775,7 +778,6 @@ fn tq_stage_command<const IS_K: bool>(
             m_scaling: None,
         },
         bindings: baked(bindings),
-        gemm: None,
     })
 }
 
@@ -816,7 +818,6 @@ fn tq_rotate_command(
             }),
         },
         bindings: super::kernel_bindings::TqRotateRowsBindingSet { rows }.into_baked(),
-        gemm: None,
     })
 }
 
@@ -1029,37 +1030,43 @@ fn route_by_sequence_count(
         UnlessOneSequence, UnlessUnrotatedBlocks,
     };
     use crate::tape::lowered::SeqScope::{AllRows, RowZero};
-    let Some(row_zero) = cmds.iter().find(|c| c.command.seq_scope() == RowZero) else {
+    // A row-zero command is a dispatch ([`TapeCommand::seq_scope`]).
+    let row_zero = cmds
+        .iter()
+        .find_map(|c| (c.dispatch()).filter(|c| c.seq_scope() == RowZero));
+    let Some(row_zero) = row_zero else {
         return Ok(cmds);
     };
-    let per_row = |c: &LoweredCommand| {
-        c.kernel == KernelId::AttentionPrefillSdpaPaged && c.seq_scope() == AllRows
+    let per_row = |c: &TapeCommand| {
+        c.kernel() == Some(KernelId::AttentionPrefillSdpaPaged) && c.seq_scope() == AllRows
     };
     // A paged attention re-ropes where it binds its rotary table (cos_sin) — not wherever it binds a
     // model source: gpt-oss's sinks are one too (slot 9), and counting them made its plain twin read
     // as re-roping, so a step of several sequences ran both twins, the sdpa-paged one ~35x the NAX's.
-    let reropes = |c: &LoweredCommand| {
-        c.bindings.iter().any(|b| {
+    let reropes = |c: &TapeCommand| {
+        c.bindings().any(|b| {
             matches!(b, Binding::Source { binding_index, .. }
-                if *binding_index == super::kernel_bindings::PREFILL_ROPE_ON_READ_SLOT)
+                if binding_index == super::kernel_bindings::PREFILL_ROPE_ON_READ_SLOT)
         })
     };
     let twins = || cmds.iter().map(|c| &c.command).filter(|c| per_row(c));
     if !twins().any(reropes) {
         return Err(LoweringError::RowZeroWithoutPerRowTwin {
             index,
-            kernel: row_zero.command.kernel,
+            kernel: row_zero.kernel,
         });
     }
     let plain = twins().any(|c| !reropes(c));
     // A verify step's lanes' attention (`verify_lane_attention`) takes the plain twin's steps
     // whose every sequence holds a lane's rows at most; the plain twin keeps the rest.
-    let lane = |c: &LoweredCommand| {
+    let lane = |c: &TapeCommand| {
         matches!(
-            c.kernel,
-            KernelId::AttentionVerifyPack
-                | KernelId::AttentionVerifySplit
-                | KernelId::AttentionDecodeCombine
+            c.kernel(),
+            Some(
+                KernelId::AttentionVerifyPack
+                    | KernelId::AttentionVerifySplit
+                    | KernelId::AttentionDecodeCombine
+            )
         )
     };
     let lanes = cmds.iter().any(|c| lane(&c.command));
@@ -1149,7 +1156,7 @@ fn route_small_m(
     }
     let wide = cmds
         .iter()
-        .any(|c| c.command.kernel == KernelId::AffineQmvWide);
+        .any(|c| c.command.kernel() == Some(KernelId::AffineQmvWide));
     if wide && pick_qmv_kernel_wide(n, k, 4, bucket_m, true).weight_streams(bucket_m) == 1 {
         return Ok(cmds);
     }
@@ -1176,13 +1183,11 @@ fn route_small_m(
     // 5120 x 17408 212 / 146, gdn qkv 10240 x 5120 117 / 89, gdn z 6144 x 5120 75 / 53, k and v
     // 1024 x 5120 29 / 16, lm_head 248320 x 5120 2406 / 1361; the pre-pass 8-9 a matmul's
     // activation). Unmeasured below the wide class.
-    let w4a8 = cmds
-        .iter()
-        .find(|c| c.command.kernel == KernelId::AffineQmmW4a8);
+    let w4a8 =
+        (cmds.iter()).find_map(|c| (c.dispatch()).filter(|c| c.kernel == KernelId::AffineQmmW4a8));
     let small_w4a8 = (w4a8.zip(W4a8Gemm::for_small_m(n, k, bucket_m)))
         .filter(|_| class == crate::tape::lowered::GenClass::M5Wide);
-    if let Some((gemm, kernel)) = small_w4a8 {
-        let gemm = gemm.command;
+    if let Some((&gemm, kernel)) = small_w4a8 {
         let small_m = LoweredCommand {
             function: kernel.static_name(dequant_dtype_for(p), scale_dtype_for(p), group_size),
             dispatch: DispatchShape {
@@ -1194,8 +1199,8 @@ fn route_small_m(
         };
         return Ok(cmds
             .into_iter()
-            .map(|c| match c.command.kernel {
-                KernelId::AffineQmmW4a8 => GatedCommand::gated(c.command, UnlessSmallMTokens),
+            .map(|c| match c.command.kernel() {
+                Some(KernelId::AffineQmmW4a8) => GatedCommand::gated(c.command, UnlessSmallMTokens),
                 _ => c,
             })
             .chain([GatedCommand::gated(small_m, OnlyIfSmallMTokens)])
@@ -1249,7 +1254,6 @@ fn route_small_m(
                 },
                 Binding::Scratch { binding_index: 1 },
             ]),
-            gemm: None,
         };
         let mut bindings =
             affine_qmm_bindings(in_slot, out_slot, layer, w.of(WeightKind::Linear, 0)?);
@@ -1281,7 +1285,6 @@ fn route_small_m(
                 m_scaling: scaling,
             },
             bindings: baked(bindings),
-            gemm: None,
         };
         // The pre-pass first, so the next matmul of the activation reads its scratch as it is.
         return Ok([GatedCommand::gated(quant, OnlyIfSmallMTokens)]
@@ -1329,7 +1332,6 @@ fn route_small_m(
             layer,
             w.of(WeightKind::Linear, 0)?,
         )),
-        gemm: None,
     };
     Ok(cmds
         .into_iter()
@@ -1438,7 +1440,8 @@ fn route_gdn(
     }
     let gdn = gdn(p)?;
     let known = GdnStepsKnown::at(p, bucket_m);
-    let decodes = cmds.iter().any(|c| c.command.library == "gdn_decode");
+    let library = |c: &GatedCommand| c.dispatch().map(|c| c.library);
+    let decodes = cmds.iter().any(|c| library(c) == Some("gdn_decode"));
     let hv = gdn.v_dim().get();
     let pipelines = gdn.k_dim().get() == 128 && hv.is_multiple_of(GDN_PIPE_ROWS);
     let simd = gdn_scan_simd_static_name(dequant_dtype_for(p));
@@ -1478,74 +1481,79 @@ fn route_gdn(
                 .copied()
                 .collect(),
         ),
-        gemm: None,
     };
     let decoded = |d: bool, q: bool| decodes && d && q;
     let piped = |d: bool, q: bool| pipelines && !d && q;
-    let gated = |command: LoweredCommand, runs: &dyn Fn(bool, bool) -> bool| match known.run(runs) {
+    let gated = |command: TapeCommand, runs: &dyn Fn(bool, bool) -> bool| match known.run(runs) {
         GuardRun::Gated(gate) => Some(GatedCommand { command, gate }),
         GuardRun::Dropped => None,
     };
     // A bucket wider than a verify lane carrying the verify pair (`gdn_verify`): it runs the steps
     // whose every sequence holds a lane's rows at most, and the commands after it every other step.
     let lane_split =
-        bucket_m > GDN_VERIFY_ROWS && cmds.iter().any(|c| c.command.library == "gdn_verify");
+        bucket_m > GDN_VERIFY_ROWS && cmds.iter().any(|c| library(c) == Some("gdn_verify"));
     let lane_gate = |gate: Option<RuntimeGate>, lane: RuntimeGate| match lane_split {
         true => Some(RuntimeGate::and(gate, &[lane])),
         false => gate,
     };
     let mut out = Vec::with_capacity(cmds.len() + 2);
-    for GatedCommand { command, .. } in cmds {
-        if command.library == "gdn_verify" {
+    for c in cmds {
+        if library(&c) == Some("gdn_verify") {
             out.push(GatedCommand {
-                command,
+                command: c.command,
                 gate: lane_gate(None, RuntimeGate::OnlyIfLaneRows),
             });
             continue;
         }
         let at = out.len();
-        if command.library == "gdn_decode" {
-            out.extend(gated(command, &decoded));
-        } else if pipelines && command.library == "gdn_scan_varlen" && command.function == simd {
-            let twin = pipelined(&command);
-            let simd_runs = |d: bool, q: bool| !decoded(d, q) && !piped(d, q);
-            // Beside the simd scan — a step that also replays or records — the pipelined scan
-            // still runs every plain sequence of more than one row, a prefill chunk, and the simd
-            // scan skips them (`GDN_SCAN_PLAIN_ROWS_PIPELINED`): such a sequence's rows and the
-            // snapshots it saves are the pipelined scan's wherever it is batched, so no save ever
-            // lands inside the simd scan's row loop. A model without drafts has no such step.
-            let beside = LoweredCommand {
-                constants: baked(
-                    (twin.constants.iter().copied())
-                        .chain([ConstantValue::boolean(GDN_PIPE_BESIDE_SIMD_SLOT, true)])
-                        .collect(),
-                ),
-                ..twin
-            };
-            // A one-row bucket's steps, and a model without drafts, have no such sequence there.
-            let beside_gate = match (known.plain, known.decode, known.run(simd_runs)) {
-                (Some(true), _, _) | (_, Some(true), _) | (_, _, GuardRun::Dropped) => None,
-                (_, _, GuardRun::Gated(gate)) => Some(GatedCommand {
-                    command: beside,
-                    gate: Some(RuntimeGate::and(gate, &[RuntimeGate::OnlyIfPlainGdnRows])),
-                }),
-            };
-            let simd_scan = LoweredCommand {
-                constants: baked(
-                    (command.constants.iter().copied())
-                        .chain([ConstantValue::boolean(
-                            GDN_SCAN_PLAIN_ROWS_PIPELINED_SLOT,
-                            true,
-                        )])
-                        .collect(),
-                ),
-                ..command
-            };
-            out.extend(gated(simd_scan, &simd_runs));
-            out.extend(gated(twin, &piped));
-            out.extend(beside_gate);
-        } else {
-            out.extend(gated(command, &|d, q| !decoded(d, q)));
+        let scan =
+            |c: &LoweredCommand| pipelines && c.library == "gdn_scan_varlen" && c.function == simd;
+        match c.command {
+            TapeCommand::Dispatch(command) if command.library == "gdn_decode" => {
+                out.extend(gated(command.into(), &decoded));
+            }
+            TapeCommand::Dispatch(command) if scan(&command) => {
+                let twin = pipelined(&command);
+                let simd_runs = |d: bool, q: bool| !decoded(d, q) && !piped(d, q);
+                // Beside the simd scan — a step that also replays or records — the pipelined
+                // scan still runs every plain sequence of more than one row, a prefill chunk, and
+                // the simd scan skips them (`GDN_SCAN_PLAIN_ROWS_PIPELINED`): such a sequence's
+                // rows and the snapshots it saves are the pipelined scan's wherever it is batched,
+                // so no save ever lands inside the simd scan's row loop. A model without drafts
+                // has no such step.
+                let beside = LoweredCommand {
+                    constants: baked(
+                        (twin.constants.iter().copied())
+                            .chain([ConstantValue::boolean(GDN_PIPE_BESIDE_SIMD_SLOT, true)])
+                            .collect(),
+                    ),
+                    ..twin
+                };
+                // A one-row bucket's steps, and a model without drafts, have no such sequence
+                // there.
+                let beside_gate = match (known.plain, known.decode, known.run(simd_runs)) {
+                    (Some(true), _, _) | (_, Some(true), _) | (_, _, GuardRun::Dropped) => None,
+                    (_, _, GuardRun::Gated(gate)) => Some(GatedCommand {
+                        command: beside.into(),
+                        gate: Some(RuntimeGate::and(gate, &[RuntimeGate::OnlyIfPlainGdnRows])),
+                    }),
+                };
+                let simd_scan = LoweredCommand {
+                    constants: baked(
+                        (command.constants.iter().copied())
+                            .chain([ConstantValue::boolean(
+                                GDN_SCAN_PLAIN_ROWS_PIPELINED_SLOT,
+                                true,
+                            )])
+                            .collect(),
+                    ),
+                    ..command
+                };
+                out.extend(gated(simd_scan.into(), &simd_runs));
+                out.extend(gated(twin.into(), &piped));
+                out.extend(beside_gate);
+            }
+            command => out.extend(gated(command, &|d, q| !decoded(d, q))),
         }
         for c in &mut out[at..] {
             c.gate = lane_gate(c.gate, RuntimeGate::UnlessLaneRows);
@@ -1651,18 +1659,19 @@ fn decode_attention_per_kv_head(
         && global.page().get().is_multiple_of(8)
         && bucket_partials <= u32::MAX as u64
         && (sinks.is_none() || at.bucket_m <= SINKS_SPLIT_MAX_BUCKET_M);
-    if !geometry || !cmds.iter().any(|c| takes(&c.command)) {
+    let taken = |c: &GatedCommand| c.dispatch().copied().filter(takes);
+    if !geometry || !cmds.iter().any(|c| taken(c).is_some()) {
         return Ok(cmds);
     }
     let row_bytes = row_partials as u32;
     let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype());
     let mut out = Vec::with_capacity(cmds.len() + 1);
-    for GatedCommand { command, gate } in cmds {
-        if !takes(&command) {
-            out.push(GatedCommand { command, gate });
+    for c in cmds {
+        let (Some(command), gate) = (taken(&c), c.gate) else {
+            out.push(c);
             continue;
-        }
+        };
         let steps = SplitSteps::of(gate.or(row_gate));
         *partials = partials.max(DecodePartials { row_bytes, steps });
         // The heads it serves are the kernel's own: no TurboQuant heads variant binds it.
@@ -1729,9 +1738,8 @@ fn decode_attention_per_kv_head(
                 ..command.dispatch
             },
             bindings: baked(kept.chain([scratch]).chain(sinks).collect()),
-            gemm: None,
         };
-        let gated = |command| GatedCommand { command, gate };
+        let gated = |command: LoweredCommand| GatedCommand::gated_by(command, gate);
         out.extend([gated(attention), gated(combine)]);
     }
     Ok(out)
@@ -1758,7 +1766,7 @@ fn row_gate(
 /// `quant` reads the slot `norm` writes, over its rows (one a threadgroup, scaled alike with the
 /// live rows), under the same gate, and the row fits beside the norm's sum in threadgroup memory.
 fn quantizing_norm(norm: &GatedCommand, quant: &GatedCommand) -> Option<GatedCommand> {
-    let (n, q) = (&norm.command, &quant.command);
+    let (n, q) = (norm.dispatch()?, quant.dispatch()?);
     let constant = |c: &LoweredCommand, index| {
         (c.constants.iter())
             .find(|v| v.index == index)
@@ -1809,15 +1817,15 @@ fn quantizing_norm(norm: &GatedCommand, quant: &GatedCommand) -> Option<GatedCom
     let bindings = (n.bindings.iter().copied())
         .chain([Binding::Scratch { binding_index: 3 }])
         .collect();
-    Some(GatedCommand {
-        command: LoweredCommand {
+    Some(GatedCommand::gated_by(
+        LoweredCommand {
             function,
             constants: baked(constants),
             bindings: baked(bindings),
             ..*n
         },
-        gate: norm.gate,
-    })
+        norm.gate,
+    ))
 }
 
 /// The quantizing twin of an RMSNorm kernel symbol (`rmsnorm.metal`'s `INST_RMSNORM_W4A8Q`,
@@ -2090,8 +2098,8 @@ fn lower(
                     MetalStep::SampledLogits(..) => {}
                     _ => {
                         let binds = |c: &GatedCommand| {
-                            (c.command.bindings.iter()).any(|b| {
-                                matches!(*b, Binding::ArenaSlot { slot, .. }
+                            (c.command.bindings()).any(|b| {
+                                matches!(b, Binding::ArenaSlot { slot, .. }
                                     if Some(Slot(slot)) == logits_slot)
                             })
                         };
@@ -2120,17 +2128,19 @@ fn lower(
                     // pre-pass pair.
                     let gemm = |c: &GatedCommand| {
                         matches!(
-                            c.command.kernel,
-                            KernelId::AffineQmmW4a8
-                                | KernelId::AffineQmmSmallM
-                                | KernelId::AffineQmvWide
-                                | KernelId::AffineQmmT
-                                | KernelId::AffineQmmTNax
+                            c.command.kernel(),
+                            Some(
+                                KernelId::AffineQmmW4a8
+                                    | KernelId::AffineQmmSmallM
+                                    | KernelId::AffineQmvWide
+                                    | KernelId::AffineQmmT
+                                    | KernelId::AffineQmmTNax
+                            )
                         )
                     };
                     quantized = cmds.split_first().and_then(|(first, rest)| {
-                        (first.command.kernel == KernelId::AffineW4a8Quant && rest.iter().all(gemm))
-                            .then_some(*first)
+                        let quant = first.command.kernel() == Some(KernelId::AffineW4a8Quant);
+                        (quant && rest.iter().all(gemm)).then_some(*first)
                     });
                     quantized_at = quantized.map(|_| commands.len());
                     // The pre-pass over the rows the norm just before it wrote: the norm writes
@@ -2154,10 +2164,7 @@ fn lower(
                 // writes it (a W4A8 pre-pass, a split-K partial) must wait for the previous reader.
                 let writes_scratch = if !reuses
                     && cmds.first().is_some_and(|c| {
-                        c.command
-                            .bindings
-                            .iter()
-                            .any(|b| matches!(b, Binding::Scratch { .. }))
+                        (c.command.bindings()).any(|b| matches!(b, Binding::Scratch { .. }))
                     }) {
                     Fence::Ordered
                 } else {
@@ -2187,8 +2194,8 @@ fn lower(
                     carried = Fence::None;
                     let norm = |c: &GatedCommand| {
                         matches!(
-                            c.command.kernel,
-                            KernelId::RmsNorm | KernelId::FusedAddRmsNorm
+                            c.command.kernel(),
+                            Some(KernelId::RmsNorm | KernelId::FusedAddRmsNorm)
                         )
                     };
                     norm_at = (n_cmds == 1 && norm(&commands[commands.len() - 1]))
@@ -2268,7 +2275,7 @@ fn pair_w4a8_gemms(
     };
     let n_of = |c: &LoweredCommand| (c.constants.iter()).find(|v| v.index == 1).map(|v| v.bits);
     let pairs = |a: &GatedCommand, b: &GatedCommand| -> Option<GatedCommand> {
-        let (x, y) = (&a.command, &b.command);
+        let (x, y) = (a.dispatch()?, b.dispatch()?);
         let same = x.kernel == KernelId::AffineQmmW4a8
             && y.kernel == KernelId::AffineQmmW4a8
             && x.function == y.function
@@ -2314,8 +2321,8 @@ fn pair_w4a8_gemms(
             .chain([ConstantValue::int(9, n2 as i32)])
             .collect();
         let (gx, gy, gz) = x.dispatch.threadgroups;
-        Some(GatedCommand {
-            command: LoweredCommand {
+        Some(GatedCommand::gated_by(
+            LoweredCommand {
                 function,
                 constants: baked(constants),
                 bindings: baked(bindings),
@@ -2325,8 +2332,8 @@ fn pair_w4a8_gemms(
                 },
                 ..*x
             },
-            gate: a.gate,
-        })
+            a.gate,
+        ))
     };
     // A loop's body boundary never splits a pair: a pair straddling one would merge two
     // iterations' commands.
@@ -2345,7 +2352,7 @@ fn pair_w4a8_gemms(
         .chain([commands.len()]);
     for end in ends.collect::<Vec<_>>() {
         for i in run_start..end {
-            if !keep[i] || commands[i].command.kernel != KernelId::AffineQmmW4a8 {
+            if !keep[i] || commands[i].command.kernel() != Some(KernelId::AffineQmmW4a8) {
                 continue;
             }
             for j in i + 1..end {
@@ -2603,7 +2610,6 @@ fn verify_lane_attention(
             }),
         },
         bindings: baked(vec![out, scratch_at(SPLIT_PARTIALS_SLOT, packed_bytes)]),
-        gemm: None,
     };
     Some([pack, split, combine])
 }
@@ -2688,6 +2694,13 @@ fn pair_coresident_param(
 /// elem_size_bytes(dtype)` across every `AffineQmm` in this tape that
 /// picked `SplitK`. The worker uses it to size the shared scratch
 /// buffer that `Binding::Scratch` resolves against.
+/// `commands`, each a [`TapeCommand::Dispatch`].
+fn dispatched(
+    commands: impl IntoIterator<Item = LoweredCommand>,
+) -> Result<Vec<TapeCommand>, LoweringError> {
+    Ok(commands.into_iter().map(TapeCommand::Dispatch).collect())
+}
+
 fn lower_one(
     p: &ModelFacts,
     chunked: bool,
@@ -2713,7 +2726,7 @@ fn lower_one(
     // `vision_merge_factor` after the merger reshape) so post-merge ops
     // dispatch over `bucket_m / m_divisor` rows.
     m_divisor: u32,
-) -> Result<Vec<LoweredCommand>, LoweringError> {
+) -> Result<Vec<TapeCommand>, LoweringError> {
     // `eff_m` = the live row count this op operates on at the bucket
     // level. For everything before the merger reshape this is `bucket_m`;
     // for the merger's `[num_tokens / vision_merge_factor, ...]` ops it
@@ -2791,11 +2804,13 @@ fn lower_one(
             let writer = part(&f.writer, writer_site)?;
             let attention = part(&f.attention, attention_site)?;
             let shape = || LoweringError::RopedAttentionShape { index: w.index };
-            let ([writer], [attention]) = (writer.as_slice(), attention.as_slice()) else {
+            let ([TapeCommand::Dispatch(writer)], [TapeCommand::Dispatch(attention)]) =
+                (writer.as_slice(), attention.as_slice())
+            else {
                 return Err(shape());
             };
             return roped_attention_command(attention, writer)
-                .map(|c| vec![c])
+                .map(|c| vec![c.into()])
                 .ok_or_else(shape);
         }
 
@@ -2843,7 +2858,6 @@ fn lower_one(
                     }),
                 },
                 bindings: baked(bindings),
-                gemm: None,
             }
         }
 
@@ -2895,7 +2909,6 @@ fn lower_one(
                     binding_index: 2,
                 },
             ]),
-            gemm: None,
         },
 
         // ── Standalone RMSNorm ─────────────────────────────────────
@@ -2965,7 +2978,6 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm: None,
         },
 
         // ── Scalar-offset RMSNorm (Gemma `rmsnorm(x, weight + 1.0)`) ─
@@ -3017,7 +3029,6 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm: None,
         },
 
         // ── Unit-gain RMSNorm (mlx RMSNormNoScale — Gemma4 v_norm) ─
@@ -3067,7 +3078,6 @@ fn lower_one(
                     binding_index: 1,
                 },
             ]),
-            gemm: None,
         },
 
         // ── Multiply by a loaded [1]-shaped weight (Gemma4 layer_scalar) ─
@@ -3111,7 +3121,6 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm: None,
         },
 
         // ── Fused residual-add + RMSNorm ───────────────────────────
@@ -3164,7 +3173,6 @@ fn lower_one(
                         2,
                     ),
                 ]),
-                gemm: None,
             }
         }
 
@@ -3215,7 +3223,6 @@ fn lower_one(
                     2,
                 ),
             ]),
-            gemm: None,
         },
 
         // ── Gemma4 post-FFN tail: rmsnorm → add → scalar_weight_mul ─
@@ -3258,7 +3265,6 @@ fn lower_one(
                         3,
                     ),
                 ]),
-                gemm: None,
             }
         }
         I::NormAddScalarMul(
@@ -3321,7 +3327,6 @@ fn lower_one(
                         4,
                     ),
                 ]),
-                gemm: None,
             }
         }
 
@@ -3331,59 +3336,24 @@ fn lower_one(
             SampledMatmul::Dense(Slot(in_slot), Slot(out_slot), LayerId(layer), NDim(n), KDim(k)),
             _,
         ) => {
-            // The worker reads `gemm.dims` and dispatches the kernel
-            // `pipeline_for_gemm` picks for them (M/N/K baked into
-            // function constants), so this tile-shape hint is a
-            // placeholder; the GEMM bake picks its own grid.
-            // `eff_m` shrinks by the merge factor for the merger's
-            // post-reshape GEMMs (`[num_tokens / vision_merge_factor,
-            // vision_merge_hidden]`); == bucket_m everywhere else. The
-            // bf16 GEMM path bakes M from `gemm.dims.m` (m_scaling is
-            // forced None for it in the worker), so the divisor MUST land
-            // on `gemm.dims.m`, not just the placeholder dispatch.
-            let tg_x = eff_m.div_ceil(GEMM_TILE_M);
-            let tg_y = (*n).div_ceil(GEMM_TILE_N);
-            LoweredCommand {
-                kernel: KernelId::Gemm,
-                // GEMM is opaque to `pipeline_for_command` — it has its own
-                // dims-keyed builder (`pipeline_for_gemm`). Empty library/function +
-                // empty constants signal the worker to route GEMM commands
-                // through the special-case path instead.
-                library: "",
-                function: "",
-                constants: &[],
-                dispatch: DispatchShape {
-                    threadgroups: (tg_x, tg_y, 1),
-                    threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        set_axis: None,
-                        axis: crate::tape::lowered::MScaleAxis::X,
-                        bucket_m: super::ids::BucketM(bucket_m),
-                    }),
+            // The worker dispatches the kernel `pipeline_for_gemm` picks for `dims`, its grid
+            // too. `eff_m` shrinks by the merge factor for the merger's post-reshape GEMMs
+            // (`[num_tokens / vision_merge_factor, vision_merge_hidden]`); == bucket_m everywhere
+            // else.
+            return Ok(vec![TapeCommand::Gemm(Gemm {
+                dims: GemmDims {
+                    m: eff_m,
+                    n: *n,
+                    k: *k,
                 },
-                bindings: baked(vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *in_slot,
-                        binding_index: 1,
-                    },
-                ]),
-                gemm: Some(Gemm {
-                    dims: GemmDims {
-                        m: eff_m,
-                        n: *n,
-                        k: *k,
-                    },
-                    weight: GemmWeight {
-                        ix: w.of(WeightKind::Linear, 0)?,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                    },
-                }),
-            }
+                weight: GemmWeight {
+                    ix: w.of(WeightKind::Linear, 0)?,
+                    which: WeightTensor::Weight,
+                    layer: super::ids::LayerId(*layer + layer_offset),
+                },
+                out: Activation::Arena { slot: *out_slot },
+                input: Activation::Arena { slot: *in_slot },
+            })]);
         }
 
         // ── MLX-affine int4 matmul (qmv + qmm_t) ──────────────────
@@ -3616,7 +3586,6 @@ fn lower_one(
                             },
                             Binding::Scratch { binding_index: 1 },
                         ]),
-                        gemm: None,
                     };
                     let mut bindings = affine_qmm_bindings(
                         *in_slot,
@@ -3648,9 +3617,8 @@ fn lower_one(
                             m_scaling: rows(),
                         },
                         bindings: baked(bindings),
-                        gemm: None,
                     };
-                    return Ok(vec![quant, gemm]);
+                    return dispatched(vec![quant, gemm]);
                 }
                 match kernel {
                     QmmTKernel::Nax(_) => {
@@ -3697,7 +3665,6 @@ fn lower_one(
                                 super::ids::LayerId(*layer + layer_offset),
                                 w.of(WeightKind::Linear, 0)?,
                             )),
-                            gemm: None,
                         }
                     }
                     QmmTKernel::Standard => {
@@ -3745,7 +3712,6 @@ fn lower_one(
                                 super::ids::LayerId(*layer + layer_offset),
                                 w.of(WeightKind::Linear, 0)?,
                             )),
-                            gemm: None,
                         }
                     }
                     QmmTKernel::SplitK {
@@ -3820,7 +3786,6 @@ fn lower_one(
                                 super::ids::LayerId(*layer + layer_offset),
                                 w.of(WeightKind::Linear, 0)?,
                             )),
-                            gemm: None,
                         };
 
                         // splitk_reduce_sum: bindings (0=output → out_slot,
@@ -3857,9 +3822,8 @@ fn lower_one(
                                 },
                                 Binding::Scratch { binding_index: 1 },
                             ]),
-                            gemm: None,
                         };
-                        return Ok(vec![qmm_t_cmd, reduce_cmd]);
+                        return dispatched(vec![qmm_t_cmd, reduce_cmd]);
                     }
                 }
             }
@@ -3925,7 +3889,6 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -3969,7 +3932,6 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -4010,7 +3972,6 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -4043,7 +4004,6 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm: None,
             }
         }
         I::DraftConv(c) => {
@@ -4069,7 +4029,6 @@ fn lower_one(
                     arena(c.residual.unwrap_or(c.input), 3),
                     arena(c.output, 4),
                 ]),
-                gemm: None,
             }
         }
         I::DraftAttention(Slot(qkv), Slot(out), LayerId(layer)) => {
@@ -4096,7 +4055,7 @@ fn lower_one(
                 .max(g.rows * (g.query_heads + g.kv_heads));
             let reorder_groups = (g.rows * g.query_heads * g.head_dim).div_ceil(THREADS_PER_GROUP);
             let splits = crate::dflash2::ATTENTION_SPLITS;
-            return Ok(vec![
+            return dispatched(vec![
                 LoweredCommand {
                     kernel: KernelId::DraftAttentionQkv,
                     library: "dflash2",
@@ -4130,7 +4089,6 @@ fn lower_one(
                         scratch(s.query_keys, 6),
                         scratch(s.query_values, 7),
                     ]),
-                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftAttentionSplit,
@@ -4152,7 +4110,6 @@ fn lower_one(
                         scratch(s.query_values, 6),
                         scratch(s.partials, 7),
                     ]),
-                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftAttentionReduce,
@@ -4165,7 +4122,6 @@ fn lower_one(
                     constants,
                     dispatch: draft_lanes_grid(g.kv_heads, g, bucket_m, 1),
                     bindings: baked(vec![scratch(s.queries, 0), scratch(s.partials, 1)]),
-                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftAttentionReorder,
@@ -4184,7 +4140,6 @@ fn lower_one(
                             binding_index: 1,
                         },
                     ]),
-                    gemm: None,
                 },
             ]);
         }
@@ -4216,7 +4171,7 @@ fn lower_one(
             ];
             let tasks = eff_m * g.kv_heads;
             // A cycle's commit, then a prompt's: `route_draft_commit` gates them apart.
-            return Ok(vec![
+            return dispatched(vec![
                 LoweredCommand {
                     kernel: KernelId::DraftContextCommit,
                     library: "dflash2",
@@ -4236,7 +4191,6 @@ fn lower_one(
                             ])
                             .collect(),
                     ),
-                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftContextPrefill,
@@ -4256,7 +4210,6 @@ fn lower_one(
                             ])
                             .collect(),
                     ),
-                    gemm: None,
                 },
             ]);
         }
@@ -4288,13 +4241,12 @@ fn lower_one(
                     constants,
                     dispatch,
                     bindings: baked(head.iter().chain(tail).copied().collect()),
-                    gemm: None,
                 };
             let rows = [
                 runtime(RuntimeBindingKind::CuSeqlensQ, 4),
                 runtime(RuntimeBindingKind::NumTokensU32, 5),
             ];
-            return Ok(match inst {
+            return dispatched(match inst {
                 // A cycle's commit, then a prompt's: `route_draft_commit` gates them apart.
                 I::DraftWindowStore(_) => vec![
                     command(
@@ -4352,7 +4304,7 @@ fn lower_one(
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
             };
-            return Ok(vec![
+            return dispatched(vec![
                 LoweredCommand {
                     kernel: KernelId::DraftSelectTop16,
                     library: "dflash2_select",
@@ -4371,7 +4323,6 @@ fn lower_one(
                         scratch(s.partial_ids, 1),
                         scratch(s.partial_values, 2),
                     ]),
-                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftSelectEdges,
@@ -4407,7 +4358,6 @@ fn lower_one(
                         runtime(RuntimeBindingKind::InputIds, 7),
                         runtime(RuntimeBindingKind::NumTokensU32, 8),
                     ]),
-                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftSelectWalk,
@@ -4425,7 +4375,6 @@ fn lower_one(
                         runtime(RuntimeBindingKind::DraftLaneParams, 6),
                         runtime(RuntimeBindingKind::NumTokensU32, 7),
                     ]),
-                    gemm: None,
                 },
                 LoweredCommand {
                     kernel: KernelId::DraftVerifyRows,
@@ -4443,7 +4392,6 @@ fn lower_one(
                         runtime(RuntimeBindingKind::DraftLaneParams, 2),
                         runtime(RuntimeBindingKind::NumTokensU32, 3),
                     ]),
-                    gemm: None,
                 },
             ]);
         }
@@ -4494,7 +4442,6 @@ fn lower_one(
                         binding_index: 3,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -4537,7 +4484,6 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -4642,7 +4588,6 @@ fn lower_one(
                         binding_index: 4,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -4741,7 +4686,6 @@ fn lower_one(
                     m_scaling: None,
                 },
                 bindings: baked(bindings),
-                gemm: None,
             }
         }
         // Dense GeGLU (Gemma3 text MLP) — same fused gate/up GEMM +
@@ -4854,7 +4798,6 @@ fn lower_one(
                     .chain(codec.into_iter().flat_map(|(_, b)| b))
                     .collect(),
                 ),
-                gemm: None,
             }
         }
 
@@ -4911,7 +4854,6 @@ fn lower_one(
                     .chain(codec.into_iter().flat_map(|(_, b)| b))
                     .collect(),
                 ),
-                gemm: None,
             }
         }
 
@@ -4999,7 +4941,6 @@ fn lower_one(
                     .chain(codec.into_iter().flat_map(|(_, b)| b))
                     .collect(),
                 ),
-                gemm: None,
             }
         }
 
@@ -5092,7 +5033,6 @@ fn lower_one(
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
-                gemm: None,
             }
         }
 
@@ -5293,7 +5233,6 @@ fn lower_one(
                             binding_index: 1,
                         },
                     ]),
-                    gemm: None,
                 });
                 // 2. gather K (rope-on-read) → Kdense [nkv,max_kv,hd].
                 cmds.push(LoweredCommand {
@@ -5317,7 +5256,6 @@ fn lower_one(
                         rt(RuntimeBindingKind::SeqUsedK, 3),
                         cossin(4),
                     ]),
-                    gemm: None,
                 });
                 // 3. gather V (transposed copy) → Vdense_T [nkv,hd,max_kv].
                 cmds.push(LoweredCommand {
@@ -5338,7 +5276,6 @@ fn lower_one(
                         rt(RuntimeBindingKind::KvCacheV { layer: lid }, 2),
                         rt(RuntimeBindingKind::SeqUsedK, 3),
                     ]),
-                    gemm: None,
                 });
                 // 4. per head: QKᵀ (NAX GEMM, N=kv_len@seq_used) → softmax → PV.
                 for h in 0..nh {
@@ -5395,7 +5332,6 @@ fn lower_one(
                             rt(RuntimeBindingKind::SpanIds, 4),
                             rt(RuntimeBindingKind::CuSeqlensQ, 5),
                         ]),
-                        gemm: None,
                     });
                     cmds.push(LoweredCommand {
                         kernel: KernelId::AttnCausalSoftmax,
@@ -5420,7 +5356,6 @@ fn lower_one(
                             rt(RuntimeBindingKind::CuSeqlensQ, 2),
                             rt(RuntimeBindingKind::SpanIds, 3),
                         ]),
-                        gemm: None,
                     });
                     // PV: NAX matmul2d (M5+) or simdgroup steel (pre-M5). Both
                     // C=A@B^T with K=kv_len read from seq_used at runtime.
@@ -5471,7 +5406,6 @@ fn lower_one(
                             rt(RuntimeBindingKind::SpanIds, 4),
                             rt(RuntimeBindingKind::CuSeqlensQ, 5),
                         ]),
-                        gemm: None,
                     });
                 }
                 // 5. O [nh,Lq,hd] head-major → [Lq,nh,hd] token-major into out_slot.
@@ -5488,7 +5422,6 @@ fn lower_one(
                         },
                         scr(out_head_off, 1),
                     ]),
-                    gemm: None,
                 });
                 Some(cmds)
             } else {
@@ -5749,7 +5682,6 @@ fn lower_one(
                     constants: constants.into_baked(),
                     dispatch: steel_paged_dispatch(q_heads, bucket_m, bq_steel, threads),
                     bindings: bindings.into_baked(),
-                    gemm: None,
                 };
                 if roped_k_scratch {
                     // Three commands: (1) RopeOnce{Nax,Steel} ropes the cache's K
@@ -5834,7 +5766,6 @@ fn lower_one(
                             table: w.table(!sliding)?,
                         }
                         .into_baked(),
-                        gemm: None,
                     };
                     let plain = LoweredCommand {
                         constants: plain_constants.into_baked(),
@@ -5861,7 +5792,7 @@ fn lower_one(
                     let mut cmds = vec![rope_cmd, attn_cmd, plain];
                     cmds.extend(lanes.into_iter().flatten());
                     cmds.push(reroping);
-                    return Ok(cmds);
+                    return dispatched(cmds);
                 }
                 attn_cmd
             } else if use_gqa_shared {
@@ -5889,7 +5820,6 @@ fn lower_one(
                             }),
                         },
                         bindings: bindings.into_baked(),
-                        gemm: None,
                     }
                 };
                 let attn_cmd = gqa_shared(constants, bindings);
@@ -5941,11 +5871,10 @@ fn lower_one(
                             table: w.table(!sliding)?,
                         }
                         .into_baked(),
-                        gemm: None,
                     };
                     let plain = gqa_shared(plain_constants, bindings_for(false, false));
                     let reroping = gqa_shared(reroping_constants, bindings_for(false, true));
-                    return Ok(vec![rope_cmd, attn_cmd, plain, reroping]);
+                    return dispatched(vec![rope_cmd, attn_cmd, plain, reroping]);
                 }
                 attn_cmd
             } else {
@@ -5954,7 +5883,7 @@ fn lower_one(
             match unfused {
                 Some(mut cmds) => {
                     cmds.push(attention);
-                    return Ok(cmds);
+                    return dispatched(cmds);
                 }
                 None => attention,
             }
@@ -6026,7 +5955,6 @@ fn lower_one(
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
-                gemm: None,
             }
         }
 
@@ -6065,7 +5993,6 @@ fn lower_one(
                     binding_index: 1,
                 },
             ]),
-            gemm: None,
         },
 
         // ── Scalar-multiply broadcast ──────────────────────────────
@@ -6117,7 +6044,6 @@ fn lower_one(
                 // constant on the specialized pipeline (Phase 5.B);
                 // no runtime binding needed.
             ]),
-            gemm: None,
         },
 
         // ── The logit tail over the sampled rows (Gemma's soft cap, Granite's scale) ──
@@ -6166,7 +6092,6 @@ fn lower_one(
                         binding_index: output,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -6207,7 +6132,6 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -6272,7 +6196,6 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -6297,11 +6220,12 @@ fn lower_one(
                     }
                 })
                 .into_iter()
+                .map(|c| c.map(TapeCommand::Dispatch))
                 .collect();
         }
         I::RotateRows(rows, which) => {
             let inverse = *which == RotatedRows::Output;
-            return Ok(vec![tq_rotate_command(p, *rows, inverse, bucket_m)?]);
+            return dispatched(vec![tq_rotate_command(p, *rows, inverse, bucket_m)?]);
         }
         // The decode attention of its class, reading the packed store.
         I::AttnPackedKv(q, out, layer, pairing, class, offsets) => {
@@ -6333,7 +6257,7 @@ fn lower_one(
             let layer = layer.get() + layer_offset;
             let q_heads = q_heads(p)?;
             let twin = |c: &LoweredCommand| tq_attention_command(c, layer, ops, bits, q_heads);
-            return Ok(via_cache.first().map(twin).into_iter().collect());
+            return dispatched(via_cache.first().and_then(TapeCommand::dispatch).map(twin));
         }
         I::Moe(block, step) => {
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
@@ -6454,7 +6378,6 @@ fn lower_one(
                         }),
                     },
                     bindings: baked(bindings),
-                    gemm: None,
                 }
             };
 
@@ -6474,7 +6397,7 @@ fn lower_one(
             if let Some(decode) = decode
                 && GdnStepsKnown::at(p, bucket_m).run(|d, q| d && q) == GuardRun::Gated(None)
             {
-                return Ok(vec![decode]);
+                return dispatched(vec![decode]);
             }
 
             // A bucket of at most GDN_VERIFY_ROWS rows holds no sequence of more: every step it
@@ -6530,7 +6453,7 @@ fn lower_one(
             // prompt's one chunk: the verify command runs a step whose sequences hold a lane's rows
             // at most, and the commands below every other (`route_gdn`, the lane-rows gates).
             let verify = match verify {
-                Some(v) if bucket_m <= GDN_VERIFY_ROWS => return Ok(v),
+                Some(v) if bucket_m <= GDN_VERIFY_ROWS => return dispatched(v),
                 v => v,
             };
 
@@ -6581,9 +6504,9 @@ fn lower_one(
 
             // The verify pair first: `route_gdn` gates it on the lane rows, the rest off them.
             if let Some(verify) = verify {
-                return Ok(verify.into_iter().chain(cmds).collect());
+                return dispatched(verify.into_iter().chain(cmds));
             }
-            return Ok(cmds);
+            return dispatched(cmds);
         }
 
         // ── Nemotron-H Mamba-2: conv1d → selective scan → gate-before-norm ──
@@ -6653,7 +6576,7 @@ fn lower_one(
                 layout.o,
                 Some(row),
             ));
-            return Ok(cmds);
+            return dispatched(cmds);
         }
 
         // ── Vision LayerNorm-with-bias (Qwen3.5-VL ViT norm1/norm2/
@@ -6705,7 +6628,6 @@ fn lower_one(
                     source(ix, WeightTensor::Weight, layer_id, 2),
                     source(ix, WeightTensor::Weight, layer_id, 3),
                 ]),
-                gemm: None,
             }
         }
 
@@ -6754,7 +6676,6 @@ fn lower_one(
                     source(ix, WeightTensor::Weight, layer_id, 2),
                     source(ix, WeightTensor::Bias, layer_id, 3),
                 ]),
-                gemm: None,
             }
         }
 
@@ -6800,7 +6721,6 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -6843,7 +6763,6 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -6896,7 +6815,6 @@ fn lower_one(
                         binding_index: 1,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -6957,9 +6875,8 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             };
-            return Ok(vec![
+            return dispatched(vec![
                 rope_cmd(*q_out_slot, *q_slot),
                 rope_cmd(*k_out_slot, *k_slot),
             ]);
@@ -7035,7 +6952,6 @@ fn lower_one(
                         binding_index: 4,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -7103,7 +7019,6 @@ fn lower_one(
                         binding_index: 4,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -7154,7 +7069,6 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
 
@@ -7162,7 +7076,7 @@ fn lower_one(
         I::Reshape(..) => {
             // A view: no device memory moves. The rows after it see its
             // shape through `update_shape_state`.
-            return Ok(Vec::new());
+            return dispatched(Vec::new());
         }
 
         // ── Multimodal embed splice (VL text decoder) ──────────────
@@ -7213,12 +7127,11 @@ fn lower_one(
                         binding_index: 2,
                     },
                 ]),
-                gemm: None,
             }
         }
     };
 
-    Ok(vec![cmd])
+    dispatched([cmd])
 }
 
 /// Default 1D threads-per-threadgroup. Matches Metal's preferred
@@ -7226,12 +7139,6 @@ fn lower_one(
 /// 5.B specialized-pipeline cache may pick a different value per
 /// kernel + bucket once measured.
 const THREADS_PER_GROUP: u32 = 256;
-
-/// 2D GEMM tile dims (M × N axes). Placeholder — kept narrow so the
-/// dispatch math stays sensible at small buckets; will be replaced
-/// per (model, bucket) by the SpecializedPipelineCache in Phase 5.B.
-const GEMM_TILE_M: u32 = 16;
-const GEMM_TILE_N: u32 = 16;
 
 /// Output tile dim for the prefill matrix variant
 /// (`fused_gate_up_silu_mul_gemm_steel_*_specialized`). 4 simdgroups
@@ -7382,8 +7289,10 @@ fn route_draft_commit(step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCom
     }
     cmds.into_iter()
         .map(|GatedCommand { command, gate }| {
-            let by = match command.kernel {
-                KernelId::DraftContextCommit | KernelId::DraftWindowStoreCommit => OnlyIfDraftCycle,
+            let by = match command.kernel() {
+                Some(KernelId::DraftContextCommit | KernelId::DraftWindowStoreCommit) => {
+                    OnlyIfDraftCycle
+                }
                 _ => UnlessDraftCycle,
             };
             let gate = Some(RuntimeGate::and(gate, baked(vec![by])));
@@ -7696,7 +7605,6 @@ fn fused_gate_up_mul_cmd(
                 2,
             ),
         ]),
-        gemm: None,
     })
 }
 
@@ -8111,7 +8019,6 @@ fn recurrent_conv(
             }),
         },
         bindings: baked(bindings),
-        gemm: None,
     })
 }
 
@@ -8223,7 +8130,6 @@ fn recurrent_scan(
                 m_scaling: seqs,
             },
             bindings: baked(bindings),
-            gemm: None,
         }
     };
     if hk.is_multiple_of(32) && hv.is_multiple_of(4) {
@@ -8274,7 +8180,6 @@ fn recurrent_scan(
             weight(WeightTensor::GdnALog, 4),
             weight(WeightTensor::GdnDtBias, 5),
         ]),
-        gemm: None,
     };
     let inputs = [scratch(2, layout.g), scratch(3, layout.beta)];
     let tgx = hv.clamp(1, THREADS_PER_GROUP);
@@ -8381,7 +8286,6 @@ fn recurrent_norm(
             z,
             norm_w,
         ]),
-        gemm: None,
     }
 }
 
@@ -8702,7 +8606,6 @@ fn make_moe_command(
         constants: baked(constants),
         dispatch,
         bindings: baked(bindings),
-        gemm: None,
     }
 }
 
@@ -8837,6 +8740,11 @@ impl MoeScratch {
 
     /// `region` as a scratch binding at `binding_index`.
     fn at(&self, binding_index: u8, region: MoeRegion) -> Binding {
+        self.region(region).at(binding_index)
+    }
+
+    /// `region` of the scratch.
+    fn region(&self, region: MoeRegion) -> Activation {
         use MoeRegion as R;
         let (l, grouping) = (&self.l, self.grouping);
         let sorted = |gathered: u32, sorted: u32| match grouping {
@@ -8854,7 +8762,7 @@ impl MoeScratch {
             R::ExpertUp => sorted(l.up_out, l.grp_up_pad),
             R::ExpertDown => sorted(l.down_out, l.grp_down_pad),
         };
-        scratch_at(binding_index, byte_offset)
+        Activation::MoeScratch { byte_offset }
     }
 }
 
@@ -8881,7 +8789,7 @@ fn lower_moe_step(
     w: RowSources<'_>,
     at: MoeBake,
     moe_scratch_bytes: &mut u32,
-) -> Result<Vec<LoweredCommand>, LoweringError> {
+) -> Result<Vec<TapeCommand>, LoweringError> {
     use super::kernel_constants::{
         AffineCombineQmvConstants, AffineGatedQmvConstants, AffineGatherQmvConstants,
         AffineQmvConstants, ArgsortConstants, GatedGatherQmvConstants, GatherRows,
@@ -8923,11 +8831,12 @@ fn lower_moe_step(
     };
     // Rows where the step that wrote them left them: the router's input, read before any sort.
     // The rows of a norm the step absorbed bind only where its command normalizes them.
-    let rows_at = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
-        MoeRows::Tokens(Slot(slot)) => Ok(arena_at(i, slot)),
-        MoeRows::Scratch(r) => Ok(s.at(i, r)),
+    let rows_act = |s: &MoeScratch, rows: MoeRows| match rows {
+        MoeRows::Tokens(Slot(slot)) => Ok(Activation::Arena { slot }),
+        MoeRows::Scratch(r) => Ok(s.region(r)),
         MoeRows::Normed(..) => Err(LoweringError::NormedRowsUnread),
     };
+    let rows_at = |s: &MoeScratch, i: u8, rows: MoeRows| rows_act(s, rows).map(|a| a.at(i));
     // An expert projection's rows: a sorted bake reads the token rows through the sort's own
     // copy, in sorted order.
     let rows_of = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
@@ -9205,17 +9114,17 @@ fn lower_moe_step(
             bindings.push(source(router()?, bias, layer(&first.layer), 14));
             constants.push(C::boolean(4, true));
         }
-        commands.push(cmd(
+        commands.push(TapeCommand::Dispatch(cmd(
             kernel,
             "quantized_qmv",
             symbol,
             constants,
             shape,
             bindings,
-        ));
+        )));
         Ok::<_, LoweringError>(commands)
     };
-    Ok(match step {
+    dispatched(match step {
         // Plain RMSNorm by the router gain: Gemma's `(1 + w)` offset does not apply to it.
         S::RouterNorm(Slot(x), l, eps) => vec![LoweredCommand {
             kernel: KernelId::RmsNorm,
@@ -9238,7 +9147,6 @@ fn lower_moe_step(
                 arena_at(1, x),
                 source(router()?, WeightTensor::GemmaRouterScale, layer(&l), 2),
             ]),
-            gemm: None,
         }],
         // One row, a norm folded in: its own pre-norm, the router scale binding as the norm's
         // gain, or the RMSNorm whose rows it reads, that norm's gain (its row's `RmsNorm` weight).
@@ -9289,32 +9197,23 @@ fn lower_moe_step(
                     ),
                     source(gain.0, gain.1, layer(&gain.2), 3),
                 ]),
-                gemm: None,
             }]
         }
         S::RouterLogits(rows, l, _) => {
-            let tiles = (bucket_m.div_ceil(GEMM_TILE_M), e.div_ceil(GEMM_TILE_N), 1);
-            let gate = crate::op_abi::router_gate(b.router);
-            vec![LoweredCommand {
-                kernel: KernelId::Gemm,
-                library: "",
-                function: "",
-                constants: &[],
-                dispatch: grid(tiles, (GEMM_TILE_M, GEMM_TILE_N, 1), ms(A::X)),
-                bindings: baked(vec![s.at(0, R::RouterLogits), rows_at(&s, 1, rows)?]),
-                gemm: Some(Gemm {
-                    dims: GemmDims {
-                        m: bucket_m,
-                        n: e,
-                        k: router_in,
-                    },
-                    weight: GemmWeight {
-                        ix: router()?,
-                        which: gate,
-                        layer: layer(&l),
-                    },
-                }),
-            }]
+            return Ok(vec![TapeCommand::Gemm(Gemm {
+                dims: GemmDims {
+                    m: bucket_m,
+                    n: e,
+                    k: router_in,
+                },
+                weight: GemmWeight {
+                    ix: router()?,
+                    which: crate::op_abi::router_gate(b.router),
+                    layer: layer(&l),
+                },
+                out: s.region(R::RouterLogits),
+                input: rows_act(&s, rows)?,
+            })]);
         }
         S::Softmax(scores) => {
             let (region, row) = match scores {
@@ -9614,7 +9513,7 @@ fn lower_moe_step(
                     ),
                     bindings,
                 );
-                return Ok(vec![gemm]);
+                return dispatched(vec![gemm]);
             }
             if s.grouping == MoeGrouping::Grouped {
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
@@ -9732,11 +9631,11 @@ fn lower_moe_step(
             let gemms = [S::ExpertMatmul(gate), S::ExpertMatmul(up)];
             let route = routing.map(S::Route);
             let mut commands = each_step(&[route.as_slice(), &gemms].concat(), moe_scratch_bytes)?;
-            commands.extend(gated_act_command(act, bias_layer)?);
-            commands
+            commands.extend(dispatched(gated_act_command(act, bias_layer)?)?);
+            return Ok(commands);
         }
         S::GateUpAct(gate, _, act, routing) => {
-            gated_command(gate, ExpertBody::Gated(act), routing, moe_scratch_bytes)?
+            return gated_command(gate, ExpertBody::Gated(act), routing, moe_scratch_bytes);
         }
         // A grouped bake, or a width with a 1-3 row tail, runs the projection and the act apart.
         S::UpAct(up, act, routing)
@@ -9744,10 +9643,10 @@ fn lower_moe_step(
         {
             let route = routing.map(S::Route);
             let steps = [S::ExpertMatmul(up), S::Act(act)];
-            each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes)?
+            return each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes);
         }
         S::UpAct(up, act, routing) => {
-            gated_command(up, ExpertBody::Ungated(act), routing, moe_scratch_bytes)?
+            return gated_command(up, ExpertBody::Ungated(act), routing, moe_scratch_bytes);
         }
         // Gathered or sorted: one command runs the down matvec of each token's pairs, 4 rows at a
         // time, and combines those rows — a sorted bake's reading each pair's row where its sort
@@ -9764,8 +9663,8 @@ fn lower_moe_step(
             // combine does.
             let bias_layer = (b.bundle == ExpertBundle::GptOss).then(|| layer(&down.layer));
             let mut commands = each_step(&[S::ExpertMatmul(down), S::Unsort], moe_scratch_bytes)?;
-            commands.extend(combine_command(out, bias_layer)?);
-            commands
+            commands.extend(dispatched(combine_command(out, bias_layer)?)?);
+            return Ok(commands);
         }
         S::DownCombine(down, Slot(out), ends) => {
             let (gs, bits) = (down.group_size, down.width.bits());
@@ -9881,6 +9780,24 @@ mod tests {
         GdnHeadDim, GdnHeads, HeadDim, HeadGeometry, HiddenSize, KvHeads, KvRope, NumDrafts,
         QueryHeads, Rope, RopePairing, RotDim, SoftCap,
     };
+
+    /// The dispatch a test reads: a command expected to lower to one (a GEMM's test matches
+    /// [`TapeCommand::Gemm`] instead).
+    trait Dispatched {
+        fn lowered(&self) -> LoweredCommand;
+    }
+
+    impl Dispatched for TapeCommand {
+        fn lowered(&self) -> LoweredCommand {
+            *self.dispatch().expect("a dispatch, not a GEMM")
+        }
+    }
+
+    impl Dispatched for GatedCommand {
+        fn lowered(&self) -> LoweredCommand {
+            self.command.lowered()
+        }
+    }
 
     /// A class's geometry: `q` query heads over `kv` kv heads of `hd`, `rot` lanes rotated, pages
     /// of `page`.
@@ -10247,12 +10164,13 @@ mod tests {
         let live: Vec<bool> = (lowered.live_expanded().iter())
             .map(|p| p.cache_writes)
             .collect();
-        assert_eq!(commands[0].command.kernel, KernelId::RopeAppend);
+        assert_eq!(commands[0].lowered().kernel, KernelId::RopeAppend);
         assert!(live[0] && writes_cache(&commands[0]));
         let (played, skipped): (Vec<_>, Vec<_>) = commands.iter().zip(&live).partition(|p| *p.1);
         assert_eq!(played.len(), 1, "the writer alone");
         assert!(
-            (skipped.iter()).any(|(c, _)| c.command.kernel == KernelId::AttentionPrefillSdpaPaged),
+            (skipped.iter())
+                .any(|(c, _)| c.lowered().kernel == KernelId::AttentionPrefillSdpaPaged),
             "the attention is skipped"
         );
 
@@ -10364,8 +10282,8 @@ mod tests {
                 .expect("a one-row fold lowers");
             assert_eq!(lowered.commands.len(), 1, "one command");
             let one = &lowered.commands.get(0);
-            let (cmd, w) = (&one.command, lower_tq(&p, plain(&[writer]), 1));
-            let writer = &w.commands.get(0).command;
+            let (cmd, w) = (&one.lowered(), lower_tq(&p, plain(&[writer]), 1));
+            let writer = &w.commands.get(0).lowered();
             let constant = |c: &LoweredCommand, slot: u16| {
                 c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
             };
@@ -10400,7 +10318,7 @@ mod tests {
         let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(1, None))
             .expect("a one-row fold lowers");
         let kernels: Vec<KernelId> = (lowered.commands.iter())
-            .map(|c| c.command.kernel)
+            .map(|c| c.lowered().kernel)
             .collect();
         assert_eq!(
             kernels,
@@ -10409,9 +10327,9 @@ mod tests {
                 KernelId::AttentionDecodeCombine,
             ]
         );
-        let split = &lowered.commands.get(0).command;
+        let split = &lowered.commands.get(0).lowered();
         let w = lower_tq(&p, plain(&[writer]), 1);
-        let writer = &w.commands.get(0).command;
+        let writer = &w.commands.get(0).lowered();
         let constant = |c: &LoweredCommand, slot: u16| {
             c.constants.iter().find(|k| k.index == slot).map(|k| k.bits)
         };
@@ -10460,7 +10378,7 @@ mod tests {
         };
         let lowered = |geometry, bucket_m| drafting(geometry, bucket_m, 0);
         let shape = |c: &[GatedCommand]| -> Vec<(&str, Option<_>)> {
-            c.iter().map(|c| (c.command.function, c.gate)).collect()
+            c.iter().map(|c| (c.lowered().function, c.gate)).collect()
         };
         let (only, unless) = (Some(OnlyIfDecodeStep), Some(UnlessDecodeStep));
         let (decode, conv) = ("gdn_decode_bf16", "gdn_conv1d_varlen_bf16");
@@ -10477,17 +10395,17 @@ mod tests {
             (norm, unless),
         ];
         assert_eq!(shape(&q27), want);
-        let d = &q27[0].command.dispatch;
+        let d = &q27[0].lowered().dispatch;
         assert_eq!(
             (d.threadgroups, d.threads_per_threadgroup),
             ((1, 16, 1), (1024, 1, 1))
         );
-        let d = &q27[2].command.dispatch;
+        let d = &q27[2].lowered().dispatch;
         assert_eq!(
             (d.threadgroups, d.threads_per_threadgroup),
             ((48 * 128 / 32, 1, 1), (128, 1, 1))
         );
-        let d = &q27[3].command.dispatch;
+        let d = &q27[3].lowered().dispatch;
         // The simdgroup form: 48 value heads (divisible by four) pack four rows a
         // threadgroup of four simdgroups — a quarter the threadgroups, the same
         // 128 threads.
@@ -10510,7 +10428,7 @@ mod tests {
         let twins = lowered((1, 8, 128, 128), 64);
         let want = [(conv, None), (simd, only), (pipe, unless), (norm, None)];
         assert_eq!(shape(&twins), want);
-        assert_eq!(twins[1].command.bindings, twins[2].command.bindings);
+        assert_eq!(twins[1].lowered().bindings, twins[2].lowered().bindings);
         // head_v 48: no decode command, and not a whole number of the pipelined scan's 32-row
         // threadgroups — the simd scan alone; neither kernel covers head_k 64 either.
         let want = [(conv, None), (simd, None), (norm_tg, None)];
@@ -10539,7 +10457,7 @@ mod tests {
         // checkpoints (8). The plain steps' kernels lay a slot out as without drafts: the decode
         // command's conv width and eps follow the geometry at 5 and 6, the pipelined scan's block
         // at 5, and the pipelined scan binds the simd scan's buffers but the lanes.
-        let constants = |i: usize| q27[i].command.constants;
+        let constants = |i: usize| q27[i].lowered().constants;
         let geometry = &constants(2)[..5];
         assert_eq!(
             constants(2)[5],
@@ -10575,19 +10493,19 @@ mod tests {
             ]
             .concat()
         );
-        assert_eq!(q27[4].command.bindings, q27[3].command.bindings);
+        assert_eq!(q27[4].lowered().bindings, q27[3].lowered().bindings);
         let lanes = |i: usize, kind: fn(LayerId) -> RuntimeBindingKind, index: u8| {
             let lane = Binding::Runtime {
                 kind: kind(LayerId(0)),
                 binding_index: index,
             };
-            q27[i].command.bindings.contains(&lane)
+            q27[i].lowered().bindings.contains(&lane)
         };
         let conv_lanes = |layer| RuntimeBindingKind::GdnConvLanes { layer };
         let ssm_lanes = |layer| RuntimeBindingKind::GdnSsmLanes { layer };
         assert!(lanes(1, conv_lanes, 8) && lanes(2, ssm_lanes, 11));
         assert!(!lanes(0, ssm_lanes, 11) && !lanes(3, ssm_lanes, 11));
-        let simd_bindings: Vec<_> = (q27[2].command.bindings.iter())
+        let simd_bindings: Vec<_> = (q27[2].lowered().bindings.iter())
             .filter(|b| {
                 !matches!(
                     b,
@@ -10599,7 +10517,7 @@ mod tests {
             })
             .copied()
             .collect();
-        assert_eq!(q27[3].command.bindings, simd_bindings);
+        assert_eq!(q27[3].lowered().bindings, simd_bindings);
         let want = [
             (decode, plain),
             (conv, replays),
@@ -10643,7 +10561,7 @@ mod tests {
         };
         let lower = |step: MetalStep| try_lower_tq(&tq_consts(), plain(&[step]), 1);
         let coded = lower(writer(LLAMA_KV, KvWrite::PoolAndPacked)).expect("lowers");
-        let c = &coded.commands.get(0).command;
+        let c = &coded.commands.get(0).lowered();
         assert_eq!((c.library, coded.commands.len()), ("kv_append", 1));
         let slot = |i: u16| c.constants.iter().find(|k| k.index == i).map(|k| k.bits);
         let hd = a(&tq_consts()).global().head_dim().get() as usize;
@@ -10668,7 +10586,7 @@ mod tests {
         // Plain on a dense model (a coded model refuses a writer that encodes nothing).
         let plain_writer = try_lower_tq(&tp(), plain(&[writer(LLAMA_KV, KvWrite::Pool)]), 1);
         let plain_writer = plain_writer.expect("lowers");
-        let c = &plain_writer.commands.get(0).command;
+        let c = &plain_writer.commands.get(0).lowered();
         assert!(c.constants.iter().all(|k| k.index < 10));
         assert!(c.bindings.iter().all(|b| b.index() < 16));
         let k_biased = scratchy_ir::KvOffsets {
@@ -10686,7 +10604,7 @@ mod tests {
         let twin = MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), NeoX, Causal, LLAMA_KV);
         let rows = plain(&[writer(LLAMA_KV, KvWrite::PoolAndPacked), twin]);
         let layer = try_lower_tq(&tq_consts(), rows, 1).expect("the coded layer lowers");
-        let kernels: Vec<KernelId> = layer.commands.iter().map(|c| c.command.kernel).collect();
+        let kernels: Vec<KernelId> = layer.commands.iter().map(|c| c.lowered().kernel).collect();
         assert_eq!(
             kernels,
             [
@@ -10728,7 +10646,7 @@ mod tests {
         // A binding as (index, what it binds), the scratch by its region's order.
         let binds = |c: &GatedCommand| -> Vec<(u8, String)> {
             let mut b: Vec<(u8, String)> = c
-                .command
+                .lowered()
                 .bindings
                 .iter()
                 .map(|b| match *b {
@@ -10767,7 +10685,10 @@ mod tests {
         for bucket_m in [1, 64] {
             // The parity-tiny geometry: in-projection row 128 + 192 + 8 = 328.
             let tiny = lowered((2, 8, 16, 16), bucket_m);
-            let functions: Vec<_> = tiny.iter().map(|c| (c.command.function, c.gate)).collect();
+            let functions: Vec<_> = tiny
+                .iter()
+                .map(|c| (c.lowered().function, c.gate))
+                .collect();
             assert_eq!(
                 functions,
                 [
@@ -10778,7 +10699,7 @@ mod tests {
                 ]
             );
             assert_eq!(
-                tiny[0].command.constants,
+                tiny[0].lowered().constants,
                 [
                     C::uint(0, 192),
                     C::uint(1, 4),
@@ -10802,7 +10723,7 @@ mod tests {
             want.insert(0, (0, conv_out.clone()));
             assert_eq!(binds(&tiny[0]), want);
             assert_eq!(
-                tiny[1].command.constants,
+                tiny[1].lowered().constants,
                 [
                     C::uint(0, bucket_m * 8),
                     C::uint(1, 8),
@@ -10830,7 +10751,7 @@ mod tests {
                 C::uint(8, 0),
                 C::boolean(5, true),
             ];
-            assert_eq!(tiny[2].command.constants, scan_constants);
+            assert_eq!(tiny[2].lowered().constants, scan_constants);
             let scan = binds(&tiny[2]);
             assert_eq!(scan[1], (1, conv_out.clone()));
             // The scan reads the gating's g and dt regions.
@@ -10842,7 +10763,7 @@ mod tests {
             );
             assert_eq!(scan[8], (8, "GdnSkip".to_owned()));
             assert_eq!(
-                tiny[3].command.constants,
+                tiny[3].lowered().constants,
                 [
                     C::uint(0, 64),
                     C::uint(1, bucket_m * 2),
@@ -10864,7 +10785,10 @@ mod tests {
             // row a sequence is the simd scan's; every other step — a prefill chunk — the
             // pipelined scan's, in its selective form (state 128, head_dim 64: its geometry).
             let real = lowered((8, 64, 128, 64), bucket_m);
-            let functions: Vec<_> = real.iter().map(|c| (c.command.function, c.gate)).collect();
+            let functions: Vec<_> = real
+                .iter()
+                .map(|c| (c.lowered().function, c.gate))
+                .collect();
             let routed: &[_] = match bucket_m {
                 1 => &[
                     ("gdn_conv1d_varlen_bf16", None),
@@ -10902,11 +10826,11 @@ mod tests {
                 ],
             ]
             .concat();
-            assert_eq!(real[1].command.constants, simd_constants);
+            assert_eq!(real[1].lowered().constants, simd_constants);
             if bucket_m > 1 {
                 // The pipelined scan: the simd scan's selective form at 5-7, its block at 10;
                 // the simd scan's bindings, `D` at 10 among them.
-                let pipe = &real[2].command;
+                let pipe = &real[2].lowered();
                 let pipe_constants = [
                     &geometry[..],
                     &[
@@ -10918,7 +10842,7 @@ mod tests {
                 ]
                 .concat();
                 assert_eq!(pipe.constants, pipe_constants);
-                assert_eq!(pipe.bindings, real[1].command.bindings);
+                assert_eq!(pipe.bindings, real[1].lowered().bindings);
                 assert_eq!(
                     (
                         pipe.dispatch.threadgroups,
@@ -10937,12 +10861,12 @@ mod tests {
                 simd[8..],
                 named(&[(8, "GdnALog"), (9, "GdnDtBias"), (10, "GdnSkip")])
             );
-            let d = &real[1].command.dispatch;
+            let d = &real[1].lowered().dispatch;
             assert_eq!(
                 (d.threadgroups, d.threads_per_threadgroup),
                 ((1, 64 * 64 / 4, 1), (32, 4, 1))
             );
-            let d = &real[real.len() - 1].command.dispatch;
+            let d = &real[real.len() - 1].lowered().dispatch;
             assert_eq!(
                 (d.threadgroups, d.threads_per_threadgroup),
                 ((bucket_m * 8, 1, 1), (256, 1, 1))
@@ -10965,7 +10889,7 @@ mod tests {
             let tape = lower_tq(&tp(), rows, bucket_m);
             assert!(
                 tape.commands.iter().all(|c| !matches!(
-                    c.command.kernel,
+                    c.lowered().kernel,
                     KernelId::TqStageRotated
                         | KernelId::TqRotateRows
                         | KernelId::AttentionViaCacheTq
@@ -11035,7 +10959,7 @@ mod tests {
         let steps = |tape: &LoweredMetalTape| {
             tape.commands
                 .iter()
-                .map(|c| (c.command.kernel, c.gate))
+                .map(|c| (c.lowered().kernel, c.gate))
                 .collect::<Vec<(KernelId, Option<RuntimeGate>)>>()
         };
         let p = tq_consts();
@@ -11050,9 +10974,9 @@ mod tests {
             ]
         );
         let (fp16, split, combine) = (
-            &tape.commands.get(1).command,
-            &tape.commands.get(2).command,
-            &tape.commands.get(3).command,
+            &tape.commands.get(1).lowered(),
+            &tape.commands.get(2).lowered(),
+            &tape.commands.get(3).lowered(),
         );
         // A threadgroup a (KV head, split) of head_dim threads, its combine one a query
         // head of two simdgroups — head_dim 64's share of every lane's elements.
@@ -11141,7 +11065,10 @@ mod tests {
                 (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (fp16, tq) = (&tape.commands.get(1).command, &tape.commands.get(2).command);
+        let (fp16, tq) = (
+            &tape.commands.get(1).lowered(),
+            &tape.commands.get(2).lowered(),
+        );
         // Same kernel; the plain command's threadgroups count head groups —
         // the baked GQA divisor, 8 heads a group here — while the twin's
         // count heads for the worker's variant division.
@@ -11209,7 +11136,7 @@ mod tests {
         let find = |k| {
             tape.commands
                 .iter()
-                .map(|c| c.command)
+                .map(|c| c.lowered())
                 .find(|c| c.kernel == k)
                 .expect("the command")
         };
@@ -11256,7 +11183,7 @@ mod tests {
         let tape = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(1, None))
             .expect("lower_subtile_tape_to_metal");
         let steps: Vec<_> = (tape.commands.iter())
-            .map(|c| (c.command.kernel, c.gate))
+            .map(|c| (c.lowered().kernel, c.gate))
             .collect();
         assert_eq!(
             steps,
@@ -11268,9 +11195,9 @@ mod tests {
             ]
         );
         let (fp16, split, combine) = (
-            &tape.commands.get(1).command,
-            &tape.commands.get(2).command,
-            &tape.commands.get(3).command,
+            &tape.commands.get(1).lowered(),
+            &tape.commands.get(2).lowered(),
+            &tape.commands.get(3).lowered(),
         );
         let sinks = |binding_index| Binding::Source {
             ix: SINKS_IX,
@@ -11336,7 +11263,7 @@ mod tests {
                 lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(bucket_m, None))
                     .expect("lower_subtile_tape_to_metal");
             (lowered.commands.iter())
-                .map(|c| c.command.kernel)
+                .map(|c| c.lowered().kernel)
                 .filter(|k| {
                     matches!(
                         k,
@@ -11384,9 +11311,9 @@ mod tests {
         )
         .expect("lower_subtile_tape_to_metal");
         let twin = (tape.commands.iter())
-            .find(|c| c.command.kernel == KernelId::AttentionViaCacheTq)
+            .find(|c| c.lowered().kernel == KernelId::AttentionViaCacheTq)
             .expect("the twin");
-        assert!((twin.command.bindings.iter()).any(|b| matches!(
+        assert!((twin.lowered().bindings.iter()).any(|b| matches!(
             b,
             Binding::Source {
                 ix: SINKS_IX,
@@ -11436,9 +11363,9 @@ mod tests {
                     .expect("lower_subtile_tape_to_metal");
             tape.commands
                 .iter()
-                .find(|c| c.command.kernel == k)
+                .find(|c| c.lowered().kernel == k)
                 .expect("command")
-                .command
+                .lowered()
         };
         let (fp16, tq) = (
             find(&crate::targets::M1_MAX, KernelId::AttentionViaCache),
@@ -11534,7 +11461,7 @@ mod tests {
     fn gated_steps(tape: &LoweredMetalTape) -> Vec<(KernelId, Option<RuntimeGate>)> {
         tape.commands
             .iter()
-            .map(|c| (c.command.kernel, c.gate))
+            .map(|c| (c.lowered().kernel, c.gate))
             .collect()
     }
 
@@ -11606,10 +11533,13 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (gqa, combine) = (&tape.commands.get(2).command, &tape.commands.get(3).command);
+        let (gqa, combine) = (
+            &tape.commands.get(2).lowered(),
+            &tape.commands.get(3).lowered(),
+        );
         let twin = with_attention(p, TP_GEOM, geom(32, 2, 256, 64, 16), None, KvRope::AtWrite);
         let twin = lower_tq(&twin, rows(), 1);
-        let twin = &twin.commands.get(2).command;
+        let twin = &twin.commands.get(2).lowered();
         assert_eq!(twin.kernel, KernelId::AttentionViaCacheTq);
         // 128 blocks of 16 keys: two threadgroups of `ATTN_SPLIT_KEYS`.
         let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
@@ -11672,7 +11602,7 @@ mod tests {
 
         let kernels = |tape: &LoweredMetalTape| {
             (tape.commands.iter())
-                .map(|c| c.command.kernel)
+                .map(|c| c.lowered().kernel)
                 .collect::<Vec<_>>()
         };
         // A batched bucket's rows ride the split too: the kernel is per-row throughout,
@@ -11714,8 +11644,8 @@ mod tests {
             ]
         );
         let (gqa, combine) = (
-            &verify.commands.get(1).command,
-            &verify.commands.get(2).command,
+            &verify.commands.get(1).lowered(),
+            &verify.commands.get(2).lowered(),
         );
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
         assert_eq!(combine.dispatch.threadgroups, (4, a(&p).q_heads().get(), 1));
@@ -11773,7 +11703,7 @@ mod tests {
                 KernelId::AttentionDecodeCombine
             ]
         );
-        let fold = &folded.commands.get(0).command;
+        let fold = &folded.commands.get(0).lowered();
         assert!(fold.constants.iter().any(|k| k.index == ATTN_FOLD.0));
         // Its splits and the writer's threadgroup.
         let fold_splits = (fold.constants.iter())
@@ -11816,7 +11746,10 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (gqa, combine) = (&tape.commands.get(2).command, &tape.commands.get(3).command);
+        let (gqa, combine) = (
+            &tape.commands.get(2).lowered(),
+            &tape.commands.get(3).lowered(),
+        );
         let splits = (128 * a(&p).global().page().get()).div_ceil(ATTN_SPLIT_KEYS);
         assert_eq!(splits, 2);
         assert_eq!(gqa.dispatch.threadgroups, (1, 4, splits));
@@ -11841,7 +11774,7 @@ mod tests {
         assert!(std::panic::catch_unwind(|| geom(29, 4, 128, 64, 16)).is_err());
         let kernels = |tape: &LoweredMetalTape| {
             (tape.commands.iter())
-                .map(|c| c.command.kernel)
+                .map(|c| c.lowered().kernel)
                 .collect::<Vec<_>>()
         };
         // granite-3.3-2b (head_dim 64, GQA 4) takes it too: its two simdgroups form one key
@@ -11856,17 +11789,17 @@ mod tests {
         );
         let granite = lower_tq(&granite, rows(), 1);
         let granite_split = (granite.commands.iter())
-            .find(|c| c.command.kernel == KernelId::AttentionDecodeGqaTq)
+            .find(|c| c.lowered().kernel == KernelId::AttentionDecodeGqaTq)
             .expect("granite's head_dim 64 takes the split");
         assert_eq!(
-            granite_split.command.dispatch.threads_per_threadgroup,
+            granite_split.lowered().dispatch.threads_per_threadgroup,
             (64, 1, 1)
         );
         let granite_combine = (granite.commands.iter())
-            .find(|c| c.command.kernel == KernelId::AttentionDecodeCombine)
+            .find(|c| c.lowered().kernel == KernelId::AttentionDecodeCombine)
             .expect("granite's split has its combine");
         assert_eq!(
-            granite_combine.command.dispatch.threads_per_threadgroup,
+            granite_combine.lowered().dispatch.threads_per_threadgroup,
             (64, 1, 1)
         );
         // The head dims between the tiling's steps stay on the twin: 192's six simdgroups do
@@ -11910,22 +11843,22 @@ mod tests {
             1,
         );
         let split = (biased.commands.iter())
-            .find(|c| c.command.kernel == KernelId::AttentionDecodeGqaTq)
+            .find(|c| c.lowered().kernel == KernelId::AttentionDecodeGqaTq)
             .expect("the biased twin takes the split");
         assert!(
             split
-                .command
+                .lowered()
                 .constants
                 .contains(&ConstantValue::uint(14, 1))
         );
         assert!(
             split
-                .command
+                .lowered()
                 .constants
                 .contains(&ConstantValue::uint(15, 1))
         );
-        assert!(split.command.bindings.iter().any(|b| b.index() == 14));
-        assert!(split.command.bindings.iter().any(|b| b.index() == 15));
+        assert!(split.lowered().bindings.iter().any(|b| b.index() == 14));
+        assert!(split.lowered().bindings.iter().any(|b| b.index() == 15));
         // A batched bucket's rows ride the grid's x axis: the kernel is per-row throughout
         // (its length, block table, slot and position all key off `seq = tg_pos.x`), so the
         // split serves m rows as m x-threadgroups and the partials carry them.
@@ -11940,8 +11873,8 @@ mod tests {
             ]
         );
         let (gqa, combine) = (
-            &batched.commands.get(2).command,
-            &batched.commands.get(3).command,
+            &batched.commands.get(2).lowered(),
+            &batched.commands.get(3).lowered(),
         );
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
         assert_eq!(combine.dispatch.threadgroups, (4, a(&p).q_heads().get(), 1));
@@ -11991,7 +11924,7 @@ mod tests {
         };
         let kernels = |tape: &LoweredMetalTape| {
             (tape.commands.iter())
-                .map(|c| c.command.kernel)
+                .map(|c| c.lowered().kernel)
                 .collect::<Vec<_>>()
         };
         let splits = (128 * a(&p).global().page().get())
@@ -12058,11 +11991,11 @@ mod tests {
         let m5 = lower(Some(&crate::targets::M5_10CORE));
         let kernels = |t: &LoweredMetalTape| {
             (t.commands.iter())
-                .map(|c| c.command.kernel)
+                .map(|c| c.lowered().kernel)
                 .collect::<Vec<_>>()
         };
         assert_eq!(kernels(&m5)[0], KernelId::RopeOnceNax);
-        let nax = &m5.commands.get(1).command;
+        let nax = &m5.commands.get(1).lowered();
         assert_eq!(
             (
                 nax.library,
@@ -12080,7 +12013,7 @@ mod tests {
 
         let steel = lower(None);
         assert_eq!(kernels(&steel)[0], KernelId::RopeOnceSteel);
-        let attn = &steel.commands.get(1).command;
+        let attn = &steel.commands.get(1).lowered();
         assert_eq!(attn.library, "attention_steel_paged");
         assert_eq!(attn.dispatch.threads_per_threadgroup, (128, 1, 1));
         assert_eq!(constant(attn, 7), Some(1024));
@@ -12111,7 +12044,7 @@ mod tests {
         };
         let m5 = lower(64, Some(&crate::targets::M5_10CORE));
         let steps: Vec<_> = (m5.commands.iter())
-            .map(|c| (c.command.kernel, c.gate))
+            .map(|c| (c.lowered().kernel, c.gate))
             .collect();
         let trio = Some(All(&[
             UnlessOneSequence,
@@ -12134,7 +12067,7 @@ mod tests {
                 (KernelId::AttentionDecodeCombine, trio),
             ]
         );
-        let [pack, split, combine] = [3, 4, 5].map(|i| m5.commands.get(i).command);
+        let [pack, split, combine] = [3, 4, 5].map(|i| m5.commands.get(i).lowered());
         let (pack, split, combine) = (&pack, &split, &combine);
         assert_eq!(pack.dispatch.threadgroups, (VERIFY_TILE_ROWS, 4, 64));
         assert_eq!(split.dispatch.threadgroups, (VERIFY_SPLITS, 4, 64));
@@ -12153,7 +12086,7 @@ mod tests {
         let partials = 64 * 24 * VERIFY_SPLITS * 258 * 4;
         assert!(m5.moe_scratch_bytes >= packed + partials);
         let has_trio = |t: &LoweredMetalTape| {
-            (t.commands.iter()).any(|c| c.command.kernel == KernelId::AttentionVerifySplit)
+            (t.commands.iter()).any(|c| c.lowered().kernel == KernelId::AttentionVerifySplit)
         };
         assert!(!has_trio(&lower(512, Some(&crate::targets::M5_10CORE))));
         assert!(!has_trio(&lower(64, None)));
@@ -12271,8 +12204,8 @@ mod tests {
             want.push((KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)));
             assert_eq!(gated_steps(&tape), want);
             let (gemm_cmd, small) = (
-                &tape.commands.get(own.len() - 1).command,
-                &tape.commands.get(own.len()).command,
+                &tape.commands.get(own.len() - 1).lowered(),
+                &tape.commands.get(own.len()).lowered(),
             );
             // Weights and output; the W4A8 GEMM reads its activation from
             // the pre-pass's scratch (binding 3).
@@ -12323,7 +12256,7 @@ mod tests {
             assert!(
                 tape.commands
                     .iter()
-                    .all(|c| c.gate.is_none() && c.command.kernel != KernelId::AffineQmmSmallM),
+                    .all(|c| c.gate.is_none() && c.lowered().kernel != KernelId::AffineQmmSmallM),
                 "bucket {bucket_m}: no small-M twin"
             );
         }
@@ -12353,7 +12286,7 @@ mod tests {
                 [(KernelId::AffineQmvWide, None)],
                 "bucket {bucket_m}"
             );
-            let constants = tape.commands.get(0).command.constants;
+            let constants = tape.commands.get(0).lowered().constants;
             assert!(
                 constants.iter().any(|c| c.index == 8) && constants.iter().any(|c| c.index == 10),
                 "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
@@ -12397,7 +12330,7 @@ mod tests {
                 [(KernelId::AffineQmvFast, None)],
                 "bucket {bucket_m}"
             );
-            let d = tape.commands.get(0).command.dispatch;
+            let d = tape.commands.get(0).lowered().dispatch;
             assert_eq!(d.threadgroups, (bucket_m, 48 / 4, 1), "bucket {bucket_m}");
             let scaling = d.m_scaling.expect("X-axis m_scaling");
             assert!(matches!(scaling.axis, MScaleAxis::X) && scaling.set_axis.is_none());
@@ -12406,7 +12339,7 @@ mod tests {
             lower_at(step, bucket_m, profile)
                 .commands
                 .iter()
-                .map(|c| c.command.kernel)
+                .map(|c| c.lowered().kernel)
                 .collect()
         };
         assert_eq!(kernels(gemm(48, 4), 1, m5), [KernelId::AffineQmvFast]);
@@ -12476,7 +12409,7 @@ mod tests {
                 ],
                 "{case}"
             );
-            let [own, small] = [1, 2].map(|i| tape.commands.get(i).command);
+            let [own, small] = [1, 2].map(|i| tape.commands.get(i).lowered());
             let (own, small) = (&own, &small);
             let kernel = W4a8Gemm::SmallM(ways);
             assert_eq!(
@@ -12507,7 +12440,7 @@ mod tests {
             let small = tape.commands.last().expect("a command");
             assert_eq!(small.gate, Some(OnlyIfSmallMTokens), "{bucket_m}");
             assert_eq!(
-                small.command.kernel,
+                small.lowered().kernel,
                 KernelId::AffineQmmSmallM,
                 "{bucket_m}"
             );
@@ -12567,7 +12500,7 @@ mod tests {
                 ],
                 "{case}"
             );
-            let [quant, wide, small] = [0, 1, 2].map(|i| tape.commands.get(i).command);
+            let [quant, wide, small] = [0, 1, 2].map(|i| tape.commands.get(i).lowered());
             let [quant, wide, small] = [&quant, &wide, &small];
             let rows = W4A8_SMALL_M_ROWS;
             let slot = |c: &LoweredCommand, i| c.constants.iter().find(|v| v.index == i).copied();
@@ -12645,7 +12578,7 @@ mod tests {
         // Group size 32: no W4A8 instantiation, the bf16 twin.
         let tape = lower_subtile_tape_to_metal(&gemm(17408, 5120, 32), &p, at).expect("lowers");
         let small = tape.commands.last().expect("a command");
-        assert_eq!(small.command.kernel, KernelId::AffineQmmSmallM);
+        assert_eq!(small.lowered().kernel, KernelId::AffineQmmSmallM);
     }
 
     /// On the wide class, a projection whose twin is at most one threadgroup a core of the class's
@@ -12715,7 +12648,7 @@ mod tests {
             .expect("lower_subtile_tape_to_metal")
         }
         for profile in [&crate::targets::M4_10CORE, &crate::targets::M5_10CORE] {
-            let command = &lower_at(profile).commands.get(0).command;
+            let command = &lower_at(profile).commands.get(0).lowered();
             assert_eq!(
                 command.kernel,
                 KernelId::AffineQmvWide,
@@ -12727,7 +12660,7 @@ mod tests {
                 "affine_qmv_wide_bf16_s_f16_gs_64_b_4_nv_4_kl_8_batch_0"
             );
         }
-        let command = &lower_at(&crate::targets::M1_MAX).commands.get(0).command;
+        let command = &lower_at(&crate::targets::M1_MAX).commands.get(0).lowered();
         assert_eq!(
             command.kernel,
             KernelId::AffineQmvFast,
@@ -12811,12 +12744,12 @@ mod tests {
         let plain = plain_q_proj(at);
         assert!(
             plain.commands.len() == 1
-                && tape.commands.get(3).command == plain.commands.get(0).command
+                && tape.commands.get(3).lowered() == plain.commands.get(0).lowered()
         );
         // The gather over the matmul's input, `k` wide, and back over it; one thread per column,
         // walking the sampled rows in order (the rows swap in place). The logits stay at the
         // front: nothing moves them back.
-        let [gather, qmv, restore] = [0, 1, 2].map(|i| tape.commands.get(i).command);
+        let [gather, qmv, restore] = [0, 1, 2].map(|i| tape.commands.get(i).lowered());
         for c in [gather, restore] {
             assert!(matches!(
                 c.bindings[0],
@@ -12897,27 +12830,27 @@ mod tests {
             let (matmul, compact) = commands.split_at(n);
             let plain_commands: Vec<GatedCommand> = plain.commands.iter().collect();
             assert!(matmul == plain_commands, "bucket {bucket_m}: plain");
-            assert_eq!(matmul.last().map(|c| c.command.kernel), Some(last));
+            assert_eq!(matmul.last().map(|c| c.lowered().kernel), Some(last));
             // The compaction: the gather over the matmul's output, `n` wide.
             let [compact] = compact else {
                 panic!("bucket {bucket_m}: one compaction after the matmul");
             };
             assert_eq!(compact.gate, Some(UnlessEveryRowSampled));
-            assert_eq!(compact.command.kernel, K::GatherSampledRows);
+            assert_eq!(compact.lowered().kernel, K::GatherSampledRows);
             assert!(matches!(
-                compact.command.bindings[0],
+                compact.lowered().bindings[0],
                 Binding::ArenaSlot {
                     slot: 11,
                     binding_index: 0
                 }
             ));
-            assert_eq!(compact.command.dispatch.threadgroups, (2048 / 256, 1, 1));
+            assert_eq!(compact.lowered().dispatch.threadgroups, (2048 / 256, 1, 1));
             assert_eq!(tape.barrier_before[n], F::Coherent);
             assert_eq!(tape.logits_rows, LogitsRows::Bucket);
             // A first command that writes the shared scratch (split-K's partial, a W4A8
             // pre-pass) waits out its last reader whatever its row's flag.
             let writes_scratch = tape.commands.first().is_some_and(|c| {
-                c.command
+                c.lowered()
                     .bindings
                     .iter()
                     .any(|b| matches!(b, Binding::Scratch { .. }))
@@ -12982,7 +12915,7 @@ mod tests {
         let codes = |tape: &LoweredMetalTape| -> Vec<AffineCodes> {
             tape.commands
                 .iter()
-                .map(|c| AffineCodes::of_constants(c.command.constants))
+                .map(|c| AffineCodes::of_constants(c.lowered().constants))
                 .collect()
         };
         let m5 = Some(&crate::targets::M5_10CORE);
@@ -12995,7 +12928,10 @@ mod tests {
                 (KernelId::AffineQmmW4a8, None)
             ]
         );
-        let (quant, qmm) = (&tape.commands.get(0).command, &tape.commands.get(1).command);
+        let (quant, qmm) = (
+            &tape.commands.get(0).lowered(),
+            &tape.commands.get(1).lowered(),
+        );
         assert_eq!(
             quant.bindings,
             [
@@ -13046,7 +12982,7 @@ mod tests {
             assert!(
                 tape.commands
                     .iter()
-                    .all(|c| c.command.kernel != KernelId::AffineQmmW4a8),
+                    .all(|c| c.lowered().kernel != KernelId::AffineQmmW4a8),
                 "{g:?}: no W4A8"
             );
             assert!(codes(&tape).iter().all(|&c| c == want), "{g:?}");
@@ -13121,7 +13057,7 @@ mod tests {
                 ..bake_point(bucket_m, Some(&crate::targets::M5_10CORE))
             };
             let tape = lower_subtile_tape_to_metal(&gemm(n, k), &tp(), at).expect("lowers");
-            let qmm = &tape.commands.get(1).command;
+            let qmm = &tape.commands.get(1).lowered();
             let case = format!("{class:?} bucket {bucket_m} n {n} k {k}");
             assert_eq!(qmm.kernel, KernelId::AffineQmmW4a8, "{case}");
             assert_eq!(qmm.function, kernel.static_name(dtype, scale, 64), "{case}");
@@ -13185,7 +13121,7 @@ mod tests {
         };
         for bucket_m in [64, 32] {
             let tape = lower(bucket_m);
-            let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+            let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.lowered().kernel).collect();
             let at = |k: KernelId| kinds.iter().position(|&e| e == k).expect("lowered");
             let quants: Vec<usize> = (kinds.iter().enumerate())
                 .filter(|(_, k)| **k == Quant)
@@ -13213,7 +13149,7 @@ mod tests {
                 ),
             ] {
                 let i = at(norm);
-                let c = &tape.commands.get(i).command;
+                let c = &tape.commands.get(i).lowered();
                 assert_eq!(
                     c.function,
                     quantizing_symbol(plain).expect("a twin"),
@@ -13245,21 +13181,21 @@ mod tests {
         // the ungated norm, which writes the small-M tile's 16-row scratch on every step.
         for bucket_m in [16, 8] {
             let tape = lower(bucket_m);
-            let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+            let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.lowered().kernel).collect();
             let case = format!("bucket {bucket_m}: {kinds:?}");
             assert_eq!(kinds[0], RmsNorm, "{case}");
             assert_ne!(kinds[1], Quant, "{case}");
             let c = &tape.commands.get(0);
             let p = tp();
             assert_eq!(
-                c.command.function,
+                c.lowered().function,
                 quantizing_symbol(rmsnorm_kernel_static_name(&p, scale_dtype_for(&p)))
                     .expect("a twin"),
                 "{case}"
             );
             assert_eq!(c.gate, None, "{case}: the norm runs on every step");
             assert!(
-                (c.command.constants.iter())
+                (c.lowered().constants.iter())
                     .any(|v| *v == ConstantValue::uint(6, W4A8_SMALL_M_ROWS)),
                 "{case}: the small-M tile's scratch rows"
             );
@@ -13311,7 +13247,7 @@ mod tests {
         // A cache-only forward skips the q projection, and plays the pre-pass k and v reuse.
         tape.backbone_live = cache_plays(&[false, true, true, false, false, true]);
         let tape = lower_subtile_tape_to_metal(&tape, &tp(), bake_point(512, m5)).expect("lowers");
-        let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+        let kinds: Vec<KernelId> = tape.commands.iter().map(|c| c.lowered().kernel).collect();
         assert_eq!(kinds, [Quant, Gemm, Gemm, Gemm, Quant, Gemm, Quant, Gemm]);
         assert_eq!(
             tape.live.iter().map(|p| p.cache_writes).collect::<Vec<_>>(),
@@ -13348,7 +13284,7 @@ mod tests {
         let every = at(&MetalStep::TanhSoftCap(Slot(2), Slot(2), width));
         assert_eq!(gated_steps(&every), [(KernelId::TanhSoftCap, None)]);
         assert_eq!(
-            every.commands.get(0).command.function,
+            every.commands.get(0).lowered().function,
             "tanh_soft_cap_bf16_specialized"
         );
         let scale = LogitOp::Scale(Scale(0.25));
@@ -13370,7 +13306,7 @@ mod tests {
         ] {
             let tape = at(&MetalStep::SampledLogits(Slot(2), Slot(2), op, width));
             assert_eq!(gated_steps(&tape), [(kernel, None)]);
-            let c = tape.commands.get(0).command;
+            let c = tape.commands.get(0).lowered();
             assert_eq!(c.function, function);
             assert_eq!(c.constants, [constant, ConstantValue::uint(6, 1000)]);
             assert_eq!(
@@ -13424,9 +13360,9 @@ mod tests {
         let rotations: Vec<(&str, u32)> = tape
             .commands
             .iter()
-            .filter(|c| c.command.kernel == KernelId::TqRotateRows)
-            .map(|c| match c.command.bindings[0] {
-                Binding::ArenaSlot { slot, .. } => (c.command.function, slot),
+            .filter(|c| c.lowered().kernel == KernelId::TqRotateRows)
+            .map(|c| match c.lowered().bindings[0] {
+                Binding::ArenaSlot { slot, .. } => (c.lowered().function, slot),
                 other => panic!("rotated rows bound as {other:?}"),
             })
             .collect();
@@ -13439,15 +13375,15 @@ mod tests {
         let staged: Vec<(bool, Option<u32>)> = tape
             .commands
             .iter()
-            .filter(|c| c.command.kernel == KernelId::TqStageRotated)
+            .filter(|c| c.lowered().kernel == KernelId::TqStageRotated)
             .map(|c| {
                 let reropes = c
-                    .command
+                    .lowered()
                     .bindings
                     .iter()
                     .any(|b| matches!(b, Binding::Source { .. }));
                 let pass = c
-                    .command
+                    .lowered()
                     .constants
                     .iter()
                     .find(|k| k.index == 17)
@@ -13469,8 +13405,8 @@ mod tests {
         let split = |tape: &LoweredMetalTape| {
             tape.commands
                 .iter()
-                .find(|c| c.command.kernel == KernelId::AttentionDecodeGqaTq)
-                .map(|c| c.command)
+                .find(|c| c.lowered().kernel == KernelId::AttentionDecodeGqaTq)
+                .map(|c| c.lowered())
                 .expect("the split")
         };
         let decode_form = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, NeoX), 64);
@@ -13514,7 +13450,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 own.iter()
-                    .map(|c| (c.command.kernel, c.gate))
+                    .map(|c| (c.lowered().kernel, c.gate))
                     .collect::<Vec<_>>(),
                 [
                     (KernelId::RopeOnceSteel, Some(one)),
@@ -13525,18 +13461,19 @@ mod tests {
                 "{attention:?}"
             );
             let binds =
-                |c: &GatedCommand, f: fn(&Binding) -> bool| c.command.bindings.iter().any(f);
+                |c: &GatedCommand, f: fn(&Binding) -> bool| c.lowered().bindings.iter().any(f);
             let scratch = |b: &Binding| matches!(b, Binding::RopedKScratch { .. });
             let cos_sin = |b: &Binding| matches!(b, Binding::Source { .. });
             assert!(binds(&own[1], scratch) && !binds(&own[1], cos_sin));
             assert!(!binds(&own[2], scratch) && !binds(&own[2], cos_sin));
             assert!(!binds(&own[3], scratch) && binds(&own[3], cos_sin));
             assert_eq!(
-                own[2].command.function, own[1].command.function,
+                own[2].lowered().function,
+                own[1].lowered().function,
                 "the plain twin is the scratch attention's own kernel"
             );
             assert_eq!(
-                own[3].command.function,
+                own[3].lowered().function,
                 "attention_prefill_sdpa_v2_paged_bf16_specialized"
             );
         }
@@ -13579,7 +13516,7 @@ mod tests {
             let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(64, None))
                 .expect("lower_subtile_tape_to_metal");
             let twins: Vec<GatedCommand> = (lowered.commands.iter())
-                .filter(|c| c.command.kernel == KernelId::AttentionPrefillSdpaPaged)
+                .filter(|c| c.lowered().kernel == KernelId::AttentionPrefillSdpaPaged)
                 .filter(|c| [plain, reroping].iter().any(|g| c.gate == Some(*g)))
                 .collect();
             assert_eq!(
@@ -13588,7 +13525,7 @@ mod tests {
                 "{attention:?}"
             );
             let sinks = |c: &GatedCommand| {
-                (c.command.bindings.iter()).any(|b| {
+                (c.lowered().bindings.iter()).any(|b| {
                     matches!(
                         b,
                         Binding::Source {
@@ -13652,7 +13589,7 @@ mod tests {
                 tape.commands
                     .iter()
                     .filter(move |c| c.gate == Some(g))
-                    .map(|c| c.command)
+                    .map(|c| c.lowered())
             };
             let own: Vec<_> = gated(one).collect();
             assert_eq!(
@@ -13736,7 +13673,7 @@ mod tests {
                 tape.commands
                     .iter()
                     .filter(move |c| c.gate == Some(g))
-                    .map(|c| c.command)
+                    .map(|c| c.lowered())
             };
             assert!(gated(one).any(|c| c.kernel == KernelId::AttnGatherKRope));
             assert!(gated(one).all(|c| c.seq_scope() == SeqScope::RowZero));
@@ -13763,17 +13700,17 @@ mod tests {
             .iter()
             .filter(|c| {
                 matches!(
-                    c.command.kernel,
+                    c.lowered().kernel,
                     KernelId::RopeOnceSteel | KernelId::AttentionPrefillSdpaPaged
                 )
             })
-            .map(|c| GatedCommand::ungated(c.command))
+            .map(|c| GatedCommand::ungated(c.lowered()))
             .collect();
         let [rope_once, scratch, plain, reroping] = cmds[..] else {
             panic!("{} commands", cmds.len());
         };
-        assert_eq!(rope_once.command.seq_scope(), SeqScope::RowZero);
-        assert_eq!(scratch.command.seq_scope(), SeqScope::RowZero);
+        assert_eq!(rope_once.lowered().seq_scope(), SeqScope::RowZero);
+        assert_eq!(scratch.lowered().seq_scope(), SeqScope::RowZero);
         for without_reroping in [vec![rope_once, scratch], vec![rope_once, scratch, plain]] {
             assert!(matches!(
                 route_by_sequence_count(7, without_reroping),
@@ -13831,7 +13768,7 @@ mod tests {
             tape.commands
                 .iter()
                 .filter_map(|c| {
-                    let c = &c.command;
+                    let c = &c.lowered();
                     let (from, slots): (u8, &[u16]) = match c.kernel {
                         KernelId::RopeAppend => (22, &[13, 14]),
                         KernelId::TqStageRotated => (10, &[14, 15]),
@@ -13915,9 +13852,9 @@ mod tests {
         )
         .expect("lower_subtile_tape_to_metal");
         let twin = (sinks.commands.iter())
-            .find(|c| c.command.kernel == KernelId::AttentionViaCacheTq)
+            .find(|c| c.lowered().kernel == KernelId::AttentionViaCacheTq)
             .expect("the twin")
-            .command;
+            .lowered();
         // The sink column (slot 16) rides along.
         assert_eq!(
             bound_from(&twin, 14),
@@ -13955,7 +13892,7 @@ mod tests {
         let vpw = scratchy_layers::turboquant::vals_per_word(bits) as u32;
         let hd = a(&p).base().head_dim().get();
         let tape = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
-        let writer = tape.commands.get(0).command;
+        let writer = tape.commands.get(0).lowered();
         assert_eq!(writer.kernel, KernelId::RopeAppend);
         assert_eq!(
             bound_from(&writer, 16),
@@ -14054,28 +13991,30 @@ mod tests {
         .expect("lower scalar_mul");
         assert_eq!(cmds.len(), 1);
         let cmd = &cmds[0];
-        assert_eq!(cmd.kernel, KernelId::ScalarMul);
+        assert_eq!(cmd.lowered().kernel, KernelId::ScalarMul);
 
         // `dispatch_1d` rounds `eff_m * width` up by THREADS_PER_GROUP (256).
         const TPG: u32 = 256;
         let want_groups = (BUCKET_M * VOCAB).div_ceil(TPG);
         let qsize_groups = (BUCKET_M * TestParams::Q_SIZE as u32).div_ceil(TPG);
         assert_eq!(
-            cmd.dispatch.threadgroups.0, want_groups,
+            cmd.lowered().dispatch.threadgroups.0,
+            want_groups,
             "ScalarMul must cover bucket_m*vocab (the full logits row)"
         );
         assert_ne!(
-            cmd.dispatch.threadgroups.0, qsize_groups,
+            cmd.lowered().dispatch.threadgroups.0,
+            qsize_groups,
             "the granite bug: bucket_m*Q_SIZE leaves the logits-row tail unscaled"
         );
         assert!(
-            cmd.dispatch.m_scaling.is_some(),
+            cmd.lowered().dispatch.m_scaling.is_some(),
             "ScalarMul carries X-axis m_scaling for the num_tokens rescale"
         );
     }
 
     /// `step` lowered alone at `bucket_m` for a model of `p`. Pure-CPU.
-    fn lower_alone(p: &ModelFacts, step: &MetalStep, bucket_m: u32) -> Vec<LoweredCommand> {
+    fn lower_alone(p: &ModelFacts, step: &MetalStep, bucket_m: u32) -> Vec<TapeCommand> {
         let (mut scratch, mut moe, mut roped_k, mut unfused) = (0u32, 0u32, 0u32, 0u32);
         lower_one(
             p,
@@ -14105,7 +14044,7 @@ mod tests {
     fn the_embed_splice_dispatches_whole_rows() {
         let p = with(tp(), |x| x.hidden = HiddenSize::new(2688));
         let cmds = lower_alone(&p, &MetalStep::SpliceMmEmbeds(Slot(0)), 8);
-        let d = cmds[0].dispatch;
+        let d = cmds[0].lowered().dispatch;
         assert_eq!(d.threadgroups, (2688u32.div_ceil(256), 8, 1));
         assert_eq!(d.threads_per_threadgroup, (256, 1, 1));
         let scaling = d.m_scaling.expect("row m_scaling");
@@ -14145,23 +14084,26 @@ mod tests {
         assert_eq!(cmds.len(), 1, "qmv branch emits exactly one command");
         assert_eq!(scratch, 0, "qmv branch never allocates splitk scratch");
         let cmd = &cmds[0];
-        assert_eq!(cmd.kernel, KernelId::AffineQmvFast);
-        assert_eq!(cmd.library, "quantized_qmv");
-        assert_eq!(cmd.function, "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0");
+        assert_eq!(cmd.lowered().kernel, KernelId::AffineQmvFast);
+        assert_eq!(cmd.lowered().library, "quantized_qmv");
         assert_eq!(
-            cmd.constants,
+            cmd.lowered().function,
+            "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0"
+        );
+        assert_eq!(
+            cmd.lowered().constants,
             vec![ConstantValue::int(0, 2048), ConstantValue::int(1, 2048)],
         );
         // qmv_fast grid: (M, ceil(N/4), B); group: (32, 2, 1).
-        assert_eq!(cmd.dispatch.threadgroups, (1, 2048 / 4, 1));
-        assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 1));
+        assert_eq!(cmd.lowered().dispatch.threadgroups, (1, 2048 / 4, 1));
+        assert_eq!(cmd.lowered().dispatch.threads_per_threadgroup, (32, 2, 1));
         // 5 bindings: weight (idx 0), scales (1), biases (2), in (3), out (4).
-        assert_eq!(cmd.bindings.len(), 5);
+        assert_eq!(cmd.lowered().bindings.len(), 5);
         // The `layer` baked into the bindings = inst.layer + layer_offset.
         // The site's first Linear source, at inst.layer + layer_offset.
         let affine = affine_weight_bindings(src(WeightKind::Linear, 0), LayerId(8));
-        assert_eq!(cmd.bindings[..3], affine);
-        match &cmd.bindings[0] {
+        assert_eq!(cmd.lowered().bindings[..3], affine);
+        match &cmd.lowered().bindings[0] {
             Binding::Source {
                 which,
                 layer,
@@ -14174,15 +14116,15 @@ mod tests {
             }
             _ => panic!("bindings[0]: expected Source"),
         }
-        match &cmd.bindings[1] {
+        match &cmd.lowered().bindings[1] {
             Binding::Source { which, .. } => assert_eq!(*which, WeightTensor::AffineScales),
             _ => panic!("bindings[1]: expected AffineScales Source"),
         }
-        match &cmd.bindings[2] {
+        match &cmd.lowered().bindings[2] {
             Binding::Source { which, .. } => assert_eq!(*which, WeightTensor::AffineBiases),
             _ => panic!("bindings[2]: expected AffineBiases Source"),
         }
-        match &cmd.bindings[3] {
+        match &cmd.lowered().bindings[3] {
             Binding::ArenaSlot {
                 slot,
                 binding_index,
@@ -14192,7 +14134,7 @@ mod tests {
             }
             _ => panic!("bindings[3]: expected in_slot ArenaSlot"),
         }
-        match &cmd.bindings[4] {
+        match &cmd.lowered().bindings[4] {
             Binding::ArenaSlot {
                 slot,
                 binding_index,
@@ -14202,7 +14144,7 @@ mod tests {
             }
             _ => panic!("bindings[4]: expected out_slot ArenaSlot"),
         }
-        assert!(cmd.gemm.is_none());
+        assert!(matches!(cmd, TapeCommand::Dispatch(_)));
     }
 
     /// At a bucket_m where `pick_qmm_t_kernel` returns `Standard`
@@ -14238,14 +14180,14 @@ mod tests {
         assert_eq!(cmds.len(), 1, "Standard path emits exactly one command");
         assert_eq!(scratch, 0, "Standard path never allocates splitk scratch");
         let cmd = &cmds[0];
-        assert_eq!(cmd.kernel, KernelId::AffineQmmT);
-        assert_eq!(cmd.library, "quantized_qmm");
+        assert_eq!(cmd.lowered().kernel, KernelId::AffineQmmT);
+        assert_eq!(cmd.lowered().library, "quantized_qmm");
         assert_eq!(
-            cmd.function,
+            cmd.lowered().function,
             "affine_qmm_t_bf16_s_f16_gs_64_b_4_alN_true_batch_0"
         );
         assert_eq!(
-            cmd.constants,
+            cmd.lowered().constants,
             vec![
                 ConstantValue::int(0, 2048),
                 ConstantValue::int(1, 2048),
@@ -14253,10 +14195,13 @@ mod tests {
             ],
         );
         // qmm_t grid: (ceil(N/32), ceil(M/32), B); group: (32, 2, 2).
-        assert_eq!(cmd.dispatch.threadgroups, (2048 / 32, 512 / 32, 1));
-        assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 2));
-        assert_eq!(cmd.bindings.len(), 5);
-        assert!(cmd.gemm.is_none());
+        assert_eq!(
+            cmd.lowered().dispatch.threadgroups,
+            (2048 / 32, 512 / 32, 1)
+        );
+        assert_eq!(cmd.lowered().dispatch.threads_per_threadgroup, (32, 2, 2));
+        assert_eq!(cmd.lowered().bindings.len(), 5);
+        assert!(matches!(cmd, TapeCommand::Dispatch(_)));
     }
 
     /// At a bucket_m where `pick_qmm_t_kernel` returns SplitK
@@ -14296,30 +14241,30 @@ mod tests {
         assert_eq!(scratch, 4 * 64 * 2048 * 2);
 
         let qmm_t = &cmds[0];
-        assert_eq!(qmm_t.kernel, KernelId::AffineQmmTSplitK);
-        assert_eq!(qmm_t.library, "quantized_qmm");
+        assert_eq!(qmm_t.lowered().kernel, KernelId::AffineQmmTSplitK);
+        assert_eq!(qmm_t.lowered().library, "quantized_qmm");
         assert_eq!(
-            qmm_t.function,
+            qmm_t.lowered().function,
             "affine_qmm_t_splitk_bf16_s_f16_gs_64_b_4_alN_true",
         );
         // qmm_t_splitk grid: (n_tiles, m_tiles, split_k); group same as qmm_t.
-        assert_eq!(qmm_t.dispatch.threadgroups, (64, 2, 4));
-        assert_eq!(qmm_t.dispatch.threads_per_threadgroup, (32, 2, 2));
+        assert_eq!(qmm_t.lowered().dispatch.threadgroups, (64, 2, 4));
+        assert_eq!(qmm_t.lowered().dispatch.threads_per_threadgroup, (32, 2, 2));
         // Bindings: w/scales/biases as Weight (0/1/2), in as ArenaSlot (3),
         // y output as Scratch (4).
-        assert_eq!(qmm_t.bindings.len(), 5);
-        match &qmm_t.bindings[4] {
+        assert_eq!(qmm_t.lowered().bindings.len(), 5);
+        match &qmm_t.lowered().bindings[4] {
             Binding::Scratch { binding_index } => assert_eq!(*binding_index, 4),
             _ => panic!("qmm_t bindings[4]: expected Scratch"),
         }
 
         let reduce = &cmds[1];
-        assert_eq!(reduce.kernel, KernelId::SplitKReduceSum);
-        assert_eq!(reduce.library, "quantized_splitk_reduce");
-        assert_eq!(reduce.function, "splitk_reduce_sum_bf16");
+        assert_eq!(reduce.lowered().kernel, KernelId::SplitKReduceSum);
+        assert_eq!(reduce.lowered().library, "quantized_splitk_reduce");
+        assert_eq!(reduce.lowered().function, "splitk_reduce_sum_bf16");
         // reduce constants: 0=M, 1=N, 2=split_k.
         assert_eq!(
-            reduce.constants,
+            reduce.lowered().constants,
             vec![
                 ConstantValue::uint(0, 64),
                 ConstantValue::uint(1, 2048),
@@ -14327,8 +14272,8 @@ mod tests {
             ],
         );
         // Bindings: 0 = output ArenaSlot, 1 = Scratch input.
-        assert_eq!(reduce.bindings.len(), 2);
-        match &reduce.bindings[0] {
+        assert_eq!(reduce.lowered().bindings.len(), 2);
+        match &reduce.lowered().bindings[0] {
             Binding::ArenaSlot {
                 slot,
                 binding_index,
@@ -14338,7 +14283,7 @@ mod tests {
             }
             _ => panic!("reduce bindings[0]: expected out ArenaSlot"),
         }
-        match &reduce.bindings[1] {
+        match &reduce.lowered().bindings[1] {
             Binding::Scratch { binding_index } => assert_eq!(*binding_index, 1),
             _ => panic!("reduce bindings[1]: expected Scratch"),
         }
@@ -14380,15 +14325,18 @@ mod tests {
         .expect("lower");
         assert_eq!(cmds.len(), 1, "SiluMul emits exactly one command");
         let cmd = &cmds[0];
-        assert_eq!(cmd.kernel, KernelId::SiluMul);
-        assert_eq!(cmd.library, "silu_mul");
-        assert_eq!(cmd.function, "silu_mul_bf16");
+        assert_eq!(cmd.lowered().kernel, KernelId::SiluMul);
+        assert_eq!(cmd.lowered().library, "silu_mul");
+        assert_eq!(cmd.lowered().function, "silu_mul_bf16");
         // n = bucket_m * width = 64 * 11008 (the instruction-carried
         // width, independent of TestParams::INTERMEDIATE_SIZE).
         let n_expected = 64 * 11008_u32;
-        assert_eq!(cmd.constants, vec![ConstantValue::uint(0, n_expected)]);
-        assert_eq!(cmd.bindings.len(), 3);
-        match &cmd.bindings[0] {
+        assert_eq!(
+            cmd.lowered().constants,
+            vec![ConstantValue::uint(0, n_expected)]
+        );
+        assert_eq!(cmd.lowered().bindings.len(), 3);
+        match &cmd.lowered().bindings[0] {
             Binding::ArenaSlot {
                 slot,
                 binding_index,
@@ -14398,7 +14346,7 @@ mod tests {
             }
             _ => panic!("bindings[0]: expected out_slot ArenaSlot"),
         }
-        match &cmd.bindings[1] {
+        match &cmd.lowered().bindings[1] {
             Binding::ArenaSlot {
                 slot,
                 binding_index,
@@ -14408,7 +14356,7 @@ mod tests {
             }
             _ => panic!("bindings[1]: expected gate_slot ArenaSlot"),
         }
-        match &cmd.bindings[2] {
+        match &cmd.lowered().bindings[2] {
             Binding::ArenaSlot {
                 slot,
                 binding_index,
@@ -14418,7 +14366,7 @@ mod tests {
             }
             _ => panic!("bindings[2]: expected up_slot ArenaSlot"),
         }
-        assert!(cmd.gemm.is_none());
+        assert!(matches!(cmd, TapeCommand::Dispatch(_)));
     }
 
     /// Unaligned-N Llama-1B-style lm_head (N=128256 — 128256 % 32 = 0
@@ -14458,11 +14406,11 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         let cmd = &cmds[0];
         assert_eq!(
-            cmd.function,
+            cmd.lowered().function,
             "affine_qmm_t_bf16_s_f16_gs_64_b_4_alN_false_batch_0"
         );
         // Ceil-div on N: 2050.div_ceil(32) = 65; M-tiles: 512/32 = 16.
-        assert_eq!(cmd.dispatch.threadgroups, (65, 512 / 32, 1));
+        assert_eq!(cmd.lowered().dispatch.threadgroups, (65, 512 / 32, 1));
     }
 
     /// AffineEmbed lowers to a single command targeting
@@ -14504,27 +14452,27 @@ mod tests {
         assert_eq!(scratch, 0, "AffineEmbed never allocates splitk scratch");
 
         let cmd = &cmds[0];
-        assert_eq!(cmd.kernel, KernelId::AffineEmbed);
-        assert_eq!(cmd.library, "quantized_dequantize");
+        assert_eq!(cmd.lowered().kernel, KernelId::AffineEmbed);
+        assert_eq!(cmd.lowered().library, "quantized_dequantize");
         // TestParams pins Bf16; group_size=64 → bf16 / s_f16 / gs_64 symbol.
-        assert_eq!(cmd.function, "affine_embed_bf16_s_f16_gs_64_b_4");
+        assert_eq!(cmd.lowered().function, "affine_embed_bf16_s_f16_gs_64_b_4");
 
         // function_constant(0) = hidden_size = the step's width = 2048.
-        assert_eq!(cmd.constants, vec![ConstantValue::uint(0, 2048)]);
+        assert_eq!(cmd.lowered().constants, vec![ConstantValue::uint(0, 2048)]);
 
         // 2D dispatch: (HIDDEN_SIZE/2 / THREADS_PER_GROUP, bucket_m, 1).
         // HIDDEN_SIZE=2048 → bytes_per_row=1024; THREADS_PER_GROUP=256.
         // groups_x = 1024.div_ceil(256) = 4.
-        assert_eq!(cmd.dispatch.threadgroups, (4, bucket_m, 1));
+        assert_eq!(cmd.lowered().dispatch.threadgroups, (4, bucket_m, 1));
         assert_eq!(
-            cmd.dispatch.threads_per_threadgroup,
+            cmd.lowered().dispatch.threads_per_threadgroup,
             (THREADS_PER_GROUP, 1, 1)
         );
 
         // 5 bindings: weight (0), scales (1), biases (2), input_ids (3), out (4).
-        assert_eq!(cmd.bindings.len(), 5);
+        assert_eq!(cmd.lowered().bindings.len(), 5);
         let embedding = src(WeightKind::AffineQuantEmbedding, 0);
-        match &cmd.bindings[0] {
+        match &cmd.lowered().bindings[0] {
             Binding::Source {
                 ix,
                 which,
@@ -14539,19 +14487,19 @@ mod tests {
             }
             _ => panic!("bindings[0]: expected the AffineQuantEmbedding source"),
         }
-        match &cmd.bindings[1] {
+        match &cmd.lowered().bindings[1] {
             Binding::Source { ix, which, .. } => {
                 assert_eq!((*ix, *which), (embedding, WeightTensor::AffineScales))
             }
             _ => panic!("bindings[1]: expected AffineScales"),
         }
-        match &cmd.bindings[2] {
+        match &cmd.lowered().bindings[2] {
             Binding::Source { ix, which, .. } => {
                 assert_eq!((*ix, *which), (embedding, WeightTensor::AffineBiases))
             }
             _ => panic!("bindings[2]: expected AffineBiases"),
         }
-        match &cmd.bindings[3] {
+        match &cmd.lowered().bindings[3] {
             Binding::Runtime {
                 kind,
                 binding_index,
@@ -14561,7 +14509,7 @@ mod tests {
             }
             _ => panic!("bindings[3]: expected InputIds runtime"),
         }
-        match &cmd.bindings[4] {
+        match &cmd.lowered().bindings[4] {
             Binding::ArenaSlot {
                 slot,
                 binding_index,
@@ -14571,7 +14519,7 @@ mod tests {
             }
             _ => panic!("bindings[4]: expected out_slot ArenaSlot"),
         }
-        assert!(cmd.gemm.is_none());
+        assert!(matches!(cmd, TapeCommand::Dispatch(_)));
     }
 
     /// The router reads the token rows it routes in every bake: a sorted bake's sort runs after
@@ -14721,10 +14669,10 @@ mod tests {
         ));
         assert_eq!(commands.len(), 3, "gate GEMM, up GEMM, act");
         let (s, act) = (MoeScratch::of(&block, 512, &p, &mut 0), &commands[2]);
-        assert_eq!(act.kernel, KernelId::SwigluOaiMul);
+        assert_eq!(act.lowered().kernel, KernelId::SwigluOaiMul);
         let n = s.l.mpad_max * 2880;
         assert_eq!(
-            act.constants,
+            act.lowered().constants,
             vec![
                 C::uint(0, n),
                 C::uint(1, 2880),
@@ -14734,7 +14682,7 @@ mod tests {
         );
         let bias = src(WeightKind::GptOssMoe, 0);
         assert_eq!(
-            act.bindings,
+            act.lowered().bindings,
             vec![
                 s.at(0, MoeRegion::ExpertGate),
                 s.at(1, MoeRegion::ExpertGate),
@@ -14764,9 +14712,9 @@ mod tests {
         let commands = lower(MoeStep::DownCombine(down, Slot(2), CombineEnds::default()));
         assert_eq!(commands.len(), 2, "down GEMM, combine");
         let combine = &commands[1];
-        assert_eq!(combine.kernel, KernelId::MoeWeightedSum);
+        assert_eq!(combine.lowered().kernel, KernelId::MoeWeightedSum);
         assert_eq!(
-            combine.constants,
+            combine.lowered().constants,
             vec![
                 C::int(0, 4),
                 C::int(1, 2880),
@@ -14775,7 +14723,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            combine.bindings,
+            combine.lowered().bindings,
             vec![
                 s.at(0, MoeRegion::ExpertDown),
                 s.at(1, MoeRegion::TopKScores),
@@ -14835,7 +14783,7 @@ mod tests {
             GatedAct::Silu,
             None,
         ));
-        let kernels: Vec<KernelId> = commands.iter().map(|c| c.kernel).collect();
+        let kernels: Vec<KernelId> = commands.iter().map(|c| c.lowered().kernel).collect();
         assert_eq!(
             kernels,
             [
@@ -14847,11 +14795,11 @@ mod tests {
         );
         let (s, act) = (MoeScratch::of(&block, 512, &p, &mut 0), &commands[2]);
         assert_eq!(
-            act.function,
+            act.lowered().function,
             w4a8_act_quant_static_name(W4a8Act::Silu, dequant_dtype_for(&p))
         );
         assert_eq!(
-            act.bindings,
+            act.lowered().bindings,
             vec![
                 s.at(0, MoeRegion::ExpertGate),
                 s.at(1, MoeRegion::ExpertUp),
@@ -14867,7 +14815,7 @@ mod tests {
         );
         let mpad = s.l.mpad_max;
         assert_eq!(
-            act.constants,
+            act.lowered().constants,
             vec![
                 ConstantValue::int(0, 512),
                 ConstantValue::int(2, mpad as i32),
@@ -14875,7 +14823,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            act.dispatch.threadgroups,
+            act.lowered().dispatch.threadgroups,
             ((512u32 / 64).div_ceil(16), mpad, 1),
             "the pre-pass's own grid"
         );
@@ -14888,7 +14836,7 @@ mod tests {
             width: ExpertWidth::OpUniform(four),
         };
         let commands = lower(MoeStep::DownCombine(down, Slot(2), CombineEnds::default()));
-        let kernels: Vec<KernelId> = commands.iter().map(|c| c.kernel).collect();
+        let kernels: Vec<KernelId> = commands.iter().map(|c| c.lowered().kernel).collect();
         assert_eq!(
             kernels,
             [KernelId::AffineGatherQmmW4a8, KernelId::MoeWeightedSum],
@@ -14900,13 +14848,16 @@ mod tests {
         // it for relu²).
         let relu2 = lower(MoeStep::Act(UngatedAct::Relu2));
         assert_eq!(relu2.len(), 1, "one fused command, no elementwise act");
-        assert_eq!(relu2[0].kernel, KernelId::AffineGatherW4a8ActQuant);
         assert_eq!(
-            relu2[0].function,
+            relu2[0].lowered().kernel,
+            KernelId::AffineGatherW4a8ActQuant
+        );
+        assert_eq!(
+            relu2[0].lowered().function,
             w4a8_act_quant_static_name(W4a8Act::Relu2, dequant_dtype_for(&p))
         );
         assert_eq!(
-            relu2[0].bindings,
+            relu2[0].lowered().bindings,
             vec![
                 s.at(0, MoeRegion::ExpertUp),
                 s.at(1, MoeRegion::ExpertUp),
@@ -14949,11 +14900,11 @@ mod tests {
             };
             let router = lower(MoeStep::RouterLogits(tokens, LayerId(0), None));
             assert_eq!(
-                router[0].bindings[1],
-                Binding::ArenaSlot {
+                router[0].bindings().nth(1),
+                Some(Binding::ArenaSlot {
                     slot: 1,
                     binding_index: 1
-                },
+                }),
                 "bucket {bucket_m}: the router's input rows"
             );
             let gate = ExpertMatmul {
@@ -14967,7 +14918,8 @@ mod tests {
             if grouping == MoeGrouping::Sorted {
                 let gate = lower(MoeStep::ExpertMatmul(gate));
                 assert_eq!(
-                    gate[0].bindings[3], copy,
+                    gate[0].lowered().bindings[3],
+                    copy,
                     "the sorted gate reads the sort's copy"
                 );
             }
@@ -15038,37 +14990,45 @@ mod tests {
         let [cmd] = gathered.as_slice() else {
             panic!("gathered: one command, got {}", gathered.len())
         };
-        assert_eq!(cmd.kernel, KernelId::MoeGateUpAct);
-        let act = cmd.constants.iter().find(|c| c.index == 3);
+        assert_eq!(cmd.lowered().kernel, KernelId::MoeGateUpAct);
+        let act = cmd.lowered().constants.iter().find(|c| c.index == 3);
         assert_eq!(act.map(|c| c.bits), Some(3), "the ungated relu² epilogue");
-        let bound: Vec<u8> = cmd.bindings.iter().map(binding_index).collect();
+        let bound: Vec<u8> = cmd.lowered().bindings.iter().map(binding_index).collect();
         assert!(
             !bound.iter().any(|i| (6..=9).contains(i)),
             "no up projection: {bound:?}"
         );
         let scratch = MoeScratch::of(&block, 1, &p, &mut 0);
-        assert!(cmd.bindings.contains(&scratch.at(5, MoeRegion::ExpertUp)));
+        assert!(
+            cmd.lowered()
+                .bindings
+                .contains(&scratch.at(5, MoeRegion::ExpertUp))
+        );
         // 2048 rows × 22 picks over 512 experts: 88 per expert, a grouped bake.
         let grouped = lower(step, 2048);
-        let kernels: Vec<KernelId> = grouped.iter().map(|c| c.kernel).collect();
+        let kernels: Vec<KernelId> = grouped.iter().map(|c| c.lowered().kernel).collect();
         assert_eq!(
             kernels,
             [KernelId::AffineGatherQmmT, KernelId::VisionGelu],
             "the grouped GEMM, then relu2"
         );
         let relu2 = &grouped[1];
-        assert_eq!(relu2.function, "relu2_bf16");
+        assert_eq!(relu2.lowered().function, "relu2_bf16");
         let up_rows = MoeScratch::of(&block, 2048, &p, &mut 0).at(0, MoeRegion::ExpertUp);
-        assert_eq!(relu2.bindings[0], up_rows, "relu² over the up rows");
+        assert_eq!(
+            relu2.lowered().bindings[0],
+            up_rows,
+            "relu² over the up rows"
+        );
         // The router: `[m, 512]` logits contracting the 4096-wide block input.
         let router = lower(
             MoeStep::RouterLogits(MoeRows::Tokens(Slot(2)), LayerId(0), None),
             8,
         );
-        assert_eq!(
-            router[0].gemm.map(|g| (g.dims.n, g.dims.k)),
-            Some((512, 4096))
-        );
+        let TapeCommand::Gemm(g) = router[0] else {
+            panic!("the router's logits are a GEMM");
+        };
+        assert_eq!((g.dims.n, g.dims.k), (512, 4096));
     }
 
     fn binding_index(b: &Binding) -> u8 {
@@ -15108,14 +15068,18 @@ mod tests {
                     router.len()
                 );
             };
-            assert_eq!(c.kernel, KernelId::NormedGemv, "bucket {bucket_m}");
             assert_eq!(
-                c.function.starts_with("gemv_normed_rows_"),
+                c.lowered().kernel,
+                KernelId::NormedGemv,
+                "bucket {bucket_m}"
+            );
+            assert_eq!(
+                c.lowered().function.starts_with("gemv_normed_rows_"),
                 bucket_m > 1,
                 "bucket {bucket_m}: {}",
-                c.function
+                c.lowered().function
             );
-            assert_eq!(c.dispatch.threadgroups, (256 / 4, bucket_m, 1));
+            assert_eq!(c.lowered().dispatch.threadgroups, (256 / 4, bucket_m, 1));
         }
     }
 }

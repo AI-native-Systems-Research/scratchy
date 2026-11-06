@@ -17,11 +17,11 @@ fn every_capture_copies_a_finished_layer_output() {
         for classed in spec.tapes {
             let commands = classed.tape.commands_expanded();
             for (i, c) in commands.iter().enumerate() {
-                if c.command.kernel != KernelId::CaptureRows {
+                if c.command.kernel() != Some(KernelId::CaptureRows) {
                     continue;
                 }
                 captures += 1;
-                let next = commands.get(i + 1).map(|n| n.command.kernel);
+                let next = commands.get(i + 1).and_then(|n| n.command.kernel());
                 assert_ne!(
                     next,
                     Some(KernelId::FusedAddRmsNorm),
