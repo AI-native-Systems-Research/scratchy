@@ -1497,6 +1497,12 @@ impl<'a> ShapeGrid<'a> {
         e.and_then(|e| self.cells(e).get(&rung).copied())
     }
 
+    /// Whether scratchy has `metric` in any of its cells: energy only where the run kept it.
+    fn measures(&self, metric: Metric) -> bool {
+        self.rungs()
+            .any(|r| timing(self.at(Some(Engine::Scratchy), r), metric).is_some())
+    }
+
     /// scratchy against `rival` at one cell: the ratio, and how it reads.
     fn versus(&self, metric: Metric, rung: (u32, u32), rival: Engine) -> (Option<f64>, String) {
         let (cs, cr) = (
@@ -1731,6 +1737,24 @@ const GRID_METRICS: [GridMetric; 3] = [
     },
 ];
 
+/// A model's own grid section: the overview's three, then its energy, joules an output token at 1
+/// user, so how much each answer cost sits beside how fast it came.
+const MODEL_GRID_METRICS: [GridMetric; 4] = [
+    GRID_METRICS[0],
+    GRID_METRICS[1],
+    GRID_METRICS[2],
+    GridMetric {
+        metric: Metric::Energy,
+        load: Load::Alone,
+        name: "Energy",
+        about: "Joules an output token with 1 user, from the CPU, GPU and ANE counters, not DRAM, \
+                the Mac's idle floor of about 1.6 W in it; read once a second, so a cell of under \
+                about 20 s is coarse.",
+        title: "energy per output token, 1 user",
+        letter: "J",
+    },
+];
+
 /// The marks any of these cells carries, each once.
 fn mark(metric: Metric, cells: &[Option<&Cell>]) -> String {
     let mut out = String::new();
@@ -1885,9 +1909,9 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         };
         let others: Vec<Engine> = g.present.iter().copied().skip(1).collect();
         // Each metric's map over the users counts it scores, where the grid ran any.
-        let parts: Vec<(GridMetric, ShapeGrid)> = (GRID_METRICS.iter())
+        let parts: Vec<(GridMetric, ShapeGrid)> = (MODEL_GRID_METRICS.iter())
             .map(|&gm| (gm, g.under(gm.load)))
-            .filter(|(_, s)| !s.down.is_empty())
+            .filter(|(gm, s)| !s.down.is_empty() && s.measures(gm.metric))
             .collect();
         rsx! {
             Stack { gap: 3,
@@ -4348,6 +4372,44 @@ mod tests {
 
     /// The runs the tests read: copies of published runs, trimmed, that no data PR touches.
     pub(super) const FIXTURES: &str = "tests/fixtures/metal";
+
+    /// A model's own grid section maps its energy beside prefill and decode, joules an output
+    /// token at 1 user; the overview keeps its three.
+    #[test]
+    fn a_models_grid_maps_its_energy_and_the_overview_does_not() {
+        let names: Vec<&str> = super::MODEL_GRID_METRICS.iter().map(|gm| gm.name).collect();
+        assert_eq!(names, ["Prefill", "Decode", "End-to-end Latency", "Energy"]);
+        let energy = super::MODEL_GRID_METRICS[3];
+        assert!(matches!(energy.metric, super::numbers::Metric::Energy));
+        assert!(matches!(energy.load, super::Load::Alone));
+        assert!(energy.about.contains("not DRAM"), "what the counters cover");
+        assert!(super::GRID_METRICS.iter().all(|gm| gm.name != "Energy"));
+    }
+
+    /// A grid measures a metric where scratchy has it in any cell: energy only from a run whose
+    /// cells kept it, so a run from before draws no empty energy map.
+    #[test]
+    fn a_grid_draws_its_energy_only_where_its_run_kept_it() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-27T031941Z-f9739363.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let run: Run = serde_json::from_str(&text).unwrap();
+        let m = &run.models[0];
+        let g = super::ShapeGrid::of(m, &run, super::Slice::Answer(64)).expect("a map");
+        assert!(g.measures(super::numbers::Metric::Ttft));
+        assert!(!g.measures(super::numbers::Metric::Energy), "no energy kept");
+        // The same run, its cells with their energy.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for c in v["models"][0]["scaling"].as_array_mut().unwrap() {
+            c["energy"] = serde_json::json!({"soc_j": 100.0, "window_s": 10.0,
+                "j_per_request": 2.0, "j_per_output_token": 0.03});
+        }
+        let run: Run = serde_json::from_value(v).unwrap();
+        let g = super::ShapeGrid::of(&run.models[0], &run, super::Slice::Answer(64)).unwrap();
+        assert!(g.measures(super::numbers::Metric::Energy));
+    }
 
     #[test]
     fn a_models_name_gives_its_parameter_size() {

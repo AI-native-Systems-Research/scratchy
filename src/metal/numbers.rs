@@ -251,6 +251,9 @@ pub enum Metric {
     Throughput,
     /// The server's peak memory footprint during the cell.
     PeakMem,
+    /// Joules an output token: the CPU, GPU and ANE counters' energy over the cell's requests
+    /// ([`super::data::Energy`]), where its run kept it.
+    Energy,
 }
 
 impl Metric {
@@ -266,6 +269,7 @@ impl Metric {
             Metric::E2el => c.e2el_ms(),
             Metric::Throughput => c.output_throughput,
             Metric::PeakMem => c.server_mem_peak_mib.filter(|_| !c.mem_below_weights),
+            Metric::Energy => c.energy.as_ref().and_then(|e| e.j_per_output_token),
         }
     }
 
@@ -274,6 +278,7 @@ impl Metric {
         match self {
             Metric::Ttft | Metric::E2el | Metric::PeakMem => 0,
             Metric::Tpot | Metric::Throughput => 1,
+            Metric::Energy => 2,
         }
     }
 
@@ -282,6 +287,7 @@ impl Metric {
             Metric::Throughput => "tok/s",
             Metric::Ttft | Metric::Tpot | Metric::E2el => "ms",
             Metric::PeakMem => "MiB",
+            Metric::Energy => "J/token",
         }
     }
 
@@ -289,7 +295,9 @@ impl Metric {
     pub fn better(self) -> Better {
         match self {
             Metric::Throughput => Better::Higher,
-            Metric::Ttft | Metric::Tpot | Metric::E2el | Metric::PeakMem => Better::Lower,
+            Metric::Ttft | Metric::Tpot | Metric::E2el | Metric::PeakMem | Metric::Energy => {
+                Better::Lower
+            }
         }
     }
 
@@ -532,3 +540,34 @@ pub fn cfmt(c: Option<&Cell>, metric: Metric) -> String {
 /// Run-to-run spread on one machine at one commit: two M1 Max runs of af009bf1
 /// agreed within about 2%, so a smaller change is noise, not a result.
 pub const NOISE: f64 = 0.03;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grid cell's energy reads as joules an output token, lower better, where the run kept it:
+    /// none from a run from before cells did, and none from a dead cell.
+    #[test]
+    fn a_grid_cells_energy_is_joules_an_output_token() {
+        let cell = |energy: serde_json::Value| -> Cell {
+            serde_json::from_value(serde_json::json!({
+                "axis": "grid", "rung": "1024x64", "conc": 1, "median_ttft_ms": 100.0,
+                "median_tpot_ms": 10.0, "output_throughput": 50.0, "completed": 8,
+                "unstreamed_requests": 0, "energy": energy,
+            }))
+            .unwrap()
+        };
+        let c = cell(serde_json::json!({"soc_j": 320.0, "window_s": 16.0,
+            "j_per_request": 40.0, "j_per_output_token": 0.625}));
+        assert_eq!(timing(Some(&c), Metric::Energy), Some(0.625));
+        assert!(matches!(Metric::Energy.better(), Better::Lower));
+        assert_eq!(Metric::Energy.unit(), "J/token");
+        assert_eq!(Metric::Energy.decimals(), 2);
+        // scratchy at 0.5 J a token against 0.75: 1.5 times less.
+        assert_eq!(Metric::Energy.faster(Some(0.5), Some(0.75)), Some(1.5));
+        assert_eq!(timing(Some(&cell(serde_json::Value::Null)), Metric::Energy), None);
+        let mut dead = c.clone();
+        dead.dead = true;
+        assert_eq!(timing(Some(&dead), Metric::Energy), None);
+    }
+}
