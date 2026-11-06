@@ -7,10 +7,14 @@ description = "KTIR -> SuperDSC (SDSC): the typed SuperDSC IR value types. No sc
 
 [lib]
 
-# ⛔ NO FEATURES, AND THAT IS THE POINT. This crate is the destination of the `ktir->superdsc`
-# extraction: a leaf a third-party KTIR producer (IBM, `triton-spyre`) can consume without pulling
-# scratchy in. A feature here would be a place for a scratchy-shaped fact to hide, so there is
-# none — and `--no-default-features` is already the whole build.
+# ⛔ NO FEATURES OF ITS OWN, AND THAT IS THE POINT. This crate is the destination of the
+# `ktir->superdsc` extraction: a leaf a third-party KTIR producer (IBM, `triton-spyre`) can consume
+# without pulling scratchy in. The only features are the world crate's `tp-N`, forwarded so the
+# build's one world selection reaches its `Build` type — they change no code here.
+[features]
+tp-2 = ["scratchy-tp-world/tp-2"]
+tp-4 = ["scratchy-tp-world/tp-4"]
+tp-8 = ["scratchy-tp-world/tp-8"]
 
 [dependencies]
 # ⭐ INTRINSIC, BECAUSE SUPERDSC IS A JSON FORMAT. What this crate produces is the `sdsc_*.json` a

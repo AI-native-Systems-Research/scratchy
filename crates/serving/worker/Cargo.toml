@@ -32,9 +32,9 @@ spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu", "scratchy-models/spyre-
 # A W-RANK TENSOR-PARALLEL WORLD: the bake shards every model W ways (scratchy-models/tp-<W>) and
 # this worker runs every rank in one process, one card each, linked by device p2p RDMA. A build that
 # names no world serves one card. Reached from the CLI as `tp/<W>`.
-tp-2 = ["spyre-hw", "scratchy-models/tp-2"]
-tp-4 = ["spyre-hw", "scratchy-models/tp-4"]
-tp-8 = ["spyre-hw", "scratchy-models/tp-8"]
+tp-2 = ["spyre-hw", "scratchy-models/tp-2", "scratchy-target-spyre/tp-2"]
+tp-4 = ["spyre-hw", "scratchy-models/tp-4", "scratchy-target-spyre/tp-4"]
+tp-8 = ["spyre-hw", "scratchy-models/tp-8", "scratchy-target-spyre/tp-8"]
 guided-decoding = ["scratchy-serving-engine/guided-decoding"]
 
 [dependencies]

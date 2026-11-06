@@ -43,7 +43,7 @@
 //!
 //! [`EmittedOp`]: crate::emit::EmittedOp
 
-pub use scratchy_tp_world::{PerRank, Rank, TpWorld, World, ranks};
+pub use scratchy_tp_world::{Build, PerRank, Rank, TpWorld, World, ranks};
 
 use crate::superdsc_opspec::{DataFormat, Fp16};
 

@@ -59,6 +59,33 @@ impl<const N: u32> World for TpWorld<N> {
     const RANKS: u32 = N;
 }
 
+/// The rank count of the world this build names — `tp-N`, or one when it names none.
+const BUILD_RANKS: u32 = {
+    let named = [
+        cfg!(feature = "tp-2"),
+        cfg!(feature = "tp-4"),
+        cfg!(feature = "tp-8"),
+    ];
+    let worlds = [2, 4, 8];
+    let mut ranks = 1;
+    let mut i = 0;
+    while i < named.len() {
+        if named[i] {
+            assert!(
+                ranks == 1,
+                "a build names one tensor-parallel world: one `tp/<N>`"
+            );
+            ranks = worlds[i];
+        }
+        i += 1;
+    }
+    ranks
+};
+
+/// ⭐ THE WORLD THIS BUILD BAKES AND SERVES — the type every top-level instantiation names. The one
+/// place a world size is spelled as a number.
+pub type Build = TpWorld<BUILD_RANKS>;
+
 /// Every rank of world `T`, in rank order.
 pub fn ranks<T: World>() -> impl Iterator<Item = Rank<T>> {
     let () = T::NONEMPTY;
@@ -185,6 +212,33 @@ impl<T: World, X> PerRank<T, X> {
     /// `f` of every rank's value, as the same world's.
     pub fn map<Y>(&self, mut f: impl FnMut(Rank<T>, &X) -> Y) -> PerRank<T, Y> {
         PerRank::from_fn(|r| f(r, self.get(r)))
+    }
+
+    /// `f` of every rank's value, by value, as the same world's; the first error stops it.
+    ///
+    /// # Errors
+    /// The first rank's error.
+    pub fn try_map_into<Y, E>(
+        self,
+        mut f: impl FnMut(Rank<T>, X) -> Result<Y, E>,
+    ) -> Result<PerRank<T, Y>, E> {
+        Ok(PerRank {
+            items: ranks::<T>()
+                .zip(alloc::vec::Vec::from(self.items))
+                .map(|(r, x)| f(r, x))
+                .collect::<Result<_, E>>()?,
+            world: PhantomData,
+        })
+    }
+}
+
+impl<X> PerRank<TpWorld<1>, X> {
+    /// The one rank's value — a world of one has exactly one.
+    pub fn into_only(self) -> X {
+        match alloc::vec::Vec::from(self.items).pop() {
+            Some(x) => x,
+            None => unreachable!("a PerRank of a world of one holds one value"),
+        }
     }
 }
 

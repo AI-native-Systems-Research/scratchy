@@ -13,14 +13,14 @@ use scratchy_target_spyre::manifest::bytes_to_f32;
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
 // runner; the bundle type + session type are cfg-selected, everything else
 // (weight load, dynamic sources, KV loop, sampling) is shared.
+#[cfg(feature = "spyre-hw")]
+use crate::spyre_types::SuperDscSession;
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::manifest::KtirBundle;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::manifest::SengraphBundle;
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 use scratchy_tensors::DType as SDType;
 use tracing::info;
 // `debug`/`warn` are only reached from the card blocks below.
@@ -96,7 +96,10 @@ fn prefill_pool_statics(
 fn adopt_from_owner(
     borrower: &mut SuperDscSession,
     owner: &SuperDscSession,
-    spill: &[(i64, Vec<u8>)],
+    spill: &[(
+        i64,
+        scratchy_target_spyre::bundle_code::collective::PerRank<World, Vec<u8>>,
+    )],
 ) -> Result<(), String> {
     for (seg, what) in RESIDENT_SEGS {
         borrower
@@ -106,8 +109,8 @@ fn adopt_from_owner(
     for (seg, image) in spill {
         borrower.write_seg_prefix(*seg, image).map_err(|e| {
             format!(
-                "seg{seg} (spilled weight tail, {} B) copy failed: {e}",
-                image.len()
+                "seg{seg} (spilled weight tail, {} B per rank) copy failed: {e}",
+                image.first().len()
             )
         })?;
     }
@@ -407,42 +410,22 @@ fn apply_weight_scale_folds(
     Ok(())
 }
 
-/// ⭐ THE WORLD THIS BUILD SERVES — the one `tp/<W>` names, one card without one: the same feature
-/// the bake read for the forwards it emitted, so the worker's `W` and the baked
-/// `TpForward<W>` are one number. A build-time fact; nothing at run time selects it, and naming two
-/// worlds is a build error.
-pub(crate) const TP_WORLD: u32 = {
-    let named = [cfg!(feature = "tp-2"), cfg!(feature = "tp-4"), cfg!(feature = "tp-8")];
-    let worlds = [2, 4, 8];
-    let mut world = 1;
-    let mut i = 0;
-    while i < named.len() {
-        if named[i] {
-            assert!(world == 1, "a build serves one tensor-parallel world: name one `tp/<W>`");
-            world = worlds[i];
-        }
-        i += 1;
-    }
-    world
-};
-
-/// The plan's world for [`TP_WORLD`].
-pub(crate) const WORLD: scratchy_target_spyre::bundle_code::collective::TpWorld =
-    scratchy_target_spyre::bundle_code::collective::TpWorld::of::<TP_WORLD>();
-
-/// The sharded forward a `TP_WORLD` build serves — the type the bake emitted `SUPERDSC_TP` as.
-type WorldForward = scratchy_target_spyre::wiring::TpForward<TP_WORLD>;
+/// The sharded forward the build's world serves — the type the bake emitted `SUPERDSC_TP` as.
+#[cfg(feature = "spyre-hw")]
+type WorldForward = scratchy_target_spyre::wiring::TpForward<World>;
 
 /// ⭐ ONE RANK'S SHARE OF THE CHECKPOINT. The generated loader binds every weight whole; a rank of
 /// a sharded world stages only its slice of each, by the law the analysis derived for that source
 /// ([`scratchy_target_spyre::wiring::TpForward::slice_source_bytes`]). `whole` is the one-rank
 /// wiring, whose shapes are the tensors' as they sit in the checkpoint.
+#[cfg(feature = "spyre-hw")]
 pub(crate) struct RankCut {
     pub(crate) forward: &'static WorldForward,
-    pub(crate) me: scratchy_target_spyre::wiring::TpRank<TP_WORLD>,
+    pub(crate) me: scratchy_target_spyre::bundle_code::collective::Rank<World>,
     pub(crate) whole: &'static scratchy_target_spyre::wiring::Wiring,
 }
 
+#[cfg(feature = "spyre-hw")]
 impl RankCut {
     fn cut(&self, id: u32, bytes: Vec<u8>, elem: usize, is_gemm: bool) -> ExecutorResult<Vec<u8>> {
         let &whole = self.whole.tensor_shapes.get(id as usize).ok_or_else(|| {
@@ -502,7 +485,7 @@ pub(crate) fn stage_bound_weights(
     // now, which carries the same per-id extents the manifest did.
     wiring: &scratchy_target_spyre::wiring::Wiring,
     // A rank of a sharded world stages its share of each tensor; `None` stages it whole.
-    cut: Option<&RankCut>,
+    #[cfg(feature = "spyre-hw")] cut: Option<&RankCut>,
     // The allocator that owns the bound tensors' buffers: staging TAKES each buffer
     // (no copy) at its last binding instead of copying it while the original stays alive. `None`
     // copies every buffer — a sharded world's earlier ranks, whose cut must leave the whole tensor
@@ -566,6 +549,8 @@ pub(crate) fn stage_bound_weights(
             }
         };
         let dt = bw.tensor.dtype();
+        // A card rank of a sharded world stages its share; the emulator serves one card, whole.
+        #[cfg(feature = "spyre-hw")]
         let bytes = match cut {
             Some(c) => c.cut(bw.id, bytes, dt.size_bytes(), is_gemm)?,
             None => bytes,
@@ -771,27 +756,29 @@ pub(crate) fn stage_bound_weights(
 impl SpyreWorker {
     /// Resolve the bundle + load all static weights + derive dims + wiring.
     pub(crate) fn load_inner(&self) -> ExecutorResult<Loaded> {
-        // ⭐ THIS WORKER'S CARDS — one per rank of the world this build bakes (`WORLD`, one card
-        // without `tp/2`), from `local_rank` up — each opened on its own background thread NOW, so
-        // their ~5.7 s bring-ups overlap each other and the host-side weight load below. Joined
+        // ⭐ THIS WORKER'S CARDS — one per rank of the world this build serves (`World`, one card
+        // without a `tp/N`), from `local_rank` up — each opened on its own background thread NOW,
+        // so their ~5.7 s bring-ups overlap each other and the host-side weight load below. Joined
         // where the first session needs them; every session of this worker spans all of them.
         #[cfg(feature = "spyre-hw")]
-        let card_open: Vec<_> = (0..WORLD.get())
-            .map(|r| {
-                let index = u32::try_from(self.config.local_rank)
-                    .ok()
-                    .and_then(|base| base.checked_add(r))
-                    .ok_or_else(|| {
-                        werr(format!(
-                            "local_rank {} + rank {r} is not a Spyre card index",
-                            self.config.local_rank
-                        ))
-                    })?;
-                Ok(std::thread::spawn(move || {
-                    scratchy_target_spyre::runtime::CardRuntime::open(index)
-                }))
-            })
-            .collect::<ExecutorResult<_>>()?;
+        let card_open =
+            scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::try_from_fn(
+                |r| -> ExecutorResult<_> {
+                    let index = u32::try_from(self.config.local_rank)
+                        .ok()
+                        .and_then(|base| base.checked_add(r.get()))
+                        .ok_or_else(|| {
+                            werr(format!(
+                                "local_rank {} + rank {} is not a Spyre card index",
+                                self.config.local_rank,
+                                r.get()
+                            ))
+                        })?;
+                    Ok(std::thread::spawn(move || {
+                        scratchy_target_spyre::runtime::CardRuntime::<World>::open(index)
+                    }))
+                },
+            )?;
 
         let model_dir = resolve_model_path(
             &self.model_path,
@@ -938,29 +925,33 @@ impl SpyreWorker {
         // ⭐ THE WORLD'S FORWARD. A build that bakes a sharded world (`tp/<W>`) serves it: every rank
         // runs the forward the bake sharded for that world — its own bundles, its own wiring, the
         // slice law each source loads by; never the one-rank forward, whose shapes are the whole
-        // model's. The forward's type IS the world (`TpForward<TP_WORLD>`), so the bake's static and
+        // model's. The forward's type IS the world (`TpForward<World>`), so the bake's static and
         // this read agree by type. A model whose bake skipped the world (its `[spyre-tp]` warning
         // names why) ships none, and this binary cannot serve it.
         #[cfg(feature = "spyre-hw")]
-        let sharded: Option<&'static WorldForward> = if WORLD.is_sharded() {
-            let baked = model
-                .superdsc_tp()
-                .and_then(|t| t.downcast_ref::<&'static [WorldForward]>())
-                .copied()
-                .ok_or_else(|| werr("the matched model exposes no sharded worlds"))?;
-            Some(baked.first().ok_or_else(|| {
-                werr(format!(
-                    "this model baked no {TP_WORLD}-rank forward — its `[spyre-tp]` build warning \
-                     names why"
-                ))
-            })?)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "spyre-hw"))]
-        let sharded: Option<&'static WorldForward> = None;
+        let sharded: Option<&'static WorldForward> =
+            if <World as scratchy_target_spyre::bundle_code::collective::World>::SHARDED {
+                let baked = model
+                    .superdsc_tp()
+                    .and_then(|t| t.downcast_ref::<&'static [WorldForward]>())
+                    .copied()
+                    .ok_or_else(|| werr("the matched model exposes no sharded worlds"))?;
+                Some(baked.first().ok_or_else(|| {
+                    werr(format!(
+                        "this model baked no {}-rank forward — its `[spyre-tp]` build warning \
+                     names why",
+                        <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS
+                    ))
+                })?)
+            } else {
+                None
+            };
+        #[cfg(feature = "spyre-hw")]
         let wirings: &'static scratchy_target_spyre::wiring::Wirings =
             sharded.map_or(one_rank, |f| &f.wirings);
+        // The emulator serves one card: its wiring is the one-rank forward's.
+        #[cfg(not(feature = "spyre-hw"))]
+        let wirings: &'static scratchy_target_spyre::wiring::Wirings = one_rank;
         #[cfg(feature = "spyre-hw")]
         let bundle: &'static SengraphBundle = match sharded {
             Some(f) => sharded_bundle(bundle, f)?,
@@ -1002,30 +993,47 @@ impl SpyreWorker {
         );
         // ⭐ ONE WEIGHT SET PER CARD: a world of one stages every weight whole; rank `r` of a sharded
         // world stages its share of each, by the slice law the analysis derived for that source.
-        let weights: Vec<Vec<StagedWeight>> = match sharded {
-            None => vec![stage_bound_weights(&bound, &wirings.decode, None, gw.allocator_mut())?],
+        #[cfg(feature = "spyre-hw")]
+        let weights: scratchy_target_spyre::bundle_code::collective::PerRank<
+            World,
+            Vec<StagedWeight>,
+        > = match sharded {
+            None => {
+                let mut whole = Some(stage_bound_weights(
+                    &bound,
+                    &wirings.decode,
+                    None,
+                    Some(gw.allocator_mut()),
+                )?);
+                // A world with no sharded forward is a world of one: its one rank takes it.
+                scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|_| {
+                    whole.take().unwrap_or_default()
+                })
+            }
             Some(forward) => {
-                let ranks: Vec<_> = scratchy_target_spyre::wiring::TpRank::<TP_WORLD>::all().collect();
-                let mut sets = Vec::with_capacity(ranks.len());
-                for (i, me) in ranks.iter().enumerate() {
+                let last =
+                    <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS - 1;
+                scratchy_target_spyre::bundle_code::collective::PerRank::try_from_fn(|me| {
                     let cut = RankCut {
                         forward,
-                        me: *me,
+                        me,
                         whole: &one_rank.decode,
                     };
                     // The last rank TAKES each buffer at its last binding; the others copy, so
                     // every rank's cut reads the whole checkpoint tensor.
-                    let alloc = (i + 1 == ranks.len()).then(|| gw.allocator_mut());
-                    sets.push(stage_bound_weights(&bound, &wirings.decode, Some(&cut), alloc)?);
-                }
-                sets
+                    let alloc = (me.get() == last).then(|| gw.allocator_mut());
+                    stage_bound_weights(&bound, &wirings.decode, Some(&cut), alloc)
+                })?
             }
         };
+        #[cfg(feature = "spyre-hw")]
         tracing::info!(
             "[weights] staged {} weight(s) on each of {} card(s)",
-            weights.first().map_or(0, Vec::len),
-            weights.len()
+            weights.first().len(),
+            <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS
         );
+        #[cfg(not(feature = "spyre-hw"))]
+        let weights = stage_bound_weights(&bound, &wirings.decode, Some(gw.allocator_mut()))?;
         // ⭐ THE LOAD CONSTS RIDE IN WITH THE WEIGHTS. The minted draw's twenty staged tables
         // (and the chained head's decompose tables) are sources the bake states once at load —
         // `Wiring::load_consts` — staged here at their TRUE dtypes exactly as the numeric gate
@@ -1104,13 +1112,21 @@ impl SpyreWorker {
             // the ladder rungs and the re-rolled siblings already use, so a program is found in one
             // place.
             let groups = |fp: &str| -> ExecutorResult<
-                &'static [scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
+                &'static [scratchy_target_spyre::bundle_code::LaunchGroup<
+                    'static,
+                    scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+                >],
             > {
-                let code = scratchy_target_spyre::bundle_code::bundle(fp).ok_or_else(|| {
+                let code = scratchy_target_spyre::bundle_code::bundle::<
+                    scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+                >(fp)
+                .ok_or_else(|| {
                     werr(format!(
                         "no KTIR programs compiled into this binary for fp={fp} — the emit ran for \
                          a different model, or without the lowering. Registered: {:?}",
-                        scratchy_target_spyre::bundle_code::registered_fps(),
+                        scratchy_target_spyre::bundle_code::registered_fps::<
+                            scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+                        >(),
                     ))
                 })?;
                 Ok(&code.groups)
@@ -1120,8 +1136,10 @@ impl SpyreWorker {
             // rungs share the weights and the pools by tensor id. Ascending by reach. A bundle with
             // no ladder is its own one rung, at the walk its wiring states (`None`).
             let rungs = |fp: &'static str| -> ExecutorResult<Vec<(Option<usize>, &'static str)>> {
-                let code = scratchy_target_spyre::bundle_code::bundle(fp)
-                    .ok_or_else(|| werr(format!("no KTIR bundle registered for fp={fp}")))?;
+                let code = scratchy_target_spyre::bundle_code::bundle::<
+                    scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+                >(fp)
+                .ok_or_else(|| werr(format!("no KTIR bundle registered for fp={fp}")))?;
                 let mut v: Vec<(Option<usize>, &'static str)> = match &code.reroll {
                     Some(meta) if !meta.rungs.is_empty() => meta
                         .rungs
@@ -1147,7 +1165,10 @@ impl SpyreWorker {
             };
             let decode_rungs = rungs(bundle.decode[0].fp)?;
             let mut programs: Vec<(
-                &[scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
+                &[scratchy_target_spyre::bundle_code::LaunchGroup<
+                    'static,
+                    scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+                >],
                 Vec<u64>,
             )> = Vec::new();
             if let Some(pp) = pparsed.as_ref() {
@@ -1165,7 +1186,10 @@ impl SpyreWorker {
                 ));
             }
             let refs: Vec<(
-                &[scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
+                &[scratchy_target_spyre::bundle_code::LaunchGroup<
+                    'static,
+                    scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+                >],
                 &[u64],
             )> = programs.iter().map(|(g, o)| (*g, o.as_slice())).collect();
             let _t_sess = std::time::Instant::now();
@@ -1243,12 +1267,12 @@ impl SpyreWorker {
                     })?;
                 // The dxp-compiled bundle for this fingerprint, carried IN THIS BINARY —
                 // `#[forward]` compiled it at build time and `inventory::submit!`ed the value.
-                let code = scratchy_target_spyre::bundle_code::bundle(fp).ok_or_else(|| {
+                let code = scratchy_target_spyre::bundle_code::bundle::<World>(fp).ok_or_else(|| {
                     werr(format!(
                         "no SuperDSC bundle compiled into this binary for fp={fp} — the emit either \
                          had no dxp_standalone to run (a cardless build) or ran for a different model. \
                          Registered: {:?}",
-                        scratchy_target_spyre::bundle_code::registered_fps(),
+                        scratchy_target_spyre::bundle_code::registered_fps::<World>(),
                     ))
                 })?;
                 // ⭐ THE SEGMENT BUDGET's runtime work list, read BEFORE any session is built (the
@@ -1258,7 +1282,7 @@ impl SpyreWorker {
                 // fit one segment, which makes every use of it below a no-op.
                 let spill_spans = spilled_weight_spans(&code.layout);
                 let spill_tids =
-                    spilled_weight_tail_tids(&code.layout, weights.iter().map(|w| w.0));
+                    spilled_weight_tail_tids(&code.layout, weights.first().iter().map(|w| w.0));
                 // Model dims from the SAME decode parse the other sessions read: vocab +
                 // kv_dim. The resident KV pool is `num_blocks` blocks of 64 slots covering
                 // the prefix capacity (mask cols) — same block_size the paged path uses.
@@ -1300,7 +1324,7 @@ impl SpyreWorker {
                     .graph_json
                     .strip_prefix(SUPERDSC_SENTINEL)
                     .filter(|pfp| *pfp != fp)
-                    .and_then(scratchy_target_spyre::bundle_code::bundle);
+                    .and_then(scratchy_target_spyre::bundle_code::bundle::<World>);
                 // ── PLACEMENT ANCHOR = the NARROWEST rung, not the widest ────────────────────────
                 // This is the one session built BEFORE the decode session, so its footprint is what
                 // positions decode's weight region (see the ownership note below). It used to be the
@@ -1333,7 +1357,7 @@ impl SpyreWorker {
                 let prefill_code = match (top_prefill, narrowest_rung) {
                     (Some(_tp), Some((rm, sent))) => Some(sent
                         .strip_prefix(SUPERDSC_SENTINEL)
-                        .and_then(scratchy_target_spyre::bundle_code::bundle)
+                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .ok_or_else(|| {
                             werr(format!(
                                 "the manifest's narrowest prefill rung (m={rm}) names no bundle \
@@ -1348,31 +1372,27 @@ impl SpyreWorker {
                 // ⭐ THE CARD, JOINED. Its capacity was read from the card when it opened — a card
                 // that cannot report one does not open — so the KV pool below is sized from the real
                 // card, with no default to fall back to.
-                let cards: Vec<std::sync::Arc<scratchy_target_spyre::runtime::CardRuntime>> =
-                    card_open
-                        .into_iter()
-                        .enumerate()
-                        .map(|(r, h)| {
-                            h.join()
-                                .map_err(|_| werr(format!("card {r}'s bring-up thread panicked")))?
-                                .map_err(|e| werr(format!("open Spyre card {r}: {e}")))
-                        })
-                        .collect::<ExecutorResult<_>>()?;
+                let cards: Cards = card_open.try_map_into(|r, h| -> ExecutorResult<_> {
+                    h.join()
+                        .map_err(|_| werr(format!("card {}'s bring-up thread panicked", r.get())))?
+                        .map_err(|e| werr(format!("open Spyre card {}: {e}", r.get())))
+                })?;
                 // ⭐ THE CARDS' P2P LINK, BEFORE THE FIRST SESSION LOADS. A sharded world's decode
                 // bundle bakes its receive window for that world; every card's base-address table
                 // gets every peer's card and its `XSEG` entries every peer's landing slots, so every
                 // session below loads against one link per card (`Executor::load` refuses a bundle
                 // whose window is elsewhere, and a sharded one on an unlinked card).
-                if let Some(window) = scratchy_target_spyre::superdsc_exec::RankSeat::baked_window(code)
-                    .map_err(|e| werr(format!("bundle {fp}: {e}")))?
+                if let Some(window) =
+                    scratchy_target_spyre::superdsc_exec::RankSeat::baked_window(code)
+                        .map_err(|e| werr(format!("bundle {fp}: {e}")))?
                 {
                     scratchy_target_spyre::runtime::link_peers(&cards, window)
                         .map_err(|e| werr(e.to_string()))?;
                     info!(
                         "[spyre-worker] linked {} cards over device p2p RDMA, window {window:?}: {}",
-                        cards.len(),
+                        <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS,
                         cards
-                            .iter()
+                            .values()
                             .map(|c| c.card().pci().to_string())
                             .collect::<Vec<_>>()
                             .join(" ")
@@ -1380,10 +1400,10 @@ impl SpyreWorker {
                 }
                 // Every rank's pool and segments are cut the same, so the smallest card bounds them.
                 let card_bytes = cards
-                    .iter()
+                    .values()
                     .map(|c| c.memory())
                     .min()
-                    .ok_or_else(|| werr("a world has at least one card"))?;
+                    .unwrap_or_else(|| unreachable!("a world has at least one card"));
                 // WHAT THE BUNDLE ALREADY OWNS ON THE CARD, charged as `weights_and_overhead` — every
                 // segment except the KV one, whose bytes are what we are about to size. The segments are
                 // typed (`SEG_INTERMEDIATE`/`SEG_WEIGHT`/`SEG_KV`/`SEG_MASK`), so this reads the KV segment
@@ -1510,21 +1530,21 @@ impl SpyreWorker {
                     .iter()
                     .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
                     .filter_map(|(_, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
-                    .filter_map(scratchy_target_spyre::bundle_code::bundle)
+                    .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                     .map(|rc| non_resident(&rc.layout))
                     .sum::<u64>()
                     + g0.decode_rungs
                         .iter()
                         .filter(|(rn, _, _, _)| rn.get() > 1)
                         .filter_map(|(_, _, sent, _)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
-                        .filter_map(scratchy_target_spyre::bundle_code::bundle)
+                        .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .map(|rc| non_resident(&rc.layout))
                         .sum::<u64>()
                     + g0.prefill_prefix
                         .iter()
                         .filter(|(pmq, _)| *pmq > 1)
                         .filter_map(|(_, psent)| psent.strip_prefix(SUPERDSC_SENTINEL))
-                        .filter_map(scratchy_target_spyre::bundle_code::bundle)
+                        .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .map(|rc| non_resident(&rc.layout))
                         .sum::<u64>();
                 // ⛔ DEVICE REGIONS ARE NEVER FREED — `DevAddr`'s own doc: "device memory lives until
@@ -1842,7 +1862,7 @@ impl SpyreWorker {
                 // swap, not work.
                 let ladder: Vec<(
                     usize,
-                    &'static scratchy_target_spyre::bundle_code::BundleCode<'static>,
+                    &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                 )> = g0
                     .prefill_rungs
                     .iter()
@@ -1853,7 +1873,7 @@ impl SpyreWorker {
                         }
                         sentinel
                             .strip_prefix(SUPERDSC_SENTINEL)
-                            .and_then(scratchy_target_spyre::bundle_code::bundle)
+                            .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
                             .map(|c| (rm, c))
                     })
                     .collect();
@@ -1906,7 +1926,7 @@ impl SpyreWorker {
                     let chunks: Vec<
                         Vec<(
                             usize,
-                            &'static scratchy_target_spyre::bundle_code::BundleCode<'static>,
+                            &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                         )>,
                     > = if chunk == 0 {
                         Vec::new()
@@ -1974,7 +1994,7 @@ impl SpyreWorker {
                         kv_dim,
                         num_blocks,
                     },
-                    weights,
+                    Some(weights),
                     wirings.decode.load_consts,
                     &pool_statics,
                     &spill_tids,
@@ -1984,9 +2004,13 @@ impl SpyreWorker {
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
                 // (see `adopt_from_owner`) because the slot it lives in cannot be aliased. Empty —
                 // and every line below a no-op — for every model whose weights fit one segment.
-                let mut spill_images: Vec<(i64, Vec<u8>)> = Vec::new();
+                let mut spill_images: Vec<(
+                    i64,
+                    scratchy_target_spyre::bundle_code::collective::PerRank<World, Vec<u8>>,
+                )> = Vec::new();
                 for (seg, len) in spill_spans {
-                    let mut image = ss.read_seg(seg).map_err(|e| {
+                    // One image per rank: a rank's spilled tail is its own shard's.
+                    let images = ss.read_seg(seg).map_err(|e| {
                         werr(format!(
                             "reading the DECODE session's seg{seg} (the spilled weight tail, which \
                              every borrowing session needs its own copy of): {e}"
@@ -1995,21 +2019,25 @@ impl SpyreWorker {
                     // A short read is a wiring bug, not something to copy a truncated weight from:
                     // the borrower would then hold a HALF tail and produce plausible-looking wrong
                     // logits. The tail spans [0, len) by construction (`spill_weight_tail`).
-                    if image.len() < len {
-                        return Err(werr(format!(
-                            "the DECODE session's seg{seg} read back only {} B, but its spilled \
-                             weight tail spans {len} B — refusing to hand the borrowing sessions a \
-                             truncated lm_head",
-                            image.len()
-                        )));
-                    }
-                    image.truncate(len);
+                    let images = images.try_map_into(|r, mut image| {
+                        if image.len() < len {
+                            return Err(werr(format!(
+                                "rank {}'s DECODE session's seg{seg} read back only {} B, but its \
+                                 spilled weight tail spans {len} B — refusing to hand the \
+                                 borrowing sessions a truncated lm_head",
+                                r.get(),
+                                image.len()
+                            )));
+                        }
+                        image.truncate(len);
+                        Ok(image)
+                    })?;
                     info!(
                         "[spyre-worker] sendnn: SEGMENT BUDGET: seg{seg} holds a {len} B spilled \
                          weight tail; captured its device image for the borrowing sessions, which \
                          cannot alias that segment"
                     );
-                    spill_images.push((seg, image));
+                    spill_images.push((seg, images));
                 }
 
                 // The pools start zeroed: `prepare` fills the paged KV segment on the device (it has
@@ -2125,7 +2153,7 @@ impl SpyreWorker {
                 // thread — it is a manifest/wiring fact, not a build result.
                 struct PrefixRungJob {
                     pmq: u32,
-                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static>,
+                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                 }
                 let pool_for_prefix = prefill_pool_statics(wirings)?;
                 let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
@@ -2135,7 +2163,7 @@ impl SpyreWorker {
                     }
                     let pcode2 = psent
                         .strip_prefix(SUPERDSC_SENTINEL)
-                        .and_then(scratchy_target_spyre::bundle_code::bundle)
+                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .unwrap_or_else(|| {
                             panic!(
                                 "prefix-capable prefill m={pmq}: sentinel did not resolve — \
@@ -2257,7 +2285,7 @@ impl SpyreWorker {
                 struct DecodeRungJob {
                     rn: usize,
                     rung_width: scratchy_subtile::sdsc_abstract::RungWidth,
-                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static>,
+                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                     rung_consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
                     logits: LogitsGeom,
                 }
@@ -2287,7 +2315,7 @@ impl SpyreWorker {
                     let rcode = sentinel
                         .as_str()
                         .strip_prefix(SUPERDSC_SENTINEL)
-                        .and_then(scratchy_target_spyre::bundle_code::bundle)
+                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .unwrap_or_else(|| {
                             panic!(
                                 "decode batch rung seqs={rn}: sentinel names no bundle compiled \
@@ -2798,16 +2826,18 @@ mod weight_scale_fold_tests {
 #[cfg(test)]
 mod weight_tail_tests {
     use scratchy_target_spyre::bundle_code::{WeightTail, bundle, registered_fps};
+    /// The one-rank world every model bakes.
+    type Alone = scratchy_target_spyre::bundle_code::collective::TpWorld<1>;
 
     #[test]
     fn every_baked_bundle_keeps_its_weight_tail_in_the_weight_segment() {
-        let fps = registered_fps();
+        let fps = registered_fps::<Alone>();
         assert!(
             !fps.is_empty(),
             "the build scope names a model, so this binary carries its bundles"
         );
         for fp in fps {
-            let code = bundle(fp).expect("a registered fingerprint resolves");
+            let code = bundle::<Alone>(fp).expect("a registered fingerprint resolves");
             assert_eq!(
                 code.layout.weight_tail,
                 WeightTail::InPlace,
