@@ -32,7 +32,7 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
         "shared-prefix-control" => ("Shared prompt, no reuse", "the same, every prompt its own"),
         "rag-accuracy" => (
             "RAG accuracy",
-            "a full run's RAG over more tasks, for its accuracy alone",
+            "RAG over more tasks, for its accuracy alone: 100 on a quick run, 400 or the whole dev set on a full one",
         ),
         _ => ("dataset", ""),
     }
@@ -118,6 +118,50 @@ fn total_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
         .flatten()
 }
 
+/// What a cell's energy figures cover, said wherever they are shown.
+pub const ENERGY_NOTE: &str = "J/request and J/token: the energy of the cell's requests, over \
+     every request sent and every output token, from the CPU, GPU and ANE counters, not DRAM, \
+     the Mac's idle floor of about 1.6 W in it; read once a second, so a cell of under about \
+     20 s is coarse.";
+
+/// A cell's joules a request, an output token, and a right answer where it is scored and shows
+/// its accuracy; None where its run kept no energy.
+fn per_request(c: &TaskCell) -> Option<f64> {
+    c.energy.as_ref().and_then(|e| e.j_per_request)
+}
+
+fn per_token(c: &TaskCell) -> Option<f64> {
+    c.energy.as_ref().and_then(|e| e.j_per_output_token)
+}
+
+fn per_right(c: &TaskCell) -> Option<f64> {
+    accuracy(c).filter(|&a| a > 0.0)?;
+    c.energy.as_ref().and_then(|e| e.j_per_right_answer)
+}
+
+/// Joules, to two decimals under 1, one under 100, whole above.
+fn joules(v: Option<f64>) -> String {
+    v.map_or_else(
+        || "—".to_string(),
+        |v| match v {
+            v if v < 1.0 => format!("{v:.2}"),
+            v if v < 100.0 => format!("{v:.1}"),
+            v => format!("{v:.0}"),
+        },
+    )
+}
+
+/// How many times less energy scratchy spent a request than the rival: as the total time's
+/// ratio is, only where both answered about one length and neither mostly ran to its cap, an
+/// engine that stops early spending less for answering less.
+fn energy_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
+    let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
+    let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
+    (close && !mostly_capped(c) && !mostly_capped(r))
+        .then(|| times(per_request(c), per_request(r), true))
+        .flatten()
+}
+
 /// The mark of a cell some of whose requests failed, as the random cells carry it.
 fn failed(c: &TaskCell) -> &'static str {
     if c.failed.unwrap_or(0) > 0 {
@@ -172,7 +216,7 @@ pub fn tasks_table(m: &Model) -> Element {
         Table {
             headers: [
                 "workload", "load", "TTFT", "total", "answer tok", "cached tok", "right",
-                "vs", "TTFT", "total",
+                "J/request", "J/token", "J/right", "vs", "TTFT", "total", "J/request",
             ]
             .map(String::from)
             .to_vec(),
@@ -182,6 +226,7 @@ pub fn tasks_table(m: &Model) -> Element {
                     let them = rival(m, &c.workload, c.conc);
                     let ttft = them.and_then(|(_, r)| ttft_times(c, r));
                     let total = them.and_then(|(_, r)| total_times(c, r));
+                    let spent = them.and_then(|(_, r)| energy_times(c, r));
                     // A borrowed rival says which run it is from, as the grid's borrowed engines do.
                     let vs = them.map_or_else(
                         || "—".to_string(),
@@ -202,12 +247,16 @@ pub fn tasks_table(m: &Model) -> Element {
                                 TableCell { "{n(c.answer_tokens())}" }
                                 TableCell { "{n(c.mean_cached_tokens)}" }
                                 TableCell { "{right(c)}" }
+                                TableCell { "{joules(per_request(c))}" }
+                                TableCell { "{joules(per_token(c))}" }
+                                TableCell { "{joules(per_right(c))}" }
                             } else {
-                                TableCell { colspan: 5, "no answers" }
+                                TableCell { colspan: 8, "no answers" }
                             }
                             TableCell { "{vs}" }
                             TableCell { "{x(ttft)}" }
                             TableCell { "{x(total)}" }
+                            TableCell { "{x(spent)}" }
                         }
                     }
                 }
@@ -219,6 +268,11 @@ pub fn tasks_table(m: &Model) -> Element {
              than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
              indicative only. The second total ratio is shown only where both engines' answers were \
              about one length."
+        }
+        p { style: "font-size: 0.875rem", {ENERGY_NOTE} " J/right: over the right answers, where \
+             the cell is scored. Its ratio is how many times less energy scratchy spent a request, \
+             shown only where both engines' answers were about one length, an engine that stops \
+             early spending less for answering less."
         }
         if open_loop {
             p { style: "font-size: 0.875rem",
@@ -322,6 +376,41 @@ mod tests {
         assert_eq!(right(&c), "~38%", "a run from before the count");
     }
 
+    /// A dataset cell's energy, where its run kept it: joules a request, an output token and, on
+    /// a scored cell that shows its accuracy, a right answer; and how many times less scratchy
+    /// spent a request than the rival, only at about one answer length, as the total time is.
+    #[test]
+    fn a_dataset_cells_energy_is_a_request_a_token_and_a_right_answer() {
+        let cell = |tokens: f64, j: f64, accuracy: Option<f64>| -> TaskCell {
+            serde_json::from_value(serde_json::json!({
+                "workload": "rag", "conc": 1, "completed": 8, "num_tasks": 8,
+                "accuracy": accuracy, "thinking_answers": 0, "capped_answers": 0,
+                "mean_output_tokens": tokens,
+                "energy": {"soc_j": j * 8.0, "window_s": 20.0, "j_per_request": j,
+                    "j_per_output_token": j / tokens,
+                    "j_per_right_answer": accuracy.filter(|&a| a > 0.0).map(|a| j / a)},
+            }))
+            .unwrap()
+        };
+        let ours = cell(100.0, 40.0, Some(0.5));
+        assert_eq!(joules(per_request(&ours)), "40.0");
+        assert_eq!(joules(per_token(&ours)), "0.40");
+        assert_eq!(joules(per_right(&ours)), "80.0");
+        // A third less energy a request than the rival's: x1.50.
+        assert_eq!(energy_times(&ours, &cell(100.0, 60.0, Some(0.5))), Some(1.5));
+        // Answers of different lengths: no ratio, as for the total time.
+        assert_eq!(energy_times(&ours, &cell(200.0, 60.0, Some(0.5))), None);
+        // Not scored, or none right: no figure a right answer.
+        assert_eq!(joules(per_right(&cell(100.0, 40.0, None))), "—");
+        assert_eq!(joules(per_right(&cell(100.0, 40.0, Some(0.0)))), "—");
+        // A run from before cells kept energy.
+        let old: TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag", "conc": 1, "completed": 8,
+        }))
+        .unwrap();
+        assert_eq!(joules(per_request(&old)), "—");
+    }
+
     /// The whole answer's time is set against the rival's only at about the same answer length,
     /// and neither mostly capped; the first token's always is.
     #[test]
@@ -344,6 +433,7 @@ mod tests {
             request_rate: None,
             timed_out: false,
             borrowed_from: None,
+            energy: None,
         };
         assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
         assert_eq!(total_times(&cell(100.0, 0), &cell(150.0, 0)), None, "longer");
@@ -442,6 +532,7 @@ mod tests {
             request_rate: None,
             timed_out: false,
             borrowed_from: None,
+            energy: None,
         };
         assert_eq!(accuracy(&cell(0)), Some(0.5));
         assert_eq!(accuracy(&cell(4)), None);

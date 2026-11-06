@@ -80,21 +80,12 @@ pub(crate) struct WeightAbi {
     pub embed: EmbedStorage,
 }
 
-/// The accessor BASE of a weight: its path joined, with a trailing numeral dropped.
-///
-/// ⛔ THE TRAILING NUMERAL IS A LAYER INDEX, and it is appended again downstream, so keeping it
-/// yields `merger_mlp_0_0`. This mirrors the metal bridge's `base_of` exactly, including its
-/// known defect on nn.Sequential members (`merger.mlp_0` and `merger.mlp_2` both truncate to
-/// `merger_mlp`) — matching it is the point: two spellings of one base is what this file exists
-/// to prevent, and diverging "to fix it here" would split the name from the load body again.
+/// The accessor BASE of a weight: its path joined. Its layer is its unroll index's alone, appended
+/// downstream; a path ending in a numeral (Qwen2-VL's `merger.mlp.0`, `merger.mlp.2`) is its own
+/// base. This is the metal bridge's `base` exactly — two spellings of one base is what this file
+/// exists to prevent.
 fn accessor_base(program: &Program, id: WeightId) -> String {
-    let mut joined = program.weights.path(id).join("_");
-    if let Some(pos) = joined.rfind('_')
-        && joined[pos + 1..].parse::<u32>().is_ok()
-    {
-        joined.truncate(pos);
-    }
-    joined
+    program.weights.path(id).join("_")
 }
 
 /// The field name of a gate/up pair PACKED INTO ONE weight: `{gate}__fused__{up}` plus the

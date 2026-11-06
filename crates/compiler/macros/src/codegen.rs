@@ -981,6 +981,43 @@ fn storage_requirement_error(
     )
 }
 
+/// Did the solver keep the `embed_tokens` of `accessors` as the packed `AffineQuantEmbedding`
+/// (metal's fused gather+dequant) or dequantize it to a dense `Embedding` (spyre/cuda host path)?
+/// A tied `lm_head` follows that representation.
+fn embed_is_affine_repr(accessors: &[WeightAccessor]) -> bool {
+    accessors.iter().any(|a| {
+        let n = a.name.to_string();
+        (n == "embed_tokens" || n.ends_with("_embed_tokens"))
+            && a.rust_type
+                .to_string()
+                .replace(' ', "")
+                .contains("AffineQuantEmbedding")
+    })
+}
+
+/// The MLX-affine codes, `(bits, group)`, a field loaded by `plan` keeps packed on device: a
+/// single-source or row-concatenated affine linear's, a tied head's over a packed embedding, and
+/// that packed embedding's. `None` for any other load — the affine sources fused at load are
+/// dequantized to one dense weight.
+fn packed_affine_codes(plan: &FieldLoad) -> Option<(u32, u32)> {
+    match *plan {
+        FieldLoad::LinearAffine {
+            group_size, bits, ..
+        }
+        | FieldLoad::LinearAffineRowConcat {
+            group_size, bits, ..
+        }
+        | FieldLoad::LinearTiedToEmbedding {
+            affine: Some((group_size, bits)),
+            ..
+        }
+        | FieldLoad::EmbeddingAffine {
+            group_size, bits, ..
+        } => Some((bits, group_size)),
+        _ => None,
+    }
+}
+
 /// Distill a `WeightAccessor` into its field-load plan. Uses the
 /// accessor's declared `rust_type` + `source_weights` and the
 /// model's config (for `rms_norm_eps` / `tie_word_embeddings`).
@@ -3360,17 +3397,7 @@ fn emit_weights_struct(
     // logic identical to the pre-grouping version. The prelude
     // bindings (`__marlin_ws`, `__bnb_code`, `__fp8_dtype`, …) are
     // captured by the layered closures via lexical scope.
-    // Did the solver keep the `embed_tokens` as the packed `AffineQuantEmbedding`
-    // (metal's fused gather+dequant) or dequantize it to a dense `Embedding`
-    // (spyre/cuda host path)? A tied `lm_head` follows that representation.
-    let embed_is_affine_repr = accessors.iter().any(|a| {
-        let n = a.name.to_string();
-        (n == "embed_tokens" || n.ends_with("_embed_tokens"))
-            && a.rust_type
-                .to_string()
-                .replace(' ', "")
-                .contains("AffineQuantEmbedding")
-    });
+    let embed_is_affine_repr = embed_is_affine_repr(&accessors);
     let plans: Vec<FieldLoad> = accessors
         .iter()
         .map(|a| plan_field_load(a, program, fuf, model, manifest, embed_is_affine_repr))
@@ -4429,27 +4456,26 @@ fn emit_weights_struct(
     (tokens, fingerprint_rows)
 }
 
-/// Split a Weights field name into `(base, layer)` where `layer`
-/// is `Some(n)` if the name ends in `_<digits>` (e.g.
-/// `input_layernorm_3` → `("input_layernorm", Some(3))`) and
-/// `None` for un-suffixed names like `embed_tokens` or `lm_head`.
-///
-/// The trailing-digits rule is the convention `weight_field_name`
-/// has used since the start: `(stem)_(layer_index)` for per-layer
-/// accessors, bare `stem` for arch-wide ones. New accessors must
-/// follow the same rule or the per-arch accessor method codegen
-/// will silently group them as non-layered. (Mixed bases —
-/// e.g. one `input_layernorm` and one `input_layernorm_0` under
-/// the same name root — panic at codegen time.)
-pub(crate) fn split_base_layer(field_name: &str) -> (String, Option<UnrollIndex>) {
-    if let Some((base, suffix)) = field_name.rsplit_once('_')
-        && !suffix.is_empty()
-        && suffix.chars().all(|c| c.is_ascii_digit())
-        && let Ok(n) = suffix.parse::<u64>()
-    {
-        return (base.to_string(), Some(UnrollIndex(n)));
+/// A Weights field's `(base, layer)`: an accessor unrolled at layer `n` is named `{base}_{n}`
+/// (`weight_field_stem`), its base that name less the suffix; an accessor of no unrolled layer is
+/// its whole name. Layer-ness is the unroll index's, never a name's digits: a weight whose own path
+/// ends in a numeral (Qwen2-VL's `merger.mlp.0` and `merger.mlp.2`) is two fields, not one
+/// field's two layers.
+pub(crate) fn base_layer(
+    field_name: &str,
+    layer: Option<UnrollIndex>,
+) -> (String, Option<UnrollIndex>) {
+    let suffix = layer.map(|n| format!("_{}", n.0));
+    match suffix.as_deref().and_then(|s| field_name.strip_suffix(s)) {
+        Some(base) => (base.to_string(), layer),
+        None => (field_name.to_string(), None),
     }
-    (field_name.to_string(), None)
+}
+
+/// An accessor's `(base, layer)` ([`base_layer`]), its layer its sources' unroll index.
+fn accessor_base_layer(acc: &WeightAccessor) -> (String, Option<UnrollIndex>) {
+    let layer = acc.source_weights.first().and_then(|(_, i)| *i);
+    base_layer(&acc.name.to_string(), layer)
 }
 
 /// One row in the per-arch `Weights` shape. The field/struct emit,
@@ -4520,10 +4546,19 @@ impl ModelDims {
     /// same packed pair of weights) of a kind whose device layer states its declared extents, at
     /// the shape the arch's trace gives it. A packed pair is its two weights side by side along
     /// `N`, which only weights of one `K` are (`PackedN`).
+    ///
+    /// A linear every layer of which keeps the same MLX-affine codes packed on device (`codes`,
+    /// `(bits, group)` from its load plan) is a quantized handle (`Q2`) of those codes; a group
+    /// whose layers' codes differ (an OptiQ per-module map) gets none.
+    ///
+    /// A field holding a bundle an op reads whole (`bundles`, derived: `bundles::derive`) is a
+    /// bundle handle (`Wb`) of its kind, each role at its derived shape.
     pub(crate) fn of(
         groups: &[AccessorGroup<'_>],
         program: &Program,
         inferred: &crate::shape::Inferred,
+        codes: &dyn Fn(&WeightAccessor) -> Option<(u32, u32)>,
+        bundles: &std::collections::BTreeMap<String, crate::bundles::Bundle>,
     ) -> Result<Self, String> {
         use crate::weight_vocab::WeightKind;
         let mut dims = Self::default();
@@ -4536,45 +4571,108 @@ impl ModelDims {
                 continue;
             };
             let ids = sources(first);
-            if !g.entries.iter().all(|(_, acc)| sources(acc) == ids)
-                || !matches!(
-                    first.kind,
-                    WeightKind::Linear | WeightKind::Embedding | WeightKind::RmsNorm
+            let kind = &first.kind;
+            let untypable = |why: &str| {
+                format!(
+                    "field `{}` ({kind:?}) has no typed handle: {why}; the generator types every \
+                     weight",
+                    g.base
                 )
-            {
-                continue;
+            };
+            if !g.entries.iter().all(|(_, acc)| sources(acc) == ids) {
+                return Err(untypable("its layers read different weights"));
             }
-            let Some(shapes) = (ids.iter())
-                .map(|id| inferred.weights.get(id))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
             let layer = &g.rust_type;
-            let mut ty = |shape: &[crate::dim::Dim]| -> Result<Option<TokenStream>, String> {
-                let mut dim = |d| dim_tokens(d, &mut dims.bounds);
-                Ok(match shape {
-                    [d] => {
-                        let d = dim(d)?;
-                        Some(quote!(#w::W1<#d, #layer>))
+            let def = 'def: {
+                // A bundle an op reads whole: its kind and each role at its derived shape.
+                let bundle = match ids[..] {
+                    [id] => bundles.get(&program.weights.path(id).join(".")),
+                    _ => None,
+                };
+                if let Some(bundle) = bundle {
+                    let mut roles = Vec::new();
+                    for shape in &bundle.roles {
+                        let ds = (shape.iter())
+                            .map(|d| dim_tokens(d, &mut dims.bounds))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        roles.push(match &ds[..] {
+                            [d] => quote!(#w::S1<#d>),
+                            [k, n] => quote!(#w::S2<#k, #n>),
+                            [e, k, n] => quote!(#w::S3<#e, #k, #n>),
+                            _ => return Err(format!("a bundle role of rank {}", ds.len())),
+                        });
                     }
-                    [k, n] => {
-                        let (k, n) = (dim(k)?, dim(n)?);
-                        Some(quote!(#w::W2<#k, #n, #layer>))
+                    let kind = format_ident!("{}", format!("K{:?}", bundle.kind));
+                    break 'def quote!(#w::Wb<#w::#kind, (#(#roles,)*), #layer>);
+                }
+                if !matches!(
+                    first.kind,
+                    WeightKind::Linear
+                        | WeightKind::Embedding
+                        | WeightKind::AffineQuantEmbedding
+                        | WeightKind::RmsNorm
+                        | WeightKind::LayerNorm
+                        | WeightKind::Tensor
+                        | WeightKind::AttnSinks
+                ) {
+                    return Err(untypable("no handle type holds its kind"));
+                }
+                let Some(shapes) = (ids.iter())
+                    .map(|id| inferred.weights.get(id))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Err(untypable("the trace gives a weight of it no shape"));
+                };
+                // Every layer's codes, which must be one: a group of two is no one handle.
+                let layer_codes = codes(first);
+                if g.entries.iter().any(|(_, acc)| codes(acc) != layer_codes) {
+                    return Err(untypable("its layers hold different affine codes"));
+                }
+                let mut ty = |shape: &[crate::dim::Dim],
+                              codes: Option<(u32, u32)>|
+                 -> Result<Option<TokenStream>, String> {
+                    let mut dim = |d| dim_tokens(d, &mut dims.bounds);
+                    Ok(match (shape, codes) {
+                        ([d], None) => {
+                            let d = dim(d)?;
+                            Some(quote!(#w::W1<#d, #layer>))
+                        }
+                        ([k, n], None) => {
+                            let (k, n) = (dim(k)?, dim(n)?);
+                            Some(quote!(#w::W2<#k, #n, #layer>))
+                        }
+                        ([k, n], Some((bits, group))) => {
+                            let (k, n) = (dim(k)?, dim(n)?);
+                            let (b, g) = (format_ident!("B{bits}"), format_ident!("G{group}"));
+                            Some(quote!(#w::Q2<#k, #n, #w::#b, #w::#g, #layer>))
+                        }
+                        _ => None,
+                    })
+                };
+                let handle = match &shapes[..] {
+                    [one] => ty(one, layer_codes)?,
+                    // A LayerNorm's weight and bias, each its width.
+                    [weight, bias] if first.kind == WeightKind::LayerNorm && weight == bias => {
+                        ty(weight, None)?
+                    }
+                    // A packed pair is dense: affine sources fused at load are dequantized.
+                    [gate, up] if first.kind == WeightKind::Linear && layer_codes.is_none() => {
+                        match (ty(gate, None)?, ty(up, None)?) {
+                            (Some(gate), Some(up)) => {
+                                Some(quote!(<(#gate, #up) as #w::PackedN>::Out))
+                            }
+                            _ => None,
+                        }
                     }
                     _ => None,
-                })
-            };
-            let handle = match &shapes[..] {
-                [one] => ty(one)?,
-                [gate, up] if first.kind == WeightKind::Linear => match (ty(gate)?, ty(up)?) {
-                    (Some(gate), Some(up)) => Some(quote!(<(#gate, #up) as #w::PackedN>::Out)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let Some(def) = handle else {
-                continue;
+                };
+                let Some(def) = handle else {
+                    let ranks: Vec<usize> = shapes.iter().map(|s| s.len()).collect();
+                    return Err(untypable(&format!(
+                        "no handle holds weights of ranks {ranks:?} with codes {layer_codes:?}"
+                    )));
+                };
+                def
             };
             let tensor = (ids.iter())
                 .map(|id| program.weights.path(*id).join("."))
@@ -4705,8 +4803,7 @@ pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<Acces
 
     let mut by_base: BTreeMap<String, Bucket<'_>> = BTreeMap::new();
     for acc in accessors {
-        let full = acc.name.to_string();
-        let (base, layer) = split_base_layer(&full);
+        let (base, layer) = accessor_base_layer(acc);
         let ty_str = acc.rust_type.to_string();
         let entry = by_base.entry(base.clone()).or_insert_with(|| Bucket {
             rust_type: acc.rust_type.clone(),
@@ -12951,7 +13048,7 @@ fn dump_wavefront_mega(
                                     WeightId(*id),
                                     *index,
                                 );
-                                let (wbase, _) = split_base_layer(&name);
+                                let (wbase, _) = base_layer(&name, *index);
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let is_gemm = gemm_weight.contains(&i);
                                 let disk = safetensors_prefix(
@@ -12998,7 +13095,7 @@ fn dump_wavefront_mega(
                                     WeightId(*id),
                                     *index,
                                 );
-                                let (wbase, _) = split_base_layer(&name);
+                                let (wbase, _) = base_layer(&name, *index);
                                 let scale_base = format!("{wbase}.weight_scale");
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let disk = safetensors_prefix(
@@ -13031,7 +13128,7 @@ fn dump_wavefront_mega(
                                     WeightId(*id),
                                     *index,
                                 );
-                                let (wbase, _) = split_base_layer(&name);
+                                let (wbase, _) = base_layer(&name, *index);
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let disk = safetensors_prefix(
                                     weight_naming,
@@ -14412,7 +14509,22 @@ pub fn emit_model(
     // metal resolver reaches each through its source slot.
     let model_dims = |accs: Option<&[WeightAccessor]>| {
         accs.map_or_else(ModelDims::default, |accs| {
-            ModelDims::of(&group_accessors_by_base(accs), program, inferred).unwrap_or_else(|e| {
+            // Each field's codes as its load plan keeps them: the very plan its load is emitted
+            // from.
+            let embed_affine = embed_is_affine_repr(accs);
+            let codes = |a: &WeightAccessor| {
+                let plan = plan_field_load(a, program, fuf, model, manifest, embed_affine);
+                packed_affine_codes(&plan)
+            };
+            // The bundles its ops read whole, as the bundle loaders' dims derive them.
+            let config = crate::bundles::BundleConfig {
+                bounds: &model.bounds,
+                activation: &model.expert_activation,
+            };
+            let bundles = crate::bundles::derive(program, &config)
+                .unwrap_or_else(|e| panic!("`{}`: its bundles: {e}", model.source_stem));
+            let groups = group_accessors_by_base(accs);
+            ModelDims::of(&groups, program, inferred, &codes, &bundles).unwrap_or_else(|e| {
                 panic!("[weights] {}: its weights' types: {e}", model.source_stem)
             })
         })
@@ -15726,14 +15838,17 @@ pub fn emit_model(
     };
 
     #[cfg(feature = "metal")]
-    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens(&resolver.typed).unwrap_or_else(
-        |e| {
-            panic!(
-                "[metal static tape] {}: command table: {e}",
-                model.source_stem
-            )
-        },
-    ));
+    {
+        let table = metal_tape_cmds
+            .into_tokens(&resolver.typed)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "[metal static tape] {}: command table: {e}",
+                    model.source_stem
+                )
+            });
+        metal_arena_bytes_statics.push(table);
+    }
     #[cfg(feature = "metal")]
     {
         let mc = &model_facts;
@@ -17468,36 +17583,6 @@ mod tests {
     }
 
     #[test]
-    fn split_base_layer_recognizes_layered_and_unlayered_names() {
-        // Layered: trailing _<digits> peels off as the layer index.
-        assert_eq!(
-            split_base_layer("input_layernorm_3"),
-            ("input_layernorm".to_string(), Some(UnrollIndex(3)))
-        );
-        assert_eq!(
-            split_base_layer("self_attn_q_proj_31"),
-            ("self_attn_q_proj".to_string(), Some(UnrollIndex(31)))
-        );
-        // Non-layered: no trailing _<digits>.
-        assert_eq!(
-            split_base_layer("embed_tokens"),
-            ("embed_tokens".to_string(), None)
-        );
-        assert_eq!(split_base_layer("lm_head"), ("lm_head".to_string(), None));
-        // Trailing-non-digit suffix isn't a layer — the whole name
-        // stays as the base.
-        assert_eq!(
-            split_base_layer("rotary_local"),
-            ("rotary_local".to_string(), None)
-        );
-        // Empty trailing chunk after `_` is not a layer either.
-        assert_eq!(
-            split_base_layer("trailing_"),
-            ("trailing_".to_string(), None)
-        );
-    }
-
-    #[test]
     fn accessor_methods_compress_layered_fields_to_slice_index() {
         // Three layers' worth of `input_layernorm_<n>` fields collapse
         // into ONE `pub fn input_layernorm(&self, layer: u32) ->
@@ -17511,7 +17596,7 @@ mod tests {
                 name: format_ident!("input_layernorm_{}", n),
                 rust_type: ty.clone(),
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(n)))],
             })
             .collect::<Vec<_>>();
         let ts = emit_weights_accessor_methods(&accessors, &ModelDims::default()).to_string();
@@ -17578,7 +17663,7 @@ mod tests {
                 name: format_ident!("norm_0"),
                 rust_type: ty.clone(),
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(0)))],
             },
         ];
         let _ = emit_weights_accessor_methods(&accessors, &ModelDims::default());
@@ -17594,13 +17679,13 @@ mod tests {
                 name: format_ident!("input_layernorm_0"),
                 rust_type: quote! { crate::__gpu::layers::RmsNorm },
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(0)))],
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
                 rust_type: quote! { crate::__gpu::layers::LinearLayer },
                 kind: crate::weight_vocab::WeightKind::Linear,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(1)))],
             },
         ];
         let _ = emit_weights_accessor_methods(&accessors, &ModelDims::default());
@@ -17709,13 +17794,13 @@ mod tests {
                 name: format_ident!("input_layernorm_0"),
                 rust_type: quote! { crate::__gpu::layers::RmsNorm },
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(0)))],
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
                 rust_type: quote! { crate::__gpu::layers::LinearLayer },
                 kind: crate::weight_vocab::WeightKind::Linear,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(1)))],
             },
         ];
         let _ = group_accessors_by_base(&accs);
@@ -17767,13 +17852,13 @@ mod tests {
                 name: format_ident!("moe_1"),
                 rust_type: quote! { crate::__gpu::layers_moe::DeepSeekV2MoELayer },
                 kind: crate::weight_vocab::WeightKind::DeepSeekMoe,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(1)))],
             },
             WeightAccessor {
                 name: format_ident!("moe_2"),
                 rust_type: quote! { crate::__gpu::layers_moe::DeepSeekV2MoELayer },
                 kind: crate::weight_vocab::WeightKind::DeepSeekMoe,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(2)))],
             },
         ];
         // No typed dims: a DeepSeek MoE bundle is no handle kind, so its accessor returns the

@@ -350,6 +350,15 @@ pub struct Scaling {
     pub min_rounds_per_cell: Option<u32>,
     #[serde(default)]
     pub task_min_prompts: Option<u32>,
+    /// How its RAG cells drew their tasks: `musique-dev-by-hops`, from all of MuSiQue's dev set in
+    /// its mix of hops. None in runs from before, which drew from its first 200, all 2-hop: other
+    /// questions, easier ones, so neither borrowed from nor joined to a run that samples the whole.
+    #[serde(default)]
+    pub task_sample: Option<String>,
+    /// How many tasks its accuracy cell (`rag-accuracy`) asked, sized apart from the others' rounds:
+    /// None in runs from before, and where it ran none.
+    #[serde(default)]
+    pub accuracy_tasks: Option<u32>,
 }
 
 impl Scaling {
@@ -591,6 +600,25 @@ pub struct TaskCell {
     /// None for a cell this run measured itself.
     #[serde(skip)]
     pub borrowed_from: Option<Utc>,
+    /// What the cell's requests cost in energy, from the power log over the wall clock they ran:
+    /// None in runs from before cells kept it.
+    #[serde(default)]
+    pub energy: Option<Energy>,
+}
+
+/// A cell's energy (`scripts/cell_energy.py`): the CPU, GPU and ANE counters' joules over the
+/// window its requests ran, the Mac's idle floor in them, DRAM not; and per request sent, per
+/// output token and, on a scored cell, per right answer (None where none was right).
+#[derive(Clone, Deserialize, Debug, PartialEq)]
+pub struct Energy {
+    pub soc_j: f64,
+    pub window_s: f64,
+    #[serde(default)]
+    pub j_per_request: Option<f64>,
+    #[serde(default)]
+    pub j_per_output_token: Option<f64>,
+    #[serde(default)]
+    pub j_per_right_answer: Option<f64>,
 }
 
 impl TaskCell {
@@ -739,6 +767,9 @@ pub struct Cell {
     pub short: Option<f64>,
     /// Every request it sent, over all its repeats; None in runs from before the run file kept them.
     pub requests: Option<Requests>,
+    /// What its requests cost in energy, over all its repeats; None in runs from before cells
+    /// kept it.
+    pub energy: Option<Energy>,
 }
 
 /// A cell's requests, in the order each repeat sent them: parallel arrays, one entry a request.
@@ -884,6 +915,8 @@ struct RawCell {
     dead_server: bool,
     #[serde(default)]
     requests: Option<Requests>,
+    #[serde(default)]
+    energy: Option<Energy>,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -927,6 +960,7 @@ impl TryFrom<RawCell> for Cell {
             dead_server: c.dead_server,
             short: None,
             requests: c.requests,
+            energy: c.energy,
         })
     }
 }

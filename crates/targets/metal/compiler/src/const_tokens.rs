@@ -99,6 +99,7 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
                 "TqDecodeHeads",
                 "CommandIx",
                 "PartIx",
+                "PartArray",
                 "QSize",
                 "IntermediateSize",
                 "HiddenSize",

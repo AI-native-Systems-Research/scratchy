@@ -422,9 +422,11 @@ jobs:
       #
       # `serve` is required, not optional: without it `anthropic` and `server`
       # are not compiled, so their tests cannot run.
+      # `--test tape_hashes`: each baked model's resolved tape held to its pinned hash
+      # (crates/models/arch/tape_hashes.txt), at this step's scope and on its build.
       - name: Serving-layer unit tests
         run: cargo test -p scratchy-serving-api -p scratchy-models
-          --features metal,serve,scratchy-models/smollm2-135m --lib
+          --features metal,serve,scratchy-models/smollm2-135m --lib --test tape_hashes
 
       # The quarantined per-tool-spans path (#193) is off by default, so
       # nothing above compiles it. Type-check it and run its gated tests so it
@@ -580,6 +582,42 @@ jobs:
         run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)
         run: cargo test -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice
+
+  # ---------------------------------------------------------------------------
+  # compile_fail doctest ERROR CODES, checked on nightly rustdoc.
+  #
+  # A ```compile_fail,E0277 doctest is a proof that rustc rejects a bad shape for
+  # THAT reason. Stable rustdoc ignores the pinned code: any compile error passes,
+  # so a typo or an unrelated breakage in the doctest satisfies it. Only nightly
+  # rustdoc checks the code ("Some expected error codes were not found").
+  #
+  # Covers every crate with a `compile_fail,E` doctest
+  # (`git grep -l 'compile_fail,E' -- crates`):
+  #   scratchy-tensors       src/typed.rs
+  #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
+  #   scratchy-target-spyre  src/runtime.rs     (gated on `spyre-hw`)
+  # `spyre-hw` pulls flex-rs, whose C++ shim needs the Spyre SDK; the shim is
+  # skipped as in the check-only jobs. Nothing links it: the crate's only
+  # runnable doctests are these compile_fail ones.
+  #
+  # Its own job (not a step in another): a second toolchain step would change the
+  # default toolchain for every later step there. Not gated on macos-scope: that
+  # gate skips spyre/tensors-only PRs, whose pins this job also checks.
+  # ---------------------------------------------------------------------------
+  nightly-compile-fail-codes:
+    name: macos-arm64 (nightly compile_fail error codes)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-compile-fail-codes
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Doctests (compile_fail error codes)
+        env:
+          SCRATCHY_SKIP_SENDNN_CXX: "1"
+        run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal -p scratchy-target-spyre --features scratchy-target-spyre/spyre-hw
 
   fmt:
     name: Format

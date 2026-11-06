@@ -150,7 +150,10 @@ fn write_hf_registry_file(out_dir: &Path, ids: &[String]) {
 /// against its configs (`configs/<arch>/`), write `$OUT_DIR/<mod>.rs`. Called
 /// concurrently across arches — must not mutate global state (e.g. env). The
 /// quant scoping (SCRATCHY_QUANTS) is set once in `main` before the fan-out.
-fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str) {
+///
+/// Returns the path (`<mod>::<model>`) of every model module the emit gives a
+/// `METAL_BUCKETS` ([`metal_tape_models`]).
+fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str) -> Vec<String> {
     println!("cargo:rerun-if-changed={}", dsl_path.display());
     // Watch the dir itself (its mtime bumps on add/remove) plus each file.
     println!("cargo:rerun-if-changed={}", configs_dir.display());
@@ -174,10 +177,60 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
     });
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
+    let models = (metal_tape_models(&tokens).into_iter())
+        .map(|model| format!("{mod_name}::{model}"))
+        .collect();
 
     let mut rendered = String::with_capacity(1 << 20);
     render_tokens(tokens, &mut rendered);
     write_if_changed(&out_dir.join(format!("{mod_name}.rs")), &rendered);
+    models
+}
+
+/// The model modules of one arch's emit that carry a metal tape: each top-level
+/// `pub mod <model> { … }` whose body names `METAL_BUCKETS` (a canonical's
+/// `static`, a shim's re-export of its canonical's).
+fn metal_tape_models(arch: &TokenStream) -> Vec<String> {
+    fn names_metal_buckets(ts: TokenStream) -> bool {
+        ts.into_iter().any(|tt| match tt {
+            TokenTree::Ident(i) => i == "METAL_BUCKETS",
+            TokenTree::Group(g) => names_metal_buckets(g.stream()),
+            _ => false,
+        })
+    }
+    let tts: Vec<TokenTree> = arch.clone().into_iter().collect();
+    (tts.windows(4))
+        .filter_map(|w| match w {
+            [
+                TokenTree::Ident(vis),
+                TokenTree::Ident(kw),
+                TokenTree::Ident(model),
+                TokenTree::Group(body),
+            ] if vis == "pub" && kw == "mod" && names_metal_buckets(body.stream()) => {
+                Some(model.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Write `$OUT_DIR/metal_models.rs`: `METAL_MODELS`, every model module this
+/// build bakes a metal tape for (`emit_arch`'s returns, sorted) beside its
+/// `METAL_BUCKETS`. `src/lib.rs` includes it under `metal`.
+#[cfg(feature = "metal")]
+fn write_metal_models(out_dir: &Path, models: &[String]) {
+    let rows: String = (models.iter())
+        .map(|m| format!("    ({m:?}, crate::{m}::METAL_BUCKETS),\n"))
+        .collect();
+    let rendered = format!(
+        "/// Every model module this build bakes a metal tape for (`<arch>::<model>`), beside\n\
+         /// its baked buckets: read off the emitted modules by the build script, sorted.\n\
+         pub static METAL_MODELS: &[(\n    \
+             &str,\n    \
+             &[::scratchy_target_metal::interpreter::metal::MetalBucketSpec],\n\
+         )] = &[\n{rows}];\n"
+    );
+    write_if_changed(&out_dir.join("metal_models.rs"), &rendered);
 }
 
 /// Write `$OUT_DIR/metal_bake.rs`: the crate-root `__metal_bake` module (`src/lib.rs`) the
@@ -484,13 +537,17 @@ fn main() {
     // models, so this is nested (arch × model) work-stealing across all cores —
     // recovering the cross-crate parallelism the per-arch crate split used to get
     // from cargo, in one process.
-    targets
+    let mut metal_models: Vec<String> = targets
         .par_iter()
-        .for_each(|(dsl_path, mod_name, configs_dir)| {
-            emit_arch(dsl_path, configs_dir, &out_dir, mod_name);
-        });
+        .flat_map(|(dsl_path, mod_name, configs_dir)| {
+            emit_arch(dsl_path, configs_dir, &out_dir, mod_name)
+        })
+        .collect();
+    metal_models.sort();
     #[cfg(feature = "metal")]
     write_metal_bake(&out_dir);
+    #[cfg(feature = "metal")]
+    write_metal_models(&out_dir, &metal_models);
     bake_tokenizers(&out_dir);
 
     // Shell-completion registry. Resolving it needs the network, so it happens

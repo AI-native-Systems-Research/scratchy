@@ -116,10 +116,229 @@
 //!     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! }
 //! ```
+//!
+//! (iv) An MLX-affine matmul's slot holds a quantized weight, and its codes and dims are the
+//! handle's — `lm_head`'s are 4 bits in groups of 64, `[2048, 128256]`:
+//!
+//! ```
+//! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+//! # use scratchy_target_metal::tape::typed::{AffineSlot, Source};
+//! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
+//! # enum Hidden {}
+//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # enum Vocab {}
+//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # struct Layer;
+//! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
+//! # struct Weights { lm_head: Head }
+//! # enum LmHead {}
+//! # impl Source for LmHead {
+//! #     type Model = Weights;
+//! #     type Handle = Head;
+//! #     const IX: SourceIx = SourceIx(0);
+//! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+//! # }
+//! let w = <LmHead as AffineSlot>::WEIGHT;
+//! assert_eq!((w.n, w.k, w.bits.get(), w.group.get()), (128256, 2048, 4, 64));
+//! ```
+//!
+//! and a dense GEMM over it has no dims to read (E0277):
+//!
+//! ```compile_fail,E0277
+//! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+//! # use scratchy_target_metal::tape::typed::{GemmSlot, Source};
+//! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
+//! # enum Hidden {}
+//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # enum Vocab {}
+//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # struct Layer;
+//! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
+//! # struct Weights { lm_head: Head }
+//! # enum LmHead {}
+//! # impl Source for LmHead {
+//! #     type Model = Weights;
+//! #     type Handle = Head;
+//! #     const IX: SourceIx = SourceIx(0);
+//! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+//! # }
+//! let w = <LmHead as GemmSlot>::WEIGHT;
+//! ```
+//!
+//! (v) A width no affine kernel is instantiated for has no slot (E0277): `B5` is a width MLX
+//! writes, not one these kernels take.
+//!
+//! ```compile_fail,E0277
+//! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+//! # use scratchy_target_metal::tape::typed::{AffineSlot, Source};
+//! # use scratchy_tensors::typed::{B5, Dim, G64, Q2};
+//! # enum Hidden {}
+//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # enum Vocab {}
+//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # struct Layer;
+//! # type Head = Q2<Hidden, Vocab, B5, G64, Layer>;
+//! # struct Weights { lm_head: Head }
+//! # enum LmHead {}
+//! # impl Source for LmHead {
+//! #     type Model = Weights;
+//! #     type Handle = Head;
+//! #     const IX: SourceIx = SourceIx(0);
+//! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+//! # }
+//! let w = <LmHead as AffineSlot>::WEIGHT;
+//! ```
+//!
+//! (vi) The bake's numbers are the slot's, tied in the build. Its codes by a bound: the markers
+//! the bake minted must be the handle's (E0271) —
+//!
+//! ```
+//! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+//! # use scratchy_target_metal::tape::typed::{AffineSlot, Source, affine_codes_agree, nax_group};
+//! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
+//! # enum Hidden {}
+//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # enum Vocab {}
+//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # struct Layer;
+//! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
+//! # struct Weights { lm_head: Head }
+//! # enum LmHead {}
+//! # impl Source for LmHead {
+//! #     type Model = Weights;
+//! #     type Handle = Head;
+//! #     const IX: SourceIx = SourceIx(0);
+//! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+//! # }
+//! const _: () = affine_codes_agree::<LmHead, scratchy_tensors::typed::B4, G64>();
+//! const _: () = <LmHead as AffineSlot>::WEIGHT.agrees(128256, 2048);
+//! const _: () = nax_group::<LmHead>();
+//! ```
+//!
+//! ```compile_fail,E0271
+//! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+//! # use scratchy_target_metal::tape::typed::{Source, affine_codes_agree};
+//! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
+//! # enum Hidden {}
+//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # enum Vocab {}
+//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # struct Layer;
+//! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
+//! # struct Weights { lm_head: Head }
+//! # enum LmHead {}
+//! # impl Source for LmHead {
+//! #     type Model = Weights;
+//! #     type Handle = Head;
+//! #     const IX: SourceIx = SourceIx(0);
+//! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+//! # }
+//! const _: () = affine_codes_agree::<LmHead, scratchy_tensors::typed::B8, G64>();
+//! ```
+//!
+//! — its n and k by a `const` evaluation (E0080), until Phase F makes a dim a type —
+//!
+//! ```compile_fail,E0080
+//! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+//! # use scratchy_target_metal::tape::typed::{AffineSlot, Source};
+//! # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
+//! # enum Hidden {}
+//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # enum Vocab {}
+//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # struct Layer;
+//! # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
+//! # struct Weights { lm_head: Head }
+//! # enum LmHead {}
+//! # impl Source for LmHead {
+//! #     type Model = Weights;
+//! #     type Handle = Head;
+//! #     const IX: SourceIx = SourceIx(0);
+//! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+//! # }
+//! const _: () = <LmHead as AffineSlot>::WEIGHT.agrees(128000, 2048);
+//! ```
+//!
+//! — and a matrix-unit kernel's group by its bound (E0277): those take no group of 32.
+//!
+//! ```compile_fail,E0277
+//! # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+//! # use scratchy_target_metal::tape::typed::{Source, nax_group};
+//! # use scratchy_tensors::typed::{B4, Dim, G32, Q2};
+//! # enum Hidden {}
+//! # impl Dim for Hidden { const N: u32 = 2048; }
+//! # enum Vocab {}
+//! # impl Dim for Vocab { const N: u32 = 128256; }
+//! # struct Layer;
+//! # type Head = Q2<Hidden, Vocab, B4, G32, Layer>;
+//! # struct Weights { lm_head: Head }
+//! # enum LmHead {}
+//! # impl Source for LmHead {
+//! #     type Model = Weights;
+//! #     type Handle = Head;
+//! #     const IX: SourceIx = SourceIx(0);
+//! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+//! # }
+//! const _: () = nax_group::<LmHead>();
+//! ```
 
-use scratchy_tensors::typed::{Dim, Shape2};
+use scratchy_tensors::typed::{B2, B3, B4, B8, Bits, Dim, G32, G64, G128, Group, QShape2, Shape2};
 
-use super::ids::{LayerId, SourceIx};
+use super::ids::{AffineBits, AffineGroupSize, LayerId, SourceIx};
+
+/// A code width the MLX-affine kernels are instantiated for, as a type: its [`AffineBits`].
+pub trait AffineBitsOf: Bits {
+    const BITS: AffineBits;
+}
+
+/// A group the MLX-affine kernels are instantiated for, as a type: its [`AffineGroupSize`].
+pub trait AffineGroupOf: Group {
+    const GROUP: AffineGroupSize;
+}
+
+/// The width of the kernels instantiated for int4 codes alone (`qmm_t_splitk`, `qmm_n`, `qvm`,
+/// the W4A8 pair).
+pub trait Int4: AffineBitsOf {}
+
+/// A group the matrix-unit kernels (`quantized_qmm_nax`) are instantiated for.
+pub trait NaxGroup: AffineGroupOf {}
+
+/// ⭐ A KERNEL SET, STATED ONCE: the marker types a kernel family is instantiated for, each
+/// implementing its trait, and the table of their numbers the refined value type
+/// ([`AffineBits`], …) is minted against. The impls and the table are one list.
+macro_rules! kernel_set {
+    ($(#[$m:meta])* $table:ident: $carrier:ident, $set:ident { $($marker:ident),+ }
+        $(=> $assoc:ident: $value:ident)?) => {
+        $(#[$m])*
+        pub const $table: &[u32] = &[$(<$marker as $carrier>::N),+];
+        kernel_set!(@impls $set [$($assoc $value)?] $carrier $($marker)+);
+    };
+    (@impls $set:ident [] $carrier:ident $($marker:ident)+) => {
+        $(impl $set for $marker {})+
+    };
+    (@impls $set:ident [$assoc:ident $value:ident] $carrier:ident $($marker:ident)+) => {
+        $(impl $set for $marker {
+            const $assoc: $value = $value::of(<$marker as $carrier>::N);
+        })+
+    };
+}
+
+kernel_set! {
+    /// The widths the affine kernels are instantiated for (`_b_{2,3,4,8}` in `quantized*.metal`).
+    AFFINE_BITS: Bits, AffineBitsOf { B2, B3, B4, B8 } => BITS: AffineBits
+}
+kernel_set! {
+    /// The groups the affine kernels are instantiated for (`_gs_{32,64,128}`).
+    AFFINE_GROUP_SIZES: Group, AffineGroupOf { G32, G64, G128 } => GROUP: AffineGroupSize
+}
+kernel_set! {
+    /// The width the int4-only kernels are instantiated for.
+    INT4_BITS: Bits, Int4 { B4 }
+}
+kernel_set! {
+    /// The groups the matrix-unit kernels are instantiated for.
+    NAX_GROUP_SIZES: Group, NaxGroup { G64, G128 }
+}
 
 /// A weight family of model `Model`: its index in the model's source manifest, and the typed
 /// handle its field holds.
@@ -151,3 +370,72 @@ impl<S: Source<Handle: Shape2>> GemmSlot for S {
         k: <<S::Handle as Shape2>::K as Dim>::N,
     };
 }
+
+/// Whether `(n, k)` are a weight's `(n, k)`: a `const` evaluation that fails the build (E0080)
+/// where the bake's numbers are not the slot's. The ratchet: n/k become type equality in Phase F,
+/// when a dim is a type the bake names.
+const fn dims_agree(n: u32, k: u32, slot_n: u32, slot_k: u32) {
+    assert!(n == slot_n, "the bake's n is not its slot's");
+    assert!(k == slot_k, "the bake's k is not its slot's");
+}
+
+impl GemmSlotWeight {
+    /// Fails the build (E0080) unless the GEMM the bake baked at `(n, k)` is this slot's.
+    pub const fn agrees(self, n: u32, k: u32) {
+        dims_agree(n, k, self.n, self.k)
+    }
+}
+
+/// An MLX-affine matmul's weight, as its slot states it: the slot's index, the handle's dims and
+/// its codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineSlotWeight {
+    pub ix: SourceIx,
+    pub n: u32,
+    pub k: u32,
+    pub bits: AffineBits,
+    pub group: AffineGroupSize,
+}
+
+impl AffineSlotWeight {
+    /// Fails the build (E0080) unless the affine kernels the bake baked at `(n, k)` read this
+    /// slot's weight. Its codes are its markers', tied by [`affine_codes_agree`].
+    pub const fn agrees(self, n: u32, k: u32) {
+        dims_agree(n, k, self.n, self.k)
+    }
+}
+
+/// A slot an MLX-affine matmul reads: only a slot whose handle is a quantized rank-2 weight of
+/// codes the affine kernels are instantiated for has an [`AffineSlotWeight`].
+pub trait AffineSlot {
+    type Bits: AffineBitsOf;
+    type Group: AffineGroupOf;
+    const WEIGHT: AffineSlotWeight;
+}
+
+impl<S> AffineSlot for S
+where
+    S: Source<Handle: QShape2>,
+    <S::Handle as QShape2>::Bits: AffineBitsOf,
+    <S::Handle as QShape2>::Group: AffineGroupOf,
+{
+    type Bits = <S::Handle as QShape2>::Bits;
+    type Group = <S::Handle as QShape2>::Group;
+    const WEIGHT: AffineSlotWeight = AffineSlotWeight {
+        ix: S::IX,
+        n: <<S::Handle as QShape2>::N as Dim>::N,
+        k: <<S::Handle as QShape2>::K as Dim>::N,
+        bits: <Self::Bits as AffineBitsOf>::BITS,
+        group: <Self::Group as AffineGroupOf>::GROUP,
+    };
+}
+
+/// The bake's codes for slot `S` are `S`'s: `B` and `G` the markers the bake minted, which must
+/// be the slot's handle's (E0271 where they are not).
+pub const fn affine_codes_agree<S: AffineSlot<Bits = B, Group = G>, B, G>() {}
+
+/// Slot `S` is read by an int4-only kernel: its codes must be 4 bits (E0277 where not).
+pub const fn int4_codes<S: AffineSlot<Bits: Int4>>() {}
+
+/// Slot `S` is read by a matrix-unit kernel: its group must be one they take (E0277 where not).
+pub const fn nax_group<S: AffineSlot<Group: NaxGroup>>() {}

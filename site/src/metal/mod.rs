@@ -180,7 +180,12 @@ fn borrow_earlier(runs: &mut [Run]) {
     // Per (machine, model, engine): its dataset cells as last measured, each tagged with when,
     // with the task cap and the scaling they were measured under (whose rounds say how many tasks
     // each cell sent).
-    type Tasked = (Vec<data::TaskCell>, Option<u32>, Option<data::TaskSizing>);
+    type Tasked = (
+        Vec<data::TaskCell>,
+        Option<u32>,
+        Option<data::TaskSizing>,
+        Option<String>,
+    );
     let mut task_cells: BTreeMap<(String, String, &str), Tasked> = BTreeMap::new();
     for i in order {
         let run = &mut runs[i];
@@ -219,6 +224,10 @@ fn borrow_earlier(runs: &mut [Run]) {
             let stacked = |c: &data::TaskCell| matches!(c.load.as_deref(), None | Some("users"));
             let open_loop = !(Engine::Scratchy.tasks(m).iter()).all(stacked);
             let sizing = (run.config.scaling.as_ref()).and_then(data::Scaling::task_sizing);
+            // And drawn the same way: a run that samples all of MuSiQue's hops asks other tasks
+            // than one that took its first 200.
+            let drawn = task_sample(&run.config);
+            let accuracy_tasks = (run.config.scaling.as_ref()).and_then(|s| s.accuracy_tasks);
             for e in Engine::RIVALS {
                 let Some(slot) = e.tasks_mut(m) else { continue };
                 let key = (at.0.clone(), at.1.clone(), e.key());
@@ -236,21 +245,32 @@ fn borrow_earlier(runs: &mut [Run]) {
                         // A run with only open-loop cells lends none, and leaves an earlier
                         // stacked run's cells to lend.
                         if !lent.is_empty() {
-                            task_cells.insert(key, (lent, cap, sizing));
+                            task_cells.insert(key, (lent, cap, sizing, drawn.clone()));
                         }
                     }
                     None if open_loop => {}
                     None => {
-                        let Some((cells, _, theirs)) =
-                            task_cells.get(&key).filter(|(_, c, _)| *c == cap)
+                        let Some((cells, _, theirs, lent_drawn)) =
+                            task_cells.get(&key).filter(|(_, c, _, _)| *c == cap)
                         else {
                             continue;
                         };
-                        let same_tasks = |c: &data::TaskCell| match (sizing, *theirs) {
-                            (Some(a), Some(b)) => {
-                                a.count(&c.workload, c.conc) == b.count(&c.workload, c.conc)
-                            }
-                            _ => false,
+                        // A MuSiQue cell only from a run that drew its tasks the same way; every
+                        // other workload's tasks are as they were. The accuracy cell is sized
+                        // apart from the rounds: as many tasks as this run's asked, by the count
+                        // the lent cell recorded.
+                        let same_tasks = |c: &data::TaskCell| {
+                            (!sampled_from_musique(&c.workload) || *lent_drawn == drawn)
+                                && match (sizing, *theirs) {
+                                    _ if c.workload == "rag-accuracy" => {
+                                        c.num_tasks.is_some() && c.num_tasks == accuracy_tasks
+                                    }
+                                    (Some(a), Some(b)) => {
+                                        a.count(&c.workload, c.conc)
+                                            == b.count(&c.workload, c.conc)
+                                    }
+                                    _ => false,
+                                }
                         };
                         let kept: Vec<data::TaskCell> =
                             cells.iter().filter(|c| same_tasks(c)).cloned().collect();
@@ -279,6 +299,18 @@ fn borrow_earlier(runs: &mut [Run]) {
 /// the same tasks only under the same cap.
 fn run_task_cap(config: &data::Config) -> Option<u32> {
     config.scaling.as_ref().and_then(|s| s.task_max_prompt)
+}
+
+/// How a run drew its RAG cells' tasks ([`data::Scaling::task_sample`]): None in runs from before
+/// it was recorded, which drew from MuSiQue's first 200.
+fn task_sample(config: &data::Config) -> Option<String> {
+    config.scaling.as_ref().and_then(|s| s.task_sample.clone())
+}
+
+/// Whether a workload's tasks are MuSiQue's, the only ones [`task_sample`] says how were drawn:
+/// a change of sampling is a change of their questions, and of no other workload's.
+fn sampled_from_musique(workload: &str) -> bool {
+    matches!(workload, "rag" | "rag-spans" | "rag-accuracy")
 }
 
 /// A dataset map's axes before there is anything to show: a place of the right shape.
@@ -1471,6 +1503,12 @@ impl<'a> ShapeGrid<'a> {
         e.and_then(|e| self.cells(e).get(&rung).copied())
     }
 
+    /// Whether scratchy has `metric` in any of its cells: energy only where the run kept it.
+    fn measures(&self, metric: Metric) -> bool {
+        self.rungs()
+            .any(|r| timing(self.at(Some(Engine::Scratchy), r), metric).is_some())
+    }
+
     /// scratchy against `rival` at one cell: the ratio, and how it reads.
     fn versus(&self, metric: Metric, rung: (u32, u32), rival: Engine) -> (Option<f64>, String) {
         let (cs, cr) = (
@@ -1705,6 +1743,24 @@ const GRID_METRICS: [GridMetric; 3] = [
     },
 ];
 
+/// A model's own grid section: the overview's three, then its energy, joules an output token at 1
+/// user, so how much each answer cost sits beside how fast it came.
+const MODEL_GRID_METRICS: [GridMetric; 4] = [
+    GRID_METRICS[0],
+    GRID_METRICS[1],
+    GRID_METRICS[2],
+    GridMetric {
+        metric: Metric::Energy,
+        load: Load::Alone,
+        name: "Energy",
+        about: "Joules an output token with 1 user, from the CPU, GPU and ANE counters, not DRAM, \
+                the Mac's idle floor of about 1.6 W in it; read once a second, so a cell of under \
+                about 20 s is coarse.",
+        title: "energy per output token, 1 user",
+        letter: "J",
+    },
+];
+
 /// The marks any of these cells carries, each once.
 fn mark(metric: Metric, cells: &[Option<&Cell>]) -> String {
     let mut out = String::new();
@@ -1859,9 +1915,9 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         };
         let others: Vec<Engine> = g.present.iter().copied().skip(1).collect();
         // Each metric's map over the users counts it scores, where the grid ran any.
-        let parts: Vec<(GridMetric, ShapeGrid)> = (GRID_METRICS.iter())
+        let parts: Vec<(GridMetric, ShapeGrid)> = (MODEL_GRID_METRICS.iter())
             .map(|&gm| (gm, g.under(gm.load)))
-            .filter(|(_, s)| !s.down.is_empty())
+            .filter(|(gm, s)| !s.down.is_empty() && s.measures(gm.metric))
             .collect();
         rsx! {
             Stack { gap: 3,
@@ -2661,10 +2717,14 @@ fn task_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
             .find(|c| c.workload == w && c.conc == 1 && c.measured() && c.borrowed_from.is_none())
             .and_then(|c| c.median_ttft_ms)
     };
+    // A MuSiQue line since its tasks were last drawn differently: a change of questions is no
+    // regression. Every other workload's tasks are as they were, so its line runs on.
+    let newest = entries.last().map(|e| task_sample(&e.run.config));
     let mut charts = Vec::new();
     for (w, value) in TASK_TIMELINES {
         let kept: Vec<&Entry> = (entries.iter())
             .filter(|e| own(e, Engine::Scratchy, w).is_some())
+            .filter(|e| !sampled_from_musique(w) || Some(task_sample(&e.run.config)) == newest)
             .collect();
         if kept.len() < 2 {
             continue;
@@ -4319,6 +4379,44 @@ mod tests {
     /// The runs the tests read: copies of published runs, trimmed, that no data PR touches.
     pub(super) const FIXTURES: &str = "tests/fixtures/metal";
 
+    /// A model's own grid section maps its energy beside prefill and decode, joules an output
+    /// token at 1 user; the overview keeps its three.
+    #[test]
+    fn a_models_grid_maps_its_energy_and_the_overview_does_not() {
+        let names: Vec<&str> = super::MODEL_GRID_METRICS.iter().map(|gm| gm.name).collect();
+        assert_eq!(names, ["Prefill", "Decode", "End-to-end Latency", "Energy"]);
+        let energy = super::MODEL_GRID_METRICS[3];
+        assert!(matches!(energy.metric, super::numbers::Metric::Energy));
+        assert!(matches!(energy.load, super::Load::Alone));
+        assert!(energy.about.contains("not DRAM"), "what the counters cover");
+        assert!(super::GRID_METRICS.iter().all(|gm| gm.name != "Energy"));
+    }
+
+    /// A grid measures a metric where scratchy has it in any cell: energy only from a run whose
+    /// cells kept it, so a run from before draws no empty energy map.
+    #[test]
+    fn a_grid_draws_its_energy_only_where_its_run_kept_it() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-27T031941Z-f9739363.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let run: Run = serde_json::from_str(&text).unwrap();
+        let m = &run.models[0];
+        let g = super::ShapeGrid::of(m, &run, super::Slice::Answer(64)).expect("a map");
+        assert!(g.measures(super::numbers::Metric::Ttft));
+        assert!(!g.measures(super::numbers::Metric::Energy), "no energy kept");
+        // The same run, its cells with their energy.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for c in v["models"][0]["scaling"].as_array_mut().unwrap() {
+            c["energy"] = serde_json::json!({"soc_j": 100.0, "window_s": 10.0,
+                "j_per_request": 2.0, "j_per_output_token": 0.03});
+        }
+        let run: Run = serde_json::from_value(v).unwrap();
+        let g = super::ShapeGrid::of(&run.models[0], &run, super::Slice::Answer(64)).unwrap();
+        assert!(g.measures(super::numbers::Metric::Energy));
+    }
+
     #[test]
     fn a_models_name_gives_its_parameter_size() {
         assert_eq!(size_name("granite-3.3-2b-instruct").as_deref(), Some("2b"));
@@ -4434,6 +4532,122 @@ mod tests {
     /// A quick run after a full run borrows the full run's engines: the quick run's 64-token
     /// answers are the full run's users × prompt map, and the full run's 512- and 2048-token
     /// answers ran at 1 user only, so they are not cells the quick run compares.
+    /// A rival's MuSiQue cells are borrowed only from a run that drew its tasks the same way: a
+    /// run that samples all of MuSiQue's hops does not take an older run's 2-hop RAG cells as its
+    /// rival's. Its other workloads' tasks did not change, so their cells are still borrowed.
+    #[test]
+    fn a_rival_is_not_borrowed_across_a_change_in_sampling() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut full: serde_json::Value = serde_json::from_str(&text).unwrap();
+        full["generated_utc"] = "2026-10-24T12:00:00Z".into();
+        let ours = full["models"][0]["tasks"].clone();
+        full["models"][0]["tasks_omlx_tq"] = ours;
+        let load = |v: &serde_json::Value| -> Run { serde_json::from_value(v.clone()).unwrap() };
+        let lent = |sample: Option<&str>| -> std::collections::BTreeSet<String> {
+            let mut quick: serde_json::Value = serde_json::from_str(&text).unwrap();
+            quick["config"]["scaling"]["task_sample"] = serde_json::json!(sample);
+            let mut runs = vec![load(&quick), load(&full)];
+            super::borrow_earlier(&mut runs);
+            (Engine::OmlxTq.tasks(&runs[0].models[0]).iter())
+                .map(|c| c.workload.clone())
+                .collect()
+        };
+        let same = lent(None);
+        assert!(
+            same.contains("rag") && same.contains("sharegpt"),
+            "{same:?}"
+        );
+        let changed = lent(Some("musique-dev-by-hops"));
+        assert!(
+            !changed.iter().any(|w| super::sampled_from_musique(w)),
+            "no 2-hop RAG cell as the rival's: {changed:?}"
+        );
+        assert!(
+            changed.contains("sharegpt") && changed.contains("sharegpt-multi-turn"),
+            "ShareGPT's tasks did not change: {changed:?}"
+        );
+    }
+
+    /// An accuracy cell is borrowed only from a run that asked as many of its tasks: a quick
+    /// run's 100 are not a full run's 400, though both are sampled the same way. A run sizes it
+    /// apart from the others (`accuracy_tasks`), not by its rounds.
+    #[test]
+    fn an_accuracy_cell_is_borrowed_only_at_its_own_size() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let with_accuracy = |n: u32, when: &str, rival: bool| -> Run {
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["generated_utc"] = when.into();
+            v["config"]["scaling"]["accuracy_tasks"] = n.into();
+            let cell = serde_json::json!({"workload": "rag-accuracy", "conc": 4, "completed": n,
+                "num_tasks": n, "accuracy": 0.5, "median_ttft_ms": 100.0});
+            v["models"][0]["tasks"] = serde_json::json!([cell.clone()]);
+            if rival {
+                v["models"][0]["tasks_omlx_tq"] = serde_json::json!([cell]);
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        for (quick, borrowed) in [(400, true), (100, false)] {
+            let full = with_accuracy(400, "2026-10-24T12:00:00Z", true);
+            let mut runs = vec![with_accuracy(quick, "2026-10-26T12:00:00Z", false), full];
+            super::borrow_earlier(&mut runs);
+            let lent = !Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty();
+            assert_eq!(lent, borrowed, "a run of {quick} against one of 400");
+        }
+    }
+
+    /// A MuSiQue timeline does not join runs that drew its tasks differently: a change of questions
+    /// is not a regression. The ShareGPT line's tasks did not change, so it joins them.
+    #[test]
+    fn a_timeline_starts_again_where_the_sampling_changed() {
+        use super::data::Run;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let two = |sample: Option<&str>| -> Vec<Run> {
+            let mut old: serde_json::Value = serde_json::from_str(&text).unwrap();
+            old["generated_utc"] = "2026-10-24T12:00:00Z".into();
+            let mut new: serde_json::Value = serde_json::from_str(&text).unwrap();
+            new["config"]["scaling"]["task_sample"] = serde_json::json!(sample);
+            vec![serde_json::from_value(old).unwrap(), serde_json::from_value(new).unwrap()]
+        };
+        let titles = |runs: &[Run]| -> Vec<&'static str> {
+            let entries: Vec<super::Entry> = (runs.iter())
+                .map(|run| super::Entry { run, m: &run.models[0] })
+                .collect();
+            super::task_timelines(&entries).into_iter().map(|(t, _)| t).collect()
+        };
+        let rag = "RAG TTFT ms, 1 user";
+        let sharegpt = "ShareGPT TTFT ms, 1 user";
+        let same = titles(&two(None));
+        assert!(
+            same.contains(&rag) && same.contains(&sharegpt),
+            "one sampling: {same:?}"
+        );
+        let changed = titles(&two(Some("musique-dev-by-hops")));
+        assert!(
+            !changed.contains(&rag),
+            "the RAG line starts again: {changed:?}"
+        );
+        assert!(
+            changed.contains(&sharegpt),
+            "the ShareGPT line runs on: {changed:?}"
+        );
+    }
+
     #[test]
     fn a_quick_runs_dataset_cells_borrow_the_rival_under_the_same_task_cap() {
         use super::data::Run;

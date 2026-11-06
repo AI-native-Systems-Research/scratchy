@@ -617,48 +617,17 @@ impl Recording<'_> {
         self.weight(i).map_or(LayerId(0), |e| self.layer(e))
     }
 
-    /// A weight's layer honouring the trailing-numeral path rule: the unroll index when present,
-    /// else a trailing numeral path segment (`merger_mlp_2` → 2).
-    fn layer_with_path(&self, e: usize) -> LayerId {
-        match &self.l.bindings[e] {
-            SourceBinding::Weight { id, index }
-            | SourceBinding::WeightScale { id, index }
-            | SourceBinding::BundleTensor { id, index, .. } => {
-                if let Some(u) = index {
-                    return LayerId(u.0 as u32);
-                }
-                let joined = self.facts.weight_paths[*id as usize].join("_");
-                let tail = joined.rfind('_').map(|p| &joined[p + 1..]);
-                LayerId(tail.and_then(|t| t.parse().ok()).unwrap_or(0))
-            }
-            _ => LayerId(0),
-        }
-    }
-
-    /// A weight's accessor base: its path joined with `_`, less a trailing `_<digits>`.
-    ///
-    /// 🛑 KNOWN DEFECT, measured 2026-08-22: dropping the numeral is why Qwen2-VL's merger applies
-    /// `visual.merger.mlp.2` TWICE and never loads `visual.merger.mlp.0` — `merger.mlp_0` and
-    /// `merger.mlp_2` both truncate to base `merger_mlp`, the accessor group collapses to ONE
-    /// Unindexed field, and the emitted accessor ignores its layer argument. The fix is NOT to keep
-    /// the numeral here: the layer is appended again downstream, which yields `merger_mlp_0_0` /
-    /// `merger_mlp_2_2` and still resolves no safetensors key. It belongs at the accessor-NAME
-    /// composition site, which must carry (base, layer) as a pair instead of a string.
-    /// A weight's accessor base: its path joined with `_`, less a trailing `_<digits>`. A
-    /// `BundleTensor` binding names the BUNDLE's path — the tensor inside it resolves by
-    /// `WeightTensor` at command lowering, so the base is the bundle's own.
+    /// A weight's accessor base: its path joined with `_`. Its layer is its unroll index's alone
+    /// ([`Self::layer`]): a path ending in a numeral (Qwen2-VL's `merger.mlp.0` and `merger.mlp.2`)
+    /// is two weights, two bases, not one base's two layers. A `BundleTensor` binding names the
+    /// BUNDLE's path — the tensor inside it resolves by `WeightTensor` at command lowering, so the
+    /// base is the bundle's own.
     fn base(&self, i: usize, e: usize) -> Result<String, StepRefusal> {
         match &self.l.bindings[e] {
             SourceBinding::Weight { id, .. }
             | SourceBinding::WeightScale { id, .. }
             | SourceBinding::BundleTensor { id, .. } => {
-                let mut joined = self.facts.weight_paths[*id as usize].join("_");
-                if let Some(pos) = joined.rfind('_')
-                    && joined[pos + 1..].parse::<u32>().is_ok()
-                {
-                    joined.truncate(pos);
-                }
-                Ok(joined)
+                Ok(self.facts.weight_paths[*id as usize].join("_"))
             }
             _ => Err(self.no(i, Refused::NotAWeight(e))),
         }
@@ -701,7 +670,7 @@ impl Recording<'_> {
             return Ok((st::KvOffset::Centered, None));
         };
         let e = self.weight_of(gemm)?;
-        let projection = self.layer_with_path(e);
+        let projection = self.layer(e);
         if projection != layer {
             return Err(self.no(
                 i,
@@ -1862,7 +1831,7 @@ impl Recording<'_> {
             return Err(self.no(i, Refused::FusionShape));
         };
         let (mut out, mut input, e) = (self.colour(mm)?, self.read(mm, 0)?, self.weight_of(mm)?);
-        let layer = self.layer_with_path(e);
+        let layer = self.layer(e);
         let k = self.graph.tensors[e].rows;
         let (nd, kd) = (st::NDim(n), st::KDim(k));
         let mut site = self.site(mm, WeightKind::Linear, e)?;
@@ -2232,7 +2201,7 @@ impl Recording<'_> {
                     GemmWeight::Affine { .. } => st::BiasStorage::Affine,
                     _ => st::BiasStorage::Dense,
                 };
-                let layer = self.layer_with_path(e);
+                let layer = self.layer(e);
                 let step = S::MetalBiasAdd(input, out, layer, st::NDim(n), storage);
                 em(
                     step,

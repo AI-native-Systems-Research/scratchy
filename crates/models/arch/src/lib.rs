@@ -61,6 +61,11 @@ mod __metal_bake {
     include!(concat!(env!("OUT_DIR"), "/metal_bake.rs"));
 }
 
+// Every model this build bakes a metal tape for, beside its buckets — listed by the build script
+// off the modules it emitted.
+#[cfg(feature = "metal")]
+include!(concat!(env!("OUT_DIR"), "/metal_models.rs"));
+
 #[cfg(all(feature = "arch-commandr", scratchy_backend))]
 #[path = "arch/commandr.rs"]
 pub mod commandr;

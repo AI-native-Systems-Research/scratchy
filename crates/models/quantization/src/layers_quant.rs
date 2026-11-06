@@ -146,3 +146,17 @@ impl AffineQuantEmbedding {
         self.hidden_size
     }
 }
+
+/// A packed embedding's declared shape is its table's, `[vocab, hidden]`, as a dense one's is.
+impl scratchy_tensors::typed::Extents<2> for AffineQuantEmbedding {
+    fn extents(&self) -> [usize; 2] {
+        [self.vocab_size, self.hidden_size]
+    }
+}
+
+/// A packed embedding's MLX-affine codes: its bits and group.
+impl scratchy_tensors::typed::AffineCodes for AffineQuantEmbedding {
+    fn affine_codes(&self) -> Option<(u32, u32)> {
+        Some((self.bits, self.group_size))
+    }
+}

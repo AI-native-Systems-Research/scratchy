@@ -169,6 +169,7 @@ pub(crate) fn tasks(length: &str, max_tokens: usize) -> Result<Vec<crate::worklo
             spans_input: None,
             max_tokens,
             score: crate::workloads::Score::Choice(q.answer.clone()),
+            label: None,
         })
         .collect())
 }

@@ -8,6 +8,7 @@
 #     scripts/bench_metal_matrix.sh --models full   # both, where each fits
 #     scripts/bench_metal_matrix.sh --models glm-4.5-air,gemma-4-26b-a4b-it   # any from MODELS_ALL
 #     scripts/bench_metal_matrix.sh --models all
+#     scripts/bench_metal_matrix.sh --full --accuracy-tasks all   # MuSiQue's whole dev set, any Mac
 #
 # A RUNNER, not a measurement tool: every number comes from a `scr bench`
 # subcommand, except BUILD TIME and BINARY SIZE per model. scratchy compiles one
@@ -21,7 +22,9 @@
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
 #   energy: J per rail, Wh + avg/peak W scratchy-power-sampler (CLPC counters,
-#                                        1 Hz, whole run, all engines)
+#                                        1 Hz, whole run, all engines); and each
+#                                        cell's J, J/request, J/output token and,
+#                                        scored, J per right answer (cell_energy.py)
 #   prompt x answer x users grid       scr bench serve (1, 2, 4 users;
 #     (heat maps, every curve)           128 to 8192 in;
 #                                        64 out, --full adds 512 and 2048 at 1)
@@ -300,22 +303,30 @@ UNPINNED=0
 SCALING=1
 # The default sweep is real dataset tasks (the tasks axis); --random runs the random-token grid.
 SCALE_AXES="tasks"
-# The dataset workloads, by run kind: a quick run's small set, a full run's five.
-# Each runs at every --scale-grid-conc users count. rag-spans, scratchy's own passage reuse,
-# runs on scratchy only, next to rag.
-WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
-# LongBench is not among them: its shortest prompts run to 32k tokens, past the grid's 8k
-# (#939), so not one of its tasks fits. `--workloads longbench --scale-grid-input ...,32768`
-# still runs it.
-(( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
-WORKLOADS_SCRATCHY="rag-spans"
-# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
-# where a task is 1 point of accuracy rather than a quick cell's 12.5. Its timing is not compared.
-ACCURACY_TASKS=0
-(( FULL )) && ACCURACY_TASKS=100
-# Its limit: 100 RAG tasks take about 25 minutes at 1 user on an 8B model, and minutes at the
-# largest users count, so --cell-timeout-s's 10 would cut it short. Still a limit, for a hung server.
-ACCURACY_TIMEOUT_S=2400
+# The dataset workloads: MuSiQue alone (rag), on a quick run and a full run alike, at every
+# --scale-grid-conc users count; a full run adds its accuracy cell (below). The others are run
+# only by name: --workloads sharegpt,sharegpt-multi-turn for chat and conversations,
+# shared-prefix,shared-prefix-control for prefix reuse, longbench for long documents (its
+# shortest prompts run to 32k tokens, past the grid's 8k, so with --scale-grid-input ...,32768),
+# and --workloads-scratchy rag-spans for scratchy's own passage reuse.
+WORKLOADS="rag"
+WORKLOADS_SCRATCHY=""
+# One more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count, drawn
+# from all of MuSiQue's dev set in its mix of 2-, 3- and 4-hop questions (bench serve stratifies
+# by hops), as every RAG cell's are. Its timing is not compared. A quick run's is 100 tasks, about
+# 6 to 10 minutes a model, within about 10 points either way at 60% right: enough to see scratchy
+# lose accuracy. A full run's, on a Mac of LARGE_GB or more, is the whole dev set, every one of
+# its 2,417 questions, about 2.5 to 3 hours an engine a model; on a smaller Mac, 400 of them,
+# about 25 to 40 minutes, within about 5 points. --accuracy-tasks N asks for N instead, 0 for
+# none; all asks for the whole set. Set once the Mac's memory is read (below).
+ACCURACY_TASKS=""
+ACCURACY_ALL=2417
+ACCURACY_SMALL=400
+ACCURACY_QUICK=100
+# Its limit: 18 s a task, at least 2400 s, so a slow model is not cut off (gpt-oss-20b took about
+# 6 s a task at 4 users on the M3 Pro, its answers reasoning to their cap). Still a limit, for a
+# hung server. --accuracy-timeout-s S sets it.
+ACCURACY_TIMEOUT_S=0
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
 TASK_MIN_PROMPTS=8
@@ -396,6 +407,8 @@ while [[ $# -gt 0 ]]; do
         --settle-s)          SETTLE_S="$2"; shift 2 ;;
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
+        --accuracy-tasks)    ACCURACY_TASKS="$2"; shift 2 ;;
+        --accuracy-timeout-s) ACCURACY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
@@ -407,6 +420,7 @@ while [[ $# -gt 0 ]]; do
         --scale-axes)        SCALE_AXES="$2"; shift 2 ;;
         --random)            SCALE_AXES="grid"; shift ;;   # the random-token grid, not datasets
         --workloads)         WORKLOADS="$2"; shift 2 ;;
+        --workloads-scratchy) WORKLOADS_SCRATCHY="$2"; shift 2 ;;
         --scale-conc)        SCALE_CONC="$2"; shift 2 ;;
         --scale-input)       SCALE_INPUT="$2"; shift 2 ;;
         --scale-output)      SCALE_OUTPUT="$2"; shift 2 ;;
@@ -438,6 +452,19 @@ while [[ $# -gt 0 ]]; do
 done
 # Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+# The accuracy cell's size: as asked, else on --full the whole dev set on a large Mac and 400
+# on a smaller one, else a quick run's 100.
+if [[ "${ACCURACY_TASKS}" == all ]]; then
+    ACCURACY_TASKS="${ACCURACY_ALL}"
+elif [[ -z "${ACCURACY_TASKS}" ]]; then
+    ACCURACY_TASKS="${ACCURACY_QUICK}"
+    if (( FULL )); then
+        if (( MEM_GB >= LARGE_GB )); then ACCURACY_TASKS="${ACCURACY_ALL}"; else ACCURACY_TASKS="${ACCURACY_SMALL}"; fi
+    fi
+fi
+[[ "${ACCURACY_TASKS}" =~ ^[0-9]+$ ]] || { echo "--accuracy-tasks takes a count or all, not ${ACCURACY_TASKS}" >&2; exit 2; }
+[[ "${ACCURACY_TIMEOUT_S}" =~ ^[0-9]+$ ]] || { echo "--accuracy-timeout-s takes seconds, not ${ACCURACY_TIMEOUT_S}" >&2; exit 2; }
+(( ACCURACY_TIMEOUT_S )) || ACCURACY_TIMEOUT_S=$(( ACCURACY_TASKS * 18 > 2400 ? ACCURACY_TASKS * 18 : 2400 ))
 MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
 if [[ -z "${SCALE_GRID_INPUT}" ]]; then
     if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="${SCALE_GRID_INPUT_LARGE}"; else SCALE_GRID_INPUT="${SCALE_GRID_INPUT_SMALL}"; fi
@@ -796,6 +823,10 @@ json.dump({
                  "grid_dataset": e["GRID_DATASET"],
                  "grid_load": float(e["GRID_LOAD"]) if e["OPEN_LOOP"] == "1" else None,
                  "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
+                 # How a RAG cell's tasks were drawn: from all of MuSiQue's dev set, stratified by
+                 # hops. Earlier runs drew from its first 200, all 2-hop, so their accuracy is of
+                 # easier questions and their tasks are not these.
+                 "task_sample": "musique-dev-by-hops",
                  "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
@@ -865,7 +896,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-# Whole-run energy, one number. The workspace's own zero-dependency sampler
+# Whole-run energy, one number, and each cell's (cell_energy.py, over the wall clock bench serve
+# stamps its requests with, read as each model is recorded). The workspace's own zero-dependency sampler
 # reads Apple's CLPC cpu/gpu/ane energy counters (IOReport, no root) once a
 # second into RAW; fold_power sums them into the run JSON at the end. It runs
 # from before the first build to after the last server is down, so the number
@@ -1413,7 +1445,7 @@ run_scale_cells() { # prefix restart-function full-length [axes]
     local -a xs os
     if [[ "${axes}" == *",tasks,"* ]]; then
         local w c; local -a ws cs
-        IFS=',' read -r -a ws <<<"${WORKLOADS}${cell_scratchy:+,${WORKLOADS_SCRATCHY}}"
+        IFS=',' read -r -a ws <<<"${WORKLOADS}${cell_scratchy:+${WORKLOADS_SCRATCHY:+,${WORKLOADS_SCRATCHY}}}"
         IFS=',' read -r -a cs <<<"${GRID_CONC_LIST}"
         if (( OPEN_LOOP )); then
             local -a steps; IFS=',' read -r -a steps <<<"${TASK_RATE_STEPS}"
@@ -1433,7 +1465,7 @@ run_scale_cells() { # prefix restart-function full-length [axes]
             # hand before a larger users count can run a server out of memory.
             for c in "${cs[@]}"; do for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "${c}"; done; done
         fi
-        # --full's accuracy cell, at the largest users count: the fewest seconds for its tasks.
+        # The accuracy cell, at the largest users count: the fewest seconds for its tasks.
         if (( ACCURACY_TASKS > 0 )); then run_task_cell "${prefix}" rag-accuracy "${cs[${#cs[@]}-1]}"; fi
     fi
     if [[ "${axes}" == *",conc,"* ]]; then
@@ -1895,11 +1927,37 @@ PY
 
     ENGINE_KEYS="$(for row in "${ENGINE_ROWS[@]}"; do echo "${row%%|*}"; done)"; export ENGINE_KEYS
     OFFLINE="${OFFLINE}" BASE_CONC="${BASE_CONC}" CONC_LIST="${CONC_LIST}" GRID_CONC_LIST="${GRID_CONC_LIST}" PARITY="${PARITY}" \
+    POWER_LOG="${POWER_LOG}" HERE="${HERE}" \
     python3 - "${JSON}" "${RAW}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
               "${build_secs}" "${bytes}" "${parity_ok}" "${MLX_PYTHON}" <<'PY'
 import glob, json, os, re, sys
 js, raw, stem, mid, quant, feats, built, secs, size, parity_ok, mlx_python = sys.argv[1:12]
 env = os.environ
+# Each cell's energy, from the power log over the wall clock its requests ran (cell_energy.py).
+# Read once a model is done: the sampler has written every second of its cells by then.
+sys.path.insert(0, env["HERE"])
+import cell_energy
+power_rows = cell_energy.read(env["POWER_LOG"]) if os.path.exists(env["POWER_LOG"]) else []
+def energy(reps):
+    """A cell's energy over all its repeats: the joules and windows of each, summed, then per
+    request, token and right answer over the cell's whole. None where any repeat has none."""
+    parts = []
+    for j in reps:
+        if j.get("started_unix_s") is None or j.get("ended_unix_s") is None:
+            return None
+        e = cell_energy.window(power_rows, float(j["started_unix_s"]), float(j["ended_unix_s"]))
+        if e is None:
+            return None
+        parts.append(e)
+    if not parts:
+        return None
+    total = {k: round(sum(p[k] for p in parts), 2) for k in ("cpu_j", "gpu_j", "ane_j", "soc_j")}
+    total |= {"window_s": round(sum(p["window_s"] for p in parts), 3),
+              "samples": sum(p["samples"] for p in parts)}
+    whole = {k: sum(j.get(k) or 0 for j in reps) for k in ("completed", "failed", "total_output_tokens")}
+    if reps[0].get("accuracy") is not None:
+        whole |= {"accuracy": reps[0]["accuracy"], "num_tasks": reps[0].get("num_tasks")}
+    return cell_energy.per(whole, total)
 # Per-token speed is TPOT, from the server's token count, never ITL: ITL is
 # the gap between stream chunks, and once an engine streams several tokens a
 # chunk (multi-token prediction, speculative decoding) one gap spans several.
@@ -1992,14 +2050,19 @@ def scaling(engine):
         while len(reps) < int(env["SCALE_REPEATS"]) and (r := load(os.path.basename(p)[:-5] + f".r{len(reps)}.json")):
             reps.append(r)
         cell = {"axis": axis, **where, **pooled(reps), "repeats": len(reps)}
+        if (e := energy(reps)) is not None:
+            cell["energy"] = e
         if all("errors" in r for r in reps):
             cell["requests"] = requests(reps)
         cells.append(cell)
     return cells or None
 # What a dataset cell keeps: the serving metrics, then what a task measures.
 TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "request_rate", "timed_answers",
-                    "start_times", "ttfts_ms", "e2els_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
-                    "accuracy", "empty_answers", "thinking_answers", "capped_answers"]
+                    "start_times", "ttfts_ms", "e2els_ms", "prompt_tokens", "tpots_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
+                    "accuracy", "empty_answers", "thinking_answers", "capped_answers",
+                    # Task by task, where the dataset names its tasks: so engines can be compared
+                    # on the same tasks, and accuracy read by MuSiQue's hops.
+                    "task_ids", "task_groups", "task_right", "accuracy_by_group"]
 TASK_CELL = re.compile(r"\.tasks-([a-z0-9-]+)@(\d+|base)\.json$")
 def tasks(engine):
     cells = []
@@ -2015,8 +2078,11 @@ def tasks(engine):
         step = 0 if key == "base" else int(key)
         kind = ("base" if key == "base" else
                 "rate" if env["OPEN_LOOP"] == "1" and workload != "rag-accuracy" else "users")
-        cells.append({"workload": workload, "conc": step, "load": kind,
-                      **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}})
+        cell = {"workload": workload, "conc": step, "load": kind,
+                **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}}
+        if (e := energy([j])) is not None:
+            cell["energy"] = e
+        cells.append(cell)
     return cells or None
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""

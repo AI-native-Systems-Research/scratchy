@@ -216,21 +216,107 @@ impl CommandIx {
     }
 }
 
-/// A position in one of a command table's part arrays
-/// ([`crate::tape::lowered::CommandTable`]): two bytes per command field, where the field itself
+/// A position in the command table's part array of `T`s ([`PartArray`] of
+/// [`crate::tape::lowered::CommandTable`]): two bytes per command field, where the field itself
 /// would be up to thirty-two plus load-time fixups. A table holds no more distinct parts of one
 /// kind than distinct commands, so whatever a [`CommandIx`] indexes, a part index does too.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
-pub struct PartIx(pub u16);
+///
+/// The array's element type is the index's: a constant set's index reads no binding list.
+///
+/// ```compile_fail,E0308
+/// # use scratchy_target_metal::tape::ids::{PartArray, PartIx};
+/// static SYMBOLS: [(&str, &str); 1] = [("lib", "fn")];
+/// static GATES: [Option<u8>; 1] = [None];
+/// let gate: PartIx<Option<u8>> = PartIx::at(0);
+/// let _ = PartArray::of(&SYMBOLS).get(gate);
+/// ```
+pub struct PartIx<T>(u16, std::marker::PhantomData<fn() -> T>);
 
-impl PartIx {
+impl<T> PartIx<T> {
     /// The index of the part at `position` of its array; `None` past the last index.
     pub fn of(position: usize) -> Option<Self> {
-        u16::try_from(position).ok().map(Self)
+        u16::try_from(position).ok().map(Self::at)
+    }
+
+    /// The part at `position`, as a table's literal names it.
+    pub const fn at(position: u16) -> Self {
+        Self(position, std::marker::PhantomData)
     }
 
     pub fn get(self) -> usize {
         usize::from(self.0)
+    }
+
+    /// Its position, as a table's literal names it.
+    pub fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+impl<T> Copy for PartIx<T> {}
+
+impl<T> Clone for PartIx<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> PartialEq for PartIx<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T> Eq for PartIx<T> {}
+
+impl<T> std::hash::Hash for PartIx<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state)
+    }
+}
+
+impl<T> std::fmt::Debug for PartIx<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PartIx({})", self.0)
+    }
+}
+
+impl<T> serde::Serialize for PartIx<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u16(self.0)
+    }
+}
+
+/// A command table's array of `T`s, read only at a [`PartIx<T>`].
+pub struct PartArray<T: 'static>(pub &'static [T]);
+
+impl<T> PartArray<T> {
+    pub const fn of(parts: &'static [T]) -> Self {
+        Self(parts)
+    }
+
+    /// The part at `ix`.
+    pub fn get(&self, ix: PartIx<T>) -> &'static T {
+        &self.0[ix.get()]
+    }
+
+    /// Every part, in order.
+    pub fn all(&self) -> &'static [T] {
+        self.0
+    }
+}
+
+impl<T> Copy for PartArray<T> {}
+
+impl<T> Clone for PartArray<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: serde::Serialize> serde::Serialize for PartArray<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_newtype_struct("PartArray", &self.0)
     }
 }
 
@@ -266,16 +352,17 @@ const fn instantiated(table: &[u32], v: u32) -> bool {
     false
 }
 
+pub use super::typed::{AFFINE_BITS, AFFINE_GROUP_SIZES, INT4_BITS, NAX_GROUP_SIZES};
+
 /// A value an instantiated kernel takes, refined by the table of the values it is instantiated
-/// for: the table is the type's constructor, so no command is built with a value its kernel
-/// lacks, and nothing downstream re-checks it.
+/// for — each table the marker types of [`super::typed`] its kernels are instantiated for: the
+/// table is the type's constructor, so no command is built with a value its kernel lacks, and
+/// nothing downstream re-checks it.
 macro_rules! refined_u32 {
-    ($($(#[$m:meta])* $name:ident: $table:ident = [$($v:literal),+ $(,)?];)*) => {$(
+    ($($(#[$m:meta])* $name:ident: $table:ident;)*) => {$(
         $(#[$m])*
         #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
         pub struct $name(u32);
-        #[doc = concat!("Every value a [`", stringify!($name), "`] may be: its kernels' instantiations.")]
-        pub const $table: &[u32] = &[$($v),+];
         impl $name {
             #[doc = concat!("`v` as a [`", stringify!($name), "`]; `None` for a value no kernel is instantiated for.")]
             pub const fn new(v: u32) -> Option<Self> {
@@ -301,16 +388,16 @@ macro_rules! refined_u32 {
 refined_u32! {
     /// MLX-affine bits per quantized weight: the widths the affine kernels are instantiated for
     /// (`_b_{2,3,4,8}` in `quantized*.metal`; the packing stride is `32 / bits` elements a word).
-    AffineBits: AFFINE_BITS = [2, 3, 4, 8];
+    AffineBits: AFFINE_BITS;
     /// MLX-affine quantization group size: the groups the affine kernels are instantiated for
     /// (`_gs_{32,64,128}`).
-    AffineGroupSize: AFFINE_GROUP_SIZES = [32, 64, 128];
+    AffineGroupSize: AFFINE_GROUP_SIZES;
     /// The group size of an MLX-affine kernel on the matrix unit (`quantized_qmm_nax`: the W4A8
     /// GEMMs, the NAX gather GEMM, a planes layout): those are instantiated for 64 and 128 only.
-    NaxGroupSize: NAX_GROUP_SIZES = [64, 128];
+    NaxGroupSize: NAX_GROUP_SIZES;
     /// The width of an MLX-affine kernel instantiated for int4 codes alone (`qmm_t_splitk`, `qmm_n`,
     /// `qvm`): 4.
-    Int4Bits: INT4_BITS = [4];
+    Int4Bits: INT4_BITS;
 }
 
 impl AffineBits {
