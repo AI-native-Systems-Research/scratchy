@@ -877,14 +877,14 @@ mod tests {
 
     // --- construction validation fires before any senlib call ---
     //
-    // PfIommuMapper::new() itself is cardless (sysconf + a table), so these
+    // A mapper on a `Card::detached()` holds no device (its senlib calls are refused), so these
     // prove the refusal order: an invalid geometry returns an error before
     // the buffer allocation and long before the senlib pin, which is what
     // makes them safe to run on a machine with no hardware.
 
     #[test]
     fn pool_construction_validates_geometry_before_any_mapping() {
-        let mapper = PfIommuMapper::new();
+        let mapper = PfIommuMapper::new(crate::senlib_ffi::Card::detached());
         // `matches!` rather than `unwrap_err()`: the Ok type owns a live
         // mapping and has no `Debug`, and the point of the test is only
         // WHICH refusal came back.

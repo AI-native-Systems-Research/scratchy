@@ -1834,6 +1834,7 @@ impl RdmaUnit {
     /// senlib calls today — scratchy is its first caller.
     pub fn attach_peer(
         &mut self,
+        card: &senlib_ffi::Card,
         target: RankId,
         peer_card_index: u32,
         len_bytes: u64,
@@ -1850,7 +1851,7 @@ impl RdmaUnit {
                 world_size: self.world_size,
             });
         }
-        let segments = senlib_ffi::p2p_create_mapping(peer_card_index, len_bytes)
+        let segments = senlib_ffi::p2p_create_mapping(card, peer_card_index, len_bytes)
             .map_err(RdmaUnitError::AttachFailed)?;
         if self
             .peers

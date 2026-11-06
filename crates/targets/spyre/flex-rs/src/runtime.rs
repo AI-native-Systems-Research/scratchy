@@ -649,7 +649,7 @@ mod tests {
         Arc::new(Mutex::new(FlexAllocator::new_without_regions(
             FlexAllocatorInit::default(),
             topo,
-            DeviceMemoryAllocator::new(1),
+            DeviceMemoryAllocator::new(crate::senlib_ffi::Card::detached(), 1),
         )))
     }
 
