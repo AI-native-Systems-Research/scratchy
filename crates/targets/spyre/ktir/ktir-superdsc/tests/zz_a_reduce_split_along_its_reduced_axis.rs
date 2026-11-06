@@ -16,6 +16,7 @@
 
 use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit::{EmittedOp, emit_sdsc_tiled};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::ScalingExtent;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
     ReduceDivision, ReduceOffSpec, reduce_opspec_off, reduce_opspec_off_divided, win_reduce_accum,
     win_reduce_data,
@@ -72,7 +73,7 @@ fn spec(op: OpFunc, division: ReduceDivision) -> Result<OpSpec, String> {
         accum,
         df: Df::Fp16,
         division,
-        scaling_cols: COLS,
+        scaling: ScalingExtent::whole(COLS),
     })
 }
 

@@ -623,7 +623,7 @@ pub fn reduce_opspec_off<D: KindTag, A: KindTag>(
         accum,
         df,
         division: ReduceDivision::Rows,
-        scaling_cols: cols,
+        scaling: ScalingExtent::whole(cols),
     })
 }
 
@@ -645,6 +645,49 @@ pub enum ReduceDivision {
     Groups(u32),
 }
 
+/// ⭐ THE EXTENT A SEEDED REDUCE'S SCALING CONST DIVIDES BY (mean/exx2's 1/N): the reduce's
+/// LOGICAL reduced extent. Private field, TWO mints and no others —
+/// [`Self::whole`] (the scaling extent IS the reduce's own width, every whole reduce) and
+/// [`Self::parent`] (a long-reduce SLICE stating its parent reduce's extent, with the slice's
+/// own width handed in so the mint can refuse a parent smaller than the slice it supposedly
+/// contains). No caller can therefore state a scaling extent smaller than the width it
+/// sweeps: the law `scaling ≥ cols` is the type's own, and the partials-add-to-the-
+/// single-shot law (every slice carries the SAME 1/N, never its own slice width) holds by
+/// construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScalingExtent {
+    cols: u32,
+}
+
+impl ScalingExtent {
+    /// A WHOLE reduce: the scaling extent is the reduced width itself — the one width the
+    /// plain constructor ([`reduce_opspec_off`]) states.
+    pub fn whole(cols: u32) -> Self {
+        Self { cols }
+    }
+
+    /// A long-reduce SLICE: the PARENT reduce's extent, taken beside the slice's own width.
+    /// `Err` is the ONE mint of the containment law — a parent smaller than the slice it
+    /// claims to contain is a caller whose split arithmetic is wrong, refused by name rather
+    /// than silently scaled.
+    pub fn parent(slice_cols: u32, parent_cols: u32) -> Result<Self, String> {
+        if parent_cols < slice_cols {
+            return Err(format!(
+                "a long-reduce slice {slice_cols} wide cannot state a scaling extent of \
+                 {parent_cols} — the parent reduce is smaller than the slice it must contain. \
+                 The slice's scaling const divides by its PARENT's extent; a parent below the \
+                 slice's own width is a defect in the split that built it."
+            ));
+        }
+        Ok(Self { cols: parent_cols })
+    }
+
+    /// The extent itself — private to this module, read once where the scaling const is built.
+    fn get(self) -> u32 {
+        self.cols
+    }
+}
+
 /// The parameter list of [`reduce_opspec_off_divided`], carried as a struct. Every field but
 /// `division` is [`reduce_opspec_off`]'s argument of the same name, with the same contract.
 /// `head_major` is no longer a field: it is DERIVED from the data operand's kind
@@ -664,11 +707,11 @@ pub struct ReduceOffSpec<'a, D: KindTag, A: KindTag> {
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`reduce_opspec_off`] byte for byte.
     pub division: ReduceDivision,
     /// The extent the scaling const divides by (mean/exx2's 1/N): the reduce's LOGICAL reduced
-    /// extent. Equals `cols` for every whole reduce; a long-reduce SLICE states the WHOLE
-    /// reduce's extent here while `cols` carries the slice's own geometry, so the slices'
-    /// partials ADD to the single-shot result — each slice's pad lanes are masked to the
-    /// reduce's identity and contribute nothing.
-    pub scaling_cols: u32,
+    /// extent, TYPED ([`ScalingExtent`]). Equals `cols` for every whole reduce; a long-reduce
+    /// SLICE states the WHOLE reduce's extent here while `cols` carries the slice's own
+    /// geometry, so the slices' partials ADD to the single-shot result — each slice's pad
+    /// lanes are masked to the reduce's identity and contribute nothing.
+    pub scaling: ScalingExtent,
 }
 
 /// [`reduce_opspec_off`] under a STATED [`ReduceDivision`]. A [`ReduceDivision::ReducedAxis`] reduce
@@ -685,7 +728,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         accum,
         df,
         division,
-        scaling_cols,
+        scaling,
     } = r;
     // TYPED: `head_major` is DERIVED from the DATA operand's kind (see `ReduceOffSpec`'s doc) —
     // the Win carries the handle, so the kind crosses into this layer by type.
@@ -874,9 +917,9 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         ));
     }
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    // The scaling const divides by the reduce's LOGICAL extent (`scaling_cols`), never by
-    // this emission's slice geometry — see `ReduceOffSpec::scaling_cols`.
-    let op_info = reduce_op_info(op, scaling_cols, df, accum_name)?;
+    // The scaling const divides by the reduce's LOGICAL extent (`ScalingExtent`), never by
+    // this emission's slice geometry — see `ReduceOffSpec::scaling`.
+    let op_info = reduce_op_info(op, scaling.get(), df, accum_name)?;
     Ok(OpSpec {
         op,
         is_reduction: true,
@@ -961,7 +1004,7 @@ pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
         accum,
         df,
         division,
-        scaling_cols: cols.get(),
+        scaling: ScalingExtent::whole(cols.get()),
     })
     .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -1167,7 +1210,7 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
         accum: probe_accum,
         df: s.df,
         division: s.division,
-        scaling_cols: s.cols,
+        scaling: ScalingExtent::whole(s.cols),
     })
     .map_err(|e| format!("{}: {e}", s.op_name))?;
     if probe.iter.split_of("out") > 1 {
@@ -1249,7 +1292,7 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
             accum: accum_win,
             df: s.df,
             division: ReduceDivision::Rows,
-            scaling_cols: s.cols,
+            scaling: ScalingExtent::parent(slice_cols, s.cols)?,
         })?;
         let folds = SdscFoldSet::new(spec.iter.cores_used());
         ops.push(
@@ -1505,7 +1548,7 @@ mod long_reduce_split {
     /// never owed: the tiler divided the PADDED stick count (16,384 sticks of 64), so the 31
     /// pad lanes ride the LAST slice as its raw remainder, masked by the reduce's own
     /// coordinate mask — the same law the single-shot padded reduce lives by. And EVERY slice
-    /// carries the WHOLE reduce's 1/N scaling const (`ReduceOffSpec::scaling_cols`), the fact
+    /// carries the WHOLE reduce's 1/N scaling const (`ReduceOffSpec::scaling`), the fact
     /// that makes the running add of the partials the single-shot mean: a slice-local 1/cols
     /// would add to `time` × it.
     ///
