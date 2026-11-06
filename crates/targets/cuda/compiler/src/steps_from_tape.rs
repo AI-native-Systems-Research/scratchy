@@ -30,13 +30,13 @@ use scratchy_target_cuda::step::{
     ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
     GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE,
     GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE,
-    GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE,
-    GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel,
-    GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GroupKind, GroupMember, LayerScaleBf16,
-    MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows,
-    RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
-    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS,
-    SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
+    GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GroupKind,
+    GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight,
+    NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
+    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -306,6 +306,9 @@ fn gate_up_act(
         Some(CudaStep::Gemm(g)) => Ok((GateUpKernel::Gemm, g)),
         Some(CudaStep::GemmCol64(g)) => Ok((GateUpKernel::GemmCol64, g)),
         Some(CudaStep::Gemv(g)) => Ok((GateUpKernel::Gemv, g)),
+        Some(CudaStep::GemmFp8(g)) => Ok((GateUpKernel::GemmFp8, g)),
+        Some(CudaStep::GemmCol64Fp8(g)) => Ok((GateUpKernel::GemmCol64Fp8, g)),
+        Some(CudaStep::GemvFp8(g)) => Ok((GateUpKernel::GemvFp8, g)),
         Some(_) | None => Err(refused()),
     };
     let (gk, gate) = kernel(absorbed_step(s, gate, computes)?)?;
@@ -496,6 +499,8 @@ fn sibling_matmuls(
     let [(kind, first), rest @ ..] = lowered.as_slice() else {
         return Err(refused());
     };
+    // One kind for every member: an fp8 member's kind is never a bf16 one's, so a group is all
+    // fp8 or all bf16 (the shared fold's rule), and a mixed one is refused here.
     let same =
         (rest.iter()).all(|(k, g)| k == kind && (g.a, g.m, g.k) == (first.a, first.m, first.k));
     let member = |(_, g): &(GroupKind, GemmBf16)| GroupMember {
@@ -534,29 +539,39 @@ fn gemm(
     weight: GemmWeight,
 ) -> Result<CudaStep, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
-    let (act, wt) = match node.inputs.as_slice() {
-        [act, wt] => (act, wt),
-        [_] | [] => return Err(operand(s, 1, OperandRefusal::Missing)),
-        [_, _, ..] => return Err(operand(s, 2, OperandRefusal::Extra)),
+    // An fp8 weight's third operand is its per-channel scale, `[1, n]`. A block-scaled kind
+    // (`GemmWeight::Fp8Block`, FP8 §6) would get its own arm here, its scale `[n/bn, k/bk]`, and
+    // its own kernel family from `gemm_kernel`'s fp8 counterpart.
+    let (act, wt, scale) = match (weight, node.inputs.as_slice()) {
+        (GemmWeight::Fp8Dynamic, [act, wt, scale]) => (act, wt, Some(scale)),
+        (GemmWeight::Fp8Dynamic, [_, _]) => return Err(operand(s, 2, OperandRefusal::Missing)),
+        (_, [act, wt]) => (act, wt, None),
+        (_, [_] | []) => return Err(operand(s, 1, OperandRefusal::Missing)),
+        (_, [_, _, ..]) => return Err(operand(s, 2, OperandRefusal::Extra)),
     };
     let m = cx.graph.shape(node.output.tensor).rows;
     let k = cx.graph.shape(wt.tensor).rows;
-    let kernel = gemm_kernel(m, n, k, cx.facts.gemm_col_tile).map_err(|rule| {
-        CanonicalRefusal::GemmShape {
-            step,
-            m,
-            n,
-            k,
-            rule,
+    let kernel = match weight {
+        GemmWeight::Dense => gemm_kernel(m, n, k, cx.facts.gemm_col_tile),
+        GemmWeight::Fp8Dynamic => gemm_fp8_kernel(m, n, k),
+        GemmWeight::Affine { .. } => {
+            return Err(CanonicalRefusal::GemmWeight {
+                step,
+                weight: weight.kind(),
+            });
         }
-    })?;
-    if !matches!(weight, GemmWeight::Dense) {
-        return Err(CanonicalRefusal::GemmWeight {
-            step,
-            weight: weight.kind(),
-        });
     }
+    .map_err(|rule| CanonicalRefusal::GemmShape {
+        step,
+        m,
+        n,
+        k,
+        rule,
+    })?;
     whole_tensors(cx, s, &[(0, act), (1, wt)])?;
+    if let Some(scale) = scale {
+        fp8_scale(cx, s, (wt, scale), n)?;
+    }
     let at = arena(cx)?;
     let mut inputs = s.inputs.iter();
     let a = activation(cx, s, 0, inputs.next())?;
@@ -1573,6 +1588,29 @@ fn router_weight(router: RouterBundle) -> Option<(ExpertBundle, MoeWeight)> {
     }
 }
 
+/// Whether the tape's expert banks are fp8 ([`ExpertWeight::Fp8Dynamic`]): one preset stores every
+/// bank of a model alike, and the shared front end refuses a mix in one bank.
+fn fp8_experts(computes: &[TapeStep<'_>]) -> bool {
+    (computes.iter()).any(|c| {
+        matches!(
+            c.node.op,
+            SubOp::ExpertMatmul {
+                weight: ExpertWeight::Fp8Dynamic,
+                ..
+            }
+        )
+    })
+}
+
+/// `layout`'s fp8 counterpart when `fp8`: the buffer a step names holds the fp8 bank.
+fn fp8_layout(layout: MoeWeight, fp8: bool) -> MoeWeight {
+    match (layout, fp8) {
+        (MoeWeight::Bundle, true) => MoeWeight::Fp8Bundle,
+        (MoeWeight::Own, true) => MoeWeight::Fp8Own,
+        (layout, _) => layout,
+    }
+}
+
 /// `RouterLogits { experts, router }` as the bf16 GEMM over the router: at byte 0 of the layer's
 /// MoE bundle (Qwen), or Gemma's own `[experts, hidden]` projection. `x` (operand 0) is `[m,
 /// hidden]`: a computed slot or the embedded hidden, or (Gemma) the `RouterNorm` it reads, in the
@@ -1589,7 +1627,9 @@ fn router_logits(
 ) -> Result<RouterLogitsBf16, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
     let weight = match router_weight(router) {
-        Some((bundle, weight)) if CUDA_GROUPED_EXPERTS.contains(&bundle) => weight,
+        Some((bundle, weight)) if CUDA_GROUPED_EXPERTS.contains(&bundle) => {
+            fp8_layout(weight, fp8_experts(computes))
+        }
         _ => return Err(moe_refusal(s, MoeShapeRule::Bundle)),
     };
     let (x, w) = match node.inputs.as_slice() {
@@ -1605,7 +1645,7 @@ fn router_logits(
     }
     same_shape(cx, s, 0, x, m, hidden)?;
     whole_tensors(cx, s, &[(0, x), (1, w)])?;
-    if weight == MoeWeight::Own {
+    if matches!(weight, MoeWeight::Own | MoeWeight::Fp8Own) {
         same_shape(cx, s, 1, w, hidden, experts)?;
     }
     let col64 =
@@ -1876,6 +1916,8 @@ fn expert_matmul(
         ExpertBundle::SwitchGlu => MoeWeight::Own,
         _ => MoeWeight::Bundle,
     };
+    let fp8 = matches!(weight, ExpertWeight::Fp8Dynamic);
+    let layout = fp8_layout(layout, fp8);
     let (projection, reads) = match proj {
         ExpertProj::Gate => (ExpertProjection::Gate, PairRows::Token),
         ExpertProj::Up => (ExpertProjection::Up, PairRows::Token),
@@ -1891,12 +1933,19 @@ fn expert_matmul(
             matches!(op, SubOp::ExpertGatedAct { .. })
         })?,
     };
-    let [_, _, w] = s.node.inputs.as_slice() else {
-        return Err(operand(s, 3, OperandRefusal::Extra));
+    // An fp8 bank's operand 3 is its scale, which the bundle holds (`step::fp8_moe_layout`).
+    let w = match (fp8, s.node.inputs.as_slice()) {
+        (false, [_, _, w]) | (true, [_, _, w, _]) => w,
+        (true, [_, _, _]) => return Err(operand(s, 3, OperandRefusal::Missing)),
+        _ => return Err(operand(s, 3, OperandRefusal::Extra)),
     };
     whole_tensors(cx, s, &[(2, w)])?;
     let bundle = weight_operand(cx, s, 2, s.inputs.iter().nth(2))?;
     let (_, out) = moe.projection_regions(projection, moe.sort.map(|t| t.rows));
+    // An fp8 projection's `k` is a whole number of its 64-byte K steps.
+    if fp8 && !k.is_multiple_of(GEMM_FP8_K_MULTIPLE) {
+        return Err(moe_refusal(s, MoeShapeRule::OffTile { dim: "k", value: k }));
+    }
     let Some(sorted) = moe.sort else {
         if !k.is_multiple_of(GEMV_BF16_MULTIPLE) {
             return Err(moe_refusal(s, MoeShapeRule::OffTile { dim: "k", value: k }));
@@ -2194,6 +2243,93 @@ fn gemm_kernel(
     }
     gemm_shape(m, n, k)?;
     Ok(CudaStep::Gemm)
+}
+
+/// Which fp8 GEMM takes `(m, n, k)` (FP8 S2; the kernels are S3's and S4's): `k` a non-zero
+/// multiple of [`GEMM_FP8_K_MULTIPLE`], every dimension at most `i32::MAX`, and then by `m` and `n`:
+/// `m = 1` the GEMV, any `n`; else `n` a multiple of 256 the tiled GEMM, of 64 the 64-column GEMM
+/// (both at `m` a multiple of 128), and below 64 a multiple of [`GEMM_NARROW_BF16_MULTIPLE`] (the
+/// bf16 output's 16-byte rows) the narrow GEMM, at any `m`.
+fn gemm_fp8_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, GemmShapeRule> {
+    for (dim, value) in [("m", m), ("n", n)] {
+        if value == 0 {
+            return Err(GemmShapeRule::OffTile {
+                dim,
+                value,
+                tile: 1,
+            });
+        }
+    }
+    if k == 0 || !k.is_multiple_of(GEMM_FP8_K_MULTIPLE) {
+        return Err(GemmShapeRule::Fp8OffTile {
+            dim: "k",
+            value: k,
+            multiple: GEMM_FP8_K_MULTIPLE,
+        });
+    }
+    for (dim, value) in [("m", m), ("n", n), ("k", k)] {
+        if i32::try_from(value).is_err() {
+            return Err(GemmShapeRule::AboveIntMax { dim, value });
+        }
+    }
+    // shortcut: the fp8 kernels take any m (TMA reads zero past the rows), but the tiled ones keep
+    // the bf16 GEMM's 128-row rule so a bucket off it is left out as the bf16 tapes leave it (its
+    // attention refuses it anyway); lift it with the attention's.
+    let tiled = m > 1 && n.is_multiple_of(GEMM_COL64_TILE.1);
+    if tiled && !m.is_multiple_of(GEMM_BF16_TILE.0) {
+        return Err(GemmShapeRule::OffTile {
+            dim: "m",
+            value: m,
+            tile: GEMM_BF16_TILE.0,
+        });
+    }
+    Ok(match (m, n) {
+        (1, _) => CudaStep::GemvFp8,
+        _ if n.is_multiple_of(GEMM_BF16_TILE.1) => CudaStep::GemmFp8,
+        _ if n.is_multiple_of(GEMM_COL64_TILE.1) => CudaStep::GemmCol64Fp8,
+        _ if n < GEMM_COL64_TILE.1 && n.is_multiple_of(GEMM_NARROW_BF16_MULTIPLE) => {
+            CudaStep::GemmNarrowFp8
+        }
+        _ => {
+            return Err(GemmShapeRule::Fp8OffTile {
+                dim: "n",
+                value: n,
+                multiple: GEMM_NARROW_BF16_MULTIPLE,
+            });
+        }
+    })
+}
+
+/// An fp8 GEMM's scale (operand 2): the `[1, n]` per-channel `weight_scale` of the weight it
+/// scales, bound to the same `(id, index)`. Its bytes are packed into the weight's own buffer
+/// (`step::fp8_weight`), so the step names no index for it.
+fn fp8_scale(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    (wt, scale): (&TensorRegion, &TensorRegion),
+    n: u32,
+) -> Result<(), CanonicalRefusal> {
+    same_shape(cx, s, 2, scale, 1, n)?;
+    whole_tensors(cx, s, &[(2, scale)])?;
+    match (
+        &cx.bindings[wt.tensor.index()],
+        &cx.bindings[scale.tensor.index()],
+    ) {
+        (
+            SourceBinding::Weight { id, index },
+            SourceBinding::WeightScale {
+                id: sid,
+                index: six,
+            },
+        ) if (id, index) == (sid, six) => Ok(()),
+        (_, binding) => Err(operand(
+            s,
+            2,
+            OperandRefusal::NotAWeight {
+                source: Some((scale.tensor.index(), binding.clone())),
+            },
+        )),
+    }
 }
 
 /// The bf16 GEMV's shape rule (`m = 1`, which the caller chose it by): `n` non-zero, `k` a

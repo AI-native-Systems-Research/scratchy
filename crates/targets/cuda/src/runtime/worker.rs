@@ -41,10 +41,10 @@ use crate::step::{
     ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
     AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS,
-    MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, RmsNormBf16, RmsNormUnitBf16,
-    RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
-    gemv_splits,
+    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16,
+    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, RmsNormBf16,
+    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16,
+    SiluMulBf16, SoftCapBf16, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -620,10 +620,42 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 }
 
 /// The name of `s` when no kernel launches it: the Qwen routing at another count than
-/// [`MOE_ROUTE_EXPERTS`]. The routing kernel's Qwen program is instantiated at 256 only (its
-/// launcher refuses any other count), so such a tape is refused before anything is enqueued,
-/// rather than at its routing step. `None` for every other step.
+/// [`MOE_ROUTE_EXPERTS`], and every fp8 step (FP8 S2: the quantization and the fp8 GEMMs are S3's
+/// kernels, the fp8 GEMVs S4's, the fp8 expert projections both). The routing kernel's Qwen
+/// program is instantiated at 256 only (its launcher refuses any other count), so such a tape is
+/// refused before anything is enqueued, rather than at its routing step. `None` for every other
+/// step.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
+    const S3: &str = "an fp8 step, whose S3 kernel is not built yet";
+    const S4: &str = "an fp8 GEMV, whose S4 kernel is not built yet";
+    match *s {
+        CudaStep::QuantRowsFp8(_)
+        | CudaStep::GemmFp8(_)
+        | CudaStep::GemmCol64Fp8(_)
+        | CudaStep::GemmNarrowFp8(_)
+        | CudaStep::GemmGroupFp8(_)
+        | CudaStep::GemmNarrowGroupFp8(_)
+        | CudaStep::GateUpAct(GateUpActBf16 {
+            kernel: GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8,
+            ..
+        }) => return Some(S3),
+        CudaStep::GemvFp8(_)
+        | CudaStep::GemvGroupFp8(_)
+        | CudaStep::GateUpAct(GateUpActBf16 {
+            kernel: GateUpKernel::GemvFp8,
+            ..
+        }) => return Some(S4),
+        CudaStep::RouterLogits(RouterLogitsBf16 { weight, .. })
+        | CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
+        | CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
+        | CudaStep::ExpertGateUpAct(ExpertGateUpActBf16 {
+            gate: ExpertGemvBf16 { weight, .. },
+            ..
+        }) if matches!(weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own) => {
+            return Some("an fp8 expert step, whose S3/S4 kernel is not built yet");
+        }
+        _ => {}
+    }
     if let CudaStep::MoeRoute(MoeRouteBf16 {
         program: RouteProgram::QwenSoftmax,
         experts,
@@ -1377,6 +1409,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
+                // Refused before any capture or forward (`not_launched`): no kernel yet.
+                CudaStep::QuantRowsFp8(_)
+                | CudaStep::GemmFp8(_)
+                | CudaStep::GemmCol64Fp8(_)
+                | CudaStep::GemmNarrowFp8(_)
+                | CudaStep::GemvFp8(_)
+                | CudaStep::GemmGroupFp8(_)
+                | CudaStep::GemmNarrowGroupFp8(_)
+                | CudaStep::GemvGroupFp8(_) => {
+                    unreachable!("`not_launched` refuses every fp8 step before a launch")
+                }
                 CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
                     let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
@@ -1688,6 +1731,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 act,
                                 stream.0,
                             ),
+                            GateUpKernel::GemmFp8
+                            | GateUpKernel::GemmCol64Fp8
+                            | GateUpKernel::GemvFp8 => {
+                                unreachable!("`not_launched` refuses every fp8 step")
+                            }
                             GateUpKernel::Gemm | GateUpKernel::GemmCol64 => {
                                 kernels::gate_up_gemm_bf16(
                                     (slot(a), gate, up),

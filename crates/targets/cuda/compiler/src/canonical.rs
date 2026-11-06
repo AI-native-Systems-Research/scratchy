@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use scratchy_subtile::handoff::{LoweredDecode, RopePairing, SourceBinding};
+use scratchy_subtile::handoff::{BundleTensor, LoweredDecode, RopePairing, SourceBinding};
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertProj;
@@ -34,7 +34,8 @@ use scratchy_target_cuda::op_abi::{
     CUDA_RESULT_ROWS, CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
 };
 use scratchy_target_cuda::step::{
-    CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
+    CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, QuantChainError,
+    QuantRowsFp8, gdn_scratch, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, KvClass, MoeSortTape, MoeTape,
@@ -513,6 +514,9 @@ pub enum CanonicalRefusal {
     },
     /// The arena cannot be laid out.
     Arena(ArenaRefusal),
+    /// The quantized rows the lowering placed are not each read by the fp8 GEMM they were
+    /// written for (`step::quant_chain`, the quant scratch's liveness).
+    QuantChain(QuantChainError),
 }
 
 /// Which rule a MoE op breaks.
@@ -705,6 +709,13 @@ pub enum GemmShapeRule {
         value: u32,
         tile: u32,
     },
+    /// An fp8 GEMM's `dim` is zero or not a multiple of `multiple`: `k` of its 64-byte K step, or
+    /// (an `n` off 64 and below it) the narrow GEMM's 8.
+    Fp8OffTile {
+        dim: &'static str,
+        value: u32,
+        multiple: u32,
+    },
 }
 
 /// Why an operand cannot be bound.
@@ -771,6 +782,16 @@ impl std::fmt::Display for CanonicalRefusal {
             } => write!(
                 f,
                 "step {step} is a GEMM of m={m} n={n} k={k}, which the bf16 kernel refuses: {rule}"
+            ),
+            Self::QuantChain(QuantChainError::Unquantized { step }) => write!(
+                f,
+                "launch {step}, an fp8 GEMM of more than one row, reads quantized rows no quant \
+                 write before it wrote for it"
+            ),
+            Self::QuantChain(QuantChainError::Overwritten { step }) => write!(
+                f,
+                "the quantized rows launch {step} wrote are overwritten or left before an fp8 \
+                 GEMM reads them"
             ),
             Self::GemmWeight { step, weight } => write!(
                 f,
@@ -1297,6 +1318,14 @@ impl std::fmt::Display for GemmShapeRule {
                 f,
                 "{dim} = {value} must be a non-zero multiple of {tile} (the 64-column GEMM)"
             ),
+            Self::Fp8OffTile {
+                dim,
+                value,
+                multiple,
+            } => write!(
+                f,
+                "{dim} = {value} must be a non-zero multiple of {multiple}, the fp8 GEMM's"
+            ),
         }
     }
 }
@@ -1497,7 +1526,14 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             CudaStep::GatedDeltaNet(g) | CudaStep::GdnDecode(g) => {
                 Some((g.bundle.0, g.bundle_layout()?.bytes))
             }
-            CudaStep::RouterLogits(_) | CudaStep::ExpertGemm(_) | CudaStep::ExpertGemv(_) => {
+            // An fp8 weight's buffer is its e4m3 bytes and f32 scales (`step::fp8_weight`).
+            CudaStep::RouterLogits(_)
+            | CudaStep::ExpertGemm(_)
+            | CudaStep::ExpertGemv(_)
+            | CudaStep::GemmFp8(_)
+            | CudaStep::GemmCol64Fp8(_)
+            | CudaStep::GemmNarrowFp8(_)
+            | CudaStep::GemvFp8(_) => {
                 let w = s.extents()?.weight?;
                 Some((w.ix.0, w.bytes))
             }
@@ -1506,6 +1542,14 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         .collect();
     let weight_bytes = (plan.lowered.bindings.iter().enumerate())
         .map(|(t, binding)| match binding {
+            // An fp8 bank's per-channel scales are packed into its bank's buffer
+            // (`step::fp8_moe_layout`), so their own sources hold nothing, as an fp8 weight's
+            // `WeightScale` source holds nothing.
+            SourceBinding::BundleTensor {
+                tensor:
+                    BundleTensor::ExpertGateS | BundleTensor::ExpertUpS | BundleTensor::ExpertDownS,
+                ..
+            } => Ok(0),
             SourceBinding::Weight { .. } | SourceBinding::BundleTensor { .. } => {
                 match bundles.get(&(t as u32)) {
                     Some(&bytes) => Ok(bytes),
@@ -1562,6 +1606,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             (Some(span), end)
         }
     };
+    let (steps, total_bytes) = quantize_fp8_inputs(steps, total_bytes)?;
     Ok(CudaCanonical {
         bucket_m: arena.bucket_m,
         colour_bytes: arena.bytes,
@@ -1606,6 +1651,46 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         moe,
         gemv_scratch,
     })
+}
+
+/// The fp8 GEMMs of more than one row, each reading its quantized input (FP8 S2, §1c): before each
+/// one (a grouped launch or a gate/up pair once), a [`QuantRowsFp8`] of its bf16 input into the
+/// quant scratch, which the GEMM then reads in place of that input. The scratch is one region at
+/// the arena's end (`total`), the largest quant write's bytes; its liveness is checked
+/// ([`quant_chain`]). Returns the steps and the arena's new end; a tape with no such GEMM is as
+/// it was. A one-row GEMV quantizes its row in its own prologue (S4), so it reads its bf16 row.
+fn quantize_fp8_inputs(
+    steps: Vec<CudaStep>,
+    total: u64,
+) -> Result<(Vec<CudaStep>, u64), CanonicalRefusal> {
+    let q = ArenaOffset(total);
+    let too_large = || CanonicalRefusal::Arena(ArenaRefusal::TooLarge);
+    let mut out = Vec::with_capacity(steps.len());
+    let mut most = 0u64;
+    for mut s in steps {
+        if let Some((x, rows, cols)) = s.quantized_input() {
+            let quant = QuantRowsFp8 { x, q, rows, cols };
+            most = most.max(quant.bytes().ok_or_else(too_large)?);
+            out.push(CudaStep::QuantRowsFp8(quant));
+            match &mut s {
+                CudaStep::GemmFp8(g) | CudaStep::GemmCol64Fp8(g) | CudaStep::GemmNarrowFp8(g) => {
+                    g.a = q
+                }
+                CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => g.a = q,
+                CudaStep::GateUpAct(g) => (g.gate.a, g.up.a) = (q, q),
+                _ => unreachable!("`quantized_input` names only the fp8 GEMMs it reads"),
+            }
+        }
+        out.push(s);
+    }
+    quant_chain(&out).map_err(CanonicalRefusal::QuantChain)?;
+    let end = match most {
+        0 => total,
+        bytes => (bytes.checked_next_multiple_of(CUDA_ARENA_ALIGN))
+            .and_then(|b| total.checked_add(b))
+            .ok_or_else(too_large)?,
+    };
+    Ok((out, end))
 }
 
 /// The KV pool of one canonical: its layers, ascending, its geometry (class 0's), and each

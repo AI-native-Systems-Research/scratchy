@@ -16,8 +16,9 @@ use crate::step::{
     ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep,
     EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
     GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
-    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16,
-    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, sort_index_regions,
+    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, QuantChainError, RmsNormBf16, RopeAppendBf16,
+    RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain,
+    sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -638,6 +639,12 @@ pub enum TapeError {
         want: u64,
         total: u64,
     },
+    /// The quant scratch (`span`) is misaligned, past the arena, over a colour, a region or
+    /// another scratch, or the quant writes start at different offsets; or the `step`-th step
+    /// touches it and is neither its writer nor a multi-row fp8 GEMM reading it.
+    QuantScratch { step: usize, span: ArenaSpan },
+    /// The quantized rows are not each read by the fp8 GEMM they were written for.
+    QuantChain { error: QuantChainError },
     /// The `step`-th step's rope reads `table`, which is not the tape's rotary table (`None`
     /// when the tape has none).
     RotaryMismatch {
@@ -923,6 +930,25 @@ impl std::fmt::Display for TapeError {
                 "the tape's KV attention classes are not a geometry the kernels take, or a layer \
                  names no class"
             ),
+            Self::QuantScratch { step, span } => write!(
+                f,
+                "step {step} touches the quant scratch {span:?}, which only a quant write writes \
+                 and only a multi-row fp8 GEMM reads, at one aligned span over no other region"
+            ),
+            Self::QuantChain {
+                error: QuantChainError::Unquantized { step },
+            } => write!(
+                f,
+                "step {step}, an fp8 GEMM of more than one row, reads quantized rows no quant \
+                 write before it wrote for it"
+            ),
+            Self::QuantChain {
+                error: QuantChainError::Overwritten { step },
+            } => write!(
+                f,
+                "the quantized rows step {step} wrote are overwritten or left before an fp8 GEMM \
+                 reads them"
+            ),
             Self::GemvScratch { span, want, total } => write!(
                 f,
                 "the GEMV scratch is {span:?}; its split steps write {want} bytes, aligned to \
@@ -1161,10 +1187,12 @@ impl CudaTape {
         let scratch = self.gdn_regions(total, &mut regions)?;
         let moe = self.moe_regions(total, &regions)?;
         let gemv = self.gemv_region(total, &regions, moe)?;
+        let quant = self.quant_region(total, &regions, [moe, gemv])?;
         for (step, whole) in self.steps.iter().enumerate() {
             self.check_group(step, whole)?;
             for s in whole.parts().iter().flatten() {
                 self.check_step(step, s, (total, &regions), (scratch, moe, gemv))?;
+                self.check_quant_scratch(step, s, quant)?;
             }
         }
         Ok(())
@@ -1661,7 +1689,7 @@ impl CudaTape {
                 }
                 Ok(())
             }
-            CudaStep::Gemv(_) => self.one_row(step, s),
+            CudaStep::Gemv(_) | CudaStep::GemvFp8(_) => self.one_row(step, s),
             // Gemma's router norm writes the scratch's router-norm region, whole.
             CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
                 Some(moe)
@@ -1708,9 +1736,17 @@ impl CudaTape {
             | CudaStep::SoftCap(_)
             | CudaStep::GemmCol64(_) => Ok(()),
             // `validate` checks a grouped GEMM through its members ([`CudaStep::parts`]).
-            CudaStep::GemmGroup(_) | CudaStep::GemmNarrowGroup(_) | CudaStep::GemvGroup(_) => {
-                Ok(())
-            }
+            CudaStep::GemmGroup(_)
+            | CudaStep::GemmNarrowGroup(_)
+            | CudaStep::GemvGroup(_)
+            | CudaStep::GemmGroupFp8(_)
+            | CudaStep::GemmNarrowGroupFp8(_)
+            | CudaStep::GemvGroupFp8(_) => Ok(()),
+            // The quant scratch's writer and readers: `quant_region` checks them.
+            CudaStep::QuantRowsFp8(_)
+            | CudaStep::GemmFp8(_)
+            | CudaStep::GemmCol64Fp8(_)
+            | CudaStep::GemmNarrowFp8(_) => Ok(()),
         }
     }
 
@@ -1799,6 +1835,81 @@ impl CudaTape {
             }
             (span, want) => Err(TapeError::GemvScratch { span, want, total }),
         }
+    }
+
+    /// The quant scratch (FP8 S2), when a step is a [`CudaStep::QuantRowsFp8`]: one span, every
+    /// quant write's `q` its start and its bytes the largest write's, aligned, inside the arena
+    /// and over no region nor the MoE or GEMV scratch; every multi-row fp8 GEMM reads the rows the
+    /// last quant write before it wrote, and every write is read before the next
+    /// ([`quant_chain`]). Returns its span.
+    fn quant_region(
+        &self,
+        total: u64,
+        regions: &[(Region, ArenaSpan)],
+        scratches: [Option<ArenaSpan>; 2],
+    ) -> Result<Option<ArenaSpan>, TapeError> {
+        quant_chain(self.steps).map_err(|error| TapeError::QuantChain { error })?;
+        let mut span: Option<ArenaSpan> = None;
+        for (step, s) in self.steps.iter().enumerate() {
+            let CudaStep::QuantRowsFp8(q) = *s else {
+                continue;
+            };
+            let bytes = q.bytes().ok_or(TapeError::StepOverflow { step })?;
+            span = match span {
+                None => Some(ArenaSpan { offset: q.q, bytes }),
+                Some(sp) if sp.offset == q.q => Some(ArenaSpan {
+                    bytes: sp.bytes.max(bytes),
+                    ..sp
+                }),
+                Some(sp) => return Err(TapeError::QuantScratch { step, span: sp }),
+            };
+        }
+        let Some(sp) = span else {
+            return Ok(None);
+        };
+        let clear = (regions.iter().map(|&(_, r)| r))
+            .chain(scratches.into_iter().flatten())
+            .all(|r| !overlap(r, sp));
+        let colours = (self
+            .arena
+            .colour_offsets
+            .iter()
+            .zip(self.arena.colour_bytes))
+        .map(|(&o, &b)| ArenaSpan {
+            offset: ArenaOffset(o),
+            bytes: b,
+        })
+        .all(|c| !overlap(c, sp));
+        if !(sp.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(sp, total) && clear && colours)
+        {
+            return Err(TapeError::QuantScratch { step: 0, span: sp });
+        }
+        Ok(Some(sp))
+    }
+
+    /// Only a quant write writes the quant scratch, and only a multi-row fp8 GEMM reads it.
+    fn check_quant_scratch(
+        &self,
+        step: usize,
+        s: &CudaStep,
+        scratch: Option<ArenaSpan>,
+    ) -> Result<(), TapeError> {
+        let Some(scratch) = scratch else {
+            return Ok(());
+        };
+        let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
+        let writes = [Some(e.writes), e.second_write];
+        let writes_it = writes.iter().flatten().any(|&w| overlap(w, scratch));
+        let reads_it = e.reads.iter().flatten().any(|&r| overlap(r, scratch));
+        let writer = matches!(s, CudaStep::QuantRowsFp8(_));
+        let reader = s.quantized_input().is_some();
+        if (writes_it && !writer) || (reads_it && !reader) {
+            return Err(TapeError::QuantScratch {
+                step,
+                span: scratch,
+            });
+        }
+        Ok(())
     }
 
     /// Only a split decode GEMV reads or writes the GEMV scratch (its partials, through the
@@ -2043,7 +2154,7 @@ impl CudaTape {
     /// those kernels index no row past the first. Any other step passes.
     fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rows = match *s {
-            CudaStep::Gemv(GemmBf16 { m, .. }) => m,
+            CudaStep::Gemv(GemmBf16 { m, .. }) | CudaStep::GemvFp8(GemmBf16 { m, .. }) => m,
             CudaStep::AttnDecode(AttnPrefillBf16 { rows, .. }) => rows,
             _ => return Ok(()),
         };
@@ -3595,6 +3706,13 @@ mod tests {
                 want: 4,
                 total: 8,
             },
+            TapeError::QuantScratch { step: 1, span: s },
+            TapeError::QuantChain {
+                error: QuantChainError::Unquantized { step: 1 },
+            },
+            TapeError::QuantChain {
+                error: QuantChainError::Overwritten { step: 1 },
+            },
         ];
         for e in &all {
             match e {
@@ -3640,7 +3758,9 @@ mod tests {
                 | TapeError::MoeStepGeometry { .. }
                 | TapeError::MoeRegionMismatch { .. }
                 | TapeError::MoeScratchTouched { .. }
-                | TapeError::GemvScratch { .. } => {}
+                | TapeError::GemvScratch { .. }
+                | TapeError::QuantScratch { .. }
+                | TapeError::QuantChain { .. } => {}
             }
         }
         all

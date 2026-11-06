@@ -12,8 +12,9 @@
 //! [`check`] checks every entry against the checkpoint's header before anything is allocated, and
 //! [`stage`] makes one entry's host bytes. The upload is `runtime::load_weights`, under `nvcc`.
 //!
-//! Every conversion is exact: a bf16 tensor is uploaded byte for byte, and a GDN bundle's pieces
-//! are widened to f32, which loses nothing from bf16 or f32.
+//! Every conversion is exact: a bf16 or e4m3 tensor is uploaded byte for byte, and a GDN bundle's
+//! pieces and an fp8 weight's per-channel scales are widened to f32, which loses nothing from bf16
+//! or f32.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +22,9 @@ use scratchy_layers::weights::GpuWeights;
 use scratchy_tensors::{DType, DeviceAllocator, PoolMemory};
 use serde::Serialize;
 
-use crate::step::{expert_bank, gdn_bundle, moe_bundle};
+use scratchy_subtile::handoff::{BundleTensor, PER_EXPERT_TENSOR_LEAVES};
+
+use crate::step::{expert_bank, fp8_moe_layout, fp8_weight, gdn_bundle, moe_bundle};
 use crate::tape::CudaTape;
 
 /// How one weight index is filled from the checkpoint.
@@ -72,7 +75,38 @@ pub enum CudaWeight {
         hidden: u32,
         inter: u32,
     },
+    /// One per-channel fp8 projection (`step::fp8_weight`): `weight` `[n, k]` e4m3 uploaded byte
+    /// for byte, then `scale` (`[n, 1]` bf16, `{prefix}.weight_scale`) widened to `[n]` f32.
+    Fp8 {
+        weight: &'static str,
+        scale: &'static str,
+        /// `[n, k]`.
+        shape: &'static [u64],
+    },
+    /// Qwen3.6's fp8 MoE layer (`step::fp8_moe_layout` with the router): `router` `[experts,
+    /// hidden]` bf16 (`{prefix}.gate.weight`, which the checkpoint leaves unquantized), then each
+    /// expert's e4m3 `gate_proj` and `up_proj` `[inter, hidden]` and `down_proj` `[hidden,
+    /// inter]`, gathered from `{experts_at}.{e}.<leaf>` (`handoff::PER_EXPERT_TENSOR_LEAVES`),
+    /// then their `[out, 1]` bf16 scales widened to f32.
+    Fp8MoeBundle {
+        router: &'static str,
+        experts_at: &'static str,
+        experts: u32,
+        hidden: u32,
+        inter: u32,
+    },
+    /// Gemma's fp8 expert bank: [`Self::Fp8MoeBundle`] with no router (its `router.proj` is a
+    /// [`Self::Bf16`] entry of its own, unquantized), the experts at `{experts_at}.{e}.<leaf>`.
+    Fp8ExpertBank {
+        experts_at: &'static str,
+        experts: u32,
+        hidden: u32,
+        inter: u32,
+    },
 }
+
+/// The dtype an fp8 weight has on disk: e4m3, never converted.
+const FP8_DTYPES: &[DType] = &[DType::Fp8E4m3];
 
 /// The dtypes a dense tensor may have on disk: bf16 only, never converted.
 const DENSE_DTYPES: &[DType] = &[DType::BF16];
@@ -81,7 +115,7 @@ const GDN_DTYPES: &[DType] = &[DType::BF16, DType::F32];
 
 /// One checkpoint tensor an entry reads, the dtypes it may have, and the shape it must have.
 struct Read {
-    tensor: &'static str,
+    tensor: String,
     accepted: &'static [DType],
     shape: Vec<u64>,
 }
@@ -94,6 +128,9 @@ impl CudaWeight {
             Self::GdnBundle { conv1d, .. } => conv1d,
             Self::MoeBundle { router, .. } => router,
             Self::ExpertBank { gate_up, .. } => gate_up,
+            Self::Fp8 { weight, .. } => weight,
+            Self::Fp8MoeBundle { router, .. } => router,
+            Self::Fp8ExpertBank { experts_at, .. } => experts_at,
         }
     }
 
@@ -101,10 +138,47 @@ impl CudaWeight {
     fn reads(&self) -> Vec<Read> {
         match *self {
             Self::Bf16 { tensor, shape } => vec![Read {
-                tensor,
+                tensor: tensor.to_string(),
                 accepted: DENSE_DTYPES,
                 shape: shape.to_vec(),
             }],
+            Self::Fp8 {
+                weight,
+                scale,
+                shape,
+            } => vec![
+                Read {
+                    tensor: weight.to_string(),
+                    accepted: FP8_DTYPES,
+                    shape: shape.to_vec(),
+                },
+                Read {
+                    tensor: scale.to_string(),
+                    accepted: DENSE_DTYPES,
+                    shape: vec![shape.first().copied().unwrap_or(0), 1],
+                },
+            ],
+            Self::Fp8MoeBundle {
+                router,
+                experts_at,
+                experts,
+                hidden,
+                inter,
+            } => {
+                let mut reads = vec![Read {
+                    tensor: router.to_string(),
+                    accepted: DENSE_DTYPES,
+                    shape: vec![u64::from(experts), u64::from(hidden)],
+                }];
+                reads.extend(expert_reads(experts_at, experts, hidden, inter));
+                reads
+            }
+            Self::Fp8ExpertBank {
+                experts_at,
+                experts,
+                hidden,
+                inter,
+            } => expert_reads(experts_at, experts, hidden, inter),
             Self::GdnBundle {
                 conv1d,
                 a_log,
@@ -115,8 +189,8 @@ impl CudaWeight {
                 nv,
                 head_v,
             } => {
-                let read = |tensor, shape: &[u32]| Read {
-                    tensor,
+                let read = |tensor: &str, shape: &[u32]| Read {
+                    tensor: tensor.to_string(),
                     accepted: GDN_DTYPES,
                     shape: shape.iter().map(|&d| u64::from(d)).collect(),
                 };
@@ -135,8 +209,8 @@ impl CudaWeight {
                 hidden,
                 inter,
             } => {
-                let read = |tensor, shape: &[u32]| Read {
-                    tensor,
+                let read = |tensor: &str, shape: &[u32]| Read {
+                    tensor: tensor.to_string(),
                     accepted: DENSE_DTYPES,
                     shape: shape.iter().map(|&d| u64::from(d)).collect(),
                 };
@@ -153,8 +227,8 @@ impl CudaWeight {
                 hidden,
                 inter,
             } => {
-                let read = |tensor, shape: &[u32]| Read {
-                    tensor,
+                let read = |tensor: &str, shape: &[u32]| Read {
+                    tensor: tensor.to_string(),
                     accepted: DENSE_DTYPES,
                     shape: shape.iter().map(|&d| u64::from(d)).collect(),
                 };
@@ -189,8 +263,65 @@ impl CudaWeight {
                 inter,
                 ..
             } => expert_bank(experts, hidden, inter).map(|b| b.bytes),
+            Self::Fp8 { shape, .. } => fp8_layout(shape).map(|w| w.bytes),
+            Self::Fp8MoeBundle {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => fp8_moe_layout(experts, hidden, inter, true).map(|b| b.experts.bytes),
+            Self::Fp8ExpertBank {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => fp8_moe_layout(experts, hidden, inter, false).map(|b| b.experts.bytes),
         }
     }
+}
+
+/// The buffer of an fp8 projection of `shape`, `[n, k]` (`step::fp8_weight`); `None` for another
+/// rank or on overflow.
+fn fp8_layout(shape: &[u64]) -> Option<crate::step::Fp8Weight> {
+    let &[n, k] = shape else {
+        return None;
+    };
+    fp8_weight(u32::try_from(n).ok()?, u32::try_from(k).ok()?)
+}
+
+/// Expert `e`'s checkpoint tensor of `leaf` (a [`PER_EXPERT_TENSOR_LEAVES`] row's) under
+/// `experts_at`: `{experts_at}.{e}.{leaf}`.
+fn expert_tensor(experts_at: &str, e: u32, which: BundleTensor) -> String {
+    let leaf = (PER_EXPERT_TENSOR_LEAVES.iter())
+        .find_map(|&(t, l)| (t == which).then_some(l))
+        .expect("every fp8 expert tensor has a per-expert leaf");
+    format!("{experts_at}.{e}.{leaf}")
+}
+
+/// Every expert's fp8 tensors, in expert order: its gate, up and down weights (e4m3 `[inter,
+/// hidden]`, `[inter, hidden]`, `[hidden, inter]`) and their `[out, 1]` bf16 scales.
+fn expert_reads(experts_at: &str, experts: u32, hidden: u32, inter: u32) -> Vec<Read> {
+    let (h, i) = (u64::from(hidden), u64::from(inter));
+    let mut reads = Vec::new();
+    for e in 0..experts {
+        for (w, sc, out, inp) in [
+            (BundleTensor::ExpertGateW, BundleTensor::ExpertGateS, i, h),
+            (BundleTensor::ExpertUpW, BundleTensor::ExpertUpS, i, h),
+            (BundleTensor::ExpertDownW, BundleTensor::ExpertDownS, h, i),
+        ] {
+            reads.push(Read {
+                tensor: expert_tensor(experts_at, e, w),
+                accepted: FP8_DTYPES,
+                shape: vec![out, inp],
+            });
+            reads.push(Read {
+                tensor: expert_tensor(experts_at, e, sc),
+                accepted: DENSE_DTYPES,
+                shape: vec![out, 1],
+            });
+        }
+    }
+    reads
 }
 
 /// Why a checkpoint cannot fill a weight table. Every arm but [`LoadError::Upload`] is found
@@ -363,22 +494,36 @@ fn check_tensors<A: DeviceAllocator>(
         shape,
     } in entry.reads()
     {
+        // A per-expert name is built here, not baked: a refusal keeps the one it names.
+        let named = |t: &str| -> &'static str { Box::leak(t.to_owned().into_boxed_str()) };
         let missing = || match *entry {
-            CudaWeight::MoeBundle { router, .. } if tensor != router => {
-                let base = tensor.rsplit_once(".experts.").map_or(tensor, |(b, _)| b);
+            CudaWeight::MoeBundle {
+                router,
+                gate_up,
+                down,
+                ..
+            } if tensor != router => {
+                let fused = if tensor == gate_up { gate_up } else { down };
+                let base = fused.rsplit_once(".experts.").map_or(fused, |(b, _)| b);
                 let per_expert = format!("{base}.experts.0.gate_proj.weight");
                 match weights.tensor_info(&per_expert) {
-                    Some(_) => LoadError::PerExpertTensors { ix, tensor },
-                    None => LoadError::Missing { ix, tensor },
+                    Some(_) => LoadError::PerExpertTensors { ix, tensor: fused },
+                    None => LoadError::Missing {
+                        ix,
+                        tensor: named(&tensor),
+                    },
                 }
             }
-            _ => LoadError::Missing { ix, tensor },
+            _ => LoadError::Missing {
+                ix,
+                tensor: named(&tensor),
+            },
         };
-        let (got, dtype) = (weights.tensor_info(tensor)).ok_or_else(missing)?;
+        let (got, dtype) = (weights.tensor_info(&tensor)).ok_or_else(missing)?;
         if !accepted.contains(&dtype) {
             return Err(LoadError::Dtype {
                 ix,
-                tensor,
+                tensor: named(&tensor),
                 got: dtype,
                 accepted,
             });
@@ -387,7 +532,7 @@ fn check_tensors<A: DeviceAllocator>(
         if got != shape {
             return Err(LoadError::Shape {
                 ix,
-                tensor,
+                tensor: named(&tensor),
                 got,
                 want: shape,
             });
@@ -486,12 +631,24 @@ pub fn stage<A: DeviceAllocator>(
     weights: &mut GpuWeights<A>,
 ) -> Result<Vec<u8>, LoadError> {
     check_tensors(ix, entry, weights)?;
-    let missing = |tensor| LoadError::Missing { ix, tensor };
+    let missing = |tensor: &str| LoadError::Missing {
+        ix,
+        tensor: Box::leak(tensor.to_owned().into_boxed_str()),
+    };
+    let overflow = |tensor| LoadError::Bytes {
+        ix,
+        tensor: Some(tensor),
+        packed: u64::MAX,
+        declared: 0,
+    };
+    // A tensor's bytes, taken out of the reader (it hands each out once).
+    let mut take = |tensor: &str| {
+        (weights.take_to_cpu_bytes(tensor))
+            .map(|(bytes, dtype, _)| (bytes, dtype))
+            .map_err(|_| missing(tensor))
+    };
     match *entry {
-        CudaWeight::Bf16 { tensor, .. } => {
-            let (bytes, ..) = (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
-            Ok(bytes)
-        }
+        CudaWeight::Bf16 { tensor, .. } => Ok(take(tensor)?.0),
         CudaWeight::GdnBundle {
             conv1d,
             a_log,
@@ -502,12 +659,8 @@ pub fn stage<A: DeviceAllocator>(
             nv,
             head_v,
         } => {
-            let layout = gdn_bundle(conv_dim, conv_kernel, nv, head_v).ok_or(LoadError::Bytes {
-                ix,
-                tensor: Some(conv1d),
-                packed: u64::MAX,
-                declared: 0,
-            })?;
+            let layout =
+                gdn_bundle(conv_dim, conv_kernel, nv, head_v).ok_or_else(|| overflow(conv1d))?;
             let mut packed = vec![0f32; layout.bytes as usize / 4];
             for (tensor, at) in [
                 (conv1d, layout.conv1d),
@@ -517,8 +670,7 @@ pub fn stage<A: DeviceAllocator>(
             ] {
                 // `[conv_dim, 1, K]` flattened is row `c` channel `c`'s taps, oldest first: the
                 // bundle's `[conv_dim, K]`.
-                let (bytes, dtype, _) =
-                    (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
+                let (bytes, dtype) = take(tensor)?;
                 let values = widen(&bytes, dtype);
                 packed[at as usize / 4..][..values.len()].copy_from_slice(&values);
             }
@@ -534,9 +686,7 @@ pub fn stage<A: DeviceAllocator>(
             // bundle's regions in order, back to back with no gap (`step::moe_bundle`).
             let mut packed = Vec::new();
             for tensor in [router, gate_up, down] {
-                let (bytes, ..) =
-                    (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
-                packed.extend_from_slice(&bytes);
+                packed.extend_from_slice(&take(tensor)?.0);
             }
             Ok(packed)
         }
@@ -544,11 +694,118 @@ pub fn stage<A: DeviceAllocator>(
             // As the bundle's, with no router: `step::expert_bank`'s two regions back to back.
             let mut packed = Vec::new();
             for tensor in [gate_up, down] {
-                let (bytes, ..) =
-                    (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
-                packed.extend_from_slice(&bytes);
+                packed.extend_from_slice(&take(tensor)?.0);
             }
             Ok(packed)
         }
+        CudaWeight::Fp8 {
+            weight,
+            scale,
+            shape,
+        } => {
+            let layout = fp8_layout(shape).ok_or_else(|| overflow(weight))?;
+            let mut packed = take(weight)?.0;
+            packed.resize(layout.scale as usize, 0);
+            let (bytes, dtype) = take(scale)?;
+            packed.extend(widen(&bytes, dtype).iter().flat_map(|v| v.to_le_bytes()));
+            Ok(packed)
+        }
+        CudaWeight::Fp8MoeBundle {
+            router,
+            experts_at,
+            experts,
+            hidden,
+            inter,
+        } => {
+            let layout =
+                fp8_moe_layout(experts, hidden, inter, true).ok_or_else(|| overflow(router))?;
+            let mut packed = vec![0u8; layout.experts.bytes as usize];
+            let bytes = take(router)?.0;
+            packed[..bytes.len()].copy_from_slice(&bytes);
+            gather_experts(
+                &mut packed,
+                layout,
+                experts_at,
+                (experts, hidden, inter),
+                take,
+            )?;
+            Ok(packed)
+        }
+        CudaWeight::Fp8ExpertBank {
+            experts_at,
+            experts,
+            hidden,
+            inter,
+        } => {
+            let layout = (fp8_moe_layout(experts, hidden, inter, false))
+                .ok_or_else(|| overflow(experts_at))?;
+            let mut packed = vec![0u8; layout.experts.bytes as usize];
+            gather_experts(
+                &mut packed,
+                layout,
+                experts_at,
+                (experts, hidden, inter),
+                take,
+            )?;
+            Ok(packed)
+        }
     }
+}
+
+/// Every expert's fp8 tensors of `experts_at`, taken by `take`, into `packed` at `layout`'s
+/// regions: per expert its gate rows then its up rows (`[2·inter, hidden]`), its down rows, the
+/// gate's and up's scales (`[2·inter]` f32) and the down's (`[hidden]` f32), the bytes verbatim and
+/// the scales widened from bf16.
+fn gather_experts(
+    packed: &mut [u8],
+    layout: crate::step::Fp8MoeBundle,
+    experts_at: &str,
+    (experts, hidden, inter): (u32, u32, u32),
+    mut take: impl FnMut(&str) -> Result<(Vec<u8>, DType), LoadError>,
+) -> Result<(), LoadError> {
+    let (h, i) = (hidden as usize, inter as usize);
+    let at = |base: u64, e: u32, per: usize| base as usize + e as usize * per;
+    for e in 0..experts {
+        let parts = [
+            (
+                BundleTensor::ExpertGateW,
+                layout.experts.gate_up,
+                2 * i * h,
+                0,
+            ),
+            (
+                BundleTensor::ExpertUpW,
+                layout.experts.gate_up,
+                2 * i * h,
+                i * h,
+            ),
+            (BundleTensor::ExpertDownW, layout.experts.down, h * i, 0),
+            (
+                BundleTensor::ExpertGateS,
+                layout.gate_up_scale,
+                2 * i * 4,
+                0,
+            ),
+            (
+                BundleTensor::ExpertUpS,
+                layout.gate_up_scale,
+                2 * i * 4,
+                i * 4,
+            ),
+            (BundleTensor::ExpertDownS, layout.down_scale, h * 4, 0),
+        ];
+        for (which, base, per, within) in parts {
+            let (bytes, dtype) = take(&expert_tensor(experts_at, e, which))?;
+            let bytes = match dtype {
+                DType::Fp8E4m3 => bytes,
+                _ => widen(&bytes, dtype)
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            };
+            let start = at(base, e, per) + within;
+            packed[start..start + bytes.len()].copy_from_slice(&bytes);
+        }
+    }
+    Ok(())
 }

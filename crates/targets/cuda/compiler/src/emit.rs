@@ -127,6 +127,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "GateUpKernel",
                 "GatedOp",
                 "ExpertGateUpActBf16",
+                "QuantRowsFp8",
             ],
         },
         ModuleRow {
@@ -468,13 +469,24 @@ enum Role {
     MoeBundle([u32; 3]),
     /// One Gemma layer's dense expert bank of this geometry: `experts`, `hidden`, `inter`.
     ExpertBank([u32; 3]),
+    /// One per-channel fp8 projection `[n, k]`: its e4m3 weight and its scale.
+    Fp8([u64; 2]),
+    /// One Qwen MoE layer's fp8 bundle of this geometry.
+    Fp8MoeBundle([u32; 3]),
+    /// One Gemma layer's fp8 expert bank of this geometry.
+    Fp8ExpertBank([u32; 3]),
 }
 
 impl Role {
     fn shape(&self) -> &[u64] {
         match self {
             Self::Bf16(dims, rank) | Self::Param(dims, rank) => &dims[..*rank],
-            Self::Bundle(_) | Self::MoeBundle(_) | Self::ExpertBank(_) => &[],
+            Self::Fp8(dims) => dims,
+            Self::Bundle(_)
+            | Self::MoeBundle(_)
+            | Self::ExpertBank(_)
+            | Self::Fp8MoeBundle(_)
+            | Self::Fp8ExpertBank(_) => &[],
         }
     }
 }
@@ -493,6 +505,12 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::GemmNarrow(GemmBf16 { b, n, k, .. })
         | CudaStep::Gemv(GemmBf16 { b, n, k, .. }) => {
             Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2)))
+        }
+        CudaStep::GemmFp8(GemmBf16 { b, n, k, .. })
+        | CudaStep::GemmCol64Fp8(GemmBf16 { b, n, k, .. })
+        | CudaStep::GemmNarrowFp8(GemmBf16 { b, n, k, .. })
+        | CudaStep::GemvFp8(GemmBf16 { b, n, k, .. }) => {
+            Some((b, Role::Fp8([u64::from(n), u64::from(k)])))
         }
         CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. })
         | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. })
@@ -589,6 +607,59 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         }) => Some((bundle, Role::ExpertBank([experts, hidden, inter]))),
+        CudaStep::RouterLogits(RouterLogitsBf16 {
+            bundle,
+            weight: MoeWeight::Fp8Bundle,
+            experts,
+            hidden,
+            inter,
+            ..
+        })
+        | CudaStep::ExpertGemm(ExpertGemmBf16 {
+            bundle,
+            weight: MoeWeight::Fp8Bundle,
+            experts,
+            hidden,
+            inter,
+            ..
+        })
+        | CudaStep::ExpertGemv(ExpertGemvBf16 {
+            bundle,
+            weight: MoeWeight::Fp8Bundle,
+            experts,
+            hidden,
+            inter,
+            ..
+        }) => Some((bundle, Role::Fp8MoeBundle([experts, hidden, inter]))),
+        // Gemma's router stays its own bf16 projection beside an fp8 bank (the checkpoint's
+        // `ignore` lists `router.proj`).
+        CudaStep::RouterLogits(RouterLogitsBf16 {
+            bundle,
+            weight: MoeWeight::Fp8Own,
+            experts,
+            hidden,
+            ..
+        }) => Some((
+            bundle,
+            Role::Bf16([u64::from(experts), u64::from(hidden)], 2),
+        )),
+        CudaStep::ExpertGemm(ExpertGemmBf16 {
+            bundle,
+            weight: MoeWeight::Fp8Own,
+            experts,
+            hidden,
+            inter,
+            ..
+        })
+        | CudaStep::ExpertGemv(ExpertGemvBf16 {
+            bundle,
+            weight: MoeWeight::Fp8Own,
+            experts,
+            hidden,
+            inter,
+            ..
+        }) => Some((bundle, Role::Fp8ExpertBank([experts, hidden, inter]))),
+        CudaStep::QuantRowsFp8(_) => None,
         CudaStep::Add(_)
         | CudaStep::SiluMul(_)
         | CudaStep::Rope(_)
@@ -606,7 +677,12 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::GeluMul(_)
         | CudaStep::SoftCap(_) => None,
         // Read through their members ([`CudaStep::parts`]), each a GEMM's `[n, k]`.
-        CudaStep::GemmGroup(_) | CudaStep::GemmNarrowGroup(_) | CudaStep::GemvGroup(_) => None,
+        CudaStep::GemmGroup(_)
+        | CudaStep::GemmNarrowGroup(_)
+        | CudaStep::GemvGroup(_)
+        | CudaStep::GemmGroupFp8(_)
+        | CudaStep::GemmNarrowGroupFp8(_)
+        | CudaStep::GemvGroupFp8(_) => None,
         // Read through their parts ([`CudaStep::parts`]): the two GEMMs (or expert GEMVs) each
         // fold.
         CudaStep::GateUpAct(_) | CudaStep::ExpertGateUpAct(_) => None,
@@ -761,8 +837,21 @@ pub fn weight_table(
                 hidden,
                 inter,
             },
+            Role::Fp8(shape) => CudaWeight::Fp8 {
+                weight: baked_str(format!("{prefix}.weight")),
+                scale: baked_str(format!("{prefix}.weight_scale")),
+                shape: baked(&shape),
+            },
+            // Each expert's own tensors, under `{prefix}.experts` (`PER_EXPERT_TENSOR_LEAVES`).
+            Role::Fp8MoeBundle([experts, hidden, inter]) => CudaWeight::Fp8MoeBundle {
+                router: baked_str(format!("{prefix}.gate.weight")),
+                experts_at: baked_str(format!("{prefix}.experts")),
+                experts,
+                hidden,
+                inter,
+            },
             // An expert bank is read only through bundle tensors, named above.
-            Role::ExpertBank(_) => {
+            Role::ExpertBank(_) | Role::Fp8ExpertBank(_) => {
                 return Err(ModelRefusal::NoPrefix {
                     ix,
                     binding: binding.clone(),
@@ -844,7 +933,22 @@ fn bundle_entry(
             hidden,
             inter,
         },
-        Role::Bundle(_) | Role::MoeBundle(_) => return None,
+        // The bank's checkpoint prefix: its gate's name, which the handoff states as the fused
+        // tensor's (`{bank}.gate_up_proj`); a per-expert checkpoint stores `{bank}.{e}.<leaf>`.
+        Role::Fp8ExpertBank([experts, hidden, inter]) => CudaWeight::Fp8ExpertBank {
+            experts_at: baked_str(
+                named(BundleTensor::ExpertGateW)?
+                    .rsplit_once('.')?
+                    .0
+                    .to_string(),
+            ),
+            experts,
+            hidden,
+            inter,
+        },
+        Role::Bundle(_) | Role::MoeBundle(_) | Role::Fp8(_) | Role::Fp8MoeBundle(_) => {
+            return None;
+        }
     })
 }
 
