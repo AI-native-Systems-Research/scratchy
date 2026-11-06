@@ -4826,9 +4826,8 @@ impl PoolPageSlots {
                 None => panic!("unreachable: a product of nonzero values is nonzero"),
             },
             None => panic!(
-                "a pool page of k blocks of {} tokens overflows u32: \
-                 k whole scheduler blocks must fit a u32 slot count",
-                blocks.get()
+                "a pool page of k whole scheduler blocks overflows u32: \
+                 the blocks-per-page policy must fit a u32 slot count"
             ),
         }
     }
