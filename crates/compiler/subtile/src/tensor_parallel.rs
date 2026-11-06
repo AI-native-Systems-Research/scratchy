@@ -48,7 +48,7 @@ use crate::subtile_ir::{RopeForm, RowScale, SourceShape, SubOp, SubtileIR, Tenso
 /// ⭐ THE WORLD IS A TYPE — the one `tp/N` the build names ([`TpWorld<N>`]). Every function here
 /// that a world shapes is generic over it: [`shard`]'s per-rank forward, [`slice_source`]'s slice
 /// law, [`eval_ranks`]' lockstep reference. Nothing stores a world size, and no op carries one.
-pub use scratchy_tp_world::{Rank, TpWorld, World, ranks};
+pub use scratchy_tp_world::{PerRank, Rank, TpWorld, World, ranks};
 
 /// The smallest column block a target can split a tensor at — a TARGET FACT the shared pass takes
 /// as input (spyre: one 64-element stick; a target with no layout granule: 1). A split whose
