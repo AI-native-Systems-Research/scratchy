@@ -16783,6 +16783,7 @@ pub fn emit_model(
                 "a forward asked the host for hidden rows of a pool that runs in another's arena \
                  (an MTP head's)"
             );
+            let n = num_tokens as usize;
 
 
             // ── Run forward + copy logits out ─────────────────────
