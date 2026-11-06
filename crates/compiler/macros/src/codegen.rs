@@ -4370,27 +4370,26 @@ fn emit_weights_struct(
     (tokens, fingerprint_rows)
 }
 
-/// Split a Weights field name into `(base, layer)` where `layer`
-/// is `Some(n)` if the name ends in `_<digits>` (e.g.
-/// `input_layernorm_3` → `("input_layernorm", Some(3))`) and
-/// `None` for un-suffixed names like `embed_tokens` or `lm_head`.
-///
-/// The trailing-digits rule is the convention `weight_field_name`
-/// has used since the start: `(stem)_(layer_index)` for per-layer
-/// accessors, bare `stem` for arch-wide ones. New accessors must
-/// follow the same rule or the per-arch accessor method codegen
-/// will silently group them as non-layered. (Mixed bases —
-/// e.g. one `input_layernorm` and one `input_layernorm_0` under
-/// the same name root — panic at codegen time.)
-pub(crate) fn split_base_layer(field_name: &str) -> (String, Option<UnrollIndex>) {
-    if let Some((base, suffix)) = field_name.rsplit_once('_')
-        && !suffix.is_empty()
-        && suffix.chars().all(|c| c.is_ascii_digit())
-        && let Ok(n) = suffix.parse::<u64>()
-    {
-        return (base.to_string(), Some(UnrollIndex(n)));
+/// A Weights field's `(base, layer)`: an accessor unrolled at layer `n` is named `{base}_{n}`
+/// (`weight_field_stem`), its base that name less the suffix; an accessor of no unrolled layer is
+/// its whole name. Layer-ness is the unroll index's, never a name's digits: a weight whose own path
+/// ends in a numeral (Qwen2-VL's `merger.mlp.0` and `merger.mlp.2`) is two fields, not one
+/// field's two layers.
+pub(crate) fn base_layer(
+    field_name: &str,
+    layer: Option<UnrollIndex>,
+) -> (String, Option<UnrollIndex>) {
+    let suffix = layer.map(|n| format!("_{}", n.0));
+    match suffix.as_deref().and_then(|s| field_name.strip_suffix(s)) {
+        Some(base) => (base.to_string(), layer),
+        None => (field_name.to_string(), None),
     }
-    (field_name.to_string(), None)
+}
+
+/// An accessor's `(base, layer)` ([`base_layer`]), its layer its sources' unroll index.
+fn accessor_base_layer(acc: &WeightAccessor) -> (String, Option<UnrollIndex>) {
+    let layer = acc.source_weights.first().and_then(|(_, i)| *i);
+    base_layer(&acc.name.to_string(), layer)
 }
 
 /// One row in the per-arch `Weights` shape. The field/struct emit,
@@ -4444,9 +4443,6 @@ pub(crate) enum AccessorGroupKind {
 pub(crate) struct ModelDims {
     handles: BTreeMap<String, TypedHandle>,
     bounds: std::collections::BTreeSet<String>,
-    /// The weight families its fields hold, typed or not (metal's bake counts its doors).
-    #[cfg(feature = "metal")]
-    families: u32,
 }
 
 /// One field's typed handle: its path (`__handles::<Field>`, what the field, its accessor and
@@ -4479,13 +4475,9 @@ impl ModelDims {
         bundles: &std::collections::BTreeMap<String, crate::bundles::Bundle>,
     ) -> Result<Self, String> {
         use crate::weight_vocab::WeightKind;
-        let mut dims = Self {
-            #[cfg(feature = "metal")]
-            families: u32::try_from(groups.len()).map_err(|_| "more weight families than a u32")?,
-            ..Self::default()
-        };
+        let mut dims = Self::default();
         let w = quote!(::scratchy_tensors::typed);
-        'groups: for g in groups {
+        for g in groups {
             let sources = |acc: &WeightAccessor| -> Vec<WeightId> {
                 acc.source_weights.iter().map(|(id, _)| *id).collect()
             };
@@ -4493,8 +4485,16 @@ impl ModelDims {
                 continue;
             };
             let ids = sources(first);
+            let kind = &first.kind;
+            let untypable = |why: &str| {
+                format!(
+                    "field `{}` ({kind:?}) has no typed handle: {why}; the generator types every \
+                     weight",
+                    g.base
+                )
+            };
             if !g.entries.iter().all(|(_, acc)| sources(acc) == ids) {
-                continue;
+                return Err(untypable("its layers read different weights"));
             }
             let layer = &g.rust_type;
             let def = 'def: {
@@ -4525,21 +4525,22 @@ impl ModelDims {
                         | WeightKind::Embedding
                         | WeightKind::AffineQuantEmbedding
                         | WeightKind::RmsNorm
+                        | WeightKind::LayerNorm
                         | WeightKind::Tensor
                         | WeightKind::AttnSinks
                 ) {
-                    continue 'groups;
+                    return Err(untypable("no handle type holds its kind"));
                 }
                 let Some(shapes) = (ids.iter())
                     .map(|id| inferred.weights.get(id))
                     .collect::<Option<Vec<_>>>()
                 else {
-                    continue 'groups;
+                    return Err(untypable("the trace gives a weight of it no shape"));
                 };
                 // Every layer's codes, which must be one: a group of two is no one handle.
                 let layer_codes = codes(first);
                 if g.entries.iter().any(|(_, acc)| codes(acc) != layer_codes) {
-                    continue 'groups;
+                    return Err(untypable("its layers hold different affine codes"));
                 }
                 let mut ty = |shape: &[crate::dim::Dim],
                               codes: Option<(u32, u32)>|
@@ -4564,6 +4565,10 @@ impl ModelDims {
                 };
                 let handle = match &shapes[..] {
                     [one] => ty(one, layer_codes)?,
+                    // A LayerNorm's weight and bias, each its width.
+                    [weight, bias] if first.kind == WeightKind::LayerNorm && weight == bias => {
+                        ty(weight, None)?
+                    }
                     // A packed pair is dense: affine sources fused at load are dequantized.
                     [gate, up] if first.kind == WeightKind::Linear && layer_codes.is_none() => {
                         match (ty(gate, None)?, ty(up, None)?) {
@@ -4576,7 +4581,10 @@ impl ModelDims {
                     _ => None,
                 };
                 let Some(def) = handle else {
-                    continue 'groups;
+                    let ranks: Vec<usize> = shapes.iter().map(|s| s.len()).collect();
+                    return Err(untypable(&format!(
+                        "no handle holds weights of ranks {ranks:?} with codes {layer_codes:?}"
+                    )));
                 };
                 def
             };
@@ -4602,12 +4610,6 @@ impl ModelDims {
 
     pub(crate) fn handle(&self, base: &str) -> Option<&TypedHandle> {
         self.handles.get(base)
-    }
-
-    /// The weight families its fields hold with no typed handle.
-    #[cfg(feature = "metal")]
-    pub(crate) fn untyped(&self) -> u32 {
-        self.families - self.handles.len() as u32
     }
 
     /// `__dims`: one marker per bound the handles name, carrying `model`'s number for it.
@@ -4715,8 +4717,7 @@ pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<Acces
 
     let mut by_base: BTreeMap<String, Bucket<'_>> = BTreeMap::new();
     for acc in accessors {
-        let full = acc.name.to_string();
-        let (base, layer) = split_base_layer(&full);
+        let (base, layer) = accessor_base_layer(acc);
         let ty_str = acc.rust_type.to_string();
         let entry = by_base.entry(base.clone()).or_insert_with(|| Bucket {
             rust_type: acc.rust_type.clone(),
@@ -12789,7 +12790,7 @@ fn dump_wavefront_mega(
                                     WeightId(*id),
                                     *index,
                                 );
-                                let (wbase, _) = split_base_layer(&name);
+                                let (wbase, _) = base_layer(&name, *index);
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let is_gemm = gemm_weight.contains(&i);
                                 let disk = safetensors_prefix(
@@ -12836,7 +12837,7 @@ fn dump_wavefront_mega(
                                     WeightId(*id),
                                     *index,
                                 );
-                                let (wbase, _) = split_base_layer(&name);
+                                let (wbase, _) = base_layer(&name, *index);
                                 let scale_base = format!("{wbase}.weight_scale");
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let disk = safetensors_prefix(
@@ -12869,7 +12870,7 @@ fn dump_wavefront_mega(
                                     WeightId(*id),
                                     *index,
                                 );
-                                let (wbase, _) = split_base_layer(&name);
+                                let (wbase, _) = base_layer(&name, *index);
                                 let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
                                 let disk = safetensors_prefix(
                                     weight_naming,
@@ -14198,11 +14199,7 @@ pub fn emit_model(
     // delegated load reads the canonical's widths, so its fingerprint
     // gate must too. `None` for canonicals themselves.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
-) -> (
-    TokenStream,
-    Vec<(String, u32, u32)>,
-    Option<crate::shape_pins::Doors>,
-) {
+) -> (TokenStream, Vec<(String, u32, u32)>) {
     // A head reading its target's KV (`reads_target_kv`) binds its target's TurboQuant runtime.
     let reads_target_kv = model.arch.reads_target_kv;
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
@@ -14213,7 +14210,7 @@ pub fn emit_model(
     // separate vision flag needed.
 
     if let Some(canonical) = canonical_override {
-        let (tokens, rows) = emit_shim_model(
+        return emit_shim_model(
             program,
             fuf,
             model,
@@ -14223,8 +14220,6 @@ pub fn emit_model(
             emit_fingerprint,
             canonical_affine_rows,
         );
-        // A shim's weights and tapes are its canonical's: its doors are counted there.
-        return (tokens, rows, None);
     }
     // The struct emitter. Metal calls it twice: once with no accessors
     // and — after the front-end swap has produced them — once with the
@@ -15579,14 +15574,9 @@ pub fn emit_model(
             };
     };
 
-    // The model's open shape doors, as this expansion counted them (#1094's ratchet, held to the
-    // model's pin by the caller): its untyped weight families, its affine matmul commands over an
-    // untyped weight and its dims asserts. Metal's bake counts them.
-    #[cfg(not(feature = "metal"))]
-    let shape_doors = None;
     #[cfg(feature = "metal")]
-    let shape_doors = {
-        let (table, doors) = metal_tape_cmds
+    {
+        let table = metal_tape_cmds
             .into_tokens(&resolver.typed)
             .unwrap_or_else(|e| {
                 panic!(
@@ -15595,12 +15585,7 @@ pub fn emit_model(
                 )
             });
         metal_arena_bytes_statics.push(table);
-        Some(crate::shape_pins::Doors {
-            untyped_weight_families: dims.untyped(),
-            untyped_affine_commands: doors.untyped_affine_commands,
-            dims_asserts: doors.dims_asserts,
-        })
-    };
+    }
     #[cfg(feature = "metal")]
     {
         let mc = &model_facts;
@@ -16831,7 +16816,7 @@ pub fn emit_model(
                 .collect()
         }
     };
-    (tokens, weights_affine_rows, shape_doors)
+    (tokens, weights_affine_rows)
 }
 
 /// Unused — consumers used to reach this by name from tests.
@@ -17314,32 +17299,33 @@ mod tests {
     }
 
     #[test]
-    fn split_base_layer_recognizes_layered_and_unlayered_names() {
-        // Layered: trailing _<digits> peels off as the layer index.
+    fn base_layer_strips_only_the_unroll_index() {
+        let at = |n| Some(UnrollIndex(n));
+        // An accessor unrolled at a layer: its name less that layer's suffix.
         assert_eq!(
-            split_base_layer("input_layernorm_3"),
-            ("input_layernorm".to_string(), Some(UnrollIndex(3)))
+            base_layer("input_layernorm_3", at(3)),
+            ("input_layernorm".to_string(), at(3))
         );
         assert_eq!(
-            split_base_layer("self_attn_q_proj_31"),
-            ("self_attn_q_proj".to_string(), Some(UnrollIndex(31)))
+            base_layer("self_attn_q_proj_31", at(31)),
+            ("self_attn_q_proj".to_string(), at(31))
         );
-        // Non-layered: no trailing _<digits>.
+        // An accessor of no unrolled layer is its whole name, digits and all.
         assert_eq!(
-            split_base_layer("embed_tokens"),
+            base_layer("embed_tokens", None),
             ("embed_tokens".to_string(), None)
         );
-        assert_eq!(split_base_layer("lm_head"), ("lm_head".to_string(), None));
-        // Trailing-non-digit suffix isn't a layer — the whole name
-        // stays as the base.
         assert_eq!(
-            split_base_layer("rotary_local"),
-            ("rotary_local".to_string(), None)
+            base_layer("merger_mlp_0", None),
+            ("merger_mlp_0".to_string(), None)
         );
-        // Empty trailing chunk after `_` is not a layer either.
         assert_eq!(
-            split_base_layer("trailing_"),
-            ("trailing_".to_string(), None)
+            base_layer("merger_mlp_2", None),
+            ("merger_mlp_2".to_string(), None)
+        );
+        assert_eq!(
+            base_layer("rotary_local", None),
+            ("rotary_local".to_string(), None)
         );
     }
 
@@ -17357,7 +17343,7 @@ mod tests {
                 name: format_ident!("input_layernorm_{}", n),
                 rust_type: ty.clone(),
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(n)))],
             })
             .collect::<Vec<_>>();
         let ts = emit_weights_accessor_methods(&accessors, &ModelDims::default()).to_string();
@@ -17424,7 +17410,7 @@ mod tests {
                 name: format_ident!("norm_0"),
                 rust_type: ty.clone(),
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(0)))],
             },
         ];
         let _ = emit_weights_accessor_methods(&accessors, &ModelDims::default());
@@ -17440,13 +17426,13 @@ mod tests {
                 name: format_ident!("input_layernorm_0"),
                 rust_type: quote! { crate::__gpu::layers::RmsNorm },
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(0)))],
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
                 rust_type: quote! { crate::__gpu::layers::LinearLayer },
                 kind: crate::weight_vocab::WeightKind::Linear,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(1)))],
             },
         ];
         let _ = emit_weights_accessor_methods(&accessors, &ModelDims::default());
@@ -17555,13 +17541,13 @@ mod tests {
                 name: format_ident!("input_layernorm_0"),
                 rust_type: quote! { crate::__gpu::layers::RmsNorm },
                 kind: crate::weight_vocab::WeightKind::RmsNorm,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(0)))],
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
                 rust_type: quote! { crate::__gpu::layers::LinearLayer },
                 kind: crate::weight_vocab::WeightKind::Linear,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(1)))],
             },
         ];
         let _ = group_accessors_by_base(&accs);
@@ -17613,13 +17599,13 @@ mod tests {
                 name: format_ident!("moe_1"),
                 rust_type: quote! { crate::__gpu::layers_moe::DeepSeekV2MoELayer },
                 kind: crate::weight_vocab::WeightKind::DeepSeekMoe,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(1)))],
             },
             WeightAccessor {
                 name: format_ident!("moe_2"),
                 rust_type: quote! { crate::__gpu::layers_moe::DeepSeekV2MoELayer },
                 kind: crate::weight_vocab::WeightKind::DeepSeekMoe,
-                source_weights: vec![],
+                source_weights: vec![(crate::classified::WeightId(0), Some(UnrollIndex(2)))],
             },
         ];
         // No typed dims: a DeepSeek MoE bundle is no handle kind, so its accessor returns the

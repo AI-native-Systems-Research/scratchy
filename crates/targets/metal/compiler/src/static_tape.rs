@@ -115,14 +115,14 @@ impl CommandPool {
     pub fn into_tokens(
         self,
         typed: &std::collections::HashSet<SourceIx>,
-    ) -> Result<(TokenStream, TableDoors), BakeDefect> {
+    ) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
             let tokens = quote! {
                 #[cfg(feature = "metal")]
                 static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] = &[];
             };
-            return Ok((tokens, TableDoors::default()));
+            return Ok(tokens);
         }
         let parts = self.table.finish();
         let gemms = TypedGemms::of(&parts, typed, &self.affine_reads)?;
@@ -270,10 +270,6 @@ impl CommandPool {
                 }
             }
         });
-        let doors = TableDoors {
-            untyped_affine_commands: gemms.untyped_affine,
-            dims_asserts: (gemms.gemm_dims.len() + gemms.affine.len()) as u32,
-        };
         let tokens = quote! {
             #[cfg(feature = "metal")]
             mod __tape_cmds {
@@ -299,7 +295,7 @@ impl CommandPool {
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
                 &__tape_cmds::KERNELS;
         };
-        Ok((tokens, doors))
+        Ok(tokens)
     }
 }
 
@@ -340,17 +336,6 @@ struct TypedGemms {
     bound: std::collections::BTreeSet<u32>,
     /// Each typed family an affine matmul reads, with the numbers the bake minted for it.
     affine: std::collections::BTreeMap<u32, AffineSlotRead>,
-    /// Its affine matmul commands whose weight is no typed slot's.
-    untyped_affine: u32,
-}
-
-/// The shape doors a model's command table leaves open (`scratchy_forward_compiler::ShapeDoors`).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TableDoors {
-    /// Affine matmul commands whose weight is no typed slot's.
-    pub untyped_affine_commands: u32,
-    /// The n/k (and dense GEMM dims) `agrees` asserts the table emits, one per typed slot read.
-    pub dims_asserts: u32,
 }
 
 /// A typed family's MLX-affine matmul reads: the one `(n, k, bits, group)` the bake minted for
@@ -412,7 +397,6 @@ impl TypedGemms {
             affine.insert(ix, read);
         }
         // Each affine matmul command over a typed family is baked at its slot's K and N.
-        let mut untyped_affine = 0;
         for c in &parts.commands {
             let PackedKind::Dispatch {
                 kernel,
@@ -455,7 +439,13 @@ impl TypedGemms {
                     read.int4 |= INT4_MATMUL_KERNELS.contains(&kernel);
                     read.nax |= NAX_MATMUL_KERNELS.contains(&kernel);
                 }
-                _ => untyped_affine += u32::from(AFFINE_MATMUL_KERNELS.contains(&kernel)),
+                _ if AFFINE_MATMUL_KERNELS.contains(&kernel) => {
+                    return Err(BakeDefect(format!(
+                        "{kernel:?} reads a weight no typed slot holds: every affine matmul's \
+                         weight is a typed handle's"
+                    )));
+                }
+                _ => {}
             }
         }
         Ok(Self {
@@ -464,7 +454,6 @@ impl TypedGemms {
             gemm_dims,
             bound,
             affine,
-            untyped_affine,
         })
     }
 

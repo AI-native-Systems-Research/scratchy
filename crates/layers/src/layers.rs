@@ -500,6 +500,18 @@ impl scratchy_tensors::typed::Extents<1> for RmsNorm {
     }
 }
 
+/// A LayerNorm's declared shape is its width: its weight's, which its bias (when it has one) is
+/// too — a bias of another width has no width (zero, which no declared shape is).
+impl scratchy_tensors::typed::Extents<1> for LayerNorm {
+    fn extents(&self) -> [usize; 1] {
+        let width = self.weight.numel();
+        match self.bias {
+            Some(bias) if bias.numel() != width => [0],
+            _ => [width],
+        }
+    }
+}
+
 impl From<Linear> for LinearLayer {
     fn from(l: Linear) -> Self {
         Self::Dense(l)

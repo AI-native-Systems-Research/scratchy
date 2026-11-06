@@ -82,7 +82,6 @@ mod typed_shapes_tests;
 // both. The target being a compile-time singleton is what makes ONE body viable: there is no
 // second target in the build to compromise for. Packing gate/up into a single `__fused__`
 // buffer is metal's kernel ABI, so it arrives as a bool argument rather than a second walk.
-mod shape_pins;
 mod weight_bindings;
 mod weight_vocab;
 
@@ -1089,7 +1088,7 @@ pub fn compile_carrier(
                 .map(|rows| rows.as_slice())
         };
 
-        let (codegen_items, model_affine_rows, shape_doors) = codegen::emit_model(
+        let (codegen_items, model_affine_rows) = codegen::emit_model(
             &sm.prog,
             sm.model,
             &sm.fuf,
@@ -1101,10 +1100,6 @@ pub fn compile_carrier(
             mode.emit_arch_dispatch,
             canonical_affine_rows,
         );
-        // Its open shape doors held to its pin: a model off its row fails its own build.
-        let ratchet = (shape_doors
-            .map(|doors| shape_pins::check(&format!("{arch_name}::{}", sm.mod_name), doors)))
-        .unwrap_or_default();
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);
         }
@@ -1143,7 +1138,6 @@ pub fn compile_carrier(
                 #stub_items
                 #codegen_items
                 #vision_glue
-                #ratchet
             }
         });
 
