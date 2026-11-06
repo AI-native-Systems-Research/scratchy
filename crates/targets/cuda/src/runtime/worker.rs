@@ -41,10 +41,10 @@ use crate::step::{
     ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
     AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16,
-    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight, gemv_splits,
+    GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS,
+    MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8, RmsNormBf16,
+    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16,
+    SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
