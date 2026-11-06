@@ -8,6 +8,7 @@
 #     scripts/bench_metal_matrix.sh --models full   # both, where each fits
 #     scripts/bench_metal_matrix.sh --models glm-4.5-air,gemma-4-26b-a4b-it   # any from MODELS_ALL
 #     scripts/bench_metal_matrix.sh --models all
+#     scripts/bench_metal_matrix.sh --full --accuracy-tasks all   # MuSiQue's whole dev set, any Mac
 #
 # A RUNNER, not a measurement tool: every number comes from a `scr bench`
 # subcommand, except BUILD TIME and BINARY SIZE per model. scratchy compiles one
@@ -309,16 +310,19 @@ WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
 # still runs it.
 (( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
 WORKLOADS_SCRATCHY="rag-spans"
-# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count.
-# Its timing is not compared. Drawn from all of MuSiQue's dev set, in its mix of 2-, 3- and 4-hop
-# questions (bench serve stratifies by hops), as every RAG cell's are, and 400 of them, so at about
-# 60% right the figure is within about 5 points (95%): 100 gave about 10, too wide to tell engines
-# apart. --accuracy-tasks N asks for N instead, 0 for none.
-ACCURACY_TASKS=0
-(( FULL )) && ACCURACY_TASKS=400
-# Its limit, at about 18 s a task and at least 2400 s: on the M3 Pro at 4 users, 400 took from
-# 1512 s (nemotron-3-nano-30b-a3b on scratchy) to 3192 s (gpt-oss-20b on oMLX), so the flat 2400 s
-# that held 100 would cut the slowest short. Still a limit, for a hung server.
+# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
+# drawn from all of MuSiQue's dev set in its mix of 2-, 3- and 4-hop questions (bench serve
+# stratifies by hops), as every RAG cell's are. Its timing is not compared. On a Mac of LARGE_GB
+# or more, the whole dev set: every one of its 2,417 questions, about 2.5 to 3 hours an engine a
+# model. On a smaller Mac, 400 of them, about 25 to 40 minutes, within about 5 points either way
+# at 60% right. --accuracy-tasks N asks for N instead, 0 for none; all asks for the whole set.
+# Set once the Mac's memory is read (below).
+ACCURACY_TASKS=""
+ACCURACY_ALL=2417
+ACCURACY_SMALL=400
+# Its limit: 18 s a task, at least 2400 s, so a slow model is not cut off (gpt-oss-20b took about
+# 6 s a task at 4 users on the M3 Pro, its answers reasoning to their cap). Still a limit, for a
+# hung server. --accuracy-timeout-s S sets it.
 ACCURACY_TIMEOUT_S=0
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
@@ -401,6 +405,7 @@ while [[ $# -gt 0 ]]; do
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
         --accuracy-tasks)    ACCURACY_TASKS="$2"; shift 2 ;;
+        --accuracy-timeout-s) ACCURACY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
@@ -441,10 +446,21 @@ while [[ $# -gt 0 ]]; do
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
-[[ "${ACCURACY_TASKS}" =~ ^[0-9]+$ ]] || { echo "--accuracy-tasks takes a count, not ${ACCURACY_TASKS}" >&2; exit 2; }
-(( ACCURACY_TIMEOUT_S )) || ACCURACY_TIMEOUT_S=$(( ACCURACY_TASKS * 18 > 2400 ? ACCURACY_TASKS * 18 : 2400 ))
 # Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+# The accuracy cell's size: as asked, else on --full the whole dev set on a large Mac and 400
+# on a smaller one, else none.
+if [[ "${ACCURACY_TASKS}" == all ]]; then
+    ACCURACY_TASKS="${ACCURACY_ALL}"
+elif [[ -z "${ACCURACY_TASKS}" ]]; then
+    ACCURACY_TASKS=0
+    if (( FULL )); then
+        if (( MEM_GB >= LARGE_GB )); then ACCURACY_TASKS="${ACCURACY_ALL}"; else ACCURACY_TASKS="${ACCURACY_SMALL}"; fi
+    fi
+fi
+[[ "${ACCURACY_TASKS}" =~ ^[0-9]+$ ]] || { echo "--accuracy-tasks takes a count or all, not ${ACCURACY_TASKS}" >&2; exit 2; }
+[[ "${ACCURACY_TIMEOUT_S}" =~ ^[0-9]+$ ]] || { echo "--accuracy-timeout-s takes seconds, not ${ACCURACY_TIMEOUT_S}" >&2; exit 2; }
+(( ACCURACY_TIMEOUT_S )) || ACCURACY_TIMEOUT_S=$(( ACCURACY_TASKS * 18 > 2400 ? ACCURACY_TASKS * 18 : 2400 ))
 MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
 if [[ -z "${SCALE_GRID_INPUT}" ]]; then
     if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="${SCALE_GRID_INPUT_LARGE}"; else SCALE_GRID_INPUT="${SCALE_GRID_INPUT_SMALL}"; fi
@@ -2009,7 +2025,7 @@ def scaling(engine):
     return cells or None
 # What a dataset cell keeps: the serving metrics, then what a task measures.
 TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "request_rate", "timed_answers",
-                    "start_times", "ttfts_ms", "e2els_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
+                    "start_times", "ttfts_ms", "e2els_ms", "prompt_tokens", "tpots_ms", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
                     "accuracy", "empty_answers", "thinking_answers", "capped_answers",
                     # Task by task, where the dataset names its tasks: so engines can be compared
                     # on the same tasks, and accuracy read by MuSiQue's hops.
