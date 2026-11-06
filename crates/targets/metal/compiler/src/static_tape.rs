@@ -20,9 +20,14 @@ use scratchy_target_metal::tape::ids::{
     TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
-    CommandTableBuilder, CommandTableParts, GatedCommand, GenClass, KernelId, KvAddressing,
-    LoweredMetalTape, LoweringError, MetalDtype, PackedKind, TapeCommands,
+    Activation, Binding, CommandTableBuilder, CommandTableParts, GatedCommand, Gemm, GenClass,
+    KernelId, KvAddressing, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
+    PackedKind, TapeCommand, TapeCommands, baked, baked_commands,
 };
+use std::collections::{BTreeMap, HashMap};
+
+use crate::canonical::StepOperands;
+use crate::steps_from_tape::ArenaValue;
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
 ///
@@ -57,6 +62,142 @@ pub struct CommandPool {
     /// Each weight family an MLX-affine matmul of any bucket reads, with every
     /// `(n, k, bits, group)` the bake minted for it.
     affine_reads: AffineReads,
+    operands: ArenaOperands,
+}
+
+/// ⭐ A MODEL'S ARENA OPERANDS, EACH TYPED ONCE: every `(slot, extents)` its commands bind an arena
+/// buffer as — the slot, and the extents the rows a command was lowered from hold there —
+/// model-wide, with the bucket arenas that bind it. A command's binding names its operand
+/// (`__tape_cmds::O<n>`), whose value is the slot of a colour hosting its extents
+/// ([`slot`](scratchy_target_metal::tape::typed::slot)) and which requires every bucket arena
+/// binding it to host them too ([`hosts`](scratchy_target_metal::tape::typed::hosts)). Keyed on
+/// the extents' spelling, not on the bucket, so the buckets' commands share a binding list
+/// wherever their colourings agree.
+#[derive(Default)]
+struct ArenaOperands {
+    ids: HashMap<(u32, Vec<String>), u32>,
+    list: Vec<ArenaOperand>,
+}
+
+struct ArenaOperand {
+    /// Each extent, by its spelling, with a value holding it.
+    extents: BTreeMap<String, ArenaValue>,
+    /// The colour types binding it — each band's colour of its slot — with the rows of the first
+    /// band seen binding it through that colour.
+    colours: BTreeMap<String, BucketRows>,
+}
+
+/// A bucket's rows, the types an extent is spelled at: a colour type's parameters, `M` for
+/// `num_tokens` and `S` for `sk_bucket` (`arena_colours!`), or one bucket's numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketRows {
+    Generic,
+    At { m: u32, sk: u32 },
+}
+
+impl BucketRows {
+    /// `num_tokens`' type and `sk_bucket`'s: a bucket's numbers as [`typenum`] types
+    /// (`scratchy_tensors::typed::unsigned_alias_path`).
+    ///
+    /// [`typenum`]: scratchy_tensors::typed::typenum
+    pub fn types(self) -> Result<(TokenStream, TokenStream), String> {
+        let number = |n: u32| {
+            let path = scratchy_tensors::typed::unsigned_alias_path(u64::from(n));
+            path.parse::<TokenStream>()
+                .map_err(|e| format!("`{path}`: {e}"))
+        };
+        match self {
+            Self::Generic => Ok((quote!(M), quote!(S))),
+            Self::At { m, sk } => Ok((number(m)?, number(sk)?)),
+        }
+    }
+}
+
+/// A band's arena: each slot's colour type (`__arena::K<n>`), and the bucket's rows.
+pub struct BandArena {
+    pub colours: Vec<String>,
+    pub rows: BucketRows,
+}
+
+/// Operand `n`'s const, `O<n>` ([`ArenaOperands`]): what a binding list's arena binding names.
+fn operand(n: u32) -> proc_macro2::Ident {
+    quote::format_ident!("O{n}")
+}
+
+/// A GEMM operand, its arena buffer named by its operand.
+fn operand_activation(a: Activation) -> Result<TokenStream, BakeDefect> {
+    match a {
+        Activation::Arena { slot } => {
+            let o = operand(slot);
+            Ok(quote!(__tl::Activation::Arena { slot: #o }))
+        }
+        other => crate::const_tokens::const_tokens(&other)
+            .map_err(|e| BakeDefect(format!("serialize command table: {e}"))),
+    }
+}
+
+impl ArenaOperands {
+    /// Each operand's const: the slot of the first colour type binding it, as one hosting its first
+    /// extent, under the requirement that each colour type binding it hosts each of its extents —
+    /// each at the rows of a bucket binding it through that colour.
+    fn tokens(&self, extent: &ExtentOf<'_>) -> Result<TokenStream, BakeDefect> {
+        if self.list.is_empty() {
+            return Ok(TokenStream::new());
+        }
+        let consts = (self.list.iter().enumerate())
+            .map(|(n, op)| {
+                let mut uses = (op.colours.iter())
+                    .flat_map(|(colour, rows)| op.extents.values().map(move |&v| (colour, rows, v)))
+                    .map(|(colour, rows, v)| {
+                        let colour = quote::format_ident!("{colour}");
+                        let e = extent(v, *rows).map_err(BakeDefect)?;
+                        let (m, sk) = rows.types().map_err(BakeDefect)?;
+                        Ok((quote!(__a::#colour<#m, #sk>), e))
+                    });
+                let (c, e) = uses.next().ok_or_else(|| {
+                    BakeDefect(format!("arena operand {n} is bound by no bucket arena"))
+                })??;
+                let hosts = uses
+                    .map(|u| u.map(|(c, e)| quote!(hosts::<#c, #e>();)))
+                    .collect::<Result<Vec<_>, BakeDefect>>()?;
+                let name = operand(n as u32);
+                Ok(quote! {
+                    const #name: u32 = { #(#hosts)* slot::<#c, #e>() };
+                })
+            })
+            .collect::<Result<Vec<_>, BakeDefect>>()?;
+        Ok(quote! {
+            use super::__arena as __a;
+            use super::__dims;
+            use ::scratchy_target_metal::tape::typed::{hosts, slot};
+            use ::scratchy_tensors::typed::Act;
+            #(#consts)*
+        })
+    }
+
+    /// The operand `slot` holding `extents` is, bound in `band`'s arena.
+    fn id(
+        &mut self,
+        slot: u32,
+        extents: BTreeMap<String, ArenaValue>,
+        band: &BandArena,
+    ) -> Result<u32, BakeDefect> {
+        let colour = (band.colours.get(slot as usize))
+            .ok_or_else(|| BakeDefect(format!("arena slot {slot} is past the band's colours")))?;
+        let key = (slot, extents.keys().cloned().collect());
+        let list = &mut self.list;
+        let id = *self.ids.entry(key).or_insert_with(|| {
+            list.push(ArenaOperand {
+                extents,
+                colours: BTreeMap::new(),
+            });
+            (list.len() - 1) as u32
+        });
+        (self.list[id as usize].colours)
+            .entry(colour.to_string())
+            .or_insert(band.rows);
+        Ok(id)
+    }
 }
 
 /// Each weight family's MLX-affine matmul reads: the `(n, k, bits, group)` the bake minted for
@@ -112,9 +253,13 @@ impl CommandPool {
     /// weight family of `typed` (the families the model's resolver declared a source slot for)
     /// takes its dims from its slot's type, and each binding of a typed family's weight its
     /// index ([`TypedGemms`]).
+    ///
+    /// Each arena operand its commands bind is a const of the module, `O<n>` ([`ArenaOperands`]),
+    /// its extents spelled by `extent`: the binding lists and GEMM operands name it.
     pub fn into_tokens(
         self,
         typed: &std::collections::HashSet<SourceIx>,
+        extent: &ExtentOf<'_>,
     ) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
@@ -190,6 +335,7 @@ impl CommandPool {
             })
             .collect();
         let markers = gemms.markers();
+        let operands = self.operands.tokens(extent)?;
         let statics = [
             array("COMMANDS", commands, quote!(__tl::PackedCommand)),
             array("SYMBOLS", symbols, quote!((&str, &str))),
@@ -208,7 +354,13 @@ impl CommandPool {
             array("GEMM_ENTRIES", gemm_entries, quote!(__tl::GemmEntry)),
             array(
                 "GEMM_OPERANDS",
-                each(&parts.gemm_operands)?,
+                (parts.gemm_operands.iter())
+                    .map(|g| {
+                        let (out, input) =
+                            (operand_activation(g.out)?, operand_activation(g.input)?);
+                        Ok(quote!(__tl::GemmOperands { out: #out, input: #input }))
+                    })
+                    .collect::<Result<Vec<_>, BakeDefect>>()?,
                 quote!(__tl::GemmOperands),
             ),
             array(
@@ -275,6 +427,7 @@ impl CommandPool {
             mod __tape_cmds {
                 #aliases
                 #markers
+                #operands
                 #gemm_helpers
                 #command_helper
                 #(#statics)*
@@ -521,6 +674,14 @@ impl TypedGemms {
                         binding_index: #bi,
                     }))
                 }
+                Binding::ArenaSlot {
+                    slot,
+                    binding_index,
+                } => {
+                    let o = operand(*slot);
+                    let bi = proc_macro2::Literal::u8_suffixed(*binding_index);
+                    Ok(quote!(__tl::Binding::ArenaSlot { slot: #o, binding_index: #bi }))
+                }
                 other => tokens(other),
             })
             .collect::<Result<Vec<_>, BakeDefect>>()?;
@@ -725,7 +886,13 @@ impl std::fmt::Display for BakeDefect {
 pub struct WideBand<'a> {
     pub steps: &'a MetalStepTape,
     pub num_arena_slots: u32,
+    /// Its rows' arena operands, and its arena.
+    pub operands: &'a StepOperands,
+    pub arena: &'a BandArena,
 }
+
+/// An arena value's extent, spelled as a type at a bucket's rows: what a colour hosting it hosts.
+pub type ExtentOf<'a> = dyn Fn(ArenaValue, BucketRows) -> Result<TokenStream, String> + Sync + 'a;
 
 /// One bucket's lowering input: its step tape and the model's KV cap ladder.
 pub struct BucketLowerInput<'a> {
@@ -740,6 +907,11 @@ pub struct BucketLowerInput<'a> {
     pub rotary: Option<RotaryTables>,
     /// The KV cap rungs the bucket bakes ([`kv_cap_ladder`]).
     pub cap_ladder: &'a [MaxBlocksPerSeq],
+    /// `steps`' rows' arena operands, and its arena.
+    pub operands: &'a StepOperands,
+    pub arena: &'a BandArena,
+    /// Each arena value's extent ([`ExtentOf`]).
+    pub extent: &'a ExtentOf<'a>,
 }
 
 /// ⭐ THE KV CAP LADDER: the block-table capacities (blocks per sequence) a model's tapes bake,
@@ -812,7 +984,7 @@ fn run_lower(
     mc: &ModelFacts,
     input: &BucketLowerInput<'_>,
     rung: &Rung<'_>,
-) -> Result<LoweredMetalTape, LoweringError> {
+) -> Result<(LoweredMetalTape, Vec<tl::CommandRows>), LoweringError> {
     let at = tl::BakePoint {
         chunked: rung.addressing == KvAddressing::Chunked,
         bucket_m: input.bucket_m,
@@ -822,7 +994,80 @@ fn run_lower(
         profile: Some(rung.profile),
         class: rung.class,
     };
-    tl::lower_subtile_tape_to_metal(rung.steps, mc, at)
+    tl::lower_with_rows(rung.steps, mc, at)
+}
+
+/// `tape` with each arena operand of its commands named by its model-wide operand
+/// ([`ArenaOperands`]): the slot it binds, held as the extents the rows the command was lowered
+/// from (`rows`) hold there, in `band`'s colouring. A command binding a slot none of its rows
+/// names refuses the bake.
+fn name_operands(
+    tape: &LoweredMetalTape,
+    rows: &[tl::CommandRows],
+    band: (&StepOperands, &BandArena),
+    extent: &ExtentOf<'_>,
+    operands: &mut ArenaOperands,
+) -> Result<LoweredMetalTape, BakeDefect> {
+    let (step_operands, arena) = band;
+    let commands = (tape.commands.iter().zip(rows).enumerate())
+        .map(|(c, (cmd, rows))| {
+            let mut named = |slot: u32| -> Result<u32, BakeDefect> {
+                let held = (rows.rows.iter())
+                    .flat_map(|&r| step_operands.row(rows.half, r))
+                    .filter(|o| o.slot.get() == slot)
+                    .map(|o| {
+                        let spelled = extent(o.value, BucketRows::Generic).map_err(BakeDefect)?;
+                        Ok((spelled.to_string(), o.value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, BakeDefect>>()?;
+                if held.is_empty() {
+                    return Err(BakeDefect(format!(
+                        "command {c} ({:?}) binds arena slot {slot}, which no row it was lowered \
+                         from names",
+                        cmd.command.kernel()
+                    )));
+                }
+                operands.id(slot, held, arena)
+            };
+            let mut activation = |a: Activation| match a {
+                Activation::Arena { slot } => Ok(Activation::Arena { slot: named(slot)? }),
+                other => Ok(other),
+            };
+            let command = match cmd.command {
+                TapeCommand::Gemm(g) => TapeCommand::Gemm(Gemm {
+                    out: activation(g.out)?,
+                    input: activation(g.input)?,
+                    ..g
+                }),
+                TapeCommand::Dispatch(d) => {
+                    let bindings = (d.bindings.iter())
+                        .map(|b| match *b {
+                            Binding::ArenaSlot {
+                                slot,
+                                binding_index,
+                            } => Ok(Binding::ArenaSlot {
+                                slot: named(slot)?,
+                                binding_index,
+                            }),
+                            other => Ok(other),
+                        })
+                        .collect::<Result<Vec<_>, BakeDefect>>()?;
+                    TapeCommand::Dispatch(LoweredCommand {
+                        bindings: baked(bindings),
+                        ..d
+                    })
+                }
+            };
+            Ok(GatedCommand { command, ..cmd })
+        })
+        .collect::<Result<Vec<_>, BakeDefect>>()?;
+    let commands = baked_commands(commands).map_err(|e| {
+        BakeDefect(format!(
+            "more than {} distinct commands: a command index cannot address them",
+            e.distinct - 1
+        ))
+    })?;
+    Ok(LoweredMetalTape { commands, ..*tape })
 }
 
 /// Bake every `(gen class × KV addressing × KV cap × TurboQuant decode heads)` variant of one
@@ -905,7 +1150,7 @@ pub fn bake_bucket_tapes(
         if ended == Some((class, addressing)) {
             continue;
         }
-        let Some(tape) = tapes.map_err(defect)? else {
+        let Some((tape, rows)) = tapes.map_err(defect)? else {
             eprintln!(
                 "[metal bake] bucket_m={}: ladder ends below KV cap rung {}",
                 input.bucket_m,
@@ -914,12 +1159,19 @@ pub fn bake_bucket_tapes(
             ended = Some((class, addressing));
             continue;
         };
+        // Its commands as the table holds them: each arena operand named by its typed operand,
+        // under the colouring of the band the rung lowered under.
+        let band = match (class, input.wide_band.as_ref()) {
+            (GenClass::M5Wide, Some(wide)) => (wide.operands, wide.arena),
+            _ => (input.operands, input.arena),
+        };
+        let named = name_operands(&tape, &rows, band, input.extent, &mut pool.operands)?;
         // The cap-sized scratch is the variant's; the rest of the tape is the body.
         let (roped_k, attn_unfused) = (tape.roped_k_scratch_bytes, tape.attn_unfused_scratch_bytes);
         let body = LoweredMetalTape {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
-            ..tape
+            ..named
         };
         let body_ix = match seen.get(&body).copied() {
             Some(ix) => ix,

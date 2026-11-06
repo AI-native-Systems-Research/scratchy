@@ -442,3 +442,108 @@ pub const fn int4_codes<S: AffineSlot<Bits: Int4>>() {}
 
 /// Slot `S` is read by a matrix-unit kernel: its group must be one they take (E0277 where not).
 pub const fn nax_group<S: AffineSlot<Group: NaxGroup>>() {}
+pub use scratchy_tensors::typed::{Act, Extent, Hosts};
+
+/// An arena colour: its slot, and the bytes its buffer holds, the largest of the extents it hosts.
+pub trait Colour {
+    const SLOT: u32;
+    const BYTES: u64;
+}
+
+/// Colour `C`'s slot, as a binding of extent `A` names it: only a colour hosting `A` has one for
+/// it. A binding's slot is this call's, so it binds a colour the colouring put its extent in.
+pub const fn slot<C: Colour + Hosts<A>, A: Extent>() -> u32 {
+    C::SLOT
+}
+
+/// That colour `C` hosts extent `A`: a binding naming `C`'s slot as `A` in another bucket than the
+/// one its [`slot`] is read from.
+pub const fn hosts<C: Hosts<A>, A: Extent>() {}
+
+/// The bytes of a colour hosting extents of `elems` elements: the largest, at metal's two bytes
+/// an element (its kernels are f16), and one byte for a colour that hosts none.
+pub const fn colour_bytes(elems: &[u64]) -> u64 {
+    let mut bytes = 1;
+    let mut i = 0;
+    while i < elems.len() {
+        let b = elems[i].saturating_mul(2);
+        if b > bytes {
+            bytes = b;
+        }
+        i += 1;
+    }
+    bytes
+}
+
+/// A bucket's arena: each slot's bytes, its colour's ([`Colour::BYTES`]), at the bucket's rows.
+pub trait Arena {
+    const BYTES: &'static [u64];
+}
+
+/// ⭐ A MODEL'S ARENA COLOURS, EACH FROM ONE LIST, GENERIC OVER A BUCKET'S ROWS:
+/// `<M, S> K3 = 3 [Act<M, D>, …] [Act<M, V>, …]` declares colour `K3<M, S>` — slot 3 of any
+/// bucket whose rows are `M` (its `sk_bucket` `S`) that the colouring gave these extents — hosting
+/// each extent of its two lists (`Hosts`). Its [`Colour::BYTES`] is the largest of the first
+/// list at the bucket's rows. The second holds what the colour hosts that its bytes do not count:
+/// what another of the bucket's sizes covers (its logits rows). The colouring's assignment is the
+/// lists, so the bytes are the extents', not a number beside them, and a binding's slot ([`slot`])
+/// is a colour that hosts its extent. Each impl holds where its extents are extents at the rows
+/// (`where Act<M, …>: Extent`), so a bucket's rows a dim's law refuses refuse its colours too.
+///
+/// ```
+/// # use scratchy_target_metal::tape::typed::{Act, Arena, slot};
+/// # use scratchy_tensors::typed::typenum::{U0, U8, U2048, U4096, U8192};
+/// scratchy_target_metal::arena_colours! { <M, S>
+///     K0 = 0 [Act<M, U2048>, Act<M, U8192>] [Act<M, U4096>]
+///     K1 = 1 [] []
+/// }
+/// scratchy_target_metal::arena_schemas! { <M, S> S0 [K0, K1] }
+/// assert_eq!(<S0<U8, U0> as Arena>::BYTES, &[8 * 8192 * 2, 1]);
+/// assert_eq!(slot::<K0<U8, U0>, Act<U8, U4096>>(), 0);
+/// ```
+///
+/// A colour hosts only the extents of its lists, at its own rows:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::typed::{Act, slot};
+/// # use scratchy_tensors::typed::typenum::{U0, U8, U2048, U8192};
+/// scratchy_target_metal::arena_colours! { <M, S> K0 = 0 [Act<M, U2048>] [] }
+/// let _ = slot::<K0<U8, U0>, Act<U8, U8192>>();
+/// ```
+#[macro_export]
+macro_rules! arena_colours {
+    (<$m:ident, $s:ident>
+     $($colour:ident = $slot:literal [$($sized:ty),* $(,)?] [$($hosted:ty),* $(,)?])*) => {$(
+        pub struct $colour<$m, $s>(::core::marker::PhantomData<fn() -> ($m, $s)>);
+        $(impl<$m, $s> $crate::tape::typed::Hosts<$sized> for $colour<$m, $s>
+            where $sized: $crate::tape::typed::Extent {})*
+        $(impl<$m, $s> $crate::tape::typed::Hosts<$hosted> for $colour<$m, $s>
+            where $hosted: $crate::tape::typed::Extent {})*
+        impl<$m, $s> $crate::tape::typed::Colour for $colour<$m, $s>
+        where
+            $($sized: $crate::tape::typed::Extent,)*
+        {
+            const SLOT: u32 = $slot;
+            const BYTES: u64 = $crate::tape::typed::colour_bytes(&[
+                $(<$sized as $crate::tape::typed::Extent>::ELEMS),*
+            ]);
+        }
+    )*};
+}
+
+/// A model's bucket arenas, each a colouring: `<M, S> S0 [K0, K1, …]` declares arena `S0<M, S>`,
+/// slot `k` its `k`th colour, its [`Arena::BYTES`] theirs at the bucket's rows `M`. A bucket is
+/// its arena at its rows: `S0<U8, U128>`.
+#[macro_export]
+macro_rules! arena_schemas {
+    (<$m:ident, $s:ident> $($arena:ident [$($colour:ident),* $(,)?])*) => {$(
+        pub struct $arena<$m, $s>(::core::marker::PhantomData<fn() -> ($m, $s)>);
+        impl<$m, $s> $crate::tape::typed::Arena for $arena<$m, $s>
+        where
+            $($colour<$m, $s>: $crate::tape::typed::Colour,)*
+        {
+            const BYTES: &'static [u64] =
+                &[$(<$colour<$m, $s> as $crate::tape::typed::Colour>::BYTES),*];
+        }
+    )*};
+}

@@ -277,6 +277,14 @@ pub enum SourceBinding {
     },
 }
 
+/// What an arena slot holds at a step: a FUF tile's output (`(tile, output)`, the key
+/// [`SlotMap`] colours), or a graph source (the embedded hidden, which a target's colour 0 is).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ArenaValue {
+    Tile { tile: u32, out: u8 },
+    Source(u32),
+}
+
 #[derive(Debug, Clone)]
 pub struct LoweredDecode {
     pub input: LoweringInput,

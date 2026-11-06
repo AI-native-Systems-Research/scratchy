@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+pub use scratchy_subtile::handoff::ArenaValue;
 use scratchy_subtile::handoff::{
     ExpansionId, LoweredDecode, SlotMap, SourceBinding, TileId, WeightKind, WeightSlot,
 };
@@ -372,6 +373,8 @@ struct Emission {
     raw: Option<MetalStep>,
     sig: HazardSig,
     sites: Vec<WeightSlot>,
+    /// The arena operands its step names: what each slot its commands bind holds.
+    operands: Vec<RowOperand>,
     lm_head: bool,
 }
 
@@ -416,6 +419,7 @@ fn roped_attention(rope: Emission, attention: Emission) -> Emission {
         raw: None,
         sig,
         sites: [rope.sites, attention.sites].concat(),
+        operands: [rope.operands, attention.operands].concat(),
         lm_head: false,
     }
 }
@@ -432,6 +436,7 @@ fn em(step: MetalStep, reads: &[Slot], writes: &[Slot], sites: Vec<WeightSlot>) 
         raw: None,
         sig,
         sites,
+        operands: Vec::new(),
         lm_head: false,
     }
 }
@@ -455,9 +460,26 @@ pub struct Recording<'a> {
     pub intermediate: Option<Inter>,
     /// The canonical's rows: its codec guards' realization.
     pub bucket_m: u32,
+    /// The arena operands the op being recorded has named so far: each slot its step reads or
+    /// writes, and the value the colouring holds there. Drained into the op's row.
+    pub named: std::cell::RefCell<Vec<RowOperand>>,
+}
+
+/// An arena operand of a step row: the slot its command binds, and the value held there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RowOperand {
+    pub slot: Slot,
+    pub value: ArenaValue,
 }
 
 impl Recording<'_> {
+    /// `slot`, noted as the op being recorded naming tile `tile`'s output `out` there.
+    fn named(&self, slot: Slot, tile: u32, out: u8) -> Slot {
+        let value = ArenaValue::Tile { tile, out };
+        self.named.borrow_mut().push(RowOperand { slot, value });
+        slot
+    }
+
     pub fn records(&self) -> Result<StepRecords, StepRefusal> {
         self.alias_invariant()?;
         // A construct fences as one, on its first row: some row of it must always run — one never
@@ -480,8 +502,14 @@ impl Recording<'_> {
             return Err(canonical_refusal(Refused::GroupNeverRuns(*g)));
         }
         let (head, skip) = self.head()?;
+        // Each op's row holds the arena operands its recording named.
         let per_op = (0..self.l.input.ops.len())
-            .map(|i| self.record(i, skip))
+            .map(|i| {
+                self.named.borrow_mut().clear();
+                let e = self.record(i, skip)?;
+                let operands = std::mem::take(&mut *self.named.borrow_mut());
+                Ok(e.map(|e| Emission { operands, ..e }))
+            })
             .collect::<Result<_, _>>()?;
         Ok(StepRecords { head, per_op })
     }
@@ -532,18 +560,29 @@ impl Recording<'_> {
     }
 
     fn colour(&self, i: usize) -> Result<Slot, StepRefusal> {
-        self.colours.of(self.l, i).map_err(|w| self.no(i, w))
+        let slot = self.colours.of(self.l, i).map_err(|w| self.no(i, w))?;
+        Ok(match self.l.op_tiles[i] {
+            Some((tile, out)) => self.named(slot, tile, out),
+            None => slot,
+        })
     }
 
     fn second(&self, i: usize) -> Result<Slot, StepRefusal> {
-        self.colours.second(self.l, i).map_err(|w| self.no(i, w))
+        let slot = self.colours.second(self.l, i).map_err(|w| self.no(i, w))?;
+        Ok(match self.l.op_tiles[i] {
+            Some((tile, _)) => self.named(slot, tile, 1),
+            None => slot,
+        })
     }
 
     /// Where `i`'s gain `(w + offset)` add lives, when its gain routes through one.
     fn gain_add(&self, i: usize) -> Result<Option<Slot>, StepRefusal> {
         let tile = self.l.norm_gain_add_tiles.get(&i);
-        tile.map(|t| self.colours.at(*t, 0).map_err(|w| self.no(i, w)))
-            .transpose()
+        tile.map(|&t| {
+            let slot = self.colours.at(t, 0).map_err(|w| self.no(i, w))?;
+            Ok(self.named(slot, t, 0))
+        })
+        .transpose()
     }
 
     /// The buffer activation operand `k` of `i` reads: its producer's colour, or colour 0 for
@@ -557,9 +596,19 @@ impl Recording<'_> {
 
     fn embedded(&self, i: usize, k: u8, e: usize) -> Result<Slot, StepRefusal> {
         match self.l.bindings[e] {
-            SourceBinding::EmbeddedHidden => Ok(Slot(0)),
+            SourceBinding::EmbeddedHidden => Ok(self.embedded_hidden(e)),
             _ => Err(self.no(i, Refused::ForeignActivation(k))),
         }
+    }
+
+    /// Colour 0, noted as holding source `e`, the embedded hidden.
+    fn embedded_hidden(&self, e: usize) -> Slot {
+        let value = ArenaValue::Source(e as u32);
+        self.named.borrow_mut().push(RowOperand {
+            slot: Slot(0),
+            value,
+        });
+        Slot(0)
     }
 
     /// The operand a fold names, read as an activation.
@@ -1045,7 +1094,13 @@ impl Recording<'_> {
         let Some(e) = self.l.bindings.iter().position(|b| *b == embedded) else {
             return Ok((Vec::new(), None));
         };
-        let zero = Slot(0);
+        // Each head row's arena operands, as it names them.
+        let row = |e: Emission| Emission {
+            operands: std::mem::take(&mut *self.named.borrow_mut()),
+            ..e
+        };
+        self.named.borrow_mut().clear();
+        let zero = self.embedded_hidden(e);
         let base = self.facts.embed_base.to_string();
         // The embedding table's rows: a drafter reading its target's table writes its target's.
         let width = st::ActivationWidth::of_cols(self.l.input.sources[e].cols);
@@ -1056,7 +1111,12 @@ impl Recording<'_> {
             ),
             None => (MetalStep::Embed(zero, width), WeightKind::Embedding),
         };
-        let mut rows = vec![em(embed, &[], &[zero], vec![WeightSlot { kind, base }])];
+        let mut rows = vec![row(em(
+            embed,
+            &[],
+            &[zero],
+            vec![WeightSlot { kind, base }],
+        ))];
         let mut skip = None;
         if let Some(i0) = ops.clone().find(|i| !norm(*i))
             && let SubOp::ScalarMul { scale } = *self.op(i0)
@@ -1065,17 +1125,18 @@ impl Recording<'_> {
             skip = Some(i0);
             // An identity multiply emits nothing.
             if scale != 1.0 {
-                let out = self.colour(i0)?;
+                let (zero, out) = (self.embedded_hidden(e), self.colour(i0)?);
                 let step = MetalStep::ScalarMul(zero, out, st::Scale(scale), self.width(i0));
-                rows.push(em(step, &[zero], &[out], Vec::new()));
+                rows.push(row(em(step, &[zero], &[out], Vec::new())));
             }
         }
-        rows.push(em(
+        let zero = self.embedded_hidden(e);
+        rows.push(row(em(
             MetalStep::SpliceMmEmbeds(zero),
             &[zero],
             &[zero],
             Vec::new(),
-        ));
+        )));
         Ok((rows, skip))
     }
 
@@ -2546,9 +2607,12 @@ pub struct Assembled {
     pub rows: Vec<StepRow>,
     sigs: Vec<HazardSig>,
     pub sites: Vec<Vec<WeightSlot>>,
+    /// Per row, the arena operands its step names (a loop marker: none).
+    pub operands: Vec<Vec<RowOperand>>,
     pub lm_rows: Vec<StepRow>,
     lm_sigs: Vec<HazardSig>,
     pub lm_sites: Vec<Vec<WeightSlot>>,
+    pub lm_operands: Vec<Vec<RowOperand>>,
 }
 
 impl Assembled {
@@ -2582,9 +2646,11 @@ pub fn assemble(
         rows: Vec::new(),
         sigs: Vec::new(),
         sites: Vec::new(),
+        operands: Vec::new(),
         lm_rows: Vec::new(),
         lm_sigs: Vec::new(),
         lm_sites: Vec::new(),
+        lm_operands: Vec::new(),
     };
     let row = |e: &Emission| match (moe, &e.raw) {
         (MoeBits::Raw, Some(raw)) => StepRow::Step(raw.clone(), e.gate),
@@ -2594,6 +2660,7 @@ pub fn assemble(
         out.rows.push(row(e));
         out.sigs.push(e.sig.clone());
         out.sites.push(e.sites.clone());
+        out.operands.push(e.operands.clone());
     }
     // ⛔ A STACK, NOT AN `Option`: gemma-4 nests a loop over its five sliding layers inside the
     // loop over its six-layer cell.
@@ -2621,19 +2688,31 @@ pub fn assemble(
                     };
                     out.sigs.insert(at, metadata);
                     out.sites.insert(at, Vec::new());
+                    out.operands.insert(at, Vec::new());
                 }
             }
             TapeItem::Step(s) => {
                 let Some(e) = &records.per_op[s.source_op.0] else {
                     continue;
                 };
-                let (rows, sigs, sites) = match e.lm_head {
-                    true => (&mut out.lm_rows, &mut out.lm_sigs, &mut out.lm_sites),
-                    false => (&mut out.rows, &mut out.sigs, &mut out.sites),
+                let (rows, sigs, sites, operands) = match e.lm_head {
+                    true => (
+                        &mut out.lm_rows,
+                        &mut out.lm_sigs,
+                        &mut out.lm_sites,
+                        &mut out.lm_operands,
+                    ),
+                    false => (
+                        &mut out.rows,
+                        &mut out.sigs,
+                        &mut out.sites,
+                        &mut out.operands,
+                    ),
                 };
                 rows.push(row(e));
                 sigs.push(e.sig.clone());
                 sites.push(e.sites.clone());
+                operands.push(e.operands.clone());
             }
         }
     }
