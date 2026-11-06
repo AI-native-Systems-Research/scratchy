@@ -17407,7 +17407,9 @@ mod tests {
                 source_weights: vec![],
             },
         ];
-        let ts = emit_weights_accessor_methods(&accs).to_string();
+        // No typed dims: a DeepSeek MoE bundle is no handle kind, so its accessor returns the
+        // bare layer.
+        let ts = emit_weights_accessor_methods(&accs, &ModelDims::default()).to_string();
         assert!(ts.contains("fn moe"));
         assert!(ts.contains("match layer"));
         // `Literal::u32_unsuffixed` emits the bare integer; the
