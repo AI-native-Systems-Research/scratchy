@@ -565,7 +565,10 @@ fn assemble_from_opspec<T: crate::collective::Tp>(
 /// silently address only the first trip. A future tiled target needs that machinery extended first,
 /// not this guard removed.
 #[allow(clippy::too_many_arguments)]
-fn assemble_from_opspec_with_epilogue<T: crate::collective::Tp, E: crate::sdsc_abstract::KindTag>(
+fn assemble_from_opspec_with_epilogue<
+    T: crate::collective::Tp,
+    E: crate::sdsc_abstract::KindTag,
+>(
     op_name: &str,
     mut op: crate::superdsc_opspec::OpSpec,
     epi: &Stk<E>,
@@ -604,7 +607,10 @@ fn assemble_from_opspec_with_epilogue<T: crate::collective::Tp, E: crate::sdsc_a
 /// precisely how a block that should fold gets emitted as one that seeds (which DISCARDS every page
 /// folded before it, silently and fluently), because the two lists drift independently.
 #[allow(clippy::too_many_arguments)]
-fn assemble_from_opspec_maybe_epilogue<T: crate::collective::Tp, E: crate::sdsc_abstract::KindTag>(
+fn assemble_from_opspec_maybe_epilogue<
+    T: crate::collective::Tp,
+    E: crate::sdsc_abstract::KindTag,
+>(
     op_name: &str,
     op: crate::superdsc_opspec::OpSpec,
     epi: Option<(&Stk<E>, crate::addr::DevOff)>,
@@ -633,7 +639,8 @@ fn assemble_from_opspec_maybe_epilogue<T: crate::collective::Tp, E: crate::sdsc_
 /// [`assemble_matmul_off`] with an OPTIONAL fused pointwise epilogue — see
 /// [`assemble_from_opspec_maybe_epilogue`] for why the epilogue is an `Option` and not two callers.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_maybe_epilogue<T: crate::collective::Tp, 
+pub fn assemble_matmul_off_maybe_epilogue<
+    T: crate::collective::Tp,
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -681,7 +688,8 @@ pub fn assemble_matmul_off_maybe_epilogue<T: crate::collective::Tp,
 /// [`assemble_matmul_off_phys_m`] with an OPTIONAL fused pointwise epilogue — see
 /// [`assemble_from_opspec_maybe_epilogue`].
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m_maybe_epilogue<T: crate::collective::Tp, 
+pub fn assemble_matmul_off_phys_m_maybe_epilogue<
+    T: crate::collective::Tp,
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -740,7 +748,8 @@ pub fn assemble_matmul_off_phys_m_maybe_epilogue<T: crate::collective::Tp,
 
 /// [`assemble_matmul_off`] with a fused pointwise epilogue — see [`assemble_from_opspec_with_epilogue`].
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_with_epilogue<T: crate::collective::Tp, 
+pub fn assemble_matmul_off_with_epilogue<
+    T: crate::collective::Tp,
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -790,7 +799,8 @@ pub fn assemble_matmul_off_with_epilogue<T: crate::collective::Tp,
 /// [`assemble_matmul_off_phys_m`] with a fused pointwise epilogue — see
 /// [`assemble_from_opspec_with_epilogue`].
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m_with_epilogue<T: crate::collective::Tp, 
+pub fn assemble_matmul_off_phys_m_with_epilogue<
+    T: crate::collective::Tp,
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(
@@ -875,7 +885,8 @@ pub fn assemble_matmul_off_phys_m_with_epilogue<T: crate::collective::Tp,
 /// `None` emits byte-for-byte what the ungathered assembler does — the indirect fields are absent from
 /// the descriptor when undeclared, which the gather-free test asserts rather than assumes.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<T: crate::collective::Tp, 
+pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
+    T: crate::collective::Tp,
     O: crate::sdsc_abstract::KindTag,
     E: crate::sdsc_abstract::KindTag,
 >(

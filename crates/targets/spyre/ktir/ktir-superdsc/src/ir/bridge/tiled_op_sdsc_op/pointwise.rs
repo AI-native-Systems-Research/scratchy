@@ -2004,7 +2004,7 @@ mod stick_permute_tests {
         l.declare_arrangement(&src, StickLayout::row_blocked(32, 128))
             .expect("the producer's stick-major [32, 128]");
         let mut sym = 0i64;
-        assemble_stick_permute(
+        assemble_stick_permute::<crate::collective::TpWorld<1>>(
             "permute_o2",
             &src,
             &dst,
@@ -2031,7 +2031,7 @@ mod stick_permute_tests {
         let l = layout();
         let (rows, out) = (act_name(2), act_name(1));
         let mut sym = 0i64;
-        assemble_stick_permute(
+        assemble_stick_permute::<crate::collective::TpWorld<1>>(
             "permute_o1",
             &rows,
             &out,
@@ -2354,7 +2354,7 @@ mod index_select_tests {
         // `LandingOffset::after(7, ...)` — seven entries already landed, each one block.
         let dst_offset = |entries: u32, dst: crate::superdsc_opspec::LandingOffset| -> u32 {
             let mut sym = 0i64;
-            let op = assemble_index_select(
+            let op = assemble_index_select::<crate::collective::TpWorld<1>>(
                 "gather_o1",
                 &act_name(1),
                 &act_name(2),
@@ -2438,7 +2438,7 @@ mod index_select_tests {
         // ONE block, two sticks wide: the (4, 1, 128) case itself — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2468,7 +2468,7 @@ mod index_select_tests {
         // declaration it must NOT make is the authority's refusal.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2503,7 +2503,7 @@ mod index_select_tests {
     fn one_blocks_landing_two_sticks_wide_declares_its_blocks_frame() {
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2536,7 +2536,7 @@ mod index_select_tests {
         // ONE block in total: one entry, one block, two sticks wide — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2560,7 +2560,7 @@ mod index_select_tests {
         // SEVERAL blocks: one entry, 8 blocks, two sticks wide — the view's own flat frame.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2595,7 +2595,7 @@ mod index_select_tests {
     fn a_one_stick_landing_keeps_the_flat_frame() {
         let l = gathered(8, 128, 64);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),

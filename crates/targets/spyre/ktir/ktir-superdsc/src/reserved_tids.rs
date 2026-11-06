@@ -539,7 +539,10 @@ pub const TP_MAX_WORLD: u32 = 64 / TP_WINDOW_CUTS;
 /// never a second window that could disagree with it.
 pub const fn tp_recv_block_tid(cut: u32, sender: u32) -> u32 {
     assert!(cut < TP_WINDOW_CUTS, "the window has TP_WINDOW_CUTS cuts");
-    assert!(sender < TP_MAX_WORLD, "a sender past the widest reserved world");
+    assert!(
+        sender < TP_MAX_WORLD,
+        "a sender past the widest reserved world"
+    );
     TP_RECV_TID - (cut * TP_MAX_WORLD + sender)
 }
 

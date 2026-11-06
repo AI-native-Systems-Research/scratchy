@@ -66,7 +66,11 @@ fn spec(op: OpFunc, division: ReduceDivision) -> Result<OpSpec, String> {
     })
 }
 
-fn emit_divided(op: OpFunc, name: &str, division: ReduceDivision) -> EmittedOp {
+fn emit_divided(
+    op: OpFunc,
+    name: &str,
+    division: ReduceDivision,
+) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let spec = spec(op, division).unwrap_or_else(|e| panic!("{name}: {e}"));
     let folds = SdscFoldSet::new(spec.iter.cores_used());
     let mut sym = 0i64;
@@ -74,11 +78,11 @@ fn emit_divided(op: OpFunc, name: &str, division: ReduceDivision) -> EmittedOp {
         .unwrap_or_else(|e| panic!("{name}: {}", e.0))
 }
 
-fn emit(op: OpFunc, name: &str) -> EmittedOp {
+fn emit(op: OpFunc, name: &str) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     emit_divided(op, name, ReduceDivision::ReducedAxis)
 }
 
-fn json(e: &EmittedOp) -> serde_json::Value {
+fn json(e: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>) -> serde_json::Value {
     serde_json::to_value(&e.op).unwrap()
 }
 

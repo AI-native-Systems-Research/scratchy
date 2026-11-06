@@ -5590,7 +5590,7 @@ mod transpose_tests {
     const MB: u32 = 256;
 
     /// The `dscs_[0]` entry of an emitted op, by name.
-    fn dsc<T: crate::collective::Tp>(op: &EmittedOp<T>, name: &str) -> Dsc {
+    fn dsc(op: &EmittedOp<crate::collective::TpWorld<1>>, name: &str) -> Dsc {
         op.op
             .as_ref()
             .expect("a transpose emits a descriptor")
@@ -5885,7 +5885,9 @@ mod transpose_tests {
         }
     }
 
-    fn lower_transpose<T: crate::collective::Tp>(k: &KtirNode) -> Result<Vec<EmittedOp<T>>, lower_ktir_to_superdsc::Error> {
+    fn lower_transpose(
+        k: &KtirNode,
+    ) -> Result<Vec<EmittedOp<crate::collective::TpWorld<1>>>, lower_ktir_to_superdsc::Error> {
         let mut sid = 0i64;
         let r = lower_ktir_to_superdsc::regions(k)?;
         lower_ktir_to_superdsc::transpose(k.func.name, &r, &mut sid, None)
@@ -7539,7 +7541,7 @@ mod gather_cut {
     /// table LAST (the one position at which `attach_gather_index`'s insert and dbo's dominance
     /// requirement coincide). `layout: None` is this crate's unit-test arm, so addresses come from the
     /// per-arg segment fallback — inert for every property below, which are all DIFFERENCES.
-    fn legs<T: crate::collective::Tp>(rows: u32) -> Vec<EmittedOp<T>> {
+    fn legs(rows: u32) -> Vec<EmittedOp<crate::collective::TpWorld<1>>> {
         // TRUE shapes, not `rbo` lies: the mint in `pointwise_broadcast_opspec_from_tile` (and the
         // gather door's output mint) checks every swept window against the handle's declared shape,
         // so the table and output are declared at the node's own `[rows, 4096]` — embedding_granite's
@@ -7570,7 +7572,7 @@ mod gather_cut {
     }
 
     /// The `dscs_[0]` body of an emitted leg.
-    fn body<T: crate::collective::Tp>(op: &EmittedOp<T>) -> &crate::wire::Dsc {
+    fn body(op: &EmittedOp<crate::collective::TpWorld<1>>) -> &crate::wire::Dsc {
         op.op
             .as_ref()
             .expect("a gather leg carries a descriptor")
@@ -7582,7 +7584,7 @@ mod gather_cut {
 
     /// The per-core start addresses of operand `lds` of a leg, lowest first. Operand order is
     /// `[scale, table, index, output]` — the index is INSERTED before the output, so the output is 3.
-    fn starts<T: crate::collective::Tp>(op: &EmittedOp<T>, lds: u32) -> Vec<u64> {
+    fn starts(op: &EmittedOp<crate::collective::TpWorld<1>>, lds: u32) -> Vec<u64> {
         let node = body(op)
             .scheduleTree_
             .iter()
@@ -7748,7 +7750,7 @@ mod gather_cut {
         let ins = [In::scalar(&scale).ew(), In::full(&table).ew()];
         let two = tile(cap() * 2);
         let mut sid = 0i64;
-        let e = match one_gathered_leg(
+        let e = match one_gathered_leg::<crate::collective::TpWorld<1>>(
             GatherLeg {
                 op_name: "scalarmul_o2",
                 leg_name: "scalarmul_o2_g0",
@@ -7781,7 +7783,7 @@ mod gather_cut {
         let one = tile(cap());
         let mut sid = 0i64;
         assert!(
-            one_gathered_leg(
+            one_gathered_leg::<crate::collective::TpWorld<1>>(
                 GatherLeg {
                     op_name: "scalarmul_o2",
                     leg_name: "scalarmul_o2_g0",
@@ -7963,7 +7965,7 @@ mod time_tiled_broadcast_operand_is_address_stable {
     const COLS: u32 = 262144;
 
     /// The failing op itself, verbatim: `tscdiv` = realdiv(x, cap), x full, cap `[1,1]` broadcast.
-    fn tscdiv<T: crate::collective::Tp>() -> EmittedOp<T> {
+    fn tscdiv() -> EmittedOp<crate::collective::TpWorld<1>> {
         let x = rb("tsc_x", ROWS, COLS);
         let cap = rb("tsc_cap", 1, Fp16::ELEMS_PER_STICK);
         let out = rb("tsc_o", ROWS, COLS);
@@ -7981,7 +7983,7 @@ mod time_tiled_broadcast_operand_is_address_stable {
     }
 
     /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
-    fn trip_start<T: crate::collective::Tp>(e: &EmittedOp<T>, t: usize, lds: u32) -> u64 {
+    fn trip_start(e: &EmittedOp<crate::collective::TpWorld<1>>, t: usize, lds: u32) -> u64 {
         let trips = e.concrete_trips();
         let node = trips.get(t).expect("a trip per time").dscs_[0]
             .values()
@@ -8080,7 +8082,7 @@ mod time_tiled_mb_operand_advances_per_trip {
 
     /// realdiv(x, gamma): x full `[rows, cols]`, gamma an `In::mb` `[1, cols]` row
     /// vector — broadcast over ROWS, ACTIVE over cols (the rmsnorm-gamma form).
-    fn mbdiv<T: crate::collective::Tp>() -> EmittedOp<T> {
+    fn mbdiv() -> EmittedOp<crate::collective::TpWorld<1>> {
         let x = rb("mb_x", ROWS, COLS);
         let gamma = rb("mb_gamma", 1, COLS);
         let out = rb("mb_o", ROWS, COLS);
@@ -8098,7 +8100,7 @@ mod time_tiled_mb_operand_advances_per_trip {
     }
 
     /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
-    fn trip_start<T: crate::collective::Tp>(e: &EmittedOp<T>, t: usize, lds: u32) -> u64 {
+    fn trip_start(e: &EmittedOp<crate::collective::TpWorld<1>>, t: usize, lds: u32) -> u64 {
         let trips = e.concrete_trips();
         let node = trips.get(t).expect("a trip per time").dscs_[0]
             .values()
@@ -8303,7 +8305,9 @@ mod embed_row_gather_tests {
         embed_row_gather_program(IDX, IDX, (HIDDEN, VOCAB), (1, HIDDEN), 0, 1)
     }
 
-    fn lower<T: crate::collective::Tp>(k: &KtirNode) -> Result<Vec<EmittedOp<T>>, lower_ktir_to_superdsc::Error> {
+    fn lower(
+        k: &KtirNode,
+    ) -> Result<Vec<EmittedOp<crate::collective::TpWorld<1>>>, lower_ktir_to_superdsc::Error> {
         let mut sid = 0i64;
         let r = lower_ktir_to_superdsc::regions(k)?;
         lower_ktir_to_superdsc::embed_row_gather(k.func.name, k, &r, &mut sid, None)
@@ -8325,7 +8329,7 @@ mod embed_row_gather_tests {
     /// The SLAB-GATHER leg's per-core Dsc — the body the card schedules from, reached off the first
     /// op of the chain (the names tests pin that ordering first). The `gather_cut` module's `body`
     /// spelling, local to this module so the two never couple.
-    fn slab_body<T: crate::collective::Tp>(ops: &[EmittedOp<T>]) -> &crate::wire::Dsc {
+    fn slab_body(ops: &[EmittedOp<crate::collective::TpWorld<1>>]) -> &crate::wire::Dsc {
         ops[0]
             .op
             .as_ref()
@@ -8338,7 +8342,7 @@ mod embed_row_gather_tests {
 
     /// The ROW-GATHER leg's per-core Dsc — the same spelling as [`slab_body`], off the chain's
     /// third op (the ramp-addressed leg the defect lived in).
-    fn row_body<T: crate::collective::Tp>(ops: &[EmittedOp<T>]) -> &crate::wire::Dsc {
+    fn row_body(ops: &[EmittedOp<crate::collective::TpWorld<1>>]) -> &crate::wire::Dsc {
         ops[2]
             .op
             .as_ref()
@@ -8823,7 +8827,7 @@ mod embed_row_gather_tests {
         let mut sid = 0i64;
         let program = whole_program();
         let r = lower_ktir_to_superdsc::regions(&program).unwrap();
-        lower_ktir_to_superdsc::embed_row_gather(
+        lower_ktir_to_superdsc::embed_row_gather::<crate::collective::TpWorld<1>>(
             program.func.name,
             &program,
             &r,
@@ -9065,7 +9069,9 @@ mod chain_stage_tests {
         )
     }
 
-    fn lower<T: crate::collective::Tp>(k: &KtirNode) -> Result<Vec<EmittedOp<T>>, lower_ktir_to_superdsc::Error> {
+    fn lower(
+        k: &KtirNode,
+    ) -> Result<Vec<EmittedOp<crate::collective::TpWorld<1>>>, lower_ktir_to_superdsc::Error> {
         let mut sid = 0i64;
         let r = lower_ktir_to_superdsc::regions(k)?;
         lower_ktir_to_superdsc::chain_stage(k.func.name, k, &r, &mut sid, None)
@@ -9236,8 +9242,14 @@ mod chain_stage_tests {
         let mut sid = 0i64;
         let k = whole_program();
         let r = lower_ktir_to_superdsc::regions(&k).unwrap();
-        lower_ktir_to_superdsc::chain_stage(k.func.name, &k, &r, &mut sid, Some(&l))
-            .expect("the legal geometry places");
+        lower_ktir_to_superdsc::chain_stage::<crate::collective::TpWorld<1>>(
+            k.func.name,
+            &k,
+            &r,
+            &mut sid,
+            Some(&l),
+        )
+        .expect("the legal geometry places");
         assert!(
             l.synth.borrow().sizes.is_empty(),
             "the tables are graph sources the placement pass places — the door must mint \

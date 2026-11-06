@@ -7664,7 +7664,10 @@ fn stored_whole(k: &KtirNode, value: Ssa, held: Region) -> Result<Option<Region>
 /// clean launch and wrong bytes downstream (granite-3.1-8b's batch-of-one attention: the output
 /// projection read an output no op wrote, "Fraryning000…"). So the lowering refuses, naming the
 /// parameter, any direct store whose parameter no emitted op writes.
-fn every_store_is_written<T: crate::collective::Tp>(k: &KtirNode, out: &[super::EmittedOp<T>]) -> Result<(), Error> {
+fn every_store_is_written<T: crate::collective::Tp>(
+    k: &KtirNode,
+    out: &[super::EmittedOp<T>],
+) -> Result<(), Error> {
     let f = &k.func;
     let written: std::collections::BTreeSet<&str> = out
         .iter()

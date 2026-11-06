@@ -44,7 +44,11 @@ fn region(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
     }
 }
 
-fn lower(kind: ReduceKind, rows: u32, cols: u32) -> Vec<EmittedOp> {
+fn lower(
+    kind: ReduceKind,
+    rows: u32,
+    cols: u32,
+) -> Vec<EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
     let data = region(7, rows, cols, false);
     let out = region(8, rows, 1, true);
     let mut sym = 0i64;
@@ -58,7 +62,10 @@ fn lower(kind: ReduceKind, rows: u32, cols: u32) -> Vec<EmittedOp> {
     })
 }
 
-fn dsc(ops: &[EmittedOp], op_name: &str) -> serde_json::Value {
+fn dsc(
+    ops: &[EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+    op_name: &str,
+) -> serde_json::Value {
     assert_eq!(ops.len(), 1, "one reduce, one op");
     serde_json::to_value(&ops[0].op).unwrap()["dscs_"][0][op_name].clone()
 }

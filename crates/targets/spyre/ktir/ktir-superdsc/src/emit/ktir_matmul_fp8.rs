@@ -766,15 +766,17 @@ mod tests {
     /// quantizes the new bytes; a reuse at another row count is refused rather than reading a
     /// quantize sized for the first.
     #[test]
-    fn a_held_quantize_is_shared_until_its_activation_is_written<T: crate::collective::Tp>() {
+    fn a_held_quantize_is_shared_until_its_activation_is_written() {
         let (m, k, n) = (1u32, 256, 128);
         let l = fp8_layout(m, k, n);
-        let chain = |ops: &[EmittedOp<T>]| {
+        let chain = |ops: &[EmittedOp<crate::collective::TpWorld<1>>]| {
             ops.iter()
                 .filter(|o| o.op_name.ends_with("fq_qspt_op") || o.op_name.ends_with("fq_afp8_op"))
                 .count()
         };
-        let mms = |ops: &[EmittedOp<T>]| ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count();
+        let mms = |ops: &[EmittedOp<crate::collective::TpWorld<1>>]| {
+            ops.iter().filter(|o| o.op_name.ends_with("fq_mm")).count()
+        };
         let mut q = QuantizedActivations::default();
         let first = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut q)
             .expect("the first matmul emits");
@@ -794,9 +796,17 @@ mod tests {
         let after = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut q)
             .expect("the matmul after the write emits");
         assert_eq!(chain(&after), 2, "a written t7 is quantized again");
-        let refused = matmul_fp8_descriptors(&facts(), 2, k, n, &mut 0, Some(&l), &mut q)
-            .err()
-            .expect("t7 held at m=1 and read at m=2 is refused");
+        let refused = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            2,
+            k,
+            n,
+            &mut 0,
+            Some(&l),
+            &mut q,
+        )
+        .err()
+        .expect("t7 held at m=1 and read at m=2 is refused");
         assert!(
             refused.0.contains("m=1") && refused.0.contains("m=2"),
             "{}",
@@ -823,8 +833,16 @@ mod tests {
         let (m, k, n) = (1024u32, 16384, 128);
         let l = fp8_layout(m, k, n);
         let mut quantized = QuantizedActivations::default();
-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the wide-geometry fp8 chain emits");
+        let ops = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            m,
+            k,
+            n,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        )
+        .expect("the wide-geometry fp8 chain emits");
         // The chain's ONE reduce — the fused quantscalepertokenfp8 — must be single-shot.
         let tiled: Vec<&str> = ops
             .iter()
@@ -865,8 +883,16 @@ mod tests {
         let (m, k, n) = (71u32, 15360, 3840);
         let l = fp8_layout(m, k, n);
         let mut quantized = QuantizedActivations::default();
-        let ops = fp8_quantize_descriptors(&facts(), m, k, 1, &mut 0, Some(&l), &mut quantized)
-            .expect("the fused-overflowing fp8 quant chain emits");
+        let ops = fp8_quantize_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            m,
+            k,
+            1,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        )
+        .expect("the fused-overflowing fp8 quant chain emits");
         assert!(
             ops.iter()
                 .all(|o| !o.op_name.contains("fq_qspt") || o.time == 1),
@@ -903,8 +929,16 @@ mod tests {
         let (m, k, n) = (32u32, 2048, 128);
         let l = fp8_layout(m, k, n);
         let mut quantized = QuantizedActivations::default();
-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the fitting-geometry fp8 chain emits");
+        let ops = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            m,
+            k,
+            n,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        )
+        .expect("the fitting-geometry fp8 chain emits");
         assert!(
             ops.iter().all(|o| o.time == 1),
             "a fitting geometry has no time-tiled op at all"
@@ -950,8 +984,16 @@ mod tests {
         );
         let l = fp8_layout(m, k, n);
         let mut quantized = QuantizedActivations::default();
-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the 2112-wide fp8 chain emits (the 26b wall is gone)");
+        let ops = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            m,
+            k,
+            n,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        )
+        .expect("the 2112-wide fp8 chain emits (the 26b wall is gone)");
         // The zero-fill exists (the `sub(448,448)` broadcast), and only ONE such op.
         assert_eq!(
             ops.iter()
@@ -997,8 +1039,16 @@ mod tests {
         let (m, k, n) = (32u32, 2048, 128);
         let l = fp8_layout(m, k, n);
         let mut quantized = QuantizedActivations::default();
-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the aligned-geometry fp8 chain emits");
+        let ops = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            m,
+            k,
+            n,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        )
+        .expect("the aligned-geometry fp8 chain emits");
         assert!(
             !ops.iter().any(|o| o.op_name.ends_with("fq_zfpad_op")),
             "no zero-fill op may exist at an aligned k"
@@ -1027,8 +1077,16 @@ mod tests {
         let (m, k, n) = (1u32, 2816, 2112);
         let l = fp8_layout(m, k, n);
         let mut quantized = QuantizedActivations::default();
-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the n=2112 packed-kernel fp8 chain emits (the 26b gate gemm wall is gone)");
+        let ops = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            m,
+            k,
+            n,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        )
+        .expect("the n=2112 packed-kernel fp8 chain emits (the 26b gate gemm wall is gone)");
         assert!(
             !ops.iter().any(|o| o.op_name.ends_with("fq_zfpad_op")),
             "an aligned k needs no K-pad"
@@ -1040,7 +1098,11 @@ mod tests {
     /// matches `needle`), in BYTES — `resolve_seg_base` folds each arg's `offset_elems` into the
     /// segment base, so the DELTAS between ops reading the same buffer at different offsets are
     /// the offsets themselves. The per-pair tail's laws read those deltas.
-    fn operand_start_bytes<T: crate::collective::Tp>(op: &EmittedOp<T>, needle: &str, want_input: bool) -> u64 {
+    fn operand_start_bytes(
+        op: &EmittedOp<crate::collective::TpWorld<1>>,
+        needle: &str,
+        want_input: bool,
+    ) -> u64 {
         let dsc = op.dsc();
         for dsc_map in dsc.dscs_.iter() {
             for dsc in dsc_map.values() {
@@ -1191,8 +1253,16 @@ mod tests {
         let k = pairs * inn;
         let l = fp8_layout(m, k, n);
         let mut quantized = QuantizedActivations::default();
-        let ops = fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l), &mut quantized)
-            .expect("the aligned-inn pair chain emits");
+        let ops = fp8_quantize_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            m,
+            k,
+            pairs,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        )
+        .expect("the aligned-inn pair chain emits");
         assert_eq!(
             ops.iter()
                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))
@@ -1232,10 +1302,18 @@ mod tests {
     /// zero-fill still aims one fp16 group past the logical width at the m=2 corner, and the
     /// reservations widen to the m-generic `[m, cl_reach]`/`[m, k_pad]`.
     #[test]
-    fn the_per_pair_tail_refuses_a_non_whole_lane_count_and_pads_per_slot_at_prefill<T: crate::collective::Tp>() {
+    fn the_per_pair_tail_refuses_a_non_whole_lane_count_and_pads_per_slot_at_prefill() {
         let l = fp8_layout(1, 9, 128);
         let mut quantized = QuantizedActivations::default();
-        let e = fp8_quantize_descriptors(&facts(), 1, 9, 2, &mut 0, Some(&l), &mut quantized);
+        let e = fp8_quantize_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            1,
+            9,
+            2,
+            &mut 0,
+            Some(&l),
+            &mut quantized,
+        );
         assert!(
             e.is_err(),
             "k=9 over pairs=2 has no whole lane count per pair — a typed refusal, not a bake"
@@ -1269,7 +1347,7 @@ mod tests {
             (pairs - 1) as usize,
             "slots 1.. carry fq_afp8_p{{s}}_op"
         );
-        let arms: Vec<&EmittedOp<T>> = ops2
+        let arms: Vec<&EmittedOp<crate::collective::TpWorld<1>>> = ops2
             .iter()
             .filter(|o| o.op_name.ends_with("fq_afp8_op") || o.op_name.contains("fq_afp8_p"))
             .collect();
@@ -1352,9 +1430,16 @@ mod tests {
         // EMITS — one whole-tensor convert, the m-generic form the prefill door consumes.
         let l3 = fp8_layout(2, 2048, 128);
         let mut quantized3 = QuantizedActivations::default();
-        let ops =
-            fp8_quantize_descriptors(&facts(), 2, 2048, 2, &mut 0, Some(&l3), &mut quantized3)
-                .expect("the aligned-inn pair chain emits at m=2");
+        let ops = fp8_quantize_descriptors::<crate::collective::TpWorld<1>>(
+            &facts(),
+            2,
+            2048,
+            2,
+            &mut 0,
+            Some(&l3),
+            &mut quantized3,
+        )
+        .expect("the aligned-inn pair chain emits at m=2");
         assert_eq!(
             ops.iter()
                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))

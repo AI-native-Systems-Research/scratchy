@@ -4772,7 +4772,9 @@ pub struct RopeAt<'a> {
 /// What it buys immediately: the collapsed RoPE form and the slab RoPE form become TWO INSTANTIATIONS
 /// rather than two arms of one function, so "a head_dim-128 bundle takes the slab path" is a fact the
 /// compiler knows.
-pub fn rope_at<T: crate::collective::Tp, const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp<T>>, Error> {
+pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
+    a: RopeAt<'_>,
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let RopeAt {
         name: _name,
         x,
@@ -7787,7 +7789,14 @@ mod elementwise_tests {
         );
         let mut sym = 0i64;
         // `EmittedOp` is not `Debug`, so `expect_err` is unavailable — bind the refusal directly.
-        let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None) else {
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("a [1,128] operand under a [4,128] output cannot be addressed here");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -7814,8 +7823,15 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None)
-            .expect("agreeing extents are the ordinary case");
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("agreeing extents are the ordinary case");
         assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
     }
 
@@ -7831,7 +7847,14 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None) else {
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("a [4,1] per-row scalar is a broadcast this path cannot state");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -7847,7 +7870,14 @@ mod elementwise_tests {
     fn a_unary_input_of_the_wrong_extent_is_refused() {
         let r = vec![reg(5, 1, 128, false), reg(7, 4, 128, true)];
         let mut sym = 0i64;
-        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &[], &mut sym, None) else {
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
+            "silu_s3",
+            Elementwise::Silu,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("a unary's input extent must match its output too");
         };
         assert!(e.message.contains("t5"), "names the operand: {}", e.message);
@@ -7864,8 +7894,15 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None)
-            .expect("a same-extent subtract is structurally an add");
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("a same-extent subtract is structurally an add");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "sub_o7");
     }
@@ -7894,7 +7931,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise(
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -7922,7 +7959,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise(
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
             "mul_s3",
             Elementwise::Mul,
             &r,
@@ -7936,7 +7973,7 @@ mod elementwise_tests {
     }
 
     /// The offset op `op` binds `buf` at.
-    fn bound_at<T: crate::collective::Tp>(op: &EmittedOp<T>, buf: &str) -> u32 {
+    fn bound_at(op: &EmittedOp<crate::collective::TpWorld<1>>, buf: &str) -> u32 {
         op.arg_bindings
             .iter()
             .find(|b| b.buffer == buf)
@@ -8335,7 +8372,7 @@ mod elementwise_tests {
             reg(7, 250, 4, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8410,7 +8447,7 @@ mod elementwise_tests {
             reg(7, 256, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8439,7 +8476,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8470,7 +8507,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8492,7 +8529,7 @@ mod elementwise_tests {
     fn a_unary_broadcast_input_is_refused_by_name() {
         let r = vec![reg(5, 4, 1, false), reg(7, 4, 128, true)];
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "silu_s3",
             Elementwise::Silu,
             &r,
@@ -8531,8 +8568,15 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary("add_s3", IntBinary::Add, &r, &[], &mut sym, None)
-            .expect("B1's own dense form");
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
+            "add_s3",
+            IntBinary::Add,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("B1's own dense form");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "addi32toi32_o7");
     }
@@ -8548,7 +8592,7 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary(
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8582,7 +8626,7 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary(
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8620,7 +8664,7 @@ mod elementwise_tests {
             reg(7, 2, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary(
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8648,7 +8692,7 @@ mod elementwise_tests {
             reg(7, 256, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = int_binary(
+        let Err(e) = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8676,7 +8720,7 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let Err(e) = int_binary(
+        let Err(e) = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8971,8 +9015,15 @@ mod elementwise_tests {
     fn a_column_blocked_chunk_writes_at_its_stick_block_corner() {
         let (r, rows, c0, c1) = mlp_chunks();
         let mut sym = 0i64;
-        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
-            .expect("a dense column-blocked chunk is exactly the arm that exists for it");
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
+            "mul_s23",
+            Elementwise::Mul,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("a dense column-blocked chunk is exactly the arm that exists for it");
         assert_eq!(ops.len(), 1);
         let dsc = ops[0]
             .op
@@ -9002,8 +9053,15 @@ mod elementwise_tests {
         // chunk-0 twin's start, which cancels every segment/arg term both share.
         let (r0, ..) = mlp_chunks_at_zero();
         let mut sym0 = 0i64;
-        let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
-            .expect("chunk 0 lowers identically");
+        let ops0 = elementwise::<crate::collective::TpWorld<1>>(
+            "mul_s22",
+            Elementwise::Mul,
+            &r0,
+            &[],
+            &mut sym0,
+            None,
+        )
+        .expect("chunk 0 lowers identically");
         let dsc0 = ops0[0].op.as_ref().expect("descriptor").dscs_[0]
             .values()
             .next()
@@ -9050,7 +9108,7 @@ mod elementwise_tests {
     /// ⛔ AND THE INPUTS READ AT THE SAME CORNER — a multiply whose operands sit at base 0 while
     /// its output writes the corner would recompute chunk 0's values into chunk 1's columns.
     #[test]
-    fn a_column_blocked_chunk_reads_its_inputs_at_the_same_corner<T: crate::collective::Tp>() {
+    fn a_column_blocked_chunk_reads_its_inputs_at_the_same_corner() {
         let (r, rows, c0, _c1) = mlp_chunks();
         let mut sym = 0i64;
         let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
@@ -9059,7 +9117,7 @@ mod elementwise_tests {
         let mut sym0 = 0i64;
         let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
             .expect("chunk 0 lowers");
-        let starts = |ops: &Vec<EmittedOp<T>>| -> Vec<u64> {
+        let starts = |ops: &Vec<EmittedOp<crate::collective::TpWorld<1>>>| -> Vec<u64> {
             let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
                 .values()
                 .next()
@@ -9102,7 +9160,7 @@ mod elementwise_tests {
     /// the per-operand window emission makes the corner an operand fact, and the class law
     /// ([`column_windows_are_honoured`]) is what holds each binding to its own region's corner.
     #[test]
-    fn unequal_input_corners_are_carried_per_operand<T: crate::collective::Tp>() {
+    fn unequal_input_corners_are_carried_per_operand() {
         let rows = 25u32;
         let r = vec![
             chunked(5, rows, 8192, 7168, 15360, false),
@@ -9116,7 +9174,7 @@ mod elementwise_tests {
         // output at the stick-block corner of column 8192.
         column_windows_are_honoured("mul_s23", &r, &ops)
             .expect("each operand is addressed at its own corner");
-        let off = |ops: &Vec<EmittedOp<T>>, buf: String| {
+        let off = |ops: &Vec<EmittedOp<crate::collective::TpWorld<1>>>, buf: String| {
             ops[0]
                 .arg_bindings
                 .iter()
@@ -9146,7 +9204,7 @@ mod elementwise_tests {
             chunked(7, rows, 8192, 7168, 15360, true),
         ];
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &rb,
@@ -9168,7 +9226,14 @@ mod elementwise_tests {
             chunked(6, rows, 8192, 8192, 15360, false),
             chunked(7, rows, 8192, 1, 15360, true),
         ];
-        let Err(e2) = elementwise("sub_s3", Elementwise::Sub, &pr, &[], &mut sym, None) else {
+        let Err(e2) = elementwise::<crate::collective::TpWorld<1>>(
+            "sub_s3",
+            Elementwise::Sub,
+            &pr,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("the per-row arm at a column corner must refuse")
         };
         assert!(
@@ -9179,7 +9244,7 @@ mod elementwise_tests {
     }
 
     /// The lowest per-core start address of each operand's allocate node, in operand order.
-    fn operand_bases<T: crate::collective::Tp>(ops: &[EmittedOp<T>]) -> Vec<u64> {
+    fn operand_bases(ops: &[EmittedOp<crate::collective::TpWorld<1>>]) -> Vec<u64> {
         let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
             .values()
             .next()
@@ -9277,16 +9342,24 @@ mod elementwise_tests {
     fn the_column_window_guard_passes_honoured_pieces_and_refuses_a_piece_at_the_base() {
         let (r, ..) = mlp_chunks();
         let mut sym = 0i64;
-        let ew = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None).unwrap();
+        let ew = elementwise::<crate::collective::TpWorld<1>>(
+            "mul_s23",
+            Elementwise::Mul,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .unwrap();
         column_windows_are_honoured("mul_s23", &r, &ew).expect("elementwise honours its window");
-        let sm =
-            silumul("silumul_s23", &r, &mut sym, None).unwrap_or_else(|e| panic!("{}", e.message));
+        let sm = silumul::<crate::collective::TpWorld<1>>("silumul_s23", &r, &mut sym, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
         column_windows_are_honoured("silumul_s23", &r, &sm).expect("silumul honours its window");
         let logits = vec![
             chunked(5, 1, 8192, 8192, 49155, false),
             chunked(7, 1, 8192, 8192, 49155, true),
         ];
-        let mut ops = scalarmul_scaled(
+        let mut ops = scalarmul_scaled::<crate::collective::TpWorld<1>>(
             "scalarmul_s1",
             &ScaleSource::Bound { tid: 99 },
             None,
@@ -9328,18 +9401,19 @@ mod elementwise_tests {
     /// tells the two pieces apart is the corner every binding carries, pinned by
     /// `a_column_blocked_chunk_reads_its_inputs_at_the_same_corner`.
     #[test]
-    fn a_chunk_at_corner_zero_keeps_the_seeded_emission<T: crate::collective::Tp>() {
-        let orders = |ops: &Vec<EmittedOp<T>>| -> Vec<Vec<&'static str>> {
-            let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
-                .values()
-                .next()
-                .expect("one dsc");
-            dsc.scheduleTree_
-                .iter()
-                .filter(|n| n.nodeType_ == "allocate")
-                .map(|n| n.layoutDimOrder_.clone())
-                .collect()
-        };
+    fn a_chunk_at_corner_zero_keeps_the_seeded_emission() {
+        let orders =
+            |ops: &Vec<EmittedOp<crate::collective::TpWorld<1>>>| -> Vec<Vec<&'static str>> {
+                let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
+                    .values()
+                    .next()
+                    .expect("one dsc");
+                dsc.scheduleTree_
+                    .iter()
+                    .filter(|n| n.nodeType_ == "allocate")
+                    .map(|n| n.layoutDimOrder_.clone())
+                    .collect()
+            };
         let (r0, ..) = mlp_chunks_at_zero();
         let mut sym = 0i64;
         let ops = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym, None)
@@ -9385,7 +9459,14 @@ mod batch_transpose_tests {
     #[test]
     fn a_flat_input_two_sticks_wide_is_refused() {
         let mut sym = 0i64;
-        let Err(e) = batch_transpose("t", 8, BatchFrame::Flat, &pages(), &mut sym, None) else {
+        let Err(e) = batch_transpose::<crate::collective::TpWorld<1>>(
+            "t",
+            8,
+            BatchFrame::Flat,
+            &pages(),
+            &mut sym,
+            None,
+        ) else {
             panic!("a flat [8, 64, 128] transposed per batch");
         };
         assert!(e.message.contains("interleave"), "{}", e.message);
@@ -9395,7 +9476,14 @@ mod batch_transpose_tests {
     #[test]
     fn an_input_in_blocks_is_read_block_by_block() {
         let mut sym = 0i64;
-        let ops = match batch_transpose("t", 8, BatchFrame::Blocks, &pages(), &mut sym, None) {
+        let ops = match batch_transpose::<crate::collective::TpWorld<1>>(
+            "t",
+            8,
+            BatchFrame::Blocks,
+            &pages(),
+            &mut sym,
+            None,
+        ) {
             Ok(ops) => ops,
             Err(e) => panic!("{}", e.message),
         };

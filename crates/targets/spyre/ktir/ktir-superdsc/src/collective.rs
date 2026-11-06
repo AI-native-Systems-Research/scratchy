@@ -85,12 +85,17 @@ const _: () = assert!(
 /// `const fn` of `T`, and a value of one world's types cannot be handed to another world's code.
 ///
 /// Its one implementor is [`TpWorld<N>`]; a build selects exactly one.
-pub trait Tp: Copy + Clone + core::fmt::Debug + PartialEq + Eq + core::hash::Hash + Send + Sync + 'static {
+pub trait Tp:
+    Copy + Clone + core::fmt::Debug + PartialEq + Eq + core::hash::Hash + Send + Sync + 'static
+{
     /// The rank count.
     const RANKS: u32;
     /// The world's laws, proven at build: at least one rank, and no wider than the card's sids.
     const CHECKED: () = {
-        assert!(Self::RANKS >= 1, "a tensor-parallel world has at least one rank");
+        assert!(
+            Self::RANKS >= 1,
+            "a tensor-parallel world has at least one rank"
+        );
         assert!(
             Self::RANKS <= MAX_WORLD,
             "every rank's landing slots take a sid of their own: a world wider than the card's sids"
@@ -386,18 +391,16 @@ impl<T: Tp> CutPayload<T> {
     /// in slot `(cut, m)`.
     pub fn landings(self, cut: WindowCut) -> impl Iterator<Item = (LandingSlot<T>, Message)> {
         // `new` bounds the count by the world's messages per cut, so every index is a slot.
-        (0..)
-            .zip(self.0.messages())
-            .map(move |(message, m)| {
-                (
-                    LandingSlot {
-                        cut,
-                        message,
-                        world: core::marker::PhantomData,
-                    },
-                    m,
-                )
-            })
+        (0..).zip(self.0.messages()).map(move |(message, m)| {
+            (
+                LandingSlot {
+                    cut,
+                    message,
+                    world: core::marker::PhantomData,
+                },
+                m,
+            )
+        })
     }
 }
 
@@ -427,9 +430,7 @@ impl<T: Tp> RecvWindow<T> {
     /// iff `offset` is flit-aligned and a block is at most the world's messages per cut — a slot
     /// each.
     pub const fn new(offset: u64, block: Payload) -> Option<Self> {
-        if !offset.is_multiple_of(FLIT_BYTES)
-            || block.message_count() > T::MESSAGES_PER_CUT
-        {
+        if !offset.is_multiple_of(FLIT_BYTES) || block.message_count() > T::MESSAGES_PER_CUT {
             return None;
         }
         Some(Self {

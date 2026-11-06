@@ -954,7 +954,13 @@ mod seeded_reduce_refusals {
             .expect("the bare opspec assembles");
         assert_eq!(op.time(), 2, "the past-the-budget row genuinely tiles");
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let err = match crate::emit::emit_sdsc_tiled("max32_bare", &op, &folds, &mut 0i64, None) {
+        let err = match crate::emit::emit_sdsc_tiled::<crate::collective::TpWorld<1>>(
+            "max32_bare",
+            &op,
+            &folds,
+            &mut 0i64,
+            None,
+        ) {
             Err(e) => e,
             // `EmittedOp` is not `Debug`, so the Ok arm states its own refusal.
             Ok(_) => panic!("the bare two-trip seeded reduce must refuse at the emission"),
