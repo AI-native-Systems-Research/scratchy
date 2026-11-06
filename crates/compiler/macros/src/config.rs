@@ -3329,33 +3329,6 @@ mod tests {
         );
     }
 
-    /// C4: `arch_compiled*` names no arch. The capability mechanism is the lowerings'
-    /// by-name refusals, so the two functions' own source must carry no arch-name
-    /// string — a list sneaking back in fails here.
-    #[test]
-    fn arch_compiled_names_no_arch() {
-        let src = fs::read_to_string(format!("{}/src/config.rs", env!("CARGO_MANIFEST_DIR")))
-            .expect("read own source");
-        let start = src
-            .find("pub fn arch_compiled(")
-            .expect("arch_compiled is defined");
-        let with = src[start..]
-            .find("fn arch_compiled_with(")
-            .map(|i| start + i)
-            .expect("arch_compiled_with follows");
-        let end = src[with..]
-            .find("\n}\n")
-            .map(|i| with + i)
-            .expect("arch_compiled_with closes");
-        let body = &src[start..end];
-        for arch in ["llama", "granite", "gemma4", "gemma4-moe"] {
-            assert!(
-                !body.contains(&format!("\"{arch}\"")),
-                "arch_compiled* names {arch} — the capability list is back"
-            );
-        }
-    }
-
     /// The tree law: EVERY arch dir under `configs/` compiles under `spyre` when its
     /// `arch-<name>` feature is on — the build script's target filter admits it, and what
     /// happens next (lowering or a named refusal) is the lowering's verdict. No name is

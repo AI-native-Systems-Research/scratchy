@@ -318,6 +318,17 @@ fn main() {
         println!("cargo:rerun-if-env-changed={name}");
     }
 
+    // The backend law, stated once: `src/lib.rs`'s arch gates read `scratchy_backend`,
+    // which this script sets exactly when a backend feature is on — so an arch compiles
+    // under a backend iff its `arch-<name>` feature and that backend are on, with no
+    // per-arch spelling left to drift.
+    println!("cargo::rustc-check-cfg=cfg(scratchy_backend)");
+    if std::env::var_os("CARGO_FEATURE_METAL").is_some()
+        || std::env::var_os("CARGO_FEATURE_SPYRE").is_some()
+    {
+        println!("cargo::rustc-cfg=scratchy_backend");
+    }
+
     // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
     // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
     // a backend they support is on. Sorted for deterministic output.
