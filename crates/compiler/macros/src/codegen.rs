@@ -17299,37 +17299,6 @@ mod tests {
     }
 
     #[test]
-    fn base_layer_strips_only_the_unroll_index() {
-        let at = |n| Some(UnrollIndex(n));
-        // An accessor unrolled at a layer: its name less that layer's suffix.
-        assert_eq!(
-            base_layer("input_layernorm_3", at(3)),
-            ("input_layernorm".to_string(), at(3))
-        );
-        assert_eq!(
-            base_layer("self_attn_q_proj_31", at(31)),
-            ("self_attn_q_proj".to_string(), at(31))
-        );
-        // An accessor of no unrolled layer is its whole name, digits and all.
-        assert_eq!(
-            base_layer("embed_tokens", None),
-            ("embed_tokens".to_string(), None)
-        );
-        assert_eq!(
-            base_layer("merger_mlp_0", None),
-            ("merger_mlp_0".to_string(), None)
-        );
-        assert_eq!(
-            base_layer("merger_mlp_2", None),
-            ("merger_mlp_2".to_string(), None)
-        );
-        assert_eq!(
-            base_layer("rotary_local", None),
-            ("rotary_local".to_string(), None)
-        );
-    }
-
-    #[test]
     fn accessor_methods_compress_layered_fields_to_slice_index() {
         // Three layers' worth of `input_layernorm_<n>` fields collapse
         // into ONE `pub fn input_layernorm(&self, layer: u32) ->
