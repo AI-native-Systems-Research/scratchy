@@ -478,25 +478,6 @@ pub fn TableCell(#[props(default)] colspan: Option<u8>, children: Element) -> El
     rsx! { cds-table-cell { "colspan": colspan.map(|n| n.to_string()), {children} } }
 }
 
-/// `cds-tag`'s colour, the ones the site uses.
-#[derive(Clone, Copy, PartialEq)]
-pub enum TagKind {
-    Green,
-    Red,
-    Gray,
-}
-
-/// A small `cds-tag`; `title` says in words what its colour means.
-#[component]
-pub fn Tag(kind: TagKind, #[props(into)] title: String, children: Element) -> Element {
-    let kind = match kind {
-        TagKind::Green => "green",
-        TagKind::Red => "red",
-        TagKind::Gray => "gray",
-    };
-    rsx! { cds-tag { "type": kind, "size": "sm", "title": title, {children} } }
-}
-
 /// A collapsed Carbon accordion item, for detail most readers skip.
 #[component]
 pub fn Fold(#[props(into)] title: String, children: Element) -> Element {
