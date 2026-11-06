@@ -319,8 +319,15 @@ fn the_prologue_quantizes_as_quant_rows_fp8() {
                     std::ptr::null_mut(),
                 )
             };
-            if r.is_err() {
-                continue;
+            match r {
+                Ok(()) => {}
+                // A split the rule does not take at this `k`: nothing launched.
+                Err(KernelError::GemvSplit { .. }) => continue,
+                Err(e) => {
+                    eprintln!("gemv_fp8 prologue k={k} splits={splits}: launch failed: {e} FAIL");
+                    bad += 1;
+                    continue;
+                }
             }
             tried += 1;
             let got = down_f32(&out);
@@ -374,8 +381,17 @@ fn the_split_fp8_gemv_is_within_the_bound_and_repeatable() {
         let refs = gemv_reference(&x, (&bq, &b_s), nu, ku);
         let own = gemv_splits(n, k, 1);
         for splits in 1..=16u32 {
-            let Ok(first) = run_gemv(&device, &xb, &w, (n, k, splits)) else {
-                continue;
+            let first = match run_gemv(&device, &xb, &w, (n, k, splits)) {
+                Ok(v) => v,
+                // A split the rule does not take at this `k`: nothing launched.
+                Err(KernelError::GemvSplit { .. }) => continue,
+                Err(e) => {
+                    eprintln!(
+                        "gemv_fp8 split n={n} k={k} splits={splits}: launch failed: {e} FAIL"
+                    );
+                    pass = false;
+                    continue;
+                }
             };
             let second = run_gemv(&device, &xb, &w, (n, k, splits)).expect("repeat");
             let p = scratch(
