@@ -120,11 +120,11 @@ pub const IDENTITY_TID: u32 = u32::MAX - 19;
 /// `i == `[`selector_head_src_col`](crate::sdsc_abstract::selector_head_src_col)`(h,hd,j)` — so
 /// `matmul(q[mq,nqh·hd], Sel_h) = q_h[mq,hd]` = head h's columns, written head-major at `h·mq·hd`. The
 /// ONLY deployed way to head-major-ize row-major q/k/v for the per-head mq>1 attention ops (a strided
-/// read / 3D reshape / restickify all fail — see [`kcache_kt_write_offset`] + Kani `selector_extracts_head_column`).
+/// read / 3D reshape / restickify all fail — see [`kt_write_off`] + Kani `selector_extracts_head_column`).
 /// Fixed (position/layer-independent) ⇒ bound ONCE at prepare, like [`ROPE_P_TID`]. Placed only when the
 /// tape has an mq>1 `AttnDecode` (the prefill bundle); the mq=1 decode bundle never references it.
 ///
-/// [`kcache_kt_write_offset`]: crate::sdsc_abstract::kcache_kt_write_offset
+/// [`kt_write_off`]: crate::sdsc_abstract::PagedKvPool::kt_write_off
 pub const SEL_HEADMAJOR_TID: u32 = u32::MAX - 7;
 
 /// RESERVED tid for the mq>1 prefill KV-width head-major selector — `nkvh` stacked one-hot

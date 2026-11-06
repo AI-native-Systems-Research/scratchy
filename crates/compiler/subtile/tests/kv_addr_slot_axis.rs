@@ -44,7 +44,9 @@ fn kvh(i: u32) -> KvHead {
 /// other way round. Pinned at every head dim, because this is the transposition the score leg depends on.
 #[test]
 fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
-    for hd in [64usize, 80, 128, 256] {
+    // Whole-stick head widths only: a part-stick width (e.g. 80) is not a head the pool can hold —
+    // HeadWidth refuses it at the mint (its own should_panic test), so it is not a fixture here.
+    for hd in [64usize, 128, 256] {
         let p = pool(NKVH, hd);
         let stick = 64u32;
         for h in [0u32, 3, 7] {
@@ -143,7 +145,9 @@ fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
 /// a copy of the thing it guards.
 #[test]
 fn no_two_slots_of_a_plane_can_alias() {
-    for hd in [64usize, 80, 128, 256] {
+    // Whole-stick head widths only: a part-stick width (e.g. 80) is not a head the pool can hold —
+    // HeadWidth refuses it at the mint (its own should_panic test), so it is not a fixture here.
+    for hd in [64usize, 128, 256] {
         let p = pool(NKVH, hd);
         let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {

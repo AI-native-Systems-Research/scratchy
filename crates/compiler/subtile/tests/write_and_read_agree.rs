@@ -14,7 +14,7 @@
 //! Checked at hd=64 AND hd=128, because a stick width standing in for a head width is the other way this
 //! family of bugs shows up, and those two are equal only at 64.
 
-use scratchy_subtile::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
+use scratchy_subtile::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot};
 use std::num::NonZeroU32;
 
 /// The test pool: head count and width as the raw fixture numbers, minted through the pool's

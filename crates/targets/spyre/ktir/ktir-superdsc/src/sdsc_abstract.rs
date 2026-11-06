@@ -1000,6 +1000,13 @@ impl HeadWidth {
         self.0
     }
 
+    /// The width as a `usize` — the accessor for the host-side element arithmetic that counts
+    /// in `usize` (lossless: a head width fits a `u32`). The ONE widening past the type, as the
+    /// page types' own `as_usize`; no use site spells `as usize` on the raw value.
+    pub const fn as_usize(self) -> usize {
+        self.0.get() as usize
+    }
+
     /// How many fp16 sticks one head spans — `hd / 64`, proven whole by construction. This is
     /// the slab count every feature-axis stride multiplies by, and the `== 1` case is the
     /// one-stick emit form's own predicate — askable by name instead of `hd == 64`.
@@ -1062,8 +1069,8 @@ pub fn row_major_is_stick_major(rows: usize, cols: usize) -> bool {
 //  OWNS `dev_off` (delegates to the free fn above, byte-identical — Kani `dev_off_method_equals_free_fn`
 //  in scratchy-sdsc's `systolic_ir`). Lives HERE (next to `dev_off`) so the live emitter — which cannot
 //  depend on the `scratchy-sdsc` tower (circular) — routes its device addresses through it; the tower's
-//  `SystolicIR` graph pass RE-USES these types. The `kcache_kt_write_offset`/`vcache_write_offset` below
-//  are the first live call sites migrated onto it.
+//  `SystolicIR` graph pass RE-USES these types. The pool's `kt_write_off`/`v_write_off` are the
+//  live call sites migrated onto it.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// HOW MUCH of a dim one tensor view's address spans, when the view does not range over that dim.
@@ -2312,64 +2319,11 @@ impl Stk<KernelTag> {
     }
 }
 
-/// THE K-CACHE PRODUCER OFFSET — the device element offset (WITHIN one head) at which the
-/// producer (the shim's host scatter) must store `K[slot][d]` so the score matmul, which reads the
-/// K cache as a `[hd, cap]` cap-sticked KERNEL, decodes it as the correct score. This is EXACTLY the
-/// consumer's device-address model evaluated at `(in=d, out=slot)` — i.e. `dev_off(&[hd, cap], 1,
-/// &[d, slot])` — so producer and consumer cannot diverge by construction. It is the single source of
-/// truth shared by: (a) the deleted builder's per-element build guard (`lower_attn_node`), (b) the interpreter
-/// proof below, and (c) (mirrored in C++) the shim's `host_kv_write` scatter. `stk` = elems per stick.
-///
-/// The bug this replaces: the cachewr used to write NATURAL slot-major `slot*hd + d`, which differs
-/// from this whenever `cap > stk` (here cap=256, hd=64), scrambling the prefix-K the score reads.
-/// ```
-/// use ktir_superdsc::sdsc_abstract::*;
-/// let (hd, cap, stk) = (64usize, 256usize, 64usize);
-/// // The Kᵀ producer offset is the consumer's read model at (d, slot) — identical for every cell.
-/// for slot in [0usize, 1, 63, 64, 65, 128, 255] { for d in [0usize, 1, 7, 63] {
-///     assert_eq!(kcache_kt_write_offset(slot, d, hd, cap, stk), dev_off(&[hd, cap], 1, &[d, slot]));
-/// }}
-/// // And it is NOT the natural slot-major layout `slot*hd+d` for cap>stk (the exact bug). Use d>0:
-/// // at (slot=64,d=1) stick-blocked = 4160 but slot-major = 64*hd+1 = 4097. (At d=0 they coincide.)
-/// assert_ne!(kcache_kt_write_offset(64, 1, hd, cap, stk), 64 * hd + 1);
-/// ```
-pub fn kcache_kt_write_offset(slot: usize, d: usize, hd: usize, cap: usize, stk: usize) -> usize {
-    debug_assert_eq!(
-        stk, STK,
-        "K-cache stick size must match the device stick (64)"
-    );
-    // WIRED onto the systolic `StickLayout`: the K cache is a `[hd, cap]` KERNEL sticked on `cap`, so
-    // element `(in=d, out=slot)` is `StickLayout::kernel(hd, cap).dev_off(d, slot)` — byte-identical to
-    // the free `dev_off(&[hd,cap],1,&[d,slot])` (Kani `dev_off_method_equals_free_fn`), i.e. the layout
-    // now OWNS this address (no hand-rolled stick math). `cap` bounds `slot`; the offset formula uses hd.
-    StickLayout::kernel(hd, cap).dev_off(d, slot)
-}
-
-/// THE V-CACHE PRODUCER OFFSET — the device element offset (WITHIN one head) at which the producer
-/// (the shim's host scatter) must store `V[slot][d]` so the VALUE bmm, which reads the V cache as a
-/// `[cap, hd]` KERNEL sticked on `hd` (`out`), decodes the correct value. `out_pre = bmm(probs[1,cap]
-/// · V[cap,hd]) → [1,hd]`, so the kernel is `[k=cap, n=hd]` sticked on `n=hd`, and its element
-/// `(k=slot, n=d)` lives at `dev_off(&[cap, hd], 1, &[slot, d])` — this IS that. Producer and consumer
-/// (value bmm read) therefore cannot diverge by construction (the twin of `kcache_kt_write_offset`).
-/// Shared source of truth for the shim's `host_kv_write` V scatter + the interpreter/Kani proof.
-/// ```
-/// use ktir_superdsc::sdsc_abstract::*;
-/// let (hd, cap, stk) = (128usize, 256usize, 64usize);
-/// for slot in [0usize, 1, 63, 255] { for d in [0usize, 63, 64, 127] {
-///     assert_eq!(vcache_write_offset(slot, d, hd, cap, stk), dev_off(&[cap, hd], 1, &[slot, d]));
-/// }}
-/// ```
-pub fn vcache_write_offset(slot: usize, d: usize, hd: usize, cap: usize, stk: usize) -> usize {
-    debug_assert_eq!(
-        stk, STK,
-        "V-cache stick size must match the device stick (64)"
-    );
-    // WIRED onto the systolic `StickLayout`: the V cache is a `[cap, hd]` KERNEL sticked on `hd`, so
-    // element `(in=slot, out=d)` is `StickLayout::kernel(cap, hd).dev_off(slot, d)` — byte-identical to
-    // the free `dev_off(&[cap,hd],1,&[slot,d])`. `hd` bounds `d`; the offset formula uses cap.
-    StickLayout::kernel(cap, hd).dev_off(slot, d)
-}
-
+/// (The Kᵀ/V producer-offset free fns that used to live here — `kcache_kt_write_offset` /
+/// `vcache_write_offset` — were the last raw-`hd: usize` doors in the pool's orbit. They were
+/// thin wrappers over [`StickLayout::kernel`]`..dev_off(..)`; the pool's own
+/// [`PagedKvPool::kt_write_off`] / [`PagedKvPool::v_write_off`] are the typed doors, and the
+/// layout tests state the address law through `StickLayout` directly.)
 /// THE RoPE ROTATE-HALF PERMUTATION MATRIX ENTRY `P[inn][o]` for a head of width `hd` (even). RoPE
 /// computes `out = x·cos + rot·sin` with `rot = matmul(x, P)`; this P makes `rot` the NeoX rotate-half:
 /// `rot[o] = -x[o+half]` for `o < half`, `+x[o-half]` for `o >= half` (half = hd/2). SINGLE SOURCE OF
@@ -5527,31 +5481,33 @@ impl PagedKvPool {
         // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
         // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
         // described this bug; it is now fixed rather than described.
-        // The one byte-math widening the host address doors share: the typed width, as the
-        // usize the host's element arithmetic runs in (lossless — a head width fits a u32).
-        let hd_elems = self.hd.get() as usize;
+        // Both hd terms arrive through the type: `hd_elems` (the host usize widening, via
+        // `as_usize`) for the page-block product, `self.hd.get()` for the u32 block term. The
+        // one `as u32` narrows the page-block product to this fn's return, not the width.
+        let hd_elems = self.hd.as_usize();
         (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS.as_usize() * hd_elems) as u32
             + b * STK as u32 * self.hd.get()
     }
 
     /// Kᵀ WRITE offset of `K[slot][d]` within a page+layer — the consumer's own read model, so
-    /// producer and consumer cannot diverge ([`kcache_kt_write_offset`] at page granularity).
+    /// producer and consumer cannot diverge (the `[hd, cap]` cap-sticked kernel's `dev_off(d, slot)`
+    /// at page granularity, stated through [`StickLayout::kernel`]).
     /// ```
     /// use ktir_superdsc::sdsc_abstract::*;
     /// use std::num::NonZeroU32;
     /// let p = PagedKvPool::new(NonZeroU32::new(8).unwrap(), HeadWidth::of_whole_sticks(64));
     /// for (slot, d) in [(0usize, 0usize), (1, 0), (63, 7), (64, 0), (255, 63)] {
-    ///     assert_eq!(p.kt_write_off(0, slot, d),
-    ///                kcache_kt_write_offset(slot, d, 64, PagedKvPool::POOL_PAGE_SLOTS.as_usize(), 64));
     ///     // 256 slots = 4 sticks ⇒ stick-blocked: (s/64)*(hd*64) + d*64 + s%64.
     ///     assert_eq!(p.kt_write_off(0, slot, d), (slot / 64) * (64 * 64) + d * 64 + slot % 64);
     /// }
     /// ```
     pub fn kt_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor, because a page holds slots and not requests.
-        let hd_elems = self.hd.get() as usize;
+        // The within-head offset is the consumer's own read model: the [hd, page] cap-sticked
+        // KERNEL's device address at (in=d, out=slot), stated once by the layout law.
+        let hd_elems = self.hd.as_usize();
         kvh * hd_elems * Self::POOL_PAGE_SLOTS.as_usize()
-            + kcache_kt_write_offset(slot, d, hd_elems, Self::POOL_PAGE_SLOTS.as_usize(), STK)
+            + StickLayout::kernel(hd_elems, Self::POOL_PAGE_SLOTS.as_usize()).dev_off(d, slot)
     }
 
     /// V WRITE offset of `V[slot][d]` within a page+layer. A `[1, hd]` row is CONTIGUOUS here, which
@@ -5567,9 +5523,11 @@ impl PagedKvPool {
     /// ```
     pub fn v_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor; a page holds slots, not requests.
-        let hd_elems = self.hd.get() as usize;
+        // The within-head offset is the consumer's own read model: the [page, hd] hd-sticked
+        // KERNEL's device address at (in=slot, out=d), stated once by the layout law.
+        let hd_elems = self.hd.as_usize();
         kvh * Self::POOL_PAGE_SLOTS.as_usize() * hd_elems
-            + vcache_write_offset(slot, d, hd_elems, Self::POOL_PAGE_SLOTS.as_usize(), STK)
+            + StickLayout::kernel(Self::POOL_PAGE_SLOTS.as_usize(), hd_elems).dev_off(slot, d)
     }
 
     /// Head width this pool laid itself out for, AS THE TYPE — the one value every reader

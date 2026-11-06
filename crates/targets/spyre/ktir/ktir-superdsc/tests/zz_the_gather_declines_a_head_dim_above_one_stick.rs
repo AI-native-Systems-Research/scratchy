@@ -186,7 +186,9 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
 /// gather would silently disagree again and this fails first.
 #[test]
 fn the_bundle_level_door_is_the_per_pass_door_at_every_window_count() {
-    for hd in [HD_2B, HD_8B, 96, 192, 256] {
+    // Whole-stick widths only: 96 (a part-stick width the old raw sweep included) is not a head
+    // the pool can hold — HeadWidth refuses it at the mint, so it cannot reach this door at all.
+    for hd in [HD_2B, HD_8B, 192, 256] {
         for mq in [1u32, 2, 4, 8, 16, 32] {
             let admits = GatherScratch::admits(pool(NKVH, hd), QueryRowCount::of_mq(mq));
             // ⛔ EVERY `active_cap` A LADDER RUNG CAN BE, not just the ceiling: the bundle-level

@@ -16,8 +16,8 @@
 //! |---|---|
 //! | `[row, col]` `[rows, cols]`        | `dev_off_stk` rank-2 |
 //! | `[row, outer, col]` `[mq, nqh, hd]`| `dev_off_head` |
-//! | `[slot, qhead, dim]` `[cap, nqh, hd]` | `vcache_write_offset` (+ head base) |
-//! | `[dim, kvhead, slot]` `[hd, nkvh, cap]` | `kcache_kt_write_offset` (+ head base) |
+//! | `[slot, qhead, dim]` `[cap, nqh, hd]` | `v_write_off` (+ head base) |
+//! | `[dim, kvhead, slot]` `[hd, nkvh, cap]` | `kt_write_off` (+ head base) |
 //!
 //! So `StickKind`'s variants are one nest at different ranks. This module makes that the *only* way
 //! to get an address: declare a tensor's axes and its OWN storage extents once, then narrow by

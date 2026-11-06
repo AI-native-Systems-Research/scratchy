@@ -280,7 +280,7 @@ fn page_addresses_are_uniformly_spaced_however_scrambled_the_table_is() {
 /// over a deliberately churned table, at both baked head widths.
 #[test]
 fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
-    use scratchy_subtile::sdsc_abstract::{PagedKvPool, gather_entries_per_page};
+    use scratchy_subtile::sdsc_abstract::gather_entries_per_page;
 
     // BOTH baked head widths: the factor carries `hd` (a stick block is `hd * 64`), so a test at one
     // width would pass on a hardcoded 4096 — which is exactly what every doc comment in the tree says.
@@ -348,7 +348,7 @@ fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
 /// first, uniformly, silently. There is no safe default, so there is a `None`.
 #[test]
 fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
-    use scratchy_subtile::sdsc_abstract::{PagedKvPool, gather_entries_per_page};
+    use scratchy_subtile::sdsc_abstract::gather_entries_per_page;
     let pool = pool(8, 64);
     assert!(
         gather_entries_per_page(pool.stick_block_bytes() + 1, pool).is_none(),
@@ -383,8 +383,8 @@ fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
 #[test]
 fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
     use scratchy_subtile::sdsc_abstract::{
-        GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
-        SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
+        GatherScratch, PAGE_MASK_COLS, POOL_STICK, PrefixMaskShape, QueryRowCount, SlotCount,
+        SlotWindow, gather_entries_per_page, gather_index_table,
     };
     // Two kv heads and one 64-slot window keeps the arithmetic readable; the request axis is what the
     // order is about, so it is the axis with two values.
@@ -503,8 +503,8 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
 #[test]
 fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds() {
     use scratchy_subtile::sdsc_abstract::{
-        GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
-        SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
+        GatherScratch, PAGE_MASK_COLS, POOL_STICK, PrefixMaskShape, QueryRowCount, SlotCount,
+        SlotWindow, gather_entries_per_page, gather_index_table,
     };
     let pool = pool(8, 64);
     let mq = QueryRowCount::of_mq(2);
