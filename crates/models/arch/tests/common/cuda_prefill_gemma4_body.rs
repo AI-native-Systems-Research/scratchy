@@ -125,6 +125,9 @@ fn roles() -> Vec<Option<Role>> {
                 }) => match weight {
                     MoeWeight::Own => set(bundle.0, Role::Matrix { k: hidden }),
                     MoeWeight::Bundle => panic!("weight {}: a Qwen MoE bundle", bundle.0),
+                    MoeWeight::Fp8Bundle | MoeWeight::Fp8Own => {
+                        panic!("weight {}: an fp8 bank in a bf16 tape", bundle.0)
+                    }
                 },
                 CudaStep::ExpertGemm(ExpertGemmBf16 {
                     bundle,
@@ -151,10 +154,21 @@ fn roles() -> Vec<Option<Role>> {
                         },
                     ),
                     MoeWeight::Bundle => panic!("weight {}: a Qwen MoE bundle", bundle.0),
+                    MoeWeight::Fp8Bundle | MoeWeight::Fp8Own => {
+                        panic!("weight {}: an fp8 bank in a bf16 tape", bundle.0)
+                    }
                 },
                 CudaStep::GatedDeltaNet(_) | CudaStep::GdnDecode(_) => {
                     panic!("a GDN layer in a Gemma tape")
                 }
+                CudaStep::QuantRowsFp8(_)
+                | CudaStep::GemmFp8(_)
+                | CudaStep::GemmCol64Fp8(_)
+                | CudaStep::GemmNarrowFp8(_)
+                | CudaStep::GemvFp8(_)
+                | CudaStep::GemmGroupFp8(_)
+                | CudaStep::GemmNarrowGroupFp8(_)
+                | CudaStep::GemvGroupFp8(_) => panic!("an fp8 step in a bf16 tape"),
                 // The steps that read no weight.
                 CudaStep::Add(_)
                 | CudaStep::SiluMul(_)
@@ -1774,6 +1788,14 @@ fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
         CudaStep::GateUpAct(_) => ("GateUpAct", "GateUpAct"),
         CudaStep::ExpertGateUpAct(_) => ("ExpertGateUpAct", "ExpertGateUpAct"),
         CudaStep::GdnDecode(_) => ("GdnDecode", "GdnDecode"),
+        CudaStep::QuantRowsFp8(_)
+        | CudaStep::GemmFp8(_)
+        | CudaStep::GemmCol64Fp8(_)
+        | CudaStep::GemmNarrowFp8(_)
+        | CudaStep::GemvFp8(_)
+        | CudaStep::GemmGroupFp8(_)
+        | CudaStep::GemmNarrowGroupFp8(_)
+        | CudaStep::GemvGroupFp8(_) => panic!("an fp8 step in a bf16 tape"),
     }
 }
 

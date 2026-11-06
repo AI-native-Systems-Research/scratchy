@@ -113,6 +113,14 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::GateUpAct(_) => "GateUpAct",
             CudaStep::ExpertGateUpAct(_) => "ExpertGateUpAct",
             CudaStep::GdnDecode(_) => "GdnDecode",
+            CudaStep::QuantRowsFp8(_) => "QuantRowsFp8",
+            CudaStep::GemmFp8(_) => "GemmFp8",
+            CudaStep::GemmCol64Fp8(_) => "GemmCol64Fp8",
+            CudaStep::GemmNarrowFp8(_) => "GemmNarrowFp8",
+            CudaStep::GemvFp8(_) => "GemvFp8",
+            CudaStep::GemmGroupFp8(_) => "GemmGroupFp8",
+            CudaStep::GemmNarrowGroupFp8(_) => "GemmNarrowGroupFp8",
+            CudaStep::GemvGroupFp8(_) => "GemvGroupFp8",
         };
         *h.entry(kind).or_default() += 1;
     }
@@ -362,6 +370,9 @@ fn the_weight_table_names_the_checkpoints_tensors() {
                 ..
             } => vec![router, gate_up, down],
             CudaWeight::ExpertBank { gate_up, down, .. } => vec![gate_up, down],
+            CudaWeight::Fp8 { .. }
+            | CudaWeight::Fp8MoeBundle { .. }
+            | CudaWeight::Fp8ExpertBank { .. } => panic!("weight {ix}: an fp8 weight in a bf16 table"),
         };
         assert!(
             leads.insert(tensors[0]),
@@ -400,6 +411,9 @@ fn the_weight_table_names_the_checkpoints_tensors() {
         CudaWeight::Bf16 { shape, .. } => shape,
         CudaWeight::GdnBundle { .. } | CudaWeight::MoeBundle { .. } => panic!("a bundle"),
         CudaWeight::ExpertBank { .. } => panic!("an expert bank"),
+        CudaWeight::Fp8 { .. } | CudaWeight::Fp8MoeBundle { .. } | CudaWeight::Fp8ExpertBank { .. } => {
+            panic!("an fp8 weight in a bf16 table")
+        }
     };
     let (e, embed) = by_name("language_model.model.embed_tokens.weight");
     assert_eq!(e, 0, "the embedding table is the embedded hidden's index");

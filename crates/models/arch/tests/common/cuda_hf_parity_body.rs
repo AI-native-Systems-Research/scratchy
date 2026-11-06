@@ -881,7 +881,10 @@ fn load_checks() {
             Some(
                 CudaWeight::Bf16 { .. }
                 | CudaWeight::GdnBundle { .. }
-                | CudaWeight::MoeBundle { .. },
+                | CudaWeight::MoeBundle { .. }
+                | CudaWeight::Fp8 { .. }
+                | CudaWeight::Fp8MoeBundle { .. }
+                | CudaWeight::Fp8ExpertBank { .. },
             )
             | None => None,
         })
