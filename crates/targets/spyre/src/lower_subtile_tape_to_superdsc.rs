@@ -3634,8 +3634,8 @@ pub fn write_eval_golden<F: RopeForm>(
 /// one, masked pages past it) at a position a request reaches, and at least the 640 keys the
 /// gate's softmax has always summed. See the decode golden's view in [`numeric_gate`].
 #[cfg(feature = "spyre-emu")]
-pub const GATE_DECODE_CONTEXT: u32 =
-    10 * scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS + scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS / 2;
+pub const GATE_DECODE_CONTEXT: u32 = 10 * scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS
+    + scratchy_triton_splice::SCHEDULER_BLOCK_TOKENS / 2;
 
 #[cfg(feature = "spyre-emu")]
 pub struct PrefillGate {

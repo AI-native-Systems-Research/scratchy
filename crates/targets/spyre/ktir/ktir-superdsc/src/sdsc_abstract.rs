@@ -3109,7 +3109,11 @@ impl RowPages {
     /// `page_slots` is a second source for a compile-time quantity — see
     /// [`crate::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS`]'s own warning about `PLANE_SLOTS`.
     pub fn holding(span: SlotCount) -> RowPages {
-        RowPages(span.get().max(1).div_ceil(PagedKvPool::POOL_PAGE_SLOTS as u32))
+        RowPages(
+            span.get()
+                .max(1)
+                .div_ceil(PagedKvPool::POOL_PAGE_SLOTS as u32),
+        )
     }
 
     /// `None` when the prefix mask cannot reach this deep — past the blocks the bundle BAKED
@@ -4819,7 +4823,8 @@ impl PagedKvPool {
     /// ⭐ PAGES ONE PROMPT WINDOW MAY SPAN — the widest prefill chunk in whole pages (1 when it fits in
     /// one). A window starting at a page boundary may fill all of them; one starting mid-page stays
     /// inside that page (see [`chunk_room`](Self::chunk_room)).
-    pub const PREFILL_WINDOW_PAGES: usize = Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::POOL_PAGE_SLOTS);
+    pub const PREFILL_WINDOW_PAGES: usize =
+        Self::PREFILL_CHUNK_SLOTS.div_ceil(Self::POOL_PAGE_SLOTS);
 
     /// ⛔⛔⛔ A CHUNK-FORM MODEL'S **BAKED** PREFILL LADDER MUST REACH THE POOL'S WINDOW — the bake's proof,
     /// panicked on by the macro.
@@ -5327,7 +5332,8 @@ impl PagedKvPool {
         // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
         // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
         // described this bug; it is now fixed rather than described.
-        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS * self.hd) as u32 + b * STK as u32 * self.hd as u32
+        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS * self.hd) as u32
+            + b * STK as u32 * self.hd as u32
     }
 
     /// Kᵀ WRITE offset of `K[slot][d]` within a page+layer — the consumer's own read model, so

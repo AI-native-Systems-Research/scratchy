@@ -3189,7 +3189,6 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
     );
 }
 
-
 /// ⭐ THE fp8-DYNAMIC EPILOGUE'S LIVE-TILE COUNT, COUNTED FROM THE MINTED
 /// PROGRAM — the pin for `scratchy_triton_splice::FP8_EPILOGUE_LIVE_TILES`,
 /// which the emu prefill-width derivation reads as the epilogue's LX cost (the
@@ -3216,17 +3215,16 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
             .expect("the spliced op carries its program");
         let ops = prog.func.ops_deep();
         let is_mn_f16 = |v: ktir_core::ir::Ssa| {
-            ops.iter()
-                .any(|op| {
-                    op.result == Some(v)
-                        && matches!(
-                            op.result_type,
-                            Some(ktir_core::irtype::IrType::Tensor {
-                                dims,
-                                elem: ktir_core::dtypes::DType::F16,
-                            }) if dims == [i64::from(m), i64::from(n)]
-                        )
-                })
+            ops.iter().any(|op| {
+                op.result == Some(v)
+                    && matches!(
+                        op.result_type,
+                        Some(ktir_core::irtype::IrType::Tensor {
+                            dims,
+                            elem: ktir_core::dtypes::DType::F16,
+                        }) if dims == [i64::from(m), i64::from(n)]
+                    )
+            })
         };
         // Def point and last use of every value, in program order.
         use std::collections::HashMap;
@@ -3246,9 +3244,7 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
             let live = def
                 .keys()
                 .filter(|&&v| {
-                    is_mn_f16(v)
-                        && def[&v] <= t
-                        && last_use.get(&v).is_some_and(|&u| u >= t)
+                    is_mn_f16(v) && def[&v] <= t && last_use.get(&v).is_some_and(|&u| u >= t)
                 })
                 .count();
             peak = peak.max(live);

@@ -865,7 +865,10 @@ mod tests {
         // whole pages (819 of 128 slots).
         let p = pool_slots(ctx, slot(40, 8, 128)).expect("a page fits");
         assert_eq!(p.get(), 104_832);
-        assert!(p.get().is_multiple_of(SCHEDULER_BLOCK_TOKENS), "whole pages");
+        assert!(
+            p.get().is_multiple_of(SCHEDULER_BLOCK_TOKENS),
+            "whole pages"
+        );
         assert!(u64::from(p.get()) * slot(40, 8, 128) <= scratchy_spyre_bundle::MAX_SEGMENT_BYTES);
         assert!(
             u64::from(p.get() + SCHEDULER_BLOCK_TOKENS) * slot(40, 8, 128)

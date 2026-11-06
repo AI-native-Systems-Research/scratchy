@@ -10692,9 +10692,7 @@ const _: () = assert!(
         let mut ok = true;
         let mut i = 0;
         while i < PREFILL_RUNGS.len() {
-            if PREFILL_RUNGS[i] == 0
-                || (i > 0 && PREFILL_RUNGS[i - 1] >= PREFILL_RUNGS[i])
-            {
+            if PREFILL_RUNGS[i] == 0 || (i > 0 && PREFILL_RUNGS[i - 1] >= PREFILL_RUNGS[i]) {
                 ok = false;
             }
             i += 1;
@@ -10702,9 +10700,7 @@ const _: () = assert!(
         let n = PREFILL_RUNGS.len();
         let top = PREFILL_RUNGS[n - 1];
         let half_page = page / 2;
-        ok
-            && top as usize
-                == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::POOL_PAGE_SLOTS
+        ok && top as usize == PagedKvPool::PREFILL_WINDOW_PAGES * PagedKvPool::POOL_PAGE_SLOTS
             && top as usize == PagedKvPool::PREFILL_CHUNK_SLOTS
             && PREFILL_RUNGS[n - 1].is_multiple_of(half_page)
             && PREFILL_RUNGS[n - 2].is_multiple_of(half_page)
@@ -10832,8 +10828,7 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
         if fp8_ns.iter().all(|&n| {
             scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n)
                 <= u128::from(scratchy_subtile::superdsc_opspec::LX_FUSION_BUDGET_BYTES)
-        })
-        {
+        }) {
             return w;
         }
     }

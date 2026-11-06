@@ -1463,7 +1463,6 @@ const _: () = assert!(
      the write and the walk rely on is not whole"
 );
 
-
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
 
@@ -1725,7 +1724,10 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
 pub fn walk_pages(pages: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
-    let swept = active_cap.resolve(pages * SCHEDULER_BLOCK_TOKENS, ktir_superdsc::sdsc_abstract::POOL_STICK);
+    let swept = active_cap.resolve(
+        pages * SCHEDULER_BLOCK_TOKENS,
+        ktir_superdsc::sdsc_abstract::POOL_STICK,
+    );
     let walked = if swept == 0 { mq } else { swept };
     walked.div_ceil(SCHEDULER_BLOCK_TOKENS).min(pages)
 }
@@ -3969,7 +3971,10 @@ mod production_ktir_dump {
                         ("T", Val::Int(t)),
                         ("NUM_KV_HEADS", Val::Int(nkvh)),
                         ("HEAD_SIZE", Val::Int(hd)),
-                        ("NUM_ROWS", Val::Int(4 * nkvh * i128::from(SCHEDULER_BLOCK_TOKENS))),
+                        (
+                            "NUM_ROWS",
+                            Val::Int(4 * nkvh * i128::from(SCHEDULER_BLOCK_TOKENS)),
+                        ),
                     ],
                 ),
                 vec![1],
