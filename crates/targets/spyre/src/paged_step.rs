@@ -145,6 +145,15 @@ impl StepRows {
         })
     }
 
+    /// One row at `start` — the literal-row mint, `const` so no `expect` stands where the value
+    /// is a literal. `NonZeroUsize::MIN` is 1, the count one row is.
+    pub const fn one_at(start: usize) -> StepRows {
+        StepRows {
+            start,
+            real: std::num::NonZeroUsize::MIN,
+        }
+    }
+
     /// The sequence position row `r` carries.
     pub fn pos(&self, r: usize) -> usize {
         self.start + r.min(self.real.get() - 1)

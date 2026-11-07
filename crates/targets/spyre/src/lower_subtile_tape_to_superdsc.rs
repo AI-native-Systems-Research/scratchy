@@ -3890,10 +3890,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 })
                 .max()
                 .unwrap_or(0);
-            crate::paged_step::StepRows::new(cached.min(p.capacity().saturating_sub(1)), 1)
-                .expect("one row is one row")
+            crate::paged_step::StepRows::one_at(cached.min(p.capacity().saturating_sub(1)))
         }
-        (None, None) => crate::paged_step::StepRows::new(0, 1).expect("one row is one row"),
+        (None, None) => crate::paged_step::StepRows::one_at(0),
     };
     // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
     // every page through the table rather than at its block's own index, and the pages the step
