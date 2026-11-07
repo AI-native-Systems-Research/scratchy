@@ -3643,8 +3643,9 @@ fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
     let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, false)
-        .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+    let spliced =
+        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
     assert_eq!(
         spliced.op_name,
         format!("rmsnorm_s{}", node.id.index()),
