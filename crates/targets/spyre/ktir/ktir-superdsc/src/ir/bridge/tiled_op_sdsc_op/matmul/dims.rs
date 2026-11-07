@@ -309,6 +309,23 @@ fn matmul_split_map_inner(
                     map.insert(InAxis::NAME, in_split);
                 }
             }
+        } else if mb == 1 {
+            // ⭐ ONE ROW, ONE OUTPUT STICK: the one-row law above, at `out = 1`. A one-row matmul is a
+            // weight stream whatever its width, and `core_split(1, ·)` would put it on ONE core — the
+            // shape a tensor-parallel rank's k/v projection takes once its heads split down to one
+            // (granite-3.1-2b at tp/8: `[2048 -> 64]`, a quarter-megabyte read by one core). The fill
+            // cuts the reduction into whole sticks over every core, which dxp PSUM-accumulates into
+            // the one shared output stick, exactly as it does for the multi-stick fill's `in` factor.
+            let in_stick_elems = dims
+                .iter()
+                .find(|d| d.name == InAxis::NAME)
+                .map(|d| d.df.elems_per_stick())
+                .unwrap_or(FP16_ELEMS_PER_STICK);
+            let (_, in_split) =
+                crate::work::one_row_core_fill(1, in_.div_ceil(in_stick_elems), max_cores);
+            if in_split > 1 {
+                map.insert(InAxis::NAME, in_split);
+            }
         } else {
             // Single-stick output = the matmul-by-ones REDUCE (rmmsum / fp8 amax) — a SCRATCHY construct,
             // not a torch-spyre matmul, so no fidelity reference. It can't N-split (one stick) and must
