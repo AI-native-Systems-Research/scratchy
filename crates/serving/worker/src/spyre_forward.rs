@@ -373,7 +373,9 @@ pub(crate) fn run_card_launch(
         .sample_seat
         .as_ref()
         .map(|seat| (seat, SeatWidth::of_launch(seat, &rows_in, mq)));
-    if let Some(&(seat, seat_width)) = &seat_launch {
+    // (the pair is `Copy` — a reference and a `Copy` width — so this binding
+    // copies it and the pick match below binds its own copy of the same one)
+    if let Some((seat, seat_width)) = seat_launch {
         let laws: Vec<RowLaw<'_>> = match seat_laws {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
