@@ -257,8 +257,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_d512_fp8kv_ker(
             warp::exp2(att_block, att_block);
             scratchy::ops::rv_ternary_map<scratchy::ops::rescale_exact1>(
                 max_vec_last, max_vec_last, max_vec, g.scale_log2);
-            warp::mul(norm_vec, norm_vec, max_vec_last);
-            warp::row_sum(norm_vec, att_block, norm_vec);
+            // The running sum `l · r + Σ p`, as ONE fused multiply-add: in the bf16 kernel nvcc
+            // contracts its `mul` then `row_sum` into one FFMA per packed row, and in this kernel's
+            // code shape it does not (two roundings: the 8–99 bits of the H100 pod at 134c057d).
+            // So the sum is formed alone (`row_sum` with no accumulator) and fused explicitly
+            // (`fma_acc`, `fmaf(r, l, Σ p)`): the bf16 kernel's bits, by construction.
+            col_vec<rt_fl<16, KV_HEIGHT>> tile_sum;
+            warp::row_sum(tile_sum, att_block);
+            scratchy::ops::rv_fma<scratchy::ops::fma_acc>(norm_vec, max_vec_last, norm_vec,
+                                                          tile_sum);
             warp::copy(att_block_mma, att_block);
             warp::mul_row(o_reg, o_reg, max_vec_last);
 
