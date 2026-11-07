@@ -1404,8 +1404,7 @@ impl SpyreWorker {
                 let card_bytes = cards
                     .values()
                     .map(|c| c.memory())
-                    .min()
-                    .unwrap_or_else(|| unreachable!("a world has at least one card"));
+                    .fold(cards.first().memory(), std::cmp::min);
                 // WHAT THE BUNDLE ALREADY OWNS ON THE CARD, charged as `weights_and_overhead` — every
                 // segment except the KV one, whose bytes are what we are about to size. The segments are
                 // typed (`SEG_INTERMEDIATE`/`SEG_WEIGHT`/`SEG_KV`/`SEG_MASK`), so this reads the KV segment

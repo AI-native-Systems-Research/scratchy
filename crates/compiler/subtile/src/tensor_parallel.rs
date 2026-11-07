@@ -197,9 +197,10 @@ pub struct ShardedForward<T: World> {
 }
 
 /// The analysis's working state. Everything it decides is written exactly once.
-struct Weave<'a> {
+struct Weave<'a, T: World> {
     input: &'a LoweringInput,
-    w: u32,
+    /// The world the forward is sharded for — every split count is `T::RANKS`.
+    world: core::marker::PhantomData<T>,
     granule: u32,
     /// Global `(rows, cols)` of every input op's output.
     shape: Vec<(u32, u32)>,
@@ -231,7 +232,7 @@ enum Follow {
     Blocks,
 }
 
-impl Weave<'_> {
+impl<T: World> Weave<'_, T> {
     fn src_shape(&self, e: usize) -> (u32, u32) {
         let s = self.input.sources[e];
         (s.rows, s.cols)
@@ -246,17 +247,17 @@ impl Weave<'_> {
 
     /// Whether `extent` splits into `W` blocks that are each a whole number of granules.
     fn splits(&self, extent: u32) -> bool {
-        extent.is_multiple_of(self.w * self.granule)
+        extent.is_multiple_of(T::RANKS * self.granule)
     }
 
     /// Whether source `e` can be loaded as `want` — unset, or already that.
     fn can_adopt(&self, e: usize, want: SourceShard) -> bool {
         let fits = match want {
             SourceShard::Whole => true,
-            SourceShard::Rows => self.input.sources[e].rows.is_multiple_of(self.w),
-            SourceShard::Cols => self.input.sources[e].cols.is_multiple_of(self.w),
+            SourceShard::Rows => self.input.sources[e].rows.is_multiple_of(T::RANKS),
+            SourceShard::Cols => self.input.sources[e].cols.is_multiple_of(T::RANKS),
             SourceShard::HeadRows { heads } => {
-                heads.get().is_multiple_of(self.w)
+                heads.get().is_multiple_of(T::RANKS)
                     && self.input.sources[e].rows.is_multiple_of(heads.get())
             }
         };
@@ -264,13 +265,20 @@ impl Weave<'_> {
     }
 
     /// The local operand standing for `r` in a WHOLE placement — the edge where the analysis
-    /// weaves a collective in, once per value however many consumers demand it.
+    /// weaves a collective in, once per value however many consumers demand it. A source is
+    /// already whole (it is loaded by its slice law), so only an op's output can need one.
     fn whole(&mut self, r: InputRef) -> Result<InputRef, ShardRefusal> {
-        let InputRef::Op(j) = r else {
-            return Ok(r);
-        };
+        match r {
+            InputRef::Op(j) => self.whole_op(j).map(InputRef::Op),
+            InputRef::Ext(_) => Ok(r),
+        }
+    }
+
+    /// [`Self::whole`] of input op `j`'s output: the local op computing it whole — its own local
+    /// op when it is already whole, else the collective woven in to make it so.
+    fn whole_op(&mut self, j: usize) -> Result<usize, ShardRefusal> {
         let (kind, op) = match self.place[j] {
-            Placement::Whole => return Ok(InputRef::Op(self.op_map[j])),
+            Placement::Whole => return Ok(self.op_map[j]),
             Placement::Partial => (CollectiveKind::AllReduce, SubOp::AllReduce),
             Placement::Split(Axis::Cols) => (
                 CollectiveKind::AllGather,
@@ -283,7 +291,7 @@ impl Weave<'_> {
             }
         };
         if let Some(k) = self.whole_of[j] {
-            return Ok(InputRef::Op(k));
+            return Ok(k);
         }
         let reads = self.op_map[j];
         let at = self.ops.len();
@@ -298,7 +306,7 @@ impl Weave<'_> {
             kind,
         });
         self.whole_of[j] = Some(at);
-        Ok(InputRef::Op(at))
+        Ok(at)
     }
 
     /// The local operand standing for `r` as it already is (its producer's placement).
@@ -392,7 +400,7 @@ impl Weave<'_> {
             // A split reduced axis: each rank contracts its K block — the result is partial.
             Placement::Split(Axis::Cols)
                 if self.can_adopt(we, SourceShard::Rows)
-                    && group_ok(k / self.w)
+                    && group_ok(k / T::RANKS)
                     && scale.is_none_or(|s| match s {
                         InputRef::Ext(se) => self.can_adopt(se, SourceShard::Whole),
                         InputRef::Op(_) => false,
@@ -438,7 +446,7 @@ impl Weave<'_> {
                     adopt.extend(scale_shard);
                     Ok(Decision {
                         op: SubOp::MatmulTile {
-                            n: n / self.w,
+                            n: n / T::RANKS,
                             weight,
                         },
                         out: Placement::Split(Axis::Cols),
@@ -602,7 +610,7 @@ impl Weave<'_> {
                     layout,
                     _form,
                 } => {
-                    let Some(local) = attention.rank_local(self.w) else {
+                    let Some(local) = attention.rank_local::<T>() else {
                         return self.replicate(i);
                     };
                     let mut split: Vec<usize> = [0, 3, 4, 5]
@@ -629,7 +637,7 @@ impl Weave<'_> {
                     attn,
                     layout,
                 } => {
-                    let Some(local) = attention.rank_local(self.w) else {
+                    let Some(local) = attention.rank_local::<T>() else {
                         return self.replicate(i);
                     };
                     let op = SubOp::KvAppend {
@@ -649,7 +657,7 @@ impl Weave<'_> {
                 } => {
                     let geom = attention.class(mask.class());
                     let nq = geom.q_heads().get();
-                    let Some(local) = attention.rank_local(self.w) else {
+                    let Some(local) = attention.rank_local::<T>() else {
                         return self.replicate(i);
                     };
                     // `[q, (k, v)…]`, or `[q, pk, pv, nk, nv, sinks]`.
@@ -678,11 +686,11 @@ impl Weave<'_> {
             match r {
                 InputRef::Op(j) => {
                     me.place[j] == Placement::Split(Axis::Cols)
-                        && (me.shape[j].1 / me.w).is_multiple_of(hd)
+                        && (me.shape[j].1 / T::RANKS).is_multiple_of(hd)
                 }
                 InputRef::Ext(e) => {
                     me.can_adopt(e, SourceShard::Cols)
-                        && (me.src_shape(e).1 / me.w).is_multiple_of(hd)
+                        && (me.src_shape(e).1 / T::RANKS).is_multiple_of(hd)
                 }
             }
         };
@@ -724,7 +732,7 @@ impl Weave<'_> {
             return self.replicate(i);
         };
         let in_cols = self.shape[j].1;
-        let w = self.w;
+        let w = T::RANKS;
         let local = |rows, cols| SubOp::Reshape { rows, cols };
         let decided = match (self.place[j], rows) {
             (Placement::Partial, _) => Some((desc.op, Placement::Partial)),
@@ -783,9 +791,9 @@ pub fn shard<T: World>(
     let () = T::NONEMPTY;
     let n = input.ops.len();
     let shape = op_shapes(input);
-    let mut wv = Weave {
+    let mut wv = Weave::<T> {
         input,
-        w: T::RANKS,
+        world: core::marker::PhantomData,
         granule: granule.get(),
         shape,
         place: Vec::with_capacity(n),
@@ -828,17 +836,8 @@ pub fn shard<T: World>(
         wv.place.push(d.out);
     }
     // The forward's result and exported hidden state are read by the host: whole.
-    let result = match wv.whole(InputRef::Op(input.result))? {
-        InputRef::Op(k) => k,
-        InputRef::Ext(_) => unreachable!(),
-    };
-    let exported = match input.exported {
-        Some(e) => match wv.whole(InputRef::Op(e))? {
-            InputRef::Op(k) => Some(k),
-            InputRef::Ext(_) => unreachable!(),
-        },
-        None => None,
-    };
+    let result = wv.whole_op(input.result)?;
+    let exported = input.exported.map(|e| wv.whole_op(e)).transpose()?;
     let sources: Vec<SourceShard> = wv
         .src
         .iter()

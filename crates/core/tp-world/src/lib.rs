@@ -232,16 +232,6 @@ impl<T: World, X> PerRank<T, X> {
     }
 }
 
-impl<X> PerRank<TpWorld<1>, X> {
-    /// The one rank's value — a world of one has exactly one.
-    pub fn into_only(self) -> X {
-        match alloc::vec::Vec::from(self.items).pop() {
-            Some(x) => x,
-            None => unreachable!("a PerRank of a world of one holds one value"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
