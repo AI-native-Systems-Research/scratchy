@@ -13,6 +13,7 @@ pub mod common {
     pub mod attn_gate;
     pub mod attn_layer;
     pub mod chains;
+    pub mod fp8;
     pub mod gdn_layer;
     pub mod gemma_attn;
     pub mod gemma_mlp;
@@ -31,6 +32,7 @@ use common::chains::{
     HIDDEN, QWEN3_5_FACTS, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
     assert_tape_is_lowered, assert_tape_is_lowered_with, three_gemm, two_gemm,
 };
+use common::fp8::{e4m3_round, e4m3_round_f64, e4m3_to_bf16_bits};
 use common::gdn_layer::{GDN_LAYER_M128, GDN_LAYER_M256, gdn_layer};
 use common::mlp::{EPS, MLP_M128, MLP_M256, mlp};
 use common::numerics::{
@@ -953,13 +955,14 @@ fn seq_positions(m: usize, prefix_len: u32) -> Vec<u32> {
     (0..m as u32).map(|t| prefix_len + t).collect()
 }
 
-/// Layer index 0's `half` of every block of the pool, in block order.
+/// Layer index 0's `half` of every block of the pool, in block order, its e4m3 bytes widened to
+/// bf16 bits (exact).
 fn read_pool(worker: &mut CudaWorker<'_>, half: KvHalf) -> Vec<Vec<u16>> {
     (0..POOL_BLOCKS)
         .map(|b| {
-            let mut out = vec![0u16; BLOCK_ELEMS];
+            let mut out = vec![0u8; BLOCK_ELEMS];
             worker.read_kv(0, half, b, &mut out).expect("read_kv");
-            out
+            e4m3_to_bf16_bits(&out)
         })
         .collect()
 }
@@ -1001,7 +1004,8 @@ fn check_attention(
     ok
 }
 
-/// The cache at each of the forward's real rows' slots is `kr`'s and `v`'s row bit for bit.
+/// The cache at each of the forward's real rows' slots is `kr`'s and `v`'s row through e4m3
+/// (`e4m3_satfinite`, then widened), bit for bit.
 fn cache_mismatches(
     (k_blocks, v_blocks): (&[Vec<u16>], &[Vec<u16>]),
     (kr, v): (&[u16], &[u16]),
@@ -1012,7 +1016,8 @@ fn cache_mismatches(
     let v_rows = gather(v_blocks, table, prefix_len + q_len);
     let at = prefix_len * AL_KV;
     let n = q_len * AL_KV;
-    mismatched_bits(&k_rows[at..][..n], &kr[..n]) + mismatched_bits(&v_rows[at..][..n], &v[..n])
+    mismatched_bits(&k_rows[at..][..n], &e4m3_round(&kr[..n]))
+        + mismatched_bits(&v_rows[at..][..n], &e4m3_round(&v[..n]))
 }
 
 /// Both buckets, P = 0 and L = M, table `[11, 3, 14, 0]` (its first `M / 64` entries), each stage
@@ -1424,7 +1429,7 @@ fn a_short_chunk_pads() {
 }
 
 /// 9 allocations at setup (7 weights, the arena, the pool), the arena 9733888 bytes and the pool
-/// 2097152; 0 allocations over five forwards (256, 128, 256, 128, 256) with the same inputs and
+/// 1048576; 0 allocations over five forwards (256, 128, 256, 128, 256) with the same inputs and
 /// sequence; free memory equal after forwards 1 and 5; every result bit-identical to its bucket's
 /// first.
 #[test]
@@ -1439,14 +1444,14 @@ fn the_attention_layer_worker_allocates_once_and_no_forward_allocates() {
     let pool = worker.kv_pool_bytes();
     eprintln!(
         "attention layer arena_bytes={arena} (expect 9733888) pool_bytes={pool:?} (expect \
-         2097152) allocations(weights + arena + pool)={built} (expect 9) {}",
-        verdict(arena == 9733888 && pool == Some(2097152) && built == 9)
+         1048576) allocations(weights + arena + pool)={built} (expect 9) {}",
+        verdict(arena == 9733888 && pool == Some(1048576) && built == 9)
     );
     assert_eq!(arena, 9733888, "the arena is the larger bucket's total");
     assert_eq!(
         pool,
-        Some(2097152),
-        "2 halves × 16 blocks × 2 heads × 64 × 256 bf16"
+        Some(1048576),
+        "2 halves × 16 blocks × 2 heads × 64 × 256 e4m3"
     );
     assert_eq!(built, 9, "seven weights, one arena, one pool");
 
@@ -1682,7 +1687,7 @@ fn a_kv_read_outside_the_pool_is_refused() {
         (0, POOL_BLOCKS, BLOCK_ELEMS),
         (0, 0, BLOCK_ELEMS - 1),
     ] {
-        let mut out = vec![SENTINEL_BF16; len];
+        let mut out = vec![SENTINEL_E4M3; len];
         let got = worker.read_kv(layer, KvHalf::V, block, &mut out);
         let want = Err(ForwardError::KvRead {
             layer,
@@ -1690,7 +1695,7 @@ fn a_kv_read_outside_the_pool_is_refused() {
             expected: BLOCK_ELEMS,
             got: len,
         });
-        let untouched = out.iter().all(|&b| b == SENTINEL_BF16);
+        let untouched = out.iter().all(|&b| b == SENTINEL_E4M3);
         eprintln!(
             "read_kv(layer {layer}, block {block}, {len} elements): {got:?} \
              out_untouched={untouched} {}",
@@ -1703,7 +1708,7 @@ fn a_kv_read_outside_the_pool_is_refused() {
     let gt = attn_table(&device, &gw);
     let mut gate_worker =
         CudaWorker::new(&device, &ATTN_BUCKETS, &gt, None, None).expect("gate worker");
-    let mut out = vec![0u16; BLOCK_ELEMS];
+    let mut out = vec![0u8; BLOCK_ELEMS];
     let got = gate_worker.read_kv(0, KvHalf::K, 0, &mut out);
     let want = Err(ForwardError::KvRead {
         layer: 0,
@@ -1719,8 +1724,8 @@ fn a_kv_read_outside_the_pool_is_refused() {
     assert!(pass, "a KV read outside the pool was not refused");
 }
 
-/// An element `read_kv` must not write.
-const SENTINEL_BF16: u16 = 0xFFFF;
+/// A byte `read_kv` must not write.
+const SENTINEL_E4M3: u8 = 0xFF;
 
 /// A worker's tapes, weights and pool.
 type PoolCase<'w> = (
@@ -3841,7 +3846,13 @@ fn ga_token(p: usize, w: &GaWeights, emulate: bool, with_q: bool) -> GaToken {
     let k = ga_norm(&ga_gemv(&n, wk, GA_KV, rnd), GA_HD, Some(kn), rnd);
     let k = ga_rope(&k, p as u32, emulate, rnd);
     let v = ga_norm(&ga_gemv(&n, wv, GA_KV, rnd), GA_HD, None, rnd);
-    [q, k, v]
+    // The GPU's cache holds K and V as e4m3: the emulation reads them as it does.
+    let cache: fn(f64) -> f64 = if emulate { e4m3_round_f64 } else { |v| v };
+    [
+        q,
+        k.into_iter().map(cache).collect(),
+        v.into_iter().map(cache).collect(),
+    ]
 }
 
 /// The k and v of positions `0 .. tokens` (both flavours), across the host's threads.
@@ -4263,7 +4274,13 @@ fn gg_token(x: &[f64], p: usize, w: &GgWeights, emulate: bool, with_q: bool) -> 
     let kv = ga_gemv(&n, wk, GG_KV, rnd);
     let k = gg_rope(&ga_norm(&kv, GG_HD, Some(kn), rnd), p as u32, emulate, rnd);
     let v = ga_norm(&kv, GG_HD, None, rnd);
-    [q, k, v]
+    // The GPU's cache holds K and V as e4m3: the emulation reads them as it does.
+    let cache: fn(f64) -> f64 = if emulate { e4m3_round_f64 } else { |v| v };
+    [
+        q,
+        k.into_iter().map(cache).collect(),
+        v.into_iter().map(cache).collect(),
+    ]
 }
 
 /// The global layer's output for input `x` at position `p` over the keys `0 ..= p` (16 heads
@@ -4503,7 +4520,7 @@ fn gemma_attn_two_classes_share_the_pool() {
     let weights: &'static [DeviceBuffer] = Box::leak(entries.into_boxed_slice());
     let mut worker = CudaWorker::new(&device, tapes, weights, GA_POOL, None).expect("worker");
     // The pool: the sliding class's 8 · 256 and the global class's 2 · 512, K and V, per token.
-    let per_token = (8 * 256 + 2 * 512) * 2 * 2;
+    let per_token = (8 * 256 + 2 * 512) * 2;
     let want = per_token * u64::from(GA_BLOCKS) * 64;
     let pool = worker.kv_pool_bytes();
     eprintln!("gemma two classes: pool {pool:?} bytes, {per_token} a token at {GA_BLOCKS} blocks");
@@ -4556,7 +4573,7 @@ fn gemma_attn_two_classes_share_the_pool() {
             } else {
                 GG_KVH * 64 * GG_HD
             };
-            let mut k = vec![0u16; elems];
+            let mut k = vec![0u8; elems];
             worker
                 .read_kv(layer, KvHalf::K, block, &mut k)
                 .expect("read a cache block");
@@ -4581,7 +4598,7 @@ fn gemma_attn_two_classes_share_the_pool() {
             } else {
                 GG_KVH * 64 * GG_HD
             };
-            let mut k = vec![0u16; elems];
+            let mut k = vec![0u8; elems];
             worker
                 .read_kv(layer, KvHalf::K, block, &mut k)
                 .expect("read a cache block");

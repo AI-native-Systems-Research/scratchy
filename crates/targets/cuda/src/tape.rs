@@ -141,7 +141,8 @@ impl KvTape {
 
     /// The KV pool of this tape's layers at `num_blocks` blocks: per layer, in [`Self::layers`] order,
     /// its class's layout (`classes[layer_class[l]]`'s `kv_heads` and `head_dim`) and the
-    /// element offset of its K buffer, then its V buffer, back to back; and the pool's bytes. `None`
+    /// element offset of its K buffer, then its V buffer, back to back; and the pool's bytes (one an
+    /// element: the cache is e4m3, [`KV_ELEM_BYTES`]). `None`
     /// when a count overflows `u64` or the host's `usize`. For one class every layer's buffer is
     /// `buffer_elems` and layer `l`'s K buffer is at `2 · l · buffer_elems`, the pool's layout before
     /// the classes.
@@ -159,7 +160,7 @@ impl KvTape {
             per_layer.push((layout, usize::try_from(at).ok()?));
             at = at.checked_add(kv_buffer_elems(&layout)?.checked_mul(2)?)?;
         }
-        let bytes = at.checked_mul(std::mem::size_of::<u16>() as u64)?;
+        let bytes = at.checked_mul(KV_ELEM_BYTES)?;
         usize::try_from(bytes).ok()?;
         Some((per_layer, bytes))
     }
@@ -186,6 +187,10 @@ pub struct KvClass {
 
 /// Bytes of one u32 entry of a KV region.
 const KV_ENTRY_BYTES: u64 = 4;
+
+/// Bytes of one KV cache element: the cache is e4m3 at a fixed per-tensor scale of 1.0 (vLLM's
+/// default for a checkpoint without KV scales), written by `kernels/kv_append_fp8.cu`.
+pub const KV_ELEM_BYTES: u64 = 1;
 
 /// The tape's Gated-DeltaNet layers: which layers' recurrent state it reads and writes, their
 /// geometry, and the two arena regions its GDN steps use.
@@ -4482,8 +4487,9 @@ mod pool_tests {
     }
 
     /// Gemma 4's 30 layers: sliding (8 × 256, window 1024) but every sixth, global (2 × 512). The
-    /// pool is 225,280 bytes a token (25 · 8 · 256 · 2 · 2 + 5 · 2 · 512 · 2 · 2, #885's 204,800 +
-    /// 20,480), each layer's K buffer right after the previous layer's V, at its class's size.
+    /// pool is 112,640 bytes a token (25 · 8 · 256 · 2 · 1 + 5 · 2 · 512 · 2 · 1, e4m3: #885's
+    /// 102,400 + 10,240), each layer's K buffer right after the previous layer's V, at its class's
+    /// size.
     #[test]
     fn the_per_class_pool_holds_gemmas_30_layers_back_to_back() {
         const CLASSES: [KvClass; 2] = [
@@ -4507,7 +4513,7 @@ mod pool_tests {
             "gemma pool: {bytes} bytes at {num_blocks} blocks, {} a token",
             bytes / tokens
         );
-        assert_eq!(bytes, 225_280 * tokens);
+        assert_eq!(bytes, 112_640 * tokens);
         let mut at = 0usize;
         for (l, ((layout, offset), &c)) in per_layer.iter().zip(&layer_class).enumerate() {
             let class = CLASSES[usize::from(c)];
@@ -4527,11 +4533,11 @@ mod pool_tests {
             );
             at += 2 * layout.buffer_elems();
         }
-        assert_eq!(at * 2, bytes as usize, "the last V ends the pool");
+        assert_eq!(at, bytes as usize, "the last V ends the pool");
     }
 
     /// One class (every Qwen tape): layer `l`'s K buffer is at `2 · l · buffer_elems`, and the
-    /// pool's bytes are `layers · 2 · buffer_elems · 2`, the pool before the classes.
+    /// pool's bytes are `layers · 2 · buffer_elems · 1`, the pool before the classes.
     #[test]
     fn a_uniform_pool_is_the_pool_before_the_classes() {
         const ONE: [KvClass; 1] = [KvClass {
@@ -4550,7 +4556,7 @@ mod pool_tests {
         .buffer_elems();
         let offsets: Vec<usize> = per_layer.iter().map(|&(_, at)| at).collect();
         assert_eq!(offsets, (0..6).map(|l| 2 * l * buffer).collect::<Vec<_>>());
-        assert_eq!(bytes, (6 * 2 * buffer * 2) as u64);
+        assert_eq!(bytes, (6 * 2 * buffer) as u64);
     }
 
     /// A class index past `classes`, or a pool past `u64`, is `None`.

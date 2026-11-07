@@ -82,5 +82,5 @@ fn the_global_and_two_class_tapes_share_a_pool_only_with_their_own_buckets() {
     }
     let two = sets[2][0].kv.expect("a KV tape");
     let (_, bytes) = two.pool_layout(48).expect("the pool fits");
-    assert_eq!(bytes, (8 * 256 + 2 * 512) * 2 * 2 * 48 * 64);
+    assert_eq!(bytes, (8 * 256 + 2 * 512) * 2 * 48 * 64);
 }

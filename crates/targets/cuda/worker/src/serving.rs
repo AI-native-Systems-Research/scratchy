@@ -38,8 +38,9 @@ use scratchy_target_cuda::weights::{check, open_checkpoint};
 use tracing::info;
 
 use crate::plan::{
-    block_table_u32, check_quantization_config, check_sampling, choose_bucket, emits_token,
-    fill_inputs, gdn_fresh, greedy_token, kv_block_bytes, logits_row, scheduled_request,
+    block_table_u32, check_kv_cache_dtype, check_quantization_config, check_sampling,
+    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_token, kv_block_bytes, logits_row,
+    scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
@@ -54,8 +55,8 @@ pub(crate) fn create(cfg: WorkerCreateConfig) -> anyhow::Result<WorkerCreationRe
     worker.load_model().context("CUDA load_model")?;
     let model = worker.model.as_ref().context("the CUDA model after load")?;
     let (hf_config, model_dir) = (model.hf_config.clone(), Some(model.dir.clone()));
-    // The KV cache is bf16.
-    Ok((Box::new(worker), hf_config, model_dir, 2))
+    // The KV cache is e4m3, one byte an element.
+    Ok((Box::new(worker), hf_config, model_dir, 1))
 }
 
 /// Refuse, before anything loads, what this worker does not do.
@@ -70,12 +71,7 @@ fn refuse_unsupported(cfg: &WorkerCreateConfig) -> anyhow::Result<()> {
     if cfg.lora_adapter.is_some() {
         return refuse("LoRA adapters");
     }
-    if cfg.kv_cache_dtype != "auto" {
-        return refuse(&format!(
-            "a KV cache of {}: its KV cache is bf16 (--kv-cache-dtype auto)",
-            cfg.kv_cache_dtype
-        ));
-    }
+    check_kv_cache_dtype(&cfg.kv_cache_dtype, cfg.calculate_kv_scales)?;
     if !matches!(cfg.dtype.as_str(), "auto" | "bfloat16" | "bf16") {
         return refuse(&format!(
             "{} weights: its tapes read bf16 (--dtype auto)",
@@ -512,7 +508,7 @@ impl Worker for CudaServingWorker {
         self.kv().map(|k| k.max_blocks_per_seq as usize + 1)
     }
 
-    /// Per KV layer, a K and a V block of `kv_heads · block_size · head_dim` bf16.
+    /// Per KV layer, a K and a V block of `kv_heads · block_size · head_dim` e4m3.
     fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
         self.kv().and_then(|k| kv_block_bytes(&k, block_size))
     }

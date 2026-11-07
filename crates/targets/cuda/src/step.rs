@@ -50,13 +50,13 @@ pub enum CudaStep {
     /// `attn · sigmoid(gate)`, lowered from `SubOp::GateApply` (`kernels/gate_apply_bf16.cu`).
     GateApply(GateApplyBf16),
     /// K's rope, then K and V written into the paged KV cache, lowered from `SubOp::RopeAppend`:
-    /// two launches, `kernels/rope_bf16.cu` then `kernels/kv_append_bf16.cu`.
+    /// two launches, `kernels/rope_bf16.cu` then `kernels/kv_append_fp8.cu` (the cache is e4m3).
     RopeAppend(RopeAppendBf16),
     /// Causal grouped-query attention of a prefill bucket over the paged KV cache, lowered from
-    /// `SubOp::AttnDecode` when the bucket has more than one row (`kernels/attn_prefill_bf16.cu`).
+    /// `SubOp::AttnDecode` when the bucket has more than one row (`kernels/attn_prefill_fp8kv.cu`).
     AttnPrefill(AttnPrefillBf16),
     /// One query row's grouped-query attention over the paged KV cache, lowered from
-    /// `SubOp::AttnDecode` when the bucket has one row (`kernels/attn_decode_bf16.cu`): the
+    /// `SubOp::AttnDecode` when the bucket has one row (`kernels/attn_decode_fp8kv.cu`): the
     /// operands of [`Self::AttnPrefill`] with `rows = 1`, another kernel.
     AttnDecode(AttnPrefillBf16),
     /// One prefill chunk of a Gated-DeltaNet linear-attention layer, lowered from
@@ -966,9 +966,10 @@ pub const KV_APPEND_BF16_HEAD_DIMS: &[u32] = &[256, 512];
 /// K's partial rope, then the paged-cache write of the rotated K and the unrotated V.
 ///
 /// Launch 1 is [`RopeBf16`]'s kernel, unchanged: `k [rows, cols]` rotated by `table` into
-/// `k_out`, `cols = kv_heads · head_dim`. Launch 2 copies, for each token row `t` whose
-/// `slot_mapping[t]` is not `u32::MAX`, row `t` of `k_out` and of `v` into layer `layer`'s K and
-/// V cache at that slot, bit for bit (`kernels/kv_append_bf16.cu`); its `head_dim` is
+/// `k_out`, `cols = kv_heads · head_dim`. Launch 2 writes, for each token row `t` whose
+/// `slot_mapping[t]` is not `u32::MAX`, row `t` of `k_out` and of `v` into layer `layer`'s e4m3 K
+/// and V cache at that slot, each element `e4m3_satfinite` at scale 1.0
+/// (`kernels/kv_append_fp8.cu`); its `head_dim` is
 /// one of [`KV_APPEND_BF16_HEAD_DIMS`]. `slot_mapping` is the tape's
 /// region ([`crate::tape::KvTape::slot_mapping`], `rows` u32); `layer` is an index into
 /// [`crate::tape::KvTape::layers`]. `k_out` overlaps no input.
@@ -990,7 +991,8 @@ pub struct RopeAppendBf16 {
 }
 
 /// Causal GQA attention of `q [rows, q_heads · head_dim]` over layer `layer`'s paged K/V cache,
-/// into `out` of the same shape, bf16 in and out, the softmax in f32.
+/// into `out` of the same shape, bf16 in and out, the softmax in f32; the cache is e4m3, widened
+/// to bf16 on read (`kernels/attn_prefill_fp8kv.cu`).
 ///
 /// The keys are the sequence's `P + L` cached tokens, read through the tape's block table; query
 /// row `i` attends to keys `0 ..= P + i` (`P`, `L` read from the tape's `sequence` region). Query

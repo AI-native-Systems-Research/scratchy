@@ -10,9 +10,9 @@ use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
 use scratchy_serving_engine::worker_factory::WorkerFactory;
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvClass, KvTape};
 use scratchy_target_cuda_worker::plan::{
-    PlanError, QuantRefusal, block_table_u32, check_quantization_config, check_sampling,
-    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_token, kv_block_bytes, logits_row,
-    scheduled_request,
+    PlanError, QuantRefusal, block_table_u32, check_kv_cache_dtype, check_quantization_config,
+    check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_token,
+    kv_block_bytes, logits_row, scheduled_request,
 };
 use scratchy_target_cuda_worker::{CudaWorkerFactory, NO_NVCC};
 
@@ -174,7 +174,24 @@ fn a_kv_block_costs_k_and_v_per_layer() {
         }],
         layer_class: &[0, 0, 0, 0, 0, 0],
     };
-    assert_eq!(kv_block_bytes(&kv, 64), Some(786_432));
+    assert_eq!(kv_block_bytes(&kv, 64), Some(393_216));
+}
+
+#[test]
+fn only_the_e4m3_kv_cache_is_served() {
+    for dtype in ["auto", "fp8", "fp8_e4m3"] {
+        assert_eq!(check_kv_cache_dtype(dtype, false), Ok(()), "{dtype}");
+    }
+    for dtype in ["bfloat16", "fp16", "fp8_e5m2", "turboquant"] {
+        assert_eq!(
+            check_kv_cache_dtype(dtype, false),
+            Err(PlanError::KvCacheDtype {
+                dtype: dtype.to_string()
+            }),
+            "{dtype}"
+        );
+    }
+    assert_eq!(check_kv_cache_dtype("auto", true), Err(PlanError::KvScales));
 }
 
 #[test]

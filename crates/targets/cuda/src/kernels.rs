@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn scratchy_cuda_gdn_rms_norm_gated_prepare() -> i32;
     fn scratchy_cuda_gdn_scan_prepare() -> i32;
     fn scratchy_cuda_kv_append_bf16_prepare() -> i32;
+    fn scratchy_cuda_kv_append_fp8_prepare() -> i32;
     fn scratchy_cuda_moe_combine_bf16_prepare() -> i32;
     fn scratchy_cuda_moe_route_bf16_prepare() -> i32;
     fn scratchy_cuda_moe_sort_prepare() -> i32;
@@ -392,6 +393,19 @@ unsafe extern "C" {
         num_blocks: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_kv_append_fp8(
+        k: *const c_void,
+        v: *const c_void,
+        slot_mapping: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        rows: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_attn_prefill_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_prefill_bf16(
         q: *const c_void,
@@ -410,8 +424,44 @@ unsafe extern "C" {
         window: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_attn_prefill_fp8kv_prepare() -> i32;
+    fn scratchy_cuda_attn_prefill_fp8kv(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_attn_prefill_d512_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_prefill_d512_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_prefill_d512_fp8kv_prepare() -> i32;
+    fn scratchy_cuda_attn_prefill_d512_fp8kv(
         q: *const c_void,
         k_cache: *const c_void,
         v_cache: *const c_void,
@@ -597,8 +647,42 @@ unsafe extern "C" {
         window: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_attn_decode_fp8kv_prepare() -> i32;
+    fn scratchy_cuda_attn_decode_fp8kv(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_attn_decode_d512_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_d512_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_decode_d512_fp8kv_prepare() -> i32;
+    fn scratchy_cuda_attn_decode_d512_fp8kv(
         q: *const c_void,
         k_cache: *const c_void,
         v_cache: *const c_void,
@@ -1030,6 +1114,20 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         "attn_decode_d512_bf16",
         scratchy_cuda_attn_decode_d512_bf16_prepare,
     ),
+    // FP8 S5: the attention kernels over the e4m3 cache, the attribute on both instances of each.
+    (
+        "attn_prefill_fp8kv",
+        scratchy_cuda_attn_prefill_fp8kv_prepare,
+    ),
+    ("attn_decode_fp8kv", scratchy_cuda_attn_decode_fp8kv_prepare),
+    (
+        "attn_prefill_d512_fp8kv",
+        scratchy_cuda_attn_prefill_d512_fp8kv_prepare,
+    ),
+    (
+        "attn_decode_d512_fp8kv",
+        scratchy_cuda_attn_decode_d512_fp8kv_prepare,
+    ),
     ("expert_gemm_bf16", scratchy_cuda_expert_gemm_bf16_prepare),
     (
         "expert_gemm_e128_bf16",
@@ -1078,6 +1176,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ),
     ("gdn_scan", scratchy_cuda_gdn_scan_prepare),
     ("kv_append_bf16", scratchy_cuda_kv_append_bf16_prepare),
+    ("kv_append_fp8", scratchy_cuda_kv_append_fp8_prepare),
     ("moe_combine_bf16", scratchy_cuda_moe_combine_bf16_prepare),
     ("moe_route_bf16", scratchy_cuda_moe_route_bf16_prepare),
     ("moe_sort", scratchy_cuda_moe_sort_prepare),
@@ -2331,6 +2430,253 @@ pub unsafe fn attn_decode_d512_bf16(
     // SAFETY: as `attn_decode_windowed_bf16`'s.
     let code = unsafe {
         scratchy_cuda_attn_decode_d512_bf16(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnDecodeShape {
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// [`kv_append_bf16`] into an e4m3 cache (FP8 S5, `kernels/kv_append_fp8.cu`): each bf16 element
+/// of row `t` is written as `e4m3_satfinite(x)`, round to nearest even and clamped to ±448, at a
+/// fixed per-tensor scale of 1.0 (vLLM's `--kv-cache-dtype fp8` for a checkpoint without KV
+/// scales). A padding slot and a block at or past `num_blocks` write nothing. Asynchronous.
+///
+/// Refused with [`KernelError::KvAppendShape`] as [`kv_append_bf16`].
+///
+/// # Safety
+///
+/// As [`kv_append_bf16`]'s, but `k_cache` and `v_cache` hold `num_blocks · kv_heads · 64 ·
+/// head_dim` e4m3 bytes each.
+pub unsafe fn kv_append_fp8(
+    (k, v): (*const c_void, *const c_void),
+    slot_mapping: *const c_void,
+    (k_cache, v_cache): (*mut c_void, *mut c_void),
+    (rows, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `kv_append_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_kv_append_fp8(
+            k,
+            v,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            rows,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::KvAppendShape {
+            rows,
+            kv_heads,
+            head_dim,
+            block_size,
+        },
+    )
+}
+
+/// [`attn_prefill_windowed_bf16`] over an e4m3 cache (FP8 S5, `kernels/attn_prefill_fp8kv.cu`):
+/// each K and V tile is widened to bf16 in shared memory (exact) and the bf16 kernel's math runs on
+/// it, so the output is the bf16 kernel's on the widened cache, bit for bit. Asynchronous.
+///
+/// Refused with [`KernelError::AttnShape`] as [`attn_prefill_windowed_bf16`].
+///
+/// # Safety
+///
+/// As [`attn_prefill_windowed_bf16`]'s, but `k_cache` and `v_cache` hold `num_blocks · kv_heads ·
+/// 64 · 256` e4m3 bytes each.
+pub unsafe fn attn_prefill_windowed_fp8kv(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (rows, q_heads, kv_heads, head_dim): (u32, u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_prefill_windowed_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_prefill_fp8kv(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnShape {
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// [`attn_prefill_d512_bf16`] over an e4m3 cache (FP8 S5, `kernels/attn_prefill_d512_fp8kv.cu`),
+/// widened on read as [`attn_prefill_windowed_fp8kv`]. Asynchronous.
+///
+/// Refused with [`KernelError::AttnShape`] as [`attn_prefill_d512_bf16`].
+///
+/// # Safety
+///
+/// As [`attn_prefill_d512_bf16`]'s, but `k_cache` and `v_cache` hold `num_blocks · kv_heads · 64 ·
+/// 512` e4m3 bytes each.
+pub unsafe fn attn_prefill_d512_fp8kv(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (rows, q_heads, kv_heads, head_dim): (u32, u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_prefill_d512_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_prefill_d512_fp8kv(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnShape {
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// [`attn_decode_windowed_bf16`] over an e4m3 cache (FP8 S5, `kernels/attn_decode_fp8kv.cu`),
+/// widened on read as [`attn_prefill_windowed_fp8kv`]. Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_windowed_bf16`].
+///
+/// # Safety
+///
+/// As [`attn_decode_windowed_bf16`]'s, but `k_cache` and `v_cache` hold `num_blocks · kv_heads ·
+/// 64 · 256` e4m3 bytes each.
+pub unsafe fn attn_decode_windowed_fp8kv(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_decode_windowed_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_decode_fp8kv(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnDecodeShape {
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// [`attn_decode_d512_bf16`] over an e4m3 cache (FP8 S5, `kernels/attn_decode_d512_fp8kv.cu`),
+/// widened on read as [`attn_prefill_windowed_fp8kv`]. Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_d512_bf16`].
+///
+/// # Safety
+///
+/// As [`attn_decode_d512_bf16`]'s, but `k_cache` and `v_cache` hold `num_blocks · kv_heads · 64 ·
+/// 512` e4m3 bytes each.
+pub unsafe fn attn_decode_d512_fp8kv(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_decode_d512_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_decode_d512_fp8kv(
             q,
             k_cache,
             v_cache,

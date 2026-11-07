@@ -17,7 +17,7 @@ use std::fmt;
 
 use scratchy_core_common::SamplingParams;
 use scratchy_layers::gdn_state::{GdnStart, GdnStep};
-use scratchy_target_cuda::tape::KvTape;
+use scratchy_target_cuda::tape::{KV_ELEM_BYTES, KvTape};
 
 /// Why a step could not be planned, or a request is refused. Every message names what to change.
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +55,10 @@ pub enum PlanError {
     /// The GDN slot allocator's step code for a sequence at token `start` is `code`: not a plain
     /// step, or fresh other than exactly at token 0.
     GdnStart { start: u32, code: u32 },
+    /// `--kv-cache-dtype` names a cache other than the e4m3 one this worker has.
+    KvCacheDtype { dtype: String },
+    /// `--calculate-kv-scales` is set; the KV scale is fixed at 1.0.
+    KvScales,
 }
 
 impl fmt::Display for PlanError {
@@ -130,6 +134,16 @@ impl fmt::Display for PlanError {
                 f,
                 "the GDN step from token {start} is {:?}: a plain step is fresh exactly at token 0",
                 GdnStep::decode(*code)
+            ),
+            Self::KvCacheDtype { dtype } => write!(
+                f,
+                "the CUDA backend does not support a KV cache of {dtype}: its KV cache is e4m3 at \
+                 a fixed scale of 1.0 (--kv-cache-dtype auto, fp8 or fp8_e4m3)"
+            ),
+            Self::KvScales => write!(
+                f,
+                "the CUDA backend does not compute KV scales: its KV scale is fixed at 1.0 (drop \
+                 --calculate-kv-scales)"
             ),
         }
     }
@@ -285,12 +299,28 @@ pub fn greedy_token(row: &[u16]) -> Result<u32, PlanError> {
 }
 
 /// The bytes one KV block of `block_size` tokens costs in a pool of `kv`'s geometry: per KV
-/// layer a K and a V block of `kv_heads · block_size · head_dim` bf16. `None` on overflow.
+/// layer a K and a V block of `kv_heads · block_size · head_dim` e4m3, one byte each. `None` on
+/// overflow.
 pub fn kv_block_bytes(kv: &KvTape, block_size: usize) -> Option<usize> {
     [kv.kv_heads as usize, block_size, kv.head_dim as usize]
         .into_iter()
         .try_fold(kv.layers.len().checked_mul(2)?, |acc, f| acc.checked_mul(f))?
-        .checked_mul(std::mem::size_of::<u16>())
+        .checked_mul(KV_ELEM_BYTES as usize)
+}
+
+/// Refuse a KV cache this worker does not have. Its cache is a fixed fact of the target, e4m3 at a
+/// per-tensor scale of 1.0 (vLLM's default for a checkpoint without KV scales): `auto`, `fp8` and
+/// `fp8_e4m3` name it, every other dtype is refused, and so are computed KV scales.
+pub fn check_kv_cache_dtype(dtype: &str, calculate_kv_scales: bool) -> Result<(), PlanError> {
+    if !matches!(dtype, "auto" | "fp8" | "fp8_e4m3") {
+        return Err(PlanError::KvCacheDtype {
+            dtype: dtype.to_string(),
+        });
+    }
+    if calculate_kv_scales {
+        return Err(PlanError::KvScales);
+    }
+    Ok(())
 }
 
 /// Whether a sequence's GDN state starts from zero this step, from the slot allocator's step

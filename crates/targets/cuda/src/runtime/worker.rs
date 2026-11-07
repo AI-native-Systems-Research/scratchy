@@ -47,8 +47,8 @@ use crate::step::{
     SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
-    RotaryTable, TapeError, TapeInput, WeightIx,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KV_ELEM_BYTES,
+    KvTape, RotaryTable, TapeError, TapeInput, WeightIx,
 };
 
 /// A forward's input, of the kind its tape takes ([`TapeInput`]).
@@ -560,7 +560,7 @@ impl KvPool {
 
     /// The device address of layer index `layer`'s `half` buffer. Computed, not dereferenced.
     fn half_ptr(&self, layer: usize, half: KvHalf) -> *mut c_void {
-        let bytes = self.half_elems(layer, half) * std::mem::size_of::<u16>();
+        let bytes = self.half_elems(layer, half) * KV_ELEM_BYTES as usize;
         self.buffer.ptr().wrapping_byte_add(bytes)
     }
 }
@@ -696,8 +696,8 @@ pub struct CudaWorker<'a, W: AsRef<[DeviceBuffer]> = &'a [DeviceBuffer]> {
     gdn: Option<GdnPool>,
 }
 
-/// A prefill attention launcher: [`kernels::attn_prefill_windowed_bf16`]'s signature, which the
-/// head-dim-512 one shares.
+/// A prefill attention launcher over the e4m3 cache: [`kernels::attn_prefill_windowed_fp8kv`]'s
+/// signature, which the head-dim-512 one shares.
 type PrefillLaunch = unsafe fn(
     (*const c_void, *mut c_void),
     (*const c_void, *const c_void),
@@ -708,8 +708,8 @@ type PrefillLaunch = unsafe fn(
     *mut c_void,
 ) -> Result<(), KernelError>;
 
-/// A decode attention launcher: [`kernels::attn_decode_windowed_bf16`]'s signature, which the
-/// head-dim-512 one shares.
+/// A decode attention launcher over the e4m3 cache: [`kernels::attn_decode_windowed_fp8kv`]'s
+/// signature, which the head-dim-512 one shares.
 type DecodeLaunch = unsafe fn(
     (*const c_void, *mut c_void),
     (*const c_void, *const c_void),
@@ -1248,13 +1248,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     }
 
     /// Copy block `block` of KV layer index `layer`'s `half` into `out` (`kv_heads · block_size ·
-    /// head_dim` bf16), synchronously: the cache's bytes, for a check after a forward.
+    /// head_dim` e4m3 bytes, one an element), synchronously: the cache's bytes, for a check after
+    /// a forward.
     pub fn read_kv(
         &mut self,
         layer: usize,
         half: KvHalf,
         block: u32,
-        out: &mut [u16],
+        out: &mut [u8],
     ) -> Result<(), ForwardError> {
         let refuse = |expected| ForwardError::KvRead {
             layer,
@@ -1277,7 +1278,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let src = pool
             .buffer
             .ptr()
-            .wrapping_byte_add(at * std::mem::size_of::<u16>());
+            .wrapping_byte_add(at * KV_ELEM_BYTES as usize);
         // SAFETY: the layer and block lie inside the pool, `out` holds exactly one block's bytes,
         // and `out` stays borrowed until the stream wait below has returned.
         let copied = check(
@@ -2061,7 +2062,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             stream.0,
                         )
                         .and_then(|()| {
-                            kernels::kv_append_bf16(
+                            kernels::kv_append_fp8(
                                 (slot(k_out), slot(v)),
                                 slot(slot_mapping),
                                 (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
@@ -2093,8 +2094,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // The column-split kernel at head dim 512, the head-dim-256 one otherwise
                     // (whose launcher refuses any other head dim).
                     let launch: PrefillLaunch = match head_dim {
-                        ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_bf16,
-                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_bf16,
+                        ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_fp8kv,
+                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_fp8kv,
                         // No prefill attention kernel at another head dim: refused, nothing
                         // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
                         other => {
@@ -2143,8 +2144,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     let l = layer as usize;
                     let layout = pool.layer_layout(l);
                     let launch: DecodeLaunch = match head_dim {
-                        ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_bf16,
-                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_bf16,
+                        ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_fp8kv,
+                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_fp8kv,
                         // No decode attention kernel at another head dim: refused, nothing
                         // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
                         other => {

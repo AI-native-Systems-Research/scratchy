@@ -89,3 +89,27 @@ pub fn quantize_rows(x: &[u16], rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>)
     }
     (q, scales)
 }
+
+/// e4m3 bytes widened to bf16 bits, exactly: every e4m3 value, subnormals included, is a bf16
+/// value. NaN (`0x7F`/`0xFF`) is `0x7FC0`. The host side of the fp8 attention kernels' widen.
+pub fn e4m3_to_bf16_bits(bytes: &[u8]) -> Vec<u16> {
+    (bytes.iter())
+        .map(|&b| match e4m3_value(b) {
+            v if v.is_nan() => 0x7FC0,
+            v => bf16::from_f64(v).to_bits(),
+        })
+        .collect()
+}
+
+/// bf16 bits as the e4m3 cache holds them, widened back to bf16: `e4m3_satfinite`, then exact.
+pub fn e4m3_round(bits: &[u16]) -> Vec<u16> {
+    let q: Vec<u8> = (bits.iter())
+        .map(|&b| e4m3_satfinite(bf16::from_bits(b).to_f32()))
+        .collect();
+    e4m3_to_bf16_bits(&q)
+}
+
+/// A bf16-exact value as the e4m3 cache holds it, in f64 (an emulated K or V element).
+pub fn e4m3_round_f64(v: f64) -> f64 {
+    e4m3_value(e4m3_satfinite(v as f32))
+}
