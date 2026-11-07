@@ -6580,9 +6580,44 @@ fn lower_function_folded<T: crate::collective::Tp>(
         // would read one column and spray it — a silent wrong answer with no shape error anywhere. The
         // pointwise arm downstream selects its operand mode from THIS extent, so pinning the two
         // together here is what stops the axis and the addressing from drifting apart.
-        for (i, axis) in bcast_axes.iter().enumerate() {
-            let Some(axis) = *axis else { continue };
+        for i in 0..bcast_axes.len() {
+            let Some(axis) = bcast_axes[i] else { continue };
             let r = per_op[i];
+            // ⭐ A ROW VECTOR HELD AS A STICK COLUMN, SPRAYED DOWN A TILE HELD AS A STICK COLUMN, IS
+            // THE OUTER ROW-SPLIT OF THE COLUMN — an addressing identity, not a new mode. The row
+            // reductions keep per-row scalars one a stick row (`[n, 1]`), so a leading-axis combine
+            // of such scalars (a decode batch's `J`-slot merge at ONE kv head: `[J, 1, 1, G] ->
+            // [1, 1, G]`, the unit kv axis folded) holds its one semantic row of `G` values as the
+            // column `[G, 1]`, and the consumer's own tile `[J, 1, 1, G]` as the column `[J·G, 1]`.
+            // Row-major the result's element `(j, g)` sits at `j·G + g` and the source's `g` at
+            // `g`, which is exactly the `Y` outer spray of the `[G, 1]` column `J` times. Stated over
+            // the REGIONS alone: a whole one-stick-column source of `mb` rows beside a dense
+            // one-stick-column operand of `y·mb` rows, `y > 1`. The consumer's want check and the
+            // `split_rows` frame law re-prove the cover before any operand is built.
+            let axis = match axis {
+                BcastAxis::Mb
+                    if r.c_len == 1
+                        && r.c_start == 0
+                        && r.r_start == 0
+                        && r.r_len == r.v_rows
+                        && r.v_rows > 1 =>
+                {
+                    let dense_rows = (0..per_op.len().min(bcast_axes.len()))
+                        .filter(|&j| j != i && bcast_axes[j].is_none())
+                        .map(|j| per_op[j])
+                        .find(|d| d.c_len == 1 && d.r_len > r.r_len && d.r_len % r.r_len == 0)
+                        .map(|d| d.r_len / r.r_len);
+                    match dense_rows {
+                        Some(y) if y > 1 => {
+                            let ax = BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(y));
+                            bcast_axes[i] = Some(ax);
+                            ax
+                        }
+                        _ => axis,
+                    }
+                }
+                other => other,
+            };
             let degenerate = match axis {
                 BcastAxis::Col => r.c_len == 1,
                 // One row of its view: the whole view at one row, or a one-row window of a taller

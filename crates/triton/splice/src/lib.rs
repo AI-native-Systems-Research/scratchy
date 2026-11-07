@@ -4823,13 +4823,25 @@ mod walk_on_the_card {
 
     /// [`batched_walk`] at head dim `hd`.
     fn batched_walk_at(seqs: u32, walk: u32, hd: u32) -> (KtirNode, BatchChunking) {
+        batched_walk_heads(seqs, walk, hd, 8, 4)
+    }
+
+    /// [`batched_walk_at`] at `kv_heads` kv heads of `group` query heads each — a tensor-parallel
+    /// rank's share of the attention.
+    fn batched_walk_heads(
+        seqs: u32,
+        walk: u32,
+        hd: u32,
+        kv_heads: u32,
+        group: u32,
+    ) -> (KtirNode, BatchChunking) {
         let TritonKernelRow::Spliced {
             src, file, entry, ..
         } = batched_decode_row()
         else {
             panic!("the batched decode row is spliced");
         };
-        let c = BatchChunking::of(seqs, walk, 8);
+        let c = BatchChunking::of(seqs, walk, kv_heads);
         let mut signature = HashMap::new();
         let mut constexprs = HashMap::new();
         for p in ["query", "k_pages", "v_pages", "mask_by_chunk", "out"] {
@@ -4843,8 +4855,8 @@ mod walk_on_the_card {
             ("NUM_SEQS", c.seqs),
             ("BLOCKS_PER_CHUNK", c.blocks_per_chunk),
             ("NUM_CHUNKS", c.num_chunks),
-            ("NUM_KV_HEADS", 8),
-            ("NUM_QUERIES_PER_KV", 4),
+            ("NUM_KV_HEADS", kv_heads),
+            ("NUM_QUERIES_PER_KV", group),
             ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
             ("HEAD_SIZE", hd),
             ("NUM_PAGES", 2048),
@@ -4959,6 +4971,37 @@ mod walk_on_the_card {
                     c.num_chunks > 1,
                     "{at}"
                 );
+            }
+        }
+    }
+
+    /// ⭐ A DECODE BATCH LOWERS AT EVERY TENSOR-PARALLEL RANK'S SHARE of granite's 8 kv heads of 4
+    /// query heads — tp/2's 4 kv heads, tp/4's 2, tp/8's 1 — at both head dims and the rung shapes
+    /// a bake asks for: a rank's attention is the same kernel over fewer heads, and every world's
+    /// must reach the card.
+    #[test]
+    fn a_decode_batch_lowers_at_every_ranks_head_share() {
+        for kv_heads in [8u32, 4, 2, 1] {
+            for hd in [64, 128] {
+                for (seqs, walk) in [(1, 1), (1, 64), (1, 2048), (4, 64), (32, 1)] {
+                    let at = format!(
+                        "{kv_heads} kv heads, {seqs} sequences over {walk} blocks at hd {hd}"
+                    );
+                    let (node, _) = batched_walk_heads(seqs, walk, hd, kv_heads, 4);
+                    let layout = triton_ktir_superdsc::layout::for_node(&node)
+                        .unwrap_or_else(|e| panic!("{at}: {e:?}"));
+                    allocate_paged_cache(&node, &layout).expect("the cache allocates");
+                    let mut sym = 0i64;
+                    ktir_superdsc::emit::whole_function::lower_walk::<
+                        ktir_superdsc::collective::TpWorld<1>,
+                    >(
+                        &node,
+                        Some(&layout),
+                        &mut sym,
+                        &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+                    )
+                    .unwrap_or_else(|e| panic!("{at}: {}", e.message));
+                }
             }
         }
     }
