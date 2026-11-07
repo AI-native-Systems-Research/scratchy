@@ -131,7 +131,9 @@ const SHAPES: &[(u32, u32, &str)] = &[
 
 /// The output stick's `(dim order, sizes)` — the property `Ddc::transformForInterSliceRestickify`
 /// reads and the V3 translator's 1-D limit is a function of.
-fn output_stick(op: &EmittedOp) -> (Vec<&'static str>, Vec<u32>) {
+fn output_stick(
+    op: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> (Vec<&'static str>, Vec<u32>) {
     let dsc = op
         .op
         .as_ref()
@@ -142,7 +144,7 @@ fn output_stick(op: &EmittedOp) -> (Vec<&'static str>, Vec<u32>) {
     (out.stickDimOrder_.clone(), out.stickSize_.clone())
 }
 
-fn write_probe_dir(label: &str, op: &EmittedOp) {
+fn write_probe_dir(label: &str, op: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>) {
     let Ok(root) = std::env::var("TRANSPOSE_PROBE_DIR") else {
         return;
     };
@@ -387,7 +389,9 @@ fn the_rerouted_ktir_door_transposes_with_a_one_dim_output_stick_at_every_shape(
 fn an_over_lx_transpose_is_refused_and_the_half_size_control_is_accepted() {
     let mut sid = -1i64;
     // `EmittedOp` is not `Debug`, so the Ok arm is named by hand rather than through `expect_err`.
-    let e = match ktir_superdsc::emit::try_assemble_restickify_transpose_2d(
+    let e = match ktir_superdsc::emit::try_assemble_restickify_transpose_2d::<
+        ktir_superdsc::collective::TpWorld<1>,
+    >(
         "big",
         4096,
         4096,

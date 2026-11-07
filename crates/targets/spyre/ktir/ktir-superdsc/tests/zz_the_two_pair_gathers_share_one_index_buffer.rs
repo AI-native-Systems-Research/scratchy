@@ -287,7 +287,9 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
     l
 }
 
-fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn emitted(
+    k: &KtirNode,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
     let layout = layout_for(k);
     let mut sid = 0i64;
     lower_function(
@@ -302,7 +304,9 @@ fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> 
 
 /// The `index_tensor` alloc's run-base word of an emitted gathered op — `None`
 /// when the op declares no index alloc. The sibling file's own reader.
-fn index_run_base(op: &ktir_superdsc::emit::EmittedOp) -> Option<u64> {
+fn index_run_base(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc
@@ -318,7 +322,9 @@ fn index_run_base(op: &ktir_superdsc::emit::EmittedOp) -> Option<u64> {
 
 /// The `value_tensor` alloc's base address in a gathered descriptor — the
 /// gather's SOURCE buffer. The rung-4 file's own reader.
-fn value_tensor_address(op: &ktir_superdsc::emit::EmittedOp) -> Option<u64> {
+fn value_tensor_address(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc
@@ -334,7 +340,10 @@ fn value_tensor_address(op: &ktir_superdsc::emit::EmittedOp) -> Option<u64> {
 
 /// The device address the `dsType_`-tagged operand of `op` starts at. The
 /// rung-4 file's own reader.
-fn alloc_address(op: &ktir_superdsc::emit::EmittedOp, tag: &str) -> Option<u64> {
+fn alloc_address(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    tag: &str,
+) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let idx = dsc.labeledDs_.iter().find(|ds| ds.dsType_ == tag)?.ldsIdx_;
@@ -370,7 +379,7 @@ const IDS_ADDR: u64 = 0xC_0000_0000 + 0x30000;
 fn two_tables_through_one_ids_each_matmul_gathers_its_own() {
     let ops = emitted(&two_pair_program())
         .expect("the two-pair program lowers through the whole-function door");
-    let copies: Vec<&ktir_superdsc::emit::EmittedOp> =
+    let copies: Vec<&ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> =
         ops.iter().filter(|o| index_run_base(o).is_some()).collect();
     assert_eq!(
         copies.len(),
@@ -410,7 +419,7 @@ fn two_tables_through_one_ids_each_matmul_gathers_its_own() {
     // ⭐ EACH CONTRACTION READS ITS OWN MINTED INTERMEDIATE — not either table
     // (the direct-read trap), and not the SAME intermediate (the
     // half-materialization: both contractions onto one gather would mint one).
-    let matmuls: Vec<&ktir_superdsc::emit::EmittedOp> = ops
+    let matmuls: Vec<&ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = ops
         .iter()
         .filter(|o| {
             o.dsc()

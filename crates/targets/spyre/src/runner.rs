@@ -192,8 +192,8 @@ impl SpyreSession {
     /// `program.rs:12-14` calls "the slow parity-oracle path", where "the GPU offloads, gated on a
     /// single-core grid, never fire" — is not reachable from outside the emulator crate.
     #[allow(clippy::type_complexity)]
-    pub fn new_multi(
-        programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
+    pub fn new_multi<T: ktir_superdsc::collective::Tp>(
+        programs: &[(&[bundle::LaunchGroup<'static, T>], &[u64])],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
     ) -> Result<Self> {
         // An empty floor matches no tid, so every stick keeps its view-derived
@@ -211,8 +211,8 @@ impl SpyreSession {
     /// statement of the tensor's extent (the same authority the bundle
     /// layout reserves from). The floor is a MAX: it can only raise an
     /// allocation, never shrink one the views already sized.
-    pub fn new_multi_floored(
-        programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
+    pub fn new_multi_floored<T: ktir_superdsc::collective::Tp>(
+        programs: &[(&[bundle::LaunchGroup<'static, T>], &[u64])],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
         shape_floor: &std::collections::HashMap<u64, usize>,
     ) -> Result<Self> {
@@ -534,7 +534,7 @@ mod tests {
             grid: (1, 1, 1),
             return_type: None,
         };
-        let group = bundle::LaunchGroup {
+        let group = bundle::LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
             kv: Default::default(),
             programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
                 func,

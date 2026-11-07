@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::canonical::StepOperands;
 use scratchy_subtile::handoff::ArenaExtents;
+use scratchy_target_metal::tape::lowering::TapeHalf;
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
 ///
@@ -69,6 +70,66 @@ pub struct CommandPool {
     /// Each weight family an MLX-affine matmul reads, with the DSL weights the matmul's op reads:
     /// what its slot's field must hold.
     affine_weights: BTreeMap<u32, BTreeSet<u32>>,
+    /// Each weight family any command binds a tensor of, with the DSL weights its rows' ops read.
+    sources: SourceReads,
+}
+
+/// The DSL weights row `row` of `half`'s op reads through a site of family `ix`.
+fn read_through(
+    operands: &StepOperands,
+    half: TapeHalf,
+    row: u32,
+    ix: SourceIx,
+) -> impl Iterator<Item = u32> + '_ {
+    (operands.weights(half, row).iter()).filter_map(move |&(at, id)| (at == ix).then_some(id))
+}
+
+/// Each weight family a command binds a tensor of — its weight, an affine part, a bundle's router
+/// or expert bank — with the DSL weights the ops of the rows the command was lowered from read
+/// through a site of that family (their own operands', `Recording::read`): what its slot's field
+/// must hold. And each family a command binds that no row it was lowered from names, with the
+/// command's kernel: a typed one refuses the bake.
+#[derive(Default)]
+struct SourceReads {
+    weights: BTreeMap<u32, BTreeSet<u32>>,
+    unnamed: BTreeMap<u32, String>,
+}
+
+impl SourceReads {
+    /// Add the families `cmd` binds, read as its rows (`rows`, of `steps`) read them.
+    fn read(
+        &mut self,
+        cmd: &TapeCommand,
+        rows: &tl::CommandRows,
+        steps: &MetalStepTape,
+        step_operands: &StepOperands,
+    ) {
+        let bound: Vec<SourceIx> = match cmd {
+            TapeCommand::Gemm(g) => vec![g.weight.ix],
+            TapeCommand::Dispatch(d) => (d.bindings.iter())
+                .filter_map(|b| match *b {
+                    Binding::Source { ix, .. } => Some(ix),
+                    _ => None,
+                })
+                .collect(),
+        };
+        let sources = match rows.half {
+            TapeHalf::Backbone => &steps.backbone_sources,
+            TapeHalf::LmHead => &steps.lm_head_sources,
+        };
+        for ix in bound {
+            let mut named = false;
+            let reads = self.weights.entry(ix.0).or_default();
+            for &r in &rows.rows {
+                let row = sources.get(r as usize).map_or(&[][..], Vec::as_slice);
+                named |= row.iter().any(|s| s.ix == ix);
+                reads.extend(read_through(step_operands, rows.half, r, ix));
+            }
+            if !named {
+                (self.unnamed.entry(ix.0)).or_insert_with(|| format!("{:?}", cmd.kernel()));
+            }
+        }
+    }
 }
 
 /// ⭐ A MODEL'S ARENA OPERANDS, EACH TYPED ONCE: every `(slot, extents)` its commands bind an arena
@@ -224,10 +285,8 @@ impl CommandPool {
         for (half, row, ix, g) in reads {
             let read = (g.n.get(), g.k.get(), g.bits.get(), g.group_size.get());
             self.affine_reads.entry(ix.0).or_default().insert(read);
-            let linears = (operands.weights(half, row).iter())
-                .filter(|(kind, _)| *kind == scratchy_subtile::handoff::WeightKind::Linear)
-                .map(|&(_, id)| id);
-            self.affine_weights.entry(ix.0).or_default().extend(linears);
+            let read = read_through(operands, half, row, ix);
+            self.affine_weights.entry(ix.0).or_default().extend(read);
         }
         Ok(())
     }
@@ -274,10 +333,13 @@ impl CommandPool {
     ///
     /// `weight_markers`: each DSL weight a typed field holds, by `WeightId`, its marker in the
     /// model's `__weights`; each typed GEMM slot is read as its GEMMs' ops' weights
-    /// ([`gemm_slot`](scratchy_target_metal::tape::typed::gemm_slot)).
+    /// ([`gemm_slot`](scratchy_target_metal::tape::typed::gemm_slot)). `named`: the families the
+    /// model names itself ([`ModelNamed`](crate::canonical::ModelNamed)), the only ones bound with
+    /// no read naming their weight.
     pub fn into_tokens(
         self,
         typed: &std::collections::HashSet<SourceIx>,
+        named: &std::collections::HashSet<SourceIx>,
         weight_markers: &BTreeMap<u32, String>,
     ) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
@@ -289,14 +351,13 @@ impl CommandPool {
             return Ok(tokens);
         }
         let parts = self.table.finish();
-        let gemms = TypedGemms::of(
-            &parts,
-            typed,
-            &self.affine_reads,
-            &self.gemm_weights,
-            &self.affine_weights,
-            weight_markers,
-        )?;
+        let reads = FamilyReads {
+            affine_reads: &self.affine_reads,
+            gemm_weights: &self.gemm_weights,
+            affine_weights: &self.affine_weights,
+            sources: &self.sources,
+        };
+        let gemms = TypedGemms::of(&parts, typed, named, &reads, weight_markers)?;
         let aliases = crate::const_tokens::alias_preamble();
         let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
             let (id, len) = (
@@ -348,7 +409,7 @@ impl CommandPool {
             .map(|list| gemms.binding_list(list))
             .collect::<Result<Vec<_>, BakeDefect>>()?;
         let gemm_entries = (parts.gemm_entries.iter())
-            .map(|g| match gemms.record(*g) {
+            .map(|g| match gemms.record(*g)? {
                 Some(record) => Ok(record),
                 None => crate::const_tokens::const_tokens(g)
                     .map_err(|e| BakeDefect(format!("serialize command table: {e}"))),
@@ -483,9 +544,21 @@ impl CommandPool {
 /// A dense GEMM's record (`Gemm`: its dims and the weight it reads, which nothing else of the
 /// command names) over a typed family's weight takes that weight's index and dims from ONE const
 /// of its slot, `__GEMM<slot>` (`GemmSlot::WEIGHT`, read off the slot's handle) — its rows and
-/// layer are its own. And each binding of a typed family's tensor names its slot's index
-/// (`__SOURCE<slot>`). Every other record and binding keeps its value; the commands resolve to
+/// layer are its own. Every other record and binding keeps its value; the commands resolve to
 /// the same values either way.
+///
+/// ⭐ AND EVERY BINDING OF A TYPED FAMILY, TYPED BY THE WEIGHTS ITS COMMAND'S OPS READ. A
+/// command's binding of a typed family's tensor — its weight, a bundle's router or expert bank, a
+/// GEMM of a router's gate — names its slot's index only as the ops of the rows the command was
+/// lowered from read it: `__SOURCE<slot>` is `source_slot::<slot, W>()` (and `holds::<slot, W2>()`
+/// each other one), `W` the marker of a DSL weight they read through a site of that family
+/// ([`SourceReads`]), E0277 where the slot's field holds another weight. A binding of an affine
+/// weight's scales, offsets or linear bias names `__SCALES<slot>` instead, the same check through
+/// `affine_part`, which only an affine slot has: so a part binds its own weight's slot, and only a
+/// quantized one. A typed family a command binds that no row it was lowered from names refuses the
+/// bake. Only a family the model names itself ([`ModelNamed`](crate::canonical::ModelNamed): its
+/// embedding table, under `embed_base`) is bound by its index alone, its parts by
+/// `affine_part_of`; any other typed family whose rows read no weight through it refuses the bake.
 ///
 /// Each typed value is one `const` per slot: the weight's index and dims depend on the slot
 /// alone, so a record that named a type of its own would only re-check it.
@@ -513,13 +586,64 @@ struct TypedGemms {
     typed: std::collections::HashSet<SourceIx>,
     /// Each typed family's dense GEMM dims `(n, k)` as the bake baked them.
     gemm_dims: std::collections::BTreeSet<(u32, u32, u32)>,
-    /// The typed families the binding lists bind, ascending.
-    bound: std::collections::BTreeSet<u32>,
+    /// The typed families the binding lists bind a tensor of other than an affine part, and the
+    /// GEMM records over a typed family's other tensor (a router's gate) name, ascending — each
+    /// with the markers of the DSL weights its commands' rows' ops read through it, if any.
+    bound: std::collections::BTreeMap<u32, Option<HeldMarkers>>,
+    /// The typed families the binding lists bind an affine part of, likewise.
+    parts: std::collections::BTreeMap<u32, Option<HeldMarkers>>,
     /// Each typed family an affine matmul reads, with the numbers the bake minted for it.
     affine: std::collections::BTreeMap<u32, AffineSlotRead>,
     /// Each typed family a dense GEMM reads, with the markers of the DSL weights its GEMMs' ops
     /// read (`__weights::<Marker>`).
-    gemm_weights: std::collections::BTreeMap<u32, (proc_macro2::Ident, Vec<proc_macro2::Ident>)>,
+    gemm_weights: std::collections::BTreeMap<u32, HeldMarkers>,
+}
+
+/// The markers of the DSL weights a slot's field must hold, the first apart ([`held_markers`]).
+type HeldMarkers = (proc_macro2::Ident, Vec<proc_macro2::Ident>);
+
+/// Whether `which` is a part of an MLX-affine weight: its scales, offsets or linear bias, which
+/// only an affine slot has. Every tensor is placed here by name: a new one is a compile error,
+/// not a binding that silently skips the affine check.
+fn affine_part(which: scratchy_target_metal::tape::lowered::WeightTensor) -> bool {
+    use scratchy_target_metal::tape::lowered::WeightTensor as T;
+    match which {
+        T::AffineScales | T::AffineBiases | T::AffineLinearBias => true,
+        // The weight itself, a dense bias, an NVFP4 linear's scales, and every bundle's own
+        // tensors: each its family's, and none an affine linear's part.
+        T::Weight
+        | T::Bias
+        | T::Nvfp4Scales
+        | T::MoeRouterGate
+        | T::GemmaRouterGate
+        | T::GemmaPerExpertScale
+        | T::GemmaRouterScale
+        | T::MoeExpertGateW
+        | T::MoeExpertGateS
+        | T::MoeExpertGateB
+        | T::MoeExpertUpW
+        | T::MoeExpertUpS
+        | T::MoeExpertUpB
+        | T::MoeExpertDownW
+        | T::MoeExpertDownS
+        | T::MoeExpertDownB
+        | T::MoeSharedGateUpW
+        | T::MoeSharedGateUpS
+        | T::MoeSharedGateUpB
+        | T::MoeSharedDownW
+        | T::MoeSharedDownS
+        | T::MoeSharedDownB
+        | T::MoeSharedExpertGate
+        | T::MoeRouterBias
+        | T::MoeExpertGateUpLinearBias
+        | T::MoeExpertDownLinearBias
+        | T::GdnConv1d
+        | T::GdnALog
+        | T::GdnDtBias
+        | T::GdnNorm
+        | T::GdnConvBias
+        | T::GdnSkip => false,
+    }
 }
 
 /// A typed family's MLX-affine matmul reads: the one `(n, k, bits, group)` the bake minted for
@@ -546,7 +670,7 @@ fn held_markers(
 ) -> Result<(proc_macro2::Ident, Vec<proc_macro2::Ident>), BakeDefect> {
     let ids = ids.filter(|ids| !ids.is_empty()).ok_or_else(|| {
         BakeDefect(format!(
-            "typed weight family {ix} is read by {what} whose ops read no linear"
+            "typed weight family {ix} is read by {what} whose ops read no weight through it"
         ))
     })?;
     let mut markers = (ids.iter())
@@ -566,17 +690,31 @@ fn held_markers(
     Ok((first, markers.collect()))
 }
 
+/// What the pool read of each weight family across the model's tapes: its affine matmuls' numbers,
+/// and the DSL weights its dense GEMMs', affine matmuls' and bindings' rows' ops read through it.
+struct FamilyReads<'a> {
+    affine_reads: &'a AffineReads,
+    gemm_weights: &'a BTreeMap<u32, BTreeSet<u32>>,
+    affine_weights: &'a BTreeMap<u32, BTreeSet<u32>>,
+    sources: &'a SourceReads,
+}
+
 impl TypedGemms {
     /// The typed GEMM records, affine matmuls and bindings of `parts`, over the families of
-    /// `typed`, the affine ones read as `affine_reads`.
+    /// `typed` (`named` those the model names itself), read as `reads`.
     fn of(
         parts: &CommandTableParts,
         typed: &std::collections::HashSet<SourceIx>,
-        affine_reads: &AffineReads,
-        gemm_weights: &BTreeMap<u32, BTreeSet<u32>>,
-        affine_weights: &BTreeMap<u32, BTreeSet<u32>>,
+        named: &std::collections::HashSet<SourceIx>,
+        reads: &FamilyReads<'_>,
         weight_markers: &BTreeMap<u32, String>,
     ) -> Result<Self, BakeDefect> {
+        let FamilyReads {
+            affine_reads,
+            gemm_weights,
+            affine_weights,
+            sources,
+        } = *reads;
         use scratchy_target_metal::tape::kernel_constants::{
             AFFINE_K, AFFINE_MATMUL_KERNELS, AFFINE_N, INT4_MATMUL_KERNELS, NAX_MATMUL_KERNELS,
         };
@@ -598,12 +736,53 @@ impl TypedGemms {
         let gemm_dims = (parts.gemm_entries.iter().filter(typed_weight))
             .map(|g| (g.ix.0, g.dims.n, g.dims.k))
             .collect();
-        let bound = (parts.bindings.iter().copied().flatten())
-            .filter_map(|b| match b {
-                Binding::Source { ix, .. } if typed.contains(ix) => Some(ix.0),
-                _ => None,
-            })
-            .collect();
+        // A typed family a command binds and no row it was lowered from names: its rows' ops say
+        // nothing of what the slot must hold.
+        if let Some((ix, kernel)) =
+            (sources.unnamed.iter()).find(|(ix, _)| typed.contains(&SourceIx(**ix)))
+        {
+            return Err(BakeDefect(format!(
+                "a {kernel} command binds typed weight family {ix}, which no row it was lowered \
+                 from names"
+            )));
+        }
+        // Each bound typed family's held markers: those of the weights its commands' rows read
+        // through it. Only a family the model names itself (its embedding table) is read through
+        // no operand; any other one whose rows read no weight through it refuses the bake.
+        let held = |ix: u32| -> Result<Option<HeldMarkers>, BakeDefect> {
+            match sources.weights.get(&ix).filter(|ids| !ids.is_empty()) {
+                Some(ids) => held_markers(ix, Some(ids), weight_markers, "commands").map(Some),
+                None if named.contains(&SourceIx(ix)) => Ok(None),
+                None => Err(BakeDefect(format!(
+                    "typed weight family {ix} is bound by commands whose rows read no weight \
+                     through it, and the model does not name it"
+                ))),
+            }
+        };
+        let (mut bound, mut affine_parts) = (BTreeMap::new(), BTreeMap::new());
+        for b in parts.bindings.iter().copied().flatten() {
+            if let Binding::Source { ix, which, .. } = b
+                && typed.contains(ix)
+            {
+                let to = if affine_part(*which) {
+                    &mut affine_parts
+                } else {
+                    &mut bound
+                };
+                if let std::collections::btree_map::Entry::Vacant(v) = to.entry(ix.0) {
+                    v.insert(held(ix.0)?);
+                }
+            }
+        }
+        // A GEMM over a typed family's other tensor (a router's gate) names its slot alike.
+        for g in &parts.gemm_entries {
+            if typed.contains(&g.ix)
+                && !Self::typed_weight(typed, g)
+                && let std::collections::btree_map::Entry::Vacant(v) = bound.entry(g.ix.0)
+            {
+                v.insert(held(g.ix.0)?);
+            }
+        }
         // Each typed family's one affine read: two are no one slot's.
         let mut affine = std::collections::BTreeMap::new();
         for (&ix, reads) in affine_reads {
@@ -688,9 +867,14 @@ impl TypedGemms {
             typed: typed.clone(),
             gemm_dims,
             bound,
+            parts: affine_parts,
             affine,
             gemm_weights,
         })
+    }
+
+    fn part(slot: SourceIx) -> proc_macro2::Ident {
+        quote::format_ident!("__SCALES{}", slot.0)
     }
 
     fn affine_slot(slot: u32) -> proc_macro2::Ident {
@@ -716,16 +900,33 @@ impl TypedGemms {
 
     /// GEMM entry `g`'s tokens, for one over a typed weight: its slot's index and dims, and its
     /// rows (its layer is each command's).
-    fn record(&self, g: scratchy_target_metal::tape::lowered::GemmEntry) -> Option<TokenStream> {
+    fn record(
+        &self,
+        g: scratchy_target_metal::tape::lowered::GemmEntry,
+    ) -> Result<Option<TokenStream>, BakeDefect> {
+        if !self.typed.contains(&g.ix) {
+            return Ok(None);
+        }
         if !Self::typed_weight(&self.typed, &g) {
-            return None;
+            // A typed family's other tensor (a router's gate): its slot as its rows read it, its
+            // dims and tensor their own.
+            let s = Self::source(g.ix);
+            let (dims, which) = (
+                crate::const_tokens::const_tokens(&g.dims),
+                crate::const_tokens::const_tokens(&g.which),
+            );
+            let tokens = |e| BakeDefect(format!("serialize command table: {e}"));
+            let (dims, which) = (dims.map_err(tokens)?, which.map_err(tokens)?);
+            return Ok(Some(
+                quote!(__tl::GemmEntry { dims: #dims, ix: #s, which: #which }),
+            ));
         }
         let (w, m) = (Self::gemm(g.ix), g.dims.m);
-        Some(quote!(__tl::GemmEntry {
+        Ok(Some(quote!(__tl::GemmEntry {
             dims: __tl::GemmDims { m: #m, n: #w.n, k: #w.k },
             ix: #w.ix,
             which: __tl::WeightTensor::Weight,
-        }))
+        })))
     }
 
     /// `list`, each weight of a typed family named through its slot's index.
@@ -746,7 +947,10 @@ impl TypedGemms {
                     layer,
                     binding_index,
                 } if self.typed.contains(ix) => {
-                    let s = Self::source(*ix);
+                    let s = match affine_part(*which) {
+                        true => Self::part(*ix),
+                        false => Self::source(*ix),
+                    };
                     let (which, layer) = (tokens(which)?, tokens(layer)?);
                     let bi = proc_macro2::Literal::u8_suffixed(*binding_index);
                     Ok(quote!(__tl::Binding::Source {
@@ -791,10 +995,31 @@ impl TypedGemms {
             let (n, k) = (unsigned(n), unsigned(k));
             quote!(const _: () = #tt::gemm_dims_agree::<super::#s, #n, #k>();)
         });
-        let sources = self.bound.iter().map(|&ix| {
+        // Each bound slot's index, as its commands' rows' ops read it (`source_slot`, `holds`); a
+        // slot read through no operand by its index alone.
+        let sources = self.bound.iter().map(|(&ix, held)| {
             let ix = SourceIx(ix);
             let (c, s) = (Self::source(ix), crate::canonical::slot(ix));
-            quote!(const #c: __ti::SourceIx = <super::#s as #tt::Source>::IX;)
+            match held {
+                Some((first, rest)) => quote!(const #c: __ti::SourceIx = {
+                    #(#tt::holds::<super::#s, super::__weights::#rest>();)*
+                    #tt::source_slot::<super::#s, super::__weights::#first>()
+                };),
+                None => quote!(const #c: __ti::SourceIx = <super::#s as #tt::Source>::IX;),
+            }
+        });
+        // Each slot an affine part of which is bound: likewise, and only an affine slot has one
+        // (`affine_part`, `affine_part_of`).
+        let parts = self.parts.iter().map(|(&ix, held)| {
+            let ix = SourceIx(ix);
+            let (c, s) = (Self::part(ix), crate::canonical::slot(ix));
+            match held {
+                Some((first, rest)) => quote!(const #c: __ti::SourceIx = {
+                    #(#tt::holds::<super::#s, super::__weights::#rest>();)*
+                    #tt::affine_part::<super::#s, super::__weights::#first>()
+                };),
+                None => quote!(const #c: __ti::SourceIx = #tt::affine_part_of::<super::#s>();),
+            }
         });
         let affine = self.affine.iter().map(|(&ix, r)| {
             let (c, s) = (Self::affine_slot(ix), crate::canonical::slot(SourceIx(ix)));
@@ -823,7 +1048,7 @@ impl TypedGemms {
                 #nax
             }
         });
-        quote!(#(#weights)* #(#gemm_dims)* #(#sources)* #(#affine)*)
+        quote!(#(#weights)* #(#gemm_dims)* #(#sources)* #(#parts)* #(#affine)*)
     }
 }
 
@@ -1091,18 +1316,21 @@ fn run_lower(
 /// `tape`'s commands with each arena operand named by its model-wide operand
 /// ([`ArenaOperands`]): the slot it binds, held as the extents the rows the command was lowered
 /// from (`rows`) hold there, in `band`'s colouring. A command binding a slot none of its rows
-/// names refuses the bake.
+/// names refuses the bake. Each weight family a command binds joins `sources` with the weights its
+/// rows' ops read ([`SourceReads`]).
 fn name_operands(
     tape: &LoweredMetalTape,
     rows: &[tl::CommandRows],
-    band: (&StepOperands, &BandArena),
+    band: (&MetalStepTape, &StepOperands, &BandArena),
     extents: &ArenaExtents,
     operands: &mut ArenaOperands,
     gemm_weights: &mut BTreeMap<u32, BTreeSet<u32>>,
+    sources: &mut SourceReads,
 ) -> Result<Vec<GatedCommand>, BakeDefect> {
-    let (step_operands, arena) = band;
+    let (steps, step_operands, arena) = band;
     (tape.commands.iter().zip(rows).enumerate())
         .map(|(c, (cmd, rows))| {
+            sources.read(&cmd.command, rows, steps, step_operands);
             let mut named = |slot: u32| -> Result<u32, BakeDefect> {
                 let held = (rows.rows.iter())
                     .flat_map(|&r| step_operands.row(rows.half, r))
@@ -1127,15 +1355,14 @@ fn name_operands(
                 Activation::Arena { slot } => Ok(Activation::Arena { slot: named(slot)? }),
                 other => Ok(other),
             };
-            // A dense GEMM's weight: the linears its rows' ops read.
+            // A dense GEMM's weight: the weights its rows' ops read through its family.
             if let TapeCommand::Gemm(g) = cmd.command
                 && g.weight.which == scratchy_target_metal::tape::lowered::WeightTensor::Weight
             {
-                let read = (rows.rows.iter())
-                    .flat_map(|&r| step_operands.weights(rows.half, r))
-                    .filter(|(kind, _)| *kind == scratchy_subtile::handoff::WeightKind::Linear)
-                    .map(|&(_, id)| id);
-                gemm_weights.entry(g.weight.ix.0).or_default().extend(read);
+                let ix = g.weight.ix;
+                let read =
+                    (rows.rows.iter()).flat_map(|&r| read_through(step_operands, rows.half, r, ix));
+                gemm_weights.entry(ix.0).or_default().extend(read);
             }
             let command = match cmd.command {
                 TapeCommand::Gemm(g) => TapeCommand::Gemm(Gemm {
@@ -1259,8 +1486,8 @@ pub fn bake_bucket_tapes(
         };
         // The band the rung lowered under, whose colouring its arena operands are named in.
         let (wide, band) = match (class, input.wide_band.as_ref()) {
-            (GenClass::M5Wide, Some(wide)) => (true, (wide.operands, wide.arena)),
-            _ => (false, (input.operands, input.arena)),
+            (GenClass::M5Wide, Some(wide)) => (true, (wide.steps, wide.operands, wide.arena)),
+            _ => (false, (input.steps, input.operands, input.arena)),
         };
         // The cap-sized scratch is the variant's; the rest of the tape is the body.
         let (roped_k, attn_unfused) = (tape.roped_k_scratch_bytes, tape.attn_unfused_scratch_bytes);
@@ -1281,6 +1508,7 @@ pub fn bake_bucket_tapes(
                     input.extents,
                     &mut pool.operands,
                     &mut pool.gemm_weights,
+                    &mut pool.sources,
                 )?;
                 let cmd_refs = (named.into_iter())
                     .map(|c| pool.intern(c))

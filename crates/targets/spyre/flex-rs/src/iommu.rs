@@ -110,6 +110,8 @@ fn proc_mapping_of(addr: usize) -> Option<String> {
 
 pub struct PfIommuMapper {
     page_size: usize,
+    /// The card whose IOMMU this maps host memory into.
+    card: Arc<crate::senlib_ffi::Card>,
     table: Mutex<std::collections::HashMap<u64, (u64, usize)>>,
 }
 
@@ -128,9 +130,10 @@ impl PfIommuMapper {
     /// (`pf_iommu_mapper.cpp:41-42`): `page_size_(common::page_size())` — the
     /// real C++ constructor derives the page size itself and never accepts
     /// it from the caller.
-    pub fn new() -> Arc<Self> {
+    pub fn new(card: Arc<crate::senlib_ffi::Card>) -> Arc<Self> {
         Arc::new(Self {
             page_size: common_page_size(),
+            card,
             table: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -152,6 +155,7 @@ impl PfIommuMapper {
         // than that).
         let rc = unsafe {
             crate::senlib_ffi::flex_senlib_iommu_register_and_map(
+                self.card.raw(),
                 hmva as *mut std::ffi::c_void,
                 size_bytes as u64,
                 writable,
@@ -266,6 +270,7 @@ impl PfIommuMapper {
         // SAFETY: `hmva`/`iova` came from a prior `map()` on this mapper.
         let rc = unsafe {
             crate::senlib_ffi::flex_senlib_iommu_unmap_and_unregister(
+                self.card.raw(),
                 hmva as *mut std::ffi::c_void,
                 iova as *mut std::ffi::c_void,
                 size_bytes,
@@ -312,7 +317,7 @@ mod tests {
     #[test]
     fn map_buffer_rejects_nullptr_buffer() {
         // Port of iommu_mapper_test.cpp's MapNullptrBufferReturnsError.
-        let mapper = PfIommuMapper::new();
+        let mapper = PfIommuMapper::new(crate::senlib_ffi::Card::detached());
         let null_buffer = RaiiBuffer::default();
 
         let status = match mapper.map_buffer(&null_buffer, true) {

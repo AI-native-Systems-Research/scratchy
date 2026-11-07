@@ -117,7 +117,8 @@ fn main() {
         Ok(n) => n,
         Err(e) => refused!(e.stage, e.message),
     };
-    let ops = match triton_ktir_superdsc::emit_node(&node) {
+    let ops = match triton_ktir_superdsc::emit_node::<ktir_superdsc::collective::TpWorld<1>>(&node)
+    {
         Ok(ops) => ops,
         Err(e) => refused!(e.stage, e.message),
     };

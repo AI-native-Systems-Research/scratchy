@@ -9332,6 +9332,98 @@ fn superdsc_rotary_kind(
     }
 }
 
+/// One decode batch rung as a bake commits it: its request count, its swept extent, its body
+/// fingerprint and its own staged constants.
+#[cfg(feature = "spyre")]
+type DecodeRungEntry = (
+    u32,
+    u32,
+    String,
+    Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
+);
+
+/// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
+/// [`SengraphBundleGroup`](scratchy_target_spyre::manifest::SengraphBundleGroup) or a
+/// [`TpForward`](scratchy_target_spyre::wiring::TpForward), from that world's committed rung cells.
+/// One renderer for every world, so a sharded world's ladders are spelled exactly as the one-rank
+/// world's.
+///
+/// The prefix-FREE prefill ladder and the decode batch ladder are emitted ONLY when more than one
+/// rung baked: a single rung is exactly the world's own `prefill`/`decode` slot, so the empty slice
+/// keeps the one-bundle path byte-identical instead of making the worker special-case a one-rung
+/// ladder. The prefix-capable ladder (start>0 chunks) ships every width that baked, a single rung
+/// included: no other slot carries it.
+#[cfg(feature = "spyre")]
+fn ladder_lits(
+    prefill_rungs: &[(u32, String)],
+    decode_rungs: &[DecodeRungEntry],
+    prefill_prefix_rungs: &[(u32, String)],
+) -> (
+    Vec<proc_macro2::TokenStream>,
+    Vec<proc_macro2::TokenStream>,
+    Vec<proc_macro2::TokenStream>,
+) {
+    let sentinel = |fp: &str| proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
+    let mq_rungs = |rungs: &[(u32, String)]| -> Vec<proc_macro2::TokenStream> {
+        let mut rungs = rungs.to_vec();
+        rungs.sort_by_key(|(mq, _)| *mq);
+        rungs
+            .iter()
+            .map(|(mq, fp)| {
+                let m = proc_macro2::Literal::u32_unsuffixed(*mq);
+                let s = sentinel(fp);
+                quote! { (#m, #s) }
+            })
+            .collect()
+    };
+    let prefix = mq_rungs(prefill_prefix_rungs);
+    let prefill = if prefill_rungs.len() > 1 {
+        mq_rungs(prefill_rungs)
+    } else {
+        Vec::new()
+    };
+    let decode = {
+        let mut rungs = decode_rungs.to_vec();
+        rungs.sort_by_key(|(n, _, _, _)| *n);
+        rungs.dedup_by_key(|(n, _, _, _)| *n);
+        if rungs.len() > 1 {
+            rungs
+                .iter()
+                .map(|(n, swept, fp, consts)| {
+                    // ⛔ `RungSeqs`, NOT a bare u32: the decode ladder is keyed by `decode_rows` (the
+                    // BATCH WIDTH), while the sibling `sk_bucket_rungs` list is keyed by `active_cap`
+                    // (the SWEEP EXTENT). Both were `(u32, String)`, and the worker selects over this
+                    // one with `>= live`. Naming the quantity here is what stops the two ladders being
+                    // interchangeable at the call site.
+                    let n = proc_macro2::Literal::u32_unsuffixed(*n);
+                    let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
+                    let sfp = sentinel(fp);
+                    // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's session, never
+                    // the single-request wiring's list: the ten uniform `[rows, 1]` tables' stick
+                    // heads are per-width (Finding 1's compounding half). Rendered by the ONE
+                    // load-const renderer the wiring static itself uses, so the spellings cannot
+                    // drift.
+                    let consts = consts
+                        .iter()
+                        .map(load_const_entry_tokens)
+                        .collect::<Vec<_>>();
+                    quote! {
+                        (
+                            ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
+                            ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
+                            ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
+                            &[#(#consts),*],
+                        )
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+    (prefill, decode, prefix)
+}
+
 /// One load-const entry `(tid, kind)` as a token stream — the ONE renderer,
 /// shared by the wiring static (`emit_superdsc_wiring`) and every decode
 /// batch rung's OWN consts in the manifest (`decode_rung_lits`), so the two
@@ -10270,12 +10362,26 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
         Ok(None) => {}
         Err(e) => panic!("[spyre] {e}"),
     }
-    let bundles =
-        match scratchy_target_spyre::lower_subtile_tape_to_superdsc::drain_emitted_bundles() {
+    // ⭐ EVERY WORLD'S BUNDLES, EACH AS ITS WORLD'S TYPE: the one-rank forward's and, when the build
+    // names a sharded world, `Build`'s. A bundle is rendered with its world spelled in its type
+    // (`BundleCode::<'static, W>`), so the registry downcast finds it in that world alone.
+    use scratchy_target_spyre::bundle_code::collective::{Build, TpWorld, World};
+    let alone = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::drain_emitted_bundles::<
+        TpWorld<1>,
+    >() {
+        Ok(b) => b,
+        Err(e) => panic!("[spyre-superdsc] {e}"),
+    };
+    let sharded = if <Build as World>::SHARDED {
+        match scratchy_target_spyre::lower_subtile_tape_to_superdsc::drain_emitted_bundles::<Build>(
+        ) {
             Ok(b) => b,
             Err(e) => panic!("[spyre-superdsc] {e}"),
-        };
-    if bundles.is_empty() {
+        }
+    } else {
+        Vec::new()
+    };
+    if alone.is_empty() && sharded.is_empty() {
         return proc_macro2::TokenStream::new();
     }
     let images = match std::env::var("OUT_DIR") {
@@ -10290,37 +10396,28 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     // programs, so they share one set of `const` items rather than each carrying its own copy.
     let mut interner = crate::ktir_tokens::ProgramInterner::default();
     let mut places_interner = PlacesInterner::default();
-    for b in &bundles {
-        let fp = proc_macro2::Literal::string(&b.fp);
-        let layout = layout_tokens(&b.layout, &mut places_interner);
-        let groups = b
-            .groups
-            .iter()
-            .enumerate()
-            .map(|(i, g)| {
-                n_groups += 1;
-                n_bytes += g.init_binary.len();
-                launch_tokens(g, i, &b.fp, &images, &mut interner)
-            })
-            .collect::<Vec<_>>();
-        let reroll = match &b.reroll {
-            Some(m) => {
-                let m = reroll_tokens(m);
-                quote! { ::core::option::Option::Some(#m) }
-            }
-            None => quote! { ::core::option::Option::None },
-        };
-        out.extend(quote! {
-            ::scratchy_target_spyre::bundle_code::inventory::submit! {
-                ::scratchy_target_spyre::bundle_code::BundleCode {
-                    fp: ::std::borrow::Cow::Borrowed(#fp),
-                    layout: #layout,
-                    groups: ::std::borrow::Cow::Borrowed(&[#(#groups),*]),
-                    reroll: #reroll,
-                }
-            }
-        });
-    }
+    let n_bundles = alone.len() + sharded.len();
+    let world_alone = quote! { ::scratchy_target_spyre::bundle_code::collective::TpWorld<1> };
+    // The binary's own `Build` — `SUPERDSC_TP`'s assertion holds it to the world baked here.
+    let world_build = quote! { ::scratchy_target_spyre::bundle_code::collective::Build };
+    bundle_items(
+        &alone,
+        &world_alone,
+        &images,
+        &mut interner,
+        &mut places_interner,
+        &mut out,
+        (&mut n_groups, &mut n_bytes),
+    );
+    bundle_items(
+        &sharded,
+        &world_build,
+        &images,
+        &mut interner,
+        &mut places_interner,
+        &mut out,
+        (&mut n_groups, &mut n_bytes),
+    );
     // ── THE BAKE BUDGET, PER MODEL (see `scratchy_target_spyre::superdsc_bake::BakeBudget`) ──
     //    Launch-group COUNT is the dxp floor's multiplication lever: the floor is total compile
     //    cost ÷ the queue's width, so a ladder that doubles its rungs doubles the floor no
@@ -10357,11 +10454,58 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     eprintln!(
         "[spyre-superdsc] baked {} bundle(s) / {n_groups} launch group(s) / {} distinct program(s) \
          / {:.1} MB of device code into the binary as Rust structs",
-        bundles.len(),
+        n_bundles,
         interner.items().len(),
         n_bytes as f64 / 1048576.0,
     );
     out
+}
+
+/// Render one world's drained bundles as `inventory` registrations — each `BundleCode::<'static, W>`
+/// (`world` is `W`'s path), registered type-erased so a lookup of world `W` finds it by downcast.
+#[cfg(feature = "spyre")]
+fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
+    bundles: &[scratchy_target_spyre::bundle_code::BundleCode<'static, T>],
+    world: &proc_macro2::TokenStream,
+    images: &std::path::Path,
+    interner: &mut crate::ktir_tokens::ProgramInterner,
+    places_interner: &mut PlacesInterner,
+    out: &mut proc_macro2::TokenStream,
+    (n_groups, n_bytes): (&mut usize, &mut usize),
+) {
+    for b in bundles {
+        let fp = proc_macro2::Literal::string(&b.fp);
+        let layout = layout_tokens(&b.layout, places_interner);
+        let groups = b
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                *n_groups += 1;
+                *n_bytes += g.init_binary.len();
+                launch_tokens(g, i, &b.fp, images, interner)
+            })
+            .collect::<Vec<_>>();
+        let reroll = match &b.reroll {
+            Some(m) => {
+                let m = reroll_tokens(m);
+                quote! { ::core::option::Option::Some(#m) }
+            }
+            None => quote! { ::core::option::Option::None },
+        };
+        out.extend(quote! {
+            ::scratchy_target_spyre::bundle_code::inventory::submit! {
+                ::scratchy_target_spyre::bundle_code::RegisteredBundle {
+                    code: &::scratchy_target_spyre::bundle_code::BundleCode::<'static, #world> {
+                        fp: ::std::borrow::Cow::Borrowed(#fp),
+                        layout: #layout,
+                        groups: ::std::borrow::Cow::Borrowed(&[#(#groups),*]),
+                        reroll: #reroll,
+                    },
+                }
+            }
+        });
+    }
 }
 
 /// A `Cow::Borrowed` string literal — every `Cow<'static, str>` field in the baked artifact.
@@ -10625,6 +10769,13 @@ impl PlacesInterner {
 }
 
 /// The whole memory plan.
+/// ⭐ THE TENSOR-PARALLEL WORLD THIS BUILD BAKES — `scratchy_tp_world::Build`, the one `tp/N` the
+/// build names (one rank when it names none). Its rank count, for the messages and the bundle names
+/// that spell it; every TYPE the bake instantiates names `Build` itself.
+#[cfg(feature = "spyre")]
+const TP_WORLD: u32 =
+    <scratchy_target_spyre::bundle_code::collective::Build as scratchy_target_spyre::bundle_code::collective::World>::RANKS;
+
 #[cfg(feature = "spyre")]
 fn layout_tokens(
     l: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout<'_>,
@@ -10726,10 +10877,10 @@ fn layout_tokens(
 /// ONE LAUNCH: its address shifts and its compiled program, as a single value. The device image is
 /// written to `OUT_DIR` and referenced by `include_bytes!`; everything else is a literal.
 #[cfg(feature = "spyre")]
-fn launch_tokens(
+fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     // `'static` because a baked program's operations live in the arena, which outlives the whole
     // expansion — the tokens borrow it rather than copying it.
-    g: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LaunchGroup<'static>,
+    g: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LaunchGroup<'static, T>,
     index: usize,
     fp: &str,
     images: &std::path::Path,
@@ -10753,7 +10904,51 @@ fn launch_tokens(
         gathered,
         fold_rows,
         walk,
+        tp,
     } = kv;
+    // A collective's consume: its kind, the operand it sends, and the fragment — re-minted through
+    // `Fragment::baked`, a `const fn`, so the static this lands in re-proves the fragment's law.
+    let tp = match tp {
+        None => quote! { ::core::option::Option::None },
+        Some(c) => {
+            use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::collective::CollectiveKind as K;
+            let kind = match c.kind {
+                K::AllReduce => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllReduce }
+                }
+                K::AllGather => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllGather }
+                }
+            };
+            let operand = place_id_tokens(&c.operand);
+            let [first, sticks, rows] = [
+                c.fragment.first_stick(),
+                c.fragment.sticks(),
+                c.fragment.rows(),
+            ]
+            .map(proc_macro2::Literal::u32_unsuffixed);
+            // The consume's rank, re-minted through `Rank::baked`, the const fn that refuses a rank
+            // past its world — the world being the bundle's type, inferred from the static.
+            let r = proc_macro2::Literal::u32_unsuffixed(c.plays_at.get());
+            let plays_at = quote! {
+                ::scratchy_target_spyre::bundle_code::collective::Rank::baked(#r)
+            };
+            // The window cut, re-minted through the const fn that refuses a cut the window
+            // does not have.
+            let cut = proc_macro2::Literal::u32_unsuffixed(c.cut.index() as u32);
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpConsume {
+                    kind: #kind,
+                    operand: #operand,
+                    fragment: ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
+                        #first, #sticks, #rows,
+                    ),
+                    plays_at: #plays_at,
+                    cut: ::scratchy_target_spyre::bundle_code::collective::WindowCut::baked(#cut),
+                })
+            }
+        }
+    };
     let walk = match walk {
         Some(scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Walk {
             trips,
@@ -10816,6 +11011,7 @@ fn launch_tokens(
                 gathered: #gathered,
                 fold_rows: #fold_rows,
                 walk: #walk,
+                tp: #tp,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,
@@ -11601,12 +11797,6 @@ fn dump_wavefront_mega(
         // `rows` — the ten uniform `[rows, 1]` tables' stick heads are per-width, Finding 1's
         // compounding half: the single-request wiring's rows=1 kinds staged into a rows=N rung
         // left every row past 0 reading zero).
-        type DecodeRungEntry = (
-            u32,
-            u32,
-            String,
-            Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
-        );
         let superdsc_decode_rungs: std::cell::RefCell<Vec<DecodeRungEntry>> =
             std::cell::RefCell::new(Vec::new());
         // The PREFIX-CAPABLE ladder `[(mq, body_fp)]` — the prefill bundles baked with a full
@@ -11637,6 +11827,55 @@ fn dump_wavefront_mega(
             std::cell::RefCell::new((None, None));
         let weight_seg_ledger: std::cell::RefCell<Vec<(String, u64, Vec<u64>)>> =
             std::cell::RefCell::new(Vec::new());
+        // ⭐ THE STATE ONE TENSOR-PARALLEL WORLD'S BAKES COMMIT INTO. Every cell above is the
+        // one-rank world's; a sharded world bakes its own forward (rank-local weights, its own
+        // fingerprints, its own wiring) and commits into cells of its own — its weight segment is
+        // not the one-rank world's, so the parity law judges its ledger apart, and its wiring must
+        // not overwrite the one-rank decode slot. ONE commit (`commit_bake`) serves every world;
+        // the world is which cells it is handed.
+        struct WorldBake<'w> {
+            fp: &'w std::cell::RefCell<Option<String>>,
+            prefill_fp: &'w std::cell::RefCell<Option<String>>,
+            prefill_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
+            prefill_prefix_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
+            decode_rungs: &'w std::cell::RefCell<Vec<DecodeRungEntry>>,
+            wiring: &'w std::cell::RefCell<WiringPair>,
+            fold_census: &'w std::cell::RefCell<WeightFoldCensus>,
+            weight_seg_ledger: &'w std::cell::RefCell<Vec<(String, u64, Vec<u64>)>>,
+        }
+        type WiringPair = (
+            Option<proc_macro2::TokenStream>,
+            Option<proc_macro2::TokenStream>,
+        );
+        let one_rank = WorldBake {
+            fp: &superdsc_fp,
+            prefill_fp: &superdsc_prefill_fp,
+            prefill_rungs: &superdsc_prefill_rungs,
+            prefill_prefix_rungs: &superdsc_prefill_prefix_rungs,
+            decode_rungs: &superdsc_decode_rungs,
+            wiring: &wiring_tokens,
+            fold_census: &weight_fold_census,
+            weight_seg_ledger: &weight_seg_ledger,
+        };
+        // The sharded world's cells (`TP_WORLD`; see the sharded bake below).
+        let tp_fp = std::cell::RefCell::new(None);
+        let tp_prefill_fp = std::cell::RefCell::new(None);
+        let tp_prefill_rungs = std::cell::RefCell::new(Vec::new());
+        let tp_prefill_prefix_rungs = std::cell::RefCell::new(Vec::new());
+        let tp_decode_rungs = std::cell::RefCell::new(Vec::new());
+        let tp_wiring: std::cell::RefCell<WiringPair> = std::cell::RefCell::new((None, None));
+        let tp_fold_census = std::cell::RefCell::new(None);
+        let tp_weight_seg_ledger = std::cell::RefCell::new(Vec::new());
+        let sharded_world = WorldBake {
+            fp: &tp_fp,
+            prefill_fp: &tp_prefill_fp,
+            prefill_rungs: &tp_prefill_rungs,
+            prefill_prefix_rungs: &tp_prefill_prefix_rungs,
+            decode_rungs: &tp_decode_rungs,
+            wiring: &tp_wiring,
+            fold_census: &tp_fold_census,
+            weight_seg_ledger: &tp_weight_seg_ledger,
+        };
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
         // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
         // shared state at all, and can run on any thread, while the expansion still sees exactly the
@@ -11704,7 +11943,12 @@ fn dump_wavefront_mega(
         let weight_naming = program.weight_naming();
         // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the concrete query-row count the
         // tape was lowered at — the ladder rung this bake belongs to. `None` = decode.
-        let emit_bundle_deferred =
+        // ⭐ ONE BAKE BODY, STAMPED PER WORLD. A bake's ops, launch groups and bundle are its
+        // world's types and a closure cannot be generic, so the body is stated ONCE here and
+        // instantiated for each world this expansion bakes: the one-rank forward's (`TpWorld<1>`)
+        // and the build's one `tp/N` (`Build`). `$W` is that world inside the body.
+        macro_rules! world_bake {
+            ($W:ty) => {
             |lwd: &to_wavefront::LoweredDecode,
              base: String,
              // The capacity THIS bundle is baked for. Decode cap buckets vary it;
@@ -11719,8 +11963,14 @@ fn dump_wavefront_mega(
              // The row count THIS bundle is baked at. Not `primary_m`: a batch-ladder
              // rung is a wider bake of the same tape, and reading the env knob here
              // would tell every rung it was one row.
-             decode_rows: u32|
+             decode_rows: u32,
+             // The slice law of every source when `lwd` is one rank of a sharded world — the
+             // numeric gate runs such a bundle on both ranks at once. `None` for a world of one.
+             shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>|
              -> (BakeOut, Vec<BakeEffect>) {
+                // Only the emulator's numeric gate reads the slice laws.
+                #[cfg(not(feature = "spyre-emu"))]
+                let _ = shards;
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
                 // A prefill chunk's rows are one prompt's positions; a decode bundle's are one token
@@ -11937,7 +12187,7 @@ fn dump_wavefront_mega(
                 // the derivation must exist before the push. `krg` is minted and validated above
                 // and only ever borrowed below, so computing the wiring here is the same value at
                 // an earlier point, nothing more.
-                let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring(
+                let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring::<$W, _>(
                     &krg,
                     &weight_ids,
                     active_cap,
@@ -11976,7 +12226,7 @@ fn dump_wavefront_mega(
                         );
                         // A hand-authored matmul, so there is no attention node for the four
                         // attention facts to be facts of — main's own `false`/absent at such a site.
-                        match superdsc::emit_bundle(
+                        match superdsc::emit_bundle::<$W>(
                             &[g1],
                             None,
                             superdsc::FoldGrouping::Split,
@@ -12011,7 +12261,7 @@ fn dump_wavefront_mega(
                             // remains the single-class roll every other model takes, byte-identical.
                             let tape_rolled = reroll_layer_classes(&tape_unrolled, &krg)
                                 .unwrap_or_else(|| reroll_subtile_tape(&tape_unrolled, &krg));
-                            match superdsc::lower_subtile_tape_to_superdsc(
+                            match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
                                 &tape_rolled,
                                 &krg,
                                 &weight_ids,
@@ -12086,11 +12336,11 @@ fn dump_wavefront_mega(
                                     // the matmul pre-tiling needed: an emulator-motivated transform
                                     // applied upstream of both consumers, moved to the consumer that
                                     // wants it.
-                                    let unrolled = superdsc::unroll_layers(&rolled);
+                                    let unrolled = superdsc::unroll_layers::<$W>(&rolled);
                                     let card = cfg!(feature = "spyre-hw");
                                     let unrolled_params = rolled.attn_params;
                                     let pre = if card {
-                                        superdsc::emit_bundle(
+                                        superdsc::emit_bundle::<$W>(
                                             &rolled.prefix,
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
@@ -12121,7 +12371,7 @@ fn dump_wavefront_mega(
                                     // walks the launch sequence across classes.
                                     let mut body_fps: Vec<String> = Vec::new();
                                     for (ci, b) in rolled.bodies.iter().enumerate() {
-                                        let r = superdsc::emit_bundle(
+                                        let r = superdsc::emit_bundle::<$W>(
                                             if card { &b.ops } else { &unrolled },
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
@@ -12174,10 +12424,10 @@ fn dump_wavefront_mega(
                                                 .bodies
                                                 .iter()
                                                 .map(|b| {
-                                                    if !superdsc::has_fused_twin(&b.ops) {
+                                                    if !superdsc::has_fused_twin::<$W>(&b.ops) {
                                                         return superdsc::bundle::SiblingFp::none();
                                                     }
-                                                    superdsc::emit_bundle(
+                                                    superdsc::emit_bundle::<$W>(
                                                         &b.ops,
                                                         Some(&rolled.layout),
                                                         superdsc::FoldGrouping::Fused,
@@ -12203,7 +12453,7 @@ fn dump_wavefront_mega(
                                     // ONE layer now, run `iters` times. The emulator keeps the single
                                     // unrolled bundle, where the suffix really is part of it.
                                     let suf = if card {
-                                        superdsc::emit_bundle(
+                                        superdsc::emit_bundle::<$W>(
                                             &rolled.suffix,
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
@@ -12281,7 +12531,7 @@ fn dump_wavefront_mega(
                                             // fold flag: the attention expands inside `emit_bundle`).
                                             // Proven below.
                                             let folds_of = |fp: &str| {
-                                                superdsc::emitted_bundle_folds(fp).unwrap_or_else(|| {
+                                                superdsc::emitted_bundle_folds::<$W>(fp).unwrap_or_else(|| {
                                                     panic!(
                                                         "[spyre-superdsc] {base}: ladder body {fp} was named but never emitted"
                                                     )
@@ -12355,7 +12605,7 @@ fn dump_wavefront_mega(
                                                     ladder
                                                         .into_par_iter()
                                                         .map(|(rung, rung_swept)| -> Option<RungRecord> {
-                                                    match superdsc::lower_subtile_tape_to_superdsc(
+                                                    match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
                                                         &tape_rolled,
                                                         &krg,
                                                         &weight_ids,
@@ -12370,7 +12620,7 @@ fn dump_wavefront_mega(
                                                             let rung_unrolled = if card {
                                                                 Vec::new()
                                                             } else {
-                                                                superdsc::unroll_layers(&rr)
+                                                                superdsc::unroll_layers::<$W>(&rr)
                                                             };
                                                             let rung_params = rr.attn_params;
                                                             // ONE FP per body class; a failed body emit
@@ -12385,7 +12635,7 @@ fn dump_wavefront_mega(
                                                             for (ci, b) in
                                                                 rr.bodies.iter().enumerate()
                                                             {
-                                                                match superdsc::emit_bundle(
+                                                                match superdsc::emit_bundle::<$W>(
                                                                     if card {
                                                                         &b.ops
                                                                     } else {
@@ -12424,9 +12674,9 @@ fn dump_wavefront_mega(
                                                                         // only where there is a fold to fuse,
                                                                         // as for the ceiling's.
                                                                         rfused.push(if card
-                                                                            && superdsc::has_fused_twin(&b.ops)
+                                                                            && superdsc::has_fused_twin::<$W>(&b.ops)
                                                                         {
-                                                                        superdsc::emit_bundle(
+                                                                        superdsc::emit_bundle::<$W>(
                                                                             &b.ops,
                                                                             Some(&rr.layout),
                                                                             superdsc::FoldGrouping::Fused,
@@ -12669,11 +12919,11 @@ fn dump_wavefront_mega(
                                             {
                                                 panic!("[spyre-superdsc] {base}: {e}");
                                             }
-                                            superdsc::attach_reroll(&bfp, meta);
+                                            superdsc::attach_reroll::<$W>(&bfp, meta);
                                             // ⛔ AND THE SESSION THIS BODY OPENS ALLOCATES FOR EVERY
                                             // SIBLING IT LAUNCHES, not for itself alone: a rung whose
                                             // scratch outgrows the ceiling's addresses past its segment.
-                                            if let Err(e) = superdsc::cover_ladder_allocation(&bfp)
+                                            if let Err(e) = superdsc::cover_ladder_allocation::<$W>(&bfp)
                                             {
                                                 panic!("[spyre-superdsc] {base}: {e}");
                                             }
@@ -12804,6 +13054,7 @@ fn dump_wavefront_mega(
                                                     fp: &bfp,
                                                     cap,
                                                     active_cap,
+                                                    shards,
                                                 };
                                                 // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
                                                 // from its emitted layout, so the twin's minted
@@ -12811,7 +13062,7 @@ fn dump_wavefront_mega(
                                                 // the bake proved (auditor ruling 2026-10-27). A
                                                 // missing entry or an unstated window here is a
                                                 // defect the gate names, not a zero it charges.
-                                                let lx_pin_window = superdsc::emitted_lx_pin_window_bytes(&bfp).unwrap_or_else(|| {
+                                                let lx_pin_window = superdsc::emitted_lx_pin_window_bytes::<$W>(&bfp).unwrap_or_else(|| {
                                                     panic!(
                                                         "[spyre-superdsc] {base}: bundle {bfp} has \
                                                          no emitted layout stating its LX pin window \
@@ -12826,7 +13077,7 @@ fn dump_wavefront_mega(
                                                         // programs the bundle's first K launches
                                                         // bind, so the emulator session runs
                                                         // exactly the classes under test.
-                                                        let twin = superdsc::covering_twin_groups(
+                                                        let twin = superdsc::covering_twin_groups::<$W>(
                                                             &rolled,
                                                             Some(lx_pin_window),
                                                         )
@@ -12839,7 +13090,7 @@ fn dump_wavefront_mega(
                                                         });
                                                         match twin {
                                                             Some((twin_groups, trunc)) => {
-                                                                match superdsc::numeric_gate(
+                                                                match superdsc::numeric_gate::<$W, _>(
                                                                     &twin_groups,
                                                                     &krg,
                                                                     &weight_ids,
@@ -12856,10 +13107,10 @@ fn dump_wavefront_mega(
                                                                 }
                                                             }
                                                             None => {
-                                                                match superdsc::with_emitted_groups(
+                                                                match superdsc::with_emitted_groups::<$W, _>(
                                                                     &bfp,
                                                                     |groups| {
-                                                                        superdsc::numeric_gate(
+                                                                        superdsc::numeric_gate::<$W, _>(
                                                                             groups,
                                                                             &krg,
                                                                             &weight_ids,
@@ -13287,41 +13538,49 @@ fn dump_wavefront_mega(
                     });
                 }
                 ((man, nodes, sengraph_json, group_graphs), fx)
+            }
             };
-        // Apply one bake's effects, in the order the bake recorded them. Serial, and the only code
-        // that touches the expansion's shared state.
-        let commit_bake = |lwd: &to_wavefront::LoweredDecode, fx: Vec<BakeEffect>| {
+        }
+        let emit_bundle_deferred =
+            world_bake!(scratchy_target_spyre::bundle_code::collective::TpWorld<1>);
+        let emit_bundle_deferred_sharded =
+            world_bake!(scratchy_target_spyre::bundle_code::collective::Build);
+        // Apply one bake's effects to `world`'s state, in the order the bake recorded them. Serial,
+        // and the only code that touches the expansion's shared state.
+        let commit_bake = |world: &WorldBake<'_>,
+                           lwd: &to_wavefront::LoweredDecode,
+                           fx: Vec<BakeEffect>| {
             for e in fx {
                 match e {
                     // Deduped on mq like the prefix-free ladder: a rebake of a width must not double-enter.
                     BakeEffect::PrefillPrefixRung { mq, fp } => {
-                        let mut r = superdsc_prefill_prefix_rungs.borrow_mut();
+                        let mut r = world.prefill_prefix_rungs.borrow_mut();
                         if !r.iter().any(|(m, _)| *m == mq) {
                             r.push((mq, fp));
                         }
                     }
                     // Ladder rung (deduped on mq: a rebake of the same width must not double-enter).
                     BakeEffect::PrefillRung { mq, fp } => {
-                        let mut r = superdsc_prefill_rungs.borrow_mut();
+                        let mut r = world.prefill_rungs.borrow_mut();
                         if !r.iter().any(|(m, _)| *m == mq) {
                             r.push((mq, fp));
                         }
                     }
-                    BakeEffect::PrefillFp(fp) => *superdsc_prefill_fp.borrow_mut() = Some(fp),
+                    BakeEffect::PrefillFp(fp) => *world.prefill_fp.borrow_mut() = Some(fp),
                     BakeEffect::DecodeRung {
                         rows,
                         cap,
                         fp,
                         consts,
                     } => {
-                        let mut r = superdsc_decode_rungs.borrow_mut();
+                        let mut r = world.decode_rungs.borrow_mut();
                         if !r.iter().any(|(n, _, _, _)| *n == rows) {
                             r.push((rows, cap, fp, consts));
                         }
                     }
-                    BakeEffect::DecodeFp(fp) => *superdsc_fp.borrow_mut() = Some(fp),
+                    BakeEffect::DecodeFp(fp) => *world.fp.borrow_mut() = Some(fp),
                     BakeEffect::FoldCensus { base, folds } => {
-                        let mut census = weight_fold_census.borrow_mut();
+                        let mut census = world.fold_census.borrow_mut();
                         match &*census {
                             None => *census = Some((base, folds)),
                             Some((ref_label, ref_folds)) if *ref_folds == folds => {}
@@ -13357,7 +13616,7 @@ fn dump_wavefront_mega(
                         man,
                     } => {
                         let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
-                        let mut s = wiring_tokens.borrow_mut();
+                        let mut s = world.wiring.borrow_mut();
                         let mut bound = registry_bound.borrow_mut();
                         match slot {
                             Some(WiringSlot::Prefill) => {
@@ -13374,7 +13633,10 @@ fn dump_wavefront_mega(
                     // ⭐ ONE LEDGER ENTRY per baked bundle — the parity law judges the
                     // whole ledger once, after the last bake.
                     BakeEffect::WeightSeg { base, bank0, banks } => {
-                        weight_seg_ledger.borrow_mut().push((base, bank0, banks));
+                        world
+                            .weight_seg_ledger
+                            .borrow_mut()
+                            .push((base, bank0, banks));
                     }
                     BakeEffect::Registry {
                         prefill,
@@ -13400,8 +13662,9 @@ fn dump_wavefront_mega(
                     prefill_mq,
                     active_cap,
                     decode_rows,
+                    None,
                 );
-                commit_bake(lwd, fx);
+                commit_bake(&one_rank, lwd, fx);
                 r
             };
 
@@ -13423,6 +13686,108 @@ fn dump_wavefront_mega(
                 primary_m,
             );
 
+        // ⭐ THE SHARDED WORLD — the same decode forward, sharded `TP_WORLD` ways by the shared
+        // analysis and baked through the same pipeline into its own world's state. Every collective
+        // in it was placed by `tensor_parallel::shard` from the dataflow; the slice law each source
+        // is loaded by rides out with the wiring (`tp_sources`).
+        //
+        // ⭐ BAKED ONLY WHEN THE BUILD NAMES IT (`tp/<W>` → this crate's `tp-<W>`, read once as
+        // `TP_WORLD`): a build that names no world bakes none, and ships an empty `SUPERDSC_TP`.
+        let tp_sources: Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>> = if !<
+            scratchy_target_spyre::bundle_code::collective::Build as scratchy_target_spyre::bundle_code::collective::World
+        >::SHARDED
+        {
+            None
+        } else {
+            let (tp_lwd, sf) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                scratchy_target_spyre::bundle_code::collective::Build,
+            >(
+                &lowered,
+                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+            )
+            .unwrap_or_else(|e| {
+                panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank forward is malformed — {e:?}")
+            });
+            let gathers = sf
+                .collectives
+                .iter()
+                .filter(|c| c.kind == scratchy_subtile::tensor_parallel::CollectiveKind::AllGather)
+                .count();
+            eprintln!(
+                "[spyre-tp] {stem}: tp={TP_WORLD} — {} ops, {} all-reduce(s), {gathers} all-gather(s)",
+                tp_lwd.input.ops.len(),
+                sf.collectives.len() - gathers,
+            );
+            // ⭐ THE COLLECTIVE LEDGER — every site the analysis wove, with the op whose output it
+            // reads and the weights that op contracts, by their generated field names: what an
+            // independent placement of the same model diffs against, site by site.
+            let weights_of = |op: usize| -> Vec<String> {
+                tp_lwd.input.ops[op]
+                    .inputs
+                    .iter()
+                    .filter_map(|i| match i {
+                        scratchy_subtile::lower::InputRef::Ext(s) => tp_lwd.bindings.get(*s),
+                        scratchy_subtile::lower::InputRef::Op(_) => None,
+                    })
+                    .filter_map(|b| match b {
+                        scratchy_subtile::handoff::SourceBinding::Weight { id, index } => Some(
+                            crate::emit::weight_field_name(program, WeightId(*id), *index)
+                                .to_string(),
+                        ),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for (k, c) in sf.collectives.iter().enumerate() {
+                // The contraction behind the read: back along the first operand through the
+                // weightless ops between it and the collective (granite's residual multiplier).
+                let mut at = c.reads;
+                while weights_of(at).is_empty() {
+                    match tp_lwd.input.ops[at].inputs.first() {
+                        Some(scratchy_subtile::lower::InputRef::Op(p)) => at = *p,
+                        _ => break,
+                    }
+                }
+                eprintln!(
+                    "[spyre-tp] {stem}: collective {k}: {:?} at op {} reading op {} ({:?}); \
+                     contracted at op {} ({:?}) over [{}]",
+                    c.kind,
+                    c.op,
+                    c.reads,
+                    tp_lwd.input.ops[c.reads].op,
+                    at,
+                    tp_lwd.input.ops[at].op,
+                    weights_of(at).join(", ")
+                );
+            }
+            if gathers > 0 && tie_word_embeddings(model) {
+                // ⛔ A VISIBLE SKIP, NAMING ITS ONE CAUSE: the decode rung's chained head gathers
+                // the drawn token's embedding row on device from the TIED table — the lm head's
+                // own staged weight — and here the analysis split that weight by vocabulary, so
+                // each rank holds half the rows a draw can name. The rank-aware chain (each rank
+                // gathers its share, a non-owner's row zero, the shares summed) is not built yet,
+                // and the chain is the only decode path, so this model ships its one-rank world.
+                println!(
+                    "cargo:warning=[spyre-tp] {stem}: no tp={TP_WORLD} bundle — its lm head splits by \
+                     vocabulary ({gathers} all-gather), and the decode chained head reads that \
+                     tied table whole; the rank-aware chained head is not built yet"
+                );
+                None
+            } else {
+                let (_, fx) = emit_bundle_deferred_sharded(
+                    &tp_lwd,
+                    format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
+                    prefix_len.get(),
+                    None,
+                    None,
+                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                    primary_m,
+                    Some(&sf.sources),
+                );
+                commit_bake(&sharded_world, &tp_lwd, fx);
+                Some(sf.sources)
+            }
+        };
         // ── DECODE CAP BUCKETS (KTIR emulator path) ───────────────────────────────────────────────
         // The emulator masks over the WHOLE prefix cache each step (decode is O(capacity)), so a
         // single big-cap program makes every short-context token pay the max-context cost. Bake the
@@ -13535,6 +13900,33 @@ fn dump_wavefront_mega(
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             seqs,
                         );
+                        // ⭐ AND THE RUNG IN THE SHARDED WORLD: a sharded session serves every live
+                        // request count on its own world's rung, never the one-rank ladder's.
+                        if let Some(shards) = tp_sources.as_deref() {
+                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                                scratchy_target_spyre::bundle_code::collective::Build,
+                            >(
+                                &lwd_b,
+                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank decode batch \
+                                     seqs={seqs} is malformed — {e:?}"
+                                )
+                            });
+                            let (_, fx) = emit_bundle_deferred_sharded(
+                                &tp_lwd,
+                                format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
+                                prefix_len.get(),
+                                None,
+                                None,
+                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                                seqs,
+                                Some(shards),
+                            );
+                            commit_bake(&sharded_world, &tp_lwd, fx);
+                        }
                     }
                     Err(e) => panic!(
                         "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e}. \
@@ -13788,7 +14180,14 @@ fn dump_wavefront_mega(
         //
         // A rung that does not lower PANICS inside its own bake — every entry that reaches
         // the commit below is `Ok`, so the committed ladder is every rung asked for.
-        type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
+        // A rung's bake in each world: the one-rank lowering, its pick and effects, and — when the
+        // sharded world baked its decode — the rung's sharded lowering and effects.
+        type RungBake = (
+            to_wavefront::LoweredDecode,
+            PrefillPick,
+            Vec<BakeEffect>,
+            Option<(to_wavefront::LoweredDecode, Vec<BakeEffect>)>,
+        );
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
             prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
@@ -13817,9 +14216,14 @@ fn dump_wavefront_mega(
             );
             match lowered {
                 Ok(lwd_p) => {
-                    let (r, fx) = emit_bundle_deferred(
-                        &lwd_p,
-                        format!("ktir_prefill_{stem_id}"),
+                    // One rung's bake, stamped for each world `lwd` may be lowered for.
+                    macro_rules! bake_rung_with {
+                        ($bake:ident) => {
+                            |lwd: &to_wavefront::LoweredDecode,
+                                     base: String,
+                                     shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>| $bake(
+                        lwd,
+                        base,
                         prefix_len.get(),
                         // prefill: rewrite the concrete prompt length `pl` → symbol
                         // s0 (offline_decoder idx-0 graph: prompt sym = Tq = Tkv).
@@ -13851,8 +14255,33 @@ fn dump_wavefront_mega(
                         // together; that combination is not what this flag selects.
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
                         1, // a prompt chunk is one request however many positions it spans
-                    );
-                    Ok((lwd_p, r, fx))
+                        shards,
+                    )
+                        };
+                    }
+                    let bake_rung = bake_rung_with!(emit_bundle_deferred);
+                    let bake_rung_sharded = bake_rung_with!(emit_bundle_deferred_sharded);
+                    let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
+                    // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
+                    // world ships whole or not at all.
+                    let tp2 = tp_sources.is_some().then(|| {
+                        let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                            scratchy_target_spyre::bundle_code::collective::Build,
+                        >(
+                            &lwd_p,
+                            scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank prefill m={pl} is malformed — {e:?}")
+                        });
+                        let (_, fx) = bake_rung_sharded(
+                            &tp_lwd,
+                            format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
+                            Some(&sf_p.sources),
+                        );
+                        (tp_lwd, fx)
+                    });
+                    Ok((lwd_p, r, fx, tp2))
                 }
                 Err(e) if sendnn_superdsc => {
                     panic!(
@@ -13869,8 +14298,11 @@ fn dump_wavefront_mega(
         // entry here is `Ok` — the window guard below still runs, over what baked.
         for rung in per_rung {
             match rung {
-                Ok((lwd_p, r, fx)) => {
-                    commit_bake(&lwd_p, fx);
+                Ok((lwd_p, r, fx, tp2)) => {
+                    commit_bake(&one_rank, &lwd_p, fx);
+                    if let Some((tp_lwd, fx)) = tp2 {
+                        commit_bake(&sharded_world, &tp_lwd, fx);
+                    }
                     prefill = Some(r);
                 }
                 Err((pl, e)) => {
@@ -13941,6 +14373,33 @@ fn dump_wavefront_mega(
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             1, // a prompt chunk is one request
                         );
+                        // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
+                        // continuation chunk on a sharded session runs on ITS world's prefix rung.
+                        if let Some(shards) = tp_sources.as_deref() {
+                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                                scratchy_target_spyre::bundle_code::collective::Build,
+                            >(
+                                &lwd_p,
+                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank prefix prefill m={m} \
+                                     is malformed — {e:?}"
+                                )
+                            });
+                            let (_, fx) = emit_bundle_deferred_sharded(
+                                &tp_lwd,
+                                format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
+                                prefix_len.get(),
+                                None,
+                                Some(m),
+                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                                1,
+                                Some(shards),
+                            );
+                            commit_bake(&sharded_world, &tp_lwd, fx);
+                        }
                     }
                     Err(e) => panic!(
                         "[spyre-superdsc] {stem}: prefix-capable prefill rung m={m} NOT LOWERED — \
@@ -13988,6 +14447,13 @@ fn dump_wavefront_mega(
             &weight_seg_ledger.borrow(),
         ) {
             panic!("[spyre-superdsc] {stem}: {e}");
+        }
+        // AND EACH SHARDED WORLD'S, APART: a rank packs its own shard of the weights, one resident
+        // segment per rank, which no one-rank bundle shares.
+        if let Err(e) = scratchy_target_spyre::lower_subtile_tape_to_superdsc::weight_segment_parity(
+            &sharded_world.weight_seg_ledger.borrow(),
+        ) {
+            panic!("[spyre-superdsc] {stem} (tp={TP_WORLD}): {e}");
         }
         // ⛔⛔ AND EVERY BUNDLE OF A PHASE PLACES THE REGISTRY ITS PHASE'S WIRING BINDS — the emulator
         // worker stages one wiring's scales for every bundle of a phase. (A card launch binds its own
@@ -14364,83 +14830,11 @@ fn dump_wavefront_mega(
                 };
             let pre_json_lit = proc_macro2::Literal::string(pre_graph);
             let dec_json_lit = proc_macro2::Literal::string(dec_graph);
-            // PREFILL WIDTH LADDER: ascending `[(mq, sentinel)]`. Emitted ONLY when >1 rung actually
-            // baked — a single rung is exactly the existing `prefill` slot, so an empty slice keeps
-            // the pre-ladder path byte-identical instead of making the worker special-case a 1-rung
-            // ladder that buys nothing.
-            // The prefix-capable ladder (start>0 chunks), ascending — every width that baked, a single
-            // rung included: unlike the prefix-free ladder there is no other slot carrying it.
-            let prefill_prefix_lits: Vec<proc_macro2::TokenStream> = {
-                let mut rungs = superdsc_prefill_prefix_rungs.borrow().clone();
-                rungs.sort_by_key(|(mq, _)| *mq);
-                rungs
-                    .iter()
-                    .map(|(mq, fp)| {
-                        let m = proc_macro2::Literal::u32_unsuffixed(*mq);
-                        let s = proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
-                        quote! { (#m, #s) }
-                    })
-                    .collect()
-            };
-            let prefill_rung_lits: Vec<proc_macro2::TokenStream> = {
-                let mut rungs = superdsc_prefill_rungs.borrow().clone();
-                rungs.sort_by_key(|(mq, _)| *mq);
-                if rungs.len() > 1 {
-                    rungs
-                        .iter()
-                        .map(|(mq, fp)| {
-                            let m = proc_macro2::Literal::u32_unsuffixed(*mq);
-                            let s = proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
-                            quote! { (#m, #s) }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            };
-            // The decode batch ladder, same shape and rule as the prefill one: emitted only when
-            // there is more than one rung, so a build that lowered a single width ships the empty
-            // slice and the worker keeps its one-request-per-forward path untouched.
-            let decode_rung_lits: Vec<proc_macro2::TokenStream> = {
-                let mut rungs = superdsc_decode_rungs.borrow().clone();
-                rungs.sort_by_key(|(n, _, _, _)| *n);
-                rungs.dedup_by_key(|(n, _, _, _)| *n);
-                if rungs.len() > 1 {
-                    rungs
-                        .iter()
-                        .map(|(n, swept, fp, consts)| {
-                            // ⛔ `RungSeqs`, NOT a bare u32: `superdsc_decode_rungs` is keyed by
-                            // `decode_rows` (the BATCH WIDTH), while the sibling `sk_bucket_rungs` list is
-                            // keyed by `active_cap` (the SWEEP EXTENT). Both were `(u32, String)`, and the
-                            // worker selects over this one with `>= live`. Naming the quantity here is what
-                            // stops the two ladders being interchangeable at the call site.
-                            let n = proc_macro2::Literal::u32_unsuffixed(*n);
-                            let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
-                            let sfp =
-                                proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
-                            // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's
-                            // session, never the single-request wiring's list: the ten uniform
-                            // `[rows, 1]` tables' stick heads are per-width (Finding 1's
-                            // compounding half). Rendered by the ONE load-const renderer the
-                            // wiring static itself uses, so the spellings cannot drift.
-                            let consts = consts
-                                .iter()
-                                .map(load_const_entry_tokens)
-                                .collect::<Vec<_>>();
-                            quote! {
-                                (
-                                    ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
-                                    ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
-                                    ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
-                                    &[#(#consts),*],
-                                )
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            };
+            let (prefill_rung_lits, decode_rung_lits, prefill_prefix_lits) = ladder_lits(
+                &superdsc_prefill_rungs.borrow(),
+                &superdsc_decode_rungs.borrow(),
+                &superdsc_prefill_prefix_rungs.borrow(),
+            );
             group_tokens.push(quote! {
                 ::scratchy_target_spyre::manifest::SengraphBundleGroup {
                     group: #g_lit,
@@ -14487,6 +14881,98 @@ fn dump_wavefront_mega(
                         };
                 });
             }
+        }
+        // ⭐ THE SHARDED WORLDS this model baked — one `TpForward` per world whose bake committed a
+        // decode bundle and its wiring.
+        {
+            use scratchy_subtile::tensor_parallel::SourceShard as S;
+            let tp_ranks = proc_macro2::Literal::u32_unsuffixed(TP_WORLD);
+            let tp_forwards: Vec<proc_macro2::TokenStream> = match (
+                tp_fp.borrow().clone(),
+                tp_wiring.borrow().clone(),
+                tp_sources.as_ref(),
+            ) {
+                (Some(fp), (Some(wiring), prefill_wiring), Some(sources)) => {
+                    let fp = proc_macro2::Literal::string(&fp);
+                    // The prefill bundle and its wiring ship together or not at all, as the
+                    // one-rank world's do.
+                    let (prefill, prefill_wiring) = match (
+                        tp_prefill_fp.borrow().clone(),
+                        prefill_wiring,
+                    ) {
+                        (Some(pfp), Some(pw)) => {
+                            let pfp = proc_macro2::Literal::string(&pfp);
+                            (
+                                quote! { ::core::option::Option::Some(
+                                    ::scratchy_target_spyre::manifest::KtirBundleData { fp: #pfp }
+                                ) },
+                                quote! { ::core::option::Option::Some(#pw) },
+                            )
+                        }
+                        _ => (
+                            quote! { ::core::option::Option::None },
+                            quote! { ::core::option::Option::None },
+                        ),
+                    };
+                    let (tp_prefill_rung_lits, tp_decode_rung_lits, tp_prefill_prefix_lits) =
+                        ladder_lits(
+                            &tp_prefill_rungs.borrow(),
+                            &tp_decode_rungs.borrow(),
+                            &tp_prefill_prefix_rungs.borrow(),
+                        );
+                    let sources = sources.iter().map(|s| match s {
+                        S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
+                        S::Rows => quote! { ::scratchy_target_spyre::wiring::SourceShard::Rows },
+                        S::Cols => quote! { ::scratchy_target_spyre::wiring::SourceShard::Cols },
+                        S::HeadRows { heads } => {
+                            let h = proc_macro2::Literal::u32_unsuffixed(heads.get());
+                            quote! {
+                                ::scratchy_target_spyre::wiring::SourceShard::HeadRows {
+                                    heads: match ::core::num::NonZeroU32::new(#h) {
+                                        ::core::option::Option::Some(n) => n,
+                                        ::core::option::Option::None => panic!("zero heads"),
+                                    },
+                                }
+                            }
+                        }
+                    });
+                    vec![quote! {
+                        ::scratchy_target_spyre::wiring::TpForward::<
+                            ::scratchy_target_spyre::bundle_code::collective::Build,
+                        > {
+                            decode: ::scratchy_target_spyre::manifest::KtirBundleData { fp: #fp },
+                            prefill: #prefill,
+                            prefill_rungs: &[#(#tp_prefill_rung_lits),*],
+                            decode_rungs: &[#(#tp_decode_rung_lits),*],
+                            prefill_prefix: &[#(#tp_prefill_prefix_lits),*],
+                            wirings: ::scratchy_target_spyre::wiring::Wirings {
+                                decode: #wiring,
+                                prefill: #prefill_wiring,
+                            },
+                            sources: &[#(#sources),*],
+                            world: ::core::marker::PhantomData,
+                        }
+                    }]
+                }
+                _ => Vec::new(),
+            };
+            ktir_bundle_out.extend(quote! {
+                // ⛔ THE BAKE'S WORLD IS THE BINARY'S. The macro runs on the host with its own copy
+                // of the world crate; the binary's `Build` must be the world it sharded for, or a
+                // session would load bundles of another world. A mismatch is this build error.
+                const _: () = assert!(
+                    <::scratchy_target_spyre::bundle_code::collective::Build
+                        as ::scratchy_target_spyre::bundle_code::collective::World>::RANKS
+                        == #tp_ranks,
+                    "#[forward] sharded for a different tensor-parallel world than this binary's \
+                     `Build` — name the same `tp/N` for the bake and the runtime"
+                );
+                /// This model's sharded worlds, emitted by `#[forward]` — see
+                /// `scratchy_target_spyre::wiring::TpForward`.
+                pub static SUPERDSC_TP: &[::scratchy_target_spyre::wiring::TpForward<
+                    ::scratchy_target_spyre::bundle_code::collective::Build,
+                >] = &[#(#tp_forwards),*];
+            });
         }
         ktir_bundle_out.extend(quote! {
             /// Embedded sendnn LAYER-GROUP bundle — baked by `#[forward]` under
@@ -15073,24 +15559,31 @@ pub fn emit_model(
             .map(|p| p.join("_"))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
-        let dsl_shared_expert_bases: Vec<String> = weight_paths
-            .iter()
-            .filter_map(|p| p.first().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
+        // Each DSL weight whose own subtree declares a `shared_expert`, by id: the bank a MoE op
+        // reads is looked up by the weight it reads.
+        let shared_expert_banks: std::collections::BTreeSet<u32> = (program.weights.ids())
+            .filter(|&id| {
+                let path = program.weights.path(id);
+                let prefix: Vec<&str> = (path.iter().map(String::as_str))
+                    .chain(["shared_expert"])
+                    .collect();
+                program.weights.has_subtree(&prefix)
+            })
+            .map(|id| id.0)
             .collect();
         let quant = model.quantization.as_ref();
-        let widths = |base: &str, layer: st::LayerId, body| {
+        // A bank's widths, by the weight its op reads: its DSL path is the resolver's prefix.
+        let widths = |bank: u32, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");
             let at = Some(UnrollIndex(layer.0 as u64));
+            let prefix = program.weights.path(WeightId(bank)).join(".");
             let bits =
-                crate::quantization::affine_moe_expert_bits(program, &qc.method, base, at, body);
+                crate::quantization::affine_moe_expert_bits(program, &qc.method, &prefix, at, body);
             bits.map_or([None; 3], |b| b.projections().map(|w| w.map(affine_bits)))
         };
         let facts = mc3::MetalStepFacts {
             weight_paths: &weight_paths,
-            dsl_shared_expert_bases: &dsl_shared_expert_bases,
+            shared_expert_banks: &shared_expert_banks,
             embed_base: &embed_base,
             embed_quant,
             mlp: if fused_mlp {
@@ -15979,7 +16472,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     {
         let table = metal_tape_cmds
-            .into_tokens(&resolver.typed, &dims.weight_markers)
+            .into_tokens(&resolver.typed, &resolver.named, &dims.weight_markers)
             .unwrap_or_else(|e| {
                 panic!(
                     "[metal static tape] {}: command table: {e}",

@@ -94,7 +94,7 @@ impl SpyreWorker {
     /// `execute_model` drops it before that step is drained. The engine discards the overshoot
     /// token of a finished request, so the drain skips its bookkeeping rather than failing the step.
     fn collect_rows(
-        sess: &mut scratchy_target_spyre::sdsc_runner::SuperDscSession,
+        sess: &mut SuperDscSession,
         sub: &crate::spyre_forward::SubmittedDecode,
         rows: Vec<(String, usize, usize)>,
         requests: &mut HashMap<String, ReqState>,

@@ -201,7 +201,9 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
 /// The `dscs_[0]` entry of an emitted op — the descriptor the assertions read, asserted on the
 /// TYPED structs so the assertions name the fields the card acts on with no second parser to
 /// disagree with the first.
-fn dsc(op: &ktir_superdsc::emit::EmittedOp) -> &ktir_superdsc::wire::Dsc {
+fn dsc(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> &ktir_superdsc::wire::Dsc {
     op.dsc()
         .dscs_
         .first()
@@ -282,7 +284,7 @@ fn a_row_view_is_not_a_bound_scale_and_the_walk_refuses_it() {
     // And the whole-function walk, with no other reading available, refuses by name.
     let layout = layout_for(&k);
     let mut sid = 0i64;
-    let e = match lower_function(
+    let e = match lower_function::<ktir_superdsc::collective::TpWorld<1>>(
         &k,
         Some(&layout),
         &mut sid,

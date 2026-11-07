@@ -80,7 +80,7 @@ fn emit_legs_at(
     rows: u32,
     cols: u32,
     first_entry: u32,
-) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
     let table = h("EmbTable", rows, cols);
     let scale = h("EmbScale", rows, cols);
     let out = h("EmbOut", rows, cols);
@@ -109,7 +109,10 @@ fn emit_legs_at(
     .map_err(|e| e.0)
 }
 
-fn emit_legs(rows: u32, cols: u32) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn emit_legs(
+    rows: u32,
+    cols: u32,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
     emit_legs_at(rows, cols, 0)
 }
 
@@ -269,7 +272,7 @@ fn the_gathered_operand_must_be_the_last_input() {
     let mut sym = 0i64;
     // `EmittedOp` is not `Debug`, so `expect_err` cannot be used — matched instead, which also names
     // what an unexpected success WOULD be.
-    let msg = match assemble_pointwise_broadcast_gather(
+    let msg = match assemble_pointwise_broadcast_gather::<ktir_superdsc::collective::TpWorld<1>, _>(
         PointwiseGather {
             op_name: "scalarmul_o2",
             tile_op: &t,

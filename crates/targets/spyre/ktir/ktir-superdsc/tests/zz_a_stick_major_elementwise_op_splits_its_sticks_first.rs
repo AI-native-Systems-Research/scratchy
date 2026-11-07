@@ -202,7 +202,7 @@ fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u6
     let b = rb("t_b", rows, full_cols);
     let o = rb("t_o", rows, full_cols);
     let mut sid = 0i64;
-    let op = assemble_pointwise_broadcast_off(
+    let op = assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
         "mul",
         "multiply",
         RowCount::of_token_rows(rows),
@@ -237,7 +237,7 @@ fn emitted_window_split(
     let w = ktir_superdsc::addr::col_window_of(rows, full_cols, c_start, Df::Fp16)
         .expect("a whole-stick corner");
     let mut sid = 0i64;
-    let op = assemble_pointwise_broadcast_off(
+    let op = assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
         "mul",
         "multiply",
         RowCount::of_token_rows(rows),

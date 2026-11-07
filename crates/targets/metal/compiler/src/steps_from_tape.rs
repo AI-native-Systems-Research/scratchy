@@ -133,6 +133,9 @@ pub enum Refused {
     /// there is no metal lowering to write; a node here is a wiring bug (a chain-minted
     /// graph handed to the metal tape), never a missing kernel.
     ChainedHead,
+    /// A collective: metal runs one rank, where tensor parallelism weaves none in, so a node
+    /// here is a sharded forward handed to the metal tape — a wiring bug, never a missing kernel.
+    Collective,
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -376,7 +379,7 @@ struct Emission {
     /// The arena operands its step names: what each slot its commands bind holds.
     operands: Vec<RowOperand>,
     /// The DSL weights its op reads ([`Recording::read`]).
-    weights: Vec<(WeightKind, u32)>,
+    weights: Vec<WeightRead>,
     lm_head: bool,
 }
 
@@ -467,11 +470,14 @@ pub struct Recording<'a> {
     /// The arena operands the op being recorded has named so far: each slot its step reads or
     /// writes, and the value the colouring holds there. Drained into the op's row.
     pub named: std::cell::RefCell<Vec<RowOperand>>,
-    /// The DSL weights the op being recorded reads, each with the kind of the site that binds it:
-    /// read off its own operand's binding (`SourceBinding::Weight`), before its site's base or any
-    /// lookup of it. Drained into the op's row.
-    pub read: std::cell::RefCell<Vec<(WeightKind, u32)>>,
+    /// The DSL weights the op being recorded reads, each with the site that binds it: read off its
+    /// own operand's binding (a weight, its scale, or a bundle's tensor), before its site's base or
+    /// any lookup of it. Drained into the op's row.
+    pub read: std::cell::RefCell<Vec<WeightRead>>,
 }
+
+/// A DSL weight (`WeightId`) an op reads, with the site — the weight family — it reads it through.
+pub type WeightRead = (WeightSlot, u32);
 
 /// An arena operand of a step row: the slot its command binds, and the value held there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -701,10 +707,38 @@ impl Recording<'_> {
     /// Weight operand `e`'s base ([`Self::base`]), noted as op `i` reading its DSL weight through a
     /// site of `kind`.
     fn read_base(&self, i: usize, kind: WeightKind, e: usize) -> Result<String, StepRefusal> {
-        if let SourceBinding::Weight { id, .. } = self.l.bindings[e] {
-            self.read.borrow_mut().push((kind, id));
+        let base = self.base(i, e)?;
+        self.read_through(i, kind, e, &base)?;
+        Ok(base)
+    }
+
+    /// Note op `i` reading weight operand `e`'s DSL weight through the site `(kind, base)` — a
+    /// site of its own base, or one it shares with another weight (a packed pair's).
+    fn read_through(
+        &self,
+        i: usize,
+        kind: WeightKind,
+        e: usize,
+        base: &str,
+    ) -> Result<(), StepRefusal> {
+        let id = self.weight_id(i, e)?;
+        let site = WeightSlot {
+            kind,
+            base: base.to_string(),
+        };
+        self.read.borrow_mut().push((site, id));
+        Ok(())
+    }
+
+    /// The DSL weight weight operand `e` binds — a plain weight, its scale, or one tensor of a
+    /// bundle (the bundle's own weight).
+    fn weight_id(&self, i: usize, e: usize) -> Result<u32, StepRefusal> {
+        match self.l.bindings[e] {
+            SourceBinding::Weight { id, .. }
+            | SourceBinding::WeightScale { id, .. }
+            | SourceBinding::BundleTensor { id, .. } => Ok(id),
+            _ => Err(self.no(i, Refused::NotAWeight(e))),
         }
-        self.base(i, e)
     }
 
     /// The rotary table a rope reads: the sliding class's when any operand binds a local cos/sin.
@@ -1000,7 +1034,7 @@ impl Recording<'_> {
         let step = match declared {
             None => raw,
             Some(w) => {
-                let widths = w(&self.base(j, e)?, layer, self.expert_body(j)?);
+                let widths = w(self.weight_id(j, e)?, layer, self.expert_body(j)?);
                 let own = match proj {
                     ExpertProj::Gate => widths[0],
                     ExpertProj::Up => widths[1],
@@ -1029,8 +1063,13 @@ impl Recording<'_> {
                 .group(i)
                 .find(|j| matches!(self.op(*j), SubOp::ExpertMatmul { .. }));
             let bank = bank.ok_or_else(|| self.no(i, Refused::IncompleteMoeBlock))?;
-            let base = self.base(bank, self.source_arg(bank, 2)?)?;
-            if !self.facts.dsl_shared_expert_bases.contains(&base) {
+            let e = self.source_arg(bank, 2)?;
+            if !self
+                .facts
+                .shared_expert_banks
+                .contains(&self.weight_id(bank, e)?)
+            {
+                let base = self.base(bank, e)?;
                 return Err(self.no(i, Refused::UndeclaredSharedExpert { base }));
             }
         }
@@ -1839,11 +1878,14 @@ impl Recording<'_> {
                     F::FusedGateUpGeluMul => MetalStep::FusedGateUpGeluMul(input, out, layer),
                     _ => MetalStep::FusedGateUpSiluMul(input, out, layer),
                 };
-                let g = self.read_base(gate, WeightKind::Linear, self.weight_of(gate)?)?;
-                let u = self.read_base(up, WeightKind::Linear, self.weight_of(up)?)?;
+                // One packed site, read for both weights.
+                let (eg, eu) = (self.weight_of(gate)?, self.weight_of(up)?);
+                let base = format!("{}__fused__{}", self.base(gate, eg)?, self.base(up, eu)?);
+                self.read_through(gate, WeightKind::Linear, eg, &base)?;
+                self.read_through(up, WeightKind::Linear, eu, &base)?;
                 let site = vec![WeightSlot {
                     kind: WeightKind::Linear,
-                    base: format!("{g}__fused__{u}"),
+                    base,
                 }];
                 Ok(em(step, &[input], &[gate_slot, up_slot, out], site))
             }
@@ -2598,6 +2640,9 @@ impl Recording<'_> {
             L::EmbedRowGather { .. } | L::ChainStage { .. } => {
                 return Err(self.no(i, Refused::ChainedHead));
             }
+            L::AllReduce | L::AllGather { .. } => {
+                return Err(self.no(i, Refused::Collective));
+            }
         }))
     }
 }
@@ -2633,12 +2678,12 @@ pub struct Assembled {
     /// Per row, the arena operands its step names (a loop marker: none).
     pub operands: Vec<Vec<RowOperand>>,
     /// Per row, the DSL weights its op reads (a loop marker: none).
-    pub weights: Vec<Vec<(WeightKind, u32)>>,
+    pub weights: Vec<Vec<WeightRead>>,
     pub lm_rows: Vec<StepRow>,
     lm_sigs: Vec<HazardSig>,
     pub lm_sites: Vec<Vec<WeightSlot>>,
     pub lm_operands: Vec<Vec<RowOperand>>,
-    pub lm_weights: Vec<Vec<(WeightKind, u32)>>,
+    pub lm_weights: Vec<Vec<WeightRead>>,
 }
 
 impl Assembled {
