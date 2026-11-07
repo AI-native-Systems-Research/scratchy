@@ -2972,6 +2972,43 @@ pub fn emit_sdsc_tiled(
 ///   * compute `affine_strides` ({out: per_iter_out_elems * device_stride_out *
 ///     2}) for the tiled W/O tensors, `{}` for INPUT/LX, and register the base
 ///     symbols. Returns the validated [`EmittedOp`] (SymbolicWhenTiled).
+/// ⭐ THE OPERAND'S OWN-FRAME EXTENT (#1113, auditor ruling 2026-11-06) — the ONE fn every
+/// per-trip advance and frame check in [`rewrite_op_for_time_tile`] reads. An operand's
+/// per-trip advance is stated over the OPERAND'S OWN frame — its own rows left of the
+/// tiled dim — NEVER the op's left-of-tiled product:
+///   * a `device_extent` override WINS: it states the tensor's TRUE physical extent along
+///     that dim (a slice/reuse of a larger allocation), whatever the view collapses;
+///   * a dim the operand COLLAPSES (`scale` RedStick/RedNonStick — a broadcast row vector
+///     like the rmsnorm gamma, `[1, cols]` over `mb`) contributes ONE row of its own
+///     frame, not the op's extent for that dim;
+///   * a dim the operand RANGES (`Active`) is the op's own extent for it — the operand
+///     covers exactly what the op iterates.
+///
+/// The tall rung's rmg gain (mb-broadcast, RedNonStick on `mb`, per-core mb 64) was
+/// handed the OP's 64-row product as its row count: a 524288 B/trip advance into its own
+/// ONE-ROW 32 KiB device frame — up to 1.6 MB past the tensor, a PCIe bus fence
+/// (RAS::PCI::BusFence 0xa35e) on the first launch (run-4, #1113). The own-frame law
+/// gives that gain its one-row slab: 8192 B/trip, each trip reading its own out-window
+/// of the row. This is the logical dual of [`materialized_bytes`] (the materialized
+/// footprint), which counts the same collapse for FOOTPRINTS; this fn counts it for
+/// STRIDES and FRAMES, and additionally honors the physical `device_extent` override.
+fn own_extent_at(
+    v: &crate::superdsc_opspec::ArgView<'_>,
+    i: usize,
+    phys_extent: &impl Fn(&'static str) -> i64,
+) -> i64 {
+    let collapsed = !v
+        .scale
+        .get(i)
+        .copied()
+        .is_none_or(|s| matches!(s, Scale::Active));
+    if collapsed && v.device_extent.get(i).copied().flatten().is_none() {
+        1
+    } else {
+        phys_extent(v.layout[i])
+    }
+}
+
 fn rewrite_op_for_time_tile(
     op_name: &str,
     op: &OpSpec,
@@ -3044,8 +3081,11 @@ fn rewrite_op_for_time_tile(
     //     DIFFERENT dim still RANGES this one and MUST advance per trip. `In::mb` (the
     //     rmsnorm gamma, a `[1,cols]` row vector) is RedNonStick on `mb` but ACTIVE on
     //     `out` — in an op tiled over `out` it takes the per-trip stride below and each
-    //     trip reads its own out-window of that row (pinned: the mb operand's trip-start
-    //     advances; a strideless ranging operand is the 2b guard's build Err).
+    //     trip reads its own out-window of that row, the advance stated over its OWN
+    //     one-row frame ([`own_extent_at`]), never the op's mb product — the run-4 tall
+    //     rung's 64× over-advance fenced a card exactly there (pinned: the mb operand's
+    //     trip-start advances by its own slab; a strideless ranging operand is the 2b
+    //     guard's build Err).
     for (ti, v) in views.iter().enumerate() {
         // ── 2a. THE SEEDED REDUCE'S ACCUM — DELETED, AND THE WIRING THAT KILLED IT ─────
         // This loop once opened with a partials-law arm: a seeded reduce that time-tiles
@@ -3134,26 +3174,33 @@ fn rewrite_op_for_time_tile(
             // KERNEL weight re-tiled `[out/STICK, in, STICK]` (out-tile OUTERMOST): advancing one `out`
             // element crosses the whole inner tile = product of its non-`out` host extents (`in`=K). ==
             // `DeviceTileLayout::per_core_stride_elems(out)`, the stride the per-core address path uses.
+            // The product reads each dim at the operand's OWN extent ([`own_extent_at`]) — a collapsed
+            // dim is one row of the kernel's own frame, and a `device_extent` override is the physical
+            // truth (the windowed matmul's K/N tile of a larger weight buffer).
             let device_stride_out: i64 = v
                 .layout
                 .iter()
-                .filter(|&&d| d != tiled_dim)
-                .map(|&d| phys_extent(d))
+                .enumerate()
+                .filter(|(_, &d)| d != tiled_dim)
+                .map(|(i, _)| own_extent_at(v, i, &phys_extent))
                 .product();
             out_per_time * device_stride_out * v.df.word_length() as i64
         } else {
             // OUTPUT/activation is STICK-BLOCKED on `out` (dev_off rank-2/3 stick_idx=1), NOT flat
             // row-major (the pre-bug#1 assumption). Advancing `out` by `out_per_time` jumps
-            // `out_per_time * (stick-block row count)`, NOT `out_per_time * 1` — the row count is the FULL
-            // extent LEFT of `out` (the device layout uses full dims; per-core mb is WRONG — it aliased at
-            // mb>1). DERIVE the advance from the SystolicIR `StickLayout::dev_off` (the ONE addressing
+            // `out_per_time * (stick-block row count)`, NOT `out_per_time * 1` — and the row count is
+            // the operand's OWN frame LEFT of `out` ([`own_extent_at`]): the full extent for a dim it
+            // ranges, ONE row for a dim it collapses (the mb-broadcast gain's own frame is its single
+            // row — never the op's mb product), the physical `device_extent` override when stated.
+            // DERIVE the advance from the SystolicIR `StickLayout::dev_off` (the ONE addressing
             // path) so it cannot diverge from per_core_addr and is stick-block-correct at ANY row count.
             // Kani: time_tile_sticklayout_stride_tiles_disjoint (GREEN: advance == trip footprint ⇒
             // disjoint) + time_tile_flat_stride_aliases_at_multirow (RED: the old flat form aliases at
             // rows>1). The `tiled_trips_alias` bake guard remains the backstop.
             let full_rows = v.layout[..oi]
                 .iter()
-                .map(|&d| phys_extent(d) as usize)
+                .enumerate()
+                .map(|(i, _)| own_extent_at(v, i, &phys_extent).max(1) as usize)
                 .product::<usize>()
                 .max(1);
             let out_full = phys_extent(tiled_dim) as usize;
@@ -3170,6 +3217,40 @@ fn rewrite_op_for_time_tile(
                     .dev_off(0, out_per_time as usize) as i64;
             advance_elems * v.df.word_length() as i64
         };
+        // ⛔ THE BAKE-TIME SEGMENT LAW (#1113, auditor ruling 2026-11-06): a time-tiled
+        // operand's WHOLE trip span — `stride × time`, the last trip's window ending at
+        // exactly that — must fit inside the operand's OWN physical device frame (the
+        // segment slice the placement hosts), counted from the operand's base
+        // (`offset_elems` included). When the advance is derived from the operand's own
+        // frame the span EQUALS the frame, so this never false-fires; it fires exactly
+        // when the op's iteration outruns an operand's physical extent — the run-4 tall
+        // rung's rmg gain (a 524288 B/trip advance into a 32 KiB one-row frame, a PCIe
+        // bus fence on the first launch), or a `device_extent` override smaller than the
+        // iterated dim. A refusal HERE, at the bake, naming the operand, the first
+        // offending trip and the frame — never a fence on the card.
+        let word = v.df.word_length() as i64;
+        let own_frame_bytes = v
+            .layout
+            .iter()
+            .enumerate()
+            .map(|(i, _)| own_extent_at(v, i, &phys_extent).max(0))
+            .product::<i64>()
+            .saturating_mul(word)
+            .saturating_sub((v.offset_elems as i64).saturating_mul(word));
+        let trip_span_bytes = stride_bytes.saturating_mul(time as i64);
+        if trip_span_bytes > own_frame_bytes {
+            let first_bad_trip = (own_frame_bytes / stride_bytes.max(1)).min(i64::from(time) - 1);
+            return Err(SuperDscError(format!(
+                "{op_name}: tensor {ti} ('{}') time-tiles {time} trips at {stride_bytes} B/trip \
+                 (a {trip_span_bytes}-B span) but its OWN device frame is {own_frame_bytes} B — \
+                 the segment slice the placement hosts. Trip {first_bad_trip} reads past the \
+                 tensor: the op's iteration outruns this operand's physical extent. A per-trip \
+                 advance is stated over the operand's own frame (emit::own_extent_at); this \
+                 refusal is the bake-time segment law (#1113) — a slice past its segment must \
+                 fail the build, never fence the card (run-4: the tall rung's rmg gain).",
+                v.name
+            )));
+        }
         let mut sm = BTreeMap::new();
         sm.insert(tiled_dim, stride_bytes);
         affine_strides[ti] = sm;
@@ -8021,6 +8102,35 @@ mod time_tiled_broadcast_operand_is_address_stable {
             );
         }
     }
+
+    /// #1113's address-resolving half, mirrored here (the OTHER time-tiled golden): every
+    /// STRIDED operand's concrete trip addresses — first to last, plus one stride for the
+    /// last trip's own window — stay inside the operand's own footprint. This is the
+    /// emitter's bake-time segment law (see `time_tiled_segment_law`) resolved against the
+    /// addresses `concrete_trips` actually baked.
+    #[test]
+    fn every_strided_operand_stays_inside_its_own_frame() {
+        let e = tscdiv();
+        for (ti, m) in e.affine_strides.iter().enumerate() {
+            let Some(&stride) = m.get("out") else {
+                continue;
+            };
+            assert!(
+                stride > 0,
+                "operand {ti}: a stride map carries a real advance"
+            );
+            let first = trip_start(&e, 0, ti as u32);
+            let last = trip_start(&e, e.time as usize - 1, ti as u32);
+            let span = last - first + stride as u64;
+            assert!(
+                span <= e.arg_bindings[ti].footprint_bytes,
+                "operand {ti}: the trips span {span} B (stride {stride} B × {} trips) but \
+                 its own frame is {} B — the op's iteration outruns the operand",
+                e.time,
+                e.arg_bindings[ti].footprint_bytes
+            );
+        }
+    }
 }
 
 /// ⛔ THE COMPLEMENT OF THE BROADCAST LAW: an operand collapsed along a dim OTHER than
@@ -8120,6 +8230,212 @@ mod time_tiled_mb_operand_advances_per_trip {
             "the mb operand moved {g0:#x} → {g1:#x}: it must ADVANCE — each trip reads its \
              own out-window of the row, unlike the address-stable scalar broadcast"
         );
+    }
+
+    /// ⭐ #1113 (auditor ruling 2026-11-06): the mb operand's per-trip advance is stated over
+    /// its OWN one-row frame, never the op's mb product. The observable law: a FULL operand
+    /// of the same op advances by `out_per_time × ROWS` (the stick-block row count — its
+    /// device layout jumps the op's whole row product per out-window), while the mb
+    /// broadcast advances by `out_per_time × 1` — its OWN single row. The run-4 defect was
+    /// exactly this ratio collapsing to 1 (the gain handed the OP's 64-row product: a
+    /// 524288 B/trip advance into a 32 KiB frame that fenced a card).
+    #[test]
+    fn the_mb_advance_is_its_own_one_row_slab_not_the_ops_row_product() {
+        let e = mbdiv();
+        let stride = e.affine_strides[1].get("out").copied().unwrap_or(0);
+        assert!(stride > 0, "the mb operand carries a per-trip stride");
+        let full_stride = e.affine_strides[0]
+            .get("out")
+            .or_else(|| e.affine_strides[2].get("out"))
+            .copied()
+            .expect("a full operand of the same op carries the control stride");
+        assert_eq!(
+            full_stride,
+            stride.saturating_mul(i64::from(ROWS)),
+            "the full operand advances by the op's {ROWS}-row product per trip while the mb \
+             broadcast advances by its OWN one row — a ratio of anything else is the run-4 \
+             over-advance class (the gain reading {stride} B/trip into a one-row frame)"
+        );
+    }
+
+    /// #1113's address-resolving half: every STRIDED operand's CONCRETE trip addresses —
+    /// first trip to last, plus one stride for the last trip's own window — stay inside
+    /// the operand's own footprint. This is the emitter's bake-time segment law resolved
+    /// against the addresses `concrete_trips` actually baked.
+    #[test]
+    fn every_strided_operand_stays_inside_its_own_frame() {
+        let e = mbdiv();
+        for (ti, m) in e.affine_strides.iter().enumerate() {
+            let Some(&stride) = m.get("out") else {
+                continue;
+            };
+            assert!(
+                stride > 0,
+                "operand {ti}: a stride map carries a real advance"
+            );
+            let first = trip_start(&e, 0, ti as u32);
+            let last = trip_start(&e, e.time as usize - 1, ti as u32);
+            let span = last - first + stride as u64;
+            assert!(
+                span <= e.arg_bindings[ti].footprint_bytes,
+                "operand {ti}: the trips span {span} B (stride {stride} B × {} trips) but \
+                 its own frame is {} B — the op's iteration outruns the operand",
+                e.time,
+                e.arg_bindings[ti].footprint_bytes
+            );
+        }
+    }
+}
+
+/// ⛔⛔ THE BAKE-TIME SEGMENT LAW (#1113, auditor ruling 2026-11-06) — a time-tiled
+/// operand's whole trip span (`stride × time`) must fit inside the operand's OWN
+/// physical device frame, and a slice past it is a BUILD refusal naming the operand,
+/// the trip and the frame — never a PCIe bus fence on the card (run-4: the tall rung's
+/// rmg gain, a 524288 B/trip advance into a 32 KiB one-row frame, RAS::PCI::BusFence
+/// 0xa35e on the first launch).
+///
+/// The law is typed where the stride is derived ([`rewrite_op_for_time_tile`], right
+/// after `stride_bytes`), so an emission that reintroduces an over-advance cannot
+/// reach a descriptor. This fixture proves the law has TEETH on a hand-minted
+/// [`OpSpec`]: an mb-broadcast operand (the rmsnorm-gamma form — `RedNonStick` on
+/// `mb`, `Active` on `out`) carrying a nonzero element offset WITHOUT a
+/// `device_extent` stating a larger allocation behind it — a view whose stated
+/// base leaves less room than its trips need — is REFUSED, naming the operand;
+/// the same op at offset 0 (the stride derived from the operand's own frame, span
+/// within the frame by construction) emits clean. The offset is stated directly on the
+/// [`TensorArg`] because the law sits BELOW the operand mint (a door would refuse
+/// the window at the mint first — the emitter must guard itself, not lean on the
+/// doors above it).
+#[cfg(test)]
+mod time_tiled_segment_law {
+    use super::*;
+
+    /// The two sibling modules' own geometry: vocab-wide cols, few rows — the tiler
+    /// lands on `time > 1` at three operands.
+    const ROWS: u32 = 35;
+    const COLS: u32 = 262144;
+    /// The LAST fp16 stick of the row: the view claims to start one stick before the
+    /// frame's end, leaving a 128-B tail, while its trips (by the own-frame stride)
+    /// need a whole per-core out-window — far past the tail. Stated this close to
+    /// the end so the law fires at ANY core division of `out` (a spatially split
+    /// `out` shrinks the per-trip window, not the frame).
+    const OFF: u32 = COLS - Fp16::ELEMS_PER_STICK;
+
+    /// `x * gamma` with gamma an mb-broadcast row vector at element offset
+    /// `gamma_off` — the mb-advance module's own op, hand-minted so the offset (or
+    /// its absence) is the ONLY difference between the firing and control cases.
+    fn opspec(gamma_off: Option<u32>) -> OpSpec {
+        let cols = StickExtent::<Fp16>::new(COLS).expect("vocab-wide cols are a stick multiple");
+        let dims = vec![
+            ItDim {
+                name: "mb",
+                size: ROWS,
+                is_reduction: false,
+                is_stick: false,
+                df: Df::Fp16,
+            },
+            ItDim {
+                name: "out",
+                size: cols.elems(),
+                is_reduction: false,
+                is_stick: true,
+                df: Df::Fp16,
+            },
+            ItDim {
+                name: "y",
+                size: 1,
+                is_reduction: false,
+                is_stick: false,
+                df: Df::Fp16,
+            },
+        ];
+        let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)
+            .expect("the plan divides");
+        let dd = plan.iter_syms(["mb", "out", "y"]);
+        let time_tile = plan
+            .time_tile_for_lx(|p, opt| pointwise_lx_resident(p, 3, opt, Df::Fp16), "out")
+            .map_err(|e| e.0)
+            .expect("the tiler consults")
+            .expect(
+                "vocab-wide x*gamma at three operands time-tiles — the two sibling modules' \
+                 own geometry",
+            );
+        let mk = |is_input: bool, name: &str, scales: [Scale; 3]| {
+            TensorArg::<3>::new(
+                is_input,
+                name.to_string(),
+                if is_input { Role::Input } else { Role::Output },
+                scales,
+                dd,
+                ["mb", "out", "y"],
+                "out",
+                Allocation::Hbm,
+            )
+            .expect("a well-formed tensor arg")
+        };
+        let mut gamma = mk(
+            true,
+            "sl_gamma",
+            [Scale::RedNonStick, Scale::Active, Scale::Active],
+        );
+        if let Some(off) = gamma_off {
+            gamma = gamma.with_offset(off);
+        }
+        let x = mk(true, "sl_x", [Scale::Active, Scale::Active, Scale::Active]);
+        let out = mk(false, "sl_o", [Scale::Active, Scale::Active, Scale::Active]);
+        OpSpec {
+            op: OpFunc::Multiply,
+            is_reduction: false,
+            iter: plan,
+            args: vec![
+                AnyTensorArg::R3(x),
+                AnyTensorArg::R3(gamma),
+                AnyTensorArg::R3(out),
+            ],
+            op_info: OpInfo::None,
+            tiled_symbols: vec![time_tile.dim()],
+            time_tile: Some(time_tile),
+            indirect: None,
+            coordinate_mask: None,
+        }
+    }
+
+    fn emit(op: &OpSpec) -> Result<EmittedOp, SuperDscError> {
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let mut sym = 0i64;
+        emit_sdsc_tiled("seg_law_t0", op, &folds, &mut sym, None)
+    }
+
+    /// The law FIRES: the offset broadcast's span (its whole one-row frame, by the
+    /// own-frame stride) does not fit the frame PAST its stated offset — a refusal
+    /// naming the operand, its position, the stride and the frame, never a
+    /// descriptor, never a card fence.
+    #[test]
+    fn an_over_advanced_operand_refuses_at_the_bake() {
+        let err = match emit(&opspec(Some(OFF))) {
+            Ok(_) => panic!("the segment law must refuse the over-advanced operand"),
+            Err(e) => e.0,
+        };
+        assert!(
+            err.contains("tensor 1 ('sl_gamma')"),
+            "the refusal names the operand and its position: {err}"
+        );
+        assert!(
+            err.contains("segment law"),
+            "the refusal names the law: {err}"
+        );
+        assert!(
+            err.contains("OWN device frame"),
+            "the refusal names the frame it does not fit: {err}"
+        );
+    }
+
+    /// The positive control: at offset 0 the own-frame stride keeps the span
+    /// within the frame — the law does not false-fire on the honest form.
+    #[test]
+    fn the_honest_own_frame_stride_emits_clean() {
+        let e = emit(&opspec(None)).expect("the honest operand emits");
+        assert!(e.time > 1, "the control is genuinely time-tiled");
     }
 }
 
