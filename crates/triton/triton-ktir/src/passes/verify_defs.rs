@@ -67,8 +67,8 @@ use std::collections::HashSet;
 use ktir_core::attrkey::AttrKey as KAttrKey;
 use ktir_core::ir::{Attr as KAttr, IRFunction, Operation as KOperation, Ssa as KSsa};
 
-use crate::ir::{Module, Op, Ssa};
 use crate::Refusal;
+use crate::ir::{Module, Op, Ssa};
 
 /// THE TYPED VIOLATION. A use that breaks the law breaks it in exactly one of
 /// two ways, and the way is a VARIANT, not a sentence: `Undefined` is a value
@@ -150,10 +150,7 @@ impl Violation {
 
 /// `pass` names the step that just ran; see the module doc for what that
 /// attribution does and does not claim.
-pub fn verify_module_defs(
-    m: &Module,
-    pass: &'static str,
-) -> std::result::Result<(), Violation> {
+pub fn verify_module_defs(m: &Module, pass: &'static str) -> std::result::Result<(), Violation> {
     // The whole program's defs, unscoped: only so the violation can say WHICH
     // law the use broke -- a value defined somewhere but out of scope here
     // (dominance) reads differently from one nothing defines (definedness).
@@ -397,9 +394,7 @@ mod tests {
         let (op, v) = break_into_forward_use(&mut m);
         match verify_module_defs(&m, "test-pass") {
             Err(Violation::OutOfScope {
-                op: got_op,
-                value,
-                ..
+                op: got_op, value, ..
             }) => {
                 assert_eq!(value, v.0);
                 assert_eq!(got_op, op);
@@ -542,11 +537,7 @@ mod tests {
             return_type: None,
         };
         match verify_irfunction_defs(&f, "test-pass") {
-            Err(Violation::OutOfScope {
-                operand,
-                value,
-                ..
-            }) => {
+            Err(Violation::OutOfScope { operand, value, .. }) => {
                 assert_eq!(value, 2);
                 assert_eq!(operand, 1);
             }

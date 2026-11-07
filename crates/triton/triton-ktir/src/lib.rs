@@ -187,27 +187,37 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 /// `spyre.passes.add_ktir_lowering(pm, list(options.grid))` threads into the C++
 /// pipeline. An empty grid keeps `DistributeWork`'s single-axis heuristic, and a
 /// multi-axis kernel then RED-stops rather than guessing a block count.
+/// One runner, one pipeline table: each row is a pass, and the runner runs the
+/// SSA verifier after EVERY entry, so no pass can be added to `make_ktir`
+/// without a verify line following it and none can be quietly skipped. A row's
+/// comment says why the pass sits where it sits.
 pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
-    passes::dot_to_linalg::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:dot_to_linalg")
-        .map_err(|v| v.refusal())?;
-    passes::convert_ttir_to_ktdp::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:convert_ttir_to_ktdp")
-        .map_err(|v| v.refusal())?;
-    passes::distribute_work::run(module, grid)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:distribute_work")
-        .map_err(|v| v.refusal())?;
-    passes::legalize_types::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:legalize_types")
-        .map_err(|v| v.refusal())?;
-    passes::canonicalize::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:canonicalize")
-        .map_err(|v| v.refusal())?;
-    passes::decompose_dense_constants::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:decompose_dense_constants")
-        .map_err(|v| v.refusal())?;
-    passes::plan_corelets::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:plan_corelets")
-        .map_err(|v| v.refusal())?;
+    let pipeline: [(&'static str, fn(&mut Module, &[i64]) -> Result<()>); 7] = [
+        ("make_ktir:dot_to_linalg", |m, _| {
+            passes::dot_to_linalg::run(m)
+        }),
+        ("make_ktir:convert_ttir_to_ktdp", |m, _| {
+            passes::convert_ttir_to_ktdp::run(m)
+        }),
+        ("make_ktir:distribute_work", |m, g| {
+            passes::distribute_work::run(m, g)
+        }),
+        ("make_ktir:legalize_types", |m, _| {
+            passes::legalize_types::run(m)
+        }),
+        ("make_ktir:canonicalize", |m, _| {
+            passes::canonicalize::run(m)
+        }),
+        ("make_ktir:decompose_dense_constants", |m, _| {
+            passes::decompose_dense_constants::run(m)
+        }),
+        ("make_ktir:plan_corelets", |m, _| {
+            passes::plan_corelets::run(m)
+        }),
+    ];
+    for (name, pass) in pipeline {
+        pass(module, grid)?;
+        passes::verify_defs::verify_module_defs(module, name).map_err(|v| v.refusal())?;
+    }
     Ok(())
 }

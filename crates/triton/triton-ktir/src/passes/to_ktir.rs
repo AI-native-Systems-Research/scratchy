@@ -101,89 +101,122 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
              so it is not guessed",
         ));
     }
-    let mut grid_size = 1i64;
     for e in grid {
         if *e <= 0 {
             return Err(refuse(format!("grid extent must be positive; got {e}")));
         }
-        grid_size *= e;
     }
 
-    // Container first: once the pointer arguments are `index`, the casts that bridged
-    // `!tt.ptr` to index are index-to-index and fold away, and the body rewrites then
-    // run on a `func.func`.
-    convert_func(module, grid_size)?;
-    verify(module, "spyre-to-ktir:convert_func")?;
-    drop_corelet_plans(module);
-    verify(module, "spyre-to-ktir:drop_corelet_plans")?;
-    fold_pointer_casts(module)?;
-    verify(module, "spyre-to-ktir:fold_pointer_casts")?;
-    convert_body(module)?;
-    verify(module, "spyre-to-ktir:convert_body")?;
-    // LAST body rewrite: fold the grid-stride work loop when it can run at most one
-    // trip, so the grid position reaches the scheduler as a per-core uniform instead of
-    // a loop induction variable.
-    fold_grid_work_loop(module)?;
-    verify(module, "spyre-to-ktir:fold_grid_work_loop")?;
-    // AFTER the fold, deliberately: a single-trip grid has no work loop left by this
-    // point, so this step is a no-op on every configuration whose emission is pinned to
-    // bytes, and only the genuinely multi-trip case is touched.
-    //
-    // ⭐ AND THE MULTI-TRIP CASE NOW HOISTS ITS OWN VIEWS, inside the unroll, because the copies
-    // have to share ONE declaration of each buffer's width rather than state four. So this is
-    // currently inert on all twelve. It is kept, not deleted: it is the guard for any work loop
-    // that reaches here still standing, and its planted-defect test still exercises the
-    // `handoff::lower` arm that reports a nested view as nested.
-    hoist_buffer_views_out_of_work_loops(module);
-    verify(module, "spyre-to-ktir:hoist_buffer_views_out_of_work_loops")?;
-    // LAST, and after both grid-loop arms: a TIME-tiled loop from the kernel's own source --
-    // flash attention's KV sweep -- is not a grid work loop, so neither arm above looks at it, and
-    // downstream every window reader walks the function's top level. Constant trip counts unroll;
-    // anything else is left for the window guard to report by name. See the pass doc.
-    unroll_constant_trip_loops(module)?;
-    verify(module, "spyre-to-ktir:unroll_constant_trip_loops:1")?;
-    fold_unit_grid_tile_id(module);
-    verify(module, "spyre-to-ktir:fold_unit_grid_tile_id")?;
-    // THE GRID-CORNER UNIFORM SPELLING, between the unit fold and the fire gate: a corner
-    // this pass rewrites is claimed by the recognizer the gate consults below, so an
-    // all-uniform grid keeps its launch instead of paying the clone protocol -- while a
-    // corner that is computed and NOT uniform (attention's head-grouped K/V at 16) still
-    // trips the gate exactly as before. See the pass doc for the proof discipline.
-    crate::passes::uniform_grid_corners::run(module, grid)?;
-    verify(module, "spyre-to-ktir:uniform_grid_corners")?;
-    // AFTER the unit fold and the uniform rewrite, deliberately: a unit grid already folded
-    // its landmark to zero and has nothing for this pass to do, and the twelve
-    // card-verified kernels at multi-tile grids (the embedding, the whole-node MLPs) never
-    // state a computed window corner, so the fire gate below leaves them byte-identical.
-    // Only the genuinely corner-carrying multi-tile body -- attention at 16, whose K/V
-    // corner is the head-grouped family the uniform pass cannot state -- is unrolled.
-    unroll_grid_positions(module)?;
-    verify(module, "spyre-to-ktir:unroll_grid_positions")?;
-    // SECOND TRIP-UNROLL ARM, deliberately after the grid unroll: a CAUSAL sweep's trip count is a
-    // function of the grid position (`off_band = f(start_m)`), so the FIRST arm above -- run while
-    // the bounds still root at the compute-tile id -- sees no constant and leaves the `scf.for`
-    // standing. The grid unroll folds each copy's bounds to constants, and THIS arm unrolls them.
-    // On the twelve card-verified kernels it is a no-op (their first-arm loops are gone; nothing
-    // new became constant), and on the noncausal 16-tile it is a no-op by construction (the sweep
-    // count is grid-invariant, so the first arm already took it).
-    unroll_constant_trip_loops(module)?;
-    verify(module, "spyre-to-ktir:unroll_constant_trip_loops:2")?;
-    // AND FOLD AGAIN: the trip unroll splices the loop BODIES out as straight line, replacing the
-    // induction variable with a per-trip constant -- but the bodies' own index arithmetic on that
-    // IV (`addi`, `index_cast` of the corner chains) is left for a folder to fold, and the last
-    // fold ran before the splice. Without this the causal kernel's window corners reach the door
-    // as `index_cast(constant)` and it refuses them -- the same message the grid-corner wall gave.
-    fold_index_arithmetic(module);
-    verify(module, "spyre-to-ktir:fold_index_arithmetic")?;
-    fold_splat_seeds(module);
-    verify(module, "spyre-to-ktir:fold_splat_seeds")?;
-    decompose_matmul_accumulators(module)?;
-    verify(module, "spyre-to-ktir:decompose_matmul_accumulators")?;
-    strip_triton_attrs(module);
-    verify(module, "spyre-to-ktir:strip_triton_attrs")?;
-    // FAIL CLOSED. A conversion that leaves one `tt.*` op behind produces a module that
-    // LOOKS converted and still cannot be parsed downstream.
-    verify_only_scheduler_dialects(module)
+    // THE PIPELINE IS A TABLE, and one runner walks it: each row is a step,
+    // and the runner runs the SSA verifier after EVERY entry, so no step can
+    // be added without a verify line following it and none can be quietly
+    // skipped. A row's comment says why the step sits where it sits.
+    let steps: [(&'static str, fn(&mut Module, &[i64]) -> Result<()>); 16] = [
+        // Container first: once the pointer arguments are `index`, the casts that bridged
+        // `!tt.ptr` to index are index-to-index and fold away, and the body rewrites then
+        // run on a `func.func`.
+        ("spyre-to-ktir:convert_func", |m, g| {
+            convert_func(m, g.iter().product())
+        }),
+        ("spyre-to-ktir:drop_corelet_plans", |m, _| {
+            drop_corelet_plans(m);
+            Ok(())
+        }),
+        ("spyre-to-ktir:fold_pointer_casts", |m, _| {
+            fold_pointer_casts(m)
+        }),
+        ("spyre-to-ktir:convert_body", |m, _| convert_body(m)),
+        // LAST body rewrite: fold the grid-stride work loop when it can run at most one
+        // trip, so the grid position reaches the scheduler as a per-core uniform instead of
+        // a loop induction variable.
+        ("spyre-to-ktir:fold_grid_work_loop", |m, _| {
+            fold_grid_work_loop(m)
+        }),
+        // AFTER the fold, deliberately: a single-trip grid has no work loop left by this
+        // point, so this step is a no-op on every configuration whose emission is pinned to
+        // bytes, and only the genuinely multi-trip case is touched.
+        //
+        // ⭐ AND THE MULTI-TRIP CASE NOW HOISTS ITS OWN VIEWS, inside the unroll, because the copies
+        // have to share ONE declaration of each buffer's width rather than state four. So this is
+        // currently inert on all twelve. It is kept, not deleted: it is the guard for any work loop
+        // that reaches here still standing, and its planted-defect test still exercises the
+        // `handoff::lower` arm that reports a nested view as nested.
+        (
+            "spyre-to-ktir:hoist_buffer_views_out_of_work_loops",
+            |m, _| {
+                hoist_buffer_views_out_of_work_loops(m);
+                Ok(())
+            },
+        ),
+        // LAST, and after both grid-loop arms: a TIME-tiled loop from the kernel's own source --
+        // flash attention's KV sweep -- is not a grid work loop, so neither arm above looks at it, and
+        // downstream every window reader walks the function's top level. Constant trip counts unroll;
+        // anything else is left for the window guard to report by name. See the pass doc.
+        ("spyre-to-ktir:unroll_constant_trip_loops:1", |m, _| {
+            unroll_constant_trip_loops(m)
+        }),
+        ("spyre-to-ktir:fold_unit_grid_tile_id", |m, _| {
+            fold_unit_grid_tile_id(m);
+            Ok(())
+        }),
+        // THE GRID-CORNER UNIFORM SPELLING, between the unit fold and the fire gate: a corner
+        // this pass rewrites is claimed by the recognizer the gate consults below, so an
+        // all-uniform grid keeps its launch instead of paying the clone protocol -- while a
+        // corner that is computed and NOT uniform (attention's head-grouped K/V at 16) still
+        // trips the gate exactly as before. See the pass doc for the proof discipline.
+        ("spyre-to-ktir:uniform_grid_corners", |m, g| {
+            crate::passes::uniform_grid_corners::run(m, g)
+        }),
+        // AFTER the unit fold and the uniform rewrite, deliberately: a unit grid already folded
+        // its landmark to zero and has nothing for this pass to do, and the twelve
+        // card-verified kernels at multi-tile grids (the embedding, the whole-node MLPs) never
+        // state a computed window corner, so the fire gate below leaves them byte-identical.
+        // Only the genuinely corner-carrying multi-tile body -- attention at 16, whose K/V
+        // corner is the head-grouped family the uniform pass cannot state -- is unrolled.
+        ("spyre-to-ktir:unroll_grid_positions", |m, _| {
+            unroll_grid_positions(m)
+        }),
+        // SECOND TRIP-UNROLL ARM, deliberately after the grid unroll: a CAUSAL sweep's trip count is a
+        // function of the grid position (`off_band = f(start_m)`), so the FIRST arm above -- run while
+        // the bounds still root at the compute-tile id -- sees no constant and leaves the `scf.for`
+        // standing. The grid unroll folds each copy's bounds to constants, and THIS arm unrolls them.
+        // On the twelve card-verified kernels it is a no-op (their first-arm loops are gone; nothing
+        // new became constant), and on the noncausal 16-tile it is a no-op by construction (the sweep
+        // count is grid-invariant, so the first arm already took it).
+        ("spyre-to-ktir:unroll_constant_trip_loops:2", |m, _| {
+            unroll_constant_trip_loops(m)
+        }),
+        // AND FOLD AGAIN: the trip unroll splices the loop BODIES out as straight line, replacing the
+        // induction variable with a per-trip constant -- but the bodies' own index arithmetic on that
+        // IV (`addi`, `index_cast` of the corner chains) is left for a folder to fold, and the last
+        // fold ran before the splice. Without this the causal kernel's window corners reach the door
+        // as `index_cast(constant)` and it refuses them -- the same message the grid-corner wall gave.
+        ("spyre-to-ktir:fold_index_arithmetic", |m, _| {
+            fold_index_arithmetic(m);
+            Ok(())
+        }),
+        ("spyre-to-ktir:fold_splat_seeds", |m, _| {
+            fold_splat_seeds(m);
+            Ok(())
+        }),
+        ("spyre-to-ktir:decompose_matmul_accumulators", |m, _| {
+            decompose_matmul_accumulators(m)
+        }),
+        ("spyre-to-ktir:strip_triton_attrs", |m, _| {
+            strip_triton_attrs(m);
+            Ok(())
+        }),
+        // FAIL CLOSED. A conversion that leaves one `tt.*` op behind produces a module that
+        // LOOKS converted and still cannot be parsed downstream.
+        ("spyre-to-ktir:verify_only_scheduler_dialects", |m, _| {
+            verify_only_scheduler_dialects(m)
+        }),
+    ];
+    for (name, step) in steps {
+        step(module, grid)?;
+        verify(module, name)?;
+    }
+    Ok(())
 }
 
 /// The SSA verifier, after every step above: a use that resolves to no
