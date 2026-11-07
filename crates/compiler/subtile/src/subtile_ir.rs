@@ -3594,7 +3594,7 @@ pub fn eval_node<F: RopeForm>(
         // ⛔ A COLLECTIVE HAS NO ONE-RANK VALUE: it reads every rank's operand. The sharded
         // forward that carries one is evaluated by `tensor_parallel::eval_ranks`, which runs
         // every other node through here and the collectives across ranks itself.
-        SubOp::AllReduce { .. } | SubOp::AllGather { .. } => panic!(
+        SubOp::AllReduce | SubOp::AllGather { .. } => panic!(
             "{} read on one rank: a sharded forward is evaluated by \
              tensor_parallel::eval_ranks",
             node.op.name()

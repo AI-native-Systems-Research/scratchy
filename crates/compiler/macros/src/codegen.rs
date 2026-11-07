@@ -9332,6 +9332,16 @@ fn superdsc_rotary_kind(
     }
 }
 
+/// One decode batch rung as a bake commits it: its request count, its swept extent, its body
+/// fingerprint and its own staged constants.
+#[cfg(feature = "spyre")]
+type DecodeRungEntry = (
+    u32,
+    u32,
+    String,
+    Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
+);
+
 /// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
 /// [`SengraphBundleGroup`](scratchy_target_spyre::manifest::SengraphBundleGroup) or a
 /// [`TpForward`](scratchy_target_spyre::wiring::TpForward), from that world's committed rung cells.
@@ -9343,9 +9353,10 @@ fn superdsc_rotary_kind(
 /// keeps the one-bundle path byte-identical instead of making the worker special-case a one-rung
 /// ladder. The prefix-capable ladder (start>0 chunks) ships every width that baked, a single rung
 /// included: no other slot carries it.
+#[cfg(feature = "spyre")]
 fn ladder_lits(
     prefill_rungs: &[(u32, String)],
-    decode_rungs: &[(u32, u32, String, Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>)],
+    decode_rungs: &[DecodeRungEntry],
     prefill_prefix_rungs: &[(u32, String)],
 ) -> (
     Vec<proc_macro2::TokenStream>,
@@ -9412,7 +9423,6 @@ fn ladder_lits(
     };
     (prefill, decode, prefix)
 }
-
 
 /// One load-const entry `(tid, kind)` as a token stream — the ONE renderer,
 /// shared by the wiring static (`emit_superdsc_wiring`) and every decode
@@ -11787,12 +11797,6 @@ fn dump_wavefront_mega(
         // `rows` — the ten uniform `[rows, 1]` tables' stick heads are per-width, Finding 1's
         // compounding half: the single-request wiring's rows=1 kinds staged into a rows=N rung
         // left every row past 0 reading zero).
-        type DecodeRungEntry = (
-            u32,
-            u32,
-            String,
-            Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
-        );
         let superdsc_decode_rungs: std::cell::RefCell<Vec<DecodeRungEntry>> =
             std::cell::RefCell::new(Vec::new());
         // The PREFIX-CAPABLE ladder `[(mq, body_fp)]` — the prefill bundles baked with a full

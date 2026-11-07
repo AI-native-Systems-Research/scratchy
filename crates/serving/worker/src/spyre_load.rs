@@ -2214,7 +2214,7 @@ impl SpyreWorker {
                                 let cards = &cards;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
-                                        &cards,
+                                        cards,
                                         job.rcode,
                                         scratchy_target_spyre::sdsc_runner::SessionDims {
                                             vocab,
@@ -2429,7 +2429,7 @@ impl SpyreWorker {
                                 let cards = &cards;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
-                                        &cards,
+                                        cards,
                                         job.rcode,
                                         scratchy_target_spyre::sdsc_runner::SessionDims {
                                             vocab,

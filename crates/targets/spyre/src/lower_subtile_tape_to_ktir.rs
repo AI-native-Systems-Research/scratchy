@@ -659,7 +659,7 @@ fn window_cut<F: RopeForm>(
         .nodes
         .iter()
         .take_while(|n| n.id != node.id)
-        .filter(|n| matches!(n.op, SubOp::AllReduce { .. } | SubOp::AllGather { .. }))
+        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
         .count();
     ktir_superdsc::collective::WindowCut::of_collective(k)
 }

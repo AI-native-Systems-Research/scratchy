@@ -962,7 +962,7 @@ pub fn eval_collective<F: RopeForm>(
 ) -> Vec<f32> {
     use crate::subtile_ir::gather;
     match node.op {
-        SubOp::AllReduce { .. } => {
+        SubOp::AllReduce => {
             let parts: Vec<Vec<f32>> = ranks
                 .iter()
                 .map(|b| gather(&node.inputs[0], graph, b).0)
@@ -1023,7 +1023,7 @@ pub fn eval_ranks<F: RopeForm, T: World>(
     for node in &graph.nodes {
         let shape: TensorShape = graph.shape(node.output.tensor);
         let outs: Vec<Vec<f32>> = match node.op {
-            SubOp::AllReduce { .. } | SubOp::AllGather { .. } => {
+            SubOp::AllReduce | SubOp::AllGather { .. } => {
                 let ranks: Vec<&[Vec<f32>]> = bufs.iter().map(|b| b.as_slice()).collect();
                 vec![eval_collective(node, graph, &ranks); w]
             }

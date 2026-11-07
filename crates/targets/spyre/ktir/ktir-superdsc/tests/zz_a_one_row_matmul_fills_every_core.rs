@@ -75,12 +75,20 @@ fn every_granite_2b_decode_projection_runs_on_all_32_cores() {
 #[test]
 fn a_one_stick_one_row_projection_runs_on_all_32_cores() {
     for (name, k, n, want) in [
-        ("granite-2b k_proj at tp/8", 2048u32, 64u32, (1u32, 1u32, 32u32)),
+        (
+            "granite-2b k_proj at tp/8",
+            2048u32,
+            64u32,
+            (1u32, 1u32, 32u32),
+        ),
         ("granite-8b k_proj at tp/8", 4096, 128, (1, 2, 16)),
         ("a four-stick reduction", 256, 64, (1, 1, 4)),
     ] {
         let got = split_triple(n, k);
-        assert_eq!(got, want, "{name} [{k} -> {n}]: (mb, out, in) = {got:?}, want {want:?}");
+        assert_eq!(
+            got, want,
+            "{name} [{k} -> {n}]: (mb, out, in) = {got:?}, want {want:?}"
+        );
     }
 }
 

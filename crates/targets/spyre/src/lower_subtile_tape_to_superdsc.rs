@@ -1077,7 +1077,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let widest_cols = ir
         .nodes
         .iter()
-        .filter(|n| matches!(n.op, SubOp::AllReduce { .. } | SubOp::AllGather { .. }))
+        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
         .map(|n| n.inputs[0].region.cols.len)
         .max();
     // A collective in a world of one is a forward the analysis never mints (its identity at
@@ -2773,7 +2773,7 @@ struct EmuReadback<'a> {
 
 /// Whether `op` reads across ranks — the nodes a rank's reference evaluates against its peer.
 fn is_collective<F: RopeForm>(op: &SubOp<F>) -> bool {
-    matches!(op, SubOp::AllReduce { .. } | SubOp::AllGather { .. })
+    matches!(op, SubOp::AllReduce | SubOp::AllGather { .. })
 }
 
 /// THE WORLD of a sharded gate, as one rank's reference reads it: which rank THIS one is and every
@@ -3940,9 +3940,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         } else if let Some(&half) = rope_table_half.get(&tid) {
             // The SAME stream the reference reads (`eval_golden_buffers`: `seed(id)`) — a rank's
             // slice of a column-split table is its own, so the stream is the rank's.
-            (0..n)
-                .map(|j| dbg_synth_val(seed(tid), j % half))
-                .collect()
+            (0..n).map(|j| dbg_synth_val(seed(tid), j % half)).collect()
         } else {
             (0..n).map(|j| dbg_synth_val(seed(tid), j)).collect()
         };
@@ -8106,6 +8104,9 @@ pub fn class_covering_depth(launches: &[(u8, u32)]) -> usize {
     total
 }
 
+/// The class-covering twin's launch groups, and where its truncation stops ([`covering_twin_groups`]).
+pub type CoveringTwin<T> = (Vec<bundle::LaunchGroup<'static, T>>, GateTrunc);
+
 /// ⭐ THE CLASS-COVERING TWIN — the shipped bundle's per-op groups sliced to
 /// the covering depth: the SAME roll, the SAME unroll law, the SAME grouping
 /// (`FoldGrouping::Split`, the spelling every bake in `codegen.rs` uses), with
@@ -8127,7 +8128,7 @@ pub fn class_covering_depth(launches: &[(u8, u32)]) -> usize {
 pub fn covering_twin_groups<T: ktir_superdsc::collective::Tp>(
     rolled: &RolledSuperDsc<T>,
     lx_pin_window_bytes: Option<u64>,
-) -> Result<Option<(Vec<bundle::LaunchGroup<'static, T>>, GateTrunc)>, SuperDscError> {
+) -> Result<Option<CoveringTwin<T>>, SuperDscError> {
     let total = rolled.launches.len();
     let k = class_covering_depth(&rolled.launches);
     if k >= total {
