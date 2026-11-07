@@ -1522,6 +1522,6 @@ pub fn lower<'a>(m: &Module, a: &'a Arena) -> Result<IRFunction<'a>> {
     // here is a defect of THIS emission -- or of the module it was fed, caught
     // already by the drivers -- and it is refused HERE, not by whichever
     // consumer happens to chase the value.
-    crate::passes::verify_defs::verify_irfunction_defs(&out, PASS)?;
+    crate::passes::verify_defs::verify_irfunction_defs(&out, PASS).map_err(|v| v.refusal())?;
     Ok(out)
 }

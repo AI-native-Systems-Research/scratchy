@@ -190,7 +190,7 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
 /// definition is refused naming the step that just ran. See `verify_defs` for
 /// the law and for what "the pass that ran last" does and does not claim.
 fn verify(module: &Module, step: &'static str) -> Result<()> {
-    crate::passes::verify_defs::verify_module_defs(module, step)
+    crate::passes::verify_defs::verify_module_defs(module, step).map_err(|v| v.refusal())
 }
 
 //===----------------------------------------------------------------------===//

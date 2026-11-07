@@ -189,18 +189,25 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 /// multi-axis kernel then RED-stops rather than guessing a block count.
 pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
     passes::dot_to_linalg::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:dot_to_linalg")?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:dot_to_linalg")
+        .map_err(|v| v.refusal())?;
     passes::convert_ttir_to_ktdp::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:convert_ttir_to_ktdp")?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:convert_ttir_to_ktdp")
+        .map_err(|v| v.refusal())?;
     passes::distribute_work::run(module, grid)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:distribute_work")?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:distribute_work")
+        .map_err(|v| v.refusal())?;
     passes::legalize_types::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:legalize_types")?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:legalize_types")
+        .map_err(|v| v.refusal())?;
     passes::canonicalize::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:canonicalize")?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:canonicalize")
+        .map_err(|v| v.refusal())?;
     passes::decompose_dense_constants::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:decompose_dense_constants")?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:decompose_dense_constants")
+        .map_err(|v| v.refusal())?;
     passes::plan_corelets::run(module)?;
-    passes::verify_defs::verify_module_defs(module, "make_ktir:plan_corelets")?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:plan_corelets")
+        .map_err(|v| v.refusal())?;
     Ok(())
 }

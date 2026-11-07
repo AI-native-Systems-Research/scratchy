@@ -68,21 +68,105 @@ use ktir_core::attrkey::AttrKey as KAttrKey;
 use ktir_core::ir::{Attr as KAttr, IRFunction, Operation as KOperation, Ssa as KSsa};
 
 use crate::ir::{Module, Op, Ssa};
-use crate::{Refusal, Result};
+use crate::Refusal;
+
+/// THE TYPED VIOLATION. A use that breaks the law breaks it in exactly one of
+/// two ways, and the way is a VARIANT, not a sentence: `Undefined` is a value
+/// nothing in the program defines; `OutOfScope` is a value something defines
+/// but not where this use sits. Both carry the facts of the use -- the pass
+/// that ran last, the op's kind, the result the op defines (if any), the
+/// operand's index, the value -- as FIELDS, so a test matches on the variant
+/// and asserts them, and the [`Refusal`] a driver hands the user is BUILT from
+/// the value rather than parsed back out of its message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Violation {
+    /// The operand resolves to nothing: no op result, argument, carry or
+    /// block argument anywhere in the program defines it.
+    Undefined {
+        pass: &'static str,
+        op: String,
+        defines: Option<u32>,
+        operand: usize,
+        value: u32,
+    },
+    /// The operand is defined somewhere in the program but not IN SCOPE at
+    /// this use: a region's defs are visible inside it only, and an op's
+    /// results are visible after the op.
+    OutOfScope {
+        pass: &'static str,
+        op: String,
+        defines: Option<u32>,
+        operand: usize,
+        value: u32,
+    },
+}
+
+impl Violation {
+    /// The refusal this violation becomes at a driver's hands. The message is
+    /// the violation's own fields rendered; nothing reads it back.
+    pub fn refusal(&self) -> Refusal {
+        let (pass, op, defines, operand, value, law) = match self {
+            Violation::Undefined {
+                pass,
+                op,
+                defines,
+                operand,
+                value,
+            } => (
+                *pass,
+                op,
+                *defines,
+                *operand,
+                *value,
+                "resolves to nothing -- no op result, argument, carry or block \
+                 argument defines it",
+            ),
+            Violation::OutOfScope {
+                pass,
+                op,
+                defines,
+                operand,
+                value,
+            } => (
+                *pass,
+                op,
+                *defines,
+                *operand,
+                *value,
+                "is defined, but not in scope at this use -- a region's defs are \
+                 visible inside it only, and an op's results are visible after the op",
+            ),
+        };
+        let who = match defines {
+            Some(r) => format!("op `{op}` (defines %{r})"),
+            None => format!("op `{op}`"),
+        };
+        Refusal::new(
+            pass,
+            format!("use of %{value}: operand {operand} of {who} {law}"),
+        )
+    }
+}
 
 /// `pass` names the step that just ran; see the module doc for what that
 /// attribution does and does not claim.
-pub fn verify_module_defs(m: &Module, pass: &'static str) -> Result<()> {
-    // The whole program's defs, unscoped: only so a refusal can say WHICH law
-    // the use broke -- a value defined somewhere but out of scope here
+pub fn verify_module_defs(
+    m: &Module,
+    pass: &'static str,
+) -> std::result::Result<(), Violation> {
+    // The whole program's defs, unscoped: only so the violation can say WHICH
+    // law the use broke -- a value defined somewhere but out of scope here
     // (dominance) reads differently from one nothing defines (definedness).
     let mut everywhere = HashSet::new();
     collect_module_defs(&m.ops, &mut everywhere);
-    verify_module_region(&m.ops, &HashSet::new(), &everywhere, pass)
+    verify_module_region(&m.ops, &mut HashSet::new(), &everywhere, pass)
 }
 
 /// Same law, over the emitted function the consumers actually see.
-pub fn verify_irfunction_defs(f: &IRFunction, pass: &'static str) -> Result<()> {
+pub fn verify_irfunction_defs(
+    f: &IRFunction,
+    pass: &'static str,
+) -> std::result::Result<(), Violation> {
     let mut everywhere: HashSet<KSsa> = f.arguments.iter().map(|(v, _)| *v).collect();
     for o in f.ops_deep() {
         if let Some(r) = o.result {
@@ -108,14 +192,14 @@ fn verify_module_region(
     inherited: &HashSet<Ssa>,
     everywhere: &HashSet<Ssa>,
     pass: &'static str,
-) -> Result<()> {
+) -> std::result::Result<(), Violation> {
     let mut visible = inherited.clone();
     for op in ops {
         for (i, v) in op.operands.iter().enumerate() {
             if !visible.contains(v) {
-                return Err(refuse_use(
+                return Err(violation_of(
                     pass,
-                    op.kind.spelling(),
+                    op.kind.spelling().to_string(),
                     op.result().map(|r| r.0),
                     i,
                     v.0,
@@ -142,14 +226,14 @@ fn verify_irfunction_region(
     inherited: &HashSet<KSsa>,
     everywhere: &HashSet<KSsa>,
     pass: &'static str,
-) -> Result<()> {
+) -> std::result::Result<(), Violation> {
     let mut visible = inherited.clone();
     for o in ops {
         for (i, v) in o.operands.iter().enumerate() {
             if !visible.contains(v) {
-                return Err(refuse_use(
+                return Err(violation_of(
                     pass,
-                    &kind_of(o),
+                    kind_of(o),
                     o.result.map(|r| r.0),
                     i,
                     v.0,
@@ -200,34 +284,36 @@ fn region_and_result_attr_keys() -> [KAttrKey; 4] {
     ]
 }
 
-/// The refusal for a use that does not resolve in scope: `defined` says which
-/// law broke -- a value defined somewhere in the program but not visible at
-/// this use is a DOMINANCE violation; one nothing anywhere defines is a
-/// DEFINEDNESS violation. Both name the op, the operand's index, the value,
-/// and the pass that ran last.
-fn refuse_use(
+/// The violation for a use that does not resolve in scope: `defined` says
+/// which law broke -- a value defined somewhere in the program but not
+/// visible at this use is `OutOfScope` (dominance); one nothing anywhere
+/// defines is `Undefined` (definedness). Both carry the op, the operand's
+/// index, the value, and the pass that ran last.
+fn violation_of(
     pass: &'static str,
-    op: &str,
+    op: String,
     defines: Option<u32>,
     operand: usize,
-    v: u32,
+    value: u32,
     defined: bool,
-) -> Refusal {
-    let who = match defines {
-        Some(r) => format!("op `{op}` (defines %{r})"),
-        None => format!("op `{op}`"),
-    };
-    let law = if defined {
-        "is defined, but not in scope at this use -- a region's defs are \
-         visible inside it only, and an op's results are visible after the op"
+) -> Violation {
+    if defined {
+        Violation::OutOfScope {
+            pass,
+            op,
+            defines,
+            operand,
+            value,
+        }
     } else {
-        "resolves to nothing -- no op result, argument, carry or block \
-         argument defines it"
-    };
-    Refusal::new(
-        pass,
-        format!("use of %{v}: operand {operand} of {who} {law}"),
-    )
+        Violation::Undefined {
+            pass,
+            op,
+            defines,
+            operand,
+            value,
+        }
+    }
 }
 
 /// Their `OpKind` has no shared spelling, but it derives `Debug` and every
@@ -254,55 +340,72 @@ mod tests {
         verify_module_defs(&m, "test").unwrap();
     }
 
-    /// One undefined operand, and only that: the refusal names the op, the
-    /// operand's index, the value, and the pass that ran last.
+    /// One undefined operand, and only that: the violation is `Undefined` and
+    /// its fields name the op, the operand's index, the value, and the pass
+    /// that ran last.
     #[test]
     fn an_undefined_operand_is_refused_naming_the_op_and_value() {
         let mut m = parse::parse(WELL_FORMED).unwrap();
         let (op, v) = break_one_operand(&mut m);
-        let e = verify_module_defs(&m, "test-pass").unwrap_err();
-        assert_eq!(e.pass, "test-pass");
-        assert!(e.message.contains(&format!("%{}", v.0)), "got {e}");
-        assert!(e.message.contains('`'), "names the op: {e}");
-        assert!(e.message.contains("operand 0"), "got {e}");
-        assert!(e.message.contains(&op), "names {op}: {e}");
-        assert!(e.message.contains("resolves to nothing"), "got {e}");
+        match verify_module_defs(&m, "test-pass") {
+            Err(Violation::Undefined {
+                pass,
+                op: got_op,
+                operand,
+                value,
+                ..
+            }) => {
+                assert_eq!(pass, "test-pass");
+                assert_eq!(value, v.0);
+                assert_eq!(operand, 0);
+                assert_eq!(got_op, op);
+            }
+            other => panic!("expected Undefined, got {other:?}"),
+        }
     }
 
     /// DOMINANCE, the region clause: a value defined inside the `tt.reduce`
     /// body is a def of that region -- a use of it AFTER the reduce, outside
-    /// the region, is refused even though a flat def set would pass it.
+    /// the region, is `OutOfScope` even though a flat def set would pass it.
     #[test]
     fn a_use_of_a_region_def_outside_the_region_is_refused() {
         let mut m = parse::parse(WELL_FORMED).unwrap();
         let (op, v) = break_into_region_escape(&mut m);
-        let e = verify_module_defs(&m, "test-pass").unwrap_err();
-        assert_eq!(e.pass, "test-pass");
-        assert!(e.message.contains(&format!("%{}", v.0)), "got {e}");
-        assert!(e.message.contains("operand 0"), "got {e}");
-        assert!(e.message.contains(&op), "names {op}: {e}");
-        assert!(
-            e.message.contains("not in scope at this use"),
-            "names dominance, not undefinedness: {e}"
-        );
-        assert!(
-            !e.message.contains("resolves to nothing"),
-            "the value IS defined, elsewhere: {e}"
-        );
+        match verify_module_defs(&m, "test-pass") {
+            Err(Violation::OutOfScope {
+                pass,
+                op: got_op,
+                operand,
+                value,
+                ..
+            }) => {
+                assert_eq!(pass, "test-pass");
+                assert_eq!(value, v.0);
+                assert_eq!(operand, 0);
+                assert_eq!(got_op, op);
+            }
+            other => panic!("expected OutOfScope, got {other:?}"),
+        }
     }
 
     /// DOMINANCE, the ordering clause: an op's results are visible AFTER the
-    /// op -- a use that textually precedes its definition is refused, where
-    /// the flat def set passed any order.
+    /// op -- a use that textually precedes its definition is `OutOfScope`,
+    /// where the flat def set passed any order.
     #[test]
     fn a_use_before_its_definition_is_refused() {
         let mut m = parse::parse(WELL_FORMED).unwrap();
         let (op, v) = break_into_forward_use(&mut m);
-        let e = verify_module_defs(&m, "test-pass").unwrap_err();
-        assert_eq!(e.pass, "test-pass");
-        assert!(e.message.contains(&format!("%{}", v.0)), "got {e}");
-        assert!(e.message.contains(&op), "names {op}: {e}");
-        assert!(e.message.contains("not in scope at this use"), "got {e}");
+        match verify_module_defs(&m, "test-pass") {
+            Err(Violation::OutOfScope {
+                op: got_op,
+                value,
+                ..
+            }) => {
+                assert_eq!(value, v.0);
+                assert_eq!(got_op, op);
+            }
+            other => panic!("expected OutOfScope, got {other:?}"),
+        }
     }
 
     /// ATTRIBUTION: a defect present before the pipeline is attributed to the
@@ -407,15 +510,21 @@ mod tests {
             grid: (1, 1, 1),
             return_type: None,
         };
-        let e = verify_irfunction_defs(&f, "test-pass").unwrap_err();
-        assert_eq!(e.pass, "test-pass");
-        assert!(e.message.contains("%5"), "got {e}");
-        assert!(e.message.contains("ArithAddf"), "names the op: {e}");
-        assert!(e.message.contains("operand 0"), "got {e}");
-        assert!(
-            e.message.contains("not in scope at this use"),
-            "names dominance, not undefinedness: {e}"
-        );
+        match verify_irfunction_defs(&f, "test-pass") {
+            Err(Violation::OutOfScope {
+                pass,
+                op,
+                operand,
+                value,
+                ..
+            }) => {
+                assert_eq!(pass, "test-pass");
+                assert_eq!(value, 5);
+                assert_eq!(operand, 0);
+                assert_eq!(op, "ArithAddf");
+            }
+            other => panic!("expected OutOfScope, got {other:?}"),
+        }
     }
 
     /// DOMINANCE over theirs, the ordering clause: a use that precedes its
@@ -432,11 +541,17 @@ mod tests {
             grid: (1, 1, 1),
             return_type: None,
         };
-        let e = verify_irfunction_defs(&f, "test-pass").unwrap_err();
-        assert_eq!(e.pass, "test-pass");
-        assert!(e.message.contains("%2"), "got {e}");
-        assert!(e.message.contains("operand 1"), "got {e}");
-        assert!(e.message.contains("not in scope at this use"), "got {e}");
+        match verify_irfunction_defs(&f, "test-pass") {
+            Err(Violation::OutOfScope {
+                operand,
+                value,
+                ..
+            }) => {
+                assert_eq!(value, 2);
+                assert_eq!(operand, 1);
+            }
+            other => panic!("expected OutOfScope, got {other:?}"),
+        }
     }
 
     /// The emitted function refuses an undefined operand, naming the op, the
@@ -452,12 +567,21 @@ mod tests {
             grid: (1, 1, 1),
             return_type: None,
         };
-        let e = verify_irfunction_defs(&f, "test-pass").unwrap_err();
-        assert_eq!(e.pass, "test-pass");
-        assert!(e.message.contains("%9"), "got {e}");
-        assert!(e.message.contains("ArithAddf"), "names the op: {e}");
-        assert!(e.message.contains("operand 1"), "got {e}");
-        assert!(e.message.contains("resolves to nothing"), "got {e}");
+        match verify_irfunction_defs(&f, "test-pass") {
+            Err(Violation::Undefined {
+                pass,
+                op,
+                operand,
+                value,
+                ..
+            }) => {
+                assert_eq!(pass, "test-pass");
+                assert_eq!(value, 9);
+                assert_eq!(operand, 1);
+                assert_eq!(op, "ArithAddf");
+            }
+            other => panic!("expected Undefined, got {other:?}"),
+        }
     }
 
     /// END TO END at the boundary: a real module through the whole pipeline,
