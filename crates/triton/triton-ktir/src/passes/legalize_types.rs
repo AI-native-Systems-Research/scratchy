@@ -39,7 +39,8 @@
 //!
 //! ⭐ THE FP32-BINDING GATE (auditor ruling 2026-10-26): the pass exists to refuse
 //! SILENT f32→f16 narrowing. An op the CARD BINDS AT FP32 lowers AS f32 -- nothing
-//! narrows, so there is nothing to refuse: the RED-stop consults [`FP32_CARD_BINDS`]
+//! narrows, so there is nothing to refuse: the RED-stop consults the ONE shared device-facts table
+//! ([`ktir_core::ddl_binds`], keyed by the typed `DeviceOp`)
 //! and lets a bound op's f32 result stand. An op with NO fp32 bind (`math.log` --
 //! the vendor templates bind it to fp16 alone) keeps today's refusal by name:
 //! emitting it would mean silently degrading it to f16, or failing at dxp. The
@@ -51,6 +52,7 @@
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
 use crate::{Refusal, Result};
+use ktir_core::ddl_binds;
 use std::collections::{HashMap, HashSet};
 
 const PASS: &str = "LegalizeTypes";
@@ -468,8 +470,9 @@ fn step_3_remove_truncf(module: &mut Module) {
 ///
 /// ⭐ THE FP32-BINDING GATE (auditor ruling 2026-10-26): the pass exists to refuse
 /// SILENT f32→f16 narrowing. An op the CARD BINDS AT FP32 lowers AS f32 -- nothing
-/// narrows, so there is nothing to refuse: the RED-stop consults [`FP32_CARD_BINDS`]
-/// and lets a bound op's f32 result stand. An op with NO fp32 bind (`math.log` --
+/// narrows, so there is nothing to refuse: the RED-stop consults the ONE
+/// shared device-facts table ([`ktir_core::ddl_binds`], keyed by the typed
+/// `DeviceOp`) and lets a bound op's f32 result stand. An op with NO fp32 bind (`math.log` --
 /// the vendor templates bind it to fp16 alone) keeps today's refusal by name:
 /// emitting it would mean silently degrading it to f16, or failing at dxp. The
 /// bindings are TARGET-ABI FACTS -- a const table the pass takes as input, each row
@@ -508,12 +511,29 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
                     .iter()
                     .filter_map(|u| index.type_of(*u).and_then(|ty| ty.elem()))
                     .collect();
-                if FP32_CARD_BINDS.iter().any(|(opcode, din, dout, _)| {
-                    *opcode == op.kind.spelling()
-                        && in_elems.contains(din)
-                        && Some(*dout) == t.elem()
-                }) {
-                    continue;
+                // The ONE shared table (`ktir_core::ddl_binds`), read through
+                // the TYPED key: the op's device form names the row, the row's
+                // bind answers fp32, and the form's input element type is the
+                // bind's own input half (the DDL binds `int32tofp32` from an
+                // IEEE_INT32 input). Every decision here is the one the pass's
+                // old inline `FP32_CARD_BINDS` scan made — this is the
+                // re-homing of that table, not a change: an op with no form,
+                // or a form with no fp32 row, keeps the refusal below
+                // (fail-closed).
+                match device_form(op, &index) {
+                    Some(DeviceForm::Op(key, din))
+                        if in_elems.contains(&din)
+                            && ddl_binds::binds::<ddl_binds::Gen1>(key, ddl_binds::DdlDf::Fp32) =>
+                    {
+                        continue;
+                    }
+                    // `tt.broadcast` MOVES DATA, dtype-free (no DDL op, no
+                    // opfunc — the emitter copies the lanes): an f32 result is
+                    // an f32 input arriving intact, never a device ask.
+                    Some(DeviceForm::MovesData) if in_elems.contains(&DType::F32) => {
+                        continue;
+                    }
+                    _ => {}
                 }
                 return Err(Refusal::new(
                     PASS,
@@ -521,7 +541,7 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
                         "genuine f32 compute remains after collapsing the \
                          stability-widening island -- this op's f32 result is not a \
                          transient extf/truncf artifact, and the card binds it to no \
-                         fp32 op (see FP32_CARD_BINDS; math.log is fp16-only in the \
+                         fp32 op (see ktir_core::ddl_binds; math.log is fp16-only in the \
                          vendor templates). Refusing to silently degrade it to f16 \
                          (SP-E2-03 RED-stop: f32 of an fp32-unbound op is an owner \
                          decision, not a pass code-around). The op is '{}'.",
@@ -534,116 +554,55 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
     Ok(())
 }
 
-/// ⭐ THE CARD'S OWN FP32 BINDINGS — the vendor DDLs' op-to-dtype binds, stated
-/// ONCE as a const table the RED-stop takes as input (the auditor ruling named
-/// above): an op bound at fp32 lowers AS f32 — no narrowing happens, nothing to
-/// refuse — while an op with NO row here keeps the refusal, because emitting it
-/// would silently degrade it to f16 or fail at dxp.
-///
-/// ⛔ EVERY ROW IS A MEASURED FACT, read directly from the vendor templates on
-/// the card pod (2026-10-26): the row's citation names the template and line.
-/// Nothing here is inferred from a composition or from another op's bind, and an
-/// opcode absent from the table is treated as UNBOUND at fp32 — fail-closed, the
-/// refusal stands. The opcodes are the KTIR spellings `from_ttir`'s census
-/// admits; only opcodes that can carry an f32 RESULT at RED-stop time need rows
-/// (an unprotected `arith.extf` is already gone by step 1, an `arith.truncf`
-/// result is f16, an `arith.fptosi` result is i32 — none of them consult this
-/// table).
-///
-/// ⛔ THE KEY IS THE FULL (opcode, OPERAND element type, RESULT element type)
-/// TRIPLE, never the spelling alone: the DDL binds `int32tofp32` from an
-/// IEEE_INT32 input, so an `arith.sitofp` reading an i1 is a DIFFERENT op with
-/// the SAME spelling — unbound, refused. A row matches only when the op's result
-/// element type is the row's and one of its operands carries the row's input
-/// element type.
-const FP32_CARD_BINDS: &[(&str, DType, DType, &str)] = &[
-    // broadcast_ops.ddl — the two-tensor pointwise family, instantiated fp32.
-    (
-        "arith.addf",
-        DType::F32,
-        DType::F32,
-        "broadcast_ops.ddl:25 add [%type_fp16, %type_fp32]",
-    ),
-    (
-        "arith.subf",
-        DType::F32,
-        DType::F32,
-        "broadcast_ops.ddl:26 sub [%type_fp16, %type_fp32]",
-    ),
-    (
-        "arith.mulf",
-        DType::F32,
-        DType::F32,
-        "broadcast_ops.ddl:27 mul [%type_fp16, %type_fp32]",
-    ),
-    (
-        "arith.divf",
-        DType::F32,
-        DType::F32,
-        "broadcast_ops.ddl:44 realdiv [%type_fp16, %type_fp32]",
-    ),
-    (
-        "arith.maxnumf",
-        DType::F32,
-        DType::F32,
-        "broadcast_ops.ddl:45 maximum [%type_fp16, %type_fp32]",
-    ),
-    (
-        "arith.minnumf",
-        DType::F32,
-        DType::F32,
-        "broadcast_ops.ddl:46 minimum [%type_fp16, %type_fp32]",
-    ),
-    // unary_parallel.ddl — the one-input family and the integer convert.
-    (
-        "math.absf",
-        DType::F32,
-        DType::F32,
-        "unary_parallel.ddl:36 abs [%type_fp16, %type_fp32]",
-    ),
-    (
-        "arith.negf",
-        DType::F32,
-        DType::F32,
-        "unary_parallel.ddl:37 neg [%type_fp16, %type_fp32]",
-    ),
-    (
-        "arith.sitofp",
-        DType::I32,
-        DType::F32,
-        "unary_parallel.ddl:49 int32tofp32 [%type_fp32]",
-    ),
-    (
-        "math.exp",
-        DType::F32,
-        DType::F32,
-        "unary_parallel.ddl:39 exp [%type_fp32]",
-    ),
-    (
-        "math.tanh",
-        DType::F32,
-        DType::F32,
-        "unary_parallel.ddl:35 tanhfp32 [%type_fp32]",
-    ),
-    (
-        "math.rsqrt",
-        DType::F32,
-        DType::F32,
-        "unary_parallel.ddl:43 rsqrt [%type_fp16, %type_fp32]",
-    ),
-    // `tt.broadcast` MOVES DATA, so it is dtype-free: its result is its input's
-    // dtype verbatim (no DDL op, no opfunc — the emitter copies the lanes), and
-    // an f32 result is an f32 input arriving intact. It is the one non-DDL row:
-    // the general table's MOVES-DATA class (auditor ruling 2026-10-26).
-    (
-        "tt.broadcast",
-        DType::F32,
-        DType::F32,
-        "moves data — dtype-free, no DDL op",
-    ),
-    // NOTE, deliberately NO row for math.log: unary_pipeline.ddl:22 binds it to
-    // [%type_fp16] ALONE — the one bind this gate exists to keep refusing.
-];
+/// The op's device form — the TYPED key into the ONE shared device-facts
+/// table (`ktir_core::ddl_binds`), with the INPUT element type the bind is
+/// keyed on (the DDL binds `int32tofp32` from an IEEE_INT32 input; every
+/// other row here reads f32 lanes). This is the old inline table's
+/// (opcode, din, dout) triple restated as a type: the vocabulary mapping is
+/// matched on the IR's own TYPED op kinds — a misspelled key cannot compile —
+/// with the spellings the IR carries as `Other` (they have no variant)
+/// matched on their one spelling and mapped to the typed key, so a typo
+/// there misses every row and reads as UNBOUND, fail-closed, exactly as an
+/// absent op does. The ROWS live in `ktir_core::ddl_binds`; nothing about
+/// the card is stated here.
+enum DeviceForm {
+    /// The typed device op this ask lowers to, and the input element type
+    /// its bind is keyed on.
+    Op(ddl_binds::DeviceOp, DType),
+    /// Dtype-free data movement (`tt.broadcast`): the result's dtype is the
+    /// input's verbatim — never a device ask, never a bind question.
+    MovesData,
+}
+
+/// The op's device form, or `None` when it is not a device ask. `index`
+/// answers the input-element-type half of the `sitofp` key.
+fn device_form(op: &Op, index: &DefIndex) -> Option<DeviceForm> {
+    let elem = |u: &Ssa| index.type_of(*u).and_then(|t| t.elem());
+    Some(match op.kind {
+        OpKind::ArithAddf => DeviceForm::Op(ddl_binds::DeviceOp::Add, DType::F32),
+        OpKind::ArithSubf => DeviceForm::Op(ddl_binds::DeviceOp::Sub, DType::F32),
+        OpKind::ArithMulf => DeviceForm::Op(ddl_binds::DeviceOp::Multiply, DType::F32),
+        OpKind::ArithDivf => DeviceForm::Op(ddl_binds::DeviceOp::RealDiv, DType::F32),
+        OpKind::ArithMaxnumf => DeviceForm::Op(ddl_binds::DeviceOp::Maximum, DType::F32),
+        OpKind::ArithMinnumf => DeviceForm::Op(ddl_binds::DeviceOp::Minimum, DType::F32),
+        OpKind::MathExp => DeviceForm::Op(ddl_binds::DeviceOp::Exp, DType::F32),
+        OpKind::TtBroadcast => DeviceForm::MovesData,
+        OpKind::Other(ref s) => match s.as_str() {
+            // The DDL's int32tofp32 is keyed on an IEEE_INT32 input: a sitofp
+            // from an i1 (the compare/select pattern) is a different op and
+            // has NO form.
+            "arith.sitofp" if op.operands.iter().any(|u| elem(u) == Some(DType::I32)) => {
+                DeviceForm::Op(ddl_binds::DeviceOp::Int32ToFp32, DType::I32)
+            }
+            "math.absf" => DeviceForm::Op(ddl_binds::DeviceOp::Abs, DType::F32),
+            "arith.negf" => DeviceForm::Op(ddl_binds::DeviceOp::Neg, DType::F32),
+            "math.tanh" => DeviceForm::Op(ddl_binds::DeviceOp::Tanh, DType::F32),
+            "math.rsqrt" => DeviceForm::Op(ddl_binds::DeviceOp::Rsqrt, DType::F32),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
 
 #[cfg(test)]
 mod tests {

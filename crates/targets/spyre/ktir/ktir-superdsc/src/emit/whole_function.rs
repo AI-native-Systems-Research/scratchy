@@ -4354,10 +4354,9 @@ pub fn staggered_sources(
             // reduction's answer is a function of the multiset, so the stagger ends here.
             Lowering::Reduce(_) => ElementArrangement::Standard,
             // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table row.
-            Lowering::Convert(kind) => {
-                crate::element_arrangement::output_arrangement_of(kind.op_func())
-                    .unwrap_or(ElementArrangement::Standard)
-            }
+            Lowering::Convert(kind) => ktir_core::ddl_binds::output_arrangement::<
+                ktir_core::ddl_binds::Gen1,
+            >(kind.device_op()),
             // POINTWISE — the stagger propagates through it, and every same-width operand that
             // is read lane-for-lane must agree with the output's arrangement.
             Lowering::Silu

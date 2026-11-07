@@ -63,6 +63,7 @@ use crate::superdsc_opspec::{
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
+use ktir_core::ddl_binds::DeviceOp;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
@@ -1944,14 +1945,14 @@ pub(crate) fn pointwise_tile_op_df(
 ///
 /// ⛔ ENUMERATED, NEVER `_`: a producer that gains a new elementwise kind is an E0004 here, which is
 /// the whole reason the kind is not a `&str` any more.
-pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static str, usize), Error> {
+pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(DeviceOp, usize), Error> {
     Ok(match kind {
-        Elementwise::Silu => ("silu", 1),
+        Elementwise::Silu => (DeviceOp::Silu, 1),
         // A REAL DDL primitive (`OpFunc::Gelu`), not a decomposition: the SFP
         // constant table ships gelu's polynomial, so this is one pointwise op.
-        Elementwise::Gelu => ("gelu", 1),
-        Elementwise::Mul => ("multiply", 2),
-        Elementwise::Add => ("add", 2),
+        Elementwise::Gelu => (DeviceOp::Gelu, 1),
+        Elementwise::Mul => (DeviceOp::Multiply, 2),
+        Elementwise::Add => (DeviceOp::Add, 2),
         // ⛔ `Sub` WAS REFUSED HERE, AND THE STATED REASON WAS FALSE IN EVERY CLAUSE. It read "Sub
         // takes a [m, 1] broadcast operand that pw2 cannot express (see the two-operand arity
         // law)". There is no arity law on `pw2`; `In::col` expresses precisely the `[m, 1]` operand
@@ -1964,30 +1965,30 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
         //
         // The hazard the old refusal gestured at is real but general, and it is now guarded where it
         // belongs — [`pointwise_extents_agree`], for EVERY binary kind.
-        Elementwise::Sub => ("sub", 2),
+        Elementwise::Sub => (DeviceOp::Sub, 2),
         // ── The rest of the `OpFunc` pointwise set. Each already had an `OpFunc` variant AND an
         // `op_func_from_str` arm before this table named it, and most are already emitted on card by
         // the attention / rmsnorm / fp8-quantiser bodies; what was missing was only the door.
-        Elementwise::Exp => ("exp", 1),
-        Elementwise::Log => ("log", 1),
-        Elementwise::Neg => ("neg", 1),
-        Elementwise::Rsqrt => ("rsqrt", 1),
-        Elementwise::Sqrt => ("sqrt", 1),
-        Elementwise::Abs => ("abs", 1),
-        Elementwise::Reciprocal => ("reciprocal", 1),
-        Elementwise::Sigmoid => ("sigmoid", 1),
-        Elementwise::Tanh => ("tanh", 1),
-        Elementwise::Mish => ("mish", 1),
-        Elementwise::RealDiv => ("realdiv", 2),
-        Elementwise::Maximum => ("maximum", 2),
-        Elementwise::Minimum => ("minimum", 2),
+        Elementwise::Exp => (DeviceOp::Exp, 1),
+        Elementwise::Log => (DeviceOp::Log, 1),
+        Elementwise::Neg => (DeviceOp::Neg, 1),
+        Elementwise::Rsqrt => (DeviceOp::Rsqrt, 1),
+        Elementwise::Sqrt => (DeviceOp::Sqrt, 1),
+        Elementwise::Abs => (DeviceOp::Abs, 1),
+        Elementwise::Reciprocal => (DeviceOp::Reciprocal, 1),
+        Elementwise::Sigmoid => (DeviceOp::Sigmoid, 1),
+        Elementwise::Tanh => (DeviceOp::Tanh, 1),
+        Elementwise::Mish => (DeviceOp::Mish, 1),
+        Elementwise::RealDiv => (DeviceOp::RealDiv, 2),
+        Elementwise::Maximum => (DeviceOp::Maximum, 2),
+        Elementwise::Minimum => (DeviceOp::Minimum, 2),
         // The equality mask. `OpFunc::Equal` realizes as `EQUAL` into a BOOL state reg then
         // `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the wire-level result IS an fp16
         // 0.0/1.0 tensor — the same shape every pointwise here already emits, NOT a bool tile
         // needing a dtype lane of its own. NaN compares FALSE on the SFP unit, which is the
         // emulator's ordered `cmpf oeq` verbatim, so the numeric rung and the card compute the
         // same predicate. Used by the first-max sampler's one-hot selectors.
-        Elementwise::Equal => ("equal", 2),
+        Elementwise::Equal => (DeviceOp::Equal, 2),
         // ⛔ THE DDL HAS NO PRIMITIVE FOR THESE TWO, AND SUBSTITUTING THE NEAREST ONE IS THE BUG.
         // `QuickGelu` is x·σ(1.702x) and `GeluErf` is the exact-erf gelu — neither is
         // `OpFunc::Gelu`'s tanh polynomial, so emitting "gelu" for them would run a DIFFERENT
@@ -2223,7 +2224,8 @@ pub fn elementwise_df<T: crate::collective::Tp>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
-    let (op_func, arity) = elementwise_op_func(name, kind)?;
+    let (op, arity) = elementwise_op_func(name, kind)?;
+    let op_func = op.op_func();
     // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD: the dense arm below places row corners
     // per-operand (the windowed emission), so which operands are inputs is a fact about the
     // parameter list, not about how one arm addresses them. The arms that CANNOT carry a corner
@@ -2684,7 +2686,8 @@ fn elementwise_per_row<T: crate::collective::Tp>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
-    let (op_func, arity) = elementwise_op_func(name, kind)?;
+    let (op, arity) = elementwise_op_func(name, kind)?;
+    let op_func = op.op_func();
     // EVERY operand must be the same per-row shape — this is the dense path's law ([`pointwise_extents_agree`])
     // restated for the one-stick emission: the op computes lane 0 of every row of every operand.
     for (i, x) in ins.iter().enumerate() {
@@ -3706,6 +3709,19 @@ impl ConvertKind {
             ConvertKind::Fp32ToInt32 => "fp32toint32",
             ConvertKind::Int32ToFp32 => "int32tofp32",
             ConvertKind::Fp32ToDl16 => "fp32todl16",
+        }
+    }
+
+    /// The TYPED device op this convert is — the ONE key into the device-facts
+    /// table (`ktir_core::ddl_binds::DEVICE_OPS`), so the arrangement
+    /// propagation reads its row and never a string. A pure vocabulary
+    /// mapping: the convert's identity, restated in the table's key type.
+    pub fn device_op(self) -> ktir_core::ddl_binds::DeviceOp {
+        match self {
+            ConvertKind::Dl16ToFp32 => ktir_core::ddl_binds::DeviceOp::Dl16ToFp32,
+            ConvertKind::Fp32ToInt32 => ktir_core::ddl_binds::DeviceOp::Fp32ToInt32,
+            ConvertKind::Int32ToFp32 => ktir_core::ddl_binds::DeviceOp::Int32ToFp32,
+            ConvertKind::Fp32ToDl16 => ktir_core::ddl_binds::DeviceOp::Fp32ToDl16,
         }
     }
 
@@ -6356,7 +6372,8 @@ pub fn scalar_binary<T: crate::collective::Tp>(
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
-    let (op_func, _) = elementwise_op_func(name, e)?;
+    let (op, _) = elementwise_op_func(name, e)?;
+    let op_func = op.op_func();
     let x = ins[0];
     if x.c_start != 0 || out.c_start != 0 || x.r_start != 0 || out.r_start != 0 {
         return err(format!(
@@ -8979,7 +8996,10 @@ mod elementwise_tests {
         for k in Elementwise::ALL {
             match elementwise_op_func("probe", *k) {
                 Ok((key, arity)) => {
-                    assert!(!key.is_empty(), "{k:?} mapped to an empty op-func key");
+                    assert!(
+                        !key.op_func().is_empty(),
+                        "{k:?} mapped to an empty op-func key"
+                    );
                     assert!(
                         arity == 1 || arity == 2,
                         "{k:?} has arity {arity}; this emitter builds unary and binary pointwise \
@@ -9020,20 +9040,25 @@ mod elementwise_tests {
     fn the_four_original_kinds_keep_their_op_func_keys() {
         assert_eq!(
             elementwise_op_func("p", Elementwise::Silu).unwrap(),
-            ("silu", 1)
+            (DeviceOp::Silu, 1)
         );
         assert_eq!(
             elementwise_op_func("p", Elementwise::Gelu).unwrap(),
-            ("gelu", 1)
+            (DeviceOp::Gelu, 1)
         );
         assert_eq!(
             elementwise_op_func("p", Elementwise::Mul).unwrap(),
-            ("multiply", 2)
+            (DeviceOp::Multiply, 2)
         );
         assert_eq!(
             elementwise_op_func("p", Elementwise::Add).unwrap(),
-            ("add", 2)
+            (DeviceOp::Add, 2)
         );
+        // And the STRINGS those ops spell — the fingerprint's own bytes.
+        assert_eq!(DeviceOp::Silu.op_func(), "silu");
+        assert_eq!(DeviceOp::Gelu.op_func(), "gelu");
+        assert_eq!(DeviceOp::Multiply.op_func(), "multiply");
+        assert_eq!(DeviceOp::Add.op_func(), "add");
     }
 
     /// Every key in the table is a key `op_func_from_str` ACCEPTS — it panics on an unknown name, so
@@ -9044,7 +9069,7 @@ mod elementwise_tests {
         for k in Elementwise::ALL {
             if let Ok((key, _)) = elementwise_op_func("probe", *k) {
                 // Panics on an unrecognized key; reaching the assert means the key is in the table.
-                let f = crate::emit::op_func_from_str(key);
+                let f = crate::emit::op_func_from_str(key.op_func());
                 assert!(
                     !f.name().is_empty(),
                     "{k:?} → {key:?} has no dxp opFuncName"

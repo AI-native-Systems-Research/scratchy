@@ -11,7 +11,8 @@
 //!
 //! The stagger is NOT expressible as strides (it is a bit rotation of a sub-index), so it cannot
 //! ride a layout; it is a fact about the OPCODE, and a fact about an opcode is a TARGET-ABI CONST
-//! TABLE ROW (the in-place-kernels/write-bindings law): [`OP_OUTPUT_ARRANGEMENT`] maps an op-func
+//! TABLE ROW (the in-place-kernels/write-bindings law): the device-facts table's arrangement
+//! field ([`ktir_core::ddl_binds::DEVICE_OPS`]) maps each typed device op
 //! to the arrangement its output carries when both operands are standard, and the bake-side
 //! propagation ([`crate::emit::whole_function::staggered_sources`]) takes that table as INPUT —
 //! never logic of its own. Everything downstream is decided at expansion: the staged tables are
@@ -30,15 +31,11 @@
 /// [`crate::wiring::SampleSeat`]) as a field, so a consumer that stages or binds a buffer
 /// states the arrangement it stages — and the propagation's refusals (a staggered value meeting
 /// a standard one where order matters) fire at EXPANSION, which is a `cargo build` error.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ElementArrangement {
-    /// Logical lane `i` at buffer position `i` — every buffer the card's ops address unless a
-    /// table row says otherwise.
-    Standard,
-    /// Logical lane `4g + r` at buffer position `4·ror(g) + r` within each 64-element block —
-    /// the measured `dl16tofp32` output stagger ([`DL16TOFP32_PERMUTATION`]).
-    Dl16ToFp32,
-}
+///
+/// The enum lives in [`ktir_core::ddl_binds`] beside the device-facts table whose rows state
+/// which op's output carries which arrangement; this module keeps the measured permutation and
+/// the staging over it, and re-exports the type so this crate's paths stand.
+pub use ktir_core::ddl_binds::ElementArrangement;
 
 /// The 64-entry permutation: `PERMUTATION[i]` is the BUFFER POSITION logical lane `i` of a
 /// 64-element block occupies in a [`ElementArrangement::Dl16ToFp32`] buffer. A const table, not
@@ -63,29 +60,15 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
     table
 }
 
-/// ⭐ THE TARGET-ABI CONST TABLE — opcode → the arrangement the op's OUTPUT carries when both
-/// operands are addressed standard. The shared propagation takes this table as INPUT; it never
-/// decides an arrangement by logic of its own (the in-place-kernels/write-bindings law: target
-/// facts are const tables, never scattered match arms).
-///
-/// The `fp32todl16` row states the INVERSE stagger — the narrow-back permutes the same way
-/// round, mapping standard-order f32 words into staggered dl16 lanes. ⛔ NOT YET MEASURED as
-/// numbers: no producer this tree compiles emits the narrow-back, so the propagation refuses a
-/// program that would need its staging rather than guessing a table for it. The row exists so
-/// the ABI fact is stated where the ABI facts live; the day a card probe measures it, the
-/// refusal is replaced by the measured table and nothing else moves.
-pub const OP_OUTPUT_ARRANGEMENT: &[(&str, ElementArrangement)] =
-    &[("dl16tofp32", ElementArrangement::Dl16ToFp32)];
-
-/// The arrangement an op-func's output carries, or `None` when the op-func is not in the table
-/// (an op not in the table addresses its operands and output standard — the default every
-/// buffer starts from). ONE lookup, straight off the const table.
-pub fn output_arrangement_of(op_func: &str) -> Option<ElementArrangement> {
-    OP_OUTPUT_ARRANGEMENT
-        .iter()
-        .find(|(op, _)| *op == op_func)
-        .map(|(_, arrangement)| *arrangement)
-}
+// ⭐ THE ARRANGEMENT FACT'S HOME — [`ktir_core::ddl_binds::DEVICE_OPS`]: each row states the
+// arrangement its op's output carries when both operands are addressed standard, and
+// [`ktir_core::ddl_binds::output_arrangement`] is the ONE lookup. The shared propagation takes
+// that table as INPUT; it never decides an arrangement by logic of its own
+// (the in-place-kernels/write-bindings law: target facts are const tables, never scattered
+// match arms). The `fp32todl16` inverse stagger is NOT YET MEASURED: no producer this tree
+// compiles emits the narrow-back, so the propagation refuses a program that would need its
+// staging rather than guessing a row for it; the day a card probe measures it, the row's
+// arrangement field is the one thing that moves.
 
 /// Stage a logical-order f32 word stream into its [`ElementArrangement::Dl16ToFp32`] buffer
 /// order: lane `i` of each 64-word block is written at `DL16TOFP32_PERMUTATION[i]`. The ONE
