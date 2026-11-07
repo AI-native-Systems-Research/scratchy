@@ -11603,7 +11603,7 @@ fn dump_wavefront_mega(
             decode_bounds,
             &bridge,
             crate::to_wavefront::PrefixCapacity::new(cap),
-            primary_m,
+            crate::to_wavefront::QueryRows::of_count(primary_m),
         )
     };
     #[cfg_attr(not(feature = "spyre"), allow(unused_mut))]
@@ -13817,7 +13817,7 @@ fn dump_wavefront_mega(
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
-                    primary_m,
+                    crate::to_wavefront::QueryRows::of_count(primary_m),
                 ) {
                     Ok(l) => l,
                     Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
@@ -13874,17 +13874,23 @@ fn dump_wavefront_mega(
             // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
             // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
             // free here: `decode_rung_lits` sorts the ladder by width before baking it.
-            for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS
-                .into_iter()
-                .rev()
-            {
+            //
+            // ⭐ EACH RUNG IS A TYPE. The walk names every batch rung as a `Rung<MQ>` and hands out
+            // its `DecodeRung`, widest first; the rung's rows reach the bridge as `QueryRows`
+            // (`lower_decode_to_wavefront`, which sets the bundle's `num_tokens` from them). The
+            // number leaves the type once more, as `seqs`, for the bake's bundle names, messages and
+            // ladder keys, which are numbers.
+            scratchy_subtile::sdsc_abstract::each_batch_rung_widest_first(|rung| {
+                let rows = crate::to_wavefront::QueryRows::of_nonzero(rung.rows());
+                // The rung's rows as the number the bake's bundle names and ladder keys state.
+                let seqs = rows.get();
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     inferred,
                     decode_bounds,
                     &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                    seqs,
+                    rows,
                 ) {
                     Ok(lwd_b) => {
                         emit_bundle(
@@ -13932,7 +13938,7 @@ fn dump_wavefront_mega(
                          batch silently runs elsewhere"
                     ),
                 }
-            }
+            });
         }
         // SuperDSC replaces the sengraph ENTIRELY: `emit_bundle` above baked the work-divided dxp bundle
         // and set `superdsc_fp`, but the SENGRAPH decode lowering is REFUSED for granite (the lm_head
@@ -14210,7 +14216,7 @@ fn dump_wavefront_mega(
                 // keeps 0 prefix rows so the prompt still attends only itself
                 // causally, and chunk k attends the k*mq rows written so far.
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                pl,
+                crate::to_wavefront::QueryRows::of_count(pl),
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -14359,7 +14365,7 @@ fn dump_wavefront_mega(
                     decode_bounds,
                     &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                    m,
+                    crate::to_wavefront::QueryRows::of_count(m),
                 ) {
                     Ok(lwd_p) => {
                         emit_bundle(
@@ -14530,7 +14536,7 @@ fn dump_wavefront_mega(
                 decode_bounds,
                 &bridge,
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                decode_mq,
+                crate::to_wavefront::QueryRows::of_count(decode_mq),
             ) {
                 Ok(lwd_cb) => {
                     let (_m, _n, sg, groups) = emit_bundle(
@@ -15120,7 +15126,7 @@ pub fn emit_model(
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
-                    wp.num_tokens as u32,
+                    crate::to_wavefront::QueryRows::of_count(wp.num_tokens as u32),
                 )
                 .ok()
             });
@@ -15215,7 +15221,7 @@ pub fn emit_model(
                 &bounds,
                 &bridge_model,
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
-                wp.num_tokens as u32,
+                crate::to_wavefront::QueryRows::of_count(wp.num_tokens as u32),
             ) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
@@ -15503,7 +15509,7 @@ pub fn emit_model(
             &bounds,
             &bridge_model,
             prefix,
-            m as u32,
+            crate::to_wavefront::QueryRows::of_count(m as u32),
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
