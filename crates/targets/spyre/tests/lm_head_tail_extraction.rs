@@ -169,9 +169,13 @@ fn run_tail(
     extra_out: &[u64],
 ) -> (Vec<f32>, Vec<f32>) {
     let weight_ids = std::collections::HashSet::new();
-    let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-            .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
+    let (ops, _layout) = superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+        ir,
+        &weight_ids,
+        superdsc::ActiveCap::FULL,
+        false,
+    )
+    .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     // The window is stated EXPLICITLY: this hand-lowered test graph minted no LX
     // pins, so the budget its fused segments run under is zero (auditor ruling
     // 2026-10-27 — a program without a stated window is refused, never silently
@@ -224,9 +228,13 @@ fn the_prefill_lm_head_tail_extracts_the_last_row() {
 
     // The fold must have fired: lower and check for the lmlast program.
     let weight_ids = std::collections::HashSet::new();
-    let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-            .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
+    let (ops, _layout) = superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        superdsc::ActiveCap::FULL,
+        false,
+    )
+    .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     let lmlast: Vec<&str> = ops
         .iter()
         .filter_map(|e| e.ktir.as_ref().map(|k| k.func.name))
@@ -324,9 +332,13 @@ fn the_tail_at_m1_still_matches_the_reference() {
     let golden = bufs[ir.result.index()].clone();
 
     let weight_ids = std::collections::HashSet::new();
-    let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-            .unwrap_or_else(|e| panic!("lower the m=1 tail: {e:?}"));
+    let (ops, _layout) = superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        superdsc::ActiveCap::FULL,
+        false,
+    )
+    .unwrap_or_else(|e| panic!("lower the m=1 tail: {e:?}"));
     let lmlast: Vec<&str> = ops
         .iter()
         .filter_map(|e| e.ktir.as_ref().map(|k| k.func.name))
@@ -438,9 +450,13 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
     // The fold must NOT fire: the q matmul's width collides with the result's,
     // but its chain to the result passes through RoPE.
     let weight_ids = std::collections::HashSet::new();
-    let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-            .unwrap_or_else(|e| panic!("lower the collision graph: {e:?}"));
+    let (ops, _layout) = superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        superdsc::ActiveCap::FULL,
+        false,
+    )
+    .unwrap_or_else(|e| panic!("lower the collision graph: {e:?}"));
     let lmlast: Vec<&str> = ops
         .iter()
         .filter_map(|e| e.ktir.as_ref().map(|k| k.func.name))

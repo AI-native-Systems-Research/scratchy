@@ -64,7 +64,9 @@ fn layout_placing(entries: &[(u32, u64)]) -> BundleLayout {
 
 /// The panic text out of a refused build — the assemblers panic with `format!`ed refusal
 /// messages, so the refusal is observable as the payload.
-fn refused(r: Result<EmittedOp, Box<dyn std::any::Any + Send>>) -> String {
+fn refused(
+    r: Result<EmittedOp<ktir_superdsc::collective::TpWorld<1>>, Box<dyn std::any::Any + Send>>,
+) -> String {
     let payload = match r {
         Ok(_) => panic!("the build was accepted — the refusal under test did not fire"),
         Err(p) => p,
@@ -85,7 +87,7 @@ fn kt_2d(
     o: &Stk<RowBlockedTag>,
     out_off: DevOff,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let mut sym = 0i64;
     assemble_restickify_kt_2d(
         "rk_test",
@@ -176,7 +178,7 @@ fn the_last_slots_convert_fits_exactly_through_the_column_door() {
     let (cl, afp8) = (rbl("cl", m, cl_reach), rb_df("afp8", m, k_pad, Df::Fp8));
     let mut sym = 0i64;
     for s in 0..pairs {
-        let op = assemble_convert_col(
+        let op = assemble_convert_col::<ktir_superdsc::collective::TpWorld<1>>(
             &format!("fq_p{s}_op"),
             "qfp8ch",
             m,
@@ -245,7 +247,7 @@ fn an_fp16_annotated_fp8_output_overstates_its_window_and_refuses() {
         rbl("t9", m, k_pad),
     );
     let mut sym = 0i64;
-    let built = assemble_convert_col(
+    let built = assemble_convert_col::<ktir_superdsc::collective::TpWorld<1>>(
         "fq_df",
         "qfp8ch",
         m,
@@ -291,7 +293,9 @@ fn an_fp16_annotated_fp8_output_overstates_its_window_and_refuses() {
 fn a_whole_tensor_convert_past_its_handle_refuses() {
     let (act, afp8) = (rbl("act", 1, 128), rb_df("afp8", 1, 128, Df::Fp8));
     let mut sym = 0i64;
-    let built = assemble_convert("fq", "qfp8ch", 1, 128, &act, &afp8, &mut sym, None);
+    let built = assemble_convert::<ktir_superdsc::collective::TpWorld<1>>(
+        "fq", "qfp8ch", 1, 128, &act, &afp8, &mut sym, None,
+    );
     assert!(built.op.is_some(), "the true handles build — the control");
 
     let small = rbl("act", 1, 64);
@@ -313,7 +317,7 @@ fn a_whole_tensor_convert_past_its_handle_refuses() {
 #[test]
 fn a_transpose_over_a_handle_smaller_than_its_view_refuses() {
     let mut sym = 0i64;
-    let built = try_assemble_restickify_transpose_2d(
+    let built = try_assemble_restickify_transpose_2d::<ktir_superdsc::collective::TpWorld<1>>(
         "tr",
         128,
         128,
@@ -325,7 +329,7 @@ fn a_transpose_over_a_handle_smaller_than_its_view_refuses() {
     assert!(built.is_ok(), "the true handles emit — the control");
 
     let mut sym = 0i64;
-    let err = match try_assemble_restickify_transpose_2d(
+    let err = match try_assemble_restickify_transpose_2d::<ktir_superdsc::collective::TpWorld<1>>(
         "tr",
         128,
         128,

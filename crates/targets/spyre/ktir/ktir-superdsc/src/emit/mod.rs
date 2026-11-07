@@ -1182,7 +1182,7 @@ fn sfp_rank1_opspec(
 }
 
 /// [`sfp_rank1_opspec`] → [`EmittedOp`].
-pub fn assemble_sfp_rank1(
+pub fn assemble_sfp_rank1<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &'static str,
     stick_elems: u32,
@@ -1190,7 +1190,7 @@ pub fn assemble_sfp_rank1(
     out_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let op = sfp_rank1_opspec(op_func_from_str(op_func), stick_elems, in_name, out_name)
         .unwrap_or_else(|e| panic!("assemble_sfp_rank1 {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -1199,7 +1199,7 @@ pub fn assemble_sfp_rank1(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast(
+pub fn assemble_pointwise_broadcast<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &'static str,
     // TYPED row/width slots, same contract as `assemble_pointwise_broadcast_off`: every caller
@@ -1210,7 +1210,7 @@ pub fn assemble_pointwise_broadcast(
     o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // RowBlocked output ⇒ residual token stream (not head-major). head_major is derived from the type.
     assemble_pointwise_broadcast_off(
         op_name,
@@ -1231,7 +1231,7 @@ pub fn assemble_pointwise_broadcast(
 /// heads/head·rows, NOT the residual token count). Byte-identical to the plain assembler on the
 /// OFF path; on the ON path it keeps the attention path rank-3 (the fix targets residual ops only).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast_hm(
+pub fn assemble_pointwise_broadcast_hm<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &'static str,
     // TYPED row/width slots — the head-major caller states its own row structure through the doors
@@ -1242,7 +1242,7 @@ pub fn assemble_pointwise_broadcast_hm(
     o: &Stk<FlatTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // Flat output ⇒ head-major (per-head attention) op; the builder derives head_major from the type.
     assemble_pointwise_broadcast_off(
         op_name,
@@ -1338,11 +1338,11 @@ pub struct PointwiseGather<'a, O: KindTag> {
 /// and no relayout. The body carries the three card measurements that fixed that shape: what the
 /// un-cut op did (`ids[r mod 32]`), what a row-major destination does (a PCIe bus fence), and which
 /// wire field the window's stick-plane stride actually comes from (`N_`, not `maxDimSizes_`).
-pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
+pub fn assemble_pointwise_broadcast_gather<T: crate::collective::Tp, O: KindTag>(
     g: PointwiseGather<'_, O>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, SuperDscError> {
+) -> Result<Vec<EmittedOp<T>>, SuperDscError> {
     let PointwiseGather {
         op_name,
         tile_op,
@@ -1520,7 +1520,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         ))
     })?;
     let legs = rows.div_ceil(rows_per_op);
-    let mut ops: Vec<EmittedOp> = Vec::with_capacity(legs as usize);
+    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(legs as usize);
     let mut first_row = 0u32;
     for k in 0..legs {
         // The LAST leg may be SHORT, and a short index run is the vendor's own shape — both fixtures
@@ -1596,11 +1596,11 @@ struct GatherLeg<'a> {
     head_major: bool,
 }
 
-fn one_gathered_leg(
+fn one_gathered_leg<T: crate::collective::Tp>(
     leg: GatherLeg<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, SuperDscError> {
+) -> Result<EmittedOp<T>, SuperDscError> {
     let GatherLeg {
         op_name,
         leg_name,
@@ -2061,7 +2061,7 @@ fn note_lx_touches(
 /// [`assemble_pointwise_broadcast`] that writes the output to a COLUMN-BLOCK OFFSET
 /// (`out_offset` elements into the output tensor) — see [`pointwise_chunk_out_offset`].
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast_off<O: KindTag>(
+pub fn assemble_pointwise_broadcast_off<T: crate::collective::Tp, O: KindTag>(
     op_name: &str,
     op_func: &'static str,
     // TYPED row/width slots. Every caller states WHICH row quantity (`RowCount`'s doors: mask rows,
@@ -2083,7 +2083,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
     out_offset: impl Into<crate::addr::OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     assemble_pointwise_broadcast_divided(
         PointwiseDivided {
             op_name,
@@ -2125,11 +2125,11 @@ pub struct PointwiseDivided<'a, O: KindTag> {
 ///     torch-spyre emits, and torch-spyre divides every elementwise op rows-first, so it is stated under
 ///     [`crate::work::EwDivision::RowsFirst`]. The law, measured faster on card, ships a different division
 ///     for the same shape.
-pub fn assemble_pointwise_broadcast_divided<O: KindTag>(
+pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag>(
     p: PointwiseDivided<'_, O>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let PointwiseDivided {
         op_name,
         op_func,
@@ -2202,7 +2202,7 @@ pub fn assemble_pointwise_broadcast_divided<O: KindTag>(
 /// fp32 elementwise (the torch-spyre RMSNorm island): every operand IEEE_FP32 (`df`), whole-tensor,
 /// non-head-major. Callers must upcast ALL operands via `dl16tofp32` first (no mixed [fp16,fp32] op).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast_df(
+pub fn assemble_pointwise_broadcast_df<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &'static str,
     rows: u32,
@@ -2212,7 +2212,7 @@ pub fn assemble_pointwise_broadcast_df(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // head_major=TRUE ⇒ rank-3 flat (NOT rank-2 stick-major). The fp32 rmsnorm island runs FLAT so it
     // agrees with the fp16↔fp32 converts (which MUST be rank-3 — the narrowing convert crashes dxp in
     // rank-2). Consistent flat inside the island; only the x-read / out-write boundaries touch RowBlocked.
@@ -2236,7 +2236,7 @@ pub fn assemble_pointwise_broadcast_df(
 
 /// The broadcast gate probe (`mul(x[full], v[out-broadcast])`) via the general
 /// [`assemble_pointwise_broadcast`] — kept for the on-card de-risk dump.
-pub fn assemble_broadcast_mul_gate(
+pub fn assemble_broadcast_mul_gate<T: crate::collective::Tp>(
     op_name: &str,
     // TYPED like every pointwise row/width slot: the probe's caller states what its tensor's rows
     // and columns are.
@@ -2245,7 +2245,7 @@ pub fn assemble_broadcast_mul_gate(
     x_name: &str,
     v_name: &str,
     o_name: &str,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let mut sym = 0i64;
     // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: x and the output are the probe's own
     // `[rows, cols]` tensors, and v is the `[rows, one-stick]` column the out-broadcast read sweeps
@@ -2279,13 +2279,13 @@ pub fn assemble_broadcast_mul_gate(
 /// offsets 0 and `half`. Tests whether dxp accepts an operand whose AllocNode
 /// `startAddr` is OFFSET into a tensor (the `.with_offset` feature). If it compiles,
 /// RoPE composes as multiplies/adds over half-slices (no shuffle). NOT in the walk.
-pub fn assemble_slice_add_gate(
+pub fn assemble_slice_add_gate<T: crate::collective::Tp>(
     op_name: &str,
     rows: u32,
     half: u32,
     x_name: &str,
     o_name: &str,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let op = slice_add_gate_opspec(rows, half, x_name, o_name)
         .unwrap_or_else(|e| panic!("assemble_slice_add_gate {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -2552,7 +2552,7 @@ pub fn touched_blocks(v: &crate::superdsc_opspec::ArgView, iter: &WorkPlan) -> T
 }
 
 #[derive(Clone)]
-pub struct EmittedOp {
+pub struct EmittedOp<T: crate::collective::Tp> {
     pub op_name: String,
     /// The SuperDSC descriptor, when this op has one.
     ///
@@ -2658,6 +2658,12 @@ pub struct EmittedOp {
     /// (no shift, since prefill `slot_pos == 0`). Decode cachewr (same slot) leaves this
     /// `false` and keeps the fused-`Slot` launch reduction. Default `false`.
     pub slot_no_fuse: bool,
+    /// ⭐ `Some` iff this op is part of a COLLECTIVE'S CONSUME — classified `GroupKind::TpConsume`:
+    /// the consume's ops are ONE launch group of their own, which the bundle's CB pipeline precedes
+    /// with this rank's send (the F-send the consume names) and the wait for the peer's. Never fused
+    /// with anything but the same consume: the send and the wait belong to exactly this launch.
+    /// Default `None`.
+    pub tp_consume: Option<crate::collective::TpConsume<T>>,
     /// HOST KV-CACHE WRITE (Route B). Set on ONE op per `AttnDecode` (the first cachewr).
     /// The shim does NOT run this op's program (nor the next [`kv_n_skip`] on-card cachewr
     /// copies): instead it host-scatters this token's roped K into the resident K cache in the
@@ -2681,7 +2687,7 @@ pub struct EmittedOp {
     pub kv_cap: u32,
 }
 
-impl EmittedOp {
+impl<T: crate::collective::Tp> EmittedOp<T> {
     /// The SuperDSC descriptor this op was built from.
     ///
     /// ⛔ THE SuperDSC PATH REQUIRES ONE, AND SAYS SO. Everything that reads a descriptor reads a
@@ -2733,7 +2739,7 @@ impl EmittedOp {
     /// This op with every HBM tensor it places in `segment` read `bytes` further in — the shift a
     /// relaunch of its group applies to that segment's base, made at compile time. LX tensors and
     /// every other segment keep their addresses.
-    pub fn shifted_in_segment(&self, segment: usize, bytes: u64) -> EmittedOp {
+    pub fn shifted_in_segment(&self, segment: usize, bytes: u64) -> EmittedOp<T> {
         let mut e = self.clone();
         let size = crate::wire::SEGMENT_SIZE;
         let Some(window) = crate::wire::SEGMENT_OFFSETS
@@ -2769,7 +2775,7 @@ impl EmittedOp {
     /// ⛔ EVERY OTHER FIELD IS THE SuperDSC DESCRIPTOR'S. `arg_bindings`, `affine_strides`, the
     /// `slot_stride_bytes` / `kv_*` classification — all of it is baked addressing and folds, which
     /// have no KTIR counterpart. A KTIR op is its func and the tensors its parameters carry.
-    pub fn bare(op_name: String) -> EmittedOp {
+    pub fn bare(op_name: String) -> EmittedOp<T> {
         EmittedOp {
             op_name,
             op: None,
@@ -2781,6 +2787,7 @@ impl EmittedOp {
             slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,
+            tp_consume: None,
             kv_page_fold: false,
             walk: None,
             kv_batched_requests: false,
@@ -2804,7 +2811,7 @@ impl EmittedOp {
 
     /// A by-value copy, for building a trimmed op list (see `ops_for_grouping`). `EmittedOp` is not
     /// `Clone` by design — copies of a baked op are almost always a mistake — so this is explicit.
-    pub fn shallow_copy(&self) -> EmittedOp {
+    pub fn shallow_copy(&self) -> EmittedOp<T> {
         EmittedOp {
             op_name: self.op_name.clone(),
             op: self.op.clone(),
@@ -2824,6 +2831,7 @@ impl EmittedOp {
             slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
             slot_no_fuse: self.slot_no_fuse,
+            tp_consume: self.tp_consume,
             host_kv_write: self.host_kv_write,
             kv_n_skip: self.kv_n_skip,
             kv_new_k_tid: self.kv_new_k_tid,
@@ -2853,7 +2861,7 @@ impl EmittedOp {
         iter: &WorkPlan,
         time: u32,
         affine_strides: Vec<BTreeMap<&'static str, i64>>,
-    ) -> EmittedOp {
+    ) -> EmittedOp<T> {
         if time > 1 {
             for dsc_map in &op.dscs_ {
                 for dsc in dsc_map.values() {
@@ -2903,6 +2911,7 @@ impl EmittedOp {
             slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,
+            tp_consume: None,
             host_kv_write: false,
             kv_n_skip: 0,
             kv_new_k_tid: 0,
@@ -2928,13 +2937,13 @@ impl EmittedOp {
 /// whole bundle: this op's first tiled symbol is `-(sym_id_base+1)`, and the
 /// returned `EmittedOp` consumed `next_sym_id - sym_id_base` ids. Threaded by the
 /// walk so negative ids are globally unique across ops (design risk #1).
-pub fn emit_sdsc_tiled(
+pub fn emit_sdsc_tiled<T: crate::collective::Tp>(
     op_name: &str,
     op: &OpSpec,
     folds: &SdscFoldSet,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, SuperDscError> {
+) -> Result<EmittedOp<T>, SuperDscError> {
     // Every op kind passes the residency consult here, not only the pointwise door — a byte-identical
     // no-op for an op that names no LX-pinned tensor.
     let marked;
@@ -2972,14 +2981,14 @@ pub fn emit_sdsc_tiled(
 ///   * compute `affine_strides` ({out: per_iter_out_elems * device_stride_out *
 ///     2}) for the tiled W/O tensors, `{}` for INPUT/LX, and register the base
 ///     symbols. Returns the validated [`EmittedOp`] (SymbolicWhenTiled).
-fn rewrite_op_for_time_tile(
+fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
     op_name: &str,
     op: &OpSpec,
     folds: &SdscFoldSet,
     mut inner: SdscOp,
     time: u32,
     sym_id_base: &mut i64,
-) -> Result<EmittedOp, SuperDscError> {
+) -> Result<EmittedOp<T>, SuperDscError> {
     let tiled_dim = op
         .time_tile
         .as_ref()
@@ -4882,7 +4891,7 @@ impl<'a, K: KindTag> In<'a, K> {
 /// flows from whatever produced `a`; the output `o`'s kind drives head_major (see
 /// [`assemble_pointwise_broadcast_off`]). Byte-identical to the slice builder (it IS the slice builder).
 #[allow(clippy::too_many_arguments)]
-pub fn pw1<A: KindTag, O: KindTag>(
+pub fn pw1<T: crate::collective::Tp, A: KindTag, O: KindTag>(
     op_name: &str,
     op_func: &'static str,
     // TYPED row/width slots — the handle-flow entry point demands the same named-door quantities
@@ -4893,7 +4902,7 @@ pub fn pw1<A: KindTag, O: KindTag>(
     o: &Stk<O>,
     sym: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     assemble_pointwise_broadcast_off(
         op_name,
         op_func,
@@ -4909,7 +4918,7 @@ pub fn pw1<A: KindTag, O: KindTag>(
 
 /// Two-input pointwise `o = f(a, b)` with TYPED handles — each input carries its own kind.
 #[allow(clippy::too_many_arguments)]
-pub fn pw2<A: KindTag, B: KindTag, O: KindTag>(
+pub fn pw2<T: crate::collective::Tp, A: KindTag, B: KindTag, O: KindTag>(
     op_name: &str,
     op_func: &'static str,
     // TYPED row/width slots — same contract as `pw1`.
@@ -4920,7 +4929,7 @@ pub fn pw2<A: KindTag, B: KindTag, O: KindTag>(
     o: &Stk<O>,
     sym: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     assemble_pointwise_broadcast_off(
         op_name,
         op_func,
@@ -5116,7 +5125,7 @@ fn convert_opspec(
 /// Assemble a dtype-convert op (see [`convert_opspec`]). Emit-time panic on a malformed spec = a `cargo build`
 /// error (guard-every-crash), same as the other `assemble_*`.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_convert(
+pub fn assemble_convert<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &str,
     rows: u32,
@@ -5125,7 +5134,7 @@ pub fn assemble_convert(
     o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // TYPED: a dtype-convert's input and output are both the RowBlocked token stream (only the df
     // changes — fp16→fp32 / fp16→fp8); the handle carries only `.name()`, so the emit is byte-identical.
     //
@@ -5168,7 +5177,7 @@ pub fn assemble_convert(
 /// there is no convert door left that takes an offset no nest minted. Emit-time panic on a
 /// malformed spec = a `cargo build` error (guard-every-crash), same as the other `assemble_*`.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_convert_col(
+pub fn assemble_convert_col<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &str,
     rows: u32,
@@ -5179,7 +5188,7 @@ pub fn assemble_convert_col(
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // TYPED, same as `assemble_convert`: both operands are the RowBlocked token stream and the
     // handles carry only `.name()` — the offsets ride the args, not the handles.
     //
@@ -5219,7 +5228,7 @@ pub fn assemble_convert_col(
 /// Assemble a complete SuperDSC for ONE shape-preserving ELEMENTWISE op over a
 /// `[rows, cols]` tile: `op_func` ∈ {"add","multiply","silu",…} (sfp unit), via
 /// the typed [`pointwise_opspec`] builder + [`emit_sdsc`].
-pub fn assemble_pointwise(
+pub fn assemble_pointwise<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &'static str,
     rows: u32,
@@ -5227,7 +5236,7 @@ pub fn assemble_pointwise(
     in_names: &[&str],
     o_name: &str,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let mut sym_id_base: i64 = 0;
     assemble_pointwise_seeded(
         op_name,
@@ -5243,7 +5252,7 @@ pub fn assemble_pointwise(
 
 /// [`assemble_pointwise`] with an explicit running symbol-id counter (risk #1).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_seeded(
+pub fn assemble_pointwise_seeded<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &'static str,
     rows: u32,
@@ -5252,7 +5261,7 @@ pub fn assemble_pointwise_seeded(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // head_major=false: every `assemble_pointwise_seeded` caller is a whole-tensor residual op
     // (MLP / fp8 quant / elementwise), so it is eligible for the stick-major m>1 seam fix.
     let op = pointwise_opspec(
@@ -5501,7 +5510,7 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
 
 /// Assemble a complete SuperDSC `interslicetranspose_fp16` transposing `in_name`
 /// `[mb,out]` → `o_name` `[out,mb]`.
-pub fn assemble_transpose(
+pub fn assemble_transpose<T: crate::collective::Tp>(
     op_name: &str,
     mb: u32,
     out: u32,
@@ -5509,7 +5518,7 @@ pub fn assemble_transpose(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     try_assemble_transpose(op_name, mb, out, in_name, o_name, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_transpose {op_name}: {e}"))
 }
@@ -5526,7 +5535,7 @@ pub fn assemble_transpose(
 /// divisions, so its guard is a net and not a reachable refusal.) So the fallible form exists and the
 /// door uses it; `assemble_transpose` keeps its signature and its panic for every existing caller.
 #[allow(clippy::too_many_arguments)]
-pub fn try_assemble_transpose(
+pub fn try_assemble_transpose<T: crate::collective::Tp>(
     op_name: &str,
     mb: u32,
     out: u32,
@@ -5534,7 +5543,7 @@ pub fn try_assemble_transpose(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = transpose_opspec(mb, out, in_name, o_name)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
@@ -5581,7 +5590,7 @@ mod transpose_tests {
     const MB: u32 = 256;
 
     /// The `dscs_[0]` entry of an emitted op, by name.
-    fn dsc(op: &EmittedOp, name: &str) -> Dsc {
+    fn dsc(op: &EmittedOp<crate::collective::TpWorld<1>>, name: &str) -> Dsc {
         op.op
             .as_ref()
             .expect("a transpose emits a descriptor")
@@ -5876,7 +5885,9 @@ mod transpose_tests {
         }
     }
 
-    fn lower_transpose(k: &KtirNode) -> Result<Vec<EmittedOp>, lower_ktir_to_superdsc::Error> {
+    fn lower_transpose(
+        k: &KtirNode,
+    ) -> Result<Vec<EmittedOp<crate::collective::TpWorld<1>>>, lower_ktir_to_superdsc::Error> {
         let mut sid = 0i64;
         let r = lower_ktir_to_superdsc::regions(k)?;
         lower_ktir_to_superdsc::transpose(k.func.name, &r, &mut sid, None)
@@ -6418,7 +6429,7 @@ fn topk_opspec(
 
 /// [`topk_opspec`] assembled — the `#[forward]` form, for callers inside an expansion where a
 /// refusal IS the build error. Door arms that can name their own blame use [`try_assemble_topk`].
-pub fn assemble_topk(
+pub fn assemble_topk<T: crate::collective::Tp>(
     op_name: &str,
     member: OpFunc,
     geom: TopKGeom,
@@ -6426,14 +6437,14 @@ pub fn assemble_topk(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     try_assemble_topk(op_name, member, geom, in_name, o_name, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_topk {op_name}: {e}"))
 }
 
 /// [`assemble_topk`] AS A `Result` — the form a door arm needs, so a refusal names the producer's
 /// own op instead of panicking inside the expansion (the `try_assemble_transpose` law).
-pub fn try_assemble_topk(
+pub fn try_assemble_topk<T: crate::collective::Tp>(
     op_name: &str,
     member: OpFunc,
     geom: TopKGeom,
@@ -6441,7 +6452,7 @@ pub fn try_assemble_topk(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = topk_opspec(member, geom, in_name, o_name)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
@@ -6563,7 +6574,7 @@ fn restickify_kt_opspec_2d(
 /// scratch into the next intermediate's bytes, read back as keys with a clean bake — is a `cargo
 /// build` failure at this door instead.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_restickify_kt_2d(
+pub fn assemble_restickify_kt_2d<T: crate::collective::Tp>(
     op_name: &str,
     slots: crate::sdsc_abstract::KtTileSlots,
     feats: crate::sdsc_abstract::KtTileFeats,
@@ -6573,7 +6584,7 @@ pub fn assemble_restickify_kt_2d(
     out_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let in_off = in_off.into_raw_elems();
     let out_off = out_off.into_raw_elems();
     // THE TILE'S FLAT RUN — the element range each side touches. Not `[slots, feats]` as a strided
@@ -6778,14 +6789,14 @@ pub(crate) fn restickify_transpose_opspec_batched(
 
 /// [`restickify_transpose_opspec_batched`] assembled over whole buffers, each side minted at its
 /// `batch` blocks' flat run.
-pub fn try_assemble_restickify_transpose_batched(
+pub fn try_assemble_restickify_transpose_batched<T: crate::collective::Tp>(
     op_name: &str,
     batch: u32,
     (rows, cols): (u32, u32),
     (in_, o): (&Stk<RowBlockedTag>, &Stk<RowBlockedTag>),
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let run = batch * rows * cols;
     mint_full_window(
         &format!("{op_name}: operand '{}'", in_.name()),
@@ -6818,7 +6829,7 @@ pub fn try_assemble_restickify_transpose_batched(
 /// many elements. The placement half is the new fact: a view can be whole while the reservation
 /// behind its name is smaller ("512 reserved against 2048 declared"), which is a clean-bake
 /// overrun into the next tensor's bytes, and it refuses here instead.
-pub fn try_assemble_restickify_transpose_2d(
+pub fn try_assemble_restickify_transpose_2d<T: crate::collective::Tp>(
     op_name: &str,
     rows: u32,
     cols: u32,
@@ -6826,7 +6837,7 @@ pub fn try_assemble_restickify_transpose_2d(
     o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     try_assemble_restickify_transpose_2d_at(
         op_name,
         rows,
@@ -6873,7 +6884,7 @@ impl<'a> RestickifySide<'a> {
 /// states the PLACEMENT's extents — for the chain that is `[width·(cols + 1), rows]`, the
 /// sentinel's reserved zero row inside the accounted extent — while the WINDOW minted is the real
 /// `[cols, rows]` transpose, exactly as the whole-buffer form mints it.
-pub fn try_assemble_restickify_transpose_2d_at(
+pub fn try_assemble_restickify_transpose_2d_at<T: crate::collective::Tp>(
     op_name: &str,
     rows: u32,
     cols: u32,
@@ -6881,7 +6892,7 @@ pub fn try_assemble_restickify_transpose_2d_at(
     o: RestickifySide<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     mint_full_window(
         &format!("{op_name}: operand '{}'", in_.h.name()),
         in_.h,
@@ -7530,7 +7541,7 @@ mod gather_cut {
     /// table LAST (the one position at which `attach_gather_index`'s insert and dbo's dominance
     /// requirement coincide). `layout: None` is this crate's unit-test arm, so addresses come from the
     /// per-arg segment fallback — inert for every property below, which are all DIFFERENCES.
-    fn legs(rows: u32) -> Vec<EmittedOp> {
+    fn legs(rows: u32) -> Vec<EmittedOp<crate::collective::TpWorld<1>>> {
         // TRUE shapes, not `rbo` lies: the mint in `pointwise_broadcast_opspec_from_tile` (and the
         // gather door's output mint) checks every swept window against the handle's declared shape,
         // so the table and output are declared at the node's own `[rows, 4096]` — embedding_granite's
@@ -7561,7 +7572,7 @@ mod gather_cut {
     }
 
     /// The `dscs_[0]` body of an emitted leg.
-    fn body(op: &EmittedOp) -> &crate::wire::Dsc {
+    fn body(op: &EmittedOp<crate::collective::TpWorld<1>>) -> &crate::wire::Dsc {
         op.op
             .as_ref()
             .expect("a gather leg carries a descriptor")
@@ -7573,7 +7584,7 @@ mod gather_cut {
 
     /// The per-core start addresses of operand `lds` of a leg, lowest first. Operand order is
     /// `[scale, table, index, output]` — the index is INSERTED before the output, so the output is 3.
-    fn starts(op: &EmittedOp, lds: u32) -> Vec<u64> {
+    fn starts(op: &EmittedOp<crate::collective::TpWorld<1>>, lds: u32) -> Vec<u64> {
         let node = body(op)
             .scheduleTree_
             .iter()
@@ -7739,7 +7750,7 @@ mod gather_cut {
         let ins = [In::scalar(&scale).ew(), In::full(&table).ew()];
         let two = tile(cap() * 2);
         let mut sid = 0i64;
-        let e = match one_gathered_leg(
+        let e = match one_gathered_leg::<crate::collective::TpWorld<1>>(
             GatherLeg {
                 op_name: "scalarmul_o2",
                 leg_name: "scalarmul_o2_g0",
@@ -7772,7 +7783,7 @@ mod gather_cut {
         let one = tile(cap());
         let mut sid = 0i64;
         assert!(
-            one_gathered_leg(
+            one_gathered_leg::<crate::collective::TpWorld<1>>(
                 GatherLeg {
                     op_name: "scalarmul_o2",
                     leg_name: "scalarmul_o2_g0",
@@ -7954,7 +7965,7 @@ mod time_tiled_broadcast_operand_is_address_stable {
     const COLS: u32 = 262144;
 
     /// The failing op itself, verbatim: `tscdiv` = realdiv(x, cap), x full, cap `[1,1]` broadcast.
-    fn tscdiv() -> EmittedOp {
+    fn tscdiv() -> EmittedOp<crate::collective::TpWorld<1>> {
         let x = rb("tsc_x", ROWS, COLS);
         let cap = rb("tsc_cap", 1, Fp16::ELEMS_PER_STICK);
         let out = rb("tsc_o", ROWS, COLS);
@@ -7972,7 +7983,7 @@ mod time_tiled_broadcast_operand_is_address_stable {
     }
 
     /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
-    fn trip_start(e: &EmittedOp, t: usize, lds: u32) -> u64 {
+    fn trip_start(e: &EmittedOp<crate::collective::TpWorld<1>>, t: usize, lds: u32) -> u64 {
         let trips = e.concrete_trips();
         let node = trips.get(t).expect("a trip per time").dscs_[0]
             .values()
@@ -8071,7 +8082,7 @@ mod time_tiled_mb_operand_advances_per_trip {
 
     /// realdiv(x, gamma): x full `[rows, cols]`, gamma an `In::mb` `[1, cols]` row
     /// vector — broadcast over ROWS, ACTIVE over cols (the rmsnorm-gamma form).
-    fn mbdiv() -> EmittedOp {
+    fn mbdiv() -> EmittedOp<crate::collective::TpWorld<1>> {
         let x = rb("mb_x", ROWS, COLS);
         let gamma = rb("mb_gamma", 1, COLS);
         let out = rb("mb_o", ROWS, COLS);
@@ -8089,7 +8100,7 @@ mod time_tiled_mb_operand_advances_per_trip {
     }
 
     /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
-    fn trip_start(e: &EmittedOp, t: usize, lds: u32) -> u64 {
+    fn trip_start(e: &EmittedOp<crate::collective::TpWorld<1>>, t: usize, lds: u32) -> u64 {
         let trips = e.concrete_trips();
         let node = trips.get(t).expect("a trip per time").dscs_[0]
             .values()
@@ -8294,7 +8305,9 @@ mod embed_row_gather_tests {
         embed_row_gather_program(IDX, IDX, (HIDDEN, VOCAB), (1, HIDDEN), 0, 1)
     }
 
-    fn lower(k: &KtirNode) -> Result<Vec<EmittedOp>, lower_ktir_to_superdsc::Error> {
+    fn lower(
+        k: &KtirNode,
+    ) -> Result<Vec<EmittedOp<crate::collective::TpWorld<1>>>, lower_ktir_to_superdsc::Error> {
         let mut sid = 0i64;
         let r = lower_ktir_to_superdsc::regions(k)?;
         lower_ktir_to_superdsc::embed_row_gather(k.func.name, k, &r, &mut sid, None)
@@ -8316,7 +8329,7 @@ mod embed_row_gather_tests {
     /// The SLAB-GATHER leg's per-core Dsc — the body the card schedules from, reached off the first
     /// op of the chain (the names tests pin that ordering first). The `gather_cut` module's `body`
     /// spelling, local to this module so the two never couple.
-    fn slab_body(ops: &[EmittedOp]) -> &crate::wire::Dsc {
+    fn slab_body(ops: &[EmittedOp<crate::collective::TpWorld<1>>]) -> &crate::wire::Dsc {
         ops[0]
             .op
             .as_ref()
@@ -8329,7 +8342,7 @@ mod embed_row_gather_tests {
 
     /// The ROW-GATHER leg's per-core Dsc — the same spelling as [`slab_body`], off the chain's
     /// third op (the ramp-addressed leg the defect lived in).
-    fn row_body(ops: &[EmittedOp]) -> &crate::wire::Dsc {
+    fn row_body(ops: &[EmittedOp<crate::collective::TpWorld<1>>]) -> &crate::wire::Dsc {
         ops[2]
             .op
             .as_ref()
@@ -8814,7 +8827,7 @@ mod embed_row_gather_tests {
         let mut sid = 0i64;
         let program = whole_program();
         let r = lower_ktir_to_superdsc::regions(&program).unwrap();
-        lower_ktir_to_superdsc::embed_row_gather(
+        lower_ktir_to_superdsc::embed_row_gather::<crate::collective::TpWorld<1>>(
             program.func.name,
             &program,
             &r,
@@ -9056,7 +9069,9 @@ mod chain_stage_tests {
         )
     }
 
-    fn lower(k: &KtirNode) -> Result<Vec<EmittedOp>, lower_ktir_to_superdsc::Error> {
+    fn lower(
+        k: &KtirNode,
+    ) -> Result<Vec<EmittedOp<crate::collective::TpWorld<1>>>, lower_ktir_to_superdsc::Error> {
         let mut sid = 0i64;
         let r = lower_ktir_to_superdsc::regions(k)?;
         lower_ktir_to_superdsc::chain_stage(k.func.name, k, &r, &mut sid, None)
@@ -9227,8 +9242,14 @@ mod chain_stage_tests {
         let mut sid = 0i64;
         let k = whole_program();
         let r = lower_ktir_to_superdsc::regions(&k).unwrap();
-        lower_ktir_to_superdsc::chain_stage(k.func.name, &k, &r, &mut sid, Some(&l))
-            .expect("the legal geometry places");
+        lower_ktir_to_superdsc::chain_stage::<crate::collective::TpWorld<1>>(
+            k.func.name,
+            &k,
+            &r,
+            &mut sid,
+            Some(&l),
+        )
+        .expect("the legal geometry places");
         assert!(
             l.synth.borrow().sizes.is_empty(),
             "the tables are graph sources the placement pass places — the door must mint \

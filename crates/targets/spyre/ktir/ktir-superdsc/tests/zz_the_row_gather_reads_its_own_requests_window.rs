@@ -193,7 +193,9 @@ fn core_starts(dsc: &serde_json::Value, i: usize) -> std::collections::BTreeMap<
 }
 
 /// Every `(name, dsc)` the emitted ops carry.
-fn dscs_of(ops: &[ktir_superdsc::emit::EmittedOp]) -> Vec<(String, serde_json::Value)> {
+fn dscs_of(
+    ops: &[ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+) -> Vec<(String, serde_json::Value)> {
     let mut out = Vec::new();
     for op in ops {
         let j = serde_json::to_value(&op.op).expect("serializes");

@@ -466,7 +466,7 @@ pub fn reduce_opspec_df_divided(
 /// fp32 REDUCE (the torch-spyre RMSNorm `mean(x²)`): native fp32 SFP reduce over `cols`, keeping all
 /// `rows` (NOT matmul — PSUM is fp16-only). `data` must be an fp32 tensor from a `dl16tofp32` convert.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_reduce_df(
+pub fn assemble_reduce_df<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &'static str,
     rows: u32,
@@ -476,7 +476,7 @@ pub fn assemble_reduce_df(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // head_major=TRUE ⇒ rank-3 flat, matching the flat fp32 island (see assemble_pointwise_broadcast_df).
     let op = reduce_opspec_df(
         op_func_from_str(op_func),
@@ -496,7 +496,7 @@ pub fn assemble_reduce_df(
 /// Assemble a complete SuperDSC for ONE REDUCTION over `[rows, cols]` reducing
 /// the `cols` axis → `[rows, 1]`: `op_func` ∈ {"sum","max","mean"} (sfp unit),
 /// via the typed [`reduce_opspec`] builder + `emit_sdsc`.
-pub fn assemble_reduce<D: KindTag, A: KindTag>(
+pub fn assemble_reduce<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     op_name: &str,
     op_func: &'static str,
     rows: u32,
@@ -504,7 +504,7 @@ pub fn assemble_reduce<D: KindTag, A: KindTag>(
     data: &Stk<D>,
     accum: &Stk<A>,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let mut sym_id_base: i64 = 0;
     assemble_reduce_seeded(
         op_name,
@@ -520,7 +520,7 @@ pub fn assemble_reduce<D: KindTag, A: KindTag>(
 
 /// [`assemble_reduce`] with an explicit running symbol-id counter (risk #1).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_reduce_seeded<D: KindTag, A: KindTag>(
+pub fn assemble_reduce_seeded<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     op_name: &str,
     op_func: &'static str,
     rows: u32,
@@ -529,7 +529,7 @@ pub fn assemble_reduce_seeded<D: KindTag, A: KindTag>(
     accum: &Stk<A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // DATA's kind now DRIVES head_major (was hardcoded `false`, forcing every caller's data operand
     // through the RowBlocked/stickmajor-eligible path regardless of what actually consumes it next).
     // The stick-major optimization exists ONLY so a whole-tensor pointwise producer's output agrees
@@ -873,7 +873,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
 // widths (one stick / `mq_pad` / head dim) the sweep is. The operands arrive as `Win`s minted by
 // [`win_reduce_data`]/[`win_reduce_accum`] — checked where their offsets are BORN — in place of
 // the `(Stk, DevOff)` pairs whose name and offset could come from different laws (the #717 class).
-pub fn assemble_reduce_off<D: KindTag, A: KindTag>(
+pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     op_name: &str,
     op_func: &'static str,
     rows: crate::sdsc_abstract::RowCount,
@@ -882,7 +882,7 @@ pub fn assemble_reduce_off<D: KindTag, A: KindTag>(
     accum: Win<'_, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let op = reduce_opspec_off(
         op_func_from_str(op_func),
         rows.get(),
@@ -911,11 +911,11 @@ pub struct ReduceDivided<'a, D: KindTag, A: KindTag> {
 
 /// [`assemble_reduce_off`] under a STATED [`ReduceDivision`] — the decode batch chunk's row max and row
 /// sum take [`ReduceDivision::ReducedAxis`] (`attn`'s `ChunkBufs::red_division_of` says why).
-pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
+pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     r: ReduceDivided<'_, D, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let ReduceDivided {
         op_name,
         op_func,
@@ -954,7 +954,13 @@ mod seeded_reduce_refusals {
             .expect("the bare opspec assembles");
         assert_eq!(op.time(), 2, "the past-the-budget row genuinely tiles");
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let err = match crate::emit::emit_sdsc_tiled("max32_bare", &op, &folds, &mut 0i64, None) {
+        let err = match crate::emit::emit_sdsc_tiled::<crate::collective::TpWorld<1>>(
+            "max32_bare",
+            &op,
+            &folds,
+            &mut 0i64,
+            None,
+        ) {
             Err(e) => e,
             // `EmittedOp` is not `Debug`, so the Ok arm states its own refusal.
             Ok(_) => panic!("the bare two-trip seeded reduce must refuse at the emission"),

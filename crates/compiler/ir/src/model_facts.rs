@@ -307,6 +307,30 @@ impl HeadGeometry {
     pub const fn kv_width(self) -> u32 {
         self.kv_width
     }
+    /// ONE TENSOR-PARALLEL RANK'S SHARE of this geometry for world `T`: the query and the kv heads
+    /// each split `T::RANKS` ways, every per-head fact (head dim, rot window, page) unchanged. `None`
+    /// when either head count does not divide by the world, or when the shares would break the GQA
+    /// law — a rank's query heads must read exactly that rank's kv heads, so the group size is kept.
+    /// The world is the type, never a number: the shard pass that asks is generic over the same `T`.
+    pub const fn rank_local<T: scratchy_tp_world::World>(self) -> Option<Self> {
+        let () = T::NONEMPTY;
+        let world = T::RANKS;
+        let (q, kv) = (self.q_heads.get(), self.kv_heads.get());
+        if !q.is_multiple_of(world) || !kv.is_multiple_of(world) {
+            return None;
+        }
+        let (lq, lkv) = (q / world, kv / world);
+        if !lq.is_multiple_of(lkv) {
+            return None;
+        }
+        Some(Self::new(
+            QueryHeads::new(lq),
+            KvHeads::new(lkv),
+            self.head_dim,
+            self.rot_dim,
+            self.page,
+        ))
+    }
 }
 
 /// One attention class's numbers, as types: `Kv` kv heads of `Hd` lanes, the leading `Rot` of
@@ -553,6 +577,21 @@ impl Attention {
     /// The base class.
     pub const fn base(self) -> HeadGeometry {
         self.base
+    }
+    /// ONE TENSOR-PARALLEL RANK'S SHARE of this attention for world `T`: every class split by the
+    /// world ([`HeadGeometry::rank_local`]), the scale, softcap, window and rope unchanged — the
+    /// softmax of one head never reads another head. `None` when either class does not split.
+    pub const fn rank_local<T: scratchy_tp_world::World>(self) -> Option<Self> {
+        let (Some(base), Some(global)) =
+            (self.base.rank_local::<T>(), self.global.rank_local::<T>())
+        else {
+            return None;
+        };
+        Some(Self {
+            base,
+            global,
+            ..self
+        })
     }
     /// The global class.
     pub const fn global(self) -> HeadGeometry {

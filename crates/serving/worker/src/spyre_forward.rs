@@ -11,10 +11,12 @@
 // The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
 // The runner type is cfg-selected: the KTIR emulator's session on the host, the sendnn one on
 // silicon. Everything around it (weight load, dynamic sources, KV loop, sampling) is shared.
+#[cfg(feature = "spyre-hw")]
+use crate::spyre_types::SuperDscSession;
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::sdsc_runner::{StepLogits, SuperDscSession};
+use scratchy_target_spyre::sdsc_runner::StepLogits;
 
 use crate::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]

@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow};
 
 use flex_rs::address::ByteSize;
 use flex_rs::memory_region::MemoryType;
-use scratchy_target_spyre::runtime::{DevAddr, Stream};
+use scratchy_target_spyre::runtime::{CardRuntime, DevAddr, Stream};
 
 /// The window step of `zero_seg`'s walk, mirrored here so the probe exercises
 /// the same single-chunk shapes the loader submits.
@@ -55,9 +55,12 @@ fn pattern_bytes(len: usize) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
-    let stream = Stream::create().context("stream create (brings the runtime up)")?;
+    let card =
+        CardRuntime::<ktir_superdsc::collective::TpWorld<1>>::open(0).context("open card 0")?;
+    let stream = Stream::create(&card).context("stream create")?;
     let total = WINDOW + TAIL;
-    let dev = DevAddr::alloc(ByteSize(total), MemoryType::Tensor).context("device buffer alloc")?;
+    let dev = DevAddr::alloc(&card, ByteSize(total), MemoryType::Tensor)
+        .context("device buffer alloc")?;
 
     // --- 1. not-X: the region really holds non-zero bytes before the fill ---
     let poison = pattern_bytes(total as usize);

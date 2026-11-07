@@ -37,7 +37,7 @@ const ROWS: u32 = 32;
 /// The fixture's own width: 514 logical → 576 stick-padded (pad 62).
 const COLS: u32 = 514;
 
-fn emit(op: OpFunc, cols: u32, name: &str) -> EmittedOp {
+fn emit(op: OpFunc, cols: u32, name: &str) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let spec = reduce_opspec(op, ROWS, cols, "t_sc", "t_bmax", false)
         .unwrap_or_else(|e| panic!("{name}: {e}"));
     let folds = SdscFoldSet::new(spec.iter.cores_used());
@@ -46,12 +46,12 @@ fn emit(op: OpFunc, cols: u32, name: &str) -> EmittedOp {
         .unwrap_or_else(|e| panic!("{name}: {}", e.0))
 }
 
-fn json(e: &EmittedOp) -> serde_json::Value {
+fn json(e: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>) -> serde_json::Value {
     serde_json::to_value(&e.op).unwrap()
 }
 
 /// The op's one `dscs_` entry, keyed by name — where the DSC-level fields live.
-fn dsc(e: &EmittedOp, name: &str) -> serde_json::Value {
+fn dsc(e: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>, name: &str) -> serde_json::Value {
     json(e)["dscs_"][0][name].clone()
 }
 

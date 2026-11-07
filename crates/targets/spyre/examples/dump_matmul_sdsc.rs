@@ -88,7 +88,7 @@ fn full(tag: &str, j: &serde_json::Value) {
 
 fn main() {
     if std::env::args().any(|a| a == "--full") {
-        let e = assemble_matmul(
+        let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MM",
             8,
             512,
@@ -107,7 +107,7 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--complete") {
         // COMPLETE dsc JSON (every field) for the field-by-field diff vs the reference.
-        let e = assemble_matmul(
+        let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MM",
             8,
             512,
@@ -138,7 +138,7 @@ fn main() {
         let (a0, a1) = (rbh("Tensor0", 8, 2048), rbh("Tensor1", 8, 2048));
         let ops = [In::full(&a0).ew(), In::full(&a1).ew()];
         let mut sib: i64 = 0;
-        let e = assemble_pointwise_broadcast(
+        let e = assemble_pointwise_broadcast::<ktir_superdsc::collective::TpWorld<1>>(
             "PW",
             "multiply",
             scratchy_subtile::sdsc_abstract::RowCount::of_token_rows(8),
@@ -153,7 +153,7 @@ fn main() {
     }
     for m in [1u32, 8] {
         // v_proj: A[m, 2048] · W[2048, 512] -> O[m, 512]  (out=512=8 sticks → mb SPLIT to fill cores)
-        let e = assemble_matmul(
+        let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MM",
             m,
             512,
@@ -170,7 +170,7 @@ fn main() {
         );
     }
     // q_proj: out=2048=32 sticks → mb UNSPLIT (row_cores=1) like the pointwise. Does it still fail?
-    let e = assemble_matmul(
+    let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
         "MM",
         8,
         2048,

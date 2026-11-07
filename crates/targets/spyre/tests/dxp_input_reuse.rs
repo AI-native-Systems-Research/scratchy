@@ -14,7 +14,9 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 use scratchy_target_spyre::superdsc_bake::CompiledGroup;
 
 /// `n` copies of one fitting matmul — one Pure trip each, so they fill groups back to back.
-fn identical_matmuls(n: usize) -> Vec<ktir_superdsc::emit::EmittedOp> {
+fn identical_matmuls(
+    n: usize,
+) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
     (0..n)
         .map(|_| {
             superdsc::assemble_matmul(

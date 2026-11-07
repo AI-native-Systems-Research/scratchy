@@ -69,6 +69,29 @@ fn every_granite_2b_decode_projection_runs_on_all_32_cores() {
     }
 }
 
+/// A one-row projection ONE output stick wide — a tensor-parallel rank's k/v once its kv heads split
+/// down to one (granite-3.1-2b at tp/8, `[2048 -> 64]`) — reads its weight on every core too: the
+/// reduction is cut into whole sticks, where `core_split(1, ·)` left it on one core.
+#[test]
+fn a_one_stick_one_row_projection_runs_on_all_32_cores() {
+    for (name, k, n, want) in [
+        (
+            "granite-2b k_proj at tp/8",
+            2048u32,
+            64u32,
+            (1u32, 1u32, 32u32),
+        ),
+        ("granite-8b k_proj at tp/8", 4096, 128, (1, 2, 16)),
+        ("a four-stick reduction", 256, 64, (1, 1, 4)),
+    ] {
+        let got = split_triple(n, k);
+        assert_eq!(
+            got, want,
+            "{name} [{k} -> {n}]: (mb, out, in) = {got:?}, want {want:?}"
+        );
+    }
+}
+
 /// The fp8 W8A8 contraction (`fq_mm`) takes the SAME door at the same `::<Fp16>` geometry with 1-byte
 /// operands, so the fill reaches it unchanged — and there it ALSO removes a time tile: gate/up at
 /// out25 ran as 2 LX-fit trips (MEASURED 425.8 µs, 123.1 GB/s) and in4·out8 runs as 1 (359.8 µs, 145.7).
