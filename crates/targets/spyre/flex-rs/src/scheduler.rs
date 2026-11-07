@@ -541,7 +541,7 @@ pub struct P2PDataParams {
 /// (`pf_runtime_scheduler.cpp:50 constexpr uint32_t P2P_RDMA_WINDOW_SIZE
 /// = 4 * 1024 * 1024`): `submitP2PRdmaSend`'s loop sends one Rdma12 CB per
 /// window-sized chunk of the transfer.
-const P2P_RDMA_WINDOW_SIZE: u64 = 4 * 1024 * 1024;
+pub const P2P_RDMA_WINDOW_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct P2PRdmaSendParams {

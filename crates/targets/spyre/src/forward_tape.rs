@@ -545,6 +545,8 @@ mod tests {
         page_slots: 4,
         rows: 3,
         nkvh: 2,
+        q_width: 128,
+        head_size: 64,
         walk: 4,
         paged_rows: crate::paged_step::PagedRows::Sequence,
     };

@@ -1604,6 +1604,10 @@ impl BatchChunking {
     /// Triton's gather floor.
     pub const GATHER_FLOOR: u32 = 8;
 
+    /// One stick of fp16 lanes — a gathered row of the folded cache or the folded query is whole
+    /// sticks of it, or the gather has no addressing for it.
+    pub const STICK: u32 = 64;
+
     /// ⛔ `seqs` AND `nkvh` ARE COUNTS, ONE OR MORE. Both divide here, so a zero is a panic at BAKE
     /// and not a wrong answer — `seqs` has divided since this function existed (`CORES / seqs`) and
     /// `nkvh` since the fold was added (`GATHER_FLOOR.div_ceil(seqs · rows_per_page)`). Every
@@ -1614,7 +1618,27 @@ impl BatchChunking {
     /// rather than a build that dies inside a `const` evaluation. The honest end state is a
     /// `NonZeroU32` pair in the signature; that waits on `PagedStep`'s fields, which the bake's
     /// codegen quotes as `u32`.
-    pub const fn of(seqs: u32, blocks: u32, nkvh: u32) -> BatchChunking {
+    ///
+    /// The fold also reads the query's own row width, `q_width = num_heads · head_size`, and the
+    /// head's: a page and a query row split into `rows_per_page` rows each, and every one of those
+    /// rows must be whole sticks of what the landing reads back.
+    ///
+    /// Under the gather floor, the fold cuts each page (and each query row) into as many rows as
+    /// reach the floor with THEIR block slots, so a chunk under the floor takes no masked block
+    /// slots past theirs: the rows are `kv_heads · 2^i`, the smallest that reaches the floor and
+    /// keeps a query row's share `q_width / rows` whole sticks. A page's share needs no test of its
+    /// own: it is `block_size · head_size / 2^i` for a cut of `2^i` rows a kv head, and the cut
+    /// never passes the floor's 8, so the share is at least 16 whole sticks. Where no such cut
+    /// reaches the floor, the widest whole-stick cut is taken and the block slots make up the rest
+    /// as before — the law stays total. At `kv_heads` rows a page this is the kv-head fold exactly;
+    /// its cut is a cut of the same bytes into finer equal rows.
+    pub const fn of(
+        seqs: u32,
+        blocks: u32,
+        nkvh: u32,
+        q_width: u32,
+        head_size: u32,
+    ) -> BatchChunking {
         let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
             let j = Self::CORES / seqs;
@@ -1622,7 +1646,24 @@ impl BatchChunking {
             if j < 1 { 1 } else { j }
         };
         let rows_per_page = if theirs * seqs < Self::GATHER_FLOOR {
-            if nkvh < 1 { 1 } else { nkvh }
+            let mut rows = if nkvh < 1 { 1 } else { nkvh };
+            // Double the cut while it is short of the floor at their block slots and the doubled
+            // query share is still whole sticks — and only for a head one stick wide: a kv head's
+            // page is then its slots' rows one after another, so a finer cut is whole rows of it,
+            // and the landing reads those rows back to back as the page (the gather's one-stick
+            // frame law). Two sticks or wider, a page's sticks interleave its rows, and a sub-page
+            // entry is no block of it.
+            // `rows < GATHER_FLOOR` bounds it: every doubling stays below twice the floor.
+            while head_size == Self::STICK
+                && rows < Self::GATHER_FLOOR
+                && theirs * seqs * rows < Self::GATHER_FLOOR
+                && q_width.is_multiple_of(rows * 2)
+                && (q_width / (rows * 2)).is_multiple_of(Self::STICK)
+                && q_width / (rows * 2) > 0
+            {
+                rows *= 2;
+            }
+            rows
         } else {
             1
         };
@@ -1953,7 +1994,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // of at most `CORES · SchedulerBlockTokens::REFERENCE` positions, and the one config in scope that small
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
-        let chunking = BatchChunking::of(mq, blocks, nkvh);
+        let chunking = BatchChunking::of(mq, blocks, nkvh, g.q_width(), g.head_dim().get());
         if chunking.entries() >= pages {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
@@ -4083,7 +4124,7 @@ mod production_ktir_dump {
             ("batched_decode_chunks_hd128", 4, 64, 128),
             ("batched_decode_one_slot_hd128", 32, 1, 128),
         ] {
-            let c = BatchChunking::of(seqs, walk, 8);
+            let c = BatchChunking::of(seqs, walk, 8, 32 * hd as u32, hd as u32);
             v.push((
                 name,
                 BATCHED_DECODE,
@@ -4841,7 +4882,7 @@ mod walk_on_the_card {
         else {
             panic!("the batched decode row is spliced");
         };
-        let c = BatchChunking::of(seqs, walk, kv_heads);
+        let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
         let mut signature = HashMap::new();
         let mut constexprs = HashMap::new();
         for p in ["query", "k_pages", "v_pages", "mask_by_chunk", "out"] {
@@ -5013,8 +5054,15 @@ mod walk_on_the_card {
     /// callers today, so nothing but this test stops the function from dying if one ever slips.
     #[test]
     fn the_chunking_is_total_at_zero_counts() {
-        for (seqs, blocks, nkvh) in [(0u32, 4u32, 8u32), (2, 4, 0), (0, 0, 0), (1, 0, 8)] {
-            let c = BatchChunking::of(seqs, blocks, nkvh);
+        for (seqs, blocks, nkvh, q_width, head_size) in [
+            (0u32, 4u32, 8u32, 2048u32, 64u32),
+            (2, 4, 0, 2048, 64),
+            (0, 0, 0, 0, 0),
+            (1, 0, 8, 2048, 64),
+            (1, 1, 1, 0, 64),
+            (1, 1, 1, 256, 0),
+        ] {
+            let c = BatchChunking::of(seqs, blocks, nkvh, q_width, head_size);
             assert!(
                 c.seqs >= 1 && c.blocks_per_chunk >= 1 && c.rows_per_page >= 1,
                 "of({seqs}, {blocks}, {nkvh}) = {c:?}"
@@ -5025,7 +5073,7 @@ mod walk_on_the_card {
         }
         // And the real geometries are untouched by the clamps.
         assert_eq!(
-            BatchChunking::of(1, 128, 8),
+            BatchChunking::of(1, 128, 8, 2048, 64),
             BatchChunking {
                 seqs: 1,
                 blocks_per_chunk: 32,
@@ -5034,7 +5082,7 @@ mod walk_on_the_card {
             }
         );
         assert_eq!(
-            BatchChunking::of(2, 1, 8).rows_per_page,
+            BatchChunking::of(2, 1, 8, 2048, 64).rows_per_page,
             8,
             "under the floor"
         );

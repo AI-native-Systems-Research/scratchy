@@ -3021,8 +3021,9 @@ pub enum LandingFrame {
         rows: NonZeroU32,
         w: StickExtent<Fp16>,
     },
-    /// Rank-2 `[T, w]` with one entry or a one-stick width — the landing IS the frame's own
-    /// bytes (a single stick column), no permute follows.
+    /// Rank-2 `[T, w]` with one entry or a one-stick width, or a rank ≥ 3 frame one stick wide
+    /// whose blocks span several entries — the landing IS the frame's own bytes (a single stick
+    /// column), no permute follows.
     Flat {
         entries: NonZeroU32,
         rows: NonZeroU32,
@@ -3131,6 +3132,23 @@ impl LandingFrame {
                 .checked_div(block)
                 .filter(|_| slab.is_multiple_of(block));
             let Some(blocks_per_entry) = blocks_per_entry else {
+                // ⭐ AT ONE STICK WIDE NO FRAME CROSSES AN ENTRY IN ITS BYTES. A one-stick
+                // stick-major `[rows, w]` block IS its rows, one after another, so a block that
+                // spans several gathered entries is byte for byte those entries' rows landed back
+                // to back — the flat landing, whatever rank the frame states. Each entry must
+                // still be whole rows of the frame (`slab % w == 0`) and the frame must re-frame
+                // exactly the gathered bytes; anything else still crosses an entry.
+                if width == stick
+                    && slab.is_multiple_of(width)
+                    && total == entries.get() as u64 * slab
+                {
+                    let rows = nz(slab / width).ok_or_else(|| FrameError::CrossesEntry {
+                        entries: entries.get(),
+                        slab,
+                        frame: to.to_vec(),
+                    })?;
+                    return Ok(LandingFrame::Flat { entries, rows, w });
+                }
                 return Err(FrameError::CrossesEntry {
                     entries: entries.get(),
                     slab,
