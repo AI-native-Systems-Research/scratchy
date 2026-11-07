@@ -2859,7 +2859,11 @@ mod tests {
             view(2, 64, 0),
             op(RMS, 1, vec![Op(3), Ext(4)]),
             view(1, 128, 4),
-            op(SubOp::rope_rotate(head_dim), 1, vec![Op(5), Ext(6), Ext(7)]),
+            op(
+                SubOp::rope_rotate(head_dim, crate::subtile_ir::RopeClass::Global),
+                1,
+                vec![Op(5), Ext(6), Ext(7)],
+            ),
             view(2, 64, 1),
             op(RMS, 1, vec![Op(7), Ext(5)]),
             view(1, 128, 8),

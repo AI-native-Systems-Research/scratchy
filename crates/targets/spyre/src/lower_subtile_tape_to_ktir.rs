@@ -1018,6 +1018,7 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
 ) -> Result<(Vec<EmittedOp>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
         lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests)?;
@@ -1041,6 +1042,7 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
                 &mut sym_id_base,
                 Some(&bundle_layout),
                 attn_params,
+                ropes,
                 &mut fp8_quantized,
             )
             .map_err(|err| {
@@ -2077,6 +2079,8 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
+    // The model's rope classes, which every rope program lowers through (`ktir_superdsc_door`).
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     let _pc = crate::pc::Pc::start("producer");
@@ -2648,6 +2652,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                 &mut declare_syms,
                 Some(&bundle_layout),
                 attn_params,
+                ropes,
                 &mut declare_fp8,
             )
             .map_err(|err| {
@@ -3485,7 +3490,7 @@ mod attn_scale_weight_fold_tests {
             },
             // 1: q_rot = rope_rotate(q, cos, sin)
             OpDesc {
-                op: SubOp::rope_rotate(hd),
+                op: SubOp::rope_rotate(hd, scratchy_subtile::subtile_ir::RopeClass::Global),
                 m: 1,
                 inputs: vec![InputRef::Op(0), InputRef::Ext(6), InputRef::Ext(7)],
             },
@@ -3633,7 +3638,7 @@ mod attn_scale_weight_fold_tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
                 },
                 OpDesc {
-                    op: SubOp::rope_rotate(hd),
+                    op: SubOp::rope_rotate(hd, scratchy_subtile::subtile_ir::RopeClass::Global),
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(8), InputRef::Ext(9)],
                 },

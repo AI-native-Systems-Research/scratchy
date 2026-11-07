@@ -6478,6 +6478,7 @@ pub fn emit_bundle(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
 ) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
     {
@@ -6505,7 +6506,7 @@ pub fn emit_bundle(
     }
     let b = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params)?
+        emit_bundle_inner(ops, layout, fold, attn_params, ropes)?
     };
     debug_assert_eq!(
         b.fp, fp,
@@ -6761,6 +6762,7 @@ fn emit_bundle_inner(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
 ) -> std::io::Result<EmittedBundle> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
@@ -6795,7 +6797,7 @@ fn emit_bundle_inner(
     // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
     let groups = if cfg!(feature = "spyre-hw") {
         PendingGroups::Staged(
-            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params)
+            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params, ropes)
                 .map_err(|e| std::io::Error::other(e.0))?,
         )
     } else {
@@ -7426,6 +7428,7 @@ fn ktir_groups_via_superdsc(
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
 ) -> Result<Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
@@ -7467,6 +7470,7 @@ fn ktir_groups_via_superdsc(
             &mut sym_id_base,
             layout,
             attn_params,
+            ropes,
             &mut fp8_quantized,
         )
         .map_err(|err| {
@@ -7871,6 +7875,7 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -7878,6 +7883,7 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         weight_ids,
         active_cap,
         rows_are_requests,
+        ropes,
     )
 }
 
@@ -8798,7 +8804,7 @@ mod tests {
             let (_, ir) = build(m);
             // t1 is the lm_head weight; t0 is the activation source.
             let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false, &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES)
                 .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
         // m>1 (prefill): the tail FOLDS — the splice's `lmlast.py` extraction (its own program,
@@ -8859,6 +8865,7 @@ mod tests {
             &mut sym,
             Some(&layout),
             None,
+            &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES,
             &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
         );
         let why = match stripped {
@@ -9018,7 +9025,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32, 3u32].into_iter().collect();
-        let (ops, _layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+        let (ops, _layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false, &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES)
             .expect("two-fp8-matmul lowering");
         let quantizes = ops
             .iter()
@@ -9101,7 +9108,7 @@ mod tests {
     fn the_residual_scalarmul_folds_into_the_weight_and_off_the_tape() {
         let scale = 2.0f32; // an UP-multiplier — the f16 floor gate's permitted class
         let (ir, weight_ids) = residual_chain_fixture(scale);
-        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false, &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES)
             .expect("the folded residual shape lowers");
 
         // (a) the ScalarMul is GONE — no program carries its name, and the walk emitted the two
@@ -9171,7 +9178,7 @@ mod tests {
     fn a_downscale_fold_refuses_at_the_f16_floor_and_stays_on_the_tape() {
         let scale = 0.130_417_02f32; // granite's residual_multiplier, as it appears in the dsl
         let (ir, weight_ids) = residual_chain_fixture(scale);
-        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
+        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false, &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES)
             .expect("the refused residual shape still lowers");
 
         // (a) the ScalarMul STAYS — three programs, exactly one of them the pointwise mul.

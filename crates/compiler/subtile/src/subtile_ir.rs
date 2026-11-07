@@ -1137,10 +1137,11 @@ pub fn draft_conv_reference(
 
 /// The ops whose lowering binds a witness, as a front end states them.
 impl<F: RopeForm> SubOp<F, Arch> {
-    /// `RopeRotate` in the graph's pairing form `F`.
-    pub const fn rope_rotate(head_dim: HeadDim) -> Self {
+    /// `RopeRotate` in the graph's pairing form `F`, at `head_dim`, binding the `rope` class.
+    pub const fn rope_rotate(head_dim: HeadDim, rope: RopeClass) -> Self {
         SubOp::RopeRotate {
             head_dim,
+            rope,
             _form: PhantomData,
         }
     }
@@ -1315,6 +1316,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `inputs[2]` = sin row.
     RopeRotate {
         head_dim: HeadDim,
+        /// The rotary class this rope binds — the extern the graph names for it
+        /// (`rotary_local` = [`RopeClass::Base`], plain `rotary` = [`RopeClass::Global`]). The
+        /// rope door lowers it through the model's own class, as a type, and refuses a program
+        /// whose head dim is not that class's.
+        rope: RopeClass,
         #[doc(hidden)]
         _form: PhantomData<F>,
     },
@@ -4265,7 +4271,15 @@ pub fn lower_region(
             SubOp::SiluMul => SubOp::SiluMul,
             SubOp::ScalarMul { scale } => SubOp::ScalarMul { scale },
             SubOp::RmsNorm { eps, gain } => SubOp::RmsNorm { eps, gain },
-            SubOp::RopeRotate { head_dim, _form } => SubOp::RopeRotate { head_dim, _form },
+            SubOp::RopeRotate {
+                head_dim,
+                rope,
+                _form,
+            } => SubOp::RopeRotate {
+                head_dim,
+                rope,
+                _form,
+            },
             SubOp::RopeAppend {
                 attention,
                 rope,
@@ -4841,7 +4855,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
     let mut nodes: Vec<SubtileNode<F>> = Vec::with_capacity(next_new_id as usize);
     for node in &graph.nodes {
         match node.op {
-            SubOp::RopeRotate { head_dim, _form: _ } => {
+            SubOp::RopeRotate { head_dim, rope, .. } => {
                 let q_in = node.inputs[0];
                 let cos_in = node.inputs[1];
                 let sin_in = node.inputs[2];
@@ -4854,6 +4868,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                         id: SubtileId(nodes.len() as u32),
                         op: SubOp::RopeRotate {
                             head_dim,
+                            rope,
                             _form: PhantomData,
                         },
                         inputs: vec![
@@ -5439,7 +5454,7 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: SubOp::rope_rotate(HeadDim::new(hd)),
+                    op: SubOp::rope_rotate(HeadDim::new(hd), RopeClass::Global),
                     m,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(2), InputRef::Ext(3)],
                 },

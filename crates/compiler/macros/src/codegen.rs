@@ -11513,10 +11513,11 @@ fn dump_wavefront_mega(
         use std::num::NonZeroU32;
         let knb = NonZeroU32::new(8192).expect("8192 != 0");
         let stem_id = stem.replace(['-', '.'], "_");
-        // SPIKE (#1094 G, arm 1): the bake's one door on model identity — its stem → its config's
-        // marker type → that type's rope adapter. The spike stops here: the adapter is checked
-        // against the facts and not yet handed to the rope door.
-        {
+        // ⛔ THE BAKE'S ONE DOOR ON MODEL IDENTITY: its config's stem → that config's marker type →
+        // the type's rope classes. Every rope this bake lowers goes through one of them
+        // (`ktir_superdsc_door`), so no head dim becomes a const anywhere below. A stem no
+        // config states is a bake error naming it.
+        let model_ropes = {
             use scratchy_subtile::model_geometry::{
                 ConfigRopes, OnConfigModel, rope_bridge::ModelRopes, with_config_model,
             };
@@ -11527,18 +11528,15 @@ fn dump_wavefront_mega(
                     M::ROPES
                 }
             }
-            let ropes = with_config_model(stem, Ropes)
-                .unwrap_or_else(|| panic!("[spyre-superdsc] {stem}: no config marker type"));
-            if let Some(a) = facts.attention() {
-                eprintln!(
-                    "[spyre-superdsc] {stem}: rope classes as types base {} / global {} (facts: {} / {})",
-                    ropes.base.0,
-                    ropes.global.0,
-                    a.base().head_dim().get(),
-                    a.global().head_dim().get(),
-                );
-            }
-        }
+            with_config_model(stem, Ropes).unwrap_or_else(|| {
+                panic!(
+                    "[spyre-superdsc] {stem}: no config under crates/models/arch/configs/ states \
+                     this stem, so its rope classes have no type ({})",
+                    scratchy_subtile::model_geometry::geometry_sources(),
+                )
+            })
+        };
+        let model_ropes = &model_ropes;
         // Opt-in `--device sdsc` (real-silicon) dump: emit the SAME real-model
         // `krg` SubtileIR to a sendnn op-graph JSON the DeepTools `compile_graph`
         // toolchain consumes. Off by default; writes one `<base>.sengraph.json`
@@ -12007,6 +12005,7 @@ fn dump_wavefront_mega(
                             None,
                             superdsc::FoldGrouping::Split,
                             None,
+                            model_ropes,
                         ) {
                             Ok(fp) => eprintln!(
                                 "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
@@ -12044,6 +12043,7 @@ fn dump_wavefront_mega(
                                 active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
                                 // start==0 chunk, FULL for the continuation bundle.
                                 rows_are_requests,
+                                model_ropes,
                             ) {
                                 Ok(rolled) => {
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
@@ -12121,6 +12121,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            model_ropes,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12156,6 +12157,7 @@ fn dump_wavefront_mega(
                                             } else {
                                                 unrolled_params
                                             },
+                                            model_ropes,
                                         );
                                         match r {
                                             Ok(fp) => body_fps.push(fp),
@@ -12208,6 +12210,7 @@ fn dump_wavefront_mega(
                                                         Some(&rolled.layout),
                                                         superdsc::FoldGrouping::Fused,
                                                         rolled.attn_params,
+                                                        model_ropes,
                                                     )
                                                     .map(superdsc::bundle::SiblingFp::from)
                                                     .unwrap_or_else(|e| {
@@ -12234,6 +12237,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            model_ropes,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12387,6 +12391,7 @@ fn dump_wavefront_mega(
                                                         &weight_ids,
                                                         rung,
                                                         rows_are_requests,
+                                                        model_ropes,
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
                                                         // card bakes the ROLLED body, the emulator the
@@ -12428,6 +12433,7 @@ fn dump_wavefront_mega(
                                                                     } else {
                                                                         rung_params
                                                                     },
+                                                                    model_ropes,
                                                                 ) {
                                                                     Ok(rfp) => {
                                                                         rfps.push(rfp);
@@ -12457,6 +12463,7 @@ fn dump_wavefront_mega(
                                                                             Some(&rr.layout),
                                                                             superdsc::FoldGrouping::Fused,
                                                                             rr.attn_params,
+                                                                            model_ropes,
                                                                         )
                                                                         .map(
                                                                             superdsc::bundle::SiblingFp::from,

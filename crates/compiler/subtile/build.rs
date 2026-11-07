@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Build script for `scratchy-subtile`.
 //!
-//! Reads every model `config.json` in the workspace and writes the
-//! head dims they declare into `$OUT_DIR/config_geometry.rs` — see
+//! Reads every model `config.json` in the workspace and writes one
+//! marker type per config, its rope classes' head dims as types, into `$OUT_DIR/config_geometry.rs` — see
 //! [`emit_config_geometry`] and `src/model_geometry.rs`.
 
 fn main() {
@@ -58,7 +58,7 @@ fn emit_config_geometry() {
 
     let mut stems: Vec<String> = Vec::new();
     let mut head_dims: Vec<u64> = Vec::new();
-    // SPIKE (#1094 G, arm 1): each config's rope classes as `(stem, base, global)`.
+    // Each config's rope classes as `(stem, base, global)`.
     let mut models: Vec<(String, u64, u64)> = Vec::new();
     for dir in &config_dirs {
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
@@ -132,30 +132,30 @@ fn emit_config_geometry() {
     }
     out.push_str("];\n\n");
 
-    out.push_str("macro_rules! for_each_config_head_dim {\n");
-    out.push_str("    ($emit:ident) => {\n        $emit! {\n");
-    for hd in &head_dims {
-        out.push_str(&format!("            {hd},\n"));
-    }
-    out.push_str("        }\n    };\n}\n");
-
-    // SPIKE: one marker type per config, its rope classes' head dims as typenum types, and the
+    // One marker type per config, its rope classes' head dims as typenum types, and the
     // `(literal, type)` pairs the type→const rope bridge is generated from.
     models.sort();
     models.dedup_by(|a, b| a.0 == b.0);
     let mut idents = std::collections::BTreeSet::new();
-    out.push_str("\n/// One marker type per model config: its rope classes' head dims, as types.\n");
+    out.push_str(
+        "\n/// One marker type per model config: its rope classes' head dims, as types.\n",
+    );
     out.push_str("pub mod config_models {\n    use scratchy_tensors::typed::typenum;\n");
     let mut arms = String::new();
     for (stem, base, global) in &models {
         let ident = camel(stem);
-        assert!(idents.insert(ident.clone()), "scratchy-subtile: two configs name the type {ident}");
+        assert!(
+            idents.insert(ident.clone()),
+            "scratchy-subtile: two configs name the type {ident}"
+        );
         out.push_str(&format!(
             "    /// `{stem}`.\n    pub enum {ident} {{}}\n    impl super::ConfigRopes for {ident} {{\n        const STEM: &'static str = {stem:?};\n        type Base = typenum::U{base};\n        type Global = typenum::U{global};\n        #[cfg(feature = \"spyre\")]\n        const ROPES: super::rope_bridge::ModelRopes = super::rope_bridge::ModelRopes::of::<Self>();\n    }}\n"
         ));
         arms.push_str(&format!("            ({stem:?}, {ident}),\n"));
     }
-    out.push_str("}\n\nmacro_rules! for_each_config_model {\n    ($emit:ident) => {\n        $emit! {\n");
+    out.push_str(
+        "}\n\nmacro_rules! for_each_config_model {\n    ($emit:ident) => {\n        $emit! {\n",
+    );
     out.push_str(&arms);
     out.push_str("        }\n    };\n}\n");
     // The rope bridge reads these pairs, and it exists under `spyre` only.
@@ -177,8 +177,13 @@ fn emit_config_geometry() {
 /// a `_` only between two numerals (`granite-3.1-8b-instruct` → `Granite3_1_8bInstruct`).
 fn camel(stem: &str) -> String {
     let mut out = String::new();
-    for seg in stem.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()) {
-        if out.ends_with(|c: char| c.is_ascii_digit()) && seg.starts_with(|c: char| c.is_ascii_digit()) {
+    for seg in stem
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+    {
+        if out.ends_with(|c: char| c.is_ascii_digit())
+            && seg.starts_with(|c: char| c.is_ascii_digit())
+        {
             out.push('_');
         }
         let mut chars = seg.chars();

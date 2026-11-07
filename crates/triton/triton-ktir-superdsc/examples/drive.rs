@@ -42,7 +42,7 @@ fn program_from(s: &str) -> Option<Program> {
         "scalarmul" => Program::ScalarMul,
         "lmlast" => Program::LmLast,
         "transpose" => Program::Transpose,
-        "rope" => Program::Rope,
+        "rope" => Program::Rope { table: None },
         other => {
             let kind = other.strip_prefix("ew:")?;
             Program::Elementwise(match kind {
@@ -176,7 +176,7 @@ fn main() {
     // code. Removed; attention is `emit_node_with`'s problem like every other program (the
     // whole-function door in `bake_py` is the from-source path that runs on card).
     let geometry_driven = match program {
-        Program::Rope => {
+        Program::Rope { .. } => {
             let g = |k: &str| match constexpr_int(config, k) {
                 Ok(v) => Ok(v),
                 Err(e) => Err(e),

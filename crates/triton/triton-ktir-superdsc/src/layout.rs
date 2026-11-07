@@ -506,7 +506,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // class 0 = the widest = `ROPE_P_TID`), and the door resolves this rope's `p_tid` off that same
     // list — so the placement pass and the lowering read ONE registry, never two.
     let mut rope_class_hds: Vec<u32> = Vec::new();
-    if matches!(node.program, Program::Rope) {
+    if matches!(node.program, Program::Rope { .. }) {
         let out = r.iter().find(|reg| reg.is_out).ok_or_else(|| Error {
             stage: "layout",
             message: format!(
@@ -878,7 +878,7 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
     match p {
         // `Rope` is HERE and not above: its one reserved constant is placed by [`for_regions`],
         // from an extent the program states.
-        Program::Rope
+        Program::Rope { .. }
         | Program::RmsNorm
         | Program::ScalarMul
         | Program::Elementwise(_)
@@ -1185,7 +1185,7 @@ fn scales_for(
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul
-        | Program::Rope
+        | Program::Rope { .. }
         // The sampler's tables are tensor operands, never `scalarmul_scales` lookups —
         // a value registered for it would occupy a slot nothing asks for.
         | Program::Sample

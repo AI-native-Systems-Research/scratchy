@@ -980,7 +980,7 @@ pub fn lower_decode_to_wavefront(
                 // writes must be THIS class's.
                 let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
                 let qi = bx.push_op(
-                    SubOp::rope_rotate(head_dim),
+                    SubOp::rope_rotate(head_dim, rope),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
                 );
                 let pairing = match node.op {
@@ -1147,7 +1147,13 @@ pub fn lower_decode_to_wavefront(
             }
             // rope_query(q, positions, rotary): the query's rotation alone — no K, no cache write.
             OpKind::RopeQuery => {
-                let head_dim = attn()?.base().head_dim();
+                // ⛔ THE BASE CLASS, WHATEVER TABLE THE QUERY NAMES — the head dim this bridge has
+                // always given `rope_query` (the base class's), stated as the class it is. A query
+                // that names plain `rotary` on a hybrid model (gemma-4-assistant's global layers)
+                // therefore rotates at the base width; the class carries that fact rather than
+                // hiding it behind a bare number.
+                let rope = scratchy_subtile::subtile_ir::RopeClass::Base;
+                let head_dim = rope.head_dim(attn()?);
                 let q = bx.input_at(tile, 0)?;
                 let q_cols = bx.out_cols(tile, 0, "rope_query q cols")?;
                 let local_rope = node.inputs.iter().any(|inp| {
@@ -1161,7 +1167,7 @@ pub fn lower_decode_to_wavefront(
                 });
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let idx = bx.push_op(
-                    SubOp::rope_rotate(head_dim),
+                    SubOp::rope_rotate(head_dim, rope),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));

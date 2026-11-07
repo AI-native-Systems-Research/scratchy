@@ -40,7 +40,7 @@ pub fn preamble() -> proc_macro2::TokenStream {
         #[allow(unused_imports)]
         use ::scratchy_target_spyre::bundle_code::{
             Elementwise as __KElem, LaunchProgram as __KProg, PlaceId as __KPlace,
-            Program as __KProgram, SynthRole as __KRole,
+            Program as __KProgram, RopeTable as __KRopeTable, SynthRole as __KRole,
         };
         #[allow(unused_imports)]
         use ::std::borrow::Cow::Borrowed as __KCow;
@@ -411,7 +411,18 @@ fn program_kind_tokens(
         Program::Matmul => quote! { __KProgram::Matmul },
         Program::Sample => quote! { __KProgram::Sample },
         Program::LmLast => quote! { __KProgram::LmLast },
-        Program::Rope => quote! { __KProgram::Rope },
+        Program::Rope { table } => {
+            let table = match table {
+                None => quote! { ::core::option::Option::None },
+                Some(scratchy_target_spyre::bundle_code::RopeTable::Base) => {
+                    quote! { ::core::option::Option::Some(__KRopeTable::Base) }
+                }
+                Some(scratchy_target_spyre::bundle_code::RopeTable::Global) => {
+                    quote! { ::core::option::Option::Some(__KRopeTable::Global) }
+                }
+            };
+            quote! { __KProgram::Rope { table: #table } }
+        }
         Program::PagedAttn => quote! { __KProgram::PagedAttn },
         Program::PagedKvWrite => quote! { __KProgram::PagedKvWrite },
         Program::Transpose => quote! { __KProgram::Transpose },

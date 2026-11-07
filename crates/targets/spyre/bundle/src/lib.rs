@@ -133,7 +133,7 @@ pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// reason as [`PlaceId`]: [`LaunchProgram::program`] carries the kind, so the token emitter
 /// (`ktir_tokens`) renders it through THIS crate's path into the generated source, and the macro
 /// crate depends on the target crate, never on `ktir-superdsc` directly.
-pub use ktir_superdsc::ktir_node::{Elementwise, Program};
+pub use ktir_superdsc::ktir_node::{Elementwise, Program, RopeTable};
 /// ⭐ THE OPERAND IDENTITY — declared in the lowering's own scratchy-free leaf and re-exported here,
 /// so every `bundle::PlaceId` / `bundle::SynthRole` path in the tree resolves unchanged. See
 /// [`ktir_superdsc::place`] for both types and for why a [`SynthRole`] belongs to the lowering that

@@ -106,7 +106,7 @@ fn main() {
     //
     // The values come from the fixture's OWN `tl.constexpr`s -- the same numbers the kernel was
     // compiled against on the leg above, not a second statement of them that could drift.
-    if program == Program::Rope {
+    if matches!(program, Program::Rope { .. }) {
         let ce = |k: &str| match kspec.constexprs.get(k) {
             Some(Val::Int(v)) => u32::try_from(*v)
                 .map_err(|_| format!("`{k}` = {v} does not fit the geometry's u32")),

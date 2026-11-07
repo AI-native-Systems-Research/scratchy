@@ -1029,7 +1029,13 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
             .expect("KTIR for a 64x16384x2048 matmul");
     let (dscs, _) =
-        superdsc::lower_graph_to_superdsc(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
+        superdsc::lower_graph_to_superdsc(
+            &ir,
+            &weight_ids,
+            superdsc::ActiveCap::FULL,
+            true,
+            &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES,
+        )
             .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {
         panic!(
@@ -1046,6 +1052,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         Some(&layout),
         superdsc::FoldGrouping::Split,
         None,
+        &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES,
     );
     unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP") };
     assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");
