@@ -246,9 +246,15 @@ __device__ inline void gemv_dots(const gemv_globals& g, const gemv_smem<ROWS>& s
     const auto issue = [&](int j) {
         const int s = (j0 + j) % STAGES;
         warp::tma::expect_bytes(sm.arrived[w][s], uint32_t(rows * sizeof(w_sv)));
-        for (int r = 0; r < rows; r++) {
-            warp::tma::load_async(sm.b[w][s][r], g.b, {0, depth, row0 + r, c0 + j},
-                                  sm.arrived[w][s]);
+        // A constant trip count, as the dot loop's. With `r < rows` as the loop bound, the 2-row
+        // instance's refills (a split of more than 4 chunks) summed wrong bytes, or hung with
+        // more than one CTA, on the H100; the 3- and 4-row instances never did.
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            if (r < rows) {
+                warp::tma::load_async(sm.b[w][s][r], g.b, {0, depth, row0 + r, c0 + j},
+                                      sm.arrived[w][s]);
+            }
         }
     };
     if (live) {
