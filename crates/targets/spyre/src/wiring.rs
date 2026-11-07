@@ -21,7 +21,7 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
-use crate::lower_subtile_tape_to_superdsc::{DeviceWidth, row_footprint_bytes};
+use crate::lower_subtile_tape_to_superdsc::row_footprint_bytes;
 pub use ktir_superdsc::element_arrangement::{
     DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
@@ -1456,14 +1456,6 @@ pub fn stage_gate_sweep<const N: usize>(
     out.resize(rows * sweep_stride, 0);
     out
 }
-
-/// ⭐ THE GATE TABLE'S OWN ROW RESERVATION — `DeviceWidth::for_convert(1)` in i32 words
-/// (64 = two u32 sticks, 256 B), the SAME one decision the convert door sweeps, the
-/// whole-function mint reserves, and the layout's `nbytes` places — stated once on the
-/// seat itself (`gate_row_words`, minted by
-/// [`lower_subtile_tape_to_ktir::sample_seat_of_ir`]) so the worker's per-row write and
-/// the placement's reservation cannot drift, exactly [`col_row_stride_bytes`]'s own
-/// contract for the one-stick tables.
 
 /// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
 /// token draw reads FRESH EVERY DECODE STEP (the seed quadruple's four word
