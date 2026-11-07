@@ -60,9 +60,10 @@ pub trait ConfigRopes {
     type Base: scratchy_tensors::typed::typenum::Unsigned;
     /// The global class's (plain `rotary`) head dim.
     type Global: scratchy_tensors::typed::typenum::Unsigned;
-    /// The rope adapter of the config's classes, read off the two types above.
+    /// The rope adapter of the config's classes in the tensor-parallel world `T`, read off the
+    /// two types above.
     #[cfg(feature = "spyre")]
-    const ROPES: rope_bridge::ModelRopes;
+    fn ropes<T: ktir_superdsc::collective::Tp>() -> rope_bridge::ModelRopes<T>;
 }
 
 /// What runs once the bake's model is a type — the consumer side of [`with_config_model`].
@@ -92,39 +93,49 @@ pub fn with_config_model<C: OnConfigModel>(stem: &str, consumer: C) -> Option<C:
 /// `rope_at::<HD>` instantiation. No value is matched: the impl is chosen by the type.
 #[cfg(feature = "spyre")]
 pub mod rope_bridge {
+    use ktir_superdsc::collective::Tp;
     use ktir_superdsc::emit::EmittedOp;
     use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, RopeAt, rope_at};
     use scratchy_tensors::typed::typenum::{self, Unsigned};
 
-    /// One rope class's lowering.
-    pub type RopeFn = for<'a> fn(RopeAt<'a>) -> Result<Vec<EmittedOp>, Error>;
+    /// One rope class's lowering, in the tensor-parallel world `T`.
+    pub type RopeFn<T> = for<'a> fn(RopeAt<'a>) -> Result<Vec<EmittedOp<T>>, Error>;
 
     /// A head dim, as a type, with its rope instantiation.
     pub trait RopeHd: Unsigned {
-        /// `rope_at::<Self::U32>`.
-        const ROPE: RopeFn;
+        /// `rope_at::<T, Self::U32>`.
+        fn rope<T: Tp>(a: RopeAt<'_>) -> Result<Vec<EmittedOp<T>>, Error>;
     }
 
     macro_rules! rope_impls {
         ($(($hd:literal, $u:ident)),* $(,)?) => {
             $(impl RopeHd for typenum::$u {
-                const ROPE: RopeFn = rope_at::<$hd>;
+                fn rope<T: Tp>(a: RopeAt<'_>) -> Result<Vec<EmittedOp<T>>, Error> {
+                    rope_at::<T, $hd>(a)
+                }
             })*
         };
     }
     for_each_config_head_dim_type!(rope_impls);
 
     /// The rope adapter the bake hands down: each class's head dim and lowering, read off the
-    /// model's marker type, so only `rope_at` is instantiated per head dim.
-    #[derive(Clone, Copy)]
-    pub struct ModelRopes {
+    /// model's marker type, so only `rope_at` is instantiated per head dim (and world).
+    pub struct ModelRopes<T: Tp> {
         /// The base class: its head dim and its lowering.
-        pub base: (u32, RopeFn),
+        pub base: (u32, RopeFn<T>),
         /// The global class: its head dim and its lowering.
-        pub global: (u32, RopeFn),
+        pub global: (u32, RopeFn<T>),
     }
 
-    impl ModelRopes {
+    // By hand: a derive would ask `T: Clone`, and the fields are fn pointers whatever `T` is.
+    impl<T: Tp> Clone for ModelRopes<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<T: Tp> Copy for ModelRopes<T> {}
+
+    impl<T: Tp> ModelRopes<T> {
         /// The adapter of the model `M`.
         pub const fn of<M: super::ConfigRopes>() -> Self
         where
@@ -132,8 +143,8 @@ pub mod rope_bridge {
             M::Global: RopeHd,
         {
             Self {
-                base: (M::Base::U32, <M::Base as RopeHd>::ROPE),
-                global: (M::Global::U32, <M::Global as RopeHd>::ROPE),
+                base: (M::Base::U32, <M::Base as RopeHd>::rope::<T>),
+                global: (M::Global::U32, <M::Global as RopeHd>::rope::<T>),
             }
         }
     }

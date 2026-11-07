@@ -751,14 +751,14 @@ fn stick_columns(a_rows: u32, b_rows: u32, cols: u32) -> Vec<(u32, u32, u32)> {
 /// [`RowScatter`]'s card form: the stick-major `[entries, cols]` rows of `src` written through the
 /// index onto the stick-major destination's rows ([`stick_columns`]), one scatter per stick column and
 /// per 32 index entries — the same scatter a parameter's rows take ([`load_scatters`]).
-pub fn row_scatter(
+pub fn row_scatter<T: crate::collective::Tp>(
     name: &str,
     src: &Region,
     sc: RowScatter,
     dst_rows: u32,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let stick = Fp16::ELEMS_PER_STICK;
     if sc.cols == 0 || !sc.cols.is_multiple_of(stick) {
         return err(format!(
@@ -821,7 +821,7 @@ pub fn row_scatter(
 /// through the index, landed stick-major `[g.entries, cols]` in `out` ([`stick_columns`]): one gather
 /// per stick column and per 32 index entries, each moving one stick per entry from the column's own
 /// base (spyre-inference's `query.index_select(0, query_row_index)`).
-pub fn row_gather(
+pub fn row_gather<T: crate::collective::Tp>(
     name: &str,
     g: &Gather,
     table_rows: u32,
@@ -829,7 +829,7 @@ pub fn row_gather(
     out: &Region,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::{
         GatheredWords, PageGatherRows, assemble_page_gather_copy,
     };
@@ -1083,12 +1083,12 @@ struct ScatterRun {
 /// rows are first relaid row-major into a scratch, one stick permute per head (the restickify
 /// torch-spyre's stickification inserts ahead of their `index_copy_`), and the scatter reads entry
 /// `j`'s sticks from the scratch's row `s0 + j`.
-pub fn load_scatters(
+pub fn load_scatters<T: crate::collective::Tp>(
     name: &str,
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let scatters = scatters_of(k)?;
     if scatters.is_empty() {
         return Ok(Vec::new());
@@ -2117,14 +2117,14 @@ impl Spray {
 /// `expand_shape`'s degenerate dim and cross-checks the `linalg.broadcast`'s `Dimensions`, then
 /// checks the axis against the resolved source's own extent). An empty slice means "no operand is
 /// broadcast", which is every existing caller.
-pub fn elementwise(
+pub fn elementwise<T: crate::collective::Tp>(
     name: &str,
     kind: Elementwise,
     r: &[Region],
     bcast: &[Option<BcastAxis>],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     elementwise_df(name, kind, r, bcast, Df::Fp16, sym_id_base, layout)
 }
 
@@ -2153,7 +2153,7 @@ pub fn elementwise(
 ///     and the CORNERED windows ([`chunk_window`]/[`band_corner`] address in `Df::Fp16`
 ///     elements) are fp16-proven forms; an fp32 op in either shape is a form this door has not
 ///     proven, and it is refused by name here rather than mis-addressed.
-pub fn elementwise_df(
+pub fn elementwise_df<T: crate::collective::Tp>(
     name: &str,
     kind: Elementwise,
     r: &[Region],
@@ -2161,7 +2161,7 @@ pub fn elementwise_df(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
     // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD: the dense arm below places row corners
     // per-operand (the windowed emission), so which operands are inputs is a fact about the
@@ -2468,10 +2468,10 @@ pub fn elementwise_df(
 ///
 /// A whole-tensor node (every corner 0) passes without looking, so nothing that is not windowed
 /// pays for it.
-pub fn column_windows_are_honoured(
+pub fn column_windows_are_honoured<T: crate::collective::Tp>(
     name: &str,
     r: &[Region],
-    ops: &[EmittedOp],
+    ops: &[EmittedOp<T>],
 ) -> Result<(), Error> {
     let windowed: Vec<&Region> = r
         .iter()
@@ -2599,14 +2599,14 @@ fn band_corner(name: &str, rows: u32, x: &Region) -> Result<crate::addr::DevOff,
 /// path below (`elementwise_broadcast`), because a spray is an addressing mode, not a width. And
 /// `rows` comes from [`node_rows`], the same source the dense path reads, so a windowed program is
 /// spanned rather than re-blocked.
-fn elementwise_per_row(
+fn elementwise_per_row<T: crate::collective::Tp>(
     name: &str,
     kind: Elementwise,
     ins: &[Region],
     out: &Region,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
     // EVERY operand must be the same per-row shape — this is the dense path's law ([`pointwise_extents_agree`])
     // restated for the one-stick emission: the op computes lane 0 of every row of every operand.
@@ -2737,14 +2737,14 @@ impl IntBinary {
 /// what a leg has measured. A program wanting one is a producer form refused BY NAME
 /// here, not lowered as the nearest measured thing. Order a specimen and the refusal
 /// opens. (`Mb` joined the measured set at wall 10 — see the admission at the door.)
-pub fn int_binary(
+pub fn int_binary<T: crate::collective::Tp>(
     name: &str,
     kind: IntBinary,
     r: &[Region],
     bcast: &[Option<BcastAxis>],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let op_func = kind.op_func();
     let (ins, out) = split_regions(name, r, layout, 2, &[])?;
     // ⛔ NO CORNER ON ANY ROUTE — dense or broadcast: the dense arm's window offsets and the
@@ -2916,11 +2916,11 @@ struct BcastReq<'a> {
     df: Df,
 }
 
-fn elementwise_broadcast(
+fn elementwise_broadcast<T: crate::collective::Tp>(
     req: BcastReq<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let BcastReq {
         name,
         what,
@@ -3196,12 +3196,12 @@ fn elementwise_broadcast(
 /// operands — a stick-major `[R, C]` tensor holds column `j`'s rows `[r0, r0 + rows)` at element
 /// `j·R·stick + r0·stick`, so every operand, its window included, is a base offset per column.
 /// Only dense and `Y` operands ride it; a `Col`/`Mb` operand beside a row split is refused.
-fn elementwise_y_by_column(
+fn elementwise_y_by_column<T: crate::collective::Tp>(
     req: BcastReq<'_>,
     (y, rows): (u32, u32),
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     if sprays_outermost(req.bcast) {
         return elementwise_by_outer_spray(req, (y, rows), sym_id_base, layout);
     }
@@ -3304,12 +3304,12 @@ fn elementwise_y_by_column(
 /// Rows several sticks wide (the prompt trip's scores over a 128-slot page, query-row-major) are
 /// their stick planes one after another, each a one-stick buffer of every row: one such op per
 /// plane, every operand read at its plane.
-fn elementwise_by_inner_spray(
+fn elementwise_by_inner_spray<T: crate::collective::Tp>(
     req: BcastReq<'_>,
     (y, rows): (u32, u32),
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let BcastReq {
         name,
         what,
@@ -3434,12 +3434,12 @@ fn sprays_outermost(bcast: &[Option<BcastAxis>]) -> bool {
 ///   `j · mb..(j + 1) · mb`, the source's own rows read as a dense operand ([`In::sliced`]);
 /// * a `RowScalars` source: per spray `j`, its one stick per row read as a per-row scalar
 ///   ([`In::col_at`], main's per-head-block reduced scalar).
-fn elementwise_by_outer_spray(
+fn elementwise_by_outer_spray<T: crate::collective::Tp>(
     req: BcastReq<'_>,
     (y, rows): (u32, u32),
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let BcastReq {
         name,
         what,
@@ -3669,13 +3669,13 @@ impl ConvertKind {
 /// precedent) and the consumer's Col window reads row r's FIRST stick alone, so the pad the
 /// convert writes is numerically inert. A window that is not whole-view keeps the refusal: a
 /// cornered sub-stick convert reads words the caller never staged.
-pub fn convert(
+pub fn convert<T: crate::collective::Tp>(
     name: &str,
     kind: ConvertKind,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let rows = pointwise_rows(name, &out)?;
     let mut cols = out.c_len;
@@ -3718,12 +3718,12 @@ pub fn convert(
 /// ⭐ THIS IS THE ONE BODY THE DEVICE'S OWN OP MAKES NECESSARY. The AIU has `OpFunc::Silu` and
 /// KTIR's `math.*` set does not, so the producer writes silu longhand (negate → exp → 1+ → divide);
 /// emitting that longhand would be five descriptors where the device has one primitive.
-pub fn silumul(
+pub fn silumul<T: crate::collective::Tp>(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, o) = split_out(name, r, layout, 2)?;
     let (gate_r, up_r) = (ins[0], ins[1]);
     check_pointwise_cols(o.c_len, "SiluMul", o.tid)?;
@@ -3831,13 +3831,13 @@ pub fn silumul(
 /// differ from `subtile→superdsc`'s — which states the epsilon inline — and the emulator's output
 /// moved. The device's constant flow is unchanged either way (the descriptor reads the registry), so
 /// the index rides on the node and the program keeps main's immediate.
-pub fn rmsnorm(
+pub fn rmsnorm<T: crate::collective::Tp>(
     name: &str,
     k: &KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // x, gamma and the output — the parameters the rmsnorm program mints. Its constants are
     // immediates, so none of them is a parameter.
     let (tensors, out) = split_out(name, r, layout, 2)?;
@@ -4248,13 +4248,13 @@ mod pointwise_width_caps {
 /// emulator's Metal offload cannot treat as a resident tile — MEASURED as 51 of 216 `map window`
 /// refusals, every one of them falling back to the interpreter. The device is unaffected either way:
 /// the descriptor below still multiplies by the bound `[1,1]` const at this slot.
-pub fn scalarmul(
+pub fn scalarmul<T: crate::collective::Tp>(
     name: &str,
     k: &KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, like the epsilon and the attention scale. It was
     // `KtirNode::scalarmul_scale_idx`, a slot the producer resolved and hung on the node — so the
     // number the emulator multiplies by and the number the descriptor multiplies by were two facts
@@ -4772,7 +4772,9 @@ pub struct RopeAt<'a> {
 /// What it buys immediately: the collapsed RoPE form and the slab RoPE form become TWO INSTANTIATIONS
 /// rather than two arms of one function, so "a head_dim-128 bundle takes the slab path" is a fact the
 /// compiler knows.
-pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
+pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
+    a: RopeAt<'_>,
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let RopeAt {
         name: _name,
         x,
@@ -4832,8 +4834,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     // h·mq·hd+r·hd (hd==STK). A single FULL [mq,heads,hd] op would device-stick differently and mismatch
     // the attention matmul's [mq,total] read; per-(r,h) [1,hd] blocks match it exactly (Kani-proven).
     // cos/sin are the worker's [mq,total] per-position head-tiled table, read at row r's head-0 slice.
-    let mut ops: Vec<EmittedOp> = Vec::with_capacity(mq as usize * heads as usize * 4);
-    let ew_ph = |ops: &mut Vec<EmittedOp>,
+    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(mq as usize * heads as usize * 4);
+    let ew_ph = |ops: &mut Vec<EmittedOp<T>>,
                  name: String,
                  f: &'static str,
                  a: &str,
@@ -5019,7 +5021,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // nest means this loop names a COORDINATE and never writes a stride.
         let doff =
             |r: usize, col: usize| crate::addr::rc_of(mq, total, r as u32, col as u32, Df::Fp16);
-        let ew_slab = |ops: &mut Vec<EmittedOp>,
+        let ew_slab = |ops: &mut Vec<EmittedOp<T>>,
                        name: String,
                        f: &'static str,
                        a: &str,
@@ -5275,7 +5277,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 l.synth(out_id.synth(r), &[heads * mq, hd]);
             }
         }
-        let ew_rows = |ops: &mut Vec<EmittedOp>,
+        let ew_rows = |ops: &mut Vec<EmittedOp<T>>,
                        name: String,
                        f: &'static str,
                        rows: u32,
@@ -5517,13 +5519,13 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
 /// program's only output is the reserved staging, so naming from `out.tid` gave every model
 /// `lmlast{j}_o4294967295`. The node's tensor arrives on [`KtirNode::node_out_tid`], stated by the
 /// producer that built both halves; see that field for why the program cannot state it.
-pub fn lmlast(
+pub fn lmlast<T: crate::collective::Tp>(
     name: &str,
     k: &KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let owner = k.node_out_tid.ok_or_else(|| Error {
         message: format!(
             "{name}: states no `node_out_tid`. The last-row extraction is HALF of an lm-head node's \
@@ -5623,6 +5625,83 @@ pub fn lmlast(
         .collect())
 }
 
+/// A BLOCK COPY — `dst[:, off .. off + C_SRC] = src` for a whole `[R, C_SRC]` source and an
+/// `[R, C_DST]` destination: an all-gather consume's leg, placing one rank's block at its columns.
+///
+/// ⭐ ONE OP, AND WHY ONE IS RIGHT HERE WHEN [`lmlast`] NEEDS `hidden/64`. Stick-major, a run of
+/// whole stick columns is contiguous at BOTH ends: the source's `C_SRC/64` stick columns are its
+/// whole buffer, and the destination's stick columns `off/64 ..` start at `rc_of(R, C_DST, 0, off)`
+/// = `(off/64)·R·64` and run on unbroken. Read as the tall-narrow `[(C_SRC/64)·R, 64]` tensor both
+/// runs physically are, the copy is ONE identity over a row range — the one coordInfo form fp16
+/// represents. `lmlast` extracts one ROW of many, whose sticks are strided by `mq`, which is what
+/// costs it one op per stick.
+pub fn block_copy<T: crate::collective::Tp>(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp<T>>, Error> {
+    let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
+    let [out] = outs[..] else {
+        return err(format!(
+            "{name}: {} parameter(s) written by a `ktdp.store` — a block copy writes exactly one",
+            outs.len()
+        ));
+    };
+    let ins: Vec<Region> = r.iter().copied().filter(|x| !x.is_out).collect();
+    let [src] = ins[..] else {
+        return err(format!(
+            "{name}: {} tensor input(s) — a block copy reads exactly one",
+            ins.len()
+        ));
+    };
+    let stk = Fp16::ELEMS_PER_STICK;
+    let (rows, c_src) = (src.v_rows, src.v_cols);
+    let (c_dst, off) = (out.v_cols, out.c_start);
+    // The source is read WHOLE from its corner, the destination at row 0 and a stick-aligned column:
+    // anything else is not a run of whole stick columns at either end, and no single row range of a
+    // tall-narrow view names it.
+    if src.r_start != 0 || src.c_start != 0 || out.r_start != 0 {
+        return err(format!(
+            "{name}: reads t{} from [{}, {}] and writes t{} from row {} — a block copy moves a WHOLE \
+             source into a column block of the destination",
+            src.tid, src.r_start, src.c_start, out.tid, out.r_start
+        ));
+    }
+    if out.v_rows != rows {
+        return err(format!(
+            "{name}: copies {rows} rows into a {}-row destination — a column block spans every row",
+            out.v_rows
+        ));
+    }
+    if !c_src.is_multiple_of(stk) || !c_dst.is_multiple_of(stk) || !off.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: source width {c_src}, destination width {c_dst} and column {off} must all be \
+             whole {stk}-fp16 sticks — a partial stick column is not a contiguous run"
+        ));
+    }
+    if off + c_src > c_dst {
+        return err(format!(
+            "{name}: the block [{off}, {}) runs past the destination's {c_dst} columns",
+            off + c_src
+        ));
+    }
+    let sticks = c_src / stk;
+    let src_name = rb(&src.name(), rows, c_src);
+    let dst = rb(&out.name(), rows, c_dst);
+    Ok(vec![assemble_pointwise_broadcast_off(
+        name,
+        "identity",
+        crate::sdsc_abstract::RowCount::of_stick_column_rows(sticks, rows),
+        crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        &[In::sliced(&src_name, crate::addr::rc_of(rows, c_src, 0, 0, Df::Fp16)).ew()],
+        &dst,
+        crate::addr::rc_of(rows, c_dst, 0, off, Df::Fp16),
+        sym_id_base,
+        layout,
+    )])
+}
+
 /// main's `lower_matmul_node` (main 7752-8362).
 ///
 /// Its door: `m`/`k`/`n` came from a `TileOp` built off the node and now come from the program's own
@@ -5638,14 +5717,14 @@ pub fn lmlast(
 /// reading the guard inside hardcoded before the orientation became a parameter. So this delegates
 /// at `TransposeB` and preserves today's behaviour byte-for-byte; only a producer that CAN prove
 /// the orientation is asked to.
-pub fn matmul(
+pub fn matmul<T: crate::collective::Tp>(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
     headmajor: Option<HeadmajorOproj>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     matmul_oriented(
         name,
         r,
@@ -5695,14 +5774,14 @@ pub struct MatmulProof {
 
 /// [`matmul`] with the weight orientation PROVEN by the caller instead of assumed — see
 /// [`super::whole_function::matmul_b_orientation`], which reads it off the op's own `indexing_maps`.
-pub fn matmul_oriented(
+pub fn matmul_oriented<T: crate::collective::Tp>(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
     proof: MatmulProof,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
     let [out] = outs[..] else {
         return err(format!(
@@ -6112,14 +6191,14 @@ fn registry_const(name: &str, value: f32, layout: Option<&BundleLayout>) -> Resu
 /// `x <min|max> c` with `c` a splatted constant — the walk's `min(tile_max - scores_max, 0)` clamp.
 /// The constant is the registry's bound `[1,1]` const sprayed over the tile, exactly as
 /// [`scalarmul_at`] sprays a multiplier.
-pub fn scalar_binary(
+pub fn scalar_binary<T: crate::collective::Tp>(
     name: &str,
     e: Elementwise,
     value: f32,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let (op_func, _) = elementwise_op_func(name, e)?;
     let x = ins[0];
@@ -6170,13 +6249,13 @@ pub fn scalar_binary(
 /// A buffer SEEDED with one value — a walk's carried state at the value the program initialises it
 /// to (`tensor.splat` of a constant): the registry's bound `[1,1]` const, sprayed over the whole
 /// buffer by an `identity`.
-pub fn fill(
+pub fn fill<T: crate::collective::Tp>(
     name: &str,
     value: f32,
     out: &Region,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let rows = out.r_len;
     let (cols, store_cols) = pointwise_width_the_output_holds(
         layout,
@@ -6226,14 +6305,14 @@ pub fn fill(
 /// ⛔ THE BATCH DOES NOT RIDE `y`. A `y`-batched contraction shares ONE kernel across the batch
 /// (`SharedKernelBmmForm`'s own law — a 3-D kernel is dxp garbage), and each batch here has its own:
 /// the score leg's `Kᵀ` page block and the value leg's `V` page block of its kv head.
-pub fn batch_matmul(
+pub fn batch_matmul<T: crate::collective::Tp>(
     name: &str,
     batch: u32,
     activation: BatchFrame,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 2)?;
     let (a, w) = (ins[0], ins[1]);
     for (x, role) in [(&a, "activation"), (&w, "kernel"), (&out, "output")] {
@@ -6415,14 +6494,14 @@ pub enum BatchFrame {
 /// `[r, c]` block only while `c` is one stick: wider, a batch's rows are interleaved stick by stick
 /// with every other batch's, and no base offset names them. Refused by name above one stick; an input
 /// in [`BatchFrame::Blocks`] is read block by block at any width.
-pub fn batch_transpose(
+pub fn batch_transpose<T: crate::collective::Tp>(
     name: &str,
     batch: u32,
     input: BatchFrame,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let a = ins[0];
     let stick = Fp16::ELEMS_PER_STICK;
@@ -6515,14 +6594,14 @@ pub fn batch_transpose(
 /// index. The gather proper then reads its index words from `run` ([`ChainedIndex`]). The words are
 /// int32, so the copy is `zero + run` against the one-stick `zero`
 /// ([`GatheredWords::SenUint32`](crate::ir::bridge::tiled_op_sdsc_op::GatheredWords::SenUint32)).
-pub fn index_run_gather(
+pub fn index_run_gather<T: crate::collective::Tp>(
     name: &str,
     g: &Gather,
     chain: ChainedIndex,
     (run, zero): (u32, u32),
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::{
         GatheredWords, PageGatherRows, assemble_page_gather_copy,
     };
@@ -6562,12 +6641,12 @@ pub fn index_run_gather(
     Ok(vec![op])
 }
 
-pub fn transpose(
+pub fn transpose<T: crate::collective::Tp>(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let a = ins[0];
     // The INPUT's view IS the op's `[rows, cols]`: the builder iterates the input shape and the
@@ -6788,13 +6867,13 @@ pub fn transpose(
 /// wider than one index stick cannot be named at all). The door's own `rows % page == 0`
 /// check holds exactly (the entry count divides the hidden), and the payload's count is
 /// checked against the geometry below.
-pub fn embed_row_gather(
+pub fn embed_row_gather<T: crate::collective::Tp>(
     name: &str,
     k: &crate::ktir_node::KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // The payload's own stated entry count — the mint's one computation of it
     // (the same read chain_stage makes of `table_rows`): the door does NOT
     // re-derive the count from hidden (the divisor-window search is the mint's
@@ -7040,7 +7119,7 @@ pub fn embed_row_gather(
         r * (stk + 1) * hidden
     }
     let mut legs: Vec<(String, crate::superdsc_opspec::OpSpec)> = Vec::new();
-    let mut xposes: Vec<super::EmittedOp> = Vec::with_capacity(width as usize);
+    let mut xposes: Vec<super::EmittedOp<T>> = Vec::with_capacity(width as usize);
     for r in 0..width {
         let slab_op = crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
             &weight.name(),
@@ -7229,7 +7308,7 @@ pub fn embed_row_gather(
     // handle out: the homogeneous stick-major copy. While they coincide this leg mints NOTHING
     // and leg 3 wrote the out's name directly — the W=1 (and one-stick-wide) byte-identity
     // claim rides that elision.
-    let relayout: Option<super::EmittedOp> = if rows_coincide {
+    let relayout: Option<super::EmittedOp<T>> = if rows_coincide {
         None
     } else {
         Some(super::pw1(
@@ -7311,13 +7390,13 @@ pub fn embed_row_gather(
 /// `[l_sticks, 32]` — one whole multi-stick index, the pair law below tying the table's
 /// row width to it — and its gather's ONE entry covers all of it (`page = l_sticks`
 /// sub-rows). The s side never widens: `k ≤ 32` always, one stick names every slab entry.
-pub fn chain_stage(
+pub fn chain_stage<T: crate::collective::Tp>(
     name: &str,
     k: &crate::ktir_node::KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // The payload's own stated table extent — the mint's one computation of
     // it. The door does NOT know `pad_vocab` (the group law that makes the
     // extent safe is asserted at the mint, where `pad_vocab` lives; this
@@ -7710,7 +7789,14 @@ mod elementwise_tests {
         );
         let mut sym = 0i64;
         // `EmittedOp` is not `Debug`, so `expect_err` is unavailable — bind the refusal directly.
-        let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None) else {
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("a [1,128] operand under a [4,128] output cannot be addressed here");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -7737,8 +7823,15 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None)
-            .expect("agreeing extents are the ordinary case");
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
+            "add_s3",
+            Elementwise::Add,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("agreeing extents are the ordinary case");
         assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
     }
 
@@ -7754,7 +7847,14 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None) else {
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("a [4,1] per-row scalar is a broadcast this path cannot state");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -7770,7 +7870,14 @@ mod elementwise_tests {
     fn a_unary_input_of_the_wrong_extent_is_refused() {
         let r = vec![reg(5, 1, 128, false), reg(7, 4, 128, true)];
         let mut sym = 0i64;
-        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &[], &mut sym, None) else {
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
+            "silu_s3",
+            Elementwise::Silu,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("a unary's input extent must match its output too");
         };
         assert!(e.message.contains("t5"), "names the operand: {}", e.message);
@@ -7787,8 +7894,15 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None)
-            .expect("a same-extent subtract is structurally an add");
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("a same-extent subtract is structurally an add");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "sub_o7");
     }
@@ -7817,7 +7931,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise(
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -7845,7 +7959,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise(
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
             "mul_s3",
             Elementwise::Mul,
             &r,
@@ -7859,7 +7973,7 @@ mod elementwise_tests {
     }
 
     /// The offset op `op` binds `buf` at.
-    fn bound_at(op: &EmittedOp, buf: &str) -> u32 {
+    fn bound_at(op: &EmittedOp<crate::collective::TpWorld<1>>, buf: &str) -> u32 {
         op.arg_bindings
             .iter()
             .find(|b| b.buffer == buf)
@@ -8258,7 +8372,7 @@ mod elementwise_tests {
             reg(7, 250, 4, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8333,7 +8447,7 @@ mod elementwise_tests {
             reg(7, 256, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8362,7 +8476,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8393,7 +8507,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &r,
@@ -8415,7 +8529,7 @@ mod elementwise_tests {
     fn a_unary_broadcast_input_is_refused_by_name() {
         let r = vec![reg(5, 4, 1, false), reg(7, 4, 128, true)];
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "silu_s3",
             Elementwise::Silu,
             &r,
@@ -8454,8 +8568,15 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary("add_s3", IntBinary::Add, &r, &[], &mut sym, None)
-            .expect("B1's own dense form");
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
+            "add_s3",
+            IntBinary::Add,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("B1's own dense form");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "addi32toi32_o7");
     }
@@ -8471,7 +8592,7 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary(
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8505,7 +8626,7 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary(
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8543,7 +8664,7 @@ mod elementwise_tests {
             reg(7, 2, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary(
+        let ops = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8571,7 +8692,7 @@ mod elementwise_tests {
             reg(7, 256, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = int_binary(
+        let Err(e) = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8599,7 +8720,7 @@ mod elementwise_tests {
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let Err(e) = int_binary(
+        let Err(e) = int_binary::<crate::collective::TpWorld<1>>(
             "add_s3",
             IntBinary::Add,
             &r,
@@ -8894,8 +9015,15 @@ mod elementwise_tests {
     fn a_column_blocked_chunk_writes_at_its_stick_block_corner() {
         let (r, rows, c0, c1) = mlp_chunks();
         let mut sym = 0i64;
-        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
-            .expect("a dense column-blocked chunk is exactly the arm that exists for it");
+        let ops = elementwise::<crate::collective::TpWorld<1>>(
+            "mul_s23",
+            Elementwise::Mul,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .expect("a dense column-blocked chunk is exactly the arm that exists for it");
         assert_eq!(ops.len(), 1);
         let dsc = ops[0]
             .op
@@ -8925,8 +9053,15 @@ mod elementwise_tests {
         // chunk-0 twin's start, which cancels every segment/arg term both share.
         let (r0, ..) = mlp_chunks_at_zero();
         let mut sym0 = 0i64;
-        let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
-            .expect("chunk 0 lowers identically");
+        let ops0 = elementwise::<crate::collective::TpWorld<1>>(
+            "mul_s22",
+            Elementwise::Mul,
+            &r0,
+            &[],
+            &mut sym0,
+            None,
+        )
+        .expect("chunk 0 lowers identically");
         let dsc0 = ops0[0].op.as_ref().expect("descriptor").dscs_[0]
             .values()
             .next()
@@ -8982,7 +9117,7 @@ mod elementwise_tests {
         let mut sym0 = 0i64;
         let ops0 = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym0, None)
             .expect("chunk 0 lowers");
-        let starts = |ops: &Vec<EmittedOp>| -> Vec<u64> {
+        let starts = |ops: &Vec<EmittedOp<crate::collective::TpWorld<1>>>| -> Vec<u64> {
             let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
                 .values()
                 .next()
@@ -9039,7 +9174,7 @@ mod elementwise_tests {
         // output at the stick-block corner of column 8192.
         column_windows_are_honoured("mul_s23", &r, &ops)
             .expect("each operand is addressed at its own corner");
-        let off = |ops: &Vec<EmittedOp>, buf: String| {
+        let off = |ops: &Vec<EmittedOp<crate::collective::TpWorld<1>>>, buf: String| {
             ops[0]
                 .arg_bindings
                 .iter()
@@ -9069,7 +9204,7 @@ mod elementwise_tests {
             chunked(7, rows, 8192, 7168, 15360, true),
         ];
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let Err(e) = elementwise::<crate::collective::TpWorld<1>>(
             "sub_s3",
             Elementwise::Sub,
             &rb,
@@ -9091,7 +9226,14 @@ mod elementwise_tests {
             chunked(6, rows, 8192, 8192, 15360, false),
             chunked(7, rows, 8192, 1, 15360, true),
         ];
-        let Err(e2) = elementwise("sub_s3", Elementwise::Sub, &pr, &[], &mut sym, None) else {
+        let Err(e2) = elementwise::<crate::collective::TpWorld<1>>(
+            "sub_s3",
+            Elementwise::Sub,
+            &pr,
+            &[],
+            &mut sym,
+            None,
+        ) else {
             panic!("the per-row arm at a column corner must refuse")
         };
         assert!(
@@ -9102,7 +9244,7 @@ mod elementwise_tests {
     }
 
     /// The lowest per-core start address of each operand's allocate node, in operand order.
-    fn operand_bases(ops: &[EmittedOp]) -> Vec<u64> {
+    fn operand_bases(ops: &[EmittedOp<crate::collective::TpWorld<1>>]) -> Vec<u64> {
         let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
             .values()
             .next()
@@ -9200,16 +9342,24 @@ mod elementwise_tests {
     fn the_column_window_guard_passes_honoured_pieces_and_refuses_a_piece_at_the_base() {
         let (r, ..) = mlp_chunks();
         let mut sym = 0i64;
-        let ew = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None).unwrap();
+        let ew = elementwise::<crate::collective::TpWorld<1>>(
+            "mul_s23",
+            Elementwise::Mul,
+            &r,
+            &[],
+            &mut sym,
+            None,
+        )
+        .unwrap();
         column_windows_are_honoured("mul_s23", &r, &ew).expect("elementwise honours its window");
-        let sm =
-            silumul("silumul_s23", &r, &mut sym, None).unwrap_or_else(|e| panic!("{}", e.message));
+        let sm = silumul::<crate::collective::TpWorld<1>>("silumul_s23", &r, &mut sym, None)
+            .unwrap_or_else(|e| panic!("{}", e.message));
         column_windows_are_honoured("silumul_s23", &r, &sm).expect("silumul honours its window");
         let logits = vec![
             chunked(5, 1, 8192, 8192, 49155, false),
             chunked(7, 1, 8192, 8192, 49155, true),
         ];
-        let mut ops = scalarmul_scaled(
+        let mut ops = scalarmul_scaled::<crate::collective::TpWorld<1>>(
             "scalarmul_s1",
             &ScaleSource::Bound { tid: 99 },
             None,
@@ -9252,17 +9402,18 @@ mod elementwise_tests {
     /// `a_column_blocked_chunk_reads_its_inputs_at_the_same_corner`.
     #[test]
     fn a_chunk_at_corner_zero_keeps_the_seeded_emission() {
-        let orders = |ops: &Vec<EmittedOp>| -> Vec<Vec<&'static str>> {
-            let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
-                .values()
-                .next()
-                .expect("one dsc");
-            dsc.scheduleTree_
-                .iter()
-                .filter(|n| n.nodeType_ == "allocate")
-                .map(|n| n.layoutDimOrder_.clone())
-                .collect()
-        };
+        let orders =
+            |ops: &Vec<EmittedOp<crate::collective::TpWorld<1>>>| -> Vec<Vec<&'static str>> {
+                let dsc = ops[0].op.as_ref().expect("descriptor").dscs_[0]
+                    .values()
+                    .next()
+                    .expect("one dsc");
+                dsc.scheduleTree_
+                    .iter()
+                    .filter(|n| n.nodeType_ == "allocate")
+                    .map(|n| n.layoutDimOrder_.clone())
+                    .collect()
+            };
         let (r0, ..) = mlp_chunks_at_zero();
         let mut sym = 0i64;
         let ops = elementwise("mul_s22", Elementwise::Mul, &r0, &[], &mut sym, None)
@@ -9308,7 +9459,14 @@ mod batch_transpose_tests {
     #[test]
     fn a_flat_input_two_sticks_wide_is_refused() {
         let mut sym = 0i64;
-        let Err(e) = batch_transpose("t", 8, BatchFrame::Flat, &pages(), &mut sym, None) else {
+        let Err(e) = batch_transpose::<crate::collective::TpWorld<1>>(
+            "t",
+            8,
+            BatchFrame::Flat,
+            &pages(),
+            &mut sym,
+            None,
+        ) else {
             panic!("a flat [8, 64, 128] transposed per batch");
         };
         assert!(e.message.contains("interleave"), "{}", e.message);
@@ -9318,7 +9476,14 @@ mod batch_transpose_tests {
     #[test]
     fn an_input_in_blocks_is_read_block_by_block() {
         let mut sym = 0i64;
-        let ops = match batch_transpose("t", 8, BatchFrame::Blocks, &pages(), &mut sym, None) {
+        let ops = match batch_transpose::<crate::collective::TpWorld<1>>(
+            "t",
+            8,
+            BatchFrame::Blocks,
+            &pages(),
+            &mut sym,
+            None,
+        ) {
             Ok(ops) => ops,
             Err(e) => panic!("{}", e.message),
         };
@@ -9413,14 +9578,14 @@ mod proofs {
 /// [`super::whole_function::program_rmsnorm_chains`] does, at the `arith.addf` each chain owns.
 ///
 /// The body below is shared, so the two doors cannot drift about what an rmsnorm EMITS.
-pub fn rmsnorm_at(
+pub fn rmsnorm_at<T: crate::collective::Tp>(
     name: &str,
     eps: f32,
     ones: Option<f32>,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // x, gamma and the output — the parameters the rmsnorm program mints. Its constants are
     // immediates, so none of them is a parameter.
     let (tensors, out) = split_out(name, r, layout, 2)?;
@@ -9492,13 +9657,13 @@ pub fn rmsnorm_at(
 /// [`assemble_rmsnorm_unit`] — the first five steps of the gained form with the
 /// normalising multiply writing `out` directly. ONE tensor parameter where
 /// `rmsnorm` splits two, which is the only structural difference.
-pub fn rmsnorm_unit(
+pub fn rmsnorm_unit<T: crate::collective::Tp>(
     name: &str,
     k: &KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let eps = program_rmsnorm_eps(&k.func).ok_or_else(|| Error {
         message: format!(
             "RmsNormUnit {name}: the program states no epsilon. `KtirFunc::rmsnorm_unit` splats \
@@ -9515,13 +9680,13 @@ pub fn rmsnorm_unit(
 /// SAME body the per-`Program` door above emits, so the two doors cannot state different
 /// formulas for one norm; the only difference is where the epsilon comes from — the chain's
 /// own `arith.addf`, threaded here, rather than the program's single root.
-pub fn rmsnorm_unit_at(
+pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
     name: &str,
     eps: f32,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // x and the output — the parameters the chain's fused op mints.
     let (tensors, out) = split_out(name, r, layout, 1)?;
     let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
@@ -9580,13 +9745,13 @@ pub fn rmsnorm_unit_at(
 /// norms are the `Scale` convention (measured: the bake's `rmsnorm_s8` states no
 /// gain-offset addf), so they lower with no add at all — byte-identical to the
 /// form before this row existed.
-pub fn windowed_rmsnorm(
+pub fn windowed_rmsnorm<T: crate::collective::Tp>(
     name: &str,
     k: &KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::{
         assemble_reduce_off, win_reduce_accum, win_reduce_data,
     };
@@ -9716,7 +9881,7 @@ pub fn windowed_rmsnorm(
     let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
     let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(d);
     let s_cols = crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16);
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     if let (Some(g), Some(ones), Some(gw)) = (&gamma_h, &ones_h, &gw_h) {
         ops.push(pw2(
             &format!("rmga_o{t}"),
@@ -9858,13 +10023,13 @@ pub fn windowed_rmsnorm(
 /// that value, and the body is [`assemble_tanhsoftcap`] — ONE `realdiv` by the
 /// bound `[1,1]` cap const, ONE `tanh`, ONE `multiply` by the same const.
 /// ONE tensor parameter, exactly like the unit norm.
-pub fn tanhsoftcap(
+pub fn tanhsoftcap<T: crate::collective::Tp>(
     name: &str,
     k: &KtirNode,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // x and the output — the parameters `KtirFunc::tanhsoftcap` mints.
     let (tensors, out) = split_out(name, r, layout, 1)?;
     let cap = program_tanhsoftcap_cap(&k.func).ok_or_else(|| Error {
@@ -9912,12 +10077,12 @@ pub fn tanhsoftcap(
 /// const the bake binds. The weight's placement pads its `[1]` extent to a
 /// whole stick (`nbytes` → `[1, 64]` f16 = 128 B), so the one-stick scalar
 /// read is in bounds by construction.
-pub fn scalarweightmul(
+pub fn scalarweightmul<T: crate::collective::Tp>(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // x, the weight, and the output — the parameters `KtirFunc::scalar_weight_mul` mints.
     let (tensors, out) = split_out(name, r, layout, 2)?;
     let rows = node_rows(name, &out)?;
@@ -9979,12 +10144,12 @@ pub fn scalarweightmul(
 /// re-stated here because a descriptor pair that moved a different number of elements than the
 /// program claims would be silently-wrong on both ends); and the windows must be whole views
 /// (`split_out` refuses a corner). A violated law is a build `Err` naming it.
-pub fn reshape(
+pub fn reshape<T: crate::collective::Tp>(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // The source and the destination — the parameters `KtirFunc::reshape` mints.
     let (tensors, out) = split_out(name, r, layout, 1)?;
     let src = &tensors[0];
@@ -10109,7 +10274,7 @@ pub fn reshape(
 /// what a scalarmul emits — only about where its number came from. It used to be a COPY with that
 /// same sentence on it, and the copy drifted in the one arm nothing could reach; see the operand-order
 /// note below for what that cost.
-pub fn scalarmul_at(
+pub fn scalarmul_at<T: crate::collective::Tp>(
     name: &str,
     scale: f32,
     // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
@@ -10119,7 +10284,7 @@ pub fn scalarmul_at(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let idx = scale_slot(layout, scale).ok_or_else(|| Error {
         message: format!(
             "ScalarMul {name}: multiplier {scale}, read off the program, is absent from \
@@ -10158,7 +10323,7 @@ pub fn scalarmul_at(
 /// by RESERVED tid (`scale_idx_of`); a positional binding is not one, so the bound scale's tid
 /// travels in the skip list explicitly — one filter, the same mechanism, keyed by the fact the
 /// source owns.
-pub fn scalarmul_bound(
+pub fn scalarmul_bound<T: crate::collective::Tp>(
     name: &str,
     bound: &crate::emit::whole_function::BoundScale,
     // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
@@ -10168,7 +10333,7 @@ pub fn scalarmul_bound(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     scalarmul_scaled(
         name,
         &ScaleSource::Bound { tid: bound.tid },
@@ -10192,14 +10357,14 @@ enum ScaleSource {
     Bound { tid: u32 },
 }
 
-fn scalarmul_scaled(
+fn scalarmul_scaled<T: crate::collective::Tp>(
     name: &str,
     scale: &ScaleSource,
     gather: Option<Gather>,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
     // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
     // than by relaxing the count. See [`split_out_excluding`]. A BOUND scale joins the skip list for
@@ -10460,14 +10625,14 @@ fn scalarmul_scaled(
 ///
 /// `attention_flash.py` and `swiglu_mlp.py` still pin `BLOCK_N = 64` — that is those kernels'
 /// own work-division choice (and the fixtures' correctness constraint), not a door law.
-pub fn reduce(
+pub fn reduce<T: crate::collective::Tp>(
     name: &str,
     kind: crate::ktir_node::ReduceKind,
     df: Df,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let data = ins[0];
     // The REDUCED extent is the data's column span and the result is one column per row. Read the
@@ -10557,14 +10722,14 @@ pub fn reduce(
 /// [`assemble_reduce_seeded`] path verbatim; every other format rides
 /// [`tiled_op_sdsc_op::reduce::assemble_reduce_df`] (the torch-spyre fp32-rmsnorm precedent's own
 /// body, head-major flat) and is refused there for any format it does not state.
-pub fn reduce_df(
+pub fn reduce_df<T: crate::collective::Tp>(
     name: &str,
     kind: crate::ktir_node::ReduceKind,
     r: &[Region],
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     if df == Df::Fp16 {
         return reduce(name, kind, df, r, sym_id_base, layout);
     }

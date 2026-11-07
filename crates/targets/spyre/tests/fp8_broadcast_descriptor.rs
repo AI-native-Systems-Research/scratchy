@@ -30,7 +30,10 @@ fn wide(n: &str, rows: usize, cols: usize) -> Stk<RowBlockedTag> {
 
 /// The 2nd input (the broadcast operand) of a 2-input pointwise op is `scheduleTree_[1]`.
 /// Return its per-dim coordInfo (`{mb:…, out:…}`).
-fn broadcast_operand_coordinfo(e: &emit::EmittedOp, op_name: &str) -> serde_json::Value {
+fn broadcast_operand_coordinfo(
+    e: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    op_name: &str,
+) -> serde_json::Value {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0][op_name]["scheduleTree_"][1]["coordinates_"]["coordInfo"].clone()
 }

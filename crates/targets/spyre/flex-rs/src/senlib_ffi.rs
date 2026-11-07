@@ -165,28 +165,28 @@ use std::os::raw::{c_char, c_int, c_uint};
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
 unsafe extern "C" {
-    /// Brings up the real device runtime (idempotent, thread-safe on the
-    /// C++ side via `std::call_once` — see `cxx-shim/flex_shim.cpp`).
-    /// MUST be called (and succeed, i.e. return 0) before any other
-    /// function in this module is called; every other function
-    /// assumes a live `flex::DeviceHandle` is already cached.
-    /// `logical_device_id` mirrors `flex::initializeRuntime`'s own parameter
-    /// (which Spyre card to bring up; 0 for a single-device host).
-    pub fn flex_shim_init_runtime(logical_device_id: i32) -> i32;
+    /// Opens the card at PCI address `pci_addr` ("DDDD:BB:DD.F") and returns
+    /// its handle, or null on failure (the reason in `flex_shim_last_error`).
+    /// `SenPci::pf(const std::string&)` selects by address, never an
+    /// enumeration index, and the `PfWrapper` constructor is the VFIO open.
+    /// Every call opens a new card; a process may hold several at once.
+    /// Use [`Card::open`], which owns the handle and closes it on drop.
+    fn flex_shim_card_open(pci_addr: *const c_char) -> *mut c_void;
 
-    /// Real device memory capacity in bytes for the currently-open card —
-    /// `flex::DeviceHandle::GetDmpaSize()`, the exact call the real C++
-    /// allocator bring-up path uses to size its single 1p0 domain
-    /// (`flex/src/runtime_stream/1p0/device_memory_topology.cpp`'s
-    /// `populateDomainTopology(mem_size)`, fed by
-    /// `getDevice()->getDeviceMemorySize() -> DeviceHandle::GetDmpaSize()`).
-    /// For a PF device this resolves to `PfDeviceHandle::GetDmpaSize() ->
-    /// device_memory_->DeviceMemorySize() -> lpddr_size_`, itself queried
-    /// once at device-open time from `senlib::v2::PfInterface::GetLPDDRSize()`
-    /// — this is the real HBM capacity of the open card, not a placeholder.
-    /// Requires `flex_shim_init_runtime` to have already succeeded; returns
-    /// 0 (and logs to stderr) otherwise.
-    pub fn flex_senlib_device_memory_size() -> u64;
+    /// Closes a card opened by `flex_shim_card_open`.
+    fn flex_shim_card_close(card: *mut c_void);
+
+    /// Writes senlib's own resolved PCI address for `card` (read from the
+    /// live `PciDevId` handed to `PfWrapper`, "DDDD:BB:DD.F") into `out`
+    /// (capacity `cap`, NUL-terminated) and returns the length written, or -1
+    /// on a null card or a too-small buffer.
+    fn flex_shim_card_pci(card: *const c_void, out: *mut c_char, cap: usize) -> i32;
+
+    /// The card's real device memory capacity in bytes,
+    /// `senlib::snt1p0::PfInterface::GetLPDDRSize()` (the call flex's own
+    /// `PfDeviceHandle` constructor sizes its single 1p0 domain from,
+    /// `pf_device_handle.cpp:153`). 0 on failure.
+    fn flex_senlib_device_memory_size(card: *mut c_void) -> u64;
 
     /// Real RCU (compute-core) count on the open card —
     /// `senlib::v2::SenPci::RCU_num_cores()`, the exact call
@@ -227,7 +227,8 @@ unsafe extern "C" {
     /// to `iomap->writable_` is handled by the caller
     /// (`iommu.rs::PfIommuMapper::map`, which already stores it on
     /// `IommuMapping` independent of this FFI call).
-    pub fn flex_senlib_iommu_register_and_map(
+    pub(crate) fn flex_senlib_iommu_register_and_map(
+        card: *mut c_void,
         hmva: *mut std::ffi::c_void,
         size_bytes: u64,
         writable: bool,
@@ -236,7 +237,8 @@ unsafe extern "C" {
     ) -> i32;
 
     /// `PfIommuMapper::Unmap`: `unpin_and_unmap` + `UnregisterMemForIOMMU`.
-    pub fn flex_senlib_iommu_unmap_and_unregister(
+    pub(crate) fn flex_senlib_iommu_unmap_and_unregister(
+        card: *mut c_void,
         hmva: *mut std::ffi::c_void,
         iova: *mut std::ffi::c_void,
         size_bytes: u64,
@@ -331,7 +333,10 @@ unsafe extern "C" {
     /// when firmware adds bank-targeted allocation support`), so a prior
     /// version of this declaration that took a `domain_id_or_negative_one`
     /// parameter here invented an FFI argument with no real senlib analog.
-    pub fn flex_senlib_memory_allocate(num_bytes: u64) -> SenlibAllocationHandle;
+    pub(crate) fn flex_senlib_memory_allocate(
+        card: *mut c_void,
+        num_bytes: u64,
+    ) -> SenlibAllocationHandle;
 
     /// Corresponds to `senlib::MemoryAllocator::Free` (PF,
     /// `device_memory_allocator.cpp:272`) / `senlib::v2::VfWrapper::Deallocate`
@@ -340,7 +345,8 @@ unsafe extern "C" {
     /// handle, or a senlib throw). Was `void`: a failed deallocation was
     /// indistinguishable from a successful one, the same swallowed-failure shape
     /// that caused the batched-decode hang on the submission path.
-    pub fn flex_senlib_memory_free(handle: SenlibAllocationHandle) -> i32;
+    pub(crate) fn flex_senlib_memory_free(card: *mut c_void, handle: SenlibAllocationHandle)
+    -> i32;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -457,13 +463,19 @@ unsafe extern "C" {
     /// the shim runtime has not been initialized (see
     /// `flex_shim_init_runtime` above) or `pipeline` is out of range.
     /// Backs `DeviceHandle::ComputeCbi()/AsyncDmaICbi()/AsyncDmaOCbi()`.
-    pub fn flex_shim_cbi_for_pipeline(pipeline: i32) -> SenlibControlBlockInterfaceHandle;
+    pub(crate) fn flex_shim_cbi_for_pipeline(
+        card: *mut c_void,
+        pipeline: i32,
+    ) -> SenlibControlBlockInterfaceHandle;
 
     /// Returns the process's single `senlib::ResponseBlockInterface*`
     /// (`DeviceHandle::Rbi()`) as an opaque handle. `pipeline` is accepted
     /// for symmetry with `flex_shim_cbi_for_pipeline` but ignored by the
     /// shim — senlib exposes exactly one RBI per device.
-    pub fn flex_shim_rbi_for_pipeline(pipeline: i32) -> SenlibResponseBlockInterfaceHandle;
+    pub(crate) fn flex_shim_rbi_for_pipeline(
+        card: *mut c_void,
+        pipeline: i32,
+    ) -> SenlibResponseBlockInterfaceHandle;
 
     /// Port of `senlib::ControlBlockInterface::capacity() const`.
     /// Call site: `runtime_scheduler.cpp:1025` (`RuntimeScheduler::getQueueCapacity`).
@@ -716,6 +728,211 @@ pub fn pcie_address_for_card(card_index: u32) -> String {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
+//  One open card
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐ ONE OPEN SPYRE CARD. Every card-scoped senlib call goes through the `Card` it acts on;
+/// there is no process-global card. A process opens as many as it drives (senlib's API is per
+/// card, and nickm5 held 8 open at once in one process, 2026-11-06), and a one-card process is the
+/// same code with one `Card`.
+///
+/// Opened by PCI address, never by enumeration index: an index can drift from `lspci` order, and a
+/// rank bound to the wrong card computes on it and reports success. Closed on drop, after every
+/// holder of the `Arc` has let go, so a card can't close under an allocation or a queue still
+/// using it.
+#[derive(Debug)]
+pub struct Card {
+    /// The shim's handle. `None` only for [`Card::detached`], a test-only card.
+    raw: Option<std::ptr::NonNull<c_void>>,
+    pci: String,
+}
+
+// SAFETY: `Card` is an opaque handle to the shim's per-card state. senlib's PfWrapper is used from
+// several threads by flex's own scheduler (the submit path and the response-completion thread),
+// and the shim serializes its own per-card tables with per-card mutexes.
+unsafe impl Send for Card {}
+unsafe impl Sync for Card {}
+
+impl Card {
+    /// Opens the card at PCI address `pci_addr` ("DDDD:BB:DD.F"), checking that senlib resolved
+    /// exactly that address.
+    ///
+    /// # Errors
+    /// The shim's message if senlib couldn't open it, or a mismatch if senlib resolved a different
+    /// address than the one asked for.
+    pub fn open(pci_addr: &str) -> Result<std::sync::Arc<Self>, String> {
+        let c_addr = std::ffi::CString::new(pci_addr)
+            .map_err(|_| "PCI address contains a NUL byte".to_string())?;
+        // SAFETY: `c_addr` is NUL-terminated for the duration of the call; the shim doesn't retain
+        // the pointer. A non-null return is a live handle this `Card` now owns.
+        let raw = unsafe { flex_shim_card_open(c_addr.as_ptr()) };
+        let raw = std::ptr::NonNull::new(raw).ok_or_else(last_shim_error)?;
+        let mut buf = [0 as c_char; 32];
+        // SAFETY: `raw` is live, and `buf` is a 32-byte writable array; the shim writes at most a
+        // NUL-terminated "DDDD:BB:DD.F" into it.
+        let n = unsafe { flex_shim_card_pci(raw.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+        let pci = if n < 0 {
+            String::new()
+        } else {
+            // SAFETY: the shim NUL-terminated the written prefix on success.
+            unsafe { CStr::from_ptr(buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        // Built before the check, so a mismatch still closes the card on drop.
+        let card = Self {
+            raw: Some(raw),
+            pci,
+        };
+        if card.pci != pci_addr {
+            return Err(format!(
+                "asked senlib for the card at {pci_addr}, and it opened {:?}",
+                card.pci
+            ));
+        }
+        Ok(std::sync::Arc::new(card))
+    }
+
+    /// The PCI address senlib resolved for this card.
+    pub fn pci(&self) -> &str {
+        &self.pci
+    }
+
+    /// The raw handle, for this crate's FFI calls only. Null only for a [`Card::detached`] test
+    /// card, which every shim entry point refuses by name ("null card").
+    pub(crate) fn raw(&self) -> *mut c_void {
+        self.raw
+            .map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
+    }
+
+    /// A card with no device behind it, for unit tests of code that holds a card but must refuse
+    /// before reaching senlib (a null buffer, a pre-mapped address, a bad geometry). Any senlib
+    /// call through it is refused by the shim's null-card check, never sent to a device.
+    #[cfg(test)]
+    pub(crate) fn detached() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            raw: None,
+            pci: String::new(),
+        })
+    }
+
+    /// The card's real device memory capacity in bytes (`GetLPDDRSize`).
+    ///
+    /// # Errors
+    /// The shim's message if senlib reported none.
+    pub fn memory_bytes(&self) -> Result<u64, String> {
+        // SAFETY: `self.raw` is live for `self`'s lifetime.
+        let bytes = unsafe { flex_senlib_device_memory_size(self.raw()) };
+        if bytes == 0 {
+            Err(last_shim_error())
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    /// Programs the on-device XSEG[SID] translation-table entry for `sid` with `xseg`, the composed
+    /// word the hal_sbf send encoder produces. It's the host door for the receiver-side table this
+    /// crate's F-sends land through.
+    ///
+    /// # Errors
+    /// The shim's message if the write didn't reach senlib.
+    pub fn write_xseg(&self, sid: u8, xseg: u32) -> Result<(), String> {
+        // SAFETY: `self.raw` is live; plain integer arguments.
+        rc_ok(unsafe { flex_senlib_write_xseg(self.raw(), sid, xseg) })
+    }
+
+    /// Reads back the XSEG[SID] translation-table entry for `sid`.
+    ///
+    /// # Errors
+    /// The shim's message if the read didn't reach senlib.
+    pub fn read_xseg(&self, sid: u8) -> Result<u32, String> {
+        let mut xseg = 0u32;
+        // SAFETY: `self.raw` is live; `xseg` is a valid out-pointer for the call.
+        rc_ok(unsafe { flex_senlib_read_xseg(self.raw(), sid, &mut xseg) })?;
+        Ok(xseg)
+    }
+
+    /// Reads the on-device write-done counter for `sid`.
+    ///
+    /// # Errors
+    /// The shim's message if the read didn't reach senlib.
+    pub fn read_wdone(&self, sid: u8) -> Result<u32, String> {
+        let mut val = 0u32;
+        // SAFETY: `self.raw` is live; `val` is a valid out-pointer for the call.
+        rc_ok(unsafe { flex_senlib_read_wdone(self.raw(), sid, &mut val) })?;
+        Ok(val)
+    }
+
+    /// Sets the on-device write-done counter for `sid` to `val` (`host_wdone.cpp:413`).
+    ///
+    /// # Errors
+    /// The shim's message if the register poke didn't reach senlib.
+    pub fn direct_set_wdone(&self, sid: u8, val: i32) -> Result<(), String> {
+        // SAFETY: `self.raw` is live; plain integer arguments.
+        rc_ok(unsafe { flex_senlib_direct_set_wdone(self.raw(), sid, val) })
+    }
+
+    /// Atomically increments the on-device write-done counter for `sid`
+    /// (`host_wdone.cpp:417,1025`).
+    ///
+    /// # Errors
+    /// The shim's message if the register poke didn't reach senlib.
+    pub fn ainc_wdone(&self, sid: u8) -> Result<(), String> {
+        // SAFETY: `self.raw` is live; plain integer argument.
+        rc_ok(unsafe { flex_senlib_ainc_wdone(self.raw(), sid) })
+    }
+
+    /// Programs peer `tid`'s base address in THIS card's RDMA base-address table, the entry the
+    /// engine's `SetTid(dest BAT index)` resolves a send to `tid` through. Every card installs an
+    /// entry for every peer (the vendor's `initialize_p2p_address_table` shape), with the value
+    /// [`pci_addr_for_region`]`(peer, 2)`.
+    ///
+    /// # Errors
+    /// The shim's message if the install didn't reach senlib.
+    pub fn set_base_addr_table(&self, tid: u8, pci_addr: u64) -> Result<(), String> {
+        // SAFETY: `self.raw` is live; plain integer arguments.
+        rc_ok(unsafe { flex_senlib_set_base_addr_table(self.raw(), tid, pci_addr) })
+    }
+
+    /// Checks and clears this card's RDMA error status. The shim's failure sentinel (-1 with an
+    /// error recorded) is `Err`; any other value is senlib's status, passed through, so a real -1
+    /// status and a failed call are never conflated.
+    ///
+    /// # Errors
+    /// The shim's message if the call didn't reach senlib.
+    pub fn check_and_clear_rdma_status(&self) -> Result<i32, String> {
+        // SAFETY: `self.raw` is live.
+        let rc = unsafe { flex_senlib_check_and_clear_rdma_status(self.raw()) };
+        if rc == -1 {
+            let err = last_shim_error();
+            if !err.is_empty() {
+                return Err(err);
+            }
+        }
+        Ok(rc)
+    }
+}
+
+impl Drop for Card {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw {
+            // SAFETY: `raw` was minted by `flex_shim_card_open` and is closed exactly once, here.
+            unsafe { flex_shim_card_close(raw.as_ptr()) };
+        }
+    }
+}
+
+/// A shim status code as a `Result`: 0 is success, and anything else carries the shim's last
+/// error.
+fn rc_ok(rc: i32) -> Result<(), String> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_shim_error())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
 //  Multi-device / cross-port P2P (re-added per issue #550)
 // ════════════════════════════════════════════════════════════════════════════════════════════
 //
@@ -831,20 +1048,30 @@ unsafe extern "C" {
     /// name parameter) and the concrete wrapper type it returns; the shim
     /// stores the wrapper type-erased and captures `hptr()` at creation, so
     /// only the shim's one construction line depends on the answer.
-    fn flex_senlib_pin_and_map(num_bytes: u64, name: *const c_char) -> SenlibPinnedMemoryHandle;
+    fn flex_senlib_pin_and_map(
+        card: *mut c_void,
+        num_bytes: u64,
+        name: *const c_char,
+    ) -> SenlibPinnedMemoryHandle;
 
     /// Releases a pinned-memory mapping obtained from `flex_senlib_pin_and_map`
     /// (unpins + unmaps + drops senlib's wrapper). Cited: hdma_shm.hpp
     /// lifetime of the `PinnedMemoryWrapperPtr` members, destructed in
     /// `HdmaShmMgmt::~HdmaShmMgmt` (hdma_shm.hpp:479). Returns 0 on success,
     /// -1 if the release did not reach senlib (unknown handle, or a throw).
-    fn flex_senlib_pinned_memory_release(handle: SenlibPinnedMemoryHandle) -> i32;
+    fn flex_senlib_pinned_memory_release(
+        card: *mut c_void,
+        handle: SenlibPinnedMemoryHandle,
+    ) -> i32;
 
     /// Returns the host-virtual pointer backing a pinned-memory region
     /// (`PinnedMemoryWrapper::hptr()`, used throughout hdma_shm.cpp, e.g.
     /// line 644). Non-null for any live handle — the allocation succeeded
     /// when the handle was minted.
-    fn flex_senlib_pinned_memory_hptr(handle: SenlibPinnedMemoryHandle) -> *mut c_void;
+    fn flex_senlib_pinned_memory_hptr(
+        card: *mut c_void,
+        handle: SenlibPinnedMemoryHandle,
+    ) -> *mut c_void;
 
     /// Directly sets the on-device write-done counter for `sid` to `val`.
     /// Cited: host_wdone.cpp:413 `pfw_->interface()->direct_set_wdone(
@@ -855,13 +1082,13 @@ unsafe extern "C" {
     /// FIXME(pod-verify): `sid`/`val` parameter widths are taken from the
     /// pre-#530 declaration's citation; check them against the pod's
     /// `pf_interface.hpp` before relying on values beyond u8/i32 range.
-    fn flex_senlib_direct_set_wdone(sid: u8, val: i32) -> i32;
+    fn flex_senlib_direct_set_wdone(card: *mut c_void, sid: u8, val: i32) -> i32;
 
     /// Atomically increments the on-device write-done counter for `sid`.
     /// Cited: host_wdone.cpp:417 and host_wdone.cpp:1025
     /// `pfw_->interface()->ainc_wdone(sid)`. Same width caveat as
     /// `flex_senlib_direct_set_wdone` (FIXME(pod-verify)).
-    fn flex_senlib_ainc_wdone(sid: u8) -> i32;
+    fn flex_senlib_ainc_wdone(card: *mut c_void, sid: u8) -> i32;
 
     /// Creates the cross-port P2P IOMMU mapping for peer card
     /// `peer_card_index`, sized `len_bytes`: senlib
@@ -888,6 +1115,7 @@ unsafe extern "C" {
     /// across peers — see `SENLIB_BOUNDARY.md`'s ledger for the recorded
     /// disassembly facts.
     fn flex_senlib_p2p_create_mapping(
+        card: *mut c_void,
         peer_card_index: c_uint,
         len_bytes: u64,
         out_segments: *mut SenlibP2pSegment,
@@ -905,7 +1133,7 @@ unsafe extern "C" {
     /// FIXME(pod-verify): whether the real `get_dmabuf` returns the fd
     /// directly or a wrapper object the shim must unwrap; the declaration
     /// assumes the former.
-    fn flex_senlib_get_dmabuf(bar: c_int, offset: u64, size: u64) -> c_int;
+    fn flex_senlib_get_dmabuf(card: *mut c_void, bar: c_int, offset: u64, size: u64) -> c_int;
 }
 
 /// Safe wrapper: pin and map `num_bytes` of host memory, optionally backed
@@ -917,6 +1145,7 @@ unsafe extern "C" {
 /// or failed — the HDMA buffers cross-process exchange depends on are not
 /// constructible by silently proceeding.
 pub fn pin_and_map(
+    card: &Card,
     num_bytes: usize,
     name: Option<&CStr>,
 ) -> Result<LivePinnedMemoryHandle, String> {
@@ -926,6 +1155,7 @@ pub fn pin_and_map(
     // before anything stores it.
     let handle = unsafe {
         flex_senlib_pin_and_map(
+            card.raw(),
             num_bytes as u64,
             name.map_or(std::ptr::null(), |n| n.as_ptr()),
         )
@@ -936,11 +1166,11 @@ pub fn pin_and_map(
 /// Safe wrapper: the host-virtual pointer backing a live pinned-memory
 /// region. Non-null by construction (the handle was minted by a successful
 /// `pin_and_map`); the region stays valid for the handle's lifetime.
-pub fn pinned_memory_hptr(handle: LivePinnedMemoryHandle) -> *mut c_void {
+pub fn pinned_memory_hptr(card: &Card, handle: LivePinnedMemoryHandle) -> *mut c_void {
     // SAFETY: `handle` is live (non-zero, from `pin_and_map`'s success path)
     // and has not been released; `hptr()` is a const accessor on senlib's
     // wrapper.
-    unsafe { flex_senlib_pinned_memory_hptr(handle.as_raw()) }
+    unsafe { flex_senlib_pinned_memory_hptr(card.raw(), handle.as_raw()) }
 }
 
 /// Safe wrapper: release a pinned-memory mapping back to senlib.
@@ -949,46 +1179,12 @@ pub fn pinned_memory_hptr(handle: LivePinnedMemoryHandle) -> *mut c_void {
 /// Returns `Err` with the shim's message if the release did not reach
 /// senlib — a pinned region that silently stays mapped leaks page-locked
 /// memory, which is precisely the failure that must not be swallowed.
-pub fn pinned_memory_release(handle: SenlibPinnedMemoryHandle) -> Result<(), String> {
+pub fn pinned_memory_release(card: &Card, handle: SenlibPinnedMemoryHandle) -> Result<(), String> {
     // SAFETY: `handle` is the raw FFI type by design (mirrors
     // `flex_senlib_memory_free`'s shape): releasing an unknown/zero handle
     // is senlib's error to report, not a memory-safety hazard — the shim's
     // table rejects it before any senlib call.
-    let rc = unsafe { flex_senlib_pinned_memory_release(handle) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(last_shim_error())
-    }
-}
-
-/// Safe wrapper: set the on-device write-done counter for `sid` to `val`
-/// (`host_wdone.cpp:413`).
-///
-/// # Errors
-/// Returns `Err` with the shim's message if the register poke did not reach
-/// senlib.
-pub fn direct_set_wdone(sid: u8, val: i32) -> Result<(), String> {
-    // SAFETY: plain integer arguments; assumes the shim runtime was brought
-    // up (`flex_shim_init_runtime` succeeded), which the shim checks itself.
-    let rc = unsafe { flex_senlib_direct_set_wdone(sid, val) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(last_shim_error())
-    }
-}
-
-/// Safe wrapper: atomically increment the on-device write-done counter for
-/// `sid` (`host_wdone.cpp:417,1025`).
-///
-/// # Errors
-/// Returns `Err` with the shim's message if the register poke did not reach
-/// senlib.
-pub fn ainc_wdone(sid: u8) -> Result<(), String> {
-    // SAFETY: plain integer argument; same shim-runtime assumption as
-    // `direct_set_wdone`.
-    let rc = unsafe { flex_senlib_ainc_wdone(sid) };
+    let rc = unsafe { flex_senlib_pinned_memory_release(card.raw(), handle) };
     if rc == 0 {
         Ok(())
     } else {
@@ -1011,6 +1207,7 @@ pub fn ainc_wdone(sid: u8) -> Result<(), String> {
 /// senlib or threw, or if the peer was already mapped with a different
 /// length.
 pub fn p2p_create_mapping(
+    card: &Card,
     peer_card_index: u32,
     len_bytes: u64,
 ) -> Result<Vec<SenlibP2pSegment>, String> {
@@ -1028,6 +1225,7 @@ pub fn p2p_create_mapping(
     // same mapping rather than creating a second one.
     let rc = unsafe {
         flex_senlib_p2p_create_mapping(
+            card.raw(),
             peer_card_index,
             len_bytes,
             segments.as_mut_ptr(),
@@ -1052,6 +1250,7 @@ pub fn p2p_create_mapping(
         // SAFETY: same as above, now sized for the reported count.
         let rc = unsafe {
             flex_senlib_p2p_create_mapping(
+                card.raw(),
                 peer_card_index,
                 len_bytes,
                 segments.as_mut_ptr(),
@@ -1075,10 +1274,10 @@ pub fn p2p_create_mapping(
 /// # Errors
 /// Returns `Err` with the shim's message if the export did not reach senlib
 /// or failed.
-pub fn get_dmabuf(bar: i32, offset: u64, size: u64) -> Result<i32, String> {
+pub fn get_dmabuf(card: &Card, bar: i32, offset: u64, size: u64) -> Result<i32, String> {
     // SAFETY: plain integer arguments; the returned fd is a process-owned
     // descriptor the caller closes — no senlib lifetime attaches to it.
-    let fd = unsafe { flex_senlib_get_dmabuf(bar, offset, size) };
+    let fd = unsafe { flex_senlib_get_dmabuf(card.raw(), bar, offset, size) };
     if fd >= 0 {
         Ok(fd)
     } else {
@@ -1165,23 +1364,36 @@ unsafe extern "C" {
     /// word the hal_sbf send encoder produces — the SAME word the vendor's
     /// T-send preamble delivers to the table (one compose, two destinations;
     /// submitP2PRdma.cpp:41-50), which is why the door is 32 bits wide.
-    fn flex_senlib_write_xseg(sid: u8, xseg: u32) -> i32;
+    fn flex_senlib_write_xseg(card: *mut c_void, sid: u8, xseg: u32) -> i32;
 
     /// `cxx-shim/senlib_ffi.cpp`: reads back the XSEG[SID] entry for `sid`
     /// (pf_interface.hpp:123 `uint32_t read_xseg(uint8_t)`). Returns 0 on
     /// success, -1 on shim failure.
-    fn flex_senlib_read_xseg(sid: u8, out_xseg: *mut u32) -> i32;
+    fn flex_senlib_read_xseg(card: *mut c_void, sid: u8, out_xseg: *mut u32) -> i32;
 
     /// `cxx-shim/senlib_ffi.cpp`: reads the on-device write-done counter for
     /// `sid` (pf_interface.hpp:121 `uint32_t read_wdone(uint8_t, bool)`).
     /// Returns 0 on success, -1 on shim failure.
-    fn flex_senlib_read_wdone(sid: u8, out_val: *mut u32) -> i32;
+    fn flex_senlib_read_wdone(card: *mut c_void, sid: u8, out_val: *mut u32) -> i32;
 
     /// `cxx-shim/senlib_ffi.cpp`: checks and clears the RDMA error status
     /// (pf_interface.hpp:118 `int check_and_clear_rdma_status()`). Returns
     /// the senlib status pass-through; -1 doubles as the shim's own failure
     /// sentinel (told apart below by whether the shim recorded an error).
-    fn flex_senlib_check_and_clear_rdma_status() -> i32;
+    fn flex_senlib_check_and_clear_rdma_status(card: *mut c_void) -> i32;
+
+    /// `cxx-shim/senlib_ffi.cpp`: programs peer `tid`'s base address in this
+    /// card's RDMA base-address table (pf_interface.hpp:178
+    /// `SetBaseAddrTable(uint8_t, uint64_t)` — the vendor's
+    /// `initialize_p2p_address_table` install). Returns 0 on success, -1 on
+    /// shim failure.
+    fn flex_senlib_set_base_addr_table(card: *mut c_void, tid: u8, pci_addr: u64) -> i32;
+
+    /// `cxx-shim/senlib_ffi.cpp`: the PCI address of `bdf`'s BAR `region`,
+    /// as senlib itself resolves it (senpci.hpp:263
+    /// `pciaddr_for_region(PciDevId, int)` — static, no runtime init
+    /// required). Returns 0 on error (a real BAR base is never 0).
+    fn flex_shim_pci_addr_for_region(bdf: *const c_char, region: u8) -> u64;
 
     /// `cxx-shim/hal_sbf.cpp`: the calling thread's most recent hal_sbf
     /// error (`""` if none). Thread-local, owned by the shim, valid until
@@ -1252,73 +1464,22 @@ pub fn last_hal_error() -> String {
     }
 }
 
-/// Safe wrapper: program the on-device XSEG[SID] translation-table entry for
-/// `sid` with `xseg` — the composed xseg word the hal_sbf send encoder
-/// produces (the same word the vendor's T-send preamble delivers to the
-/// table). THE host door for the receiver-side table this crate's F-sends
-/// land through.
+/// Safe wrapper: the PCI address of `bdf`'s BAR `region`, as senlib itself
+/// resolves it — the vendor's own BAT value source. A `region` of 2 is
+/// BAR2, the no-NTB P2P base the BAT installs.
 ///
 /// # Errors
-/// Returns `Err` with the shim's message if the write did not reach senlib.
-pub fn write_xseg(sid: u8, xseg: u32) -> Result<(), String> {
-    // SAFETY: plain integer arguments; the shim checks its own runtime
-    // state before touching senlib.
-    let rc = unsafe { flex_senlib_write_xseg(sid, xseg) };
-    if rc == 0 {
-        Ok(())
+/// Returns `Err` if senlib resolved 0 (a real BAR base is never 0).
+pub fn pci_addr_for_region(bdf: &str, region: u8) -> Result<u64, String> {
+    let c_bdf = std::ffi::CString::new(bdf).map_err(|_| "BDF contains a NUL byte".to_string())?;
+    // SAFETY: `c_bdf` is a NUL-terminated CString valid for the duration of
+    // the static senlib call; the shim does not retain the pointer.
+    let v = unsafe { flex_shim_pci_addr_for_region(c_bdf.as_ptr(), region) };
+    if v != 0 {
+        Ok(v)
     } else {
         Err(last_shim_error())
     }
-}
-
-/// Safe wrapper: read back the XSEG[SID] translation-table entry for `sid`.
-///
-/// # Errors
-/// Returns `Err` with the shim's message if the read did not reach senlib.
-pub fn read_xseg(sid: u8) -> Result<u32, String> {
-    let mut xseg = 0u32;
-    // SAFETY: `xseg` is a valid out-pointer for the duration of the call.
-    let rc = unsafe { flex_senlib_read_xseg(sid, &mut xseg) };
-    if rc == 0 {
-        Ok(xseg)
-    } else {
-        Err(last_shim_error())
-    }
-}
-
-/// Safe wrapper: read the on-device write-done counter for `sid`.
-///
-/// # Errors
-/// Returns `Err` with the shim's message if the read did not reach senlib.
-pub fn read_wdone(sid: u8) -> Result<u32, String> {
-    let mut val = 0u32;
-    // SAFETY: `val` is a valid out-pointer for the duration of the call.
-    let rc = unsafe { flex_senlib_read_wdone(sid, &mut val) };
-    if rc == 0 {
-        Ok(val)
-    } else {
-        Err(last_shim_error())
-    }
-}
-
-/// Safe wrapper: check and clear the RDMA error status. The returned value
-/// is senlib's own status, passed through — except that the shim's failure
-/// sentinel (-1, with an error recorded on the shim's channel) is reported
-/// as `Err` instead, so a real -1 status and a failed call cannot be
-/// conflated by a caller that only inspects the number.
-///
-/// # Errors
-/// Returns `Err` with the shim's message if the call did not reach senlib.
-pub fn check_and_clear_rdma_status() -> Result<i32, String> {
-    // SAFETY: no arguments; the shim checks its own runtime state.
-    let rc = unsafe { flex_senlib_check_and_clear_rdma_status() };
-    if rc == -1 {
-        let err = last_shim_error();
-        if !err.is_empty() {
-            return Err(err);
-        }
-    }
-    Ok(rc)
 }
 
 /// Safe wrapper: the R5 control-block section word from semantic scalars.

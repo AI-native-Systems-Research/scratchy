@@ -149,7 +149,7 @@ fn emit_config_geometry() {
             "scratchy-subtile: two configs name the type {ident}"
         );
         out.push_str(&format!(
-            "    /// `{stem}`.\n    pub enum {ident} {{}}\n    impl super::ConfigRopes for {ident} {{\n        const STEM: &'static str = {stem:?};\n        type Base = typenum::U{base};\n        type Global = typenum::U{global};\n        #[cfg(feature = \"spyre\")]\n        const ROPES: super::rope_bridge::ModelRopes = super::rope_bridge::ModelRopes::of::<Self>();\n    }}\n"
+            "    /// `{stem}`.\n    pub enum {ident} {{}}\n    impl super::ConfigRopes for {ident} {{\n        const STEM: &'static str = {stem:?};\n        type Base = typenum::U{base};\n        type Global = typenum::U{global};\n        #[cfg(feature = \"spyre\")]\n        fn ropes<T: ktir_superdsc::collective::Tp>() -> super::rope_bridge::ModelRopes<T> {{\n            super::rope_bridge::ModelRopes::of::<Self>()\n        }}\n    }}\n"
         ));
         arms.push_str(&format!("            ({stem:?}, {ident}),\n"));
     }

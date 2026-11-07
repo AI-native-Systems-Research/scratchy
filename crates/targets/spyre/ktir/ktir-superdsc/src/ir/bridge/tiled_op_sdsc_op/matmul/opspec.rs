@@ -1205,8 +1205,10 @@ mod x_batched_tests {
     fn operands(op: &OpSpec) -> Vec<(Vec<String>, Vec<u64>)> {
         let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
         let mut sym = 0i64;
-        let emitted = crate::emit::emit_sdsc_tiled("bmm_x", op, &folds, &mut sym, None)
-            .expect("the all-heads contraction emits");
+        let emitted = crate::emit::emit_sdsc_tiled::<crate::collective::TpWorld<1>>(
+            "bmm_x", op, &folds, &mut sym, None,
+        )
+        .expect("the all-heads contraction emits");
         let dsc = emitted.op.expect("a descriptor").dscs_[0]
             .values()
             .next()
@@ -1288,8 +1290,10 @@ mod rows_split_tests {
     fn operands(op: &OpSpec) -> Vec<(serde_json::Value, Vec<u64>)> {
         let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
         let mut sym = 0i64;
-        let emitted = crate::emit::emit_sdsc_tiled("bmm_r", op, &folds, &mut sym, None)
-            .expect("the contraction emits");
+        let emitted = crate::emit::emit_sdsc_tiled::<crate::collective::TpWorld<1>>(
+            "bmm_r", op, &folds, &mut sym, None,
+        )
+        .expect("the contraction emits");
         let dsc = emitted.op.expect("a descriptor").dscs_[0]
             .values()
             .next()

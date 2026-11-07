@@ -41,8 +41,8 @@ fn host_glue_kind<F: RopeForm>(op: &SubOp<F>) -> &'static str {
 /// [`lower_graph_to_ktir`] walk and the RE-ROLLED tape-driven walk so the
 /// per-op `match` lives exactly once (the reroll just changes WHICH nodes are
 /// walked + how many times the body runs, not how each op lowers).
-pub(crate) enum NodeLowering {
-    Ops(Vec<EmittedOp>),
+pub(crate) enum NodeLowering<T: ktir_superdsc::collective::Tp> {
+    Ops(Vec<EmittedOp<T>>),
     /// An op kind not yet lowerable (collected into the hard-error worklist).
     Unhandled(String),
     /// A recognized data-movement op routed host-side (not a SuperDSC tile).
@@ -524,11 +524,11 @@ fn chain_skeleton<F: RopeForm>(
 /// ONE SPELLING'S spyre-side call: this node carries no k of its own (the ChainStage's
 /// payload does), so the emitter asks [`chain_slab_entries`] at THIS node's own `hidden`
 /// — the same pure fn the mint stated, called on the same hidden, the ruled third site.
-fn embed_row_gather_emitted<F: RopeForm>(
+fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     hidden: u32,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     if node.inputs.len() != 3 {
         return Err(format!(
             "embed_row_gather t{}: {} input(s) — the mint's shape is exactly three (the \
@@ -563,13 +563,13 @@ fn embed_row_gather_emitted<F: RopeForm>(
 /// gather's own `hidden` payload — the same single statement `load_consts_of_ir` stages
 /// the `ChainStageTable`s from — never a second derivation: the mint splices the pair
 /// together, so the find cannot miss.
-fn chain_stage_emitted<F: RopeForm>(
+fn chain_stage_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     pad_vocab: u32,
     table_rows: u32,
     k: u32,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     if node.inputs.len() != 5 {
         return Err(format!(
             "chain_stage t{}: {} input(s) — the mint's shape is exactly five (the pick \
@@ -606,10 +606,238 @@ fn chain_stage_emitted<F: RopeForm>(
 
 /// One [`EmittedOp`] carrying ONLY its KTIR program — the splice's own `bare` law: the
 /// door is the body, so the producer states the program and nothing else.
-fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
+fn ktir_only<T: ktir_superdsc::collective::Tp>(
+    k: ktir_superdsc::ktir_node::KtirNode,
+) -> EmittedOp<T> {
     let mut e = EmittedOp::bare(k.func.name.to_string());
     e.ktir = Some(k);
     e
+}
+
+/// ⭐ WHAT A COLLECTIVE'S SENDS MOVE — this rank's operand `x` as ONE fragment. A send is not a
+/// program: it is an F-send control block (device p2p RDMA, flex-rs
+/// `scheduler::build_rdma_send_cb`) the CB pipeline issues, once per peer, ahead of the consume's
+/// waits, moving the fragment from `x`'s own placement into this rank's block of every peer's
+/// receive window on this card's DMA engine. The consume names the operand and this fragment
+/// ([`TpConsume`]), which is all the sends need.
+///
+/// ⛔ ONE FRAGMENT: a window block holds one fragment — `WINDOW_ROWS` rows of the operand
+/// (`RecvWindow::block_bytes_for`), more than any bundle hands a collective — so every operand is
+/// one, and each send is a run of messages when it passes the cap. An operand with more rows than a
+/// block is refused by name.
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+fn send_fragment<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+    node: &SubtileNode<F>,
+    kind: ktir_superdsc::collective::CollectiveKind,
+) -> Result<ktir_superdsc::collective::Fragment, NodeLowering<T>> {
+    let x = node.inputs[0];
+    let (rows, cols) = (x.region.rows.len, x.region.cols.len);
+    match crate::tp_plan::consume_fragments::<T>(rows, cols).as_deref() {
+        Ok([f]) => Ok(*f),
+        Ok(more) => Err(NodeLowering::Unhandled(format!(
+            "the {kind:?} operand [{rows}, {cols}] is {} p2p fragments — more rows than a \
+             receive window block holds, and two fragments of one collective cannot share it",
+            more.len()
+        ))),
+        Err(why) => Err(NodeLowering::Unhandled(format!(
+            "the {kind:?} operand [{rows}, {cols}] cannot be cut into p2p fragments: {why:?}"
+        ))),
+    }
+}
+
+/// ⭐ THE WINDOW CUT `node`'S COLLECTIVE USES — [`WindowCut::of_collective`] its index in the
+/// forward's own order (how many collectives precede it in `ir`), so consecutive collectives land
+/// in alternate cuts. The same index on every rank and in every bundle that carries the node.
+///
+/// [`WindowCut::of_collective`]: ktir_superdsc::collective::WindowCut::of_collective
+fn window_cut<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> ktir_superdsc::collective::WindowCut {
+    let k = ir
+        .nodes
+        .iter()
+        .take_while(|n| n.id != node.id)
+        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .count();
+    ktir_superdsc::collective::WindowCut::of_collective(k)
+}
+
+/// The `[rows, cols]` region of `tensor` starting at its first byte — how a consume reads a
+/// sender's fragment out of its window block (a run of whole stick columns is byte-identical to
+/// such a tensor).
+fn whole_block(
+    tensor: TensorId,
+    rows: u32,
+    cols: u32,
+) -> scratchy_subtile::subtile_ir::TensorRegion {
+    use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
+    TensorRegion {
+        tensor,
+        region: Region {
+            rows: Range::new(0, rows),
+            cols: Range::new(0, cols),
+        },
+    }
+}
+
+/// The all-reduce's consumes: per rank `me` of the world, the sum of every rank's share in
+/// ABSOLUTE RANK ORDER (`((x_0 + x_1) + x_2) + …`), each share read from `me`'s own operand when it
+/// is `me`'s and from the sender's block of the window otherwise. A chain of `W - 1` ordinary `Add`
+/// splices into the output's fragment columns — the running sum lives in the output, so the chain
+/// is one program per add and no temporary. Every rank adds the same values in the same order, so
+/// the replicated result is bit-identical on every card (the analysis's own law,
+/// `tensor_parallel::eval_collective`). All of one rank's adds carry ONE [`TpConsume`] that plays
+/// at that rank, so they fuse into its consume group behind its sends and waits.
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+) -> NodeLowering<T> {
+    use ktir_superdsc::collective::{CollectiveKind, Rank, TpConsume, ranks};
+    use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let rows = x.region.rows.len;
+    let f = match send_fragment::<T, F>(node, CollectiveKind::AllReduce) {
+        Ok(f) => f,
+        Err(refusal) => return refusal,
+    };
+    let cut = window_cut(node, ir);
+    let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
+    let own = TensorRegion {
+        tensor: x.tensor,
+        region: Region {
+            rows: x.region.rows,
+            cols: cols_at(x.region.cols.start),
+        },
+    };
+    let out = TensorRegion {
+        tensor: node.output.tensor,
+        region: Region {
+            rows: node.output.region.rows,
+            cols: cols_at(node.output.region.cols.start),
+        },
+    };
+    let mut ops = Vec::new();
+    for me in ranks::<T>() {
+        let consume = TpConsume {
+            kind: CollectiveKind::AllReduce,
+            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            fragment: f,
+            plays_at: me,
+            cut,
+        };
+        let share = |s: Rank<T>| {
+            if s == me {
+                own
+            } else {
+                whole_block(
+                    TensorId::from_index(cut.block_tid(s) as usize),
+                    rows,
+                    f.cols(),
+                )
+            }
+        };
+        // Rank 0's share then each later rank's, each add accumulating into the output.
+        let mut acc = share(Rank::of::<0>());
+        for (k, s) in ranks::<T>().enumerate().skip(1) {
+            let add = SubtileNode {
+                id: node.id,
+                op: SubOp::Elementwise(EwKind::Add),
+                inputs: vec![acc, share(s)],
+                output: out,
+            };
+            let mut e = match scratchy_triton_splice::lower(&add, ir, rows_are_requests) {
+                Ok(e) => e,
+                Err(reason) => return NodeLowering::Unhandled(reason),
+            };
+            // One name per (rank, add): they share the node's id, and a launch's name is its
+            // program's identity.
+            let name = format!("tpreduce_s{}_r{}_a{k}", node.id.index(), me.get());
+            if let Some(kt) = e.ktir.as_mut() {
+                kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
+            }
+            e.op_name = name;
+            e.tp_consume = Some(consume);
+            ops.push(e);
+            acc = out;
+        }
+    }
+    NodeLowering::Ops(ops)
+}
+
+/// The all-gather's consumes: per rank `me` of the world, one block copy
+/// (`scratchy_triton_splice::lower_block_copy`) per rank `s` — `me`'s own `[rows, lc]` block from
+/// its operand, every other rank's out of that sender's block of the window — to columns `s · lc`
+/// of the gathered output. All of one rank's copies carry ONE [`TpConsume`] that plays at that
+/// rank, so they fuse into its consume group and every other rank skips it whole.
+///
+/// ⛔ ONE FRAGMENT. A block copy moves a WHOLE source, and a window block holds one fragment —
+/// `WINDOW_ROWS` rows of the block, which every block a bundle hands a gather fits.
+///
+/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    cols: u32,
+) -> NodeLowering<T> {
+    use ktir_superdsc::collective::{CollectiveKind, TpConsume, World, ranks};
+    use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
+    let x = node.inputs[0];
+    let (rows, lc) = (x.region.rows.len, x.region.cols.len);
+    if cols != <T as World>::RANKS * lc {
+        return NodeLowering::Unhandled(format!(
+            "the all-gather restores {cols} columns from a {lc}-column block — not {} blocks",
+            <T as World>::RANKS
+        ));
+    }
+    let fragment = match send_fragment::<T, F>(node, CollectiveKind::AllGather) {
+        Ok(f) => f,
+        Err(refusal) => return refusal,
+    };
+    let cut = window_cut(node, ir);
+    let block_at = |rank: u32| TensorRegion {
+        tensor: node.output.tensor,
+        region: Region {
+            rows: node.output.region.rows,
+            cols: Range::new(node.output.region.cols.start + rank * lc, lc),
+        },
+    };
+    let mut ops = Vec::with_capacity((<T as World>::RANKS * <T as World>::RANKS) as usize);
+    for me in ranks::<T>() {
+        let consume = TpConsume {
+            kind: CollectiveKind::AllGather,
+            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
+            fragment,
+            plays_at: me,
+            cut,
+        };
+        for s in ranks::<T>() {
+            let src = if s == me {
+                x
+            } else {
+                whole_block(TensorId::from_index(cut.block_tid(s) as usize), rows, lc)
+            };
+            let name = format!("tpgather_s{}_r{}_b{}", node.id.index(), me.get(), s.get());
+            match scratchy_triton_splice::lower_block_copy(
+                node,
+                src,
+                block_at(s.get()),
+                cols,
+                &name,
+            ) {
+                Ok(mut e) => {
+                    e.tp_consume = Some(consume);
+                    ops.push(e);
+                }
+                Err(reason) => return NodeLowering::Unhandled(reason),
+            }
+        }
+    }
+    NodeLowering::Ops(ops)
 }
 
 /// Lower ONE [`SubtileNode`] to its SuperDSC op(s) — the single source of the the
@@ -620,7 +848,7 @@ fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
 /// that grain. KTIR does not: a node's whole computation is one `func`, with its inputs loaded from
 /// HBM and its output stored back, and the work division stated INSIDE it as the grid and its
 /// loops. So this walk yields one [`EmittedOp`] per node, carrying that program.
-pub(crate) fn lower_one_node<F: RopeForm>(
+pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     // Sweep KV extent for AttnDecode (paged-attn ladder rung); FULL ⇒ full cap. See main's
@@ -628,7 +856,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`: whether this bundle's rows are separate requests.
     rows_are_requests: bool,
-) -> NodeLowering {
+) -> NodeLowering<T> {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
     // out of the tape — its multiplier rides the staged weight bytes ([`scalar_mul_weight_folds`])
@@ -687,6 +915,16 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::KvAppend { .. }
         | SubOp::ExpertAct { .. }
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        // ⭐ THE ALL-REDUCE'S CONSUME. The exchange itself is not a program — the bundle's CB
+        // pipeline sends this rank's operand fragment into every peer's window and waits for every
+        // peer's before the consume launches (`bundle::collective::cb_pipeline`). What IS a program
+        // is the sum: a chain of ordinary `Add` splices over every rank's share in absolute rank
+        // order, so every rank computes bit-identical sums at any world width.
+        SubOp::AllReduce => all_reduce_consumes(node, ir, rows_are_requests),
+        // ⭐ THE ALL-GATHER'S CONSUME: every rank's block lands at that rank's columns, read from
+        // this rank's operand or the sender's window block; the bake carries one consume per rank
+        // and each session plays its own (`bundle::collective::cb_pipeline`).
+        SubOp::AllGather { cols } => all_gather_consumes(node, ir, *cols),
         // ⛔ THE 2b EXPANSION KINDS, named here instead of `expansion_ops!()`: the 2a
         // routing below made the macro's patterns for THOSE kinds unreachable
         // (`unreachable_patterns` is `-D warnings`), and the remaining members are a
@@ -938,14 +1176,14 @@ pub(crate) fn lower_one_node<F: RopeForm>(
 /// caller that asked it for descriptors got `EmittedOp::bare` — `op: None`, `time: 1` — and every
 /// question it then asked of them ("how many descriptors?", "is this op tiled?") was answered about a
 /// program instead. The WHOLE lowering is [`lower_graph_to_superdsc`] below; this is its first half.
-pub fn lower_graph_to_ktir<F: RopeForm>(
+pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     // Swept KV extent for the decode attention (paged-attn ladder rung); FULL ⇒ full cap (byte-identical).
     active_cap: ActiveCap,
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
-) -> Result<(Vec<EmittedOp>, BundleLayout), SuperDscError> {
+) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     // GLOBAL ≤7-segment memory layout (task #55) computed ONCE for the whole bundle.
     // Every op resolves each tensor's HBM address from this (by `t{id}` name) so a
     // tensor shared across ops gets the SAME address — fixing the per-op `arg_index`
@@ -955,13 +1193,13 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout = compute_bundle_layout(
+    let bundle_layout = compute_bundle_layout::<T, F>(
         ir,
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &[],
     )?;
-    let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
+    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
     // reconnaissance, not a silent skip: a non-empty set is a HARD error so a
     // partial (silently-wrong) bundle is never baked (guard-every-crash rule).
@@ -1013,13 +1251,13 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
 /// activation-quantize dedup set as it built each DESCRIPTOR, so both are per-bundle facts of the
 /// descriptor pass — the producer's copies are threaded but never written (main's
 /// `lower_matmul_node`'s `_quantized`). `ktir_groups_via_superdsc` mints them at exactly this grain for exactly this reason.
-pub fn lower_graph_to_superdsc<F: RopeForm>(
+pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
-) -> Result<(Vec<EmittedOp>, BundleLayout), SuperDscError> {
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
+) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
         lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests)?;
     // The fact no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
@@ -1027,18 +1265,20 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     let attn_params = attn_bundle_params(ir, rows_are_requests);
     let mut sym_id_base: i64 = 0;
     let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
-    let mut ops: Vec<EmittedOp> = Vec::with_capacity(programs.len());
+    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(programs.len());
     for e in &programs {
-        let k = e.ktir.as_ref().ok_or_else(|| {
-            SuperDscError(format!(
+        if e.ktir.is_none() {
+            return Err(SuperDscError(format!(
                 "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
                  program computes something else",
                 e.op_name
-            ))
-        })?;
+            )));
+        }
+        // ⭐ `lower_op`, not `lower`: a collective's consume carries its `tp_consume` from the
+        // emitted op onto every SuperDSC op its program lowers to.
         ops.extend(
-            crate::ktir_superdsc_door::lower(
-                k,
+            crate::ktir_superdsc_door::lower_op(
+                e,
                 &mut sym_id_base,
                 Some(&bundle_layout),
                 attn_params,
@@ -1383,7 +1623,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
 /// the REGISTRY the lowering writes constants into — the door registers its attention
 /// scale in `BundleLayout.scalarmul_scales` and refuses without one ("registry desync") — so a
 /// wiring pass that threads `None` does not get placement-independent answers, it gets no answers.
-pub fn graph_wiring<F: RopeForm>(
+pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
@@ -1401,7 +1641,9 @@ pub fn graph_wiring<F: RopeForm>(
     // card.
     let _ = weight_ids;
     let registries = WiringRegistries {
-        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry(ir, paged_rows)?,
+        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry::<T, F>(
+            ir, paged_rows,
+        )?,
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
@@ -1446,7 +1688,7 @@ pub fn graph_wiring<F: RopeForm>(
         ir.nodes
             .par_iter()
             .map(|node| {
-                let ops = match lower_one_node(node, ir, ActiveCap::FULL, false) {
+                let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
                     // still occupies a position in the node order, so it contributes an empty entry.
@@ -1835,7 +2077,7 @@ pub fn chain_of_ir<F: RopeForm>(ir: &SubtileIR<F>) -> crate::wiring::ChainFact {
 /// during the bake, and re-lowering the whole graph per gate run would double
 /// the build's expensive half. The kernel memo is process-wide, so the
 /// sample kernel itself compiles once.
-pub fn staggered_of_ir<F: RopeForm>(
+pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
 ) -> Result<
     std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
@@ -1847,7 +2089,7 @@ pub fn staggered_of_ir<F: RopeForm>(
         .iter()
         .filter(|n| matches!(n.op, SubOp::Sample { .. }))
     {
-        let ops = match lower_one_node(node, ir, ActiveCap::FULL, false) {
+        let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false) {
             NodeLowering::Ops(v) => v,
             NodeLowering::HostRouted(_) => continue,
             NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
@@ -2069,7 +2311,7 @@ pub fn node_output_on_f16_stick<F: RopeForm>(
 /// `lower_one_node`); post-loop Computes → `suffix`. Collects the per-layer tid map
 /// (`Compute::per_layer_out` for outputs + `ComputeInput::External::per_layer` for
 /// weights) for the executor's per-iteration address advance.
-pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
+pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     tape: &scratchy_subtile::subtile_tape::SubtileTape,
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -2080,8 +2322,8 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
     // The model's rope classes, which every rope program lowers through (`ktir_superdsc_door`).
-    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
-) -> Result<RolledSuperDsc, SuperDscError> {
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
+) -> Result<RolledSuperDsc<T>, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     let _pc = crate::pc::Pc::start("producer");
     // ⭐ THE GEMM WEIGHTS' HOST PAIRS — the union of each weight's matmul consumers'
@@ -2110,7 +2352,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
-    let mut bundle_layout = compute_bundle_layout(
+    let mut bundle_layout = compute_bundle_layout::<T, F>(
         ir,
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
@@ -2238,8 +2480,8 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             }
         }
     }
-    let mut prefix: Vec<EmittedOp> = Vec::new();
-    let mut suffix: Vec<EmittedOp> = Vec::new();
+    let mut prefix: Vec<EmittedOp<T>> = Vec::new();
+    let mut suffix: Vec<EmittedOp<T>> = Vec::new();
     let mut unhandled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // ⭐ SEEDED FROM THE PRE-PASS RATHER THAN REBUILT. `per_layer_external_tids` already read every
     // per-layer WEIGHT/KV class off this same tape — it had to, because `compute_bundle_layout` needs
@@ -2265,7 +2507,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     let mut seg: usize = 0;
     // The BODIES, one per loop, filled as the walk crosses each OpenLoop. `bodies[bi].iters` is
     // that class's layer count; its `layer_ids` are collected from its own RopeAppend table below.
-    let mut bodies: Vec<crate::lower_subtile_tape_to_superdsc::RolledBody> =
+    let mut bodies: Vec<crate::lower_subtile_tape_to_superdsc::RolledBody<T>> =
         Vec::with_capacity(loops.len());
     // Each body's PER-LAYER REPRESENTATIVE tids — every External table + per-layer node output
     // this body's own instrs name, plus its kct. `body_of_tid` (the launch-table guard) uses this
@@ -2630,7 +2872,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
     let pools = crate::lower_subtile_tape_to_superdsc::kv_pool_tids(ir);
-    let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
+    let body_op_lists: Vec<&Vec<EmittedOp<T>>> = bodies.iter().map(|b| &b.ops).collect();
     for ops in std::iter::once(&prefix)
         .chain(body_op_lists.iter().copied())
         .chain(std::iter::once(&suffix))
@@ -2647,7 +2889,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             if !cfg!(feature = "spyre-hw") && k.bindings.iter().any(|b| pools.contains(&b.get())) {
                 continue;
             }
-            crate::ktir_superdsc_door::lower(
+            crate::ktir_superdsc_door::lower::<T>(
                 k,
                 &mut declare_syms,
                 Some(&bundle_layout),

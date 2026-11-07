@@ -261,11 +261,11 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
 
             // The fused lowering: one WindowedRmsNorm program + the sink's elementwise.
             let weight_ids = std::collections::HashSet::new();
-            let (ops, _layout) =
-                superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-                    .unwrap_or_else(|e| {
-                        panic!("lower the sandwich (m={m}, H={heads}, D={d}): {e:?}")
-                    });
+            let (ops, _layout) = superdsc::lower_graph_to_ktir::<
+                ktir_superdsc::collective::TpWorld<1>,
+                _,
+            >(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+            .unwrap_or_else(|e| panic!("lower the sandwich (m={m}, H={heads}, D={d}): {e:?}"));
             let windowed: Vec<&str> = ops
                 .iter()
                 .filter_map(|e| e.ktir.as_ref().map(|k| k.func.name))
@@ -369,9 +369,13 @@ fn a_whole_row_rmsnorm_never_enters_the_windowed_path() {
         op_output: Vec::new(),
     };
     let weight_ids = std::collections::HashSet::new();
-    let (ops, _layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-            .expect("lower the granite-shaped norm");
+    let (ops, _layout) = superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        superdsc::ActiveCap::FULL,
+        false,
+    )
+    .expect("lower the granite-shaped norm");
     for e in &ops {
         let k = e.ktir.as_ref().expect("the norm carries its program");
         assert!(
@@ -405,9 +409,11 @@ fn an_extra_consumer_of_the_split_refuses_the_fusion() {
         // The refused graph: the split's output has a second reader.
         let ir = sandwich_ir(m, heads, d, gain, true);
         let weight_ids = std::collections::HashSet::new();
-        let (ops, _layout) =
-            superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-                .expect("lower the refused sandwich");
+        let (ops, _layout) = superdsc::lower_graph_to_ktir::<
+            ktir_superdsc::collective::TpWorld<1>,
+            _,
+        >(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
+        .expect("lower the refused sandwich");
         // NO windowed program was minted...
         for e in &ops {
             if let Some(k) = e.ktir.as_ref() {

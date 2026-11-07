@@ -938,6 +938,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::RouteGatherScores
             | SubOp::RouteRenorm
             | SubOp::ExpertUnsort => {}
+            // The world is the forward's type, not the op's: one forward, one world.
+            SubOp::AllReduce => {}
+            // The whole width a gather restores is class: two widths are two exchanges.
+            SubOp::AllGather { cols } => cols.hash(h),
             // The vocab and the row count are class: two vocab widths are
             // different programs (every staged table and the whole row's tile
             // shape key off it), and so are two batch widths (the grid and
@@ -1491,6 +1495,23 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     Mamba2 { inner: u32 },
     /// Row mean: `out[m, 1] = mean(x, axis = -1)`. `inputs` = `[x]`.
     Mean,
+
+    // ── Collectives: what tensor parallelism weaves in ──────────────
+    //
+    // ⛔ NEVER STATED BY A FRONT END. Only `crate::tensor_parallel::shard` inserts these, at
+    // exactly the edges where a value's placement does not meet its consumer's demand, so the
+    // per-rank forward that carries them is the one the analysis proved equal to the unsharded
+    // one. Their operand is a value in rank-local shape; every rank runs the same op.
+    /// The sum over every rank of a PARTIAL value: `out = Σ_r x_r`, summed in ABSOLUTE RANK
+    /// ORDER (`((x_0 + x_1) + x_2) + …`) on every rank, so the replicated result is
+    /// bit-identical across ranks. `inputs` = `[x]`; output the shape of `x`. Every rank of the
+    /// forward's world contributes — the world is the forward's TYPE (`tensor_parallel::World`),
+    /// never a number the op carries.
+    AllReduce,
+    /// The concatenation over every rank of a column-SPLIT value: rank `r`'s `[rows, cols / W]`
+    /// block lands at columns `[r · cols / W, (r + 1) · cols / W)`. `inputs` = `[x]`; `cols` is the
+    /// WHOLE width the gather restores. `W` is the forward's world type.
+    AllGather { cols: u32 },
 
     // ── A MoE block, op by op (see `NumExperts`) ──────────────────
     /// The router's own pre-norm: `rmsnorm(x, router.scale)`. `inputs` = `[x, router]`.
@@ -2077,10 +2098,16 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
                 t = node.inputs[0].tensor;
             }
             SubOp::MatmulTile { .. } => break,
+            // ⭐ A SHARDED LM HEAD'S GATHER ENDS THE CHAIN. Below it the projection is one RANK'S
+            // block of the vocabulary — `vocab / W` wide, not the vocabulary — so it is not widened:
+            // the draw reads the GATHERED row, whose pad lanes the widening above reserves, and the
+            // gather's block copies address a column block the same way at any total width
+            // (stick-major places a column by its stick and row alone).
+            SubOp::AllGather { .. } => break,
             other => panic!(
                 "the device sampling mint walked a {other:?} result tail — the admission \
-                 gate (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap) \
-                 refuses this graph, so the mint was called outside it"
+                 gate (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap, \
+                 gathered when sharded) refuses this graph, so the mint was called outside it"
             ),
         }
     }
@@ -2974,7 +3001,7 @@ pub fn mint_embed_chain<F: RopeForm>(
 // ── Host evaluation ────────────────────────────────────────────────
 
 /// Gather a tensor region into a dense row-major `(buf, rows, cols)`.
-fn gather<F: RopeForm>(
+pub(crate) fn gather<F: RopeForm>(
     tr: &TensorRegion,
     graph: &SubtileIR<F>,
     bufs: &[Vec<f32>],
@@ -3570,6 +3597,14 @@ pub fn eval_node<F: RopeForm>(
         SubOp::RopeAppend {
             attention, rope, ..
         } => rope_eval(node, graph, bufs, rope.head_dim(attention).get()),
+        // ⛔ A COLLECTIVE HAS NO ONE-RANK VALUE: it reads every rank's operand. The sharded
+        // forward that carries one is evaluated by `tensor_parallel::eval_ranks`, which runs
+        // every other node through here and the collectives across ranks itself.
+        SubOp::AllReduce | SubOp::AllGather { .. } => panic!(
+            "{} read on one rank: a sharded forward is evaluated by \
+             tensor_parallel::eval_ranks",
+            node.op.name()
+        ),
         SubOp::Mean => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             debug_assert_eq!(out_cols, 1, "mean output must be [m, 1]");
@@ -4413,6 +4448,8 @@ pub fn lower_region(
             SubOp::GatedDeltaNet => SubOp::GatedDeltaNet,
             SubOp::Mamba2 { inner } => SubOp::Mamba2 { inner },
             SubOp::Mean => SubOp::Mean,
+            SubOp::AllReduce => SubOp::AllReduce,
+            SubOp::AllGather { cols } => SubOp::AllGather { cols },
             SubOp::RouterNorm { eps, router } => SubOp::RouterNorm { eps, router },
             SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },
             SubOp::RouteSoftmax => SubOp::RouteSoftmax,

@@ -16,8 +16,22 @@ use scratchy_core_model::weight::HfModelConfig;
 // (weight load, dynamic sources, KV loop, sampling) is shared.
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
+
+/// ⭐ THE WORLD THIS BUILD SERVES — `Build`, the one `tp/N` the build names (one card when it names
+/// none): the same type the bake baked every bundle for, so a session and its bundles agree by type.
 #[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::sdsc_runner::SuperDscSession;
+pub(crate) type World = scratchy_target_spyre::bundle_code::collective::Build;
+
+/// A session over the build's world: one executor per rank of [`World`].
+#[cfg(feature = "spyre-hw")]
+pub(crate) type SuperDscSession = scratchy_target_spyre::sdsc_runner::SuperDscSession<World>;
+
+/// The build's cards, one per rank of [`World`].
+#[cfg(feature = "spyre-hw")]
+pub(crate) type Cards = scratchy_target_spyre::bundle_code::collective::PerRank<
+    World,
+    std::sync::Arc<scratchy_target_spyre::runtime::CardRuntime<World>>,
+>;
 
 /// One layer's KV pools: the K and V cache tensors its paged attention gathers from and its KV
 /// write scatters into. The emulator never stages them — the session's own zeroed allocation is

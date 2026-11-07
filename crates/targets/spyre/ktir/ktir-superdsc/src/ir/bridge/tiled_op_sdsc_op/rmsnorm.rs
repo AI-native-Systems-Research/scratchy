@@ -44,7 +44,7 @@ use crate::superdsc_opspec::{DataFormat, Fp16};
 /// `xn + xn·w` rewrite. `None` is the Scale convention: no add, the multiply
 /// reads the stored gamma, byte-identical to the form before the row existed.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_rmsnorm(
+pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     prefix: &str,
     rows: u32,
     cols: u32,
@@ -55,10 +55,10 @@ pub fn assemble_rmsnorm(
     ones_const: Option<&str>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp> {
+) -> Vec<EmittedOp<T>> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     // The op's operand SPELLING, rendered from the identity the layout is keyed by.
     let out_s = out_id.to_string();
     let out = out_s.as_str();
@@ -247,7 +247,7 @@ pub fn assemble_rmsnorm(
 /// form mints no `Xn`, because the normalising multiply's result is the output
 /// buffer, not a synthetic intermediate.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_rmsnorm_unit(
+pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     prefix: &str,
     rows: u32,
     cols: u32,
@@ -256,10 +256,10 @@ pub fn assemble_rmsnorm_unit(
     eps_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp> {
+) -> Vec<EmittedOp<T>> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     let out_s = out_id.to_string();
     let out = out_s.as_str();
     let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
@@ -365,7 +365,7 @@ pub fn assemble_rmsnorm_unit(
 /// mints, so it takes a `SynthRole` (`Tanhc`) and is reserved through the
 /// layout exactly as `Sq16` is — placed, never aliased.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_tanhsoftcap(
+pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     prefix: &str,
     rows: u32,
     cols: u32,
@@ -374,9 +374,9 @@ pub fn assemble_tanhsoftcap(
     cap_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp> {
+) -> Vec<EmittedOp<T>> {
     use crate::place::SynthRole as R;
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     let out_s = out_id.to_string();
     let out = out_s.as_str();
     let tanhc = crate::placement::syn(layout, out_id.synth(R::Tanhc)); // tanh(x/cap) [rows, cols]

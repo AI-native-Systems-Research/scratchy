@@ -49,7 +49,9 @@ fn region(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
 }
 
 /// The run-5 shape: dense `[ROWS, COLS]` × per-row `[ROWS, 1]` (a `Col` broadcast), at `df`.
-fn lower_s690(df: Df) -> Vec<ktir_superdsc::emit::EmittedOp> {
+fn lower_s690(
+    df: Df,
+) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
     let dense = region(1, ROWS, COLS, false);
     let col = region(2, ROWS, 1, false);
     let out = region(3, ROWS, COLS, true);
@@ -71,7 +73,10 @@ fn lower_s690(df: Df) -> Vec<ktir_superdsc::emit::EmittedOp> {
     })
 }
 
-fn dsc(ops: &[ktir_superdsc::emit::EmittedOp], op_name: &str) -> serde_json::Value {
+fn dsc(
+    ops: &[ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+    op_name: &str,
+) -> serde_json::Value {
     assert_eq!(ops.len(), 1, "one broadcast mul, one op");
     serde_json::to_value(&ops[0].op).unwrap()["dscs_"][0][op_name].clone()
 }
@@ -175,7 +180,7 @@ fn the_fp32_per_row_output_is_still_refused() {
     let col = region(2, ROWS, 1, false);
     let out = region(3, ROWS, 1, true);
     let mut sym = 0i64;
-    let e = match elementwise_df(
+    let e = match elementwise_df::<ktir_superdsc::collective::TpWorld<1>>(
         "sample_per_row",
         Elementwise::Mul,
         &[dense, col, out],
@@ -209,7 +214,7 @@ fn a_corner_on_a_broadcast_operand_is_refused_at_any_df() {
         col.c_start = 64;
         let out = region(3, ROWS, COLS, true);
         let mut sym = 0i64;
-        let e = match elementwise_df(
+        let e = match elementwise_df::<ktir_superdsc::collective::TpWorld<1>>(
             "sample_cornered",
             Elementwise::Mul,
             &[dense, col, out],
@@ -239,7 +244,7 @@ fn a_format_that_is_neither_fp16_nor_fp32_is_refused() {
     let col = region(2, ROWS, 1, false);
     let out = region(3, ROWS, COLS, true);
     let mut sym = 0i64;
-    let e = match elementwise_df(
+    let e = match elementwise_df::<ktir_superdsc::collective::TpWorld<1>>(
         "sample_fp8",
         Elementwise::Mul,
         &[dense, col, out],

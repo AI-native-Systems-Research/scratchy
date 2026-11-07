@@ -197,7 +197,7 @@ fn phantom_scaled_stick_dim_is_unconstructible() {
 //      (3) that const's value fits 16 bits (fp16 element)               (DSC2ToDataflowIR.cpp:51).
 #[test]
 fn reduce_and_multiop_invariants() {
-    let emitted = assemble_reduce(
+    let emitted = assemble_reduce::<ktir_superdsc::collective::TpWorld<1>, _, _>(
         "mean_g",
         "mean",
         64,
@@ -244,7 +244,7 @@ fn reduce_and_multiop_invariants() {
     // is now the device's own fused `exx2` reduce (the vendor layernorm head borrowed for RMS —
     // rmsnorm.rs's module doc): the former `rmsq`+`rmmean` pair is ONE op, 6 → 5.
     let mut sym = 0i64;
-    let ops = assemble_rmsnorm(
+    let ops = assemble_rmsnorm::<ktir_superdsc::collective::TpWorld<1>>(
         "g",
         64,
         576,
@@ -383,7 +383,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
         place(&mut l, 7, xy); // out
         l
     }
-    let run = |rows: u32| -> Vec<emit::EmittedOp> {
+    let run = |rows: u32| -> Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
         let l = layout_for(rows, 576);
         let mut sym = 0i64;
         assemble_rmsnorm(
@@ -402,7 +402,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
             Some(&l),
         )
     };
-    let json_of = |op: &emit::EmittedOp| -> (String, serde_json::Value) {
+    let json_of = |op: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>| -> (String, serde_json::Value) {
         (
             op.op_name.clone(),
             serde_json::from_str(&serde_json::to_string(&op.op).unwrap()).unwrap(),
@@ -561,7 +561,7 @@ fn norm(
     prefix: &str,
     out: u32,
     sym: &mut i64,
-) -> Vec<emit::EmittedOp> {
+) -> Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
     assemble_rmsnorm(
         prefix,
         64,
@@ -767,7 +767,7 @@ fn the_walk_refuses_a_pin_no_program_writes() {
     // A's chain with its WRITER dropped — `rmrsqrt`, the op whose OUTPUT binding is the pin's
     // one write. The pin is still declared (the chain's own mint), and `rmxn` still READS it
     // by name, so the walk sees a read-only touch.
-    let a: Vec<emit::EmittedOp> = norm(&l, "a", 7, &mut sym)
+    let a: Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = norm(&l, "a", 7, &mut sym)
         .into_iter()
         .filter(|e| e.op_name != "rmrsqrt_a")
         .collect();
@@ -801,7 +801,7 @@ fn the_walk_refuses_a_pin_no_program_reads() {
     // A's chain with its READER dropped — `rmxn`, the op whose INPUT binding (the `col_at`
     // view of the pin) is the pin's one read. The writer still declares it, so the walk sees
     // a write-only touch: dead scratch against the LX window.
-    let a: Vec<emit::EmittedOp> = norm(&l, "a", 7, &mut sym)
+    let a: Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = norm(&l, "a", 7, &mut sym)
         .into_iter()
         .filter(|e| e.op_name != "rmxn_a")
         .collect();
@@ -887,7 +887,9 @@ fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
 //    `n·2` bytes. Pins that the offset reaches the emitted startAddr.
 #[test]
 fn slice_operand_offsets_startaddr() {
-    let e = emit::assemble_slice_add_gate("slice_g", 64, 64, "sx", "so");
+    let e = emit::assemble_slice_add_gate::<ktir_superdsc::collective::TpWorld<1>>(
+        "slice_g", 64, 64, "sx", "so",
+    );
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&e.op).unwrap()).unwrap();
     let nodes = &j["dscs_"][0]["slice_g"]["scheduleTree_"];
@@ -915,7 +917,11 @@ fn slice_operand_offsets_startaddr() {
 // (3) an unsplit (reduction-resident) operand shares one address across cores.
 
 /// Parse the per-core startAddr map of allocate node `ldsidx` of op `op_name`.
-fn per_core_addrs(emitted: &emit::EmittedOp, op_name: &str, ldsidx: u32) -> Vec<u64> {
+fn per_core_addrs(
+    emitted: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    op_name: &str,
+    ldsidx: u32,
+) -> Vec<u64> {
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&emitted.op).unwrap()).unwrap();
     let nodes = j["dscs_"][0][op_name]["scheduleTree_"]
@@ -1025,18 +1031,21 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     // LOWERED descriptor, and the bundle off the PROGRAMS.
     let ir = single_matmul_ir(64, 16384, 2048);
     let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-    let (programs, layout) =
-        superdsc::lower_graph_to_ktir(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
-            .expect("KTIR for a 64x16384x2048 matmul");
-    let (dscs, _) =
-        superdsc::lower_graph_to_superdsc(
-            &ir,
-            &weight_ids,
-            superdsc::ActiveCap::FULL,
-            true,
-            &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES,
-        )
-            .expect("SuperDSC for a 64x16384x2048 matmul");
+    let (programs, layout) = superdsc::lower_graph_to_ktir::<
+        ktir_superdsc::collective::TpWorld<1>,
+        _,
+    >(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
+    .expect("KTIR for a 64x16384x2048 matmul");
+    let (dscs, _) = superdsc::lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        superdsc::ActiveCap::FULL,
+        true,
+        &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+            ktir_superdsc::collective::TpWorld<1>,
+        >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(),
+    )
+    .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {
         panic!(
             "one matmul node lowers to one descriptor, got {:?}",
@@ -1052,7 +1061,9 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         Some(&layout),
         superdsc::FoldGrouping::Split,
         None,
-        &<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct as scratchy_subtile::model_geometry::ConfigRopes>::ROPES,
+        &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+            ktir_superdsc::collective::TpWorld<1>,
+        >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(),
     );
     unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP") };
     assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");
@@ -1063,7 +1074,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
 /// kernel slab overflows LX — at most 32 cores leave every core ≥ 1024 `out` columns, 2 MiB of kernel.
 /// A `y`-batched matmul keeps the frontend's LX trips, and a one-stick
 /// contraction is the only `y`-batched form the build admits.
-fn batched_lx_overflowing_matmul() -> emit::EmittedOp {
+fn batched_lx_overflowing_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let (m, n, k, batch) = (64, 32768, 64, 16);
     superdsc::assemble_matmul(
         "matmul_o7",
@@ -1082,7 +1093,9 @@ fn batched_lx_overflowing_matmul() -> emit::EmittedOp {
 /// batches: a 32-stick contraction under a `y` batch, the form measured incoherent on granite-3.1-8b.
 /// It must stay a build error, and the error must name why.
 fn assert_the_multi_stick_batched_matmul_is_refused() {
-    let refused = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::try_assemble_matmul_seeded(
+    let refused = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::try_assemble_matmul_seeded::<
+        ktir_superdsc::collective::TpWorld<1>,
+    >(
         "matmul_o7",
         64,
         16384,
@@ -1343,7 +1356,7 @@ fn tiled_bundle_mlir_is_concrete_unroll() {
 // (iv-b) ── a time=1 op's bundle.mlir is byte-identical to the historical flat form ──
 #[test]
 fn time1_bundle_mlir_is_byte_identical_to_flat() {
-    let emitted = superdsc::assemble_matmul(
+    let emitted = superdsc::assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
         "MatMul_0",
         384,
         384,
@@ -1375,7 +1388,7 @@ fn dump_gate_bundles() {
     use std::path::Path;
     let root = Path::new("/tmp/superdsc_gate");
     // (A) FITTING 64×64×64 — time=1, no loop. Hypothesis-b probe.
-    let fit = superdsc::assemble_matmul(
+    let fit = superdsc::assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
         "gate1_mm",
         64,
         64,
@@ -1410,7 +1423,7 @@ fn dump_gate_bundles() {
             "{label} {m}x{n}x{k} b{b}: split={s:?} per_core_out={per_core_out} full={full} single_stick={stick} usable={USABLE_LX_BYTES}"
         );
         if full > USABLE_LX_BYTES && stick <= USABLE_LX_BYTES {
-            let ov = superdsc::assemble_matmul(
+            let ov = superdsc::assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
                 "gate1b_mm",
                 m,
                 n,
@@ -1436,7 +1449,7 @@ fn dump_gate_bundles() {
     // (C) BROADCAST gate: multiply(x[m,cols], v[m,1 broadcast-over-cols]) — the
     //     RmsNorm/RoPE/Attn prerequisite. v's `out`=RedStick → alpha_=0 stick fold
     //     (broadcast read). Tests whether dxp accepts a broadcast operand.
-    let bc = emit::assemble_broadcast_mul_gate(
+    let bc = emit::assemble_broadcast_mul_gate::<ktir_superdsc::collective::TpWorld<1>>(
         "bcast_mul",
         scratchy_subtile::sdsc_abstract::RowCount::of_token_rows(64),
         scratchy_subtile::sdsc_abstract::BlockCols::of_feature_cols(256),
@@ -1450,7 +1463,7 @@ fn dump_gate_bundles() {
     //     device's own fused `exx2` head) over [m=64, hidden=576] (SmolLM2 hidden). Tests the
     //     multi-op + broadcast chain (exx2-reduce→add(eps)→rsqrt→broadcast-mul) on-card.
     let mut sym = 0i64;
-    let rms = assemble_rmsnorm(
+    let rms = assemble_rmsnorm::<ktir_superdsc::collective::TpWorld<1>>(
         "gate",
         64,
         576,
@@ -1465,7 +1478,13 @@ fn dump_gate_bundles() {
     eprintln!("→ BAKING rmsnorm gate: {} ops", rms.len());
     superdsc::write_dxp_input(&root.join("rmsnorm"), &rms, superdsc::FoldGrouping::Split).unwrap();
     // (E) SLICE gate: add(x[:,0:64], x[:,64:128]) — the RoPE slice-operand probe.
-    let sl = emit::assemble_slice_add_gate("slice_add", 64, 64, "sl_x", "sl_o");
+    let sl = emit::assemble_slice_add_gate::<ktir_superdsc::collective::TpWorld<1>>(
+        "slice_add",
+        64,
+        64,
+        "sl_x",
+        "sl_o",
+    );
     eprintln!("→ BAKING slice-add gate: time={}", sl.time);
     superdsc::write_dxp_input(&root.join("slice"), &[sl], superdsc::FoldGrouping::Split).unwrap();
     eprintln!("wrote fit64, ov_tiled, bcast, rmsnorm, slice");

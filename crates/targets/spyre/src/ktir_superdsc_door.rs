@@ -9,7 +9,7 @@
 //! here; the program's own head dim is checked against the class it binds.
 //!
 //! ⛔ THE MARKER TYPES ARE THE CONSUMER'S MODEL INVENTORY, SO A LEAF CRATE MUST NOT OWN THEM. So the
-//! crate exposes [`rope_at`](ktir_superdsc::emit::lower_ktir_to_superdsc::rope_at)`::<HD>` as a
+//! crate exposes [`rope_at`](ktir_superdsc::emit::lower_ktir_to_superdsc::rope_at)`::<T, HD>` as a
 //! public generic entry point and THE CALLER NAMES ITS INSTANTIATION: this tree through its configs'
 //! marker types, a third-party KTIR producer from its own.
 //!
@@ -96,14 +96,14 @@ pub struct BundleAttnParams {
 /// `ropes` is the model's rope classes, read off its config's marker type at the bake's one door on
 /// model identity (`scratchy_subtile::model_geometry::with_config_model`): a rope lowers through its
 /// class's own `rope_at` instantiation.
-pub fn lower(
+pub fn lower<T: ktir_superdsc::collective::Tp>(
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
-    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
     quantized: &mut QuantizedActivations,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // ⛔ WHAT THIS PROGRAM WRITES IS NOT THE QUANTIZE ANY EARLIER PROGRAM TOOK, before it lowers
     // (a matmul reading what its own program wrote reads the new bytes) and after (no later matmul
     // may reuse a chain over bytes this program replaced).
@@ -119,14 +119,14 @@ pub fn lower(
 }
 
 /// [`lower`]'s dispatch, by the program's kind.
-fn lower_kind(
+fn lower_kind<T: ktir_superdsc::collective::Tp>(
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
-    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
     quantized: &mut QuantizedActivations,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // The name is still the program's identity for the emulator (which keys functions by it) and for
     // the descriptor suffixes, so it is READ — but nothing is parsed out of it.
     let name = k.func.name;
@@ -225,6 +225,8 @@ fn lower_kind(
         // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
         // half-lowering it.
         Program::LmLast => lower_function(k, layout, sym_id_base, None, quantized),
+        // An all-gather consume's block copy — the same pure-copy arm of the walk.
+        Program::BlockCopy => lower_function(k, layout, sym_id_base, None, quantized),
         Program::Rope { table } => rope(name, &r, table, ropes, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
@@ -233,14 +235,40 @@ fn lower_kind(
     }
 }
 
+/// THE PRODUCER'S OP THROUGH THE DOOR — [`lower`] over `e`'s program, with every per-op fact the
+/// producer stated and the program does not carried onto EVERY descriptor op it yields.
+///
+/// ⛔ ONE STAMP SITE. The door mints fresh ops from the program, so a fact the producer put on its
+/// op (today: the collective send and consume markers) is dropped unless something copies it, and a program
+/// can lower to several descriptor ops — each must carry it, or the ones that don't fuse into an
+/// ordinary group that takes the per-layer weight shift and reads the receive window somewhere
+/// else. The callers that keep the door's output call this, so none of them can forget the copy.
+pub fn lower_op<T: ktir_superdsc::collective::Tp>(
+    e: &EmittedOp<T>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    attn_params: Option<BundleAttnParams>,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
+    quantized: &mut QuantizedActivations,
+) -> Result<Vec<EmittedOp<T>>, Error> {
+    let k = e.ktir.as_ref().ok_or_else(|| Error {
+        message: format!("{}: no KTIR program to lower", e.op_name),
+    })?;
+    let mut ops = lower(k, sym_id_base, layout, attn_params, ropes, quantized)?;
+    for o in &mut ops {
+        o.tp_consume = e.tp_consume;
+    }
+    Ok(ops)
+}
+
 /// A column-tiled body's ops, held to the windows its program states
 /// ([`lk::column_windows_are_honoured`]): the bake fails naming the op rather than baking a piece
 /// that writes another piece's columns.
-fn windowed(
+fn windowed<T: ktir_superdsc::collective::Tp>(
     name: &str,
     r: &[Region],
-    ops: Result<Vec<EmittedOp>, Error>,
-) -> Result<Vec<EmittedOp>, Error> {
+    ops: Result<Vec<EmittedOp<T>>, Error>,
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let ops = ops?;
     lk::column_windows_are_honoured(name, r, &ops)?;
     Ok(ops)
@@ -251,15 +279,15 @@ fn windowed(
 /// both carried on [`KtirNode::out_shape`], because the program states only their product with
 /// `heads` (see that field). The head dim is the `x` view's own column extent, checked against the
 /// class of the table the program binds, whose `rope_at` instantiation lowers it.
-fn rope(
+fn rope<T: ktir_superdsc::collective::Tp>(
     name: &str,
     r: &[Region],
     table: Option<RopeTable>,
-    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // ⭐ THE CLASS, NOT THE NUMBER. The rope lowers through the model's own class — its config's
     // marker type named the class's head dim as a type and its `rope_at` instantiation
     // (`rope_bridge`) — so no head dim becomes a const here.
@@ -386,25 +414,27 @@ fn rope(
 /// `[mq, total]` plane's rows and width. Both forms describe the same bytes, so the device program is
 /// one function of these three numbers — lowered through `class`, the model's rope class for the
 /// `table` the program binds.
-#[derive(Clone, Copy)]
-struct RopePlane {
+struct RopePlane<T: ktir_superdsc::collective::Tp> {
     hd: u32,
     mq: u32,
     total: u32,
     table: RopeTable,
-    class: (u32, scratchy_subtile::model_geometry::rope_bridge::RopeFn),
+    class: (
+        u32,
+        scratchy_subtile::model_geometry::rope_bridge::RopeFn<T>,
+    ),
 }
 
 /// The rope's lowering once its [`RopePlane`] is read.
-fn rope_at_geometry(
+fn rope_at_geometry<T: ktir_superdsc::collective::Tp>(
     name: &str,
     ins: &[Region],
     out: &Region,
-    plane: RopePlane,
+    plane: RopePlane<T>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let RopePlane {
         hd,
         mq,

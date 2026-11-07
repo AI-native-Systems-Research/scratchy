@@ -107,7 +107,10 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     GroupKind, Trip, TripRequest, group_ranges, group_ranges_cover_ok, group_spans_two_requests,
 };
 
-fn pure(r: u32) -> Trip {
+/// A launch-grouping law is the same in every world; the fixtures run one card's.
+type W1 = ktir_superdsc::collective::TpWorld<1>;
+
+fn pure(r: u32) -> Trip<W1> {
     Trip::new(GroupKind::Pure, TripRequest(r))
 }
 
@@ -118,7 +121,7 @@ fn pure(r: u32) -> Trip {
 /// test from `Trip::fusable_with` and this drops to 1 group.)
 #[test]
 fn pure_run_breaks_at_every_request_change() {
-    let trips: Vec<Trip> = (0..8u32).map(pure).collect();
+    let trips: Vec<Trip<W1>> = (0..8u32).map(pure).collect();
     let groups = group_ranges(&trips, 512);
     assert_eq!(
         groups.len(),
@@ -137,7 +140,7 @@ fn pure_run_breaks_at_every_request_change() {
 /// of 8 ran ~20x slower when its cache writes were made singletons, so over-breaking is not free.
 #[test]
 fn one_requests_run_still_fuses_to_g() {
-    let trips: Vec<Trip> = (0..8).map(|_| pure(3)).collect();
+    let trips: Vec<Trip<W1>> = (0..8).map(|_| pure(3)).collect();
     assert_eq!(group_ranges(&trips, 512), vec![0..8]);
     assert_eq!(group_ranges(&trips, 3), vec![0..3, 3..6, 6..8]);
 }
@@ -148,7 +151,7 @@ fn one_requests_run_still_fuses_to_g() {
 #[test]
 fn no_kind_fuses_across_requests() {
     for kind in [
-        GroupKind::Pure,
+        GroupKind::<W1>::Pure,
         GroupKind::Slab,
         GroupKind::PageFold { gathered: true },
         GroupKind::PageFold { gathered: false },
@@ -169,7 +172,7 @@ fn no_kind_fuses_across_requests() {
     }
     // `Slot` carries its request in the kind as well; both paths must agree.
     let trips = vec![
-        Trip::new(GroupKind::Slot { req: 0 }, TripRequest(0)),
+        Trip::<W1>::new(GroupKind::Slot { req: 0 }, TripRequest(0)),
         Trip::new(GroupKind::Slot { req: 1 }, TripRequest(1)),
     ];
     assert_eq!(group_ranges(&trips, 512).len(), 2);
@@ -181,7 +184,7 @@ fn no_kind_fuses_across_requests() {
 #[test]
 fn reclassified_fold_keeps_its_request() {
     let trips = vec![
-        Trip::new(GroupKind::Pure, TripRequest(0)), // was PageFold, now Pure, still request 0
+        Trip::<W1>::new(GroupKind::Pure, TripRequest(0)), // was PageFold, now Pure, still request 0
         Trip::new(GroupKind::Pure, TripRequest(1)),
     ];
     assert!(!group_spans_two_requests(&trips, 512));
@@ -203,7 +206,7 @@ fn unbatched_partition_is_unchanged() {
         GroupKind::Slab,
         GroupKind::Pure,
     ];
-    let trips: Vec<Trip> = kinds
+    let trips: Vec<Trip<W1>> = kinds
         .iter()
         .map(|k| Trip::new(*k, TripRequest(0)))
         .collect();
@@ -278,7 +281,7 @@ fn partition_still_covers_exactly_with_mixed_requests() {
 fn a_gathered_page_fold_run_is_never_chunked_by_the_group_size() {
     let fold = |r: u32| Trip::new(GroupKind::PageFold { gathered: true }, TripRequest(r));
     // Longer than every `g` tried, so a cap that still applied would show up as more than one group.
-    let trips: Vec<Trip> = (0..40).map(|_| fold(0)).collect();
+    let trips: Vec<Trip<W1>> = (0..40).map(|_| fold(0)).collect();
     for g in [1usize, 2, 3, 8, 128, 512] {
         assert_eq!(
             group_ranges(&trips, g),
@@ -299,7 +302,7 @@ fn a_gathered_page_fold_run_is_never_chunked_by_the_group_size() {
     assert_eq!(group_ranges(&mixed, 512), vec![0..2, 2..4]);
     // ⛔ AND ONLY THE GATHERED FOLD IS EXEMPT — a `Pure` run of the same length still chunks, which is
     // what keeps the launch budget meaningful for the rest of the body.
-    let pures: Vec<Trip> = (0..40).map(|_| pure(0)).collect();
+    let pures: Vec<Trip<W1>> = (0..40).map(|_| pure(0)).collect();
     assert_eq!(group_ranges(&pures, 8).len(), 5);
 }
 
@@ -327,7 +330,7 @@ fn a_gathered_page_fold_run_is_never_chunked_by_the_group_size() {
 #[test]
 fn an_ungathered_page_fold_run_is_chunked_like_any_other() {
     let fold = Trip::new(GroupKind::PageFold { gathered: false }, TripRequest(0));
-    let trips: Vec<Trip> = (0..40).map(|_| fold).collect();
+    let trips: Vec<Trip<W1>> = (0..40).map(|_| fold).collect();
     assert_eq!(
         group_ranges(&trips, 8),
         vec![0..8, 8..16, 16..24, 24..32, 32..40],
@@ -347,7 +350,7 @@ fn an_ungathered_page_fold_run_is_chunked_like_any_other() {
     // mixed run would hand one half the other's cap — silently, and in the direction that loses the
     // gathered fold's exemption.
     let mixed = vec![
-        Trip::new(GroupKind::PageFold { gathered: true }, TripRequest(0)),
+        Trip::<W1>::new(GroupKind::PageFold { gathered: true }, TripRequest(0)),
         Trip::new(GroupKind::PageFold { gathered: false }, TripRequest(0)),
     ];
     assert_eq!(group_ranges(&mixed, 512), vec![0..1, 1..2]);

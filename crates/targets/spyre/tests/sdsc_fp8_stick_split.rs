@@ -231,7 +231,7 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
     // `L3DlOpsScheduler:1070` that persisted after the matmul fix). Assert per-core out is 128-aligned.
     let mut sym: i64 = 0;
     for &cols in &[2048u32, 8192, 512] {
-        let e = assemble_convert(
+        let e = assemble_convert::<ktir_superdsc::collective::TpWorld<1>>(
             "fq_afp8",
             "qfp8ch",
             1,

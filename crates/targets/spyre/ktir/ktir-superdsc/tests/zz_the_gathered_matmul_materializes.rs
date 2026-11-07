@@ -325,7 +325,9 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
 /// The emitted ops, descriptors and all — asserted on the TYPED structs rather than re-parsed
 /// JSON, so the assertions name the fields the card acts on (`labeledDs_`, `scheduleTree_`) with
 /// no second parser to disagree with the first.
-fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn emitted(
+    k: &KtirNode,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
     let layout = layout_for(k);
     let mut sid = 0i64;
     lower_function(
@@ -343,7 +345,10 @@ fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> 
 /// on: two descriptors reading the same buffer name it through the same number, and the
 /// descriptor names operands only positionally (`Tensor0/1/2`), so the address is the
 /// discriminator.
-fn alloc_address(op: &ktir_superdsc::emit::EmittedOp, tag: &str) -> Option<u64> {
+fn alloc_address(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    tag: &str,
+) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let idx = dsc.labeledDs_.iter().find(|ds| ds.dsType_ == tag)?.ldsIdx_;
@@ -359,7 +364,9 @@ fn alloc_address(op: &ktir_superdsc::emit::EmittedOp, tag: &str) -> Option<u64> 
 }
 
 /// The `value_tensor` alloc's base address in a gathered descriptor — the gather's SOURCE buffer.
-fn value_tensor_address(op: &ktir_superdsc::emit::EmittedOp) -> Option<u64> {
+fn value_tensor_address(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc

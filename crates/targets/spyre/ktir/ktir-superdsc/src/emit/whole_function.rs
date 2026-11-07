@@ -1303,32 +1303,32 @@ impl<'a> HeadMajorCopies<'a> {
     }
 
     /// Stick `s` of every head, block to head-major.
-    fn to_heads(
+    fn to_heads<T: crate::collective::Tp>(
         &self,
         name: &str,
         sym_id_base: &mut i64,
         layout: &BundleLayout,
-    ) -> Result<Vec<super::EmittedOp>, Error> {
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
         self.copies(name, true, sym_id_base, layout)
     }
 
     /// Stick `s` of every head, head-major to block.
-    fn to_block(
+    fn to_block<T: crate::collective::Tp>(
         &self,
         name: &str,
         sym_id_base: &mut i64,
         layout: &BundleLayout,
-    ) -> Result<Vec<super::EmittedOp>, Error> {
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
         self.copies(name, false, sym_id_base, layout)
     }
 
-    fn copies(
+    fn copies<T: crate::collective::Tp>(
         &self,
         name: &str,
         to_heads: bool,
         sym_id_base: &mut i64,
         layout: &BundleLayout,
-    ) -> Result<Vec<super::EmittedOp>, Error> {
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
         use crate::ir::bridge::tiled_op_sdsc_op::{StickRuns, assemble_stick_runs_copy};
         let stick = crate::work::FP16_ELEMS_PER_STICK;
         let (a, b, n) = (self.a, self.b, self.sticks);
@@ -4262,13 +4262,13 @@ pub fn staggered_sources(
 /// lowering one program alone passes a fresh one.
 ///
 /// [`QuantizedActivations`]: super::ktir_matmul_fp8::QuantizedActivations
-pub fn lower_function(
+pub fn lower_function<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     lower_function_folded(k, layout, sym_id_base, headmajor, None, quantized)
 }
 
@@ -4282,12 +4282,12 @@ pub fn lower_function(
 /// A ONE-TRIP walk states no loop at all — the front end promotes it to its body (MLIR's
 /// `SimplifyTrivialLoops`), the carried values read as their splatted inits — and lowers as the
 /// straight-line program it is.
-pub fn lower_walk(
+pub fn lower_walk<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let flat = super::loop_fold::flatten(k)?;
     let (node, fold) = match &flat {
         Some(flat) => (&flat.node, Some(&flat.fold)),
@@ -4302,7 +4302,7 @@ pub fn lower_walk(
         // The probe is a dry run: it learns the slicing from the set as the real lowering will
         // see it, and leaves the bundle's set as it found it.
         let mut sym = *sym_id_base;
-        lower_function_folded(
+        lower_function_folded::<T>(
             node,
             Some(probe),
             &mut sym,
@@ -4342,14 +4342,14 @@ pub fn lower_walk(
     Ok(ops)
 }
 
-fn lower_function_folded(
+fn lower_function_folded<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     fold: Option<&super::loop_fold::LoopFold>,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
     let mut lowered = 0usize;
@@ -6580,9 +6580,44 @@ fn lower_function_folded(
         // would read one column and spray it — a silent wrong answer with no shape error anywhere. The
         // pointwise arm downstream selects its operand mode from THIS extent, so pinning the two
         // together here is what stops the axis and the addressing from drifting apart.
-        for (i, axis) in bcast_axes.iter().enumerate() {
-            let Some(axis) = *axis else { continue };
+        for i in 0..bcast_axes.len() {
+            let Some(axis) = bcast_axes[i] else { continue };
             let r = per_op[i];
+            // ⭐ A ROW VECTOR HELD AS A STICK COLUMN, SPRAYED DOWN A TILE HELD AS A STICK COLUMN, IS
+            // THE OUTER ROW-SPLIT OF THE COLUMN — an addressing identity, not a new mode. The row
+            // reductions keep per-row scalars one a stick row (`[n, 1]`), so a leading-axis combine
+            // of such scalars (a decode batch's `J`-slot merge at ONE kv head: `[J, 1, 1, G] ->
+            // [1, 1, G]`, the unit kv axis folded) holds its one semantic row of `G` values as the
+            // column `[G, 1]`, and the consumer's own tile `[J, 1, 1, G]` as the column `[J·G, 1]`.
+            // Row-major the result's element `(j, g)` sits at `j·G + g` and the source's `g` at
+            // `g`, which is exactly the `Y` outer spray of the `[G, 1]` column `J` times. Stated over
+            // the REGIONS alone: a whole one-stick-column source of `mb` rows beside a dense
+            // one-stick-column operand of `y·mb` rows, `y > 1`. The consumer's want check and the
+            // `split_rows` frame law re-prove the cover before any operand is built.
+            let axis = match axis {
+                BcastAxis::Mb
+                    if r.c_len == 1
+                        && r.c_start == 0
+                        && r.r_start == 0
+                        && r.r_len == r.v_rows
+                        && r.v_rows > 1 =>
+                {
+                    let dense_rows = (0..per_op.len().min(bcast_axes.len()))
+                        .filter(|&j| j != i && bcast_axes[j].is_none())
+                        .map(|j| per_op[j])
+                        .find(|d| d.c_len == 1 && d.r_len > r.r_len && d.r_len % r.r_len == 0)
+                        .map(|d| d.r_len / r.r_len);
+                    match dense_rows {
+                        Some(y) if y > 1 => {
+                            let ax = BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(y));
+                            bcast_axes[i] = Some(ax);
+                            ax
+                        }
+                        _ => axis,
+                    }
+                }
+                other => other,
+            };
             let degenerate = match axis {
                 BcastAxis::Col => r.c_len == 1,
                 // One row of its view: the whole view at one row, or a one-row window of a taller
@@ -7552,17 +7587,22 @@ fn lower_function_folded(
     // that grew a compute op is a NEW producer form, and lowering its compute while silently not
     // running the copy half would emit a program whose stores are never written — so that case
     // refuses here rather than half-lowering.
-    if k.program == Program::LmLast {
+    if matches!(k.program, Program::LmLast | Program::BlockCopy) {
         if lowered > 0 {
             return err(format!(
-                "{}: an LmLast program with {lowered} compute op(s) — the last-row extraction is a \
-                 PURE COPY (loads and stores only), so a compute op here means the producer's form \
-                 changed and the copy half must be re-derived for it, not skipped",
-                f.name
+                "{}: a {:?} program with {lowered} compute op(s) — a copy is a PURE COPY (loads \
+                 and stores only), so a compute op here means the producer's form changed and the \
+                 copy half must be re-derived for it, not skipped",
+                f.name, k.program
             ));
         }
         let r = regions(k)?;
-        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
+        return match k.program {
+            Program::BlockCopy => {
+                super::lower_ktir_to_superdsc::block_copy(f.name, &r, sym_id_base, layout)
+            }
+            _ => super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout),
+        };
     }
     if lowered == 0 && !scatters {
         return err(format!(
@@ -7659,7 +7699,10 @@ fn stored_whole(k: &KtirNode, value: Ssa, held: Region) -> Result<Option<Region>
 /// clean launch and wrong bytes downstream (granite-3.1-8b's batch-of-one attention: the output
 /// projection read an output no op wrote, "Fraryning000…"). So the lowering refuses, naming the
 /// parameter, any direct store whose parameter no emitted op writes.
-fn every_store_is_written(k: &KtirNode, out: &[super::EmittedOp]) -> Result<(), Error> {
+fn every_store_is_written<T: crate::collective::Tp>(
+    k: &KtirNode,
+    out: &[super::EmittedOp<T>],
+) -> Result<(), Error> {
     let f = &k.func;
     let written: std::collections::BTreeSet<&str> = out
         .iter()
@@ -8048,7 +8091,7 @@ impl Permuted {
 }
 
 /// One stick permute between `src` and `dst` ([`crate::ir::bridge::tiled_op_sdsc_op::StickPermute`]).
-fn permute(
+fn permute<T: crate::collective::Tp>(
     name: &str,
     src: &Region,
     dst: &Region,
@@ -8060,7 +8103,7 @@ fn permute(
     direction: crate::ir::bridge::tiled_op_sdsc_op::StickPermute,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<super::EmittedOp, Error> {
+) -> Result<super::EmittedOp<T>, Error> {
     let base = block.map_or(0, |b| b * rows * sticks * crate::work::FP16_ELEMS_PER_STICK);
     let op_name = match block {
         None => format!("permute_o{}", dst.tid),
@@ -8101,7 +8144,7 @@ struct HeadBlock {
 /// rows of every head). `into_heads` lays the block out as per-head rows; otherwise the reverse. A
 /// head one stick wide is one stick permute; wider, the per-head rows go row-major through `mid` first
 /// (two permutes, [`HeadRows`]'s two).
-fn heads_inner_relayout(
+fn heads_inner_relayout<T: crate::collective::Tp>(
     name: &str,
     (src, dst, mid): (&Region, &Region, Option<&Region>),
     HeadBlock {
@@ -8112,7 +8155,7 @@ fn heads_inner_relayout(
     into_heads: bool,
     sym_id_base: &mut i64,
     layout: &BundleLayout,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::StickPermute::{RowToStick, StickToRow};
     let (block, per_head) = (
         Permuted::whole((rows, heads * sticks)),
@@ -8188,7 +8231,7 @@ struct Minter<'a> {
 /// [`heads_inner_relayout`] into a buffer minted for `key` (and, for heads wider than a stick, the
 /// row-major scratch it goes through): the head-major pair under the prompt trip's division. Returns
 /// the relayout and the result's region.
-fn heads_inner_pair(
+fn heads_inner_pair<T: crate::collective::Tp>(
     m: Minter<'_>,
     key: Ssa,
     name: &str,
@@ -8196,7 +8239,7 @@ fn heads_inner_pair(
     block: HeadBlock,
     into_heads: bool,
     sym_id_base: &mut i64,
-) -> Result<(Vec<super::EmittedOp>, Region), Error> {
+) -> Result<(Vec<super::EmittedOp<T>>, Region), Error> {
     let tid = mint_inter(m.k, m.layout, m.floor, key);
     let dst = if into_heads {
         stick_major_region(tid, block.rows * block.heads, block.sticks, m.layout)
@@ -8378,7 +8421,7 @@ struct BundleFacts<'q> {
 /// Every body here is unchanged and unaware it is being called per-op rather than per-function:
 /// `split_out` filters the list by `is_out`, and this list holds exactly one output and that op's
 /// inputs, so its arity check passes for the reason it was written to.
-fn emit_one(
+fn emit_one<T: crate::collective::Tp>(
     name: &str,
     program: Lowering,
     per_op: &[Region],
@@ -8386,7 +8429,7 @@ fn emit_one(
     layout: Option<&BundleLayout>,
     proof: WalkProof<'_>,
     bundle: BundleFacts<'_>,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let WalkProof {
         b_orient,
         gather,
@@ -8641,17 +8684,17 @@ fn emit_one(
 /// [`GatherEmit`] rather than as three more arguments — the walk owns one of these, threading it
 /// to every materialization. `floor` is [`lower_function`]'s node-derived tid bound, carried so
 /// this mint honors it like the walk's own does.
-struct GatherEmit<'a> {
+struct GatherEmit<'a, T: crate::collective::Tp> {
     sym_id_base: &'a mut i64,
-    out: &'a mut Vec<super::EmittedOp>,
+    out: &'a mut Vec<super::EmittedOp<T>>,
     floor: u32,
     inter: &'a mut std::collections::HashMap<Ssa, Region>,
 }
 
-fn gathered_matmul_materializes(
+fn gathered_matmul_materializes<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
-    emit: &mut GatherEmit<'_>,
+    emit: &mut GatherEmit<'_, T>,
     g: Gather,
     gathered_input: usize,
     in_values: &[Ssa],

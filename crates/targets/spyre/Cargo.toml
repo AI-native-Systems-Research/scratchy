@@ -6,6 +6,11 @@ license.workspace = true
 description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR target. No GPU toolchain."
 
 [features]
+# THE BUILD'S ONE TENSOR-PARALLEL WORLD (`tp/N` from the CLI): the world crate's `Build` is
+# `TpWorld<N>`, and everything that instantiates a world at the top names `Build`.
+tp-2 = ["ktir-superdsc/tp-2"]
+tp-4 = ["ktir-superdsc/tp-4"]
+tp-8 = ["ktir-superdsc/tp-8"]
 # THE CARD: link the IBM Spyre runtime so a bundle runs on the AIU. No GPU toolchain; the SDK is
 # only present/linked on a Spyre host. Pulls in `scratchy-subtile` because the session setters take
 # its `sdsc_abstract` law types (mask stride / fold pages / mask blocks / int stride) rather than
@@ -152,6 +157,11 @@ required-features = ["spyre-hw"]
 # (poisoned non-zero first, all-zero after), across a window boundary.
 [[example]]
 name = "fill_zero_probe"
+required-features = ["spyre-hw"]
+
+# One process, N cards: an all-gather over the real flex card-to-card path, byte-exact on every card.
+[[example]]
+name = "cards_all_gather"
 required-features = ["spyre-hw"]
 
 # The proof harnesses in this crate compile only under the model checker, so `cfg(kani)` is a real name a

@@ -117,7 +117,9 @@ fn layout(w: u32) -> BundleLayout {
 }
 
 /// Every `(name, dsc)` the emitted ops carry.
-fn dscs_of(ops: &[ktir_superdsc::emit::EmittedOp]) -> Vec<(String, serde_json::Value)> {
+fn dscs_of(
+    ops: &[ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+) -> Vec<(String, serde_json::Value)> {
     let mut out = Vec::new();
     for op in ops {
         let j = serde_json::to_value(&op.op).expect("serializes");
@@ -131,7 +133,9 @@ fn dscs_of(ops: &[ktir_superdsc::emit::EmittedOp]) -> Vec<(String, serde_json::V
 }
 
 /// The relayout leg's dsc, by name.
-fn rowflat_dsc(ops: &[ktir_superdsc::emit::EmittedOp]) -> Option<serde_json::Value> {
+fn rowflat_dsc(
+    ops: &[ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+) -> Option<serde_json::Value> {
     dscs_of(ops)
         .into_iter()
         .find(|(n, _)| n.contains("rowflat"))

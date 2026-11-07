@@ -1954,6 +1954,7 @@ version = "0.1.0"
 dependencies = [
  "half",
  "ktir-core",
+ "scratchy-tp-world",
  "serde",
  "serde_json",
 ]
@@ -3304,6 +3305,7 @@ dependencies = [
  "scratchy-serving-api",
  "scratchy-spec",
  "scratchy-target-spyre",
+ "scratchy-tp",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3436,6 +3438,7 @@ dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-tensors",
+ "scratchy-tp-world",
 ]
 
 [[package]]
@@ -3658,6 +3661,7 @@ dependencies = [
  "scratchy-ir",
  "scratchy-spyre-bundle",
  "scratchy-tensors",
+ "scratchy-tp-world",
  "serde_json",
  "syn 3.0.9",
 ]
@@ -3742,6 +3746,18 @@ dependencies = [
  "memmap2",
  "typenum",
 ]
+
+[[package]]
+name = "scratchy-tp"
+version = "0.1.0"
+dependencies = [
+ "scratchy-models",
+ "scratchy-serving-worker",
+]
+
+[[package]]
+name = "scratchy-tp-world"
+version = "0.1.0"
 
 [[package]]
 name = "scratchy-triton-splice"
