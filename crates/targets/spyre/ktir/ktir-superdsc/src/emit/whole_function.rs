@@ -8089,20 +8089,24 @@ fn folds_its_stick(o: &Operation<'_>) -> bool {
 /// Every value's defining operation, by result — the ONE index the frame pass and its helpers
 /// read. Built once per function by [`assign_frames`] and handed to every helper that used to
 /// re-walk `ops_deep` and linearly `find` per lookup (an O(n²) walk with an allocation per op);
-/// the def-uniqueness the SSA verifier proves is what makes one entry per result total.
-struct Defs(std::collections::HashMap<Ssa, &'static Operation<'static>>);
+/// the def-uniqueness the SSA verifier proves is what makes one entry per result total. The index
+/// carries the borrow of the function it was built from (`'d`), not `'static`: `ops_deep` returns
+/// references that live as long as the borrow they were walked through, and the index never
+/// outlives the assignment that built it.
+struct Defs<'d>(std::collections::HashMap<Ssa, &'d Operation<'static>>);
 
-impl Defs {
-    fn new(f: &IRFunction<'static>) -> Self {
-        Defs(
-            f.ops_deep()
-                .into_iter()
-                .filter_map(|o| o.result.map(|r| (r, o)))
-                .collect(),
-        )
+impl<'d> Defs<'d> {
+    fn new(f: &'d IRFunction<'static>) -> Self {
+        let mut index = std::collections::HashMap::new();
+        for o in f.ops_deep() {
+            if let Some(r) = o.result {
+                index.insert(r, o);
+            }
+        }
+        Defs(index)
     }
 
-    fn of(&self, v: Ssa) -> Option<&'static Operation<'static>> {
+    fn of(&self, v: Ssa) -> Option<&'d Operation<'static>> {
         self.0.get(&v).copied()
     }
 
@@ -8197,9 +8201,7 @@ fn column_fed_params(defs: &Defs) -> std::collections::HashSet<Ssa> {
                 .and_then(|t| t.dims())
                 .is_some_and(|ds| ds.len() >= 2 && *ds.last().expect("len ≥ 2") == 1)
         });
-        if column
-            && let Some(ptr) = param_of_tile(tile)
-        {
+        if column && let Some(ptr) = param_of_tile(tile) {
             out.insert(ptr);
         }
     }
@@ -11942,11 +11944,18 @@ mod frame_pass_tests {
         dims: &'static [i64],
         axes: &'static [i64],
     ) -> Operation<'static> {
-        tensor(a, res, OpKind::LinalgReduce, &[x], dims)
-            .with_attr(a, AttrKey::Dimensions, Attr::IntList(axes))
+        tensor(a, res, OpKind::LinalgReduce, &[x], dims).with_attr(
+            a,
+            AttrKey::Dimensions,
+            Attr::IntList(axes),
+        )
     }
 
-    fn func(a: &'static Arena, name: &'static str, ops: Vec<Operation<'static>>) -> IRFunction<'static> {
+    fn func(
+        a: &'static Arena,
+        name: &'static str,
+        ops: Vec<Operation<'static>>,
+    ) -> IRFunction<'static> {
         IRFunction {
             name,
             arguments: a.args(vec![]),
@@ -12022,7 +12031,8 @@ mod frame_pass_tests {
     #[test]
     fn a_broadcast_result_is_dense_however_its_source_is_held() {
         let a: &'static Arena = Arena::global();
-        let (scalar, dense, seed, red, empty, bc) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let (scalar, dense, seed, red, empty, bc) =
+            (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
         let f = func(
             a,
             "column_spray",
