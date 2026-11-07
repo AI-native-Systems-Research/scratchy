@@ -602,9 +602,10 @@ mod tests {
             output_arrangement::<Gen1>(DeviceOp::Fp32ToDl16),
             Some(ElementArrangement::Standard)
         );
-        // No silent default: an op with no row answers `None`, and the caller
-        // refuses rather than guessing `Standard`.
-        assert_eq!(output_arrangement::<Gen1>(DeviceOp::Sum), None);
+        // No silent default: a row-less op answers `None` and the caller
+        // refuses. Every DeviceOp variant states a row today, so `None` is
+        // unreachable for every op the enum names — the Option is the API's
+        // honesty for the first op that lands without one.
     }
 
     /// THE MoE ROW: the max reduce is bound at BOTH formats (the fp16 and
