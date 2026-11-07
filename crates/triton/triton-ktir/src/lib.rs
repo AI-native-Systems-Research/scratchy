@@ -177,6 +177,10 @@ impl std::fmt::Display for Refusal {
 
 pub type Result<T> = std::result::Result<T, Refusal>;
 
+/// One pass of a pipeline table: a named step plus the function that runs it.
+/// Both drivers' tables are `[(name, Pass); N]`, walked by one runner.
+pub type Pass = fn(&mut Module, &[i64]) -> Result<()>;
+
 /// Run `make_ktir`'s pipeline, in `make_ktir`'s order, on a ttir value.
 ///
 /// After every pass the SSA verifier runs ([`passes::verify_defs`]): a module
@@ -192,7 +196,7 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 /// without a verify line following it and none can be quietly skipped. A row's
 /// comment says why the pass sits where it sits.
 pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
-    let pipeline: [(&'static str, fn(&mut Module, &[i64]) -> Result<()>); 7] = [
+    let pipeline: [(&'static str, Pass); 7] = [
         ("make_ktir:dot_to_linalg", |m, _| {
             passes::dot_to_linalg::run(m)
         }),

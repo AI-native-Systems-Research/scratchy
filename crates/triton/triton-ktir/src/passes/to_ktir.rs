@@ -111,7 +111,7 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
     // and the runner runs the SSA verifier after EVERY entry, so no step can
     // be added without a verify line following it and none can be quietly
     // skipped. A row's comment says why the step sits where it sits.
-    let steps: [(&'static str, fn(&mut Module, &[i64]) -> Result<()>); 16] = [
+    let steps: [(&'static str, crate::Pass); 16] = [
         // Container first: once the pointer arguments are `index`, the casts that bridged
         // `!tt.ptr` to index are index-to-index and fold away, and the body rewrites then
         // run on a `func.func`.
