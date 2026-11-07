@@ -804,14 +804,39 @@ enum KvGeometry {
     Paged(PoolGeometry),
 }
 
+/// One pool page's stride across layers — the addressing law the baked value carries, stated as
+/// its two cases. The value's domain is `{0} ∪ positive` BY THE PRODUCER'S OWN CONSTRUCTION
+/// (the reroll pass computes a max of per-layer placement ENDS — `offset + size`, non-negative —
+/// with `unwrap_or(0)`), so the latch's classification is TOTAL AND LOSSLESS: `NonZeroU64::new(v)`
+/// is `Some(s)` exactly when `v = s > 0` and `None` exactly when `v = 0`. The case names what the
+/// value MEANS, it does not re-prove the bake: `Unrolled` IS the stride-0 law — an unrolled
+/// bundle, or a rolled one whose reroll summed no paged KV — and `Strided` is the baked
+/// `Σ n_c · stride_c` every layer of one page spans.
+#[derive(Clone, Copy)]
+enum Stride {
+    Unrolled,
+    Strided(std::num::NonZeroU64),
+}
+
+impl Stride {
+    /// The byte stride — `0` on the stride-0 law, the baked page stride on `Strided`. The
+    /// lossless inverse of the latch's classification: no clamp, no fallback, nothing refused.
+    fn bytes(self) -> u64 {
+        match self {
+            Stride::Unrolled => 0,
+            Stride::Strided(n) => n.get(),
+        }
+    }
+}
+
 /// One pool's geometry — every field a fact the latch stated when it saw an op declare a paged
-/// pool. Page slots are nonzero by mint ([`PageSlots`]); the stride is the bake's own
-/// `Σ n_c · stride_c`, which is `0` for an unrolled paged bundle by the latch's law.
+/// pool. Page slots are nonzero by mint ([`PageSlots`]); the stride is the baked `Σ n_c·stride_c`
+/// classified by its own domain ([`Stride`]).
 #[derive(Clone, Copy)]
 struct PoolGeometry {
     page_slots: PageSlots,
     /// Bytes per page = all layers of one page.
-    page_stride_bytes: u64,
+    page_stride: Stride,
     pool_pages: PoolPages,
 }
 
@@ -827,13 +852,16 @@ impl KvGeometry {
     /// ⭐ THE STAND-IN GEOMETRY a SYNTHETIC session addresses — the CB gates' synthetic folds and
     /// the replay player's canvas math, which must name distinct pages whether or not this
     /// session has any. The session's own page slots and stride when it has them; a page of one
-    /// slot and one byte when it does not — an unpaged bundle, or an unrolled paged one whose
-    /// stride is 0 by the latch's own law. ONE statement, shared by every site that used to
-    /// re-derive it as a per-site `.max(1)`.
+    /// slot and one byte when it does not — an unpaged bundle, or one on the stride-0 law
+    /// ([`Stride::Unrolled`]), whose stand-in pages sit one byte apart. ONE statement, shared by
+    /// every site that used to re-derive it as a per-site `.max(1)`.
     fn synthetic(&self) -> (bool, i64, u64) {
         match self {
             KvGeometry::Unpaged => (false, 1, 1),
-            KvGeometry::Paged(g) => (true, g.page_slots.0.get(), g.page_stride_bytes.max(1)),
+            KvGeometry::Paged(g) => match g.page_stride {
+                Stride::Unrolled => (true, g.page_slots.0.get(), 1),
+                Stride::Strided(n) => (true, g.page_slots.0.get(), n.get()),
+            },
         }
     }
 }
@@ -1645,11 +1673,15 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // and the emitter's `kv_page_stride` already sums every class's extent (`Σ n_c·stride_c`),
         // proven against the placements. 0 on an UNROLLED bundle (no reroll meta) is the same value
         // the old `iters × kv_stride` formula produced there (0 × 0), and the geometry latch below
-        // runs identically — an unrolled paged bundle keeps its pre-split behavior whole.
-        let page_stride_bytes = self.rolled.as_ref().map_or(0, |r| r.kv_page_stride);
+        // runs identically — an unrolled paged bundle keeps its pre-split behavior whole. The
+        // CLASSIFICATION into [`Stride`] is total and lossless over the value's own domain (see
+        // the enum): the case states which addressing law the value carries, nothing re-proved.
+        let page_stride =
+            std::num::NonZeroU64::new(self.rolled.as_ref().map_or(0, |r| r.kv_page_stride))
+                .map_or(Stride::Unrolled, Stride::Strided);
         let geom = PoolGeometry {
             page_slots: PageSlots(page_slots),
-            page_stride_bytes,
+            page_stride,
             pool_pages: PoolPages(if self.num_blocks.0 > 0 {
                 self.num_blocks.0
             } else {
@@ -1658,7 +1690,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         };
         self.fold.paged = true;
         self.fold.page_slots = fold_plan::PageSlots::per_page(geom.page_slots.0.get());
-        self.fold.page_stride_bytes = Bytes(geom.page_stride_bytes);
+        self.fold.page_stride_bytes = Bytes(geom.page_stride.bytes());
         // CREATE-TIME IDENTITY MAP. A session forwarded before any `set_block_table` addresses
         // logical page n as physical page n, which is what the unpaged path did.
         let ident: Vec<i64> = (0..geom.pool_pages.0).collect();
@@ -1668,9 +1700,9 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             "[sdsc-superdsc] PAGED KV: page={} slots, page_stride={} B, pool={} pages ({:.1} MB) \
              => {} positions of context available to one request",
             geom.page_slots.0.get(),
-            geom.page_stride_bytes,
+            geom.page_stride.bytes(),
             geom.pool_pages.0,
-            (geom.pool_pages.0 as u64 * geom.page_stride_bytes) as f64 / 1048576.0,
+            (geom.pool_pages.0 as u64 * geom.page_stride.bytes()) as f64 / 1048576.0,
             geom.pool_pages.0 * geom.page_slots.0.get(),
         );
         self.kv = KvGeometry::Paged(geom);
@@ -2599,7 +2631,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 && !self.seg_borrowed[i]
                 && let Some(g) = self.kv.paged()
             {
-                let pool = g.pool_pages.0 as u64 * g.page_stride_bytes;
+                let pool = g.pool_pages.0 as u64 * g.page_stride.bytes();
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
@@ -6329,7 +6361,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     /// `fold_plan::page_base_bytes` multiplies a block-table entry by, so it is also the number the
     /// gather's index unit must divide. `0` for an unpaged bundle.
     pub fn kv_page_stride_bytes(&self) -> u64 {
-        self.kv.paged().map_or(0, |g| g.page_stride_bytes)
+        self.kv.paged().map_or(0, |g| g.page_stride.bytes())
     }
 
     pub fn pmask_slots(&self) -> Option<usize> {
