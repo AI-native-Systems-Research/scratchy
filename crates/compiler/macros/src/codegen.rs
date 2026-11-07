@@ -11709,10 +11709,23 @@ fn dump_wavefront_mega(
         use std::num::NonZeroU32;
         let knb = NonZeroU32::new(8192).expect("8192 != 0");
         let stem_id = stem.replace(['-', '.'], "_");
-        // ⛔ THE BAKE'S ONE DOOR ON MODEL IDENTITY: its config's stem → that config's marker type →
-        // the type's rope classes, in the tensor-parallel world `T` a bake runs in. Every rope this
-        // bake lowers goes through one of them (`ktir_superdsc_door`), so no head dim becomes a
-        // const anywhere below. A stem no config states is a bake error naming it.
+        // ⛔ THE BAKE'S ONE DOOR ON MODEL IDENTITY: its config FILE's stem → that config's marker
+        // type → the type's rope classes, in the tensor-parallel world `T` a bake runs in. The
+        // file's, not `source_stem`: a quant variant's `source_stem` carries its preset
+        // (`granite-3.1-2b-instruct-fp8-dynamic-per-channel`), and its rope classes are its base
+        // config's. Every rope this bake lowers goes through one of them (`ktir_superdsc_door`),
+        // so no head dim becomes a const anywhere below. A stem no config states is a bake error
+        // naming it.
+        let config_stem = model
+            .source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "[spyre-superdsc] {stem}: its config path {} has no stem",
+                    model.source_path.display()
+                )
+            });
         fn model_ropes_in<T: scratchy_target_spyre::bundle_code::collective::Tp>(
             stem: &str,
         ) -> scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T> {
@@ -11993,7 +12006,7 @@ fn dump_wavefront_mega(
              // numeric gate runs such a bundle on both ranks at once. `None` for a world of one.
              shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>|
              -> (BakeOut, Vec<BakeEffect>) {
-                let model_ropes = &model_ropes_in::<$W>(stem);
+                let model_ropes = &model_ropes_in::<$W>(config_stem);
                 // Only the emulator's numeric gate reads the slice laws.
                 #[cfg(not(feature = "spyre-emu"))]
                 let _ = shards;
