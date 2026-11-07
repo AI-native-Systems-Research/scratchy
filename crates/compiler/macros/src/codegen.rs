@@ -9332,6 +9332,88 @@ fn superdsc_rotary_kind(
     }
 }
 
+/// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
+/// [`SengraphBundleGroup`](scratchy_target_spyre::manifest::SengraphBundleGroup) or a
+/// [`TpForward`](scratchy_target_spyre::wiring::TpForward), from that world's committed rung cells.
+/// One renderer for every world, so a sharded world's ladders are spelled exactly as the one-rank
+/// world's.
+///
+/// The prefix-FREE prefill ladder and the decode batch ladder are emitted ONLY when more than one
+/// rung baked: a single rung is exactly the world's own `prefill`/`decode` slot, so the empty slice
+/// keeps the one-bundle path byte-identical instead of making the worker special-case a one-rung
+/// ladder. The prefix-capable ladder (start>0 chunks) ships every width that baked, a single rung
+/// included: no other slot carries it.
+fn ladder_lits(
+    prefill_rungs: &[(u32, String)],
+    decode_rungs: &[(u32, u32, String, Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>)],
+    prefill_prefix_rungs: &[(u32, String)],
+) -> (
+    Vec<proc_macro2::TokenStream>,
+    Vec<proc_macro2::TokenStream>,
+    Vec<proc_macro2::TokenStream>,
+) {
+    let sentinel = |fp: &str| proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
+    let mq_rungs = |rungs: &[(u32, String)]| -> Vec<proc_macro2::TokenStream> {
+        let mut rungs = rungs.to_vec();
+        rungs.sort_by_key(|(mq, _)| *mq);
+        rungs
+            .iter()
+            .map(|(mq, fp)| {
+                let m = proc_macro2::Literal::u32_unsuffixed(*mq);
+                let s = sentinel(fp);
+                quote! { (#m, #s) }
+            })
+            .collect()
+    };
+    let prefix = mq_rungs(prefill_prefix_rungs);
+    let prefill = if prefill_rungs.len() > 1 {
+        mq_rungs(prefill_rungs)
+    } else {
+        Vec::new()
+    };
+    let decode = {
+        let mut rungs = decode_rungs.to_vec();
+        rungs.sort_by_key(|(n, _, _, _)| *n);
+        rungs.dedup_by_key(|(n, _, _, _)| *n);
+        if rungs.len() > 1 {
+            rungs
+                .iter()
+                .map(|(n, swept, fp, consts)| {
+                    // ⛔ `RungSeqs`, NOT a bare u32: the decode ladder is keyed by `decode_rows` (the
+                    // BATCH WIDTH), while the sibling `sk_bucket_rungs` list is keyed by `active_cap`
+                    // (the SWEEP EXTENT). Both were `(u32, String)`, and the worker selects over this
+                    // one with `>= live`. Naming the quantity here is what stops the two ladders being
+                    // interchangeable at the call site.
+                    let n = proc_macro2::Literal::u32_unsuffixed(*n);
+                    let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
+                    let sfp = sentinel(fp);
+                    // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's session, never
+                    // the single-request wiring's list: the ten uniform `[rows, 1]` tables' stick
+                    // heads are per-width (Finding 1's compounding half). Rendered by the ONE
+                    // load-const renderer the wiring static itself uses, so the spellings cannot
+                    // drift.
+                    let consts = consts
+                        .iter()
+                        .map(load_const_entry_tokens)
+                        .collect::<Vec<_>>();
+                    quote! {
+                        (
+                            ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
+                            ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
+                            ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
+                            &[#(#consts),*],
+                        )
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+    (prefill, decode, prefix)
+}
+
+
 /// One load-const entry `(tid, kind)` as a token stream — the ONE renderer,
 /// shared by the wiring static (`emit_superdsc_wiring`) and every decode
 /// batch rung's OWN consts in the manifest (`decode_rung_lits`), so the two
@@ -13812,6 +13894,33 @@ fn dump_wavefront_mega(
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             seqs,
                         );
+                        // ⭐ AND THE RUNG IN THE SHARDED WORLD: a sharded session serves every live
+                        // request count on its own world's rung, never the one-rank ladder's.
+                        if let Some(shards) = tp_sources.as_deref() {
+                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                                scratchy_target_spyre::bundle_code::collective::Build,
+                            >(
+                                &lwd_b,
+                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank decode batch \
+                                     seqs={seqs} is malformed — {e:?}"
+                                )
+                            });
+                            let (_, fx) = emit_bundle_deferred_sharded(
+                                &tp_lwd,
+                                format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
+                                prefix_len.get(),
+                                None,
+                                None,
+                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                                seqs,
+                                Some(shards),
+                            );
+                            commit_bake(&sharded_world, &tp_lwd, fx);
+                        }
                     }
                     Err(e) => panic!(
                         "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e}. \
@@ -14258,6 +14367,33 @@ fn dump_wavefront_mega(
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             1, // a prompt chunk is one request
                         );
+                        // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
+                        // continuation chunk on a sharded session runs on ITS world's prefix rung.
+                        if let Some(shards) = tp_sources.as_deref() {
+                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                                scratchy_target_spyre::bundle_code::collective::Build,
+                            >(
+                                &lwd_p,
+                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank prefix prefill m={m} \
+                                     is malformed — {e:?}"
+                                )
+                            });
+                            let (_, fx) = emit_bundle_deferred_sharded(
+                                &tp_lwd,
+                                format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
+                                prefix_len.get(),
+                                None,
+                                Some(m),
+                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                                1,
+                                Some(shards),
+                            );
+                            commit_bake(&sharded_world, &tp_lwd, fx);
+                        }
                     }
                     Err(e) => panic!(
                         "[spyre-superdsc] {stem}: prefix-capable prefill rung m={m} NOT LOWERED — \
@@ -14688,83 +14824,11 @@ fn dump_wavefront_mega(
                 };
             let pre_json_lit = proc_macro2::Literal::string(pre_graph);
             let dec_json_lit = proc_macro2::Literal::string(dec_graph);
-            // PREFILL WIDTH LADDER: ascending `[(mq, sentinel)]`. Emitted ONLY when >1 rung actually
-            // baked — a single rung is exactly the existing `prefill` slot, so an empty slice keeps
-            // the pre-ladder path byte-identical instead of making the worker special-case a 1-rung
-            // ladder that buys nothing.
-            // The prefix-capable ladder (start>0 chunks), ascending — every width that baked, a single
-            // rung included: unlike the prefix-free ladder there is no other slot carrying it.
-            let prefill_prefix_lits: Vec<proc_macro2::TokenStream> = {
-                let mut rungs = superdsc_prefill_prefix_rungs.borrow().clone();
-                rungs.sort_by_key(|(mq, _)| *mq);
-                rungs
-                    .iter()
-                    .map(|(mq, fp)| {
-                        let m = proc_macro2::Literal::u32_unsuffixed(*mq);
-                        let s = proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
-                        quote! { (#m, #s) }
-                    })
-                    .collect()
-            };
-            let prefill_rung_lits: Vec<proc_macro2::TokenStream> = {
-                let mut rungs = superdsc_prefill_rungs.borrow().clone();
-                rungs.sort_by_key(|(mq, _)| *mq);
-                if rungs.len() > 1 {
-                    rungs
-                        .iter()
-                        .map(|(mq, fp)| {
-                            let m = proc_macro2::Literal::u32_unsuffixed(*mq);
-                            let s = proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
-                            quote! { (#m, #s) }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            };
-            // The decode batch ladder, same shape and rule as the prefill one: emitted only when
-            // there is more than one rung, so a build that lowered a single width ships the empty
-            // slice and the worker keeps its one-request-per-forward path untouched.
-            let decode_rung_lits: Vec<proc_macro2::TokenStream> = {
-                let mut rungs = superdsc_decode_rungs.borrow().clone();
-                rungs.sort_by_key(|(n, _, _, _)| *n);
-                rungs.dedup_by_key(|(n, _, _, _)| *n);
-                if rungs.len() > 1 {
-                    rungs
-                        .iter()
-                        .map(|(n, swept, fp, consts)| {
-                            // ⛔ `RungSeqs`, NOT a bare u32: `superdsc_decode_rungs` is keyed by
-                            // `decode_rows` (the BATCH WIDTH), while the sibling `sk_bucket_rungs` list is
-                            // keyed by `active_cap` (the SWEEP EXTENT). Both were `(u32, String)`, and the
-                            // worker selects over this one with `>= live`. Naming the quantity here is what
-                            // stops the two ladders being interchangeable at the call site.
-                            let n = proc_macro2::Literal::u32_unsuffixed(*n);
-                            let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
-                            let sfp =
-                                proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
-                            // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's
-                            // session, never the single-request wiring's list: the ten uniform
-                            // `[rows, 1]` tables' stick heads are per-width (Finding 1's
-                            // compounding half). Rendered by the ONE load-const renderer the
-                            // wiring static itself uses, so the spellings cannot drift.
-                            let consts = consts
-                                .iter()
-                                .map(load_const_entry_tokens)
-                                .collect::<Vec<_>>();
-                            quote! {
-                                (
-                                    ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
-                                    ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
-                                    ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
-                                    &[#(#consts),*],
-                                )
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            };
+            let (prefill_rung_lits, decode_rung_lits, prefill_prefix_lits) = ladder_lits(
+                &superdsc_prefill_rungs.borrow(),
+                &superdsc_decode_rungs.borrow(),
+                &superdsc_prefill_prefix_rungs.borrow(),
+            );
             group_tokens.push(quote! {
                 ::scratchy_target_spyre::manifest::SengraphBundleGroup {
                     group: #g_lit,
@@ -14844,6 +14908,12 @@ fn dump_wavefront_mega(
                             quote! { ::core::option::Option::None },
                         ),
                     };
+                    let (tp_prefill_rung_lits, tp_decode_rung_lits, tp_prefill_prefix_lits) =
+                        ladder_lits(
+                            &tp_prefill_rungs.borrow(),
+                            &tp_decode_rungs.borrow(),
+                            &tp_prefill_prefix_rungs.borrow(),
+                        );
                     let sources = sources.iter().map(|s| match s {
                         S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
                         S::Rows => quote! { ::scratchy_target_spyre::wiring::SourceShard::Rows },
@@ -14866,6 +14936,9 @@ fn dump_wavefront_mega(
                         > {
                             decode: ::scratchy_target_spyre::manifest::KtirBundleData { fp: #fp },
                             prefill: #prefill,
+                            prefill_rungs: &[#(#tp_prefill_rung_lits),*],
+                            decode_rungs: &[#(#tp_decode_rung_lits),*],
+                            prefill_prefix: &[#(#tp_prefill_prefix_lits),*],
                             wirings: ::scratchy_target_spyre::wiring::Wirings {
                                 decode: #wiring,
                                 prefill: #prefill_wiring,

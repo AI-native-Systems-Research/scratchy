@@ -441,9 +441,9 @@ impl RankCut {
 }
 
 /// The sharded forward `f`, in the shape the card loader reads a model's bundle in: its decode
-/// bundle, and its prefill bundle when the bake made one (else the decode bundle's own fingerprint,
-/// the loader's "no batched prefill"). A sharded world bakes no batch or width ladders, so it
-/// names none. Leaked: the process serves one model for its life.
+/// bundle, its prefill bundle when the bake made one (else the decode bundle's own fingerprint,
+/// the loader's "no batched prefill"), and its world's ladders — the same rungs the one-rank world
+/// bakes, baked for this world. Leaked: the process serves one model for its life.
 #[cfg(feature = "spyre-hw")]
 fn sharded_bundle(
     one_rank: &'static SengraphBundle,
@@ -465,9 +465,11 @@ fn sharded_bundle(
         result_tensor: g0.result_tensor,
         prefill: named(f.prefill.as_ref().map_or(f.decode.fp, |p| p.fp)),
         decode: named(f.decode.fp),
-        prefill_rungs: &[],
-        decode_rungs: &[],
-        prefill_prefix: &[],
+        // The world's own ladders: every prompt length and live request count the one-rank world
+        // serves, on this world's bundles.
+        prefill_rungs: f.prefill_rungs,
+        decode_rungs: f.decode_rungs,
+        prefill_prefix: f.prefill_prefix,
     };
     Ok(Box::leak(Box::new(SengraphBundle {
         groups: Box::leak(Box::new([group])),
@@ -1877,6 +1879,42 @@ impl SpyreWorker {
                             .map(|c| (rm, c))
                     })
                     .collect();
+                let _t_sess = std::time::Instant::now();
+                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
+                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
+                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
+                // buffer is ever made.
+                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
+                // decode kernel's walk reads; every other session's kernels read none.
+                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
+                    .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
+                let mut ss = SuperDscSession::new(
+                    &cards,
+                    code,
+                    scratchy_target_spyre::sdsc_runner::SessionDims {
+                        vocab,
+                        kv_dim,
+                        num_blocks,
+                    },
+                    Some(weights),
+                    wirings.decode.load_consts,
+                    &pool_statics,
+                    &spill_tids,
+                )
+                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
+                // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
+                // placement in it, so where peers' sends land is the allocator's answer for THIS
+                // session's region — pointed before any step, and checked equal on every rank.
+                ss.point_landing_slots(&cards)
+                    .map_err(|e| werr(format!("the receive window's landing slots: {e}")))?;
+                // ⛔ THE LADDER STARTS ONLY ONCE THE OWNER HAS ALLOCATED. A rung build allocates on
+                // every card, and a background build racing the owner's allocation lands the owner's
+                // weight segment — and the receive window placed in it — at an address that differs
+                // card to card (MEASURED at tp/2 with the world's prefill ladder: windows at
+                // 0x98fb19980 and 0xa01b0b480, refused at load). Started here, every card has made the
+                // same allocations in the same order when its window is placed, so the world's windows
+                // sit at one address by the load order itself, and the rungs still build while the
+                // load goes on.
                 let _t_ladder = std::time::Instant::now();
                 // FANNED OUT. One thread building 20 rungs serially is ~6s, and that cost is per
                 // BUNDLE (re-roll + ~1558 placements), not per weight byte — so it is the SAME for
@@ -1977,34 +2015,6 @@ impl SpyreWorker {
                     })
                 };
 
-                let _t_sess = std::time::Instant::now();
-                // The DECODE session is the sole OWNER of the resident weights — it is the only one that
-                // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
-                // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
-                // buffer is ever made.
-                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
-                // decode kernel's walk reads; every other session's kernels read none.
-                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
-                    .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
-                let mut ss = SuperDscSession::new(
-                    &cards,
-                    code,
-                    scratchy_target_spyre::sdsc_runner::SessionDims {
-                        vocab,
-                        kv_dim,
-                        num_blocks,
-                    },
-                    Some(weights),
-                    wirings.decode.load_consts,
-                    &pool_statics,
-                    &spill_tids,
-                )
-                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
-                // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
-                // placement in it, so where peers' sends land is the allocator's answer for THIS
-                // session's region — pointed before any step, and checked equal on every rank.
-                ss.point_landing_slots(&cards)
-                    .map_err(|e| werr(format!("the receive window's landing slots: {e}")))?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
                 // (see `adopt_from_owner`) because the slot it lives in cannot be aliased. Empty —

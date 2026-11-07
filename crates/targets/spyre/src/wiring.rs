@@ -1847,6 +1847,19 @@ pub struct TpForward<T: crate::bundle_code::collective::World> {
     pub decode: crate::manifest::KtirBundleData,
     /// The rank-local batched-prefill bundle, when the model bakes one.
     pub prefill: Option<crate::manifest::KtirBundleData>,
+    /// The world's ladders, as the one-rank bundle group carries its own
+    /// ([`crate::manifest::SengraphBundleGroup`]): the prefix-free prefill rungs, the decode batch
+    /// rungs and the prefix-capable prefill rungs — every rung the one-rank world serves, baked for
+    /// this world, so a sharded session serves every prompt length and live request count on its
+    /// own world's bundles.
+    pub prefill_rungs: &'static [(u32, &'static str)],
+    pub decode_rungs: &'static [(
+        crate::manifest::RungSeqs,
+        crate::manifest::SweptCols,
+        crate::manifest::BundleSentinel,
+        crate::manifest::RungLoadConsts,
+    )],
+    pub prefill_prefix: &'static [(u32, &'static str)],
     /// Their launch wirings, numbered by the rank-local forwards' own tensor ids.
     pub wirings: Wirings,
     /// Per source of the one-rank forward (same indices): the slice each rank loads.
