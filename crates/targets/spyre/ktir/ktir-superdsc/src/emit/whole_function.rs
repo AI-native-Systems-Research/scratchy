@@ -8057,10 +8057,12 @@ struct Frames {
 }
 
 impl Frames {
-    /// The world of `v`. A value the pass holds no world for — a plumbing result, a scalar — is
-    /// the row world: the table below names every kind that produces data, so a value with no
-    /// entry is one no column question was ever asked of, and the row frame is what every reader
-    /// gave it.
+    /// The world of `v`. A value the pass holds no world for is the row world, and after the
+    /// seeds that domain is STATED, not assumed: every function argument is seeded, every loop's
+    /// carried args take their init's world, and every op the table names inserts its result —
+    /// so no entry means the value's producer is a None-arm kind (plumbing: a tile, a view, a
+    /// store, a yield, a marker, integer addressing) or a region-arg marker with no result:
+    /// values that state a window or a boundary, never a data frame.
     fn world_of(&self, v: Ssa) -> World {
         self.world.get(&v).copied().unwrap_or(World::Row)
     }
@@ -8093,29 +8095,74 @@ fn folds_its_stick(o: &Operation<'_>) -> bool {
 /// carries the borrow of the function it was built from (`'d`), not `'static`: `ops_deep` returns
 /// references that live as long as the borrow they were walked through, and the index never
 /// outlives the assignment that built it.
-struct Defs<'d>(std::collections::HashMap<Ssa, &'d Operation<'static>>);
+///
+/// The index also holds the SHAPES of the values with no defining operation — the function's own
+/// arguments (their types, as the signature states them) and every loop's carried args (each
+/// typed as its init: the program's own statement of a carry's shape) — so a helper reading an
+/// operand's count sees a region arg's shape, not a missing one silently read as a scalar.
+struct Defs<'d> {
+    def: std::collections::HashMap<Ssa, &'d Operation<'static>>,
+    shape: std::collections::HashMap<Ssa, Vec<i64>>,
+}
 
 impl<'d> Defs<'d> {
     fn new(f: &'d IRFunction<'static>) -> Self {
-        let mut index = std::collections::HashMap::new();
+        let mut def = std::collections::HashMap::new();
         for o in f.ops_deep() {
             if let Some(r) = o.result {
-                index.insert(r, o);
+                def.insert(r, o);
             }
         }
-        Defs(index)
+        let mut shape = std::collections::HashMap::new();
+        for (v, t) in f.arguments {
+            if let Some(d) = t.dims() {
+                shape.insert(*v, d.to_vec());
+            }
+        }
+        for o in f.ops_deep() {
+            for (arg, init) in Self::carries(o) {
+                let d = shape.get(&init).cloned().or_else(|| {
+                    def.get(&init)
+                        .and_then(|d| d.result_type)
+                        .and_then(|t| t.dims())
+                        .map(<[i64]>::to_vec)
+                });
+                if let Some(d) = d {
+                    shape.insert(arg, d);
+                }
+            }
+        }
+        Defs { def, shape }
+    }
+
+    /// A `scf.for`'s carried args paired with their inits — `IterArgs` over `operands[3..]`,
+    /// the walk's own correspondence (`loop_fold`). One spelling, read by the shape seeds here
+    /// and the world seeds in [`assign_frames`].
+    fn carries(o: &'d Operation<'static>) -> Vec<(Ssa, Ssa)> {
+        let args: &[Ssa] = match o.attr(AttrKey::IterArgs) {
+            Some(Attr::Ssas(v)) => v,
+            _ => &[],
+        };
+        let inits = &o.operands[3.min(o.operands.len())..];
+        args.iter()
+            .copied()
+            .zip(inits.iter().copied())
+            .collect()
     }
 
     fn of(&self, v: Ssa) -> Option<&'d Operation<'static>> {
-        self.0.get(&v).copied()
+        self.def.get(&v).copied()
     }
 
-    /// The value's own stated shape, off its def.
+    /// The value's own stated shape: off its def, or off the program's statement of a value
+    /// with no def (an argument, a carried arg).
     fn dims_of(&self, v: Ssa) -> Option<Vec<i64>> {
-        self.of(v)
-            .and_then(|d| d.result_type)
-            .and_then(|t| t.dims())
-            .map(<[i64]>::to_vec)
+        self.shape.get(&v).cloned().or_else(|| {
+            self.of(v)
+                .and_then(|d| d.result_type)
+                .and_then(|t| t.dims())
+                .map(<[i64]>::to_vec)
+        })
     }
 }
 
@@ -8191,7 +8238,7 @@ fn column_fed_params(defs: &Defs) -> std::collections::HashSet<Ssa> {
             .flatten()
     };
     let mut out = std::collections::HashSet::new();
-    for o in defs.0.values().filter(|o| o.op_type == OpKind::KtdpStore) {
+    for o in defs.def.values().filter(|o| o.op_type == OpKind::KtdpStore) {
         // `ktdp.store(value, tile)`: the value is operand 0, the tile operand 1.
         let (Some(&value), Some(&tile)) = (o.operands.first(), o.operands.get(1)) else {
             continue;
@@ -8341,6 +8388,11 @@ fn load_world(
 /// * contractions and `linalg.transpose` — dense outputs, the row world.
 /// * a splat, a region arg, a slice or a generated tile — a value that states a shape but no
 ///   world of its own takes the world its dims name in the column lineage ([`column_dims`]).
+/// * a loop's carried args — each takes its INIT's world BY VALUE (never its shape's: two
+///   `[64]` values are two frames when one is a carry seeded by a stick fold and the other a
+///   load off a `[1, 64]` tile), and so do the loop's results; the sweep runs to a fixed point
+///   over the body.
+/// * the function's arguments — dense tiles and scalars crossing the boundary: the row world.
 /// * plumbing and scalars — tiles, views, stores, yields, markers, integer addressing: no data
 ///   frame, no entry, and [`Frames::world_of`]'s row-world default is the only answer they get.
 fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
@@ -8349,9 +8401,53 @@ fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
     let columns = column_dims(f, &defs);
     let column_fed = column_fed_params(&defs);
     let mut world: std::collections::HashMap<Ssa, World> = std::collections::HashMap::new();
-    for o in deep.iter() {
-        let Some(res) = o.result else { continue };
-        let w: Option<World> = match o.op_type {
+    // ── THE SEEDS: every value with no defining op in this function ──
+    // The arguments are dense tiles and scalars crossing the boundary — the row world, the frame
+    // every reader already gave them. A loop's carried args are seeded when the sweep reaches
+    // the loop (below), each taking its INIT's world BY VALUE: two values of one shape are not
+    // one frame — a `[64]` carry seeded by a stick fold is a column, a `[64]` load off a
+    // `[1, 64]` tile is a row vector, and the carry's world is the init's, not its shape's.
+    for (a, _) in f.arguments {
+        world.insert(*a, World::Row);
+    }
+    // The sweep runs to a FIXED POINT over the body: every rule is a copy of a world already
+    // assigned or a Column-wins merge, so worlds only strengthen Row→Column and the sweep
+    // converges (SSA dominance already puts every def before its uses; the fixed point makes
+    // that claim checked rather than assumed).
+    loop {
+        let mut changed = false;
+        for o in deep.iter() {
+            // ── THE LOOP'S CARRIES: each takes its INIT's world BY VALUE ──
+            // `scf.for` spells its carries as `IterArgs` over `operands[3..]` (`Defs::carries`,
+            // the walk's own correspondence) and its results as a `ResultNames` attr (or its
+            // single result). The induction variable is an index; it names no frame.
+            if o.op_type == OpKind::ScfFor {
+                for (arg, init) in Defs::carries(o) {
+                    let w = world.get(&init).copied().unwrap_or(World::Row);
+                    if world.get(&arg) != Some(&w) {
+                        world.insert(arg, w);
+                        changed = true;
+                    }
+                }
+                let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
+                    Some(Attr::Ssas(v)) => v.to_vec(),
+                    _ => o.result.into_iter().collect(),
+                };
+                let args: Vec<Ssa> = match o.attr(AttrKey::IterArgs) {
+                    Some(Attr::Ssas(v)) => v.to_vec(),
+                    _ => Vec::new(),
+                };
+                for (r, arg) in results.iter().zip(args.iter()) {
+                    if let Some(&w) = world.get(arg)
+                        && world.get(r) != Some(&w)
+                    {
+                        world.insert(*r, w);
+                        changed = true;
+                    }
+                }
+            }
+            let Some(res) = o.result else { continue };
+            let w: Option<World> = match o.op_type {
             // ── THE REDUCTION: the axis it folds decides the world it writes ──
             OpKind::LinalgReduce => Some(if folds_its_stick(o) {
                 World::Column
@@ -8440,7 +8536,6 @@ fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
             | OpKind::KtdpInterTileReduce
             | OpKind::KtdpYieldPartial
             | OpKind::KtdpYieldReduced
-            | OpKind::ScfFor
             | OpKind::ScfForall
             | OpKind::ScfIf
             | OpKind::ScfParallel
@@ -8451,6 +8546,9 @@ fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
                     .is_some_and(|d| columns.iter().any(|c| c.as_slice() == d));
                 Some(if column { World::Column } else { World::Row })
             }
+            // ── THE LOOP: its carried args and results were seeded BY VALUE above, each from
+            // its init — the for itself states no world of its own ──
+            OpKind::ScfFor => None,
             // ── PLUMBING AND SCALARS: no data frame, no entry ──
             // Integer arithmetic is addressing here (or the noise hash's i32 compute, whose
             // values are dense); a constant is the scalar a splat reads; a tile, a view, a
@@ -8499,8 +8597,15 @@ fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
             | OpKind::KtdpCoreid
             | OpKind::KtdpNotYet => None,
         };
-        if let Some(w) = w {
+        if let Some(w) = w
+            && world.get(&res) != Some(&w)
+        {
             world.insert(res, w);
+            changed = true;
+        }
+        }
+        if !changed {
+            break;
         }
     }
     Ok(Frames { world })
@@ -12161,6 +12266,82 @@ mod frame_pass_tests {
             frames.world_of(load),
             World::Column,
             "the rank-1 tile restates the window; the [N, 1] store names the column"
+        );
+    }
+
+    /// ⭐ A LOOP'S CARRIES TAKE THEIR INIT'S WORLD BY VALUE — never their shape's: the walk's
+    /// carried max is a `[64]` splat seeded by the stick fold (a column), and beside it a `[64]`
+    /// load off a `[64]` tile is a row vector. One shape, two worlds — the carry, the body's
+    /// elementwise over it, and the result the loop returns for it all hold the init's.
+    #[test]
+    fn a_carried_value_takes_its_inits_world_not_its_shapes() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (p, view, tile, load, row) = (Ssa(4), Ssa(5), Ssa(6), Ssa(7), Ssa(8));
+        let (lb, ub, step, iv, carry, body, lres) =
+            (Ssa(9), Ssa(10), Ssa(11), Ssa(12), Ssa(13), Ssa(14), Ssa(15));
+        let body_ops = a.ops(vec![
+            tensor(a, body, OpKind::MathExp, &[carry], &[64]),
+            Operation::new(a, None, OpKind::ScfYield, &[body]),
+        ]);
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[])
+                .with_attr(a, AttrKey::Value, Attr::Int(value))
+        };
+        let f = IRFunction {
+            name: "carried_worlds",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                fold_reduce(a, red, dense, &[64], &[1]),
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[64] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[64]),
+                tensor(a, row, OpKind::MathExp, &[load], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![body_ops]),
+                    result_type: Some(IrType::Tensor { dims: &[64], elem: DType::F32 }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Ssas(a.ssa(vec![carry])))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Ssas(a.ssa(vec![lres])))
+                },
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let frames = assign_frames(&f).expect("the carry and the load both state their worlds");
+        assert_eq!(
+            frames.world_of(load),
+            World::Row,
+            "a [64] tile states a row vector's window"
+        );
+        assert_eq!(
+            frames.world_of(row),
+            World::Row,
+            "the row's elementwise keeps the lane it reads"
+        );
+        assert_eq!(
+            frames.world_of(carry),
+            World::Column,
+            "the carry takes its init's world — the splat the stick fold seeds — not its shape's"
+        );
+        assert_eq!(
+            frames.world_of(body),
+            World::Column,
+            "the body's elementwise reads the carry lane-for-lane, so it keeps the column"
+        );
+        assert_eq!(
+            frames.world_of(lres),
+            World::Column,
+            "the loop returns the carry it holds"
         );
     }
 }
