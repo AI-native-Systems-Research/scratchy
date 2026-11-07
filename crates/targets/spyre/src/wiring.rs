@@ -664,6 +664,12 @@ pub struct PagedStep {
     pub rows: u32,
     /// KV heads per layer.
     pub nkvh: u32,
+    /// The query's row width, `num_heads · head_size` — what a decode batch's fold cuts a query
+    /// row into whole sticks by ([`crate::paged_step::BatchChunking::of`]).
+    pub q_width: u32,
+    /// The head's width — whether a decode batch's fold may cut a page finer than its kv heads
+    /// ([`crate::paged_step::BatchChunking::of`]).
+    pub head_size: u32,
     /// Blocks of the page table this bundle's attention walks — the bake's
     /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
     pub walk: u32,
@@ -698,7 +704,11 @@ impl PagedStep {
     pub const fn batch(self) -> Option<crate::paged_step::BatchChunking> {
         match self.paged_rows {
             crate::paged_step::PagedRows::Batch => Some(crate::paged_step::BatchChunking::of(
-                self.rows, self.walk, self.nkvh,
+                self.rows,
+                self.walk,
+                self.nkvh,
+                self.q_width,
+                self.head_size,
             )),
             crate::paged_step::PagedRows::Sequence => None,
         }

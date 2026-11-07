@@ -1595,6 +1595,8 @@ pub fn paged_step_of_ir<F: RopeForm>(
             page_slots: slots,
             rows: mq,
             nkvh: attention.class(mask.class()).kv_heads().get(),
+            q_width: attention.class(mask.class()).q_width(),
+            head_size: attention.class(mask.class()).head_dim().get(),
             walk,
             paged_rows,
         };
