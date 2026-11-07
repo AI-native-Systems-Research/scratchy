@@ -8097,7 +8097,8 @@ fn kv_codec_for(
 /// A canonical's facts as the expression its generated `CanonicalParams::FACTS` states: every
 /// group through its own constructor (an attention through `Attention::of`, a GDN through
 /// `Gdn::of`: their laws bounds on their numbers as types), so the emitted const re-checks each
-/// law when rustc type-checks it. The one serializer of the value the fill built (and the metal bake read).
+/// law when rustc type-checks it. The one serializer of the value the fill built (and the metal
+/// bake read).
 fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     use scratchy_ir::model_facts::{
         Attention, AttnClass, KvRope, RopePairing, TargetRouting, TargetWidth, Vision,

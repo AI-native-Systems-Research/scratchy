@@ -311,7 +311,7 @@ impl HeadGeometry {
 
 /// One attention class's numbers, as types: `Kv` kv heads of `Hd` lanes, the leading `Rot` of
 /// them rotated, cached in pages of `Page` positions. [`ClassOf`] states its laws.
-pub struct Class<Kv, Hd, Rot, Page>(PhantomData<fn() -> (Kv, Hd, Rot, Page)>);
+pub struct Class<Kv, Hd, Rot, Page>(PhantomData<(Kv, Hd, Rot, Page)>);
 
 /// An attention class over `Q` query heads, its laws its bounds: the kv heads divide the query
 /// heads and the rot window fits its head ([`HeadGeometry::of`]'s).
@@ -358,7 +358,7 @@ impl MropeSection {
 pub struct NoMrope;
 
 /// An MRoPE section as types: the pairs `T`, `H` and `W` its temporal, height and width bands take.
-pub struct Mrope<T, H, W>(PhantomData<fn() -> (T, H, W)>);
+pub struct Mrope<T, H, W>(PhantomData<(T, H, W)>);
 
 /// A rope's MRoPE section over a class whose rot window is `Rot`, its law its bound: a section's
 /// pairs are half the window (`2 · (T + H + W) = Rot`), so its bands rotate every lane the window
