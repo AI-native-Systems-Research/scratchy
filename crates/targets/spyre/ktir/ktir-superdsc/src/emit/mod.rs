@@ -5318,13 +5318,13 @@ pub struct ConvertBand<'a> {
 /// the parent's, so without the declaration the walk strides the parent's column planes at the
 /// band's own fewer rows. Emit-time panic on a malformed spec = a `cargo build` error
 /// (guard-every-crash), same as the other `assemble_*`.
-pub fn assemble_convert_band(
+pub fn assemble_convert_band<T: crate::collective::Tp>(
     op_name: &str,
     op_func: &str,
     band: ConvertBand<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let ConvertBand { rows, cols, in_, o } = band;
     let ConvertBandSide { h: in_, w: in_w } = in_;
     let ConvertBandSide { h: o, w: o_w } = o;

@@ -3491,7 +3491,9 @@ impl FrameLaw {
                 Program::Matmul => FrameLaw::OwnLaw,
                 // rows collapse — the extraction writes one row; the draw's twenty-seven
                 // parameters are staged sticks and whole rows, no windowed tile among them.
-                Program::LmLast | Program::Sample => FrameLaw::OwnLaw,
+                // BlockCopy is the all-gather consume's leg, a pure copy like LmLast: the whole
+                // source into a column block of the destination, by its own law.
+                Program::LmLast | Program::Sample | Program::BlockCopy => FrameLaw::OwnLaw,
                 // a banded launch — per-core tiles over positions, the band the launch's own.
                 Program::Rope => FrameLaw::OwnLaw,
                 // the page walk and the pool scatter — gathered and scattered rows, the

@@ -111,7 +111,7 @@ fn layout_placing() -> BundleLayout {
 
 /// The input corners of one emitted piece, sorted — read off the door's own
 /// `arg_bindings`, never re-derived from the regions.
-fn input_corners(op: &EmittedOp, buffer: &str) -> Vec<u32> {
+fn input_corners(op: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>, buffer: &str) -> Vec<u32> {
     let mut cs: Vec<u32> = op
         .arg_bindings
         .iter()
@@ -123,7 +123,7 @@ fn input_corners(op: &EmittedOp, buffer: &str) -> Vec<u32> {
 }
 
 /// The output corner of one emitted piece.
-fn out_corner(op: &EmittedOp, buffer: &str) -> Option<u32> {
+fn out_corner(op: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>, buffer: &str) -> Option<u32> {
     op.arg_bindings
         .iter()
         .find(|b| !b.is_input && b.buffer == buffer)
@@ -136,7 +136,7 @@ fn out_corner(op: &EmittedOp, buffer: &str) -> Option<u32> {
 #[test]
 fn the_epilogue_add_reads_its_head_band_at_the_parents_pitch() {
     let l = layout_placing();
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = Vec::new();
     let mut sym = 0i64;
     for c in 0..(COLS / STICK) {
         ops.extend(

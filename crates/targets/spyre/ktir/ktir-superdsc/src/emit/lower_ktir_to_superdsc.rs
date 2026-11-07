@@ -9203,7 +9203,7 @@ mod elementwise_tests {
     /// The `maxDimSizes_` of one operand's allocate node — the wire's own statement of the
     /// walk (`DeviceWalk::of_window` pins a windowed operand to its parent's extents; a
     /// reconstructing walk is all `-1`). `ldsIdx_` is the arg's own index.
-    fn walk_of(op: &EmittedOp, lds: u32) -> serde_json::Value {
+    fn walk_of(op: &EmittedOp<crate::collective::TpWorld<1>>, lds: u32) -> serde_json::Value {
         let dsc = op.op.as_ref().expect("a descriptor").dscs_[0]
             .values()
             .next()
@@ -9383,7 +9383,7 @@ mod elementwise_tests {
         // no whole view.
         let narrow = vec![split(5, 64, 0, 42, 32), reg(6, 42, 32, true)];
         let mut sym = 0i64;
-        let Err(e) = convert("cvt_s4", ConvertKind::Dl16ToFp32, &narrow, &mut sym, None) else {
+        let Err(e) = convert::<crate::collective::TpWorld<1>>("cvt_s4", ConvertKind::Dl16ToFp32, &narrow, &mut sym, None) else {
             panic!("a sub-width band would read words the caller never staged");
         };
         assert!(
@@ -9987,7 +9987,7 @@ mod elementwise_tests {
         let cols = 4096u32;
         let r = vec![split(5, 64, 0, 21, cols), reg(7, 42, cols, true)];
         let mut sym = 0i64;
-        let Err(e) = scalarmul_scaled(
+        let Err(e) = scalarmul_scaled::<crate::collective::TpWorld<1>>(
             "scalarmul_s5",
             &ScaleSource::Bound { tid: 99 },
             None,
@@ -10032,7 +10032,7 @@ mod elementwise_tests {
             via: None,
         };
         let mut sym = 0i64;
-        let Err(e) = scalarmul_scaled(
+        let Err(e) = scalarmul_scaled::<crate::collective::TpWorld<1>>(
             "scalarmul_s6",
             &ScaleSource::Bound { tid: 99 },
             Some(g),
