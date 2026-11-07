@@ -515,14 +515,12 @@ impl SampledRowCount {
 /// argmax's input every iter is correct.
 #[cfg(feature = "metal")]
 pub trait ChainStepHandle {
-    /// Encode one bucket forward dispatch onto the chain encoder.
-    /// `num_tokens` is real (the bucket is fixed across iters
-    /// because the K-step decode shape doesn't change); `sampled_rows`
-    /// the rows whose logits it leaves, at the front.
+    /// Encode one bucket forward dispatch onto the chain encoder, at the tokens its bucket was
+    /// chosen for (the bucket is fixed across iters because the K-step decode shape doesn't
+    /// change); `sampled_rows` the rows whose logits it leaves, at the front.
     fn run_forward_step(
         &self,
         encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-        num_tokens: u32,
         num_seqs: u32,
         sampled_rows: SampledRowCount,
     ) -> Result<(), String>;

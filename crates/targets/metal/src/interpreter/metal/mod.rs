@@ -6,6 +6,7 @@
 //! [`LoweredMetalTape`]. Worker pool / pipeline cache / `forward()`
 //! land in subsequent sub-phases.
 
+pub mod bucket;
 pub mod continuation_witness;
 pub mod ids;
 pub mod kernel_bindings;
@@ -40,6 +41,7 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 /// (the baked chunk-table constant) share one value. See
 /// [`crate::BLOCKS_PER_CHUNK`].
 pub use crate::BLOCKS_PER_CHUNK;
+pub use bucket::{BakedBucket, BakedBuckets, Buckets, Door, Fits, Picked, bucket, bucket_row};
 pub use forward::{
     Deferral, DeviceInput, DeviceInputInto, DraftInputs, ForwardError, ForwardInputs, ForwardReads,
     GpuSpan, InFlight, build_mrope_cos_sin_override, last_gpu_span,

@@ -477,6 +477,8 @@ pub const fn colour_bytes(elems: &[u64]) -> u64 {
 
 /// A bucket's arena: each slot's bytes, its colour's ([`Colour::BYTES`]), at the bucket's rows.
 pub trait Arena {
+    /// The rows it is the arena at: a bucket's `M`.
+    type Rows;
     const BYTES: &'static [u64];
 }
 
@@ -570,6 +572,7 @@ macro_rules! arena_schemas {
         where
             $($colour<$m, $s>: $crate::tape::typed::Colour,)*
         {
+            type Rows = $m;
             const BYTES: &'static [u64] =
                 &[$(<$colour<$m, $s> as $crate::tape::typed::Colour>::BYTES),*];
         }
