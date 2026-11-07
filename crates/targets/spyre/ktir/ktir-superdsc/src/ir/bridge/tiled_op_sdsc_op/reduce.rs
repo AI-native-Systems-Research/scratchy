@@ -1251,11 +1251,11 @@ impl ReduceSlices {
 /// here, with this body's op name. Swallowing it instead would turn a past-the-budget reduce
 /// into a silently-unsplit wrong program, which is the one thing this body exists to make
 /// impossible.
-pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
+pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     s: ReduceSplit<'_, D, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Option<Vec<EmittedOp>>, String> {
+) -> Result<Option<Vec<EmittedOp<T>>>, String> {
     let rows = s.rows.get();
     let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(rows);
     // The parent's full column extent, read off the handle — the nest every slice corner is
@@ -1318,7 +1318,7 @@ pub fn assemble_reduce_split<D: KindTag, A: KindTag>(
         .iter()
         .map(|n| partial_accum_handle(n, rows, stick, s.df))
         .collect::<Result<_, _>>()?;
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     for j in 0..time {
         let slice_cols = slices.cols_of(j);
         let corner = crate::addr::col_of(
@@ -1559,7 +1559,7 @@ mod long_reduce_split {
             ),
         )
         .expect("the fp32 flat accum handle mints");
-        let split = assemble_reduce_split(
+        let split = assemble_reduce_split::<crate::collective::TpWorld<1>, _, _>(
             ReduceSplit::new(
                 "max32",
                 ReduceGeometry::new(OpFunc::Max, 1, 524_288, Df::Fp32, ReduceDivision::Rows)
@@ -1584,7 +1584,7 @@ mod long_reduce_split {
     #[test]
     fn a_fitting_reduce_is_left_to_the_callers_single_shot() {
         let (data, accum) = handles(1, 4096);
-        let split = assemble_reduce_split(
+        let split = assemble_reduce_split::<crate::collective::TpWorld<1>, _, _>(
             ReduceSplit::new(
                 "sum16",
                 ReduceGeometry::new(OpFunc::Sum, 1, 4096, Df::Fp16, ReduceDivision::Rows)
@@ -1605,7 +1605,7 @@ mod long_reduce_split {
     }
 
     /// The op's one `dscs_` entry, keyed by its emitted name — where the DSC-level fields live.
-    fn dsc(e: &EmittedOp, name: &str) -> serde_json::Value {
+    fn dsc(e: &EmittedOp<crate::collective::TpWorld<1>>, name: &str) -> serde_json::Value {
         serde_json::to_value(&e.op).unwrap()["dscs_"][0][name].clone()
     }
 
@@ -1640,7 +1640,7 @@ mod long_reduce_split {
             ),
         )
         .expect("the fp16 flat accum handle mints");
-        let split = assemble_reduce_split(
+        let split = assemble_reduce_split::<crate::collective::TpWorld<1>, _, _>(
             ReduceSplit::new(
                 "mean16",
                 ReduceGeometry::new(OpFunc::Mean, 1, cols, Df::Fp16, ReduceDivision::Rows)

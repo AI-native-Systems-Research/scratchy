@@ -184,7 +184,7 @@ fn the_past_the_budget_reduce_splits_through_the_door() {
 }
 
 /// `dsc` for a door that emitted MORE than one op — keyed by the op's emitted name.
-fn dsc_of(ops: &[EmittedOp], op_name: &str) -> serde_json::Value {
+fn dsc_of(ops: &[EmittedOp<ktir_superdsc::collective::TpWorld<1>>], op_name: &str) -> serde_json::Value {
     ops.iter()
         .map(|e| serde_json::to_value(&e.op).unwrap()["dscs_"][0][op_name].clone())
         .find(|v| !v.is_null())

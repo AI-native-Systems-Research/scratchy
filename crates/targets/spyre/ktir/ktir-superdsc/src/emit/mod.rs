@@ -8408,7 +8408,7 @@ mod time_tiled_segment_law {
         }
     }
 
-    fn emit(op: &OpSpec) -> Result<EmittedOp, SuperDscError> {
+    fn emit(op: &OpSpec) -> Result<EmittedOp<crate::collective::TpWorld<1>>, SuperDscError> {
         let folds = SdscFoldSet::new(op.iter.cores_used());
         let mut sym = 0i64;
         emit_sdsc_tiled("seg_law_t0", op, &folds, &mut sym, None)
