@@ -11513,6 +11513,32 @@ fn dump_wavefront_mega(
         use std::num::NonZeroU32;
         let knb = NonZeroU32::new(8192).expect("8192 != 0");
         let stem_id = stem.replace(['-', '.'], "_");
+        // SPIKE (#1094 G, arm 1): the bake's one door on model identity — its stem → its config's
+        // marker type → that type's rope adapter. The spike stops here: the adapter is checked
+        // against the facts and not yet handed to the rope door.
+        {
+            use scratchy_subtile::model_geometry::{
+                ConfigRopes, OnConfigModel, rope_bridge::ModelRopes, with_config_model,
+            };
+            struct Ropes;
+            impl OnConfigModel for Ropes {
+                type Out = ModelRopes;
+                fn on_model<M: ConfigRopes>(self) -> ModelRopes {
+                    M::ROPES
+                }
+            }
+            let ropes = with_config_model(stem, Ropes)
+                .unwrap_or_else(|| panic!("[spyre-superdsc] {stem}: no config marker type"));
+            if let Some(a) = facts.attention() {
+                eprintln!(
+                    "[spyre-superdsc] {stem}: rope classes as types base {} / global {} (facts: {} / {})",
+                    ropes.base.0,
+                    ropes.global.0,
+                    a.base().head_dim().get(),
+                    a.global().head_dim().get(),
+                );
+            }
+        }
         // Opt-in `--device sdsc` (real-silicon) dump: emit the SAME real-model
         // `krg` SubtileIR to a sendnn op-graph JSON the DeepTools `compile_graph`
         // toolchain consumes. Off by default; writes one `<base>.sengraph.json`
