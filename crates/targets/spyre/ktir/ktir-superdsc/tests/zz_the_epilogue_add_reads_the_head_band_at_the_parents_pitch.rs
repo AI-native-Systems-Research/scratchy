@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ⭐⭐⭐⭐⭐ THE ATTN-EPILOGUE ADD READS ITS HEAD BAND AT THE PARENT'S OWN PITCH — the
-//! #1112 mis-addressing finding's plain CI pin, replacing the card seal cell
+//! #1126 mis-addressing finding's plain CI pin, replacing the card seal cell
 //! (`zz_the_attn_epilogue_add_seal_dump.rs`, deleted with this change; the card numbers
 //! stay in #1126 and the PR body as evidence). No card, no env vars, no #[ignore]:
 //! this is the elementwise door the bake calls, driven at the probe-measured regions of
