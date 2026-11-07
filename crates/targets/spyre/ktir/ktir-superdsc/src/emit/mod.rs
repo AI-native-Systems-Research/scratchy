@@ -2972,6 +2972,7 @@ pub fn emit_sdsc_tiled(
 ///   * compute `affine_strides` ({out: per_iter_out_elems * device_stride_out *
 ///     2}) for the tiled W/O tensors, `{}` for INPUT/LX, and register the base
 ///     symbols. Returns the validated [`EmittedOp`] (SymbolicWhenTiled).
+///
 /// ⭐ THE OPERAND'S OWN-FRAME EXTENT (#1113, auditor ruling 2026-11-06) — the ONE fn every
 /// per-trip advance and frame check in [`rewrite_op_for_time_tile`] reads. An operand's
 /// per-trip advance is stated over the OPERAND'S OWN frame — its own rows left of the
