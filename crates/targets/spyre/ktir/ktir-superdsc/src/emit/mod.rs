@@ -1982,8 +1982,8 @@ fn core_slices(op: &OpSpec, v: &ArgView<'_>) -> Result<(u64, Vec<u64>), SuperDsc
         .layout
         .iter()
         .zip(v.scale.iter())
-        .map(|(&d, &sc)| match sc {
-            Scale::Active => u64::from(plan.per_core_extent(d)),
+        .map(|(&d, &sc)| match sc.is_active() {
+            true => u64::from(plan.per_core_extent(d)),
             _ if d == v.stick => u64::from(v.df.elems_per_stick()),
             _ => 1,
         })
@@ -2410,8 +2410,8 @@ pub fn materialized_bytes(v: &crate::superdsc_opspec::ArgView, iter: &WorkPlan) 
     v.layout
         .iter()
         .zip(v.scale.iter())
-        .map(|(&d, &sc)| match sc {
-            Scale::Active => iter.extent(d) as u64,
+        .map(|(&d, &sc)| match sc.is_active() {
+            true => iter.extent(d) as u64,
             _ if d == v.stick => v.df.elems_per_stick() as u64, // fp16/bf16: 64; fp32: 32; fp8/int8: 128
             _ => 1u64,
         })
@@ -2514,8 +2514,8 @@ pub fn touched_blocks(v: &crate::superdsc_opspec::ArgView, iter: &WorkPlan) -> T
         .layout
         .iter()
         .enumerate()
-        .map(|(i, &d)| match v.scale[i] {
-            Scale::Active => iter.extent(d) as u64,
+        .map(|(i, &d)| match v.scale[i].is_active() {
+            true => iter.extent(d) as u64,
             _ if d == v.stick => lanes,
             _ => 1,
         })
@@ -4043,8 +4043,8 @@ pub fn emit_sdsc(
         } else {
             let mut clamped = 1u64;
             for (li, &d) in v.layout.iter().enumerate() {
-                let ext = match v.scale.get(li) {
-                    Some(Scale::Active) => iter.extent(d) as u64,
+                let ext = match v.scale.get(li).map(Scale::is_active) {
+                    Some(true) => iter.extent(d) as u64,
                     _ if d == v.stick => v.df.elems_per_stick() as u64,
                     _ => 1,
                 };
