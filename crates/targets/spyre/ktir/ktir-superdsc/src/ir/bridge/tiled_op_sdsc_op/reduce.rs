@@ -46,7 +46,7 @@ fn reduce_tile_kind(op: OpFunc) -> TileOpKind {
 /// This is the vendor's own shape — `_get_padded_iteration_space` (codegen/superdsc.py:477-507)
 /// pads every iteration space to stick alignment, and their `[mb=32, 514]` max fixture walks
 /// `out_ = 576` with `coordinateMasking_: {"out": [[514, 62]]}` (sdsc_max.json).
-fn reduce_stick_elems(cols: u32, df: Df) -> Result<u32, String> {
+pub(crate) fn reduce_stick_elems(cols: u32, df: Df) -> Result<u32, String> {
     if cols == 0 {
         return Err(
             "reduce width 0: a reduce needs at least one element along its reduced axis"
@@ -168,9 +168,10 @@ pub fn win_reduce_data<'a, K: KindTag>(
     off: DevOff,
     rows: RowCount,
     cols: BlockCols,
+    df: Df,
     what: &str,
 ) -> Result<Win<'a, K>, String> {
-    let stick_elems = reduce_stick_elems(cols.get(), Df::Fp16)?;
+    let stick_elems = reduce_stick_elems(cols.get(), df)?;
     mint_reduce_win(layout, stk, off, rows.get(), stick_elems, what)
 }
 
@@ -184,16 +185,10 @@ pub fn win_reduce_accum<'a, K: KindTag>(
     stk: &'a Stk<K>,
     off: DevOff,
     rows: RowCount,
+    df: Df,
     what: &str,
 ) -> Result<Win<'a, K>, String> {
-    mint_reduce_win(
-        layout,
-        stk,
-        off,
-        rows.get(),
-        <Fp16 as DataFormat>::ELEMS_PER_STICK,
-        what,
-    )
+    mint_reduce_win(layout, stk, off, rows.get(), df.elems_per_stick(), what)
 }
 
 /// The two family mints' shared door: the placement authority when the caller holds one, the
@@ -239,6 +234,46 @@ fn mint_reduce_win<'a, K: KindTag>(
 /// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
 /// both `inputLabeledDs[1]` and the sole output, `out`-axis stick-reduction
 /// `[Active, RedStick, Active]`).
+/// ⭐ THE REDUCE'S OWN SCALING CONST — ONE construction for every seeded-reduce builder (the named
+/// and the offset-carrying `_off` family both), so the two cannot drift about what a reduce's
+/// `op_info` states. The sum/mean/max reduce template (summeanmaxexx2.ddl) requires a
+/// `scaling_factor` external const (= 1/N for mean, 1.0 for sum/max — packed fp16). `cols` is the
+/// reduced extent N. `exx2` divides by the SAME 1/N — its `exx2scale` const is the E[x²] divisor
+/// (the template's own `@outDivisor@`).
+///
+/// The const is read by the device as SEN169_FP16 (1-6-9), NOT IEEE f16 (1-5-10) — see
+/// `sen169_bits`'s own doc for why a plain `half::f16` encoding silently mis-scales every reduce.
+/// The const's element type MUST match the OP's data_format (torch-spyre
+/// `encode_constant(value, data_format)`, compute_ops.py:127): the fp32 reduce (mq>1 rmsnorm
+/// mean(x²)) needs an IEEE_FP32 const (raw f32 bits), else a SEN169_FP16 const feeding an fp32 op
+/// is a MIXED [fp16,fp32] op → DD2 "Unsupported result precision conversion".
+fn reduce_op_info(op: OpFunc, cols: u32, df: Df, accum_name: &str) -> Result<OpInfo, String> {
+    let scale = match op {
+        OpFunc::Mean | OpFunc::Exx2 => 1.0f32 / cols as f32,
+        _ => 1.0f32, // sum / max: identity scaling
+    };
+    if op == OpFunc::Exx2 {
+        // BUILD-TIME GUARD (guard-every-crash-at-build-time): the exx2 bind in summeanmaxexx2.ddl
+        // declares %type_fp16 ONLY — an fp32 exx2 does not exist on the device, and emitting one
+        // would fail at dxp with an op-mapping refusal that names neither the dtype nor the op.
+        // The fp32 rmsnorm island keeps its elementary mean(x²) chain instead.
+        if matches!(df, Df::Fp32) {
+            return Err(format!(
+                "reduce `{accum_name}`: exx2 is fp16-only (summeanmaxexx2.ddl binds %type_fp16 \
+                 exclusively) — the fp32 mean(x²) must ride the elementary chain"
+            ));
+        }
+        // The pair `exx2scale` + `useZeroMean` (the RAW 0 — at 1 ddc renames the op to
+        // exx2_zeromean, which the runtime smc table cannot resolve; see OpInfo::Exx2Scale's doc).
+        return Ok(OpInfo::Exx2Scale(sen169_bits(scale) as u32));
+    }
+    Ok(if matches!(df, Df::Fp32) {
+        OpInfo::ReduceScalingFp32(scale.to_bits())
+    } else {
+        OpInfo::ReduceScaling(sen169_bits(scale) as u32)
+    })
+}
+
 /// fp16 wrapper (every existing caller). The torch-spyre fp32 `mean(x²)` uses [`reduce_opspec_df`].
 pub fn reduce_opspec(
     op: OpFunc,
@@ -417,39 +452,7 @@ pub fn reduce_opspec_df_divided(
         ));
     }
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    // The sum/mean/max reduce template (summeanmaxexx2.ddl) requires a
-    // `scaling_factor` external const (= 1/N for mean, 1.0 for sum/max — packed
-    // fp16). `cols` is the reduced extent N. `exx2` divides by the SAME 1/N — its
-    // `exx2scale` const is the E[x²] divisor (the template's own `@outDivisor@`).
-    let scale = match op {
-        OpFunc::Mean | OpFunc::Exx2 => 1.0f32 / cols as f32,
-        _ => 1.0f32, // sum / max: identity scaling
-    };
-    // The const is read by the device as SEN169_FP16 (1-6-9), NOT IEEE f16 (1-5-10) — see
-    // `sen169_bits`'s own doc for why a plain `half::f16` encoding silently mis-scales every reduce.
-    // The const's element type MUST match the OP's data_format (torch-spyre
-    // `encode_constant(value, data_format)`, compute_ops.py:127): the fp32 reduce (mq>1 rmsnorm
-    // mean(x²)) needs an IEEE_FP32 const (raw f32 bits), else a SEN169_FP16 const feeding an fp32 op
-    // is a MIXED [fp16,fp32] op → DD2 "Unsupported result precision conversion".
-    let op_info = if op == OpFunc::Exx2 {
-        // BUILD-TIME GUARD (guard-every-crash-at-build-time): the exx2 bind in summeanmaxexx2.ddl
-        // declares %type_fp16 ONLY — an fp32 exx2 does not exist on the device, and emitting one
-        // would fail at dxp with an op-mapping refusal that names neither the dtype nor the op.
-        // The fp32 rmsnorm island keeps its elementary mean(x²) chain instead.
-        if matches!(df, Df::Fp32) {
-            return Err(format!(
-                "reduce `{accum_name}`: exx2 is fp16-only (summeanmaxexx2.ddl binds %type_fp16 \
-                 exclusively) — the fp32 mean(x²) must ride the elementary chain"
-            ));
-        }
-        // The pair `exx2scale` + `useZeroMean` (the RAW 0 — at 1 ddc renames the op to
-        // exx2_zeromean, which the runtime smc table cannot resolve; see OpInfo::Exx2Scale's doc).
-        OpInfo::Exx2Scale(sen169_bits(scale) as u32)
-    } else if matches!(df, Df::Fp32) {
-        OpInfo::ReduceScalingFp32(scale.to_bits())
-    } else {
-        OpInfo::ReduceScaling(sen169_bits(scale) as u32)
-    };
+    let op_info = reduce_op_info(op, cols, df, accum_name)?;
     Ok(OpSpec {
         op,
         is_reduction: true,
@@ -610,6 +613,7 @@ pub fn reduce_opspec_off<D: KindTag, A: KindTag>(
     cols: u32,
     data: Win<'_, D>,
     accum: Win<'_, A>,
+    df: Df,
 ) -> Result<OpSpec, String> {
     reduce_opspec_off_divided(ReduceOffSpec {
         op,
@@ -617,7 +621,9 @@ pub fn reduce_opspec_off<D: KindTag, A: KindTag>(
         cols,
         data,
         accum,
+        df,
         division: ReduceDivision::Rows,
+        scaling: ScalingExtent::whole(cols),
     })
 }
 
@@ -639,6 +645,33 @@ pub enum ReduceDivision {
     Groups(u32),
 }
 
+/// ⭐ THE EXTENT A SEEDED REDUCE'S SCALING CONST DIVIDES BY (mean/exx2's 1/N): the reduce's
+/// LOGICAL reduced extent. Private field, TWO mints and no others — [`Self::whole`] (the
+/// scaling extent IS the reduce's own width, every whole reduce) and [`ReduceSlices`]'s own
+/// (`scaling_of`, a long-reduce SLICE stating the parent extent the slices were minted FROM
+/// — infallible, because slice j's width ≤ the parent's extent is `ReduceSlices`'s own
+/// construction law). No caller can therefore state a scaling extent smaller than the width
+/// it sweeps: the law `scaling ≥ cols` is the type's own, and the
+/// partials-add-to-the-single-shot law (every slice carries the SAME 1/N, never its own
+/// slice width) holds by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScalingExtent {
+    cols: u32,
+}
+
+impl ScalingExtent {
+    /// A WHOLE reduce: the scaling extent is the reduced width itself — the one width the
+    /// plain constructor ([`reduce_opspec_off`]) states.
+    pub fn whole(cols: u32) -> Self {
+        Self { cols }
+    }
+
+    /// The extent itself — private to this module, read once where the scaling const is built.
+    fn get(self) -> u32 {
+        self.cols
+    }
+}
+
 /// The parameter list of [`reduce_opspec_off_divided`], carried as a struct. Every field but
 /// `division` is [`reduce_opspec_off`]'s argument of the same name, with the same contract.
 /// `head_major` is no longer a field: it is DERIVED from the data operand's kind
@@ -651,8 +684,18 @@ pub struct ReduceOffSpec<'a, D: KindTag, A: KindTag> {
     pub cols: u32,
     pub data: Win<'a, D>,
     pub accum: Win<'a, A>,
+    /// The reduce's own device format — the stick basis, the pad-lane mask and the scaling const
+    /// all state it. `Df::Fp16` is every caller this family had before the long-reduce split
+    /// threaded fp32 through it.
+    pub df: Df,
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`reduce_opspec_off`] byte for byte.
     pub division: ReduceDivision,
+    /// The extent the scaling const divides by (mean/exx2's 1/N): the reduce's LOGICAL reduced
+    /// extent, TYPED ([`ScalingExtent`]). Equals `cols` for every whole reduce; a long-reduce
+    /// SLICE states the WHOLE reduce's extent here while `cols` carries the slice's own
+    /// geometry, so the slices' partials ADD to the single-shot result — each slice's pad
+    /// lanes are masked to the reduce's identity and contribute nothing.
+    pub scaling: ScalingExtent,
 }
 
 /// [`reduce_opspec_off`] under a STATED [`ReduceDivision`]. A [`ReduceDivision::ReducedAxis`] reduce
@@ -667,7 +710,9 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         cols,
         data,
         accum,
+        df,
         division,
+        scaling,
     } = r;
     // TYPED: `head_major` is DERIVED from the DATA operand's kind (see `ReduceOffSpec`'s doc) —
     // the Win carries the handle, so the kind crosses into this layer by type.
@@ -682,8 +727,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     // `[rows, one stick]`. A win minted at any other extents is a caller whose window and whose
     // iteration dims come from different laws — the exact pairing the raw `(name, u32)` seam used
     // to allow. Refused here, naming the op and both extents.
-    let stick_elems = reduce_stick_elems(cols, Df::Fp16)?;
-    let eps = <Fp16 as DataFormat>::ELEMS_PER_STICK;
+    let stick_elems = reduce_stick_elems(cols, df)?;
+    let eps = df.elems_per_stick();
     if data.rows() != rows || data.cols() != stick_elems {
         return Err(format!(
             "reduce `{accum_name}`: the data operand's window is {}×{} but the op sweeps \
@@ -705,14 +750,14 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     }
     // LOWER to TileIR: same pattern as `reduce_opspec_df` — the per-head/offset reduce variant
     // over the SAME shared declaration, kind picked off the DDL arity ([`reduce_tile_kind`]).
-    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
+    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, df)?;
     // The pad-lane mask (see `reduce_opspec_df`'s identical call): stated first so an
     // unmaskable shape is a build Err, never a silently-wrong descriptor.
-    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, Df::Fp16, accum_name)?;
+    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, df, accum_name)?;
     let tile_op = TileOp {
         kind,
         dims: dims.clone(),
-        df: Df::Fp16,
+        df,
     };
     let tiled = match division {
         ReduceDivision::Rows => tile_op.tile(MaxCores::<MAX_CORES>, distribute_cores, "out"),
@@ -761,7 +806,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     let block = rows.saturating_mul(cols).max(1);
     let stickmajor = !head_major
         && rows > 1
-        && cols > Fp16::ELEMS_PER_STICK
+        && cols > df.elems_per_stick()
         && data_off.is_multiple_of(block)
         && accum_off.is_multiple_of(block);
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
@@ -778,6 +823,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(data_off),
         )
     } else {
@@ -793,6 +840,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(data_off),
         )
     };
@@ -817,6 +866,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(accum_off),
         )
     } else {
@@ -832,6 +883,8 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32))
             .with_offset(accum_off),
         )
     };
@@ -848,17 +901,15 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         ));
     }
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    let scale = match op {
-        OpFunc::Mean => 1.0f32 / cols as f32,
-        _ => 1.0f32,
-    };
-    let scale_bits = sen169_bits(scale) as u32;
+    // The scaling const divides by the reduce's LOGICAL extent (`ScalingExtent`), never by
+    // this emission's slice geometry — see `ReduceOffSpec::scaling`.
+    let op_info = reduce_op_info(op, scaling.get(), df, accum_name)?;
     Ok(OpSpec {
         op,
         is_reduction: true,
         iter: plan,
         args,
-        op_info: OpInfo::ReduceScaling(scale_bits),
+        op_info,
         tiled_symbols,
         time_tile,
         indirect: None,
@@ -880,6 +931,7 @@ pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     cols: crate::sdsc_abstract::BlockCols,
     data: Win<'_, D>,
     accum: Win<'_, A>,
+    df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp<T> {
@@ -889,6 +941,7 @@ pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         cols.get(),
         data,
         accum,
+        df,
     )
     .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -905,6 +958,7 @@ pub struct ReduceDivided<'a, D: KindTag, A: KindTag> {
     pub cols: crate::sdsc_abstract::BlockCols,
     pub data: Win<'a, D>,
     pub accum: Win<'a, A>,
+    pub df: Df,
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`assemble_reduce_off`] byte for byte.
     pub division: ReduceDivision,
 }
@@ -923,6 +977,7 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
         cols,
         data,
         accum,
+        df,
         division,
     } = r;
     let op = reduce_opspec_off_divided(ReduceOffSpec {
@@ -931,7 +986,9 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
         cols: cols.get(),
         data,
         accum,
+        df,
         division,
+        scaling: ScalingExtent::whole(cols.get()),
     })
     .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -939,41 +996,725 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
         .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"))
 }
 
+/// ⭐⭐⭐⭐⭐ THE LONG-REDUCE SPLIT — the ONE law for a seeded row reduce too long for one
+/// on-core LX pass.
+///
+/// A seeded reduce `[rows, N] → [rows, 1]` whose per-core LX residency overruns the budget
+/// time-tiles: the tiler answers `time > 1` with the reduced axis unsplit across cores, and
+/// every trip of a time-tiled seeded reduce would write the SAME one-stick accum (the `RedStick`
+/// scale is stride-exempt in `rewrite_op_for_time_tile`) — the #50 `tiled_trips_alias` alias.
+/// The split is the remedy `reduce.rs` has always named, stated ONCE here for every seeded row
+/// reduce in the tree (the rmsnorm means, the per-head windowed mean, and the bare-reduce door):
+///
+/// * THE TILER DECIDES — the probe builds the SAME opspec the caller's own single-shot emission
+///   builds (same op, rows, cols, df, division; the operand names and offsets cannot move the
+///   tiler's answer) and reads its typed time-tile answer ([`DividedSticks`] — trips that
+///   divide the reduced dim's own stick count, proven inside the tiler's divisor search) and
+///   the reduced axis's core split. One trip, or a [`ReduceDivision::ReducedAxis`] reduce whose
+///   template rings the cores' partials itself, returns `Ok(None)` and the caller emits its
+///   single descriptor UNCHANGED — byte-identical for every reduce that fits, which is every
+///   shipped bundle.
+/// * THE SPLIT: `time` SINGLE-SHOT seeded reduces, each over one column slice of the data at
+///   `col_of`'s whole-block shift of the op's own slab (the fp8 amax-partial precedent). The
+///   tiler divided the reduced dim's PADDED stick count, so every slice but the last is a
+///   whole-stick run at the full per-trip width, and a sub-stick width's tail pad rides the
+///   LAST slice as its raw remainder — masked by the reduce's own coordinate mask, the same law
+///   the single-shot padded reduce lives by. Slice 0 seeds the CALLER's accum
+///   (attn's bmax→run_m law: no copy op for the only-ever-first slot); slices 1..time each land
+///   in their OWN `[rows, stick]` synth under the reduce's place
+///   ([`crate::place::SynthRole::ReducePartial`]), so no two reduces share an output byte — the
+///   alias is unrepresentable, not avoided. Each slice is single-shot BY CONSTRUCTION: its
+///   residency is at most the per-trip residency the tiler validated when it chose `time`.
+/// * THE COMBINE, ONE PER REDUCE KIND, never per shape or model: `max` takes the maximum —
+///   exactly reassociable, the same bits in any order — and every sum-class kind (sum, mean,
+///   exx2) ADDS its partials: each slice's scaling const is the SAME 1/N, so the running add of
+///   the partials is the single-shot result (a split sum re-associates its adds at the reduce's
+///   own precision; the alternative is no lowering at all, and the card gate arbitrates the
+///   numerics). Running, in place on the caller's accum, through the SAME pointwise door every
+///   other combine in the tree takes.
+///
+/// The fp8 `quantscalepertokenfp8` partials in `emit/ktir_matmul_fp8.rs` are NOT this body: that
+/// is the FUSED unseeded op, whose combine folds SCALES not amaxes (a monotone-commutation
+/// proof of its own). Two op classes, two combine laws, one slice mechanics.
+pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
+    /// The op-name prefix the slice and combine ops take (`{op_name}_p{j}_op`, `{op_name}_c{j}_op`).
+    op_name: &'a str,
+    op: OpFunc,
+    /// At least one row — a zero-row reduce has no output byte to combine into.
+    rows: std::num::NonZeroU32,
+    /// The reduced extent N — the window's LOGICAL width, not the parent's. NOT a
+    /// [`crate::superdsc_opspec::StickExtent`]: the reduce family PADS a sub-stick width up to
+    /// a whole stick and masks the pad lanes ([`reduce_stick_elems`] — the vendor's own
+    /// `[32, 514]` max fixture), so a fitted sub-stick reduce is a legal single shot. The
+    /// whole-stick law is a law OF THE SPLIT, and it lives where the split is decided: the
+    /// [`ReduceSlices`] type below, minted from the tiler's own [`DividedSticks`] witness.
+    cols: u32,
+    df: Df,
+    /// The data's PARENT handle, declared at the parent's own full `[rows, parent_cols]`
+    /// extents — the stick-major nest `col_of` addresses the slices within.
+    data: &'a Stk<D>,
+    /// The parent's full column extent, read ONCE at the mint (u32, or the build refuses —
+    /// an overflowing width is a real error, never a silent `u32::MAX` the addressing
+    /// would fold into every slice corner). The body and the column-window mint read this
+    /// stored value; neither re-derives it off the handle.
+    parent_cols: u32,
+    /// The reduce window's base column in the parent (0 for a whole buffer) — typed as the
+    /// whole-stick column window it must be: a sub-stick base sits mid-plane, so no slice
+    /// corner of it is a stick-major tensor of its own.
+    data_col: crate::addr::ColWindow,
+    /// The result handle: `[rows, one stick]` at the reduce's own df.
+    accum: &'a Stk<A>,
+    accum_off: DevOff,
+    /// The place the partial synthetics mint under — the reduce's own place, whatever the
+    /// caller holds for it.
+    parent: crate::place::PlaceId,
+    /// The caller's OWN core division — the probe must ask the tiler the question the caller's
+    /// single-shot emission asks.
+    division: ReduceDivision,
+}
+
+/// ⭐ THE SPLIT'S GEOMETRY — the reduce's own facts as ONE value: the op, the row count,
+/// the reduced extent, the device format, and the caller's core division. `rows` enters
+/// RAW here and nowhere else — the one mint of the row count a split can state.
+#[derive(Clone, Copy, Debug)]
+pub struct ReduceGeometry {
+    op: OpFunc,
+    rows: std::num::NonZeroU32,
+    cols: u32,
+    df: Df,
+    division: ReduceDivision,
+}
+
+impl ReduceGeometry {
+    /// THE ONE MINT of the row count: a zero-row reduce has no output byte to combine
+    /// into, so the raw `u32` a program states is non-zero or the build refuses here.
+    pub fn new(
+        op: OpFunc,
+        rows: u32,
+        cols: u32,
+        df: Df,
+        division: ReduceDivision,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            op,
+            rows: std::num::NonZeroU32::new(rows)
+                .ok_or_else(|| "a long reduce needs at least one row".to_string())?,
+            cols,
+            df,
+            division,
+        })
+    }
+}
+
+/// The split's DATA leg — the PARENT handle and its base column in the parent, ONE value.
+/// The column is minted to a whole-stick [`ColWindow`] by [`ReduceSplit::new`], against the
+/// geometry's own row count and the handle's own full width, so a sub-stick base (a corner
+/// that sits mid-plane) is refused at that one mint.
+pub struct ReduceDataLeg<'a, D: KindTag> {
+    stk: &'a Stk<D>,
+    col: u32,
+}
+
+impl<'a, D: KindTag> ReduceDataLeg<'a, D> {
+    /// The leg at the parent's own column 0 — every whole-buffer caller.
+    pub fn whole(stk: &'a Stk<D>) -> Self {
+        Self { stk, col: 0 }
+    }
+
+    /// The leg at a stated base column — a per-head window's offset in the parent.
+    pub fn at_column(stk: &'a Stk<D>, col: u32) -> Self {
+        Self { stk, col }
+    }
+}
+
+/// The split's ACCUM leg — the result handle and its device offset, ONE value. Both facts
+/// are already typed ([`Stk`], [`DevOff`]); the leg is the grouping, not a new law.
+pub struct ReduceAccumLeg<'a, A: KindTag> {
+    stk: &'a Stk<A>,
+    off: DevOff,
+}
+
+impl<'a, A: KindTag> ReduceAccumLeg<'a, A> {
+    pub fn new(stk: &'a Stk<A>, off: DevOff) -> Self {
+        Self { stk, off }
+    }
+}
+
+impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
+    /// THE ONE CONSTRUCTOR: the grouped facts the caller holds, typed at the mint. The one
+    /// `Err` is the data leg's column mint ([`col_window_of`] — a base column that is not a
+    /// whole stick of the data's own parent); the row count's mint lives on
+    /// [`ReduceGeometry::new`], so the body below cannot spell an untyped extent.
+    pub fn new(
+        op_name: &'a str,
+        geometry: ReduceGeometry,
+        data: ReduceDataLeg<'a, D>,
+        accum: ReduceAccumLeg<'a, A>,
+        parent: crate::place::PlaceId,
+    ) -> Result<Self, String> {
+        let parent_cols = u32::try_from(data.stk.layout().cols).map_err(|_| {
+            format!(
+                "{op_name}: the data handle's width {} overflows u32 — the parent's own \
+                 extent is the nest every slice corner is addressed within, so a width the \
+                 address law cannot state cannot split",
+                data.stk.layout().cols
+            )
+        })?;
+        Ok(Self {
+            op_name,
+            op: geometry.op,
+            rows: geometry.rows,
+            cols: geometry.cols,
+            df: geometry.df,
+            data: data.stk,
+            parent_cols,
+            data_col: crate::addr::col_window_of(
+                geometry.rows.get(),
+                parent_cols,
+                data.col,
+                geometry.df,
+            )
+            .map_err(|e| format!("{op_name}: {e}"))?,
+            accum: accum.stk,
+            accum_off: accum.off,
+            parent,
+            division: geometry.division,
+        })
+    }
+}
+
+/// ⭐ THE SLICES of a split long reduce. Minted only from the tiler's own typed answer
+/// ([`DividedSticks`] — trips that divide the stick count of the dim the tiler tiled, proven
+/// inside `time_tile_for_lx`'s divisor search, superdsc_opspec.rs), so the TimeTile invariant
+/// ("every slice is a whole-stick run of every row") is the TYPE's law and no divisibility is
+/// ever re-checked here.
+///
+/// The sticks the tiler divided are the reduced dim's PADDED extent (`reduce_dims_kind` states
+/// the "out" dim at [`reduce_stick_elems`]'s pad-up), and a sub-stick reduced width pads its
+/// tail into the LAST slice: every slice but the last is a whole-stick run at the full slice
+/// width, and the last slice carries the RAW remainder, whose own pad lanes are masked by the
+/// reduce's own coordinate mask — the same [`reduce_coordinate_mask`] law the single-shot
+/// padded reduce lives by, stated per slice because each slice IS an ordinary reduce at its
+/// own width. No width is refused: the split is the LOWERING, and the masked tail is
+/// numerically inert in the combine (the mask word is the reduce's identity).
+struct ReduceSlices {
+    time: u32,
+    slice_cols: u32,
+    last_cols: u32,
+    /// The PARENT reduce's logical extent — the width every slice's scaling const divides by.
+    whole_cols: u32,
+}
+
+impl ReduceSlices {
+    /// The slices of `cols` under the tiler's own divided sticks. The raw width always reaches
+    /// into the last slice (`padded < cols + stick`, and one slice is at least a whole stick),
+    /// so the remainder below is at least one element and at most one slice.
+    fn of(divided: crate::superdsc_opspec::DividedSticks, cols: u32, stick: u32) -> ReduceSlices {
+        let time = divided.trips();
+        let slice_cols = divided.sticks_per_trip() * stick;
+        ReduceSlices {
+            time,
+            slice_cols,
+            last_cols: cols - (time - 1) * slice_cols,
+            whole_cols: cols,
+        }
+    }
+
+    /// Slice `j`'s raw element width — the full whole-stick run, or the last slice's remainder.
+    fn cols_of(&self, j: u32) -> u32 {
+        if j + 1 == self.time {
+            self.last_cols
+        } else {
+            self.slice_cols
+        }
+    }
+
+    /// Slice `j`'s SCALING extent — the parent's, which the slices were minted from.
+    /// INFALLIBLE by this type's own construction law: every slice's width (whole-stick runs
+    /// of `cols`' padded sticks, the last one its raw remainder) is at most `whole_cols`, so
+    /// no slice can state a scaling extent smaller than the width it sweeps. This is the
+    /// slice's ONLY mint of a [`ScalingExtent`] — the fact the split already knows, stated
+    /// where it is known, never re-derived or re-checked by the caller.
+    fn scaling_of(&self, _j: u32) -> ScalingExtent {
+        ScalingExtent {
+            cols: self.whole_cols,
+        }
+    }
+}
+
+/// ⭐ THE PROBE-AND-SPLIT BODY. `Ok(None)` = the reduce fits (or the cores split the reduced
+/// axis): the caller emits its own single descriptor unchanged. `Ok(Some(ops))` = the split —
+/// the caller extends with these INSTEAD of its single-shot reduce. Every `Err` PROPAGATES:
+/// the probe states the caller's own single-shot opspec (the same op, rows, cols, df and
+/// division, its windows the caller's own extents against the caller's own handles), so an
+/// `Err` here is the same fact the caller's own single-shot builder refuses — stated once,
+/// here, with this body's op name. Swallowing it instead would turn a past-the-budget reduce
+/// into a silently-unsplit wrong program, which is the one thing this body exists to make
+/// impossible.
+pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
+    s: ReduceSplit<'_, D, A>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Option<Vec<EmittedOp<T>>>, String> {
+    let rows = s.rows.get();
+    let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    // The parent's full column extent, read off the handle — the nest every slice corner is
+    // addressed within, the one law the caller cannot restate differently.
+    let probe_data = win_reduce_data(
+        layout,
+        s.data,
+        s.data_col.dev(),
+        rows_t,
+        crate::sdsc_abstract::BlockCols::of_feature_cols(s.cols),
+        s.df,
+        &format!("{}: the long-reduce probe's data window", s.op_name),
+    )?;
+    let probe_accum = win_reduce_accum(
+        layout,
+        s.accum,
+        s.accum_off,
+        rows_t,
+        s.df,
+        &format!("{}: the long-reduce probe's accum window", s.op_name),
+    )?;
+    let probe = reduce_opspec_off_divided(ReduceOffSpec {
+        op: s.op,
+        rows,
+        cols: s.cols,
+        data: probe_data,
+        accum: probe_accum,
+        df: s.df,
+        division: s.division,
+        scaling: ScalingExtent::whole(s.cols),
+    })
+    .map_err(|e| format!("{}: {e}", s.op_name))?;
+    if probe.iter.split_of("out") > 1 {
+        return Ok(None);
+    }
+    // The tiler's own typed answer: `None` is one trip (the reduce fits — the caller's single
+    // shot), `Some` is trips that divide the reduced dim's stick count by the search's own law.
+    let Some(divided) = probe.time_divided() else {
+        return Ok(None);
+    };
+    let stick = s.df.elems_per_stick();
+    let slices = ReduceSlices::of(divided, s.cols, stick);
+    let time = slices.time;
+    // The partials: `time - 1` synthetics under the reduce's own place, one stick per row each,
+    // so no two slice reduces share an output byte. Slice 0 seeds the CALLER's accum.
+    use crate::place::SynthRole as R;
+    let partial_ids: Vec<crate::place::PlaceId> = (1..time)
+        .map(|j| s.parent.synth(R::ReducePartial(j)))
+        .collect();
+    let partial_names: Vec<String> = partial_ids
+        .iter()
+        .map(|id| crate::placement::syn(layout, *id))
+        .collect();
+    if let Some(l) = layout {
+        for id in &partial_ids {
+            l.synth(*id, &[rows, stick]);
+        }
+    }
+    let partials: Vec<Stk<A>> = partial_names
+        .iter()
+        .map(|n| partial_accum_handle(n, rows, stick, s.df))
+        .collect::<Result<_, _>>()?;
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
+    for j in 0..time {
+        let slice_cols = slices.cols_of(j);
+        let corner = crate::addr::col_of(
+            rows,
+            s.parent_cols,
+            s.data_col.column() + j * slices.slice_cols,
+            s.df,
+        );
+        let op_name = format!("{}_p{j}_op", s.op_name);
+        let data_win = win_reduce_data(
+            layout,
+            s.data,
+            corner,
+            rows_t,
+            crate::sdsc_abstract::BlockCols::of_feature_cols(slice_cols),
+            s.df,
+            &format!("{op_name}: the slice's data window"),
+        )?;
+        let accum_win = if j == 0 {
+            win_reduce_accum(
+                layout,
+                s.accum,
+                s.accum_off,
+                rows_t,
+                s.df,
+                &format!("{op_name}: the slice's accum window (the caller's own)"),
+            )?
+        } else {
+            let p = &partials[(j - 1) as usize];
+            win_reduce_accum(
+                layout,
+                p,
+                DevOff::ZERO,
+                rows_t,
+                s.df,
+                &format!("{op_name}: the slice's accum window (its own partial)"),
+            )?
+        };
+        // The slice's own geometry (`cols` = the slice's width, its pad lanes masked) with the
+        // WHOLE reduce's scaling extent — the partials must add to the single-shot result.
+        let spec = reduce_opspec_off_divided(ReduceOffSpec {
+            op: s.op,
+            rows,
+            cols: slice_cols,
+            data: data_win,
+            accum: accum_win,
+            df: s.df,
+            division: ReduceDivision::Rows,
+            scaling: slices.scaling_of(j),
+        })?;
+        let folds = SdscFoldSet::new(spec.iter.cores_used());
+        ops.push(
+            crate::emit::emit_sdsc_tiled(&op_name, &spec, &folds, sym_id_base, layout)
+                .map_err(|e| e.0)?,
+        );
+    }
+    // THE COMBINE, one per reduce kind: accum = accum ∘ partial_j, running, in place on the
+    // caller's accum, through the same pointwise door every other combine takes. The width is
+    // the accum handle's own declared stick — one law, read once. fp16 rides the shipped offset
+    // door; every other df rides the SAME one builder that door wraps
+    // (`pointwise_broadcast_opspec_df`), stated at the reduce's own df — an fp32 accum is 32
+    // lanes wide, a width the fp16-stick door cannot even spell (and an fp16 add over fp32
+    // lanes would mis-read every value).
+    let combine_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(
+        u32::try_from(s.accum.layout().cols).unwrap_or(stick),
+    );
+    let combine = combine_op_func_of(s.op);
+    for (i, p) in partials.iter().enumerate() {
+        let op_name = format!("{}_c{}_op", s.op_name, i + 1);
+        if matches!(s.df, Df::Fp16) {
+            ops.push(crate::emit::assemble_pointwise_broadcast_off(
+                &op_name,
+                combine,
+                rows_t,
+                combine_cols,
+                &[
+                    crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                    crate::emit::In::full(p).ew(),
+                ],
+                s.accum,
+                s.accum_off,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            let mut op = crate::emit::pointwise_broadcast_opspec_df(
+                op_func_from_str(combine),
+                rows,
+                stick,
+                &[
+                    crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                    crate::emit::In::full(p).ew(),
+                ],
+                s.accum.name(),
+                crate::addr::OutCorner::At(s.accum_off),
+                A::kind() == StickKind::Flat,
+                s.df,
+                layout,
+                crate::work::EwDivision::Law,
+            )
+            .map_err(|e| format!("{op_name}: {e}"))?;
+            crate::emit::apply_lx_residency(&mut op, layout);
+            let folds = SdscFoldSet::new(op.iter.cores_used());
+            ops.push(
+                crate::emit::emit_sdsc_tiled(&op_name, &op, &folds, sym_id_base, layout)
+                    .map_err(|e| e.0)?,
+            );
+        }
+    }
+    Ok(Some(ops))
+}
+
+/// The COMBINE op of a reduce kind — ONE table, stated per kind, never per shape: `max` is
+/// exactly reassociable so the partials take their maximum; every sum-class kind adds (each
+/// slice carries the same scaling const, so the running add is the single-shot result).
+fn combine_op_func_of(op: OpFunc) -> &'static str {
+    match op {
+        OpFunc::Max => "maximum",
+        _ => "add",
+    }
+}
+
+/// A reduce ACCUM handle at the buffer's TRUE device shape — the accum's own kind and df,
+/// `[rows, one stick]` ([`win_reduce_accum`]'s own contract: the seeded convention writes one
+/// stick per row whatever the trip, and the placement reserves exactly that through
+/// `row_footprint_bytes`). Minted for a long-reduce partial's synthetic name AND for a door's
+/// reduce-output buffer alike — one law, one mint. A `Kernel` accum is not a seeded reduce's
+/// and is refused by name rather than re-tagged.
+pub(crate) fn partial_accum_handle<A: KindTag>(
+    name: &str,
+    rows: u32,
+    stick: u32,
+    df: Df,
+) -> Result<Stk<A>, String> {
+    let layout = match A::kind() {
+        StickKind::RowBlocked => {
+            crate::sdsc_abstract::StickLayout::row_blocked_df(rows as usize, stick as usize, df)
+        }
+        StickKind::Flat => {
+            crate::sdsc_abstract::StickLayout::flat_df(rows as usize, stick as usize, df)
+        }
+        other => {
+            return Err(format!(
+                "{name}: a long-reduce partial is a row-blocked or flat one-stick-per-row \
+                 buffer, not a {other:?} tensor — the partial carries the accum's own kind"
+            ));
+        }
+    };
+    Stk::new(name, layout).map_err(|e| {
+        format!(
+            "{name}: a long-reduce partial handle at the accum's own kind: {:?}",
+            e
+        )
+    })
+}
+
+/// A reduce DOOR's DATA handle — the buffer's TRUE device shape: the stick-padded width
+/// ([`reduce_stick_elems`], the same pad-up the single-shot descriptor's iteration domain
+/// states, and the same whole sticks the placement reserves through `row_footprint_bytes`),
+/// at the door's own kind and df. The probe's data window is `rows × padded` — minting the
+/// handle at the logical `cols` would under-declare the very sweep the descriptor bills.
+pub(crate) fn reduce_data_handle<D: KindTag>(
+    name: &str,
+    rows: u32,
+    cols: u32,
+    df: Df,
+) -> Result<Stk<D>, String> {
+    let padded = reduce_stick_elems(cols, df)?;
+    let layout = match D::kind() {
+        StickKind::RowBlocked => {
+            crate::sdsc_abstract::StickLayout::row_blocked_df(rows as usize, padded as usize, df)
+        }
+        StickKind::Flat => {
+            crate::sdsc_abstract::StickLayout::flat_df(rows as usize, padded as usize, df)
+        }
+        other => {
+            return Err(format!(
+                "{name}: a reduce door's data operand is a row-blocked or flat activation, \
+                 not a {other:?} tensor — the kind the single shot states is the kind the \
+                 probe asks its question at"
+            ));
+        }
+    };
+    Stk::new(name, layout).map_err(|e| {
+        format!(
+            "{name}: a reduce door's data handle at the buffer's true device shape: {:?}",
+            e
+        )
+    })
+}
+
 #[cfg(test)]
-mod seeded_reduce_refusals {
+mod long_reduce_split {
     use super::*;
 
-    /// ⛔ A TIME-TILED SEEDED REDUCE REFUSES AT THE EMISSION — never an emitted op whose
-    /// trips alias on one accum stick (the #50 `tiled_trips_alias` collision). With the
-    /// partials builder gone, the single-trip row is the only seeded form; a caller whose
-    /// row genuinely overruns the usable LX must split the reduce itself (the fp8 qspt
-    /// path's per-slice single-shot + combine pattern in `emit/ktir_matmul_fp8.rs`).
+    /// A handle for the tests: a row-blocked `[rows, cols]` data parent and a `[rows, stick]`
+    /// accum, over plain names (no layout — the mints' no-authority bound is the handle's own
+    /// declared shape, the same absence every unit test of this family runs under).
+    fn handles(
+        rows: u32,
+        cols: u32,
+    ) -> (
+        Stk<crate::sdsc_abstract::RowBlockedTag>,
+        Stk<crate::sdsc_abstract::RowBlockedTag>,
+    ) {
+        let data = Stk::new(
+            "w",
+            crate::sdsc_abstract::StickLayout::row_blocked(rows as usize, cols as usize),
+        )
+        .expect("the data handle mints");
+        let stick = <Fp16 as DataFormat>::ELEMS_PER_STICK;
+        let accum = Stk::new(
+            "j",
+            crate::sdsc_abstract::StickLayout::row_blocked(rows as usize, stick as usize),
+        )
+        .expect("the accum handle mints");
+        (data, accum)
+    }
+
+    /// ⭐ THE SHAPE THAT USED TO REFUSE NOW SPLITS: the gemma-4 argmax max32 geometry (fp32,
+    /// one row, 524288 wide) billed past the usable LX, the tiler answered time=2, and the
+    /// emission refused "not in the partials form". The ONE split body lowers it: `time`
+    /// single-shot slice reduces — slice 0 into the caller's own accum, the rest into their
+    /// own partial synthetics — then `time - 1` running `maximum` combines into the accum.
     #[test]
-    fn a_time_tiled_seeded_reduce_refuses_naming_the_single_trip_law() {
-        let op = reduce_opspec_df(OpFunc::Max, 1, 524_288, "w", "j", false, Df::Fp32)
-            .expect("the bare opspec assembles");
-        assert_eq!(op.time(), 2, "the past-the-budget row genuinely tiles");
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let err = match crate::emit::emit_sdsc_tiled::<crate::collective::TpWorld<1>>(
-            "max32_bare",
-            &op,
-            &folds,
+    fn the_past_the_budget_max_splits_into_single_shot_slices_and_combines() {
+        let data = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "w",
+            crate::sdsc_abstract::StickLayout::flat_df(1, 524_288, Df::Fp32),
+        )
+        .expect("the fp32 flat data handle mints");
+        let accum = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "j",
+            crate::sdsc_abstract::StickLayout::flat_df(
+                1,
+                <Fp32 as DataFormat>::ELEMS_PER_STICK as usize,
+                Df::Fp32,
+            ),
+        )
+        .expect("the fp32 flat accum handle mints");
+        let split = assemble_reduce_split::<crate::collective::TpWorld<1>, _, _>(
+            ReduceSplit::new(
+                "max32",
+                ReduceGeometry::new(OpFunc::Max, 1, 524_288, Df::Fp32, ReduceDivision::Rows)
+                    .expect("the split's geometry mints"),
+                ReduceDataLeg::whole(&data),
+                ReduceAccumLeg::new(&accum, DevOff::ZERO),
+                crate::place::PlaceId::Act(1),
+            )
+            .expect("the split request mints"),
             &mut 0i64,
             None,
-        ) {
-            Err(e) => e,
-            // `EmittedOp` is not `Debug`, so the Ok arm states its own refusal.
-            Ok(_) => panic!("the bare two-trip seeded reduce must refuse at the emission"),
-        };
+        )
+        .expect("the split body runs")
+        .expect("the past-the-budget row genuinely splits");
+        // time=2: two slice reduces + one combine.
+        assert_eq!(split.len(), 2 + 1, "two slices and their combine");
+    }
+
+    /// ⭐ A REDUCE THAT FITS IS NOT SPLIT — the single-trip row returns `Ok(None)` and the
+    /// caller emits its own single descriptor, byte-identical. (The residency of one 4096-wide
+    /// fp16 row is 8 KiB against the 1,677,721-B budget.)
+    #[test]
+    fn a_fitting_reduce_is_left_to_the_callers_single_shot() {
+        let (data, accum) = handles(1, 4096);
+        let split = assemble_reduce_split::<crate::collective::TpWorld<1>, _, _>(
+            ReduceSplit::new(
+                "sum16",
+                ReduceGeometry::new(OpFunc::Sum, 1, 4096, Df::Fp16, ReduceDivision::Rows)
+                    .expect("the split's geometry mints"),
+                ReduceDataLeg::whole(&data),
+                ReduceAccumLeg::new(&accum, DevOff::ZERO),
+                crate::place::PlaceId::Act(1),
+            )
+            .expect("the split request mints"),
+            &mut 0i64,
+            None,
+        )
+        .expect("the split body runs");
         assert!(
-            err.0.contains("not in the partials form"),
-            "the refusal names the law: {}",
-            err.0
+            split.is_none(),
+            "a fitting reduce is the caller's own single shot"
         );
-        assert!(
-            err.0.contains("single trip"),
-            "the refusal names the remedy: {}",
-            err.0
+    }
+
+    /// The op's one `dscs_` entry, keyed by its emitted name — where the DSC-level fields live.
+    fn dsc(e: &EmittedOp<crate::collective::TpWorld<1>>, name: &str) -> serde_json::Value {
+        serde_json::to_value(&e.op).unwrap()["dscs_"][0][name].clone()
+    }
+
+    /// ⭐ A SUB-STICK REDUCED WIDTH SPLITS TOO, and the split is the LOWERING the old refusal
+    /// never owed: the tiler divided the PADDED stick count (16,384 sticks of 64), so the 31
+    /// pad lanes ride the LAST slice as its raw remainder, masked by the reduce's own
+    /// coordinate mask — the same law the single-shot padded reduce lives by. And EVERY slice
+    /// carries the WHOLE reduce's 1/N scaling const (`ReduceOffSpec::scaling`), the fact
+    /// that makes the running add of the partials the single-shot mean: a slice-local 1/cols
+    /// would add to `time` × it.
+    ///
+    /// (fp16, one row, 1,048,545 wide — 31 lanes past the stick-aligned 1,048,576; full-width
+    /// residency 2,097,280 B bills past the 1,677,721-B budget, and half of it fits, so the
+    /// tiler answers time=2.)
+    #[test]
+    fn a_sub_stick_width_splits_with_its_pad_masked_on_the_last_slice() {
+        let cols = 1_048_545u32;
+        // The data handle declares the caller's PADDED extent (the stick-granular buffer the
+        // allocator hands out) — the same contract every caller of the win mints states, and
+        // the mint's own bound.
+        let data = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "w",
+            crate::sdsc_abstract::StickLayout::flat_df(1, 1_048_576, Df::Fp16),
+        )
+        .expect("the fp16 flat data handle mints");
+        let accum = Stk::<crate::sdsc_abstract::FlatTag>::new(
+            "j",
+            crate::sdsc_abstract::StickLayout::flat_df(
+                1,
+                <Fp16 as DataFormat>::ELEMS_PER_STICK as usize,
+                Df::Fp16,
+            ),
+        )
+        .expect("the fp16 flat accum handle mints");
+        let split = assemble_reduce_split::<crate::collective::TpWorld<1>, _, _>(
+            ReduceSplit::new(
+                "mean16",
+                ReduceGeometry::new(OpFunc::Mean, 1, cols, Df::Fp16, ReduceDivision::Rows)
+                    .expect("the split's geometry mints"),
+                ReduceDataLeg::whole(&data),
+                ReduceAccumLeg::new(&accum, DevOff::ZERO),
+                crate::place::PlaceId::Act(1),
+            )
+            .expect("the split request mints"),
+            &mut 0i64,
+            None,
+        )
+        .expect("the split body runs")
+        .expect("the past-the-budget row genuinely splits");
+        // time=2: two slice reduces + one combine.
+        assert_eq!(split.len(), 2 + 1, "two slices and their combine");
+        let d0 = dsc(&split[0], "mean16_p0_op");
+        let d1 = dsc(&split[1], "mean16_p1_op");
+        // Both slices walk their own padded extent (524,288 = 8,192 sticks)...
+        assert_eq!(
+            d0["N_"]["out_"].as_u64(),
+            Some(524_288),
+            "slice 0's padded out"
+        );
+        assert_eq!(
+            d1["N_"]["out_"].as_u64(),
+            Some(524_288),
+            "slice 1's padded out"
+        );
+        // ...but only the LAST slice masks: its raw remainder is 524,257, 31 lanes short.
+        assert_eq!(
+            d0["coordinateMasking_"].to_string(),
+            "{}",
+            "slice 0 is stick-aligned"
+        );
+        assert_eq!(
+            d1["coordinateMasking_"].to_string(),
+            r#"{"out":[[524257,31]]}"#,
+            "the tail pad rides the last slice, masked"
+        );
+        // Every slice's scaling const is the SAME whole-reduce 1/N — never its own slice width.
+        assert_eq!(
+            d0["constantInfo_"]["0"]["name_"], "scaling_factor",
+            "the mean's scaling const"
+        );
+        assert_eq!(
+            d0["constantInfo_"]["0"], d1["constantInfo_"]["0"],
+            "both slices carry the WHOLE reduce's 1/N, so the partials add to the single-shot mean"
+        );
+        // ...and that shared const IS the whole-row mean's divisor, at the program's own
+        // precision (the SEN169 fp16 word `reduce_op_info` encodes): 1/1,048,545, NEVER the
+        // slice-local 1/524,288. A slice-local divisor is the numerics bug the split's
+        // binding order caught — each partial would be a mean of its own half-width and the
+        // running add would land at `time` × the true mean. With the SAME 1/N on every slice
+        // and an `add` combine, the two partial means sum to the whole-row mean (re-associated
+        // at fp16; the card gate arbitrates the numerics).
+        let whole = (sen169_bits(1.0f32 / cols as f32) as u32).to_string();
+        let slice_local = (sen169_bits(1.0f32 / 524_288f32) as u32).to_string();
+        assert_ne!(
+            whole, slice_local,
+            "the fixture's two candidate divisors must differ, or the pin is vacuous"
+        );
+        for (d, which) in [(&d0, "slice 0"), (&d1, "slice 1")] {
+            assert_eq!(
+                d["constantInfo_"]["0"]["data_"]["data_"]["[0, 0, 0]"][0],
+                whole.as_str(),
+                "{which}'s scaling const is the WHOLE reduce's 1/N at the program's precision"
+            );
+        }
+        // The combine is the sum-class law: an `add`, running, in place on the caller's accum.
+        let c = dsc(&split[2], "mean16_c1_op");
+        assert_eq!(
+            c["computeOp_"][0]["opFuncName"], "add",
+            "the mean's combine"
         );
     }
 }

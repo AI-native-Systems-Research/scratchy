@@ -3621,3 +3621,113 @@ fn the_fp8_epilogue_holds_three_live_mn_tiles_at_its_peak() {
         );
     }
 }
+
+/// ⭐⭐ THE TALL WIDE-HIDDEN RUNG — a prefill-width rmsnorm at hidden 16384 whose
+/// mean(x²) bills past the per-core LX budget (2048 rows × 32 KiB/row, spread over the
+/// cores, is past 1,677,721 B per core), so the chain's own reduce goes through the
+/// LONG-REDUCE SPLIT inside `assemble_rmsnorm`: `time` single-shot slice reduces plus
+/// `time − 1` running combines, in place on the chain's own mean. The door lowers the
+/// whole program — nothing refuses — and the split's slice marker (`_p1_op`, an op name
+/// only the split body mints) is present in the emission. The SHAPES sweep above is the
+/// byte-identity control: every fitting rung still lowers one-for-one.
+#[test]
+fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
+    let (m, c) = (2048u32, 16384u32);
+    let ir = rmsnorm_ir(m, c, GainConvention::Scale);
+    let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+    let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        PagedRows::Sequence,
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
+    let node = &ir.nodes[0];
+    let spliced =
+        scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+    assert_eq!(
+        spliced.op_name,
+        format!("rmsnorm_s{}", node.id.index()),
+        "op_name (m={m} c={c})"
+    );
+    let mut sym = 0i64;
+    let emitted = door_lower(
+        spliced
+            .ktir
+            .as_ref()
+            .expect("spliced op carries its program"),
+        &mut sym,
+        Some(&layout),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
+    assert!(
+        emitted.iter().any(|e| e.op_name.contains("_p1_op")),
+        "the tall rung's mean(x²) splits: no `_p1_op` slice among {} emitted ops",
+        emitted.len()
+    );
+    // ⛔ #1113's ADDRESS-RESOLVING CHECK (auditor ruling 2026-11-06): every time-tiled op
+    // the door emitted — the split's own slices and combines included — must keep every
+    // STRIDED operand's whole trip span inside that operand's own footprint, resolved
+    // against the concrete per-trip addresses `concrete_trips` baked. This is the rung
+    // whose rmg gain (an mb-broadcast read by a time-tiled op) advanced 64× past its
+    // one-row frame on the card (run-4, RAS::PCI::BusFence 0xa35e); the own-frame stride
+    // law plus the emitter's bake-time segment law must hold here op by op, and this
+    // asserts it on the REAL door emission, not a hand-minted fixture.
+    let mut tiled_ops = 0usize;
+    for e in &emitted {
+        if e.time == 1 {
+            continue;
+        }
+        tiled_ops += 1;
+        for (ti, strides) in e.affine_strides.iter().enumerate() {
+            let Some(&stride) = strides.values().next() else {
+                continue;
+            };
+            assert!(
+                stride > 0,
+                "m={m} c={c} op '{}': operand {ti} carries a stride map with a non-advance",
+                e.op_name
+            );
+            let trips = e.concrete_trips();
+            let start = |t: usize| -> u64 {
+                trips
+                    .get(t)
+                    .unwrap_or_else(|| panic!("a trip per time ({})", e.time))
+                    .dscs_[0]
+                    .values()
+                    .next()
+                    .expect("one dsc")
+                    .scheduleTree_
+                    .iter()
+                    .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ as usize == ti)
+                    .unwrap_or_else(|| {
+                        panic!("op '{}': an allocate node per operand {ti}", e.op_name)
+                    })
+                    .startAddressCoreCorelet_
+                    .data_
+                    .values()
+                    .next()
+                    .expect("a per-core address")
+                    .parse()
+                    .expect("a decimal address")
+            };
+            let span = start(e.time as usize - 1) - start(0) + stride as u64;
+            assert!(
+                span <= e.arg_bindings[ti].footprint_bytes,
+                "m={m} c={c} op '{}': operand {ti}'s trips span {span} B (stride {stride} B × \
+                 {} trips) but its own frame is {} B — the op's iteration outruns the operand",
+                e.op_name,
+                e.time,
+                e.arg_bindings[ti].footprint_bytes
+            );
+        }
+    }
+    assert!(
+        tiled_ops > 0,
+        "m={m} c={c}: the tall rung's emission carries at least one time-tiled op — the \
+         split's slices are single-trip by construction, but the program's wide pointwise \
+         applies tile"
+    );
+}

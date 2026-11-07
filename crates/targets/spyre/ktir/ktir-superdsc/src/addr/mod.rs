@@ -392,12 +392,21 @@ pub fn col_of(rows: u32, cols: u32, c: u32, df: Df) -> DevOff {
 pub struct ColWindow {
     corner: DevOff,
     rows: u32,
+    /// The window's own column index in the parent (a whole stick, by [`col_window_of`]'s mint) —
+    /// carried so a caller can state further whole-stick windows of the SAME parent as offsets of
+    /// this one, without re-deriving the base from the corner.
+    col: u32,
 }
 
 impl ColWindow {
     /// The corner as a device offset — the same element [`col_of`] gives.
     pub fn dev(self) -> DevOff {
         self.corner
+    }
+
+    /// The window's own whole-stick column index in the parent.
+    pub fn column(self) -> u32 {
+        self.col
     }
 
     /// Whether a `[rows, ·]` view from this corner is the window's stick-major tensor: the parent's plane
@@ -422,6 +431,7 @@ pub fn col_window_of(rows: u32, full: u32, c: u32, df: Df) -> Result<ColWindow, 
     Ok(ColWindow {
         corner: col_of(rows, full, c, df),
         rows,
+        col: c,
     })
 }
 
