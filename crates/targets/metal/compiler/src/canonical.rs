@@ -35,8 +35,11 @@ use scratchy_target_metal::tape::step::{
     RotaryTables, RowSource,
 };
 
+use scratchy_target_metal::tape::lowering::TapeHalf;
+
 use crate::steps_from_tape::{
-    Assembled, MoeBits, OpColours, Recording, StepRefusal, UnrolledSteps, assemble, proves,
+    Assembled, MoeBits, OpColours, Recording, RowOperand, StepRefusal, UnrolledSteps, assemble,
+    proves,
 };
 
 /// A model's SOURCE MANIFEST: every weight family its tapes bind — a `(kind, accessor)` bundle on
@@ -86,11 +89,12 @@ impl SourceManifest {
     }
 
     /// The model's `ModelSources` impl: one arm per family, `ix => bundle at layer`. A family
-    /// whose field holds a typed handle (`handle`: its type, by field base) is a source slot
-    /// ([`slot`]): its arm matches the slot's `IX` and reaches the field through the slot.
+    /// whose field holds a typed handle (`handle`: its type and the marker of the DSL weights it
+    /// stands in for, by field base) is a source slot ([`slot`]): its arm matches the slot's `IX`
+    /// and reaches the field through the slot.
     pub fn resolver(
         &self,
-        handle: &dyn Fn(&str) -> Option<TokenStream>,
+        handle: &dyn Fn(&str) -> Option<(TokenStream, TokenStream)>,
     ) -> Result<Resolver, UnboundKind> {
         let r = quote!(::scratchy_target_metal::tape::lowered::SourceRef);
         let ids = quote!(::scratchy_target_metal::tape::ids);
@@ -99,7 +103,7 @@ impl SourceManifest {
             let (ix, base) = (Literal::u32_unsuffixed(n), format_ident!("{}", f.base));
             // `device`: the field's device layer, copied out — a typed field's through its handle.
             let (field, device, pat) = match handle(&f.base) {
-                Some(ty) => {
+                Some((ty, weights)) => {
                     let s = slot(SourceIx(n));
                     typed.insert(SourceIx(n));
                     slots.push(quote! {
@@ -107,6 +111,7 @@ impl SourceManifest {
                         impl ::scratchy_target_metal::tape::typed::Source for #s {
                             type Model = Weights;
                             type Handle = #ty;
+                            type Weights = #weights;
                             const IX: #ids::SourceIx = #ids::SourceIx(#ix);
                             fn at(w: &Weights, layer: #ids::LayerId) -> &#ty {
                                 w.#base(layer.get())
@@ -261,6 +266,8 @@ pub enum RollOutcome {
 /// One decode canonical, lowered.
 pub struct MetalCanonical {
     pub steps: MetalStepTape,
+    /// Parallel to `steps`' rows: the arena operands each row's step names.
+    pub operands: StepOperands,
     pub colours: ColourCount,
     /// The colour holding the forward's result.
     pub result: Colour,
@@ -269,6 +276,38 @@ pub struct MetalCanonical {
     /// `(tile, output)` → colour, what the arena statics are sized from.
     pub arena: SlotMap,
     pub roll: RollOutcome,
+}
+
+/// A step tape's rows' arena operands: per backbone row, then per lm_head row, what each slot its
+/// step names holds (`MetalStepTape::backbone` / `lm_head` index them alike).
+#[derive(Clone, Debug, Default)]
+pub struct StepOperands {
+    pub backbone: Vec<Vec<RowOperand>>,
+    pub lm_head: Vec<Vec<RowOperand>>,
+    /// Per backbone row, then per lm_head row, the DSL weights its op reads, each with its site's
+    /// kind (`Recording::read`).
+    pub backbone_weights: Vec<Vec<(WeightKind, u32)>>,
+    pub lm_head_weights: Vec<Vec<(WeightKind, u32)>>,
+}
+
+impl StepOperands {
+    /// The operands of row `row` of `half`.
+    pub fn row(&self, half: TapeHalf, row: u32) -> &[RowOperand] {
+        let rows = match half {
+            TapeHalf::Backbone => &self.backbone,
+            TapeHalf::LmHead => &self.lm_head,
+        };
+        rows.get(row as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// The DSL weights row `row` of `half`'s op reads.
+    pub fn weights(&self, half: TapeHalf, row: u32) -> &[(WeightKind, u32)] {
+        let rows = match half {
+            TapeHalf::Backbone => &self.backbone_weights,
+            TapeHalf::LmHead => &self.lm_head_weights,
+        };
+        rows.get(row as usize).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Why a canonical could not be lowered. The macro panics with it: a declared pilot has no
@@ -439,6 +478,8 @@ pub fn lower_canonical(
         hidden: HiddenSize(consts.hidden().get() as u32),
         intermediate: (consts.intermediate()).map(|i| IntermediateSize(i.get() as u32)),
         bucket_m: m as u32,
+        named: Default::default(),
+        read: Default::default(),
     }
     .records()
     .map_err(Steps)?;
@@ -467,7 +508,7 @@ pub fn lower_canonical(
             RollOutcome::Rolled { peel: 0 },
             rolled.rows,
             rolled_flags,
-            rolled.sites,
+            (rolled.sites, rolled.operands, rolled.weights),
             rolled_live,
         )),
         Err(e) => {
@@ -484,7 +525,8 @@ pub fn lower_canonical(
         match candidate(items) {
             Ok((b, flags)) if cut.as_ref().is_none_or(|c| b.rows.len() < c.1.len()) => {
                 let live = b.play_live();
-                cut = Some((RollOutcome::LayerClasses, b.rows, flags, b.sites, live));
+                let sites = (b.sites, b.operands, b.weights);
+                cut = Some((RollOutcome::LayerClasses, b.rows, flags, sites, live));
             }
             Ok(_) => {}
             Err(e) => why.push(format!("layer-class: {e}")),
@@ -500,7 +542,8 @@ pub fn lower_canonical(
             match candidate(&items) {
                 Ok((b, flags)) => {
                     let live = b.play_live();
-                    cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, b.sites, live));
+                    let sites = (b.sites, b.operands, b.weights);
+                    cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, sites, live));
                     break;
                 }
                 Err(e) => why.push(format!("peel={peel}: {e}")),
@@ -508,14 +551,19 @@ pub fn lower_canonical(
         }
     }
     let from = unrolled.rows.len();
-    let (roll, backbone, backbone_barriers, backbone_sites, (backbone_live, lm_head_live)) = cut
-        .unwrap_or((
-            RollOutcome::Unrolled,
-            unrolled.rows,
-            unrolled_flags,
-            unrolled.sites,
-            unrolled_live,
-        ));
+    let (
+        roll,
+        backbone,
+        backbone_barriers,
+        (backbone_sites, backbone_operands, backbone_weights),
+        (backbone_live, lm_head_live),
+    ) = cut.unwrap_or((
+        RollOutcome::Unrolled,
+        unrolled.rows,
+        unrolled_flags,
+        (unrolled.sites, unrolled.operands, unrolled.weights),
+        unrolled_live,
+    ));
     match roll {
         RollOutcome::Unrolled => eprintln!(
             "[m2-roll] {stem} m={m}: NO cut rolls — emitting the un-rolled tape. {}",
@@ -546,6 +594,12 @@ pub fn lower_canonical(
             lm_head_barriers,
             lm_head_sources: rolled.lm_sites.iter().map(|s| sources.row(s)).collect(),
             lm_head_live,
+        },
+        operands: StepOperands {
+            backbone: backbone_operands,
+            lm_head: rolled.lm_operands,
+            backbone_weights,
+            lm_head_weights: rolled.lm_weights,
         },
         colours: colour_count,
         result,

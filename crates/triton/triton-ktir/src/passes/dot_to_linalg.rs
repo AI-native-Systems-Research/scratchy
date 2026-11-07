@@ -342,7 +342,7 @@ pub fn run(module: &mut Module) -> Result<()> {
         //     (`stage_2d(&StickLayout::kernel(k, n), ..)`, `sdsc_abstract.rs:2124`), at bake time,
         //     for free at inference. That is this fold, and it is measured byte-identical.
         //   * a CACHE is moved by the device writing it already transposed
-        //     (`kcache_kt_write_offset`), which is why the shipped attention keeps a third physical
+        //     (`kt_write_off`), which is why the shipped attention keeps a third physical
         //     Kᵀ plane at all.
         //   * an IN-REGISTER COMPUTED VALUE has NEITHER. Nothing places its bytes, and nothing in
         //     `ktir-superdsc` reads an access tile's `CoordinateOrder` (`grep -rn CoordinateOrder

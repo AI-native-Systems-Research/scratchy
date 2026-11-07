@@ -25,6 +25,7 @@ use crate::interpreter::metal::__re::{
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 
+use super::bucket::{BakedBuckets, Buckets, Picked};
 use super::ids::LayerId;
 use super::lowered::{
     Binding, Fence, KernelId, LoweredCommand, LoweredMetalTape, StepKernel, TapeCommand,
@@ -207,7 +208,79 @@ impl ArenaRanks {
         );
         Self { all, hosting }
     }
+}
 
+/// ⭐ A MODEL'S ARENA RANKS, READ OFF ITS BUCKETS: each slot of `0..N` (`N` the most slots a
+/// bucket has) by its bytes at its largest bucket — the bytes its colours host there — largest
+/// first, ties by slot; the hosting ranks the same less every bucket's final hidden states. Held
+/// in a `static`, which [`Self::ranks`] lends to the model's [`ArenaRanks`].
+pub struct RankedSlots<const N: usize> {
+    all: [u32; N],
+    hosting: [u32; N],
+    hosting_len: usize,
+}
+
+impl<const N: usize> RankedSlots<N> {
+    pub const fn of(buckets: &[super::pool::MetalBucketSpec]) -> Self {
+        let mut bytes = [0u64; N];
+        let mut b = 0;
+        while b < buckets.len() {
+            let arena = buckets[b].arena_bytes;
+            let mut s = 0;
+            while s < arena.len() {
+                if arena[s] > bytes[s] {
+                    bytes[s] = arena[s];
+                }
+                s += 1;
+            }
+            b += 1;
+        }
+        // Each rank's slot: the largest left, the lowest slot among equals.
+        let (mut all, mut taken) = ([0u32; N], [false; N]);
+        let mut r = 0;
+        while r < N {
+            let mut best = N;
+            let mut s = 0;
+            while s < N {
+                if !taken[s] && (best == N || bytes[s] > bytes[best]) {
+                    best = s;
+                }
+                s += 1;
+            }
+            taken[best] = true;
+            all[r] = best as u32;
+            r += 1;
+        }
+        let (mut hosting, mut hosting_len) = ([0u32; N], 0);
+        let mut a = 0;
+        while a < N {
+            let mut is_hidden = false;
+            let mut k = 0;
+            while k < buckets.len() {
+                is_hidden |= buckets[k].backbone_slot == all[a];
+                k += 1;
+            }
+            if !is_hidden {
+                hosting[hosting_len] = all[a];
+                hosting_len += 1;
+            }
+            a += 1;
+        }
+        Self {
+            all,
+            hosting,
+            hosting_len,
+        }
+    }
+
+    /// The ranks, of the model whose buckets are `buckets` (the ones they were read off).
+    pub const fn ranks(&'static self, buckets: &[super::pool::MetalBucketSpec]) -> ArenaRanks {
+        let (hosting, _) = self.hosting.split_at(self.hosting_len);
+        ArenaRanks::new(&self.all, hosting, buckets)
+    }
+}
+
+impl ArenaRanks {
     /// The slots of an arena of `len` slots, in the order of `ranks`.
     fn within(ranks: &[u32], len: usize) -> impl Iterator<Item = Slot> + '_ {
         (ranks.iter().map(|&s| Slot(s as usize))).filter(move |s| s.0 < len)
@@ -1107,9 +1180,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
     }
 
     /// Count total dispatches across all MTL4 steps in this bucket.
-    pub fn count_dispatches(&self, bucket: usize) -> usize {
+    pub fn count_dispatches(&self, bucket: &W::Bucket) -> usize
+    where
+        W: BakedBuckets,
+    {
         self.bucket_bakings
-            .get(bucket)
+            .get(bucket.picked().index())
             .and_then(|b| b.mtl4_steps.as_ref())
             .map(|steps| steps.iter().map(|s| s.dispatches.len()).sum())
             .unwrap_or(0)
@@ -1127,9 +1203,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// it; only the CB boundary does. The pool serializes such buckets
     /// via [`run_dump_segment`]-style chunked commits. Cheap to scan
     /// (handful of steps) and the result gates a once-per-image path.
-    pub fn bucket_has_avg_pool_2d(&self, bucket: usize) -> bool {
+    pub fn bucket_has_avg_pool_2d(&self, bucket: &W::Bucket) -> bool
+    where
+        W: BakedBuckets,
+    {
         self.bucket_bakings
-            .get(bucket)
+            .get(bucket.picked().index())
             .and_then(|b| b.mtl4_steps.as_ref())
             .map(|steps| {
                 steps
@@ -1146,16 +1225,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// residency wiring (`useResidencySet`), commit, and event-based
     /// wait. Returns an error if MTL4 was not baked for this bucket
     /// (e.g. a kernel exceeds the 31-binding argument-table cap).
+    /// The token count it plays is the bucket's proof's: at most its rows.
     pub fn run_bucket_mtl4(
         &self,
-        bucket: usize,
-        num_tokens: u32,
+        bucket: &W::Bucket,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-    ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, sampled_rows, reads, enc, None)
+    ) -> Result<(), WorkerError>
+    where
+        W: BakedBuckets,
+    {
+        let picked = bucket.picked();
+        self.run_bucket_mtl4_inner(picked, num_seqs, sampled_rows, reads, enc, None)
     }
 
     /// Activation-dump replay segment: encode only the flat dispatch
@@ -1166,16 +1249,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// segments with a host wait + arena readback between them.
     pub fn run_bucket_mtl4_range(
         &self,
-        bucket: usize,
-        num_tokens: u32,
+        bucket: &W::Bucket,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: std::ops::Range<usize>,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<(), WorkerError>
+    where
+        W: BakedBuckets,
+    {
         self.run_bucket_mtl4_inner(
-            bucket,
-            num_tokens,
+            bucket.picked(),
             num_seqs,
             sampled_rows,
             super::ForwardReads::Outputs,
@@ -1184,16 +1268,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
         )
     }
 
+    /// The bucket `picked` proves the request fits, at the request's tokens.
     fn run_bucket_mtl4_inner(
         &self,
-        bucket: usize,
-        num_tokens: u32,
+        picked: &Picked,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: Option<std::ops::Range<usize>>,
     ) -> Result<(), WorkerError> {
+        let (bucket, num_tokens) = (picked.index(), picked.tokens().get());
         use ::objc2_metal::{
             MTL4CommandEncoder, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
         };

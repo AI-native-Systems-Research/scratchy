@@ -19,6 +19,18 @@
 use scratchy_subtile::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
 use std::num::NonZeroU32;
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
+    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 const NKVH: usize = 8;
 
 fn kvh(i: u32) -> KvHead {
@@ -32,8 +44,10 @@ fn kvh(i: u32) -> KvHead {
 /// other way round. Pinned at every head dim, because this is the transposition the score leg depends on.
 #[test]
 fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
-    for hd in [64usize, 80, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+    // Whole-stick head widths only: a part-stick width (e.g. 80) is not a head the pool can hold —
+    // HeadWidth refuses it at the mint (its own should_panic test), so it is not a fixture here.
+    for hd in [64usize, 128, 256] {
+        let p = pool(NKVH, hd);
         let stick = 64u32;
         for h in [0u32, 3, 7] {
             let kt = KvCoord::block(KvPlane::Kt, kvh(h));
@@ -87,7 +101,7 @@ fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
 #[test]
 fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
     for hd in [64usize, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+        let p = pool(NKVH, hd);
         let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             let base = KvCoord::block(plane, kvh(0));
@@ -131,8 +145,10 @@ fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
 /// a copy of the thing it guards.
 #[test]
 fn no_two_slots_of_a_plane_can_alias() {
-    for hd in [64usize, 80, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+    // Whole-stick head widths only: a part-stick width (e.g. 80) is not a head the pool can hold —
+    // HeadWidth refuses it at the mint (its own should_panic test), so it is not a fixture here.
+    for hd in [64usize, 128, 256] {
+        let p = pool(NKVH, hd);
         let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             for h in [0u32, 5, 7] {
@@ -169,7 +185,7 @@ fn no_two_slots_of_a_plane_can_alias() {
 #[test]
 fn no_two_slot_feature_pairs_can_alias() {
     for hd in [64usize, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+        let p = pool(NKVH, hd);
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             let base = KvCoord::block(plane, kvh(2));
             let mut seen: std::collections::BTreeMap<u32, (u32, u32)> = Default::default();

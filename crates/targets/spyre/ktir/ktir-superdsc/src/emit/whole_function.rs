@@ -127,10 +127,10 @@ pub struct SiluMulChain {
 ///
 /// * **The device slot is in-rows.** [`crate::sdsc_abstract::StickLayout::kernel`] is `[in(K),
 ///   out(N)]` with `rows = k_in`, and `matmul` declares exactly that (`Stk::kernel(k, n_dev, ..)`) for
-///   BOTH forms. `vcache_write_offset`'s doc states the same thing for the hardware-proven attention —
+///   BOTH forms. `PagedKvPool::v_write_off`'s doc states the same thing for the hardware-proven attention —
 ///   "the V cache … the VALUE bmm reads as a `[cap, hd]` KERNEL sticked on `hd` (`out`) … the kernel is
 ///   `[k=cap, n=hd]`" — and `attn.rs`'s value leg contracts the V cache WHERE IT LIES, no relayout, at
-///   41 tok/s. `p @ V` IS this contraction. Its twin `kcache_kt_write_offset` is the other half of the
+///   41 tok/s. `p @ V` IS this contraction. Its twin `kt_write_off` is the other half of the
 ///   argument: the score leg's kernel is `[hd, cap]`, in-rows again, which is why the K cache is
 ///   written already-transposed rather than transposed on the way in.
 /// * **The relayout could not have computed it anyway.** MEASURED on both decoders: the transposing
@@ -238,7 +238,7 @@ pub fn matmul_b_orientation(
 ///
 ///  * a PRESENTED weight — the HOST stage, once, at bake time (`stage_2d(&StickLayout::kernel(k, n),
 ///    ..)`, `sdsc_abstract.rs:2124`). Free at inference, and the whole regression bar is this case.
-///  * a CACHE — the DEVICE, writing it already transposed (`kcache_kt_write_offset`), which is why the
+///  * a CACHE — the DEVICE, writing it already transposed (`kt_write_off`), which is why the
 ///    shipped attention pays for a third physical Kᵀ plane (`assemble_restickify_kt_2d`) rather than
 ///    relabelling the one it has. **The relayout exists to MAKE a `[k, n]` buffer, never to consume
 ///    one.**
@@ -290,7 +290,7 @@ fn transposed_b_is_placeable(
          the kernel slot reads `[k, n]` (`StickLayout::kernel(k_in, n_out)`) whatever they say. \
          A presented weight spends that transposition in the host stage \
          (`stage_2d(&StickLayout::kernel(k, n), ..)`) and a cache in the device's \
-         already-transposed write (`kcache_kt_write_offset`); an in-register value has neither, \
+         already-transposed write (`kt_write_off`); an in-register value has neither, \
          and nothing here reads an access tile's `CoordinateOrder`. Lowering it would emit a \
          well-formed descriptor computing `A @ B` instead of `A @ Bᵀ`, which NO extent guard can \
          catch when k == n. So the producer must emit a real relayout beside this matmul (a \
@@ -6307,10 +6307,10 @@ fn lower_function_folded(
         // producing matmul wrote IS a `[k, n]` kernel with `in = mb`.
         //
         // ⭐ THE DEVICE EVIDENCE IS THE SHIPPED ATTENTION, AND IT IS THIS EXACT CONTRACTION.
-        // `sdsc_abstract::vcache_write_offset`: "the V cache … the VALUE bmm reads as a `[cap, hd]`
+        // `sdsc_abstract::PagedKvPool::v_write_off`: "the V cache … the VALUE bmm reads as a `[cap, hd]`
         // KERNEL sticked on `hd` (`out`) … the kernel is `[k=cap, n=hd]`", and `attn.rs`'s value leg
         // declares `Stk::kernel(v_stride, hd)` — the V cache contracted in place, no relayout, granite
-        // fp8 at 41 tok/s. `p @ V` is `tl.dot(p, v)`. Its twin `kcache_kt_write_offset` completes the
+        // fp8 at 41 tok/s. `p @ V` is `tl.dot(p, v)`. Its twin `kt_write_off` completes the
         // argument from the other side: the SCORE leg's kernel is `[hd, cap]`, in-rows again, which is
         // why the K cache is written ALREADY TRANSPOSED (`restickify_kt_opspec_2d`) — the relayout
         // exists to MAKE a `[k, n]` buffer, never to consume one.
@@ -9270,7 +9270,7 @@ mod matmul_orientation_tests {
     /// ⛔ THE OTHER SINGLE-VARIABLE CONTROL: the ORIENTATION moved alone, provenance held at
     /// COMPUTED. `tl.dot(p, v)` — `v` is this kernel's own V projection, an in-register `[k, n]`
     /// tile, and `[k, n]` IS the slot's device order, so it is contracted WHERE IT LIES. That is the
-    /// leg the shipped attention runs against its V cache at 41 tok/s (`vcache_write_offset`: "the
+    /// leg the shipped attention runs against its V cache at 41 tok/s (`v_write_off`: "the
     /// kernel is `[k=cap, n=hd]`"). A guard that refused every computed B would break it, and both
     /// decoders would stop lowering for the wrong reason.
     #[test]

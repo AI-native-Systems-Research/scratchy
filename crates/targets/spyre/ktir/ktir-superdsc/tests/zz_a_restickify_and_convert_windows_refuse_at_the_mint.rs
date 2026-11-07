@@ -90,7 +90,7 @@ fn kt_2d(
     assemble_restickify_kt_2d(
         "rk_test",
         KtTileSlots::of_row_window(RowWindow::ROWS),
-        KtTileFeats::of_head_dim(64),
+        KtTileFeats::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(64)),
         in_,
         in_off,
         o,

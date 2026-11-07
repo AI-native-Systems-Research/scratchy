@@ -28,6 +28,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -35,6 +36,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = W2<Hidden, Vocab, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! # }
@@ -56,6 +58,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -79,6 +82,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -86,6 +90,7 @@
 //! impl Source for LmHead {
 //!     type Model = Weights;
 //!     type Handle = W2<Hidden, Vocab, Layer>;
+//!     type Weights = ();
 //!     const IX: SourceIx = SourceIx(0);
 //!     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! }
@@ -105,6 +110,7 @@
 //! # impl Source for Norm {
 //! #     type Model = Weights;
 //! #     type Handle = W1<Hidden, Layer>;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(1);
 //! #     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.norm }
 //! # }
@@ -112,6 +118,7 @@
 //! impl Source for LmHead {
 //!     type Model = Weights;
 //!     type Handle = W2<Vocab, Hidden, Layer>;
+//!     type Weights = ();
 //!     const IX: SourceIx = SourceIx(0);
 //!     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.lm_head }
 //! }
@@ -135,6 +142,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -159,6 +167,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -183,6 +192,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -208,6 +218,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -231,6 +242,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -256,6 +268,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -279,6 +292,7 @@
 //! # impl Source for LmHead {
 //! #     type Model = Weights;
 //! #     type Handle = Head;
+//! #     type Weights = ();
 //! #     const IX: SourceIx = SourceIx(0);
 //! #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
 //! # }
@@ -345,13 +359,78 @@ kernel_set! {
     NAX_GROUP_SIZES: Group, NaxGroup { G64, G128 }
 }
 
-/// A weight family of model `Model`: its index in the model's source manifest, and the typed
-/// handle its field holds.
+/// A weight family of model `Model`: its index in the model's source manifest, the typed handle its
+/// field holds, and the DSL weights that field stands in for (`Weights`, a marker that
+/// [`HoldsWeight`](scratchy_tensors::typed::HoldsWeight) each).
 pub trait Source {
     type Model;
     type Handle;
+    type Weights;
     const IX: SourceIx;
     fn at(model: &Self::Model, layer: LayerId) -> &Self::Handle;
+}
+
+/// Slot `S`'s GEMM weight, as a GEMM of DSL weight `W` reads it: only a slot whose field holds `W`
+/// has one for it. `W` is the weight the GEMM's op reads, recorded from the op's own operand, so a
+/// GEMM whose slot names another weight does not compile, whatever their shapes.
+///
+/// ```
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, gemm_slot};
+/// # use scratchy_tensors::typed::{HoldsWeight, W2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # struct Weights { k_proj: W2<U2048, U256, Layer>, v_proj: W2<U2048, U256, Layer> }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = W2<U2048, U256, Layer>;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.v_proj }
+/// }
+/// assert_eq!(gemm_slot::<VSlot, VProj>().ix, SourceIx(1));
+/// ```
+///
+/// The same slot read by a GEMM of the K projection, of the very same shape, is refused:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, gemm_slot};
+/// # use scratchy_tensors::typed::{HoldsWeight, W2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # struct Weights { k_proj: W2<U2048, U256, Layer>, v_proj: W2<U2048, U256, Layer> }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = W2<U2048, U256, Layer>;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.v_proj }
+/// }
+/// let _ = gemm_slot::<VSlot, KProj>();
+/// ```
+pub const fn gemm_slot<S, W>() -> GemmSlotWeight
+where
+    S: GemmSlot + Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
+    S::WEIGHT
+}
+
+/// That slot `S`'s field holds DSL weight `W` too: a GEMM of two weights' slot (a packed pair).
+pub const fn holds<S, W>()
+where
+    S: Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
 }
 
 /// A GEMM's weight, as its slot states it: the slot's index and the handle's dims, `n` (output
@@ -442,3 +521,139 @@ pub const fn int4_codes<S: AffineSlot<Bits: Int4>>() {}
 
 /// Slot `S` is read by a matrix-unit kernel: its group must be one they take (E0277 where not).
 pub const fn nax_group<S: AffineSlot<Group: NaxGroup>>() {}
+pub use scratchy_tensors::typed::{Act, Extent, ExtentAt, Hosts};
+
+/// An arena colour: its slot, and the bytes its buffer holds, the largest of the extents it hosts.
+pub trait Colour {
+    const SLOT: u32;
+    const BYTES: u64;
+}
+
+/// Colour `C`'s slot, as a binding of extent `E` names it: only a colour hosting `E` has one for
+/// it. A binding's slot is this call's, so it binds a colour the colouring put its extent in.
+pub const fn slot<C: Colour + Hosts<E>, E>() -> u32 {
+    C::SLOT
+}
+
+/// That colour `C` hosts extent `E`: a binding naming `C`'s slot as `E` through another colour
+/// type than the one its [`slot`] is read from.
+pub const fn hosts<C: Hosts<E>, E>() {}
+
+/// The bytes of a colour hosting extents of `elems` elements: the largest, at metal's two bytes
+/// an element (its kernels are f16), and one byte for a colour that hosts none.
+pub const fn colour_bytes(elems: &[u64]) -> u64 {
+    let mut bytes = 1;
+    let mut i = 0;
+    while i < elems.len() {
+        let b = elems[i].saturating_mul(2);
+        if b > bytes {
+            bytes = b;
+        }
+        i += 1;
+    }
+    bytes
+}
+
+/// A bucket's arena: each slot's bytes, its colour's ([`Colour::BYTES`]), at the bucket's rows.
+pub trait Arena {
+    /// The rows it is the arena at: a bucket's `M`.
+    type Rows;
+    const BYTES: &'static [u64];
+}
+
+/// A model's arena extents, each a marker ([`ExtentAt`]): `<M, S> [E3 = Act<M, D>; …] [E7 = …;
+/// …]` declares `E3`, the extent `Act<M, D>` at a bucket's rows `M` (its `sk_bucket` `S`). The
+/// first list's are extents at any rows; the second's compute over the rows (`Act<Mul<M, K>, D>`),
+/// so each is an extent where its dims' laws hold at the bucket's rows.
+#[macro_export]
+macro_rules! arena_extents {
+    (<$m:ident, $s:ident> [$($extent:ident = $at:ty;)*] [$($computed:ident = $cat:ty;)*]) => {
+        $(
+            pub enum $extent {}
+            impl<$m: ::scratchy_tensors::typed::Dim, $s> $crate::tape::typed::ExtentAt<$m, $s>
+                for $extent
+            {
+                type At = $at;
+            }
+        )*
+        $(
+            pub enum $computed {}
+            impl<$m, $s> $crate::tape::typed::ExtentAt<$m, $s> for $computed
+            where
+                $cat: $crate::tape::typed::Extent,
+            {
+                type At = $cat;
+            }
+        )*
+    };
+}
+
+/// ⭐ A MODEL'S ARENA COLOURS, EACH FROM ONE LIST, GENERIC OVER A BUCKET'S ROWS:
+/// `<M, S> K3 = 3 [E0, …] [E5, …]` declares colour `K3<M, S>` — slot 3 of any bucket whose rows
+/// are `M` (its `sk_bucket` `S`) that the colouring gave these extents — hosting each extent of its
+/// two lists (`Hosts`, over [`arena_extents!`] markers). Its [`Colour::BYTES`] is the largest of
+/// the first list at the bucket's rows. The second holds what the colour hosts that its bytes do
+/// not count: what another of the bucket's sizes covers (its logits rows). Both lists' extents
+/// must be extents at the bucket's rows. The colouring's assignment is the lists, so the bytes are
+/// the extents', not a number beside them, and a binding's slot ([`slot`]) is a colour that hosts
+/// its extent.
+///
+/// ```
+/// # use scratchy_target_metal::tape::typed::{Act, Arena, slot};
+/// # use scratchy_tensors::typed::typenum::{U0, U1, U8, U2048, U4096, U8192};
+/// scratchy_target_metal::arena_extents! { <M, S>
+///     [E0 = Act<M, U2048>; E1 = Act<M, U8192>; E2 = Act<U1, U4096>;] []
+/// }
+/// scratchy_target_metal::arena_colours! { <M, S> K0 = 0 [E0, E1] [E2] K1 = 1 [] [] }
+/// scratchy_target_metal::arena_schemas! { <M, S> S0 [K0, K1] }
+/// assert_eq!(<S0<U8, U0> as Arena>::BYTES, &[8 * 8192 * 2, 1]);
+/// assert_eq!(slot::<K0<U1, U0>, E2>(), 0);
+/// ```
+///
+/// A colour hosts only the extents of its lists:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::typed::{Act, slot};
+/// # use scratchy_tensors::typed::typenum::{U0, U8, U2048, U8192};
+/// scratchy_target_metal::arena_extents! { <M, S> [E0 = Act<M, U2048>; E1 = Act<M, U8192>;] [] }
+/// scratchy_target_metal::arena_colours! { <M, S> K0 = 0 [E0] [] }
+/// let _ = slot::<K0<U8, U0>, E1>();
+/// ```
+#[macro_export]
+macro_rules! arena_colours {
+    (<$m:ident, $s:ident>
+     $($colour:ident = $slot:literal [$($sized:ident),* $(,)?] [$($hosted:ident),* $(,)?])*) => {$(
+        pub struct $colour<$m, $s>(::core::marker::PhantomData<fn() -> ($m, $s)>);
+        $(impl<$m, $s> $crate::tape::typed::Hosts<$sized> for $colour<$m, $s> {})*
+        $(impl<$m, $s> $crate::tape::typed::Hosts<$hosted> for $colour<$m, $s> {})*
+        impl<$m, $s> $crate::tape::typed::Colour for $colour<$m, $s>
+        where
+            $($sized: $crate::tape::typed::ExtentAt<$m, $s>,)*
+            $($hosted: $crate::tape::typed::ExtentAt<$m, $s>,)*
+        {
+            const SLOT: u32 = $slot;
+            const BYTES: u64 = $crate::tape::typed::colour_bytes(&[$(
+                <<$sized as $crate::tape::typed::ExtentAt<$m, $s>>::At
+                    as $crate::tape::typed::Extent>::ELEMS
+            ),*]);
+        }
+    )*};
+}
+
+/// A model's bucket arenas, each a colouring: `<M, S> S0 [K0, K1, …]` declares arena `S0<M, S>`,
+/// slot `k` its `k`th colour, its [`Arena::BYTES`] theirs at the bucket's rows `M`. A bucket is
+/// its arena at its rows: `S0<U8, U128>`.
+#[macro_export]
+macro_rules! arena_schemas {
+    (<$m:ident, $s:ident> $($arena:ident [$($colour:ident),* $(,)?])*) => {$(
+        pub struct $arena<$m, $s>(::core::marker::PhantomData<fn() -> ($m, $s)>);
+        impl<$m, $s> $crate::tape::typed::Arena for $arena<$m, $s>
+        where
+            $($colour<$m, $s>: $crate::tape::typed::Colour,)*
+        {
+            type Rows = $m;
+            const BYTES: &'static [u64] =
+                &[$(<$colour<$m, $s> as $crate::tape::typed::Colour>::BYTES),*];
+        }
+    )*};
+}

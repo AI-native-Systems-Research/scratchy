@@ -27,6 +27,7 @@ use objc2_metal::{
 
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
+use super::bucket::{BakedBuckets, Buckets, bucket};
 use super::forward::{
     CommitFeedback, Deferral, Delivered, DeviceInputInto, ForwardError, ForwardInputs,
     ForwardReads, InFlight,
@@ -199,7 +200,7 @@ pub enum PoolBuildError {
     Worker(WorkerError),
     /// Caller-provided `bucket_specs` was empty. The pool always
     /// needs at least one bucket; degenerate models that emit none
-    /// would fail at `pick_bucket` time anyway, so we fail early.
+    /// would fail at the door ([`bucket`]) anyway, so we fail early.
     NoBuckets,
     /// The device's IO-registry entry has no GPU core count
     /// ([`crate::device::gpu_cores`]), which the TurboQuant decode tapes need.
@@ -526,6 +527,10 @@ pub struct MetalRungs {
     pub tq: Option<TqGroup>,
     /// Its arena slots by size, as a guest and as a host ([`ArenaRanks`]).
     pub ranks: ArenaRanks,
+    /// The door ([`bucket_row`](super::bucket::bucket_row)) at the model's bucket enum: the row a
+    /// request runs, of the rows it is handed.
+    pub door:
+        fn(&[&'static MetalBucketSpec], u32) -> Result<&'static MetalBucketSpec, ForwardError>,
 }
 
 /// The rung a pool runs on: its KV cap, which is the row width of every step's block tables, and
@@ -656,7 +661,7 @@ impl PickedRung<'_> {
 /// (at least the smallest, so decode and minimal prefill still run on a memory-starved device),
 /// less any whose tape cannot exist at the rung (its scratch outgrows the 32-bit offsets its
 /// kernels bind: no such rung was baked). Longer prompts chunk to the largest kept bucket via
-/// `pick_bucket`.
+/// the door ([`bucket`]).
 pub fn pick_rung(
     device: &ProtocolObject<dyn MTLDevice>,
     rungs: &MetalRungs,
@@ -668,6 +673,7 @@ pub fn pick_rung(
         buckets: bucket_specs,
         tq,
         ranks,
+        door: _,
     } = *rungs;
     // The bucket rows whose band this device lowers — one per bucket, the other band's row
     // dropped here — kept to those the memory budget affords, at least the smallest.
@@ -760,6 +766,13 @@ impl MetalRungs {
         baked: &'static (dyn std::any::Any + Send + Sync),
     ) -> Result<&'static Self, PoolBuildError> {
         baked.downcast_ref().ok_or(PoolBuildError::NotMetalRungs)
+    }
+
+    /// The row of the bucket a request of `num_tokens` runs among every row of this model, either
+    /// band's ([`Self::door`]).
+    pub fn bucket_row(&self, num_tokens: u32) -> Result<&'static MetalBucketSpec, ForwardError> {
+        let rows: Vec<&'static MetalBucketSpec> = self.buckets.iter().collect();
+        (self.door)(&rows, num_tokens)
     }
 
     /// [`pick_rung`] over this model's buckets.
@@ -1058,66 +1071,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
     }
 
-    /// The bucket row of the bucket at `bucket_idx` ([`Self::pick_bucket`]'s index): the slots its
-    /// forward leaves the final hidden states and logits in. The model's baked table holds a row
-    /// per bucket per fold band ([`FoldBand`]), so only the pool's own rows are indexed this way.
-    pub fn bucket_spec(&self, bucket_idx: usize) -> &'static MetalBucketSpec {
-        self.bucket_specs[bucket_idx]
-    }
-
-    /// Map a real `num_tokens` to the bucket index that should run.
-    ///
-    /// Picks the smallest bucket whose `bucket_m >= num_tokens`. Tape
-    /// ordering inside `bucket_tapes` is intentionally not assumed —
-    /// the macro / model loader supplies whatever order it likes
-    /// (typically ascending), and a linear scan over a handful of
-    /// buckets is cheaper than maintaining a sorted invariant.
-    ///
-    /// **Safe-bucket floor:** multi-row buckets are only selected from
-    /// `SAFE_MULTI_ROW_BUCKET_M` up. The historical reason — the fused
-    /// MLP / MLX-steel kernels' BM=32 tile overrunning arenas sized for
-    /// `bucket_m < 8` — is stale: the steel kernel has carried M-tail
-    /// guards since its initial commit and the arenas are
-    /// elementwise-maxed across buckets. Validated at 2–7 concurrent
-    /// sequences on Llama-3.2-1B (dense fused-MLP) and gemma-4-26b-a4b
-    /// (MoE, qmv_wide) with greedy-output checks; the floor now exists
-    /// to keep `num_tokens=2..7` off the (correct but slow) M=8
-    /// grouped-MoE bucket's padded compute only when no smaller bucket
-    /// fits.
-    pub fn pick_bucket(&self, num_tokens: u32) -> Result<usize, ForwardError> {
-        const SAFE_MULTI_ROW_BUCKET_M: u32 = 2;
-        if num_tokens == 0 {
-            return Err(ForwardError::ZeroTokens);
-        }
-        let effective_min = if num_tokens == 1 {
-            1
-        } else {
-            num_tokens.max(SAFE_MULTI_ROW_BUCKET_M)
-        };
-        let mut best: Option<(usize, u32)> = None;
-        let mut max_bucket: u32 = 0;
-        for (i, tape) in self.bucket_tapes.iter().enumerate() {
-            if tape.bucket_m > max_bucket {
-                max_bucket = tape.bucket_m;
-            }
-            if tape.bucket_m >= effective_min {
-                best = match best {
-                    Some((_, bm)) if bm <= tape.bucket_m => best,
-                    _ => Some((i, tape.bucket_m)),
-                };
-            }
-        }
-        best.map(|(i, _)| i).ok_or(ForwardError::NoBucketFits {
-            num_tokens,
-            max_bucket,
-        })
-    }
-
-    /// [`Self::pick_bucket`] for `inputs`' step, whose logits its bucket's buffer must hold
-    /// ([`LoweredMetalTape::logits_overflow`]): a step writing more would write past it.
-    pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
-        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
-        let spec = self.bucket_specs[bucket_idx];
+    /// The bucket a request of `inputs` runs ([`bucket`]: the door), whose logits its bucket's
+    /// buffer must hold ([`LoweredMetalTape::logits_overflow`]): a step writing more would write
+    /// past it.
+    pub fn bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<W::Bucket, ForwardError>
+    where
+        W: BakedBuckets,
+    {
+        let bucket: W::Bucket = bucket(&self.bucket_specs, inputs.num_tokens)?;
+        let spec = bucket.row();
         // A rebuild plays the window's load and the ring writers after it: every tile of it is one
         // the context commit's arena holds.
         let commit_only = matches!(
@@ -1132,10 +1094,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             });
         }
         let sampled = inputs.sampled_row_count();
-        let tape = &self.bucket_tapes[bucket_idx];
+        let tape = &self.bucket_tapes[bucket.picked().index()];
         match tape.logits_overflow(self.decode_rows, sampled) {
             Some(overflow) => Err(ForwardError::TooManySampledRows { sampled, overflow }),
-            None => Ok(bucket_idx),
+            None => Ok(bucket),
         }
     }
 
@@ -1184,8 +1146,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     fn run_bucket_mtl4_with_tail<F>(
         &self,
         worker: &MetalWorker<W>,
-        bucket_idx: usize,
-        num_tokens: usize,
+        bucket: &W::Bucket,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         reads: ForwardReads,
@@ -1194,10 +1155,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         deferred: Option<&Deferral>,
     ) -> Result<(), ForwardError>
     where
+        W: BakedBuckets,
         F: FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
-            usize,
+            &W::Bucket,
         ) -> Result<(), ForwardError>,
     {
         self.ensure_mtl4();
@@ -1216,7 +1178,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // tail), so the per-segment host-wait overhead (~0.5 ms ×
         // dispatches) is immaterial against the multi-second tower.
         // The AvgPool2d-tape auto-trigger runs the segment at K=1.
-        let needs_serialized = worker.bucket_has_avg_pool_2d(bucket_idx);
+        let needs_serialized = worker.bucket_has_avg_pool_2d(bucket);
         if needs_serialized {
             assert!(
                 deferred.is_none(),
@@ -1228,14 +1190,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                  (vision towers have no argmax tail)",
             );
             let k = 1;
-            let total = worker.count_dispatches(bucket_idx);
+            let total = worker.count_dispatches(bucket);
             let mut start = 0usize;
             while start < total {
                 let end = (start + k).min(total);
                 self.run_dump_segment(
                     worker,
-                    bucket_idx,
-                    num_tokens,
+                    bucket,
                     num_seqs,
                     sampled_rows,
                     start..end,
@@ -1250,20 +1211,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             dyn ::objc2_metal::MTL4ComputeCommandEncoder,
         >| {
             worker
-                .run_bucket_mtl4(
-                    bucket_idx,
-                    num_tokens as u32,
-                    num_seqs,
-                    sampled_rows,
-                    reads,
-                    enc,
-                )
+                .run_bucket_mtl4(bucket, num_seqs, sampled_rows, reads, enc)
                 .map_err(ForwardError::Worker)?;
             // Caller-supplied encoder-tail hook (e.g. argmax dispatch)
             // runs on the SAME MTL4 compute encoder as the forward —
             // forward + tail share one CB, one commit, one host wait.
             if let Some(t) = tail {
-                t(enc, worker, bucket_idx)?;
+                t(enc, worker, bucket)?;
             }
             Ok(())
         };
@@ -1274,9 +1228,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         let ((), took) = self.submit(Some(writes), encode)?;
         if trace {
-            let dispatches = worker.count_dispatches(bucket_idx);
+            let dispatches = worker.count_dispatches(bucket);
+            let (m, num_tokens) = (bucket.row().bucket_m, bucket.tokens());
             eprintln!(
-                "[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4 dispatches={dispatches}] {took}"
+                "[forward bucket_m={m} num_tokens={num_tokens} mtl4 dispatches={dispatches}] {took}"
             );
         }
         Ok(())
@@ -1422,23 +1377,18 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     fn run_dump_segment(
         &self,
         worker: &MetalWorker<W>,
-        bucket_idx: usize,
-        num_tokens: usize,
+        bucket: &W::Bucket,
         num_seqs: u32,
         sampled_rows: crate::tape::ids::SampledRowCount,
         range: std::ops::Range<usize>,
         writes: Option<&InputWrites>,
-    ) -> Result<(), ForwardError> {
+    ) -> Result<(), ForwardError>
+    where
+        W: BakedBuckets,
+    {
         self.submit(writes, |enc| {
             worker
-                .run_bucket_mtl4_range(
-                    bucket_idx,
-                    num_tokens as u32,
-                    num_seqs,
-                    sampled_rows,
-                    enc,
-                    range,
-                )
+                .run_bucket_mtl4_range(bucket, num_seqs, sampled_rows, enc, range)
                 .map_err(ForwardError::Worker)
         })?;
         Ok(())
@@ -1510,13 +1460,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     pub fn forward<R>(
         &self,
         inputs: &ForwardInputs<'_>,
-        with_output: impl FnOnce(&MetalWorker<W>, usize) -> R,
-    ) -> Result<R, ForwardError> {
+        with_output: impl FnOnce(&MetalWorker<W>, &W::Bucket) -> R,
+    ) -> Result<R, ForwardError>
+    where
+        W: BakedBuckets,
+    {
         self.forward_with_tail::<R, fn(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
             &RuntimeBindings,
-            usize,
+            &W::Bucket,
         ) -> Result<(), ForwardError>>(inputs, with_output, None)
     }
 
@@ -1529,18 +1482,19 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     pub fn forward_with_tail<R, F>(
         &self,
         inputs: &ForwardInputs<'_>,
-        with_output: impl FnOnce(&MetalWorker<W>, usize) -> R,
+        with_output: impl FnOnce(&MetalWorker<W>, &W::Bucket) -> R,
         tail: Option<F>,
     ) -> Result<R, ForwardError>
     where
+        W: BakedBuckets,
         F: FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
             &RuntimeBindings,
-            usize,
+            &W::Bucket,
         ) -> Result<(), ForwardError>,
     {
-        let bucket_idx = self.pick_bucket_for(inputs)?;
+        let bucket = self.bucket_for(inputs)?;
         let num_seqs = num_seqs(inputs);
         let sampled_rows = inputs.sampled_row_count();
         self.attach_residency();
@@ -1548,7 +1502,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let guard = self.checkout()?;
         let writes = begin_step(&guard, inputs, self.block_table_stride)?;
         let runtime = &guard.runtime;
-        let tail = tail.map(|f| move |enc: &_, worker: &_, idx| f(enc, worker, runtime, idx));
+        let tail = tail.map(|f| move |enc: &_, worker: &_, b: &_| f(enc, worker, runtime, b));
 
         // All execution goes through the MTL4 path. (The opt-in MTL3
         // dispatch path was removed — it only ever ran the all-dispatch
@@ -1557,15 +1511,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // (`mtl4_steps == None`) only if a kernel exceeds the 31-entry
         // argument-table bind cap.
         assert!(
-            guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
-            "bucket {} is not MTL4-eligible (a kernel exceeds the 31-binding \
+            guard.worker.bucket_bakings[bucket.picked().index()]
+                .mtl4_steps
+                .is_some(),
+            "bucket of {} rows is not MTL4-eligible (a kernel exceeds the 31-binding \
              argument-table cap)",
-            bucket_idx,
+            bucket.row().bucket_m,
         );
         self.run_bucket_mtl4_with_tail(
             &guard.worker,
-            bucket_idx,
-            inputs.num_tokens as usize,
+            &bucket,
             num_seqs,
             sampled_rows,
             inputs.reads,
@@ -1625,7 +1580,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
 
-        Ok(with_output(&guard.worker, bucket_idx))
+        Ok(with_output(&guard.worker, &bucket))
     }
 
     /// Encode one forward onto `enc` — another pool's command buffer, after what is already on it:
@@ -1637,7 +1592,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         &self,
         inputs: &ForwardInputs<'_>,
         enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
-    ) -> Result<Onto<'_, W>, ForwardError> {
+    ) -> Result<Onto<'_, W>, ForwardError>
+    where
+        W: BakedBuckets,
+    {
+        let bucket = self.bucket_for(inputs)?;
         self.attach_residency();
         let mut guard = self.checkout()?;
         let slot = guard.next_staging;
@@ -1646,10 +1605,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let mut onto = Onto {
             guard,
             slot,
-            bucket_idx: 0,
+            bucket,
             staged: 0,
         };
-        onto.then(inputs, enc)?;
+        onto.encode(bucket, inputs, enc)?;
         Ok(onto)
     }
 
@@ -1855,21 +1814,32 @@ fn bytemuck_words(words: &[u32]) -> &[u8] {
 /// they are encoded, before that command buffer is done, only while at most one other command
 /// buffer the pool's forwards were played onto is still running: the worker's next checkout but
 /// one takes this one's staging slot again.
-pub struct Onto<'p, W: CanonicalParams> {
+pub struct Onto<'p, W: CanonicalParams + BakedBuckets> {
     guard: WorkerGuard<'p, W>,
     /// The worker's staging slot its forwards' input writes take.
     slot: usize,
     /// The bucket the last forward ran.
-    bucket_idx: usize,
+    bucket: W::Bucket,
     /// The bytes of the slot's buffer the forwards' input writes take.
     staged: usize,
 }
 
-impl<W: CanonicalParams> Onto<'_, W> {
+impl<W: CanonicalParams + BakedBuckets> Onto<'_, W> {
     /// Encode another forward on the same worker onto `enc`, after what is on it — the forwards
     /// before it among that — with its input writes at its head.
     pub fn then(
         &mut self,
+        inputs: &ForwardInputs<'_>,
+        enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
+    ) -> Result<(), ForwardError> {
+        let bucket = self.guard.pool.bucket_for(inputs)?;
+        self.encode(bucket, inputs, enc)
+    }
+
+    /// Encode the forward of `inputs`, which runs `bucket`, as [`Self::then`] does.
+    fn encode(
+        &mut self,
+        bucket: W::Bucket,
         inputs: &ForwardInputs<'_>,
         enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>,
     ) -> Result<(), ForwardError> {
@@ -1879,9 +1849,8 @@ impl<W: CanonicalParams> Onto<'_, W> {
             "a forward played in another's command buffer is waited for with it"
         );
         let pool = self.guard.pool;
-        let bucket_idx = pool.pick_bucket_for(inputs)?;
         assert!(
-            !self.guard.worker.bucket_has_avg_pool_2d(bucket_idx),
+            !self.guard.worker.bucket_has_avg_pool_2d(&bucket),
             "a serialized forward runs in command buffers of its own"
         );
         let writes = begin_step(&self.guard, inputs, pool.block_table_stride)?;
@@ -1907,8 +1876,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
         );
         (pooled.worker)
             .run_bucket_mtl4(
-                bucket_idx,
-                inputs.num_tokens,
+                &bucket,
                 num_seqs(inputs),
                 inputs.sampled_row_count(),
                 inputs.reads,
@@ -1916,13 +1884,14 @@ impl<W: CanonicalParams> Onto<'_, W> {
             )
             .map_err(ForwardError::Worker)?;
         if std::env::var_os("SCRATCHY_METAL_TRACE").is_some() {
-            let dispatches = pooled.worker.count_dispatches(bucket_idx);
+            let dispatches = pooled.worker.count_dispatches(&bucket);
             eprintln!(
-                "[forward-onto bucket={bucket_idx} num_tokens={} mtl4 dispatches={dispatches}]",
-                inputs.num_tokens
+                "[forward-onto bucket_m={} num_tokens={} mtl4 dispatches={dispatches}]",
+                bucket.row().bucket_m,
+                bucket.tokens(),
             );
         }
-        self.bucket_idx = bucket_idx;
+        self.bucket = bucket;
         Ok(())
     }
 
@@ -1931,9 +1900,9 @@ impl<W: CanonicalParams> Onto<'_, W> {
         &self.guard.worker
     }
 
-    /// The bucket row of the bucket the last forward ran ([`MetalWorkerPool::bucket_spec`]).
-    pub fn bucket_spec(&self) -> &'static MetalBucketSpec {
-        self.guard.pool.bucket_spec(self.bucket_idx)
+    /// The bucket the last forward ran.
+    pub fn bucket(&self) -> &W::Bucket {
+        &self.bucket
     }
 
     /// The worker's runtime bindings, which hold its last forward's runtime outputs (a DFlash2
@@ -2982,19 +2951,47 @@ mod tests {
         Some(pool)
     }
 
+    /// The door picks the smallest kept bucket whose rows hold the request, whatever order the
+    /// rows come in, and refuses an empty request and one past every bucket.
     #[test]
-    fn pick_bucket_returns_smallest_fit() {
-        let Some(pool) = build_multi_bucket_pool(&[1, 8, 32], 1) else {
-            eprintln!("skipping: no Metal device");
-            return;
+    fn the_door_picks_the_smallest_bucket_that_holds_the_request() {
+        let at = |ms: &[u32], n: u32| {
+            let kept: Vec<_> = ms.iter().map(|&m| test_spec(m, true)).collect();
+            bucket::<TestBucket>(&kept, n).map(|b| (b.picked().index(), b.tokens().get()))
         };
-        // Decode bucket.
-        assert_eq!(pool.pick_bucket(1).unwrap(), 0);
-        // Doesn't fit bucket 0; picks the next-smallest that fits.
-        assert_eq!(pool.pick_bucket(2).unwrap(), 1);
-        assert_eq!(pool.pick_bucket(8).unwrap(), 1);
-        assert_eq!(pool.pick_bucket(9).unwrap(), 2);
-        assert_eq!(pool.pick_bucket(32).unwrap(), 2);
+        assert_eq!(at(&[1, 8, 32], 1).ok(), Some((0, 1)));
+        assert_eq!(at(&[1, 8, 32], 2).ok(), Some((1, 2)));
+        assert_eq!(at(&[1, 8, 32], 8).ok(), Some((1, 8)));
+        assert_eq!(at(&[1, 8, 32], 9).ok(), Some((2, 9)));
+        assert_eq!(at(&[1, 8, 32], 32).ok(), Some((2, 32)));
+        assert_eq!(at(&[32, 1, 8], 1).ok(), Some((1, 1)));
+        assert_eq!(at(&[32, 1, 8], 8).ok(), Some((2, 8)));
+        assert_eq!(at(&[32, 1, 8], 9).ok(), Some((0, 9)));
+        assert!(matches!(at(&[1, 8], 0), Err(ForwardError::ZeroTokens)));
+        assert!(matches!(
+            at(&[1, 8], 9),
+            Err(ForwardError::NoBucketFits {
+                num_tokens: 9,
+                max_bucket: 8,
+            })
+        ));
+    }
+
+    /// A row no bucket type of the model is — a band its rows have no bucket of, an arena not its
+    /// type's — is no bucket the door hands out.
+    #[test]
+    fn the_door_hands_out_only_a_kept_row_of_the_bucket_type() {
+        let wide = &*Box::leak(Box::new(MetalBucketSpec {
+            band: FoldBand::Wide,
+            ..*test_spec(4, true)
+        }));
+        let other_arena = &*Box::leak(Box::new(MetalBucketSpec {
+            arena_bytes: &[1],
+            ..*test_spec(8, true)
+        }));
+        let kept = [test_spec(1, true), wide, other_arena, test_spec(32, true)];
+        let b = bucket::<TestBucket>(&kept, 2).map(|b| b.picked().index());
+        assert_eq!(b.ok(), Some(3));
     }
 
     /// A DFlash2 drafter's bucket past its block draft plays its context commit, or its rings'
@@ -3037,7 +3034,7 @@ mod tests {
                 deferred: None,
                 reads,
             };
-            pool.pick_bucket_for(&inputs)
+            pool.bucket_for(&inputs).map(|b| b.picked().index())
         };
         for reads in [ForwardReads::CacheWrites, ForwardReads::Rebuild] {
             assert_eq!(
@@ -3068,15 +3065,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pick_bucket_zero_tokens_errors() {
-        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
-            eprintln!("skipping: no Metal device");
-            return;
-        };
-        assert!(matches!(pool.pick_bucket(0), Err(ForwardError::ZeroTokens)));
-    }
-
     /// The wide class is the M5 generation at Max-scale core counts alone: the class the routed
     /// fold's wide band rides on (`M5_WIDE_MIN_CORES` — measured on a 40-core M5 Max, PR #847,
     /// and lost on a 10-core base M5, its review). Every other chip, and an M5 under the
@@ -3097,43 +3085,6 @@ mod tests {
         assert_eq!(band(G::M5, 40), FoldBand::Wide);
         assert_eq!(band(G::M5, 10), FoldBand::Narrow);
         assert_eq!(band(G::M2, 10), FoldBand::Narrow);
-    }
-
-    #[test]
-    fn pick_bucket_overflow_errors() {
-        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
-            eprintln!("skipping: no Metal device");
-            return;
-        };
-        match pool.pick_bucket(9) {
-            Err(ForwardError::NoBucketFits {
-                num_tokens: 9,
-                max_bucket: 8,
-            }) => {}
-            other => panic!("expected NoBucketFits {{ 9, 8 }}, got {other:?}"),
-        }
-    }
-
-    /// Tape order isn't required to be sorted — `pick_bucket` should
-    /// still find the smallest fit when buckets come in arbitrary
-    /// order.
-    #[test]
-    fn pick_bucket_handles_unsorted_tape_order() {
-        let Some(pool) = build_multi_bucket_pool(&[32, 1, 8], 1) else {
-            eprintln!("skipping: no Metal device");
-            return;
-        };
-        assert_eq!(
-            pool.pick_bucket(1).unwrap(),
-            1,
-            "smallest bucket at index 1"
-        );
-        assert_eq!(
-            pool.pick_bucket(8).unwrap(),
-            2,
-            "8 fits index 2 (bucket_m=8)"
-        );
-        assert_eq!(pool.pick_bucket(9).unwrap(), 0, "9 only fits the 32 bucket");
     }
 
     /// A step of one query token per sequence, its `used` keys over `table`'s rows.
@@ -3727,7 +3678,7 @@ mod tests {
         let too_big = [0u32, 0u32, 0u32, 0u32, 0u32];
         let inputs = ForwardInputs {
             span_ids: None,
-            num_tokens: 1, // pick_bucket succeeds (bucket 0 = decode)
+            num_tokens: 1, // the door picks bucket 0 (decode)
             input_ids: &too_big,
             positions: &[0u32],
             slot_mappings: Vec::new(),
@@ -3848,26 +3799,60 @@ mod tests {
     ) -> Vec<(&'static MetalBucketSpec, LoweredMetalTape)> {
         (tapes.iter())
             .map(|&tape| {
-                let spec = &*Box::leak(Box::new(MetalBucketSpec {
-                    bucket_m: tape.bucket_m,
-                    band: FoldBand::Narrow,
+                let spec = MetalBucketSpec {
                     num_arena_slots: tape.num_arena_slots,
-                    terminal_slot: 0,
-                    backbone_slot: 0,
-                    arena_bytes: TEST_ARENA_BYTES,
-                    logits_row_bytes: 0,
-                    backbone: EMPTY_BACKBONE,
-                    lm_head: EMPTY_LM_HEAD,
-                    backbone_barriers: EMPTY_BARRIERS,
-                    lm_head_barriers: EMPTY_BARRIERS,
-                    tapes: &[],
-                    kernels: &[],
-                    plays_result: plays_result(tape.bucket_m),
-                    weight_bytes: crate::tape::step::WeightBytes::default(),
-                }));
-                (spec, tape)
+                    ..*test_spec(tape.bucket_m, plays_result(tape.bucket_m))
+                };
+                (&*Box::leak(Box::new(spec)), tape)
             })
             .collect()
+    }
+
+    /// A narrow row of `bucket_m` rows, which plays its result when `plays_result` (leaked: a
+    /// pool's rows are `'static`).
+    fn test_spec(bucket_m: u32, plays_result: bool) -> &'static MetalBucketSpec {
+        Box::leak(Box::new(MetalBucketSpec {
+            bucket_m,
+            band: FoldBand::Narrow,
+            num_arena_slots: 2,
+            terminal_slot: 0,
+            backbone_slot: 0,
+            arena_bytes: TEST_ARENA_BYTES,
+            logits_row_bytes: 0,
+            backbone: EMPTY_BACKBONE,
+            lm_head: EMPTY_LM_HEAD,
+            backbone_barriers: EMPTY_BARRIERS,
+            lm_head_barriers: EMPTY_BARRIERS,
+            tapes: &[],
+            kernels: &[],
+            plays_result,
+            weight_bytes: crate::tape::step::WeightBytes::default(),
+        }))
+    }
+
+    /// The test rows' arena at rows `M`: [`TEST_ARENA_BYTES`].
+    struct TestArena<M>(std::marker::PhantomData<M>);
+
+    impl<M> crate::tape::typed::Arena for TestArena<M> {
+        type Rows = M;
+        const BYTES: &'static [u64] = TEST_ARENA_BYTES;
+    }
+
+    use scratchy_tensors::typed::typenum as t;
+    crate::baked_buckets! {
+        enum TestBucket {
+            T1 = (t::U1, Narrow, TestArena<t::U1>),
+            T1Wide = (t::U1, Wide, TestArena<t::U1>),
+            T4 = (t::U4, Narrow, TestArena<t::U4>),
+            T8 = (t::U8, Narrow, TestArena<t::U8>),
+            T8Wide = (t::U8, Wide, TestArena<t::U8>),
+            T32 = (t::U32, Narrow, TestArena<t::U32>),
+            T64 = (t::U64, Narrow, TestArena<t::U64>),
+        }
+    }
+
+    impl BakedBuckets for TestWeights {
+        type Bucket = TestBucket;
     }
 
     /// `specs` as one model's rungs, ranked `ranks` (leaked: a pool's rungs are `'static`).
@@ -3876,6 +3861,7 @@ mod tests {
             buckets: Box::leak(specs.to_vec().into_boxed_slice()),
             tq: TqGroup::of(TestWeights::FACTS),
             ranks,
+            door: super::super::bucket::bucket_row::<TestBucket>,
         }))
     }
 
@@ -4018,7 +4004,7 @@ mod tests {
         }
     }
 
-    /// Two empty buckets — verifies pick_bucket sees both
+    /// Two empty buckets — verifies the door sees both
     /// `bucket_m`s and the constructor preserves spec order via
     /// `Arc<[…]>`.
     #[test]
@@ -4065,12 +4051,10 @@ mod tests {
             return;
         };
         let pool = res.expect("for_buckets constructs pool");
-        assert_eq!(pool.pick_bucket(1).unwrap(), 0);
-        assert_eq!(pool.pick_bucket(8).unwrap(), 1);
-        assert!(matches!(
-            pool.pick_bucket(9),
-            Err(ForwardError::NoBucketFits { .. })
-        ));
+        let at = |n| bucket::<TestBucket>(&pool.bucket_specs, n).map(|b| b.picked().index());
+        assert_eq!(at(1).ok(), Some(0));
+        assert_eq!(at(8).ok(), Some(1));
+        assert!(matches!(at(9), Err(ForwardError::NoBucketFits { .. })));
     }
 
     /// A pool's bucket row is its own bucket's, in its device's band: the model's table holds a
@@ -4111,9 +4095,10 @@ mod tests {
             return;
         };
         let pool = res.expect("for_buckets constructs pool");
-        let band = pool.bucket_spec(0).band;
-        for (bucket_idx, bucket_m) in [1, 8].into_iter().enumerate() {
-            let spec = pool.bucket_spec(bucket_idx);
+        let band = pool.bucket_specs[0].band;
+        for bucket_m in [1, 8] {
+            let spec = (bucket::<TestBucket>(&pool.bucket_specs, bucket_m).map(|b| b.row()))
+                .expect("a kept bucket of the request's rows");
             assert_eq!(spec.bucket_m, bucket_m);
             assert_eq!(spec.band, band);
             assert_eq!((spec.terminal_slot, spec.backbone_slot), slots(band));

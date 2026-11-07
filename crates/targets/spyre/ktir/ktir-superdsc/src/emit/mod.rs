@@ -6457,7 +6457,7 @@ pub fn try_assemble_topk(
 ///     ⇒ reads K[slot][d] at `dev_off([cap,hd],1,·)` — EXACTLY the SLAB-MAJOR store the on-card cachewr
 ///     writes (`[hd/64,cap,64]`, one `[1,64]` slab-copy per token-slot; at hd==64 = the flat `slot*hd+d`).
 ///   • OUTPUT logical `[hd,cap]`, stick = `cap` (dim 1 = LAST) ⇒ device_size `[cap/64,hd,64]` ⇒ writes
-///     K[slot][d] at `kcache_kt_write_offset(slot,d)` = `dev_off([hd,cap],1,[d,slot])`, the score read.
+///     K[slot][d] at `dev_off([hd,cap],1,[d,slot])`, the score read.
 /// Proven by `natural_store_plus_restickify_produces_kt_layout` (interp) + the `pathb_k_*` Kani chain.
 /// `datastageBasedElemOff` (true ONLY for ReStickify, ddcv1.cpp:3630) drives the element offsets from
 /// these per-operand datastage tilings, so the transpose is realized on-card. Emitted PER HEAD (offsets).
@@ -6469,7 +6469,9 @@ fn restickify_kt_opspec_2d(
     in_off: u32,
     out_off: u32,
 ) -> Result<OpSpec, String> {
-    // Both extents must be whole 64-sticks: cap is the OUTPUT stick, hd is the (padded) free dim.
+    // Both extents must be whole 64-sticks: cap is the OUTPUT stick, hd is the (padded) free dim —
+    // and the free dim is NOT necessarily a head width here (the transpose door passes an arbitrary
+    // producer-stated extent), so the check is the stick law, not the head law.
     let _cap_ext = StickExtent::<Fp16>::new(cap)?;
     let _hd_ext = StickExtent::<Fp16>::new(hd)?;
     // INPUT sticks on its LAST dim `hd` (dxp requires the stick on the last dim — a stick-on-dim0
@@ -6519,7 +6521,7 @@ fn restickify_kt_opspec_2d(
     .map_err(|e| e.0)?
     .with_offset(in_off);
     // OUTPUT: Kᵀ kernel view `[out=hd, y=cap]` sticked on `y` (=cap, dim 1 = LAST) ⇒ device_size
-    // `[cap/64,hd,64]` = the exact cap-sticked layout the score matmul reads (kcache_kt_write_offset).
+    // `[cap/64,hd,64]` = the exact cap-sticked layout the score matmul reads (`PagedKvPool::kt_write_off`).
     let output = TensorArg::<2>::new(
         false,
         o_name.to_string(),

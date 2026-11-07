@@ -38,6 +38,18 @@ use ktir_superdsc::sdsc_abstract::{
 };
 use std::num::NonZeroU32;
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 /// granite-3.1-2b (hd=64, the one geometry the gather has run at) and granite-3.1-8b fp8 (hd=128, the
 /// 70-config slice the refusal excludes). `nkvh` is 8 on both.
 const NKVH: usize = 8;
@@ -73,7 +85,7 @@ fn corner(pool: &PagedKvPool, plane: KvPlane, kvh: u32, window: u32, slab: u32) 
 #[test]
 fn a_kt_window_is_one_contiguous_stick_block_at_every_head_dim() {
     for hd in [HD_2B, HD_8B] {
-        let pool = PagedKvPool::new(NKVH, hd);
+        let pool = pool(NKVH, hd);
         let unit = pool.stick_block_elems() as u32;
         assert_eq!(
             unit,
@@ -135,7 +147,7 @@ fn a_kt_window_is_one_contiguous_stick_block_at_every_head_dim() {
 #[test]
 fn the_v_window_stride_is_one_slab_window_and_refutes_a_stick_block_entry_at_hd_128() {
     for hd in [HD_2B, HD_8B] {
-        let pool = PagedKvPool::new(NKVH, hd);
+        let pool = pool(NKVH, hd);
         let nslab = hd as u32 / POOL_STICK;
         let unit = pool.stick_block_elems() as u32;
         let head_block = pool.plane_block_elems() as u32;
@@ -223,7 +235,7 @@ fn the_v_window_stride_is_one_slab_window_and_refutes_a_stick_block_entry_at_hd_
 #[test]
 fn the_two_planes_block_numbering_coincides_exactly_at_one_slab() {
     for hd in [HD_2B, HD_8B] {
-        let pool = PagedKvPool::new(NKVH, hd);
+        let pool = pool(NKVH, hd);
         let nslab = hd as u32 / POOL_STICK;
         let blocks_per_page = PagedKvPool::POOL_PAGE_SLOTS.get() / POOL_STICK;
         let mut agree = true;
@@ -276,7 +288,7 @@ fn the_two_planes_block_numbering_coincides_exactly_at_one_slab() {
 /// claim "hd=64 is byte-identical under the finer unit" is checked rather than argued.
 #[test]
 fn the_shipped_entry_unit_at_hd_64_is_already_one_slab_window() {
-    let pool = PagedKvPool::new(NKVH, HD_2B);
+    let pool = pool(NKVH, HD_2B);
     assert_eq!(pool.stick_block_elems() as u32, SLAB_WINDOW_ELEMS);
     let scratch = GatherScratch::of_fold_pass(
         pool,

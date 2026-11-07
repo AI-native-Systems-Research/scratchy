@@ -21,6 +21,18 @@ use ktir_superdsc::emit as superdsc;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec;
 use ktir_superdsc::superdsc_opspec::{KernelAxis, PageExtent, SdscFoldSet};
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 /// Granite-3.1-2b's KV geometry, the bundle this work targets.
 const NKVH: i64 = 8;
 const HD: i64 = 64;
@@ -133,10 +145,8 @@ fn the_instrument_reproduces_a_known_product() {
 /// than an ENTRY split would halve `skip_addr`.
 #[test]
 fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
-    use ktir_superdsc::sdsc_abstract::{
-        GatherScratch, PagedKvPool, QueryRowCount, SlotCount, SlotWindow,
-    };
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    use ktir_superdsc::sdsc_abstract::{GatherScratch, QueryRowCount, SlotCount, SlotWindow};
+    let pool = pool(NKVH as usize, HD as usize);
     for mq in [2u32, 8] {
         for swept in [64u32, 128, 256] {
             let scratch = GatherScratch::of_fold_pass(
@@ -218,7 +228,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
 ///    refused at bake (`L3DlOpsScheduler.cpp:1534`, `isDoubleBuffering`).
 #[test]
 fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
-    use ktir_superdsc::sdsc_abstract::{PageScratch, PagedKvPool, QueryRowCount};
+    use ktir_superdsc::sdsc_abstract::{PageScratch, QueryRowCount};
     // ⭐⭐⭐⭐⭐ SWEPT OVER `nkvh` x `hd`, BECAUSE `skip_addr` IS `hd * POOL_STICK` AND THE PIN IS `hd`
     // SUB-ROWS — two quantities that are BOTH `POOL_STICK` at hd=64 and neither of them at hd=128. This
     // measurement was taken at the single point (nkvh=8, hd=64) where the pin, the stick and the IBR
@@ -233,7 +243,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
         (16, 128),
         (32, 64),
     ] {
-        let pool = PagedKvPool::new(nkvh as usize, hd as usize);
+        let pool = pool(nkvh as usize, hd as usize);
         for mq in [2u32, 8] {
             let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
                 .expect("granite's geometry admits the page copy");
@@ -452,11 +462,11 @@ fn a_per_kv_head_operand_is_short_of_a_layer_page_by_exactly_nkvh() {
 /// that is invisible from this side.
 #[test]
 fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
-    use ktir_superdsc::sdsc_abstract::{POOL_STICK, PagedKvPool};
+    use ktir_superdsc::sdsc_abstract::POOL_STICK;
     use ktir_superdsc::superdsc_opspec::{EntryBase, GatherIndex};
 
     const HD_8B: i64 = 128;
-    let pool = PagedKvPool::new(NKVH as usize, HD_8B as usize);
+    let pool = pool(NKVH as usize, HD_8B as usize);
     // The two strides, from the pool — not spelled as 8192/4096.
     let kt_window = pool.stick_block_elems() as i64;
     let v_window = (POOL_STICK * POOL_STICK) as i64;

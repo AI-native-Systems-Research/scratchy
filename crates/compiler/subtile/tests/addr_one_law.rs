@@ -8,7 +8,7 @@
 #![cfg(feature = "spyre")]
 
 use scratchy_subtile::addr::{Head, Idx, Nest, Slot};
-use scratchy_subtile::sdsc_abstract::{dev_off_stk, kcache_kt_write_offset, vcache_write_offset};
+use scratchy_subtile::sdsc_abstract::{StickLayout, dev_off_stk};
 use scratchy_subtile::superdsc_opspec::Df;
 
 const STK: usize = 64;
@@ -58,7 +58,7 @@ fn v_cache_is_the_same_nest() {
                 for d in [0usize, 1, 63, 64, hd - 1] {
                     assert_eq!(
                         n.off(&[slot as u32, h as u32, d as u32]),
-                        (h * cap * hd + vcache_write_offset(slot, d, hd, cap, STK)) as i64,
+                        (h * cap * hd + StickLayout::kernel(cap, hd).dev_off(slot, d)) as i64,
                         "vcache nqh={nqh} cap={cap} hd={hd} at (h={h},slot={slot},d={d})"
                     );
                 }
@@ -82,7 +82,7 @@ fn kt_cache_is_the_same_nest() {
                 for slot in [0usize, 1, 63, 64, cap - 1] {
                     assert_eq!(
                         n.off(&[d as u32, h as u32, slot as u32]),
-                        (h * hd * cap + kcache_kt_write_offset(slot, d, hd, cap, STK)) as i64,
+                        (h * hd * cap + StickLayout::kernel(hd, cap).dev_off(d, slot)) as i64,
                         "kt nkvh={nkvh} cap={cap} hd={hd} at (h={h},d={d},slot={slot})"
                     );
                 }

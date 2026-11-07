@@ -74,7 +74,6 @@ fn the_staged_angles_land_where_the_collapsed_read_expects() {
 /// the emitter keeps the slab form for `hd > 64`.
 #[test]
 fn the_collapse_is_refused_above_one_stick_per_head() {
-    use scratchy_subtile::addr::Shape;
     use scratchy_subtile::superdsc_opspec::Fp16;
     assert!(
         (64u32 == <Fp16 as scratchy_subtile::superdsc_opspec::DataFormat>::DF.elems_per_stick())

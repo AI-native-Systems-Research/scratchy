@@ -55,6 +55,18 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::{
 use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
 use ktir_superdsc::superdsc_opspec::{Fp16, GatherIndex, SdscFoldSet};
 
+/// The test pool: head count and width as the raw fixture numbers, minted through the pool's
+/// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
+        std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
+            .expect("a fixture pool has heads"),
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
+            u32::try_from(hd).expect("a fixture head width fits a u32"),
+        ),
+    )
+}
+
 const GATHER_1CORE_TEXT: &str = include_str!("fixtures/sdsc_gather_1core.json");
 const PAGED_L3LU_TEXT: &str = include_str!("fixtures/sdsc_add_paged_l3lu.json");
 
@@ -309,12 +321,12 @@ fn the_batch_invariant_matmul_form_is_refused_at_build_time() {
 #[test]
 fn the_index_declares_entries_and_every_core_reads_the_same_table() {
     use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec;
-    use ktir_superdsc::sdsc_abstract::{GatherScratch, PagedKvPool, SlotCount, SlotWindow};
+    use ktir_superdsc::sdsc_abstract::{GatherScratch, SlotCount, SlotWindow};
     use ktir_superdsc::superdsc_opspec::GatherIndex;
 
     // The SHIPPED geometry, from the pool the fold actually reads — so the numbers below are the
     // descriptor's, not a harness's.
-    let pool = PagedKvPool::new(8, 64);
+    let pool = pool(8, 64);
     let scratch = GatherScratch::of_fold_pass(
         pool,
         SlotWindow::count_in(SlotCount::new(256)),
