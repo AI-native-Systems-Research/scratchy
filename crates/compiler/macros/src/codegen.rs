@@ -1430,7 +1430,7 @@ fn plan_field_load(
         // shared tensors and the DSL leaf accessors keep sole ownership.
         let moe_base = program.weights.path(only_src).first().cloned();
         let shared_expert_intermediate_size = match &moe_base {
-            Some(b) if program.weights.has_subtree(&[b.as_str(), "shared_expert"]) => 0,
+            Some(b) if program.weights.shared_expert_bases().contains(b) => 0,
             _ => shared_expert_intermediate_size,
         };
         let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
@@ -1974,6 +1974,97 @@ fn plan_field_load(
     }
 }
 
+/// The rope base frequency the config DECLARES: `scalars["rope_theta"]`, else
+/// `bounds["rope_theta"]`, and `None` when it declares neither — no default is invented here
+/// (a caller that needs one picks it, and says why).
+pub(crate) fn declared_rope_theta(model: &ModelParams) -> Option<f64> {
+    model
+        .scalars
+        .get("rope_theta")
+        .copied()
+        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+}
+
+/// The global attention class's geometry: a hybrid sliding/global arch's full-attention layers
+/// (`GLOBAL_HEAD_DIM`, `NUM_GLOBAL_KV_HEADS`, `GLOBAL_ROT_DIM`, `ROPE_PROPORTIONAL`), the base
+/// class's on a uniform model. One derivation, read by metal's `CanonicalParams` impl and by the
+/// target-emitter seam's attention classes.
+pub(crate) struct GlobalAttnClass {
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    pub rot_dim: u32,
+    /// Proportional rope: lane `i` pairs with `i + head_dim/2`, not `i + rot_dim/2`.
+    pub proportional: bool,
+}
+
+/// [`GlobalAttnClass`] from the config, the base class's `(head_dim, kv_heads, rot_dim)` beside it
+/// (`kv_heads` already divided by `tp`).
+///
+/// Per-layer-class geometry for hybrid sliding/global arches whose classes differ in dims
+/// (Gemma4: sliding 256×8kv full-rope vs global 512×1kv proportional-rope-128). Config keys
+/// `global_head_dim` / `num_global_key_value_heads` / `global_partial_rotary_factor` feed it;
+/// absent keys fall back to the base values (uniform models unchanged).
+pub(crate) fn global_attn_class(
+    model: &ModelParams,
+    tp: u32,
+    (head_dim, num_kv_heads, rot_dim_val): (u32, u32, u32),
+) -> GlobalAttnClass {
+    let global_head_dim: u32 = model
+        .bounds
+        .get("global_head_dim")
+        .map(|&v| v as u32)
+        .unwrap_or(head_dim);
+    let num_global_kv_heads: u32 = model
+        .bounds
+        .get("num_global_key_value_heads")
+        .map(|&v| (v as u32) / tp)
+        .unwrap_or(num_kv_heads);
+    let global_rot_dim: u32 = model
+        .scalars
+        .get("global_partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * global_head_dim as f64).round() as u32)
+        // Fallback must honor the BASE partial factor on uniform
+        // models (global_head_dim == head_dim): Qwen3.5's full-
+        // attention layers lower through the is_global arm, and the
+        // old `global_head_dim` fallback rotated the FULL 256-dim
+        // head against the 64-wide partial cos/sin table — rows past
+        // the table read zeros and zeroed Q/K for every token beyond
+        // ~4 (the "rambling, input-blind thinker" failure). Hybrid
+        // arches with distinct global dims and genuinely full global
+        // rope (no factor) keep the old fallback.
+        .unwrap_or(if global_head_dim == head_dim {
+            rot_dim_val
+        } else {
+            global_head_dim
+        });
+    // Proportional rope marker — same predicate that routes the
+    // rotary cache builder to `new_proportional_from_gpuweights`.
+    // Drives the metal rope kernel's pairing offset (lane i pairs
+    // with i + head_dim/2, not i + rot_dim/2).
+    let proportional = global_rot_dim != global_head_dim
+        && model.scalars.contains_key("global_partial_rotary_factor");
+    GlobalAttnClass {
+        head_dim: global_head_dim,
+        kv_heads: num_global_kv_heads,
+        rot_dim: global_rot_dim,
+        proportional,
+    }
+}
+
+/// The rotated lanes of a `head_dim`-wide head: `partial_rotary_factor · head_dim` for a
+/// partial-rope arch (Qwen3.5: 0.25 · 256 = 64), else the full `head_dim`.
+pub(crate) fn rot_dim(model: &ModelParams, head_dim: u32) -> u32 {
+    model
+        .scalars
+        .get("partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * head_dim as f64).round() as u32)
+        .unwrap_or(head_dim)
+}
+
 pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
     // HF configs carry `rms_norm_eps` (RMSNorm convention used by
     // Llama/Qwen2/Mistral/etc.) or `layer_norm_eps` (CohereLayerNorm
@@ -2482,12 +2573,7 @@ fn emit_fingerprint_check(
     // code is a single compare against two literals — and so a config spelling
     // `1000000` where the checkpoint spells `1000000.0` cannot trip it. It is far
     // tighter than any real theta gap (the closest in-tree pair differs by 2×).
-    let rope_theta_check: TokenStream = match model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-    {
+    let rope_theta_check: TokenStream = match declared_rope_theta(model) {
         Some(theta) => {
             let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
             let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
@@ -7975,6 +8061,213 @@ fn bounds_for_wp(
     bounds
 }
 
+/// The model as the target-emitter seam takes it: the shared front end's canonical at every
+/// workload point (or its refusal), and the config facts a target reads beside a canonical.
+/// Target-neutral: every value is a fact about the model.
+#[cfg(feature = "target-emitter")]
+fn target_model_input(
+    program: &Program,
+    bridge_model: &crate::to_wavefront::BridgeModel<'_>,
+    fuf: &Fuf,
+    inferred: &crate::shape::Inferred,
+    workloads: &WorkloadPoints,
+    tp_world_size: u8,
+) -> scratchy_subtile::handoff::TargetModelInput {
+    use scratchy_subtile::handoff::{
+        TargetBucket, TargetGdnFacts, TargetModelFacts, TargetModelInput, TargetPoint,
+    };
+    let model = bridge_model.params;
+    let stem = &model.source_stem;
+    let point = |wp: &WorkloadPoint| {
+        let fit = |what: &str, v: u64| {
+            u32::try_from(v).unwrap_or_else(|_| panic!("[target-emitter] {stem}: {what} {v}"))
+        };
+        TargetPoint {
+            m: fit("num_tokens", wp.num_tokens),
+            sk: fit("sk_bucket", wp.sk_bucket),
+        }
+    };
+    let mut buckets = Vec::new();
+    let mut unlowered = Vec::new();
+    for wp in workloads.iter() {
+        let bounds = bounds_for_wp(model, *wp, tp_world_size);
+        let prefix =
+            crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
+        let at = point(wp);
+        match crate::to_wavefront::lower_decode_to_wavefront(
+            fuf,
+            inferred,
+            &bounds,
+            bridge_model,
+            prefix,
+            at.m,
+            crate::to_wavefront::DenseExperts::Lower,
+        ) {
+            Ok(lowered) => buckets.push(TargetBucket { point: at, lowered }),
+            Err(e) => unlowered.push((at, e.to_string())),
+        }
+    }
+    let bound = |k: &str| model.bounds.get(k).map(|&v| v as u32);
+    let head_dim = bound("head_dim").unwrap_or(0);
+    let gdn = fuf
+        .nodes
+        .iter()
+        .any(|n| n.op == OpKind::GatedDeltaNet)
+        .then(|| {
+            let need = |k: &str| {
+                bound(k).unwrap_or_else(|| {
+                    panic!("[target-emitter] {stem}: a Gated-DeltaNet model with no `{k}`")
+                })
+            };
+            TargetGdnFacts {
+                num_k_heads: need("linear_num_key_heads"),
+                head_k: need("linear_key_head_dim"),
+                conv_kernel: need("linear_conv_kernel_dim"),
+            }
+        });
+    // Every weight a canonical binds, named as the checkpoint names it. A tied lm_head is lent the
+    // embedding table's prefix, as every target's loader reads it.
+    use scratchy_forward_compiler::LentWeight;
+    let lm_head = program.weights.find(&["lm_head"]);
+    let weights: std::collections::BTreeSet<(u32, Option<UnrollIndex>)> = (buckets.iter())
+        .flat_map(|b| b.lowered.bindings.iter())
+        .filter_map(|b| match *b {
+            scratchy_subtile::handoff::SourceBinding::Weight { id, index } => Some((id, index)),
+            _ => None,
+        })
+        .collect();
+    let weight_prefixes = (weights.into_iter())
+        .map(|(id, index)| {
+            let own =
+                || safetensors_prefix(program.weight_naming(), &model.arch, WeightId(id), index);
+            let prefix = match (lm_head, index) {
+                (Some(head), None) if head == WeightId(id) => {
+                    lent_weight_prefix(program, fuf, model, LentWeight::LmHead).unwrap_or_else(own)
+                }
+                _ => own(),
+            };
+            (id, index, prefix)
+        })
+        .collect();
+    // Every bundle tensor a canonical binds that has a checkpoint leaf, named in full: the
+    // bundle's own prefix, its suffix rewritten as the shared table says, then the leaf.
+    let bundle_tensors: std::collections::BTreeMap<_, _> = (buckets.iter())
+        .flat_map(|b| b.lowered.bindings.iter())
+        .filter_map(|b| match *b {
+            scratchy_subtile::handoff::SourceBinding::BundleTensor { id, index, tensor } => {
+                Some(((id, index, tensor.name()), tensor))
+            }
+            _ => None,
+        })
+        .collect();
+    let bundle_tensor_names = (bundle_tensors.into_iter())
+        .filter_map(|((id, index, _), tensor)| {
+            use scratchy_subtile::handoff::{BUNDLE_PREFIX_REWRITES, BUNDLE_TENSOR_LEAVES};
+            let leaf =
+                (BUNDLE_TENSOR_LEAVES.iter()).find_map(|&(t, l)| (t == tensor).then_some(l))?;
+            let prefix =
+                safetensors_prefix(program.weight_naming(), &model.arch, WeightId(id), index);
+            let prefix = (BUNDLE_PREFIX_REWRITES.iter())
+                .find_map(|&(from, to)| {
+                    let base = prefix.strip_suffix(from)?;
+                    (base.is_empty() || base.ends_with('.')).then(|| format!("{base}{to}"))
+                })
+                .unwrap_or(prefix);
+            Some((id, index, tensor, format!("{prefix}.{leaf}")))
+        })
+        .collect();
+    let sliding = (fuf.nodes.iter()).any(|n| {
+        matches!(
+            n.op,
+            OpKind::SlidingAttention | OpKind::SinkSlidingAttention
+        )
+    });
+    let attn_classes = target_attn_classes(model, tp_world_size, head_dim, sliding);
+    // The arch is the config's directory (`configs/<arch>/<stem>.json`), the name the build
+    // scopes by; `model.arch` is the declared arch spec, not its name.
+    let arch = (model.source_path.parent())
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("[target-emitter] {stem}: no arch directory"))
+        .to_string();
+    TargetModelInput {
+        stem: stem.clone(),
+        arch,
+        buckets,
+        unlowered,
+        weight_prefixes,
+        embed_prefix: lent_weight_prefix(program, fuf, model, LentWeight::EmbedTokens),
+        bundle_tensor_names,
+        facts: TargetModelFacts {
+            head_dim,
+            rot_dim: rot_dim(model, head_dim),
+            rope_theta: declared_rope_theta(model),
+            rms_norm_eps: rms_norm_eps(model),
+            vocab_size: bound("vocab_size").unwrap_or(0),
+            gdn,
+            dsl_shared_expert_bases: program.weights.shared_expert_bases(),
+            attn_classes,
+        },
+    }
+}
+
+/// The model's attention classes, for the target-emitter seam: the base class (its rope base
+/// frequency `rope_local_base_freq` on a hybrid arch, which rotates its sliding layers by the
+/// local table, else `rope_theta`; its window `sliding_window` when the DSL has a sliding
+/// attention, `sliding`), then the global class ([`global_attn_class`]) when its geometry is not
+/// the base's.
+#[cfg(feature = "target-emitter")]
+fn target_attn_classes(
+    model: &ModelParams,
+    tp_world_size: u8,
+    head_dim: u32,
+    sliding: bool,
+) -> Vec<scratchy_subtile::handoff::TargetAttnClass> {
+    use scratchy_subtile::handoff::{RopePairing, TargetAttnClass};
+    let tp = u32::from(tp_world_size);
+    let kv_heads = model
+        .bounds
+        .get("num_key_value_heads")
+        .map_or(0, |&v| v as u32)
+        / tp;
+    let base_rot = rot_dim(model, head_dim);
+    let global = global_attn_class(model, tp, (head_dim, kv_heads, base_rot));
+    let theta = declared_rope_theta(model);
+    let local_theta = (model.scalars.get("rope_local_base_freq").copied())
+        .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64));
+    let window = (model.bounds.get("sliding_window"))
+        .and_then(|&w| u32::try_from(w).ok())
+        .and_then(std::num::NonZeroU32::new);
+    let hybrid =
+        (global.head_dim, global.kv_heads, global.rot_dim) != (head_dim, kv_heads, base_rot);
+    let base = TargetAttnClass {
+        head_dim,
+        kv_heads,
+        rot_dim: base_rot,
+        rope_theta: match hybrid {
+            true => local_theta.or(theta),
+            false => theta,
+        },
+        pairing: RopePairing::HalfRotated,
+        window: window.filter(|_| sliding),
+    };
+    let mut classes = vec![base];
+    if hybrid {
+        classes.push(TargetAttnClass {
+            head_dim: global.head_dim,
+            kv_heads: global.kv_heads,
+            rot_dim: global.rot_dim,
+            rope_theta: theta,
+            pairing: match global.proportional {
+                true => RopePairing::HalfHead,
+                false => RopePairing::HalfRotated,
+            },
+            window: None,
+        });
+    }
+    classes
+}
+
 /// Whether this model uses rotary position embeddings — any `Rotary` extern
 /// input in the Fuf. Drives `CanonicalParams::ROPE_ON_READ` (rope-on-read is
 /// the universal default for rope models) and the matching
@@ -8568,13 +8861,7 @@ pub(crate) fn fill_canonical_params(
     // the full `head_dim`. Without this the impl falls back to the trait
     // default `ROT_DIM = HEAD_DIM`, so the kernel rotates head_dim dims
     // against a rotary_dim-wide cos/sin cache → partial-rope arches break.
-    let rot_dim_val: u32 = model
-        .scalars
-        .get("partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9)
-        .map(|f| (f * head_dim as f64).round() as u32)
-        .unwrap_or(head_dim);
+    let rot_dim_val: u32 = rot_dim(model, head_dim);
     // Per-layer-class geometry for hybrid sliding/global arches whose
     // classes differ in dims (Gemma4: sliding 256×8kv full-rope vs
     // global 512×1kv proportional-rope-128). Config keys
@@ -8582,36 +8869,12 @@ pub(crate) fn fill_canonical_params(
     // `global_partial_rotary_factor` feed the GLOBAL_* consts read by
     // the full-attention metal lowering arms; absent keys fall back to
     // the base values (uniform models unchanged).
-    let global_head_dim: u32 = model
-        .bounds
-        .get("global_head_dim")
-        .map(|&v| v as u32)
-        .unwrap_or(head_dim);
-    let num_global_kv_heads: u32 = model
-        .bounds
-        .get("num_global_key_value_heads")
-        .map(|&v| (v as u32) / tp)
-        .unwrap_or(num_kv_heads);
-    let global_rot_dim: u32 = model
-        .scalars
-        .get("global_partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9)
-        .map(|f| (f * global_head_dim as f64).round() as u32)
-        // Fallback must honor the BASE partial factor on uniform
-        // models (global_head_dim == head_dim): Qwen3.5's full-
-        // attention layers lower through the is_global arm, and the
-        // old `global_head_dim` fallback rotated the FULL 256-dim
-        // head against the 64-wide partial cos/sin table — rows past
-        // the table read zeros and zeroed Q/K for every token beyond
-        // ~4 (the "rambling, input-blind thinker" failure). Hybrid
-        // arches with distinct global dims and genuinely full global
-        // rope (no factor) keep the old fallback.
-        .unwrap_or(if global_head_dim == head_dim {
-            rot_dim_val
-        } else {
-            global_head_dim
-        });
+    let GlobalAttnClass {
+        head_dim: global_head_dim,
+        kv_heads: num_global_kv_heads,
+        rot_dim: global_rot_dim,
+        proportional: rope_proportional,
+    } = global_attn_class(model, tp, (head_dim, num_kv_heads, rot_dim_val));
     // GUARD: the rope cos/sin table is
     // rotary_dim wide; a kernel-side rot const that disagrees reads
     // past the table into zeros and silently zeroes Q/K for every
@@ -8627,12 +8890,6 @@ pub(crate) fn fill_canonical_params(
         rot_dim_val,
         head_dim,
     );
-    // Proportional rope marker — same predicate that routes the
-    // rotary cache builder to `new_proportional_from_gpuweights`.
-    // Drives the metal rope kernel's pairing offset (lane i pairs
-    // with i + head_dim/2, not i + rot_dim/2).
-    let rope_proportional = global_rot_dim != global_head_dim
-        && model.scalars.contains_key("global_partial_rotary_factor");
     // GLOBAL_BLOCK_SIZE override — vLLM's hybrid-KV page-size unification
     // (`unify_kv_cache_spec_page_size`, kv_cache_utils.py:944:
     // `new_block_size = block_size * ratio`). When the full (global) and
@@ -11413,6 +11670,7 @@ fn dump_wavefront_mega(
             &bridge,
             crate::to_wavefront::PrefixCapacity::new(cap),
             primary_m,
+            crate::to_wavefront::DenseExperts::Refuse,
         )
     };
     #[cfg_attr(not(feature = "spyre"), allow(unused_mut))]
@@ -13458,6 +13716,7 @@ fn dump_wavefront_mega(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
                     primary_m,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(l) => l,
                     Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
@@ -13525,6 +13784,7 @@ fn dump_wavefront_mega(
                     &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_b) => {
                         emit_bundle(
@@ -13817,6 +14077,7 @@ fn dump_wavefront_mega(
                 // causally, and chunk k attends the k*mq rows written so far.
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 pl,
+                crate::to_wavefront::DenseExperts::Refuse,
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -13933,6 +14194,7 @@ fn dump_wavefront_mega(
                     &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_p) => {
                         emit_bundle(
@@ -14070,6 +14332,7 @@ fn dump_wavefront_mega(
                 &bridge,
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 decode_mq,
+                crate::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(lwd_cb) => {
                     let (_m, _n, sg, groups) = emit_bundle(
@@ -14609,8 +14872,8 @@ pub fn emit_model(
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
     );
     // The config params and the typed facts are ONE model — the bridge takes them together.
-    // (Its readers below are the metal/spyre bridge calls; a cuda-only build lowers no tape.)
-    #[cfg(any(feature = "metal", feature = "spyre"))]
+    // (Its readers below are the metal/spyre bridge calls and the target-emitter seam.)
+    #[cfg(any(feature = "metal", feature = "spyre", feature = "target-emitter"))]
     let bridge_model = crate::to_wavefront::BridgeModel {
         params: model,
         facts: &model_facts,
@@ -14622,7 +14885,7 @@ pub fn emit_model(
     // is already target-neutral (`crate::__gpu::layers::*`, where `__gpu` is
     // the per-target alias), so the same fields compile and load on any
     // backend.
-    #[cfg(all(feature = "spyre", not(feature = "metal")))]
+    #[cfg(not(feature = "metal"))]
     let (weights, weights_affine_rows) = {
         let lowered = workloads
             .iter()
@@ -14640,6 +14903,7 @@ pub fn emit_model(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
                     wp.num_tokens as u32,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 )
                 .ok()
             });
@@ -14680,7 +14944,10 @@ pub fn emit_model(
         // The id → FIELD binding, emitted INTO THE SAME MODULE as the struct so
         // its arms can name `w.self_attn_q_proj[3]` directly. This is what the
         // worker's `"{disk}.weight"` lookup is replaced by; only generated code
-        // can name a generated field.
+        // can name a generated field. Spyre's alone: no other backend binds through it.
+        #[cfg(not(feature = "spyre"))]
+        let bindings = quote! {};
+        #[cfg(feature = "spyre")]
         let bindings = match (lowered.as_ref(), tw.as_ref()) {
             (Some(l), Some(t)) => crate::weight_bindings::emit_weight_bindings(l, program, t)
                 .unwrap_or_else(|e| panic!("[weight-bindings] {}: {e}", model.source_stem)),
@@ -14735,6 +15002,7 @@ pub fn emit_model(
                 &bridge_model,
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
                 wp.num_tokens as u32,
+                crate::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
@@ -15023,6 +15291,7 @@ pub fn emit_model(
             &bridge_model,
             prefix,
             m as u32,
+            crate::to_wavefront::DenseExperts::Refuse,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
@@ -15076,13 +15345,7 @@ pub fn emit_model(
             .map(|p| p.join("_"))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
-        let dsl_shared_expert_bases: Vec<String> = weight_paths
-            .iter()
-            .filter_map(|p| p.first().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
-            .collect();
+        let dsl_shared_expert_bases = program.weights.shared_expert_bases();
         let quant = model.quantization.as_ref();
         let widths = |base: &str, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");
@@ -17181,10 +17444,31 @@ pub fn emit_model(
             (quote! {}, quote! {}, quote! {}, quote! {})
         };
 
+    // ⭐ THE TARGET-EMITTER SEAM. The target compiler Cargo linked under the `target-emitter` key
+    // gets the model as neutral data and hands back the items it emits for it; they are spliced
+    // into the module as they come. Nothing here knows which target that is.
+    #[cfg(feature = "target-emitter")]
+    let target_tokens = {
+        let input = target_model_input(
+            program,
+            &bridge_model,
+            fuf,
+            inferred,
+            workloads,
+            tp_world_size,
+        );
+        crate::record_target_input(&input);
+        target_emitter::emit::emit_model(&input)
+    };
+    #[cfg(not(feature = "target-emitter"))]
+    let target_tokens = TokenStream::new();
+
     let tokens = quote! {
         #weights
 
         #ktir_bundle_const
+
+        #target_tokens
 
         #canonical_params_impl
 
@@ -18475,6 +18759,94 @@ mod fingerprint_tests {
         )
     }
 
+    /// The three fp8 checkpoints' layer-0 and layer-3 tensors, from their safetensors headers
+    /// (`tests/fixtures/fp8_checkpoint_layer_dtypes.json`): each resolves to fp8 iff the header
+    /// stores it F8_E4M3. A tensor that is a model weight's own reads `storage_format_for_weight`;
+    /// one inside a MoE bundle (a router's projection, an expert's) reads its bundle's format, unless
+    /// an `ignore` entry names its module, the way a target's loader must read each bundle tensor.
+    /// Only a Linear's `.weight` is ever quantized (compressed-tensors `targets: ["Linear"]`).
+    #[test]
+    fn fp8_storage_follows_each_checkpoints_header() {
+        use crate::quantization::{StorageFormat, ignore_entry_matches, storage_format_for_weight};
+        use scratchy_subtile::handoff::{BUNDLE_PREFIX_REWRITES, PER_EXPERT_TENSOR_LEAVES};
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fp8_checkpoint_layer_dtypes.json");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        // Every expert tensor leaf the fixture holds is one the shared table names.
+        let expert_leaves: Vec<&str> = PER_EXPERT_TENSOR_LEAVES.iter().map(|&(_, l)| l).collect();
+        for (arch, stem) in [
+            ("qwen3-5", "qwen3.8-27b"),
+            ("qwen3-5-moe", "qwen3.6-35b-a3b"),
+            ("gemma4-moe", "gemma-4-26b-a4b-it"),
+        ] {
+            let model = variant_of(arch, stem, "fp8-dynamic-per-channel")
+                .unwrap_or_else(|| panic!("{stem}: the declared fp8 preset was refused"));
+            let ignore = &model.quantization.as_ref().unwrap().modules_to_not_convert;
+            let (program, fuf) = fuf_of(arch, &model);
+            // Each layer-0/3 weight's checkpoint prefix (a bundle's as its tensors sit on disk).
+            let mut weights: Vec<(String, String, StorageFormat)> = Vec::new();
+            for input in fuf.nodes.iter().flat_map(|n| &n.inputs) {
+                if let crate::fuf::FufInput::Weight { id, index, storage } = input
+                    && matches!(index.map(|i| i.0), Some(0 | 3))
+                {
+                    let prefix =
+                        safetensors_prefix(program.weight_naming(), &model.arch, *id, *index);
+                    let prefix = (BUNDLE_PREFIX_REWRITES.iter())
+                        .find_map(|&(from, to)| Some(format!("{}{to}", prefix.strip_suffix(from)?)))
+                        .unwrap_or(prefix);
+                    let dotted = program.weights.path(*id).join(".");
+                    let fmt = storage_format_for_weight(&program, &fuf, *id, *index, &model);
+                    assert_eq!(&fmt, storage, "{stem}: {prefix}'s annotated storage");
+                    weights.push((prefix, dotted, fmt));
+                }
+            }
+            let tensors = fixture["models"][stem]["tensors"].as_object().unwrap();
+            assert!(tensors.len() > 20, "{stem}: the fixture's layers 0 and 3");
+            let mut experts = 0;
+            for (name, dtype) in tensors {
+                // The loader reads HF's `model.language_model.` decoder under ours.
+                let name = name.replace("model.language_model.", "language_model.model.");
+                let (prefix, dotted, fmt) = (weights.iter())
+                    .filter(|(p, ..)| name == *p || name.starts_with(&format!("{p}.")))
+                    .max_by_key(|(p, ..)| p.len())
+                    .unwrap_or_else(|| panic!("{stem}: no model weight loads {name}"));
+                let leaf = name[prefix.len()..].trim_start_matches('.');
+                let fp8 = match leaf {
+                    "" | "weight" => matches!(fmt, StorageFormat::Fp8 { .. }),
+                    sub => {
+                        let Some(sub) = sub.strip_suffix(".weight") else {
+                            assert_eq!(dtype, "BF16", "{stem}: {name} is no Linear's weight");
+                            continue;
+                        };
+                        // An expert's own tensor: `….{e}.<leaf>`, the leaf the shared table names.
+                        let segs: Vec<&str> = sub.split('.').collect();
+                        if let Some(e) = segs.iter().position(|s| s.parse::<u32>().is_ok()) {
+                            let leaf = format!("{}.weight", segs[e + 1..].join("."));
+                            assert!(expert_leaves.contains(&leaf.as_str()), "{stem}: {name}");
+                            experts += 1;
+                        }
+                        let (role, module) = (format!("{dotted}.{sub}"), format!("{prefix}.{sub}"));
+                        matches!(fmt, StorageFormat::Fp8 { .. })
+                            && !(ignore.iter())
+                                .any(|e| ignore_entry_matches(e, &role, || module.clone()))
+                    }
+                };
+                assert_eq!(
+                    fp8,
+                    dtype == "F8_E4M3",
+                    "{stem}: {name} is {dtype}, resolved {fmt:?}"
+                );
+            }
+            // The MoE checkpoints' expert 0, gate, up and down, at both layers.
+            assert_eq!(
+                experts,
+                if arch == "qwen3-5" { 0 } else { 6 },
+                "{stem}'s expert tensors"
+            );
+        }
+    }
+
     /// ⛔ THE REGRESSION THIS GATE EXISTS FOR (#202), at the layer that decides
     /// it. The two in-tree qwen3-5-moe stems are byte-identical on every other
     /// fingerprint axis — same hidden size, layer count, expert count, vocab, no
@@ -18567,6 +18939,16 @@ mod fingerprint_tests {
         model: &crate::config::ModelParams,
         ast: &crate::ast::Ast,
     ) -> (Program, Fuf) {
+        let (program, fuf, _) = inferred_fuf_of_ast(arch, model, ast);
+        (program, fuf)
+    }
+
+    /// [`fuf_of_ast`] with the shapes it inferred, which the wavefront bridge also reads.
+    fn inferred_fuf_of_ast(
+        arch: &str,
+        model: &crate::config::ModelParams,
+        ast: &crate::ast::Ast,
+    ) -> (Program, Fuf, crate::shape::Inferred) {
         let mut program = crate::classify::classify_with(ast, crate::classified::Prelude::Decoder)
             .expect("classify");
         program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
@@ -18574,7 +18956,71 @@ mod fingerprint_tests {
         let cfg = crate::cfg::build_cfg(&program, model).expect("cfg");
         let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
         fuf.annotate_storage_formats(&program, model);
-        (program, fuf)
+        (program, fuf, inferred)
+    }
+
+    /// An fp8 checkpoint's expert banks (Qwen3.6's `moe_block`, Gemma 4's SwitchGLU) lower as
+    /// fp8 expert matmuls, each binding its scale as operand 3, for a target that realizes them
+    /// (`DenseExperts::Lower`); read as dense, their e4m3 bytes would be taken for bf16. A target
+    /// passing `Refuse` (Metal, Spyre) keeps the path it had: the Qwen bank refused, the Gemma one
+    /// the affine fallback.
+    #[test]
+    fn an_fp8_expert_bank_lowers_as_fp8_only_where_its_target_realizes_it() {
+        use crate::to_wavefront::{DenseExperts, PrefixCapacity, lower_decode_to_wavefront};
+        use scratchy_subtile::lower::ExpertWeight;
+        use scratchy_subtile::subtile_ir::SubOp;
+        let prefix = PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
+        for (arch, stem) in [
+            ("qwen3-5-moe", "qwen3.6-35b-a3b"),
+            ("gemma4-moe", "gemma-4-26b-a4b-it"),
+        ] {
+            let model = variant_of(arch, stem, "fp8-dynamic-per-channel")
+                .unwrap_or_else(|| panic!("{stem}: the declared fp8 preset was refused"));
+            let ast = crate::draft_capture::insert(&dsl_of(arch));
+            let (_, fuf, inferred) = inferred_fuf_of_ast(arch, &model, &ast);
+            let lower = |experts| {
+                let wp = crate::workload::WorkloadPoint {
+                    num_tokens: 1,
+                    sk_bucket: 256,
+                };
+                let bounds = bounds_for_wp(&model, wp, 1);
+                // #1093: the bridge takes the config params and the typed facts together.
+                let facts =
+                    fill_canonical_params(&model, 1, false, &KvCacheLayers::of(&fuf), None).0;
+                let bridge = crate::to_wavefront::BridgeModel {
+                    params: &model,
+                    facts: &facts,
+                };
+                lower_decode_to_wavefront(&fuf, &inferred, &bounds, &bridge, prefix, 1, experts)
+            };
+            let lowered = lower(DenseExperts::Lower).expect("the fp8 model lowers");
+            let banks: Vec<_> = (lowered.input.ops.iter())
+                .filter_map(|o| match o.op {
+                    SubOp::ExpertMatmul { weight, .. } => Some((weight, o.inputs.len())),
+                    _ => None,
+                })
+                .collect();
+            assert!(!banks.is_empty(), "{stem}: no expert matmul");
+            for bank in banks {
+                assert_eq!(bank, (ExpertWeight::Fp8Dynamic, 4), "{stem}");
+            }
+            let refused = lower(DenseExperts::Refuse);
+            let kept = (refused.iter().flat_map(|l| &l.input.ops)).all(|o| {
+                !matches!(
+                    o.op,
+                    SubOp::ExpertMatmul {
+                        weight: ExpertWeight::Fp8Dynamic | ExpertWeight::Dense,
+                        ..
+                    }
+                )
+            });
+            assert!(kept, "{stem}: an fp8 expert matmul under Refuse");
+            assert_eq!(
+                refused.is_err(),
+                arch == "qwen3-5-moe",
+                "{stem}: Refuse's path"
+            );
+        }
     }
 
     /// A drafter's capture is the compiler's (`draft_capture`), not an arch's, so every decoder

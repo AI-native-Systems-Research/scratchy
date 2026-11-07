@@ -211,6 +211,27 @@ pub enum FoldPattern<K: 'static> {
         writers: &'static [K],
         kernel: K,
     },
+    /// Up to `max` free `matmul`s reading the same operand 0 — the q, k and v projections off one
+    /// norm — all dense or all fp8, whose output widths fall in the same one of `bands`, fold into the first on
+    /// the tape: one command over several weights that shares the input. Each other matmul is the
+    /// command's epilogue, so every output keeps its own buffer. A matmul a step of `gated` kinds
+    /// reads is left to the gated folds, which take it whole; one in no band never folds.
+    SiblingMatmuls {
+        matmul: SubOpKind,
+        max: u8,
+        bands: &'static [ColsBand],
+        gated: &'static [SubOpKind],
+        kernel: K,
+    },
+}
+
+/// A band of matmul output widths one [`FoldPattern::SiblingMatmuls`] command takes together: the
+/// widths that are a multiple of `multiple` and at most `max`. A width is in the first band of a
+/// table it fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColsBand {
+    pub multiple: u32,
+    pub max: u32,
 }
 
 /// The stages a routing fold's scores may pass through after the gather.
@@ -303,6 +324,7 @@ impl<K> FoldPattern<K> {
             Self::RoutedExperts { top_k, .. } => *top_k,
             Self::MatvecEpilogue { anchor, .. } => *anchor,
             Self::RopedAttention { attention, .. } => *attention,
+            Self::SiblingMatmuls { matmul, .. } => *matmul,
         }
     }
 }
@@ -455,7 +477,15 @@ pub enum FusedShape {
         gate_scale: Option<(SlotId, [StepOperand; 2])>,
         add: Option<(SlotId, StepOperand)>,
     },
+    /// The sibling matmuls the driving matmul's command also computes, in source-op order: each
+    /// writes its own buffer, as the driver's epilogue.
+    SiblingMatmuls {
+        slots: [Option<SlotId>; SIBLING_MATMULS],
+    },
 }
+
+/// The sibling matmuls one [`FusedShape::SiblingMatmuls`] fold takes beside its driver, at most.
+pub const SIBLING_MATMULS: usize = 3;
 
 /// A fold a step drives: the fused command it becomes, and what that command computes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -941,6 +971,16 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 kernel,
                 ..
             } => self.roped_attention(i, rope, writers, kernel),
+            FoldPattern::SiblingMatmuls {
+                matmul,
+                max,
+                bands,
+                gated,
+                kernel,
+            } => {
+                self.sibling_matmuls(i, (matmul, max), (bands, gated), kernel);
+                Ok(())
+            }
         }
     }
 
@@ -990,6 +1030,71 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         let writer = self.ops.slot[w];
         self.absorb(i, &[w], kernel, FusedShape::RopedAttention { writer });
         Ok(())
+    }
+
+    /// Matmul `i` and the other free dense `matmul`s reading its operand 0 in its band, up to
+    /// `max` in all, as one command ([`FoldPattern::SiblingMatmuls`]). `i` drives only when it is
+    /// the first of them on the tape: the command runs there, before any sibling's reader.
+    fn sibling_matmuls(
+        &mut self,
+        i: usize,
+        (matmul, max): (SubOpKind, u8),
+        (bands, gated): (&[ColsBand], &[SubOpKind]),
+        kernel: K,
+    ) {
+        let ops = &self.ops;
+        let n = ops.slot.len();
+        let band = |j: usize| {
+            (bands.iter())
+                .position(|b| ops.cols[j].is_multiple_of(b.multiple) && ops.cols[j] <= b.max)
+        };
+        let read_gated = |j: usize| {
+            (0..n).any(|c| {
+                gated.contains(&ops.kind(c))
+                    && ops.args[c]
+                        .iter()
+                        .any(|a| matches!(a, Arg::Op(q) if *q == j))
+            })
+        };
+        // A group's members share the driver's weights: all dense, or all fp8 (each its own scale).
+        let weights = match ops.op(i) {
+            SubOp::MatmulTile { weight, .. } => weight.kind(),
+            _ => return,
+        };
+        if !matches!(weights, GemmWeightKind::Dense | GemmWeightKind::Fp8Dynamic) {
+            return;
+        }
+        let free = |j: usize| {
+            ops.kind(j) == matmul
+                && self.is_matvec(j, weights)
+                && self.absorbed[j].is_none()
+                && self.epilogue[j].is_none()
+                && self.fusions[j].is_empty()
+                && !read_gated(j)
+        };
+        let (Some(input), Some(b)) = (ops.first_op(i), band(i)) else {
+            return;
+        };
+        if !free(i) {
+            return;
+        }
+        let mut group: Vec<usize> = (0..n)
+            .filter(|&j| j != i && free(j) && ops.first_op(j) == Some(input) && band(j) == Some(b))
+            .collect();
+        group.sort_by_key(|&j| ops.pos[j]);
+        if group.first().is_some_and(|&j| ops.pos[j] < ops.pos[i]) {
+            return;
+        }
+        group.truncate(usize::from(max).saturating_sub(1).min(SIBLING_MATMULS));
+        if group.is_empty() {
+            return;
+        }
+        let mut slots = [None; SIBLING_MATMULS];
+        for (slot, &j) in slots.iter_mut().zip(&group) {
+            self.epilogue[j] = Some(i);
+            *slot = Some(self.ops.slot[j]);
+        }
+        self.record(i, kernel, FusedShape::SiblingMatmuls { slots });
     }
 
     /// Every free row-wise step into row programs, from the tape's end ([`RowFold`]).
@@ -1785,6 +1890,7 @@ mod tests {
         Rows,
         Routed,
         RopedAttention,
+        Siblings,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -2033,6 +2139,126 @@ mod tests {
         hidden_out: false,
     };
 
+    /// The sibling-matmul table: up to three dense matmuls off one input in a band, with the
+    /// widths of 64 at most 64 and of 256 in two bands, and a matmul an activation reads left to
+    /// the gated fold.
+    const SIBLINGS: FusionTable<Kern> = FusionTable {
+        counted: &[],
+        sweeps: &[&[FoldPattern::SiblingMatmuls {
+            matmul: SubOpKind::MatmulTile,
+            max: 3,
+            bands: &[
+                ColsBand {
+                    multiple: 256,
+                    max: u32::MAX,
+                },
+                ColsBand {
+                    multiple: 8,
+                    max: 64,
+                },
+            ],
+            gated: &[SubOpKind::Silu],
+            kernel: Kern::Siblings,
+        }]],
+        rows: None,
+    };
+
+    /// Three same-band matmuls off one norm fold into the first on the tape, each other one its
+    /// epilogue; a fourth (past `max`), one of another band, one of another input and one a gated
+    /// activation reads stay their own.
+    #[test]
+    fn sibling_matmuls_off_one_input_fold_into_the_first() {
+        let ops = vec![
+            norm(vec![Ext(0), Ext(1)]),
+            gemm(256, vec![Op(0), Ext(2)]),
+            gemm(256, vec![Op(0), Ext(3)]),
+            gemm(16, vec![Op(0), Ext(4)]),
+            gemm(256, vec![Op(0), Ext(5)]),
+            gemm(16, vec![Op(0), Ext(6)]),
+            gemm(256, vec![Op(0), Ext(7)]),
+            gemm(256, vec![Op(1), Ext(8)]),
+            gemm(256, vec![Op(0), Ext(9)]),
+            op(SubOp::Elementwise(EwKind::Silu), 1, vec![Op(8)]),
+            op(MUL, 1, vec![Op(9), Op(4)]),
+            op(ADD, 1, vec![Op(1), Op(2)]),
+            op(ADD, 1, vec![Op(11), Op(6)]),
+            op(ADD, 1, vec![Op(12), Op(7)]),
+            op(ADD, 1, vec![Op(13), Op(10)]),
+            op(ADD, 1, vec![Op(3), Op(5)]),
+            gemm(256, vec![Op(15), Ext(10)]),
+            op(ADD, 1, vec![Op(14), Op(16)]),
+        ];
+        let src = [
+            (1, 64),
+            (1, 64),
+            (64, 256),
+            (64, 256),
+            (64, 16),
+            (64, 256),
+            (64, 16),
+            (64, 256),
+            (256, 256),
+            (64, 256),
+            (16, 256),
+        ];
+        let (s, f) = fold(&src, weights(11), ops, &[], &SIBLINGS, SPLIT);
+        let siblings = |slots: [Option<SlotId>; SIBLING_MATMULS]| Fusion {
+            kernel: Kern::Siblings,
+            shape: FusedShape::SiblingMatmuls { slots },
+        };
+        assert_eq!(f.driven(s[1]), [siblings([Some(s[2]), Some(s[4]), None])]);
+        assert_eq!(f.role(s[2]), StepRole::Epilogue { of: s[1] });
+        assert_eq!(f.role(s[4]), StepRole::Epilogue { of: s[1] });
+        // Past `max`: the fourth 256-band matmul off the norm leads no group of its own either,
+        // since its one free sibling (the gated one) is not free.
+        assert_eq!(f.role(s[6]), StepRole::Kept);
+        // The narrow band groups apart.
+        assert_eq!(f.driven(s[3]), [siblings([Some(s[5]), None, None])]);
+        assert_eq!(f.role(s[5]), StepRole::Epilogue { of: s[3] });
+        // Another input; a matmul the activation reads.
+        assert_eq!(f.role(s[7]), StepRole::Kept);
+        assert_eq!(f.role(s[8]), StepRole::Kept);
+    }
+
+    /// A sibling group's members share their weights' scheme: two fp8 matmuls off one norm group
+    /// together, each binding its own scale, and two dense ones apart from them, never one group
+    /// of both.
+    #[test]
+    fn sibling_matmuls_group_only_with_their_own_weights() {
+        let fp8 = |inputs| {
+            let weight = GemmWeight::Fp8Dynamic;
+            op(SubOp::MatmulTile { n: 256, weight }, 1, inputs)
+        };
+        let ops = vec![
+            norm(vec![Ext(0), Ext(1)]),
+            fp8(vec![Op(0), Ext(2), Ext(3)]),
+            gemm(256, vec![Op(0), Ext(4)]),
+            fp8(vec![Op(0), Ext(5), Ext(6)]),
+            gemm(256, vec![Op(0), Ext(7)]),
+            op(ADD, 1, vec![Op(1), Op(2)]),
+            op(ADD, 1, vec![Op(5), Op(3)]),
+            op(ADD, 1, vec![Op(6), Op(4)]),
+        ];
+        let (w, scale) = ((64, 256), (1, 256));
+        let src = [(1, 64), (1, 64), w, scale, w, w, scale, w];
+        let mut bindings = weights(src.len());
+        for id in [3, 6] {
+            bindings[id] = SourceBinding::WeightScale {
+                id: id as u32 - 1,
+                index: None,
+            };
+        }
+        let (s, f) = fold(&src, bindings, ops, &[], &SIBLINGS, SPLIT);
+        let siblings = |slots: [Option<SlotId>; SIBLING_MATMULS]| Fusion {
+            kernel: Kern::Siblings,
+            shape: FusedShape::SiblingMatmuls { slots },
+        };
+        assert_eq!(f.driven(s[1]), [siblings([Some(s[3]), None, None])]);
+        assert_eq!(f.role(s[3]), StepRole::Epilogue { of: s[1] });
+        assert_eq!(f.driven(s[2]), [siblings([Some(s[4]), None, None])]);
+        assert_eq!(f.role(s[4]), StepRole::Epilogue { of: s[2] });
+    }
+
     #[test]
     fn a_norm_only_matvecs_read_folds_into_each() {
         let ops = |reader: OpDesc| {
@@ -2124,7 +2350,7 @@ mod tests {
 
     #[test]
     fn a_norm_a_router_gathered_experts_and_a_shared_matvec_read_folds_into_each() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{
             ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, TopK,
         };
@@ -2133,14 +2359,14 @@ mod tests {
         let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
         let (router, bundle) = (RouterBundle::SharedFused, ExpertBundle::SharedFused);
         let matmul = |proj, m, inputs| {
-            let quant = ExpertQuant::declared(64, 4);
+            let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
             let n = 32;
             op(
                 SubOp::ExpertMatmul {
                     proj,
                     n,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 m,
@@ -2202,7 +2428,7 @@ mod tests {
 
     #[test]
     fn a_routing_only_expert_commands_read_folds_into_each_of_them() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{
             ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, SharedExpertBound, TopK,
         };
@@ -2214,12 +2440,12 @@ mod tests {
         let ops = |scores_read_again: bool, rows: u32, experts: u32, top_k: u32| {
             let (experts, k) = (NumExperts::new(nz(experts)), TopK::new(nz(top_k)));
             let matmul = |proj, n, inputs| {
-                let quant = ExpertQuant::declared(64, 4);
+                let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
                 let m = SubOp::ExpertMatmul {
                     proj,
                     n,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 };
                 op(m, rows, inputs)
@@ -2598,18 +2824,18 @@ mod tests {
 
     #[test]
     fn expert_projections_fold_into_their_activation_and_combine_only_when_read_once() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{ExpertBundle, ExpertProj, GatedAct, SharedExpertBound, TopK};
         let matmul = |proj, n, inputs| {
             let k = TopK::new(std::num::NonZeroU32::new(2).expect("two experts"));
-            let quant = ExpertQuant::declared(64, 4);
+            let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
             let bundle = ExpertBundle::SwitchGlu;
             op(
                 SubOp::ExpertMatmul {
                     proj,
                     n,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 1,
@@ -2670,17 +2896,20 @@ mod tests {
 
     #[test]
     fn an_ungated_experts_one_projection_folds_into_its_activation() {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{ExpertBundle, ExpertProj, SharedExpertBound, TopK, UngatedAct};
         let k = TopK::new(std::num::NonZeroU32::new(2).expect("two experts"));
         let matmul = |proj, n, inputs| {
-            let (quant, bundle) = (ExpertQuant::declared(64, 4), ExpertBundle::SharedFused);
+            let (weight, bundle) = (
+                ExpertWeight::Affine(ExpertQuant::declared(64, 4)),
+                ExpertBundle::SharedFused,
+            );
             op(
                 SubOp::ExpertMatmul {
                     proj,
                     n,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 1,

@@ -3313,6 +3313,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-const-tokens"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "scratchy-core-common"
 version = "0.1.0"
 dependencies = [
@@ -3414,10 +3424,12 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rayon",
+ "regex",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
  "scratchy-subtile",
+ "scratchy-target-cuda-compiler",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
  "scratchy-target-spyre",
@@ -3470,6 +3482,9 @@ dependencies = [
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-subtile",
+ "scratchy-target-cuda",
+ "scratchy-target-cuda-compiler",
  "scratchy-target-metal",
  "scratchy-target-spyre",
  "scratchy-tensors",
@@ -3617,6 +3632,7 @@ dependencies = [
  "scratchy-serving-scheduler",
  "scratchy-serving-transport",
  "scratchy-subtile",
+ "scratchy-target-cuda-worker",
  "scratchy-target-metal",
  "scratchy-target-spyre",
  "scratchy-tensors",
@@ -3660,6 +3676,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-target-cuda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "inventory",
+ "safetensors",
+ "scratchy-ir",
+ "scratchy-layers",
+ "scratchy-subtile",
+ "scratchy-target-cuda-compiler",
+ "scratchy-tensors",
+ "serde",
+]
+
+[[package]]
+name = "scratchy-target-cuda-compiler"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "scratchy-const-tokens",
+ "scratchy-ir",
+ "scratchy-subtile",
+ "scratchy-target-cuda",
+]
+
+[[package]]
+name = "scratchy-target-cuda-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "inventory",
+ "scratchy-core-common",
+ "scratchy-core-model",
+ "scratchy-forward-compiler",
+ "scratchy-layers",
+ "scratchy-serving-engine",
+ "scratchy-serving-scheduler",
+ "scratchy-target-cuda",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "scratchy-target-metal"
 version = "0.1.0"
 dependencies = [
@@ -3696,6 +3757,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "scratchy-const-tokens",
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-metal",

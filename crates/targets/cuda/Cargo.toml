@@ -1,0 +1,150 @@
+[package]
+name = "scratchy-target-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NVIDIA CUDA backend for scratchy: the per-opcode ABI as declared data, and the H100 kernels behind the `nvcc` feature."
+
+# The runtime side of the CUDA target: the const ABI tables the shared passes take as input
+# (`op_abi`), the step type opcode lowering produces (`step`), and, under `nvcc`, the kernels.
+#
+# THE FEATURE TIERS (as `spyre` / `spyre-hw` split, `crates/targets/spyre/Cargo.toml`):
+#
+#   (none) — toolchain-free. `build.rs` spawns nothing and links nothing, so the crate compiles
+#            anywhere, with no nvcc and no GPU. This is the build CI and the Mac use.
+#   nvcc   — compiles `kernels/*.cu` (ThunderKittens vendored at `kernels/thunderkittens/`) with
+#            nvcc from CUDA 12.8+ on PATH for `sm_90a`, links them, and adds `kernels`, their
+#            launchers and the runtime that plays a tape (`runtime`). Named for the toolchain it
+#            needs, not for a GPU: it compiles on any Linux host with nvcc. Its tests (`gemm_bf16`,
+#            `tape_player`) need an sm_90 GPU and fail without one. Never built in CI; the GKE
+#            H100 run is its only gate.
+[features]
+nvcc = []
+
+[dependencies]
+# The SHARED front end and passes. CUDA lowers the same `SubtileTape` metal and spyre lower; the
+# tables here are inputs to `tape_colouring`, `tape_folding` and `sample_rows`.
+scratchy-subtile = { path = "../../compiler/subtile" }
+# bf16 round-to-nearest-even for the rotary table the worker builds on the host (`rotary`), and
+# bf16 <-> f32 for the GPU tests' inputs and outputs.
+half = { workspace = true }
+# `Serialize` on the tape and step types, so CUDA's compiler renders a lowered tape as the tokens
+# of a `static` (`scratchy-const-tokens`). Plain Rust: no toolchain.
+serde = { workspace = true }
+# The weight loader (`weights`, `runtime::load_weights`) reads the checkpoint through the shared
+# safetensors reader, `GpuWeights` (one reader, and the VL name aliases), for its host-side reads
+# only; `scratchy-tensors` holds the `DeviceAllocator` trait its stub allocator implements, and
+# `anyhow` that trait's error type. All three are plain Rust, with no backend code.
+scratchy-layers = { path = "../../layers" }
+scratchy-tensors = { path = "../../tensors" }
+anyhow = { workspace = true }
+# The model registry (`registry`): each model's emitted tapes and weight table, submitted at link
+# time and walked by the serving worker. Plain Rust: no toolchain.
+inventory = { workspace = true }
+
+[dev-dependencies]
+# The tape tests build their fixtures with the shared lowering types and lower them with CUDA's
+# compiler, which depends on this crate: a dev-only cycle Cargo allows. The integration tests link
+# one copy of this library, the one the compiler links too.
+scratchy-subtile = { path = "../../compiler/subtile" }
+# The model facts the attention fixtures build (#1093: the attention ops carry `Attention`).
+scratchy-ir = { path = "../../compiler/ir" }
+scratchy-target-cuda-compiler = { path = "compiler" }
+# `weight_table` writes a tiny synthetic checkpoint with `safetensors::serialize`.
+safetensors = { workspace = true }
+
+# The bf16 GEMM against a CPU reference, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "gemm_bf16"
+required-features = ["nvcc"]
+
+# What a ThunderKittens TMA tile load and store do with a box past its array's edge, swizzled and
+# plain (`kernels/tma_box_probe.cu`): the GKE probe's R1 cases, the GEMV's and the narrow GEMM's
+# first gate, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "tma_bounds"
+required-features = ["nvcc"]
+
+# The row kernels (RMSNorm, add, SiluMul) against a CPU reference, on the GPU. Not built without
+# `nvcc`.
+[[test]]
+name = "row_ops"
+required-features = ["nvcc"]
+
+# The MoE block's kernels (#857: route, sort, expert GEMM and GEMV, combine, gate scale) against
+# f64 CPU references and exact host results, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "moe"
+required-features = ["nvcc"]
+
+# The rope, gate-split and gate-apply kernels against a CPU reference, on the GPU. Not built
+# without `nvcc`.
+[[test]]
+name = "rope_gate"
+required-features = ["nvcc"]
+
+# The KV append and the prefill attention over the paged KV cache against a CPU reference and
+# exact probes, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "attention"
+required-features = ["nvcc"]
+
+# The Gated-DeltaNet kernels (conv1d, gating, recurrent scan, gated norm) against f64 CPU
+# references, self-checks and exact probes, over a NaN-poisoned state pool, on the GPU. Not built
+# without `nvcc`.
+[[test]]
+name = "gdn"
+required-features = ["nvcc"]
+
+# The hand-written tapes against what CUDA's compiler lowers. No toolchain needed.
+[[test]]
+name = "tape_layout"
+
+# The worker's KV pool rule on lowered Gemma tapes (#923), with no CUDA toolchain.
+[[test]]
+name = "kv_pool"
+
+# The weight table's checks and host staging against a synthetic checkpoint, in both VL name
+# orderings. No toolchain needed.
+[[test]]
+name = "weight_table"
+
+# Every kernel is written with ThunderKittens: a check of the kernels' source text (rules T1-T10),
+# with kernels not yet rewritten on its `NOT_YET_PORTED` list. No toolchain needed.
+[[test]]
+name = "kernels_use_thunderkittens"
+
+# The prefill attention's full output per case, dumped for a bit-identity comparison across two
+# commits (#845), on the GPU. Not built without `nvcc`.
+[[test]]
+name = "attn_prefill_dump"
+required-features = ["nvcc"]
+
+# The embed row gather against an exact reference over a NaN-poisoned output, and its launcher's
+# refusals, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "embed"
+required-features = ["nvcc"]
+
+# FP8 S3: the prefill fp8 GEMMs against an f64 reference on the same e4m3 inputs and scales, on
+# the GPU. Not built without `nvcc`.
+[[test]]
+name = "gemm_fp8"
+required-features = ["nvcc"]
+
+# FP8 S3: the per-token quantization bit for bit against the host quantizer, on the GPU, in a binary
+# of its own so an fp8 GEMM's fault cannot hide its verdict. Not built without `nvcc`.
+[[test]]
+name = "quant_rows_fp8"
+required-features = ["nvcc"]
+
+# FP8 S4: the decode fp8 GEMVs against an f64 reference, their prologue quantization against
+# `quant_rows_fp8` bit for bit, and their bit identities, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "gemv_fp8"
+required-features = ["nvcc"]
+
+# The tape player on the GPU: GEMM chains through the arena against a CPU reference.
+[[test]]
+name = "tape_player"
+required-features = ["nvcc"]

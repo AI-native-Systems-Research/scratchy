@@ -59,7 +59,14 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   `-Fquant/<preset>` only if the change is quant-specific. Never build
   `model/<arch>` or `model/all` just to test one thing — that forward-expands
   every config in scope (minutes-to-hours, OOM risk on a laptop).
-- `metal` and `spyre` are mutually exclusive.
+- `cuda`, `metal` and `spyre` are mutually exclusive. `cuda` builds FP8 models
+  only: name `quant/fp8-dynamic-per-channel` with one of
+  `model/qwen3.8-27b-text-only`, `model/qwen3.6-35b-a3b` or
+  `model/gemma-4-26b-a4b-it`; any other `cuda` build panics at build time.
+- `scratchy-target-cuda`'s `nvcc` feature compiles `kernels/*.cu`
+  (ThunderKittens vendored at `kernels/thunderkittens/`) for `sm_90a` and links
+  them. It needs CUDA 12.8+ `nvcc` on `PATH`, and its tests need an H100. CI
+  never builds it, so the GKE H100 run is its only gate.
 - Multimodal (vision arches + the `image`/`scratchy-vision` decode stack) is
   opt-in via the `multimodal` feature on `scratchy-cli` (on by default
   there) — a plain `chat`-only build never compiles image/png/zune-jpeg/etc.
@@ -76,7 +83,11 @@ check/clippy don't link the C++ shim). Both metal crates are excluded because
 they depend unconditionally on Apple-only `objc2` — the
 compiler crate via its own edge to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
-one of the two still drags `objc2` onto Linux); the **macOS** job
+one of the two still drags `objc2` onto Linux). Its "CUDA scaffold" step then
+lints `scratchy-target-cuda`/`scratchy-target-cuda-compiler` (`--all-targets`)
+and the macro under `--features cuda`, runs the two CUDA crates' tests, and
+expands the three FP8 models to their tapes (`cuda_tapes_*_fp8`) — no nvcc, no
+GPU. The **macOS** job
 runs `cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings`
 + kernel tests (`mtp` adds the multi-token-prediction head of every model whose
 checkpoint carries one: heads have no configs of their own, so `all` alone

@@ -265,3 +265,17 @@ fn agnostic_zones_do_not_reference_cuda_graphs() {
         v.join("\n")
     );
 }
+
+// ---- Principle: the cuda crate does not know about metal ----------------------
+
+#[test]
+fn cuda_crate_does_not_reexport_metal() {
+    let v = imports_target_crate("crates/targets/cuda", "scratchy_target_metal");
+    assert!(
+        v.is_empty(),
+        "\n`scratchy-target-cuda` references `scratchy_target_metal` ({} site(s)) — a target \
+         crate must not multiplex another backend:\n{}\n",
+        v.len(),
+        v.join("\n")
+    );
+}

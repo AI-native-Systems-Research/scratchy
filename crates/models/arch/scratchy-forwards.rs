@@ -68,6 +68,19 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
     out.into_iter().collect()
 }
 
+/// Lossy FORWARD-only feature/env name mangle: non-alphanumeric → `_`, upper.
+fn envify(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// The quant presets enabled for one arch: its `quantizations.json`
 /// ∩ the enabled preset features (no `quant-` prefix on scratchy-quantizations,
 /// same reasoning as `<stem>` having no `model-` prefix on this crate).
@@ -242,6 +255,40 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
+/// Arches whose emit only compiles under metal. Kept in sync with src/lib.rs
+/// gates.
+const METAL_ONLY: &[&str] = &[
+    "dflash2",
+    "gemma4-assistant",
+    "glm4-moe",
+    "gpt-oss",
+    "nemotron-h",
+    "nemotron-h-latent",
+    "nemotron-h-mtp",
+];
+/// Arches that additionally support the spyre (KTIR) backend.
+///
+/// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
+/// is dropped by the `supported` gate below before its configs are read.
+const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
+/// Arches the cuda backend lowers: every op of their prefill canonicals has a CUDA kernel. Each
+/// model of one emits its per-bucket `static` CUDA tapes (`CUDA_TAPES`).
+///
+/// Listed per arch, built per stem, and under `fp8-dynamic-per-channel` only ([`CUDA_PRESETS`]):
+/// CUDA serves FP8 models only (#978). Not every config of a listed arch lowers (a tiny parity
+/// config's GEMMs sit off the tiles), so the arch-wide `model/<arch>` panics at build time naming
+/// that refusal. Build one FP8 checkpoint's stem with the preset: `model/qwen3.8-27b-text-only`
+/// (the bare stem selects the vision arch), `model/qwen3.6-35b-a3b` or `model/gemma-4-26b-a4b-it`,
+/// each with `quant/fp8-dynamic-per-channel`.
+///
+/// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
+/// by name below rather than silently dropped.
+const CUDA_CAPABLE: &[&str] = &["qwen3-5", "qwen3-5-moe", "gemma4-moe"];
+/// The quant presets the cuda backend builds, and the only ones: CUDA serves FP8 models only
+/// (#978), so a cuda build that would compile a model dense, or under a preset CUDA has no
+/// kernels for, is refused below.
+const CUDA_PRESETS: &[&str] = &["fp8-dynamic-per-channel"];
+
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
 fn config_shape(path: &Path) -> Option<(String, u64, u64, u64)> {
@@ -370,6 +417,11 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
+    let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
+    let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
+    let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
+    // Every arch whose `arch-<name>` feature is on, whether or not a selected backend emits it.
+    let mut selected: Vec<String> = Vec::new();
 
     // The backend law, stated once: `src/lib.rs`'s arch gates read `scratchy_backend`,
     // which this script sets exactly when a backend feature is on — so an arch compiles
@@ -378,6 +430,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(scratchy_backend)");
     if std::env::var_os("CARGO_FEATURE_METAL").is_some()
         || std::env::var_os("CARGO_FEATURE_SPYRE").is_some()
+        || std::env::var_os("CARGO_FEATURE_CUDA").is_some()
     {
         println!("cargo::rustc-cfg=scratchy_backend");
     }
@@ -424,9 +477,21 @@ fn main() {
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".py"))?
                 .to_string();
-            // Its `arch-<name>` feature and a backend it compiles for, as the `pub mod <name>`
-            // cfg in src/lib.rs has it: never the pipeline of an arch whose mod won't compile.
-            if !scratchy_forward_compiler_macro::arch_compiled(&arch) {
+            // Feature gate: `arch-<name>` → CARGO_FEATURE_ARCH_<ENVIFY(name)>.
+            if std::env::var(format!("CARGO_FEATURE_ARCH_{}", envify(&arch))).is_err() {
+                return None;
+            }
+            selected.push(arch.clone());
+            // Backend gate: mirror the `pub mod <name>` cfg in src/lib.rs, so we
+            // never run the pipeline for an arch whose mod won't be compiled.
+            let supported = (if METAL_ONLY.contains(&arch.as_str()) {
+                metal
+            } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
+                metal || spyre
+            } else {
+                metal
+            }) || (cuda && CUDA_CAPABLE.contains(&arch.as_str()));
+            if !supported {
                 return None;
             }
             let mod_name = arch.replace('-', "_");
@@ -448,6 +513,20 @@ fn main() {
         .flat_map(|(_, _, cfg)| enabled_quants(&cfg.join("quantizations.json"), &enabled_presets))
         .collect();
     let quants = quant_union.iter().cloned().collect::<Vec<_>>().join(",");
+    // CUDA builds FP8 models only (#978): every selected CUDA arch compiles under exactly
+    // `CUDA_PRESETS`, never dense (no preset) and never under a preset with no CUDA kernels.
+    // Refused here, before any expansion.
+    if cuda {
+        for (_, mod_name, cfg) in &targets {
+            let q = enabled_quants(&cfg.join("quantizations.json"), &enabled_presets);
+            if q.is_empty() || q.iter().any(|p| !CUDA_PRESETS.contains(&p.as_str())) {
+                panic!(
+                    "CUDA builds FP8 models only: add quant/fp8-dynamic-per-channel and no other \
+                     quant preset (arch `{mod_name}` would compile with presets {q:?})"
+                );
+            }
+        }
+    }
     // SAFETY: set once here, before the rayon fan-out reads it; no other thread
     // mutates the environment. `set_var` is unsafe on 2024.
     unsafe {
@@ -508,6 +587,16 @@ fn main() {
     let unmatched = scratchy_forward_compiler_macro::unmatched_build_filter_tags();
     if !unmatched.is_empty() {
         panic!("SCRATCHY_BUILD_FILTER tag(s) matched no config in any arch: {unmatched:?}");
+    }
+
+    // Under `cuda`, a build that named models none of which the cuda backend lowers would
+    // otherwise reach the "no models selected" panic below, which blames the wrong thing.
+    if cuda && !selected.is_empty() && !selected.iter().any(|a| CUDA_CAPABLE.contains(&a.as_str()))
+    {
+        panic!(
+            "the cuda backend lowers none of the selected architectures \
+             (CUDA_CAPABLE = {CUDA_CAPABLE:?}); selected: {selected:?}"
+        );
     }
 
     // scratchy-models has no default model features (deliberately — see

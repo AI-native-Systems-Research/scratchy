@@ -7,6 +7,8 @@ description = "Backend-neutral universal interpreter instruction set for scratch
 
 [features]
 metal = []
+# NVIDIA CUDA: gates nothing yet; the chain from the model crate down reaches here like metal's.
+cuda = []
 # Spyre (KTIR): gates the same `WeightAccessors` trait on so the host-neutral
 # KTIR backend can name it (return types are the cfg-free `scratchy_layers::*`).
 spyre = []
