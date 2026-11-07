@@ -3938,8 +3938,10 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         } else if let Some(v) = staged_rope.get(&tid) {
             v.clone()
         } else if let Some(&half) = rope_table_half.get(&tid) {
+            // The SAME stream the reference reads (`eval_golden_buffers`: `seed(id)`) — a rank's
+            // slice of a column-split table is its own, so the stream is the rank's.
             (0..n)
-                .map(|j| dbg_synth_val(tid as usize, j % half))
+                .map(|j| dbg_synth_val(seed(tid), j % half))
                 .collect()
         } else {
             (0..n).map(|j| dbg_synth_val(seed(tid), j)).collect()
