@@ -8086,6 +8086,35 @@ fn folds_its_stick(o: &Operation<'_>) -> bool {
     )
 }
 
+/// Every value's defining operation, by result — the ONE index the frame pass and its helpers
+/// read. Built once per function by [`assign_frames`] and handed to every helper that used to
+/// re-walk `ops_deep` and linearly `find` per lookup (an O(n²) walk with an allocation per op);
+/// the def-uniqueness the SSA verifier proves is what makes one entry per result total.
+struct Defs(std::collections::HashMap<Ssa, &'static Operation<'static>>);
+
+impl Defs {
+    fn new(f: &IRFunction<'static>) -> Self {
+        Defs(
+            f.ops_deep()
+                .into_iter()
+                .filter_map(|o| o.result.map(|r| (r, o)))
+                .collect(),
+        )
+    }
+
+    fn of(&self, v: Ssa) -> Option<&'static Operation<'static>> {
+        self.0.get(&v).copied()
+    }
+
+    /// The value's own stated shape, off its def.
+    fn dims_of(&self, v: Ssa) -> Option<Vec<i64>> {
+        self.of(v)
+            .and_then(|d| d.result_type)
+            .and_then(|t| t.dims())
+            .map(<[i64]>::to_vec)
+    }
+}
+
 /// The SHAPES this function's per-row columns take — the dims of the values the lineage holds
 /// columnar. Seeded by the reductions that fold their input's last axis (one value per stick row
 /// is what such a reduce writes) and grown through the ops that keep a column a column: a
@@ -8098,7 +8127,7 @@ fn folds_its_stick(o: &Operation<'_>) -> bool {
 /// still the one statement of a VALUE's world; this states which SHAPES the function's columns
 /// have, the same statement the deleted `value_frame`'s fixpoint made, kept verbatim so the frames
 /// the pass assigns are the frames its readers already used.
-fn column_dims(f: &IRFunction<'static>) -> Vec<Vec<i64>> {
+fn column_dims(f: &IRFunction<'static>, defs: &Defs) -> Vec<Vec<i64>> {
     // The shapes a per-row column takes: a stick fold's result, a leading fold of a per-row
     // column (a decode batch's `J` block slots' running max, folded), and a shape op over one (the
     // folded max expanded back over the slots: one value per stick row in either shape) — to a
@@ -8125,8 +8154,7 @@ fn column_dims(f: &IRFunction<'static>) -> Vec<Vec<i64>> {
             .filter(|o| {
                 o.operands
                     .first()
-                    .and_then(|&v| deep.iter().find(|d| d.result == Some(v)))
-                    .and_then(|d| dims_of(d))
+                    .and_then(|&v| defs.dims_of(v))
                     .is_some_and(|d| columns.contains(&d))
             })
             .filter_map(|o| dims_of(o))
@@ -8149,9 +8177,8 @@ fn column_dims(f: &IRFunction<'static>) -> Vec<Vec<i64>> {
 /// — `[N]` is a row to a tile — so the store is the statement that holds. The parameter is the
 /// memory view's pointer operand, the same chain `region_of_view_operand` walks on the region
 /// side, so the two walks cannot disagree about which parameter a tile addresses.
-fn column_fed_params(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
-    let deep = f.ops_deep();
-    let def_of = |v: Ssa| deep.iter().copied().find(|o| o.result == Some(v));
+fn column_fed_params(defs: &Defs) -> std::collections::HashSet<Ssa> {
+    let def_of = |v: Ssa| defs.of(v);
     let param_of_tile = |tile: Ssa| -> Option<Ssa> {
         let t = def_of(tile)?;
         let view = def_of(*t.operands.first()?)?;
@@ -8160,7 +8187,7 @@ fn column_fed_params(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> 
             .flatten()
     };
     let mut out = std::collections::HashSet::new();
-    for o in deep.iter().filter(|o| o.op_type == OpKind::KtdpStore) {
+    for o in defs.0.values().filter(|o| o.op_type == OpKind::KtdpStore) {
         // `ktdp.store(value, tile)`: the value is operand 0, the tile operand 1.
         let (Some(&value), Some(&tile)) = (o.operands.first(), o.operands.get(1)) else {
             continue;
@@ -8197,16 +8224,11 @@ fn column_fed_params(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> 
 fn elementwise_world(
     f: &IRFunction<'static>,
     o: &Operation<'static>,
+    defs: &Defs,
     world: &std::collections::HashMap<Ssa, World>,
 ) -> Result<World, Error> {
-    let deep = f.ops_deep();
-    let def_of = |v: Ssa| deep.iter().copied().find(|d| d.result == Some(v));
-    let dims_of = |v: Ssa| -> Option<Vec<i64>> {
-        def_of(v)
-            .and_then(|d| d.result_type)
-            .and_then(|t| t.dims())
-            .map(<[i64]>::to_vec)
-    };
+    let def_of = |v: Ssa| defs.of(v);
+    let dims_of = |v: Ssa| -> Option<Vec<i64>> { defs.dims_of(v) };
     let Some(res_dims) = o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec) else {
         // A value that states no shape names no column: the row world, the frame every reader
         // already gave it.
@@ -8262,12 +8284,11 @@ fn elementwise_world(
 /// read as one whatever its tile restates — the store is the statement that holds where the
 /// tile's rank-1 restatement lies.
 fn load_world(
-    f: &IRFunction<'static>,
     o: &Operation<'static>,
+    defs: &Defs,
     column_fed: &std::collections::HashSet<Ssa>,
 ) -> World {
-    let deep = f.ops_deep();
-    let def_of = |v: Ssa| deep.iter().copied().find(|d| d.result == Some(v));
+    let def_of = |v: Ssa| defs.of(v);
     let tile = o.operands.first().and_then(|&t| def_of(t));
     // The op the column extent is read from: the tile itself, or the gathered tile's DATA view.
     let states_extent = tile.and_then(|t| {
@@ -8322,8 +8343,9 @@ fn load_world(
 ///   frame, no entry, and [`Frames::world_of`]'s row-world default is the only answer they get.
 fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
     let deep = f.ops_deep();
-    let columns = column_dims(f);
-    let column_fed = column_fed_params(f);
+    let defs = Defs::new(f);
+    let columns = column_dims(f, &defs);
+    let column_fed = column_fed_params(&defs);
     let mut world: std::collections::HashMap<Ssa, World> = std::collections::HashMap::new();
     for o in deep.iter() {
         let Some(res) = o.result else { continue };
@@ -8355,7 +8377,7 @@ fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
                 Some(World::Row)
             }
             // ── THE LOAD: what it reads, as its tile, its own shape, or its store states ──
-            OpKind::KtdpLoad => Some(load_world(f, o, &column_fed)),
+            OpKind::KtdpLoad => Some(load_world(o, &defs, &column_fed)),
             // ── THE ELEMENTWISE FAMILY: the mixed-worlds law ──
             OpKind::ArithAbsf
             | OpKind::ArithAddf
@@ -8400,7 +8422,7 @@ fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
             | OpKind::LinalgMul
             | OpKind::LinalgDiv
             | OpKind::LinalgMax
-            | OpKind::LinalgMin => Some(elementwise_world(f, o, &world)?),
+            | OpKind::LinalgMin => Some(elementwise_world(f, o, &defs, &world)?),
             // ── A VALUE THAT STATES A SHAPE BUT NO WORLD OF ITS OWN: the column lineage ──
             OpKind::TensorSplat
             | OpKind::RegionBb0Args
