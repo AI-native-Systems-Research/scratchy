@@ -156,7 +156,7 @@ pub fn verify_module_defs(m: &Module, pass: &'static str) -> std::result::Result
     // (dominance) reads differently from one nothing defines (definedness).
     let mut everywhere = HashSet::new();
     collect_module_defs(&m.ops, &mut everywhere);
-    verify_module_region(&m.ops, &mut HashSet::new(), &everywhere, pass)
+    verify_module_region(&m.ops, &mut Scope::new(), &everywhere, pass)
 }
 
 /// Same law, over the emitted function the consumers actually see.
@@ -175,25 +175,80 @@ pub fn verify_irfunction_defs(
             }
         }
     }
-    let top: HashSet<KSsa> = f.arguments.iter().map(|(v, _)| *v).collect();
-    verify_irfunction_region(f.operations, &top, &everywhere, pass)
+    let mut scope = Scope::new();
+    scope.push_all(f.arguments.iter().map(|(v, _)| *v));
+    verify_irfunction_region(f.operations, &mut scope, &everywhere, pass)
 }
 
-/// One region of ours: `inherited` is what encloses this region (the defs
-/// visible before the op that carries it), `everywhere` is the unscoped set
-/// the refusal wording reads. Each op's operands are checked against what is
-/// visible AT THAT POINT; its results join the visible set only after its own
-/// regions are walked, so nothing inside an op can use the op's results.
+/// ONE SCOPE STACK, both representations. Entering a region pushes its defs
+/// and remembers the stack's depth; leaving truncates back to that depth, so
+/// a region's defs vanish exactly at its end. Nothing clones the scope it
+/// inherited -- the per-region `HashSet` clone this replaces paid the whole
+/// visible set again at every nesting level. The insertion log is what makes
+/// a hash set truncatable: a value defined twice (a malformed program's
+/// shadowing) is counted, and leaves the scope only when its last definition
+/// does.
+struct Scope<V: std::hash::Hash + Eq + Copy> {
+    counts: std::collections::HashMap<V, u32>,
+    log: Vec<V>,
+}
+
+impl<V: std::hash::Hash + Eq + Copy> Scope<V> {
+    fn new() -> Self {
+        Scope {
+            counts: std::collections::HashMap::new(),
+            log: Vec::new(),
+        }
+    }
+
+    /// The depth to truncate back to when the region being entered is left.
+    fn mark(&self) -> usize {
+        self.log.len()
+    }
+
+    fn push(&mut self, v: V) {
+        *self.counts.entry(v).or_insert(0) += 1;
+        self.log.push(v);
+    }
+
+    fn push_all(&mut self, vs: impl IntoIterator<Item = V>) {
+        for v in vs {
+            self.push(v);
+        }
+    }
+
+    fn contains(&self, v: &V) -> bool {
+        self.counts.contains_key(v)
+    }
+
+    fn truncate(&mut self, mark: usize) {
+        while self.log.len() > mark {
+            let v = self.log.pop().expect("mark <= log len");
+            if let Some(c) = self.counts.get_mut(&v) {
+                *c -= 1;
+                if *c == 0 {
+                    self.counts.remove(&v);
+                }
+            }
+        }
+    }
+}
+
+/// One region of ours, walked over the shared [`Scope`]: what is visible at a
+/// use is everything pushed so far, which is exactly the defs of the
+/// enclosing regions plus the results of the ops that precede this one. An
+/// op's results are pushed only after its own regions are walked, so nothing
+/// inside an op can use the op's results; a region's block arguments are
+/// pushed inside its own mark, so nothing outside the region can use them.
 fn verify_module_region(
     ops: &[Op],
-    inherited: &HashSet<Ssa>,
+    scope: &mut Scope<Ssa>,
     everywhere: &HashSet<Ssa>,
     pass: &'static str,
 ) -> std::result::Result<(), Violation> {
-    let mut visible = inherited.clone();
     for op in ops {
         for (i, v) in op.operands.iter().enumerate() {
-            if !visible.contains(v) {
+            if !scope.contains(v) {
                 return Err(violation_of(
                     pass,
                     op.kind.spelling().to_string(),
@@ -205,29 +260,30 @@ fn verify_module_region(
             }
         }
         for r in &op.regions {
-            let mut inner = visible.clone();
-            inner.extend(r.args.iter().map(|(v, _)| *v));
-            verify_module_region(&r.ops, &inner, everywhere, pass)?;
+            let mark = scope.mark();
+            scope.push_all(r.args.iter().map(|(v, _)| *v));
+            verify_module_region(&r.ops, scope, everywhere, pass)?;
+            scope.truncate(mark);
         }
-        visible.extend(op.results.iter().copied());
+        scope.push_all(op.results.iter().copied());
     }
     Ok(())
 }
 
-/// One region of theirs, same law: `IterVar` / `IterArgs` name an `scf.for`'s
-/// region arguments and are visible inside its regions only; `result`,
+/// One region of theirs, same law, over the shared [`Scope`]: `IterVar` /
+/// `IterArgs` name an `scf.for`'s region arguments and are pushed inside the
+/// op's own mark, so they are visible inside its regions only; `result`,
 /// `ResultNames` and a `region.bb0_args` marker's `Names` are the op's own
-/// defs and are visible after it.
+/// defs, pushed after its regions, so they are visible after it.
 fn verify_irfunction_region(
     ops: &[KOperation],
-    inherited: &HashSet<KSsa>,
+    scope: &mut Scope<KSsa>,
     everywhere: &HashSet<KSsa>,
     pass: &'static str,
 ) -> std::result::Result<(), Violation> {
-    let mut visible = inherited.clone();
     for o in ops {
         for (i, v) in o.operands.iter().enumerate() {
-            if !visible.contains(v) {
+            if !scope.contains(v) {
                 return Err(violation_of(
                     pass,
                     kind_of(o),
@@ -238,21 +294,22 @@ fn verify_irfunction_region(
                 ));
             }
         }
-        let mut inner = visible.clone();
+        let mark = scope.mark();
         for key in [KAttrKey::IterVar, KAttrKey::IterArgs] {
             if let Some(KAttr::Ssas(vs)) = o.attr(key) {
-                inner.extend(vs.iter().copied());
+                scope.push_all(vs.iter().copied());
             }
         }
         for r in o.regions {
-            verify_irfunction_region(r, &inner, everywhere, pass)?;
+            verify_irfunction_region(r, scope, everywhere, pass)?;
         }
+        scope.truncate(mark);
         if let Some(r) = o.result {
-            visible.insert(r);
+            scope.push(r);
         }
         for key in [KAttrKey::ResultNames, KAttrKey::Names] {
             if let Some(KAttr::Ssas(vs)) = o.attr(key) {
-                visible.extend(vs.iter().copied());
+                scope.push_all(vs.iter().copied());
             }
         }
     }
