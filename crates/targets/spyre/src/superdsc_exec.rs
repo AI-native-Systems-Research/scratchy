@@ -573,7 +573,7 @@ pub(crate) struct OpProg<T: ktir_superdsc::collective::Tp> {
 /// The forget is kept by choice, and it costs nothing: the device region a session-lifetime
 /// handle describes lives until process exit regardless (see the `DevAddr` doc), so a freeing
 /// drop could reclaim only a descriptor value, once, at shutdown. Nothing crashes without it
-/// today — every session holds its card's `CardRuntime` by `Arc`, so the context outlives it, and
+/// today — every session borrows its card's `CardRuntime` (`&'c`), so the context outlives it, and
 /// `DevAddr`'s drop cannot reach the allocator — but the law stays load-bearing anyway:
 /// `CardRuntime::reset` (the leak probe) tears the context down MID-PROCESS, and a future
 /// `DevAddr` drop that learns to free must not find session handles betting on drop order
@@ -593,7 +593,7 @@ impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> Drop for Executor<T> {
+impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, T> {
     fn drop(&mut self) {
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
@@ -808,12 +808,14 @@ struct KvGeometry {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One resident SuperDSC session: program + weights + KV resident on-card.
-pub struct Executor<T: ktir_superdsc::collective::Tp> {
+pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
     /// binary.
     code: &'static bundle::BundleCode<'static, T>,
-    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's.
-    card: std::sync::Arc<CardRuntime<T>>,
+    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's. BORROWED:
+    /// the card's owner opened it once for the process, and `'c` is the proof, checked by the
+    /// compiler, that this session cannot outlive it.
+    card: &'c CardRuntime<T>,
 
     pub vocab: Vocab,
     pub kv_dim: KvDim,
@@ -1020,10 +1022,6 @@ fn dump_prog_index(fp: &str) -> usize {
     *reg.entry(fp.to_string()).or_insert(n)
 }
 
-// Driven single-threaded by the worker thread (the session moves between forwards, as the C++
-// session pointer did).
-unsafe impl<T: ktir_superdsc::collective::Tp> Send for Executor<T> {}
-
 /// ⭐⭐⭐⭐⭐ A RAW (device-format) PAYLOAD **AND THE PLACEMENT IT FITS**, as one value — the only thing
 /// [`Executor::bind_input_raw`] accepts, and the reason a raw bind can no longer overrun its tensor.
 ///
@@ -1220,7 +1218,7 @@ impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> Executor<T> {
+impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1231,12 +1229,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     ///
     /// Nothing is read from disk: `code` is `&'static` data in this binary.
     pub fn load(
-        card: std::sync::Arc<CardRuntime<T>>,
+        card: &'c CardRuntime<T>,
         code: &'static bundle::BundleCode<'static, T>,
         vocab: Vocab,
         kv_dim: KvDim,
         num_blocks: PoolPages,
-    ) -> Result<Executor<T>> {
+    ) -> Result<Executor<'c, T>> {
         // ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
         // receive window); the card says which rank it runs as (its [`CardRuntime::link`]). The
         // two must agree — see [`RankSeat::of`] — and a sharded session then binds only the launch
@@ -2488,7 +2486,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // 331,220 fences over 1,570 forwards with RSS flat to the kB). The resident
         // program/weight/KV allocations live on the runtime, not the stream.
         self.stream = Some(
-            Stream::create(&self.card)
+            Stream::create(self.card)
                 .map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?,
         );
         lap("stream-create", &mut t0);
@@ -2563,7 +2561,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
-                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor)
+                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
@@ -2579,7 +2577,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 self.weight_bank_bytes[b].max(128)
             };
             self.weight_bank_addr[b] = Some(
-                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
@@ -3124,7 +3122,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     })?;
                 let head = img.bootstrap();
                 let addr = DevAddr::alloc(
-                    &self.card,
+                    self.card,
                     ByteSize(img.alloc_bytes()),
                     MemoryType::Program,
                 )
@@ -6110,7 +6108,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let region = self.seg_addr[SEG_WEIGHT.get()]
             .as_ref()
             .ok_or_else(|| anyhow!("point_landing_slots: the weight segment is not allocated"))?;
-        crate::runtime::point_landing_slots(&self.card, region).map_err(|e| anyhow!("{e}"))
+        crate::runtime::point_landing_slots(self.card, region).map_err(|e| anyhow!("{e}"))
     }
 
     /// The receive window this session's bundle bakes, `None` in a world of one.
@@ -6119,7 +6117,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         RankSeat::baked_window(self.code).map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))
     }
 
-    pub fn alias_seg_from(&mut self, owner: &Executor<T>, seg: SegIdx) -> Result<()> {
+    pub fn alias_seg_from(&mut self, owner: &Executor<'_, T>, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {
             bail!("alias_seg(seg{i}): a session has no region for it");

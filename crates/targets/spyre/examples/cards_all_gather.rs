@@ -61,9 +61,10 @@ fn flat_va(segment: u64, offset_bytes: u64) -> u64 {
     ((segment << 27) | (offset_bytes >> 7)) << 7
 }
 
-/// One card's side of the run: its runtime, one stream, and its N-slot buffer.
-struct Side {
-    card: Arc<CardRuntime>,
+/// One card's side of the run: its runtime (borrowed from `main`, which owns every card), one
+/// stream, and its N-slot buffer.
+struct Side<'c> {
+    card: &'c CardRuntime,
     stream: Arc<RuntimeStream>,
     buf: Arc<CompositeAddress>,
     /// The buffer's (segment, byte offset) on this card — what a peer's send lands against.
@@ -71,8 +72,8 @@ struct Side {
     offset_bytes: u64,
 }
 
-impl Side {
-    fn new(card: Arc<CardRuntime>, n: usize) -> Result<Self> {
+impl<'c> Side<'c> {
+    fn new(card: &'c CardRuntime, n: usize) -> Result<Self> {
         let rt = card.context().clone();
         let allocator = rt.get_allocator().map_err(|e| anyhow!("allocator: {e}"))?;
         let buf = Arc::new(
@@ -165,7 +166,7 @@ fn main() -> Result<()> {
 
     // ── Open every card, in parallel: each bring-up is ~5.7 s. ──
     let t = Instant::now();
-    let cards: Vec<Arc<CardRuntime>> = (0..n as u32)
+    let cards: Vec<CardRuntime> = (0..n as u32)
         .map(|i| std::thread::spawn(move || CardRuntime::open(i)))
         .collect::<Vec<_>>()
         .into_iter()
@@ -208,8 +209,8 @@ fn main() -> Result<()> {
     println!("linked: {} base-address-table entries", n * (n - 1));
 
     // ── Buffers: own pattern in own slot, zeros elsewhere. ──
-    let sides: Vec<Side> = cards
-        .into_iter()
+    let sides: Vec<Side<'_>> = cards
+        .iter()
         .enumerate()
         .map(|(i, c)| Side::new(c, n).with_context(|| format!("card {i}")))
         .collect::<Result<_>>()?;

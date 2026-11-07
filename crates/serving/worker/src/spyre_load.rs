@@ -1374,11 +1374,18 @@ impl SpyreWorker {
                 // ⭐ THE CARD, JOINED. Its capacity was read from the card when it opened — a card
                 // that cannot report one does not open — so the KV pool below is sized from the real
                 // card, with no default to fall back to.
-                let cards: Cards = card_open.try_map_into(|r, h| -> ExecutorResult<_> {
+                //
+                // ⭐ OPENED ONCE, FOR THE PROCESS, AND BORROWED BY EVERY SESSION. The sessions land in
+                // `Loaded`, which the worker holds for the life of the process (a `Box<dyn Worker>`,
+                // so `'static`), and each borrows its card: `&'static` is the borrow that outlives
+                // them, given to the cards ONCE here — the same as the bundles this load leaks — so
+                // the compiler, not a refcount, checks that no session outlives its card.
+                let opened: Cards = card_open.try_map_into(|r, h| -> ExecutorResult<_> {
                     h.join()
                         .map_err(|_| werr(format!("card {}'s bring-up thread panicked", r.get())))?
                         .map_err(|e| werr(format!("open Spyre card {}: {e}", r.get())))
                 })?;
+                let cards: &'static Cards = Box::leak(Box::new(opened));
                 // ⭐ THE CARDS' P2P LINK, BEFORE THE FIRST SESSION LOADS. A sharded world's decode
                 // bundle bakes its receive window for that world; every card's base-address table
                 // gets every peer's card and its `XSEG` entries every peer's landing slots, so every
@@ -1388,7 +1395,7 @@ impl SpyreWorker {
                     scratchy_target_spyre::superdsc_exec::RankSeat::baked_window(code)
                         .map_err(|e| werr(format!("bundle {fp}: {e}")))?
                 {
-                    scratchy_target_spyre::runtime::link_peers(&cards, window)
+                    scratchy_target_spyre::runtime::link_peers(cards, window)
                         .map_err(|e| werr(e.to_string()))?;
                     info!(
                         "[spyre-worker] linked {} cards over device p2p RDMA, window {window:?}: {}",
@@ -1804,7 +1811,7 @@ impl SpyreWorker {
                         let anchor_pool = prefill_pool_statics(wirings)?;
                         let pss = if anchor_reserves {
                             SuperDscSession::new_reserving(
-                                &cards,
+                                cards,
                                 pcode,
                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                     vocab,
@@ -1817,7 +1824,7 @@ impl SpyreWorker {
                             )
                         } else {
                             SuperDscSession::new_borrowing_with_consts(
-                                &cards,
+                                cards,
                                 pcode,
                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                     vocab,
@@ -1888,7 +1895,7 @@ impl SpyreWorker {
                 let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
                     .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
-                    &cards,
+                    cards,
                     code,
                     scratchy_target_spyre::sdsc_runner::SessionDims {
                         vocab,
@@ -1904,7 +1911,7 @@ impl SpyreWorker {
                 // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
                 // placement in it, so where peers' sends land is the allocator's answer for THIS
                 // session's region — pointed before any step, and checked equal on every rank.
-                ss.point_landing_slots(&cards)
+                ss.point_landing_slots(cards)
                     .map_err(|e| werr(format!("the receive window's landing slots: {e}")))?;
                 // ⛔ THE LADDER STARTS ONLY ONCE THE OWNER HAS ALLOCATED. A rung build allocates on
                 // every card, and a background build racing the owner's allocation lands the owner's
@@ -1976,7 +1983,8 @@ impl SpyreWorker {
                     // These are PREFILL rungs (`rung_consts = prefill_consts`), so each stages the
                     // pool's tables for itself ([`prefill_pool_statics`]).
                     let ladder_pool = prefill_pool_statics(wirings)?;
-                    let ladder_cards = cards.clone();
+                    // The cards are the loader's `&'static` borrow, so the background build takes
+                    // the reference itself — nothing to clone, nothing kept alive by the build.
                     std::thread::spawn(move || {
                         let workers: Vec<_> = chunks
                             .into_iter()
@@ -1984,12 +1992,11 @@ impl SpyreWorker {
                                 let rung_spill = ladder_spill.clone();
                                 let rung_consts = prefill_consts;
                                 let rung_pool = ladder_pool.clone();
-                                let rung_cards = ladder_cards.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
                                             let r = SuperDscSession::new_borrowing_with_consts(
-                                                &rung_cards,
+                                                cards,
                                                 rcode,
                                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                                     vocab,
@@ -2210,7 +2217,6 @@ impl SpyreWorker {
                                 // ([`prefill_pool_statics`]). Borrowed from outside the scope, as
                                 // `spill` is — a binding inside it would not outlive the spawn.
                                 let pool = &pool_for_prefix;
-                                let cards = &cards;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
                                         cards,
@@ -2425,7 +2431,6 @@ impl SpyreWorker {
                             .iter()
                             .map(|job| {
                                 let spill = &spill_tids;
-                                let cards = &cards;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
                                         cards,

@@ -100,7 +100,10 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     /// Single on-card domain (`DomainId(0)`), unconditionally: nothing in this codebase has ever
     /// asked the topology which domain is real, and this module does not invent a multi-domain
     /// topology query that has no call site anywhere else.
-    pub fn open(index: u32) -> Result<Arc<Self>, HwError> {
+    ///
+    /// Returned BY VALUE: the caller is the card's one owner, and every session and executor on it
+    /// borrows it (`&'c CardRuntime<T>`), so the compiler checks that none outlives its card.
+    pub fn open(index: u32) -> Result<Self, HwError> {
         let pci = flex_rs::senlib_ffi::pcie_address_for_card(index);
         if pci.is_empty() {
             return Err(HwError::BringUp(Arc::new(BringUpError::NoSuchCard {
@@ -111,7 +114,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         Self::build(index, &pci).map_err(|e| HwError::BringUp(Arc::new(e)))
     }
 
-    fn build(index: u32, pci: &str) -> Result<Arc<Self>, BringUpError> {
+    fn build(index: u32, pci: &str) -> Result<Self, BringUpError> {
         let card = flex_rs::senlib_ffi::Card::open(pci).map_err(BringUpError::Open)?;
         // Real single on-card domain, sized off the card's actual HBM capacity and RCU core count —
         // `flex::populateDomainTopology` (`device_memory_topology.cpp`), ported natively as
@@ -148,12 +151,12 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         .map_err(BringUpError::Scheduler)?;
 
         let rt = RuntimeContext::create(DeviceId(i64::from(index)), scheduler, allocator);
-        Ok(Arc::new(Self {
+        Ok(Self {
             card,
             memory,
             rt,
             link: std::sync::OnceLock::new(),
-        }))
+        })
     }
 
     /// The senlib card this runtime drives.
@@ -162,9 +165,10 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     }
 
     /// This card's key in the RB telemetry ring (`flex_rs::rb_telemetry::RbTiming::source`) —
-    /// the same identity its hardware submitter records completions under.
+    /// the same identity its hardware submitter records completions under, from the one
+    /// definition both read ([`flex_rs::senlib_ffi::Card::telemetry_key`]).
     pub fn telemetry_key(&self) -> usize {
-        Arc::as_ptr(&self.card) as usize
+        self.card.telemetry_key()
     }
 
     /// This card's p2p link, when it runs one rank of a sharded world ([`link_peers`]).
@@ -1405,7 +1409,7 @@ impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
 /// # Errors
 /// [`AttachRefusal`], by name.
 pub fn link_peers<T: ktir_superdsc::collective::Tp>(
-    cards: &PerRank<T, Arc<CardRuntime<T>>>,
+    cards: &PerRank<T, CardRuntime<T>>,
     window: RecvWindow<T>,
 ) -> Result<(), AttachRefusal<T>> {
     for (r, a) in cards.iter() {
@@ -1560,7 +1564,7 @@ impl std::error::Error for WindowsApart {}
 /// # Errors
 /// [`WindowsApart`], naming every rank's landing.
 pub fn refuse_if_windows_apart<T: ktir_superdsc::collective::Tp>(
-    cards: &PerRank<T, Arc<CardRuntime<T>>>,
+    cards: &PerRank<T, CardRuntime<T>>,
 ) -> Result<u64, WindowsApart> {
     let landings: Vec<Option<u64>> = cards
         .values()
