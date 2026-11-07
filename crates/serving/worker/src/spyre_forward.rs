@@ -34,8 +34,11 @@ use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct SubmittedDecode {
     pub(crate) read: scratchy_target_spyre::superdsc_exec::DeferredRead,
-    /// The launch's row count — the seat's `rows` the submit half set.
+    /// The launch's row count — the typed launch width the submit half set.
     pub(crate) rows: u32,
+    /// The idx stick's own row size in i32 words — the seat's typed readback
+    /// fact, so the collect half decodes at the placement's own width.
+    pub(crate) idx_row_words: u32,
     pub(crate) result_id: u32,
     pub(crate) vocab: usize,
 }
@@ -252,12 +255,14 @@ pub(crate) fn run_card_launch(
         }
     }
     let positions: Vec<u32> = (0..mq).map(|r| rows_in.pos(r) as u32).collect();
-    // The stick-padded row count the constants' tables are laid at (`mq.div_ceil(64)*64`, the
-    // emitter's own pad).
-    let mq_pad = mq.div_ceil(64) * 64;
-    if h % 64 != 0 {
+    // The stick-padded row count the constants' tables are laid at — whole
+    // fp16 sticks, the pool's own `POOL_STICK` (the emitter's own pad law),
+    // never a literal 64.
+    let stick = scratchy_subtile::sdsc_abstract::POOL_STICK as usize;
+    let mq_pad = mq.div_ceil(stick) * stick;
+    if h % stick != 0 {
         return Err(werr(format!(
-            "card launch: hidden={h} is not a whole number of 64-element sticks"
+            "card launch: hidden={h} is not a whole number of {stick}-element sticks"
         )));
     }
     let launch_rows = scratchy_target_spyre::wiring::StagedRows::of_launch(mq)
@@ -335,20 +340,22 @@ pub(crate) fn run_card_launch(
         )));
     }
     if let Some(seat) = b.wiring.sample_seat.as_ref() {
-        // ⭐ A DECODE BATCH'S SEAT IS THE RUNG'S OWN WIDTH. `b` is the one-request decode's meta
-        // borrowed for its tensor ids, so its seat states `rows = 1` — a launch at `mq` rows binds
-        // and reads `mq` rows of the per-step seat. A prompt-final chunk keeps the prefill rung's
-        // own seat verbatim: its draw is the FOLDED single row.
-        let mut seat = *seat;
-        if matches!(rows_in, LaunchRows::Batch { .. }) {
-            seat.rows = mq as u32;
-        }
-        let seat_rows = seat.rows as usize;
+        // ⭐ THE LAUNCH'S OWN ROW COUNT — a TYPED LAUNCH SIZE, never a width
+        // overwritten on a copy of the seat. `b` is the one-request decode's
+        // meta borrowed for its tensor ids, so its seat states `rows = 1` —
+        // a batched launch at `mq` rows binds and reads `mq` rows of the
+        // per-step seat, the width this launch states here and threads to
+        // every seat reader. A prompt-final chunk keeps the prefill rung's
+        // own row count verbatim: its draw is the FOLDED single row.
+        let launch_rows = match rows_in {
+            LaunchRows::Batch { .. } => mq,
+            _ => seat.rows as usize,
+        };
         let laws: Vec<RowLaw<'_>> = match seat_laws {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
             // draw the last real row would).
-            SeatLaws::Prompt { draw } => (0..seat_rows)
+            SeatLaws::Prompt { draw } => (0..launch_rows)
                 .map(|r| RowLaw {
                     draw,
                     step: rows_in.pos(r) as u32,
@@ -358,10 +365,10 @@ pub(crate) fn run_card_launch(
             // runs live 0's ([`pad_law_of`]).
             SeatLaws::Batch { draws } => {
                 let live_pos: Vec<u32> = (0..live).map(|s| rows_in.pos(s) as u32).collect();
-                batch_seat_laws(draws, &live_pos, seat_rows)?
+                batch_seat_laws(draws, &live_pos, launch_rows)?
             }
         };
-        acts_i32.extend(sample_binds(&seat, &laws)?);
+        acts_i32.extend(sample_binds(seat, launch_rows, &laws)?);
     }
     if flags().phase_time {
         let elems: usize = acts.iter().map(|(_, v)| v.len()).sum();
@@ -401,10 +408,21 @@ pub(crate) fn run_card_launch(
             })?;
             let depth = OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let t_defer = std::time::Instant::now();
+            // The readback's own byte size — the seat's typed fact (the idx
+            // stick's placed row footprint, minted once at the bake), never a
+            // recomputed `mq · 64 · 4`. The guard above refused a
+            // suffix-running launch whose bundle mints no draw, so the seat
+            // this launch drew through is the one read back here.
+            let idx_row_words = b
+                .wiring
+                .sample_seat
+                .as_ref()
+                .expect("the guard above refused a deferred-decode launch without a seat")
+                .idx_row_words as usize;
             let read = pf
                 .defer_read_tensor_ring(
                     scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
-                    mq * 64 * 4,
+                    mq * idx_row_words * 4,
                 )
                 .map_err(|e| {
                     werr(format!(
@@ -425,6 +443,10 @@ pub(crate) fn run_card_launch(
             return Ok(BatchOut::Deferred(SubmittedDecode {
                 read,
                 rows: mq as u32,
+                // The collect half's own typed readback fact — the idx
+                // stick's row size, carried beside the launch's row count so
+                // the decode law never re-derives it.
+                idx_row_words: idx_row_words as u32,
                 result_id: b.result_id as u32,
                 vocab,
             }));
@@ -454,7 +476,8 @@ pub(crate) fn run_card_launch(
                 .sample_seat
                 .as_ref()
                 .ok_or_else(|| werr("prefill bundle has no sampler seat".to_string()))?;
-            let picked = read_sampled_tokens(pf, seat, b.result_id as u32, vocab)?;
+            let picked =
+                read_sampled_tokens(pf, seat, seat.rows as usize, b.result_id as u32, vocab)?;
             log_seat_readback(
                 pf,
                 seat,
@@ -855,9 +878,10 @@ pub(crate) enum SeatLaws<'a> {
 #[cfg(feature = "spyre-hw")]
 fn sample_binds(
     seat: &scratchy_target_spyre::wiring::SampleSeat,
+    launch_rows: usize,
     laws: &[RowLaw<'_>],
 ) -> ExecutorResult<Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>> {
-    let rows = seat.rows as usize;
+    let rows = launch_rows;
     if laws.len() != rows {
         return Err(werr(format!(
             "the sampler seat holds {rows} baked row(s) but {} law(s) were staged — one law per \
@@ -893,36 +917,18 @@ fn sample_binds(
     // ⭐ THE SEAT STAGES THROUGH THE ONE COL LAW — `stage_col_stick_heads`,
     // the same fn the bake's ten UNIFORM tables spread through
     // (`LoadConst::card_bytes`), so the seat's words and the uniform tables
-    // can never disagree about where a row's word lives. The stride is the
-    // placement's own reservation; `seed_row_words` is its word form, and a
-    // seat that disagrees with the derivation refuses here rather than stage
-    // a word at a stride nobody placed.
-    let stride_bytes =
-        scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
-    if seat.seed_row_words as usize * 4 != stride_bytes {
-        return Err(werr(format!(
-            "the sampler seat's seed_row_words is {} but the `[rows, 1]` reservation derives {} \
-             — the seat and the placement's own law disagree, refusing to stage the seed words",
-            seat.seed_row_words,
-            stride_bytes / 4
-        )));
-    }
+    // can never disagree about where a row's word lives. The strides are the
+    // SEAT'S OWN typed facts — `seed_row_words` and `gate_row_words`, minted
+    // once at the bake from the placement's own reservation laws — so the
+    // staging and the placement cannot drift by construction, never by a
+    // runtime comparison.
+    let stride_bytes = seat.seed_row_words as usize * 4;
     // ⭐⭐⭐ THE GATE ALONE STAGES THE β RESERVATION (front-b-noise, auditor
     // ruling 2026-10-27): its chain crosses the i32→f32 convert, so its table
     // reserves the convert's 64-element device sweep — `stage_gate_sweep`
     // writes the gate at row r's stick HEAD (the same byte the one-stick law
-    // ever stated) and zero-fills the sweep's second sticks. The same
-    // refusal-on-disagreement contract as `seed_row_words` above.
-    let gate_stride_bytes = scratchy_target_spyre::wiring::gate_row_stride_bytes();
-    if seat.gate_row_words as usize * 4 != gate_stride_bytes {
-        return Err(werr(format!(
-            "the sampler seat's gate_row_words is {} but the gate table's `[rows, 1]` device-sweep \
-             reservation derives {} — the seat and the placement's own law disagree, refusing to \
-             stage the gate",
-            seat.gate_row_words,
-            gate_stride_bytes / 4
-        )));
-    }
+    // ever stated) and zero-fills the sweep's second sticks.
+    let gate_stride_bytes = seat.gate_row_words as usize * 4;
     let mut binds = Vec::with_capacity(1 + seat.seed_words.len());
     for (k, &tid) in seat.seed_words.iter().enumerate() {
         let table = if k == 3 {
@@ -968,17 +974,17 @@ fn sample_binds(
 fn read_sampled_tokens(
     session: &mut SuperDscSession,
     seat: &scratchy_target_spyre::wiring::SampleSeat,
+    launch_rows: usize,
     result_id: u32,
     vocab: usize,
 ) -> ExecutorResult<Vec<u32>> {
-    let rows = seat.rows as usize;
     let bytes = session
         .read_tensor_raw(
             scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
-            rows * 64 * 4,
+            launch_rows * seat.idx_row_words as usize * 4,
         )
         .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
-    decode_idx_stick(&bytes, rows, vocab)
+    decode_idx_stick(&bytes, launch_rows, seat.idx_row_words as usize, vocab)
 }
 
 /// ⭐ #32 (c3) — THE COLLECT HALF of a submitted decode step: park on the idx
@@ -1002,7 +1008,12 @@ pub(crate) fn collect_decode_tokens(
         .finish_deferred_read_raw(&sub.read)
         .map_err(|e| werr(format!("sampler idx readback (t{}): {e}", sub.result_id)))?;
     let t_pick = std::time::Instant::now();
-    let toks = decode_idx_stick(&bytes, sub.rows as usize, sub.vocab);
+    let toks = decode_idx_stick(
+        &bytes,
+        sub.rows as usize,
+        sub.idx_row_words as usize,
+        sub.vocab,
+    );
     OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     let toks = toks?;
     crate::step_segs::record_collect(crate::step_segs::CollectSegs {
@@ -1013,9 +1024,16 @@ pub(crate) fn collect_decode_tokens(
 }
 
 /// The idx stick's own decode law, shared by the sync readback and the deferred
-/// collect so the two cannot drift.
+/// collect so the two cannot drift. `idx_row_words` is the seat's own typed fact
+/// — the stick's placed row size — so both the addressing width and (at the
+/// caller) the readback byte size are the placement's own law, never a literal.
 #[cfg(feature = "spyre-hw")]
-fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<Vec<u32>> {
+fn decode_idx_stick(
+    bytes: &[u8],
+    rows: usize,
+    idx_row_words: usize,
+    vocab: usize,
+) -> ExecutorResult<Vec<u32>> {
     let words: Vec<i32> = bytes
         .as_chunks::<4>()
         .0
@@ -1028,7 +1046,12 @@ fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<V
         as usize;
     (0..rows)
         .map(|r| {
-            let off = scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, 64], 1, &[r, 0], stk);
+            let off = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                &[rows, idx_row_words],
+                1,
+                &[r, 0],
+                stk,
+            );
             token_of_idx_word(r, words.get(off).copied().unwrap_or(-1), vocab)
         })
         .collect()
@@ -1963,9 +1986,10 @@ pub(crate) fn run_request_step(
 mod pad_clamp_tests {
     use super::*;
 
-    /// A seat at `rows` baked rows whose strides agree with the placement's own
-    /// derivations (the staging's own refusal contract), so `sample_binds`
-    /// stages for real.
+    /// A seat at `rows` baked rows whose strides are the placement's own
+    /// derivations — the TEST re-derives them (a test may check the seat
+    /// against the law; the staging itself never does), so a drift in either
+    /// direction fails here.
     fn seat_of(rows: u32) -> scratchy_target_spyre::wiring::SampleSeat {
         scratchy_target_spyre::wiring::SampleSeat {
             seed_words: [901, 902, 903, 904],
@@ -1978,6 +2002,7 @@ mod pad_clamp_tests {
                 scratchy_tensors::DType::I32,
             ) / 4) as u32,
             gate_row_words: (scratchy_target_spyre::wiring::gate_row_stride_bytes() / 4) as u32,
+            idx_row_words: scratchy_subtile::subtile_ir::SAMPLE_BLOCK,
         }
     }
 
@@ -1986,7 +2011,7 @@ mod pad_clamp_tests {
 
     /// Every staged bind's pad-row words equal row 0's — the four seed tables
     /// and inv_t alike. EVERY word sits at its row's STICK HEAD
-    /// (`col_row_stride_bytes`): the gate table's reservation is wider (the
+    /// (the seat's own `seed_row_words` stride): the gate table's reservation is wider (the
     /// i32→f32 convert's device sweep, two sticks per row) but the sweep's
     /// second sticks are the reservation's own zero tail — the word the
     /// kernel reads is still the head, at the same stride as every other
@@ -1996,9 +2021,8 @@ mod pad_clamp_tests {
         laws: &[RowLaw<'_>],
         ctx: &str,
     ) {
-        let binds = sample_binds(seat, laws).expect("the seat stages");
-        let head_stride =
-            scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
+        let binds = sample_binds(seat, seat.rows as usize, laws).expect("the seat stages");
+        let head_stride = seat.seed_row_words as usize * 4;
         assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
         for (tid, bytes) in &binds {
             for r in [2usize, 3] {

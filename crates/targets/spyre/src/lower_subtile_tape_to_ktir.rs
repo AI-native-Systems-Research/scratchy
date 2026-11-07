@@ -2202,6 +2202,25 @@ pub fn sample_seat_of_ir<F: RopeForm>(
             // layout's `nbytes` reserves and the door sweeps, stated here on the
             // seat so the worker's staging and the placement cannot drift.
             let gate_row_words = DeviceWidth::for_convert(1).get();
+            // ⭐ THE IDX STICK'S OWN ROW SIZE — the readback's typed byte law.
+            // The mint re-points the rung's result at the Sample node's own
+            // output, the `[rows, SAMPLE_BLOCK]` SenUint32 idx stick, so the
+            // seat states that placement's own row footprint: the worker's
+            // readback size and its per-row addressing both read this one
+            // fact, never a recomputed `64 · 4`. At SenUint32 a width that is
+            // whole sticks reserves exactly its own words per row (one u32
+            // word per element) — the assert states that law at the mint, so
+            // a footprint that ever disagreed with the placed width is a
+            // build error, never a runtime comparison.
+            let idx_cols = ir.tensors[node.output.tensor.index()].cols;
+            let idx_row_words = (row_footprint_bytes(idx_cols, Df::SenUint32) / 4) as u32;
+            assert_eq!(
+                idx_row_words,
+                idx_cols,
+                "the idx stick t{} is {idx_cols} wide but its SenUint32 row footprint derives \
+                 {idx_row_words} words — the u32 stick's row reservation is its own placed width",
+                node.output.tensor.index()
+            );
             Ok(Some(crate::wiring::SampleSeat {
                 seed_words,
                 invt: node.inputs[5].tensor.index() as u32,
@@ -2214,6 +2233,7 @@ pub fn sample_seat_of_ir<F: RopeForm>(
                 pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
                 seed_row_words,
                 gate_row_words,
+                idx_row_words,
             }))
         }
     }

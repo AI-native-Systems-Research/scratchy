@@ -1518,6 +1518,16 @@ pub struct SampleSeat {
     pub vocab: u32,
     /// `sample_pad_vocab(vocab)` — the width the f32 tables share.
     pub pad_vocab: u32,
+    /// ⭐ THE IDX STICK'S OWN ROW SIZE in i32 words — the readback's typed
+    /// byte law. The mint re-points the rung's result at the draw's idx
+    /// stick, a `[rows, SAMPLE_BLOCK]` SenUint32 placement, and this is that
+    /// placement's own row footprint (`row_footprint_bytes` at the placed
+    /// width, one u32 word per element): the worker's readback reads
+    /// `rows · idx_row_words · 4` bytes of it and addresses row r's lane 0
+    /// at the stick's own placed width — never a recomputed `64 · 4`. Minted
+    /// once at the bake ([`sample_seat_of_ir`]), exactly `seed_row_words`'s
+    /// own contract.
+    pub idx_row_words: u32,
     /// Every seed word table's ROW STRIDE in i32 words on the CARD — the
     /// placement's own reservation law for a `[rows, 1]` SenUint32 table
     /// (`row_footprint_bytes(1, SenUint32) / 4`, a whole 32-element u32
@@ -1536,9 +1546,8 @@ pub struct SampleSeat {
     /// law ever stated, because the convert's `[rows, 64]` addressing is
     /// stick-blocked (row r's first stick is flat stick `r`) — and the
     /// widened words past the head are the sweep's own padding: converted,
-    /// never read. Staged by [`stage_gate_sweep`]; the worker checks it
-    /// against [`gate_row_stride_bytes`] the same way `seed_row_words` is
-    /// checked against [`col_row_stride_bytes`].
+    /// never read. Staged by [`stage_gate_sweep`] — the worker stages at
+    /// this stride directly, the seat's own fact.
     pub gate_row_words: u32,
 }
 
