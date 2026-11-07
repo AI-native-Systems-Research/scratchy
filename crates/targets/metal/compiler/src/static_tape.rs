@@ -66,6 +66,9 @@ pub struct CommandPool {
     /// Each weight family a dense GEMM reads, with the DSL weights the GEMM's ops read (their own
     /// operands', `Recording::read`): what its slot's field must hold.
     gemm_weights: BTreeMap<u32, BTreeSet<u32>>,
+    /// Each weight family an MLX-affine matmul reads, with the DSL weights the matmul's op reads:
+    /// what its slot's field must hold.
+    affine_weights: BTreeMap<u32, BTreeSet<u32>>,
 }
 
 /// ⭐ A MODEL'S ARENA OPERANDS, EACH TYPED ONCE: every `(slot, extents)` its commands bind an arena
@@ -209,13 +212,22 @@ type AffineReads =
     std::collections::BTreeMap<u32, std::collections::BTreeSet<(u32, u32, u32, u32)>>;
 
 impl CommandPool {
-    /// Add the MLX-affine matmuls of `steps` to the families' reads.
-    fn read_affine(&mut self, steps: &MetalStepTape) -> Result<(), BakeDefect> {
+    /// Add the MLX-affine matmuls of `steps` to the families' reads, each with the linears its
+    /// row's op reads (`operands`).
+    fn read_affine(
+        &mut self,
+        steps: &MetalStepTape,
+        operands: &StepOperands,
+    ) -> Result<(), BakeDefect> {
         let reads = scratchy_target_metal::tape::lowering::affine_matmul_reads(steps)
             .map_err(|e| BakeDefect(format!("an affine matmul's weight: {e}")))?;
-        for (ix, g) in reads {
+        for (half, row, ix, g) in reads {
             let read = (g.n.get(), g.k.get(), g.bits.get(), g.group_size.get());
             self.affine_reads.entry(ix.0).or_default().insert(read);
+            let linears = (operands.weights(half, row).iter())
+                .filter(|(kind, _)| *kind == scratchy_subtile::handoff::WeightKind::Linear)
+                .map(|&(_, id)| id);
+            self.affine_weights.entry(ix.0).or_default().extend(linears);
         }
         Ok(())
     }
@@ -282,6 +294,7 @@ impl CommandPool {
             typed,
             &self.affine_reads,
             &self.gemm_weights,
+            &self.affine_weights,
             weight_markers,
         )?;
         let aliases = crate::const_tokens::alias_preamble();
@@ -482,6 +495,9 @@ impl CommandPool {
 /// kernels, named their symbols and compiled their pipelines from the numbers it minted, so each
 /// slot's numbers are tied to the bake's in the build:
 ///
+/// - the weight it reads by what its field holds: its record's weight, `__AFFINE<slot>`, is
+///   `affine_slot::<slot, W>()`, `W` the marker of a DSL weight its matmuls' ops read (and
+///   `holds::<slot, W2>()` each other one), E0277 where the slot's field holds another weight;
 /// - its codes by a bound: `affine_codes_agree::<slot, B, G>()`, `B` and `G` the markers of the
 ///   bits and group the bake minted, is E0271 where they are not the handle's;
 /// - an int4-only or matrix-unit kernel's codes by its bound (`int4_codes`, `nax_group`: E0277);
@@ -515,6 +531,39 @@ struct AffineSlotRead {
     group: u32,
     int4: bool,
     nax: bool,
+    /// The markers of the DSL weights its matmuls' ops read, the first apart ([`held_markers`]).
+    weights: (proc_macro2::Ident, Vec<proc_macro2::Ident>),
+}
+
+/// The markers (`__weights::<Marker>`) of the DSL weights typed family `ix`'s `what` ops read
+/// (`ids`), the first apart: what its slot's field must hold. A family no op of which names a
+/// weight, or one naming a weight no typed field holds, refuses the bake.
+fn held_markers(
+    ix: u32,
+    ids: Option<&BTreeSet<u32>>,
+    weight_markers: &BTreeMap<u32, String>,
+    what: &str,
+) -> Result<(proc_macro2::Ident, Vec<proc_macro2::Ident>), BakeDefect> {
+    let ids = ids.filter(|ids| !ids.is_empty()).ok_or_else(|| {
+        BakeDefect(format!(
+            "typed weight family {ix} is read by {what} whose ops read no linear"
+        ))
+    })?;
+    let mut markers = (ids.iter())
+        .map(|id| {
+            let marker = weight_markers.get(id).ok_or_else(|| {
+                BakeDefect(format!(
+                    "typed weight family {ix}'s {what} read DSL weight {id}, which no typed field \
+                     holds"
+                ))
+            })?;
+            Ok(quote::format_ident!("{marker}"))
+        })
+        .collect::<Result<Vec<_>, BakeDefect>>()?
+        .into_iter();
+    let first = (markers.next())
+        .ok_or_else(|| BakeDefect(format!("typed weight family {ix} has no {what} weight")))?;
+    Ok((first, markers.collect()))
 }
 
 impl TypedGemms {
@@ -525,6 +574,7 @@ impl TypedGemms {
         typed: &std::collections::HashSet<SourceIx>,
         affine_reads: &AffineReads,
         gemm_weights: &BTreeMap<u32, BTreeSet<u32>>,
+        affine_weights: &BTreeMap<u32, BTreeSet<u32>>,
         weight_markers: &BTreeMap<u32, String>,
     ) -> Result<Self, BakeDefect> {
         use scratchy_target_metal::tape::kernel_constants::{
@@ -541,27 +591,8 @@ impl TypedGemms {
         // refuses the bake.
         let gemm_weights = (read.iter())
             .map(|&ix| {
-                let ids = gemm_weights.get(&ix).filter(|ids| !ids.is_empty()).ok_or_else(|| {
-                    BakeDefect(format!(
-                        "typed weight family {ix} is read by GEMMs whose ops read no linear weight"
-                    ))
-                })?;
-                let mut markers = (ids.iter())
-                    .map(|id| {
-                        let marker = weight_markers.get(id).ok_or_else(|| {
-                            BakeDefect(format!(
-                                "typed weight family {ix}'s GEMM reads DSL weight {id}, which no \
-                                 typed field holds"
-                            ))
-                        })?;
-                        Ok(quote::format_ident!("{marker}"))
-                    })
-                    .collect::<Result<Vec<_>, BakeDefect>>()?
-                    .into_iter();
-                let first = markers.next().ok_or_else(|| {
-                    BakeDefect(format!("typed weight family {ix} has no GEMM weight"))
-                })?;
-                Ok((ix, (first, markers.collect())))
+                let held = held_markers(ix, gemm_weights.get(&ix), weight_markers, "GEMMs")?;
+                Ok((ix, held))
             })
             .collect::<Result<_, BakeDefect>>()?;
         let gemm_dims = (parts.gemm_entries.iter().filter(typed_weight))
@@ -592,6 +623,12 @@ impl TypedGemms {
                 group,
                 int4: false,
                 nax: false,
+                weights: held_markers(
+                    ix,
+                    affine_weights.get(&ix),
+                    weight_markers,
+                    "affine matmuls",
+                )?,
             };
             affine.insert(ix, read);
         }
@@ -773,8 +810,13 @@ impl TypedGemms {
             let nax = r
                 .nax
                 .then(|| quote!(const _: () = #tt::nax_group::<super::#s>();));
+            // The slot's weight, as its matmuls' ops' DSL weights read it (`affine_slot`).
+            let (first, rest) = &r.weights;
             quote! {
-                const #c: #tt::AffineSlotWeight = <super::#s as #tt::AffineSlot>::WEIGHT;
+                const #c: #tt::AffineSlotWeight = {
+                    #(#tt::holds::<super::#s, super::__weights::#rest>();)*
+                    #tt::affine_slot::<super::#s, super::__weights::#first>()
+                };
                 const _: () = #tt::affine_dims_agree::<super::#s, #n, #k>();
                 const _: () = #tt::affine_codes_agree::<super::#s, #w::#b, #w::#g>();
                 #int4
@@ -1143,9 +1185,9 @@ pub fn bake_bucket_tapes(
     input: &BucketLowerInput<'_>,
     pool: &mut CommandPool,
 ) -> Result<TokenStream, BakeDefect> {
-    pool.read_affine(input.steps)?;
+    pool.read_affine(input.steps, input.operands)?;
     if let Some(wide) = &input.wide_band {
-        pool.read_affine(wide.steps)?;
+        pool.read_affine(wide.steps, wide.operands)?;
     }
     let classes = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
     // The TurboQuant decode's head groups the global class admits; a model without attention
