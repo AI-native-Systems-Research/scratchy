@@ -1372,6 +1372,18 @@ pub enum Scale {
     RedStick,
 }
 impl Scale {
+    /// The dim is present in the output (`Active`), not reduced away. The one
+    /// spelling of the test the emitters make per operand dim — every reducer
+    /// asks the same question, so it is a method on the sealed enum, exhaustive
+    /// (a new variant is a compile error here, not a silently-wrong `matches!`
+    /// at a site that forgot to grow).
+    pub const fn is_active(self) -> bool {
+        match self {
+            Scale::Active => true,
+            Scale::RedNonStick | Scale::RedStick => false,
+        }
+    }
+
     /// The JSON `scale_` integer.
     pub fn to_i64(self) -> i64 {
         match self {

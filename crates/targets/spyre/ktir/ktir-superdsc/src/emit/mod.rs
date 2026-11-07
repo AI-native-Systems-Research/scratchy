@@ -3011,7 +3011,7 @@ fn own_extent_at(
         .scale
         .get(i)
         .copied()
-        .is_none_or(|s| matches!(s, Scale::Active));
+        .is_none_or(Scale::is_active);
     if collapsed && v.device_extent.get(i).copied().flatten().is_none() {
         1
     } else {
@@ -3121,7 +3121,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
             && v.layout
                 .iter()
                 .position(|&d| d == tiled_dim)
-                .is_some_and(|si| v.scale.get(si).is_none_or(|s| matches!(s, Scale::Active)));
+                .is_some_and(|si| v.scale.get(si).is_none_or(Scale::is_active));
         if !tiled {
             continue;
         }
@@ -3297,7 +3297,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         let Some(si) = v.layout.iter().position(|&d| d == tiled_dim) else {
             continue; // does not range the tiled dim (a matmul's A): re-read is correct
         };
-        if !v.scale.get(si).is_none_or(|s| matches!(s, Scale::Active)) {
+        if !v.scale.get(si).is_none_or(Scale::is_active) {
             continue; // collapsed along the tiled dim: the broadcast exemption above
         }
         let phys = v
@@ -4104,7 +4104,7 @@ pub fn emit_sdsc(
         // the whole-tensor `[nqh,hd]` read, a false positive). Only an access covering the full footprint
         // speaks for the tensor.
         if let Some(l) = layout {
-            let active = v.offset_elems == 0 && v.scale.iter().all(|s| matches!(s, Scale::Active));
+            let active = v.offset_elems == 0 && v.scale.iter().all(Scale::is_active);
             // The tensor's FULL footprint: a real `t{id}` from its placement, a synth from the synth
             // registry. An op whose access is smaller than this is a partial (block/col-chunk) write and
             // does NOT speak for the canonical layout (else a `[1,8192]` logits-chunk write conflicts with
