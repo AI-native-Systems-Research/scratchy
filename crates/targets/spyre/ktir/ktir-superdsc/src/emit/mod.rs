@@ -646,6 +646,10 @@ pub struct EwOperand<'a> {
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
     col_window: Option<crate::addr::ColWindow>,
+    /// The [`crate::addr::RowWindow`] `col_offset` came from — set only by [`In::row_window`],
+    /// so a row band of a taller parent carries the parent's row count by type, never by
+    /// re-deriving it from the offset.
+    row_window: Option<crate::addr::RowWindow>,
 }
 impl<'a> EwOperand<'a> {
     pub(crate) fn scale(&self) -> [Scale; 3] {
@@ -709,6 +713,11 @@ impl<'a> EwOperand<'a> {
     /// Whether this operand is a [`crate::addr::ColWindow`] whose `[rows, ·]` view is stick-major.
     pub(crate) fn is_stick_major_window_for(&self, rows: u32) -> bool {
         self.col_window.is_some_and(|w| w.is_stick_major_for(rows))
+    }
+    /// The row band of a taller parent, when `col_offset` came from [`In::row_window`] — the
+    /// parent's row count is carried by the window, never re-derived from the offset.
+    pub(crate) fn row_window(&self) -> Option<crate::addr::RowWindow> {
+        self.row_window
     }
     /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand.
     pub(crate) fn declared(&self) -> StickLayout {
@@ -4723,6 +4732,7 @@ pub struct In<'a, K: KindTag> {
     y_order: SprayOrder,
     col_offset: u32,
     col_window: Option<crate::addr::ColWindow>,
+    row_window: Option<crate::addr::RowWindow>,
 }
 #[allow(dead_code)] // ctors are used as the pointwise builders migrate to handle-flow (rmsnorm first)
 impl<'a, K: KindTag> In<'a, K> {
@@ -4735,6 +4745,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
+            row_window: None,
         }
     }
     pub fn scalar(h: &'a Stk<K>) -> Self {
@@ -4746,6 +4757,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
+            row_window: None,
         }
     }
     pub fn col(h: &'a Stk<K>) -> Self {
@@ -4757,6 +4769,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
+            row_window: None,
         }
     }
     pub fn sliced(h: &'a Stk<K>, col_offset: crate::addr::DevOff) -> Self {
@@ -4768,6 +4781,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
+            row_window: None,
         }
     }
     /// [`sliced`](Self::sliced) at a [`crate::addr::ColWindow`] — a whole-stick column window of a
@@ -4783,6 +4797,25 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: w.dev().into_raw_elems(),
             col_window: Some(w),
+            row_window: None,
+        }
+    }
+    /// [`sliced`](Self::sliced) at a [`crate::addr::RowWindow`] — a row band of a TALLER parent
+    /// (`[rows, cols]` of a `[parent_rows, cols]` value). The same offset `sliced` would carry;
+    /// what it adds is the FACT that the rows the op reads are a band, so the door presents the
+    /// op rank-2 at the band's own row count while the walk of the band on the device still
+    /// divides the PARENT's rows (`device_extent` carries `parent_rows` — the window is a
+    /// stick-major tensor of its own only when the whole parent is).
+    pub fn row_window(h: &'a Stk<K>, w: crate::addr::RowWindow) -> Self {
+        In {
+            h,
+            mb_broadcast: false,
+            out_broadcast: false,
+            y_broadcast: 0,
+            y_order: SprayOrder::Outer,
+            col_offset: w.dev().into_raw_elems(),
+            col_window: None,
+            row_window: Some(w),
         }
     }
     /// [`col`] (per-row scalar, out-broadcast over the stick) PLUS a base `col_offset` — the per-head-block
@@ -4796,6 +4829,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
+            row_window: None,
         }
     }
     /// Broadcast a `[1,cols]` const/gain over rows (the rmsnorm gamma / a mb-broadcast operand).
@@ -4808,6 +4842,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: 0,
             col_window: None,
+            row_window: None,
         }
     }
     /// [`mb`] PLUS a base `col_offset` — the per-block prefix-mask slice (`pmask[.., b*stick..]`,
@@ -4821,6 +4856,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: SprayOrder::Outer,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
+            row_window: None,
         }
     }
     /// ⭐⭐⭐ THE ROW-SPLIT (Y) BROADCAST — a `[mb, out]` source sprayed down the op's LEADING
@@ -4849,6 +4885,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: spray.order,
             col_offset: 0,
             col_window: None,
+            row_window: None,
         }
     }
     /// [`y_broadcast`](Self::y_broadcast) PLUS a base `col_offset` — the spray's `[mb, out]` source
@@ -4874,6 +4911,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_order: self.y_order,
             col_offset: self.col_offset,
             col_window: self.col_window,
+            row_window: self.row_window,
         }
     }
 }
@@ -4947,7 +4985,7 @@ pub fn pw2<A: KindTag, B: KindTag, O: KindTag>(
 /// `primaryDsInfo_` entries (input vs output stick) a convert needs — the typed replacement for the
 /// old `_fp32`/`_fp8` name-suffix sniffing. A non-convert op is `(Fp16, Fp16)` (unreached — only
 /// [`convert_opspec`] calls this, and only for the convert OpFuncs).
-fn convert_dtypes(op: OpFunc) -> (Df, Df) {
+pub(crate) fn convert_dtypes(op: OpFunc) -> (Df, Df) {
     match op {
         OpFunc::Dl16ToFp32 => (Df::Fp16, Df::Fp32),
         OpFunc::Fp32ToDl16 => (Df::Fp32, Df::Fp16),
@@ -4979,6 +5017,15 @@ fn convert_dtypes(op: OpFunc) -> (Df, Df) {
 /// A dtype-convert's opspec: both operands keep their stick on `out`, addressed RowBlocked
 /// at rows>1 — the rank-3 `[mb,out,1]` staging every residual-style consumer reads.
 ///
+/// `band_multistick` states that at least one side is a row band of a taller parent whose
+/// width spans MORE THAN ONE of its own sticks — the [`assemble_convert_band`] form. Such a
+/// band's bytes are a stick-major tensor of the PARENT's, so the seam laws that keyed on
+/// `rows > 1` key on the band too: a non-narrowing convert presents rank-2 stick-major even
+/// at `rows == 1` (a rank-3 flat walk of a multi-stick band mis-strides the parent's column
+/// planes), and a narrowing one — which keeps rank-3 — extends its RowBlocked arrangement and
+/// its `mb` device extent (the parent's row count, set by [`assemble_convert_band`]) to the
+/// band, so the rank-3 walk strides the parent's planes at the parent's pitch.
+///
 /// (The FLAT per-operand arrangement — BOTH operands stick `mb`, the DDL-equality form the
 /// deleted per-expert index-table chain needed — is gone with that chain; the probe record
 /// for its two DDL laws survives in this file's history.)
@@ -4988,6 +5035,7 @@ fn convert_opspec(
     cols: u32,
     in_name: &str,
     o_name: &str,
+    band_multistick: bool,
 ) -> Result<OpSpec, String> {
     let (in_df, out_df) = convert_dtypes(op);
     // A dtype-CONVERT touches BOTH its input and output dataspaces per core, so the stick-axis split
@@ -5050,14 +5098,14 @@ fn convert_opspec(
     // consecutive u32 entries — the arrangement the index's own declaration states, not a
     // residual's.
     let is_narrowing_convert = is_fp32_convert || matches!(op, OpFunc::Fp32ToInt32);
-    let stickmajor = rows > 1 && !is_narrowing_convert;
+    let stickmajor = (rows > 1 || band_multistick) && !is_narrowing_convert;
     let time_tile = plan
         .time_tile_for_lx(|p, opt| pointwise_lx_resident(p, 2, opt, Df::Fp16), "out")
         .map_err(|e| e.0)?;
     // The fp32 convert (rank-3) must ADDRESS RowBlocked so it reads/writes the RowBlocked residual byte-for-
     // byte (a rank-3 flat read row-mixes). Force the per-tensor ElementArrangement on BOTH operands (the fp16
     // side reads RowBlocked x; the fp32 side writes RowBlocked x32). Only for multi-row fp32 converts.
-    let rb = is_fp32_convert && rows > 1;
+    let rb = is_fp32_convert && (rows > 1 || band_multistick);
     let mk = |is_input: bool, name: &str, role: Role, df: Df| -> Result<AnyTensorArg, String> {
         // Both operands keep their stick on `out`; the pair addresses RowBlocked at rows>1
         // for the fp32 residual seam (`rb` below).
@@ -5151,8 +5199,15 @@ pub fn assemble_convert(
         layout,
     )
     .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
-    let op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
-        .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
+    let op = convert_opspec(
+        op_func_from_str(op_func),
+        rows,
+        cols,
+        in_.name(),
+        o.name(),
+        false,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"))
@@ -5206,14 +5261,108 @@ pub fn assemble_convert_col(
         layout,
     )
     .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
-    let mut op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
-        .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
+    let mut op = convert_opspec(
+        op_func_from_str(op_func),
+        rows,
+        cols,
+        in_.name(),
+        o.name(),
+        false,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
     for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
         arg.set_offset_elems(off.into_raw_elems());
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"))
+}
+
+/// Assemble a dtype-convert op over a ROW BAND of one side (see [`convert_opspec`]): `in_w`/`o_w`
+/// carry the band's corner and parent height when that side is a window of a taller tensor,
+/// `None` when it is a whole value at the op's own `[rows, cols]`. This is the gelu-longhand
+/// split's corner — the chain's `dl16tofp32` reads a `[rows, cols]` band of the 64/96-row
+/// parameter while its output is the whole minted piece, and the piece's `fp32todl16` reverses
+/// the roles — so ONE door serves both orientations: each side states its own window, and the
+/// door addresses each at its own corner. A band whose width is not the op's own `cols` is a
+/// build failure here (the convert's read IS the band; a wider or narrower one is a different
+/// computation), and a band spanning more than one stick declares its PARENT's row count as the
+/// `mb` device extent — the band's bytes are a stick-major tensor of the parent's, so without
+/// the declaration the walk strides the parent's column planes at the band's own fewer rows.
+/// Emit-time panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the
+/// other `assemble_*`.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_convert_band(
+    op_name: &str,
+    op_func: &str,
+    rows: u32,
+    cols: u32,
+    in_: &Stk<RowBlockedTag>,
+    in_w: Option<crate::addr::RowWindow>,
+    o: &Stk<RowBlockedTag>,
+    o_w: Option<crate::addr::RowWindow>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    // ⭐ MINTED per side, each at its own corner — the #731 law: the band side's `[rows, cols]`
+    // window at its corner must fit the PARENT's full-buffer handle (`rb_df(v_rows, v_cols, df)`
+    // at STORAGE), the whole side's whole `[rows, cols]` at 0 must fit the piece's own. A caller
+    // that shrinks either side without re-deriving the other is a build failure.
+    for (label, h, w) in [("operand", in_, in_w), ("output", o, o_w)] {
+        let off_elems = match w {
+            Some(w) => {
+                assert!(
+                    w.width() == cols,
+                    "assemble_convert_band {op_name}: {label} '{}' is a row band {} elements \
+                     wide of a {}-row parent, but the op converts a width of {cols} — the \
+                     convert's read IS the band, so a band of any other width is a different \
+                     computation",
+                    h.name(),
+                    w.width(),
+                    w.parent_rows()
+                );
+                w.dev().into_raw_elems() as u64
+            }
+            None => 0,
+        };
+        mint_full_window(
+            &format!("{op_name}: {label} '{}'", h.name()),
+            h,
+            off_elems,
+            rows,
+            cols,
+            layout,
+        )
+        .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
+    }
+    // The band's bytes stride at the PARENT's row count when the window crosses a column plane
+    // (more than one stick wide); a one-stick band never crosses one and needs no declaration —
+    // the card-proven rotate-half form, byte for byte. One predicate (`spans_one_stick`), read
+    // where each side needs it.
+    let band_multistick = [in_w, o_w]
+        .into_iter()
+        .flatten()
+        .any(|w| !w.spans_one_stick());
+    let mut op = convert_opspec(
+        op_func_from_str(op_func),
+        rows,
+        cols,
+        in_.name(),
+        o.name(),
+        band_multistick,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
+    for (arg, w) in op.args.iter_mut().zip([in_w, o_w]) {
+        if let Some(w) = w {
+            arg.set_offset_elems(w.dev().into_raw_elems());
+            if !w.spans_one_stick() {
+                arg.set_device_extent("mb", w.parent_rows());
+            }
+        }
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"))
 }
 
 /// Assemble a complete SuperDSC for ONE shape-preserving ELEMENTWISE op over a
@@ -7813,7 +7962,7 @@ mod fp32toint32_convert_law {
     /// The convert at the MoE router's own geometry: the top-k output's `[m, W]` rows over the
     /// router's padded expert width (tiny26: m=2, E=8, W=64).
     fn op(rows: u32) -> OpSpec {
-        convert_opspec(OpFunc::Fp32ToInt32, rows, 64, "rt_topk", "moe_idx")
+        convert_opspec(OpFunc::Fp32ToInt32, rows, 64, "rt_topk", "moe_idx", false)
             .expect("the convert emits")
     }
 
@@ -7906,7 +8055,7 @@ mod fp32toint32_convert_law {
     /// still emits stick-on-`out` and classifies stick-major at rows>1.
     #[test]
     fn the_staged_default_is_unchanged() {
-        let o = convert_opspec(OpFunc::Fp32ToInt32, 128, 128, "a", "b").expect("emits");
+        let o = convert_opspec(OpFunc::Fp32ToInt32, 128, 128, "a", "b", false).expect("emits");
         let out = out_arg(&o);
         assert_eq!(out.view().stick, "out");
         assert!(

@@ -3507,9 +3507,14 @@ impl FrameLaw {
 /// ⭐⭐⭐⭐⭐ THE SWEPT-WINDOW LAW — the two refusals that keep a plain sweep honest, factored
 /// as ONE fn so its class scoping is stated once and tested as a unit:
 ///
-/// * swept operands stating ONE window over DIFFERENT views — the piece's bytes are the
-///   sweep's, and two views behind one sweep name two different values. Every class: this
-///   one is about the SWEEP's own consistency, not the result frame.
+/// * ONE VALUE stating two frames — swept operands of the SAME value (`tid`) whose views
+///   disagree: the piece's bytes are the sweep's, and one value behind two views names two
+///   different tensors for one sweep, so the mint cannot pick. Every class: this one is
+///   about the SWEEP's own consistency, not the result frame. Two DIFFERENT values each
+///   state the sweep in their own frame — the split piece's minted `[42, cols]` beside the
+///   64-row parameter's load of the same window — and the door places each (the piece
+///   whole, the load a row band of its parent); refusing that pair was refusing the split
+///   itself (#1112's Convert corner).
 /// * a POINTWISE op's result type whose rows are not the sweep's — [`FrameLaw::Pointwise`]'s
 ///   own law, because that class preserves the flat frame and the result type's rows ARE the
 ///   sweep's (#1112's row split: the `[0, 42)` block of a 64-row parameter is a 42-row
@@ -3527,17 +3532,18 @@ fn swept_window_agrees(
     first: Region,
     swept: &[Region],
 ) -> Result<(), Error> {
-    if !swept.iter().all(|r| r.v_rows == first.v_rows) {
-        let other = swept
-            .iter()
-            .find(|r| r.v_rows != first.v_rows)
-            .map_or(first.v_rows, |r| r.v_rows);
-        return err(format!(
-            "{name}: `{kind:?}`'s swept operands state one window (rows [{}, {})) over \
-             DIFFERENT views ({} and {} rows) — the minted piece is the sweep the \
-             program states, and two views behind one sweep name two different values",
-            first.r_start, first.r_len, first.v_rows, other
-        ));
+    for (i, a) in swept.iter().enumerate() {
+        for b in swept.iter().skip(i + 1) {
+            if a.tid == b.tid && a.v_rows != b.v_rows {
+                return err(format!(
+                    "{name}: `{kind:?}`'s swept operands state one window (rows [{}, {})) over \
+                     DIFFERENT views ({} and {} rows) — the minted piece is the sweep the \
+                     program states, and one value behind two views names two different tensors \
+                     for one sweep",
+                    a.r_start, a.r_len, a.v_rows, b.v_rows
+                ));
+            }
+        }
     }
     if dims[0] != first.r_len && law == FrameLaw::Pointwise {
         return err(format!(
@@ -7372,7 +7378,10 @@ fn lower_function_folded(
             // with this op's [`FrameLaw`]; a family whose swept windows DISAGREE (a
             // contraction's activation and kernel, sweeping `m` and `k`), an empty sweep, or
             // a banded one states no plain window and keeps the mint's own law for the op's
-            // body to judge, exactly as before.
+            // body to judge, exactly as before. The view half of that law is ONE VALUE's: a
+            // minted piece is its own value at the piece's height and a parameter's load is a
+            // window of the parameter's view, so the two state the sweep in different frames
+            // without contradiction — what refuses is ONE VALUE behind two views.
             //
             // ⛔ BYTE-IDENTICAL FOR EVERY MINT THAT BAKES TODAY: a whole-view swept family has
             // `r_len == v_rows` and `dims[0] == r_len`, so neither refusal fires and the mint
@@ -10025,10 +10034,12 @@ mod swept_window_law_tests {
         );
     }
 
-    /// ⛔ THE SWEEP'S OWN CONSISTENCY IS EVERY CLASS's LAW — one window over two views names
-    /// two different values behind one sweep, whatever the op does with the frame.
+    /// ⛔ THE SWEEP'S OWN CONSISTENCY IS EVERY CLASS's LAW — ONE VALUE over two views names
+    /// two different tensors behind one sweep, whatever the op does with the frame. Both
+    /// regions here are the SAME value (`tid` 0), so the pair is the contradiction the law
+    /// refuses.
     #[test]
-    fn one_window_over_two_views_refuses_for_every_class() {
+    fn one_value_over_two_views_refuses_for_every_class() {
         let first = reg(64, 128);
         let other = Region {
             v_rows: 32,
@@ -10049,13 +10060,44 @@ mod swept_window_law_tests {
             first,
             &[first, other],
         ) else {
-            panic!("two views behind one sweep name two different values");
+            panic!("one value behind two views names two different tensors");
         };
         assert!(
             m.message.contains("DIFFERENT views (64 and 32 rows)"),
             "names the two views: {:?}",
             m.message
         );
+    }
+
+    /// ⭐ TWO VALUES EACH STATE THE SWEEP IN THEIR OWN FRAME — the gelu longhand's split
+    /// Mulf (#1112's Convert corner): the converted 42-row PIECE (its own value, minted at
+    /// the piece's height) beside the 64-row PARAMETER's load of the same window `[0, 42)`.
+    /// One window, two views, TWO VALUES — each operand's frame is its own, the door places
+    /// each (the piece whole, the load a row band of its parent), and the law admits it.
+    #[test]
+    fn two_values_each_state_the_sweep_in_their_own_frame() {
+        let piece = reg(42, 4096);
+        let load = Region {
+            tid: 5,
+            v_rows: 64,
+            r_len: 42,
+            r_cover: (0, 64),
+            ..reg(42, 4096)
+        };
+        let law = FrameLaw::of(
+            Lowering::Node(Program::Elementwise(Elementwise::Mul)),
+            false,
+        );
+        assert_eq!(law, FrameLaw::Pointwise);
+        swept_window_agrees(
+            "gelu_longhand",
+            OpKind::ArithMulf,
+            law,
+            [42, 4096],
+            piece,
+            &[piece, load],
+        )
+        .expect("two values each state the sweep in their own frame — the split's own pairing");
     }
 
     /// THE FOLD'S LEADER IS ITS OWN CLASS, AND THE PROOF OUTRANKS THE KIND — a silu that the

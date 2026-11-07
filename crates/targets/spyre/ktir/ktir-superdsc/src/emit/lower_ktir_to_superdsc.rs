@@ -34,9 +34,9 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, bmm_site,
-    check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
-    pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
+    EmittedOp, In, assemble_convert, assemble_convert_band, assemble_pointwise_broadcast_off,
+    bmm_site, check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
+    pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -2407,10 +2407,20 @@ pub fn elementwise_df(
     // would silently read the wrong band at the base if the row corner were not part of this
     // gate. The row term joins the column term here rather than in `base_addressed`, because the
     // arm below this one CAN place it.
+    //
+    // ⛔ AND "BASE" MEANS THE WHOLE VIEW. The seeded form presents every operand as a whole
+    // `[rows, cols]` tensor — a split piece's head block (rows `[0, 42)` of a 64-row value)
+    // has every corner 0 but a TALLER view, and seeding it would declare the parent a
+    // `[42, cols]` tensor of its own: the op's own bytes would be right, but the buffer the
+    // program states is the parent's, and the piece's mint is the sweep the program states.
+    // Such an operand is a row band of a taller parent and routes to the banded form below,
+    // which carries the parent's row count by type.
     if out.c_start == 0
         && ins.iter().all(|x| x.c_start == 0)
         && out.r_start == 0
         && ins.iter().all(|x| x.r_start == 0)
+        && out.v_rows == rows
+        && ins.iter().all(|x| x.v_rows == rows)
     {
         let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
         let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
@@ -2439,19 +2449,23 @@ pub fn elementwise_df(
     // every column-blocked chunk the front end mints — emit exactly the bytes the shared-corner
     // form did: same offset on every operand, same [`crate::addr::ColWindow`].
     //
-    // ⭐ TWO FORMS, ONE BUILDER, PICKED BY THE ROW CORNER. At row 0 the window is a whole-stick
-    // COLUMN window of a same-rows stick-major parent — a [`crate::addr::ColWindow`], so the
-    // piece is presented stick-major and the work-division law reaches it (#622; the 12b gemma-4
-    // chunk family, card-proven). At a nonzero row corner — a BANDED program's window, one
-    // core's row band of a taller view — the window is not a column window of a same-rows tensor
-    // at all; it is a rectangle at `(r_start, c_start)` of the parent, addressed flat through
-    // [`band_corner`] (`In::sliced` at an `rc_of` corner, the write at `OutCorner::At`). That
-    // form is exactly the card-proven rotate-half geometry — a `[rows, 64]` window at a column
-    // corner of a wider view — with the row term the corner adds.
-    let out_off: crate::addr::OutCorner = if out.r_start == 0 {
+    // ⭐ TWO FORMS, ONE BUILDER, PICKED BY THE FRAME. A WHOLE operand — row corner 0 and the
+    // view at the op's own row count — is a whole-stick COLUMN window of a same-rows
+    // stick-major parent: a [`crate::addr::ColWindow`], so the piece is presented stick-major
+    // and the work-division law reaches it (#622; the 12b gemma-4 chunk family, card-proven).
+    // Any other operand is a BAND — a row band of a taller view, at row 0 of a taller parent
+    // (a split piece's head block) or at a nonzero row corner (one core's band of a banded
+    // program) — and is a [`crate::addr::RowWindow`] through [`band_corner`]: the same
+    // rectangle at `(r_start, c_start)` of the parent the flat corner always addressed, now
+    // CARRYING the parent's row count so the door declares it (`device_extent`) and strides
+    // the parent's column planes at the parent's pitch. A one-stick band is the card-proven
+    // rotate-half geometry byte for byte (no declaration, the flat offset); a multi-stick band
+    // is the device-extent form the granite `[84, 128]`-of-`[672, 128]` window measured.
+    let whole = |x: &Region| x.r_start == 0 && x.v_rows == rows;
+    let out_off: crate::addr::OutCorner = if whole(&out) {
         chunk_window(name, rows, &out)?.into()
     } else {
-        crate::addr::OutCorner::At(band_corner(name, rows, &out)?)
+        crate::addr::OutCorner::Row(band_corner(name, rows, &out, Df::Fp16)?)
     };
     // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
     // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
@@ -2470,10 +2484,10 @@ pub fn elementwise_df(
         .iter()
         .zip(ins.iter())
         .map(|(h, x)| {
-            Ok(if x.r_start == 0 {
+            Ok(if whole(x) {
                 In::col_window(h, chunk_window(name, rows, x)?).ew()
             } else {
-                In::sliced(h, band_corner(name, rows, x)?).ew()
+                In::row_window(h, band_corner(name, rows, x, Df::Fp16)?).ew()
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -2585,43 +2599,48 @@ fn chunk_window(name: &str, rows: u32, out: &Region) -> Result<crate::addr::ColW
     })
 }
 
-/// ⭐ THE CORNER OF A BANDED WINDOW — a row AND column corner of a stick-blocked view, the
-/// per-operand spelling the banded family's emission addresses through (`In::sliced` on the read
-/// side, `OutCorner::At` on the write). A rope copy's window is `[band, 64]` at `(r_start, 0)` or
-/// `(r_start, 64)` of its `[v_rows, 128]` view; the corner is that rectangle's first element in
-/// the view's own nest, `rc_of` — the parent's plane stride `v_rows·64` and row stride `64` both
-/// stated by the VIEW, never by the window.
+/// ⭐ THE WINDOW OF A BANDED OPERAND — a row band `[r_len, c_len]` at `(r_start, c_start)` of a
+/// stick-blocked `[v_rows, v_cols]` view, as a [`crate::addr::RowWindow`]: the rectangle's first
+/// element in the view's own nest (`rc_of` — the parent's plane stride `v_rows·lanes` and row
+/// stride `lanes` both stated by the VIEW, never by the window), CARRYING the parent's row count
+/// so the door that addresses it can declare the parent's pitch (`device_extent`). A rope copy's
+/// window is `[band, 64]` at `(r_start, 0)` or `(r_start, 64)` of its `[v_rows, 128]` view; a
+/// split piece's head block is `[rows, cols]` at `(0, 0)` of a TALLER `[v_rows, cols]` parent —
+/// one law for both, the band of a taller parent.
 ///
-/// ⛔⛔ SINGLE-STICK ONLY, AND THIS IS GEOMETRY, NOT TASTE. A window at a nonzero row corner is
-/// addressable only while it stays inside ONE column plane of the parent: the parent strides its
-/// planes `v_rows·64` apart while the window's own `[rows, c_len]` stick-major view strides them
-/// `rows·64`, so a multi-stick window's second plane lands `rows·64` from the first in the window
-/// and `(v_rows − rows)·64` further in the parent — not contiguous, and no flat or stick-major
-/// presentation reaches both planes at once. A sub-stick width mis-strides the rows the same way
-/// (`rows·c_len` against the parent's `rows·64`). The card-proven precedents for this exact form
-/// are the rotate-half halves and the per-head attention blocks — `[rows, 64]` rectangles at a
-/// corner of a wider view — and the band lift adds only the row term to that corner. Anything
-/// wider than one stick at a row corner is refused BY NAME, here, where the geometry says so.
-fn band_corner(name: &str, rows: u32, x: &Region) -> Result<crate::addr::DevOff, Error> {
-    if x.c_len != FP16_ELEMS_PER_STICK || !x.c_start.is_multiple_of(FP16_ELEMS_PER_STICK) {
+/// ⛔ THE BAND IS THE OP'S WHOLE ROW SWEEP, INSIDE THE PARENT. `r_len` must equal the op's rows
+/// (a band that sweeps fewer rows than the op is a different computation wearing the op's name)
+/// and `r_start + r_len` must not pass `v_rows` (a band past the parent's last row addresses
+/// bytes the parent does not have). Both refused BY NAME, here, where the geometry says so.
+///
+/// ⛔ THE COLUMN CORNER IS A WHOLE STICK, AT THE WINDOW'S OWN DF. A sub-stick corner sits
+/// mid-plane, and no stick-major presentation of the parent reaches the window's bytes —
+/// refused by [`crate::addr::row_window_of`], which owns that law. The WIDTH is unconstrained:
+/// a one-stick band never crosses a column plane and needs no declaration (the card-proven
+/// rotate-half form, byte for byte), and a multi-stick band is reached by DECLARING the
+/// parent's row count — the device-extent form, the same law the granite `[84, 128]`-of-
+/// `[672, 128]` window measured on card.
+fn band_corner(name: &str, rows: u32, x: &Region, df: Df) -> Result<crate::addr::RowWindow, Error> {
+    if x.r_len != rows {
         return err(format!(
-            "{name}: t{}'s window is `[{}, {}]` at column {} of its `[{}, {}]` view, at row \
-             corner {} — a banded window is addressable only as ONE WHOLE \
-             {FP16_ELEMS_PER_STICK}-element stick at a whole-stick column: the parent strides its \
-             column planes `v_rows·64` elements apart while a window of {rows} rows would stride \
-             its own `rows·64`, so a multi-stick window's planes are not contiguous in the parent, \
-             and a sub-stick width mis-strides every row. Widen the sweep or keep the window at \
-             row 0, where the whole-stick column-window form reaches any width.",
-            x.tid, x.r_len, x.c_len, x.c_start, x.v_rows, x.v_cols, x.r_start,
+            "{name}: t{}'s window is `[{}, {}]` at row {} of its `[{}, {}]` view, but the op \
+             sweeps {rows} rows — a banded operand must state the op's whole row sweep, never a \
+             piece of it. Widen the sweep or split the op.",
+            x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols,
         ));
     }
-    Ok(crate::addr::rc_of(
-        x.v_rows,
-        x.v_cols,
-        x.r_start,
-        x.c_start,
-        Df::Fp16,
-    ))
+    if x.r_start + x.r_len > x.v_rows {
+        return err(format!(
+            "{name}: t{}'s window is `[{}, {}]` at row {} of its `[{}, {}]` view — the band \
+             passes the parent's last row, addressing bytes the parent does not have.",
+            x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols,
+        ));
+    }
+    crate::addr::row_window_of(x.v_rows, x.v_cols, x.r_start, x.c_start, x.c_len, df).map_err(|e| {
+        Error {
+            message: format!("{name}: {e}"),
+        }
+    })
 }
 
 /// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
@@ -3690,6 +3709,13 @@ impl ConvertKind {
             ConvertKind::Fp32ToDl16 => Df::Fp16,
         }
     }
+
+    /// The (input, output) dtypes intrinsic to this convert — [`crate::emit::convert_dtypes`]
+    /// at this kind's own `op_func` key, so the band door can state each side's df without
+    /// re-deriving the pair (the pair is a property of the op, never of the operand names).
+    fn dtypes(self) -> (Df, Df) {
+        crate::emit::convert_dtypes(op_func_from_str(self.op_func()))
+    }
 }
 
 /// THE CONVERT DOOR: one dtype-convert op, ONE tensor input, ONE output, both the RowBlocked
@@ -3713,6 +3739,19 @@ impl ConvertKind {
 /// precedent) and the consumer's Col window reads row r's FIRST stick alone, so the pad the
 /// convert writes is numerically inert. A window that is not whole-view keeps the refusal: a
 /// cornered sub-stick convert reads words the caller never staged.
+///
+/// ⭐⭐⭐ AND ONE DOOR FOR THE BAND (the Convert corner, #1112): a split program's convert —
+/// the gelu longhand's per-block `dl16tofp32`, reading block b's `[rows, cols]` band of the
+/// 64/96-row parameter while its output is the whole minted piece — has operands in DIFFERENT
+/// frames, and the door states each side's own: a WHOLE side (corner-0, the view at the op's
+/// own rows) keeps the whole-tensor form above verbatim; a BAND side is a
+/// [`crate::addr::RowWindow`] of its taller parent ([`band_corner`], each side at its OWN df
+/// from [`ConvertKind::dtypes`] — the two sides of one convert can disagree on stick width,
+/// fp16's 64 against fp32's 32), and the op is assembled by [`assemble_convert_band`], which
+/// declares the parent's row count on every multi-stick side. The split runs through
+/// [`split_regions`], not [`split_out`]: this door is one of the emitters that CAN place a row
+/// corner, so which operands are inputs is a fact about the parameter list, not about the
+/// addressing.
 pub fn convert(
     name: &str,
     kind: ConvertKind,
@@ -3720,10 +3759,70 @@ pub fn convert(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    let (ins, out) = split_out(name, r, layout, 1)?;
+    let (ins, out) = split_regions(name, r, layout, 1, &[])?;
     let rows = pointwise_rows(name, &out)?;
     let mut cols = out.c_len;
     let dev_cols = DeviceWidth::for_convert(cols).get();
+    // A side is WHOLE when it states the op's own frame — corner-0 and the view at the op's
+    // rows; any other side is a row band of a taller parent.
+    let whole = |x: &Region| x.r_start == 0 && x.c_start == 0 && x.v_rows == rows;
+    let op_func = kind.op_func();
+    let op_name = format!("{op_func}_o{}", out.tid);
+    if !(whole(&out) && whole(&ins[0])) {
+        // ⭐ THE BAND PATH — extents first (the elementwise door's own law: every operand holds
+        // the op's sweep as its own window), then the width. A band is admitted only at the
+        // DEVICE WIDTH: the β admission's whole-view predicate is a WHOLE-side statement (the
+        // widened words past the logical column are the reservation's own padding), and a band
+        // of a taller parent has no whole view to widen — a sub-width band would read words of
+        // the PARENT's rows the caller never staged. Refused by name, here.
+        pointwise_extents_agree(name, "Convert", &[ins[0]], &out, rows)?;
+        if cols != dev_cols {
+            return err(format!(
+                "{name}: Convert t{} sweeps a {cols}-column band of a taller parent, widened \
+                 to the {dev_cols}-element device width — the β admission is a WHOLE-VIEW \
+                 statement (the widened words are the reservation's own padding), and a band \
+                 has no whole view to widen: a sub-width band would read words of the parent's \
+                 rows the caller never staged",
+                out.tid
+            ));
+        }
+        check_pointwise_cols_df(cols, "Convert", out.tid, kind.stick_df())?;
+        let (in_df, out_df) = kind.dtypes();
+        // Each side's window at its OWN df, and each side's handle at its own storage: the band
+        // side declares the PARENT `[v_rows, v_cols]` (the corner arithmetic addresses within
+        // it, and the mint prices the parent's bytes at the side's real word length), the whole
+        // side the piece's own `[rows, cols]`.
+        let in_w = if whole(&ins[0]) {
+            None
+        } else {
+            Some(band_corner(name, rows, &ins[0], in_df)?)
+        };
+        let o_w = if whole(&out) {
+            None
+        } else {
+            Some(band_corner(name, rows, &out, out_df)?)
+        };
+        let in_h = match in_w {
+            Some(_) => rb_df(&ins[0].name(), ins[0].v_rows, ins[0].v_cols, in_df),
+            None => rb_df(&ins[0].name(), rows, cols, in_df),
+        };
+        let out_h = match o_w {
+            Some(_) => rb_df(&out.name(), out.v_rows, out.v_cols, out_df),
+            None => rb_df(&out.name(), rows, cols, out_df),
+        };
+        return Ok(vec![assemble_convert_band(
+            &op_name,
+            op_func,
+            rows,
+            cols,
+            &in_h,
+            in_w,
+            &out_h,
+            o_w,
+            sym_id_base,
+            layout,
+        )]);
+    }
     if cols != dev_cols {
         let whole_view = |x: &Region| x.c_start == 0 && x.c_len == x.v_cols;
         if !(whole_view(&out) && whole_view(&ins[0]) && ins[0].c_len == out.c_len) {
@@ -3738,8 +3837,6 @@ pub fn convert(
         cols = dev_cols;
     }
     check_pointwise_cols_df(cols, "Convert", out.tid, kind.stick_df())?;
-    let op_func = kind.op_func();
-    let op_name = format!("{op_func}_o{}", out.tid);
     // The handles are ANNOTATION-ONLY (`assemble_convert` reads `.name()`; the dtypes ride the
     // `OpFunc` through `convert_dtypes`), so the RowBlocked mint is exact for both operands.
     let in_h = rb(&ins[0].name(), rows, cols);
@@ -8957,6 +9054,238 @@ mod elementwise_tests {
             )
             .is_err()
         );
+    }
+
+    // ── THE CONVERT CORNER — the m64/m96 gelu_longhand MISSING-LOWERING, closed ────────────────
+    //
+    // ⛔⛔⛔ THE MOVED REFUSAL. At 8ba2f8aa71 the m64/m96 cells still refused, at the WALK:
+    // "`ArithMulf`'s swept operands state one window (rows [0, 42)) over DIFFERENT views (42
+    // and 64 rows)". The 42 is the split piece of one operand (the minted intermediate, its
+    // own value at the piece's height), the other is the unsplit 64-row parameter — TWO VALUES
+    // each stating the sweep in their own frame, which the view-equality clause read as one
+    // value behind two views. The walk's law now refuses only ONE VALUE over two views
+    // (`swept_window_agrees`), and this door places each frame: the piece WHOLE, the
+    // parameter's load a ROW BAND of its parent (`RowWindow`), the parent's row count declared
+    // as the `mb` device extent so the walk strides the parent's column planes at the parent's
+    // pitch.
+
+    /// The `maxDimSizes_` of one operand's allocate node — the wire's own statement of the
+    /// walk (`DeviceWalk::of_window` pins a windowed operand to its parent's extents; a
+    /// reconstructing walk is all `-1`). `ldsIdx_` is the arg's own index.
+    fn walk_of(op: &EmittedOp, lds: u32) -> serde_json::Value {
+        let dsc = op.op.as_ref().expect("a descriptor").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc");
+        serde_json::to_value(
+            &dsc.scheduleTree_
+                .iter()
+                .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+                .expect("an allocate node per operand")
+                .maxDimSizes_,
+        )
+        .expect("the walk serializes")
+    }
+
+    /// ⭐⭐⭐ THE LEAD'S OWN FIXTURE — the Mulf the moved refusal named: one operand the
+    /// converted 42-row PIECE (a whole `[42, 4096]` value), the other the whole 64-row VALUE's
+    /// load of the same window `[0, 42)`. One window, two frames, TWO VALUES — the door places
+    /// each: the piece whole (a reconstructing walk), the load a row band whose walk is PINNED
+    /// to the parent's `[64, 4096]` extents. And the tail block's Mulf — the piece `[0, 22)`
+    /// beside the load `[42, 64)` — places its load at the band's own corner, 2688 elements in.
+    #[test]
+    fn a_split_piece_beside_its_parent_load_states_one_window_two_frames() {
+        let cols = 4096u32;
+        // HEAD: piece `[0,42)` of its own 42-row value, load `[0,42)` of the 64-row parameter.
+        let head = node(
+            reg(6, 42, cols, false),
+            split(5, 64, 0, 42, cols),
+            reg(7, 42, cols, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise("mulf_s9", Elementwise::Mul, &head, &[], &mut sym, None)
+            .expect("two values each state the sweep in their own frame");
+        assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
+        // The load (arg 1) is PINNED to the parent's extents — without the declaration dxp
+        // strides its stick groups by the sweep's 42 rows, short by 22 for every stick after
+        // the first. The piece (arg 0) and the output (arg 2) reconstruct.
+        assert_eq!(
+            walk_of(&ops[0], 1),
+            serde_json::json!([64, cols]),
+            "the load walks the PARENT's rows"
+        );
+        assert_eq!(
+            walk_of(&ops[0], 0),
+            serde_json::json!([-1, -1]),
+            "the piece is its own value"
+        );
+        assert_eq!(
+            walk_of(&ops[0], 2),
+            serde_json::json!([-1, -1]),
+            "the output piece is its own value"
+        );
+        assert_eq!(bound_at(&ops[0], "t5"), 0, "the head band's corner is 0");
+        // TAIL: piece `[0,22)` of its own 22-row value, load `[42,64)` of the same parameter.
+        let tail = node(
+            reg(6, 22, cols, false),
+            split(5, 64, 42, 22, cols),
+            reg(7, 22, cols, true),
+        );
+        let ops = elementwise("mulf_s10", Elementwise::Mul, &tail, &[], &mut sym, None)
+            .expect("the tail pairing lowers the same way");
+        assert_eq!(
+            walk_of(&ops[0], 1),
+            serde_json::json!([64, cols]),
+            "the tail load walks the PARENT's rows too"
+        );
+        assert_eq!(
+            bound_at(&ops[0], "t5"),
+            42 * 64,
+            "the tail band's corner is the parent's own `rc_of` nest: 42·64 = {}",
+            42 * 64
+        );
+    }
+
+    /// ⭐ THE BAND CONVERT — the chain's per-block `dl16tofp32`: the input a `[rows, cols]`
+    /// band of the 64-row parameter, the output the whole minted fp32 piece. The input arg
+    /// DECLARES the parent's row count (its walk pinned to `[64, 4096, 1]` — the rank-3
+    /// row-blocked form the narrowing fp32 convert keeps), the output piece reconstructs, and
+    /// each side sits at its own corner: the head at 0, the tail at 2688.
+    #[test]
+    fn a_band_convert_declares_the_parent_and_places_the_corner() {
+        let cols = 4096u32;
+        let head = vec![split(5, 64, 0, 42, cols), reg(6, 42, cols, true)];
+        let mut sym = 0i64;
+        let ops = convert("cvt_s1", ConvertKind::Dl16ToFp32, &head, &mut sym, None)
+            .expect("the head convert lowers as a band");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            walk_of(&ops[0], 0),
+            serde_json::json!([64, cols, 1]),
+            "the band input walks the PARENT's rows, rank-3 as the narrowing convert keeps"
+        );
+        assert_eq!(
+            walk_of(&ops[0], 1),
+            serde_json::json!([-1, -1, -1]),
+            "the output piece is its own value"
+        );
+        assert_eq!(bound_at(&ops[0], "t5"), 0, "the head band's corner is 0");
+        assert_eq!(bound_at(&ops[0], "t6"), 0, "the piece's corner is 0");
+        let tail = vec![split(5, 64, 42, 22, cols), reg(6, 22, cols, true)];
+        let ops = convert("cvt_s2", ConvertKind::Dl16ToFp32, &tail, &mut sym, None)
+            .expect("the tail convert lowers as a band");
+        assert_eq!(
+            walk_of(&ops[0], 0),
+            serde_json::json!([64, cols, 1]),
+            "the tail band walks the PARENT's rows too"
+        );
+        assert_eq!(
+            bound_at(&ops[0], "t5"),
+            42 * 64,
+            "the tail band's corner is the parent's own nest: 42·64 = {}",
+            42 * 64
+        );
+    }
+
+    /// ⭐ THE ONE-STICK BAND NEEDS NO DECLARATION — the rotate-half law, restated at the
+    /// convert: a window at most one stick wide never crosses a column plane, so its own
+    /// stick-major layout is the parent's within that plane and the emitted form is the flat
+    /// corner alone (every walk reconstructing, no `maxDimSizes_` pin).
+    #[test]
+    fn a_one_stick_band_convert_keeps_the_rotate_half_form() {
+        let band = vec![split(5, 64, 42, 22, 64), reg(6, 22, 64, true)];
+        let mut sym = 0i64;
+        let ops = convert("cvt_s3", ConvertKind::Dl16ToFp32, &band, &mut sym, None)
+            .expect("a one-stick band is the card-proven rotate-half geometry");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            walk_of(&ops[0], 0),
+            serde_json::json!([-1, -1, -1]),
+            "no declaration: the window never crosses a plane"
+        );
+        assert_eq!(
+            bound_at(&ops[0], "t5"),
+            42 * 64,
+            "the flat corner the rotate-half form always addressed"
+        );
+    }
+
+    /// ⛔ THE NEAR-MISSES. A band whose `r_len` is not the op's rows is a different computation
+    /// wearing the op's name; a band at a sub-stick column corner sits mid-plane and no
+    /// stick-major presentation of the parent reaches its bytes; a band narrower than the
+    /// device width has no whole view to widen (the β admission is a whole-view statement), so
+    /// it would read words of the parent's rows the caller never staged.
+    #[test]
+    fn the_band_near_misses_refuse_by_name() {
+        // `r_len` ≠ rows — refused at the band's own law, naming the sweep.
+        let Err(e) = band_corner("p", 42, &split(5, 64, 0, 21, 4096), Df::Fp16) else {
+            panic!("a band must state the op's whole row sweep");
+        };
+        assert!(
+            e.message.contains("sweeps 42 rows"),
+            "names the sweep: {}",
+            e.message
+        );
+        // A band past its parent's last row.
+        let Err(e) = band_corner("p", 42, &split(5, 64, 42, 42, 4096), Df::Fp16) else {
+            panic!("a band past the parent's last row addresses bytes it does not have");
+        };
+        assert!(
+            e.message.contains("passes the parent's last row"),
+            "names the parent: {}",
+            e.message
+        );
+        // A sub-stick column corner — mid-plane, refused by `row_window_of`'s own law.
+        let mid_plane = Region {
+            c_start: 32,
+            ..split(5, 64, 42, 22, 4096)
+        };
+        let Err(e) = band_corner("p", 22, &mid_plane, Df::Fp16) else {
+            panic!("a sub-stick corner sits mid-plane");
+        };
+        assert!(
+            e.message.contains("not a whole 64-lane stick"),
+            "names the stick law: {}",
+            e.message
+        );
+        // A sub-device-width BAND — the β admission is whole-view or refused, and a band has
+        // no whole view.
+        let narrow = vec![split(5, 64, 0, 42, 32), reg(6, 42, 32, true)];
+        let mut sym = 0i64;
+        let Err(e) = convert("cvt_s4", ConvertKind::Dl16ToFp32, &narrow, &mut sym, None) else {
+            panic!("a sub-width band would read words the caller never staged");
+        };
+        assert!(
+            e.message.contains("no whole view to widen"),
+            "names the β law: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ THE WHOLE FAMILY STILL SEEDS — the seeded form's gate now also demands every
+    /// operand's VIEW at the op's own rows (a split piece's head block has every corner 0 but
+    /// a taller view, and seeding it would declare the parent a piece-sized tensor of its
+    /// own). The control: an all-whole family keeps the seeded form — one op, every walk
+    /// reconstructing, no parent declaration crept in.
+    #[test]
+    fn a_whole_family_still_seeds_with_no_declaration() {
+        let cols = 4096u32;
+        let r = node(
+            reg(5, 42, cols, false),
+            reg(6, 42, cols, false),
+            reg(7, 42, cols, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise("mulf_s11", Elementwise::Mul, &r, &[], &mut sym, None)
+            .expect("the whole family is the ordinary case");
+        assert_eq!(ops.len(), 1);
+        for lds in 0..3u32 {
+            assert_eq!(
+                walk_of(&ops[0], lds),
+                serde_json::json!([-1, -1]),
+                "arg {lds}: a whole value reconstructs"
+            );
+        }
     }
 
     /// The arity of every key, against the arithmetic the op IS. Unary functions take one operand and
