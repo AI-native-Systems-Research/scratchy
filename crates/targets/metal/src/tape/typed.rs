@@ -433,6 +433,183 @@ where
 {
 }
 
+/// Slot `S`'s MLX-affine matmul weight, as a matmul of DSL weight `W` reads it: only a slot whose
+/// field holds `W` has one for it ([`gemm_slot`]'s rule, for the affine kernels). `W` is the weight
+/// the matmul's op reads, recorded from the op's own operand.
+///
+/// ```
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, affine_slot};
+/// # use scratchy_tensors::typed::{B4, G64, HoldsWeight, Q2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # type Proj = Q2<U2048, U256, B4, G64, Layer>;
+/// # struct Weights { k_proj: Proj, v_proj: Proj }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = Proj;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Proj { &w.v_proj }
+/// }
+/// assert_eq!(affine_slot::<VSlot, VProj>().ix, SourceIx(1));
+/// ```
+///
+/// The same slot read by a matmul of the K projection, of the very same shape and codes:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, affine_slot};
+/// # use scratchy_tensors::typed::{B4, G64, HoldsWeight, Q2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # type Proj = Q2<U2048, U256, B4, G64, Layer>;
+/// # struct Weights { k_proj: Proj, v_proj: Proj }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = Proj;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Proj { &w.v_proj }
+/// }
+/// let _ = affine_slot::<VSlot, KProj>();
+/// ```
+pub const fn affine_slot<S, W>() -> AffineSlotWeight
+where
+    S: AffineSlot + Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
+    S::WEIGHT
+}
+
+/// Slot `S`'s index, as a command binding one of its tensors reads it for DSL weight `W`: only a
+/// slot whose field holds `W` has one for it ([`gemm_slot`]'s rule, for every binding of a typed
+/// family — a bundle's router and expert banks among them). `W` is a weight the ops of the rows the
+/// command was lowered from read, recorded from their own operands.
+///
+/// ```
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, source_slot};
+/// # use scratchy_tensors::typed::{HoldsWeight, W2};
+/// # use scratchy_tensors::typed::typenum::{U128, U2048};
+/// # struct Layer;
+/// # type Router = W2<U2048, U128, Layer>;
+/// # struct Weights { mlp: Router, shared_mlp: Router }
+/// enum Mlp {}
+/// enum SharedMlp {}
+/// impl HoldsWeight<Mlp> for Mlp {}
+/// impl HoldsWeight<SharedMlp> for SharedMlp {}
+/// enum MlpSlot {}
+/// impl Source for MlpSlot {
+///     type Model = Weights;
+///     type Handle = Router;
+///     type Weights = Mlp;
+///     const IX: SourceIx = SourceIx(4);
+///     fn at(w: &Weights, _: LayerId) -> &Router { &w.mlp }
+/// }
+/// assert_eq!(source_slot::<MlpSlot, Mlp>(), SourceIx(4));
+/// ```
+///
+/// The same slot bound by a command whose op reads another bundle, of the very same shape:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, source_slot};
+/// # use scratchy_tensors::typed::{HoldsWeight, W2};
+/// # use scratchy_tensors::typed::typenum::{U128, U2048};
+/// # struct Layer;
+/// # type Router = W2<U2048, U128, Layer>;
+/// # struct Weights { mlp: Router, shared_mlp: Router }
+/// enum Mlp {}
+/// enum SharedMlp {}
+/// impl HoldsWeight<Mlp> for Mlp {}
+/// impl HoldsWeight<SharedMlp> for SharedMlp {}
+/// enum MlpSlot {}
+/// impl Source for MlpSlot {
+///     type Model = Weights;
+///     type Handle = Router;
+///     type Weights = Mlp;
+///     const IX: SourceIx = SourceIx(4);
+///     fn at(w: &Weights, _: LayerId) -> &Router { &w.mlp }
+/// }
+/// let _ = source_slot::<MlpSlot, SharedMlp>();
+/// ```
+pub const fn source_slot<S, W>() -> SourceIx
+where
+    S: Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
+    S::IX
+}
+
+/// Slot `S`'s index, as a command binding its MLX-affine scales, offsets or linear bias reads it for
+/// DSL weight `W`: [`source_slot`]'s rule, and only an affine slot has those tensors at all. A
+/// scale of a dense weight's slot is E0277:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, affine_part};
+/// # use scratchy_tensors::typed::{HoldsWeight, W2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # struct Weights { k_proj: W2<U2048, U256, Layer> }
+/// enum KProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// enum KSlot {}
+/// impl Source for KSlot {
+///     type Model = Weights;
+///     type Handle = W2<U2048, U256, Layer>;
+///     type Weights = KProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Self::Handle { &w.k_proj }
+/// }
+/// let _ = affine_part::<KSlot, KProj>();
+/// ```
+///
+/// An affine slot's scales bound for its own weight:
+///
+/// ```
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, affine_part};
+/// # use scratchy_tensors::typed::{B4, G64, HoldsWeight, Q2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # type Proj = Q2<U2048, U256, B4, G64, Layer>;
+/// # struct Weights { k_proj: Proj }
+/// enum KProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// enum KSlot {}
+/// impl Source for KSlot {
+///     type Model = Weights;
+///     type Handle = Proj;
+///     type Weights = KProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Proj { &w.k_proj }
+/// }
+/// assert_eq!(affine_part::<KSlot, KProj>(), SourceIx(1));
+/// ```
+pub const fn affine_part<S, W>() -> SourceIx
+where
+    S: AffineSlot + Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
+    S::IX
+}
+
+/// Slot `S`'s index, as a command binding the MLX-affine scales, offsets or linear bias of a
+/// weight no op reads through an operand (the embedding table, named by the model): only an affine
+/// slot has them ([`affine_part`] without the weight).
+pub const fn affine_part_of<S: AffineSlot + Source>() -> SourceIx {
+    S::IX
+}
+
 /// A GEMM's weight, as its slot states it: the slot's index and the handle's dims, `n` (output
 /// columns) and `k` (the inner dim).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
