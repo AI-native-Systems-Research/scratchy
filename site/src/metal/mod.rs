@@ -4317,9 +4317,13 @@ mod tests {
     /// M4 Max's large set (10-28) and its small set (10-29), both published, both drawn.
     #[test]
     fn every_model_a_machine_ran_is_drawn() {
+        // A newer run moves either into history/, so look there too.
         let read = |name: &str| -> Run {
-            let p = format!("{}/{}/{name}", env!("CARGO_MANIFEST_DIR"), super::DATA);
-            serde_json::from_str(&std::fs::read_to_string(&p).expect(name)).expect(name)
+            let at = |dir: &str| format!("{}/{dir}/{name}", env!("CARGO_MANIFEST_DIR"));
+            let s = std::fs::read_to_string(at(super::DATA))
+                .or_else(|_| std::fs::read_to_string(at(super::HISTORY)))
+                .expect(name);
+            serde_json::from_str(&s).expect(name)
         };
         let runs = vec![
             read("apple-m4-max-2026-10-28T041936Z-dbe48cd2.json"),
