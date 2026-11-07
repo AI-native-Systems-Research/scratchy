@@ -502,12 +502,14 @@ pub fn binds<G: DeviceGen>(op: DeviceOp, df: DdlDf) -> bool {
 }
 
 /// The arrangement `op`'s output carries on `G` when both operands are
-/// addressed standard. An op with no row is not a device ask; the caller
-/// treats it as `Standard` — the default every buffer starts from.
-pub fn output_arrangement<G: DeviceGen>(op: DeviceOp) -> ElementArrangement {
-    row::<G>(op)
-        .map(|r| r.arrangement)
-        .unwrap_or(ElementArrangement::Standard)
+/// addressed standard, or `None` when no row names it. There is NO silent
+/// `Standard` default here — a missing row is a fact the caller does not
+/// hold, and the caller refuses by name rather than guessing (main's old
+/// table defaulted silently; every convert op now states a row, so the
+/// refusal is unreachable for every op this tree emits and the behavior is
+/// unchanged).
+pub fn output_arrangement<G: DeviceGen>(op: DeviceOp) -> Option<ElementArrangement> {
+    row::<G>(op).map(|r| r.arrangement)
 }
 
 #[cfg(test)]
@@ -594,12 +596,15 @@ mod tests {
     fn the_dl16_stagger_row_is_the_widen_alone() {
         assert_eq!(
             output_arrangement::<Gen1>(DeviceOp::Dl16ToFp32),
-            ElementArrangement::Dl16ToFp32
+            Some(ElementArrangement::Dl16ToFp32)
         );
         assert_eq!(
             output_arrangement::<Gen1>(DeviceOp::Fp32ToDl16),
-            ElementArrangement::Standard
+            Some(ElementArrangement::Standard)
         );
+        // No silent default: an op with no row answers `None`, and the caller
+        // refuses rather than guessing `Standard`.
+        assert_eq!(output_arrangement::<Gen1>(DeviceOp::Sum), None);
     }
 
     /// THE MoE ROW: the max reduce is bound at BOTH formats (the fp16 and
@@ -620,7 +625,10 @@ mod tests {
                 binds::<Gen1>(op, DdlDf::Fp32),
                 "{op:?} must stay fp32-bound"
             );
-            assert_eq!(output_arrangement::<Gen1>(op), ElementArrangement::Standard);
+            assert_eq!(
+                output_arrangement::<Gen1>(op),
+                Some(ElementArrangement::Standard)
+            );
             assert_eq!(op.family(), DeviceFamily::Reduce);
         }
     }

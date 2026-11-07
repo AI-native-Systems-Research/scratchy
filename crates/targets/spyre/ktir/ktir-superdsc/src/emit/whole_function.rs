@@ -4354,10 +4354,24 @@ pub fn staggered_sources(
             // A REDUCTION IS ORDER-FREE: the stagger permutes within 64-element blocks and the
             // reduction's answer is a function of the multiset, so the stagger ends here.
             Lowering::Reduce(_) => ElementArrangement::Standard,
-            // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table row.
-            Lowering::Convert(kind) => ktir_core::ddl_binds::output_arrangement::<
+            // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table
+            // row. NO SILENT DEFAULT — a convert whose op states no row is a fact the
+            // bake does not hold, refused by name here (every convert op states a row,
+            // so this is unreachable for every op this tree emits).
+            Lowering::Convert(kind) => match ktir_core::ddl_binds::output_arrangement::<
                 ktir_core::ddl_binds::Gen1,
-            >(kind.device_op()),
+            >(kind.device_op())
+            {
+                Some(arr) => arr,
+                None => {
+                    return err(format!(
+                        "the convert {} states no arrangement row in the device-facts table \
+                         (ktir_core::ddl_binds, Gen1) — refusing to guess Standard for a fact \
+                         the table does not hold",
+                        kind.op_func()
+                    ))
+                }
+            },
             // POINTWISE — the stagger propagates through it, and every same-width operand that
             // is read lane-for-lane must agree with the output's arrangement.
             Lowering::Silu

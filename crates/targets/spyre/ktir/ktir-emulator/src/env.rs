@@ -108,7 +108,8 @@ impl ConvertModel {
             && to == Some(DType::F32)
             && ktir_core::ddl_binds::output_arrangement::<ktir_core::ddl_binds::Gen1>(
                 ktir_core::ddl_binds::DeviceOp::Dl16ToFp32,
-            ) == ktir_core::ddl_binds::ElementArrangement::Dl16ToFp32
+            )
+                .is_some_and(|a| a == ktir_core::ddl_binds::ElementArrangement::Dl16ToFp32)
     }
 }
 
