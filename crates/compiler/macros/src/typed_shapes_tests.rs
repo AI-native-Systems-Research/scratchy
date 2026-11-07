@@ -960,3 +960,59 @@ fn every_bundle_carrier_config_sizes_its_loaders() {
     }
     assert!(checked > 20, "{checked} configs");
 }
+
+/// A query's rope runs at the class of the table it names. gemma-4-assistant's global layers rope
+/// their query on plain `rotary` (`qg = rope_query(qg, positions, rotary)`) and its sliding ones on
+/// `rotary_local`, and its config states `head_dim` 256 and `global_head_dim` 512: the bridge mints
+/// both, each at its own class's width — the global query not rotated as two 256-wide heads.
+#[test]
+fn a_query_rope_runs_at_the_class_of_the_table_it_names() {
+    use scratchy_subtile::subtile_ir::{RopeClass, SubOp};
+    let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
+    let stem = "gemma4-assistant";
+    let source = std::fs::read_to_string(arch.join(format!("dsl/{stem}.py"))).expect("carrier");
+    let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
+    let program = crate::classify::carrier_program(&carrier).unwrap();
+    let inferred = crate::typed_shapes::traced(&carrier.arch_name).expect("typed");
+    let (_, _, model) = carrier_models(&arch, stem, false)
+        .into_iter()
+        .find(|(cfg, _, _)| cfg.contains("gemma-4-26b-a4b-it-assistant"))
+        .expect("the gemma-4-26b-a4b-it-assistant config");
+    let model = model.expect("its config loads");
+    let mut prog = program.clone();
+    prog.decoder_safetensors_prefix = model.arch.decoder_prefix.clone();
+    prog.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
+    crate::shape::erase_identity_regroupings(&mut prog, &inferred, &model.bounds);
+    let cfg = crate::cfg::build_cfg(&prog, &model).expect("cfg");
+    let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
+    // The bake's own passes between the unroll and the bridge (`compile_carrier`), at one rank.
+    crate::tp_lowering::insert_all_reduces(&mut fuf, &prog, 1);
+    crate::tp_lowering::insert_lm_head_allgather(&mut fuf, &prog, 1);
+    crate::rows_lowering::materialize_rows(&mut fuf);
+    let facts = head_facts(&program, &inferred, &model);
+    let lowered = crate::to_wavefront::lower_decode_to_wavefront(
+        &fuf,
+        &inferred,
+        &model.bounds,
+        &crate::to_wavefront::BridgeModel {
+            params: &model,
+            facts: &facts,
+        },
+        crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::MIN),
+        crate::to_wavefront::QueryRows::SOLO,
+    )
+    .expect("the assistant's decode lowers");
+    let mut ropes: Vec<(u32, RopeClass)> = (lowered.input.ops.iter())
+        .filter_map(|o| match o.op {
+            SubOp::RopeRotate { head_dim, rope, .. } => Some((head_dim.get(), rope)),
+            _ => None,
+        })
+        .collect();
+    ropes.sort_by_key(|&(hd, _)| hd);
+    ropes.dedup();
+    assert_eq!(
+        ropes,
+        [(256, RopeClass::Base), (512, RopeClass::Global)],
+        "each query rope at its table's class"
+    );
+}
