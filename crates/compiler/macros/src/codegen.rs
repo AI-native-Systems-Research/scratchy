@@ -15557,24 +15557,31 @@ pub fn emit_model(
             .map(|p| p.join("_"))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
-        let dsl_shared_expert_bases: Vec<String> = weight_paths
-            .iter()
-            .filter_map(|p| p.first().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
+        // Each DSL weight whose own subtree declares a `shared_expert`, by id: the bank a MoE op
+        // reads is looked up by the weight it reads.
+        let shared_expert_banks: std::collections::BTreeSet<u32> = (program.weights.ids())
+            .filter(|&id| {
+                let path = program.weights.path(id);
+                let prefix: Vec<&str> = (path.iter().map(String::as_str))
+                    .chain(["shared_expert"])
+                    .collect();
+                program.weights.has_subtree(&prefix)
+            })
+            .map(|id| id.0)
             .collect();
         let quant = model.quantization.as_ref();
-        let widths = |base: &str, layer: st::LayerId, body| {
+        // A bank's widths, by the weight its op reads: its DSL path is the resolver's prefix.
+        let widths = |bank: u32, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");
             let at = Some(UnrollIndex(layer.0 as u64));
+            let prefix = program.weights.path(WeightId(bank)).join(".");
             let bits =
-                crate::quantization::affine_moe_expert_bits(program, &qc.method, base, at, body);
+                crate::quantization::affine_moe_expert_bits(program, &qc.method, &prefix, at, body);
             bits.map_or([None; 3], |b| b.projections().map(|w| w.map(affine_bits)))
         };
         let facts = mc3::MetalStepFacts {
             weight_paths: &weight_paths,
-            dsl_shared_expert_bases: &dsl_shared_expert_bases,
+            shared_expert_banks: &shared_expert_banks,
             embed_base: &embed_base,
             embed_quant,
             mlp: if fused_mlp {
@@ -16463,7 +16470,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     {
         let table = metal_tape_cmds
-            .into_tokens(&resolver.typed, &dims.weight_markers)
+            .into_tokens(&resolver.typed, &resolver.named, &dims.weight_markers)
             .unwrap_or_else(|e| {
                 panic!(
                     "[metal static tape] {}: command table: {e}",
