@@ -1967,17 +1967,24 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
 /// ⭐ EVERY INPUT, NOT JUST A BINARY'S SECOND. The builder gives a unary's single input the output's
 /// dims too, so the same silence applies; the invariant is "all operands share the output's extent",
 /// and stating it per-arity would be the scattered logic this crate exists to avoid.
-/// ⭐⭐⭐ TWO BASES, ONE LAW: every operand must hold the op's row sweep (`rows` — the basis
-/// [`pointwise_rows`] reads off the OUTPUT), and the basis an operand holds it in is the
-/// operand's own.
+/// ⭐⭐⭐ TWO FORMS, ONE LAW: every operand must hold the op's row sweep (`rows` — the basis
+/// [`pointwise_rows`] reads off the OUTPUT), and the form an operand holds it in is the
+/// operand's own. The two forms are checked as a DISJUNCTION, never selected by the cover:
 ///
-/// A WHOLE-VIEW operand holds the sweep by BEING it (`v_rows == rows`, at row 0) — the seeded
-/// family's shape, and the only shape the old law here described (it compared `v_rows` against
-/// the output's `v_rows`). A WINDOWED operand — a banded program's per-core window, or a minted
-/// intermediate consumed by a banded op — holds the sweep as its WINDOW (`r_len == rows`, fitting
-/// its view), and comparing its `v_rows` instead would refuse exactly the programs the band lift
-/// admits: a banded output's whole view is every core's bands, not this op's sweep. The c_len
-/// equality is unchanged — the op's width is one number every operand shares.
+/// * THE WINDOW FORM — the operand holds the sweep as its OWN WINDOW (`r_len == rows`, fitting
+///   its view at `r_start`). This is the form every SPLIT program states: an unrolled row
+///   block's load, whose own window is its sweep while its COVER — the hull over every block's
+///   read of the same parameter — spans the parameter's whole view. A cover-based selector
+///   sends that load to the view form and refuses it; the window form is what admits it, and
+///   it is checked FIRST so the cover never overrides what the operand's own window states.
+/// * THE VIEW FORM — the operand holds the sweep by BEING it (`v_rows == rows`, at row 0), with
+///   its cover `(0, v_rows)` as the program's own EVIDENCE that its reads span the view: the
+///   folded row-blocked family's leader, whose one descriptor spans every member's load. The
+///   cover is evidence here, never the selector — an operand whose cover is its view but whose
+///   window is narrower (the split load above) is a WINDOW-form operand, and the view form must
+///   not claim it.
+///
+/// The c_len equality is unchanged — the op's width is one number every operand shares.
 /// `what` is the refusal's label — the caller's own kind spelling (`Elementwise({kind:?})`, or
 /// [`int_binary`]'s `IntBinary`), so the message names the door that refused it.
 fn pointwise_extents_agree(
@@ -1988,13 +1995,10 @@ fn pointwise_extents_agree(
     rows: u32,
 ) -> Result<(), Error> {
     for (i, x) in ins.iter().enumerate() {
-        let row_ok = if x.r_cover == (0, x.v_rows) {
-            x.r_start == 0 && x.v_rows == rows
-        } else {
-            x.r_len == rows && x.r_start + x.r_len <= x.v_rows
-        };
+        let row_ok = (x.r_len == rows && x.r_start + x.r_len <= x.v_rows)
+            || (x.r_cover == (0, x.v_rows) && x.r_start == 0 && x.v_rows == rows);
         if !row_ok || x.c_len != out.c_len {
-            if x.r_cover == (0, x.v_rows) {
+            if x.r_start == 0 && x.r_len == x.v_rows {
                 return err(format!(
                     "{what} {name}: input {i} t{} is `[{}, {}]` (view rows × window \
                      cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
@@ -7688,6 +7692,27 @@ mod elementwise_tests {
         }
     }
 
+    /// A row-split intermediate: the window `[r_start, r_start+r_len)` of a taller `[v_rows, ·]`
+    /// view, the view itself as the cover — the shape the full-extent mint states for an op whose
+    /// operands swept one plain window of a taller value (#1112's gelu longhand: the head block's
+    /// `[0,42)` and the tail's `[42,64)` of one `[64, ·]` value).
+    fn split(tid: u32, v_rows: u32, r_start: u32, r_len: u32, cols: u32) -> Region {
+        Region {
+            tid,
+            v_rows,
+            v_cols: cols,
+            r_start,
+            c_start: 0,
+            r_len,
+            c_len: cols,
+            r_cover: (0, v_rows),
+            c_cover: (0, cols),
+            is_out: false,
+            is_fp8: false,
+            band: None,
+        }
+    }
+
     /// A binary node's parameter list in producer order: `[in0, in1, out]`.
     fn node(a: Region, b: Region, o: Region) -> Vec<Region> {
         vec![a, b, o]
@@ -8812,6 +8837,83 @@ mod elementwise_tests {
                 }
             }
         }
+    }
+
+    /// ⛔ THE TWO FORMS OF #1112 — the row-split view leak, at the guard that refused it. A
+    /// row-split program (the gelu longhand at m=64, c=4096: `EW_LX_ELEMS` blocks of 42 rows)
+    /// spells one chain per block over ONE value: the head block's ops sweep `[0,42)` of a
+    /// 64-row view, the tail's `[42,64)`. The walk now mints such an intermediate at the
+    /// VALUE's full extent (`whole_function`'s full-extent mint), so the guard admits TWO
+    /// forms — the operand's OWN window (the split program's basis: `r_len` rows inside a
+    /// taller view) and, as evidence the folded family leader states, the view itself (cover
+    /// `(0, v_rows)` spanning every member's load). These fixtures pin the matrix: every
+    /// green form above stays admitted, and the near-misses — a window at a basis that is
+    /// neither its own height nor its view, a tail window read at the node basis, a
+    /// whole-view input at the wrong height — stay refused.
+    #[test]
+    fn the_extent_guard_admits_the_row_split_forms_and_refuses_the_near_misses() {
+        // THE measured geometry: m=64 rows split at 42 (`EW_LX_ELEMS`), so the head window is
+        // `[0,42)` and the tail `[42,64)` of one `[64, ·]` value; 4096 columns throughout.
+        let cols = 4096u32;
+        let v = 64u32;
+        let head = split(5, v, 0, 42, cols);
+        let tail = split(5, v, 42, 22, cols);
+        let out = reg(7, 42, cols, true);
+        // THE HEAD, at its own window basis — the form the old guard refused (#1112's
+        // MISSING-LOWERING): the input states a plain window of a taller view.
+        assert!(pointwise_extents_agree("p", "Elementwise(Mul)", &[head], &out, 42).is_ok());
+        // THE TAIL, at its own window basis — the form that could not even be STATED before
+        // (the old mint shrank the view to the piece, so `[42,64)` fit nothing).
+        let tail_out = reg(7, 22, cols, true);
+        assert!(pointwise_extents_agree("p", "Elementwise(Mul)", &[tail], &tail_out, 22).is_ok());
+        // THE FOLDED FAMILY LEADER, at the node basis — one descriptor sweeping the whole
+        // view while the member loads state their own blocks: admitted by the VIEW form,
+        // cover `(0, v_rows)` as evidence.
+        let node_out = reg(7, v, cols, true);
+        assert!(pointwise_extents_agree("p", "Elementwise(Mul)", &[head], &node_out, v).is_ok());
+        assert!(
+            pointwise_extents_agree(
+                "p",
+                "Elementwise(Mul)",
+                &reg(5, v, cols, false),
+                &node_out,
+                v
+            )
+            .is_ok()
+        );
+        // ⛔ THE NEAR-MISSES stay refused. A window at a basis that is neither its own height
+        // nor its view (the head read as if the node swept 50 rows — no descriptor states
+        // this sweep):
+        let mid = reg(7, 50, cols, true);
+        assert!(pointwise_extents_agree("p", "Elementwise(Mul)", &[head], &mid, 50).is_err());
+        // The TAIL at the node basis — the honest store-side refusal: a node-basis
+        // descriptor would read the value's unwritten head rows (the store side's own
+        // ruling, unchanged here):
+        assert!(pointwise_extents_agree("p", "Elementwise(Mul)", &[tail], &node_out, v).is_err());
+        // A whole-view input at the wrong height (the guard's original law, kept):
+        let wrong = reg(7, 32, cols, true);
+        assert!(
+            pointwise_extents_agree(
+                "p",
+                "Elementwise(Mul)",
+                &[reg(5, v, cols, false)],
+                &wrong,
+                32
+            )
+            .is_err()
+        );
+        // A window past its view (`r_start + r_len > v_rows` — nothing places this):
+        let past = split(5, v, 42, 42, cols);
+        assert!(
+            pointwise_extents_agree(
+                "p",
+                "Elementwise(Mul)",
+                &[past],
+                &reg(7, 42, cols, true),
+                42
+            )
+            .is_err()
+        );
     }
 
     /// The arity of every key, against the arithmetic the op IS. Unary functions take one operand and
@@ -10216,7 +10318,14 @@ fn scalarmul_scaled(
     };
     let x = ins[0].name();
     let out_name = out.name();
-    let rows = node_rows(name, &out)?;
+    // ⭐ THE ROW BASIS THE POINTWISE ARMS STATE ([`pointwise_rows`]), not the folded-only one.
+    // A scalarmul's out is either a STORE tile — cover `(0, v_rows)`, where [`pointwise_rows`]
+    // delegates to [`node_rows`] and the bytes are exactly what they were — or an INTERMEDIATE
+    // minted by the walk, which a row-split program states as its window of the value's full
+    // view (the mint's own law, `whole_function`'s full-extent mint): a cover that is the
+    // window, not the view. `node_rows` refuses that cover by construction; the window basis
+    // is the one this body sweeps, and every whole-view case keeps it byte-identical.
+    let rows = pointwise_rows(name, &out)?;
     // ⛔⛔⛔ A COLUMN-BLOCKED PIECE READS AND WRITES ITS OWN COLUMNS — the granite logits. The front end
     // column-tiles a wide ScalarMul (`subtile_ir.rs`'s tiling set) into pieces that share one input and
     // one output tensor, and this body emitted every piece at the tensors' bases. MEASURED on the card's
