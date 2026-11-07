@@ -146,7 +146,7 @@ impl LaunchRows<'_> {
 /// a copy of the seat.
 #[cfg(feature = "spyre-hw")]
 #[derive(Clone, Copy, Debug)]
-struct SeatWidth(usize);
+pub(crate) struct SeatWidth(usize);
 
 #[cfg(feature = "spyre-hw")]
 impl SeatWidth {
