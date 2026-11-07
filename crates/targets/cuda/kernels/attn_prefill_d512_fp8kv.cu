@@ -17,11 +17,11 @@
 //   - The order per tile: K half c into W[c], `warpgroup::mma_fence()` (TK's `wgmma.fence` +
 //     `fence.proxy.async.shared::cta`: the widen writes through the generic proxy, WGMMA reads
 //     through the async one), the consumers' barrier 1; both warpgroups' Q·Kᵀ over W[0] and W[1],
-//     its wait, `k_done`, and barrier 1 again (the other warpgroup has stopped reading W[c] as K);
-//     then V half c into W[c], the fence, the warpgroup's own named barrier c + 4 (only c reads it
-//     for P·V), and P·V. The next tile's K widen into W[c] is safe: only warpgroup c read it last.
-//     Barriers 4 and 5 also guard the O store after the loop; the uses never overlap. So no
-//     inline PTX.
+//     its wait, `k_done`, the softmax, `v_arrived`, and barrier 1 again (the other warpgroup has
+//     stopped reading W[c] as K); then V half c into W[c], the fence, the warpgroup's own named
+//     barrier c + 4 (only c reads it for P·V), and P·V. The next tile's K widen into W[c] is safe:
+//     only warpgroup c read it last. Barriers 4 and 5 also guard the O store after the loop; the
+//     uses never overlap. So no inline PTX.
 //   - The V rows of slots at or past kv_len (an unwritten e4m3 byte may be NaN) are zeroed in
 //     registers during the widen, `warp::lower_fill` with +0, for the bf16 kernel's shared-memory
 //     loop: the same +0 rows. K needs nothing, as there: `right_fill` overwrites those scores.
@@ -252,8 +252,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_d512_fp8kv_ker(
             if (warpgroup::laneid() == 0) {
                 arrive(k_done, 1);
             }
-            // Both warpgroups past their Q·Kᵀ: each bf16 half is free for its own V.
-            consumers::sync(CONSUMERS_BARRIER);
 
             // The D = 256 kernel's masks and online softmax, line for line.
             const int k0 = j * KV_HEIGHT;
@@ -285,6 +283,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_d512_fp8kv_ker(
             wait(v_arrived, phase);
             // Half c of V widened over K; only this warpgroup reads it. A partial last tile's rows
             // of the slots at or past kv_len, which no append wrote, are +0 (0 · NaN = NaN, #791).
+            // Both warpgroups past this tile's Q·Kᵀ (each waited on it before its softmax), so W[c]
+            // is free for V. The barrier sits here, not between the score wait and the softmax:
+            // the code from the score wait to `wait(v_arrived)` is the bf16 kernel's, token for
+            // token, so nvcc and ptxas compile the softmax as they do there.
+            consumers::sync(CONSUMERS_BARRIER);
             widen_kv(kv_bf[c], v_smem[c], kv_len - k0);
             warpgroup::mma_fence();
             warpgroup::sync(c + 4);
