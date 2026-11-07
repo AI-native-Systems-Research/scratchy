@@ -419,14 +419,14 @@ impl DeviceGen for Gen1 {
         //    lane-permuted at standard addressing (probe-8, granite-2b fp8,
         //    2026-10-26) — the arrangement fact the propagation reads, cited to
         //    the card measurement because the DDL does not state it. The
-        //    NARROW-BACK (`fp32todl16`) states the INVERSE stagger — mapping
-        //    standard-order f32 words into staggered dl16 lanes — but it is NOT
-        //    YET MEASURED as numbers: no producer this tree compiles emits the
-        //    narrow-back, so the propagation refuses a program that would need
-        //    its staging rather than guessing a row for it. Its arrangement is
-        //    `Standard` and its bind citation is the template's; the day a card
-        //    probe measures the inverse stagger, the arrangement field is the
-        //    one thing that moves.
+        //    NARROW-BACK (`fp32todl16`) is ALSO MEASURED — the inverse stagger,
+        //    shift −1 (convert-probe on the card, 2026-11-07: element-exact at
+        //    [256,2048] and [1,2048], legs 1 and 2) — but main's arrangement
+        //    table stated NO row for it, so the propagation stages it Standard;
+        //    this row keeps main's behavior (Standard) with the measured fact
+        //    recorded in its citation, and moving the arrangement field to the
+        //    measured inverse stagger is the Z4 solve's own PR, where the
+        //    staging over it lands with it.
         DeviceOpRow {
             op: DeviceOp::Dl16ToFp32,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
@@ -439,8 +439,10 @@ impl DeviceGen for Gen1 {
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "quantization_double_pad.ddl:59 fp32todl16 (fp32 in, fp16 \
-                   out); the inverse stagger NOT YET MEASURED — see the row \
-                   doc above",
+                   out); the inverse stagger MEASURED on card — shift −1, \
+                   convert-probe 2026-11-07, element-exact at [256,2048] and \
+                   [1,2048]; main stages it Standard, so this row keeps main's \
+                   behavior, and moving it is the Z4 solve's PR",
         },
         // ── summeanmaxexx2.ddl / summeanmaxexx2_fp32.ddl — the reduce family,
         //    every combiner bound at BOTH formats (the fp16 template's stick

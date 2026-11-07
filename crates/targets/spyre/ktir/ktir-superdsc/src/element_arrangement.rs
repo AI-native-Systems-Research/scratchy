@@ -65,10 +65,11 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
 // [`ktir_core::ddl_binds::output_arrangement`] is the ONE lookup. The shared propagation takes
 // that table as INPUT; it never decides an arrangement by logic of its own
 // (the in-place-kernels/write-bindings law: target facts are const tables, never scattered
-// match arms). The `fp32todl16` inverse stagger is NOT YET MEASURED: no producer this tree
-// compiles emits the narrow-back, so the propagation refuses a program that would need its
-// staging rather than guessing a row for it; the day a card probe measures it, the row's
-// arrangement field is the one thing that moves.
+// match arms). The `fp32todl16` inverse stagger IS measured — shift −1 (convert-probe on the
+// card, 2026-11-07, element-exact at [256,2048] and [1,2048]) — but main's table stated NO
+// row for it, so the propagation stages it Standard; the row keeps main's behavior with the
+// measured fact in its citation, and moving the arrangement field is the Z4 solve's PR, where
+// the staging over the measured stagger lands with it.
 
 /// Stage a logical-order f32 word stream into its [`ElementArrangement::Dl16ToFp32`] buffer
 /// order: lane `i` of each 64-word block is written at `DL16TOFP32_PERMUTATION[i]`. The ONE

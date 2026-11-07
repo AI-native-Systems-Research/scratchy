@@ -4159,7 +4159,8 @@ pub(super) fn mint_floor(k: &KtirNode) -> u32 {
 ///
 /// The `dl16tofp32` widen writes its output lane-permuted when both operands are standard (the
 /// measured stagger — see [`crate::element_arrangement`]). That is a fact about the OPCODE, so
-/// it is stated as a const table row ([`crate::element_arrangement::OP_OUTPUT_ARRANGEMENT`])
+/// it is stated as a row of the device-facts table
+/// ([`ktir_core::ddl_binds::DEVICE_OPS`], via [`ktir_core::ddl_binds::output_arrangement`])
 /// and THIS pass takes the table as input: a convert's output carries whatever arrangement its
 /// row states, a POINTWISE op propagates the stagger to every same-width operand and its output
 /// (the device reads operand buffers lane-for-lane, so a standard-staged operand of a staggered
