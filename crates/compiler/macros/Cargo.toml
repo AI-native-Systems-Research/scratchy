@@ -50,6 +50,13 @@ spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu"]
 # with `KV_CODEC = TurboQuant`, the rest stay dense and are named in the build
 # output. Nothing selects it at runtime. `scratchy-cli` turns it on by default.
 turboquant = []
+# `tp-<W>` — bake a W-RANK tensor-parallel world beside every model's one-rank forward: the shared
+# analysis (`scratchy_subtile::tensor_parallel::shard`) shards the decode and prefill tapes, and the
+# same pipeline bakes the rank-local bundles. Off by default — a build bakes a world only when it
+# names it (`tp/2` from scratchy-cli). Spyre is the one target with collectives.
+tp-2 = ["spyre", "scratchy-target-spyre/tp-2"]
+tp-4 = ["spyre", "scratchy-target-spyre/tp-4"]
+tp-8 = ["spyre", "scratchy-target-spyre/tp-8"]
 
 [dependencies]
 tracing = { workspace = true }

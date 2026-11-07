@@ -51,7 +51,13 @@ fn dst_nest(hd: u32) -> Nest {
 
 /// The cache write EXACTLY as main's `lower_attn_node` emits it: one op per (request, slab, tensor), `y`
 /// over this slab's kv heads, one-stick identity contraction, head-outermost walk.
-fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> emit::EmittedOp {
+fn cachewr_op(
+    mq: u32,
+    hd: u32,
+    per_request: bool,
+    req: u32,
+    s: u32,
+) -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let (src, dst) = (src_nest(mq, hd), dst_nest(hd));
     let n = slabs(hd);
     let a_place = OperandPlacement::of_plane_walk_by_head(&src, Idx::<Row>::n(req), s, n);
@@ -79,7 +85,10 @@ fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> emit::Em
     )
 }
 
-fn layout_dim_order(e: &emit::EmittedOp, arg: usize) -> Vec<String> {
+fn layout_dim_order(
+    e: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    arg: usize,
+) -> Vec<String> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0]["cachewr_pin"]["scheduleTree_"][arg]["layoutDimOrder_"]
         .as_array()
@@ -89,7 +98,10 @@ fn layout_dim_order(e: &emit::EmittedOp, arg: usize) -> Vec<String> {
         .collect()
 }
 
-fn max_dim_sizes(e: &emit::EmittedOp, arg: usize) -> Vec<i64> {
+fn max_dim_sizes(
+    e: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    arg: usize,
+) -> Vec<i64> {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0]["cachewr_pin"]["scheduleTree_"][arg]["maxDimSizes_"]
         .as_array()
@@ -101,7 +113,7 @@ fn max_dim_sizes(e: &emit::EmittedOp, arg: usize) -> Vec<i64> {
 
 /// The op's own base address for one operand, in elements — the minimum over the per-core start
 /// addresses, so it is the emitter's answer and not a re-derivation of the placement.
-fn base_addr_elems(e: &emit::EmittedOp, arg: usize) -> i64 {
+fn base_addr_elems(e: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>, arg: usize) -> i64 {
     let v = serde_json::to_value(&e.op).unwrap();
     v["dscs_"][0]["cachewr_pin"]["scheduleTree_"][arg]["startAddressCoreCorelet_"]["data_"]
         .as_object()

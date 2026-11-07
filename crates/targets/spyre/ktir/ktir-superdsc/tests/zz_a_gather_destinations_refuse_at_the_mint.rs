@@ -101,7 +101,9 @@ fn layout_placing(tid: u32, size: u64) -> BundleLayout {
 
 /// The panic text out of a refused build — the assemblers panic with `format!`ed refusal messages,
 /// so the refusal is observable as the payload.
-fn refused(r: Result<EmittedOp, Box<dyn std::any::Any + Send>>) -> String {
+fn refused(
+    r: Result<EmittedOp<ktir_superdsc::collective::TpWorld<1>>, Box<dyn std::any::Any + Send>>,
+) -> String {
     let payload = match r {
         Ok(_) => panic!("the build was accepted — the refusal under test did not fire"),
         Err(p) => p,
@@ -258,7 +260,7 @@ fn a_destination_past_its_placement_refuses() {
     let true_layout = layout_placing(7, u64::from(rows) * u64::from(cols) * 2);
     let (src, index) = declare_gather_rig(&true_layout, cp);
     let mut sym = 0i64;
-    let built = assemble_gather_copy(
+    let built = assemble_gather_copy::<ktir_superdsc::collective::TpWorld<1>>(
         "gdst_true",
         &src,
         "t7",
@@ -320,7 +322,7 @@ fn a_core_local_destination_the_layout_does_not_hold_refuses() {
     lx_layout.synth_lx_core_local(core_id, lx.per_core_bytes());
     let (src, index) = declare_gather_rig(&lx_layout, cp);
     let mut sym = 0i64;
-    let built = assemble_gather_copy(
+    let built = assemble_gather_copy::<ktir_superdsc::collective::TpWorld<1>>(
         "glx_true",
         &src,
         &core_id.to_string(),

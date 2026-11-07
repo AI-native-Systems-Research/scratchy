@@ -32,8 +32,8 @@ use crate::fold_plan::{
     self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
 };
 use crate::runtime::{
-    BatchedCompute, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
-    Stream,
+    BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
+    HwError, PeerLink, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -146,13 +146,13 @@ pub(crate) struct LaunchWhere {
 }
 
 /// One rung launch staged for the rung's single doorbell. `launch_ops_inner` collects these across
-/// its whole (op, rep) loop and flushes once at the end ([`crate::runtime::Stream::compute_batch`]
+/// its whole (op, rep) loop and flushes once at the end ([`crate::runtime::Stream::submit_batch`]
 /// — the vendor's multi-CB branch). The site context rides alongside the item because the per-op
 /// `fault` closure dumps from loop locals (`ta`/`off`/the fold rep), which are gone by flush time:
 /// a refused flush rebuilds the offending entry's dump from these, and the flex-rs error names the
 /// entry index it refused.
 struct PendingLaunch {
-    item: BatchedCompute,
+    item: BatchedCb,
     /// Which op of the rung (`oi`) and which fold rep produced this entry.
     op_index: usize,
     rep: i64,
@@ -549,9 +549,9 @@ fn timers() -> std::sync::MutexGuard<'static, Timers> {
 /// orphaned the matmul in the fused bundle). A group that carries an address shift — a KV slot write,
 /// a Kᵀ slab restickify, a page fold — is a singleton at ANY group size, because the shift is applied
 /// once to the whole group.
-pub(crate) struct OpProg {
+pub(crate) struct OpProg<T: ktir_superdsc::collective::Tp> {
     /// The launch: its address shifts and the compiled program they apply to.
-    pub(crate) code: &'static bundle::LaunchGroup<'static>,
+    pub(crate) code: &'static bundle::LaunchGroup<'static, T>,
     /// The bundle this launch belongs to, and its position in that bundle's launch order — together,
     /// the whole of "which program is this".
     fp: &'static str,
@@ -561,6 +561,9 @@ pub(crate) struct OpProg {
     pub(crate) addr: Option<DevAddr>,
     /// The KV facts `fold_plan` reads: whose KV, which pass shape, which strides.
     pub(crate) kv: OpKv,
+    /// When this group is a collective's consume: the send its baked placements name and the
+    /// session's route — bound once, at [`bind_ops`].
+    pub(crate) collective: Option<cb_plan::BoundCollective<T>>,
 }
 
 /// ⛔⛔⛔ A SESSION-LIFETIME DEVICE HANDLE IS FORGOTTEN AT DROP ON PURPOSE. Per-step windows
@@ -570,9 +573,9 @@ pub(crate) struct OpProg {
 /// The forget is kept by choice, and it costs nothing: the device region a session-lifetime
 /// handle describes lives until process exit regardless (see the `DevAddr` doc), so a freeing
 /// drop could reclaim only a descriptor value, once, at shutdown. Nothing crashes without it
-/// today — the context in `runtime::runtime_cell` is a `static` that is never dropped, and
+/// today — every session holds its card's `CardRuntime` by `Arc`, so the context outlives it, and
 /// `DevAddr`'s drop cannot reach the allocator — but the law stays load-bearing anyway:
-/// `runtime_reset` (the leak probe) tears the context down MID-PROCESS, and a future
+/// `CardRuntime::reset` (the leak probe) tears the context down MID-PROCESS, and a future
 /// `DevAddr` drop that learns to free must not find session handles betting on drop order
 /// versus that.
 ///
@@ -584,13 +587,13 @@ pub(crate) struct OpProg {
 /// ⛔ DO NOT "SIMPLIFY" THIS BY FREEING THE SESSION-LIFETIME HANDLES AT DROP. The per-step
 /// windows (`shifted`, built per layer per launch) must keep dying as owned values — at ~120
 /// per forward a leaked descriptor each grows without bound.
-impl Drop for OpProg {
+impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
     fn drop(&mut self) {
         std::mem::forget(self.addr.take());
     }
 }
 
-impl Drop for Executor {
+impl<T: ktir_superdsc::collective::Tp> Drop for Executor<T> {
     fn drop(&mut self) {
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
@@ -598,18 +601,24 @@ impl Drop for Executor {
     }
 }
 
-impl OpProg {
+impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
     /// Pair one launch-index entry with the program it names.
     ///
     /// `slot_write`/`slab_write` stay DERIVED from their strides ("> 0", as the C++ had them) so a
     /// stride and its flag cannot disagree.
-    fn new(code: &'static bundle::LaunchGroup<'static>, fp: &'static str, index: usize) -> OpProg {
+    fn new(
+        code: &'static bundle::LaunchGroup<'static, T>,
+        fp: &'static str,
+        index: usize,
+        collective: Option<cb_plan::BoundCollective<T>>,
+    ) -> Self {
         let kv = &code.kv;
         OpProg {
             code,
             fp,
             index,
             addr: None,
+            collective,
             kv: OpKv {
                 request: kv.request as u64,
                 slot_offset: kv.slot_offset as u64,
@@ -632,10 +641,19 @@ impl OpProg {
     pub(crate) fn label(&self) -> String {
         format!("{}/group_{}", self.fp, self.index)
     }
+
+    /// What [`cb_plan::site_cbs`] needs to stage this group's control blocks.
+    pub(crate) fn site_tp(&self) -> cb_plan::SiteTp<T> {
+        cb_plan::SiteTp {
+            index: self.index,
+            consume: self.code.kv.tp,
+            bound: self.collective,
+        }
+    }
 }
 
 /// A launch sequence — a body rung, the prefix, the suffix, or a fold-fused twin.
-pub(crate) type Ops = Vec<OpProg>;
+pub(crate) type Ops<T> = Vec<OpProg<T>>;
 
 /// The host-shadow slice covering the WHOLE of `addr` — the H2D source for a segment.
 ///
@@ -790,10 +808,12 @@ struct KvGeometry {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One resident SuperDSC session: program + weights + KV resident on-card.
-pub struct Executor {
+pub struct Executor<T: ktir_superdsc::collective::Tp> {
     /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
     /// binary.
-    code: &'static bundle::BundleCode<'static>,
+    code: &'static bundle::BundleCode<'static, T>,
+    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's.
+    card: std::sync::Arc<CardRuntime<T>>,
 
     pub vocab: Vocab,
     pub kv_dim: KvDim,
@@ -830,21 +850,21 @@ pub struct Executor {
 
     // ── Programs ──
     rolled: Option<Rolled>,
-    prefix_ops: Ops,
+    prefix_ops: Ops<T>,
     /// ONE LIST PER ATTENTION CLASS — `body_ops[c]` is class `c`'s body. A single-class model
     /// (every model but the hybrid-attention ones) has exactly one.
-    body_ops: Vec<Ops>,
-    suffix_ops: Ops,
+    body_ops: Vec<Ops<T>>,
+    suffix_ops: Ops<T>,
     /// Each class's body with the per-page fold fused back in — one fewer launch per layer. Used
     /// whenever the context fits ONE page, which is the case that must cost what unpaged cost.
     /// `None` unless EVERY class has its twin ([`PerClass`]).
-    body_fused: Option<PerClass<Ops>>,
+    body_fused: Option<PerClass<Ops<T>>>,
     /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
     /// is the full cap.
-    body_rungs: Vec<(SweptCols, Vec<Ops>)>,
+    body_rungs: Vec<(SweptCols, Vec<Ops<T>>)>,
     /// The rungs whose EVERY class has a fold-fused twin, ascending, each with its twins in class
     /// order ([`fused_rungs`]). A rung with any class sitting out is absent, so it runs split.
-    body_rungs_fused: Vec<(SweptCols, PerClass<Ops>)>,
+    body_rungs_fused: Vec<(SweptCols, PerClass<Ops<T>>)>,
     /// PAGED: the SPLIT bodies are only reachable once a context outgrows one page, so their
     /// Program memory is allocated on first selection.
     split_bodies_ready: bool,
@@ -970,6 +990,10 @@ pub struct Executor {
     /// one; every batched or instrumented step takes the walk instead, so
     /// nothing here is consulted (or populated) off the player's own path.
     step_images: StepImageCache,
+    /// ⭐ THE RANK THIS SESSION RUNS AS — [`RankSeat::Alone`] for a world of one. Bound once, at
+    /// load ([`Executor::load`] reads its card's link); every collective's send and wait names its
+    /// route, and every consume group this session binds was chosen by its identity.
+    seat: RankSeat<T>,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -998,7 +1022,7 @@ fn dump_prog_index(fp: &str) -> usize {
 
 // Driven single-threaded by the worker thread (the session moves between forwards, as the C++
 // session pointer did).
-unsafe impl Send for Executor {}
+unsafe impl<T: ktir_superdsc::collective::Tp> Send for Executor<T> {}
 
 /// ⭐⭐⭐⭐⭐ A RAW (device-format) PAYLOAD **AND THE PLACEMENT IT FITS**, as one value — the only thing
 /// [`Executor::bind_input_raw`] accepts, and the reason a raw bind can no longer overrun its tensor.
@@ -1094,7 +1118,109 @@ struct ForwardHalf {
     h2d_bytes: u64,
 }
 
-impl Executor {
+/// WHICH RANK A SESSION RUNS AS — the bundle's world and its card's link, agreed at load.
+#[derive(Clone, Copy, Debug)]
+pub enum RankSeat<T: ktir_superdsc::collective::Tp> {
+    /// A world of one: the bundle places no receive window and the card linked no peer.
+    Alone,
+    /// One rank of a sharded world: the bundle's window is the one whose slots the card's link
+    /// pointed its `XSEG` entries at.
+    Linked { me: bundle::collective::Rank<T> },
+}
+
+/// Why a bundle cannot run in this process's world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatRefusal<T: ktir_superdsc::collective::Tp> {
+    /// The bundle was baked for a sharded world, and its card linked no peer to send to.
+    Unlinked,
+    /// The card runs one rank of a sharded world, and the bundle was baked for a world of one.
+    UnshardedBundle,
+    /// The bundle's window is not the one the card's link programmed — the peer's sends would
+    /// land where this bundle's consumes do not read.
+    WindowMoved {
+        baked: bundle::collective::RecvWindow<T>,
+        linked: bundle::collective::RecvWindow<T>,
+    },
+    /// The bundle's window cuts are not one flit-aligned window in bank 0 of the weight segment.
+    Misplaced(bundle::collective::SendUnplaced),
+}
+
+impl<T: ktir_superdsc::collective::Tp> std::fmt::Display for SeatRefusal<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlinked => write!(
+                f,
+                "baked for a sharded world, but its card linked no peer (`runtime::link_peers`) — \
+                 a world-of-one session cannot run it"
+            ),
+            Self::UnshardedBundle => write!(
+                f,
+                "baked for a world of one, but its card runs one rank of a sharded world"
+            ),
+            Self::WindowMoved { baked, linked } => write!(
+                f,
+                "its receive window {baked:?} is not the {linked:?} this card's XSEG entries \
+                 point at — every bundle a rank runs must bake the same window"
+            ),
+            Self::Misplaced(why) => write!(
+                f,
+                "its receive window's cuts are not one flit-aligned window: {why:?}"
+            ),
+        }
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> std::error::Error for SeatRefusal<T> {}
+
+impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
+    /// The seat a session over `code` takes on a card holding `link`.
+    ///
+    /// # Errors
+    /// [`SeatRefusal`], by name.
+    pub fn of(
+        code: &bundle::BundleCode<'_, T>,
+        link: Option<&PeerLink<T>>,
+    ) -> Result<Self, SeatRefusal<T>> {
+        Self::agree(Self::baked_window(code)?, link.map(PeerLink::window))?;
+        Ok(link.map_or(Self::Alone, |l| Self::Linked { me: l.identity() }))
+    }
+
+    /// The receive window `code` bakes — `None` for a bundle baked for a world of one. What a
+    /// world's [`crate::runtime::link_peers`] programs, read off the bundle that will run.
+    ///
+    /// # Errors
+    /// [`SeatRefusal::Misplaced`] when the cuts are not one flit-aligned window
+    /// ([`bundle::collective::baked_window`]).
+    pub fn baked_window(
+        code: &bundle::BundleCode<'_, T>,
+    ) -> Result<Option<bundle::collective::RecvWindow<T>>, SeatRefusal<T>> {
+        bundle::collective::baked_window::<T>(&code.layout).map_err(SeatRefusal::Misplaced)
+    }
+
+    /// The seat law over the two windows: the bundle's and the link's, each present or not.
+    fn agree(
+        baked: Option<bundle::collective::RecvWindow<T>>,
+        linked: Option<bundle::collective::RecvWindow<T>>,
+    ) -> Result<(), SeatRefusal<T>> {
+        match (baked, linked) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(SeatRefusal::Unlinked),
+            (None, Some(_)) => Err(SeatRefusal::UnshardedBundle),
+            (Some(baked), Some(linked)) if baked == linked => Ok(()),
+            (Some(baked), Some(linked)) => Err(SeatRefusal::WindowMoved { baked, linked }),
+        }
+    }
+
+    /// The rank this seat runs as — `None` alone.
+    fn identity(self) -> Option<bundle::collective::Rank<T>> {
+        match self {
+            Self::Alone => None,
+            Self::Linked { me } => Some(me),
+        }
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1105,11 +1231,39 @@ impl Executor {
     ///
     /// Nothing is read from disk: `code` is `&'static` data in this binary.
     pub fn load(
-        code: &'static bundle::BundleCode<'static>,
+        card: std::sync::Arc<CardRuntime<T>>,
+        code: &'static bundle::BundleCode<'static, T>,
         vocab: Vocab,
         kv_dim: KvDim,
         num_blocks: PoolPages,
-    ) -> Result<Executor> {
+    ) -> Result<Executor<T>> {
+        // ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
+        // receive window); the card says which rank it runs as (its [`CardRuntime::link`]). The
+        // two must agree — see [`RankSeat::of`] — and a sharded session then binds only the launch
+        // groups its rank plays.
+        let seat =
+            RankSeat::of(code, card.link()).map_err(|e| anyhow!("bundle {}: {e}", code.fp))?;
+        // ⛔ A SHARDED RANK'S STEP CANNOT DRAIN MID-SUBMIT: its collectives wait on peers that
+        // submit only after it returns, so an instrument that synchronizes between ops waits on a
+        // send never issued (measured: a 280 s stream timeout). Those instruments are a one-card
+        // tool; a sharded session refuses them at load, by name, rather than hang.
+        if <T as ktir_superdsc::collective::World>::SHARDED {
+            let d = Diag::get();
+            let drains = [
+                ("SCRATCHY_SDSC_PEROP_SYNC", d.perop_sync),
+                ("SCRATCHY_SDSC_GROUP_TIME", d.group_time),
+                ("SCRATCHY_SDSC_PREFIX_TIME", d.prefix_time),
+                ("SCRATCHY_SDSC_REPEAT_PROBE", d.repeat_probe),
+                ("SCRATCHY_SDSC_OPTRACE", d.optrace),
+                ("SCRATCHY_SDSC_TENSORDUMP", d.tensordump.is_some()),
+            ];
+            if let Some((name, _)) = drains.iter().find(|(_, on)| *on) {
+                bail!(
+                    "{name} drains the stream between a step's ops, and a sharded rank's step \
+                     cannot drain before its peers submit — run it on a one-card build"
+                );
+            }
+        }
         let places: BTreeMap<bundle::PlaceId, &'static Placement> =
             code.layout.places.iter().map(|p| (p.id, p)).collect();
         // ⛔⛔⛔ THE MAP MUST NOT HAVE LOST A PLACEMENT. This was keyed by `p.name` (a String) and
@@ -1149,6 +1303,7 @@ impl Executor {
 
         let mut ex = Executor {
             code,
+            card,
             vocab,
             kv_dim,
             num_blocks,
@@ -1201,6 +1356,7 @@ impl Executor {
             n_weights_staged: 0,
             dump: None,
             step_images: StepImageCache::default(),
+            seat,
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -1234,16 +1390,28 @@ impl Executor {
     /// ⛔ A SIBLING IS A FINGERPRINT THE REGISTRY RESOLVES. A rung this binary does not carry is a hard
     /// load error naming it and listing what IS carried — the alternative, treating it as absent, runs
     /// the batch on a bundle the ladder said was there.
-    fn sibling_ops(what: &str, fp: &bundle::SiblingFp<'static>) -> Result<Ops> {
+    fn sibling_ops(&self, what: &str, fp: &bundle::SiblingFp<'static>) -> Result<Ops<T>> {
         let code = bundle::sibling(fp).ok_or_else(|| {
             anyhow!(
                 "{what} {} is not compiled into this binary — the emit either produced no such \
                  bundle or ran for a different model. Registered: {:?}",
                 fp.as_str(),
-                bundle::registered_fps(),
+                bundle::registered_fps::<T>(),
             )
         })?;
-        Ok(bind_ops(code))
+        bind_ops(code, self.session())
+    }
+
+    /// An OPTIONAL sibling's launch groups — a fold-fused twin, which a bundle may not carry.
+    fn optional_sibling_ops(&self, fp: &bundle::SiblingFp<'static>) -> Result<Option<Ops<T>>> {
+        bundle::sibling(fp)
+            .map(|code| bind_ops(code, self.session()))
+            .transpose()
+    }
+
+    /// The rank this session runs as, when it runs one rank of a sharded world.
+    fn session(&self) -> Option<bundle::collective::Rank<T>> {
+        self.seat.identity()
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
@@ -1302,8 +1470,8 @@ impl Executor {
             prefix_weight_bank: m.prefix_weight_bank as usize,
             suffix_weight_bank: m.suffix_weight_bank as usize,
         });
-        self.prefix_ops = Self::sibling_ops("rolled prefix", &m.prefix)?;
-        self.suffix_ops = Self::sibling_ops("rolled suffix", &m.suffix)?;
+        self.prefix_ops = self.sibling_ops("rolled prefix", &m.prefix)?;
+        self.suffix_ops = self.sibling_ops("rolled suffix", &m.suffix)?;
         debug!(
             "[sdsc-superdsc] load: RE-ROLLED — {} body class(es) + prefix({}) + suffix({}); {} \
              launch(es), page_stride={} B",
@@ -1340,31 +1508,32 @@ impl Executor {
         };
         // An UNROLLED bundle is its one body; a rolled one is its ladder, and runs only its rungs.
         if rungs.is_empty() {
-            self.body_ops = vec![bind_ops(self.code)];
+            self.body_ops = vec![bind_ops(self.code, self.session())?];
         }
         // The ladder came ASCENDING by `active_cap` from the emit, so it stays so. Each rung's
         // class 0 body IS this bundle's rung sibling — the registry resolves like any other.
         for r in rungs {
-            self.body_rungs.push((
-                r.active_cap,
-                r.bodies
-                    .iter()
-                    .map(|fp| Self::sibling_ops("decode rung", fp))
-                    .collect::<Result<Vec<_>>>()?,
-            ));
+            let bodies = r
+                .bodies
+                .iter()
+                .map(|fp| self.sibling_ops("decode rung", fp))
+                .collect::<Result<Vec<_>>>()?;
+            self.body_rungs.push((r.active_cap, bodies));
         }
         // A rung's fold-fused twins are optional: a rung where any class sits out runs its split
         // bodies — correct, one launch per layer dearer. See [`fused_rungs`] for why it is per rung.
-        self.body_rungs_fused = fused_rungs(rungs.iter().map(|r| {
-            (
+        let mut twins = Vec::with_capacity(rungs.len());
+        for r in rungs {
+            twins.push((
                 r.active_cap,
                 r.bodies.len(),
                 r.bodies_fused
                     .iter()
-                    .map(|fp| bundle::sibling(fp).map(bind_ops))
-                    .collect::<Vec<_>>(),
-            )
-        }));
+                    .map(|fp| self.optional_sibling_ops(fp))
+                    .collect::<Result<Vec<_>>>()?,
+            ));
+        }
+        self.body_rungs_fused = fused_rungs(twins);
         // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
         //
         // A bundle carries a memory PLAN and a set of device PROGRAMS. The plan is what every session
@@ -1470,7 +1639,7 @@ impl Executor {
         );
     }
 
-    fn lists(&self) -> Vec<&Ops> {
+    fn lists(&self) -> Vec<&Ops<T>> {
         vec![&self.prefix_ops]
             .into_iter()
             .chain(self.body_ops.iter())
@@ -2309,8 +2478,6 @@ impl Executor {
             *from = Instant::now();
         };
 
-        crate::runtime::init_runtime().map_err(|e| anyhow!("flex runtime init failed: {e}"))?;
-        lap("runtime-init", &mut t0);
         // A DEDICATED created stream (not the default), and PERSISTENT for the session: the
         // scheduler retires each op's fence from its per-stream deque at completion
         // (SchedulerState::retire_fence), so the deques hold only in-flight fences instead of
@@ -2320,8 +2487,10 @@ impl Executor {
         // recreate-and-destroy workaround papered over exactly this; the PR1 gate run retired
         // 331,220 fences over 1,570 forwards with RSS flat to the kB). The resident
         // program/weight/KV allocations live on the runtime, not the stream.
-        self.stream =
-            Some(Stream::create().map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?);
+        self.stream = Some(
+            Stream::create(&self.card)
+                .map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?,
+        );
         lap("stream-create", &mut t0);
 
         // ── Programs. Each op's device binary gets its OWN Program-segment alloc + H2D ONCE; they
@@ -2394,7 +2563,7 @@ impl Executor {
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
-                DevAddr::alloc(ByteSize(bytes), MemoryType::Tensor)
+                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
@@ -2410,7 +2579,7 @@ impl Executor {
                 self.weight_bank_bytes[b].max(128)
             };
             self.weight_bank_addr[b] = Some(
-                DevAddr::alloc(ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
@@ -2644,7 +2813,7 @@ impl Executor {
     /// ⭐ #603 PR2 STAGE 2a — THE PREPARE-TIME CB PARITY GATE. Every allocated launch list is
     /// rendered TWO ways — the submit walk's own enumeration (`cb_plan::walk_items`) and the data
     /// twin (`cb_plan::build_cb_plan` + `CbPlan::render`) — through ONE render door
-    /// (`Stream::render_compute_batch`, the same `build_compute_cb` the submit path runs), and a
+    /// (`Stream::render_batch`, the same `build_compute_cb` the submit path runs), and a
     /// differing byte REFUSES THE LOAD. This is the gate that will let 2c's player replay
     /// pre-rendered images: it proves, at prepare, that the plan's data twin of the walk is
     /// byte-identical, so no step ever needs to re-derive (or re-check) what it replays.
@@ -2954,14 +3123,18 @@ impl Executor {
                         )
                     })?;
                 let head = img.bootstrap();
-                let addr = DevAddr::alloc(ByteSize(img.alloc_bytes()), MemoryType::Program)
-                    .map_err(|e| {
-                        anyhow!(
-                            "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
-                            img.alloc_bytes(),
-                            img.image_bytes()
-                        )
-                    })?;
+                let addr = DevAddr::alloc(
+                    &self.card,
+                    ByteSize(img.alloc_bytes()),
+                    MemoryType::Program,
+                )
+                .map_err(|e| {
+                    anyhow!(
+                        "program alloc of {} B ({head} B prologue + {} B image) failed: {e}",
+                        img.alloc_bytes(),
+                        img.image_bytes()
+                    )
+                })?;
                 // ⛔⛔⛔ DMA A PROGRAM OUT OF ANONYMOUS MEMORY, NEVER OUT OF THE EXECUTABLE.
                 //
                 // A BAKED program is `Cow::Borrowed(&'static [u8])`, which lives in the executable's
@@ -3025,7 +3198,7 @@ impl Executor {
         r
     }
 
-    fn list_mut(&mut self, sel: ListSel) -> &mut Ops {
+    fn list_mut(&mut self, sel: ListSel) -> &mut Ops<T> {
         match sel {
             ListSel::Prefix => &mut self.prefix_ops,
             ListSel::Body(c) => &mut self.body_ops[c],
@@ -3042,7 +3215,7 @@ impl Executor {
 
     /// The same list, read-only — for the per-body facts [`StepBody`] carries, which are read off the
     /// body's own OPS.
-    fn list(&self, sel: ListSel) -> &Ops {
+    fn list(&self, sel: ListSel) -> &Ops<T> {
         match sel {
             ListSel::Prefix => &self.prefix_ops,
             ListSel::Body(c) => &self.body_ops[c],
@@ -3075,7 +3248,7 @@ impl Executor {
     /// only value that answers either question is minted here, by the selector, from the selector's own
     /// answer.
     /// The baked bundle this executor runs.
-    pub fn code(&self) -> &'static bundle::BundleCode<'static> {
+    pub fn code(&self) -> &'static bundle::BundleCode<'static, T> {
         self.code
     }
 
@@ -3341,7 +3514,7 @@ impl Executor {
         r
     }
 
-    fn launch_ops_inner(&mut self, ops: &Ops, where_: LaunchWhere, d: &Diag) -> Result<()> {
+    fn launch_ops_inner(&mut self, ops: &Ops<T>, where_: LaunchWhere, d: &Diag) -> Result<()> {
         // `slot_pos`/`kv_page_base`/`weight_bank` are read only inside
         // `cb_plan::launch_site`, through `where_` — nothing else in the walk uses them.
         let LaunchWhere {
@@ -3537,6 +3710,10 @@ impl Executor {
                     timers().rb_seq.push(((ops.len(), oi), op.label()));
                 }
 
+                // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
+                // its send and its wait — staged by `cb_plan::site_cbs`, the one function the
+                // parity twin stages through too.
+                let cbs = cb_plan::site_cbs(op.site_tp(), site.batched_compute())?;
                 if collect {
                     // STAGE, DON'T SUBMIT — the rung pays one doorbell at its end. The item OWNS
                     // its handles because the shifted bases and `ta` borrows above are rep-local.
@@ -3544,12 +3721,12 @@ impl Executor {
                     // `cb_plan::walk_items` stages through too — so the item the real walk
                     // submits and the item the parity gate renders cannot drift apart in shape.
                     let st0 = Instant::now();
-                    pending.push(PendingLaunch {
-                        item: site.batched_compute(),
+                    pending.extend(cbs.into_iter().map(|item| PendingLaunch {
+                        item,
                         op_index: oi,
                         rep,
                         off,
-                    });
+                    }));
                     batch_barrier |= barrier;
                     if d.submit_time {
                         // Prep is still per-op; the enqueue it feeds is now the rung's single
@@ -3557,6 +3734,10 @@ impl Executor {
                         let mut t = timers();
                         t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
                     }
+                } else if op.collective.is_some() {
+                    // A COLLECTIVE IS ONE SUBMISSION even off the batched path: its send, wait and
+                    // consume ride one doorbell, in order, so no diag mode can split them.
+                    stream.submit_batch(&cbs, barrier).map_err(fault)?;
                 } else if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
@@ -3639,7 +3820,7 @@ impl Executor {
             // the doorbell takes, the context is what a refusal dumps.
             let mut sites: Vec<(usize, i64, [u64; NUM_SEGMENTS])> =
                 Vec::with_capacity(pending.len());
-            let items: Vec<BatchedCompute> = pending
+            let items: Vec<BatchedCb> = pending
                 .drain(..)
                 .map(|p| {
                     sites.push((p.op_index, p.rep, p.off));
@@ -3648,7 +3829,7 @@ impl Executor {
                 .collect();
             let stream = self.stream_ref()?;
             let st0 = Instant::now();
-            let r = stream.compute_batch(&items, batch_barrier);
+            let r = stream.submit_batch(&items, batch_barrier);
             let st1 = Instant::now();
             if let Err(e) = r {
                 // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
@@ -3659,7 +3840,6 @@ impl Executor {
                 if let HwError::Stream(RuntimeStreamError::BatchElement { index, .. }) = &e
                     && let Some(&(oi, rep, off)) = sites.get(*index)
                 {
-                    let ta: Vec<&DevAddr> = items[*index].tensor_allocs.iter().collect();
                     // ⛔ ONE WRITE — same single-`format!` discipline as `[progverify]`.
                     let one = format!(
                         "[flush] refused at batch entry {index} (op {oi}, rep {rep}) of {} \
@@ -3667,14 +3847,19 @@ impl Executor {
                         items.len()
                     );
                     eprint!("{one}");
-                    self.dump_launch_site(
-                        "FAULT(batch-flush)",
-                        &ta,
-                        &ops[oi],
-                        &items[*index].prog,
-                        items[*index].bootstrap_offset,
-                        &off,
-                    );
+                    // A launch dumps its aim; a send or wait has no program to dump, and its op's
+                    // launch sits two entries on.
+                    if let BatchedCb::Compute(l) | BatchedCb::Consume(l) = &items[*index] {
+                        let ta: Vec<&DevAddr> = l.tensor_allocs.iter().collect();
+                        self.dump_launch_site(
+                            "FAULT(batch-flush)",
+                            &ta,
+                            &ops[oi],
+                            &l.prog,
+                            l.bootstrap_offset,
+                            &off,
+                        );
+                    }
                 }
                 let sweep = self.prog_images_sweep("FAULT", ops);
                 eprint!("{sweep}");
@@ -3704,7 +3889,7 @@ impl Executor {
     fn dump_seg_addrs(
         &self,
         ta: &[&DevAddr],
-        op: &OpProg,
+        op: &OpProg<T>,
         prog: &DevAddr,
         bootstrap: u64,
         off: &[u64; NUM_SEGMENTS],
@@ -3731,7 +3916,7 @@ impl Executor {
         &self,
         who: &str,
         ta: &[&DevAddr],
-        op: &OpProg,
+        op: &OpProg<T>,
         prog: &DevAddr,
         bootstrap: u64,
         off: &[u64; NUM_SEGMENTS],
@@ -3802,7 +3987,7 @@ impl Executor {
     /// faulted. Sweeping the whole list sidesteps the question entirely: if any program's device copy
     /// differs from its baked bytes, this finds it without having to know which one the hardware was
     /// running.
-    fn prog_images_sweep(&self, who: &str, ops: &Ops) -> String {
+    fn prog_images_sweep(&self, who: &str, ops: &Ops<T>) -> String {
         use std::fmt::Write as _;
         let mut same = 0usize;
         let mut unread = 0usize;
@@ -3858,7 +4043,7 @@ impl Executor {
     /// translation for segment 7 than the one this address describes, the bytes here are the correct
     /// ones and the fault is in the mapping, not the image. That is the shape "identical" leaves
     /// standing, and it is worth naming because it is the only one left after this.
-    fn prog_image_report(&self, op: &OpProg, prog: &DevAddr) -> String {
+    fn prog_image_report(&self, op: &OpProg<T>, prog: &DevAddr) -> String {
         use std::fmt::Write as _;
         let baked: &[u8] = &op.code.init_binary;
         let stick = usize::try_from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES)
@@ -4032,7 +4217,7 @@ impl Executor {
     /// emulator never dumps those (host-bound sources), so they simply have no reference file.
     /// Bank ≥ 1 weights and placements past a clamped shadow window are skipped (unreadable), each
     /// with one `skip.txt` line so the gap is visible rather than silent.
-    fn tensordump(&mut self, oi: usize, op: &OpProg) -> Result<()> {
+    fn tensordump(&mut self, oi: usize, op: &OpProg<T>) -> Result<()> {
         let Some(dir) = Diag::get().tensordump.clone() else {
             return Ok(());
         };
@@ -4167,7 +4352,7 @@ impl Executor {
     /// read for free instead.
     fn rb_attribute(&mut self) {
         let seq = std::mem::take(&mut timers().rb_seq);
-        let mut entries = flex_rs::rb_telemetry::drain();
+        let mut entries = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         let mut t = timers();
         t.rb_steps += 1;
         // The DMA crossings belong to no op — the preamble-H2D and logits-D2H — so they
@@ -4242,6 +4427,71 @@ impl Executor {
                 fmt(&d2h),
                 fmt(&other)
             );
+        }
+        // ⭐ ONE FORWARD'S DEVICE TIME BY CB KIND — one line per forward, every forward: the span
+        // from the first compute CB's start to the last's end, the summed compute EXEC, and the
+        // gaps (span − exec: waits, sends, idle). A replayed forward records no launch sequence,
+        // so this is the replay path's one decomposition; a decode step of a sharded world reads
+        // its collectives' cost straight off it.
+        {
+            let ops: Vec<&flex_rs::rb_telemetry::RbTiming> = entries
+                .iter()
+                .filter(|e| {
+                    matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) && e.dma.is_none()
+                })
+                .collect();
+            let exec: u64 = ops.iter().map(|e| u64::from(e.rb.exec_cmpt_cycles())).sum();
+            let busy = ops.iter().filter(|e| e.rb.exec_cmpt_cycles() > 0).count();
+            let start = ops
+                .iter()
+                .map(|e| e.rb.timestamps()[0])
+                .filter(|&t| t != 0)
+                .min();
+            let end = ops.iter().map(|e| e.rb.timestamps()[4]).max();
+            if let (Some(a), Some(b)) = (start, end) {
+                let span = u64::from(b.wrapping_sub(a));
+                // The top exec-time CBs, by their place in the forward: which CB of the step the
+                // time is in (the sends, waits and consumes sit at fixed places in a replayed
+                // step, the same every forward).
+                let mut by_place: Vec<(u32, usize)> = ops
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (e.rb.exec_cmpt_cycles(), i))
+                    .collect();
+                by_place.sort_unstable_by(|x, y| y.cmp(x));
+                let top: Vec<String> = by_place
+                    .iter()
+                    .take(6)
+                    .map(|(c, i)| format!("{i}:{c}"))
+                    .collect();
+                // Where the gaps sit: the largest waits between one CB's end and the next's start.
+                let mut gaps: Vec<(u32, usize)> = ops
+                    .windows(2)
+                    .enumerate()
+                    .map(|(i, w)| {
+                        (
+                            w[1].rb.timestamps()[2].wrapping_sub(w[0].rb.timestamps()[4]),
+                            i + 1,
+                        )
+                    })
+                    .filter(|(g, _)| *g < 1 << 31)
+                    .collect();
+                gaps.sort_unstable_by(|x, y| y.cmp(x));
+                let gtop: Vec<String> = gaps
+                    .iter()
+                    .take(6)
+                    .map(|(g, i)| format!("{i}:{g}"))
+                    .collect();
+                eprintln!(
+                    "[sdsc-rbkind] fwd {} cbs {} (exec>0 {busy}) span {span} exec {exec} gap {} \
+                     cycles  top-exec {} top-gap {}",
+                    t.rb_steps,
+                    ops.len(),
+                    span.saturating_sub(exec),
+                    top.join(" "),
+                    gtop.join(" ")
+                );
+            }
         }
         // The op entries: compute CBs that are not DMA crossings. A crossing kept here would
         // both break the 1:1 zip below and bill the preamble/readback to whichever op it
@@ -4322,7 +4572,7 @@ impl Executor {
         // entries at its synchronize; what is left in the ring now is pre-forward history
         // (prepare's weight uploads belong to no op), and the launch sequence starts at zero.
         if d.rb_time {
-            let _ = flex_rs::rb_telemetry::drain();
+            let _ = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         }
         timers().rb_seq.clear();
 
@@ -4337,7 +4587,12 @@ impl Executor {
         let t0 = t_stream0;
         let (h2d_note, h2d_bytes) = self.refill_activations(d)?;
         let t0b = Instant::now();
-        if d.phase_time {
+        // ⛔ A SHARDED RANK NEVER DRAINS MID-SUBMIT. Its forward's collectives wait on every peer's
+        // sends, and a peer submits only after this rank returns: a drain here waits on a send that
+        // cannot have been issued yet, and the stream times out (measured: 280 s, every phase-timed
+        // tp/2 prefill). The phase split of a sharded step is the finish side's alone.
+        let sharded = <T as ktir_superdsc::collective::World>::SHARDED;
+        if d.phase_time && !sharded {
             let _ = self.stream_ref()?.synchronize();
         }
         let t1 = Instant::now();
@@ -4357,7 +4612,7 @@ impl Executor {
             self.launch_forward(seq_pos, suffix)?;
         }
 
-        if d.phase_time {
+        if d.phase_time && !sharded {
             let _ = self.stream_ref()?.synchronize();
         }
         let t2 = Instant::now();
@@ -4436,7 +4691,7 @@ impl Executor {
             if t.forwards == n {
                 let before = vmrss_kb();
                 self.stream = None;
-                let _ = crate::runtime::runtime_reset();
+                let _ = self.card.reset();
                 let after = vmrss_kb();
                 eprintln!(
                     "[sdsc-leak-probe] fwd={n} VmRSS {before} -> {after} kB (freed {} kB)",
@@ -4451,10 +4706,25 @@ impl Executor {
     /// `logits` says what the caller does with this forward's logits ([`Logits`]): a prompt chunk
     /// whose logits nobody reads skips the suffix and the read-back both.
     pub fn predict(&mut self, n_new: NewTokens, seq_pos: SeqPos, logits: Logits<'_>) -> Result<()> {
-        let (suffix, out_logits) = match logits {
-            Logits::Discarded => (SuffixLaunch::Skipped, None),
-            Logits::ReadBack(out) => (SuffixLaunch::Launched, Some(out)),
-            Logits::LeftOnDevice => (SuffixLaunch::Launched, None),
+        let want = LogitsRead::of(&logits);
+        let submitted = self.predict_submit(n_new, seq_pos, want)?;
+        self.predict_finish(submitted, logits)
+    }
+
+    /// ⭐ THE SUBMIT HALF OF [`Self::predict`]: the forward and, when its logits are read back, the
+    /// logits D2H behind it on the compute pipeline — enqueued, nothing waited on. A forward that
+    /// spans several cards (a sharded world's ranks, whose collectives wait on each other's sends)
+    /// submits on EVERY card before it waits on any, so no card's wait can stall a peer's send;
+    /// [`Self::predict_finish`] is the wait. One card is the same two halves back to back.
+    pub fn predict_submit(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        want: LogitsRead,
+    ) -> Result<PredictSubmitted> {
+        let suffix = match want {
+            LogitsRead::Discarded => SuffixLaunch::Skipped,
+            LogitsRead::ReadBack | LogitsRead::LeftOnDevice => SuffixLaunch::Launched,
         };
         let d = Diag::get();
         let n_new = NewTokens(n_new.0.max(1));
@@ -4474,7 +4744,7 @@ impl Executor {
             .cloned()
             .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
         let (mut d2h_seg, mut d2h_bytes) = (-1i64, 0u64);
-        if out_logits.is_some() {
+        if want == LogitsRead::ReadBack {
             let seg = SegIdx::checked(lp.segment as i64)
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             d2h_seg = lp.segment as i64;
@@ -4536,20 +4806,69 @@ impl Executor {
                 .d2h_on_compute(host, src)
                 .map_err(|e| anyhow!("logits D2H: {e}"))?;
         }
-        let t2b = Instant::now();
+        Ok(PredictSubmitted {
+            half,
+            want,
+            n_new,
+            d2h_seg,
+            d2h_bytes,
+            t2b: Instant::now(),
+        })
+    }
+
+    /// ⭐ A PEER RANK'S HALF OF THE LOOP'S ONE FENCE — what a sharded step's non-lead card does when
+    /// the lead's stick read lands: take its shadow's quiet point ([`Self::quiet_shadow`], the same
+    /// door every shadow writer passes through), and nothing else. Its stream holds the step the
+    /// pipelined loop already submitted behind this one, so a whole-stream synchronize here would
+    /// fence that step too and serialize the pipeline; the collectives tie the peer's progress to
+    /// the lead's, so the lead's landed read is the step's end on every card that matters.
+    pub fn settle_peer_step(&mut self) -> Result<()> {
+        self.quiet_shadow()?;
+        // A peer's RB records — whatever of its steps has completed (`[sdsc-rbkind]`).
+        if Diag::get().rb_time {
+            self.rb_attribute();
+        }
+        Ok(())
+    }
+
+    /// ⭐ THE WAIT HALF OF [`Self::predict`]: drain this card's stream, then convert the logits row
+    /// into `logits` when the submit read it back. `logits` must be the read the submit was asked
+    /// for — a mismatch is refused, never a silent skip.
+    pub fn predict_finish(&mut self, s: PredictSubmitted, logits: Logits<'_>) -> Result<()> {
+        if LogitsRead::of(&logits) != s.want {
+            bail!(
+                "predict_finish: the forward was submitted for {:?} and finished for {:?}",
+                s.want,
+                LogitsRead::of(&logits)
+            );
+        }
+        let d = Diag::get();
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("predict: sync: {e}"))?;
 
         if d.phase_time {
             let t3 = Instant::now();
-            Self::print_step_phase(&half, "logits", d2h_seg, d2h_bytes, t2b, t3, n_new.0);
+            Self::print_step_phase(
+                &s.half,
+                "logits",
+                s.d2h_seg,
+                s.d2h_bytes,
+                s.t2b,
+                t3,
+                s.n_new.0,
+            );
             let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
-            report_phase_timers(ms(half.t1, half.t2));
+            report_phase_timers(ms(s.half.t1, s.half.t2));
         }
 
-        if let Some(out) = out_logits {
-            let seg = SegIdx::checked(lp.segment as i64).unwrap();
+        if let Logits::ReadBack(out) = logits {
+            let lp = self
+                .places
+                .get(&self.logits_id)
+                .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
+            let seg = SegIdx::checked(lp.segment as i64)
+                .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             let elems = self.vocab.0.min(out.len() / 2);
             let src = &self.seg_host[seg.get()][lp.offset as usize..];
             sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
@@ -5648,6 +5967,11 @@ impl Executor {
         // latch has fired (or was never armed); this is where the drain
         // HANDS the quiet point to the next writer by taking it.
         self.quiet_shadow()?;
+        // The pipelined step's RB records — its one decomposition, since a replayed step records
+        // no launch sequence (`[sdsc-rbkind]`).
+        if Diag::get().rb_time {
+            self.rb_attribute();
+        }
         // May only return the bytes the transfer actually brought back.
         let avail = (read.end - read.offset) as usize;
         let n = (read.size as usize).min(read.cap).min(avail);
@@ -5772,7 +6096,30 @@ impl Executor {
     /// Only THIS session's descriptor is replaced; `owner` is untouched, so aliasing prefill onto
     /// decode leaves the decode session bit-for-bit unchanged. MUST be called AFTER both sessions'
     /// prepare (which zero-inits and H2Ds every segment).
-    pub fn alias_seg_from(&mut self, owner: &Executor, seg: SegIdx) -> Result<()> {
+    /// ⭐ POINT THIS CARD'S LANDING SLOTS AT THIS SESSION'S RECEIVE WINDOW — the owner session's,
+    /// once [`Self::prepare`] has allocated its weight segment (the window is a placement in it). A
+    /// world of one has no window and nothing to point.
+    ///
+    /// # Errors
+    /// An unprepared session, or the link's refusal ([`crate::runtime::point_landing_slots`]).
+    #[cfg(feature = "spyre-hw")]
+    pub fn point_landing_slots(&self) -> Result<()> {
+        if self.seat_window()?.is_none() {
+            return Ok(());
+        }
+        let region = self.seg_addr[SEG_WEIGHT.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("point_landing_slots: the weight segment is not allocated"))?;
+        crate::runtime::point_landing_slots(&self.card, region).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// The receive window this session's bundle bakes, `None` in a world of one.
+    #[cfg(feature = "spyre-hw")]
+    fn seat_window(&self) -> Result<Option<bundle::collective::RecvWindow<T>>> {
+        RankSeat::baked_window(self.code).map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))
+    }
+
+    pub fn alias_seg_from(&mut self, owner: &Executor<T>, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {
             bail!("alias_seg(seg{i}): a session has no region for it");
@@ -6064,6 +6411,37 @@ pub enum Logits<'a> {
     Discarded,
 }
 
+/// What a forward's submit half reads back — [`Logits`] without the buffer, which only the wait
+/// half ([`Executor::predict_finish`]) holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogitsRead {
+    ReadBack,
+    LeftOnDevice,
+    Discarded,
+}
+
+impl LogitsRead {
+    /// The read `logits` asks for.
+    pub fn of(logits: &Logits<'_>) -> Self {
+        match logits {
+            Logits::ReadBack(_) => Self::ReadBack,
+            Logits::LeftOnDevice => Self::LeftOnDevice,
+            Logits::Discarded => Self::Discarded,
+        }
+    }
+}
+
+/// One forward submitted by [`Executor::predict_submit`] and not yet waited on — the token
+/// [`Executor::predict_finish`] consumes. Not `Clone`: a submission is finished once.
+pub struct PredictSubmitted {
+    half: ForwardHalf,
+    want: LogitsRead,
+    n_new: NewTokens,
+    d2h_seg: i64,
+    d2h_bytes: u64,
+    t2b: Instant,
+}
+
 /// Whether [`Executor::launch_forward`] launches the suffix — read off [`Logits`] in one place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SuffixLaunch {
@@ -6139,16 +6517,58 @@ impl StepBody {
     }
 }
 
-/// This bundle's launches, in launch order.
+/// This bundle's launches that the session running as `session` plays, in launch order — every
+/// group of a world of one; a sharded rank's minus every other rank's consumes
+/// ([`bundle::collective::plays_on`], the law the bundle's CB pipeline reads too). Each consume
+/// carries its send, read off the bundle's baked placements.
 ///
-/// Infallible: a launch IS its program ([`bundle::LaunchGroup`]), so there is no index that could name
-/// a program the bundle does not carry.
-fn bind_ops(code: &'static bundle::BundleCode<'static>) -> Ops {
-    code.groups
-        .iter()
-        .enumerate()
-        .map(|(i, g)| OpProg::new(g, &code.fp, i))
-        .collect()
+/// A launch IS its program ([`bundle::LaunchGroup`]), so there is no index that could name a
+/// program the bundle does not carry. What can fail is the WORLD: a consume bound by a session of
+/// a world of one, or a rank-selected consume baked for another world, is a bundle the session was
+/// never meant to run.
+fn bind_ops<T: ktir_superdsc::collective::Tp>(
+    code: &'static bundle::BundleCode<'static, T>,
+    session: Option<bundle::collective::Rank<T>>,
+) -> Result<Ops<T>> {
+    let sends: BTreeMap<usize, bundle::collective::TpSend<T>> =
+        bundle::collective::sends(&code.layout, &code.groups)
+            .map_err(|u| {
+                anyhow!(
+                    "bundle {}: group {}'s collective send names no baked bytes: {:?}",
+                    code.fp,
+                    u.group,
+                    u.why
+                )
+            })?
+            .into_iter()
+            .map(|s| (s.group, s.send))
+            .collect();
+    let mut ops = Vec::with_capacity(code.groups.len());
+    for (i, g) in code.groups.iter().enumerate() {
+        let mut collective = None;
+        if let Some(consume) = g.kv.tp {
+            let Some(me) = session else {
+                bail!(
+                    "bundle {} group {i} is a collective's consume, so the bundle was baked for a \
+                     sharded world — a world-of-one session cannot run it (link the world's \
+                     cards before loading: `runtime::link_peers`)",
+                    code.fp
+                );
+            };
+            if !bundle::collective::plays_on(Some(consume), me) {
+                continue;
+            }
+            let Some(&send) = sends.get(&i) else {
+                bail!(
+                    "bundle {} group {i}: a consume `sends` did not resolve",
+                    code.fp
+                );
+            };
+            collective = Some(cb_plan::BoundCollective { send, me });
+        }
+        ops.push(OpProg::new(g, &code.fp, i, collective));
+    }
+    Ok(ops)
 }
 
 fn launch_err(e: HwError) -> anyhow::Error {
@@ -6409,6 +6829,35 @@ fn report_phase_timers(compute_ms: f64) {
 mod tests {
     use super::*;
 
+    /// The seat law: a bundle runs in a process only when both agree on the world — no window and
+    /// no link, or the link's window exactly — and every disagreement refuses by name.
+    #[test]
+    fn a_bundle_runs_only_where_the_process_linked_its_window() {
+        use bundle::collective::{Payload, RecvWindow, TpWorld, WireBytes};
+        type W4 = TpWorld<4>;
+        let at = |offset| RecvWindow::<W4>::new(offset, Payload::from(WireBytes::CAP)).unwrap();
+        assert_eq!(RankSeat::<W4>::agree(None, None), Ok(()));
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), Some(at(1 << 20))),
+            Ok(())
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(1 << 20)), None),
+            Err(SeatRefusal::Unlinked)
+        );
+        assert_eq!(
+            RankSeat::agree(None, Some(at(1 << 20))),
+            Err(SeatRefusal::UnshardedBundle)
+        );
+        assert_eq!(
+            RankSeat::agree(Some(at(2 << 20)), Some(at(1 << 20))),
+            Err(SeatRefusal::WindowMoved {
+                baked: at(2 << 20),
+                linked: at(1 << 20)
+            })
+        );
+    }
+
     /// A compile-time-named segment cannot be out of range, and a runtime one is checked.
     #[test]
     fn segment_indices_are_bounded() {
@@ -6573,6 +7022,7 @@ mod tests {
         };
         let entry =
             |id: u64, pipeline: PipelineId, dma: Option<DmaDirection>, ts: [u32; 5]| RbTiming {
+                source: 0,
                 id,
                 pipeline,
                 dma,

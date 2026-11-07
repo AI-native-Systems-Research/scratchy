@@ -62,7 +62,13 @@ struct PerCore {
 
 impl PerCore {
     /// Read operand `arg` (0=input, 1=kernel, 2=output) of an emitted op.
-    fn of(e: &emit::EmittedOp, op: &str, arg: usize, y_extent: u32, mb_extent: u32) -> PerCore {
+    fn of(
+        e: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+        op: &str,
+        arg: usize,
+        y_extent: u32,
+        mb_extent: u32,
+    ) -> PerCore {
         let v = serde_json::to_value(&e.op).unwrap();
         let wk = v["coreIdToWkSlice_"]
             .as_object()

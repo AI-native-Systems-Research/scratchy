@@ -8,7 +8,8 @@
 
 use crate::address::ByteSize;
 use crate::memory_region::DomainId;
-use crate::senlib_ffi::{self, LiveAllocationHandle};
+use crate::senlib_ffi::{self, Card, LiveAllocationHandle};
+use std::sync::Arc;
 
 /// Permanent (long-lived, e.g. model weights) vs Temporary (short-lived,
 /// e.g. activations) allocation lifetime hint. Port of `flex::AllocType`.
@@ -32,11 +33,14 @@ pub struct DeviceMemoryAllocation {
     // `DeviceMemoryAllocation` can never be constructed holding onto a
     // failed allocation's handle by accident.
     handle: LiveAllocationHandle,
+    /// The card this allocation lives on, and is freed on. Held by `Arc` so the card can't close
+    /// while an allocation on it is alive.
+    card: Arc<Card>,
 }
 
 impl DeviceMemoryAllocation {
-    fn new(size: ByteSize, handle: LiveAllocationHandle) -> Self {
-        Self { size, handle }
+    fn new(size: ByteSize, handle: LiveAllocationHandle, card: Arc<Card>) -> Self {
+        Self { size, handle, card }
     }
 
     pub fn size(&self) -> ByteSize {
@@ -75,7 +79,7 @@ impl Drop for DeviceMemoryAllocation {
         // The C++ `~DeviceMemoryAllocation()` cannot report a failed `Free`
         // either, but it does not hide one: log it rather than dropping it on
         // the floor (a leaked device allocation is silent otherwise).
-        let rc = unsafe { senlib_ffi::flex_senlib_memory_free(self.handle.as_raw()) };
+        let rc = unsafe { senlib_ffi::flex_senlib_memory_free(self.card.raw(), self.handle.as_raw()) };
         if rc != 0 {
             tracing::error!(handle = ?self.handle, "senlib device-memory Free failed; allocation leaked");
         }
@@ -123,14 +127,24 @@ impl std::error::Error for DeviceMemoryAllocatorError {}
 /// is documented (see `SENLIB_BOUNDARY.md`) to unify both backends behind one
 /// call, since which backend is active is a hardware-driver concern, not a
 /// flex-logic concern.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DeviceMemoryAllocator {
     platform_alignment: u64,
+    /// The card every allocation from this allocator lives on.
+    card: Arc<Card>,
 }
 
 impl DeviceMemoryAllocator {
-    pub fn new(platform_alignment: u64) -> Self {
-        Self { platform_alignment }
+    pub fn new(card: Arc<Card>, platform_alignment: u64) -> Self {
+        Self {
+            platform_alignment,
+            card,
+        }
+    }
+
+    /// The card this allocator allocates on.
+    pub fn card(&self) -> &Arc<Card> {
+        &self.card
     }
 
     pub fn platform_alignment(&self) -> u64 {
@@ -211,20 +225,20 @@ impl DeviceMemoryAllocator {
         // SAFETY: FFI call into senlib with plain integer arguments; no
         // pointers, no aliasing concerns. Failure is signaled via a
         // zero handle per the `senlib_ffi` contract.
-        let mut handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(padded_bytes) };
+        let mut handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(self.card.raw(), padded_bytes) };
         let mut retry_count = 0;
         while handle.into_live().is_none() && retry_count < max_retries {
             retry_count += 1;
             std::thread::sleep(std::time::Duration::from_millis(
                 retry_delay_ms.max(0) as u64
             ));
-            handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(padded_bytes) };
+            handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(self.card.raw(), padded_bytes) };
             retry_delay_ms = retry_delay_ms.saturating_mul(BACKOFF_MULTIPLIER);
         }
         let handle = handle
             .into_live()
             .ok_or(DeviceMemoryAllocatorError::SenlibAllocationFailed)?;
-        Ok(DeviceMemoryAllocation::new(num_bytes, handle))
+        Ok(DeviceMemoryAllocation::new(num_bytes, handle, self.card.clone()))
     }
 }
 

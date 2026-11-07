@@ -47,7 +47,7 @@ fn qg() -> QGroupBlock {
 }
 
 /// The re-layout's ops, kv-head-major then slab — exactly what the chunk would emit.
-fn relayout_ops() -> Vec<EmittedOp> {
+fn relayout_ops() -> Vec<EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
     let q = qg();
     ops_with(|kvh, s| q.copy_dest(kvh, s).expect("in range"))
 }
@@ -55,7 +55,7 @@ fn relayout_ops() -> Vec<EmittedOp> {
 /// The re-layout with the DESTINATION placement chosen per (kv head, slab) — the real law, or a control.
 fn ops_with(
     dest: impl Fn(u32, u32) -> ktir_superdsc::sdsc_abstract::OperandPlacement,
-) -> Vec<EmittedOp> {
+) -> Vec<EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
     let q = qg();
     let mut sym = 0i64;
     let mut ops = Vec::new();
@@ -85,7 +85,9 @@ fn ops_with(
     ops
 }
 
-fn body(e: &EmittedOp) -> (serde_json::Value, serde_json::Value) {
+fn body(
+    e: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> (serde_json::Value, serde_json::Value) {
     let v = serde_json::to_value(&e.op).unwrap();
     let b = v["dscs_"][0]
         .as_object()
@@ -234,7 +236,9 @@ fn the_permutation_check_refuses_a_slab_swap_and_a_copy_that_does_not_relayout()
 /// The evaluator behind the permutation proof (see the test above): `Ok` iff every emitted op, walked
 /// from its own descriptor, writes each query element `(h, f)` exactly once at the RowBlocked address
 /// `(row h%gqa, feat f)` of block `h/gqa`, and every block element is written.
-fn check_permutation(ops: &[EmittedOp]) -> Result<(), String> {
+fn check_permutation(
+    ops: &[EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+) -> Result<(), String> {
     let block_elems = (GQA * HD) as u64;
     let mut landed = vec![None::<(u32, u32)>; (NKVH.get() * GQA * HD) as usize];
     for e in ops {

@@ -48,7 +48,10 @@
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
-use scratchy_target_spyre::runtime::{DevAddr, HwError, Stream};
+use scratchy_target_spyre::runtime::{CardRuntime as AnyCard, DevAddr, HwError, Stream};
+
+/// A one-card probe: the card's runtime is a world of one's.
+type CardRuntime = AnyCard<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>;
 
 /// 512 MiB — see the module doc: the park B pays is bounded by the DmaBufPool's
 /// in-flight cap and varies run to run with the staging-vs-drain race, so the size
@@ -81,14 +84,20 @@ fn pattern_word(i: usize, xor: u64) -> u64 {
 
 /// One round: stage `old`, launch A's write of `new`, then race B's read on its own
 /// thread. Returns (B's launch duration — the park, when tracked, B's readback).
-fn run_round(track_hazards: bool, addr: &DevAddr) -> anyhow::Result<(Duration, Duration, Vec<u8>)> {
+fn run_round(
+    card: &CardRuntime,
+    track_hazards: bool,
+    addr: &DevAddr,
+) -> anyhow::Result<(Duration, Duration, Vec<u8>)> {
     let a = Stream::create_with(
+        card,
         flex_rs::stream::RuntimeStreamPriority::Normal,
         flex_rs::stream::RuntimeStreamMode::OpOrdering,
         track_hazards,
     )
     .map_err(|e| anyhow!("stream A (track={track_hazards}): {e}"))?;
     let b = Stream::create_with(
+        card,
         flex_rs::stream::RuntimeStreamPriority::Normal,
         flex_rs::stream::RuntimeStreamMode::OpOrdering,
         track_hazards,
@@ -145,14 +154,16 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    let card = CardRuntime::open(0).map_err(|e| anyhow!("open card 0: {e}"))?;
     let addr = DevAddr::alloc(
+        &card,
         flex_rs::address::ByteSize(SIZE_BYTES as u64),
         flex_rs::memory_region::MemoryType::Tensor,
     )
     .map_err(|e| anyhow!("alloc: {e}"))?;
 
     // ── Round 1: tracked OP_ORDERING streams — the RAW edge must order them. ──
-    let (b_launch_tracked, _t_a, readback) = run_round(true, &addr)?;
+    let (b_launch_tracked, _t_a, readback) = run_round(&card, true, &addr)?;
     let mismatches: usize = words(&readback)
         .enumerate()
         .map(|(i, got)| usize::from(got != pattern_word(i, NEW_XOR)))
@@ -169,7 +180,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // ── Round 2 (control): untracked — same shapes, no edge, no park. ──
-    let (b_launch_untracked, _t_a, readback) = run_round(false, &addr)?;
+    let (b_launch_untracked, _t_a, readback) = run_round(&card, false, &addr)?;
     // No assertion on WHAT the racing read saw — untracked means unordered, and a torn
     // read is a possible (not promised) outcome. Report it honestly.
     let matched_new = words(&readback)

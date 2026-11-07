@@ -623,7 +623,7 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 /// source placed after it, and the rung read the paged step 128 B away from where the host staged
 /// it (llama-3.2-1b, `active_cap=128`). A constant a rung reads that the full walk does not is the
 /// door's refusal, never a silent slot.
-pub fn bundle_registry<F: RopeForm>(
+pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     paged_rows: scratchy_triton_splice::PagedRows,
 ) -> Result<Vec<f32>, SuperDscError> {
@@ -631,7 +631,8 @@ pub fn bundle_registry<F: RopeForm>(
     let mut registry = scalar_registry(ir);
     let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
     for node in &ir.nodes {
-        let NodeLowering::Ops(ops) = lower_one_node(node, ir, ActiveCap::FULL, rows_are_requests)
+        let NodeLowering::Ops(ops) =
+            lower_one_node::<T, F>(node, ir, ActiveCap::FULL, rows_are_requests)
         else {
             continue;
         };
@@ -746,7 +747,7 @@ pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
     pools
 }
 
-pub fn compute_bundle_layout<F: RopeForm>(
+pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
@@ -1060,6 +1061,72 @@ pub fn compute_bundle_layout<F: RopeForm>(
             WeightTail::InPlace,
         )
     };
+    // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW — placed iff the forward carries a collective, in the
+    // weight segment's base region (bank 0) directly above the packed weights: `WINDOW_CUTS`
+    // adjacent cuts, each one block per sending rank of the forward's world, each block
+    // `RecvWindow::block_bytes_for` its widest collective operand, one placement per block's tid
+    // (`WindowCut::block_tid`) — collective `k` lands in cut `WindowCut::of_collective(k)`.
+    //
+    // ⛔ UNIFORM BY CONSTRUCTION, NOT BY COORDINATION. Every bundle of a forward (prefix, rolled
+    // body, suffix) is baked over THIS one layout, and `weight_segment_parity` holds every layout
+    // of a session to one weight extent — so `(seg1, align128(extent), size)` is the same triple
+    // wherever a send is baked and wherever its consume reads. The size reads only the operand's
+    // COLUMNS and the target's row cap (`WINDOW_ROWS`), never this bundle's row count, which is
+    // what keeps a decode layout and every prefill rung's equal; and `consume_fragments` cuts at
+    // the same law, so no fragment can exceed it.
+    let widest_cols = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+        .map(|n| n.inputs[0].region.cols.len)
+        .max();
+    // A collective in a world of one is a forward the analysis never mints (its identity at
+    // `W = 1`), so the window is placed for exactly the sharded worlds that carry collectives.
+    if let Some(widest_cols) =
+        widest_cols.filter(|_| <T as ktir_superdsc::collective::World>::SHARDED)
+    {
+        let w = SegRole::Weight.segment();
+        let block = ktir_superdsc::collective::RecvWindow::<T>::block_bytes_for(widest_cols)
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "a collective's operand has {widest_cols} columns — no receive window of a \
+                     {}-rank world holds it",
+                    <T as ktir_superdsc::collective::World>::RANKS
+                ))
+            })?;
+        let window = ktir_superdsc::collective::RecvWindow::<T>::new(align128(seg_bytes[w]), block)
+            .ok_or_else(|| SuperDscError("an align128 offset is flit-aligned".to_string()))?;
+        if window.end() > bundle::MAX_SEGMENT_BYTES {
+            return Err(SuperDscError(format!(
+                "the tensor-parallel receive window [{}, {}) does not fit the weight segment's \
+                 {}-byte base region above the packed weights",
+                window.offset(),
+                window.end(),
+                bundle::MAX_SEGMENT_BYTES,
+            )));
+        }
+        // One placement per (cut, sending rank): rank `s`'s block of cut `c`, where `s`'s sends
+        // into `c` land on every card and where every consume reads `s`'s share.
+        for cut in (0..ktir_superdsc::collective::WINDOW_CUTS)
+            .map(ktir_superdsc::collective::WindowCut::of_collective)
+        {
+            for from in ktir_superdsc::collective::ranks::<T>() {
+                let tid = cut.block_tid(from);
+                placements.insert(
+                    tid,
+                    TensorPlacement {
+                        tid,
+                        role: SegRole::Weight,
+                        segment: w,
+                        bank: 0,
+                        offset: window.block_offset(cut, from),
+                        size: window.block().get(),
+                    },
+                );
+            }
+        }
+        seg_bytes[w] = window.end();
+    }
     // ── ROPE permutation matrix P [hd,hd] (task: in-bundle RoPE) ── If the tape has
     // any RopeRotate/RopeAppend, main's `lower_rope_node` emits `rot = matmul(x, P)` (the
     // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
@@ -1469,7 +1536,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
     //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
-    let scalarmul_scales = bundle_registry(ir, paged_rows)?;
+    let scalarmul_scales = bundle_registry::<T, F>(ir, paged_rows)?;
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -2517,6 +2584,9 @@ fn stage_synth_weights<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     only: Option<&std::collections::HashSet<u64>>,
+    // Each weight's synth stream (`dbg_synth_val`'s first argument) — its own tid, except where a
+    // sharded gate gives a rank's slice of a sharded weight a stream of its own.
+    seed: &dyn Fn(u32) -> usize,
 ) -> StagedWeights {
     use scratchy_subtile::lower::GemmWeight;
     // ── The fp8 operand classification, off the IR the lowering itself read ──
@@ -2632,14 +2702,14 @@ fn stage_synth_weights<F: RopeForm>(
                 for j in 0..cols {
                     for l in 0..rows {
                         b.push(ktir_core::codec::f32_to_e4m3(
-                            dbg_synth_val(tid as usize, l * cols + j) * FP8_SYNTH_SCALE,
+                            dbg_synth_val(seed(tid), l * cols + j) * FP8_SYNTH_SCALE,
                         ));
                     }
                 }
             } else {
                 for e in 0..n {
                     b.push(ktir_core::codec::f32_to_e4m3(
-                        dbg_synth_val(tid as usize, e) * FP8_SYNTH_SCALE,
+                        dbg_synth_val(seed(tid), e) * FP8_SYNTH_SCALE,
                     ));
                 }
             }
@@ -2655,13 +2725,13 @@ fn stage_synth_weights<F: RopeForm>(
                     for l in 0..rows {
                         push(
                             &mut b,
-                            dbg_synth_val(tid as usize, l * cols + j) * fold_scale(tid),
+                            dbg_synth_val(seed(tid), l * cols + j) * fold_scale(tid),
                         );
                     }
                 }
             } else {
                 for e in 0..n {
-                    push(&mut b, dbg_synth_val(tid as usize, e) * fold_scale(tid));
+                    push(&mut b, dbg_synth_val(seed(tid), e) * fold_scale(tid));
                 }
             }
             b
@@ -2692,6 +2762,54 @@ fn stage_synth_weights<F: RopeForm>(
 ///                            synthetic SuperDscSession; the rest are activations).
 /// Pre-attention tids (rmsnorm/qkv/rope) depend only on hidden+weights, so the
 /// comparison needs NO mask/cache alignment — the bug localizes to one op.
+/// A gated run's readback, as the teacher-forced walk restarts from it: the run's own tensors, and —
+/// for one rank of a sharded gate — the world whose emulated operands its collectives read.
+#[cfg(feature = "spyre-emu")]
+#[derive(Clone, Copy)]
+struct EmuReadback<'a> {
+    own: &'a std::collections::HashMap<u64, Vec<f32>>,
+    peer: Option<GatePeer<'a>>,
+}
+
+/// Whether `op` reads across ranks — the nodes a rank's reference evaluates against its peer.
+fn is_collective<F: RopeForm>(op: &SubOp<F>) -> bool {
+    matches!(op, SubOp::AllReduce | SubOp::AllGather { .. })
+}
+
+/// THE WORLD of a sharded gate, as one rank's reference reads it: which rank THIS one is and every
+/// rank's buffers, indexed by rank then tid like the rank's own, that its collectives read every
+/// operand from (in absolute rank order — `eval_collective`'s law). An empty rank's buffers stand
+/// for a rank not yet evaluated — the first pass of the lockstep golden, whose collectives the
+/// later passes correct — and read as this rank's own.
+#[derive(Clone, Copy)]
+pub(crate) struct GatePeer<'a> {
+    pub rank: u32,
+    pub ranks: &'a [Vec<Vec<f32>>],
+}
+
+impl GatePeer<'_> {
+    fn collective<F: RopeForm>(
+        self,
+        node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
+        ir: &SubtileIR<F>,
+        own: &[Vec<f32>],
+    ) -> Vec<f32> {
+        let ranks: Vec<&[Vec<f32>]> = self
+            .ranks
+            .iter()
+            .enumerate()
+            .map(|(r, b)| {
+                if r as u32 == self.rank || b.is_empty() {
+                    own
+                } else {
+                    b.as_slice()
+                }
+            })
+            .collect();
+        scratchy_subtile::tensor_parallel::eval_collective(node, ir, &ranks)
+    }
+}
+
 /// ⭐ THE IN-MEMORY HALF OF THE GOLDEN — the reference semantics of the same
 /// `dsl_math`, computed independently of the spyre lowering: every tensor's f32
 /// values under the synthetic source law (`dbg_synth_val`), with the fold's WHOLE
@@ -2705,6 +2823,10 @@ fn stage_synth_weights<F: RopeForm>(
 /// ([`numeric_gate`]) compares them against the emulator's own run IN-PROCESS —
 /// the same values, no files — so the gate needs no environment variable and
 /// cannot be skipped by forgetting to set one.
+///
+/// One rank of a sharded forward evaluates its collectives against its `peer`
+/// ([`GatePeer`]): the reference walks the rank's own graph, and only a collective
+/// reads across ranks.
 pub(crate) fn eval_golden_buffers<F: RopeForm>(
     ir: &SubtileIR<F>,
     staged_rope: &std::collections::HashMap<u32, Vec<f32>>,
@@ -2720,6 +2842,12 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // truncated bundle does not bind, and leaves every non-bound tensor's
     // buffer unallocated.
     covering: Option<&std::collections::HashSet<u64>>,
+    // One rank of a sharded forward: the peer whose buffers its collectives read. `None` for a
+    // forward with no collective, where meeting one panics (`eval_node`'s own refusal).
+    peer: Option<GatePeer<'_>>,
+    // Each synth source's stream — `stage_gate_probe`'s own `seed`, so the reference reads exactly
+    // the values the session was handed.
+    seed: &dyn Fn(u32) -> usize,
 ) -> Vec<Vec<f32>> {
     let nsrc = ir.num_sources as usize;
     // ⭐ THE FOLD, STATED FOR THE GOLDEN TOO — BOTH KINDS. A weight-folded ScalarMul has no
@@ -2823,8 +2951,10 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 let rows = read_rows.get(&id).copied().unwrap_or(t.rows).min(t.rows);
                 let n = (rows as usize) * (t.cols as usize);
                 match rope_table_half.get(&(id as u32)) {
-                    Some(&half) => (0..n).map(|j| dbg_synth_val(id, j % half)).collect(),
-                    None => (0..n).map(|j| dbg_synth_val(id, j)).collect(),
+                    Some(&half) => (0..n)
+                        .map(|j| dbg_synth_val(seed(id as u32), j % half))
+                        .collect(),
+                    None => (0..n).map(|j| dbg_synth_val(seed(id as u32), j)).collect(),
                 }
             }
         })
@@ -2999,7 +3129,10 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 (node, scratchy_subtile::subtile_ir::AttnScaleSite::InKernel)
             }
         };
-        let mut out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &bufs);
+        let mut out = match peer {
+            Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &bufs),
+            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &bufs),
+        };
         // The fp8 matmul's quant model (see the closures above): the ideal product over
         // the ROUND-TRIPPED payload, then the ws mulf — fold included — on the result.
         // The payload swap is temporary and per node: `eval_node` reads `inputs[1]` and
@@ -3195,7 +3328,7 @@ fn region_slice(
 fn teacher_forced_walk<F: RopeForm>(
     ir: &SubtileIR<F>,
     golden: &mut [Vec<f32>],
-    emu: &std::collections::HashMap<u64, Vec<f32>>,
+    run: EmuReadback<'_>,
     tainted: &std::collections::HashSet<u32>,
     // The lm-head tail fold's tids (`is_prefill_lm_head_tail` — the splice's
     // own predicate): their program product is ONE row (row 0 of a stick the
@@ -3210,6 +3343,7 @@ fn teacher_forced_walk<F: RopeForm>(
     weights: &StagedWeightView<'_>,
     covering: Option<&std::collections::HashSet<u64>>,
 ) -> (Vec<Vec<f32>>, Vec<TeacherForcedRow>) {
+    let EmuReadback { own: emu, peer } = run;
     let nsrc = ir.num_sources as usize;
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let attn_folds = crate::lower_subtile_tape_to_ktir::attn_scale_weight_folds(ir);
@@ -3330,7 +3464,10 @@ fn teacher_forced_walk<F: RopeForm>(
                 tf[w] = vals;
             }
         }
-        let mut tf_out = scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &tf);
+        let mut tf_out = match peer {
+            Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &tf),
+            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &tf),
+        };
         if let SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
             ..
@@ -3503,9 +3640,9 @@ pub fn write_eval_golden<F: RopeForm>(
     // The full-depth staging (`None` — the DBG oracle states the whole
     // graph's law), with the golden materializing each node's weights from
     // it per node: the same product, the same values, no all-weights f32.
-    let staged = stage_synth_weights(ir, weight_ids, None);
+    let staged = stage_synth_weights(ir, weight_ids, None, &|tid| tid as usize);
     let view = staged.view();
-    let bufs = eval_golden_buffers(ir, staged_rope, &view, None);
+    let bufs = eval_golden_buffers(ir, staged_rope, &view, None, None, &|tid| tid as usize);
     // The scales manifest's skip set — the same folded-node predicate the walk used.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
@@ -3575,6 +3712,287 @@ pub fn write_eval_golden<F: RopeForm>(
         format!("[{}]", smj.join(",")),
     )?;
     Ok(())
+}
+
+/// ⭐ THE GATE'S PROBE — everything one gated session binds and its reference reads: the staged
+/// synth weights (the session's resident bytes, and the clone the reference view decodes), the
+/// load-time constants, the seat, and every probe source (synth at the IR shape, scales as ones,
+/// the rope rows, the compile-time scalars, the length mask). ONE staging for every gate: the
+/// one-rank gate stages it once; the sharded gate once per rank, with `seed` naming each source's
+/// synth stream — a rank's slice of a sharded source is its own, a replicated source the same on
+/// every rank.
+#[cfg(feature = "spyre-emu")]
+struct GateProbe {
+    emu_weights: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)>,
+    view_bytes: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)>,
+    gemm: std::collections::HashSet<u32>,
+    scale_rows: std::collections::HashSet<u32>,
+    load_consts: Vec<(u32, crate::wiring::LoadConst)>,
+    staged_rope: std::collections::HashMap<u32, Vec<f32>>,
+    sources: Vec<(u64, Vec<f32>, Vec<usize>)>,
+}
+
+#[cfg(feature = "spyre-emu")]
+fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+    ir: &SubtileIR<F>,
+    weight_ids: &std::collections::HashSet<u32>,
+    covering: Option<&std::collections::HashSet<u64>>,
+    prefill: Option<&PrefillGate>,
+    cap: u32,
+    active_cap: ActiveCap,
+    seed: &dyn Fn(u32) -> usize,
+) -> Result<GateProbe, String> {
+    // ── The fold list the scales manifest's skip set states ──
+    let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
+    // ── Synth weights: staged ONCE for both legs — the emulator's resident
+    //    bytes (moved into the session's HBM below) and the reference legs'
+    //    per-node materialization (the clone the view borrows: `new_multi`
+    //    moves the staging's own bytes, and the golden and the walk both
+    //    outlive the session). The covering filter stages just the weights
+    //    the kept launches read (measured shape: the 12b's full staging is
+    //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
+    //    the one transient double, and the slice keeps both sides small. ──
+    let StagedWeights {
+        bytes: mut emu_weights,
+        gemm,
+        scale_rows,
+    } = stage_synth_weights(ir, weight_ids, covering, seed);
+    // ⭐ THE LOAD-TIME CONSTANTS — resident bytes at their TRUE dtypes, staged
+    // into the session exactly as the worker stages them at load: each entry's
+    // kind names the ONE builder (`LoadConst::build`) both legs call, so a
+    // staging defect cannot hide on one leg only. A source the list names is
+    // minted below the `LoweredDecode` binding layer (no `SourceBinding`,
+    // absent from `weight_ids`), so the source loop below would otherwise hand
+    // it to `run_step`'s f16-only source channel — and an fp32 table would
+    // encode into half the bytes its f32 view spans. ⛔ THE REFERENCE LEGS TAKE
+    // THEM THROUGH THE VIEW'S OWN `stage_load_consts`, NOT `bytes`: the clone
+    // crosses BEFORE the entries join the session's staging, because
+    // `materialize` substitutes at every READ (a weight's bytes are its value)
+    // and an OUTPUT-tid entry reaching it would replace the computed product
+    // with its own initial bytes at every consumer (measured: the argmax
+    // mint's widened row read back as its staged zeros, golden idx 0 against
+    // a true argmax of 12358 on both legs).
+    // The ARRANGEMENT FACTS the worker's staging carries — the gate-side twin of the wiring's
+    // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
+    // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
+    // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
+    let staggered =
+        crate::lower_subtile_tape_to_ktir::staggered_of_ir::<T, F>(ir).map_err(|e| e.0)?;
+    let load_consts =
+        crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
+    let load_const_tids: std::collections::HashSet<u32> =
+        load_consts.iter().map(|&(tid, _)| tid).collect();
+    let weights_ref = emu_weights.clone();
+    for &(tid, kind) in &load_consts {
+        let (bytes, dt, shape) = kind.build();
+        emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
+    }
+    // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
+    // states (`eval_golden_buffers`' seat block), staged into the session at
+    // the operands' TRUE dtypes so neither rides `run_step`'s f16-only
+    // source channel: the four seed word tables as i32 LE words (each view
+    // is si32, so `set_source_bytes` lands them verbatim through
+    // `weight_arg`'s I32 arm), the inv_t as f32 bytes at [rows, 1] (verbatim
+    // at its own view — the f16 channel would encode it into half the bytes
+    // its f32 view spans, the load-consts comment's own failure mode, and
+    // the gate would compare a golden against a channel-mangled operand).
+    // The emulator is memref-faithful, so each word table stages PACKED at
+    // [rows, 1] — not at the card seat's reservation stride (the worker's
+    // own law, `seed_row_words`).
+    let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir).map_err(|e| e.0)?;
+    if let Some(seat) = &sample_seat {
+        // The greedy law's quadruple `(0, 0, 7, 0)` — one word per table,
+        // in the quadruple's own order (the GATE table's 0 IS the law); the
+        // row word is gone from the key (the P3 localization ruling).
+        const GREEDY_QUAD: [i32; 4] = [0, 0, 7, 0];
+        for (k, &tid) in seat.seed_words.iter().enumerate() {
+            let word_bytes: Vec<u8> = (0..seat.rows)
+                .map(|_| GREEDY_QUAD[k])
+                .flat_map(i32::to_le_bytes)
+                .collect();
+            emu_weights.push((
+                tid as usize,
+                word_bytes,
+                scratchy_tensors::DType::I32,
+                vec![seat.rows as usize, 1],
+            ));
+        }
+        let invt_bytes: Vec<u8> = (0..seat.rows).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        emu_weights.push((
+            seat.invt as usize,
+            invt_bytes,
+            scratchy_tensors::DType::F32,
+            vec![seat.rows as usize, 1],
+        ));
+    }
+    // ── The probe sources: synth at the IR shape, scales as ones, the mask
+    //    keeping the prefix region's rows valid (the reference's own key set) ──
+    // The rope cos/sin sources stage at their runtime contract — period-`half`,
+    // per [`rope_table_periods`] — not as flat noise.
+    let rope_table_half = rope_table_periods(ir);
+    // ⭐ THE PREFILL ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
+    // this product feeds the emulator's probe binds below AND the golden's
+    // source buffers (`eval_golden_buffers`), so a staging defect cannot hide
+    // on one side only. Decode stages nothing here and keeps the period-half
+    // synth below — its tables are one row, where the periodic pattern and
+    // the run-time staging agree by construction.
+    let staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
+        Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
+        None => Default::default(),
+    };
+    // ⭐ THE PAGED STEP, STAGED BY THE WORKER'S OWN LAW (`crate::paged_step`). The gate's one step
+    // is the reference's own: at decode, the rope-append prefix's rows cached and the new token at
+    // the next position; at a first prompt chunk, nothing cached and `mq` rows from position 0. The
+    // request's blocks run the pool's pages in REVERSE, so the walk reads every page through the
+    // table rather than at its block's own index. The reference attends the cache's token-major
+    // rows; the pools the paged walk reads are those SAME values laid into their pages
+    // (`pool_of_rows`), so the two read one set of keys.
+    // One request's step: the gate runs in an emulator bake, whose decode rungs are one request
+    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
+    // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
+    // chunk's rows are one sequence's (the bake's `rows_are_requests`).
+    let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+        ir,
+        active_cap,
+        scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
+    )
+    .map_err(|e| e.0)?;
+    let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
+        SubOp::AttnDecode {
+            mask, attention, ..
+        } => Some(attention.class(mask.class()).head_dim().get() as usize),
+        _ => None,
+    });
+    let pool_tids: std::collections::HashSet<u32> = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode { .. } if n.inputs.len() >= 3 => Some([
+                n.inputs[1].tensor.index() as u32,
+                n.inputs[2].tensor.index() as u32,
+            ]),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let step_rows = match (prefill, paged) {
+        (Some(pg), _) => crate::paged_step::StepRows {
+            start: 0,
+            real: pg.mq as usize,
+        },
+        (None, Some(p)) => {
+            let cached = ir
+                .nodes
+                .iter()
+                .filter_map(|n| match &n.op {
+                    SubOp::AttnDecode { .. } if n.inputs.len() >= 5 => {
+                        Some(n.inputs[1].region.rows.len as usize)
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            crate::paged_step::StepRows {
+                start: cached.min(p.capacity().saturating_sub(1)),
+                real: 1,
+            }
+        }
+        (None, None) => crate::paged_step::StepRows { start: 0, real: 1 },
+    };
+    // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
+    // every page through the table rather than at its block's own index, and the pages the step
+    // touches stay at the pool's start (the staging below writes only that prefix).
+    let blocks: Vec<u32> = paged
+        .map(|p| {
+            let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
+            if need < p.pages {
+                (1..=need).collect()
+            } else {
+                (0..need).collect()
+            }
+        })
+        .unwrap_or_default();
+    let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
+    for tid in 0..ir.num_sources {
+        // The covering slice: a source only the dropped launches read is not
+        // part of the graph under test. The reserved-tid sources appended
+        // below (the scalars, the mask) stay UNfiltered — the twin's programs
+        // bind them exactly as the full bundle does.
+        if weight_ids.contains(&tid)
+            || load_const_tids.contains(&tid)
+            || sample_seat.is_some_and(|s| s.seed_words.contains(&tid) || s.invt == tid)
+            || covering.is_some_and(|c| !c.contains(&(tid as u64)))
+        {
+            continue;
+        }
+        let t = ir.tensors[tid as usize];
+        // A pool's stimulus is its cached rows alone: the rows past them are no step's, and the
+        // session's own allocation holds them at zero.
+        let n = if pool_tids.contains(&tid) {
+            step_rows.start * t.cols as usize
+        } else {
+            (t.rows as usize) * (t.cols as usize)
+        };
+        let vals = if scale_rows.contains(&tid) {
+            vec![1.0; n]
+        } else if let Some(v) = staged_rope.get(&tid) {
+            v.clone()
+        } else if let Some(&half) = rope_table_half.get(&tid) {
+            // The SAME stream the reference reads (`eval_golden_buffers`: `seed(id)`) — a rank's
+            // slice of a column-split table is its own, so the stream is the rank's.
+            (0..n).map(|j| dbg_synth_val(seed(tid), j % half)).collect()
+        } else {
+            (0..n).map(|j| dbg_synth_val(seed(tid), j)).collect()
+        };
+        match (paged, paged_hd) {
+            (Some(p), Some(hd)) if pool_tids.contains(&tid) => {
+                let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
+                    .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
+                if !pool.is_empty() {
+                    let rows = pool.len() / t.cols as usize;
+                    sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
+                }
+            }
+            _ => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
+        }
+    }
+    // The compile-time scalars, at their reserved tids — the reader-side law
+    // `scalarmul_scales.json` states (same first-seen non-folded walk).
+    let folded =
+        |id: scratchy_subtile::subtile_ir::SubtileId| sm_folds.iter().any(|(fid, _, _)| *fid == id);
+    let mut sm: Vec<f32> = Vec::new();
+    for node in &ir.nodes {
+        if let SubOp::ScalarMul { scale } = &node.op
+            && !folded(node.id)
+            && !sm.iter().any(|s| s.to_bits() == scale.to_bits())
+        {
+            sm.push(*scale);
+        }
+    }
+    for (i, v) in sm.iter().enumerate() {
+        sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
+    }
+    // The paged step's three sources, by the worker's law: the mask stack an f16 source like any
+    // other, the page table and the write rows int32 words on the typed channel (the f16 source
+    // channel would encode them into half the bytes their views span).
+    if let Some(p) = paged {
+        let srcs = crate::paged_step::request_sources(&p, &blocks, &step_rows)
+            .map_err(|e| format!("the gate's paged step: {e}"))?;
+        for (tid, bytes, shape) in srcs.int32 {
+            emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
+        }
+        let (mask_tid, mask, mask_shape) = srcs.mask;
+        sources.push((u64::from(mask_tid), mask, mask_shape));
+    }
+    Ok(GateProbe {
+        emu_weights,
+        view_bytes: weights_ref,
+        gemm,
+        scale_rows,
+        load_consts,
+        staged_rope,
+        sources,
+    })
 }
 
 /// ⭐⭐⭐ THE BAKE-TIME NUMERIC GATE — "if there is garbage, it cannot compile."
@@ -3666,11 +4084,15 @@ pub struct GateRung<'a> {
     /// The rung's sweep — its paged walk ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]),
     /// so the gate stages the step against the reach the bundle was baked with.
     pub active_cap: ActiveCap,
+    /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
+    /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
+    /// ranks at once ([`numeric_gate_sharded`]).
+    pub shards: Option<&'a [scratchy_subtile::tensor_parallel::SourceShard]>,
 }
 
 #[cfg(feature = "spyre-emu")]
-pub fn numeric_gate<F: RopeForm>(
-    groups: &[bundle::LaunchGroup<'static>],
+pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+    groups: &[bundle::LaunchGroup<'static, T>],
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     // ⭐ THE RUNG UNDER TEST — see [`GateRung`]: the fingerprint every message
@@ -3686,6 +4108,22 @@ pub fn numeric_gate<F: RopeForm>(
     // The rung's identity, named for the body: the messages say `{fp}`, the
     // decode mask stages `cap` — both off the ONE param that carried them in.
     let (fp, cap) = (rung.fp, rung.cap);
+    // ⛔ A SHARDED FORWARD HAS NO ONE-RANK RUN. Its consumes read the receive window the peer's
+    // send fills, and its collectives have no one-rank reference, so it is gated on every rank at
+    // once — below, once the covering slice is known. Which gate runs is the rung's WORLD, its
+    // type; a sharded rung with no slice laws to stage its ranks by is a bake defect, refused by
+    // name.
+    use ktir_superdsc::collective::World;
+    let sharded = match (<T as World>::SHARDED, rung.shards) {
+        (false, _) => None,
+        (true, Some(shards)) => Some(shards),
+        (true, None) => {
+            return Err(format!(
+                "a {}-rank rung reached the gate with no slice laws to stage its ranks by",
+                <T as World>::RANKS
+            ));
+        }
+    };
     // ⛔ KEEP IN STEP with `eval_node`'s no-host-reference arms: an op listed
     // here that gains a reference makes the gate skip a graph it could check;
     // one missing here PANICS inside `eval_golden_buffers` with eval's own
@@ -3824,8 +4262,6 @@ pub fn numeric_gate<F: RopeForm>(
     } else {
         ir
     };
-    // ── The fold list the scales manifest's skip set states ──
-    let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     // ── The taint map: which tensors' values cross an fp8 payload's grid ──
     let mut tainted: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for node in &ir.nodes {
@@ -3885,251 +4321,58 @@ pub fn numeric_gate<F: RopeForm>(
         keep
     });
     let covering: Option<&std::collections::HashSet<u64>> = covering_owned.as_ref();
-    // ── Synth weights: staged ONCE for both legs — the emulator's resident
-    //    bytes (moved into the session's HBM below) and the reference legs'
-    //    per-node materialization (the clone the view borrows: `new_multi`
-    //    moves the staging's own bytes, and the golden and the walk both
-    //    outlive the session). The covering filter stages just the weights
-    //    the kept launches read (measured shape: the 12b's full staging is
-    //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
-    //    the one transient double, and the slice keeps both sides small. ──
-    let StagedWeights {
-        bytes: mut emu_weights,
+    // ⭐ A SHARDED RUNG IS GATED ON EVERY RANK AT ONCE — see [`numeric_gate_sharded`]: its
+    // consumes read the window the peers' sends fill, so the ranks step collective by collective.
+    if let Some(shards) = sharded {
+        let mut scope = String::new();
+        if let Some(p) = prefill {
+            scope.push_str(&format!(" [prefill mq={}]", p.mq));
+        }
+        if let Some(t) = trunc {
+            scope.push_str(&format!(
+                " [class-covering {}/{} layers]",
+                t.layers.0, t.layers.1
+            ));
+        }
+        return numeric_gate_sharded(ShardedGate {
+            groups,
+            ir,
+            weight_ids,
+            covering,
+            tainted: &tainted,
+            prefill,
+            fp,
+            cap,
+            active_cap: rung.active_cap,
+            shards,
+            scope,
+        });
+    }
+    // ── The probe: ONE staging for every gate (`stage_gate_probe`) — the one-rank gate's sources
+    //    each draw their own tid's synth stream. ──
+    let GateProbe {
+        mut emu_weights,
+        view_bytes,
         gemm,
         scale_rows,
-    } = stage_synth_weights(ir, weight_ids, covering);
-    // ⭐ THE LOAD-TIME CONSTANTS — resident bytes at their TRUE dtypes, staged
-    // into the session exactly as the worker stages them at load: each entry's
-    // kind names the ONE builder (`LoadConst::build`) both legs call, so a
-    // staging defect cannot hide on one leg only. A source the list names is
-    // minted below the `LoweredDecode` binding layer (no `SourceBinding`,
-    // absent from `weight_ids`), so the source loop below would otherwise hand
-    // it to `run_step`'s f16-only source channel — and an fp32 table would
-    // encode into half the bytes its f32 view spans. ⛔ THE REFERENCE LEGS TAKE
-    // THEM THROUGH THE VIEW'S OWN `stage_load_consts`, NOT `bytes`: the clone
-    // crosses BEFORE the entries join the session's staging, because
-    // `materialize` substitutes at every READ (a weight's bytes are its value)
-    // and an OUTPUT-tid entry reaching it would replace the computed product
-    // with its own initial bytes at every consumer (measured: the argmax
-    // mint's widened row read back as its staged zeros, golden idx 0 against
-    // a true argmax of 12358 on both legs).
-    // The ARRANGEMENT FACTS the worker's staging carries — the gate-side twin of the wiring's
-    // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
-    // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
-    // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
-    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir(ir).map_err(|e| e.0)?;
-    let load_consts =
-        crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
-    let load_const_tids: std::collections::HashSet<u32> =
-        load_consts.iter().map(|&(tid, _)| tid).collect();
-    let weights_ref = emu_weights.clone();
+        load_consts,
+        staged_rope,
+        mut sources,
+    } = stage_gate_probe::<T, F>(
+        ir,
+        weight_ids,
+        covering,
+        prefill,
+        cap,
+        rung.active_cap,
+        &|tid| tid as usize,
+    )?;
     let view = StagedWeightView {
-        bytes: &weights_ref,
+        bytes: &view_bytes,
         gemm: &gemm,
         scale_rows: &scale_rows,
         load_consts: &load_consts,
     };
-    for &(tid, kind) in &load_consts {
-        let (bytes, dt, shape) = kind.build();
-        emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
-    }
-    // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
-    // states (`eval_golden_buffers`' seat block), staged into the session at
-    // the operands' TRUE dtypes so neither rides `run_step`'s f16-only
-    // source channel: the four seed word tables as i32 LE words (each view
-    // is si32, so `set_source_bytes` lands them verbatim through
-    // `weight_arg`'s I32 arm), the inv_t as f32 bytes at [rows, 1] (verbatim
-    // at its own view — the f16 channel would encode it into half the bytes
-    // its f32 view spans, the load-consts comment's own failure mode, and
-    // the gate would compare a golden against a channel-mangled operand).
-    // The emulator is memref-faithful, so each word table stages PACKED at
-    // [rows, 1] — not at the card seat's reservation stride (the worker's
-    // own law, `seed_row_words`).
-    let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir).map_err(|e| e.0)?;
-    if let Some(seat) = &sample_seat {
-        // The greedy law's quadruple `(0, 0, 7, 0)` — one word per table,
-        // in the quadruple's own order (the GATE table's 0 IS the law); the
-        // row word is gone from the key (the P3 localization ruling).
-        const GREEDY_QUAD: [i32; 4] = [0, 0, 7, 0];
-        for (k, &tid) in seat.seed_words.iter().enumerate() {
-            let word_bytes: Vec<u8> = (0..seat.rows)
-                .map(|_| GREEDY_QUAD[k])
-                .flat_map(i32::to_le_bytes)
-                .collect();
-            emu_weights.push((
-                tid as usize,
-                word_bytes,
-                scratchy_tensors::DType::I32,
-                vec![seat.rows as usize, 1],
-            ));
-        }
-        let invt_bytes: Vec<u8> = (0..seat.rows).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        emu_weights.push((
-            seat.invt as usize,
-            invt_bytes,
-            scratchy_tensors::DType::F32,
-            vec![seat.rows as usize, 1],
-        ));
-    }
-    // ── The probe sources: synth at the IR shape, scales as ones, the mask
-    //    keeping the prefix region's rows valid (the reference's own key set) ──
-    // The rope cos/sin sources stage at their runtime contract — period-`half`,
-    // per [`rope_table_periods`] — not as flat noise.
-    let rope_table_half = rope_table_periods(ir);
-    // ⭐ THE PREFILL ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
-    // this product feeds the emulator's probe binds below AND the golden's
-    // source buffers (`eval_golden_buffers`), so a staging defect cannot hide
-    // on one side only. Decode stages nothing here and keeps the period-half
-    // synth below — its tables are one row, where the periodic pattern and
-    // the run-time staging agree by construction.
-    let staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
-        Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
-        None => Default::default(),
-    };
-    // ⭐ THE PAGED STEP, STAGED BY THE WORKER'S OWN LAW (`crate::paged_step`). The gate's one step
-    // is the reference's own: at decode, the rope-append prefix's rows cached and the new token at
-    // the next position; at a first prompt chunk, nothing cached and `mq` rows from position 0. The
-    // request's blocks run the pool's pages in REVERSE, so the walk reads every page through the
-    // table rather than at its block's own index. The reference attends the cache's token-major
-    // rows; the pools the paged walk reads are those SAME values laid into their pages
-    // (`pool_of_rows`), so the two read one set of keys.
-    // One request's step: the gate runs in an emulator bake, whose decode rungs are one request
-    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
-    // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
-    // chunk's rows are one sequence's (the bake's `rows_are_requests`).
-    let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
-        ir,
-        rung.active_cap,
-        scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
-    )
-    .map_err(|e| e.0)?;
-    let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode {
-            mask, attention, ..
-        } => Some(attention.class(mask.class()).head_dim().get() as usize),
-        _ => None,
-    });
-    let pool_tids: std::collections::HashSet<u32> = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::AttnDecode { .. } if n.inputs.len() >= 3 => Some([
-                n.inputs[1].tensor.index() as u32,
-                n.inputs[2].tensor.index() as u32,
-            ]),
-            _ => None,
-        })
-        .flatten()
-        .collect();
-    let step_rows = match (prefill, paged) {
-        (Some(pg), _) => crate::paged_step::StepRows {
-            start: 0,
-            real: pg.mq as usize,
-        },
-        (None, Some(p)) => {
-            let cached = ir
-                .nodes
-                .iter()
-                .filter_map(|n| match &n.op {
-                    SubOp::AttnDecode { .. } if n.inputs.len() >= 5 => {
-                        Some(n.inputs[1].region.rows.len as usize)
-                    }
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            crate::paged_step::StepRows {
-                start: cached.min(p.capacity().saturating_sub(1)),
-                real: 1,
-            }
-        }
-        (None, None) => crate::paged_step::StepRows { start: 0, real: 1 },
-    };
-    // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
-    // every page through the table rather than at its block's own index, and the pages the step
-    // touches stay at the pool's start (the staging below writes only that prefix).
-    let blocks: Vec<u32> = paged
-        .map(|p| {
-            let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
-            if need < p.pages {
-                (1..=need).collect()
-            } else {
-                (0..need).collect()
-            }
-        })
-        .unwrap_or_default();
-    let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
-    for tid in 0..ir.num_sources {
-        // The covering slice: a source only the dropped launches read is not
-        // part of the graph under test. The reserved-tid sources appended
-        // below (the scalars, the mask) stay UNfiltered — the twin's programs
-        // bind them exactly as the full bundle does.
-        if weight_ids.contains(&tid)
-            || load_const_tids.contains(&tid)
-            || sample_seat.is_some_and(|s| s.seed_words.contains(&tid) || s.invt == tid)
-            || covering.is_some_and(|c| !c.contains(&(tid as u64)))
-        {
-            continue;
-        }
-        let t = ir.tensors[tid as usize];
-        // A pool's stimulus is its cached rows alone: the rows past them are no step's, and the
-        // session's own allocation holds them at zero.
-        let n = if pool_tids.contains(&tid) {
-            step_rows.start * t.cols as usize
-        } else {
-            (t.rows as usize) * (t.cols as usize)
-        };
-        let vals = if scale_rows.contains(&tid) {
-            vec![1.0; n]
-        } else if let Some(v) = staged_rope.get(&tid) {
-            v.clone()
-        } else if let Some(&half) = rope_table_half.get(&tid) {
-            (0..n)
-                .map(|j| dbg_synth_val(tid as usize, j % half))
-                .collect()
-        } else {
-            (0..n).map(|j| dbg_synth_val(tid as usize, j)).collect()
-        };
-        match (paged, paged_hd) {
-            (Some(p), Some(hd)) if pool_tids.contains(&tid) => {
-                let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
-                    .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
-                if !pool.is_empty() {
-                    let rows = pool.len() / t.cols as usize;
-                    sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
-                }
-            }
-            _ => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
-        }
-    }
-    // The compile-time scalars, at their reserved tids — the reader-side law
-    // `scalarmul_scales.json` states (same first-seen non-folded walk).
-    let folded =
-        |id: scratchy_subtile::subtile_ir::SubtileId| sm_folds.iter().any(|(fid, _, _)| *fid == id);
-    let mut sm: Vec<f32> = Vec::new();
-    for node in &ir.nodes {
-        if let SubOp::ScalarMul { scale } = &node.op
-            && !folded(node.id)
-            && !sm.iter().any(|s| s.to_bits() == scale.to_bits())
-        {
-            sm.push(*scale);
-        }
-    }
-    for (i, v) in sm.iter().enumerate() {
-        sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
-    }
-    // The paged step's three sources, by the worker's law: the mask stack an f16 source like any
-    // other, the page table and the write rows int32 words on the typed channel (the f16 source
-    // channel would encode them into half the bytes their views span).
-    if let Some(p) = paged {
-        let srcs = crate::paged_step::request_sources(&p, &blocks, &step_rows)
-            .map_err(|e| format!("the gate's paged step: {e}"))?;
-        for (tid, bytes, shape) in srcs.int32 {
-            emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
-        }
-        let (mask_tid, mask, mask_shape) = srcs.mask;
-        sources.push((u64::from(mask_tid), mask, mask_shape));
-    }
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the
     // registry name of the op that first produces it (`SubOp::name`, so no
@@ -4137,22 +4380,11 @@ pub fn numeric_gate<F: RopeForm>(
     // into every verdict row: a refusal then names the CLASSES that diverge
     // and hands the reader the input buffers to judge magnitude-dependent
     // mechanisms (a reduce's landing grid is a function of its input scale).
-    let mut seen = std::collections::HashSet::new();
-    let mut golden_tids: Vec<u64> = Vec::new();
-    let mut golden_op: std::collections::HashMap<u64, &'static str> =
-        std::collections::HashMap::new();
-    let mut golden_ins: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
-    for n in &ir.nodes {
-        let t = n.output.tensor.index() as u64;
-        if seen.insert(t) {
-            golden_tids.push(t);
-            golden_op.insert(t, n.op.name());
-            golden_ins.insert(
-                t,
-                n.inputs.iter().map(|r| r.tensor.index() as u32).collect(),
-            );
-        }
-    }
+    let GoldenIndex {
+        tids: golden_tids,
+        op: golden_op,
+        ins: golden_ins,
+    } = GoldenIndex::of(ir);
     // ⭐ THE GATE DECLARES ITS OWN READBACK SET — the golden tids are the program's
     // RESULTS, not just the compare list. `observable_tids` is the honest set of
     // what a run leaves in observable state, and a tensor only earns that by being
@@ -4187,7 +4419,7 @@ pub fn numeric_gate<F: RopeForm>(
         .copied()
         .filter(|t| bound.contains(t))
         .collect();
-    let refs: Vec<(&[bundle::LaunchGroup<'static>], &[u64])> = vec![(groups, &results)];
+    let refs: Vec<(&[bundle::LaunchGroup<'static, T>], &[u64])> = vec![(groups, &results)];
     // ⭐ THE SHAPE FLOOR — the krg's own tensor shapes, the tape's statement
     // the resident sticks allocate at LEAST. The emulator's view walk derives a
     // tid's extent only from views its arg→tid mappings reach, and a widened
@@ -4224,9 +4456,113 @@ pub fn numeric_gate<F: RopeForm>(
         .run_step(0, sources, &compare)
         .map_err(|e| format!("gate run: {e}"))?;
     // ── Compare at the floor, against the in-memory reference ──
-    // `mut`: the teacher-forced walk borrows the golden's staged sources
-    // through it (pointer-swapped per node, restored before return).
-    let mut eval_bufs = eval_golden_buffers(ir, &staged_rope, &view, covering);
+    // `mut` in the judge: the teacher-forced walk borrows the golden's staged sources through it
+    // (pointer-swapped per node, restored before return).
+    let eval_bufs =
+        eval_golden_buffers(ir, &staged_rope, &view, covering, None, &|tid| tid as usize);
+    let GateWorst {
+        local_clean: worst_local_clean,
+        local_fp8: worst_local_fp8,
+        total_clean: worst_clean,
+        total_fp8: worst_fp8,
+    } = judge_gate_run(
+        GateRun {
+            ir,
+            prefill,
+            compare: &compare,
+            out: &out,
+            tainted: &tainted,
+            golden_op: &golden_op,
+            golden_ins: &golden_ins,
+            view: &view,
+            covering,
+            fp,
+            cap,
+            peer: None,
+        },
+        eval_bufs,
+    )?;
+    let mut scope = String::new();
+    if let Some(p) = prefill {
+        scope.push_str(&format!(" [prefill mq={}]", p.mq));
+    }
+    if let Some(t) = trunc {
+        scope.push_str(&format!(
+            " [class-covering {}/{} layers]",
+            t.layers.0, t.layers.1
+        ));
+    }
+    // ⭐ THE RESIDENCY HIGH-WATER MARK, STATED ON EVERY PASS — a bundle that
+    // fits must leave headroom, not fit by zero (the wall-5 law), and the
+    // peak is the number that says so: the maximum live LX charge any core
+    // reached across this gate's runs, over the per-core capacity.
+    let (lx_peak, lx_cap) = (session.lx_peak_used(), session.lx_capacity());
+    eprintln!(
+        "[spyre-superdsc] NUMERIC GATE PASS {fp}: {} tensors at the floor (worst local \
+         clean {worst_local_clean:.4}, worst local fp8-chained {worst_local_fp8:.4}; worst \
+         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4}; LX peak \
+         {lx_peak} of {lx_cap} bytes, {:.1}% of capacity){scope}",
+        compare.len(),
+        if lx_cap > 0 {
+            lx_peak as f64 * 100.0 / lx_cap as f64
+        } else {
+            f64::NAN
+        }
+    );
+    Ok(())
+}
+
+/// One gated run, judged: its readback against its reference — the run's own inputs. One rank's
+/// run of a sharded gate carries its world, whose buffers the reference's collectives read.
+#[cfg(feature = "spyre-emu")]
+struct GateRun<'a, F: RopeForm> {
+    ir: &'a SubtileIR<F>,
+    prefill: Option<&'a PrefillGate>,
+    compare: &'a [(u64, usize)],
+    out: &'a std::collections::HashMap<u64, Vec<f32>>,
+    tainted: &'a std::collections::HashSet<u32>,
+    golden_op: &'a std::collections::HashMap<u64, &'static str>,
+    golden_ins: &'a std::collections::HashMap<u64, Vec<u32>>,
+    view: &'a StagedWeightView<'a>,
+    covering: Option<&'a std::collections::HashSet<u64>>,
+    fp: &'a str,
+    cap: u32,
+    peer: Option<GatePeer<'a>>,
+}
+
+/// A passing run's worst errors: each compared tensor's producing op's own execution (`local`) and
+/// the chain's accumulation (`total`), clean and fp8-chained.
+#[cfg(feature = "spyre-emu")]
+struct GateWorst {
+    local_clean: f32,
+    local_fp8: f32,
+    total_clean: f32,
+    total_fp8: f32,
+}
+
+/// ⭐ THE GATE'S VERDICT ON ONE RUN — every compared tensor at its floor, judged on its producing
+/// op's own execution (the teacher-forced walk), the refusal carrying its evidence. The one-rank
+/// gate judges its one run here; the sharded gate each rank's.
+#[cfg(feature = "spyre-emu")]
+fn judge_gate_run<F: RopeForm>(
+    run: GateRun<'_, F>,
+    mut eval_bufs: Vec<Vec<f32>>,
+) -> Result<GateWorst, String> {
+    let GateRun {
+        ir,
+        prefill,
+        compare,
+        out,
+        tainted,
+        golden_op,
+        golden_ins,
+        view,
+        covering,
+        fp,
+        cap,
+        peer,
+    } = run;
+    // ── Compare at the floor, against the in-memory reference ──
     const CLEAN_TOL: f32 = 5e-3;
     // The fp8 chains' slack over CLEAN_TOL: the quant model makes the e4m3 grid and
     // the ws mulf COMMON to both sides and the f16-stick model puts every exchanged
@@ -4349,7 +4685,7 @@ pub fn numeric_gate<F: RopeForm>(
         crate::lower_subtile_tape_to_ktir::result_dtype_of_ir(ir),
         Ok(scratchy_tensors::DType::I32) | Ok(scratchy_tensors::DType::U32)
     );
-    for &(tid, _) in &compare {
+    for &(tid, _) in compare {
         let g_full = &eval_bufs[tid as usize];
         let e = match out.get(&tid) {
             Some(v) => v,
@@ -4436,8 +4772,15 @@ pub fn numeric_gate<F: RopeForm>(
     //    short to region-slice) falls back to the total at the same
     //    tolerance — the pre-split rule — so no compared tensor escapes
     //    judgment.
-    let (walk_tf, split) =
-        teacher_forced_walk(ir, &mut eval_bufs, &out, &tainted, &folded, &view, covering);
+    let (walk_tf, split) = teacher_forced_walk(
+        ir,
+        &mut eval_bufs,
+        EmuReadback { own: out, peer },
+        tainted,
+        &folded,
+        view,
+        covering,
+    );
     drop(walk_tf);
     let mut local_by_tid: std::collections::HashMap<u64, f32> =
         std::collections::HashMap::with_capacity(split.len());
@@ -4504,10 +4847,13 @@ pub fn numeric_gate<F: RopeForm>(
             let (tf, _rows) = teacher_forced_walk(
                 ir,
                 &mut eval_bufs,
-                &overlay,
-                &tainted,
+                EmuReadback {
+                    own: &overlay,
+                    peer,
+                },
+                tainted,
                 &folded,
-                &view,
+                view,
                 covering,
             );
             let tail = compare.len() - (compare.len() / 10).clamp(1, compare.len() / 2);
@@ -4561,7 +4907,7 @@ pub fn numeric_gate<F: RopeForm>(
             restarts: &restarts,
         };
         let dump_note =
-            match write_refusal_dump(fp, cap, &failures, &verdicts, &eval_bufs, &out, &evidence) {
+            match write_refusal_dump(fp, cap, &failures, &verdicts, &eval_bufs, out, &evidence) {
                 Ok(dir) => format!(" — full dump: {}", dir.display()),
                 Err(e) => format!(" — dump failed: {e}"),
             };
@@ -4574,32 +4920,441 @@ pub fn numeric_gate<F: RopeForm>(
             samples.join(" | ")
         ));
     }
-    let mut scope = String::new();
-    if let Some(p) = prefill {
-        scope.push_str(&format!(" [prefill mq={}]", p.mq));
+    Ok(GateWorst {
+        local_clean: worst_local_clean,
+        local_fp8: worst_local_fp8,
+        total_clean: worst_clean,
+        total_fp8: worst_fp8,
+    })
+}
+
+/// Every tensor the reference computes, in the writer's own first-seen order — each with the
+/// registry name of the op that first produces it (`SubOp::name`, so no parallel string table can
+/// drift) and that node's INPUT tids, carried into every verdict row: a refusal then names the
+/// CLASSES that diverge and hands the reader the input buffers to judge magnitude-dependent
+/// mechanisms (a reduce's landing grid is a function of its input scale).
+#[cfg(feature = "spyre-emu")]
+struct GoldenIndex {
+    tids: Vec<u64>,
+    op: std::collections::HashMap<u64, &'static str>,
+    ins: std::collections::HashMap<u64, Vec<u32>>,
+}
+
+#[cfg(feature = "spyre-emu")]
+impl GoldenIndex {
+    fn of<F: RopeForm>(ir: &SubtileIR<F>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut index = Self {
+            tids: Vec::new(),
+            op: std::collections::HashMap::new(),
+            ins: std::collections::HashMap::new(),
+        };
+        for n in &ir.nodes {
+            let t = n.output.tensor.index() as u64;
+            if seen.insert(t) {
+                index.tids.push(t);
+                index.op.insert(t, n.op.name());
+                index.ins.insert(
+                    t,
+                    n.inputs.iter().map(|r| r.tensor.index() as u32).collect(),
+                );
+            }
+        }
+        index
     }
-    if let Some(t) = trunc {
-        scope.push_str(&format!(
-            " [class-covering {}/{} layers]",
-            t.layers.0, t.layers.1
+}
+
+/// A sharded rung under the sharded gate — what [`numeric_gate`] hands [`numeric_gate_sharded`]
+/// once its covering slice and taint map are known.
+#[cfg(feature = "spyre-emu")]
+struct ShardedGate<'a, T: ktir_superdsc::collective::Tp, F: RopeForm> {
+    groups: &'a [bundle::LaunchGroup<'static, T>],
+    ir: &'a SubtileIR<F>,
+    weight_ids: &'a std::collections::HashSet<u32>,
+    covering: Option<&'a std::collections::HashSet<u64>>,
+    tainted: &'a std::collections::HashSet<u32>,
+    prefill: Option<&'a PrefillGate>,
+    fp: &'a str,
+    cap: u32,
+    active_cap: ActiveCap,
+    shards: &'a [scratchy_subtile::tensor_parallel::SourceShard],
+    scope: String,
+}
+
+/// ⭐⭐ THE SHARDED GATE — a sharded rung, run on EVERY rank at once and judged against the
+/// sharded reference. The review's law (#1009, item 3): the bundle's own consumes read the window
+/// the peer's send filled, so the gate steps the ranks' emulator sessions collective by collective,
+/// exactly as the cards step: each rank runs up to its next consume, the PEER's operand fragment —
+/// what the peer's F-send would land — is staged into this rank's receive window, and the consume
+/// runs over it. Then:
+///
+/// - each rank's run is judged against its OWN reference ([`judge_gate_run`], the one-rank gate's
+///   verdict) — the rank's graph evaluated with its collectives read across ranks
+///   ([`GatePeer`], `tensor_parallel::eval_collective`'s law), the lockstep golden settled to a
+///   fixed point (each pass resolves one more collective);
+/// - every value the reference holds bit-identical on every rank — a REPLICATED value — must come
+///   back bit-identical from every emulated rank (the canonical reduction order's promise).
+///
+/// A rank's slice of a sharded source draws its own synth stream, so the ranks' partials differ
+/// and a consume that read its own operand twice, or the window at the wrong offset, diverges;
+/// replicated sources are the same on every rank, as they are on the cards.
+#[cfg(feature = "spyre-emu")]
+fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+    gate: ShardedGate<'_, T, F>,
+) -> Result<(), String> {
+    use crate::bundle_code::collective::{Rank, plays_on, ranks as all_ranks};
+    use scratchy_subtile::tensor_parallel::SourceShard;
+    let ShardedGate {
+        groups,
+        ir,
+        weight_ids,
+        covering,
+        tainted,
+        prefill,
+        fp,
+        cap,
+        active_cap,
+        shards,
+        scope,
+    } = gate;
+    // The world the bake sharded the rung for is the rung's type.
+    let ranks: Vec<Rank<T>> = all_ranks::<T>().collect();
+    // ── Each rank's probe: its slices of the sharded sources on a stream of their own (ONE seed,
+    //    read by the session's staging and by the reference alike) ──
+    const RANK_STREAM: usize = 1 << 28;
+    let seed = |r: usize| {
+        move |tid: u32| match shards.get(tid as usize) {
+            Some(SourceShard::Whole) | None => tid as usize,
+            Some(_) => tid as usize + r * RANK_STREAM,
+        }
+    };
+    let mut probes: Vec<GateProbe> = Vec::with_capacity(ranks.len());
+    for me in &ranks {
+        probes.push(stage_gate_probe::<T, F>(
+            ir,
+            weight_ids,
+            covering,
+            prefill,
+            cap,
+            active_cap,
+            &seed(me.get() as usize),
+        )?);
+    }
+    let golden_index = GoldenIndex::of(ir);
+    let shape_floor: std::collections::HashMap<u64, usize> = ir
+        .tensors
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i as u64, t.rows as usize * t.cols as usize))
+        .collect();
+    // ── Each rank's session: its played groups, cut before every consume ──
+    let segments = |me: Rank<T>| -> Vec<Vec<bundle::LaunchGroup<'static, T>>> {
+        let mut segs: Vec<Vec<bundle::LaunchGroup<'static, T>>> = vec![Vec::new()];
+        for g in groups.iter().filter(|g| plays_on(g.kv.tp, me)) {
+            if g.kv.tp.is_some() && segs.last().is_some_and(|s| !s.is_empty()) {
+                segs.push(Vec::new());
+            }
+            if let Some(s) = segs.last_mut() {
+                s.push(g.clone());
+            }
+        }
+        segs
+    };
+    let segs: Vec<Vec<Vec<bundle::LaunchGroup<'static, T>>>> =
+        ranks.iter().map(|&me| segments(me)).collect();
+    let nseg = segs[0].len();
+    if segs.iter().any(|s| s.len() != nseg) {
+        return Err(format!(
+            "the ranks cut into {:?} segments — every rank meets every collective",
+            segs.iter().map(Vec::len).collect::<Vec<_>>()
         ));
     }
-    // ⭐ THE RESIDENCY HIGH-WATER MARK, STATED ON EVERY PASS — a bundle that
-    // fits must leave headroom, not fit by zero (the wall-5 law), and the
-    // peak is the number that says so: the maximum live LX charge any core
-    // reached across this gate's runs, over the per-core capacity.
-    let (lx_peak, lx_cap) = (session.lx_peak_used(), session.lx_capacity());
-    eprintln!(
-        "[spyre-superdsc] NUMERIC GATE PASS {fp}: {} tensors at the floor (worst local \
-         clean {worst_local_clean:.4}, worst local fp8-chained {worst_local_fp8:.4}; worst \
-         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4}; LX peak \
-         {lx_peak} of {lx_cap} bytes, {:.1}% of capacity){scope}",
-        compare.len(),
-        if lx_cap > 0 {
-            lx_peak as f64 * 100.0 / lx_cap as f64
-        } else {
-            f64::NAN
+    let mut sessions = Vec::with_capacity(ranks.len());
+    let mut observables: Vec<Vec<Vec<u64>>> = Vec::with_capacity(ranks.len());
+    for (r, rank_segs) in segs.iter().enumerate() {
+        let results: Vec<Vec<u64>> = rank_segs
+            .iter()
+            .map(|seg| {
+                let bound: std::collections::HashSet<u64> = seg
+                    .iter()
+                    .flat_map(|g| g.programs.iter())
+                    .flat_map(|p| p.args.iter())
+                    .map(|(_, id)| u64::from(id.tid()))
+                    .collect();
+                golden_index
+                    .tids
+                    .iter()
+                    .copied()
+                    .filter(|t| bound.contains(t))
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<(&[bundle::LaunchGroup<'static, T>], &[u64])> = rank_segs
+            .iter()
+            .zip(&results)
+            .map(|(seg, res)| (seg.as_slice(), res.as_slice()))
+            .collect();
+        let session = crate::runner::SpyreSession::new_multi_floored(
+            &refs,
+            std::mem::take(&mut probes[r].emu_weights),
+            &shape_floor,
+        )
+        .map_err(|e| format!("rank {r}'s gate session: {e}"))?;
+        observables.push((0..nseg).map(|k| session.observable_tids(k)).collect());
+        sessions.push(session);
+    }
+    // ── The lockstep run: segment k on every rank, then every peer's block of the window cut each
+    //    rank's next consume reads gets that peer's fragment of the operand it names — what the
+    //    peer's F-send lands ──
+    // ⛔ THE OPERAND IS THE IR NODE'S, NOT THE BAKED CONSUME'S. A rolled body bakes ONE consume per
+    // class and replays it per layer; its `TpConsume::operand` names the class's tid, and the card's
+    // send reaches layer `l`'s copy through the launch's layer shift. The gate has no shift to
+    // apply, so it reads each segment's collective off the graph it lowered: segment `k + 1` opens
+    // with the consume of the `k`-th collective node, whose input IS that layer's operand.
+    // The covering slice's own: a truncated bundle carries only the kept layers' consumes.
+    let collective_nodes: Vec<&scratchy_subtile::subtile_ir::SubtileNode<F>> = ir
+        .nodes
+        .iter()
+        .filter(|n| {
+            is_collective(&n.op)
+                && covering.is_none_or(|c| c.contains(&(n.output.tensor.index() as u64)))
+        })
+        .collect();
+    if collective_nodes.len() + 1 != nseg {
+        return Err(format!(
+            "{} segment(s) for {} collective node(s) — a consume per collective",
+            nseg,
+            collective_nodes.len()
+        ));
+    }
+    let mut outs: Vec<std::collections::HashMap<u64, Vec<f32>>> =
+        vec![std::collections::HashMap::new(); ranks.len()];
+    // A staged window block: `run_step`'s source — the block's tid, its values, their shape.
+    type StagedWindow = (u64, Vec<f32>, Vec<usize>);
+    let mut windows: Vec<Vec<StagedWindow>> = vec![Vec::new(); ranks.len()];
+    for k in 0..nseg {
+        for (r, session) in sessions.iter_mut().enumerate() {
+            let sources = if k == 0 {
+                std::mem::take(&mut probes[r].sources)
+            } else {
+                let staged = std::mem::take(&mut windows[r]);
+                if staged.len() + 1 != ranks.len() {
+                    return Err(format!(
+                        "rank {r} reached segment {k} with {} of its {} peers' blocks staged",
+                        staged.len(),
+                        ranks.len() - 1
+                    ));
+                }
+                staged
+            };
+            let mut want: Vec<(u64, usize)> = golden_index
+                .tids
+                .iter()
+                .filter(|t| observables[r][k].contains(t))
+                .map(|t| (*t, 0))
+                .collect();
+            if let Some(n) = collective_nodes.get(k) {
+                let t = n.inputs[0].tensor.index() as u64;
+                if !want.iter().any(|(w, _)| *w == t) {
+                    want.push((t, 0));
+                }
+            }
+            let o = session
+                .run_step(k, sources, &want)
+                .map_err(|e| format!("rank {r} segment {k}: {e}"))?;
+            outs[r].extend(o);
         }
+        if k + 1 == nseg {
+            break;
+        }
+        for (r, window) in windows.iter_mut().enumerate() {
+            // The cut is the RECEIVER's consume's — the one its programs read.
+            let Some(mine) = segs[r][k + 1].first().and_then(|g| g.kv.tp) else {
+                return Err(format!(
+                    "rank {r}'s segment {} does not open with a consume",
+                    k + 1
+                ));
+            };
+            for peer in ranks[r].peers() {
+                let p = peer.get() as usize;
+                let Some(c) = segs[p][k + 1].first().and_then(|g| g.kv.tp) else {
+                    return Err(format!(
+                        "rank {p}'s segment {} does not open with a consume",
+                        k + 1
+                    ));
+                };
+                let x = collective_nodes[k].inputs[0];
+                let tid = x.tensor.index();
+                let t = ir.tensors[tid];
+                let (rows, cols) = (t.rows as usize, t.cols as usize);
+                let v = outs[p].get(&(tid as u64)).ok_or_else(|| {
+                    format!(
+                        "rank {p}'s operand t{tid} for consume {} was not read back",
+                        k + 1
+                    )
+                })?;
+                // The fragment's columns are the operand REGION's (`send_fragment` cuts the region).
+                let f = c.fragment;
+                let (r0, fr) = (x.region.rows.start as usize, f.rows() as usize);
+                let (c0, fc) = (
+                    (x.region.cols.start + f.first_col()) as usize,
+                    f.cols() as usize,
+                );
+                if r0 + fr > rows || c0 + fc > cols || v.len() < rows * cols {
+                    return Err(format!(
+                        "rank {p}'s operand t{tid} [{rows}, {cols}] ({} read back) cannot hold \
+                         the fragment rows {fr} cols [{c0}, {})",
+                        v.len(),
+                        c0 + fc
+                    ));
+                }
+                let mut win = Vec::with_capacity(fr * fc);
+                for i in r0..r0 + fr {
+                    win.extend_from_slice(&v[i * cols + c0..i * cols + c0 + fc]);
+                }
+                window.push((u64::from(mine.cut.block_tid(peer)), win, vec![fr, fc]));
+            }
+        }
+    }
+    // ── The lockstep reference, to its fixed point ──
+    let views: Vec<StagedWeightView<'_>> = probes
+        .iter()
+        .map(|p| StagedWeightView {
+            bytes: &p.view_bytes,
+            gemm: &p.gemm,
+            scale_rows: &p.scale_rows,
+            load_consts: &p.load_consts,
+        })
+        .collect();
+    let collectives = ir.nodes.iter().filter(|n| is_collective(&n.op)).count();
+    let mut golden: Vec<Vec<Vec<f32>>> = vec![Vec::new(); ranks.len()];
+    let mut settled = false;
+    for _ in 0..=collectives + 1 {
+        let next: Vec<Vec<Vec<f32>>> = ranks
+            .iter()
+            .enumerate()
+            .map(|(r, me)| {
+                eval_golden_buffers(
+                    ir,
+                    &probes[r].staged_rope,
+                    &views[r],
+                    covering,
+                    Some(GatePeer {
+                        rank: me.get(),
+                        ranks: &golden,
+                    }),
+                    &seed(r),
+                )
+            })
+            .collect();
+        settled = next == golden;
+        golden = next;
+        if settled {
+            break;
+        }
+    }
+    if !settled {
+        return Err(format!(
+            "the {}-rank reference did not settle in {} passes over {collectives} collective(s)",
+            ranks.len(),
+            collectives + 2
+        ));
+    }
+    // ── Each rank judged against its own reference ──
+    let mut worst: Vec<GateWorst> = Vec::with_capacity(ranks.len());
+    let mut compared = 0;
+    for (r, me) in ranks.iter().enumerate() {
+        let compare: Vec<(u64, usize)> = golden_index
+            .tids
+            .iter()
+            .filter(|t| observables[r].iter().any(|o| o.contains(t)))
+            .map(|t| (*t, 0))
+            .collect();
+        compared += compare.len();
+        let rank_bufs: Vec<Vec<Vec<f32>>> = outs
+            .iter()
+            .map(|o| {
+                let mut b: Vec<Vec<f32>> = vec![Vec::new(); ir.tensors.len()];
+                for (t, v) in o {
+                    if let Some(slot) = b.get_mut(*t as usize) {
+                        slot.clone_from(v);
+                    }
+                }
+                b
+            })
+            .collect();
+        worst.push(
+            judge_gate_run(
+                GateRun {
+                    ir,
+                    prefill,
+                    compare: &compare,
+                    out: &outs[r],
+                    tainted,
+                    golden_op: &golden_index.op,
+                    golden_ins: &golden_index.ins,
+                    view: &views[r],
+                    covering,
+                    fp,
+                    cap,
+                    peer: Some(GatePeer {
+                        rank: me.get(),
+                        ranks: &rank_bufs,
+                    }),
+                },
+                golden[r].clone(),
+            )
+            .map_err(|e| format!("rank {r}: {e}"))?,
+        );
+    }
+    // ── Replicated values: bit-identical on every emulated rank ──
+    let same = |a: &[f32], b: &[f32]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+    let mut replicated = 0;
+    let mut split: Vec<String> = Vec::new();
+    for &t in &golden_index.tids {
+        let g0 = &golden[0][t as usize];
+        if g0.is_empty() || !golden.iter().all(|g| same(g0, &g[t as usize])) {
+            continue;
+        }
+        let emitted: Option<Vec<&Vec<f32>>> = outs.iter().map(|o| o.get(&t)).collect();
+        if let Some(emitted) = emitted {
+            replicated += 1;
+            if !emitted.iter().all(|e| same(emitted[0], e)) {
+                split.push(format!(
+                    "t{t} ({})",
+                    golden_index.op.get(&t).copied().unwrap_or("?")
+                ));
+            }
+        }
+    }
+    if !split.is_empty() {
+        return Err(format!(
+            "{} of {replicated} replicated tensor(s) differ between the emulated ranks — every \
+             rank must compute a replicated value bit-identically: [{}]",
+            split.len(),
+            split.join(", ")
+        ));
+    }
+    let (lx_peak, lx_cap) = sessions
+        .iter()
+        .map(|s| (s.lx_peak_used(), s.lx_capacity()))
+        .max()
+        .unwrap_or((0, 0));
+    let w = |f: fn(&GateWorst) -> f32| worst.iter().map(f).fold(0f32, f32::max);
+    eprintln!(
+        "[spyre-superdsc] NUMERIC GATE PASS {fp} ({} ranks, {} gated collective(s) of \
+         {collectives}): {compared} rank-tensors at the floor, {replicated} replicated tensors \
+         bit-identical across ranks (worst local clean {:.4}, worst local fp8-chained {:.4}; \
+         worst total clean {:.4}, worst total fp8-chained {:.4}; LX peak {lx_peak} of {lx_cap} \
+         bytes){scope}",
+        ranks.len(),
+        collective_nodes.len(),
+        w(|g| g.local_clean),
+        w(|g| g.local_fp8),
+        w(|g| g.total_clean),
+        w(|g| g.total_fp8),
     );
     Ok(())
 }
@@ -4714,7 +5469,7 @@ fn write_refusal_dump(
 /// bundle of up to `g` trips; ops the shim intercepts per-manifest-entry must
 /// stay SINGLETON so the interception lands on the right entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupKind {
+pub enum GroupKind<T: ktir_superdsc::collective::Tp> {
     /// Fusable on-card trip (no per-entry shim handling).
     Pure,
     /// `host_kv_write`: the shim host-scatters KV then does `oi += skip` to skip
@@ -4763,6 +5518,13 @@ pub enum GroupKind {
     /// needs its index staged, so a `Pure` op swept in would lose its page base, and a copy swept into
     /// a `Pure` group would gain one.
     Gathered,
+    /// A COLLECTIVE'S CONSUME ([`EmittedOp::tp_consume`]) — ONE launch group per consume, holding
+    /// every descriptor op its program lowered to and nothing else. The bundle's CB pipeline puts
+    /// this rank's send (the F-send the consume names) and the wait for the peer's in front of
+    /// exactly this launch: a neighbour fused in would run before its operand's exchange, and a
+    /// consume split across two groups would send twice. So trips fuse iff they carry the SAME
+    /// consume, and the run is never chunked by the group size ([`GroupKind::run_may_be_chunked`]).
+    TpConsume(ktir_superdsc::collective::TpConsume<T>),
 }
 
 /// WHICH REQUEST A TRIP'S ADDRESSING BELONGS TO.
@@ -4789,8 +5551,8 @@ pub struct TripRequest(pub u32);
 /// tagged with a request, like the per-page Kᵀ re-transpose) got it wrong by default.
 /// Now the request is checked ONCE, for all kinds, in [`Trip::fusable_with`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Trip {
-    pub kind: GroupKind,
+pub struct Trip<T: ktir_superdsc::collective::Tp> {
+    pub kind: GroupKind<T>,
     pub req: TripRequest,
     /// ⭐ THE OP'S [`EmittedOp::kv_slot_offset`] — which PAGE PART of a multi-page prefill window it
     /// addresses. Checked beside the request, for every kind, and for the same reason: a launch resolves
@@ -4799,13 +5561,13 @@ pub struct Trip {
     pub slot_offset: u32,
 }
 
-impl GroupKind {
+impl<T: ktir_superdsc::collective::Tp> GroupKind<T> {
     /// Whether two trips of these kinds may share one concrete bundle, IGNORING the request.
     ///
     /// Note `SlotSolo` and `HostKv` are not fusable even with THEMSELVES — that is how "this trip is
     /// a singleton by construction" is expressed, and it is what makes the walk's advance-by-one
     /// fallback unnecessary: a run is `[start, start+1)` unless the kind opts in.
-    fn fusable_kind_with(self, other: GroupKind) -> bool {
+    fn fusable_kind_with(self, other: GroupKind<T>) -> bool {
         match (self, other) {
             (GroupKind::Pure, GroupKind::Pure) => true,
             (GroupKind::Slab, GroupKind::Slab) => true,
@@ -4816,6 +5578,8 @@ impl GroupKind {
             // half the other's cap. Breaking at that boundary can only cost a launch.
             (GroupKind::PageFold { gathered: a }, GroupKind::PageFold { gathered: b }) => a == b,
             (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
+            // One consume's descriptor ops are one launch; two consumes never share one.
+            (GroupKind::TpConsume(a), GroupKind::TpConsume(b)) => a == b,
             // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
             // HostKv: the shim's `oi += skip` must land on this exact entry.
             _ => false,
@@ -4885,18 +5649,24 @@ impl GroupKind {
     /// ungathered pass rebases the KV segment instead and holds no state between groups — the online
     /// softmax is accumulate-only — so it needs no exemption and is not given one.
     fn run_may_be_chunked(self) -> bool {
-        !matches!(self, GroupKind::PageFold { gathered: true })
+        // ⭐ A CONSUME IS NEVER CHUNKED EITHER: each group of a chunked run would be a launch the CB
+        // pipeline puts a send and a wait in front of — two sends of one fragment, and a wait for a
+        // second peer send that never comes.
+        !matches!(
+            self,
+            GroupKind::PageFold { gathered: true } | GroupKind::TpConsume(_)
+        )
     }
 }
 
-impl Trip {
+impl<T: ktir_superdsc::collective::Tp> Trip<T> {
     /// A trip addressing its request's page at the write cursor — every trip but a page part's.
-    pub fn new(kind: GroupKind, req: TripRequest) -> Trip {
+    pub fn new(kind: GroupKind<T>, req: TripRequest) -> Trip<T> {
         Trip::at_slot_offset(kind, req, 0)
     }
 
     /// A trip addressing the page `slot_offset` slots past the write cursor (see [`Trip::slot_offset`]).
-    pub fn at_slot_offset(kind: GroupKind, req: TripRequest, slot_offset: u32) -> Trip {
+    pub fn at_slot_offset(kind: GroupKind<T>, req: TripRequest, slot_offset: u32) -> Trip<T> {
         Trip {
             kind,
             req,
@@ -4910,7 +5680,7 @@ impl Trip {
     /// shifts the segment base ONCE. Two requests therefore cannot share a group whatever their
     /// kinds — so the request test lives HERE, above the kind test, and applies to kinds that do not
     /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page.
-    fn fusable_with(&self, other: &Trip) -> bool {
+    fn fusable_with(&self, other: &Trip<T>) -> bool {
         self.req == other.req
             && self.slot_offset == other.slot_offset
             && self.kind.fusable_kind_with(other.kind)
@@ -4925,7 +5695,10 @@ impl Trip {
 /// it replaces) and each `Slot` is its OWN singleton. `g==1` reproduces the per-op
 /// partition EXACTLY. PURE (no env/IO) so Kani verifies the covering-partition
 /// invariant (no trip dropped or double-emitted → no dropped/duplicated compute).
-pub fn group_ranges(trips: &[Trip], g: usize) -> Vec<core::ops::Range<usize>> {
+pub fn group_ranges<T: ktir_superdsc::collective::Tp>(
+    trips: &[Trip<T>],
+    g: usize,
+) -> Vec<core::ops::Range<usize>> {
     let g = if g == 0 { 1 } else { g };
     let n = trips.len();
     let mut groups: Vec<core::ops::Range<usize>> = Vec::new();
@@ -4977,7 +5750,10 @@ pub fn group_ranges(trips: &[Trip], g: usize) -> Vec<core::ops::Range<usize>> {
 /// [`group_ranges`]'s exact walk, proving `(covered_end==n && ok)` proves the Vec
 /// version is an EXACT covering partition (no trip dropped/double-emitted) with the
 /// size/singleton invariant. Keep byte-identical to `group_ranges`'s match arms.
-pub fn group_ranges_cover_ok(trips: &[Trip], g: usize) -> (usize, bool) {
+pub fn group_ranges_cover_ok<T: ktir_superdsc::collective::Tp>(
+    trips: &[Trip<T>],
+    g: usize,
+) -> (usize, bool) {
     let g = if g == 0 { 1 } else { g };
     let n = trips.len();
     let mut i = 0usize;
@@ -5025,7 +5801,10 @@ pub fn group_ranges_cover_ok(trips: &[Trip], g: usize) -> (usize, bool) {
 /// A group is one launch, and a launch shifts the KV base by ONE request's page/cursor. So a group
 /// holding trips of two requests gives the second request the first's KV, silently: fluent output,
 /// wrong tokens. Scalar (Vec-free) so CBMC can prove it never happens for ANY trip sequence.
-pub fn group_spans_two_requests(trips: &[Trip], g: usize) -> bool {
+pub fn group_spans_two_requests<T: ktir_superdsc::collective::Tp>(
+    trips: &[Trip<T>],
+    g: usize,
+) -> bool {
     let g = if g == 0 { 1 } else { g };
     let n = trips.len();
     let mut i = 0usize;
@@ -5195,7 +5974,7 @@ pub fn bundle_mlir(sdsc_filenames: &[String]) -> String {
 /// replaces a symbolic `scf.for` — dxp's always-on `LoopUnroll` would otherwise
 /// clone an in-loop `sdsc_execute` with IDENTICAL `symbol_ids` and double-reserve
 /// them (DtException "Symbol already reserved", VariableDefinition.cpp:629; #53).
-pub fn concrete_trips(e: &EmittedOp) -> Vec<SdscOp> {
+pub fn concrete_trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec<SdscOp> {
     if e.time <= 1 {
         return vec![e.dsc().clone()];
     }
@@ -5230,7 +6009,7 @@ pub fn concrete_trips(e: &EmittedOp) -> Vec<SdscOp> {
 /// pre-unrolled trips from [`concrete_trips`]); a time=1 op contributes one. The
 /// trip ordering is `ops` in order, trips `0..time` — IDENTICAL to [`write_bundle`]
 /// so `sdsc_{i}.json` names line up. Delegates to [`bundle_mlir`].
-pub fn emit_bundle_mlir(ops: &[EmittedOp]) -> String {
+pub fn emit_bundle_mlir<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>]) -> String {
     let total: usize = ops.iter().map(|e| e.time.max(1) as usize).sum();
     let filenames: Vec<String> = (0..total).map(|i| format!("sdsc_{i}.json")).collect();
     bundle_mlir(&filenames)
@@ -5256,13 +6035,17 @@ pub fn emit_bundle_mlir(ops: &[EmittedOp]) -> String {
 /// carries `HostKv{skip=kv_n_skip}` (kv_n_skip counts the on-card cachewr TRIPS
 /// it replaces — the same unit the shim's `oi += kv_n_skip` advances over);
 /// `slot_stride_bytes>0` → `Slot`; everything else `Pure` (fusable).
-fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
+fn trip_kinds_and_owner<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+) -> (Vec<Trip<T>>, Vec<usize>) {
     let mut kinds = Vec::new();
     let mut owner = Vec::new();
     for (oi, e) in ops.iter().enumerate() {
         let nt = (e.time.max(1)) as usize; // == concrete_trips(e).len()
         for ti in 0..nt {
-            let k = if e.host_kv_write && ti == 0 {
+            let k = if let Some(consume) = e.tp_consume {
+                GroupKind::TpConsume(consume)
+            } else if e.host_kv_write && ti == 0 {
                 GroupKind::HostKv {
                     skip: e.kv_n_skip as usize,
                 }
@@ -5327,11 +6110,17 @@ pub enum FoldGrouping {
 /// The ops a bundle variant actually contains. `Fused` serves single-page contexts, which have no
 /// FULL pages at all, so their zero-masked fold is dropped outright — keeping it would add back the
 /// very launches this variant exists to avoid.
-pub fn ops_for_grouping(ops: &[EmittedOp], _fold: FoldGrouping) -> Vec<&EmittedOp> {
+pub fn ops_for_grouping<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+    _fold: FoldGrouping,
+) -> Vec<&EmittedOp<T>> {
     ops.iter().collect()
 }
 
-fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usize>) {
+fn trip_kinds_for<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+    fold: FoldGrouping,
+) -> (Vec<Trip<T>>, Vec<usize>) {
     let (mut kinds, owner) = trip_kinds_and_owner(ops);
     if fold == FoldGrouping::Fused {
         for (t, &o) in kinds.iter_mut().zip(&owner) {
@@ -5347,7 +6136,7 @@ fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usiz
 /// The one trip [`FoldGrouping::Fused`] regroups: a per-page fold. ⛔ A WALK'S BODY IS NEVER FUSED
 /// AWAY: its relaunch count is the walk's own, baked with the rung, and running it once would attend
 /// one block.
-fn fuses_away(t: &Trip, op: &EmittedOp) -> bool {
+fn fuses_away<T: ktir_superdsc::collective::Tp>(t: &Trip<T>, op: &EmittedOp<T>) -> bool {
     matches!(t.kind, GroupKind::PageFold { .. }) && op.walk.is_none()
 }
 
@@ -5355,7 +6144,7 @@ fn fuses_away(t: &Trip, op: &EmittedOp) -> bool {
 /// differently from [`FoldGrouping::Split`] at all. Where no trip fuses away, the "twin" is the split
 /// bundle's program again under a second fingerprint: a second dxp compile and a second copy in the
 /// image, which the selector would then prefer over the split body it equals.
-pub fn has_fused_twin(ops: &[EmittedOp]) -> bool {
+pub fn has_fused_twin<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>]) -> bool {
     let (kinds, owner) = trip_kinds_and_owner(ops);
     kinds
         .iter()
@@ -5368,7 +6157,9 @@ pub fn has_fused_twin(ops: &[EmittedOp]) -> bool {
 /// 0 — the matmul/pointwise itself; a fused epilogue's own 2nd entry is looked at separately by
 /// `print_fusion_candidates`, which is exactly the case a scan for NEW candidates must not double
 /// count as still-unfused).
-fn primary_compute_op(e: &EmittedOp) -> Option<(&Dsc, &ComputeOp)> {
+fn primary_compute_op<T: ktir_superdsc::collective::Tp>(
+    e: &EmittedOp<T>,
+) -> Option<(&Dsc, &ComputeOp)> {
     let dsc = e.dsc().dscs_.first()?.values().next()?;
     let cop = dsc.computeOp_.first()?;
     Some((dsc, cop))
@@ -5395,7 +6186,7 @@ const MATMUL_OP_FUNCS: &[&str] = &[
 /// extra operand), prints that buffer's own `scale_` from `labeledDs_` — a `-1`/non-1 entry is this
 /// codebase's existing broadcast marker (see `Scale`), the signal that decides admissibility,
 /// not an assumption made without looking.
-fn print_fusion_candidates(ops: &[EmittedOp]) {
+fn print_fusion_candidates<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>]) {
     let mut n = 0usize;
     for i in 0..ops.len().saturating_sub(1) {
         let (a, b) = (&ops[i], &ops[i + 1]);
@@ -5458,7 +6249,10 @@ fn print_fusion_candidates(ops: &[EmittedOp]) {
 /// with the same `group_size()`, and `group_ranges` is Kani-proven an exact covering partition; the two
 /// are then ZIPPED into one [`bundle::LaunchGroup`] each, so the pairing exists at one site instead of
 /// being an index the reader has to trust.
-pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShifts> {
+pub fn launch_index<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+    fold: FoldGrouping,
+) -> Vec<bundle::KvShifts<T>> {
     // MEDIUM-GRAIN: one manifest entry per fusion GROUP (a contiguous run of ≤ g Pure
     // trips = one concrete dxp bundle; every host_kv_write/slot trip a singleton). g==1
     // reproduces the historical per-trip manifest exactly. The shim reads one entry →
@@ -5580,7 +6374,7 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             );
         }
     }
-    let mut shifts: Vec<bundle::KvShifts> = Vec::new();
+    let mut shifts: Vec<bundle::KvShifts<T>> = Vec::new();
     for (gi, r) in groups.iter().enumerate() {
         // The group's first trip's owning op supplies name + any per-entry metadata.
         let e = &ops[owner[r.start]];
@@ -5707,6 +6501,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
                 trips: w.trips,
                 step_bytes: w.step_bytes,
             }),
+            // A consume group holds exactly one consume's trips, so its kind names it.
+            tp: match kinds[r.start].kind {
+                GroupKind::TpConsume(consume) => Some(consume),
+                _ => None,
+            },
         });
     }
     shifts
@@ -5779,8 +6578,8 @@ pub struct LxSlotRow {
 ///
 /// On a refusal the fallback is to SPLIT THE CONFLICTING CLASS — give the returning name its
 /// own slot — never to un-share globally; the walk itself only refuses.
-pub fn walk_lx_slot_alternation(
-    sdsc_ops: &[EmittedOp],
+pub fn walk_lx_slot_alternation<T: ktir_superdsc::collective::Tp>(
+    sdsc_ops: &[EmittedOp<T>],
     per_prog: &[(String, usize)],
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
@@ -5998,7 +6797,10 @@ pub struct GroupInput {
 /// describes, silently dropping whole groups of every layer. Both call `trip_kinds_for` +
 /// `group_ranges` with the same `group_size()`, and `group_ranges` is Kani-proven an exact covering
 /// partition (`group_ranges_is_exact_covering_partition`).
-pub fn render_dxp_input(ops: &[EmittedOp], fold: FoldGrouping) -> std::io::Result<Vec<GroupInput>> {
+pub fn render_dxp_input<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+    fold: FoldGrouping,
+) -> std::io::Result<Vec<GroupInput>> {
     // Pre-unroll every op into its concrete trips, in `ops`-order then trip-order. The json is
     // rendered per GROUP below, because the key's step index is the WITHIN-GROUP position.
     let mut trips: Vec<(&str, SdscOp)> = Vec::new();
@@ -6074,9 +6876,9 @@ pub fn render_dxp_input(ops: &[EmittedOp], fold: FoldGrouping) -> std::io::Resul
 /// Not part of the build (the bake queue stages its own copy and reclaims it): this is for handing a
 /// bundle to `dxp_standalone --bundle -d <dir>` by hand, which is how a scheduler refusal gets
 /// diagnosed and how the on-card gate bundles are produced.
-pub fn write_dxp_input(
+pub fn write_dxp_input<T: ktir_superdsc::collective::Tp>(
     dir: &std::path::Path,
-    ops: &[EmittedOp],
+    ops: &[EmittedOp<T>],
     fold: FoldGrouping,
 ) -> std::io::Result<()> {
     write_rendered_dxp_input(dir, &render_dxp_input(ops, fold)?)
@@ -6304,27 +7106,27 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
 /// `COMPILE_WIDTH` wide across bundle boundaries instead of winding down to one at each of them. So the
 /// metadata is finished here and the programs are collected by [`Self::into_code`], after the ONE drain
 /// at the end of the emit.
-pub struct EmittedBundle {
+pub struct EmittedBundle<T: ktir_superdsc::collective::Tp> {
     /// Content fingerprint — this bundle's identity, and how a sibling names it.
     pub fp: String,
     /// The memory plan. Empty (`Default`) when the caller supplied no layout.
     pub layout: bundle::BundleLayout<'static>,
-    pub groups: PendingGroups,
+    pub groups: PendingGroups<T>,
 }
 
 /// A bundle's launches, either already complete or waiting on the device compiler.
-pub enum PendingGroups {
+pub enum PendingGroups<T: ktir_superdsc::collective::Tp> {
     /// ⭐ EVERY LAUNCH, IN LAUNCH ORDER, COMPLETE — the `-Fspyre-emu` shape.
     ///
     /// A launch group carries the PROGRAMS it runs, so there is nothing left to resolve later:
     /// no compiler to wait on, no id to look a device image up by. A constructed program is
     /// finished the moment it is constructed.
-    Ready(Vec<bundle::LaunchGroup<'static>>),
+    Ready(Vec<bundle::LaunchGroup<'static, T>>),
     /// `-Fspyre-hw`'s shape: each group's SuperDSC directory is staged and submitted
     /// ([`ktir_groups_via_superdsc`]), and its `(KvShifts, GroupId)` is all `into_code` needs to
     /// find the compiled artifact once `superdsc_bake::finish_global()` has drained the queue —
     /// exactly the id `emit_bundle_inner` "used to" carry before this branch pivoted to KTIR.
-    Staged(Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>),
+    Staged(Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>),
 }
 
 /// Every `scf.for` in `body` (recursing through nested regions) as `(which, lower, upper, step)`,
@@ -6382,7 +7184,7 @@ fn loop_bounds(body: &[ktir_core::ir::Operation<'_>]) -> Vec<(String, i64, i64, 
 ///   * the func's own grid names at least one core, and — on `spyre-hw` only, where the limit
 ///     exists — no more than `MAX_CORES`
 ///   * every `scf.for` in the program runs a non-empty range with a positive step
-fn audit_op_work(ops: &[EmittedOp], fp: &str) {
+fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &str) {
     let mut fail: Vec<String> = Vec::new();
 
     for op in ops {
@@ -6473,8 +7275,8 @@ fn audit_op_work(ops: &[EmittedOp], fp: &str) {
 ///
 /// `attn_params` is [`RolledSuperDsc::attn_params`] — the four attention facts no KTIR states, which
 /// main's own walk held as parameters. It is `None` for a bundle with no attention node.
-pub fn emit_bundle(
-    ops: &[EmittedOp],
+pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
@@ -6500,7 +7302,7 @@ pub fn emit_bundle(
     let _one_emit = gate
         .lock()
         .map_err(|_| std::io::Error::other("a bundle emit panicked holding its fingerprint"))?;
-    if emitted().lock().is_ok_and(|c| c.contains_key(&fp)) {
+    if emitted::<T>().lock().is_ok_and(|c| c.contains_key(&fp)) {
         return Ok(fp);
     }
     let b = {
@@ -6511,7 +7313,7 @@ pub fn emit_bundle(
         b.fp, fp,
         "bundle_fp and emit_bundle_inner disagree on the fingerprint"
     );
-    if let Ok(mut c) = emitted().lock() {
+    if let Ok(mut c) = emitted::<T>().lock() {
         c.entry(fp.clone()).or_insert((b, None));
     }
     {
@@ -6534,8 +7336,8 @@ pub fn emit_bundle(
 /// [`emit_bundle`] returns the FIRST rung's body for all of them, and a 16-page context runs a 1-page
 /// chunk: clean bake, no fault, every key past slot 256 silently unread. Appended only when present, so
 /// every bundle without a chunk keeps its fingerprint byte for byte.
-fn bundle_fp(
-    ops: &[EmittedOp],
+fn bundle_fp<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> String {
@@ -6551,8 +7353,11 @@ fn bundle_fp(
 ///
 /// Separate from [`emit_bundle`] because a body's meta names its prefix, suffix, fused twin and every
 /// ladder rung — none of which exist yet when the body itself is emitted.
-pub fn attach_reroll(fp: &str, meta: bundle::RerollMeta<'static>) {
-    if let Ok(mut c) = emitted().lock()
+pub fn attach_reroll<T: ktir_superdsc::collective::Tp>(
+    fp: &str,
+    meta: bundle::RerollMeta<'static>,
+) {
+    if let Ok(mut c) = emitted::<T>().lock()
         && let Some(slot) = c.get_mut(fp)
     {
         slot.1 = Some(meta);
@@ -6585,8 +7390,8 @@ pub fn attach_reroll(fp: &str, meta: bundle::RerollMeta<'static>) {
 /// less of it; under-allocating it is an address. Under this law the first case's 12-page rung runs,
 /// with replies byte-identical to the V-only build's: a 2,413-token prompt that decodes in that rung
 /// from its first step, and a 1,987-token one that crosses into it from the 8-page rung.
-pub fn cover_ladder_allocation(fp: &str) -> Result<(), String> {
-    let mut c = emitted()
+pub fn cover_ladder_allocation<T: ktir_superdsc::collective::Tp>(fp: &str) -> Result<(), String> {
+    let mut c = emitted::<T>()
         .lock()
         .map_err(|_| "the emit collector was poisoned by a panic".to_string())?;
     let siblings: Vec<String> = c
@@ -6676,8 +7481,8 @@ mod session_allocation_tests {
 /// the runtime loads. Asked of the emitted bundle, not of the program it was emitted from: the
 /// attention expands inside [`emit_bundle`], and the fold flag is set by that expansion. `None` when
 /// no bundle by that fingerprint was emitted.
-pub fn emitted_bundle_folds(fp: &str) -> Option<bool> {
-    let c = emitted().lock().ok()?;
+pub fn emitted_bundle_folds<T: ktir_superdsc::collective::Tp>(fp: &str) -> Option<bool> {
+    let c = emitted::<T>().lock().ok()?;
     let (b, _) = c.get(fp)?;
     Some(match &b.groups {
         PendingGroups::Ready(groups) => groups.iter().any(|g| g.kv.page_fold),
@@ -6691,11 +7496,11 @@ pub fn emitted_bundle_folds(fp: &str) -> Option<bool> {
 /// [`numeric_gate`] uses this to run the just-baked program; `None` when the
 /// fp has no bundle (not emitted, or emitted but still waiting on a device
 /// compiler — the `-Fspyre-hw` shape, where there is nothing to gate).
-pub fn with_emitted_groups<R>(
+pub fn with_emitted_groups<T: ktir_superdsc::collective::Tp, R>(
     fp: &str,
-    f: impl FnOnce(&[bundle::LaunchGroup<'static>]) -> R,
+    f: impl FnOnce(&[bundle::LaunchGroup<'static, T>]) -> R,
 ) -> Option<R> {
-    let c = emitted().lock().ok()?;
+    let c = emitted::<T>().lock().ok()?;
     let (b, _) = c.get(fp)?;
     match &b.groups {
         PendingGroups::Ready(groups) => Some(f(groups)),
@@ -6710,8 +7515,8 @@ pub fn with_emitted_groups<R>(
 /// bundle or its layout stated no window — the twin then mints programs the
 /// resident fused path will refuse at load, naming them, rather than passing
 /// the LX guard on a silent zero.
-pub fn emitted_lx_pin_window_bytes(fp: &str) -> Option<u64> {
-    let c = emitted().lock().ok()?;
+pub fn emitted_lx_pin_window_bytes<T: ktir_superdsc::collective::Tp>(fp: &str) -> Option<u64> {
+    let c = emitted::<T>().lock().ok()?;
     let (b, _) = c.get(fp)?;
     b.layout.lx_pin_window_bytes
 }
@@ -6720,15 +7525,31 @@ pub fn emitted_lx_pin_window_bytes(fp: &str) -> Option<u64> {
 ///
 /// ⛔ A REGISTRATION, NOT A SEARCH. A bundle is in here because [`emit_bundle`] put it here, so
 /// [`drain_emitted_bundles`] cannot silently return fewer bundles than were emitted.
-#[allow(clippy::type_complexity)]
-fn emitted()
--> &'static std::sync::Mutex<BTreeMap<String, (EmittedBundle, Option<bundle::RerollMeta<'static>>)>>
-{
-    static C: std::sync::OnceLock<
-        std::sync::Mutex<BTreeMap<String, (EmittedBundle, Option<bundle::RerollMeta<'static>>)>>,
-    > = std::sync::OnceLock::new();
-    C.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+///
+/// ⭐ ONE COLLECTOR PER WORLD. A bundle's world is its type, so each world's bundles are collected
+/// apart, keyed by the world's own `TypeId` — the macro drains the world it bakes
+/// (`drain_emitted_bundles::<T>`), and a bundle of one world is never handed to another's drain.
+fn emitted<T: ktir_superdsc::collective::Tp>() -> &'static Collector<T> {
+    use std::any::{Any, TypeId};
+    type Worlds = std::sync::Mutex<BTreeMap<TypeId, &'static (dyn Any + Send + Sync)>>;
+    static WORLDS: std::sync::OnceLock<Worlds> = std::sync::OnceLock::new();
+    let mut worlds = WORLDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry: &'static (dyn Any + Send + Sync) = *worlds
+        .entry(TypeId::of::<T>())
+        .or_insert_with(|| Box::leak(Box::new(Collector::<T>::default())));
+    // The entry under `TypeId::of::<T>()` is only ever this arm's own `Collector<T>`.
+    match entry.downcast_ref::<Collector<T>>() {
+        Some(c) => c,
+        None => unreachable!("the collector keyed by T's TypeId is a Collector<T>"),
+    }
 }
+
+/// One world's emitted bundles, by fingerprint.
+type Collector<T> =
+    std::sync::Mutex<BTreeMap<String, (EmittedBundle<T>, Option<bundle::RerollMeta<'static>>)>>;
 
 /// The lock [`emit_bundle`] holds for one fingerprint while it checks [`emitted`] and emits.
 fn emitting(fp: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
@@ -6745,8 +7566,9 @@ fn emitting(fp: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
 /// Take every emitted bundle, complete with its compiled device code — what the macro bakes.
 ///
 /// Call ONCE, after `superdsc_bake::finish_global()` has drained the compilers.
-pub fn drain_emitted_bundles() -> Result<Vec<bundle::BundleCode<'static>>, String> {
-    let taken = match emitted().lock() {
+pub fn drain_emitted_bundles<T: ktir_superdsc::collective::Tp>()
+-> Result<Vec<bundle::BundleCode<'static, T>>, String> {
+    let taken = match emitted::<T>().lock() {
         Ok(mut c) => std::mem::take(&mut *c),
         Err(_) => return Err("the emit collector was poisoned by a panic".to_string()),
     };
@@ -6756,12 +7578,12 @@ pub fn drain_emitted_bundles() -> Result<Vec<bundle::BundleCode<'static>>, Strin
         .collect()
 }
 
-fn emit_bundle_inner(
-    ops: &[EmittedOp],
+fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-) -> std::io::Result<EmittedBundle> {
+) -> std::io::Result<EmittedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
     //    per-core HBM segment addressing each tiled tensor's trips advance from a real per-core base,
@@ -6778,9 +7600,9 @@ fn emit_bundle_inner(
     }
 
     let fp = bundle_fp(ops, fold, attn_params);
-    let kept: Vec<&EmittedOp> = ops_for_grouping(ops, fold);
-    let filtered: Vec<EmittedOp>;
-    let ops: &[EmittedOp] = if kept.len() == ops.len() {
+    let kept: Vec<&EmittedOp<T>> = ops_for_grouping(ops, fold);
+    let filtered: Vec<EmittedOp<T>>;
+    let ops: &[EmittedOp<T>] = if kept.len() == ops.len() {
         ops
     } else {
         // Rebuild the trimmed list by value only when something was actually dropped.
@@ -6812,7 +7634,7 @@ fn emit_bundle_inner(
     })
 }
 
-impl EmittedBundle {
+impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
     /// Collect this bundle's compiled programs and produce the value the macro bakes.
     ///
     /// Call AFTER `superdsc_bake::finish_global()`. A group the queue has no result for is an `Err`
@@ -6821,7 +7643,7 @@ impl EmittedBundle {
     pub fn into_code(
         self,
         reroll: Option<bundle::RerollMeta<'static>>,
-    ) -> Result<bundle::BundleCode<'static>, String> {
+    ) -> Result<bundle::BundleCode<'static, T>, String> {
         let groups = match self.groups {
             PendingGroups::Ready(g) => g,
             PendingGroups::Staged(staged) => {
@@ -6866,6 +7688,15 @@ impl EmittedBundle {
                 out
             }
         };
+        // ⭐ EVERY SEND NAMES BAKED BYTES, OR THE BUNDLE DOES NOT BAKE. A consume's send reads its
+        // operand's placement and lands at the receive window's; the loader reads them through this
+        // same resolution, so a bundle that passes here never meets an unplaced send at load.
+        bundle::collective::sends(&self.layout, &groups).map_err(|u| {
+            format!(
+                "{}: group {}'s collective send names no baked bytes: {:?}",
+                self.fp, u.group, u.why
+            )
+        })?;
         Ok(bundle::BundleCode {
             fp: std::borrow::Cow::Owned(self.fp),
             layout: self.layout,
@@ -6881,13 +7712,16 @@ impl EmittedBundle {
 /// Stable across builds (`DefaultHasher` has a fixed seed). Hashes the launch grouping, and per op its
 /// name, `time`, KTIR program and bindings, and its lowered SuperDSC descriptor: everything dxp is
 /// handed for it.
-pub fn bundle_fingerprint(ops: &[EmittedOp]) -> String {
+pub fn bundle_fingerprint<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>]) -> String {
     bundle_fingerprint_grouped(ops, FoldGrouping::Split)
 }
 
 /// As [`bundle_fingerprint`], keyed by the fold grouping as well — the two variants share their ops and
 /// differ only in group boundaries.
-pub fn bundle_fingerprint_grouped(ops: &[EmittedOp], fold: FoldGrouping) -> String {
+pub fn bundle_fingerprint_grouped<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+    fold: FoldGrouping,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // MEDIUM-GRAIN: fold the group size in, since flipping G repartitions the body into different
@@ -6935,7 +7769,7 @@ pub fn bundle_fingerprint_grouped(ops: &[EmittedOp], fold: FoldGrouping) -> Stri
 /// alias is found (→ a build `Err` in [`write_bundle_cached`]). A time=1 op never
 /// aliases (one trip). Only OUTPUT/non-input HBM allocate nodes are checked —
 /// inputs/LX legitimately repeat addresses (they are read, never written).
-fn tiled_trips_alias(e: &EmittedOp) -> bool {
+fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool {
     if e.time <= 1 {
         return false;
     }
@@ -7025,9 +7859,9 @@ pub use scratchy_subtile::superdsc_error::SuperDscError;
 /// decode step. The class split is not an optimization; it is the only shape whose launch table
 /// can address a hybrid model.
 #[derive(Clone)]
-pub struct RolledBody {
+pub struct RolledBody<T: ktir_superdsc::collective::Tp> {
     /// ONE layer's ops, baked at the class's layer-0 offsets.
-    pub ops: Vec<EmittedOp>,
+    pub ops: Vec<EmittedOp<T>>,
     /// How many layers of THIS class the body serves.
     pub iters: u32,
     /// The ABSOLUTE layer ids this body serves, in class order — `[ids[iter]]` is the true
@@ -7040,7 +7874,7 @@ pub struct RolledBody {
     pub hidden_out_tid: u32,
 }
 
-impl RolledBody {
+impl<T: ktir_superdsc::collective::Tp> RolledBody<T> {
     /// The absolute layer run at class-relative `iter`, or `None` past the end. Used by
     /// the executor's launch sequence derivation; `unroll_layers` reads `layer_ids` directly.
     pub fn layer_at(&self, iter: u32) -> Option<u32> {
@@ -7063,11 +7897,11 @@ impl RolledBody {
 /// so the host neither copies nor addresses them (see the pre-pass in
 /// `lower_subtile_tape_to_ktir`).
 #[derive(Clone)]
-pub struct RolledSuperDsc {
-    pub prefix: Vec<EmittedOp>,
+pub struct RolledSuperDsc<T: ktir_superdsc::collective::Tp> {
+    pub prefix: Vec<EmittedOp<T>>,
     /// ONE entry per attention class, in the order [`bundle::RerollMeta::bodies`] bakes.
-    pub bodies: Vec<RolledBody>,
-    pub suffix: Vec<EmittedOp>,
+    pub bodies: Vec<RolledBody<T>>,
+    pub suffix: Vec<EmittedOp<T>>,
     pub layout: BundleLayout,
     /// Per-layer tid map, keyed by each class's representative (layer-0-of-class) tid.
     /// A table's length is ITS class's `iters` — two classes of different layer counts
@@ -7114,7 +7948,7 @@ pub struct RolledSuperDsc {
     pub attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 }
 
-impl RolledSuperDsc {
+impl<T: ktir_superdsc::collective::Tp> RolledSuperDsc<T> {
     /// The total layer count — the sum over classes.
     pub fn iters(&self) -> u32 {
         self.bodies.iter().map(|b| b.iters).sum()
@@ -7141,7 +7975,9 @@ impl RolledSuperDsc {
 /// `iters` copies of a body are `iters` copies of the ARGS over ONE shared program. That is why
 /// unrolling here does not reintroduce the unrolled-bundle compile blowup the reroll was built to
 /// avoid: the programs are interned once (`ktir_tokens::ProgramInterner`).
-pub fn unroll_layers(rolled: &RolledSuperDsc) -> Vec<EmittedOp> {
+pub fn unroll_layers<T: ktir_superdsc::collective::Tp>(
+    rolled: &RolledSuperDsc<T>,
+) -> Vec<EmittedOp<T>> {
     let mut ops = rolled.prefix.clone();
     // ⭐⭐ THE LOOP-CARRIED RESIDUAL IS **NOT** IN `per_layer`, AND IT IS NOT AN OVERSIGHT.
     // [`RolledBody::hidden_in_tid`] documents the card's arrangement: the layout aliases every
@@ -7268,6 +8104,9 @@ pub fn class_covering_depth(launches: &[(u8, u32)]) -> usize {
     total
 }
 
+/// The class-covering twin's launch groups, and where its truncation stops ([`covering_twin_groups`]).
+pub type CoveringTwin<T> = (Vec<bundle::LaunchGroup<'static, T>>, GateTrunc);
+
 /// ⭐ THE CLASS-COVERING TWIN — the shipped bundle's per-op groups sliced to
 /// the covering depth: the SAME roll, the SAME unroll law, the SAME grouping
 /// (`FoldGrouping::Split`, the spelling every bake in `codegen.rs` uses), with
@@ -7286,10 +8125,10 @@ pub fn class_covering_depth(launches: &[(u8, u32)]) -> usize {
 /// emitted layout, [`emitted_lx_pin_window_bytes`]) — the twin runs the SAME
 /// bundle's first K launches under the SAME budget the bake proved, stamped
 /// onto every program it mints.
-pub fn covering_twin_groups(
-    rolled: &RolledSuperDsc,
+pub fn covering_twin_groups<T: ktir_superdsc::collective::Tp>(
+    rolled: &RolledSuperDsc<T>,
     lx_pin_window_bytes: Option<u64>,
-) -> Result<Option<(Vec<bundle::LaunchGroup<'static>>, GateTrunc)>, SuperDscError> {
+) -> Result<Option<CoveringTwin<T>>, SuperDscError> {
     let total = rolled.launches.len();
     let k = class_covering_depth(&rolled.launches);
     if k >= total {
@@ -7350,12 +8189,12 @@ pub fn covering_twin_groups(
 /// charges per segment (auditor ruling 2026-10-27). `None` when no placement layout was
 /// computed for this emission: the program then carries no window, and the resident
 /// fused path REFUSES it at load rather than passing the LX guard on a silent zero.
-pub fn ktir_groups(
-    ops: &[EmittedOp],
+pub fn ktir_groups<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
     _fold: FoldGrouping,
     lx_pin_window_bytes: Option<u64>,
-) -> Result<Vec<bundle::LaunchGroup<'static>>, SuperDscError> {
-    let mut out = Vec::with_capacity(ops.len());
+) -> Result<Vec<bundle::LaunchGroup<'static, T>>, SuperDscError> {
+    let mut out: Vec<bundle::LaunchGroup<'static, T>> = Vec::with_capacity(ops.len());
     for e in ops {
         let k = e.ktir.as_ref().ok_or_else(|| {
             SuperDscError(format!(
@@ -7384,14 +8223,29 @@ pub fn ktir_groups(
             .zip(k.bindings.iter())
             .map(|((ssa, _), b)| (*ssa, bundle::PlaceId::Act(b.get())))
             .collect();
+        let program = bundle::LaunchProgram {
+            func: k.func,
+            program: k.program,
+            args: std::borrow::Cow::Owned(args),
+            lx_pin_window_bytes,
+        };
+        // ⭐ ONE GROUP PER OP — EXCEPT A COLLECTIVE'S CONSUME, whose ops are ONE group: the CB
+        // pipeline puts the send and the wait in front of a consume group, so a consume split
+        // over two groups would send twice and wait for a second send that never comes (the
+        // descriptor path's `GroupKind::TpConsume` fuses them the same way).
+        if let Some(last) = out.last_mut()
+            && e.tp_consume.is_some()
+            && last.kv.tp == e.tp_consume
+        {
+            last.programs.to_mut().push(program);
+            continue;
+        }
         out.push(bundle::LaunchGroup {
-            kv: bundle::KvShifts::default(),
-            programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
-                func: k.func,
-                program: k.program,
-                args: std::borrow::Cow::Owned(args),
-                lx_pin_window_bytes,
-            }]),
+            kv: bundle::KvShifts {
+                tp: e.tp_consume,
+                ..bundle::KvShifts::default()
+            },
+            programs: std::borrow::Cow::Owned(vec![program]),
             init_binary: std::borrow::Cow::Borrowed(&[]),
             job_bin_ptr: 0,
             correction: std::borrow::Cow::Borrowed(&[]),
@@ -7420,17 +8274,17 @@ pub fn ktir_groups(
 /// Returns the identity each group's compiled artifact will be found under — nothing here reads a
 /// compiled result back; that happens once for the whole emit, in [`EmittedBundle::into_code`], after
 /// `superdsc_bake::finish_global()` has drained the queue.
-fn ktir_groups_via_superdsc(
-    ops: &[EmittedOp],
+fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
     fp: &str,
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-) -> Result<Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>, SuperDscError> {
+) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
     let mut sym_id_base: i64 = 0;
-    let mut sdsc_ops: Vec<EmittedOp> = Vec::new();
+    let mut sdsc_ops: Vec<EmittedOp<T>> = Vec::new();
     // fp8 activation-quantize dedup, per BUNDLE — threaded the way main's tape walk threaded it:
     // q/k/v share one rms output and gate/up another, so each distinct activation is quantized ONCE
     // and the later matmuls emit only `matmulfp8` + dequant.
@@ -7454,16 +8308,17 @@ fn ktir_groups_via_superdsc(
                 e.op_name
             )));
         }
-        let k = e.ktir.as_ref().ok_or_else(|| {
-            SuperDscError(format!(
+        if e.ktir.is_none() {
+            return Err(SuperDscError(format!(
                 "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
                  program computes something else",
                 e.op_name
-            ))
-        })?;
+            )));
+        }
         let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
-        let lowered = crate::ktir_superdsc_door::lower(
-            k,
+        // ⭐ `lower_op`: a collective's consume carries its `tp_consume` onto every op it lowers to.
+        let lowered = crate::ktir_superdsc_door::lower_op(
+            e,
             &mut sym_id_base,
             layout,
             attn_params,
@@ -7798,7 +8653,7 @@ fn ktir_groups_via_superdsc(
         let _pc = crate::pc::Pc::start("launch");
         launch_index(&sdsc_ops, fold)
     };
-    let mut groups: Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)> = Vec::new();
+    let mut groups: Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)> = Vec::new();
     let mut staged: u64 = 0;
     // No dxp (a Mac / cardless `cargo check`) ⇒ nothing to stage, and nothing to stage it FOR. This
     // is a CAPABILITY probe, not a behaviour flag.
@@ -7865,13 +8720,13 @@ fn ktir_groups_via_superdsc(
 /// the layout they share.
 ///
 /// [`lower_subtile_tape_to_ktir`]: crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir
-pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
+pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     tape: &scratchy_subtile::subtile_tape::SubtileTape,
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-) -> Result<RolledSuperDsc, SuperDscError> {
+) -> Result<RolledSuperDsc<T>, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
         ir,
@@ -8255,7 +9110,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(
+        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &ir,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
@@ -8372,14 +9227,14 @@ mod tests {
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
         mint_sample(&mut minted, SampleRows::All);
-        let l_plain = compute_bundle_layout(
+        let l_plain = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &plain,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
         .expect("plain lays out");
-        let l_minted = compute_bundle_layout(
+        let l_minted = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &minted,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
@@ -8475,7 +9330,7 @@ mod tests {
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
         mint_sample(&mut minted, SampleRows::All);
-        let layout = compute_bundle_layout(
+        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &minted,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
@@ -8798,8 +9653,13 @@ mod tests {
             let (_, ir) = build(m);
             // t1 is the lm_head weight; t0 is the activation source.
             let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-            lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-                .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
+            lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+            )
+            .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
         // m>1 (prefill): the tail FOLDS — the splice's `lmlast.py` extraction (its own program,
         // over the reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul, never a
@@ -8839,22 +9699,25 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(
+        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &ir,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
         .expect("the tail's layout mints");
-        let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
-            .expect("the splice's fold mints the tail");
+        let mut programs = scratchy_triton_splice::lower_all::<
+            ktir_superdsc::collective::TpWorld<1>,
+            _,
+        >(&node, &ir, false)
+        .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
             .find(|e| e.op_name.starts_with("lmlast"))
             .expect("the tail emits an extraction program");
         extract.ktir.as_mut().expect("its KTIR").node_out_tid = None;
         let mut sym = 0i64;
-        let stripped = crate::ktir_superdsc_door::lower(
+        let stripped = crate::ktir_superdsc_door::lower::<ktir_superdsc::collective::TpWorld<1>>(
             extract.ktir.as_ref().unwrap(),
             &mut sym,
             Some(&layout),
@@ -8923,7 +9786,7 @@ mod tests {
         // fp8 (arity-3): the placement reserves the PADDED extent — 2176·2816·1 B, the exact
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
-        let layout = compute_bundle_layout(
+        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &ir,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
@@ -8937,7 +9800,7 @@ mod tests {
         );
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
-        let layout = compute_bundle_layout(
+        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &ir,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
@@ -9018,8 +9881,13 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32, 3u32].into_iter().collect();
-        let (ops, _layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-            .expect("two-fp8-matmul lowering");
+        let (ops, _layout) = lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
+            &ir,
+            &weight_ids,
+            ActiveCap::FULL,
+            false,
+        )
+        .expect("two-fp8-matmul lowering");
         let quantizes = ops
             .iter()
             .filter(|o| o.op_name.ends_with("fq_afp8_op"))
@@ -9101,8 +9969,13 @@ mod tests {
     fn the_residual_scalarmul_folds_into_the_weight_and_off_the_tape() {
         let scale = 2.0f32; // an UP-multiplier — the f16 floor gate's permitted class
         let (ir, weight_ids) = residual_chain_fixture(scale);
-        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-            .expect("the folded residual shape lowers");
+        let (ops, layout) = lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
+            &ir,
+            &weight_ids,
+            ActiveCap::FULL,
+            false,
+        )
+        .expect("the folded residual shape lowers");
 
         // (a) the ScalarMul is GONE — no program carries its name, and the walk emitted the two
         // matmuls and nothing else. ⛔ THE COUNT IS THE ANTI-VACUOUS HALF: a name filter alone
@@ -9171,8 +10044,13 @@ mod tests {
     fn a_downscale_fold_refuses_at_the_f16_floor_and_stays_on_the_tape() {
         let scale = 0.130_417_02f32; // granite's residual_multiplier, as it appears in the dsl
         let (ir, weight_ids) = residual_chain_fixture(scale);
-        let (ops, layout) = lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-            .expect("the refused residual shape still lowers");
+        let (ops, layout) = lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
+            &ir,
+            &weight_ids,
+            ActiveCap::FULL,
+            false,
+        )
+        .expect("the refused residual shape still lowers");
 
         // (a) the ScalarMul STAYS — three programs, exactly one of them the pointwise mul.
         // ⛔ THE COUNT IS THE ANTI-VACUOUS HALF, same law as the folded test's.
@@ -9304,7 +10182,7 @@ mod tests {
     #[test]
     fn assemble_matmul_serializes_and_fills_cores() {
         // bmm 384×384×64 batch16 fits LX (576 KiB < 1.6 MiB) → time=1 EmittedOp.
-        let emitted = assemble_matmul(
+        let emitted = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MatMul_0",
             384,
             384,
@@ -9348,7 +10226,7 @@ mod tests {
         assert!(b.contains("func.func @sdsc_bundle()"));
         assert!(b.contains("sdscbundle.sdsc_execute () {sdsc_filename=\"sdsc_0.json\"}"));
         // A time=1 EmittedOp routes through emit_bundle_mlir → the SAME flat body.
-        let emitted = assemble_matmul(
+        let emitted = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MatMul_0",
             384,
             384,
@@ -9377,7 +10255,7 @@ mod tests {
         // every core ≥ 1024 `out` columns, 2 MiB of kernel. The same shape UNBATCHED is handed to dxp
         // whole, in one descriptor, which this asserts first.
         let (m, n, k, batch) = (64, 32768, 64, 16);
-        let whole = assemble_matmul(
+        let whole = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "matmul_o7",
             m,
             n,
@@ -9392,7 +10270,9 @@ mod tests {
         // The shape this test drove before the refusal, 64×16384×2048 at two kernel batches: a
         // 32-stick contraction under a `y` batch, the form measured incoherent on granite-3.1-8b.
         // It is a build error now, and the error names why.
-        let refused = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::try_assemble_matmul_seeded(
+        let refused = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::try_assemble_matmul_seeded::<
+            ktir_superdsc::collective::TpWorld<1>,
+        >(
             "matmul_o7",
             64,
             16384,
@@ -9412,7 +10292,7 @@ mod tests {
             ) && refused.contains("card-validated only at a one-stick contraction"),
             "the refusal names the shape and the reason: {refused}"
         );
-        let emitted = assemble_matmul(
+        let emitted = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "matmul_o7",
             m,
             n,
@@ -9643,7 +10523,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [0u32].into_iter().collect();
         // The budget pass refuses the same fixture the wiring accepts — on the UNROLLED graph,
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
-        let err = compute_bundle_layout(
+        let err = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
             &ir,
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
@@ -9656,7 +10536,10 @@ mod tests {
         );
         // The wiring builds NO placement — it reads only the registries — so the same fixture
         // wires, and the scalar registry it carries is the pure walk's content.
-        let wiring = crate::lower_subtile_tape_to_ktir::graph_wiring(
+        let wiring = crate::lower_subtile_tape_to_ktir::graph_wiring::<
+            ktir_superdsc::collective::TpWorld<1>,
+            _,
+        >(
             &ir,
             &weight_ids,
             ActiveCap::FULL,
@@ -9885,7 +10768,9 @@ mod tests {
         let pass = |layout: &ktir_superdsc::placement::BundleLayout| {
             for k in &programs {
                 let mut syms = 0i64;
-                ktir_superdsc::emit::whole_function::lower_function(
+                ktir_superdsc::emit::whole_function::lower_function::<
+                    ktir_superdsc::collective::TpWorld<1>,
+                >(
                     k,
                     Some(layout),
                     &mut syms,
@@ -9935,6 +10820,84 @@ mod tests {
         );
     }
 
+    /// A sharded bundle's sends, as the loader reads them off the BAKED layout, at every world: each
+    /// rank's consume sends the partial at its own placement into THAT RANK'S block of the window —
+    /// the very bytes every peer's consume reads for it — and a layout that lost the window refuses
+    /// by name, the bake's gate.
+    #[test]
+    fn a_baked_send_reads_the_partial_into_its_senders_block() {
+        use crate::bundle_code::collective::{Rank, Tp, TpWorld, World};
+        use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
+        use crate::tp_plan::tp_bake;
+        use ktir_superdsc::ktir_node::ActiveCap;
+        use scratchy_subtile::fixtures::mlp_sublayer;
+        use scratchy_subtile::subtile_ir::lower_region;
+
+        fn check<T: Tp>() {
+            let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
+            let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
+            let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
+            let (ops, layout) =
+                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
+            let groups: Vec<bundle::LaunchGroup<'static, T>> =
+                launch_index(&ops, FoldGrouping::Split)
+                    .into_iter()
+                    .map(|kv| bundle::LaunchGroup {
+                        kv,
+                        ..Default::default()
+                    })
+                    .collect();
+            let baked = bake_layout(&layout);
+            let sends = bundle::collective::sends(&baked, &groups).unwrap();
+            assert_eq!(
+                sends.len(),
+                <T as World>::RANKS as usize,
+                "one all-reduce, one consume (and its sends) per rank"
+            );
+            for s in &sends {
+                let consume = groups[s.group].kv.tp.unwrap();
+                let me = consume.plays_at;
+                let partial = layout.placements[&consume.operand.tid()];
+                let block = layout.placements[&consume.cut.block_tid(me)];
+                assert_eq!(consume.cut, bundle::collective::WindowCut::of_collective(0));
+                assert_eq!(
+                    s.send,
+                    bundle::collective::TpSend {
+                        source_segment: partial.segment as u8,
+                        source_offset: partial.offset,
+                        window_offset: block.offset,
+                        bytes: bundle::collective::CutPayload::new(consume.fragment.bytes())
+                            .unwrap(),
+                        cut: consume.cut,
+                    }
+                );
+            }
+            let first = groups[sends[0].group].kv.tp.unwrap();
+            let rank0 = Rank::<T>::of::<0>();
+            let windowless = bundle::BundleLayout {
+                places: baked
+                    .places
+                    .iter()
+                    .filter(|p| p.id != bundle::PlaceId::Act(first.cut.block_tid(rank0)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into(),
+                ..baked.clone()
+            };
+            assert_eq!(
+                bundle::collective::sends(&windowless, &groups),
+                Err(bundle::collective::UnplacedGroup {
+                    group: sends[0].group,
+                    why: bundle::collective::SendUnplaced::Window
+                })
+            );
+        }
+        check::<TpWorld<2>>();
+        check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
+    }
+
     /// ⛔ THE REFUSAL ITSELF: a layout whose synthetics collide with a real placement is a BUILD
     /// failure, not a card one. The duplicate is injected by hand — declaring a synthetic at an
     /// already-placed tid, exactly what a colliding mint does — because the mint path that used
@@ -9967,7 +10930,7 @@ mod fingerprint_tests {
     #[test]
     fn a_changed_descriptor_changes_the_fingerprint() {
         let at = |m: u32| {
-            assemble_matmul(
+            assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
                 "MatMul_0",
                 m,
                 384,

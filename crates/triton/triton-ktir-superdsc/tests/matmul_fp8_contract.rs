@@ -136,7 +136,8 @@ fn drive_src(
     triton_ktir::make_ktir(&mut m, grid).map_err(|e| format!("make_ktir: {e}"))?;
     triton_ktir::passes::to_ktir::run(&mut m, grid).map_err(|e| format!("to_ktir: {e}"))?;
     let node = triton_ktir_superdsc::node_for(&m, Program::Matmul).map_err(|e| e.message)?;
-    let ops = triton_ktir_superdsc::emit_node(&node).map_err(|e| e.message)?;
+    let ops = triton_ktir_superdsc::emit_node::<ktir_superdsc::collective::TpWorld<1>>(&node)
+        .map_err(|e| e.message)?;
     Ok(ops.into_iter().map(|o| o.op_name.clone()).collect())
 }
 

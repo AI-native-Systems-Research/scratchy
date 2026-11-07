@@ -103,13 +103,13 @@ pub struct BundleAttnParams {
 ///
 /// `attn_params` is [`BundleAttnParams`] — main's own remaining parameters, for the two bodies whose
 /// device laws need a fact no program states.
-pub fn lower(
+pub fn lower<T: ktir_superdsc::collective::Tp>(
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
     quantized: &mut QuantizedActivations,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // ⛔ WHAT THIS PROGRAM WRITES IS NOT THE QUANTIZE ANY EARLIER PROGRAM TOOK, before it lowers
     // (a matmul reading what its own program wrote reads the new bytes) and after (no later matmul
     // may reuse a chain over bytes this program replaced).
@@ -125,13 +125,13 @@ pub fn lower(
 }
 
 /// [`lower`]'s dispatch, by the program's kind.
-fn lower_kind(
+fn lower_kind<T: ktir_superdsc::collective::Tp>(
     k: &KtirNode,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
     quantized: &mut QuantizedActivations,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     // The name is still the program's identity for the emulator (which keys functions by it) and for
     // the descriptor suffixes, so it is READ — but nothing is parsed out of it.
     let name = k.func.name;
@@ -230,6 +230,8 @@ fn lower_kind(
         // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
         // half-lowering it.
         Program::LmLast => lower_function(k, layout, sym_id_base, None, quantized),
+        // An all-gather consume's block copy — the same pure-copy arm of the walk.
+        Program::BlockCopy => lower_function(k, layout, sym_id_base, None, quantized),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
@@ -238,26 +240,53 @@ fn lower_kind(
     }
 }
 
+/// THE PRODUCER'S OP THROUGH THE DOOR — [`lower`] over `e`'s program, with every per-op fact the
+/// producer stated and the program does not carried onto EVERY descriptor op it yields.
+///
+/// ⛔ ONE STAMP SITE. The door mints fresh ops from the program, so a fact the producer put on its
+/// op (today: the collective send and consume markers) is dropped unless something copies it, and a program
+/// can lower to several descriptor ops — each must carry it, or the ones that don't fuse into an
+/// ordinary group that takes the per-layer weight shift and reads the receive window somewhere
+/// else. The callers that keep the door's output call this, so none of them can forget the copy.
+pub fn lower_op<T: ktir_superdsc::collective::Tp>(
+    e: &EmittedOp<T>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    attn_params: Option<BundleAttnParams>,
+    quantized: &mut QuantizedActivations,
+) -> Result<Vec<EmittedOp<T>>, Error> {
+    let k = e.ktir.as_ref().ok_or_else(|| Error {
+        message: format!("{}: no KTIR program to lower", e.op_name),
+    })?;
+    let mut ops = lower(k, sym_id_base, layout, attn_params, quantized)?;
+    for o in &mut ops {
+        o.tp_consume = e.tp_consume;
+    }
+    Ok(ops)
+}
+
 /// A column-tiled body's ops, held to the windows its program states
 /// ([`lk::column_windows_are_honoured`]): the bake fails naming the op rather than baking a piece
 /// that writes another piece's columns.
-fn windowed(
+fn windowed<T: ktir_superdsc::collective::Tp>(
     name: &str,
     r: &[Region],
-    ops: Result<Vec<EmittedOp>, Error>,
-) -> Result<Vec<EmittedOp>, Error> {
+    ops: Result<Vec<EmittedOp<T>>, Error>,
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let ops = ops?;
     lk::column_windows_are_honoured(name, r, &ops)?;
     Ok(ops)
 }
 
 /// The orphan-rule carrier for [`lk::RopeAt`] — see the module header.
-struct RopeAt<'a>(lk::RopeAt<'a>);
+struct RopeAt<'a, T>(lk::RopeAt<'a>, core::marker::PhantomData<T>);
 
-impl scratchy_subtile::model_geometry::OnHeadDim for RopeAt<'_> {
-    type Out = Result<Vec<EmittedOp>, Error>;
+impl<T: ktir_superdsc::collective::Tp> scratchy_subtile::model_geometry::OnHeadDim
+    for RopeAt<'_, T>
+{
+    type Out = Result<Vec<EmittedOp<T>>, Error>;
     fn on_head_dim<const HD: u32>(self) -> Self::Out {
-        rope_at::<HD>(self.0)
+        rope_at::<T, HD>(self.0)
     }
 }
 
@@ -266,13 +295,13 @@ impl scratchy_subtile::model_geometry::OnHeadDim for RopeAt<'_> {
 /// both carried on [`KtirNode::out_shape`], because the program states only their product with
 /// `heads` (see that field). The head dim is the `x` view's own column extent, and it becomes the
 /// const generic through the SAME door main crossed.
-fn rope(
+fn rope<T: ktir_superdsc::collective::Tp>(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 3)?;
     // ⛔ THE WHOLE-TENSOR ROW WINDOW, THE 2a LAW — for BOTH forms below. `rope.py`'s per-row form states a
     // row window (`R_START` baked into every access tile's corner) — the producer's per-position
@@ -385,7 +414,7 @@ struct RopePlane {
 }
 
 /// The rope's lowering once its [`RopePlane`] is read.
-fn rope_at_geometry(
+fn rope_at_geometry<T: ktir_superdsc::collective::Tp>(
     name: &str,
     ins: &[Region],
     out: &Region,
@@ -393,7 +422,7 @@ fn rope_at_geometry(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
-) -> Result<Vec<EmittedOp>, Error> {
+) -> Result<Vec<EmittedOp<T>>, Error> {
     let RopePlane { hd, mq, total } = plane;
     // ⛔ THE ROW KIND, AS A PARAMETER — main's `LowerRope::rows_are_requests`, which main also took as
     // a parameter and for the reason its own comment gives. It decides whether the head-major collapse
@@ -425,7 +454,8 @@ fn rope_at_geometry(
         })?;
     scratchy_subtile::model_geometry::with_config_head_dim(
         scratchy_ir::model_facts::HeadDim::new(hd),
-        RopeAt(lk::RopeAt {
+        RopeAt(
+            lk::RopeAt {
             name,
             x: ins[0].name(),
             cos: ins[1].name(),
@@ -436,9 +466,11 @@ fn rope_at_geometry(
             total,
             p_tid,
             sym_id_base,
-            layout,
-            rows_are_requests,
-        }),
+                layout,
+                rows_are_requests,
+            },
+            core::marker::PhantomData::<T>,
+        ),
     )
     .ok_or_else(|| Error {
         message: format!(

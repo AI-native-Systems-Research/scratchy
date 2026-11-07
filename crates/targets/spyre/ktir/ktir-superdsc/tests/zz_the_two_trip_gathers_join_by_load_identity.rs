@@ -304,7 +304,9 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
     l
 }
 
-fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn emitted(
+    k: &KtirNode,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
     let layout = layout_for(k);
     let mut sid = 0i64;
     lower_function(
@@ -320,7 +322,9 @@ fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> 
 /// The `index_tensor` alloc's run-base word (`startAddressCoreCorelet_.data_["[0, 0, 0]"]`,
 /// in 4-B index words) of an emitted gathered op — THE fact that differs between two trips with
 /// different start entries. `None` when the op declares no index alloc.
-fn index_run_base(op: &ktir_superdsc::emit::EmittedOp) -> Option<u64> {
+fn index_run_base(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc
@@ -350,7 +354,7 @@ fn two_trips_with_different_starts_gather_from_different_index_words() {
     let ops = emitted(&two_trip_program(Swapped::No))
         .expect("the two-trip program lowers through the whole-function door");
     // 4 materialized copy legs (two trips × two 32-entry sticks each) + 2 matmuls + 1 addf.
-    let copies: Vec<&ktir_superdsc::emit::EmittedOp> =
+    let copies: Vec<&ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> =
         ops.iter().filter(|o| index_run_base(o).is_some()).collect();
     assert_eq!(
         copies.len(),
@@ -389,9 +393,10 @@ fn swapping_the_trips_swaps_the_index_offsets() {
         emitted(&two_trip_program(Swapped::No)).expect("the straight two-trip program lowers");
     let swapped =
         emitted(&two_trip_program(Swapped::Yes)).expect("the swapped two-trip program lowers");
-    let bases = |ops: &Vec<ktir_superdsc::emit::EmittedOp>| -> Vec<u64> {
-        ops.iter().filter_map(index_run_base).collect()
-    };
+    let bases = |ops: &Vec<
+        ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    >|
+     -> Vec<u64> { ops.iter().filter_map(index_run_base).collect() };
     let (b, s) = (bases(&straight), bases(&swapped));
     assert_ne!(
         b, s,

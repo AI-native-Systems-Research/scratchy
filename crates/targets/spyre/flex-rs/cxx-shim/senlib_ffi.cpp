@@ -53,18 +53,11 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 namespace {
-
-// Process-wide PF device handle, brought up once. Mirrors flex's own
-// call_once/shared_ptr pattern for the same reason: opening the device is
-// expensive (real hardware bring-up) and must happen exactly once per
-// process, not once per FFI call.
-std::shared_ptr<senlib::snt1p0::PfWrapper> g_pfw;
-std::once_flag g_pfw_once;
-int g_pfw_init_rc = -1;
 
 // Diagnostic channel for the exceptions this ABI boundary is obliged to catch.
 //
@@ -97,86 +90,10 @@ extern "C" const char* flex_shim_last_error(void) {
     return g_last_error.c_str();
 }
 
-void init_pfw_once(int32_t /*logical_device_id*/) {
-    std::call_once(g_pfw_once, [] {
-        try {
-            // Real device identification + open: senlib::snt1p0::SenPci::pf()
-            // with no argument selects "first available device", matching
-            // flex's own CreatePciId() fallback path
-            // (pf_device_handle.cpp:145) for the single-device case this ABI
-            // slice needs. senlib::snt1p0::PfWrapper's constructor is the actual
-            // VFIO device open.
-            auto pci_id = senlib::snt1p0::SenPci::pf();
-            g_pfw = std::make_shared<senlib::snt1p0::PfWrapper>(pci_id);
-            g_pfw_init_rc = 0;
-        } catch (const std::exception& e) {
-            fprintf(stderr, "[senlib-ffi] init_pfw: %s\n", e.what());
-            g_pfw_init_rc = -2;
-        } catch (...) {
-            fprintf(stderr, "[senlib-ffi] init_pfw: unknown exception\n");
-            g_pfw_init_rc = -2;
-        }
-    });
-}
-
-// Process-wide memory allocator, constructed once GetLPDDRSize() is known.
-// Mirrors flex::DeviceMemoryAllocator's own PF-mode construction
-// (device_memory_allocator.cpp:122): base = reinterpret_cast<void*>(alignment)
-// (a nonzero placeholder so device address 0 is never returned as valid, per
-// senlib's own memory_allocator.hpp doc comment), size = real LPDDR size,
-// page_size = DEVICE_ALIGNMENT (128, matching flex-rs's own
-// allocator.rs::DEVICE_ALIGNMENT).
-constexpr uint64_t kDeviceAlignment = 128;
-
-std::shared_ptr<senlib::shared::MemoryAllocator> g_mem_allocator;
-std::once_flag g_mem_allocator_once;
-
-senlib::shared::MemoryAllocator* mem_allocator() {
-    std::call_once(g_mem_allocator_once, [] {
-        auto size = g_pfw->interface()->GetLPDDRSize();
-        g_mem_allocator = std::make_shared<senlib::shared::MemoryAllocator>(
-            reinterpret_cast<void*>(kDeviceAlignment), size, kDeviceAlignment);
-    });
-    return g_mem_allocator.get();
-}
-
-// Process-wide handle table for outstanding device-memory allocations.
-// senlib::shared::MemoryAllocator::Allocate returns a raw void*; Rust's
-// senlib_ffi::SenlibAllocationHandle is a bare u64, so this table
-// is what turns "free this u64" back into "free this void*" (the pointer
-// value itself, widened to u64, IS the handle — no separate ownership object
-// to track, unlike the old flex::DeviceMemoryAllocationPtr shared_ptr table).
-std::mutex g_alloc_table_mu;
-std::unordered_map<uint64_t, void*> g_alloc_table;
-
-// ---------------------------------------------------------------------
-// Multi-device / cross-port P2P state (issue #550 re-add)
-// ---------------------------------------------------------------------
-
-// Pinned host-memory wrapper table. flex_senlib_pin_and_map's senlib
-// counterpart (`PfWrapper::allocate_pin_and_map`, cited from flex-cxx
-// hdma_shm.cpp:903-914) returns a heap wrapper object whose concrete
-// post-reorg type is not checkable from this worktree (FIXME(pod-verify));
-// it is therefore stored TYPE-ERASED — a shared_ptr<void> whose erasing
-// deleter keeps the wrapper alive — with the host pointer captured at
-// creation, so `flex_senlib_pinned_memory_hptr` needs no downcast and
-// `flex_senlib_pinned_memory_release` needs only the table.
 struct PinnedTableEntry {
     std::shared_ptr<void> keepalive;
     void* hptr;
 };
-std::mutex g_pinned_table_mu;
-std::unordered_map<uint64_t, PinnedTableEntry> g_pinned_table;
-uint64_t g_pinned_next_handle = 1;
-
-// Cross-port P2P mapping memo: peer card index -> length it was mapped
-// with. Nothing above senlib calls the mapping today (scratchy is its first
-// caller), and double-mapping a peer is undefined territory, so the shim
-// makes flex_senlib_p2p_create_mapping idempotent per (peer, len) — a retry
-// re-marshals the current peer_dev_info instead of creating a second
-// mapping. A mismatched length for an already-mapped peer is an error.
-std::mutex g_p2p_mu;
-std::unordered_map<uint32_t, uint64_t> g_p2p_mapped;
 
 // Mirrors Rust's `SenlibP2pSegment` (#[repr(C)] { c_int aux; void* addr }).
 struct FlexP2pSegmentShim {
@@ -184,62 +101,175 @@ struct FlexP2pSegmentShim {
     void* addr;
 };
 
-// FIXME(pod-verify) — the reachability of the vfio_backend from the public
-// PfInterface this shim holds. Recorded facts (pod disassembly, #550 brief):
-//   1. the concrete `PfInterface_impl` IS-A `vfio_backend` (public
-//      inheritance; `senlib::v2::vfio_backend` in the pre-D-2 disassembly,
-//      `vfio::snt1p0::vfio_backend` since), and
-//   2. `PfInterface` stores its impl pointer at offset +0x18.
-// Both must be re-verified against the pod headers before this is trusted
-// on hardware; if `PfInterface` (or PfWrapper) exposes a public accessor
-// for the impl or the vfio device, replace this body with it — that is the
-// preferred fix, and the offset read below is only the evidence-backed
-// fallback. The reinterpret_cast assumes vfio_backend is the primary base
-// of PfInterface_impl (offset 0), which the disassembly's working call
-// sequence also implies; if the inheritance is non-primary, this needs the
-// typed static_cast instead.
-vfio::snt1p0::vfio_backend* p2p_vfio_backend() {
-    auto* iface = g_pfw->interface();
-    void* impl = *reinterpret_cast<void**>(reinterpret_cast<char*>(iface) + 0x18);
-    return reinterpret_cast<vfio::snt1p0::vfio_backend*>(impl);
-}
+constexpr uint64_t kDeviceAlignment = 128;
+
+// ── ONE OPEN CARD ────────────────────────────────────────────────────────
+//
+// Everything this shim knows about a card lives in one `Card`: the senlib
+// device handle, the PCI id senlib resolved, the device-memory allocator,
+// the allocation and pinned-memory tables, and the cross-port P2P memo. A
+// process opens as many cards as it drives (senlib's API is per card:
+// `SenPci::pf(const std::string&)`, senpci.hpp:36, a `PfWrapper` per
+// `PciDevId`, pf_wrapper.hpp:65, per-device VFIO state,
+// vfio_backend.hpp:114-121; and measured on nickm5 2026-11-06: 8 cards held
+// open in one process, every card linked to every peer, each card's memory
+// its own). There is no process-global card: every entry point below takes
+// the `Card*` it acts on. A one-card process is the same code with one card.
+//
+// The handle Rust holds is the `Card*` itself, minted by
+// `flex_shim_card_open` and released by `flex_shim_card_close`.
+struct Card {
+    std::shared_ptr<senlib::snt1p0::PfWrapper> pfw;
+    vfio::shared::PciDevId pci;
+
+    // Device-memory allocator, constructed once GetLPDDRSize() is known.
+    // Mirrors flex::DeviceMemoryAllocator's own PF-mode construction
+    // (device_memory_allocator.cpp:122): base = reinterpret_cast<void*>(alignment)
+    // (a nonzero placeholder so device address 0 is never returned as valid, per
+    // senlib's own memory_allocator.hpp doc comment), size = real LPDDR size,
+    // page_size = DEVICE_ALIGNMENT (128, matching flex-rs's own
+    // allocator.rs::DEVICE_ALIGNMENT).
+    std::shared_ptr<senlib::shared::MemoryAllocator> mem;
+    std::once_flag mem_once;
+
+    // Outstanding device-memory allocations. senlib::shared::MemoryAllocator::
+    // Allocate returns a raw void*; Rust's SenlibAllocationHandle is a bare
+    // u64, so this table turns "free this u64" back into "free this void*" (the
+    // pointer value itself, widened to u64, IS the handle). Per card: two
+    // cards' allocators hand out the same device addresses.
+    std::mutex alloc_mu;
+    std::unordered_map<uint64_t, void*> alloc_table;
+
+    // Pinned host-memory wrapper table. flex_senlib_pin_and_map's senlib
+    // counterpart (`PfWrapper::allocate_pin_and_map`, cited from flex-cxx
+    // hdma_shm.cpp:903-914) returns a heap wrapper object whose concrete
+    // post-reorg type is not checkable from this worktree (FIXME(pod-verify));
+    // it is therefore stored TYPE-ERASED — a shared_ptr<void> whose erasing
+    // deleter keeps the wrapper alive — with the host pointer captured at
+    // creation, so `flex_senlib_pinned_memory_hptr` needs no downcast and
+    // `flex_senlib_pinned_memory_release` needs only the table.
+    std::mutex pinned_mu;
+    std::unordered_map<uint64_t, PinnedTableEntry> pinned_table;
+    uint64_t pinned_next_handle = 1;
+
+    // Cross-port P2P mapping memo: peer card index -> length it was mapped
+    // with. Double-mapping a peer is undefined territory, so the shim makes
+    // flex_senlib_p2p_create_mapping idempotent per (peer, len) — a retry
+    // re-marshals the current peer_dev_info instead of creating a second
+    // mapping. A mismatched length for an already-mapped peer is an error.
+    std::mutex p2p_mu;
+    std::unordered_map<uint32_t, uint64_t> p2p_mapped;
+
+    Card(std::shared_ptr<senlib::snt1p0::PfWrapper> p, vfio::shared::PciDevId id)
+        : pfw(std::move(p)), pci(id) {}
+
+    senlib::snt1p0::PfInterface* iface() const { return pfw->interface(); }
+
+    senlib::shared::MemoryAllocator* allocator() {
+        std::call_once(mem_once, [this] {
+            auto size = iface()->GetLPDDRSize();
+            mem = std::make_shared<senlib::shared::MemoryAllocator>(
+                reinterpret_cast<void*>(kDeviceAlignment), size, kDeviceAlignment);
+        });
+        return mem.get();
+    }
+
+    // FIXME(pod-verify) — the reachability of the vfio_backend from the public
+    // PfInterface this shim holds. Recorded facts (pod disassembly, #550 brief):
+    //   1. the concrete `PfInterface_impl` IS-A `vfio_backend` (public
+    //      inheritance; `senlib::v2::vfio_backend` in the pre-D-2 disassembly,
+    //      `vfio::snt1p0::vfio_backend` since), and
+    //   2. `PfInterface` stores its impl pointer at offset +0x18.
+    // Both must be re-verified against the pod headers before this is trusted
+    // on hardware; if `PfInterface` (or PfWrapper) exposes a public accessor
+    // for the impl or the vfio device, replace this body with it — that is the
+    // preferred fix, and the offset read below is only the evidence-backed
+    // fallback.
+    vfio::snt1p0::vfio_backend* p2p_vfio_backend() const {
+        auto* i = iface();
+        void* impl = *reinterpret_cast<void**>(reinterpret_cast<char*>(i) + 0x18);
+        return reinterpret_cast<vfio::snt1p0::vfio_backend*>(impl);
+    }
+};
 
 }  // namespace
 
 extern "C" {
 
 // ---------------------------------------------------------------------
-// Runtime bring-up (senlib_ffi.rs)
+// Card bring-up (senlib_ffi.rs)
 // ---------------------------------------------------------------------
 
-int32_t flex_shim_init_runtime(int32_t logical_device_id) {
+// Opens the card at PCI address `pci_addr` ("DDDD:BB:DD.F") and returns its
+// handle, or nullptr on failure (the reason in flex_shim_last_error()).
+// SenPci::pf(const std::string&) (senpci.hpp:36) selects by address — never an
+// enumeration index that can drift from lspci order — and the PfWrapper
+// constructor (pf_wrapper.hpp:65) is the VFIO device open itself. Every open is
+// a new card; a process may hold several at once.
+void* flex_shim_card_open(const char* pci_addr) {
     try {
-        init_pfw_once(logical_device_id);
-        return (g_pfw_init_rc == 0 && g_pfw) ? 0 : (g_pfw_init_rc == 0 ? -1 : g_pfw_init_rc);
+        if (!pci_addr) {
+            shim_record_error("flex_shim_card_open", "null pci_addr");
+            return nullptr;
+        }
+        auto id = senlib::snt1p0::SenPci::pf(std::string(pci_addr));
+        auto pfw = std::make_shared<senlib::snt1p0::PfWrapper>(id);
+        return static_cast<void*>(new Card(std::move(pfw), id));
     } catch (const std::exception& e) {
-        fprintf(stderr, "[senlib-ffi] flex_shim_init_runtime: %s\n", e.what());
-        return -2;
+        shim_record_error("flex_shim_card_open", e.what());
+        return nullptr;
     } catch (...) {
-        fprintf(stderr, "[senlib-ffi] flex_shim_init_runtime: unknown exception\n");
-        return -2;
+        shim_record_error("flex_shim_card_open", "unknown exception");
+        return nullptr;
     }
 }
 
-// Real device memory capacity, in bytes — senlib::snt1p0::PfInterface::GetLPDDRSize(),
-// the exact senlib call flex's own PfDeviceHandle constructor uses
-// (pf_device_handle.cpp:153: `pfw_->interface()->GetLPDDRSize()`).
-uint64_t flex_senlib_device_memory_size(void) {
+// Closes a card opened by flex_shim_card_open: drops its device handle, which
+// closes the VFIO device. The caller must have released every allocation and
+// pinned mapping on it first; anything left is destroyed with the card.
+void flex_shim_card_close(void* card) {
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_device_memory_size: runtime not initialized\n");
+        delete static_cast<Card*>(card);
+    } catch (...) {
+        fprintf(stderr, "[senlib-ffi] flex_shim_card_close: exception\n");
+    }
+}
+
+// The PCI address senlib resolved for `card`, read from the live PciDevId
+// handed to PfWrapper (senlib's own accessors, its "DDDD:BB:DD.F" format), into
+// a caller-provided buffer. Returns the length written (excluding the NUL), or
+// -1 on a null card or a too-small buffer. The caller names the address it
+// asked for; this is what senlib actually resolved.
+int32_t flex_shim_card_pci(const void* card, char* out, size_t cap) {
+    if (!card || !out || cap == 0) {
+        return -1;
+    }
+    const auto& id = static_cast<const Card*>(card)->pci;
+    char buf[32];
+    const int n = snprintf(buf, sizeof(buf), "%04x:%02x:%02x.%x", id.pci_seg(), id.pci_bus(),
+                           id.pci_dev(), id.pci_func());
+    if (n < 0 || static_cast<size_t>(n) >= cap) {
+        return -1;
+    }
+    memcpy(out, buf, static_cast<size_t>(n) + 1);
+    return n;
+}
+
+// The card's real device memory capacity, in bytes:
+// senlib::snt1p0::PfInterface::GetLPDDRSize(), the exact senlib call flex's own
+// PfDeviceHandle constructor uses (pf_device_handle.cpp:153). 0 on failure.
+uint64_t flex_senlib_device_memory_size(void* card) {
+    try {
+        if (!card) {
+            shim_record_error("flex_senlib_device_memory_size", "null card");
             return 0;
         }
-        return static_cast<uint64_t>(g_pfw->interface()->GetLPDDRSize());
+        return static_cast<uint64_t>(static_cast<Card*>(card)->iface()->GetLPDDRSize());
     } catch (const std::exception& e) {
-        fprintf(stderr, "[senlib-ffi] flex_senlib_device_memory_size: %s\n", e.what());
+        shim_record_error("flex_senlib_device_memory_size", e.what());
         return 0;
     } catch (...) {
-        fprintf(stderr, "[senlib-ffi] flex_senlib_device_memory_size: unknown exception\n");
+        shim_record_error("flex_senlib_device_memory_size", "unknown exception");
         return 0;
     }
 }
@@ -267,10 +297,10 @@ uint32_t flex_senlib_rcu_num_cores(void) {
 //   senlib::shared::MemoryAllocator::Allocate(bytes) -> void* / Free(void*)
 // ---------------------------------------------------------------------
 
-uint64_t flex_senlib_memory_allocate(uint64_t num_bytes) {
+uint64_t flex_senlib_memory_allocate(void* card, uint64_t num_bytes) {
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_memory_allocate: runtime not initialized\n");
+        if (!card) {
+            fprintf(stderr, "[senlib-ffi] flex_senlib_memory_allocate: null card\n");
             return 0;
         }
         // This 1p0 target has exactly one memory domain (matches flex's own
@@ -283,7 +313,7 @@ uint64_t flex_senlib_memory_allocate(uint64_t num_bytes) {
         // mismatch (harmless on x86_64 System V since the extra arg just sat
         // in an ignored register, but exactly the kind of unlocked skeleton
         // this hardening pass exists to remove).
-        void* ptr = mem_allocator()->Allocate(static_cast<size_t>(num_bytes));
+        void* ptr = static_cast<Card*>(card)->allocator()->Allocate(static_cast<size_t>(num_bytes));
         if (ptr == nullptr) {
             return 0;
         }
@@ -292,8 +322,8 @@ uint64_t flex_senlib_memory_allocate(uint64_t num_bytes) {
             fprintf(stderr, "[senlib-ffi] flex_senlib_memory_allocate: pointer 0 collides with failure sentinel\n");
             return 0;
         }
-        std::lock_guard<std::mutex> lock(g_alloc_table_mu);
-        g_alloc_table[handle] = ptr;
+        std::lock_guard<std::mutex> lock(static_cast<Card*>(card)->alloc_mu);
+        static_cast<Card*>(card)->alloc_table[handle] = ptr;
         return handle;
     } catch (const std::exception& e) {
         fprintf(stderr, "[senlib-ffi] flex_senlib_memory_allocate: %s\n", e.what());
@@ -304,19 +334,19 @@ uint64_t flex_senlib_memory_allocate(uint64_t num_bytes) {
     }
 }
 
-int32_t flex_senlib_memory_free(uint64_t handle) {
+int32_t flex_senlib_memory_free(void* card, uint64_t handle) {
     try {
         if (handle == 0) {
             return 0;
         }
-        std::lock_guard<std::mutex> lock(g_alloc_table_mu);
-        auto it = g_alloc_table.find(handle);
-        if (it == g_alloc_table.end()) {
+        std::lock_guard<std::mutex> lock(static_cast<Card*>(card)->alloc_mu);
+        auto it = static_cast<Card*>(card)->alloc_table.find(handle);
+        if (it == static_cast<Card*>(card)->alloc_table.end()) {
             shim_record_error("flex_senlib_memory_free", "unknown handle");
             return -1;
         }
-        mem_allocator()->Free(it->second);
-        g_alloc_table.erase(it);
+        static_cast<Card*>(card)->allocator()->Free(it->second);
+        static_cast<Card*>(card)->alloc_table.erase(it);
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_memory_free", e.what());
@@ -341,11 +371,11 @@ enum FlexShimPipeline : int32_t {
     kFlexShimPipelineAsyncDmaOCbi = 2,
 };
 
-static senlib::snt1p0::ControlBlockInterface* cbi_for_pipeline(int32_t pipeline) {
-    if (!g_pfw) {
+static senlib::snt1p0::ControlBlockInterface* cbi_for_pipeline(Card* c, int32_t pipeline) {
+    if (!c) {
         return nullptr;
     }
-    auto* iface = g_pfw->interface();
+    auto* iface = c->iface();
     switch (pipeline) {
         case kFlexShimPipelineComputeCbi:
             return iface->GetCmptCbi();
@@ -358,18 +388,18 @@ static senlib::snt1p0::ControlBlockInterface* cbi_for_pipeline(int32_t pipeline)
     }
 }
 
-void* flex_shim_cbi_for_pipeline(int32_t pipeline) {
+void* flex_shim_cbi_for_pipeline(void* card, int32_t pipeline) {
     try {
-        return static_cast<void*>(cbi_for_pipeline(pipeline));
+        return static_cast<void*>(cbi_for_pipeline(static_cast<Card*>(card), pipeline));
     } catch (...) {
         fprintf(stderr, "[senlib-ffi] flex_shim_cbi_for_pipeline: exception\n");
         return nullptr;
     }
 }
 
-void* flex_shim_rbi_for_pipeline(int32_t /*pipeline*/) {
+void* flex_shim_rbi_for_pipeline(void* card, int32_t /*pipeline*/) {
     try {
-        if (!g_pfw) {
+        if (!card) {
             return nullptr;
         }
         // senlib exposes exactly one Rbi() per device.
@@ -388,7 +418,7 @@ void* flex_shim_rbi_for_pipeline(int32_t /*pipeline*/) {
         // subobject happens to sit at offset 0. Matches how
         // `cbi_for_pipeline` above already returns the base
         // `ControlBlockInterface*`.
-        return static_cast<void*>(static_cast<senlib::snt1p0::ResponseBlockInterface*>(g_pfw->interface()->GetRbi()));
+        return static_cast<void*>(static_cast<senlib::snt1p0::ResponseBlockInterface*>(static_cast<Card*>(card)->iface()->GetRbi()));
     } catch (...) {
         fprintf(stderr, "[senlib-ffi] flex_shim_rbi_for_pipeline: exception\n");
         return nullptr;
@@ -562,11 +592,11 @@ const char* senlib_senpci_pf_address(uint32_t card_index) {
 // caller, which on the Rust side is handled by iommu.rs::PfIommuMapper::map
 // after this call returns. Accepted here purely so this shim's signature
 // matches the real Map() it mirrors.
-int32_t flex_senlib_iommu_register_and_map(void* hmva, uint64_t size_bytes, bool writable, void** out_iova, uint64_t* out_size) {
+int32_t flex_senlib_iommu_register_and_map(void* card, void* hmva, uint64_t size_bytes, bool writable, void** out_iova, uint64_t* out_size) {
     (void)writable;
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_iommu_register_and_map: runtime not initialized\n");
+        if (!card) {
+            fprintf(stderr, "[senlib-ffi] flex_senlib_iommu_register_and_map: null card\n");
             return -1;
         }
         // Exact call pair, in this order, from pf_iommu_mapper.cpp:50-51.
@@ -574,8 +604,8 @@ int32_t flex_senlib_iommu_register_and_map(void* hmva, uint64_t size_bytes, bool
         // page-rounds (see below), and that asymmetry is deliberate in the
         // C++ (it carries its own `TODO(mschaal): Should we really try to fix
         // this here?`), so it is reproduced rather than "corrected".
-        g_pfw->interface()->RegisterMemForIOMMU(hmva, size_bytes);
-        auto pm = g_pfw->interface()->pin_and_map(hmva, size_bytes);
+        static_cast<Card*>(card)->iface()->RegisterMemForIOMMU(hmva, size_bytes);
+        auto pm = static_cast<Card*>(card)->iface()->pin_and_map(hmva, size_bytes);
         if (pm.dev_shm_sglist.empty()) {
             // pf_iommu_mapper.cpp:53-56: RAS::DEVICE_PF::IommuNoMapping().Throw().
             fprintf(stderr, "[senlib-ffi] flex_senlib_iommu_register_and_map: IommuNoMapping (empty dev_shm_sglist)\n");
@@ -597,10 +627,10 @@ int32_t flex_senlib_iommu_register_and_map(void* hmva, uint64_t size_bytes, bool
     }
 }
 
-int32_t flex_senlib_iommu_unmap_and_unregister(void* hmva, void* iova, uint64_t size_bytes) {
+int32_t flex_senlib_iommu_unmap_and_unregister(void* card, void* hmva, void* iova, uint64_t size_bytes) {
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_iommu_unmap_and_unregister: runtime not initialized\n");
+        if (!card) {
+            fprintf(stderr, "[senlib-ffi] flex_senlib_iommu_unmap_and_unregister: null card\n");
             return -1;
         }
         // pf_iommu_mapper.cpp:90-93: a fresh `pinned_memory` carrying exactly
@@ -613,8 +643,8 @@ int32_t flex_senlib_iommu_unmap_and_unregister(void* hmva, void* iova, uint64_t 
         // brace-initializer order matches the C++'s.
         senlib::shared::pinned_memory pm;
         pm.dev_shm_sglist.push_back({iova, static_cast<size_t>(size_bytes)});
-        g_pfw->interface()->unpin_and_unmap(pm);
-        g_pfw->interface()->UnregisterMemForIOMMU(hmva, static_cast<size_t>(size_bytes));
+        static_cast<Card*>(card)->iface()->unpin_and_unmap(pm);
+        static_cast<Card*>(card)->iface()->UnregisterMemForIOMMU(hmva, static_cast<size_t>(size_bytes));
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[senlib-ffi] flex_senlib_iommu_unmap_and_unregister: %s\n", e.what());
@@ -641,10 +671,10 @@ int32_t flex_senlib_iommu_unmap_and_unregister(void* hmva, void* iova, uint64_t 
 // flex-cxx hdma_shm.cpp:903-914 — the HDMA instruction/mgmt/data buffers.
 // Returns 0 (the failure sentinel shared with every handle-minting entry
 // point in this shim) on failure.
-uint64_t flex_senlib_pin_and_map(uint64_t num_bytes, const char* name) {
+uint64_t flex_senlib_pin_and_map(void* card, uint64_t num_bytes, const char* name) {
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_pin_and_map: runtime not initialized\n");
+        if (!card) {
+            fprintf(stderr, "[senlib-ffi] flex_senlib_pin_and_map: null card\n");
             return 0;
         }
         // FIXME(pod-verify): the exact post-reorg signature of
@@ -658,16 +688,16 @@ uint64_t flex_senlib_pin_and_map(uint64_t num_bytes, const char* name) {
         // static_pointer_cast below with
         // `std::shared_ptr<void> keepalive(std::move(pm));` — the table's
         // type erasure is written so that is the only line that changes.
-        auto pm = g_pfw->allocate_pin_and_map(static_cast<size_t>(num_bytes), name);
+        auto pm = static_cast<Card*>(card)->pfw->allocate_pin_and_map(static_cast<size_t>(num_bytes), name);
         if (!pm) {
             return 0;
         }
         PinnedTableEntry entry;
         entry.hptr = pm->hptr();
         entry.keepalive = std::static_pointer_cast<void>(pm);
-        std::lock_guard<std::mutex> lock(g_pinned_table_mu);
-        uint64_t handle = g_pinned_next_handle++;
-        g_pinned_table[handle] = std::move(entry);
+        std::lock_guard<std::mutex> lock(static_cast<Card*>(card)->pinned_mu);
+        uint64_t handle = static_cast<Card*>(card)->pinned_next_handle++;
+        static_cast<Card*>(card)->pinned_table[handle] = std::move(entry);
         return handle;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_pin_and_map", e.what());
@@ -681,18 +711,18 @@ uint64_t flex_senlib_pin_and_map(uint64_t num_bytes, const char* name) {
 // Releases a pinned-memory mapping minted by flex_senlib_pin_and_map:
 // drops the table's type-erased keepalive (whose deleter unpins/unmaps and
 // destroys senlib's wrapper). 0 on success, -1 on an unknown handle.
-int32_t flex_senlib_pinned_memory_release(uint64_t handle) {
+int32_t flex_senlib_pinned_memory_release(void* card, uint64_t handle) {
     try {
         if (handle == 0) {
             return 0;
         }
-        std::lock_guard<std::mutex> lock(g_pinned_table_mu);
-        auto it = g_pinned_table.find(handle);
-        if (it == g_pinned_table.end()) {
+        std::lock_guard<std::mutex> lock(static_cast<Card*>(card)->pinned_mu);
+        auto it = static_cast<Card*>(card)->pinned_table.find(handle);
+        if (it == static_cast<Card*>(card)->pinned_table.end()) {
             shim_record_error("flex_senlib_pinned_memory_release", "unknown handle");
             return -1;
         }
-        g_pinned_table.erase(it);
+        static_cast<Card*>(card)->pinned_table.erase(it);
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_pinned_memory_release", e.what());
@@ -705,11 +735,11 @@ int32_t flex_senlib_pinned_memory_release(uint64_t handle) {
 
 // Host-virtual pointer backing a pinned-memory region. nullptr for an
 // unknown handle (a live handle's region is non-null by construction).
-void* flex_senlib_pinned_memory_hptr(uint64_t handle) {
+void* flex_senlib_pinned_memory_hptr(void* card, uint64_t handle) {
     try {
-        std::lock_guard<std::mutex> lock(g_pinned_table_mu);
-        auto it = g_pinned_table.find(handle);
-        if (it == g_pinned_table.end()) {
+        std::lock_guard<std::mutex> lock(static_cast<Card*>(card)->pinned_mu);
+        auto it = static_cast<Card*>(card)->pinned_table.find(handle);
+        if (it == static_cast<Card*>(card)->pinned_table.end()) {
             shim_record_error("flex_senlib_pinned_memory_hptr", "unknown handle");
             return nullptr;
         }
@@ -721,16 +751,16 @@ void* flex_senlib_pinned_memory_hptr(uint64_t handle) {
 
 // Directly sets the on-device write-done counter for `sid` to `val`.
 // Cited: host_wdone.cpp:413 `pfw_->interface()->direct_set_wdone(instr.sid, val)`.
-int32_t flex_senlib_direct_set_wdone(uint8_t sid, int32_t val) {
+int32_t flex_senlib_direct_set_wdone(void* card, uint8_t sid, int32_t val) {
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_direct_set_wdone: runtime not initialized\n");
+        if (!card) {
+            fprintf(stderr, "[senlib-ffi] flex_senlib_direct_set_wdone: null card\n");
             return -1;
         }
         // FIXME(pod-verify): `sid`/`val` widths are carried from the
         // pre-#530 declaration's citation; if the pod header widens `sid`
         // (e.g. uint32_t), widen the extern in senlib_ffi.rs to match.
-        g_pfw->interface()->direct_set_wdone(sid, val);
+        static_cast<Card*>(card)->iface()->direct_set_wdone(sid, val);
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_direct_set_wdone", e.what());
@@ -743,15 +773,15 @@ int32_t flex_senlib_direct_set_wdone(uint8_t sid, int32_t val) {
 
 // Atomically increments the on-device write-done counter for `sid`.
 // Cited: host_wdone.cpp:417 and :1025 `pfw_->interface()->ainc_wdone(sid)`.
-int32_t flex_senlib_ainc_wdone(uint8_t sid) {
+int32_t flex_senlib_ainc_wdone(void* card, uint8_t sid) {
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_ainc_wdone: runtime not initialized\n");
+        if (!card) {
+            fprintf(stderr, "[senlib-ffi] flex_senlib_ainc_wdone: null card\n");
             return -1;
         }
         // FIXME(pod-verify): same width caveat as
         // flex_senlib_direct_set_wdone.
-        g_pfw->interface()->ainc_wdone(sid);
+        static_cast<Card*>(card)->iface()->ainc_wdone(sid);
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_ainc_wdone", e.what());
@@ -773,13 +803,13 @@ int32_t flex_senlib_ainc_wdone(uint8_t sid) {
 // Writes the on-device XSEG[SID] translation-table entry for `sid`.
 // Cited: pf_interface.hpp:122 `void write_xseg(uint8_t sid, uint32_t xseg,
 // bool checkregs = true)`.
-int32_t flex_senlib_write_xseg(uint8_t sid, uint32_t xseg) {
+int32_t flex_senlib_write_xseg(void* card, uint8_t sid, uint32_t xseg) {
     try {
-        if (!g_pfw) {
-            shim_record_error("flex_senlib_write_xseg", "runtime not initialized");
+        if (!card) {
+            shim_record_error("flex_senlib_write_xseg", "null card");
             return -1;
         }
-        g_pfw->interface()->write_xseg(sid, xseg);
+        static_cast<Card*>(card)->iface()->write_xseg(sid, xseg);
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_write_xseg", e.what());
@@ -790,16 +820,64 @@ int32_t flex_senlib_write_xseg(uint8_t sid, uint32_t xseg) {
     }
 }
 
-// Reads back the on-device XSEG[SID] translation-table entry for `sid`.
-// Cited: pf_interface.hpp:123 `uint32_t read_xseg(uint8_t sid)`.
-int32_t flex_senlib_read_xseg(uint8_t sid, uint32_t* out_xseg) {
+// ── The symmetric-BAT doors (Phase 2 Step 1's L5 half)
+//
+// The BAT (RDMA base-address table) is what the SetTid(dest BAT index) of a
+// unicast send resolves through on the ENGINE: BAT[peer_tid] = the peer
+// card's BAR2 PCI base. The vendor's wireup is symmetric — every rank
+// installs every peer's entry at PfDeviceHandle construction, before any CB
+// exists (pf_device_handle.cpp:138-147, :228-277) — with the value
+// `pciaddr_for_region(SenPci::pf(peer_bdf), 2)`.
+
+// Programs peer `tid`'s base address in this card's RDMA base-address table.
+// Cited: pf_interface.hpp:178 `void SetBaseAddrTable(uint8_t tid, uint64_t
+// pci_addr)`; flex pf_device_handle.cpp:255 (NTB) / :271 (PCI BAR2) in
+// initialize_p2p_address_table.
+int32_t flex_senlib_set_base_addr_table(void* card, uint8_t tid, uint64_t pci_addr) {
     try {
-        if (!g_pfw || !out_xseg) {
-            shim_record_error("flex_senlib_read_xseg",
-                              !g_pfw ? "runtime not initialized" : "null out_xseg");
+        if (!card) {
+            shim_record_error("flex_senlib_set_base_addr_table", "null card");
             return -1;
         }
-        *out_xseg = g_pfw->interface()->read_xseg(sid);
+        static_cast<Card*>(card)->iface()->SetBaseAddrTable(tid, pci_addr);
+        return 0;
+    } catch (const std::exception& e) {
+        shim_record_error("flex_senlib_set_base_addr_table", e.what());
+        return -1;
+    } catch (...) {
+        shim_record_error("flex_senlib_set_base_addr_table", "unknown exception");
+        return -1;
+    }
+}
+
+// The vendor's BAT value source: the PCI address of `bdf`'s BAR `region`, as
+// senlib itself resolves it. Cited: senpci.hpp:263 `static uint64_t
+// pciaddr_for_region(PciDevId bus_id, int region_number)`. Static senlib
+// calls — no runtime init required. Returns 0 on error (a real BAR base is
+// never 0); the message is in the shim error buffer.
+uint64_t flex_shim_pci_addr_for_region(const char* bdf, uint8_t region) {
+    try {
+        auto pci_id = senlib::snt1p0::SenPci::pf(std::string(bdf));
+        return senlib::snt1p0::SenPci::pciaddr_for_region(pci_id, static_cast<int>(region));
+    } catch (const std::exception& e) {
+        shim_record_error("flex_shim_pci_addr_for_region", e.what());
+        return 0;
+    } catch (...) {
+        shim_record_error("flex_shim_pci_addr_for_region", "unknown exception");
+        return 0;
+    }
+}
+
+// Reads back the on-device XSEG[SID] translation-table entry for `sid`.
+// Cited: pf_interface.hpp:123 `uint32_t read_xseg(uint8_t sid)`.
+int32_t flex_senlib_read_xseg(void* card, uint8_t sid, uint32_t* out_xseg) {
+    try {
+        if (!card || !out_xseg) {
+            shim_record_error("flex_senlib_read_xseg",
+                              !card ? "null card" : "null out_xseg");
+            return -1;
+        }
+        *out_xseg = static_cast<Card*>(card)->iface()->read_xseg(sid);
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_read_xseg", e.what());
@@ -813,14 +891,14 @@ int32_t flex_senlib_read_xseg(uint8_t sid, uint32_t* out_xseg) {
 // Reads the on-device write-done counter for `sid`.
 // Cited: pf_interface.hpp:121 `uint32_t read_wdone(uint8_t sid,
 // bool checkregs = false)`.
-int32_t flex_senlib_read_wdone(uint8_t sid, uint32_t* out_val) {
+int32_t flex_senlib_read_wdone(void* card, uint8_t sid, uint32_t* out_val) {
     try {
-        if (!g_pfw || !out_val) {
+        if (!card || !out_val) {
             shim_record_error("flex_senlib_read_wdone",
-                              !g_pfw ? "runtime not initialized" : "null out_val");
+                              !card ? "null card" : "null out_val");
             return -1;
         }
-        *out_val = g_pfw->interface()->read_wdone(sid);
+        *out_val = static_cast<Card*>(card)->iface()->read_wdone(sid);
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_read_wdone", e.what());
@@ -835,14 +913,14 @@ int32_t flex_senlib_read_wdone(uint8_t sid, uint32_t* out_val) {
 // Cited: pf_interface.hpp:118 `int check_and_clear_rdma_status()`.
 // Returns the senlib status pass-through; -1 doubles as this shim's own
 // failure sentinel (told apart via `flex_shim_last_error()`).
-int32_t flex_senlib_check_and_clear_rdma_status(void) {
+int32_t flex_senlib_check_and_clear_rdma_status(void* card) {
     try {
-        if (!g_pfw) {
+        if (!card) {
             shim_record_error("flex_senlib_check_and_clear_rdma_status",
-                              "runtime not initialized");
+                              "null card");
             return -1;
         }
-        return g_pfw->interface()->check_and_clear_rdma_status();
+        return static_cast<Card*>(card)->iface()->check_and_clear_rdma_status();
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_check_and_clear_rdma_status", e.what());
         return -1;
@@ -860,22 +938,22 @@ int32_t flex_senlib_check_and_clear_rdma_status(void) {
 // (std::vector<std::pair<int, void*>>) into `out_segments`: up to
 // `max_segments` entries, with the TRUE total always written to
 // `*out_count` (a too-small buffer is reported, never silently
-// truncated). Idempotent per (peer, len) via the g_p2p_mapped memo; a
+// truncated). Idempotent per (peer, len) via the card's p2p_mapped memo; a
 // mismatched length for an already-mapped peer is an error.
-int32_t flex_senlib_p2p_create_mapping(uint32_t peer_card_index, uint64_t len_bytes,
+int32_t flex_senlib_p2p_create_mapping(void* card, uint32_t peer_card_index, uint64_t len_bytes,
                                        void* out_segments, size_t max_segments,
                                        size_t* out_count) {
     try {
-        if (!g_pfw || !out_count) {
+        if (!card || !out_count) {
             shim_record_error("flex_senlib_p2p_create_mapping",
-                              !g_pfw ? "runtime not initialized" : "null out_count");
+                              !card ? "null card" : "null out_count");
             return -1;
         }
-        auto* vb = p2p_vfio_backend();
+        auto* vb = static_cast<Card*>(card)->p2p_vfio_backend();
         {
-            std::lock_guard<std::mutex> lock(g_p2p_mu);
-            auto it = g_p2p_mapped.find(peer_card_index);
-            if (it != g_p2p_mapped.end()) {
+            std::lock_guard<std::mutex> lock(static_cast<Card*>(card)->p2p_mu);
+            auto it = static_cast<Card*>(card)->p2p_mapped.find(peer_card_index);
+            if (it != static_cast<Card*>(card)->p2p_mapped.end()) {
                 if (it->second != len_bytes) {
                     char msg[128];
                     snprintf(msg, sizeof(msg),
@@ -899,7 +977,7 @@ int32_t flex_senlib_p2p_create_mapping(uint32_t peer_card_index, uint64_t len_by
                 auto peer = senlib::shared::SenPciShared::pf(peer_card_index);
                 vb->create_iommu_mapping_for_cross_port_p2p_rdma(
                     peer, static_cast<size_t>(len_bytes));
-                g_p2p_mapped.emplace(peer_card_index, len_bytes);
+                static_cast<Card*>(card)->p2p_mapped.emplace(peer_card_index, len_bytes);
             }
         }
         const auto& info = vb->peer_dev_info;
@@ -926,17 +1004,17 @@ int32_t flex_senlib_p2p_create_mapping(uint32_t peer_card_index, uint64_t len_by
 // PfInterface::get_dmabuf(int bar, uint64_t offset, size_t size)
 // (pf_interface.hpp:111 — the same header this shim already includes).
 // Returns the fd, or -1 on failure.
-int32_t flex_senlib_get_dmabuf(int32_t bar, uint64_t offset, uint64_t size) {
+int32_t flex_senlib_get_dmabuf(void* card, int32_t bar, uint64_t offset, uint64_t size) {
     try {
-        if (!g_pfw) {
-            fprintf(stderr, "[senlib-ffi] flex_senlib_get_dmabuf: runtime not initialized\n");
+        if (!card) {
+            fprintf(stderr, "[senlib-ffi] flex_senlib_get_dmabuf: null card\n");
             return -1;
         }
         // FIXME(pod-verify): the declaration assumes get_dmabuf returns the
         // fd itself; if the pod header returns a DMABuf wrapper object,
         // marshal the fd out of it here (one line).
         return static_cast<int32_t>(
-            g_pfw->interface()->get_dmabuf(bar, offset, static_cast<size_t>(size)));
+            static_cast<Card*>(card)->iface()->get_dmabuf(bar, offset, static_cast<size_t>(size)));
     } catch (const std::exception& e) {
         shim_record_error("flex_senlib_get_dmabuf", e.what());
         return -1;
