@@ -3373,7 +3373,7 @@ fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
 /// the fold PROVED the family's stores tile the view exactly, which makes that cover the hull
 /// of every member's store — the one whole-view basis a multi-block program honestly states.
 /// The leader's exception is applied at the two call sites (the walk's input and out
-/// presentations, gated on `pointwise_tiles`), never here, so no other reader of
+/// presentations, gated on [`FrameLaw::Pointwise`]), never here, so no other reader of
 /// `region_for_operand` — the fold's own proof included — can inherit it by accident.
 ///
 /// ⛔ BYTE-IDENTICAL FOR EVERY PROGRAM THAT BAKES TODAY: a whole-view tile's cover is its own
@@ -3392,6 +3392,161 @@ fn at_own_extent(r: Region) -> Region {
     } else {
         r
     }
+}
+
+/// ⭐⭐⭐⭐⭐ THE TILE'S KIND, AS A TYPE — how an op maps its operands' flat `[rows, cols]`
+/// frames to its result's. ONE derivation ([`FrameLaw::of`], from the op's own lowering kind
+/// and the fold's proof), consulted by every mint law that needs it, so no two sites can
+/// disagree about what op this is. The tile's BANDED-ness is not a variant here because it is
+/// not a fact of the op: it is the region's own `Option<RowBand>`, already typed, and every
+/// law below reads it where it reads the region.
+///
+/// * [`FrameLaw::Pointwise`] — the kinds that lower through the pointwise bodies and are not
+///   the fold's leader: the result's flat frame IS each operand's (same rows, same cols), so
+///   a parameter tile states its OWN window as its extent ([`at_own_extent`]'s strip) and the
+///   mint's swept-window law demands the result type's rows equal the sweep's (#1112's row
+///   split: the `[0, 42)` block of a 64-row parameter is a 42-row piece, and the equality is
+///   the law that keeps the piece honest).
+/// * [`FrameLaw::FoldLeader`] — the row fold's leader: the fold PROVED the family's stores
+///   tile the parameter's view, so its tiles keep the parameter's cover as the proven hull —
+///   the one whole-view basis a multi-block program honestly states.
+/// * [`FrameLaw::OwnLaw`] — the op maps frames by its own semantics: a banded launch's band,
+///   a contraction's `[m, n]` output, a reduction's `[rows, 1]` column, a rank-3 transpose's
+///   re-fold — the SAME elements at different flat rows (a `[8, 128, 64]` operand sweeps 1024
+///   rows, its `[8, 64, 128]` result states 512; at square swapped axes the two agree, which
+///   is why an hd-128 pool passes where an hd-64 one refuses). Both sides are the program's
+///   own statement, so the mint keeps the region the walk states and demands NO row equality
+///   between them: the equality would assert the op preserves the flat frame, and this class
+///   is exactly the ops that do not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameLaw {
+    Pointwise,
+    FoldLeader,
+    OwnLaw,
+}
+
+impl FrameLaw {
+    /// The ONE derivation: the op's own lowering kind, and whether the row fold proved this op
+    /// the family's leader. Nothing else inputs, so no site re-derives it. ⛔ The match is
+    /// EXHAUSTIVE OVER BOTH ENUMS WITH NO `_` ARM: a new op kind is a compile error here
+    /// until it is classified, never silently `OwnLaw`.
+    fn of(program: Lowering, fold_leader: bool) -> FrameLaw {
+        if fold_leader {
+            return FrameLaw::FoldLeader;
+        }
+        match program {
+            // ⭐ PRESERVING — the kinds that lower through the pointwise bodies: the result's
+            // flat frame IS each operand's, so the tile's own window is its extent and the
+            // swept-window equality is a true law of the op.
+            Lowering::Silu
+            | Lowering::ScalarMul(_)
+            | Lowering::BoundScalarMul(_)
+            | Lowering::Convert(_)
+            | Lowering::ScalarBinary(..)
+            | Lowering::Node(Program::Elementwise(_)) => FrameLaw::Pointwise,
+
+            // ⭐ OWN LAW — every arm names WHY the op maps the frame by its own semantics:
+            // the fold reorders rows (a rank-3 transpose re-folds the SAME elements to
+            // different flat rows — `[8, 128, 64]` sweeps 1024, its `[8, 64, 128]` result
+            // states 512), so no row equality is demanded and the mint keeps the region the
+            // walk states.
+            Lowering::BatchTranspose { .. } => FrameLaw::OwnLaw,
+            // a contraction — the output frame is the `[b·m, n]` product, not either
+            // operand's sweep.
+            Lowering::BatchMatmul { .. } => FrameLaw::OwnLaw,
+            // rows collapse — a reduction writes one value per row.
+            Lowering::Reduce(_) => FrameLaw::OwnLaw,
+            // a fused reduction chain — the mean collapses rows inside the fusion. The UNIT
+            // form (the identity gain, #1112) is the same reduce-then-scale with the multiply
+            // elided: the mean still collapses rows, so it keeps this class.
+            Lowering::RmsNorm(..) | Lowering::RmsNormUnit(_) => FrameLaw::OwnLaw,
+            // SENUINT32 sticks — the integer class is addressed in the card's own integer
+            // form, not the fp16 flat frame these laws read.
+            Lowering::IntBinary(_) => FrameLaw::OwnLaw,
+
+            Lowering::Node(p) => match p {
+                // (the walk's own derivation of this kind is the `Pointwise` arm above; the
+                // inner match restates it because exhaustiveness is per match)
+                Program::Elementwise(_) => FrameLaw::Pointwise,
+                // the producer-stated fused kind — the walk re-derives the chain as
+                // `Lowering::Silu` when it proves it, and an unproven statement keeps the
+                // region the walk states.
+                Program::SiluMul => FrameLaw::OwnLaw,
+                // reduction chains — the mean collapses rows (per-head windows for the
+                // windowed form).
+                Program::RmsNorm | Program::RmsNormUnit | Program::WindowedRmsNorm { .. } => {
+                    FrameLaw::OwnLaw
+                }
+                // a longhand chain fused at the door — the cap's mint is its own arm's.
+                Program::TanhSoftCap => FrameLaw::OwnLaw,
+                // the multiplier is a bound `[1]` weight broadcast on both dims — the
+                // emission addresses it at its own basis, and a producer-stated `ScalarMul`
+                // is the same registry-const shape.
+                Program::ScalarWeightMul | Program::ScalarMul => FrameLaw::OwnLaw,
+                // the fold re-lays the buffer — `[r_in, c_in] → [r_out, c_out]` preserves the
+                // flat element sequence and nothing else; the 2-D block transpose reorders
+                // rows outright.
+                Program::Reshape | Program::Transpose => FrameLaw::OwnLaw,
+                // a contraction.
+                Program::Matmul => FrameLaw::OwnLaw,
+                // rows collapse — the extraction writes one row; the draw's twenty-seven
+                // parameters are staged sticks and whole rows, no windowed tile among them.
+                Program::LmLast | Program::Sample => FrameLaw::OwnLaw,
+                // a banded launch — per-core tiles over positions, the band the launch's own.
+                Program::Rope => FrameLaw::OwnLaw,
+                // the page walk and the pool scatter — gathered and scattered rows, the
+                // pools' own frames.
+                Program::PagedAttn | Program::PagedKvWrite => FrameLaw::OwnLaw,
+                // door-assembled gather legs — the index sticks' own frames.
+                Program::EmbedRowGather { .. } | Program::ChainStage { .. } => FrameLaw::OwnLaw,
+            },
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE SWEPT-WINDOW LAW — the two refusals that keep a plain sweep honest, factored
+/// as ONE fn so its class scoping is stated once and tested as a unit:
+///
+/// * swept operands stating ONE window over DIFFERENT views — the piece's bytes are the
+///   sweep's, and two views behind one sweep name two different values. Every class: this
+///   one is about the SWEEP's own consistency, not the result frame.
+/// * a POINTWISE op's result type whose rows are not the sweep's — [`FrameLaw::Pointwise`]'s
+///   own law, because that class preserves the flat frame and the result type's rows ARE the
+///   sweep's (#1112's row split: the `[0, 42)` block of a 64-row parameter is a 42-row
+///   piece, and the equality is the law that keeps the piece honest). An
+///   [`FrameLaw::OwnLaw`] op maps frames by its own semantics — the rank-3 transpose
+///   re-folds the SAME elements to different flat rows (`[8, 128, 64]` sweeps 1024, its
+///   `[8, 64, 128]` result states 512; square swapped axes agree, which is why an hd-128
+///   pool passes where an hd-64 one refuses) — so no equality is demanded of it and its
+///   mint keeps the region the walk states.
+fn swept_window_agrees(
+    name: &str,
+    kind: OpKind,
+    law: FrameLaw,
+    dims: [u32; 2],
+    first: Region,
+    swept: &[Region],
+) -> Result<(), Error> {
+    if !swept.iter().all(|r| r.v_rows == first.v_rows) {
+        let other = swept
+            .iter()
+            .find(|r| r.v_rows != first.v_rows)
+            .map_or(first.v_rows, |r| r.v_rows);
+        return err(format!(
+            "{name}: `{kind:?}`'s swept operands state one window (rows [{}, {})) over \
+             DIFFERENT views ({} and {} rows) — the minted piece is the sweep the \
+             program states, and two views behind one sweep name two different values",
+            first.r_start, first.r_len, first.v_rows, other
+        ));
+    }
+    if dims[0] != first.r_len && law == FrameLaw::Pointwise {
+        return err(format!(
+            "{name}: `{kind:?}`'s result type states {} row(s) while its operands sweep {} — \
+             the minted piece is the sweep the program states, and the two disagree",
+            dims[0], first.r_len
+        ));
+    }
+    Ok(())
 }
 
 /// The ONE band a set of inputs states, refusing disagreement: an op sweeps one band,
@@ -6522,7 +6677,7 @@ fn lower_function_folded(
         // not a row-blocked family, so a single-window or column-chunked program never enters it.
         //
         // ⭐ THE ROW FOLD'S LEADER — the one op this iteration whose tiles keep the parameter's
-        // cover as the family's proven hull (see `pointwise_tiles` below and
+        // cover as the family's proven hull (see [`FrameLaw`] below and
         // [`row_tiled_family`]'s own doc). Set by the gate, read by the two presentation sites.
         let mut fold_leader = false;
         if bcast_axes.iter().all(Option::is_none)
@@ -6539,25 +6694,14 @@ fn lower_function_folded(
             row_fold_skip.extend(members);
             fold_leader = true;
         }
-        // ⭐⭐⭐⭐⭐ A POINTWISE OP's PARAMETER TILES STATE THEIR OWN WINDOWS AS THEIR EXTENTS
-        // ([`at_own_extent`]'s law) — every kind that lowers through the pointwise bodies and
-        // is not the fold's leader. The leader is the one op whose tiles keep the parameter's
-        // cover: the fold PROVED the family's stores tile the view, so that cover is the hull
-        // of every member's store, and the leader's one whole-view descriptor is sized by it
-        // (`node_rows`' fold). Every other pointwise op presents each tile at the window the
-        // tile itself states, so the mint sizes the piece ([`band_rows_of`], which until this
-        // law could not see a row-split window under its inherited whole-view cover) and the
-        // extents law reads the window, never the parameter's view.
-        let pointwise_tiles = !fold_leader
-            && matches!(
-                program,
-                Lowering::Silu
-                    | Lowering::ScalarMul(_)
-                    | Lowering::BoundScalarMul(_)
-                    | Lowering::Convert(_)
-                    | Lowering::ScalarBinary(..)
-                    | Lowering::Node(Program::Elementwise(_))
-            );
+        // ⭐⭐⭐⭐⭐ THE TILE'S KIND AS A TYPE ([`FrameLaw`]) — derived ONCE here from the op's
+        // own lowering kind and the fold's proof, and read by the two presentation sites and
+        // the mint's swept-window law, so every law that needs to know how this op maps flat
+        // frames consults one derivation: the pointwise kinds present each tile at the window
+        // the tile itself states ([`at_own_extent`]'s strip), the fold's leader keeps the
+        // parameter's cover as the family's proven hull, and every other op maps frames by
+        // its own semantics and keeps the region the walk states.
+        let frame_law = FrameLaw::of(program, fold_leader);
 
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
         // ⭐ WHICH OPERANDS ARE PARAMETER-BACKED, kept BESIDE the regions because a `Region` cannot
@@ -6598,7 +6742,11 @@ fn lower_function_folded(
                     // ⭐ A POINTWISE OP's LOAD STATES ITS OWN WINDOW AS ITS EXTENT
                     // ([`at_own_extent`]) — the parameter's cover is evidence only where a fold
                     // proved the family tiles the view, which is `fold_leader`'s one case.
-                    let r = if pointwise_tiles { at_own_extent(r) } else { r };
+                    let r = if frame_law == FrameLaw::Pointwise {
+                        at_own_extent(r)
+                    } else {
+                        r
+                    };
                     per_op.push(present(r)?);
                     from_parameter.push(true);
                 }
@@ -7211,7 +7359,7 @@ fn lower_function_folded(
                 .map(|(_, r)| *r)
                 .collect();
             let dims = [band_rows_of(&swept, dims[0]), dims[1]];
-            // ⭐⭐⭐⭐⭐ THE SWEPT-WINDOW REFUSALS — an intermediate is minted at the PIECE its
+            // ⭐⭐⭐⭐⭐ THE SWEPT-WINDOW LAW — an intermediate is minted at the PIECE its
             // producing op sweeps. The sizing is not stated here at all: [`at_own_extent`]
             // presents a pointwise op's windowed tiles at their own windows, so
             // [`band_rows_of`] — the law that already sizes a banded op's mint at the sweep —
@@ -7219,23 +7367,19 @@ fn lower_function_folded(
             // as the column side has always minted a column-chunked op's piece at its chunk,
             // and the region constructed below is the ordinary whole-view region at those
             // dims: a value's extent is its PRODUCER's window, never a parameter's cover
-            // inherited through the elementwise op. What this block states are the two
-            // REFUSALS that keep the sweep honest where its pieces agree:
-            //
-            // * swept operands stating ONE window over DIFFERENT views — the piece's bytes are
-            //   the sweep's, and two views behind one sweep name two different values;
-            // * a result type whose rows are not the sweep's — the minted piece is the sweep
-            //   the program states, and the type disagrees with it.
-            //
-            // A family whose swept windows DISAGREE (a contraction's activation and kernel,
-            // sweeping `m` and `k`), an empty sweep, or a banded one states no plain window:
-            // the mint keeps its own law for the op's body to judge, exactly as before.
+            // inherited through the elementwise op. The refusals that keep the sweep honest
+            // where its pieces agree are [`swept_window_agrees`]'s own law, consulted here
+            // with this op's [`FrameLaw`]; a family whose swept windows DISAGREE (a
+            // contraction's activation and kernel, sweeping `m` and `k`), an empty sweep, or
+            // a banded one states no plain window and keeps the mint's own law for the op's
+            // body to judge, exactly as before.
             //
             // ⛔ BYTE-IDENTICAL FOR EVERY MINT THAT BAKES TODAY: a whole-view swept family has
             // `r_len == v_rows` and `dims[0] == r_len`, so neither refusal fires and the mint
             // states the region it always did; a banded family keeps the band law above; a
             // windowed sweep minted no buffer before — it refused at the extents law (#1112's
-            // MISSING-LOWERING), which is the class this law exists to lower.
+            // MISSING-LOWERING), which is the class this law exists to lower; and every
+            // OwnLaw op keeps the mint it always had, its equality demand never consulted.
             let plain_window: Option<Region> =
                 if swept.is_empty() || swept.iter().any(|r| r.band.is_some()) {
                     None
@@ -7251,25 +7395,7 @@ fn lower_function_folded(
                     }
                 };
             if let Some(first) = plain_window {
-                if !swept.iter().all(|r| r.v_rows == first.v_rows) {
-                    let other = swept
-                        .iter()
-                        .find(|r| r.v_rows != first.v_rows)
-                        .map_or(first.v_rows, |r| r.v_rows);
-                    return err(format!(
-                        "{}: `{:?}`'s swept operands state one window (rows [{}, {})) over \
-                         DIFFERENT views ({} and {} rows) — the minted piece is the sweep the \
-                         program states, and two views behind one sweep name two different values",
-                        f.name, op.op_type, first.r_start, first.r_len, first.v_rows, other
-                    ));
-                }
-                if dims[0] != first.r_len {
-                    return err(format!(
-                        "{}: `{:?}`'s result type states {} row(s) while its operands sweep {} — \
-                         the minted piece is the sweep the program states, and the two disagree",
-                        f.name, op.op_type, dims[0], first.r_len
-                    ));
-                }
+                swept_window_agrees(f.name, op.op_type, frame_law, dims, first, &swept)?;
             }
             let Some(layout) = layout else {
                 return err(format!(
@@ -7601,7 +7727,7 @@ fn lower_function_folded(
         // comes from its PRODUCER's window, and the one op that may widen it past the store's
         // own tile is the row fold's leader, whose family proof made the parameter's cover the
         // hull of every member's store.
-        if pointwise_tiles {
+        if frame_law == FrameLaw::Pointwise {
             o = at_own_extent(o);
         }
         o.is_out = true;
@@ -9813,6 +9939,133 @@ mod presented_flat_tests {
         )
         .expect("the identity");
         assert_eq!((p.v_rows, p.v_cols), (64, 4));
+    }
+}
+
+/// THE SWEPT-WINDOW LAW, as a unit: the equality demand is [`FrameLaw::Pointwise`]'s own,
+/// and the re-folding class — the 2b decode's rank-3 transpose — admits its sweep.
+#[cfg(test)]
+mod swept_window_law_tests {
+    use super::*;
+
+    fn reg(rows: u32, cols: u32) -> Region {
+        Region {
+            tid: 0,
+            v_rows: rows,
+            v_cols: cols,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            c_cover: (0, cols),
+            is_out: false,
+            is_fp8: false,
+            band: None,
+        }
+    }
+
+    /// ⭐ THE 2b DECODE'S OWN SHAPE, from the `paged_attn_decode_pool` KTIR dump: the rank-3
+    /// transpose's operand `[8, 128, 64]` folds to a `[1024, 64]` window while its
+    /// `[8, 64, 128]` result type folds to `[512, 128]` — the SAME 65536 elements at
+    /// different flat rows, which is the op's own semantics, so the law admits it. 4b359d05c8
+    /// demanded the equality of every class and refused three of the four gate scopes here.
+    #[test]
+    fn a_rank3_transpose_refold_admits_its_sweep() {
+        let swept = [reg(1024, 64)];
+        let law = FrameLaw::of(
+            Lowering::BatchTranspose {
+                batch: 8,
+                input: super::super::lower_ktir_to_superdsc::BatchFrame::Flat,
+            },
+            false,
+        );
+        assert_eq!(
+            law,
+            FrameLaw::OwnLaw,
+            "the derivation classifies the re-fold"
+        );
+        swept_window_agrees(
+            "paged_attn_decode_pool",
+            OpKind::LinalgTranspose,
+            law,
+            [512, 128],
+            swept[0],
+            &swept,
+        )
+        .expect("the re-fold is the transpose's own semantics, not a wrong link");
+    }
+
+    /// ⛔ #1112's LEAK CLASS STILL REFUSES — a pointwise op's result type stating rows the
+    /// sweep does not (the output handle's 42-row view over the block's 64-row sweep): the
+    /// pointwise class preserves the flat frame, so the disagreement names a wrong link.
+    #[test]
+    fn a_pointwise_row_mismatch_still_refuses() {
+        let swept = [reg(64, 128)];
+        let law = FrameLaw::of(
+            Lowering::Node(Program::Elementwise(Elementwise::Mul)),
+            false,
+        );
+        assert_eq!(law, FrameLaw::Pointwise);
+        let Err(m) = swept_window_agrees(
+            "gelu_longhand",
+            OpKind::LinalgGeneric,
+            law,
+            [42, 128],
+            swept[0],
+            &swept,
+        ) else {
+            panic!("a 42-row result type over a 64-row sweep is the leak the law exists for");
+        };
+        assert!(
+            m.message
+                .contains("result type states 42 row(s) while its operands sweep 64"),
+            "names the arithmetic: {:?}",
+            m.message
+        );
+    }
+
+    /// ⛔ THE SWEEP'S OWN CONSISTENCY IS EVERY CLASS's LAW — one window over two views names
+    /// two different values behind one sweep, whatever the op does with the frame.
+    #[test]
+    fn one_window_over_two_views_refuses_for_every_class() {
+        let first = reg(64, 128);
+        let other = Region {
+            v_rows: 32,
+            ..reg(64, 128)
+        };
+        let law = FrameLaw::of(
+            Lowering::BatchTranspose {
+                batch: 8,
+                input: super::super::lower_ktir_to_superdsc::BatchFrame::Flat,
+            },
+            false,
+        );
+        let Err(m) = swept_window_agrees(
+            "p",
+            OpKind::LinalgTranspose,
+            law,
+            [64, 128],
+            first,
+            &[first, other],
+        ) else {
+            panic!("two views behind one sweep name two different values");
+        };
+        assert!(
+            m.message.contains("DIFFERENT views (64 and 32 rows)"),
+            "names the two views: {:?}",
+            m.message
+        );
+    }
+
+    /// THE FOLD'S LEADER IS ITS OWN CLASS, AND THE PROOF OUTRANKS THE KIND — a silu that the
+    /// row fold proved the family's leader keeps the parameter's cover as the proven hull
+    /// (`FoldLeader`, never `Pointwise`, so the strip does not touch its tiles); unproven,
+    /// the same kind is the pointwise body it is.
+    #[test]
+    fn the_fold_leader_is_its_own_class() {
+        assert_eq!(FrameLaw::of(Lowering::Silu, true), FrameLaw::FoldLeader);
+        assert_eq!(FrameLaw::of(Lowering::Silu, false), FrameLaw::Pointwise);
     }
 }
 
