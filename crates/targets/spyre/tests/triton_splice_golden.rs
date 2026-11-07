@@ -3635,8 +3635,13 @@ fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
     let (m, c) = (2048u32, 16384u32);
     let ir = rmsnorm_ir(m, c, GainConvention::Scale);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
-        .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
+    let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        PagedRows::Sequence,
+        &[],
+    )
+    .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
     let node = &ir.nodes[0];
     let spliced = scratchy_triton_splice::lower(node, &ir, false)
         .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
