@@ -58,7 +58,7 @@
 //! ```
 
 use ktir_superdsc::emit::EmittedOp;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, elementwise};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, Region, elementwise};
 use ktir_superdsc::ktir_node::Elementwise;
 use ktir_superdsc::place::{PlaceId, act_name};
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
@@ -233,7 +233,7 @@ fn dump_attn_epilogue_add_seal() {
                 Some(&l),
             )?);
         }
-        Ok(ops)
+        Ok::<Vec<EmittedOp>, Error>(ops)
     }));
     std::panic::set_hook(prev_hook);
 
@@ -261,7 +261,8 @@ fn dump_attn_epilogue_add_seal() {
             (COLS / STICK) as usize,
             "the door must emit one op per column piece"
         );
-        for (c, op) in ops.iter().enumerate() {
+        for (i, op) in ops.iter().enumerate() {
+            let c = i as u32;
             assert_eq!(
                 op.op_name, "add_o1190",
                 "the door names the op for its output tensor — the bake's own name"
