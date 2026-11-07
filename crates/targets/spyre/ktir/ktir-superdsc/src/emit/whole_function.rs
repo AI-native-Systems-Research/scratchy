@@ -7172,6 +7172,64 @@ fn lower_function_folded<T: crate::collective::Tp>(
                 .map(|(_, r)| *r)
                 .collect();
             let dims = [band_rows_of(&swept, dims[0]), dims[1]];
+            // ⭐⭐⭐⭐⭐ AN OP WHOSE OPERANDS STATE PLAIN WINDOWS MINTS THE INTERMEDIATE AT THE
+            // VALUE'S FULL EXTENT, AND THE MINT CARRIES THE PRODUCING OP'S WINDOW. A row-split
+            // program — the gelu longhand, whose `EW_LX_ELEMS` row blocking the row-tiled fold
+            // cannot take (the chain mixes kinds, so no single-kind family) — spells one
+            // load/chain per block, each block's op sweeping its own window `[r_start, r_len)`
+            // of a taller value. The old mint stated the PIECE's height as the view (`[42, …]`
+            // for a 42-row block of a 64-row value), so no later window of the same value — the
+            // tail block's `[42, 22)`, which does not FIT a 42-row view — could be placed, and
+            // the extents law refused the split load at the very next op (#1112's
+            // MISSING-LOWERING). The value's full extent is the operands' own `v_rows` — every
+            // swept operand must state the SAME view, or the mint refuses by name (a chain
+            // mixing an op that minted at another extent is not one value) — and the window is
+            // the producing op's sweep, which the result type must also state (`dims[0] ==
+            // r_len`): the same agreement the extents law demanded at the consumer, moved here
+            // to where the buffer is sized.
+            //
+            // ⛔ BYTE-IDENTICAL FOR EVERY MINT THAT BAKES TODAY, BY THE WALK'S OWN ADMISSIONS.
+            // A whole-view swept family has `r_len == v_rows`, so the full extent IS the result
+            // type's rows and the mint states exactly the whole-view region it did before; a
+            // BANDED swept family keeps the band law above (the mint states the band, and the
+            // `band` field carries it); a family whose swept windows DISAGREE — a contraction's
+            // activation and kernel, whose sweeps are `m` and `k` — states no plain window, and
+            // the mint keeps today's form for the op's own body to judge. Only the split
+            // program's windowed mint changes, and no such program lowered before: it refused
+            // at the extents law.
+            let mint_window: Option<(u32, u32, u32)> = if swept.is_empty()
+                || swept.iter().any(|r| r.band.is_some())
+            {
+                None
+            } else {
+                let first = swept[0];
+                if !swept
+                    .iter()
+                    .all(|r| r.r_start == first.r_start && r.r_len == first.r_len)
+                {
+                    None
+                } else if !swept.iter().all(|r| r.v_rows == first.v_rows) {
+                    let other = swept
+                        .iter()
+                        .find(|r| r.v_rows != first.v_rows)
+                        .map_or(first.v_rows, |r| r.v_rows);
+                    return err(format!(
+                        "{}: `{:?}`'s swept operands state one window (rows [{}, {})) over \
+                         DIFFERENT views ({} and {} rows) — an intermediate is minted at the \
+                         VALUE's full extent, and two extents are stated",
+                        f.name, op.op_type, first.r_start, first.r_len, first.v_rows, other
+                    ));
+                } else if dims[0] != first.r_len {
+                    return err(format!(
+                        "{}: `{:?}`'s result type states {} row(s) while its operands sweep {} — \
+                         the minted window is the sweep the program states, and the two disagree",
+                        f.name, op.op_type, dims[0], first.r_len
+                    ));
+                } else {
+                    Some((first.v_rows, first.r_start, first.r_len))
+                }
+            };
+            let dims = [mint_window.map_or(dims[0], |(v, _, _)| v), dims[1]];
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
@@ -7282,15 +7340,21 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // would drop the typed fact and the second op's inputs would look whole-view
             // again, minting `[1, ·]` while its per-row operands are `[B, ·]`.
             let band = band_of(f.name, &per_op)?;
+            // The minted window — the producing op's sweep, carried on the region (the (a)
+            // law above). `None` keeps today's whole-view mint verbatim, byte for byte.
+            let (r_start, r_len, r_cover) = match mint_window {
+                Some((_, s, l)) => (s, l, (s, s + l)),
+                None => (0, dims[0], (0, dims[0])),
+            };
             let r = Region {
                 tid,
                 v_rows: dims[0],
                 v_cols: dims[1],
-                r_start: 0,
+                r_start,
                 c_start: 0,
-                r_len: dims[0],
+                r_len,
                 c_len: dims[1],
-                r_cover: (0, dims[0]),
+                r_cover,
                 c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
