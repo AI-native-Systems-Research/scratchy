@@ -1324,6 +1324,43 @@ fn node_rows(name: &str, out: &Region) -> Result<u32, Error> {
     Ok(out.v_rows)
 }
 
+/// ⭐⭐⭐⭐⭐ THE FORM AN OPERAND HOLDS THE OP'S ROW SWEEP IN — the ONE typed predicate behind both
+/// the extents law ([`pointwise_extents_agree`], the SELECTOR) and the row-basis pickers
+/// ([`pointwise_rows`], the DESCRIPTOR). One predicate, minted once per operand, so the two can
+/// never drift: the form the law admits is the form the descriptor addresses.
+///
+/// * [`OperandView::Window`] — the operand's OWN WINDOW is the sweep: `r_len` rows of a taller
+///   view, fitting it at `r_start`. This is the form every SPLIT program states: an unrolled row
+///   block's load or minted piece, whose tile presents the window it itself covers
+///   (`whole_function`'s `at_own_extent` — a pointwise op's parameter tiles state their own
+///   windows as their extents). The window form is checked FIRST, so the cover never overrides
+///   what the operand's own window states.
+/// * [`OperandView::View`] — the operand IS the sweep: the whole view, `v_rows == rows` at row 0,
+///   with its cover `(0, v_rows)` as the program's own EVIDENCE (never the selector): the folded
+///   row-blocked family's leader, whose one descriptor spans every member's load.
+///
+/// `None` is neither form — the operand holds no sweep this law recognises, and every reader
+/// refuses it by name. THE NEW ADMISSION SET (auditor-ruled, #1112) beyond the old law is
+/// exactly `{cover = the full view ∧ r_len == rows}`: the split program's windowed operand
+/// whose cover happens to span the view — the case the old, cover-selected law sent to the
+/// view form and refused.
+enum OperandView {
+    Window,
+    View,
+}
+
+impl OperandView {
+    fn of(r: &Region, rows: u32) -> Option<OperandView> {
+        if r.r_len == rows && r.r_start + r.r_len <= r.v_rows {
+            Some(OperandView::Window)
+        } else if r.r_cover == (0, r.v_rows) && r.r_start == 0 && r.v_rows == rows {
+            Some(OperandView::View)
+        } else {
+            None
+        }
+    }
+}
+
 /// ⭐⭐⭐ THE ROW BASIS AN ELEMENTWISE OP SWEEPS — the matmul windowing arm's law, stated once for the
 /// pointwise arms.
 ///
@@ -1339,24 +1376,31 @@ fn node_rows(name: &str, out: &Region) -> Result<u32, Error> {
 /// or an unrolled trip whose corner the fold pass carried away). A program whose window sits at a
 /// nonzero row is the 16-tile grid-corner case, and it is refused by that guard rather than here.
 fn pointwise_rows(name: &str, out: &Region) -> Result<u32, Error> {
-    if out.r_cover == (0, out.v_rows) {
-        node_rows(name, out)
-    } else {
-        // The window basis is only honest if the op's rows ARE the window's: the caller's extent
-        // checks compare every operand against this number, and `r_len` is the window one tile
-        // states. A cover that is neither the whole view nor a single window (two disjoint
-        // windows, say) is a program shape this basis does not describe, and is refused by name
-        // rather than folded.
-        if out.r_cover.1 - out.r_cover.0 != out.r_len {
-            return err(format!(
-                "{name}: the output t{}'s store windows cover rows {}..{} in blocks of {} row(s) — \
-                 neither a row-blocked program one descriptor can fold (windows tiling the view) nor \
-                 a grid program's single window. The pointwise arms sweep one rectangle; this \
-                 program states several disjoint ones.",
-                out.tid, out.r_cover.0, out.r_cover.1, out.r_len,
-            ));
+    // ⭐ THE DESCRIPTOR'S READER OF [`OperandView::of`] — the same one predicate the extents law
+    // admits by, so the basis the descriptor sweeps is the form the law proved. The out holds the
+    // view form when its cover spans it at row 0 (the folded row-blocked program, one descriptor
+    // over every member's store): the basis is the view's own rows. Every other form — whole-view
+    // window included, where the number is the same — is the op's own window, and the basis is
+    // the window's height.
+    match OperandView::of(out, out.v_rows) {
+        Some(OperandView::View) => Ok(out.v_rows),
+        _ => {
+            // The window basis is only honest if the op's rows ARE the window's: the caller's
+            // extent checks compare every operand against this number, and `r_len` is the window
+            // one tile states. A cover that is neither the whole view nor a single window (two
+            // disjoint windows, say) is a program shape this basis does not describe, and is
+            // refused by name rather than folded.
+            if out.r_cover.1 - out.r_cover.0 != out.r_len {
+                return err(format!(
+                    "{name}: the output t{}'s store windows cover rows {}..{} in blocks of {} \
+                     row(s) — neither a row-blocked program one descriptor can fold (windows tiling \
+                     the view) nor a grid program's single window. The pointwise arms sweep one \
+                     rectangle; this program states several disjoint ones.",
+                    out.tid, out.r_cover.0, out.r_cover.1, out.r_len,
+                ));
+            }
+            Ok(out.r_len)
         }
-        Ok(out.r_len)
     }
 }
 
@@ -1967,22 +2011,15 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
 /// ⭐ EVERY INPUT, NOT JUST A BINARY'S SECOND. The builder gives a unary's single input the output's
 /// dims too, so the same silence applies; the invariant is "all operands share the output's extent",
 /// and stating it per-arity would be the scattered logic this crate exists to avoid.
-/// ⭐⭐⭐ TWO FORMS, ONE LAW: every operand must hold the op's row sweep (`rows` — the basis
-/// [`pointwise_rows`] reads off the OUTPUT), and the form an operand holds it in is the
-/// operand's own. The two forms are checked as a DISJUNCTION, never selected by the cover:
-///
-/// * THE WINDOW FORM — the operand holds the sweep as its OWN WINDOW (`r_len == rows`, fitting
-///   its view at `r_start`). This is the form every SPLIT program states: an unrolled row
-///   block's load, whose own window is its sweep while its COVER — the hull over every block's
-///   read of the same parameter — spans the parameter's whole view. A cover-based selector
-///   sends that load to the view form and refuses it; the window form is what admits it, and
-///   it is checked FIRST so the cover never overrides what the operand's own window states.
-/// * THE VIEW FORM — the operand holds the sweep by BEING it (`v_rows == rows`, at row 0), with
-///   its cover `(0, v_rows)` as the program's own EVIDENCE that its reads span the view: the
-///   folded row-blocked family's leader, whose one descriptor spans every member's load. The
-///   cover is evidence here, never the selector — an operand whose cover is its view but whose
-///   window is narrower (the split load above) is a WINDOW-form operand, and the view form must
-///   not claim it.
+/// ⭐⭐⭐ TWO FORMS, ONE LAW — [`OperandView::of`], the ONE typed predicate behind this selector
+/// and the descriptor's basis picker ([`pointwise_rows`]) alike: every operand must hold the op's
+/// row sweep (`rows` — the basis `pointwise_rows` reads off the OUTPUT), and the form an operand
+/// holds it in is the operand's own. THE NEW ADMISSION SET (auditor-ruled, #1112) beyond the old
+/// law is exactly `{cover = the full view ∧ r_len == rows}`: the split program's windowed operand
+/// whose cover spans the view — the case the old, cover-selected law sent to the view form and
+/// refused. The window form is checked FIRST so the cover never overrides what the operand's own
+/// window states; the view form takes the cover `(0, v_rows)` as the folded family leader's own
+/// EVIDENCE, never as the selector.
 ///
 /// The c_len equality is unchanged — the op's width is one number every operand shares.
 /// `what` is the refusal's label — the caller's own kind spelling (`Elementwise({kind:?})`, or
@@ -1995,10 +2032,13 @@ fn pointwise_extents_agree(
     rows: u32,
 ) -> Result<(), Error> {
     for (i, x) in ins.iter().enumerate() {
-        let row_ok = (x.r_len == rows && x.r_start + x.r_len <= x.v_rows)
-            || (x.r_cover == (0, x.v_rows) && x.r_start == 0 && x.v_rows == rows);
-        if !row_ok || x.c_len != out.c_len {
-            if x.r_start == 0 && x.r_len == x.v_rows {
+        // ⭐ THE SELECTOR'S READER OF [`OperandView::of`] — the one predicate the descriptor's
+        // basis picker ([`pointwise_rows`]) reads too, so what admits here is what the
+        // descriptor addresses.
+        if OperandView::of(x, rows).is_none() || x.c_len != out.c_len {
+            // The message picks its form the same way — an operand whose own window is its
+            // view is told its extent disagrees; a windowed one is told which window.
+            if OperandView::of(x, x.v_rows).is_some() {
                 return err(format!(
                     "{what} {name}: input {i} t{} is `[{}, {}]` (view rows × window \
                      cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
@@ -7692,10 +7732,12 @@ mod elementwise_tests {
         }
     }
 
-    /// A row-split intermediate: the window `[r_start, r_start+r_len)` of a taller `[v_rows, ·]`
-    /// view, the view itself as the cover — the shape the full-extent mint states for an op whose
-    /// operands swept one plain window of a taller value (#1112's gelu longhand: the head block's
-    /// `[0,42)` and the tail's `[42,64)` of one `[64, ·]` value).
+    /// A row-split tile: the window `[r_start, r_start+r_len)` of a taller `[v_rows, ·]` view,
+    /// the view itself as the cover — the fold LEADER's load shape (the family's proven hull as
+    /// evidence), and the cover every parameter tile carried before #1112's own-window law
+    /// (`whole_function`'s `at_own_extent`) stated a tile's extent as its own window. The
+    /// gelu longhand's head block `[0,42)` and tail `[42,64)` of one `[64, ·]` parameter are
+    /// the measured shapes.
     fn split(tid: u32, v_rows: u32, r_start: u32, r_len: u32, cols: u32) -> Region {
         Region {
             tid,
@@ -8842,14 +8884,15 @@ mod elementwise_tests {
     /// ⛔ THE TWO FORMS OF #1112 — the row-split view leak, at the guard that refused it. A
     /// row-split program (the gelu longhand at m=64, c=4096: `EW_LX_ELEMS` blocks of 42 rows)
     /// spells one chain per block over ONE value: the head block's ops sweep `[0,42)` of a
-    /// 64-row view, the tail's `[42,64)`. The walk now mints such an intermediate at the
-    /// VALUE's full extent (`whole_function`'s full-extent mint), so the guard admits TWO
-    /// forms — the operand's OWN window (the split program's basis: `r_len` rows inside a
-    /// taller view) and, as evidence the folded family leader states, the view itself (cover
-    /// `(0, v_rows)` spanning every member's load). These fixtures pin the matrix: every
-    /// green form above stays admitted, and the near-misses — a window at a basis that is
-    /// neither its own height nor its view, a tail window read at the node basis, a
-    /// whole-view input at the wrong height — stay refused.
+    /// 64-row view, the tail's `[42,64)`. A pointwise op's tiles state their OWN windows as
+    /// their extents (`whole_function`'s `at_own_extent`), and its intermediates are minted
+    /// at the PIECE the sweep states — so the guard admits TWO forms: the operand's OWN
+    /// window (`r_len` rows inside a taller view — the split chain's loads and minted pieces)
+    /// and, as evidence only the folded family leader states, the view itself (cover
+    /// `(0, v_rows)` spanning every member's load, the family's proven hull). These fixtures
+    /// pin the matrix: every green form above stays admitted, and the near-misses — a window
+    /// at a basis that is neither its own height nor its view, a tail window read at the node
+    /// basis, a whole-view input at the wrong height — stay refused.
     #[test]
     fn the_extent_guard_admits_the_row_split_forms_and_refuses_the_near_misses() {
         // THE measured geometry: m=64 rows split at 42 (`EW_LX_ELEMS`), so the head window is
@@ -10319,12 +10362,14 @@ fn scalarmul_scaled(
     let x = ins[0].name();
     let out_name = out.name();
     // ⭐ THE ROW BASIS THE POINTWISE ARMS STATE ([`pointwise_rows`]), not the folded-only one.
-    // A scalarmul's out is either a STORE tile — cover `(0, v_rows)`, where [`pointwise_rows`]
-    // delegates to [`node_rows`] and the bytes are exactly what they were — or an INTERMEDIATE
-    // minted by the walk, which a row-split program states as its window of the value's full
-    // view (the mint's own law, `whole_function`'s full-extent mint): a cover that is the
-    // window, not the view. `node_rows` refuses that cover by construction; the window basis
-    // is the one this body sweeps, and every whole-view case keeps it byte-identical.
+    // A scalarmul's out is a STORE tile or an INTERMEDIATE the walk minted, and both state
+    // their extents the same two ways: a whole-view tile (cover `(0, v_rows)`, `r_len ==
+    // v_rows`) takes the WINDOW form at its own height — the bytes exactly what they were —
+    // and the row-fold LEADER's store takes the VIEW form (the family's proven hull, the one
+    // case `node_rows`' fold exists for). A row-split chain's pieces — a store tile at its
+    // own window (`whole_function`'s `at_own_extent`), an intermediate minted at the sweep's
+    // piece — take the window basis this body sweeps, and every whole-view case keeps it
+    // byte-identical.
     let rows = pointwise_rows(name, &out)?;
     // ⛔⛔⛔ A COLUMN-BLOCKED PIECE READS AND WRITES ITS OWN COLUMNS — the granite logits. The front end
     // column-tiles a wide ScalarMul (`subtile_ir.rs`'s tiling set) into pieces that share one input and

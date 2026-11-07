@@ -3349,6 +3349,51 @@ fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
         .map_or(logical, |x| x.r_len)
 }
 
+/// ⭐⭐⭐⭐⭐ A POINTWISE OP's PARAMETER TILE STATES ITS OWN WINDOW AS ITS EXTENT — the tile's
+/// `r_cover` is the hull of the stores THIS op's emission covers, never the parameter's whole
+/// view inherited through the elementwise op (#1112's row split: the gelu longhand's head block
+/// loads and stores `[0, 42)` of a 64-row parameter, and the inherited `(0, 64)` cover made the
+/// load look whole-view — so the mint could not see the window and the terminal took the
+/// parameter's 64-row basis while its honestly-windowed intermediates could not reach it).
+///
+/// A VALUE's extent is its PRODUCER's window, stated over ops and values only. With the cover
+/// the tile's own window:
+///
+/// * [`band_rows_of`] — the law that already sizes a banded op's mint at the sweep — sees the
+///   row-split window and sizes the intermediate at the PIECE (`[42, …]` for a 42-row block),
+///   exactly as the column side has always minted a column-chunked op's piece at the chunk;
+/// * the extents law ([`OperandView::of`]) reads the window form, so a whole-view sibling and
+///   a windowed tile admit at the WINDOW basis, and the terminal's out region gives
+///   [`pointwise_rows`] the store's own height — the descriptor computes the rows the program
+///   states, never the parameter's unstated remainder.
+///
+/// TWO EXCEPTIONS, BOTH THE PRODUCER's OWN STATEMENT: a BANDED tile (`band.is_some()`) keeps
+/// the band its launch's corner spelled — that cover is the launch's own tiling, not an
+/// inherited parameter view; and the ROW FOLD'S LEADER keeps the parameter's cover, because
+/// the fold PROVED the family's stores tile the view exactly, which makes that cover the hull
+/// of every member's store — the one whole-view basis a multi-block program honestly states.
+/// The leader's exception is applied at the two call sites (the walk's input and out
+/// presentations, gated on `pointwise_tiles`), never here, so no other reader of
+/// `region_for_operand` — the fold's own proof included — can inherit it by accident.
+///
+/// ⛔ BYTE-IDENTICAL FOR EVERY PROGRAM THAT BAKES TODAY: a whole-view tile's cover is its own
+/// window already (`r_len == v_rows` at row 0); a column-chunked tile sits at row 0 for all
+/// its view's rows; a banded tile is exempt; the fold's members never present (they are
+/// skipped at the loop top) and its leader is exempt at the call sites. Only the row-split
+/// class changes, and no member of it lowered before — it refused at the extents law. The
+/// seal is the four-granite bundle-identity gate: every folded family goes through the exempt
+/// leader unchanged.
+fn at_own_extent(r: Region) -> Region {
+    if r.band.is_none() {
+        Region {
+            r_cover: (r.r_start, r.r_start.saturating_add(r.r_len)),
+            ..r
+        }
+    } else {
+        r
+    }
+}
+
 /// The ONE band a set of inputs states, refusing disagreement: an op sweeps one band,
 /// and a mint between two differently-banded inputs would size to whichever it saw
 /// first. `None` when no input is banded — the ordinary case, byte-identical to before.
@@ -6475,6 +6520,11 @@ fn lower_function_folded(
         // broadcast family's blocks do not tile the view the same way and the broadcast arms
         // address operands at their own extent). The analysis itself bails on everything that is
         // not a row-blocked family, so a single-window or column-chunked program never enters it.
+        //
+        // ⭐ THE ROW FOLD'S LEADER — the one op this iteration whose tiles keep the parameter's
+        // cover as the family's proven hull (see `pointwise_tiles` below and
+        // [`row_tiled_family`]'s own doc). Set by the gate, read by the two presentation sites.
+        let mut fold_leader = false;
         if bcast_axes.iter().all(Option::is_none)
             && matches!(
                 program,
@@ -6487,7 +6537,27 @@ fn lower_function_folded(
             && let Some(members) = row_tiled_family(k, op, kind, &in_values, n_in, &analyses)?
         {
             row_fold_skip.extend(members);
+            fold_leader = true;
         }
+        // ⭐⭐⭐⭐⭐ A POINTWISE OP's PARAMETER TILES STATE THEIR OWN WINDOWS AS THEIR EXTENTS
+        // ([`at_own_extent`]'s law) — every kind that lowers through the pointwise bodies and
+        // is not the fold's leader. The leader is the one op whose tiles keep the parameter's
+        // cover: the fold PROVED the family's stores tile the view, so that cover is the hull
+        // of every member's store, and the leader's one whole-view descriptor is sized by it
+        // (`node_rows`' fold). Every other pointwise op presents each tile at the window the
+        // tile itself states, so the mint sizes the piece ([`band_rows_of`], which until this
+        // law could not see a row-split window under its inherited whole-view cover) and the
+        // extents law reads the window, never the parameter's view.
+        let pointwise_tiles = !fold_leader
+            && matches!(
+                program,
+                Lowering::Silu
+                    | Lowering::ScalarMul(_)
+                    | Lowering::BoundScalarMul(_)
+                    | Lowering::Convert(_)
+                    | Lowering::ScalarBinary(..)
+                    | Lowering::Node(Program::Elementwise(_))
+            );
 
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
         // ⭐ WHICH OPERANDS ARE PARAMETER-BACKED, kept BESIDE the regions because a `Region` cannot
@@ -6525,6 +6595,10 @@ fn lower_function_folded(
             };
             match region_for_operand(k, *v)? {
                 Some(r) => {
+                    // ⭐ A POINTWISE OP's LOAD STATES ITS OWN WINDOW AS ITS EXTENT
+                    // ([`at_own_extent`]) — the parameter's cover is evidence only where a fold
+                    // proved the family tiles the view, which is `fold_leader`'s one case.
+                    let r = if pointwise_tiles { at_own_extent(r) } else { r };
                     per_op.push(present(r)?);
                     from_parameter.push(true);
                 }
@@ -7137,64 +7211,66 @@ fn lower_function_folded(
                 .map(|(_, r)| *r)
                 .collect();
             let dims = [band_rows_of(&swept, dims[0]), dims[1]];
-            // ⭐⭐⭐⭐⭐ AN OP WHOSE OPERANDS STATE PLAIN WINDOWS MINTS THE INTERMEDIATE AT THE
-            // VALUE'S FULL EXTENT, AND THE MINT CARRIES THE PRODUCING OP'S WINDOW. A row-split
-            // program — the gelu longhand, whose `EW_LX_ELEMS` row blocking the row-tiled fold
-            // cannot take (the chain mixes kinds, so no single-kind family) — spells one
-            // load/chain per block, each block's op sweeping its own window `[r_start, r_len)`
-            // of a taller value. The old mint stated the PIECE's height as the view (`[42, …]`
-            // for a 42-row block of a 64-row value), so no later window of the same value — the
-            // tail block's `[42, 22)`, which does not FIT a 42-row view — could be placed, and
-            // the extents law refused the split load at the very next op (#1112's
-            // MISSING-LOWERING). The value's full extent is the operands' own `v_rows` — every
-            // swept operand must state the SAME view, or the mint refuses by name (a chain
-            // mixing an op that minted at another extent is not one value) — and the window is
-            // the producing op's sweep, which the result type must also state (`dims[0] ==
-            // r_len`): the same agreement the extents law demanded at the consumer, moved here
-            // to where the buffer is sized.
+            // ⭐⭐⭐⭐⭐ THE SWEPT-WINDOW REFUSALS — an intermediate is minted at the PIECE its
+            // producing op sweeps. The sizing is not stated here at all: [`at_own_extent`]
+            // presents a pointwise op's windowed tiles at their own windows, so
+            // [`band_rows_of`] — the law that already sizes a banded op's mint at the sweep —
+            // sizes the row-split piece (`[42, …]` for one block of a 64-row program), exactly
+            // as the column side has always minted a column-chunked op's piece at its chunk,
+            // and the region constructed below is the ordinary whole-view region at those
+            // dims: a value's extent is its PRODUCER's window, never a parameter's cover
+            // inherited through the elementwise op. What this block states are the two
+            // REFUSALS that keep the sweep honest where its pieces agree:
             //
-            // ⛔ BYTE-IDENTICAL FOR EVERY MINT THAT BAKES TODAY, BY THE WALK'S OWN ADMISSIONS.
-            // A whole-view swept family has `r_len == v_rows`, so the full extent IS the result
-            // type's rows and the mint states exactly the whole-view region it did before; a
-            // BANDED swept family keeps the band law above (the mint states the band, and the
-            // `band` field carries it); a family whose swept windows DISAGREE — a contraction's
-            // activation and kernel, whose sweeps are `m` and `k` — states no plain window, and
-            // the mint keeps today's form for the op's own body to judge. Only the split
-            // program's windowed mint changes, and no such program lowered before: it refused
-            // at the extents law.
-            let mint_window: Option<(u32, u32, u32)> = if swept.is_empty()
-                || swept.iter().any(|r| r.band.is_some())
-            {
-                None
-            } else {
-                let first = swept[0];
-                if !swept
-                    .iter()
-                    .all(|r| r.r_start == first.r_start && r.r_len == first.r_len)
-                {
+            // * swept operands stating ONE window over DIFFERENT views — the piece's bytes are
+            //   the sweep's, and two views behind one sweep name two different values;
+            // * a result type whose rows are not the sweep's — the minted piece is the sweep
+            //   the program states, and the type disagrees with it.
+            //
+            // A family whose swept windows DISAGREE (a contraction's activation and kernel,
+            // sweeping `m` and `k`), an empty sweep, or a banded one states no plain window:
+            // the mint keeps its own law for the op's body to judge, exactly as before.
+            //
+            // ⛔ BYTE-IDENTICAL FOR EVERY MINT THAT BAKES TODAY: a whole-view swept family has
+            // `r_len == v_rows` and `dims[0] == r_len`, so neither refusal fires and the mint
+            // states the region it always did; a banded family keeps the band law above; a
+            // windowed sweep minted no buffer before — it refused at the extents law (#1112's
+            // MISSING-LOWERING), which is the class this law exists to lower.
+            let plain_window: Option<Region> =
+                if swept.is_empty() || swept.iter().any(|r| r.band.is_some()) {
                     None
-                } else if !swept.iter().all(|r| r.v_rows == first.v_rows) {
+                } else {
+                    let first = swept[0];
+                    if !swept
+                        .iter()
+                        .all(|r| r.r_start == first.r_start && r.r_len == first.r_len)
+                    {
+                        None
+                    } else {
+                        Some(first)
+                    }
+                };
+            if let Some(first) = plain_window {
+                if !swept.iter().all(|r| r.v_rows == first.v_rows) {
                     let other = swept
                         .iter()
                         .find(|r| r.v_rows != first.v_rows)
                         .map_or(first.v_rows, |r| r.v_rows);
                     return err(format!(
                         "{}: `{:?}`'s swept operands state one window (rows [{}, {})) over \
-                         DIFFERENT views ({} and {} rows) — an intermediate is minted at the \
-                         VALUE's full extent, and two extents are stated",
+                         DIFFERENT views ({} and {} rows) — the minted piece is the sweep the \
+                         program states, and two views behind one sweep name two different values",
                         f.name, op.op_type, first.r_start, first.r_len, first.v_rows, other
                     ));
-                } else if dims[0] != first.r_len {
+                }
+                if dims[0] != first.r_len {
                     return err(format!(
                         "{}: `{:?}`'s result type states {} row(s) while its operands sweep {} — \
-                         the minted window is the sweep the program states, and the two disagree",
+                         the minted piece is the sweep the program states, and the two disagree",
                         f.name, op.op_type, dims[0], first.r_len
                     ));
-                } else {
-                    Some((first.v_rows, first.r_start, first.r_len))
                 }
-            };
-            let dims = [mint_window.map_or(dims[0], |(v, _, _)| v), dims[1]];
+            }
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
@@ -7305,21 +7381,19 @@ fn lower_function_folded(
             // would drop the typed fact and the second op's inputs would look whole-view
             // again, minting `[1, ·]` while its per-row operands are `[B, ·]`.
             let band = band_of(f.name, &per_op)?;
-            // The minted window — the producing op's sweep, carried on the region (the (a)
-            // law above). `None` keeps today's whole-view mint verbatim, byte for byte.
-            let (r_start, r_len, r_cover) = match mint_window {
-                Some((_, s, l)) => (s, l, (s, s + l)),
-                None => (0, dims[0], (0, dims[0])),
-            };
+            // The minted region is the ordinary whole-view region at the piece's dims — the
+            // piece the swept window stated (`band_rows_of` above), never a window of a taller
+            // view: the buffer is the value, and its rows are the rows the producing op
+            // writes.
             let r = Region {
                 tid,
                 v_rows: dims[0],
                 v_cols: dims[1],
-                r_start,
+                r_start: 0,
                 c_start: 0,
-                r_len,
+                r_len: dims[0],
                 c_len: dims[1],
-                r_cover,
+                r_cover: (0, dims[0]),
                 c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
@@ -7521,6 +7595,15 @@ fn lower_function_folded(
             ));
         };
         o = windowed_region(k, o, tile)?;
+        // ⭐ A POINTWISE OP's STORE STATES ITS OWN WINDOW AS ITS EXTENT ([`at_own_extent`]) —
+        // the terminal's row basis is then the window it stores (the gelu longhand's `[0, 42)`
+        // head block of a 64-row output), never the parameter's whole view: a value's extent
+        // comes from its PRODUCER's window, and the one op that may widen it past the store's
+        // own tile is the row fold's leader, whose family proof made the parameter's cover the
+        // hull of every member's store.
+        if pointwise_tiles {
+            o = at_own_extent(o);
+        }
         o.is_out = true;
         // ⭐ THROUGH A SHAPE OP THAT MOVES NO BYTE, THE OUTPUT IS READ IN THE OP'S OWN FRAME — the
         // same card bytes, framed as the op's operands are: a decode batch of one's `[1, KV, G, D]`
