@@ -199,7 +199,7 @@ fn slab_rope_math_matches_neox_hd128() {
     let sf = |d: usize| seed_val(3, d as u64, 0, 0);
     let want = rope_reference(&xf2, &cf, &sf, 1, HD128); // NeoX reference for one head, [hd]
     let xf = |d: usize| xf2(0, d);
-    for d in 0..HD128 {
+    for (d, &want_d) in want.iter().enumerate().take(HD128) {
         let (s, dp) = (d / STK, d % STK);
         let first_half = s < n_slabs / 2;
         let partner = if first_half {
@@ -214,9 +214,9 @@ fn slab_rope_math_matches_neox_hd128() {
             xf(d) * cf(d) + xf(partner) * sf(d)
         };
         assert!(
-            (got - want[d]).abs() < 1e-12,
+            (got - want_d).abs() < 1e-12,
             "hd=128 slab rope dim {d} (slab {s}): slab-swap {got} != NeoX reference {}",
-            want[d]
+            want_d
         );
     }
 }

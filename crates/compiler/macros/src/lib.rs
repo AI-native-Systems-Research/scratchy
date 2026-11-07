@@ -529,6 +529,16 @@ pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
 ) -> Result<proc_macro2::TokenStream, CarrierError> {
+    compile_carrier_in(carrier, models_dir, &config::BuildScope::of_build())
+}
+
+/// [`compile_carrier`] under `scope`: the configs the pipeline compiles are the ones `scope`
+/// selects (`config::load_dir`).
+pub fn compile_carrier_in(
+    carrier: PythonCarrier,
+    models_dir: &std::path::Path,
+    scope: &config::BuildScope,
+) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
         CompileMode::VISION
@@ -574,8 +584,8 @@ pub fn compile_carrier(
         // bound set from the nested `vision_config` block via the
         // declared `Params` schema instead of the decoder's flat
         // top-level harvest.
-        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec),
-        _ => config::load_dir(models_dir, &spec),
+        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec, scope),
+        _ => config::load_dir(models_dir, &spec, scope),
     }
     .map_err(|e| {
         // A refusal that belongs to ONE config rides the per-stem arm —

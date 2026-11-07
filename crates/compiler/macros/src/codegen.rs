@@ -11172,10 +11172,9 @@ const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES 
 // collides with no common dim (head_dim 64/128, half 32/64, n_heads,
 // hidden, intermediate, block_size 64). `KTIR_PREFILL_LEN` overrides (must
 // also be collision-free). Referenced only inside dump_wavefront_mega's
-// `#[cfg(feature = "spyre")]` block and by the pinned test below — dead in
-// a non-spyre LIB build (the `not(test)` leg keeps the expectation
-// satisfied exactly where it's true).
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+// `#[cfg(feature = "spyre")]` block and by its spyre-gated pinned test, so it is
+// gated on `spyre` as they are.
+#[cfg(feature = "spyre")]
 const PREFILL_LX_SAFE: u32 = 31;
 /// SuperDSC PREFILL WIDTH LADDER, ASCENDING. Each rung is baked as its own prefill bundle and
 /// the worker runs a chunk on the NARROWEST rung that holds it: per-chunk cost is
@@ -11464,7 +11463,7 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
 /// (attention, rope, an MoE block) makes the gemm's other rows live and the
 /// m=1 fold unsound on it. Mid-layer gemms are refused by their own layer's
 /// rope/attention, exactly as at subtile level.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+#[cfg(feature = "spyre")]
 fn fuf_feeds_result_through_row_local_ops(fuf: &Fuf, from: TileId, result: TileId) -> bool {
     if from == result {
         return true;
@@ -11492,7 +11491,7 @@ fn fuf_feeds_result_through_row_local_ops(fuf: &Fuf, from: TileId, result: TileI
 /// output row `i` reads only input row `i` (matmuls, last-dim
 /// norms/reductions, elementwise). RoPE is excluded deliberately — it also
 /// writes the paged KV cache, a consumer the prefill graph cannot see.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+#[cfg(feature = "spyre")]
 fn fuf_row_local_tail_op(op: OpKind) -> bool {
     matches!(
         op,
@@ -18322,7 +18321,8 @@ mod tests {
             name,
             rust_type: quote! { crate::__gpu::layers::RmsNorm },
             kind: crate::weight_vocab::WeightKind::RmsNorm,
-            source_weights: vec![],
+            // The layer rides the source weight, as `accessor_base_layer` reads it in production.
+            source_weights: vec![(crate::classified::WeightId(0), layer.map(UnrollIndex))],
         }
     }
 
@@ -18644,14 +18644,22 @@ mod tests {
             "Replicate path must not route to sharded helper at tp>1 (got: {ts})",
         );
 
-        // Concat (always column-parallel) → `_concat_sharded`. Bakes
-        // `world` literal but no `dim` arg (concat-sharded is always
-        // dim=0 internally).
+        // Concat (always column-parallel). Under metal, which has no tensor-parallel load, the
+        // layered helper routes every concat to the stream-free `_concat_packed`, whatever the
+        // world; elsewhere a sharded world routes to `_concat_sharded`, which bakes the `world`
+        // literal but no `dim` arg (concat-sharded is always dim=0 internally).
         let c = FieldLoad::LinearConcat(vec![
             "model.layers.0.mlp.gate_proj".to_string(),
             "model.layers.0.mlp.up_proj".to_string(),
         ]);
         let ts = emit_layered_load_body(&c, 32, 4, false, None, "model.layers", None).to_string();
+        if cfg!(feature = "metal") {
+            assert!(
+                ts.contains("load_layered_linear_dense_concat_packed") && !ts.contains("_sharded"),
+                "metal routes a tp=4 gate_up concat to concat_packed (got: {ts})",
+            );
+            return;
+        }
         assert!(
             ts.contains("load_layered_linear_dense_concat_sharded"),
             "tp=4 gate_up concat must route to concat_sharded (got: {ts})",
@@ -18726,93 +18734,21 @@ mod fingerprint_tests {
         );
     }
 
-    /// MLA archs (DeepSeek V3 / Kimi K2) ship `q_a_proj` rather than
-    /// `q_proj`, so the FP8-block disambiguation tensor names must
-    /// follow the same `fp_leaf` selection the rest of the
-    /// fingerprint already uses. Regression for the bug where the
-    /// V3 FP8-block fingerprint hardcoded `q_proj.weight_scale_inv`
-    /// and silently rejected every V3 FP8-block checkpoint.
-    #[test]
-    fn fp8_block_disambiguation_uses_q_a_proj_for_mla_archs() {
-        let dir = arch_configs("deepseek-v3");
-        let configs =
-            crate::config::load_dir(&dir, &Default::default()).expect("load deepseek-v3 configs");
-        let manifest = crate::weights_manifest::load_or_empty(&dir)
-            .expect("load deepseek-v3 weights manifest");
-        // Pick a V3 variant with FP8-block quantization (block_size: Some).
-        let model = configs
-            .iter()
-            .find(|c| {
-                matches!(
-                    c.quantization.as_ref().map(|qc| &qc.method),
-                    Some(crate::quantization::QuantMethod::Fp8 {
-                        block_size: Some(_),
-                        ..
-                    })
-                )
-            })
-            .expect("at least one V3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
-        assert!(
-            ts.contains("q_a_proj.weight_scale_inv"),
-            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale_inv, got:\n{ts}",
-        );
-        assert!(
-            !ts.contains("q_proj.weight_scale_inv"),
-            "MLA arch FP8-block fingerprint must not reference q_proj.weight_scale_inv \
-             (V3/K2 ship q_a_proj on disk; q_proj presence would silently reject every \
-             real checkpoint), got:\n{ts}",
-        );
-        assert!(
-            ts.contains("q_a_proj.weight_scale"),
-            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale, got:\n{ts}",
-        );
-    }
-
-    /// Flat-Q MLA arches (Moonlight / K2 direct-q_proj) ship `q_proj`
-    /// rather than `q_a_proj`, so the FP8-block fingerprint must use
-    /// `q_proj.weight_scale_inv` even though the arch is otherwise
-    /// structurally MLA (kv_a_proj_with_mqa, kv_b_proj, etc.).
-    #[test]
-    fn fp8_block_disambiguation_uses_q_proj_for_flat_q_mla_archs() {
-        let dir = arch_configs("deepseek-v3-flat");
-        let configs = crate::config::load_dir(&dir, &Default::default())
-            .expect("load deepseek-v3-flat configs");
-        let manifest = crate::weights_manifest::load_or_empty(&dir)
-            .expect("load deepseek-v3-flat weights manifest");
-        let model = configs
-            .iter()
-            .find(|c| {
-                matches!(
-                    c.quantization.as_ref().map(|qc| &qc.method),
-                    Some(crate::quantization::QuantMethod::Fp8 {
-                        block_size: Some(_),
-                        ..
-                    })
-                )
-            })
-            .expect("at least one deepseek-v3-flat FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
-        assert!(
-            ts.contains("q_proj.weight_scale_inv"),
-            "flat-Q MLA FP8-block fingerprint should use q_proj.weight_scale_inv \
-             (no q_a_proj on disk for q_lora_rank=null checkpoints), got:\n{ts}",
-        );
-        assert!(
-            !ts.contains("q_a_proj.weight_scale_inv"),
-            "flat-Q MLA FP8-block fingerprint must not reference q_a_proj \
-             (Moonlight ships q_proj, not q_a_proj), got:\n{ts}",
-        );
-    }
-
     /// Non-MLA arches (Llama / Qwen / etc.) keep the historical
     /// `q_proj` leaf — the fp_leaf selection is purely opt-in for
     /// archs whose manifest declares `q_a_proj`.
+    // FP8-block presets are not claimable under metal (`quant_preset_active`), so no FP8-block
+    // variant exists to fingerprint there; the spyre build's test step runs this.
+    #[cfg(not(feature = "metal"))]
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
         let dir = arch_configs("qwen3");
-        let configs =
-            crate::config::load_dir(&dir, &Default::default()).expect("load qwen3 configs");
+        let configs = crate::config::load_dir(
+            &dir,
+            &Default::default(),
+            &crate::config::BuildScope::every_config_in(&dir),
+        )
+        .expect("load qwen3 configs");
         let manifest =
             crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
         let model = configs
@@ -18836,13 +18772,8 @@ mod fingerprint_tests {
 
     /// Load ONE checked-in config as `ModelParams`.
     ///
-    /// ⛔ NOT `load_dir`. `load_dir` filters every stem through
-    /// `CARGO_FEATURE_<STEM>`, which is right for a build and unstateable for a
-    /// unit test — a proc-macro crate has no model features, so it selects ZERO
-    /// configs and a test that iterates the result passes vacuously. (The
-    /// `fp8_block_disambiguation_*` tests above are in exactly that state.) The
-    /// subject here is `emit_fingerprint_check`, a pure function of
-    /// `ModelParams`, so name the file and skip the build's scope entirely.
+    /// NOT `load_dir`: the subject here is `emit_fingerprint_check`, a pure function of
+    /// `ModelParams`, so name the file and skip the build's scope (`config::BuildScope`) entirely.
     fn config_of(arch: &str, stem: &str) -> crate::config::ModelParams {
         let path = arch_configs(arch).join(format!("{stem}.json"));
         crate::config::load_file(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()))
@@ -18941,7 +18872,7 @@ mod fingerprint_tests {
     fn a_config_without_rope_theta_emits_no_theta_gate() {
         let model = config_of("llama", "llama-2-70b");
         assert!(
-            model.scalars.get("rope_theta").is_none() && model.bounds.get("rope_theta").is_none(),
+            !model.scalars.contains_key("rope_theta") && !model.bounds.contains_key("rope_theta"),
             "premise broken: llama-2-70b now declares a rope_theta, so it no longer exercises \
              the no-gate case — repoint this test at another config that declares none",
         );

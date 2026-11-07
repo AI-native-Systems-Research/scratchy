@@ -369,11 +369,106 @@ impl std::error::Error for ConfigError {}
 ///
 /// Results are sorted alphabetically by file stem for build
 /// determinism; synthesized variants appear after their base.
+///
+/// `scope` is what the build selected: the configs it loads and the quant presets it synthesizes
+/// ([`BuildScope`]).
 pub fn load_dir(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    scope: &BuildScope,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Decoder, spec)
+    load_dir_mode(dir, ConfigMode::Decoder, spec, scope)
+}
+
+/// ⭐ WHAT A BUILD SELECTED, AS THE CONFIG LOADER READS IT: the Cargo features of the crate whose
+/// build script runs the pipeline (a config's `<stem>` or `<arch>-<stem>`, `mtp`, `mtp-heads`), and
+/// the quant presets that build script forwards (`SCRATCHY_QUANTS`).
+///
+/// A build reads both from its own environment ([`of_build`](Self::of_build)), where Cargo sets
+/// `CARGO_FEATURE_*`. A test NAMES them ([`of_features`](Self::of_features)): the macro crate's own
+/// test binary has no model features to read, so the environment would select zero configs and a
+/// test iterating the result would pass having checked nothing.
+#[derive(Clone, Debug)]
+pub struct BuildScope {
+    features: ScopeFeatures,
+    quants: Option<std::collections::HashSet<String>>,
+}
+
+/// Where a [`BuildScope`]'s features come from.
+#[derive(Clone, Debug)]
+enum ScopeFeatures {
+    /// Cargo's `CARGO_FEATURE_*`, in the build script's process.
+    Cargo,
+    /// The features a test names.
+    #[cfg(test)]
+    Named(std::collections::HashSet<String>),
+}
+
+impl BuildScope {
+    /// This build's scope: Cargo's features, and the presets `SCRATCHY_QUANTS` forwards (unset ⇒
+    /// every backend-applicable preset; set, even to an empty list ⇒ only those listed).
+    pub fn of_build() -> Self {
+        let quants = std::env::var("SCRATCHY_QUANTS").ok().map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        });
+        Self {
+            features: ScopeFeatures::Cargo,
+            quants,
+        }
+    }
+
+    /// The scope of exactly `features`, with every backend-applicable preset.
+    #[cfg(test)]
+    pub fn of_features<'a>(features: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            features: ScopeFeatures::Named(features.into_iter().map(str::to_string).collect()),
+            quants: None,
+        }
+    }
+
+    /// Whether `feature` is on.
+    pub fn on(&self, feature: &str) -> bool {
+        match &self.features {
+            ScopeFeatures::Cargo => std::env::var(format!(
+                "CARGO_FEATURE_{}",
+                feature.to_uppercase().replace('-', "_")
+            ))
+            .is_ok(),
+            #[cfg(test)]
+            ScopeFeatures::Named(on) => on.contains(feature),
+        }
+    }
+
+    /// The presets the build forwarded, `None` when it forwarded none.
+    fn quants(&self) -> Option<&std::collections::HashSet<String>> {
+        self.quants.as_ref()
+    }
+
+    /// The scope selecting every config in `dir`: a test whose subject is what the loader makes of
+    /// an arch's configs loads all of them.
+    #[cfg(test)]
+    pub(crate) fn every_config_in(dir: &Path) -> Self {
+        let stems: Vec<String> = model_configs(dir)
+            .unwrap_or_else(|e| panic!("list {}: {e}", dir.display()))
+            .iter()
+            .map(|p| stem_of(p).unwrap_or_else(|e| panic!("stem of {}: {e}", p.display())))
+            .flat_map(|stem| [format!("{stem}-text-only"), stem])
+            .collect();
+        Self::of_features(stems.iter().map(String::as_str))
+    }
+
+    /// This scope, with exactly `presets` forwarded — what a build's `quant/<preset>` features
+    /// forward through `SCRATCHY_QUANTS`. No presets is a dense-only build.
+    #[cfg(test)]
+    pub(crate) fn with_quants<'a>(self, presets: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            quants: Some(presets.into_iter().map(str::to_string).collect()),
+            ..self
+        }
+    }
 }
 
 /// [`load_dir`] for a `#[vision_forward]` crate's configs/ dir.
@@ -384,8 +479,9 @@ pub fn load_dir(
 pub fn load_dir_vision(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    scope: &BuildScope,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Vision, spec)
+    load_dir_mode(dir, ConfigMode::Vision, spec, scope)
 }
 
 /// Process-wide set of `SCRATCHY_BUILD_FILTER` tags that matched at least
@@ -490,6 +586,7 @@ fn load_dir_mode(
     dir: &Path,
     mode: ConfigMode,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    scope: &BuildScope,
 ) -> Result<Vec<ModelParams>, ConfigError> {
     init_stem_logging();
     if !dir.is_dir() {
@@ -547,9 +644,6 @@ fn load_dir_mode(
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
-    let feature_env_var = |feature: &str| -> String {
-        format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"))
-    };
     let model_feature_enabled = |arch_name: &str, stem: &str| -> bool {
         if let Some((_, vision_arch)) = VISION_ARCH_FOR_STEM.iter().find(|(s, _)| *s == stem) {
             let candidate = if arch_name == *vision_arch {
@@ -557,10 +651,9 @@ fn load_dir_mode(
             } else {
                 format!("{stem}-text-only")
             };
-            return std::env::var(feature_env_var(&candidate)).is_ok();
+            return scope.on(&candidate);
         }
-        std::env::var(feature_env_var(stem)).is_ok()
-            || std::env::var(feature_env_var(&format!("{arch_name}-{stem}"))).is_ok()
+        scope.on(stem) || scope.on(&format!("{arch_name}-{stem}"))
     };
     // A head (an arch registering under an identity of its own, `hf_architectures`) compiles beside
     // the targets it drafts for: one that ships inside its targets' checkpoints (`checkpoint_of`)
@@ -571,8 +664,8 @@ fn load_dir_mode(
     // drafts with by default (`published_as`), under `mtp` (`spec/mtp`) every one, which drafts
     // when `--speculative-model` names it. Either way the target's verify steps carry the head's
     // drafts (`spec_drafts`, the head's arch.json).
-    let mtp = std::env::var(feature_env_var("mtp")).is_ok();
-    let mtp_heads = std::env::var(feature_env_var("mtp-heads")).is_ok();
+    let mtp = scope.on("mtp");
+    let mtp_heads = scope.on("mtp-heads");
     let configs_root = dir
         .parent()
         .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
@@ -655,13 +748,7 @@ fn load_dir_mode(
     // hand-set env var. UNSET = legacy behaviour (every backend-applicable
     // preset emits), so un-migrated arch crates are unaffected; SET (even to an
     // empty list) = emit only the listed presets, i.e. dense-only by default.
-    let enabled_quants: Option<std::collections::HashSet<String>> =
-        std::env::var("SCRATCHY_QUANTS").ok().map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        });
+    let enabled_quants = scope.quants();
     // Whether `preset_name` both survived Cargo-feature quant scoping AND is
     // one this backend can actually claim. Shared by the dense-suppression
     // pre-check (below, before the base loop) and the overlay-synthesis
@@ -2874,24 +2961,77 @@ mod tests {
         assert!(stem_to_ident("").is_err());
     }
 
+    /// The presets of an arch's `quantizations.json` the backend this test binary is built for can
+    /// lower (`quant_preset_active`): metal claims the MLX affine presets and NVFP4; any other
+    /// backend claims every preset.
+    #[cfg(feature = "metal")]
+    const LLAMA_PRESETS: &[&str] = &["mlx-affine-b4-g64", "mlx-affine-b4-g64-qembed", "nvfp4"];
+    #[cfg(not(feature = "metal"))]
+    const LLAMA_PRESETS: &[&str] = &[
+        "awq-gemm",
+        "bnb-nf4-dq",
+        "ct-int4-sym",
+        "fp8-dynamic-per-tensor",
+        "fp8-static-per-tensor",
+        "ggml",
+        "gptq-sym",
+        "gptq-sym-desc_act",
+        "mlx-affine-b4-g64",
+        "mlx-affine-b4-g64-qembed",
+        "nvfp4",
+    ];
+    #[cfg(feature = "metal")]
+    const QWEN2_PRESETS: &[&str] = &["mlx-affine-b4-g64", "mlx-affine-b4-g64-qembed"];
+    #[cfg(not(feature = "metal"))]
+    const QWEN2_PRESETS: &[&str] = &[
+        "awq-gemm",
+        "bnb-nf4-dq",
+        "ct-int4-sym",
+        "fp8-dynamic-per-tensor",
+        "fp8-static-per-tensor",
+        "ggml",
+        "gptq-sym",
+        "mlx-affine-b4-g64",
+        "mlx-affine-b4-g64-qembed",
+    ];
+
+    /// What `dir`'s configs load as, under a build of every one of them: dense-only (no preset
+    /// forwarded), one variant per base; and with every preset the backend claims, each base's
+    /// variants exactly `<base>-<preset>` for `presets` — a selected preset replaces the dense
+    /// variant, it doesn't add to it. Returns the dense variants.
+    fn every_variant_of(dir: &Path, presets: &[&str]) -> Vec<ModelParams> {
+        let dense = load_dir(
+            dir,
+            &Default::default(),
+            &BuildScope::every_config_in(dir).with_quants([]),
+        )
+        .unwrap_or_else(|e| panic!("load {} dense: {e}", dir.display()));
+        let mut bases: Vec<&str> = dense.iter().map(|c| c.source_stem.as_str()).collect();
+        bases.sort();
+        let mut files: Vec<String> = model_configs(dir)
+            .expect("list configs")
+            .iter()
+            .map(|p| stem_of(p).expect("stem"))
+            .collect();
+        files.sort();
+        assert_eq!(bases, files, "every config loads as one dense variant");
+
+        let quantized = load_dir(dir, &Default::default(), &BuildScope::every_config_in(dir))
+            .unwrap_or_else(|e| panic!("load {} with every preset: {e}", dir.display()));
+        let mut got: Vec<&str> = quantized.iter().map(|c| c.source_stem.as_str()).collect();
+        got.sort();
+        let mut want: Vec<String> = bases
+            .iter()
+            .flat_map(|b| presets.iter().map(move |p| format!("{b}-{p}")))
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "every base × every preset this backend claims");
+        dense
+    }
+
     #[test]
     fn load_real_llama_configs() {
-        let dir = repo_model_archs("llama");
-        let configs = load_dir(&dir, &Default::default()).expect("load llama configs");
-
-        // 12 dense bases (9 Llama + 2 smollm2 + 1 tinyllama) ×
-        // (1 dense + 8 quant presets from `quantizations.json`:
-        //  awq-gemm, bnb-nf4-dq, gptq-sym, gptq-sym-desc_act,
-        //  ct-int4-sym, fp8-dynamic-per-tensor, fp8-static-per-tensor,
-        //  ggml) = 108. Individual sizes don't always have real HF
-        //  repos in every preset, but the compiler emits variants for
-        //  all of them so fingerprint dispatch stays open-set at
-        //  runtime.
-        assert_eq!(
-            configs.len(),
-            108,
-            "expected 108 Llama variants (12 bases × 9 variants)"
-        );
+        let configs = every_variant_of(&repo_model_archs("llama"), LLAMA_PRESETS);
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16
@@ -2920,17 +3060,7 @@ mod tests {
 
     #[test]
     fn load_real_qwen2_configs() {
-        let dir = repo_model_archs("qwen2");
-        let configs = load_dir(&dir, &Default::default()).expect("load qwen2 configs");
-        // 13 dense (11 text + qwen2-vl-2b + qwen2.5-vl-3b text
-        // decoders) × (1 dense + 7 presets: awq-gemm, bnb-nf4-dq,
-        // ct-int4-sym, gptq-sym, fp8-dynamic-per-tensor,
-        // fp8-static-per-tensor, ggml) = 104.
-        assert_eq!(
-            configs.len(),
-            104,
-            "expected 104 Qwen2 variants (13 bases × 8 variants)"
-        );
+        let configs = every_variant_of(&repo_model_archs("qwen2"), QWEN2_PRESETS);
 
         // Ground-truth check on Qwen2-0.5B:
         //   num_hidden_layers    = 24
@@ -2968,12 +3098,24 @@ mod tests {
         //      anchoring `vision_in_features` / `vision_rope_half_dim`)
         //      lands in `bounds`.
         let dir = repo_model_archs("qwen2-vl");
-        let configs =
-            load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl vision configs");
+        let configs = load_dir_vision(
+            &dir,
+            &load_arch_json(&dir).expect("qwen2-vl arch.json"),
+            &BuildScope::every_config_in(&dir),
+        )
+        .expect("load qwen2-vl vision configs");
+        let mut stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
+        stems.sort();
         assert_eq!(
-            configs.len(),
-            3,
-            "expected 3 Qwen2-VL vision variants (2b/7b/72b)"
+            stems,
+            [
+                "qwen2-vl-2b-instruct",
+                "qwen2-vl-2b-instruct-parity-tiny",
+                "qwen2-vl-2b-mlx",
+                "qwen2-vl-72b-instruct",
+                "qwen2-vl-7b-instruct",
+            ],
+            "every Qwen2-VL vision config loads"
         );
 
         // Per-variant `d_model` (= text-decoder hidden), vision tower
@@ -3086,7 +3228,12 @@ mod tests {
     #[test]
     fn bounds_are_sorted_by_stem_for_determinism() {
         let dir = repo_model_archs("llama");
-        let configs = load_dir(&dir, &Default::default()).unwrap();
+        let configs = load_dir(
+            &dir,
+            &Default::default(),
+            &BuildScope::every_config_in(&dir),
+        )
+        .unwrap();
         let stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
         let mut sorted = stems.clone();
         sorted.sort();
@@ -3862,7 +4009,7 @@ mod tests {
         assert_eq!(mp.scalars.get("attention_multiplier"), Some(&1.0));
         // Logit softcap is verbatim in-config.
         assert_eq!(mp.scalars.get("final_logit_softcapping"), Some(&30.0));
-        assert_eq!(mp.tie_word_embeddings, true);
+        assert!(mp.tie_word_embeddings);
     }
 
     /// End-to-end: the VERBATIM upstream `gemma-4-12b-it` config (the
@@ -3908,6 +4055,7 @@ mod tests {
         let result = load_dir(
             Path::new("/nonexistent/path/to/configs"),
             &Default::default(),
+            &BuildScope::of_features([]),
         );
         assert!(matches!(result, Err(ConfigError::NotADirectory(_))));
     }
@@ -3953,7 +4101,12 @@ mod tests {
         // hardcoded softmax scale in `AttentionViaCacheImpl`. The
         // Llama path has no such field today; lock that in.
         let dir = repo_model_archs("llama");
-        let configs = load_dir(&dir, &Default::default()).expect("load llama configs");
+        let configs = load_dir(
+            &dir,
+            &Default::default(),
+            &BuildScope::every_config_in(&dir),
+        )
+        .expect("load llama configs");
         for cfg in &configs {
             assert!(
                 !cfg.scalars.contains_key("query_pre_attn_scalar"),
@@ -3977,7 +4130,12 @@ mod tests {
         fs::write(tmp.join("model.json"), r#"{"num_hidden_layers": 4}"#).unwrap();
         fs::write(tmp.join("README.txt"), "ignore me").unwrap();
 
-        let configs = load_dir(&tmp, &Default::default()).unwrap();
+        let configs = load_dir(
+            &tmp,
+            &Default::default(),
+            &BuildScope::of_features(["model"]),
+        )
+        .unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].source_stem, "model");
 

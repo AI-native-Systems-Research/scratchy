@@ -8909,17 +8909,30 @@ mod chain_stage_tests {
     /// s stick, l stick, s table, l table, s-value out), each with a memory view and an
     /// access tile of its whole buffer, one load off the pick tile and one store through
     /// the out tile.
+    /// The six buffers' `[rows, cols]` of a [`chain_stage_program`], in parameter order.
+    struct ChainShapes {
+        pick: (i64, i64),
+        s: (i64, i64),
+        l: (i64, i64),
+        stab: (i64, i64),
+        ltab: (i64, i64),
+        out: (i64, i64),
+    }
+
     fn chain_stage_program(
-        pick_shape: (i64, i64),
-        s_shape: (i64, i64),
-        l_shape: (i64, i64),
-        stab_shape: (i64, i64),
-        ltab_shape: (i64, i64),
-        out_shape: (i64, i64),
+        shapes: ChainShapes,
         pad_vocab: u32,
         table_rows: u32,
         hidden: u32,
     ) -> KtirNode {
+        let ChainShapes {
+            pick: pick_shape,
+            s: s_shape,
+            l: l_shape,
+            stab: stab_shape,
+            ltab: ltab_shape,
+            out: out_shape,
+        } = shapes;
         let a: &'static Arena = Arena::global();
         let shape = |op: Operation<'static>, s: (i64, i64)| {
             op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![s.0, s.1])))
@@ -9065,7 +9078,17 @@ mod chain_stage_tests {
 
     fn whole_program() -> KtirNode {
         chain_stage_program(
-            PICK, USTICK, USTICK, TABLES, TABLES, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
+            ChainShapes {
+                pick: PICK,
+                s: USTICK,
+                l: USTICK,
+                stab: TABLES,
+                ltab: TABLES,
+                out: USTICK,
+            },
+            PAD_VOCAB,
+            TABLE_ROWS,
+            HIDDEN,
         )
     }
 
@@ -9115,12 +9138,14 @@ mod chain_stage_tests {
     #[test]
     fn a_pick_stick_off_the_argmax_class_is_refused() {
         let e = refusal(&chain_stage_program(
-            (1, 32),
-            USTICK,
-            USTICK,
-            TABLES,
-            TABLES,
-            USTICK,
+            ChainShapes {
+                pick: (1, 32),
+                s: USTICK,
+                l: USTICK,
+                stab: TABLES,
+                ltab: TABLES,
+                out: USTICK,
+            },
             PAD_VOCAB,
             TABLE_ROWS,
             HIDDEN,
@@ -9141,12 +9166,14 @@ mod chain_stage_tests {
     #[test]
     fn a_destination_off_the_ustick_class_is_refused_and_named() {
         let e = refusal(&chain_stage_program(
-            PICK,
-            (1, 64),
-            USTICK,
-            TABLES,
-            TABLES,
-            USTICK,
+            ChainShapes {
+                pick: PICK,
+                s: (1, 64),
+                l: USTICK,
+                stab: TABLES,
+                ltab: TABLES,
+                out: USTICK,
+            },
             PAD_VOCAB,
             TABLE_ROWS,
             HIDDEN,
@@ -9160,12 +9187,14 @@ mod chain_stage_tests {
             "names the class the destination must carry, got: {e}"
         );
         let e = refusal(&chain_stage_program(
-            PICK,
-            USTICK,
-            USTICK,
-            TABLES,
-            TABLES,
-            (1, 64),
+            ChainShapes {
+                pick: PICK,
+                s: USTICK,
+                l: USTICK,
+                stab: TABLES,
+                ltab: TABLES,
+                out: (1, 64),
+            },
             PAD_VOCAB,
             TABLE_ROWS,
             HIDDEN,
@@ -9186,7 +9215,17 @@ mod chain_stage_tests {
     fn a_table_off_the_staged_extent_is_refused_and_named() {
         let short = (TABLE_ROWS as i64 - 1, 32);
         let e = refusal(&chain_stage_program(
-            PICK, USTICK, USTICK, short, TABLES, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
+            ChainShapes {
+                pick: PICK,
+                s: USTICK,
+                l: USTICK,
+                stab: short,
+                ltab: TABLES,
+                out: USTICK,
+            },
+            PAD_VOCAB,
+            TABLE_ROWS,
+            HIDDEN,
         ));
         assert!(
             e.contains("the s decompose table t305 states [8256, 32]"),
@@ -9197,7 +9236,17 @@ mod chain_stage_tests {
             "names the payload's own stated extent, got: {e}"
         );
         let e = refusal(&chain_stage_program(
-            PICK, USTICK, USTICK, TABLES, short, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
+            ChainShapes {
+                pick: PICK,
+                s: USTICK,
+                l: USTICK,
+                stab: TABLES,
+                ltab: short,
+                out: USTICK,
+            },
+            PAD_VOCAB,
+            TABLE_ROWS,
+            HIDDEN,
         ));
         assert!(
             e.contains("the l decompose table t306 states [8256, 32]"),

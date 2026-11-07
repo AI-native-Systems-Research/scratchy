@@ -1741,7 +1741,10 @@ mod tests {
         }
     }"#;
 
-    fn optiq_per_module() -> (u32, u32, Vec<(String, (u32, u32))>) {
+    /// An affine quantization's `(bits, group_size)`.
+    type BitsGroup = (u32, u32);
+
+    fn optiq_per_module() -> (u32, u32, Vec<(String, BitsGroup)>) {
         let qc = QuantizationConfig::parse(&json(OPTIQ_SLICE))
             .unwrap()
             .expect("some");
@@ -1833,11 +1836,13 @@ mod tests {
         // in the DSL but share the on-disk leaf `self_attn.q_proj`. The
         // rename must be applied before matching the per-module key.
         let (_, _, per_module) = optiq_per_module();
-        let mut program = Program::default();
-        program.weight_leaf_renames = vec![(
-            "self_attn.q_proj_global".to_string(),
-            "self_attn.q_proj".to_string(),
-        )];
+        let program = Program {
+            weight_leaf_renames: vec![(
+                "self_attn.q_proj_global".to_string(),
+                "self_attn.q_proj".to_string(),
+            )],
+            ..Program::default()
+        };
         assert_eq!(
             per_module_lookup(
                 &program,
@@ -1891,9 +1896,10 @@ mod tests {
 
     /// The nemotron-h DSL names the MoE bundle `moe`; on disk it is `mixer`.
     fn nemotron_program() -> Program {
-        let mut program = Program::default();
-        program.weight_leaf_renames = vec![("moe".to_string(), "mixer".to_string())];
-        program
+        Program {
+            weight_leaf_renames: vec![("moe".to_string(), "mixer".to_string())],
+            ..Program::default()
+        }
     }
 
     /// ONE resolver gives each routed-expert projection its own width: the 4/2 split bundle of

@@ -112,23 +112,20 @@ mod parse_python {
         let py_text =
             std::fs::read_to_string(root.join("crates/models/arch/dsl/qwen3.py")).unwrap();
         let py_carrier = crate::parse_python::parse_python_file(&py_text).expect("python parse");
-        let py_tokens =
-            crate::compile_carrier(py_carrier, &configs_dir).expect("python-costume pipeline");
+        // ONE model, named: the scope a `-Fmodel/qwen3-0.6b` build selects. The pipeline's subject
+        // here is the emission, not the selection.
+        let scope = crate::config::BuildScope::of_features(["qwen3-0.6b"]);
+        let py_tokens = crate::compile_carrier_in(py_carrier, &configs_dir, &scope)
+            .expect("python-costume pipeline");
 
         let mut py_rendered = String::with_capacity(1 << 20);
         crate::render_tokens(py_tokens, &mut py_rendered);
 
-        // Non-vacuity guard: model selection reads `CARGO_FEATURE_*`
-        // ambient env vars (they belong to the scratchy-models crate,
-        // so they are only set when the test is invoked as
-        // `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test ...`). Without
-        // this check, an unscoped run emits an EMPTY token stream and
-        // the test passes having verified nothing.
+        // Non-vacuity guard: a scope that selects nothing emits an EMPTY token stream, and the
+        // test would pass having verified nothing.
         assert!(
             py_rendered.len() > 100_000,
-            "qwen3 emission is {} bytes — model selection filtered everything out. \
-             Run with `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test -p \
-             scratchy-forward-compiler-macro --features metal --lib parse_python`",
+            "qwen3 emission is {} bytes — the scope selected no model",
             py_rendered.len(),
         );
 
