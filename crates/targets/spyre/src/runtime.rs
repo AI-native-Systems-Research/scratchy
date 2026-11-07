@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 const _: () = {
     assert!(
         crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES
-            == flex_rs::multi_device::MAX_HDMA_MESSAGE_BYTES
+            == flex_rs::scheduler::P2P_RDMA_WINDOW_SIZE
     );
     assert!(
         crate::bundle_code::collective::FLIT_BYTES == flex_rs::control_block_wire::Flits::BYTES

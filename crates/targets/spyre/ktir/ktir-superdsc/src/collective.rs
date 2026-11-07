@@ -47,8 +47,10 @@ pub use scratchy_tp_world::{Build, PerRank, Rank, TpWorld, World, ranks};
 
 use crate::superdsc_opspec::{DataFormat, Fp16};
 
-/// The widest single p2p message, in bytes — the cross-card transfer cap (`CopyToRemote`'s
-/// validation; flex-rs `multi_device::MAX_HDMA_MESSAGE_BYTES`, which the target crate pins equal).
+/// The widest single p2p message, in bytes — the vendor's per-message RDMA window
+/// (`pf_runtime_scheduler.cpp:50`'s `P2P_RDMA_WINDOW_SIZE`, flex-rs
+/// `scheduler::P2P_RDMA_WINDOW_SIZE`, which the target crate pins equal): one F-send moves at most
+/// this many bytes, and a longer send is a run of messages.
 pub const RDMA_MESSAGE_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One flit, the unit every CB address and length field counts in (flex-rs
