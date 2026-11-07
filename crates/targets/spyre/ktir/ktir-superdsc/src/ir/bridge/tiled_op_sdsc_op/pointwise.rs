@@ -1541,6 +1541,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     layout: Option<&BundleLayout>,
     division: CoreDivision,
 ) -> Result<OpSpec, String> {
+    let out_row_window = out_offset.row_window();
     let (out_window, out_offset) = (
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
@@ -1611,12 +1612,27 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // integer: the window's planes are whole `[rows, 64]` planes of the parent at the parent's plane stride,
     // so the `[rows, cols]` stick-major view from its corner reaches the parent's bytes
     // (`tests/zz_a_whole_stick_column_window_is_stick_major.rs`).
+    //
+    // ⭐ A ROW BAND OF A TALLER PARENT ([`crate::addr::RowWindow`], carried as
+    // `EwOperand::row_window` / `out_row_window`) is a stick-major corner TOO, for the same
+    // reason at the parent's own height: the band's `[rows, cols]` planes are whole planes of
+    // the PARENT at the parent's plane stride, so the stick-major view from the band's corner
+    // reaches the parent's bytes — with the parent's row count declared as the `mb` device
+    // extent (see `mk` below) so the walk strides those planes at the parent's pitch, never at
+    // the band's own fewer rows'. And a multi-stick band must be rank-2 even at `rows == 1`:
+    // a rank-3 flat walk of a window wider than one stick mis-strides the parent's column
+    // planes, which is why `any_row_window` joins the `rows > 1` clause.
+    let any_row_window =
+        out_row_window.is_some() || inputs.iter().any(|i| i.row_window().is_some());
     let stickmajor = !head_major
-        && rows > 1
+        && (rows > 1 || any_row_window)
         && cols > Fp16::ELEMS_PER_STICK
-        && (out_window || block_aligned(out_offset))
+        && (out_window || out_row_window.is_some() || block_aligned(out_offset))
         && inputs.iter().all(|i| {
-            i.out_broadcast() || i.is_stick_major_window_for(rows) || block_aligned(i.col_offset())
+            i.out_broadcast()
+                || i.is_stick_major_window_for(rows)
+                || i.row_window().is_some()
+                || block_aligned(i.col_offset())
         });
     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
     // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
@@ -1726,54 +1742,71 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // `["mb", "y", "out"]`, the caller passing the scale in the same order via
     // [`EwOperand::scale_sprayed`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
-    let mk =
-        |is_input: bool, name: &str, scale: [Scale; 3], off: u32| -> Result<AnyTensorArg, String> {
-            if stickmajor {
-                Ok(AnyTensorArg::R2(
-                    TensorArg::<2>::new(
-                        is_input,
-                        name.to_string(),
-                        Role::Output,
-                        [scale[0], scale[1]],
-                        device_dims_r2,
-                        ["mb", "out"],
-                        "out",
-                        Allocation::Hbm,
-                    )
-                    .map_err(|e| e.0)?
-                    .with_offset(off)
-                    .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32)),
-                ))
-            } else {
-                Ok(AnyTensorArg::R3({
-                    let t = TensorArg::<3>::new(
-                        is_input,
-                        name.to_string(),
-                        Role::Output,
-                        scale,
-                        device_dims,
-                        match spray {
-                            Some(order) => order.layout(),
-                            None => ["mb", "out", "y"],
-                        },
-                        "out",
-                        Allocation::Hbm,
-                    )
-                    .map_err(|e| e.0)?
-                    .with_offset(off)
-                    .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32));
-                    // A spray's two row dims go to dxp innermost first.
+    //
+    // `dev_rows` declares a ROW-WINDOW operand's PARENT row count as the `mb` device extent
+    // (the caller passes it only when the window spans more than one stick — a one-stick window
+    // never crosses a column plane and needs no declaration): the band's bytes are a
+    // stick-major tensor of the parent's, so the walk must stride the parent's column planes
+    // at the parent's `parent_rows·lanes` pitch, never at the band's own fewer rows'.
+    let mk = |is_input: bool,
+              name: &str,
+              scale: [Scale; 3],
+              off: u32,
+              dev_rows: Option<u32>|
+     -> Result<AnyTensorArg, String> {
+        if stickmajor {
+            let t = TensorArg::<2>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [scale[0], scale[1]],
+                device_dims_r2,
+                ["mb", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(off)
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32));
+            let t = match dev_rows {
+                Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                None => t,
+            };
+            Ok(AnyTensorArg::R2(t))
+        } else {
+            Ok(AnyTensorArg::R3({
+                let t = TensorArg::<3>::new(
+                    is_input,
+                    name.to_string(),
+                    Role::Output,
+                    scale,
+                    device_dims,
                     match spray {
-                        Some(order) => t
-                            .with_device_order(order.device_layout())
-                            .map_err(|e| e.0)?,
-                        None => t,
-                    }
-                }))
-            }
-        };
+                        Some(order) => order.layout(),
+                        None => ["mb", "out", "y"],
+                    },
+                    "out",
+                    Allocation::Hbm,
+                )
+                .map_err(|e| e.0)?
+                .with_offset(off)
+                .with_df(df)
+                .with_row_blocked(matches!(df, Df::Fp32));
+                let t = match dev_rows {
+                    Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                    None => t,
+                };
+                // A spray's two row dims go to dxp innermost first.
+                match spray {
+                    Some(order) => t
+                        .with_device_order(order.device_layout())
+                        .map_err(|e| e.0)?,
+                    None => t,
+                }
+            }))
+        }
+    };
     let mut args = Vec::with_capacity(inputs.len() + 1);
     for inp in inputs {
         args.push(mk(
@@ -1784,6 +1817,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 None => inp.scale(),
             },
             inp.col_offset(),
+            inp.row_window()
+                .filter(|w| !w.spans_one_stick())
+                .map(|w| w.parent_rows()),
         )?);
     }
     // The OUTPUT may write to a COLUMN SLICE of its tensor (`out_offset` cols in →
@@ -1796,6 +1832,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
         o_name,
         [Scale::Active, Scale::Active, Scale::Active],
         out_offset,
+        out_row_window
+            .filter(|w| !w.spans_one_stick())
+            .map(|w| w.parent_rows()),
     )?);
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     Ok(OpSpec {
