@@ -9039,7 +9039,7 @@ mod elementwise_tests {
             pointwise_extents_agree(
                 "p",
                 "Elementwise(Mul)",
-                &reg(5, v, cols, false),
+                &[reg(5, v, cols, false)],
                 &node_out,
                 v
             )
