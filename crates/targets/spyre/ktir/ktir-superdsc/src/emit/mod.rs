@@ -3007,11 +3007,7 @@ fn own_extent_at(
     i: usize,
     phys_extent: &impl Fn(&'static str) -> i64,
 ) -> i64 {
-    let collapsed = !v
-        .scale
-        .get(i)
-        .copied()
-        .is_none_or(Scale::is_active);
+    let collapsed = !v.scale.get(i).copied().is_none_or(Scale::is_active);
     if collapsed && v.device_extent.get(i).copied().flatten().is_none() {
         1
     } else {

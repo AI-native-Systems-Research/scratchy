@@ -1377,7 +1377,7 @@ impl Scale {
     /// asks the same question, so it is a method on the sealed enum, exhaustive
     /// (a new variant is a compile error here, not a silently-wrong `matches!`
     /// at a site that forgot to grow).
-    pub const fn is_active(self) -> bool {
+    pub const fn is_active(&self) -> bool {
         match self {
             Scale::Active => true,
             Scale::RedNonStick | Scale::RedStick => false,
