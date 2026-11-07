@@ -11,7 +11,9 @@
 //! fails the build in the constructor that states it.
 
 pub use crate::KvCodec;
-use scratchy_tensors::typed::{Dim, DimN, Divides, FitsIn};
+use core::marker::PhantomData;
+use scratchy_tensors::typed::typenum::U2;
+use scratchy_tensors::typed::{Add, Dim, DimN, Divides, Equals, FitsIn, Mul};
 pub use scratchy_tensors::{MetalDtype, ScaleDtype};
 
 /// A positive count or extent: the constructor refuses zero.
@@ -307,6 +309,32 @@ impl HeadGeometry {
     }
 }
 
+/// One attention class's numbers, as types: `Kv` kv heads of `Hd` lanes, the leading `Rot` of
+/// them rotated, cached in pages of `Page` positions. [`ClassOf`] states its laws.
+pub struct Class<Kv, Hd, Rot, Page>(PhantomData<fn() -> (Kv, Hd, Rot, Page)>);
+
+/// An attention class over `Q` query heads, its laws its bounds: the kv heads divide the query
+/// heads and the rot window fits its head ([`HeadGeometry::of`]'s).
+pub trait ClassOf<Q: Dim> {
+    /// The rot window.
+    type Rot: Dim;
+    /// The elements one KV page holds: `Page · Kv · Hd`.
+    type PageElems: Dim;
+    /// The class as the value its readers take.
+    const GEOMETRY: HeadGeometry;
+}
+
+impl<Q: Dim, Kv: Divides<Q>, Hd: Dim, Rot: FitsIn<Hd>, Page: Dim> ClassOf<Q>
+    for Class<Kv, Hd, Rot, Page>
+where
+    Mul<Mul<Page, Kv>, Hd>: Dim,
+{
+    type Rot = Rot;
+    type PageElems = Mul<Mul<Page, Kv>, Hd>;
+    const GEOMETRY: HeadGeometry =
+        HeadGeometry::of::<Q, Kv, Hd, Rot>(BlockSize::new(<Page as DimN>::N));
+}
+
 /// An MRoPE section: the rotary pairs the temporal, height and width bands take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MropeSection([u32; 3]);
@@ -324,6 +352,35 @@ impl MropeSection {
     pub const fn pairs(self) -> u32 {
         self.0[0] + self.0[1] + self.0[2]
     }
+}
+
+/// A 1-D rope: no MRoPE section, which every rot window has.
+pub struct NoMrope;
+
+/// An MRoPE section as types: the pairs `T`, `H` and `W` its temporal, height and width bands take.
+pub struct Mrope<T, H, W>(PhantomData<fn() -> (T, H, W)>);
+
+/// A rope's MRoPE section over a class whose rot window is `Rot`, its law its bound: a section's
+/// pairs are half the window (`2 · (T + H + W) = Rot`), so its bands rotate every lane the window
+/// does and no other.
+pub trait MropeOf<Rot: Dim> {
+    /// The section, as the value its readers take.
+    const SECTION: Option<MropeSection>;
+}
+
+impl<Rot: Dim> MropeOf<Rot> for NoMrope {
+    const SECTION: Option<MropeSection> = None;
+}
+
+impl<T: Dim, H: Dim, W: Dim, Rot: Dim> MropeOf<Rot> for Mrope<T, H, W>
+where
+    Mul<Add<Add<T, H>, W>, U2>: Equals<Rot>,
+{
+    const SECTION: Option<MropeSection> = Some(MropeSection::new([
+        <T as DimN>::N,
+        <H as DimN>::N,
+        <W as DimN>::N,
+    ]));
 }
 
 /// Which attention class a layer is: a sliding-window layer reads the base class, a full layer the
@@ -387,9 +444,91 @@ pub struct Attention {
 }
 
 impl Attention {
-    /// The attention, refused when its classes disagree on the query heads (every layer projects
-    /// the same query heads; only the kv side differs by class), or when an MRoPE section does not
-    /// fill each class's rot window (its bands' pairs are half the window's lanes).
+    /// The attention of a model's numbers, as types: its laws are its bounds. Both classes project
+    /// the one `Q` query heads ([`ClassOf<Q>`]); their pages hold the same elements
+    /// (`G::PageElems: Equals<B::PageElems>`: the two classes' blocks share one physical pool,
+    /// vLLM's page-size unification); and an MRoPE section's pairs are half each class's rot
+    /// window ([`MropeOf`]). A model's emitted `FACTS` states its attention through this, so rustc
+    /// checks every law for every model.
+    ///
+    /// ```
+    /// # use scratchy_ir::model_facts::*;
+    /// # use scratchy_tensors::typed::typenum::{U2, U10, U11, U16, U64, U256};
+    /// const A: Attention = Attention::of::<
+    ///     U16,
+    ///     Class<U2, U256, U64, U16>,
+    ///     Class<U2, U256, U64, U16>,
+    ///     Mrope<U11, U11, U10>,
+    /// >(AttnScale::new(0.0625), None, None, RopePairing::Standard, KvRope::AtWrite);
+    /// assert_eq!(A.mrope().map(MropeSection::pairs), Some(32));
+    /// ```
+    ///
+    /// Gemma 4's global class, 2 kv heads of 512 against its sliding class's 8 of 256, holds the
+    /// same elements a page at twice the sliding page:
+    ///
+    /// ```
+    /// # use scratchy_ir::model_facts::*;
+    /// # use scratchy_tensors::typed::typenum::{U2, U8, U16, U32, U256, U512};
+    /// const A: Attention = Attention::of::<
+    ///     U32,
+    ///     Class<U8, U256, U256, U16>,
+    ///     Class<U2, U512, U512, U32>,
+    ///     NoMrope,
+    /// >(AttnScale::new(1.0), None, None, RopePairing::Proportional, KvRope::AtWrite);
+    /// assert_eq!(A.global().page().get(), 32);
+    /// ```
+    ///
+    /// A section whose pairs are not half the rot window rotates lanes the window does not (E0277):
+    ///
+    /// ```compile_fail,E0277
+    /// # use scratchy_ir::model_facts::*;
+    /// # use scratchy_tensors::typed::typenum::{U2, U16, U24, U64, U256};
+    /// const A: Attention = Attention::of::<
+    ///     U16,
+    ///     Class<U2, U256, U64, U16>,
+    ///     Class<U2, U256, U64, U16>,
+    ///     Mrope<U16, U24, U24>,
+    /// >(AttnScale::new(0.0625), None, None, RopePairing::Standard, KvRope::AtWrite);
+    /// ```
+    ///
+    /// and a global page that holds other than the sliding page's elements shares no pool with it
+    /// (E0277):
+    ///
+    /// ```compile_fail,E0277
+    /// # use scratchy_ir::model_facts::*;
+    /// # use scratchy_tensors::typed::typenum::{U2, U8, U16, U32, U256, U512};
+    /// const A: Attention = Attention::of::<
+    ///     U32,
+    ///     Class<U8, U256, U256, U16>,
+    ///     Class<U2, U512, U512, U16>,
+    ///     NoMrope,
+    /// >(AttnScale::new(1.0), None, None, RopePairing::Proportional, KvRope::AtWrite);
+    /// ```
+    pub const fn of<
+        Q: Dim,
+        B: ClassOf<Q>,
+        G: ClassOf<Q, PageElems: Equals<B::PageElems>>,
+        M: MropeOf<B::Rot> + MropeOf<G::Rot>,
+    >(
+        scale: AttnScale,
+        softcap: Option<SoftCap>,
+        window: Option<AttnWindow>,
+        pairing: RopePairing,
+        kv_rope: KvRope,
+    ) -> Self {
+        Self::new(
+            B::GEOMETRY,
+            G::GEOMETRY,
+            scale,
+            softcap,
+            window,
+            Rope::new(pairing, kv_rope, <M as MropeOf<B::Rot>>::SECTION),
+        )
+    }
+
+    /// The attention of values the fill and the tests read, refused when its classes disagree on
+    /// the query heads (every layer projects the same query heads; only the kv side differs by
+    /// class). Its other laws are [`Attention::of`]'s bounds, which every model's `FACTS` states.
     pub const fn new(
         base: HeadGeometry,
         global: HeadGeometry,
@@ -402,13 +541,6 @@ impl Attention {
             base.q_heads.get() == global.q_heads.get(),
             "Attention: both classes project the same query heads"
         );
-        if let Some(section) = rope.mrope {
-            assert!(
-                2 * section.pairs() == base.rot_dim.get()
-                    && 2 * section.pairs() == global.rot_dim.get(),
-                "Attention: an MRoPE section's pairs are half each class's rot window"
-            );
-        }
         Self {
             base,
             global,
@@ -553,10 +685,43 @@ pub struct Gdn {
 }
 
 impl Gdn {
-    /// The layers' geometry, refused unless the short convolution covers exactly its streams: the
-    /// q and k streams (`2 · k_heads · k_dim`) beside the v stream (`v_heads · v_dim`). Mamba-2's
-    /// conv covers its `x` (`heads · head_dim`) beside its B and C (`2 · groups · state`): the same
-    /// law under the reading above.
+    /// The layers' geometry of a model's numbers, as types: `KH` key heads of `KD` lanes, `VH`
+    /// value heads of `VD`, a short convolution `CK` wide over `CD` channels. Its law is its bound:
+    /// the convolution covers exactly its streams, the q and k streams (`2 · KH · KD`) beside the v
+    /// stream (`VH · VD`). Mamba-2's conv covers its `x` (`heads · head_dim`) beside its B and C
+    /// (`2 · groups · state`): the same law under the reading above. A model's emitted `FACTS`
+    /// states its layers through this, so rustc checks the law for every model.
+    ///
+    /// ```
+    /// # use scratchy_ir::model_facts::Gdn;
+    /// # use scratchy_tensors::typed::typenum::{U4, U16, U32, U128, U8192};
+    /// const G: Gdn = Gdn::of::<U16, U32, U128, U128, U4, U8192>();
+    /// assert_eq!(G.conv_dim().get(), 8192);
+    /// ```
+    ///
+    /// A convolution of another width than its streams' (E0277):
+    ///
+    /// ```compile_fail,E0277
+    /// # use scratchy_ir::model_facts::Gdn;
+    /// # use scratchy_tensors::typed::typenum::{U4, U16, U32, U128, U4096};
+    /// const G: Gdn = Gdn::of::<U16, U32, U128, U128, U4, U4096>();
+    /// ```
+    pub const fn of<KH: Dim, VH: Dim, KD: Dim, VD: Dim, CK: Dim, CD: Dim>() -> Self
+    where
+        Add<Mul<U2, Mul<KH, KD>>, Mul<VH, VD>>: Equals<CD>,
+    {
+        Self::new(
+            GdnHeads::new(<KH as DimN>::N),
+            GdnHeads::new(<VH as DimN>::N),
+            GdnHeadDim::new(<KD as DimN>::N),
+            GdnHeadDim::new(<VD as DimN>::N),
+            ConvKernel::new(<CK as DimN>::N),
+            ConvDim::new(<CD as DimN>::N as usize),
+        )
+    }
+
+    /// The layers' geometry of values the fill and the tests read. Its law is [`Gdn::of`]'s bound,
+    /// which every model's `FACTS` states.
     pub const fn new(
         k_heads: GdnHeads,
         v_heads: GdnHeads,
@@ -565,12 +730,6 @@ impl Gdn {
         conv_kernel: ConvKernel,
         conv_dim: ConvDim,
     ) -> Self {
-        let streams = 2 * k_heads.get() as usize * k_dim.get() as usize
-            + v_heads.get() as usize * v_dim.get() as usize;
-        assert!(
-            conv_dim.get() == streams,
-            "Gdn: the convolution covers the q, k and v streams side by side"
-        );
         Self {
             k_heads,
             v_heads,
@@ -1229,70 +1388,6 @@ mod tests {
     #[should_panic(expected = "AttnScale is finite")]
     fn a_nan_scale_is_refused() {
         AttnScale::new(f32::NAN);
-    }
-
-    /// Qwen3.5's section [11, 11, 10] is 32 pairs: a 64-lane rot window.
-    #[test]
-    fn an_mrope_section_fills_its_rot_window() {
-        let a = Attention::new(
-            geometry(16, 2, 256, 64),
-            geometry(16, 2, 256, 64),
-            AttnScale::new(0.0625),
-            None,
-            None,
-            Rope::new(
-                RopePairing::Standard,
-                KvRope::AtWrite,
-                Some(MropeSection::new([11, 11, 10])),
-            ),
-        );
-        assert_eq!(a.mrope().map(MropeSection::pairs), Some(32));
-    }
-
-    #[test]
-    #[should_panic(expected = "an MRoPE section's pairs are half each class's rot window")]
-    fn an_mrope_section_that_misses_its_rot_window_is_refused() {
-        Attention::new(
-            geometry(16, 2, 256, 64),
-            geometry(16, 2, 256, 64),
-            AttnScale::new(0.0625),
-            None,
-            None,
-            Rope::new(
-                RopePairing::Standard,
-                KvRope::AtWrite,
-                Some(MropeSection::new([16, 24, 24])),
-            ),
-        );
-    }
-
-    /// Qwen3.5's GDN: 16 key heads of 128 and 32 value heads of 128 convolve 2·2048 + 4096.
-    #[test]
-    fn a_gdn_convolution_covers_its_streams() {
-        let g = |conv_dim| {
-            Gdn::new(
-                GdnHeads::new(16),
-                GdnHeads::new(32),
-                GdnHeadDim::new(128),
-                GdnHeadDim::new(128),
-                ConvKernel::new(4),
-                ConvDim::new(conv_dim),
-            )
-        };
-        assert_eq!(g(8192).conv_dim().get(), 8192);
-    }
-
-    #[test]
-    #[should_panic(expected = "the convolution covers the q, k and v streams side by side")]
-    fn a_gdn_convolution_of_another_width_is_refused() {
-        Gdn::new(
-            GdnHeads::new(16),
-            GdnHeads::new(32),
-            GdnHeadDim::new(128),
-            GdnHeadDim::new(128),
-            ConvKernel::new(4),
-            ConvDim::new(8000),
-        );
     }
 
     /// A hybrid's attention layers, ascending, are a KV table.

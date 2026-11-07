@@ -128,6 +128,22 @@ impl ParamExpr {
         Ok(e)
     }
 
+    /// The expression as a dim, the one spelling the typed carrier and a model's `__dims` both
+    /// read: sums, products, quotients and literals. `None` for a difference or a root, a dim the
+    /// types cannot hold.
+    pub fn dim(&self) -> Option<crate::dim::Dim> {
+        use crate::dim::{Dim, canonical_add, canonical_mul};
+        Some(match self {
+            Self::Bound(b) => Dim::Bound(b.clone()),
+            Self::Lit(n) => Dim::Lit(*n),
+            Self::Mul(a, b) => canonical_mul(vec![a.dim()?, b.dim()?]),
+            Self::Div(a, b) => Dim::Div(Box::new(a.dim()?), Box::new(b.dim()?)),
+            Self::FloorDiv(a, b) => Dim::FloorDiv(Box::new(a.dim()?), Box::new(b.dim()?)),
+            Self::Add(a, b) => canonical_add(vec![a.dim()?, b.dim()?]),
+            Self::Sub(..) | Self::Sqrt(_) => return None,
+        })
+    }
+
     /// Its value under `env`.
     pub fn eval(&self, env: &BTreeMap<String, u64>) -> Result<u64, String> {
         Ok(match self {

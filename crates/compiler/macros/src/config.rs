@@ -127,7 +127,8 @@ pub struct ModelParams {
     pub expert_activation: ExpertActivation,
     /// Each bound the loader derived where the config states none, as the dim it derived it from
     /// (`head_dim` as `hidden_size / num_attention_heads`, `attn_q_dim` as
-    /// `num_attention_heads * head_dim`, …): the model's dims as types spell each so where it still
+    /// `num_attention_heads * head_dim`, an arch.json `expr` param such as `vision_head_dim` as
+    /// `vision_embed_dim / vision_num_heads`, …): the model's dims as types spell each so where it still
     /// evaluates to the bound's value, which makes its derivation's law (an exact quotient) a bound
     /// rustc checks.
     pub derived: BTreeMap<String, crate::dim::Dim>,
@@ -1722,11 +1723,12 @@ fn model_params_from_json(
     // Arch-declared `Params` schema (additive over the standard flat
     // harvest for decoder crates that need non-standard fields).
     let scheduled_layers = bounds.get("num_hidden_layers").copied();
-    spec.eval_params(json, &mut bounds)
-        .map_err(|reason| ConfigError::VisionDerivation {
+    derived.extend(spec.eval_params(json, &mut bounds).map_err(|reason| {
+        ConfigError::VisionDerivation {
             path: source_path.to_path_buf(),
             reason,
-        })?;
+        }
+    })?);
     // A schema that replaces the layer count leaves the block schedule another model's: an MTP
     // head's config is its target's verbatim, so its sets name the target's layers, not the head's.
     let own_layers = bounds.get("num_hidden_layers").copied() == scheduled_layers;
@@ -1850,11 +1852,12 @@ fn vision_params_from_json(
     // derived widths, the lot — is declared (typed, named) in the
     // crate's carrier mod and evaluated here against the verbatim
     // config. No family table, no generic derivation chain.
-    spec.eval_params(json, &mut bounds)
-        .map_err(|reason| ConfigError::VisionDerivation {
-            path: source_path.to_path_buf(),
-            reason,
-        })?;
+    let mut derived =
+        spec.eval_params(json, &mut bounds)
+            .map_err(|reason| ConfigError::VisionDerivation {
+                path: source_path.to_path_buf(),
+                reason,
+            })?;
 
     // Mirror of the decoder path's int/float double-counting: every
     // derived integer bound is also visible as a scalar, plus the
@@ -1908,7 +1911,7 @@ fn vision_params_from_json(
     }
 
     let expert_activation = ExpertActivation::of(json);
-    let derived = apply_generic_bound_defaults(&mut bounds);
+    derived.extend(apply_generic_bound_defaults(&mut bounds));
 
     Ok(ModelParams {
         name,
@@ -3331,6 +3334,28 @@ mod tests {
         let mp = model_params_from_json(&json, "s", &path, Vec::new(), &spec).expect("parse");
         assert_eq!(mp.bounds["mamba_conv_dim"], 10240);
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
+    }
+
+    /// A vision tower's `expr` params are derivations of the model's, as a decoder's `head_dim`
+    /// default is: qwen2.5-vl's `vision_head_dim` is the exact quotient of its embedding over its
+    /// heads, which `__dims` spells so rustc checks the division.
+    #[test]
+    fn a_vision_expr_param_is_recorded_as_its_derivation() {
+        use crate::dim::Dim;
+        let bound = |b: &str| Box::new(Dim::Bound(b.to_string()));
+        let path = repo_model_archs("qwen2-5-vl").join("qwen2.5-vl-3b-instruct.json");
+        let mp = load_file_declared_vision(&path).expect("parse");
+        assert_eq!(
+            mp.derived.get("vision_head_dim"),
+            Some(&Dim::Div(
+                bound("vision_embed_dim"),
+                bound("vision_num_heads")
+            ))
+        );
+        assert_eq!(
+            crate::shape::eval_closed_dim(&mp.derived["vision_head_dim"], &mp.bounds),
+            Some(mp.bounds["vision_head_dim"])
+        );
     }
 
     /// An arch compiles under its `arch-<name>` feature and a backend — the ONE law, no
