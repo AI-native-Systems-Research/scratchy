@@ -610,6 +610,26 @@ impl QueryRows {
     }
 }
 
+/// The rotary class a rope node binds: the extern it names — `rotary_local` is the BASE class,
+/// plain `rotary` the GLOBAL one. One reading for the K rope (`rope_append`) and the query's
+/// (`rope_query`), so the two cannot disagree about which table is which class.
+fn rope_class_of(node: &crate::fuf::FufNode) -> scratchy_subtile::subtile_ir::RopeClass {
+    let local = node.inputs.iter().any(|inp| {
+        matches!(
+            inp,
+            FufInput::Extern {
+                kind: ExternKind::RotaryLocal,
+                ..
+            }
+        )
+    });
+    if local {
+        scratchy_subtile::subtile_ir::RopeClass::Base
+    } else {
+        scratchy_subtile::subtile_ir::RopeClass::Global
+    }
+}
+
 /// The one model the bridge lowers: its config params and its typed facts
 /// travel together — they are the same model, and the bake holds both.
 pub struct BridgeModel<'a> {
@@ -978,15 +998,8 @@ pub fn lower_decode_to_wavefront(
                 // them directly (no in-graph Concat-tile -> no partitioner crash).
                 let q_cols = bx.out_cols(tile, 0, "rope q cols")?;
                 let k_cols = bx.out_cols(tile, 1, "rope k cols")?;
-                let local_rope = node.inputs.iter().any(|inp| {
-                    matches!(
-                        inp,
-                        FufInput::Extern {
-                            kind: ExternKind::RotaryLocal,
-                            ..
-                        }
-                    )
-                });
+                let rope = rope_class_of(node);
+                let local_rope = rope == scratchy_subtile::subtile_ir::RopeClass::Base;
                 // ⭐ THE HEAD DIM IS THE ROTARY CLASS'S OWN, NOT THE MODEL'S. A hybrid-attention
                 // arch (gemma-4) binds TWO rotary externs: `rotary_local` names the BASE class
                 // and plain `rotary` names the GLOBAL one (head_dim 512 where the base is 256).
@@ -997,11 +1010,6 @@ pub fn lower_decode_to_wavefront(
                 // global twin (its geometry IS the model's), and the facts' global class equals
                 // the base exactly when the two classes do.
                 let attention = attn()?;
-                let rope = if local_rope {
-                    scratchy_subtile::subtile_ir::RopeClass::Base
-                } else {
-                    scratchy_subtile::subtile_ir::RopeClass::Global
-                };
                 let head_dim = rope.head_dim(attention);
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
@@ -1181,24 +1189,14 @@ pub fn lower_decode_to_wavefront(
             }
             // rope_query(q, positions, rotary): the query's rotation alone — no K, no cache write.
             OpKind::RopeQuery => {
-                // ⛔ THE BASE CLASS, WHATEVER TABLE THE QUERY NAMES — the head dim this bridge has
-                // always given `rope_query` (the base class's), stated as the class it is. A query
-                // that names plain `rotary` on a hybrid model (gemma-4-assistant's global layers)
-                // therefore rotates at the base width; the class carries that fact rather than
-                // hiding it behind a bare number.
-                let rope = scratchy_subtile::subtile_ir::RopeClass::Base;
+                // The class of the table the query names, as a K rope's is: a query naming plain
+                // `rotary` on a hybrid model (gemma-4-assistant's global layers) rotates at the
+                // global class's head dim (512), not the base's (256).
+                let rope = rope_class_of(node);
+                let local_rope = rope == scratchy_subtile::subtile_ir::RopeClass::Base;
                 let head_dim = rope.head_dim(attn()?);
                 let q = bx.input_at(tile, 0)?;
                 let q_cols = bx.out_cols(tile, 0, "rope_query q cols")?;
-                let local_rope = node.inputs.iter().any(|inp| {
-                    matches!(
-                        inp,
-                        FufInput::Extern {
-                            kind: ExternKind::RotaryLocal,
-                            ..
-                        }
-                    )
-                });
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let idx = bx.push_op(
                     SubOp::rope_rotate(head_dim, rope),
