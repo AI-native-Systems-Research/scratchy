@@ -374,16 +374,21 @@ fn a_column_chunked_silumul_splices_through_the_door() {
 /// (M, N).
 const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096), (96, 4096)];
 
-/// Every `EwKind` the splice has a row for. The kinds the door refuses
-/// (Gelu/QuickGelu/GeluErf) and the kind the splice itself refuses (Relu2 —
-/// an arch using it fails the build at that row, by name) are absent: they
-/// have no descriptor chain, so a door comparison would pin nothing.
+/// Every `EwKind` the splice has a row for. The kinds the DDL has no primitive for
+/// (QuickGelu/GeluErf — the consumer's own `elementwise_op_func` refuses them by name) and
+/// the kind the splice itself refuses (Relu2 — an arch using it fails the build at that row,
+/// by name) are absent: they have no descriptor chain, so a door comparison would pin
+/// nothing. `Gelu` IS here: its kernel spells the tanh-form longhand, which the walk's gelu
+/// recogniser folds into the one `"gelu"` primitive — before that fold existed, the longhand
+/// reached the SILU recogniser's shared exp-island head and was refused there, which is why
+/// this list once excluded it.
 const EW_KINDS: &[EwKind] = &[
     EwKind::Add,
     EwKind::BiasAdd,
     EwKind::Mul,
     EwKind::Sub,
     EwKind::Silu,
+    EwKind::Gelu,
 ];
 
 /// The stem law the op_name carries (`add_s{id}`, `mul_s{id}`, ...; BiasAdd is
@@ -732,13 +737,27 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         EwKind::Mul => a.iter().zip(&b).map(|(x, y)| x * y).collect(),
         EwKind::Sub => a.iter().zip(&b).map(|(x, y)| x - y).collect(),
         EwKind::Silu => a.iter().map(|&x| x / (1.0 + (-x).exp())).collect(),
+        // The TANH form — the function `OpFunc::Gelu`'s polynomial and the longhand's sigmoid
+        // identity both state — over the same f16-scale values (the fixture's ±0.06 window keeps
+        // the whole run inside one f16 ulp of the reference either way).
+        EwKind::Gelu => a
+            .iter()
+            .map(|&x| {
+                // √(2/π) = (2/√π)·(1/√2), the std constants' own derivation, cast once to the
+                // reference's float type — not a 16-digit literal clippy must audit against
+                // f32's precision.
+                let k = (std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::FRAC_1_SQRT_2) as f32;
+                let u = k * (x + 0.044_715 * x * x * x);
+                0.5 * x * (1.0 + u.tanh())
+            })
+            .collect(),
         other => unreachable!("exec fixture for {other:?}"),
     };
 
     let mut session =
         scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
             .expect("build the one-program session");
-    let sources = if matches!(kind, EwKind::Silu) {
+    let sources = if matches!(kind, EwKind::Silu | EwKind::Gelu) {
         vec![(0u64, a, vec![m as usize, c as usize])]
     } else {
         vec![
@@ -3047,6 +3066,24 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
                 1,
                 "one chain per gained program (m={m} c={c})"
             );
+            // ⛔ THE GAIN LEG IS CLAIMED ON THE REAL SPLICED PROGRAM, at every row count — the
+            // one-row tile included, where the row's spray is extent-1, the producer folds the
+            // broadcast away, and only the leg's own `[1, cols]` shape states the row. A close
+            // as the identity here would flip every decode-bucket norm to the unit form and
+            // move the gained bundles (the g2bfp8 gate's measured diff).
+            assert!(
+                match gain {
+                    GainConvention::Scale => matches!(
+                        chains[0].gain,
+                        ktir_superdsc::emit::whole_function::GainLeg::Scale(_)
+                    ),
+                    GainConvention::OnePlusScale => matches!(
+                        chains[0].gain,
+                        ktir_superdsc::emit::whole_function::GainLeg::OnePlusScale(_)
+                    ),
+                },
+                "the real spliced {gain:?} program claims its gain row (m={m} c={c})"
+            );
             let sticks = rmsnorm_scalar_sticks(f.func.operations);
             assert_eq!(
                 sticks.len(),
@@ -3075,9 +3112,11 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
         }
     }
 
-    // The un-gained spelling: the door reads it through the per-op epsilon
-    // reader (one root, the addf carrying the eps splat), the emulator through
-    // the same scalar-chain walk — and the eps both see is the f16 image.
+    // The un-gained spelling: the door recognizes it as the SAME chain with the gain leg
+    // closed as the identity — one chain, `GainLeg::Identity`, its terminal the normalising
+    // multiply — and reads it through the per-op epsilon reader (one root, the addf carrying
+    // the eps splat), the emulator through the same scalar-chain walk — and the eps both see
+    // is the f16 image.
     for &(m, c) in SHAPES {
         let ir = rmsnormunit_ir(m, c);
         let node = &ir.nodes[0];
@@ -3088,6 +3127,16 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
             .as_ref()
             .expect("spliced op carries its program");
 
+        let chains = program_rmsnorm_chains(&f.func)
+            .unwrap_or_else(|e| panic!("door recognized the unit row m={m} c={c}: {}", e.message));
+        assert_eq!(chains.len(), 1, "one chain per unit program (m={m} c={c})");
+        assert!(
+            matches!(
+                chains[0].gain,
+                ktir_superdsc::emit::whole_function::GainLeg::Identity
+            ),
+            "the unit program's gain leg closes as the identity (m={m} c={c})"
+        );
         let eps = program_rmsnorm_eps(&f.func)
             .unwrap_or_else(|| panic!("door read the unit program's eps (m={m} c={c})"));
         assert_eq!(
@@ -3100,6 +3149,12 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
             sticks.len(),
             3,
             "the unit chain's three sticks (m={m} c={c})"
+        );
+        let consumed: HashSet<_> = chains[0].consumed.iter().copied().collect();
+        assert_eq!(
+            sticks.intersection(&consumed).count(),
+            3,
+            "the unit chain's sticks are its own interior (m={m} c={c})"
         );
     }
 

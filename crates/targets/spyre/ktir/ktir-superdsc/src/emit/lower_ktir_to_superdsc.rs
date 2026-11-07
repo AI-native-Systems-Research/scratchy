@@ -9499,8 +9499,6 @@ pub fn rmsnorm_unit(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    // x and the output — the parameters `KtirFunc::rmsnorm_unit` mints.
-    let (tensors, out) = split_out(name, r, layout, 1)?;
     let eps = program_rmsnorm_eps(&k.func).ok_or_else(|| Error {
         message: format!(
             "RmsNormUnit {name}: the program states no epsilon. `KtirFunc::rmsnorm_unit` splats \
@@ -9508,6 +9506,24 @@ pub fn rmsnorm_unit(
              const is resolved from that value, so a program without it cannot be lowered."
         ),
     })?;
+    rmsnorm_unit_at(name, eps, r, sym_id_base, layout)
+}
+
+/// The whole-function walk's door for the GAINLESS rmsnorm chain — the chain whose gain leg
+/// closed as the identity (`GainLeg::Identity`, see [`crate::emit::whole_function`]'s chain
+/// reader). The
+/// SAME body the per-`Program` door above emits, so the two doors cannot state different
+/// formulas for one norm; the only difference is where the epsilon comes from — the chain's
+/// own `arith.addf`, threaded here, rather than the program's single root.
+pub fn rmsnorm_unit_at(
+    name: &str,
+    eps: f32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters the chain's fused op mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
     let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
         message: format!(
             "RmsNormUnit {name}: epsilon {eps}, read off the program, is absent from \
