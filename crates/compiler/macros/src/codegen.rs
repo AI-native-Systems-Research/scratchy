@@ -4722,9 +4722,18 @@ impl ModelDims {
     /// reads, each a marker too, so the derivation's law is the type's: `head_dim` derived as
     /// `hidden_size / num_attention_heads` is that exact quotient, which rustc refuses where the
     /// heads do not divide the width. A derivation the bound's value is no longer (a later step
-    /// restated it) is not the bound's, and its number is stated instead.
+    /// restated it) is not the bound's, and its number is stated instead. Every bound the loader
+    /// derived is declared, whether or not a handle names it (`vision_head_dim` as
+    /// `vision_embed_dim / vision_num_heads`), so each derivation's law is a type of the model's.
     pub(crate) fn module(&self, model: &ModelParams) -> Result<TokenStream, String> {
         let mut named = self.bounds.clone();
+        named.extend(
+            model
+                .derived
+                .keys()
+                .filter(|b| model.bounds.contains_key(*b))
+                .cloned(),
+        );
         let mut todo: Vec<String> = named.iter().cloned().collect();
         let mut markers = std::collections::BTreeMap::new();
         let mut spelled = false;
@@ -8086,9 +8095,10 @@ fn kv_codec_for(
 }
 
 /// A canonical's facts as the expression its generated `CanonicalParams::FACTS` states: every
-/// group through its own constructor (a head geometry through `HeadGeometry::of`, its laws bounds on
-/// its numbers as types), so the emitted const re-checks each law when rustc evaluates
-/// it. The one serializer of the value the fill built (and the metal bake read).
+/// group through its own constructor (an attention through `Attention::of`, a GDN through
+/// `Gdn::of`: their laws bounds on their numbers as types), so the emitted const re-checks each
+/// law when rustc type-checks it. The one serializer of the value the fill built (and the metal
+/// bake read).
 fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     use scratchy_ir::model_facts::{
         Attention, AttnClass, KvRope, RopePairing, TargetRouting, TargetWidth, Vision,
@@ -8106,23 +8116,21 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
         Some(t) => quote! { ::core::option::Option::Some(#t) },
         None => quote! { ::core::option::Option::None },
     };
-    let geometry = |g: scratchy_ir::model_facts::HeadGeometry| {
-        let n = |v: u32| unsigned_tokens(u64::from(v));
-        let (q, kv, hd, rot, page) = (
-            n(g.q_heads().get()),
+    let n = |v: u32| unsigned_tokens(u64::from(v));
+    let class = |g: scratchy_ir::model_facts::HeadGeometry| {
+        let (kv, hd, rot, page) = (
             n(g.kv_heads().get()),
             n(g.head_dim().get()),
             n(g.rot_dim().get()),
-            u32_(g.page().get()),
+            n(g.page().get()),
         );
-        quote! {
-            #m::HeadGeometry::of::<#q, #kv, #hd, #rot>(#m::BlockSize::new(#page))
-        }
+        quote! { #m::Class<#kv, #hd, #rot, #page> }
     };
     let attention = opt(f.attention().map(|a: Attention| {
-        let (base, global) = (
-            geometry(a.class(AttnClass::Sliding)),
-            geometry(a.class(AttnClass::Full)),
+        let (q, base, global) = (
+            n(a.q_heads().get()),
+            class(a.class(AttnClass::Sliding)),
+            class(a.class(AttnClass::Full)),
         );
         let scale = f32_(a.scale().get());
         let softcap = opt(a.softcap().map(|c| {
@@ -8141,18 +8149,20 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             KvRope::AtWrite => quote! { #m::KvRope::AtWrite },
             KvRope::OnRead => quote! { #m::KvRope::OnRead },
         };
-        let mrope = opt(a.mrope().map(|s| {
-            let s = s.get().map(u32_);
-            quote! { #m::MropeSection::new([#(#s),*]) }
-        }));
+        let mrope = match a.mrope() {
+            Some(s) => {
+                let s = s.get().map(n);
+                quote! { #m::Mrope<#(#s),*> }
+            }
+            None => quote! { #m::NoMrope },
+        };
         quote! {
-            #m::Attention::new(
-                #base,
-                #global,
+            #m::Attention::of::<#q, #base, #global, #mrope>(
                 #m::AttnScale::new(#scale),
                 #softcap,
                 #window,
-                #m::Rope::new(#pairing, #kv_rope, #mrope),
+                #pairing,
+                #kv_rope,
             )
         }
     }));
@@ -8189,23 +8199,14 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     }));
     let gdn = opt(f.gdn().map(|g| {
         let (kh, vh, kd, vd, ck, cd) = (
-            u32_(g.k_heads().get()),
-            u32_(g.v_heads().get()),
-            u32_(g.k_dim().get()),
-            u32_(g.v_dim().get()),
-            u32_(g.conv_kernel().get()),
-            usize_(g.conv_dim().get()),
+            n(g.k_heads().get()),
+            n(g.v_heads().get()),
+            n(g.k_dim().get()),
+            n(g.v_dim().get()),
+            n(g.conv_kernel().get()),
+            unsigned_tokens(g.conv_dim().get() as u64),
         );
-        quote! {
-            #m::Gdn::new(
-                #m::GdnHeads::new(#kh),
-                #m::GdnHeads::new(#vh),
-                #m::GdnHeadDim::new(#kd),
-                #m::GdnHeadDim::new(#vd),
-                #m::ConvKernel::new(#ck),
-                #m::ConvDim::new(#cd),
-            )
-        }
+        quote! { #m::Gdn::of::<#kh, #vh, #kd, #vd, #ck, #cd>() }
     }));
     let drafter = opt(f.drafter().map(|d| {
         let (g, r, t) = (
@@ -8658,15 +8659,9 @@ pub(crate) fn fill_canonical_params(
     let resolved_global_block_size: u32 = if uniform_page {
         base_block_size
     } else if global_per_token < sliding_per_token {
-        // Global is the smaller page → scale its block_size up (gemma4).
-        assert!(
-            sliding_per_token.is_multiple_of(global_per_token),
-            "model `{}`: sliding page {} not divisible by global page {} — \
-             cannot page-unify by scaling block_size (vLLM raises the same)",
-            model.source_stem,
-            sliding_per_token,
-            global_per_token,
-        );
+        // Global is the smaller page → scale its block_size up (gemma4). The two classes' pages
+        // then hold the same elements: `Attention::of`'s bound, which the model's `FACTS` states,
+        // so a ratio with a remainder (vLLM raises the same) fails the model's build (E0277).
         base_block_size * (sliding_per_token / global_per_token)
     } else {
         // Sliding is the smaller page — vLLM would scale BLOCK_SIZE (sliding)

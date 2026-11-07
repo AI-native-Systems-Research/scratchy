@@ -3,7 +3,7 @@
 //! not derivable from a verbatim HF `config.json` plus the DSL body.
 //!
 //! This module holds the RESOLVED form ([`DeclaredArchSpec`]) plus the
-//! two evaluators that turn it into bounds — [`eval_expr`] for the
+//! two evaluators that turn it into bounds — `ParamExpr` for the
 //! `expr` arithmetic and [`json_path`] for dotted config lookups. It
 //! does no parsing of its own: the declarations are read from
 //! `configs/<arch>/arch.json` by [`crate::config::load_arch_json`].
@@ -169,11 +169,16 @@ impl DeclaredArchSpec {
     /// bound already present (the flat `.overrides.json` drift
     /// surface) wins over the schema's value, and is visible to later
     /// `#[expr]` fields.
+    ///
+    /// Returns each bound an `expr` derived, as the dim it derived it from (`ParamExpr::dim`; a
+    /// difference or a root is no dim, and is stated as its number), so a model's `__dims` spells
+    /// it as its derivation and the derivation's law is the type's.
     pub fn eval_params(
         &self,
         json: &serde_json::Value,
         bounds: &mut std::collections::BTreeMap<String, u64>,
-    ) -> Result<(), String> {
+    ) -> Result<std::collections::BTreeMap<String, crate::dim::Dim>, String> {
+        let mut derived = std::collections::BTreeMap::new();
         for f in &self.params {
             if bounds.contains_key(&f.name) && !f.replaces {
                 continue;
@@ -183,8 +188,15 @@ impl DeclaredArchSpec {
                     .and_then(|v| v.as_u64())
                     .or(*default)
                     .ok_or_else(|| format!("params field `{}`: config has no `{path}`", f.name))?,
-                ParamSource::Expr(e) => eval_expr(e, bounds)
-                    .map_err(|err| format!("params field `{}`: {err}", f.name))?,
+                ParamSource::Expr(e) => {
+                    let e = crate::hf_config::ParamExpr::parse(e)
+                        .map_err(|err| format!("params field `{}`: {err}", f.name))?;
+                    if let Some(dim) = e.dim() {
+                        derived.insert(f.name.clone(), dim);
+                    }
+                    e.eval(bounds)
+                        .map_err(|err| format!("params field `{}`: {err}", f.name))?
+                }
                 ParamSource::Value(v) => *v,
                 ParamSource::LenOf(path) => json_path(json, path)
                     .and_then(|v| v.as_array())
@@ -195,13 +207,8 @@ impl DeclaredArchSpec {
             };
             bounds.insert(f.name.clone(), v);
         }
-        Ok(())
+        Ok(derived)
     }
-}
-
-/// An `#[expr]` field's value: the shared grammar (`crate::hf_config::ParamExpr`), evaluated.
-fn eval_expr(src: &str, env: &std::collections::BTreeMap<String, u64>) -> Result<u64, String> {
-    crate::hf_config::ParamExpr::parse(src)?.eval(env)
 }
 
 #[cfg(test)]
@@ -239,6 +246,9 @@ mod tests {
         let mut env = std::collections::BTreeMap::new();
         env.insert("a".to_string(), 1152u64);
         env.insert("b".to_string(), 16u64);
+        let eval_expr = |src: &str, env: &std::collections::BTreeMap<String, u64>| {
+            crate::hf_config::ParamExpr::parse(src)?.eval(env)
+        };
         assert_eq!(eval_expr("a / b", &env).unwrap(), 72);
         assert_eq!(eval_expr("a / b / 2", &env).unwrap(), 36);
         assert_eq!(eval_expr("3 * (a + b)", &env).unwrap(), 3504);

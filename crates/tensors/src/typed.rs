@@ -156,6 +156,38 @@ pub trait FitsIn<A>: Dim {}
 
 impl<A: Dim, R: Dim> FitsIn<A> for R where R::Num: typenum::IsLessOrEqual<A::Num, Output: Holds> {}
 
+/// A number that is true: the outcome of an equality that holds.
+#[diagnostic::on_unimplemented(
+    message = "the two dims are not equal",
+    label = "a dim that must equal another differs from it"
+)]
+pub trait Same {}
+
+impl Same for typenum::B1 {}
+
+/// `Self` equals `A`: their numbers are one number, however each is spelled.
+///
+/// ```
+/// # use scratchy_tensors::typed::{Add, Equals, Mul};
+/// # use scratchy_tensors::typed::typenum::{U2, U3, U4, U10};
+/// fn equal<R: Equals<A>, A>() {}
+/// equal::<Add<Mul<U2, U3>, U4>, U10>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// # use scratchy_tensors::typed::{Add, Equals, Mul};
+/// # use scratchy_tensors::typed::typenum::{U2, U3, U4, U11};
+/// fn equal<R: Equals<A>, A>() {}
+/// equal::<Add<Mul<U2, U3>, U4>, U11>();
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not equal `{A}`",
+    label = "a dim that must equal another differs from it"
+)]
+pub trait Equals<A>: Dim {}
+
+impl<A: Dim, R: Dim> Equals<A> for R where R::Num: typenum::IsEqual<A::Num, Output: Same> {}
+
 /// The quotient `A / B`, exact: a `B` that does not divide `A` has none (E0277).
 pub struct Div<A, B>(PhantomData<(A, B)>);
 
