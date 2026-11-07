@@ -9861,6 +9861,184 @@ mod elementwise_tests {
         );
     }
 
+    // ── THE SCALARMUL'S OWN TWO FORMS — the #1112 row-split view leak, restated at the
+    // multiply-by-a-scalar ────────────────────────────────────────────────────────────────────
+    //
+    // ⛔ THE SAME LAW THE ELEMENTWISE DOOR STATES, AT THE OP WHOSE SECOND OPERAND IS A SCALAR. A
+    // row-split chain's ScalarMul sweeps a row band of a taller value — the head block `[0,42)`
+    // of a 64-row view, the tail `[42,64)` — and the door's input is now TWO FORMS picked by the
+    // input's frame: the whole view a column window (the bytes every whole-tensor program has
+    // always baked), the band a `RowWindow` through `band_corner` CARRYING the parent's row
+    // count. These fixtures pin the matrix: both bands declare the parent and sit at their own
+    // corners, the whole input keeps the column-window form, and a band that is not the op's
+    // whole row sweep is refused by name.
+
+    /// ⭐ THE HEAD BAND — a split piece's head block, `[0,42)` of a `[64, ·]` value, under a
+    /// whole `[42, ·]` output: the input DECLARES the parent (its walk pinned to `[64, cols]`,
+    /// so the door strides the parent's column planes at the parent's pitch) and sits at corner
+    /// 0. This is the frame the `v_rows == rows` clause exists for: a row-0 window of a TALLER
+    /// parent must never take the column-window form, whose corner math strides the planes at
+    /// the OP's own rows — the head-block mis-stride, unreachable here.
+    #[test]
+    fn a_head_band_scalarmul_declares_the_parent() {
+        let cols = 4096u32;
+        let r = vec![split(5, 64, 0, 42, cols), reg(7, 42, cols, true)];
+        let mut sym = 0i64;
+        let ops = scalarmul_scaled(
+            "scalarmul_s2",
+            &ScaleSource::Bound { tid: 99 },
+            None,
+            &r,
+            &mut sym,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("the head band lowers: {}", e.message));
+        assert_eq!(ops.len(), 1, "one descriptor, not a decomposition");
+        assert_eq!(ops[0].op_name, "scalarmul_o7");
+        assert_eq!(
+            walk_of(&ops[0], 0),
+            serde_json::json!([64, cols]),
+            "the band input walks the PARENT's rows"
+        );
+        assert_eq!(bound_at(&ops[0], "t5"), 0, "the head band's corner is 0");
+        assert_eq!(
+            bound_at(&ops[0], "t7"),
+            0,
+            "the output piece writes its base"
+        );
+    }
+
+    /// ⭐ THE TAIL BAND — `[42,64)` of the same `[64, ·]` value under a whole `[22, ·]` output:
+    /// the same parent declaration, and the corner at the parent's OWN nest — `rc_of(64, ·, 42,
+    /// 0)` = 42·64 — never the op-rows pitch, which would read the head's rows as the tail's.
+    #[test]
+    fn a_tail_band_scalarmul_sits_at_the_parent_s_own_corner() {
+        let cols = 4096u32;
+        let r = vec![split(5, 64, 42, 22, cols), reg(7, 22, cols, true)];
+        let mut sym = 0i64;
+        let ops = scalarmul_scaled(
+            "scalarmul_s3",
+            &ScaleSource::Bound { tid: 99 },
+            None,
+            &r,
+            &mut sym,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("the tail band lowers: {}", e.message));
+        assert_eq!(ops.len(), 1, "one descriptor, not a decomposition");
+        assert_eq!(
+            walk_of(&ops[0], 0),
+            serde_json::json!([64, cols]),
+            "the tail band walks the PARENT's rows too"
+        );
+        assert_eq!(
+            bound_at(&ops[0], "t5"),
+            42 * 64,
+            "the tail band's corner is the parent's own `rc_of` nest: 42·64 = {}",
+            42 * 64
+        );
+    }
+
+    /// ⭐ THE WHOLE INPUT KEEPS THE COLUMN-WINDOW FORM — the control: a whole-view input under a
+    /// same-rows output reconstructs (no parent declaration crept in) and sits at corner 0, the
+    /// bytes every whole-tensor ScalarMul has always baked.
+    #[test]
+    fn a_whole_scalarmul_input_keeps_the_column_window_form() {
+        let cols = 4096u32;
+        let r = vec![reg(5, 42, cols, false), reg(7, 42, cols, true)];
+        let mut sym = 0i64;
+        let ops = scalarmul_scaled(
+            "scalarmul_s4",
+            &ScaleSource::Bound { tid: 99 },
+            None,
+            &r,
+            &mut sym,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("the whole family lowers: {}", e.message));
+        assert_eq!(ops.len(), 1, "one descriptor, not a decomposition");
+        assert_eq!(
+            walk_of(&ops[0], 0),
+            serde_json::json!([-1, -1]),
+            "a whole value reconstructs — no parent declaration"
+        );
+        assert_eq!(
+            bound_at(&ops[0], "t5"),
+            0,
+            "the whole input sits at its base"
+        );
+    }
+
+    /// ⛔ THE NEAR-MISS — a band that sweeps fewer rows than the op is a different computation
+    /// wearing the op's name: refused at `band_corner`'s own law, naming the tensor and the
+    /// sweep.
+    #[test]
+    fn a_scalarmul_band_must_state_the_op_s_whole_row_sweep() {
+        let cols = 4096u32;
+        let r = vec![split(5, 64, 0, 21, cols), reg(7, 42, cols, true)];
+        let mut sym = 0i64;
+        let Err(e) = scalarmul_scaled(
+            "scalarmul_s5",
+            &ScaleSource::Bound { tid: 99 },
+            None,
+            &r,
+            &mut sym,
+            None,
+        ) else {
+            panic!("a band must state the op's whole row sweep");
+        };
+        assert!(e.message.contains("t5"), "names the tensor: {}", e.message);
+        assert!(
+            e.message.contains("sweeps 42 rows"),
+            "names the sweep: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE GATHERED TABLE IS NOT A BAND — the near-miss on the MOVED guard. The split above is
+    /// guard-free now (the dense arms place the input's row corner per-operand), so the row-corner
+    /// refusal the split used to carry travels WITH the arm that needs it: the gathered table is
+    /// read at the BUFFER BASE (`In::full`, the idx→address program walking its rows from the
+    /// base), and a band table there would gather the HEAD's rows as the band's — silently, with a
+    /// clean bake. Refused by name, the same `base_addressed` text the split's guard stated before
+    /// the two-form door existed, so nothing the old door refused is admitted by the new one.
+    #[test]
+    fn a_gathered_scalarmul_table_must_be_a_whole_tensor() {
+        let cols = 4096u32;
+        let r = vec![
+            split(5, 64, 42, 22, cols),
+            reg(7, 22, cols, true),
+            reg(9, 22, 1, false),
+        ];
+        let g = Gather {
+            index_tid: 9,
+            value_tid: 5,
+            entries: 22,
+            first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+            // This body never reads the gather's SSA identities (they are the walk's join keys);
+            // the fixture states the door's own contract — index, table, entry count.
+            tile: ktir_core::ir::Ssa(0),
+            load: ktir_core::ir::Ssa(1),
+            via: None,
+        };
+        let mut sym = 0i64;
+        let Err(e) = scalarmul_scaled(
+            "scalarmul_s6",
+            &ScaleSource::Bound { tid: 99 },
+            Some(g),
+            &r,
+            &mut sym,
+            None,
+        ) else {
+            panic!("a gathered table must be a whole tensor — In::full reads the buffer base");
+        };
+        assert!(
+            e.message.contains("input 0 t5") && e.message.contains("row corner 42"),
+            "names the operand and its corner: {}",
+            e.message
+        );
+    }
+
     /// ⭐ THE CONTROL: chunk 0 — corner 0 on every operand — still takes the SEEDED emission,
     /// byte-identical to every whole-tensor program this crate has ever baked. The offset is the
     /// only thing the chunked arm adds, so a corner-free program must not change form: the seeded
@@ -10841,14 +11019,23 @@ fn scalarmul_scaled<T: crate::collective::Tp>(
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
     // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
-    // than by relaxing the count. See [`split_out_excluding`]. A BOUND scale joins the skip list for
+    // than by relaxing the count. See [`split_regions`]. A BOUND scale joins the skip list for
     // the same reason (its `[1,1]` region is not tensor arity either); a registry slot needs no skip
-    // because `split_out_excluding` already drops reserved scale tids.
+    // because the split already drops reserved scale tids.
     let mut skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
     if let ScaleSource::Bound { tid } = scale {
         skip.push(*tid);
     }
-    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
+    // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD — `elementwise`'s own route (its own comment at the
+    // `split_regions` call): the dense arms below place the input's row corner per-operand (the
+    // two-form door), so which operands are inputs is a fact about the parameter list, not about
+    // how any one arm addresses them. The arms that CANNOT carry a row corner keep the guard, by
+    // name, where they are taken — the OUTPUT (its corner is `chunk_window`'s column window, and
+    // the out handle `rb` names the buffer base) and the GATHERED TABLE (`In::full`, the gather
+    // walking rows of it from the base) — so nothing that would have been refused before is
+    // silently mis-addressed now. Every other body keeps `split_out_excluding`'s guard.
+    let (ins, out) = split_regions(name, r, layout, 1, &skip)?;
+    base_addressed(name, &out, "output")?;
     let scale_tid = match scale {
         ScaleSource::Registry { slot } => *slot,
         ScaleSource::Bound { tid } => *tid,
@@ -10908,10 +11095,35 @@ fn scalarmul_scaled<T: crate::collective::Tp>(
     let x_h = rb(&x, rows, store_cols);
     let out_h = rb(&out_name, rows, store_cols);
     let scale_h = rbo(&scale_name);
-    // `In::col_window` at corner 0 is field for field `In::full` in what it emits (corner 0 is a whole-block
-    // shift, stick-major either way), so a whole-tensor ScalarMul (piece 0, and every node narrower than one
-    // tiling block) emits the bytes it always did.
-    let inputs = [In::col_window(&x_h, corner).ew(), In::scalar(&scale_h).ew()];
+    // ⭐ TWO FORMS, ONE OP, PICKED BY THE INPUT'S FRAME — `elementwise`'s own law (the #1112
+    // row-split view leak, restated at the multiply-by-a-scalar). A WHOLE input — row corner 0
+    // and the view at the op's own row count — is a whole-stick COLUMN window of a same-rows
+    // stick-major parent: `In::col_window` at the shared column corner, which at corner 0 is
+    // field for field `In::full` (a whole-block shift, stick-major either way), so a
+    // whole-tensor ScalarMul (piece 0, and every node narrower than one tiling block) emits
+    // the bytes it always did. Any other input is a BAND — a row band of a taller view, at
+    // row 0 of a taller parent (a split piece's head block) or at a nonzero row corner (the
+    // tail) — and is an `In::row_window` through `band_corner`: the same rectangle at
+    // `(r_start, c_start)` of the parent, CARRYING the parent's row count so the door declares
+    // it (`device_extent`) and strides the parent's column planes at the parent's pitch, never
+    // at the op's own rows. The `v_rows == rows` clause is what keeps the head-block
+    // mis-stride unreachable: a row-0 window of a TALLER parent can never take the column
+    // window form here.
+    //
+    // ⭐ AND THE BAND HANDLE DECLARES THE PARENT'S OWN VIEW, `[v_rows, v_cols]` — the storage
+    // the corner arithmetic (`band_corner` over `rc_of`'s nest) addresses within — never the
+    // op's `[rows, store_cols]`: a piece-rows declaration makes the band's own corner
+    // past-the-end, which the operand mint refuses. The WHOLE form keeps the store-width
+    // handle it always had (the padded-logits law above), so the ordinary case's bytes do not
+    // move.
+    let x_whole = ins[0].r_start == 0 && ins[0].v_rows == rows;
+    let x_band_h = rb(&x, ins[0].v_rows, ins[0].v_cols);
+    let x_in = if x_whole {
+        In::col_window(&x_h, corner).ew()
+    } else {
+        In::row_window(&x_band_h, band_corner(name, rows, &ins[0], Df::Fp16)?).ew()
+    };
+    let inputs = [x_in, In::scalar(&scale_h).ew()];
     // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
     let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
@@ -10928,8 +11140,12 @@ fn scalarmul_scaled<T: crate::collective::Tp>(
     // than the node has rows would be described with an index vector of the WRONG LENGTH — and the
     // length is what the idx→address program iterates.
     if let Some(g) = gather {
-        // A gathered operand is addressed through its index from the table's BASE, so a column window
-        // has no place on it.
+        // A gathered operand is addressed through its index from the table's BASE — the whole-buffer
+        // `In::full` below — so neither a column window nor a row corner has any place on it. The
+        // column refusal is this arm's own; the row one is `base_addressed`'s, kept here by name
+        // because the split above no longer carries it (the dense arms place the corner; this arm
+        // cannot).
+        base_addressed(name, &ins[0], "input 0")?;
         if out.c_start != 0 {
             return err(format!(
                 "{name}: a gathered ScalarMul at column corner {} of its output t{} — the gather \
