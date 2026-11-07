@@ -34,8 +34,8 @@ use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct SubmittedDecode {
     pub(crate) read: scratchy_target_spyre::superdsc_exec::DeferredRead,
-    /// The launch's row count — the typed launch width the submit half set.
-    pub(crate) rows: u32,
+    /// The launch's own typed width ([`SeatWidth`]) the submit half minted.
+    pub(crate) rows: SeatWidth,
     /// The idx stick's own row size in i32 words — the seat's typed readback
     /// fact, so the collect half decodes at the placement's own width.
     pub(crate) idx_row_words: u32,
@@ -132,6 +132,38 @@ impl LaunchRows<'_> {
                 }
             }
         }
+    }
+}
+
+/// ⭐ THE SEAT'S LAUNCH WIDTH — the typed row count a launch binds and reads
+/// the per-step seat at. `b` is the one-request decode's meta borrowed for
+/// its tensor ids, so its seat states `rows = 1`; a batched launch at `mq`
+/// rows binds and reads `mq` rows of the per-step seat, and a prompt keeps
+/// the prefill rung's own row count verbatim (its draw is the FOLDED single
+/// row). Minted by ONE fn ([`SeatWidth::of_launch`]) from the seat and the
+/// launch's own rows, so no call site spells a number — the width a
+/// batching launch takes is this type's value, never a field overwritten on
+/// a copy of the seat.
+#[cfg(feature = "spyre-hw")]
+#[derive(Clone, Copy, Debug)]
+struct SeatWidth(usize);
+
+#[cfg(feature = "spyre-hw")]
+impl SeatWidth {
+    /// The ONE mint — the launch's own row count over the seat.
+    fn of_launch(
+        seat: &scratchy_target_spyre::wiring::SampleSeat,
+        rows_in: &LaunchRows<'_>,
+        mq: usize,
+    ) -> Self {
+        Self(match rows_in {
+            LaunchRows::Batch { .. } => mq,
+            _ => seat.rows as usize,
+        })
+    }
+
+    fn get(self) -> usize {
+        self.0
     }
 }
 
@@ -330,32 +362,18 @@ pub(crate) fn run_card_launch(
     // seat's five sources are placed in this bundle all the same, and the launch's completeness
     // check (`require_sources_filled`) refuses a placed source nobody wrote. The laws a middle
     // chunk stages are this request's own, so nothing is invented.
-    let decodes = matches!(want_logits, LogitsWanted::PerRequestDeferred);
-    let suffix_runs = decodes || matches!(want_logits, LogitsWanted::LastRow);
-    if suffix_runs && b.wiring.sample_seat.is_none() {
-        return Err(werr(format!(
-            "bundle has no sampler seat (result t{}) — a launch whose suffix runs cannot \
-             pick without the minted draw",
-            b.result_id
-        )));
-    }
     if let Some(seat) = b.wiring.sample_seat.as_ref() {
-        // ⭐ THE LAUNCH'S OWN ROW COUNT — a TYPED LAUNCH SIZE, never a width
-        // overwritten on a copy of the seat. `b` is the one-request decode's
-        // meta borrowed for its tensor ids, so its seat states `rows = 1` —
-        // a batched launch at `mq` rows binds and reads `mq` rows of the
-        // per-step seat, the width this launch states here and threads to
-        // every seat reader. A prompt-final chunk keeps the prefill rung's
-        // own row count verbatim: its draw is the FOLDED single row.
-        let launch_rows = match rows_in {
-            LaunchRows::Batch { .. } => mq,
-            _ => seat.rows as usize,
-        };
+        // ⭐ THE LAUNCH'S OWN ROW COUNT — the typed width ([`SeatWidth`]'s one
+        // mint), never a number spelled at a call site and never a width
+        // overwritten on a copy of the seat: a batched launch at `mq` rows
+        // binds and reads `mq` rows of the per-step seat, and a prompt-final
+        // chunk keeps the prefill rung's own row count verbatim.
+        let seat_width = SeatWidth::of_launch(seat, &rows_in, mq);
         let laws: Vec<RowLaw<'_>> = match seat_laws {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
             // draw the last real row would).
-            SeatLaws::Prompt { draw } => (0..launch_rows)
+            SeatLaws::Prompt { draw } => (0..seat_width.get())
                 .map(|r| RowLaw {
                     draw,
                     step: rows_in.pos(r) as u32,
@@ -365,10 +383,10 @@ pub(crate) fn run_card_launch(
             // runs live 0's ([`pad_law_of`]).
             SeatLaws::Batch { draws } => {
                 let live_pos: Vec<u32> = (0..live).map(|s| rows_in.pos(s) as u32).collect();
-                batch_seat_laws(draws, &live_pos, launch_rows)?
+                batch_seat_laws(draws, &live_pos, seat_width.get())?
             }
         };
-        acts_i32.extend(sample_binds(seat, launch_rows, &laws)?);
+        acts_i32.extend(sample_binds(seat, seat_width, &laws)?);
     }
     if flags().phase_time {
         let elems: usize = acts.iter().map(|(_, v)| v.len()).sum();
@@ -381,12 +399,16 @@ pub(crate) fn run_card_launch(
         );
     }
     log_binds(&format!("launch mq={mq} at={seq_pos}"), b.wiring, &acts);
-    let picked = match want_logits {
+    // ⭐ THE SEAT IS THE PICK'S OWN MATCH — every suffix arm takes it as the
+    // match's own binding, never a second Option and never an unwrap over a
+    // guard established lines earlier: a launch whose suffix runs and whose
+    // bundle mints no draw is refused AT THE ARM, before anything stages.
+    let picked = match (want_logits, b.wiring.sample_seat) {
         // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read, return. The
         // minted sampler consumes the `[rows, vocab]` result on the card and leaves the idx stick in
         // its place; this arm defers the ONE raw D2H of that stick — never a logits read, never a
         // host argmax — and the caller collects it through `collect_decode_tokens`.
-        LogitsWanted::PerRequestDeferred => {
+        (LogitsWanted::PerRequestDeferred, Some(seat)) => {
             // ⭐ #32 (E) — THE OVERLAP PROBE'S ASK: had the PREVIOUS step's stick read already
             // landed? NOT-yet-landed is "card busy at submit".
             let card_busy_at_submit = PRIOR_READ
@@ -409,20 +431,13 @@ pub(crate) fn run_card_launch(
             let depth = OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let t_defer = std::time::Instant::now();
             // The readback's own byte size — the seat's typed fact (the idx
-            // stick's placed row footprint, minted once at the bake), never a
-            // recomputed `mq · 64 · 4`. The guard above refused a
-            // suffix-running launch whose bundle mints no draw, so the seat
-            // this launch drew through is the one read back here.
-            let idx_row_words = b
-                .wiring
-                .sample_seat
-                .as_ref()
-                .expect("the guard above refused a deferred-decode launch without a seat")
-                .idx_row_words as usize;
+            // stick's placed row, minted once at the bake), never a
+            // recomputed `mq · 64 · 4`, at the typed launch width.
+            let seat_width = SeatWidth::of_launch(&seat, &rows_in, mq);
             let read = pf
                 .defer_read_tensor_ring(
                     scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
-                    mq * idx_row_words * 4,
+                    seat_width.get() * seat.idx_row_words as usize * 4,
                 )
                 .map_err(|e| {
                     werr(format!(
@@ -442,17 +457,26 @@ pub(crate) fn run_card_launch(
             });
             return Ok(BatchOut::Deferred(SubmittedDecode {
                 read,
-                rows: mq as u32,
+                rows: seat_width,
                 // The collect half's own typed readback fact — the idx
-                // stick's row size, carried beside the launch's row count so
-                // the decode law never re-derives it.
-                idx_row_words: idx_row_words as u32,
+                // stick's row size, carried beside the launch's typed width
+                // so the decode law never re-derives it.
+                idx_row_words: seat.idx_row_words,
                 result_id: b.result_id as u32,
                 vocab,
             }));
         }
+        // A deferred decode whose bundle mints no draw — refused at the arm,
+        // before anything stages (the match's own binding, no second Option).
+        (LogitsWanted::PerRequestDeferred, None) => {
+            return Err(werr(format!(
+                "bundle has no sampler seat (result t{}) — a deferred decode cannot pick \
+                 without the minted draw",
+                b.result_id
+            )));
+        }
         // A middle prompt chunk: no suffix runs and nothing is read back.
-        LogitsWanted::None => {
+        (LogitsWanted::None, _) => {
             pf.run_step_i32(mq, seq_pos, &acts, &[], &acts_i32, StepLogits::Discarded)
                 .map_err(|e| {
                     werr(format!(
@@ -464,28 +488,39 @@ pub(crate) fn run_card_launch(
         // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
         // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
         // stick comes back raw, exactly like a decode's.
-        LogitsWanted::LastRow => {
+        (LogitsWanted::LastRow, Some(seat)) => {
             pf.run_step_i32(mq, seq_pos, &acts, &[], &acts_i32, StepLogits::LeftOnDevice)
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
                     ))
                 })?;
-            let seat = b
-                .wiring
-                .sample_seat
-                .as_ref()
-                .ok_or_else(|| werr("prefill bundle has no sampler seat".to_string()))?;
-            let picked =
-                read_sampled_tokens(pf, seat, seat.rows as usize, b.result_id as u32, vocab)?;
+            // The prompt-final width is the seat's own row count — the one
+            // mint's verbatim prompt case, the same fn every launch width
+            // comes from.
+            let picked = read_sampled_tokens(
+                pf,
+                &seat,
+                SeatWidth::of_launch(&seat, &rows_in, mq),
+                b.result_id as u32,
+                vocab,
+            )?;
             log_seat_readback(
                 pf,
-                seat,
+                &seat,
                 b.wiring.load_consts,
                 &picked,
                 &format!("prefill-final mq={mq} at={seq_pos}"),
             );
             Some(picked)
+        }
+        // A prompt-final pick whose bundle mints no draw — refused at the arm.
+        (LogitsWanted::LastRow, None) => {
+            return Err(werr(format!(
+                "bundle has no sampler seat (result t{}) — a prompt-final pick cannot run \
+                 without the minted draw",
+                b.result_id
+            )));
         }
     };
     Ok(BatchOut::Done(picked))
@@ -878,10 +913,10 @@ pub(crate) enum SeatLaws<'a> {
 #[cfg(feature = "spyre-hw")]
 fn sample_binds(
     seat: &scratchy_target_spyre::wiring::SampleSeat,
-    launch_rows: usize,
+    width: SeatWidth,
     laws: &[RowLaw<'_>],
 ) -> ExecutorResult<Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>> {
-    let rows = launch_rows;
+    let rows = width.get();
     if laws.len() != rows {
         return Err(werr(format!(
             "the sampler seat holds {rows} baked row(s) but {} law(s) were staged — one law per \
@@ -974,17 +1009,17 @@ fn sample_binds(
 fn read_sampled_tokens(
     session: &mut SuperDscSession,
     seat: &scratchy_target_spyre::wiring::SampleSeat,
-    launch_rows: usize,
+    width: SeatWidth,
     result_id: u32,
     vocab: usize,
 ) -> ExecutorResult<Vec<u32>> {
     let bytes = session
         .read_tensor_raw(
             scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
-            launch_rows * seat.idx_row_words as usize * 4,
+            width.get() * seat.idx_row_words as usize * 4,
         )
         .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
-    decode_idx_stick(&bytes, launch_rows, seat.idx_row_words as usize, vocab)
+    decode_idx_stick(&bytes, width.get(), seat.idx_row_words as usize, vocab)
 }
 
 /// ⭐ #32 (c3) — THE COLLECT HALF of a submitted decode step: park on the idx
@@ -1010,7 +1045,7 @@ pub(crate) fn collect_decode_tokens(
     let t_pick = std::time::Instant::now();
     let toks = decode_idx_stick(
         &bytes,
-        sub.rows as usize,
+        sub.rows.get(),
         sub.idx_row_words as usize,
         sub.vocab,
     );
@@ -2021,7 +2056,8 @@ mod pad_clamp_tests {
         laws: &[RowLaw<'_>],
         ctx: &str,
     ) {
-        let binds = sample_binds(seat, seat.rows as usize, laws).expect("the seat stages");
+        let binds =
+            sample_binds(seat, SeatWidth(seat.rows as usize), laws).expect("the seat stages");
         let head_stride = seat.seed_row_words as usize * 4;
         assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
         for (tid, bytes) in &binds {

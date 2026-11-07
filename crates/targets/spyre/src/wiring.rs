@@ -1521,12 +1521,13 @@ pub struct SampleSeat {
     /// ⭐ THE IDX STICK'S OWN ROW SIZE in i32 words — the readback's typed
     /// byte law. The mint re-points the rung's result at the draw's idx
     /// stick, a `[rows, SAMPLE_BLOCK]` SenUint32 placement, and this is that
-    /// placement's own row footprint (`row_footprint_bytes` at the placed
-    /// width, one u32 word per element): the worker's readback reads
-    /// `rows · idx_row_words · 4` bytes of it and addresses row r's lane 0
-    /// at the stick's own placed width — never a recomputed `64 · 4`. Minted
-    /// once at the bake ([`sample_seat_of_ir`]), exactly `seed_row_words`'s
-    /// own contract.
+    /// stick's own PLACED WIDTH in words (one u32 word per element — not the
+    /// `row_footprint_bytes` reservation, whose occupancy pad is a
+    /// weight-streaming fact the readback never reads): the worker's
+    /// readback reads `rows · idx_row_words · 4` bytes of it and addresses
+    /// row r's lane 0 at the stick's own placed width — never a recomputed
+    /// `64 · 4`. Minted once at the bake ([`sample_seat_of_ir`]), exactly
+    /// `seed_row_words`'s own contract.
     pub idx_row_words: u32,
     /// Every seed word table's ROW STRIDE in i32 words on the CARD — the
     /// placement's own reservation law for a `[rows, 1]` SenUint32 table
