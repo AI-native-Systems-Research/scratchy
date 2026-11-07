@@ -23,7 +23,7 @@
 
 use crate::sdsc_abstract::{DeviceWalk, StickLayout};
 use crate::superdsc_error::SuperDscError;
-use crate::superdsc_opspec::{ArgView, Role, Scale, SdscFoldSet, WorkPlan};
+use crate::superdsc_opspec::{ArgView, Role, SdscFoldSet, WorkPlan};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
