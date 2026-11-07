@@ -22,4 +22,7 @@ pub mod to_ktir;
 /// output. `to_ktir::lower` is the door; nothing else should call into here.
 pub mod to_ktir_emit;
 pub mod uniform_grid_corners;
+/// The SSA verifier: every operand must resolve to a definition. Called by the
+/// pass drivers after each pass, not by the passes themselves.
+pub mod verify_defs;
 pub mod walk;

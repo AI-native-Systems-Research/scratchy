@@ -179,17 +179,28 @@ pub type Result<T> = std::result::Result<T, Refusal>;
 
 /// Run `make_ktir`'s pipeline, in `make_ktir`'s order, on a ttir value.
 ///
+/// After every pass the SSA verifier runs ([`passes::verify_defs`]): a module
+/// that uses a value nothing defines is refused the moment the pass that left
+/// it that way completes, naming that pass.
+///
 /// `grid` is the launch grid, fastest-varying axis first -- the same list
 /// `spyre.passes.add_ktir_lowering(pm, list(options.grid))` threads into the C++
 /// pipeline. An empty grid keeps `DistributeWork`'s single-axis heuristic, and a
 /// multi-axis kernel then RED-stops rather than guessing a block count.
 pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
     passes::dot_to_linalg::run(module)?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:dot_to_linalg")?;
     passes::convert_ttir_to_ktdp::run(module)?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:convert_ttir_to_ktdp")?;
     passes::distribute_work::run(module, grid)?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:distribute_work")?;
     passes::legalize_types::run(module)?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:legalize_types")?;
     passes::canonicalize::run(module)?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:canonicalize")?;
     passes::decompose_dense_constants::run(module)?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:decompose_dense_constants")?;
     passes::plan_corelets::run(module)?;
+    passes::verify_defs::verify_module_defs(module, "make_ktir:plan_corelets")?;
     Ok(())
 }
