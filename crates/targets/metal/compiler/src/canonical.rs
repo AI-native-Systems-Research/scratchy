@@ -48,6 +48,50 @@ use crate::steps_from_tape::{
 #[derive(Default)]
 pub struct SourceManifest {
     families: Vec<WeightSlot>,
+    /// The families the model names itself, not an op's operand: the rotary tables and the
+    /// embedding table ([`ModelNamed`]). Only these are bound with no read naming their weight.
+    named: std::collections::HashSet<SourceIx>,
+}
+
+/// A family a row names because the model does, not because an op reads it through an operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelNamed {
+    /// A rotary table (`rotary`, `rotary_local`): no field holds it.
+    Rotary,
+    /// The embedding table, named by the model's `embed_base`: the embed op reads token ids, not
+    /// the table, so no operand of it is the weight.
+    Embedding,
+}
+
+impl ModelNamed {
+    /// Which, if either, `site` is, the model's embedding table being under `embed_base`.
+    fn of(site: &WeightSlot, embed_base: &str) -> Option<Self> {
+        match site.kind {
+            WeightKind::CosSin => Some(Self::Rotary),
+            WeightKind::Embedding | WeightKind::AffineQuantEmbedding if site.base == embed_base => {
+                Some(Self::Embedding)
+            }
+            WeightKind::Embedding
+            | WeightKind::AffineQuantEmbedding
+            | WeightKind::RmsNorm
+            | WeightKind::LayerNorm
+            | WeightKind::Linear
+            | WeightKind::FusedMoe
+            | WeightKind::SharedFusedMoe
+            | WeightKind::GemmaRouter
+            | WeightKind::GemmaSwitchGlu
+            | WeightKind::GatedDeltaNet
+            | WeightKind::AttnSinks
+            | WeightKind::Tensor
+            | WeightKind::GptOssMoe
+            | WeightKind::Marlin
+            | WeightKind::Bnb4
+            | WeightKind::Fp8
+            | WeightKind::DeepSeekMoe
+            | WeightKind::DeepSeekMoeFp8
+            | WeightKind::DeepSeekMoeGgml => None,
+        }
+    }
 }
 
 /// A weight kind metal binds no bundle of (quantized linears and MoEs metal has no kernels for).
@@ -79,12 +123,20 @@ impl SourceManifest {
             .collect()
     }
 
-    fn row(&mut self, site: &[WeightSlot]) -> Vec<RowSource> {
-        let source = |s: &WeightSlot| RowSource {
-            kind: s.kind.clone(),
-            ix: self.intern(s),
+    /// A row's sites' families, each interned; a site the model names itself ([`ModelNamed`],
+    /// its embedding under `embed_base`) is noted as one.
+    fn row(&mut self, site: &[WeightSlot], embed_base: &str) -> Vec<RowSource> {
+        let mut source = |s: &WeightSlot| {
+            let ix = self.intern(s);
+            if ModelNamed::of(s, embed_base).is_some() {
+                self.named.insert(ix);
+            }
+            RowSource {
+                kind: s.kind.clone(),
+                ix,
+            }
         };
-        site.iter().map(source).collect()
+        site.iter().map(&mut source).collect()
     }
 
     /// The rotary table each attention class re-ropes cached K with: the global `rotary`, and
@@ -92,7 +144,9 @@ impl SourceManifest {
     pub fn rotary_tables(&mut self, local: bool) -> RotaryTables {
         let mut table = |base: &str| {
             let (kind, base) = (WeightKind::CosSin, base.to_string());
-            self.intern(&WeightSlot { kind, base })
+            let ix = self.intern(&WeightSlot { kind, base });
+            self.named.insert(ix);
+            ix
         };
         let global = table("rotary");
         let sliding = if local { table("rotary_local") } else { global };
@@ -205,14 +259,21 @@ impl SourceManifest {
                 }
             }
         };
-        Ok(Resolver { tokens, typed })
+        let named = self.named.clone();
+        Ok(Resolver {
+            tokens,
+            typed,
+            named,
+        })
     }
 }
 
-/// A model's resolver, and the families it declared a source slot ([`slot`]) for.
+/// A model's resolver, the families it declared a source slot ([`slot`]) for, and the families
+/// the model names itself ([`ModelNamed`]).
 pub struct Resolver {
     pub tokens: TokenStream,
     pub typed: std::collections::HashSet<SourceIx>,
+    pub named: std::collections::HashSet<SourceIx>,
 }
 
 /// The source slot marker of family `ix`, beside the model's `Weights`.
@@ -601,11 +662,18 @@ pub fn lower_canonical(
         steps: MetalStepTape {
             backbone,
             backbone_barriers,
-            backbone_sources: backbone_sites.iter().map(|s| sources.row(s)).collect(),
+            backbone_sources: backbone_sites
+                .iter()
+                .map(|s| sources.row(s, facts.embed_base))
+                .collect(),
             backbone_live,
             lm_head: rolled.lm_rows,
             lm_head_barriers,
-            lm_head_sources: rolled.lm_sites.iter().map(|s| sources.row(s)).collect(),
+            lm_head_sources: rolled
+                .lm_sites
+                .iter()
+                .map(|s| sources.row(s, facts.embed_base))
+                .collect(),
             lm_head_live,
         },
         operands: StepOperands {

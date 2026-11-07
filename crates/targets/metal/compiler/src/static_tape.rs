@@ -333,10 +333,13 @@ impl CommandPool {
     ///
     /// `weight_markers`: each DSL weight a typed field holds, by `WeightId`, its marker in the
     /// model's `__weights`; each typed GEMM slot is read as its GEMMs' ops' weights
-    /// ([`gemm_slot`](scratchy_target_metal::tape::typed::gemm_slot)).
+    /// ([`gemm_slot`](scratchy_target_metal::tape::typed::gemm_slot)). `named`: the families the
+    /// model names itself ([`ModelNamed`](crate::canonical::ModelNamed)), the only ones bound with
+    /// no read naming their weight.
     pub fn into_tokens(
         self,
         typed: &std::collections::HashSet<SourceIx>,
+        named: &std::collections::HashSet<SourceIx>,
         weight_markers: &BTreeMap<u32, String>,
     ) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
@@ -348,15 +351,13 @@ impl CommandPool {
             return Ok(tokens);
         }
         let parts = self.table.finish();
-        let gemms = TypedGemms::of(
-            &parts,
-            typed,
-            &self.affine_reads,
-            &self.gemm_weights,
-            &self.affine_weights,
-            &self.sources,
-            weight_markers,
-        )?;
+        let reads = FamilyReads {
+            affine_reads: &self.affine_reads,
+            gemm_weights: &self.gemm_weights,
+            affine_weights: &self.affine_weights,
+            sources: &self.sources,
+        };
+        let gemms = TypedGemms::of(&parts, typed, named, &reads, weight_markers)?;
         let aliases = crate::const_tokens::alias_preamble();
         let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
             let (id, len) = (
@@ -555,8 +556,9 @@ impl CommandPool {
 /// weight's scales, offsets or linear bias names `__SCALES<slot>` instead, the same check through
 /// `affine_part`, which only an affine slot has: so a part binds its own weight's slot, and only a
 /// quantized one. A typed family a command binds that no row it was lowered from names refuses the
-/// bake. A family whose rows read no weight through it (the embedding, named by the model) is
-/// bound by its index alone — its parts by `affine_part_of`.
+/// bake. Only a family the model names itself ([`ModelNamed`](crate::canonical::ModelNamed): its
+/// embedding table, under `embed_base`) is bound by its index alone, its parts by
+/// `affine_part_of`; any other typed family whose rows read no weight through it refuses the bake.
 ///
 /// Each typed value is one `const` per slot: the weight's index and dims depend on the slot
 /// alone, so a record that named a type of its own would only re-check it.
@@ -601,13 +603,47 @@ struct TypedGemms {
 type HeldMarkers = (proc_macro2::Ident, Vec<proc_macro2::Ident>);
 
 /// Whether `which` is a part of an MLX-affine weight: its scales, offsets or linear bias, which
-/// only an affine slot has.
+/// only an affine slot has. Every tensor is placed here by name: a new one is a compile error,
+/// not a binding that silently skips the affine check.
 fn affine_part(which: scratchy_target_metal::tape::lowered::WeightTensor) -> bool {
     use scratchy_target_metal::tape::lowered::WeightTensor as T;
-    matches!(
-        which,
-        T::AffineScales | T::AffineBiases | T::AffineLinearBias
-    )
+    match which {
+        T::AffineScales | T::AffineBiases | T::AffineLinearBias => true,
+        // The weight itself, a dense bias, an NVFP4 linear's scales, and every bundle's own
+        // tensors: each its family's, and none an affine linear's part.
+        T::Weight
+        | T::Bias
+        | T::Nvfp4Scales
+        | T::MoeRouterGate
+        | T::GemmaRouterGate
+        | T::GemmaPerExpertScale
+        | T::GemmaRouterScale
+        | T::MoeExpertGateW
+        | T::MoeExpertGateS
+        | T::MoeExpertGateB
+        | T::MoeExpertUpW
+        | T::MoeExpertUpS
+        | T::MoeExpertUpB
+        | T::MoeExpertDownW
+        | T::MoeExpertDownS
+        | T::MoeExpertDownB
+        | T::MoeSharedGateUpW
+        | T::MoeSharedGateUpS
+        | T::MoeSharedGateUpB
+        | T::MoeSharedDownW
+        | T::MoeSharedDownS
+        | T::MoeSharedDownB
+        | T::MoeSharedExpertGate
+        | T::MoeRouterBias
+        | T::MoeExpertGateUpLinearBias
+        | T::MoeExpertDownLinearBias
+        | T::GdnConv1d
+        | T::GdnALog
+        | T::GdnDtBias
+        | T::GdnNorm
+        | T::GdnConvBias
+        | T::GdnSkip => false,
+    }
 }
 
 /// A typed family's MLX-affine matmul reads: the one `(n, k, bits, group)` the bake minted for
@@ -654,18 +690,31 @@ fn held_markers(
     Ok((first, markers.collect()))
 }
 
+/// What the pool read of each weight family across the model's tapes: its affine matmuls' numbers,
+/// and the DSL weights its dense GEMMs', affine matmuls' and bindings' rows' ops read through it.
+struct FamilyReads<'a> {
+    affine_reads: &'a AffineReads,
+    gemm_weights: &'a BTreeMap<u32, BTreeSet<u32>>,
+    affine_weights: &'a BTreeMap<u32, BTreeSet<u32>>,
+    sources: &'a SourceReads,
+}
+
 impl TypedGemms {
     /// The typed GEMM records, affine matmuls and bindings of `parts`, over the families of
-    /// `typed`, the affine ones read as `affine_reads`.
+    /// `typed` (`named` those the model names itself), read as `reads`.
     fn of(
         parts: &CommandTableParts,
         typed: &std::collections::HashSet<SourceIx>,
-        affine_reads: &AffineReads,
-        gemm_weights: &BTreeMap<u32, BTreeSet<u32>>,
-        affine_weights: &BTreeMap<u32, BTreeSet<u32>>,
-        sources: &SourceReads,
+        named: &std::collections::HashSet<SourceIx>,
+        reads: &FamilyReads<'_>,
         weight_markers: &BTreeMap<u32, String>,
     ) -> Result<Self, BakeDefect> {
+        let FamilyReads {
+            affine_reads,
+            gemm_weights,
+            affine_weights,
+            sources,
+        } = *reads;
         use scratchy_target_metal::tape::kernel_constants::{
             AFFINE_K, AFFINE_MATMUL_KERNELS, AFFINE_N, INT4_MATMUL_KERNELS, NAX_MATMUL_KERNELS,
         };
@@ -698,11 +747,16 @@ impl TypedGemms {
             )));
         }
         // Each bound typed family's held markers: those of the weights its commands' rows read
-        // through it, none for a family read through no operand.
+        // through it. Only a family the model names itself (its embedding table) is read through
+        // no operand; any other one whose rows read no weight through it refuses the bake.
         let held = |ix: u32| -> Result<Option<HeldMarkers>, BakeDefect> {
             match sources.weights.get(&ix).filter(|ids| !ids.is_empty()) {
                 Some(ids) => held_markers(ix, Some(ids), weight_markers, "commands").map(Some),
-                None => Ok(None),
+                None if named.contains(&SourceIx(ix)) => Ok(None),
+                None => Err(BakeDefect(format!(
+                    "typed weight family {ix} is bound by commands whose rows read no weight \
+                     through it, and the model does not name it"
+                ))),
             }
         };
         let (mut bound, mut affine_parts) = (BTreeMap::new(), BTreeMap::new());

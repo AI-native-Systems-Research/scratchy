@@ -15984,7 +15984,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     {
         let table = metal_tape_cmds
-            .into_tokens(&resolver.typed, &dims.weight_markers)
+            .into_tokens(&resolver.typed, &resolver.named, &dims.weight_markers)
             .unwrap_or_else(|e| {
                 panic!(
                     "[metal static tape] {}: command table: {e}",
