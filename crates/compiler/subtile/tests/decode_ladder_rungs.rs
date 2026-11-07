@@ -18,13 +18,21 @@ use scratchy_subtile::sdsc_abstract::{PaddedMq, PagedKvPool, Rung, each_batch_ru
 #[test]
 fn the_walk_hands_out_every_batch_rung_widest_first_with_a_one_stick_pad() {
     let mut walked = Vec::new();
-    each_batch_rung_widest_first(|width| walked.push(width));
-    let widths: Vec<u32> = walked.iter().map(|w| w.mq().get()).collect();
+    each_batch_rung_widest_first(|rung| walked.push(rung));
+    let rows: Vec<u32> = walked.iter().map(|r| r.rows().get()).collect();
     let mut ladder = PagedKvPool::BATCH_RUNGS.to_vec();
     ladder.reverse();
-    assert_eq!(widths, ladder, "every batch rung, widest first");
+    assert_eq!(rows, ladder, "every batch rung, widest first");
+    for rung in &walked {
+        assert_eq!(
+            rung.width().mq().get(),
+            rung.rows().get(),
+            "a rung's width is its own rows"
+        );
+    }
     for width in walked
         .into_iter()
+        .map(|r| r.width())
         .chain([PaddedMq::of_rung(Rung::<1>::baked())])
     {
         assert_eq!(
@@ -32,23 +40,6 @@ fn the_walk_hands_out_every_batch_rung_widest_first_with_a_one_stick_pad() {
             64,
             "rung {}: every baked rung pads to one stick of rows",
             width.mq().get()
-        );
-    }
-}
-
-/// A prefill chunk's width is a runtime quantity and takes the runtime arm of the SAME law — same
-/// arithmetic, no rung: 31 pads to 64, 96 to 128, 65 to 128. The chunk arm cannot mint a `Rung`
-/// (there is no value→const conversion at all), which is what keeps the wide prefill range from
-/// multiplying the const-generic instantiations.
-#[test]
-fn a_prefill_width_takes_the_runtime_law() {
-    for (w, pad) in [(31u32, 64u32), (47, 64), (64, 64), (65, 128), (96, 128)] {
-        let width = PaddedMq::of_chunk(w);
-        assert_eq!(width.mq().get(), w);
-        assert_eq!(
-            width.pad().rows().row_axis_extent(),
-            pad,
-            "prefill width {w}"
         );
     }
 }
