@@ -13713,6 +13713,7 @@ fn dump_wavefront_mega(
             >(
                 &lowered,
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                &[],
             )
             .unwrap_or_else(|e| {
                 panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank forward is malformed — {e:?}")
@@ -13748,9 +13749,23 @@ fn dump_wavefront_mega(
                     .collect()
             };
             for (k, c) in sf.collectives.iter().enumerate() {
+                let reads = match c.reads {
+                    scratchy_subtile::lower::InputRef::Op(r) => r,
+                    // A gathered row's partial sum: the gather is its contraction.
+                    scratchy_subtile::lower::InputRef::Ext(e) => {
+                        eprintln!(
+                            "[spyre-tp] {stem}: collective {k}: {:?} at op {} reading source t{e} \
+                             ({:?}), a row gathered from a column-split table",
+                            c.kind,
+                            c.op,
+                            tp_lwd.bindings.get(e),
+                        );
+                        continue;
+                    }
+                };
                 // The contraction behind the read: back along the first operand through the
                 // weightless ops between it and the collective (granite's residual multiplier).
-                let mut at = c.reads;
+                let mut at = reads;
                 while weights_of(at).is_empty() {
                     match tp_lwd.input.ops[at].inputs.first() {
                         Some(scratchy_subtile::lower::InputRef::Op(p)) => at = *p,
@@ -13762,8 +13777,8 @@ fn dump_wavefront_mega(
                      contracted at op {} ({:?}) over [{}]",
                     c.kind,
                     c.op,
-                    c.reads,
-                    tp_lwd.input.ops[c.reads].op,
+                    reads,
+                    tp_lwd.input.ops[reads].op,
                     at,
                     tp_lwd.input.ops[at].op,
                     weights_of(at).join(", ")
@@ -13915,6 +13930,7 @@ fn dump_wavefront_mega(
                             >(
                                 &lwd_b,
                                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                &[],
                             )
                             .unwrap_or_else(|e| {
                                 panic!(
@@ -14277,6 +14293,7 @@ fn dump_wavefront_mega(
                         >(
                             &lwd_p,
                             scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                            &[],
                         )
                         .unwrap_or_else(|e| {
                             panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank prefill m={pl} is malformed — {e:?}")
@@ -14388,6 +14405,7 @@ fn dump_wavefront_mega(
                             >(
                                 &lwd_p,
                                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                &[],
                             )
                             .unwrap_or_else(|e| {
                                 panic!(
@@ -14931,6 +14949,9 @@ fn dump_wavefront_mega(
                         S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
                         S::Rows => quote! { ::scratchy_target_spyre::wiring::SourceShard::Rows },
                         S::Cols => quote! { ::scratchy_target_spyre::wiring::SourceShard::Cols },
+                        S::Partial => {
+                            quote! { ::scratchy_target_spyre::wiring::SourceShard::Partial }
+                        }
                         S::HeadRows { heads } => {
                             let h = proc_macro2::Literal::u32_unsuffixed(heads.get());
                             quote! {

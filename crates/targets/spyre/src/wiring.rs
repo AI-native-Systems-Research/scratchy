@@ -1989,7 +1989,7 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
     }
     let w = T::RANKS;
     let divides = match shard {
-        SourceShard::Whole => true,
+        SourceShard::Whole | SourceShard::Partial => true,
         SourceShard::Rows => rows.is_multiple_of(w),
         SourceShard::Cols => cols.is_multiple_of(w),
         SourceShard::HeadRows { heads } => {
@@ -2013,7 +2013,8 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
         match shard {
             SourceShard::Rows => (disk, SourceShard::Cols),
             SourceShard::Cols => (disk, SourceShard::Rows),
-            SourceShard::Whole => (disk, SourceShard::Whole),
+            // Rank 0 holds the value and every other rank zeros, in either byte order.
+            SourceShard::Whole | SourceShard::Partial => (disk, shard),
             SourceShard::HeadRows { .. } => return Err(SliceRefusal::HeadSplitGemm { id }),
         }
     } else {
