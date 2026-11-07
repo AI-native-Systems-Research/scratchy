@@ -1333,8 +1333,10 @@ pub(crate) fn superdsc_forward_chunk(
             LaunchRows::Sequence {
                 blocks: &blocks,
                 rows: StepRows::new(pos, real).ok_or_else(|| {
-                    werr("superdsc prefill: a chunk of zero real rows — the chunker staged no                          chunk"
-                        .to_string())
+                    werr(
+                        "superdsc prefill: a chunk of zero real rows — the chunker staged no chunk"
+                            .to_string(),
+                    )
                 })?,
             },
             sh,
