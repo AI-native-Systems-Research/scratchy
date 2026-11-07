@@ -4317,14 +4317,12 @@ mod tests {
     /// M4 Max's large set (10-28) and its small set (10-29), both published, both drawn.
     #[test]
     fn every_model_a_machine_ran_is_drawn() {
-        let read = |name: &str| -> Run {
-            let p = format!("{}/{}/{name}", env!("CARGO_MANIFEST_DIR"), super::DATA);
-            serde_json::from_str(&std::fs::read_to_string(&p).expect(name)).expect(name)
-        };
-        let runs = vec![
-            read("apple-m4-max-2026-10-28T041936Z-dbe48cd2.json"),
-            read("apple-m4-max-2026-10-29T013115Z-8385aba7.json"),
-        ];
+        // The M4 Max ran the large set (10-28) and then the small one (10-29), its current models
+        // both: every one of them is drawn, the large set's beside the small set's.
+        let runs = fixtures(&[
+            "apple-m4-max-2026-10-28T041936Z-dbe48cd2.json",
+            "apple-m4-max-2026-10-29T013115Z-8385aba7.json",
+        ]);
         let machines = super::index(&runs);
         let html = render(super::datasets::section(
             super::datasets::RANDOM,
@@ -4433,14 +4431,10 @@ mod tests {
     /// code. The M3 Pro's two published grid runs of gpt-oss-20b, 10-29 and 11-03.
     #[test]
     fn a_model_run_twice_shows_its_before_and_after() {
-        let read = |name: &str| -> Run {
-            let p = format!("{}/{}/{name}", env!("CARGO_MANIFEST_DIR"), super::DATA);
-            serde_json::from_str(&std::fs::read_to_string(&p).expect(name)).expect(name)
-        };
-        let runs = vec![
-            read("apple-m3-pro-2026-10-29T002524Z-8385aba7.json"),
-            read("apple-m3-pro-2026-11-03T081127Z-11091c9a.json"),
-        ];
+        let runs = fixtures(&[
+            "apple-m3-pro-2026-10-21T145041Z-a7820fbc.json",
+            "apple-m3-pro-2026-10-27T031941Z-f9739363.json",
+        ]);
         let machines = super::index(&runs);
         let html = render(super::datasets::section(
             super::datasets::RANDOM,
