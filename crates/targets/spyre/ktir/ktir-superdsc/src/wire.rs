@@ -626,7 +626,7 @@ pub fn build_coordinates(
         let scale = arg.scale[i];
         let split = plan.split_of(d) as i64;
         let full = plan.extent(d) as i64;
-        let (size, nsplits) = if scale == Scale::Active {
+        let (size, nsplits) = if scale.is_active() {
             ((full / split.max(1)).max(1), split.max(1))
         } else {
             (1, 1)
