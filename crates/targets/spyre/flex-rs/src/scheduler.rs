@@ -1513,6 +1513,13 @@ pub trait HardwareSubmit: Send + Sync {
     /// importantly — not possible to receive slots and forget to free them.
     /// See [`ResponseCredit`].
     fn free_responses(&self, pipeline: PipelineId, credit: PipelineCredit);
+
+    /// The key this hardware's completions are recorded under in the RB telemetry ring
+    /// ([`crate::rb_telemetry::RbTiming::source`]) — distinct per card, so a process driving
+    /// several cards attributes each CB to the card that ran it. `0` for hardware with no card.
+    fn telemetry_key(&self) -> usize {
+        0
+    }
 }
 
 /// Proof that `outstanding` response slots have been taken from senlib and not
@@ -1772,7 +1779,9 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         let shim_pipeline = pipeline.shim_index();
         // SAFETY: safe to call at any time; returns a null handle if the
         // shim runtime is not initialized (see its own doc comment).
-        let cbi = unsafe { crate::senlib_ffi::flex_shim_cbi_for_pipeline(self.card.raw(), shim_pipeline) };
+        let cbi = unsafe {
+            crate::senlib_ffi::flex_shim_cbi_for_pipeline(self.card.raw(), shim_pipeline)
+        };
         let Some(cbi) = cbi.into_live() else {
             return Err(mock_error(
                 "SenlibHardwareSubmit: no ControlBlockInterface for this pipeline (shim not initialized)",
@@ -1846,7 +1855,9 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         let shim_pipeline = pipeline.shim_index();
         // SAFETY: as `queue_control_blocks` above — null handle if the shim
         // runtime is not initialized.
-        let cbi = unsafe { crate::senlib_ffi::flex_shim_cbi_for_pipeline(self.card.raw(), shim_pipeline) };
+        let cbi = unsafe {
+            crate::senlib_ffi::flex_shim_cbi_for_pipeline(self.card.raw(), shim_pipeline)
+        };
         let Some(cbi) = cbi.into_live() else {
             tracing::error!(
                 pipeline = shim_pipeline,
@@ -1861,6 +1872,10 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         if let Err(e) = crate::senlib_ffi::cbi_free_responses(cbi, num_responses) {
             tracing::error!(pipeline = shim_pipeline, num_responses, err = %e, "senlib FreeResponses failed");
         }
+    }
+
+    fn telemetry_key(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.card) as usize
     }
 }
 
@@ -2721,6 +2736,7 @@ impl ResponseWorker {
         // completed CB's timing is already in the ring.
         if let Some(pipeline) = pipeline {
             crate::rb_telemetry::record(crate::rb_telemetry::RbTiming {
+                source: self.hw.telemetry_key(),
                 id,
                 pipeline,
                 dma,
@@ -3928,7 +3944,9 @@ impl QueueCapacitySource for SenlibQueueCapacity {
     fn capacity(&self, pipeline: PipelineId) -> Option<u64> {
         let shim_pipeline = pipeline.shim_index();
         // SAFETY: see `SenlibHardwareSubmit::submit`'s identical call.
-        let cbi = unsafe { crate::senlib_ffi::flex_shim_cbi_for_pipeline(self.card.raw(), shim_pipeline) };
+        let cbi = unsafe {
+            crate::senlib_ffi::flex_shim_cbi_for_pipeline(self.card.raw(), shim_pipeline)
+        };
         let cbi = cbi.into_live();
         // Port of `RuntimeScheduler::getQueueCapacity`'s own `0` handling
         // (`runtime_scheduler.cpp:1022-1028`): "capacity() == 0 is senlib's

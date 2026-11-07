@@ -161,6 +161,12 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         &self.card
     }
 
+    /// This card's key in the RB telemetry ring (`flex_rs::rb_telemetry::RbTiming::source`) —
+    /// the same identity its hardware submitter records completions under.
+    pub fn telemetry_key(&self) -> usize {
+        Arc::as_ptr(&self.card) as usize
+    }
+
     /// This card's p2p link, when it runs one rank of a sharded world ([`link_peers`]).
     pub fn link(&self) -> Option<&PeerLink<T>> {
         self.link.get()
@@ -993,14 +999,17 @@ impl Stream {
                 BatchedCb::Consume(l) => compute(l, tag)?.with_ctrl_barrier(),
                 // ⭐ THE SEND WAITS FOR ITS PRODUCER: the barrier keeps the DMA engine from
                 // reading the operand before the compute that writes it has retired.
-                BatchedCb::Send(s) => build_rdma_send_cb(&resolver, &s.params(), tag, true)
+                BatchedCb::Send(s) => build_rdma_send_cb(&resolver, &s.params(), tag, s.barrier)
                     .map_err(HwError::CbRender)?,
                 // The wait is the scheduler submit's own CB (`submit_p2p_rdma_wait`): the Rdma10
                 // wdone-barrier words, sync set, on an empty segment table.
-                BatchedCb::Wait { sid } => ControlBlockWire::p2p_rdma_wait(
+                BatchedCb::Wait { sids } => ControlBlockWire::p2p_rdma_wait(
                     tag,
-                    flex_rs::hal_sbf::rdma10_wdone_wait(&[u64::from(*sid)], true)
-                        .map_err(|e| HwError::CbRender(format!("rdma10_wdone_wait: {e}").into()))?,
+                    flex_rs::hal_sbf::rdma10_wdone_wait(
+                        &sids.iter().map(|&s| u64::from(s)).collect::<Vec<_>>(),
+                        true,
+                    )
+                    .map_err(|e| HwError::CbRender(format!("rdma10_wdone_wait: {e}").into()))?,
                 ),
             });
         }
@@ -1115,9 +1124,9 @@ pub enum BatchedCb {
     Consume(BatchedCompute),
     /// A collective's F-send into the peer's receive window.
     Send(RdmaSend),
-    /// Wait for one of the peer's messages to land: one write-done count on the sid the PEER
-    /// signals for that message's landing slot.
-    Wait { sid: u8 },
+    /// Wait for one message from each of several peers to land: one write-done count on each sid
+    /// the PEERS signal for that message's landing slot — the wdone barrier's own sid set.
+    Wait { sids: Vec<u8> },
 }
 
 /// One end of a send, addressed as the launch it is aimed from addresses it: the allocation backing
@@ -1140,6 +1149,11 @@ pub struct RdmaSend {
     pub window: RdmaEnd,
     /// This message's place in its send's run.
     pub place: flex_rs::scheduler::RunPlace,
+    /// Whether this send waits for everything ahead of it to retire (the CTRL barrier). The FIRST
+    /// send of a collective takes it — its operand is the compute just before it — and every later
+    /// send of the same collective reads that same operand, already waited for, so it rides the
+    /// FIFO behind the first without a barrier of its own.
+    pub barrier: bool,
 }
 
 impl RdmaSend {

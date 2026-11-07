@@ -264,17 +264,20 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow!("card {i} send to {j}: {e}"))?;
         }
     }
+    // `ONE_WAIT=1`: each card waits ONCE, on every peer's sid in one wait CB (the wdone barrier's
+    // list bitmask) — the question being whether one multi-sid wait consumes one count per sid.
+    let one_wait = std::env::var_os("ONE_WAIT").is_some();
     for (j, s) in sides.iter().enumerate() {
-        for i in (0..n).filter(|&i| i != j) {
+        let peers: Vec<u32> = (0..n).filter(|&i| i != j).map(|i| i as u32).collect();
+        let lists: Vec<Vec<u32>> = if one_wait {
+            vec![peers]
+        } else {
+            peers.into_iter().map(|i| vec![i]).collect()
+        };
+        for sid_list in lists {
             s.stream
-                .launch_p2p_rdma_wait(
-                    P2PRdmaWaitParams {
-                        sid_list: vec![i as u32],
-                    },
-                    false,
-                    None,
-                )
-                .map_err(|e| anyhow!("card {j} wait on {i}: {e}"))?;
+                .launch_p2p_rdma_wait(P2PRdmaWaitParams { sid_list }, false, None)
+                .map_err(|e| anyhow!("card {j} wait: {e}"))?;
         }
     }
     for (j, s) in sides.iter().enumerate() {

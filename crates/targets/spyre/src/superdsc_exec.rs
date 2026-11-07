@@ -1243,6 +1243,27 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // groups its rank plays.
         let seat =
             RankSeat::of(code, card.link()).map_err(|e| anyhow!("bundle {}: {e}", code.fp))?;
+        // ⛔ A SHARDED RANK'S STEP CANNOT DRAIN MID-SUBMIT: its collectives wait on peers that
+        // submit only after it returns, so an instrument that synchronizes between ops waits on a
+        // send never issued (measured: a 280 s stream timeout). Those instruments are a one-card
+        // tool; a sharded session refuses them at load, by name, rather than hang.
+        if <T as ktir_superdsc::collective::World>::SHARDED {
+            let d = Diag::get();
+            let drains = [
+                ("SCRATCHY_SDSC_PEROP_SYNC", d.perop_sync),
+                ("SCRATCHY_SDSC_GROUP_TIME", d.group_time),
+                ("SCRATCHY_SDSC_PREFIX_TIME", d.prefix_time),
+                ("SCRATCHY_SDSC_REPEAT_PROBE", d.repeat_probe),
+                ("SCRATCHY_SDSC_OPTRACE", d.optrace),
+                ("SCRATCHY_SDSC_TENSORDUMP", d.tensordump.is_some()),
+            ];
+            if let Some((name, _)) = drains.iter().find(|(_, on)| *on) {
+                bail!(
+                    "{name} drains the stream between a step's ops, and a sharded rank's step \
+                     cannot drain before its peers submit — run it on a one-card build"
+                );
+            }
+        }
         let places: BTreeMap<bundle::PlaceId, &'static Placement> =
             code.layout.places.iter().map(|p| (p.id, p)).collect();
         // ⛔⛔⛔ THE MAP MUST NOT HAVE LOST A PLACEMENT. This was keyed by `p.name` (a String) and
@@ -4200,12 +4221,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let Some(dir) = Diag::get().tensordump.clone() else {
             return Ok(());
         };
-        // A sharded world's ranks dump apart: one directory per rank, so rank `r`'s tensors are
-        // never overwritten by another rank's of the same name.
-        let dir = match self.session() {
-            Some(me) => dir.join(format!("rank{}", me.get())),
-            None => dir,
-        };
         if self.dump.is_none() {
             let prog = dump_prog_index(&self.code.fp);
             let _ = std::fs::create_dir_all(&dir);
@@ -4337,7 +4352,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     /// read for free instead.
     fn rb_attribute(&mut self) {
         let seq = std::mem::take(&mut timers().rb_seq);
-        let mut entries = flex_rs::rb_telemetry::drain();
+        let mut entries = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         let mut t = timers();
         t.rb_steps += 1;
         // The DMA crossings belong to no op — the preamble-H2D and logits-D2H — so they
@@ -4412,6 +4427,71 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 fmt(&d2h),
                 fmt(&other)
             );
+        }
+        // ⭐ ONE FORWARD'S DEVICE TIME BY CB KIND — one line per forward, every forward: the span
+        // from the first compute CB's start to the last's end, the summed compute EXEC, and the
+        // gaps (span − exec: waits, sends, idle). A replayed forward records no launch sequence,
+        // so this is the replay path's one decomposition; a decode step of a sharded world reads
+        // its collectives' cost straight off it.
+        {
+            let ops: Vec<&flex_rs::rb_telemetry::RbTiming> = entries
+                .iter()
+                .filter(|e| {
+                    matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) && e.dma.is_none()
+                })
+                .collect();
+            let exec: u64 = ops.iter().map(|e| u64::from(e.rb.exec_cmpt_cycles())).sum();
+            let busy = ops.iter().filter(|e| e.rb.exec_cmpt_cycles() > 0).count();
+            let start = ops
+                .iter()
+                .map(|e| e.rb.timestamps()[0])
+                .filter(|&t| t != 0)
+                .min();
+            let end = ops.iter().map(|e| e.rb.timestamps()[4]).max();
+            if let (Some(a), Some(b)) = (start, end) {
+                let span = u64::from(b.wrapping_sub(a));
+                // The top exec-time CBs, by their place in the forward: which CB of the step the
+                // time is in (the sends, waits and consumes sit at fixed places in a replayed
+                // step, the same every forward).
+                let mut by_place: Vec<(u32, usize)> = ops
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (e.rb.exec_cmpt_cycles(), i))
+                    .collect();
+                by_place.sort_unstable_by(|x, y| y.cmp(x));
+                let top: Vec<String> = by_place
+                    .iter()
+                    .take(6)
+                    .map(|(c, i)| format!("{i}:{c}"))
+                    .collect();
+                // Where the gaps sit: the largest waits between one CB's end and the next's start.
+                let mut gaps: Vec<(u32, usize)> = ops
+                    .windows(2)
+                    .enumerate()
+                    .map(|(i, w)| {
+                        (
+                            w[1].rb.timestamps()[2].wrapping_sub(w[0].rb.timestamps()[4]),
+                            i + 1,
+                        )
+                    })
+                    .filter(|(g, _)| *g < 1 << 31)
+                    .collect();
+                gaps.sort_unstable_by(|x, y| y.cmp(x));
+                let gtop: Vec<String> = gaps
+                    .iter()
+                    .take(6)
+                    .map(|(g, i)| format!("{i}:{g}"))
+                    .collect();
+                eprintln!(
+                    "[sdsc-rbkind] fwd {} cbs {} (exec>0 {busy}) span {span} exec {exec} gap {} \
+                     cycles  top-exec {} top-gap {}",
+                    t.rb_steps,
+                    ops.len(),
+                    span.saturating_sub(exec),
+                    top.join(" "),
+                    gtop.join(" ")
+                );
+            }
         }
         // The op entries: compute CBs that are not DMA crossings. A crossing kept here would
         // both break the 1:1 zip below and bill the preamble/readback to whichever op it
@@ -4492,7 +4572,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // entries at its synchronize; what is left in the ring now is pre-forward history
         // (prepare's weight uploads belong to no op), and the launch sequence starts at zero.
         if d.rb_time {
-            let _ = flex_rs::rb_telemetry::drain();
+            let _ = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         }
         timers().rb_seq.clear();
 
@@ -4507,7 +4587,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let t0 = t_stream0;
         let (h2d_note, h2d_bytes) = self.refill_activations(d)?;
         let t0b = Instant::now();
-        if d.phase_time {
+        // ⛔ A SHARDED RANK NEVER DRAINS MID-SUBMIT. Its forward's collectives wait on every peer's
+        // sends, and a peer submits only after this rank returns: a drain here waits on a send that
+        // cannot have been issued yet, and the stream times out (measured: 280 s, every phase-timed
+        // tp/2 prefill). The phase split of a sharded step is the finish side's alone.
+        let sharded = <T as ktir_superdsc::collective::World>::SHARDED;
+        if d.phase_time && !sharded {
             let _ = self.stream_ref()?.synchronize();
         }
         let t1 = Instant::now();
@@ -4527,7 +4612,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             self.launch_forward(seq_pos, suffix)?;
         }
 
-        if d.phase_time {
+        if d.phase_time && !sharded {
             let _ = self.stream_ref()?.synchronize();
         }
         let t2 = Instant::now();
@@ -4737,7 +4822,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     pub fn drain_stream(&mut self) -> Result<()> {
         self.stream_ref()?
             .synchronize()
-            .map_err(|e| anyhow!("drain: sync: {e}"))
+            .map_err(|e| anyhow!("drain: sync: {e}"))?;
+        // A rank drained here ran a pipelined step whose RB records nothing else reads.
+        if Diag::get().rb_time {
+            self.rb_attribute();
+        }
+        Ok(())
     }
 
     /// ⭐ THE WAIT HALF OF [`Self::predict`]: drain this card's stream, then convert the logits row
@@ -5876,6 +5966,11 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // latch has fired (or was never armed); this is where the drain
         // HANDS the quiet point to the next writer by taking it.
         self.quiet_shadow()?;
+        // The pipelined step's RB records — its one decomposition, since a replayed step records
+        // no launch sequence (`[sdsc-rbkind]`).
+        if Diag::get().rb_time {
+            self.rb_attribute();
+        }
         // May only return the bytes the transfer actually brought back.
         let avail = (read.end - read.offset) as usize;
         let n = (read.size as usize).min(read.cap).min(avail);
@@ -6926,6 +7021,7 @@ mod tests {
         };
         let entry =
             |id: u64, pipeline: PipelineId, dma: Option<DmaDirection>, ts: [u32; 5]| RbTiming {
+                source: 0,
                 id,
                 pipeline,
                 dma,

@@ -388,6 +388,9 @@ pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
     };
     let mut launch = Some(launch);
     let mut out = Vec::new();
+    // Only a group's first send waits on the compute ahead of it: every send reads the same
+    // operand, which the first one's barrier already saw written.
+    let mut first_send = true;
     for step in group_steps(index, consume) {
         match step {
             // ⭐ THE CUT: a send is its run of messages (`TpSend::messages`, the vendor's windowed
@@ -407,6 +410,7 @@ pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
                             first: m.first,
                             last: m.last,
                         },
+                        barrier: std::mem::replace(&mut first_send, false),
                     }));
                 }
             }
@@ -415,13 +419,22 @@ pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
             // messages is waited for N times, once per slot. Every rank's run is this rank's own —
             // the forward is SPMD and the fragment is the payload's — so this rank's messages name
             // `from`'s slots too.
+            // ⭐ ONE WAIT CB PER MESSAGE SLOT, OVER EVERY PEER AT ONCE. The wdone barrier waits on a
+            // SET of sids (its list bitmask) and consumes one count from each — measured on four
+            // cards (`cards_all_gather`, `ONE_WAIT=1`: byte-exact, every wdone back to 0) — so the
+            // `W - 1` peers' landings into slot `s` are one CB, not `W - 1`. The pipeline names
+            // every peer's wait step in order; the CB for the slot is staged at the first and covers
+            // them all, so the later steps stage nothing.
             CbStep::Wait { from, .. } => {
-                let Some(BoundCollective { send, .. }) = bound else {
+                let Some(BoundCollective { send, me }) = bound else {
                     bail!("group {index} waits with no binding");
                 };
+                if me.peers().next() != Some(from) {
+                    continue;
+                }
                 for m in send.messages() {
                     out.push(BatchedCb::Wait {
-                        sid: Sid::of(from, m.slot).get(),
+                        sids: me.peers().map(|p| Sid::of(p, m.slot).get()).collect(),
                     });
                 }
             }
@@ -580,25 +593,37 @@ impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
         Ok((items, barrier))
     }
 
-    /// Which entry, and which of its group's steps, the plan's `i`-th CB is — an entry stages one
-    /// CB per step ([`site_cbs`]), so a refusal names the send or wait, not just its group.
+    /// Which entry, and which of its CBs, the plan's `i`-th CB is — the CBs an entry stages are
+    /// [`entry_cbs`]'s (one per message of each send, one wait per message slot, the launch), so
+    /// a refusal names the send or wait, not just its group.
     fn cb_label(&self, i: usize) -> String {
         self.entries
             .iter()
-            .flat_map(|e| group_steps(e.tp.index, e.tp.consume).map(move |s| (e, s)))
+            .flat_map(|e| entry_cbs(&e.tp).into_iter().map(move |k| (e, k)))
             .nth(i)
-            .map_or_else(
-                || format!("CB {i}"),
-                |(e, s)| {
-                    let step = match s {
-                        CbStep::Send { .. } => "send",
-                        CbStep::Wait { .. } => "wait",
-                        CbStep::Launch { .. } => "launch",
-                    };
-                    format!("{} {step}", e.label)
-                },
-            )
+            .map_or_else(|| format!("CB {i}"), |(e, k)| format!("{} {k}", e.label))
     }
+}
+
+/// The kind of every CB [`site_cbs`] stages for `tp`, in order — the same walk, without the
+/// addresses: each send is one CB per message, the waits one CB per message slot over every
+/// peer, then the launch.
+fn entry_cbs<T: ktir_superdsc::collective::Tp>(tp: &SiteTp<T>) -> Vec<&'static str> {
+    let messages = tp.bound.map_or(0, |b| b.send.messages().count());
+    let mut out = Vec::new();
+    let mut waited = false;
+    for step in group_steps(tp.index, tp.consume) {
+        match step {
+            CbStep::Send { .. } => out.extend(std::iter::repeat_n("send", messages)),
+            CbStep::Wait { .. } if !waited => {
+                waited = true;
+                out.extend(std::iter::repeat_n("wait", messages));
+            }
+            CbStep::Wait { .. } => {}
+            CbStep::Launch { .. } => out.push("launch"),
+        }
+    }
+    out
 }
 
 /// Assemble the plan for one launch call: the (op, fold pass) enumeration and
@@ -1274,7 +1299,8 @@ mod tests {
                 .unwrap();
                 let peers: Vec<Rank<T>> = me.peers().collect();
                 let n = peers.len();
-                assert_eq!(cbs.len(), 2 * n + 1, "world {}", <T as World>::RANKS);
+                // A send to every peer, ONE wait over every peer's sid, the consume.
+                assert_eq!(cbs.len(), n + 2, "world {}", <T as World>::RANKS);
                 for (i, to) in peers.iter().enumerate() {
                     let BatchedCb::Send(s) = &cbs[i] else {
                         panic!("the sends lead");
@@ -1285,6 +1311,11 @@ mod tests {
                     );
                     assert_eq!(s.place, RunPlace::ALONE);
                     assert_eq!(
+                        s.barrier,
+                        i == 0,
+                        "only the first send waits on the compute"
+                    );
+                    assert_eq!(
                         (region(&s.source), s.source.segment, s.source.offset),
                         (13, 3, 4096)
                     );
@@ -1293,11 +1324,9 @@ mod tests {
                         (11, 1, 1 << 20)
                     );
                 }
-                for (i, from) in peers.iter().enumerate() {
-                    let want = Sid::of(*from, slot).get();
-                    assert!(matches!(cbs[n + i], BatchedCb::Wait { sid } if sid == want));
-                }
-                assert!(matches!(cbs[2 * n], BatchedCb::Consume(_)));
+                let want: Vec<u8> = peers.iter().map(|&p| Sid::of(p, slot).get()).collect();
+                assert!(matches!(&cbs[n], BatchedCb::Wait { sids } if *sids == want));
+                assert!(matches!(cbs[n + 1], BatchedCb::Consume(_)));
             }
         }
         check::<TpWorld<2>>();
@@ -1334,7 +1363,8 @@ mod tests {
         )
         .unwrap();
         let peers: Vec<Rank<W4>> = me.peers().collect();
-        assert_eq!(cbs.len(), peers.len() * 4 + 1);
+        // Two messages to each peer, one wait per message slot over every peer, the consume.
+        assert_eq!(cbs.len(), peers.len() * 2 + 2 + 1);
         for (p, to) in peers.iter().enumerate() {
             let sends: Vec<&RdmaSend> = cbs[2 * p..2 * p + 2]
                 .iter()
@@ -1371,14 +1401,10 @@ mod tests {
                 [Sid::of(me, slot(0)).get(), Sid::of(me, slot(1)).get()]
             );
         }
-        let waits = &cbs[2 * peers.len()..4 * peers.len()];
-        for (p, from) in peers.iter().enumerate() {
-            for m in 0..2 {
-                let want = Sid::of(*from, slot(m)).get();
-                assert!(
-                    matches!(waits[2 * p + m as usize], BatchedCb::Wait { sid } if sid == want)
-                );
-            }
+        let waits = &cbs[2 * peers.len()..2 * peers.len() + 2];
+        for m in 0..2 {
+            let want: Vec<u8> = peers.iter().map(|&p| Sid::of(p, slot(m)).get()).collect();
+            assert!(matches!(&waits[m as usize], BatchedCb::Wait { sids } if *sids == want));
         }
         assert!(matches!(cbs.last(), Some(BatchedCb::Consume(_))));
     }

@@ -481,6 +481,36 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
             .collect()
     }
 
+    /// ⭐ [`Self::each`] ON EVERY CARD AT ONCE — one scoped thread per rank, the results in rank
+    /// order. A sharded step's host work (its refill, its CB render, its doorbell) is per card and
+    /// independent, and run serially the last card starts a whole `W - 1` submits after the first,
+    /// stalling every collective that waits on it (measured at tp/8: ~2.2 ms a rank, the eighth
+    /// card's doorbell 18 ms into the step). A world of one runs on the caller's thread.
+    fn each_parallel<R: Send>(
+        &mut self,
+        f: impl Fn(&mut Executor<T>) -> Result<R> + Sync,
+    ) -> Result<Vec<R>> {
+        use ktir_superdsc::collective::World;
+        if !<T as World>::SHARDED {
+            return self.each(f);
+        }
+        let f = &f;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .ranks
+                .iter_mut()
+                .map(|(r, e)| {
+                    scope
+                        .spawn(move || f(e).map_err(|err| err.context(format!("rank {}", r.get()))))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        })
+    }
+
     /// Whether this bundle's resident cache is PAGED.
     pub fn is_paged(&self) -> bool {
         self.page_slots > 0
@@ -766,8 +796,15 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
-        self.each(|e| e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64)))
-            .map(|_| ())
+        let t0 = std::time::Instant::now();
+        let at = self.each_parallel(|e| {
+            e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        })?;
+        if std::env::var_os("SCRATCHY_SDSC_RB_TIME").is_some() {
+            eprintln!("[sdsc-submit] step {seq_pos}: rank submits done at {at:.2?} ms");
+        }
+        Ok(())
     }
 
     /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the
@@ -951,7 +988,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         };
         // ⭐ EVERY CARD SUBMITS BEFORE ANY CARD IS WAITED ON — a rank's collective waits on its
         // peers' sends, so the forward is in flight on all of them before the host drains one.
-        let submitted = self.each(|e| e.predict_submit(n_new, seq_pos, want))?;
+        let submitted = self.each_parallel(|e| e.predict_submit(n_new, seq_pos, want))?;
         let mut row = vec![0u8; self.vocab * 2];
         for ((r, e), s) in self.ranks.iter_mut().zip(submitted) {
             // Rank 0 reads the row back; every other rank's forward is drained, its read the same
@@ -1069,11 +1106,8 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
             return Ok(());
         }
         self.each(|e| e.point_landing_slots())?;
-        let landing =
-            crate::runtime::refuse_if_windows_apart(cards).map_err(|e| anyhow!("{e}"))?;
-        tracing::info!(
-            "[spyre-tp] every rank's receive window lands at 0x{landing:x}"
-        );
+        let landing = crate::runtime::refuse_if_windows_apart(cards).map_err(|e| anyhow!("{e}"))?;
+        tracing::info!("[spyre-tp] every rank's receive window lands at 0x{landing:x}");
         Ok(())
     }
 
