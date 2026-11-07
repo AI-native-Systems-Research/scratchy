@@ -339,8 +339,11 @@ fn dump_attn_epilogue_add_seal() {
             .unwrap_or_else(|e| panic!("{}: write_dxp_input: {e}", dir.display()));
     }
     write_placements(&dir, &l);
-    std::fs::write(dir.join("cell.json"), serde_json::to_string_pretty(&cell).unwrap())
-        .unwrap();
+    std::fs::write(
+        dir.join("cell.json"),
+        serde_json::to_string_pretty(&cell).unwrap(),
+    )
+    .unwrap();
     eprintln!(
         "epilogue-add seal: head_c64_corner={head_c64} elems, {}",
         if runnable {
@@ -379,7 +382,11 @@ fn write_placements(dir: &std::path::Path, l: &BundleLayout) {
                 tid,
                 // The read-back tensor is the producer's own statement: the runner reads back
                 // whichever place carries the `Logits` role, and this cell's output is it.
-                if *tid == OUT_TID { "Logits" } else { "Activation" },
+                if *tid == OUT_TID {
+                    "Logits"
+                } else {
+                    "Activation"
+                },
                 p.segment,
                 p.bank,
                 p.offset,
