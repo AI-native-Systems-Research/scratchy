@@ -4369,7 +4369,7 @@ pub fn staggered_sources(
                          (ktir_core::ddl_binds, Gen1) — refusing to guess Standard for a fact \
                          the table does not hold",
                         kind.op_func()
-                    ))
+                    ));
                 }
             },
             // POINTWISE — the stagger propagates through it, and every same-width operand that
