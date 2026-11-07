@@ -2234,8 +2234,7 @@ fn emit_fingerprint_check(
     // fingerprint sniff. Packed parents come first (Phi-3 ships
     // `self_attn.qkv_proj.weight` on disk; ModernBERT ships
     // `attn.Wqkv.weight`; the per-slice virtual entries get carved at
-    // load time, AFTER fingerprint matching). Then MLA archs (DeepSeek
-    // V3) which use `q_a_proj` instead of `q_proj`. Then plain
+    // load time, AFTER fingerprint matching). Then plain
     // `self_attn.q_proj` (llama-style decoder fleet) and finally
     // `attn.q_proj` (encoder-style without `self_` prefix). Without
     // this, the fingerprint misses and scratchy returns Ok(None) even
@@ -2251,8 +2250,6 @@ fn emit_fingerprint_check(
         .map(|(k, _)| k.clone())
     {
         parent
-    } else if manifest.entries.contains_key("self_attn.q_a_proj") {
-        "self_attn.q_a_proj".to_string()
     } else if manifest.entries.contains_key("self_attn.q_proj") {
         "self_attn.q_proj".to_string()
     } else if manifest.entries.contains_key("attn.q_proj") {
@@ -2855,9 +2852,8 @@ fn emit_fingerprint_check(
             block_size: Some(_),
             ..
         }) => {
-            // MLA archs ship `q_a_proj` instead of `q_proj` — match
-            // the leaf the fingerprint already chose above so V3 / K2
-            // FP8-block fixtures aren't silently rejected.
+            // The leaf the fingerprint already chose above, so a packed-parent arch's FP8-block
+            // checkpoint is sniffed at the tensor it ships.
             let inv_tensor = under_root(
                 &dec_root,
                 &format!("layers.{marker_layer}.{fp_leaf}.weight_scale_inv"),
@@ -18734,9 +18730,7 @@ mod fingerprint_tests {
         );
     }
 
-    /// Non-MLA arches (Llama / Qwen / etc.) keep the historical
-    /// `q_proj` leaf — the fp_leaf selection is purely opt-in for
-    /// archs whose manifest declares `q_a_proj`.
+    /// A llama-style arch's FP8-block fingerprint sniffs its `q_proj` leaf's scales.
     // FP8-block presets are not claimable under metal (`quant_preset_active`), so no FP8-block
     // variant exists to fingerprint there; the spyre build's test step runs this.
     #[cfg(not(feature = "metal"))]
