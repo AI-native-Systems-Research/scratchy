@@ -14,13 +14,20 @@
 # THE BAR: the read-back buffer holds the card image of
 #   out[r][c] = parent[r][c] + parent[512 + r][c]      for r in 0..512, c in 0..128
 # — head plus tail, the row-band windows the program states — with the parent filled by
-# ELEMENT-INDEX in two runs (row+1, then col+1, both fp16-exact), so the first wrong element is
-# reported with its position. The verdict splits the wrong count by COLUMN HALF: the c0 half is
+# ELEMENT-INDEX in two runs (row+1, then col+1), so the first wrong element is reported with
+# its position. The run stages the parent RAW (no IEEE→SEN conversion) and reads the output
+# RAW, so BOTH buffers carry DL16 words (SEN169: 1 sign, 6 exponent, 9 mantissa bits), and the
+# decode reads them as what they are: every word decoded as DL16, both images gathered to their
+# LOGICAL frames through the stick-major law D = (c/S)·R·S + r·S + c%S, compared in 2-D against
+# want = head + tail rounded HALF-UP to 10 significant bits (the measured narrow rounding,
+# convert probe 2026-11-07). The verdict splits the wrong count by COLUMN HALF: the c0 half is
 # the control (every door addresses it right), the c64 half is the discriminator — the finding
 # under seal says MAIN binds the c64 piece's head input at tail[c0]'s base there, so MAIN is
-# expected wrong on EVERY c64 lane and no c0 lane, and the fix right on every lane. The verdict
+# expected wrong on EVERY c64 lane and no c0 lane (the decode also counts the lanes equal to
+# that wrong binding, tail[c0] + tail[c64]), and the fix right on every lane. The verdict
 # line carries the dump's own record of the c64 head corner (element 32768 at main, 65536 at the
-# fix), so one line states both the emission fact and the numeric outcome.
+# fix), so one line states both the emission fact and the numeric outcome. A decode failure is
+# a NOT-RUN verdict and a non-zero exit — never a traceback that reads as done.
 #
 # ⛔ THE FENCE PROTOCOL (the page-gather sweep's own): one cell alone — the runner holds
 # /work/.spyre-bake.lock for the whole run — and ABORT ON FENCE: after the compile and every
@@ -83,8 +90,9 @@ PY
 [ "$skip" = "True" ] && { echo "SKIP epilogue-add-o1190 (already verdicted at sha $sha md5 $md5)"; exit 0; }
 
 # The fills: the parent device image (stick-major [parent_rows, cols]: D = stick·(rows·64) +
-# r·64 + lane), one run naming the ROW (+1), one naming the COLUMN (+1) — both fp16-exact, so
-# every element of the parent is named by the pair and every sum stays exact.
+# r·64 + lane), one run naming the ROW (+1), one naming the COLUMN (+1). The words are staged
+# RAW, so the card holds each 16-bit pattern as a DL16 word — the decode reads the fill back
+# as DL16 too, so want is computed from the values the card actually holds.
 python3 - "$CELL" <<"PY"
 import json, sys
 import numpy as np
@@ -127,11 +135,17 @@ for fill in row col; do
   [ $rrc -ne 0 ] && { echo "VERDICT epilogue-add-o1190 NOT-RUN run-$fill-rc=$rrc sha=$sha md5=$md5" | tee -a "$LOG"; exit 1; }
 done
 
-# ⭐ THE DECODE — the host reference FROM THE STATED WINDOWS: out[r][c] = parent[r][c] +
-# parent[512+r][c], the parent value named by the fill (row+1 / col+1), the read-back decoded
-# at the output stick-major [rows, cols] image of its own. The wrong count is split by column
-# half: c0 is the control, c64 the discriminator. The verdict line carries the dump record of
-# the c64 head corner, so the emission fact and the numeric outcome are one line.
+# ⭐ THE DECODE — the DEVICE format, both images, in 2-D. The run stages the parent RAW and
+# reads the output RAW, so both buffers carry DL16 words (SEN169: 1 sign, 6 exponent, 9
+# mantissa bits): every word is decoded as DL16, both images are gathered to their LOGICAL
+# frames through the stick-major law D = (c/S)·R·S + r·S + c%S (the parent at
+# [parent_rows, cols], the read-back at [rows, cols]), and want = head + tail is rounded
+# HALF-UP to 10 significant bits — the measured narrow rounding (convert probe 2026-11-07).
+# The wrong count is split by column half (c0 control, c64 discriminator), and the lanes equal
+# to the binding MAIN is suspected of — tail[c0] + tail[c64] — are counted beside it. The
+# verdict line carries the dump record of the c64 head corner, so the emission fact and the
+# numeric outcome are one line. Any decode failure is a NOT-RUN verdict and a non-zero exit —
+# a traceback never reads as done.
 python3 - "$CELL" >> "$LOG" <<"PY"
 import hashlib, json, sys
 import numpy as np
@@ -139,44 +153,74 @@ cell = sys.argv[1]
 c = json.load(open(f"{cell}/cell.json"))
 R, C, S = c["parent_rows"], c["cols"], c["stick"]
 rows = c["rows"]
-n = rows * C
-D = np.arange(n)
-stick, rem = np.divmod(D, rows * S)
-r, lane = np.divmod(rem, S)
-col = stick * S + lane
-c0 = col < S
-c64 = ~c0
-fills = {"row": (r + 1).astype(np.float16), "col": (col + 1).astype(np.float16)}
+T = R - rows
+
+def dl16(bits):
+    # SEN169: 1 sign, 6 exponent (bias 31), 9 mantissa bits.
+    b = bits.astype(np.int64)
+    sign = np.where(b >> 15, -1.0, 1.0)
+    e = (b >> 9) & 0x3F
+    m = b & 0x1FF
+    return (sign * (1.0 + m / 512.0) * np.exp2(e - 31.0) * (e != 0)
+            + sign * (m / 512.0) * np.exp2(-30.0) * (e == 0))
+
+def round_dl16(v):
+    # HALF-UP to 10 significant bits — the measured narrow rounding.
+    out = np.zeros_like(v)
+    nz = v != 0
+    q = np.exp2(np.floor(np.log2(np.abs(v[nz]))) - 9)
+    out[nz] = np.sign(v[nz]) * np.floor(np.abs(v[nz]) / q + 0.5) * q
+    return out
+
+# The logical frames, gathered out of the stick-major device images: in a [NR, C] frame the
+# word at logical (r, c) sits at (c//S)·NR·S + r·S + c%S.
+rr, cc = np.meshgrid(np.arange(rows), np.arange(C), indexing="ij")
+out_idx = (cc // S) * rows * S + rr * S + cc % S
+pr, pc = np.meshgrid(np.arange(R), np.arange(C), indexing="ij")
+par_idx = (pc // S) * R * S + pr * S + pc % S
+
 bad_total = 0
 first = None
-got = {}
-for name, pval in fills.items():
-    g = np.fromfile(f"{cell}/out-{name}.bin", dtype=np.float16, count=n)
-    if g.size < n:
-        print("VERDICT epilogue-add-o1190 NOT-RUN short-readback %d of %d sha=%s md5=%s"
-              % (g.size, n, c["sha"], c["group_0_md5"]))
-        sys.exit()
-    got[name] = g
-    # want[r][c] = parent[r][c] + parent[R-rows+r][c] — head band plus tail band, the stated windows
-    want = (pval + pval[R - rows: R - rows + rows]).astype(np.float16)
-    bad = g != want
-    if bad.any() and first is None:
-        i = int(bad.nonzero()[0][0])
-        first = (name, i, int(r[i]), int(col[i]), float(g[i]), float(want[i]))
-    bad_total += int(bad.sum())
-    print("  run-%s: wrong-c0=%d/%d wrong-c64=%d/%d first-wrong=%s"
-          % (name, int((bad & c0).sum()), int(c0.sum()), int((bad & c64).sum()), int(c64.sum()),
-             "none" if not bad.any() else "(r=%d,c=%d got=%.0f want=%.0f)" % (r[bad.nonzero()[0][0]], col[bad.nonzero()[0][0]], g[bad.nonzero()[0][0]], want[bad.nonzero()[0][0]])))
-md5_row = hashlib.md5(open(f"{cell}/out-row.bin", "rb").read()).hexdigest()
-md5_col = hashlib.md5(open(f"{cell}/out-col.bin", "rb").read()).hexdigest()
+md5s = {}
+try:
+    for name in ("row", "col"):
+        pf = np.fromfile(f"{cell}/fill-{name}.bin", dtype=np.uint16)
+        of = np.fromfile(f"{cell}/out-{name}.bin", dtype=np.uint16)
+        if pf.size < R * C:
+            raise ValueError("short-fill %d of %d" % (pf.size, R * C))
+        if of.size < rows * C:
+            raise ValueError("short-readback %d of %d" % (of.size, rows * C))
+        P = dl16(pf)[par_idx]
+        g = dl16(of)[out_idx]
+        want = round_dl16(P[:rows] + P[T:T + rows])
+        # what MAIN is measured to emit on the c64 half: tail[c0] + tail[c64]
+        alt = want.copy()
+        alt[:, S:] = round_dl16(P[T:T + rows, :S] + P[T:T + rows, S:])
+        bad = g != want
+        if bad.any() and first is None:
+            r0, c0 = [int(v) for v in np.argwhere(bad)[0]]
+            first = (name, r0, c0, float(g[r0, c0]), float(want[r0, c0]))
+        bad_total += int(bad.sum())
+        md5s[name] = hashlib.md5(open(f"{cell}/out-{name}.bin", "rb").read()).hexdigest()
+        for half, sl in (("c0", np.s_[:, :S]), ("c64", np.s_[:, S:])):
+            b = bad[sl]
+            a = g[sl] == alt[sl]
+            print("  run-%s %s: wrong=%d/%d equal-to-tail[c0]+tail[c64]=%d/%d"
+                  % (name, half, int(b.sum()), b.size, int(a.sum()), a.size))
+except Exception as ex:
+    print("VERDICT epilogue-add-o1190 NOT-RUN decode-failed %s sha=%s md5=%s"
+          % (ex, c["sha"], c.get("group_0_md5", "-")))
+    sys.exit(3)
 if bad_total == 0:
     print("VERDICT epilogue-add-o1190 PASS head_c64_corner=%d sha=%s md5=%s out-row-md5=%s out-col-md5=%s"
-          % (c["head_c64_corner_elems"], c["sha"], c["group_0_md5"], md5_row, md5_col))
+          % (c["head_c64_corner_elems"], c["sha"], c["group_0_md5"], md5s["row"], md5s["col"]))
 else:
-    name, i, rr, cc, gv, wv = first
-    print("VERDICT epilogue-add-o1190 FIRST-WRONG run-%s (r=%d,c=%d) got=%.0f want=%.0f wrong=%d/%d head_c64_corner=%d sha=%s md5=%s out-row-md5=%s out-col-md5=%s"
-          % (name, rr, cc, gv, wv, bad_total, 2 * n, c["head_c64_corner_elems"], c["sha"], c["group_0_md5"], md5_row, md5_col))
+    name, r0, c0, gv, wv = first
+    print("VERDICT epilogue-add-o1190 FIRST-WRONG run-%s (r=%d,c=%d) got=%r want=%r wrong=%d/%d head_c64_corner=%d sha=%s md5=%s out-row-md5=%s out-col-md5=%s"
+          % (name, r0, c0, gv, wv, bad_total, 2 * rows * C, c["head_c64_corner_elems"], c["sha"], c["group_0_md5"], md5s["row"], md5s["col"]))
     sys.exit(1)
 PY
+drc=$?
+[ $drc -eq 0 ] || exit $drc
 echo SEAL_RUN_DONE
 ' _ "$CELL" "$TREE" "$LOG"
