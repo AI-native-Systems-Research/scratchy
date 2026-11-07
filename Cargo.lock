@@ -3655,12 +3655,15 @@ version = "0.1.0"
 dependencies = [
  "half",
  "ktir-superdsc",
+ "proc-macro2",
+ "quote",
  "scratchy-forward-compiler",
  "scratchy-ir",
  "scratchy-spyre-bundle",
  "scratchy-tensors",
  "scratchy-tp-world",
  "serde_json",
+ "syn 3.0.9",
 ]
 
 [[package]]
