@@ -144,6 +144,13 @@ required-features = ["nvcc"]
 name = "gemv_fp8"
 required-features = ["nvcc"]
 
+# FP8 S5: the e4m3 KV append bit for bit, and each attention kernel over the e4m3 cache against its
+# bf16 kernel on the widened cache, bit for bit, on the GPU. A binary of its own so a fault cannot
+# hide `attention`'s verdict. Not built without `nvcc`.
+[[test]]
+name = "attention_fp8kv"
+required-features = ["nvcc"]
+
 # The tape player on the GPU: GEMM chains through the arena against a CPU reference.
 [[test]]
 name = "tape_player"
