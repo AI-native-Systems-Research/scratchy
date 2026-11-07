@@ -6300,13 +6300,14 @@ impl Worker for MetalWorker {
         }
     }
 
-    fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
+    fn kv_block_bytes(&self, block: scratchy_core_common::KvBlockTokens) -> Option<usize> {
         // A uniform TurboQuant model's blocks are packed codes, and a hybrid
         // model's are group-shared pages plus its TurboQuant global store — not
         // the dense rows the engine would derive. The same cost the draft split
         // in `determine_available_memory` divides by.
         // A Gated-DeltaNet hybrid's dense pool holds its attention layers alone, which the
         // engine's every-layer row would overcount.
+        let block_size = block.get();
         let model = self.model.as_deref()?;
         (uniform_turboquant(model, block_size)
             || hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_some()

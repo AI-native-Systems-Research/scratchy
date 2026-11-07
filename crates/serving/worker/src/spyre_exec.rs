@@ -215,19 +215,15 @@ impl Worker for SpyreWorker {
     /// ONE SCHEDULER BLOCK'S BYTES — a pool page ([`Loaded::pool_stride_bytes`]). `None` on the
     /// emulator.
     ///
-    /// ⛔ A BLOCK IS A PAGE, CHECKED HERE. The scheduler's `slot = block · block_size + offset` and
-    /// the worker's page map address the same cells only at `block_size == SchedulerBlockTokens::REFERENCE`, which
+    /// ⭐ A BLOCK IS A PAGE BY CONSTRUCTION, not by a check here. The scheduler's
+    /// `slot = block · block_size + offset` and the worker's page map address the same cells
+    /// because the block size the engine runs with IS this factory's own declaration —
     /// [`required_block_size`](scratchy_serving_engine::worker_factory::WorkerFactory::required_block_size)
-    /// demands at init. A pool sized from any other block would hold the wrong page count, so a
-    /// mismatched caller is a panic naming both, not a prorated byte count.
-    fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
-        let page_slots =
-            scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.as_usize();
-        assert_eq!(
-            block_size, page_slots,
-            "spyre: the scheduler's KV block is {block_size} token(s); the pool's page is \
-             {page_slots} slots, and a block must be one page"
-        );
+    /// states `SchedulerBlockTokens::REFERENCE` (the page every pool was baked at), and
+    /// `effective_block_size` threads that declaration past any configured value — so the
+    /// typed [`KvBlockTokens`] arriving here is the page count the bake already sized by. The
+    /// runtime assert that re-proved it is gone: the fact is stated once, at the declaration.
+    fn kv_block_bytes(&self, _block: scratchy_core_common::KvBlockTokens) -> Option<usize> {
         self.model
             .as_ref()
             .and_then(|m| m.pool_stride_bytes)

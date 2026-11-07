@@ -550,7 +550,10 @@ fn init_cache(
         dtype_elem_bytes,
         utilization,
         kv_cache_dtype,
-        worker.kv_block_bytes(block_size),
+        worker.kv_block_bytes(
+            scratchy_core_common::KvBlockTokens::new(block_size)
+                .context("the KV block size is zero — a block holds at least one token")?,
+        ),
         worker.supports_hybrid_swa_kv(),
     );
     // Fixed-size resident KV pool cap (spyre/sendnn PAGED CB): the on-card pool is

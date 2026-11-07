@@ -124,21 +124,35 @@ pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::No
 /// [`PagedStep::rows`] wide. A row past the real ones repeats the last real token
 /// ([`scratchy_subtile::sdsc_abstract::ChunkRows::row_logical_pos`]'s law), so its forward, its
 /// mask and its KV write are the last real token's.
+///
+/// ⭐ `real` IS A COUNT, ONE OR MORE — a step of zero real rows is no step, and every reader that
+/// clamped it (`pos`'s own `.max(1)`, the worker's `live_of`) was defending against a value that
+/// names a broken staging, not tolerating a real one. The mint refuses it, so the count the type
+/// carries is the count the staging meant.
 #[derive(Clone, Copy, Debug)]
 pub struct StepRows {
     pub start: usize,
-    pub real: usize,
+    pub real: std::num::NonZeroUsize,
 }
 
 impl StepRows {
+    /// Declare `real` rows from `start`. `None` for zero real rows — a staging that asks for a
+    /// step of nothing, which the caller names at its own door.
+    pub fn new(start: usize, real: usize) -> Option<StepRows> {
+        Some(StepRows {
+            start,
+            real: std::num::NonZeroUsize::new(real)?,
+        })
+    }
+
     /// The sequence position row `r` carries.
     pub fn pos(&self, r: usize) -> usize {
-        self.start + r.min(self.real.max(1) - 1)
+        self.start + r.min(self.real.get() - 1)
     }
 
     /// One past the last position this step reaches — the KV length after its write.
     pub fn end(&self) -> usize {
-        self.start + self.real
+        self.start + self.real.get()
     }
 }
 
@@ -157,7 +171,7 @@ impl std::fmt::Display for PagedStepError {
 fn check(step: &PagedStep, blocks: &[u32], rows: &StepRows) -> Result<(), PagedStepError> {
     let slots = step.page_slots as usize;
     let need = rows.end().div_ceil(slots);
-    if rows.real == 0 || rows.real > step.rows as usize {
+    if rows.real.get() > step.rows as usize {
         return Err(PagedStepError(format!(
             "a step of {} real row(s) in a {}-row bundle",
             rows.real, step.rows
@@ -612,7 +626,7 @@ pub fn request_sources(
 ) -> Result<StepSources, PagedStepError> {
     match step.paged_rows {
         PagedRows::Sequence => step_sources(step, blocks, rows),
-        PagedRows::Batch if rows.real == 1 => batch_sources(
+        PagedRows::Batch if rows.real.get() == 1 => batch_sources(
             step,
             &[BatchSeq {
                 blocks,
@@ -711,6 +725,10 @@ pub fn pool_of_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nz(n: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(n).unwrap()
+    }
 
     fn step() -> PagedStep {
         PagedStep {
@@ -1013,7 +1031,15 @@ mod tests {
             ..step()
         };
         let blocks = [2u32, 3];
-        let got = request_sources(&decode, &blocks, &StepRows { start: 5, real: 1 }).unwrap();
+        let got = request_sources(
+            &decode,
+            &blocks,
+            &StepRows {
+                start: 5,
+                real: nz(1),
+            },
+        )
+        .unwrap();
         let want = batch_sources(
             &decode,
             &[BatchSeq {
@@ -1028,7 +1054,10 @@ mod tests {
         assert!(tids.contains(&decode.rep_rows) && tids.contains(&decode.chunk_pages));
         assert!(!tids.contains(&decode.page_table) && !tids.contains(&decode.kv_row_pool));
         let prompt = step();
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         assert_eq!(
             request_sources(&prompt, &blocks, &rows).unwrap().int32,
             step_sources(&prompt, &blocks, &rows).unwrap().int32
@@ -1048,7 +1077,10 @@ mod tests {
     #[test]
     fn the_tables_follow_spyre_inference_s_laws() {
         let s = step();
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         let blocks = [2u32, 0];
         let pt = page_table(&s, &blocks, &rows).unwrap();
         assert_eq!(
@@ -1101,10 +1133,24 @@ mod tests {
                 .collect()
         };
         let chunk = step();
-        let staged = tids(&chunk, StepRows { start: 5, real: 2 });
+        let staged = tids(
+            &chunk,
+            StepRows {
+                start: 5,
+                real: nz(2),
+            },
+        );
         assert!(!staged.contains(&chunk.kv_row_pool) && !staged.contains(&chunk.int32_zero));
         let decode = PagedStep { rows: 1, ..step() };
-        let srcs = step_sources(&decode, &blocks, &StepRows { start: 5, real: 1 }).unwrap();
+        let srcs = step_sources(
+            &decode,
+            &blocks,
+            &StepRows {
+                start: 5,
+                real: nz(1),
+            },
+        )
+        .unwrap();
         assert!(srcs.int32.iter().any(|(t, ..)| *t == decode.kv_row_pool));
         let (_, zero, _) = srcs
             .int32
@@ -1127,7 +1173,10 @@ mod tests {
     #[test]
     fn the_card_holds_the_page_table_one_block_per_trip() {
         let s = step();
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         let blocks = [2u32, 3];
         let card = card_step_sources(&s, &blocks, &rows).unwrap();
         let pitch = s.card_walk_step() as usize;
@@ -1164,7 +1213,10 @@ mod tests {
             page_slots: 128,
             ..step()
         };
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         let blocks = [2u32, 3];
         let logical = mask_stack(&s, &rows);
         let card = card_step_sources(&s, &blocks, &rows).unwrap();
@@ -1318,7 +1370,10 @@ mod tests {
                 let body = full
                     .on_body(rows, PagedRows::Sequence, walk * full.page_slots)
                     .unwrap();
-                let st = StepRows { start: 0, real };
+                let st = StepRows {
+                    start: 0,
+                    real: nz(real),
+                };
                 let card = card_step_sources(&body, &[3, 2, 1, 0], &st).unwrap();
                 fits(full, &card, &card_statics(&body).unwrap());
             }
@@ -1362,8 +1417,28 @@ mod tests {
     #[test]
     fn a_step_past_the_request_s_blocks_is_refused() {
         let s = step();
-        assert!(page_table(&s, &[2], &StepRows { start: 3, real: 2 }).is_err());
-        assert!(write_rows(&s, &[2, 9], &StepRows { start: 0, real: 1 }).is_err());
+        assert!(
+            page_table(
+                &s,
+                &[2],
+                &StepRows {
+                    start: 3,
+                    real: nz(2)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            write_rows(
+                &s,
+                &[2, 9],
+                &StepRows {
+                    start: 0,
+                    real: nz(1)
+                }
+            )
+            .is_err()
+        );
     }
 
     /// A bundle whose attention walks two of the pool's four blocks serves a chunk over a cached
@@ -1373,8 +1448,21 @@ mod tests {
         let s = PagedStep { walk: 2, ..step() };
         assert_eq!(s.reach(), 8);
         let blocks = [3u32, 1, 0];
-        assert!(page_table(&s, &blocks, &StepRows { start: 5, real: 3 }).is_ok());
-        let past = StepRows { start: 6, real: 3 };
+        assert!(
+            page_table(
+                &s,
+                &blocks,
+                &StepRows {
+                    start: 5,
+                    real: nz(3)
+                }
+            )
+            .is_ok()
+        );
+        let past = StepRows {
+            start: 6,
+            real: nz(3),
+        };
         assert!(page_table(&s, &blocks, &past).is_err());
         assert!(write_rows(&s, &blocks, &past).is_err());
     }

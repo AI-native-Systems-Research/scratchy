@@ -591,7 +591,7 @@ mod tests {
     /// card's placements hold. The index tables arrive as INTEGER words, the mask as values.
     #[test]
     fn the_paged_steps_are_the_card_steps_tables() {
-        let rows = crate::paged_step::StepRows { start: 9, real: 3 };
+        let rows = crate::paged_step::StepRows::new(9, 3).expect("three rows is three rows");
         let card = crate::paged_step::card_step_sources(&STEP, &[3, 1, 0], &rows).expect("staged");
         let inp = inputs(Some(&card));
         for t in [STEP.page_table, STEP.write_rows, STEP.query_rows] {

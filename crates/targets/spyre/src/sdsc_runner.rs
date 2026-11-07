@@ -446,8 +446,8 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         Ok(Self {
             vocab: exec.vocab.0,
             cap: exec.cap() as usize,
-            pool_pages: exec.pool_pages().0 as usize,
-            page_slots: exec.page_slots().0 as usize,
+            pool_pages: exec.pool_pages().map_or(0, |p| p.0 as usize),
+            page_slots: exec.page_slots().map_or(0, |p| p.0.get() as usize),
             kv_dim: exec.kv_dim.0,
             pmask_slots: exec.pmask_slots(),
             paged: exec.is_paged(),
