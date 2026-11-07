@@ -1353,12 +1353,24 @@ impl OperandView {
     fn of(r: &Region, rows: u32) -> Option<OperandView> {
         if r.r_len == rows && r.r_start + r.r_len <= r.v_rows {
             Some(OperandView::Window)
-        } else if r.r_cover == (0, r.v_rows) && r.r_start == 0 && r.v_rows == rows {
+        } else if r.r_cover == (0, r.v_rows) && is_whole_view(r, rows) {
             Some(OperandView::View)
         } else {
             None
         }
     }
+}
+
+/// ⭐ THE WHOLE-VIEW PREDICATE — ONE law, every reader: a region whose view is the op's own row
+/// count at row 0 IS the op's whole sweep, so the door addresses it as a same-rows stick-major
+/// parent (a whole-stick column window) rather than a band of a taller one. The two-form doors
+/// (`elementwise`, `scalarmul_scaled`) pick their form by it, and [`OperandView::of`]'s view arm
+/// reads it as its own clause — the cover beside it there is the program's EVIDENCE, never the
+/// selector. `c_start` is deliberately NOT part of the law: a whole-view region can still sit
+/// at a column corner (a column-blocked piece of a same-rows view), which is [`chunk_window`]'s
+/// business, not this one.
+fn is_whole_view(x: &Region, rows: u32) -> bool {
+    x.r_start == 0 && x.v_rows == rows
 }
 
 /// ⭐⭐⭐ THE ROW BASIS AN ELEMENTWISE OP SWEEPS — the matmul windowing arm's law, stated once for the
@@ -2417,10 +2429,8 @@ pub fn elementwise_df(
     // which carries the parent's row count by type.
     if out.c_start == 0
         && ins.iter().all(|x| x.c_start == 0)
-        && out.r_start == 0
-        && ins.iter().all(|x| x.r_start == 0)
-        && out.v_rows == rows
-        && ins.iter().all(|x| x.v_rows == rows)
+        && is_whole_view(&out, rows)
+        && ins.iter().all(|x| is_whole_view(x, rows))
     {
         let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
         let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
@@ -2461,8 +2471,7 @@ pub fn elementwise_df(
     // the parent's column planes at the parent's pitch. A one-stick band is the card-proven
     // rotate-half geometry byte for byte (no declaration, the flat offset); a multi-stick band
     // is the device-extent form the granite `[84, 128]`-of-`[672, 128]` window measured.
-    let whole = |x: &Region| x.r_start == 0 && x.v_rows == rows;
-    let out_off: crate::addr::OutCorner = if whole(&out) {
+    let out_off: crate::addr::OutCorner = if is_whole_view(&out, rows) {
         chunk_window(name, rows, &out)?.into()
     } else {
         crate::addr::OutCorner::Row(band_corner(name, rows, &out, Df::Fp16)?)
@@ -2484,7 +2493,7 @@ pub fn elementwise_df(
         .iter()
         .zip(ins.iter())
         .map(|(h, x)| {
-            Ok(if whole(x) {
+            Ok(if is_whole_view(x, rows) {
                 In::col_window(h, chunk_window(name, rows, x)?).ew()
             } else {
                 In::row_window(h, band_corner(name, rows, x, Df::Fp16)?).ew()
@@ -10951,7 +10960,7 @@ fn scalarmul_scaled(
     // past-the-end, which the operand mint refuses. The WHOLE form keeps the store-width
     // handle it always had (the padded-logits law above), so the ordinary case's bytes do not
     // move.
-    let x_whole = ins[0].r_start == 0 && ins[0].v_rows == rows;
+    let x_whole = is_whole_view(&ins[0], rows);
     let x_band_h = rb(&x, ins[0].v_rows, ins[0].v_cols);
     let x_in = if x_whole {
         In::col_window(&x_h, corner).ew()
