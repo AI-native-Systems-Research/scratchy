@@ -199,8 +199,10 @@ fn out_corner(op: &EmittedOp, buffer: &str) -> Option<u32> {
 /// Dump the cell. `group_0/` ([`superdsc::write_dxp_input`]), `placements.json` (the launch map,
 /// the `bake.rs::write_placements` format, the output row labeled `Logits` so the runner reads it
 /// back) and `cell.json` (this cell's own statement, for the runner's fills and decoder).
+/// `EPILOGUE_ADD_SEAL_ROOT`/`EPILOGUE_ADD_SEAL_SHA` are this test's own input paths — where the
+/// cell is written and which sha stamps it — not a ladder behavior toggle.
 #[test]
-#[ignore]
+#[ignore = "needs a spyre card: dumps the 8b epilogue-add seal cells for epilogue_add_seal_run.sh"]
 fn dump_attn_epilogue_add_seal() {
     let Some(root) = std::env::var_os("EPILOGUE_ADD_SEAL_ROOT") else {
         panic!("EPILOGUE_ADD_SEAL_ROOT=<dir> names where the cell is written");
