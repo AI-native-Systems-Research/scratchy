@@ -38,6 +38,10 @@ use super::{
     check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
     pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
+use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
+    ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
+    assemble_reduce_split, partial_accum_handle, reduce_data_handle,
+};
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
@@ -3903,7 +3907,7 @@ pub fn rmsnorm(
     let x = tensors[0].name();
     let gamma = tensors[1].name();
     let t = out.tid;
-    Ok(assemble_rmsnorm(
+    assemble_rmsnorm(
         &format!("o{t}"),
         rows,
         cols,
@@ -3914,7 +3918,8 @@ pub fn rmsnorm(
         ones_const.as_deref(),
         sym_id_base,
         layout,
-    ))
+    )
+    .map_err(|e| Error { message: e })
 }
 
 /// THE POINTWISE DEVICE-WIDTH PAD, CAPPED AT THE WIDTH THE OUTPUT'S PLACEMENT ACTUALLY HOLDS.
@@ -9470,7 +9475,7 @@ pub fn rmsnorm_at(
     let x = tensors[0].name();
     let gamma = tensors[1].name();
     let t = out.tid;
-    Ok(assemble_rmsnorm(
+    assemble_rmsnorm(
         &format!("o{t}"),
         rows,
         cols,
@@ -9481,7 +9486,8 @@ pub fn rmsnorm_at(
         ones_const.as_deref(),
         sym_id_base,
         layout,
-    ))
+    )
+    .map_err(|e| Error { message: e })
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::RmsNormUnit`] —
@@ -9521,7 +9527,7 @@ pub fn rmsnorm_unit(
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
     let x = tensors[0].name();
     let t = out.tid;
-    Ok(assemble_rmsnorm_unit(
+    assemble_rmsnorm_unit(
         &format!("o{t}"),
         rows,
         cols,
@@ -9530,7 +9536,8 @@ pub fn rmsnorm_unit(
         &eps_const,
         sym_id_base,
         layout,
-    ))
+    )
+    .map_err(|e| Error { message: e })
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::WindowedRmsNorm`] — the
@@ -9571,8 +9578,10 @@ pub fn windowed_rmsnorm(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
+    use crate::emit::op_func_from_str;
     use crate::ir::bridge::tiled_op_sdsc_op::{
-        assemble_reduce_off, win_reduce_accum, win_reduce_data,
+        ReduceDivision, ReduceSplit, assemble_reduce_off, assemble_reduce_split, win_reduce_accum,
+        win_reduce_data,
     };
     let unit = matches!(
         k.program,
@@ -9737,35 +9746,65 @@ pub fn windowed_rmsnorm(
             layout,
         ));
         // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
-        //    its own head's buffer at ZERO (the fp8 amax-partial shape).
+        //    its own head's buffer at ZERO (the fp8 amax-partial shape). THE ONE PROBE-AND-SPLIT
+        //    BODY owns the long form: a head window too wide for one LX pass splits into
+        //    single-shot slices and their running combine, and a fitting one is this single
+        //    descriptor unchanged.
         let rmmean_op = format!("rmmean_{prefix}");
-        ops.push(assemble_reduce_off(
-            &rmmean_op,
-            "mean",
-            t_rows,
-            f_cols,
-            // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
-            // whole-block shift, minted against the buffer's own handle.
-            win_reduce_data(
-                layout,
-                &sq16_h,
-                win,
-                t_rows,
-                f_cols,
-                &format!("{rmmean_op}: squares"),
-            )
-            .map_err(|e| Error { message: e })?,
-            win_reduce_accum(
-                layout,
-                &mean_h,
-                crate::addr::DevOff::ZERO,
-                t_rows,
-                &format!("{rmmean_op}: mean"),
+        let split = assemble_reduce_split(
+            ReduceSplit::new(
+                &rmmean_op,
+                ReduceGeometry::new(
+                    op_func_from_str("mean"),
+                    t_rows.get(),
+                    d,
+                    crate::superdsc_opspec::Df::Fp16,
+                    ReduceDivision::Rows,
+                )
+                .map_err(|e| Error { message: e })?,
+                ReduceDataLeg::at_column(&sq16_h, h * d),
+                ReduceAccumLeg::new(&mean_h, crate::addr::DevOff::ZERO),
+                out_id,
             )
             .map_err(|e| Error { message: e })?,
             sym_id_base,
             layout,
-        ));
+        )
+        .map_err(|e| Error { message: e })?;
+        if let Some(split) = split {
+            ops.extend(split);
+        } else {
+            ops.push(assemble_reduce_off(
+                &rmmean_op,
+                "mean",
+                t_rows,
+                f_cols,
+                // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
+                // whole-block shift, minted against the buffer's own handle.
+                win_reduce_data(
+                    layout,
+                    &sq16_h,
+                    win,
+                    t_rows,
+                    f_cols,
+                    crate::superdsc_opspec::Df::Fp16,
+                    &format!("{rmmean_op}: squares"),
+                )
+                .map_err(|e| Error { message: e })?,
+                win_reduce_accum(
+                    layout,
+                    &mean_h,
+                    crate::addr::DevOff::ZERO,
+                    t_rows,
+                    crate::superdsc_opspec::Df::Fp16,
+                    &format!("{rmmean_op}: mean"),
+                )
+                .map_err(|e| Error { message: e })?,
+                crate::superdsc_opspec::Df::Fp16,
+                sym_id_base,
+                layout,
+            ));
+        }
         // 3. mean + eps.
         ops.push(pw2(
             &format!("rmeps_{prefix}"),
@@ -10496,19 +10535,130 @@ pub fn reduce(
     // stays byte-identical; every other df is a build-time refusal by name, never a silent
     // nearest-format downgrade.
     match df {
-        Df::Fp16 => Ok(vec![
-            crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded(
-                &op_name,
-                kind.op_func(),
+        Df::Fp16 => {
+            // ⭐ THE LONG-REDUCE SPLIT — the same probe-and-split body the rmsnorm chain's own
+            // reduces take, on this door's own facts: the probe states THIS op's single-shot
+            // opspec (the same op, rows, cols, df and the same core division the single shot
+            // below derives), so `Ok(None)` — the reduce fits one LX pass, or the cores split
+            // the reduced axis — falls through to the single shot BYTE-IDENTICAL: the handles
+            // state the buffers' TRUE device shapes (the data at its stick-padded width, the
+            // accum at one stick per row — what the placement already reserves), and the single
+            // shot reads only their names and kind tags. The placement itself is untouched —
+            // `compute_bundle_layout` sizes it from the tape, never from a door's handles.
+            let data_h = reduce_data_handle::<crate::sdsc_abstract::RowBlockedTag>(
+                &data.name(),
                 rows,
                 cols,
-                &rb(&data.name(), rows, cols),
-                &rb(&out.name(), rows, 1),
+                Df::Fp16,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let accum_h = partial_accum_handle::<crate::sdsc_abstract::RowBlockedTag>(
+                &out.name(),
+                rows,
+                <Fp16 as DataFormat>::ELEMS_PER_STICK,
+                Df::Fp16,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let split = assemble_reduce_split(
+                ReduceSplit::new(
+                    &op_name,
+                    ReduceGeometry::new(
+                        op_func_from_str(kind.op_func()),
+                        rows,
+                        cols,
+                        Df::Fp16,
+                        layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+                    )
+                    .map_err(|e| Error {
+                        message: format!("{name}: {e}"),
+                    })?,
+                    ReduceDataLeg::whole(&data_h),
+                    ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
+                    PlaceId::Act(out.tid),
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: {e}"),
+                })?,
                 sym_id_base,
                 layout,
-            ),
-        ]),
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            if let Some(ops) = split {
+                return Ok(ops);
+            }
+            Ok(vec![
+                crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded(
+                    &op_name,
+                    kind.op_func(),
+                    rows,
+                    cols,
+                    &rb(&data.name(), rows, cols),
+                    &rb(&out.name(), rows, 1),
+                    sym_id_base,
+                    layout,
+                ),
+            ])
+        }
         Df::Fp32 => {
+            // ⭐ THE SAME SPLIT at fp32 — the probe asks the tiler the question this arm's
+            // single shot asks (`head_major = true`, the flat rank-3 form the card-proven fp32
+            // reduce states, so the data handle is Flat and the probe derives the same
+            // `head_major` from its kind). An fp32 reduced width that is not a whole 32-elem
+            // stick propagates the probe's `Err` — the same pad-mask refusal the single shot's
+            // own builder raises, stated once.
+            let data_h = reduce_data_handle::<crate::sdsc_abstract::FlatTag>(
+                &data.name(),
+                rows,
+                cols,
+                Df::Fp32,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let accum_h = partial_accum_handle::<crate::sdsc_abstract::FlatTag>(
+                &out.name(),
+                rows,
+                <Fp32 as DataFormat>::ELEMS_PER_STICK,
+                Df::Fp32,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            let split = assemble_reduce_split(
+                ReduceSplit::new(
+                    &op_name,
+                    ReduceGeometry::new(
+                        op_func_from_str(kind.op_func()),
+                        rows,
+                        cols,
+                        Df::Fp32,
+                        ReduceDivision::Rows,
+                    )
+                    .map_err(|e| Error {
+                        message: format!("{name}: {e}"),
+                    })?,
+                    ReduceDataLeg::whole(&data_h),
+                    ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
+                    PlaceId::Act(out.tid),
+                )
+                .map_err(|e| Error {
+                    message: format!("{name}: {e}"),
+                })?,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?;
+            if let Some(ops) = split {
+                return Ok(ops);
+            }
             // `head_major = true` — the flat rank-3 form the card-proven fp32 reduce
             // (`assemble_reduce_df`, torch-spyre's rmsnorm mean(x²)) already states.
             let op = crate::ir::bridge::tiled_op_sdsc_op::reduce::reduce_opspec_df(
@@ -10577,6 +10727,51 @@ pub fn reduce_df(
         ));
     }
     let op_name = format!("{}_o{}", kind.op_func(), out.tid);
+    // ⭐ THE LONG-REDUCE SPLIT, the same probe-and-split body [`reduce`]'s arms take: the probe
+    // states this arm's own single-shot question ([`assemble_reduce_df`]'s flat head-major form,
+    // at the stated df), so `Ok(None)` falls through to the single shot byte-identical.
+    let data_h = reduce_data_handle::<crate::sdsc_abstract::FlatTag>(&data.name(), rows, cols, df)
+        .map_err(|e| Error {
+            message: format!("{name}: {e}"),
+        })?;
+    let accum_h = partial_accum_handle::<crate::sdsc_abstract::FlatTag>(
+        &out.name(),
+        rows,
+        df.elems_per_stick(),
+        df,
+    )
+    .map_err(|e| Error {
+        message: format!("{name}: {e}"),
+    })?;
+    let split = assemble_reduce_split(
+        ReduceSplit::new(
+            &op_name,
+            ReduceGeometry::new(
+                op_func_from_str(kind.op_func()),
+                rows,
+                cols,
+                df,
+                ReduceDivision::Rows,
+            )
+            .map_err(|e| Error {
+                message: format!("{name}: {e}"),
+            })?,
+            ReduceDataLeg::whole(&data_h),
+            ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
+            PlaceId::Act(out.tid),
+        )
+        .map_err(|e| Error {
+            message: format!("{name}: {e}"),
+        })?,
+        sym_id_base,
+        layout,
+    )
+    .map_err(|e| Error {
+        message: format!("{name}: {e}"),
+    })?;
+    if let Some(ops) = split {
+        return Ok(ops);
+    }
     Ok(vec![
         crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_df(
             &op_name,

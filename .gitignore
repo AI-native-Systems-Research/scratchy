@@ -24,3 +24,4 @@ flamegraph.svg.gz
 .DS_Store
 __pycache__/
 .pr-ab-*/
+target-metal-check/

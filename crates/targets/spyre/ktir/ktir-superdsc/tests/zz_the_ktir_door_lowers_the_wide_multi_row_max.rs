@@ -110,3 +110,76 @@ fn the_controls_still_lower() {
     let v = dsc(&lower(ReduceKind::Sum, ROWS, WIDE), "sum_o8");
     assert_eq!(v["computeOp_"][0]["opFuncName"], "sum");
 }
+
+/// ⭐⭐ THE PAST-THE-BUDGET REDUCE SPLITS THROUGH THE DOOR ITSELF — the long-reduce split
+/// body (`assemble_reduce_split`) is wired into this door, on the door's own facts: a reduce
+/// whose full width bills past the usable LX lowers as `time` single-shot slice reduces
+/// (slice 0 into the caller's own accum, the rest into their own partial synthetics) plus
+/// `time − 1` running combines, in place on the caller's accum. The probe states the door's
+/// own single-shot opspec — the same op, rows, cols, df and core division — so a reduce that
+/// FITS returns `Ok(None)` inside the door and emits its ONE descriptor byte-identical,
+/// which is what every test above this one still pins (the handles' names and kind tags are
+/// all the single shot reads; the placement is sized from the tape, never from a door's
+/// handles).
+///
+/// One row, 1,048,545 wide at fp16: the full-width residency bills past the 1,677,721-B
+/// budget, half of it fits, so the tiler answers `time = 2` (the same geometry the split
+/// body's own lib fixtures pin, `long_reduce_split`).
+#[test]
+fn the_past_the_budget_reduce_splits_through_the_door() {
+    for (kind, combine) in [(ReduceKind::Sum, "add"), (ReduceKind::Max, "maximum")] {
+        let ops = lower(kind, 1, 1_048_545);
+        assert_eq!(
+            ops.len(),
+            3,
+            "{kind:?}: two slice reduces and their combine"
+        );
+        let name = format!("{}_o8", kind.op_func());
+        let d0 = dsc_of(&ops, &format!("{name}_p0_op"));
+        let d1 = dsc_of(&ops, &format!("{name}_p1_op"));
+        // Both slices walk their own whole-stick run (524,288 = 8,192 sticks)...
+        assert_eq!(
+            d0["N_"]["out_"].as_u64(),
+            Some(524_288),
+            "{kind:?}: slice 0"
+        );
+        assert_eq!(
+            d1["N_"]["out_"].as_u64(),
+            Some(524_288),
+            "{kind:?}: slice 1"
+        );
+        // ...the raw remainder (524,257, 31 lanes short) rides the LAST slice, masked with
+        // the reduce's own identity — the same samv law the single-shot padded reduce lives by.
+        assert_eq!(
+            d0["coordinateMasking_"].to_string(),
+            "{}",
+            "{kind:?}: slice 0 is stick-aligned"
+        );
+        assert_eq!(
+            d1["coordinateMasking_"].to_string(),
+            r#"{"out":[[524257,31]]}"#,
+            "{kind:?}: the tail pad rides the last slice, masked"
+        );
+        // THE COMBINE, one per reduce kind — never per shape: `max` takes the maximum
+        // (exactly reassociable), every sum-class kind adds.
+        let c = dsc_of(&ops, &format!("{name}_c1_op"));
+        assert_eq!(
+            c["computeOp_"][0]["opFuncName"], combine,
+            "{kind:?}: the combine op"
+        );
+        // The combine runs IN PLACE on the caller's own accum, at one stick per row.
+        assert_eq!(
+            c["N_"]["out_"].as_u64(),
+            Some(64),
+            "{kind:?}: the combine's width"
+        );
+    }
+}
+
+/// `dsc` for a door that emitted MORE than one op — keyed by the op's emitted name.
+fn dsc_of(ops: &[EmittedOp], op_name: &str) -> serde_json::Value {
+    ops.iter()
+        .map(|e| serde_json::to_value(&e.op).unwrap()["dscs_"][0][op_name].clone())
+        .find(|v| !v.is_null())
+        .unwrap_or_else(|| panic!("no op named {op_name} among the door's {} ops", ops.len()))
+}

@@ -10429,6 +10429,11 @@ fn synth_role_tokens(
             let j = proc_macro2::Literal::u32_unsuffixed(*j);
             quote! { #b::FqAmaxP(#j) }
         }
+        // The long-reduce partial slot — indexed like `FqAmaxP`, same reason.
+        R::ReducePartial(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(*j);
+            quote! { #b::ReducePartial(#j) }
+        }
         // The per-head windowed-norm synthetics (the `FqAmaxP` shape: one per head,
         // all at offset zero).
         R::HeadMean(h) => {
