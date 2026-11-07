@@ -433,6 +433,64 @@ where
 {
 }
 
+/// Slot `S`'s MLX-affine matmul weight, as a matmul of DSL weight `W` reads it: only a slot whose
+/// field holds `W` has one for it ([`gemm_slot`]'s rule, for the affine kernels). `W` is the weight
+/// the matmul's op reads, recorded from the op's own operand.
+///
+/// ```
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, affine_slot};
+/// # use scratchy_tensors::typed::{B4, G64, HoldsWeight, Q2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # type Proj = Q2<U2048, U256, B4, G64, Layer>;
+/// # struct Weights { k_proj: Proj, v_proj: Proj }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = Proj;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Proj { &w.v_proj }
+/// }
+/// assert_eq!(affine_slot::<VSlot, VProj>().ix, SourceIx(1));
+/// ```
+///
+/// The same slot read by a matmul of the K projection, of the very same shape and codes:
+///
+/// ```compile_fail,E0277
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::typed::{Source, affine_slot};
+/// # use scratchy_tensors::typed::{B4, G64, HoldsWeight, Q2};
+/// # use scratchy_tensors::typed::typenum::{U256, U2048};
+/// # struct Layer;
+/// # type Proj = Q2<U2048, U256, B4, G64, Layer>;
+/// # struct Weights { k_proj: Proj, v_proj: Proj }
+/// enum KProj {}
+/// enum VProj {}
+/// impl HoldsWeight<KProj> for KProj {}
+/// impl HoldsWeight<VProj> for VProj {}
+/// enum VSlot {}
+/// impl Source for VSlot {
+///     type Model = Weights;
+///     type Handle = Proj;
+///     type Weights = VProj;
+///     const IX: SourceIx = SourceIx(1);
+///     fn at(w: &Weights, _: LayerId) -> &Proj { &w.v_proj }
+/// }
+/// let _ = affine_slot::<VSlot, KProj>();
+/// ```
+pub const fn affine_slot<S, W>() -> AffineSlotWeight
+where
+    S: AffineSlot + Source<Weights: scratchy_tensors::typed::HoldsWeight<W>>,
+{
+    S::WEIGHT
+}
+
 /// A GEMM's weight, as its slot states it: the slot's index and the handle's dims, `n` (output
 /// columns) and `k` (the inner dim).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
