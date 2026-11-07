@@ -9383,7 +9383,13 @@ mod elementwise_tests {
         // no whole view.
         let narrow = vec![split(5, 64, 0, 42, 32), reg(6, 42, 32, true)];
         let mut sym = 0i64;
-        let Err(e) = convert::<crate::collective::TpWorld<1>>("cvt_s4", ConvertKind::Dl16ToFp32, &narrow, &mut sym, None) else {
+        let Err(e) = convert::<crate::collective::TpWorld<1>>(
+            "cvt_s4",
+            ConvertKind::Dl16ToFp32,
+            &narrow,
+            &mut sym,
+            None,
+        ) else {
             panic!("a sub-width band would read words the caller never staged");
         };
         assert!(
