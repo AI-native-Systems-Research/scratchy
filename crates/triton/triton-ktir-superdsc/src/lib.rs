@@ -289,7 +289,7 @@ fn emit_regions<T: ktir_superdsc::collective::Tp>(
         // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
         // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
         // count is a silently wrong grouping.
-        Program::Rope => {
+        Program::Rope { .. } => {
             return Err(Error {
                 stage: "program",
                 message: format!(
@@ -859,7 +859,7 @@ mod rope_from_the_fixture {
         let grid = vec![4, 8];
         triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
         triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
-        node_for(&m, Program::Rope).expect("node_for")
+        node_for(&m, Program::Rope { table: None }).expect("node_for")
     }
 
     /// ⭐ THE LAYOUT SERVES A ROPE NOW. It used to refuse the program outright for naming

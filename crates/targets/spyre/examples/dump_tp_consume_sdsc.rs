@@ -39,8 +39,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ir = lower_region(&bake.sharded.local, NonZeroU32::new(128).ok_or("128 != 0")?);
     // The sublayer's gemm weights: gate, up, down.
     let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-    let (ops, layout) = lower_graph_to_superdsc::<W, _>(&ir, &weight_ids, ActiveCap::FULL, false)
-        .map_err(|e| format!("the sharded sublayer does not lower: {e:?}"))?;
+    let (ops, layout) = lower_graph_to_superdsc::<W, _>(
+        &ir,
+        &weight_ids,
+        ActiveCap::FULL,
+        false,
+        &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<W>::of::<
+            scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+        >(),
+    )
+    .map_err(|e| format!("the sharded sublayer does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
         .filter(|e| e.tp_consume.is_some())
@@ -78,8 +86,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroU32::new(128).ok_or("128 != 0")?,
     );
     let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-    let (ops, _) = lower_graph_to_superdsc::<W, _>(&ir, &weight_ids, ActiveCap::FULL, false)
-        .map_err(|e| format!("the sharded projection does not lower: {e:?}"))?;
+    let (ops, _) = lower_graph_to_superdsc::<W, _>(
+        &ir,
+        &weight_ids,
+        ActiveCap::FULL,
+        false,
+        &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<W>::of::<
+            scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+        >(),
+    )
+    .map_err(|e| format!("the sharded projection does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
         .filter(|e| e.tp_consume.is_some())

@@ -7272,6 +7272,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
 ) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
     {
@@ -7299,7 +7300,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     }
     let b = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params)?
+        emit_bundle_inner(ops, layout, fold, attn_params, ropes)?
     };
     debug_assert_eq!(
         b.fp, fp,
@@ -7575,6 +7576,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
 ) -> std::io::Result<EmittedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
@@ -7609,7 +7611,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
     let groups = if cfg!(feature = "spyre-hw") {
         PendingGroups::Staged(
-            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params)
+            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params, ropes)
                 .map_err(|e| std::io::Error::other(e.0))?,
         )
     } else {
@@ -8272,6 +8274,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
 ) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
@@ -8314,6 +8317,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
             &mut sym_id_base,
             layout,
             attn_params,
+            ropes,
             &mut fp8_quantized,
         )
         .map_err(|err| {
@@ -8718,6 +8722,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    ropes: &scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T>,
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -8725,6 +8730,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
         weight_ids,
         active_cap,
         rows_are_requests,
+        ropes,
     )
 }
 
@@ -9650,6 +9656,10 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
+                &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+                    ktir_superdsc::collective::TpWorld<1>,
+                >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(
+                ),
             )
             .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
@@ -9714,6 +9724,10 @@ mod tests {
             &mut sym,
             Some(&layout),
             None,
+            &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+                ktir_superdsc::collective::TpWorld<1>,
+            >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(
+            ),
             &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
         );
         let why = match stripped {
@@ -9878,6 +9892,10 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+                ktir_superdsc::collective::TpWorld<1>,
+            >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(
+            ),
         )
         .expect("two-fp8-matmul lowering");
         let quantizes = ops
@@ -9966,6 +9984,10 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+                ktir_superdsc::collective::TpWorld<1>,
+            >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(
+            ),
         )
         .expect("the folded residual shape lowers");
 
@@ -10041,6 +10063,10 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+                ktir_superdsc::collective::TpWorld<1>,
+            >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(
+            ),
         )
         .expect("the refused residual shape still lowers");
 
@@ -10829,8 +10855,16 @@ mod tests {
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<T>::of::<
+                    scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+                >(),
+            )
+            .unwrap();
             // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
             let groups: Vec<bundle::LaunchGroup<'static, T>> =
                 launch_index(&ops, FoldGrouping::Split)

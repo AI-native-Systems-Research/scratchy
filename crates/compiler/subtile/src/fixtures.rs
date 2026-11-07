@@ -131,7 +131,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 4: q' = rope(q)
             OpDesc {
-                op: SubOp::rope_rotate(head_dim),
+                op: SubOp::rope_rotate(head_dim, crate::subtile_ir::RopeClass::Global),
                 m: 1,
                 inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
             },
@@ -697,7 +697,7 @@ pub fn rope_rotate_only_input() -> LoweringInput {
             }, // 2  sin
         ],
         ops: vec![OpDesc {
-            op: SubOp::rope_rotate(HeadDim::new(head_dim)),
+            op: SubOp::rope_rotate(HeadDim::new(head_dim), crate::subtile_ir::RopeClass::Global),
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
         }],

@@ -4731,7 +4731,7 @@ pub fn program_tanhsoftcap_cap(f: &IRFunction<'static>) -> Option<f32> {
 }
 
 /// main's `lower_rope_node` (main 8696-9528), waiting for its head dim to become a const — the
-/// consumer side of `with_config_head_dim`, exactly as main's `LowerRope` was.
+/// argument pack of a rope class's `rope_at::<HD>` instantiation, exactly as main's `LowerRope` was.
 pub struct RopeAt<'a> {
     pub name: &'a str,
     /// x, cos, sin, out — main's `inputs[0..3]` and `output`.

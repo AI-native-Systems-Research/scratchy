@@ -11603,7 +11603,7 @@ fn dump_wavefront_mega(
             decode_bounds,
             &bridge,
             crate::to_wavefront::PrefixCapacity::new(cap),
-            primary_m,
+            crate::to_wavefront::QueryRows::of_count(primary_m),
         )
     };
     #[cfg_attr(not(feature = "spyre"), allow(unused_mut))]
@@ -11709,6 +11709,44 @@ fn dump_wavefront_mega(
         use std::num::NonZeroU32;
         let knb = NonZeroU32::new(8192).expect("8192 != 0");
         let stem_id = stem.replace(['-', '.'], "_");
+        // ⛔ THE BAKE'S ONE DOOR ON MODEL IDENTITY: its config FILE's stem → that config's marker
+        // type → the type's rope classes, in the tensor-parallel world `T` a bake runs in. The
+        // file's, not `source_stem`: a quant variant's `source_stem` carries its preset
+        // (`granite-3.1-2b-instruct-fp8-dynamic-per-channel`), and its rope classes are its base
+        // config's. Every rope this bake lowers goes through one of them (`ktir_superdsc_door`),
+        // so no head dim becomes a const anywhere below. A stem no config states is a bake error
+        // naming it.
+        let config_stem = model
+            .source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "[spyre-superdsc] {stem}: its config path {} has no stem",
+                    model.source_path.display()
+                )
+            });
+        fn model_ropes_in<T: scratchy_target_spyre::bundle_code::collective::Tp>(
+            stem: &str,
+        ) -> scratchy_subtile::model_geometry::rope_bridge::ModelRopes<T> {
+            use scratchy_subtile::model_geometry::{
+                ConfigRopes, OnConfigModel, rope_bridge::ModelRopes, with_config_model,
+            };
+            struct Ropes<T>(core::marker::PhantomData<T>);
+            impl<T: scratchy_target_spyre::bundle_code::collective::Tp> OnConfigModel for Ropes<T> {
+                type Out = ModelRopes<T>;
+                fn on_model<M: ConfigRopes>(self) -> ModelRopes<T> {
+                    M::ropes::<T>()
+                }
+            }
+            with_config_model(stem, Ropes(core::marker::PhantomData)).unwrap_or_else(|| {
+                panic!(
+                    "[spyre-superdsc] {stem}: no config under crates/models/arch/configs/ states \
+                     this stem, so its rope classes have no type ({})",
+                    scratchy_subtile::model_geometry::geometry_sources(),
+                )
+            })
+        }
         // Opt-in `--device sdsc` (real-silicon) dump: emit the SAME real-model
         // `krg` SubtileIR to a sendnn op-graph JSON the DeepTools `compile_graph`
         // toolchain consumes. Off by default; writes one `<base>.sengraph.json`
@@ -11968,6 +12006,7 @@ fn dump_wavefront_mega(
              // numeric gate runs such a bundle on both ranks at once. `None` for a world of one.
              shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>|
              -> (BakeOut, Vec<BakeEffect>) {
+                let model_ropes = &model_ropes_in::<$W>(config_stem);
                 // Only the emulator's numeric gate reads the slice laws.
                 #[cfg(not(feature = "spyre-emu"))]
                 let _ = shards;
@@ -12231,6 +12270,7 @@ fn dump_wavefront_mega(
                             None,
                             superdsc::FoldGrouping::Split,
                             None,
+                            model_ropes,
                         ) {
                             Ok(fp) => eprintln!(
                                 "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
@@ -12268,6 +12308,7 @@ fn dump_wavefront_mega(
                                 active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
                                 // start==0 chunk, FULL for the continuation bundle.
                                 rows_are_requests,
+                                model_ropes,
                             ) {
                                 Ok(rolled) => {
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
@@ -12345,6 +12386,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            model_ropes,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12380,6 +12422,7 @@ fn dump_wavefront_mega(
                                             } else {
                                                 unrolled_params
                                             },
+                                            model_ropes,
                                         );
                                         match r {
                                             Ok(fp) => body_fps.push(fp),
@@ -12432,6 +12475,7 @@ fn dump_wavefront_mega(
                                                         Some(&rolled.layout),
                                                         superdsc::FoldGrouping::Fused,
                                                         rolled.attn_params,
+                                                        model_ropes,
                                                     )
                                                     .map(superdsc::bundle::SiblingFp::from)
                                                     .unwrap_or_else(|e| {
@@ -12458,6 +12502,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            model_ropes,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12611,6 +12656,7 @@ fn dump_wavefront_mega(
                                                         &weight_ids,
                                                         rung,
                                                         rows_are_requests,
+                                                        model_ropes,
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
                                                         // card bakes the ROLLED body, the emulator the
@@ -12652,6 +12698,7 @@ fn dump_wavefront_mega(
                                                                     } else {
                                                                         rung_params
                                                                     },
+                                                                    model_ropes,
                                                                 ) {
                                                                     Ok(rfp) => {
                                                                         rfps.push(rfp);
@@ -12681,6 +12728,7 @@ fn dump_wavefront_mega(
                                                                             Some(&rr.layout),
                                                                             superdsc::FoldGrouping::Fused,
                                                                             rr.attn_params,
+                                                                            model_ropes,
                                                                         )
                                                                         .map(
                                                                             superdsc::bundle::SiblingFp::from,
@@ -13817,7 +13865,7 @@ fn dump_wavefront_mega(
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
-                    primary_m,
+                    crate::to_wavefront::QueryRows::of_count(primary_m),
                 ) {
                     Ok(l) => l,
                     Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
@@ -13874,17 +13922,23 @@ fn dump_wavefront_mega(
             // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
             // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
             // free here: `decode_rung_lits` sorts the ladder by width before baking it.
-            for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS
-                .into_iter()
-                .rev()
-            {
+            //
+            // ⭐ EACH RUNG IS A TYPE. The walk names every batch rung as a `Rung<MQ>` and hands out
+            // its `DecodeRung`, widest first; the rung's rows reach the bridge as `QueryRows`
+            // (`lower_decode_to_wavefront`, which sets the bundle's `num_tokens` from them). The
+            // number leaves the type once more, as `seqs`, for the bake's bundle names, messages and
+            // ladder keys, which are numbers.
+            scratchy_subtile::sdsc_abstract::each_batch_rung_widest_first(|rung| {
+                let rows = crate::to_wavefront::QueryRows::of_nonzero(rung.rows());
+                // The rung's rows as the number the bake's bundle names and ladder keys state.
+                let seqs = rows.get();
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     inferred,
                     decode_bounds,
                     &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                    seqs,
+                    rows,
                 ) {
                     Ok(lwd_b) => {
                         emit_bundle(
@@ -13932,7 +13986,7 @@ fn dump_wavefront_mega(
                          batch silently runs elsewhere"
                     ),
                 }
-            }
+            });
         }
         // SuperDSC replaces the sengraph ENTIRELY: `emit_bundle` above baked the work-divided dxp bundle
         // and set `superdsc_fp`, but the SENGRAPH decode lowering is REFUSED for granite (the lm_head
@@ -14210,7 +14264,7 @@ fn dump_wavefront_mega(
                 // keeps 0 prefix rows so the prompt still attends only itself
                 // causally, and chunk k attends the k*mq rows written so far.
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                pl,
+                crate::to_wavefront::QueryRows::of_count(pl),
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -14359,7 +14413,7 @@ fn dump_wavefront_mega(
                     decode_bounds,
                     &bridge,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                    m,
+                    crate::to_wavefront::QueryRows::of_count(m),
                 ) {
                     Ok(lwd_p) => {
                         emit_bundle(
@@ -14530,7 +14584,7 @@ fn dump_wavefront_mega(
                 decode_bounds,
                 &bridge,
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
-                decode_mq,
+                crate::to_wavefront::QueryRows::of_count(decode_mq),
             ) {
                 Ok(lwd_cb) => {
                     let (_m, _n, sg, groups) = emit_bundle(
@@ -15120,7 +15174,7 @@ pub fn emit_model(
                     crate::to_wavefront::PrefixCapacity::new(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
-                    wp.num_tokens as u32,
+                    crate::to_wavefront::QueryRows::of_count(wp.num_tokens as u32),
                 )
                 .ok()
             });
@@ -15215,7 +15269,7 @@ pub fn emit_model(
                 &bounds,
                 &bridge_model,
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
-                wp.num_tokens as u32,
+                crate::to_wavefront::QueryRows::of_count(wp.num_tokens as u32),
             ) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
@@ -15503,7 +15557,7 @@ pub fn emit_model(
             &bounds,
             &bridge_model,
             prefix,
-            m as u32,
+            crate::to_wavefront::QueryRows::of_count(m as u32),
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
