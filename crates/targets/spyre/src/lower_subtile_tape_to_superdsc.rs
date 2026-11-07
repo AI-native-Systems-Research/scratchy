@@ -3738,7 +3738,6 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     covering: Option<&std::collections::HashSet<u64>>,
     prefill: Option<&PrefillGate>,
-    cap: u32,
     active_cap: ActiveCap,
     seed: &dyn Fn(u32) -> usize,
 ) -> Result<GateProbe, String> {
@@ -4351,22 +4350,16 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // ── The probe: ONE staging for every gate (`stage_gate_probe`) — the one-rank gate's sources
     //    each draw their own tid's synth stream. ──
     let GateProbe {
-        mut emu_weights,
+        emu_weights,
         view_bytes,
         gemm,
         scale_rows,
         load_consts,
         staged_rope,
-        mut sources,
-    } = stage_gate_probe::<T, F>(
-        ir,
-        weight_ids,
-        covering,
-        prefill,
-        cap,
-        rung.active_cap,
-        &|tid| tid as usize,
-    )?;
+        sources,
+    } = stage_gate_probe::<T, F>(ir, weight_ids, covering, prefill, rung.active_cap, &|tid| {
+        tid as usize
+    })?;
     let view = StagedWeightView {
         bytes: &view_bytes,
         gemm: &gemm,
@@ -5035,7 +5028,6 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             weight_ids,
             covering,
             prefill,
-            cap,
             active_cap,
             &seed(me.get() as usize),
         )?);

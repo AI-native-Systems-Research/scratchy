@@ -574,9 +574,15 @@ mod tests {
         let b = RuntimeContext::create(DeviceId(1), test_scheduler(), test_allocator());
         assert_eq!(a.device_id().unwrap(), DeviceId(0));
         assert_eq!(b.device_id().unwrap(), DeviceId(1));
-        assert_ne!(a.default_stream_id().unwrap(), b.default_stream_id().unwrap());
+        assert_ne!(
+            a.default_stream_id().unwrap(),
+            b.default_stream_id().unwrap()
+        );
         a.reset().unwrap();
-        assert!(matches!(a.device_id(), Err(RuntimeContextError::NotCreated)));
+        assert!(matches!(
+            a.device_id(),
+            Err(RuntimeContextError::NotCreated)
+        ));
         assert_eq!(
             b.device_id().unwrap(),
             DeviceId(1),

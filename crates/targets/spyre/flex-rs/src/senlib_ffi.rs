@@ -333,7 +333,10 @@ unsafe extern "C" {
     /// when firmware adds bank-targeted allocation support`), so a prior
     /// version of this declaration that took a `domain_id_or_negative_one`
     /// parameter here invented an FFI argument with no real senlib analog.
-    pub(crate) fn flex_senlib_memory_allocate(card: *mut c_void, num_bytes: u64) -> SenlibAllocationHandle;
+    pub(crate) fn flex_senlib_memory_allocate(
+        card: *mut c_void,
+        num_bytes: u64,
+    ) -> SenlibAllocationHandle;
 
     /// Corresponds to `senlib::MemoryAllocator::Free` (PF,
     /// `device_memory_allocator.cpp:272`) / `senlib::v2::VfWrapper::Deallocate`
@@ -342,7 +345,8 @@ unsafe extern "C" {
     /// handle, or a senlib throw). Was `void`: a failed deallocation was
     /// indistinguishable from a successful one, the same swallowed-failure shape
     /// that caused the batched-decode hang on the submission path.
-    pub(crate) fn flex_senlib_memory_free(card: *mut c_void, handle: SenlibAllocationHandle) -> i32;
+    pub(crate) fn flex_senlib_memory_free(card: *mut c_void, handle: SenlibAllocationHandle)
+    -> i32;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -459,13 +463,19 @@ unsafe extern "C" {
     /// the shim runtime has not been initialized (see
     /// `flex_shim_init_runtime` above) or `pipeline` is out of range.
     /// Backs `DeviceHandle::ComputeCbi()/AsyncDmaICbi()/AsyncDmaOCbi()`.
-    pub(crate) fn flex_shim_cbi_for_pipeline(card: *mut c_void, pipeline: i32) -> SenlibControlBlockInterfaceHandle;
+    pub(crate) fn flex_shim_cbi_for_pipeline(
+        card: *mut c_void,
+        pipeline: i32,
+    ) -> SenlibControlBlockInterfaceHandle;
 
     /// Returns the process's single `senlib::ResponseBlockInterface*`
     /// (`DeviceHandle::Rbi()`) as an opaque handle. `pipeline` is accepted
     /// for symmetry with `flex_shim_cbi_for_pipeline` but ignored by the
     /// shim — senlib exposes exactly one RBI per device.
-    pub(crate) fn flex_shim_rbi_for_pipeline(card: *mut c_void, pipeline: i32) -> SenlibResponseBlockInterfaceHandle;
+    pub(crate) fn flex_shim_rbi_for_pipeline(
+        card: *mut c_void,
+        pipeline: i32,
+    ) -> SenlibResponseBlockInterfaceHandle;
 
     /// Port of `senlib::ControlBlockInterface::capacity() const`.
     /// Call site: `runtime_scheduler.cpp:1025` (`RuntimeScheduler::getQueueCapacity`).
@@ -791,7 +801,8 @@ impl Card {
     /// The raw handle, for this crate's FFI calls only. Null only for a [`Card::detached`] test
     /// card, which every shim entry point refuses by name ("null card").
     pub(crate) fn raw(&self) -> *mut c_void {
-        self.raw.map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
+        self.raw
+            .map_or(std::ptr::null_mut(), std::ptr::NonNull::as_ptr)
     }
 
     /// A card with no device behind it, for unit tests of code that holds a card but must refuse
@@ -1037,20 +1048,30 @@ unsafe extern "C" {
     /// name parameter) and the concrete wrapper type it returns; the shim
     /// stores the wrapper type-erased and captures `hptr()` at creation, so
     /// only the shim's one construction line depends on the answer.
-    fn flex_senlib_pin_and_map(card: *mut c_void, num_bytes: u64, name: *const c_char) -> SenlibPinnedMemoryHandle;
+    fn flex_senlib_pin_and_map(
+        card: *mut c_void,
+        num_bytes: u64,
+        name: *const c_char,
+    ) -> SenlibPinnedMemoryHandle;
 
     /// Releases a pinned-memory mapping obtained from `flex_senlib_pin_and_map`
     /// (unpins + unmaps + drops senlib's wrapper). Cited: hdma_shm.hpp
     /// lifetime of the `PinnedMemoryWrapperPtr` members, destructed in
     /// `HdmaShmMgmt::~HdmaShmMgmt` (hdma_shm.hpp:479). Returns 0 on success,
     /// -1 if the release did not reach senlib (unknown handle, or a throw).
-    fn flex_senlib_pinned_memory_release(card: *mut c_void, handle: SenlibPinnedMemoryHandle) -> i32;
+    fn flex_senlib_pinned_memory_release(
+        card: *mut c_void,
+        handle: SenlibPinnedMemoryHandle,
+    ) -> i32;
 
     /// Returns the host-virtual pointer backing a pinned-memory region
     /// (`PinnedMemoryWrapper::hptr()`, used throughout hdma_shm.cpp, e.g.
     /// line 644). Non-null for any live handle — the allocation succeeded
     /// when the handle was minted.
-    fn flex_senlib_pinned_memory_hptr(card: *mut c_void, handle: SenlibPinnedMemoryHandle) -> *mut c_void;
+    fn flex_senlib_pinned_memory_hptr(
+        card: *mut c_void,
+        handle: SenlibPinnedMemoryHandle,
+    ) -> *mut c_void;
 
     /// Directly sets the on-device write-done counter for `sid` to `val`.
     /// Cited: host_wdone.cpp:413 `pfw_->interface()->direct_set_wdone(

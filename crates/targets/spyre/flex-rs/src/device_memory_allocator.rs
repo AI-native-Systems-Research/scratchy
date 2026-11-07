@@ -79,7 +79,8 @@ impl Drop for DeviceMemoryAllocation {
         // The C++ `~DeviceMemoryAllocation()` cannot report a failed `Free`
         // either, but it does not hide one: log it rather than dropping it on
         // the floor (a leaked device allocation is silent otherwise).
-        let rc = unsafe { senlib_ffi::flex_senlib_memory_free(self.card.raw(), self.handle.as_raw()) };
+        let rc =
+            unsafe { senlib_ffi::flex_senlib_memory_free(self.card.raw(), self.handle.as_raw()) };
         if rc != 0 {
             tracing::error!(handle = ?self.handle, "senlib device-memory Free failed; allocation leaked");
         }
@@ -225,20 +226,26 @@ impl DeviceMemoryAllocator {
         // SAFETY: FFI call into senlib with plain integer arguments; no
         // pointers, no aliasing concerns. Failure is signaled via a
         // zero handle per the `senlib_ffi` contract.
-        let mut handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(self.card.raw(), padded_bytes) };
+        let mut handle =
+            unsafe { senlib_ffi::flex_senlib_memory_allocate(self.card.raw(), padded_bytes) };
         let mut retry_count = 0;
         while handle.into_live().is_none() && retry_count < max_retries {
             retry_count += 1;
             std::thread::sleep(std::time::Duration::from_millis(
                 retry_delay_ms.max(0) as u64
             ));
-            handle = unsafe { senlib_ffi::flex_senlib_memory_allocate(self.card.raw(), padded_bytes) };
+            handle =
+                unsafe { senlib_ffi::flex_senlib_memory_allocate(self.card.raw(), padded_bytes) };
             retry_delay_ms = retry_delay_ms.saturating_mul(BACKOFF_MULTIPLIER);
         }
         let handle = handle
             .into_live()
             .ok_or(DeviceMemoryAllocatorError::SenlibAllocationFailed)?;
-        Ok(DeviceMemoryAllocation::new(num_bytes, handle, self.card.clone()))
+        Ok(DeviceMemoryAllocation::new(
+            num_bytes,
+            handle,
+            self.card.clone(),
+        ))
     }
 }
 

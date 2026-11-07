@@ -207,7 +207,9 @@ pub struct ResidentExecutor {
     /// once via `set_source`, NOT zeroed per pass. Union across all programs.
     sources: std::collections::HashSet<u64>,
     /// This executor's identity on the thread-local GPU weight cache — see
-    /// `metal::claim_weight_cache`. Unique per executor in the process, never 0.
+    /// `metal::claim_weight_cache`. Unique per executor in the process, never 0. The cache is the
+    /// Metal path's alone, so the field exists only there.
+    #[cfg(metal)]
     id: u64,
     /// Tensor ids written by some forward NODE (a node output) — MUTABLE across
     /// passes (e.g. the KV-cache prefixes the decode forward grows). A cached GPU
@@ -562,8 +564,10 @@ impl ResidentExecutor {
             )
             .collect();
 
+        #[cfg(metal)]
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(ResidentExecutor {
+            #[cfg(metal)]
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             programs,
             shapes,

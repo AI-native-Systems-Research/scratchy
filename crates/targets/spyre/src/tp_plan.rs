@@ -375,9 +375,9 @@ mod tests {
     }
 
     /// ⭐ THE STATIC AUDIT (#1007 §5), AT EVERY WORLD: every peer's block a rank's consume reads is
-    /// addressed, in the very input dxp compiles, at its TYPED placement — `SEGMENT_OFFSETS[segment]
-    /// + offset`, the emitter's own segment law — one stick per core, and the rank's OWN block is
-    /// never read. (Compiled by hand with `dxp_standalone` through the `dump_tp_consume_sdsc`
+    /// addressed, in the very input dxp compiles, at its TYPED placement (`SEGMENT_OFFSETS[segment]`
+    /// plus the offset, the emitter's own segment law), one stick per core, and the rank's OWN block
+    /// is never read. (Compiled by hand with `dxp_standalone` through the `dump_tp_consume_sdsc`
     /// example.)
     #[test]
     fn each_consume_reads_every_peer_block_at_its_typed_placement() {
