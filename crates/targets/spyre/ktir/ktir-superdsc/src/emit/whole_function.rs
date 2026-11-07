@@ -4201,6 +4201,10 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
     let gelus = program_gelu_chains(f)?;
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
     let equal_masks = program_equal_masks(f)?;
+    // The ONE frame assignment, read here and nowhere re-derived: the classification's
+    // order-freeness question — does this operand supply one scalar per output row? — is the
+    // value's WORLD, and the pass is its one answer.
+    let frames = assign_frames(f)?;
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -4317,35 +4321,16 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
         };
         // One input's (SOURCE, ORDER-FREENESS). The ruling's semantics are a SHAPE fact, not a
         // spelling fact: an operand that supplies ONE SCALAR PER OUTPUT ROW is order-free — a
-        // `Col` broadcast chain, a `[·, 1]` parameter, or a computed per-row value (a reduce
-        // result) whose own type states the degenerate column — while a dense operand, an
-        // `Mb`/`Y` spray and a `[1, ·]` row are read LANE FOR LANE, so the consumer's
-        // arrangement is the operand's. Read off the broadcast chain when the program spells
-        // one, and off the operand's OWN region/type when it does not (Triton's implicit
-        // broadcast needs no chain, and the emitter selects the operand mode from the same
-        // degenerate extent).
-        let dims_of = |v: Ssa| -> Option<&'static [i64]> {
-            f.operations
-                .iter()
-                .find(|o| o.result == Some(v))
-                .and_then(|o| o.result_type)
-                .and_then(|t| t.dims())
-        };
+        // `Col` broadcast chain, or a value the frame pass holds columnar — while a dense
+        // operand, an `Mb`/`Y` spray and a `[1, ·]` row are read LANE FOR LANE, so the
+        // consumer's arrangement is the operand's. Read off the broadcast chain when the
+        // program spells one (the chain's source is what the consumer binds); otherwise off the
+        // ONE frame assignment, whose load arm is the same degenerate-column read this
+        // classifier used to re-derive here.
         let resolved = |v: Ssa| -> (Ssa, bool) {
             match bcasts.get(&v) {
                 Some(b) => (b.src, b.axis == BcastAxis::Col),
-                None => {
-                    let per_row = match region_for_operand(k, v) {
-                        // A parameter: the VIEW's own column extent decides.
-                        Ok(Some(r)) => r.c_len == 1,
-                        // A value this function computed: its own result type's shape decides —
-                        // `[·, 1]` or rank-1 `[rows]` is the per-row vector a reduce produces.
-                        _ => {
-                            matches!(dims_of(v), Some(d) if d.len() == 1 || *d.last().unwrap_or(&0) == 1)
-                        }
-                    };
-                    (v, per_row)
-                }
+                None => (v, frames.world_of(v) == World::Column),
             }
         };
         // `arr` is mutated inside the marking loop below, so this is a fn taking the map rather
@@ -4575,6 +4560,10 @@ fn lower_function_folded<T: crate::collective::Tp>(
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let f = &k.func;
+    // Every value's world, minted once by the ONE frame assignment, and read here and nowhere
+    // re-derived: the carried-state mint, the shape-op reframe and the splatted constants below
+    // all ask this table.
+    let frames = assign_frames(f)?;
     let mut out = Vec::new();
     let mut lowered = 0usize;
 
@@ -4725,7 +4714,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name, c.arg.0
                 ));
             }
-            let frame = value_frame(f, &dims);
+            let frame = frames.frame_of(c.init, &dims);
             let tid = mint_inter(k, layout, floor, c.arg);
             layout.synth(crate::place::PlaceId::Act(tid), &frame);
             let r = Region {
@@ -4794,7 +4783,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         if inter.contains_key(&v) {
                             continue;
                         }
-                        if let Some((r, value)) = splat_buffer(k, layout, floor, v)? {
+                        if let Some((r, value)) = splat_buffer(k, layout, floor, &frames, v)? {
                             out.extend(super::lower_ktir_to_superdsc::fill(
                                 f.name,
                                 value,
@@ -5878,8 +5867,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
             };
             // The same bytes, in the frame the result is held in — the frame its consumers read
             // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`; a
-            // per-row column stays one value per stick row, [`value_frame`]).
-            let [rr, rc] = value_frame(f, &to);
+            // per-row column stays one value per stick row, the frame pass's one table).
+            let [rr, rc] = frames.frame_of(res, &to);
             let whole = source.r_start == 0
                 && source.c_start == 0
                 && source.r_len == source.v_rows
@@ -6788,7 +6777,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     // registry's bound const ([`super::lower_ktir_to_superdsc::fill`]). The op that
                     // reads it keeps its own kind; only a multiply/min/max beside a dense tensor
                     // reads its constant side as a scalar instead (`ScalarMul`, `ScalarBinary`).
-                    None => match splat_buffer(k, layout, floor, *v)? {
+                    None => match splat_buffer(k, layout, floor, &frames, *v)? {
                         Some((r, value)) => {
                             out.extend(super::lower_ktir_to_superdsc::fill(
                                 f.name,
@@ -8035,10 +8024,81 @@ fn every_store_is_written<T: crate::collective::Tp>(
     Ok(())
 }
 
-/// THE FRAME A VALUE OF `dims` IS HELD IN: a per-row scalar of a reduction — a value shaped as a
-/// `linalg.reduce` result of this function, the running max and sum — is the `[numel, 1]` column the
-/// reduction writes; anything else is its flat frame.
-fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE FRAME ASSIGNMENT — one pass, every value's world, and no second statement anywhere
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐⭐⭐⭐ THE WORLD A VALUE'S FRAME IS HELD IN. `Column` is the per-row column a reduction that
+/// folds its input's last axis writes — one value per stick row, presented `[numel, 1]`, the frame
+/// the `In::col` operand mode addresses. `Row` is the flat frame — every axis but the last folded
+/// into rows ([`flat_frame`]) — the frame a dense tile's bytes already are. The two are DIFFERENT
+/// BYTES for any value with more than one element per row (a dense frame packs a row's values into
+/// its sticks; a column holds one), which is the whole question: a reader that answers it wrong
+/// addresses the same value at the wrong stride.
+///
+/// ONE pass assigns it ([`assign_frames`], a total function over the op kinds), and every reader
+/// asks the result: the walk's carried-state mint, the shape-op reframe, a splatted constant's
+/// buffer, and the arrangement classifier's order-freeness. Before the pass, three readers derived
+/// the frame three ways and could disagree — the deleted `value_frame`'s shape-lineage fixpoint,
+/// the classifier's degenerate-extent read, the broadcast chase's `shape_2d` — and a disagreement
+/// of exactly that kind is what stopped gemma-4-12b's `attn_s147` at a bake. Now it is
+/// unrepresentable: there is one table and every reader reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum World {
+    /// One value per stick row, presented `[numel, 1]`.
+    Column,
+    /// Every axis but the last folded into rows.
+    Row,
+}
+
+/// Every value's [`World`], minted once by [`assign_frames`].
+struct Frames {
+    world: std::collections::HashMap<Ssa, World>,
+}
+
+impl Frames {
+    /// The world of `v`. A value the pass holds no world for — a plumbing result, a scalar — is
+    /// the row world: the table below names every kind that produces data, so a value with no
+    /// entry is one no column question was ever asked of, and the row frame is what every reader
+    /// gave it.
+    fn world_of(&self, v: Ssa) -> World {
+        self.world.get(&v).copied().unwrap_or(World::Row)
+    }
+
+    /// The `[rows, cols]` frame `v` is held in, at `dims` — the value's own stated shape, the same
+    /// dims its producer's result type states: the column's `[numel, 1]`, or the flat frame.
+    fn frame_of(&self, v: Ssa, dims: &[i64]) -> [u32; 2] {
+        match self.world_of(v) {
+            World::Column => [dims.iter().product::<i64>() as u32, 1],
+            World::Row => flat_frame(dims),
+        }
+    }
+}
+
+/// Whether a `linalg.reduce` folds its input's LAST axis — the pass's `LinalgReduce` arm's own
+/// predicate: such a reduce writes one value per stick row, a [`World::Column`], while a fold of
+/// any other axis (the leading `J` of a decode batch's block slots) writes a tile of the input's
+/// own rows.
+fn folds_its_stick(o: &Operation<'_>) -> bool {
+    let rank = o.result_type.and_then(|t| t.dims()).map_or(0, <[i64]>::len);
+    o.attributes.iter().any(
+        |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [rank as i64]),
+    )
+}
+
+/// The SHAPES this function's per-row columns take — the dims of the values the lineage holds
+/// columnar. Seeded by the reductions that fold their input's last axis (one value per stick row
+/// is what such a reduce writes) and grown through the ops that keep a column a column: a
+/// leading-axis fold of one, and the shape ops over one. This is a census the pass takes BEFORE it
+/// assigns, not a reader of the assignment: a splat or a shape-op result states no world of its
+/// own (a splat is a constant; a shape op moves no element), so it takes the world its own dims
+/// name in the lineage — and the lineage can be spelled AFTER the value that shares its shape (the
+/// walk's carried init is a splat seeded by a reduction inside the walk's body), which is why the
+/// census is a fixpoint rather than the pass's own forward order. [`assign_frames`]'s table is
+/// still the one statement of a VALUE's world; this states which SHAPES the function's columns
+/// have, the same statement the deleted `value_frame`'s fixpoint made, kept verbatim so the frames
+/// the pass assigns are the frames its readers already used.
+fn column_dims(f: &IRFunction<'static>) -> Vec<Vec<i64>> {
     // The shapes a per-row column takes: a stick fold's result, a leading fold of a per-row
     // column (a decode batch's `J` block slots' running max, folded), and a shape op over one (the
     // folded max expanded back over the slots: one value per stick row in either shape) — to a
@@ -8047,14 +8107,14 @@ fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
     let dims_of = |o: &Operation<'_>| o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec);
     let mut columns: Vec<Vec<i64>> = deep
         .iter()
-        .filter(|o| o.op_type == OpKind::LinalgReduce && folds_the_stick(o))
+        .filter(|o| o.op_type == OpKind::LinalgReduce && folds_its_stick(o))
         .filter_map(|o| dims_of(o))
         .collect();
     loop {
         let more: Vec<Vec<i64>> = deep
             .iter()
             .filter(|o| {
-                (o.op_type == OpKind::LinalgReduce && !folds_the_stick(o))
+                (o.op_type == OpKind::LinalgReduce && !folds_its_stick(o))
                     || matches!(
                         o.op_type,
                         OpKind::TensorReshape
@@ -8077,22 +8137,349 @@ fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
         }
         columns.extend(more);
     }
-    let per_row = columns.iter().any(|d| d == dims);
-    if per_row {
-        [dims.iter().product::<i64>() as u32, 1]
+    columns
+}
+
+/// ⭐ THE PARAMETERS THIS FUNCTION STORES PER-ROW COLUMNS INTO — the one fact that flows AGAINST
+/// the pass's forward order, stated as its own function the pass takes as INPUT so no arm of the
+/// table can reorder it: a `ktdp.store` whose VALUE's own stated shape is a column (`[..., 1]`,
+/// rank ≥ 2 — a shape that cannot be a row vector) writes that column into a parameter, and a
+/// `ktdp.load` of the parameter reads it back as one. A load's own tile states its window's
+/// column extent, and a rank-1 restatement of a column (`[N]` for `[N, 1]`) states the WRONG one
+/// — `[N]` is a row to a tile — so the store is the statement that holds. The parameter is the
+/// memory view's pointer operand, the same chain `region_of_view_operand` walks on the region
+/// side, so the two walks cannot disagree about which parameter a tile addresses.
+fn column_fed_params(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
+    let deep = f.ops_deep();
+    let def_of = |v: Ssa| deep.iter().copied().find(|o| o.result == Some(v));
+    let param_of_tile = |tile: Ssa| -> Option<Ssa> {
+        let t = def_of(tile)?;
+        let view = def_of(*t.operands.first()?)?;
+        (view.op_type == OpKind::KtdpConstructMemoryView)
+            .then(|| view.operands.first().copied())
+            .flatten()
+    };
+    let mut out = std::collections::HashSet::new();
+    for o in deep.iter().filter(|o| o.op_type == OpKind::KtdpStore) {
+        // `ktdp.store(value, tile)`: the value is operand 0, the tile operand 1.
+        let (Some(&value), Some(&tile)) = (o.operands.first(), o.operands.get(1)) else {
+            continue;
+        };
+        let column = def_of(value).is_some_and(|d| {
+            d.result_type
+                .and_then(|t| t.dims())
+                .is_some_and(|ds| ds.len() >= 2 && *ds.last().expect("len ≥ 2") == 1)
+        });
+        if column
+            && let Some(ptr) = param_of_tile(tile)
+        {
+            out.insert(ptr);
+        }
+    }
+    out
+}
+
+/// ⭐ THE ELEMENTWISE FAMILY'S MIXED-WORLDS LAW — one result element per operand element, so the
+/// result's world is the world its LANE-FOR-LANE operands share, and every operand that does not
+/// read lane-for-lane must EXPLAIN itself, in one of exactly two ways the device states:
+///
+/// * a [`World::Column`] operand with one value per RESULT ROW — the `In::col` reading, Triton's
+///   chain-less implicit broadcast (a softmax walk body's `max(m, x)`): consumed by the operand
+///   mode, it sets no frame;
+/// * the result of a `linalg.broadcast` already classified — the spray states its own mismatch
+///   (the `Y` row-split modes present the source in the consumer's own frame).
+///
+/// A scalar — one element, or no stated shape at all — is the same value in every frame and names
+/// none. Anything else — a column at a count the result's rows do not explain, a dense tile at a
+/// count that is neither lane nor scalar, with no stated broadcast — is a BAKE ERROR naming the op
+/// and the operand: the device's pointwise modes address exactly the three readings above, so
+/// this is named rather than half-addressed, and never silently read as a row.
+fn elementwise_world(
+    f: &IRFunction<'static>,
+    o: &Operation<'static>,
+    world: &std::collections::HashMap<Ssa, World>,
+) -> Result<World, Error> {
+    let deep = f.ops_deep();
+    let def_of = |v: Ssa| deep.iter().copied().find(|d| d.result == Some(v));
+    let dims_of = |v: Ssa| -> Option<Vec<i64>> {
+        def_of(v)
+            .and_then(|d| d.result_type)
+            .and_then(|t| t.dims())
+            .map(<[i64]>::to_vec)
+    };
+    let Some(res_dims) = o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec) else {
+        // A value that states no shape names no column: the row world, the frame every reader
+        // already gave it.
+        return Ok(World::Row);
+    };
+    let res_numel: i64 = res_dims.iter().product();
+    let [res_rows, _] = flat_frame(&res_dims);
+    let mut lane: Option<World> = None;
+    for &v in o.operands.iter() {
+        let Some(d) = dims_of(v) else {
+            // A scalar operand names no frame.
+            continue;
+        };
+        let n: i64 = d.iter().product();
+        if n == 1 {
+            // A scalar is the same value in every frame.
+            continue;
+        }
+        let w = world.get(&v).copied().unwrap_or(World::Row);
+        if n == res_numel {
+            // LANE-FOR-LANE: the result takes its world. A column read at the result's own count
+            // is the column frame both sides can honor, so a column lane wins — the result keeps
+            // the per-row reading.
+            lane = Some(if w == World::Column || lane == Some(World::Column) {
+                World::Column
+            } else {
+                World::Row
+            });
+        } else if w == World::Column && n == i64::from(res_rows) {
+            // One scalar per result row — the `In::col` reading, consumed by the operand mode.
+        } else if def_of(v).is_some_and(|d| d.op_type == OpKind::LinalgBroadcast) {
+            // A stated broadcast's spray explains its own mismatch.
+        } else {
+            return err(format!(
+                "{}: `{:?}` reads %{} — {} elements in the {w:?} world — beside its other \
+                 operands for a {res_numel}-element result of {} rows: a count the result's own \
+                 rows do not explain and no stated broadcast sprays. The device's pointwise modes \
+                 address a lane-for-lane tile, one scalar per row, and a stated spray; this \
+                 operand is none of them, so its frame is named rather than guessed",
+                f.name, o.op_type, v.0, n, res_rows
+            ));
+        }
+    }
+    Ok(lane.unwrap_or(World::Row))
+}
+
+/// ⭐ THE LOAD'S WORLD — what the load reads is a per-row column iff the tile states a one-column
+/// window (the same fact `windowed_region` reads on the region side, so the two walks cannot
+/// disagree about one tile), or — for a gathered (indirect) tile, whose region is the TABLE's
+/// rather than the window's — the data view states one. A tile that states no shape at all leaves
+/// the load's own result shape the fallback the classifier always had: rank-1, or a degenerate
+/// trailing axis. And a parameter this function stores a column into ([`column_fed_params`]) is
+/// read as one whatever its tile restates — the store is the statement that holds where the
+/// tile's rank-1 restatement lies.
+fn load_world(
+    f: &IRFunction<'static>,
+    o: &Operation<'static>,
+    column_fed: &std::collections::HashSet<Ssa>,
+) -> World {
+    let deep = f.ops_deep();
+    let def_of = |v: Ssa| deep.iter().copied().find(|d| d.result == Some(v));
+    let tile = o.operands.first().and_then(|&t| def_of(t));
+    // The op the column extent is read from: the tile itself, or the gathered tile's DATA view.
+    let states_extent = tile.and_then(|t| {
+        if t.op_type == OpKind::KtdpConstructIndirectAccessTile {
+            t.operands.first().and_then(|&v| def_of(v))
+        } else {
+            Some(t)
+        }
+    });
+    let col_one = match states_extent.and_then(super::lower_ktir_to_superdsc::shape_2d) {
+        Some((_, c)) => c == 1,
+        None => o
+            .result_type
+            .and_then(|t| t.dims())
+            .is_some_and(|d| d.len() == 1 || *d.last().unwrap_or(&0) == 1),
+    };
+    let param = tile.and_then(|t| {
+        let view = t.operands.first().and_then(|&v| def_of(v))?;
+        (view.op_type == OpKind::KtdpConstructMemoryView)
+            .then(|| view.operands.first().copied())
+            .flatten()
+    });
+    if col_one || param.is_some_and(|p| column_fed.contains(&p)) {
+        World::Column
     } else {
-        flat_frame(dims)
+        World::Row
     }
 }
 
-/// Whether a `linalg.reduce` folds its input's LAST axis — the stick, one value per row of the
-/// flat frame, the per-row column a row reduction writes. A fold of any other axis (the leading
-/// `J` of a decode batch's block slots) writes a tile of the input's own rows.
-fn folds_the_stick(o: &Operation<'_>) -> bool {
-    let rank = o.result_type.and_then(|t| t.dims()).map_or(0, <[i64]>::len);
-    o.attributes.iter().any(
-        |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [rank as i64]),
-    )
+/// ⭐⭐⭐⭐⭐ THE ONE FRAME ASSIGNMENT — every value's [`World`], as a TOTAL function over the op
+/// kinds: an exhaustive match with no `_` arm, so an op kind added without a frame law is a
+/// COMPILE ERROR here, and a value the table cannot decide (the elementwise mixed-worlds
+/// refusal) is a BAKE ERROR naming the op and its operands — never a runtime refusal, never a
+/// silent default.
+///
+/// THE TABLE, as the program states it:
+///
+/// * `linalg.reduce` — the axis it folds decides the world it writes: the last axis (the stick)
+///   writes one value per row, a [`World::Column`]; any other axis writes a tile of the input's
+///   own rows, the operand's world.
+/// * `linalg.broadcast` — the sprayed result is dense, however the source is held: the row world.
+///   The SOURCE's world is the source's own row in this table, which is what the broadcast chase
+///   reads.
+/// * the shape ops — no element moves, so the result is held as its operand is.
+/// * the elementwise family — the mixed-worlds law ([`elementwise_world`]).
+/// * `ktdp.load` — the tile's own column extent, the load's own shape when the tile states none,
+///   or the parameter's store-fed column ([`load_world`]).
+/// * contractions and `linalg.transpose` — dense outputs, the row world.
+/// * a splat, a region arg, a slice or a generated tile — a value that states a shape but no
+///   world of its own takes the world its dims name in the column lineage ([`column_dims`]).
+/// * plumbing and scalars — tiles, views, stores, yields, markers, integer addressing: no data
+///   frame, no entry, and [`Frames::world_of`]'s row-world default is the only answer they get.
+fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
+    let deep = f.ops_deep();
+    let columns = column_dims(f);
+    let column_fed = column_fed_params(f);
+    let mut world: std::collections::HashMap<Ssa, World> = std::collections::HashMap::new();
+    for o in deep.iter() {
+        let Some(res) = o.result else { continue };
+        let w: Option<World> = match o.op_type {
+            // ── THE REDUCTION: the axis it folds decides the world it writes ──
+            OpKind::LinalgReduce => Some(if folds_its_stick(o) {
+                World::Column
+            } else {
+                o.operands
+                    .first()
+                    .and_then(|&v| world.get(&v))
+                    .copied()
+                    .unwrap_or(World::Row)
+            }),
+            // ── THE BROADCAST: the sprayed result is dense, however the source is held ──
+            OpKind::LinalgBroadcast => Some(World::Row),
+            // ── THE SHAPE OPS: no element moves, so the result is held as its operand is ──
+            OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape => {
+                Some(
+                    o.operands
+                        .first()
+                        .and_then(|&v| world.get(&v))
+                        .copied()
+                        .unwrap_or(World::Row),
+                )
+            }
+            // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs ──
+            OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul | OpKind::LinalgTranspose => {
+                Some(World::Row)
+            }
+            // ── THE LOAD: what it reads, as its tile, its own shape, or its store states ──
+            OpKind::KtdpLoad => Some(load_world(f, o, &column_fed)),
+            // ── THE ELEMENTWISE FAMILY: the mixed-worlds law ──
+            OpKind::ArithAbsf
+            | OpKind::ArithAddf
+            | OpKind::ArithSubf
+            | OpKind::ArithMulf
+            | OpKind::ArithDivf
+            | OpKind::ArithRemf
+            | OpKind::ArithMinf
+            | OpKind::ArithMaxf
+            | OpKind::ArithMinnumf
+            | OpKind::ArithMaxnumf
+            | OpKind::ArithMinimumf
+            | OpKind::ArithMaximumf
+            | OpKind::ArithNegf
+            | OpKind::ArithCmpf
+            | OpKind::ArithSelect
+            | OpKind::ArithSitofp
+            | OpKind::ArithUitofp
+            | OpKind::ArithFptosi
+            | OpKind::ArithFptoui
+            | OpKind::ArithExtf
+            | OpKind::ArithTruncf
+            | OpKind::ArithConvertf
+            | OpKind::ArithBitcast
+            | OpKind::MathAbsf
+            | OpKind::MathCeil
+            | OpKind::MathCos
+            | OpKind::MathErf
+            | OpKind::MathExp
+            | OpKind::MathFloor
+            | OpKind::MathFma
+            | OpKind::MathLog
+            | OpKind::MathLog1p
+            | OpKind::MathLog2
+            | OpKind::MathPowf
+            | OpKind::MathRsqrt
+            | OpKind::MathSin
+            | OpKind::MathSqrt
+            | OpKind::MathTanh
+            | OpKind::LinalgAdd
+            | OpKind::LinalgSub
+            | OpKind::LinalgMul
+            | OpKind::LinalgDiv
+            | OpKind::LinalgMax
+            | OpKind::LinalgMin => Some(elementwise_world(f, o, &world)?),
+            // ── A VALUE THAT STATES A SHAPE BUT NO WORLD OF ITS OWN: the column lineage ──
+            OpKind::TensorSplat
+            | OpKind::RegionBb0Args
+            | OpKind::TensorExtractSlice
+            | OpKind::TensorInsertSlice
+            | OpKind::TensorFromElements
+            | OpKind::TensorGenerate
+            | OpKind::LinalgFill
+            | OpKind::LinalgGeneric
+            | OpKind::KtdpReduce
+            | OpKind::KtdpAllgather
+            | OpKind::KtdpInterTileProduce
+            | OpKind::KtdpInterTileReduce
+            | OpKind::KtdpYieldPartial
+            | OpKind::KtdpYieldReduced
+            | OpKind::ScfFor
+            | OpKind::ScfForall
+            | OpKind::ScfIf
+            | OpKind::ScfParallel
+            | OpKind::ScfWhile => {
+                let column = o
+                    .result_type
+                    .and_then(|t| t.dims())
+                    .is_some_and(|d| columns.iter().any(|c| c.as_slice() == d));
+                Some(if column { World::Column } else { World::Row })
+            }
+            // ── PLUMBING AND SCALARS: no data frame, no entry ──
+            // Integer arithmetic is addressing here (or the noise hash's i32 compute, whose
+            // values are dense); a constant is the scalar a splat reads; a tile, a view, a
+            // store, a yield or a marker states a window or a boundary, never a value's frame.
+            OpKind::ArithConstant
+            | OpKind::ArithCmpi
+            | OpKind::ArithIndexCast
+            | OpKind::ArithIndexCastui
+            | OpKind::ArithAddi
+            | OpKind::ArithSubi
+            | OpKind::ArithMuli
+            | OpKind::ArithDivsi
+            | OpKind::ArithDivui
+            | OpKind::ArithRemsi
+            | OpKind::ArithRemui
+            | OpKind::ArithExtsi
+            | OpKind::ArithExtui
+            | OpKind::ArithTrunci
+            | OpKind::ArithCeildivsi
+            | OpKind::ArithCeildivui
+            | OpKind::ArithFloordivsi
+            | OpKind::ArithShli
+            | OpKind::ArithShrsi
+            | OpKind::ArithShrui
+            | OpKind::ArithAndi
+            | OpKind::ArithOri
+            | OpKind::ArithXori
+            | OpKind::ArithMaxsi
+            | OpKind::ArithMaxui
+            | OpKind::ArithMinsi
+            | OpKind::ArithMinui
+            | OpKind::MathAbsi
+            | OpKind::TensorExtract
+            | OpKind::TensorEmpty
+            | OpKind::TensorYield
+            | OpKind::LinalgYield
+            | OpKind::LinalgIndex
+            | OpKind::FuncReturn
+            | OpKind::ScfYield
+            | OpKind::KtdpConstructMemoryView
+            | OpKind::KtdpConstructAccessTile
+            | OpKind::KtdpConstructIndirectAccessTile
+            | OpKind::KtdpConstructDistributedMemoryView
+            | OpKind::KtdpStore
+            | OpKind::KtdpGetComputeTileId
+            | OpKind::KtdpCoreid
+            | OpKind::KtdpNotYet => None,
+        };
+        if let Some(w) = w {
+            world.insert(res, w);
+        }
+    }
+    Ok(Frames { world })
 }
 
 /// The values of the splatted constants the walk MATERIALIZES — a splat read as a dense operand of a
@@ -8174,12 +8561,14 @@ fn dense_splat_operands(f: &IRFunction<'static>, o: &Operation<'static>) -> Vec<
         .collect()
 }
 
-/// A splatted float constant's BUFFER — minted at its frame ([`value_frame`]) and declared to the
-/// layout, with the value it holds — or `None` when `v` is not a `tensor.splat` of a float constant.
+/// A splatted float constant's BUFFER — minted at its frame (the frame pass's one table) and
+/// declared to the layout, with the value it holds — or `None` when `v` is not a `tensor.splat`
+/// of a float constant.
 fn splat_buffer(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     floor: u32,
+    frames: &Frames,
     v: Ssa,
 ) -> Result<Option<(Region, f32)>, Error> {
     let f = &k.func;
@@ -8208,7 +8597,7 @@ fn splat_buffer(
             f.name
         ));
     };
-    let [rows, cols] = value_frame(f, dims);
+    let [rows, cols] = frames.frame_of(v, dims);
     let tid = mint_inter(k, layout, floor, v);
     layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
     Ok(Some((
@@ -11493,5 +11882,253 @@ mod gelu_chain_tests {
         );
         let gelus = program_gelu_chains(&f).expect("the gelu is still recognised");
         assert_eq!(gelus.len(), 1, "and the gelu recogniser owns it");
+    }
+}
+
+#[cfg(test)]
+mod frame_pass_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::dtypes::DType;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// An op whose result is a `dims`-shaped f32 tensor — the pass reads `result_type` for the
+    /// shape a value states, so every fixture states it.
+    fn tensor(
+        a: &'static Arena,
+        res: Ssa,
+        kind: OpKind,
+        operands: &[Ssa],
+        dims: &'static [i64],
+    ) -> Operation<'static> {
+        Operation {
+            result_type: Some(IrType::Tensor {
+                dims,
+                elem: DType::F32,
+            }),
+            ..Operation::new(a, Some(res), kind, operands)
+        }
+    }
+
+    /// A `linalg.reduce` over `x` with a stated fold axis — `Dimensions = [axes]`, the running
+    /// max's own spelling when the axis is the stick.
+    fn fold_reduce(
+        a: &'static Arena,
+        res: Ssa,
+        x: Ssa,
+        dims: &'static [i64],
+        axes: &'static [i64],
+    ) -> Operation<'static> {
+        tensor(a, res, OpKind::LinalgReduce, &[x], dims)
+            .with_attr(a, AttrKey::Dimensions, Attr::IntList(axes))
+    }
+
+    fn func(a: &'static Arena, name: &'static str, ops: Vec<Operation<'static>>) -> IRFunction<'static> {
+        IRFunction {
+            name,
+            arguments: a.args(vec![]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// ⭐ THE REDUCTION'S AXIS DECIDES THE WORLD IT WRITES: a fold of the LAST axis (the stick)
+    /// writes one value per stick row — the `[numel, 1]` column — while a fold of any other axis
+    /// (the leading `J` of a decode batch's block slots) writes a tile of the input's own rows.
+    #[test]
+    fn a_stick_fold_writes_a_column_a_leading_fold_keeps_the_operands_world() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, red, lead) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let f = func(
+            a,
+            "reduce_worlds",
+            vec![
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                fold_reduce(a, red, dense, &[64], &[1]),
+                fold_reduce(a, lead, dense, &[128], &[0]),
+            ],
+        );
+        let frames = assign_frames(&f).expect("both folds state their worlds");
+        assert_eq!(
+            frames.world_of(red),
+            World::Column,
+            "the stick fold writes one value per stick row"
+        );
+        assert_eq!(
+            frames.frame_of(red, &[64]),
+            [64, 1],
+            "the column presents as [numel, 1]"
+        );
+        assert_eq!(
+            frames.world_of(lead),
+            World::Row,
+            "a leading fold writes a tile of the input's own rows"
+        );
+    }
+
+    /// ⭐ A SPLATTED SEED TAKES THE COLUMN LINEAGE IT SEEDS — the walk's carried init is a splat
+    /// whose dims are the stick-fold reduce's result dims, spelled AFTER the splat in program
+    /// order, which is why the lineage is a fixpoint the pass takes as input rather than its own
+    /// forward order.
+    #[test]
+    fn a_splatted_seed_takes_the_column_lineage_it_seeds() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let f = func(
+            a,
+            "walk_carried_seed",
+            vec![
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                fold_reduce(a, red, dense, &[64], &[1]),
+            ],
+        );
+        let frames = assign_frames(&f).expect("the seed states its world through the lineage");
+        assert_eq!(
+            frames.world_of(seed),
+            World::Column,
+            "the seed is held as the column it seeds, however early it is spelled"
+        );
+        assert_eq!(frames.frame_of(seed, &[64]), [64, 1]);
+    }
+
+    /// ⭐ A BROADCAST RESULT IS DENSE HOWEVER ITS SOURCE IS HELD — the spray writes every lane, so
+    /// the sprayed value is a row even when what it sprays is the per-row column (the softmax
+    /// walk's folded max expanded back over the lanes).
+    #[test]
+    fn a_broadcast_result_is_dense_however_its_source_is_held() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red, empty, bc) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let f = func(
+            a,
+            "column_spray",
+            vec![
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                fold_reduce(a, red, dense, &[64], &[1]),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[seed, empty], &[64, 128]),
+            ],
+        );
+        let frames = assign_frames(&f).expect("the spray states its own world");
+        assert_eq!(
+            frames.world_of(bc),
+            World::Row,
+            "the sprayed result is dense; the SOURCE's column is the source's own row"
+        );
+    }
+
+    /// ⭐ A COLUMN READ BESIDE ITS LANES IS CONSUMED — the softmax walk body's `max(m, x)`: the
+    /// running max supplies one value per result row, the `In::col` reading, and the result keeps
+    /// the lanes' dense world. No refusal, and no quiet column either.
+    #[test]
+    fn a_column_read_beside_its_lanes_is_consumed() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, m, red, res) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let f = func(
+            a,
+            "softmax_max",
+            vec![
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, m, OpKind::TensorSplat, &[scalar], &[64]),
+                fold_reduce(a, red, dense, &[64], &[1]),
+                tensor(a, res, OpKind::ArithMaxf, &[m, dense], &[64, 128]),
+            ],
+        );
+        let frames = assign_frames(&f).expect("the per-row column beside its lanes is a reading");
+        assert_eq!(
+            frames.world_of(res),
+            World::Row,
+            "the consumed column sets no frame; the lanes' world is the result's"
+        );
+    }
+
+    /// ⛔ AN UNEXPLAINED MIXED WORLD IS REFUSED BY NAME — an operand at a count the result's rows
+    /// do not explain, with no stated broadcast: the device's pointwise modes address a
+    /// lane-for-lane tile, one scalar per row, and a stated spray, so this is named rather than
+    /// silently read as a row.
+    #[test]
+    fn an_unexplained_mixed_world_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, odd, res) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let f = func(
+            a,
+            "mixed_world",
+            vec![
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, odd, OpKind::TensorSplat, &[scalar], &[32]),
+                tensor(a, res, OpKind::ArithAddf, &[dense, odd], &[64, 128]),
+            ],
+        );
+        let Err(e) = assign_frames(&f) else {
+            panic!("a 32-element operand beside an 8192-element result is not a reading");
+        };
+        assert!(
+            e.message.contains("ArithAddf") && e.message.contains("%2"),
+            "the refusal names the op and the operand: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ THE LOAD'S WORLD IS WHAT IT READS — the tile's own column extent for a direct window
+    /// (the same fact `windowed_region` reads), stated by the tile with no result type on the
+    /// load itself.
+    #[test]
+    fn a_load_takes_its_tiles_column_extent() {
+        let a: &'static Arena = Arena::global();
+        let (p, view, tile, load) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let f = IRFunction {
+            name: "column_window_load",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[64, 1] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                Operation::new(a, Some(load), OpKind::KtdpLoad, &[tile]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let frames = assign_frames(&f).expect("the tile states the window");
+        assert_eq!(
+            frames.world_of(load),
+            World::Column,
+            "a one-column window reads the per-row column"
+        );
+    }
+
+    /// ⭐ THE CENSUS FIXTURE — a rank-1 tile (`[N]`, a row to a tile) over a `[N, 1]`-shaped store
+    /// states the WRONG extent, so the parameter this function stores a column into is read as
+    /// one whatever its tile restates: the store is the statement that holds.
+    #[test]
+    fn a_store_fed_column_load_reads_the_parameter_as_one() {
+        let a: &'static Arena = Arena::global();
+        let (p, view, tile, val, store, load) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let f = IRFunction {
+            name: "store_fed_column",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                tensor(a, val, OpKind::TensorSplat, &[Ssa(9)], &[64, 1]),
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[64] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                Operation::new(a, Some(store), OpKind::KtdpStore, &[val, tile]),
+                Operation::new(a, Some(load), OpKind::KtdpLoad, &[tile]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let frames = assign_frames(&f).expect("the store states the parameter's world");
+        assert_eq!(
+            frames.world_of(load),
+            World::Column,
+            "the rank-1 tile restates the window; the [N, 1] store names the column"
+        );
     }
 }
