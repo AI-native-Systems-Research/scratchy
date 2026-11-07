@@ -3190,7 +3190,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
                 .layout
                 .iter()
                 .enumerate()
-                .filter(|(_, &d)| d != tiled_dim)
+                .filter(|&(_, &d)| d != tiled_dim)
                 .map(|(i, _)| own_extent_at(v, i, &phys_extent))
                 .product();
             out_per_time * device_stride_out * v.df.word_length() as i64
