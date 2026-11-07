@@ -13,7 +13,9 @@
 //! * each entry's plane (`slab` elements) is a whole number of the frame's
 //!   `[rows, w]` blocks — a frame whose blocks cross an entry is
 //!   [`FrameError::CrossesEntry`];
-//! * rank ≥ 3 states its blocks: `Blocks`, and the landing registers them;
+//! * rank ≥ 3 states its blocks: `Blocks`, and the landing registers them —
+//!   except at one stick wide, where a stick-major block IS its rows, so a block
+//!   spanning several whole-row entries is those entries back to back: `Flat`;
 //! * rank 2 states none: the landing is the frame's own bytes when there is one
 //!   entry or one stick (`Flat`), and one whole-stick permute away otherwise
 //!   (`Restickify`).
@@ -71,7 +73,16 @@ fn expect(to: &[i64], sticks: u32, entries: u32) -> Expected {
         // plane must tile into whole blocks and the stated total must agree.
         let rows = to[to.len() - 2] as u64;
         let block = rows * w;
-        if rows == 0 || block == 0 || !slab.is_multiple_of(block) {
+        if rows == 0 || block == 0 {
+            return Expected::CrossesEntry;
+        }
+        if !slab.is_multiple_of(block) {
+            let to_total: u64 = to.iter().map(|&d| d as u64).product();
+            if w == STICK && slab.is_multiple_of(w) && to_total == total {
+                return Expected::Flat {
+                    rows: (slab / w) as u32,
+                };
+            }
             return Expected::CrossesEntry;
         }
         let blocks_per_entry = slab / block;
@@ -210,6 +221,42 @@ fn a_frame_that_crosses_an_entry_refuses_by_name() {
     // rank 3: a stated total that disagrees with the entries it re-frames
     let err = LandingFrame::of(&[8, 2, 64], plane(2), nz(4)).expect_err("8 frames of 4 entries");
     assert!(matches!(err, FrameError::CrossesEntry { .. }), "{err:?}");
+}
+
+/// ⭐ ONE STICK WIDE, A BLOCK MAY SPAN ENTRIES — the split-page decode gather (one kv head's
+/// page cut into whole-row entries): a `[2, 128, 64]` frame over 8 entries of 2048 elements is
+/// those entries' rows back to back, the flat landing. Its near-misses still refuse: two sticks
+/// wide (a stick-major block is no longer its rows), entries that are not whole rows, and a frame
+/// that does not re-frame exactly the gathered bytes.
+#[test]
+fn one_stick_wide_a_block_may_span_whole_row_entries() {
+    // 8 entries of a 32-stick (2048-element) plane, framed as 2 blocks of [128, 64]
+    match LandingFrame::of(&[2, 128, 64], plane(32), nz(8)) {
+        Ok(LandingFrame::Flat { entries, rows, w }) => {
+            assert_eq!((entries.get(), rows.get(), w.elems()), (8, 32, 64));
+        }
+        other => panic!("expected the flat landing, got {other:?}"),
+    }
+    // the q side: 8 one-stick entries framed as [2, 4, 64]
+    assert!(matches!(
+        LandingFrame::of(&[2, 4, 64], plane(1), nz(8)),
+        Ok(LandingFrame::Flat { .. })
+    ));
+    // two sticks wide: the block's sticks interleave the entries — still crosses
+    assert!(matches!(
+        LandingFrame::of(&[2, 128, 128], plane(64), nz(8)),
+        Err(FrameError::CrossesEntry { .. })
+    ));
+    // a frame that does not re-frame exactly the gathered bytes
+    assert!(matches!(
+        LandingFrame::of(&[3, 128, 64], plane(32), nz(8)),
+        Err(FrameError::CrossesEntry { .. })
+    ));
+    // the whole-entry frames are unchanged: one block an entry
+    assert!(matches!(
+        LandingFrame::of(&[8, 128, 64], plane(128), nz(8)),
+        Ok(LandingFrame::Blocks { .. })
+    ));
 }
 
 /// ⭐ THE CHUNK ITERATOR'S OWN LAW — every total entry count from 1 to 200
