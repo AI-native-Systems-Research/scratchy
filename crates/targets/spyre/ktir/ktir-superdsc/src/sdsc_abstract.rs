@@ -89,22 +89,14 @@ impl PlaneExtent {
 pub struct MqPad(u32);
 
 /// THE PAD LAW ITSELF — `mq.div_ceil(stick) * stick`, floored at one stick: the one place the
-/// arithmetic is written. `const`, because it has two spenders with two evaluation times and they
-/// must be the same law: [`MqPad::of_chunk`] applies it to a runtime prefill width, and
-/// [`Rung::PAD`] has the COMPILER apply it to a decode-ladder width.
+/// arithmetic is written. `const`, so [`Rung::PAD`] has the COMPILER apply it to a decode-ladder
+/// width, and a runtime prefill width pads by the same law (`tests::the_pad_law_at_a_prefill_width`).
 const fn pad_of_mq(mq: u32) -> u32 {
     let sticks = mq.div_ceil(POOL_STICK);
     (if sticks == 0 { 1 } else { sticks }) * POOL_STICK
 }
 
 impl MqPad {
-    /// From the chunk's real row count, by [`pad_of_mq`]. Module-private: outside this file a pad
-    /// exists only inside a [`PaddedMq`], fused to the width it was computed from — a bare `u32`
-    /// cannot become a pad without also fixing which `mq` it pads.
-    fn of_chunk(mq: u32) -> MqPad {
-        MqPad(pad_of_mq(mq))
-    }
-
     /// Query rows the block is padded to.
     pub fn rows(self) -> PaddedRows {
         PaddedRows(self.0)
@@ -194,7 +186,7 @@ impl ScoreWidth {}
 ///
 /// The window is stick-tall because every reduce works on ONE stick of columns and the new block's
 /// padded rows ARE its score columns (each new token occupies one slot), so the reduce's column budget
-/// blocks the rows in sticks — that is the same law [`MqPad::of_chunk`] pads by. The window index is
+/// blocks the rows in sticks — that is the same law [`pad_of_mq`] pads by. The window index is
 /// three coordinates at once, all the [`MqPad`] rows/slots/cols identity: the source's row corner
 /// ([`Self::first_row`]), the block's own Kᵀ slot-stick plane, and the cmask's block index.
 ///
@@ -205,7 +197,7 @@ impl ScoreWidth {}
 pub struct RowWindow(u32);
 
 impl RowWindow {
-    /// Rows one window covers — the granularity [`MqPad::of_chunk`] pads to, held zero-sized in
+    /// Rows one window covers — the granularity [`pad_of_mq`] pads to, held zero-sized in
     /// [`WindowRows`]. By the window's own identity this is ALSO its SCORE-COLUMN count (each padded
     /// row is one score column against the new block, sized by the reduce's one-stick column budget,
     /// which is why the window is stick-tall in the first place) — spending it as columns goes
@@ -247,8 +239,8 @@ impl WindowRows {
 ///   BUILD, because [`baked`](Self::baked) evaluates a membership assert against the pool's own
 ///   ladder. The ladder and the rung type cannot drift — changing [`PagedKvPool::BATCH_RUNGS`] alone
 ///   re-decides which `Rung`s exist;
-/// * [`PAD`](Self::PAD) is [`pad_of_mq`] evaluated at compile time — the SAME law as the prefill
-///   mint ([`PaddedMq::of_chunk`]), called once, not respelled;
+/// * [`PAD`](Self::PAD) is [`pad_of_mq`] evaluated at compile time — the SAME law a prefill width
+///   pads by, called once, not respelled;
 /// * [`SUB_BLOCKS`](Self::SUB_BLOCKS) carries a PROOF, not just a value: every baked rung pads to
 ///   ONE stick of rows, so a decode bundle's new block is swept in exactly one [`RowWindow`] — the
 ///   emit form proven on hardware. A ladder widened past one stick (a 128-wide rung, say) stops
@@ -309,6 +301,16 @@ impl<const MQ: u32> Rung<MQ> {
         RowWindow(0)
     };
 
+    /// The rung's query rows, never zero: `MQ`, read off the type. Evaluating it evaluates the
+    /// membership assert, so an unlisted width has no rows to name.
+    pub const ROWS: std::num::NonZeroU32 = {
+        let () = Self::IS_A_BAKED_RUNG;
+        match std::num::NonZeroU32::new(MQ) {
+            Some(rows) => rows,
+            None => panic!("Rung<MQ>: a baked rung has at least one row"),
+        }
+    };
+
     /// The rung as the ladder baked it. The only constructor, and it insists on the membership
     /// assert — `Rung` has no door that skips the ladder.
     pub const fn baked() -> Rung<MQ> {
@@ -325,10 +327,10 @@ impl<const MQ: u32> Rung<MQ> {
 /// The two mints, and the wall between them:
 /// * a DECODE width comes in through [`of_rung`](Self::of_rung) only — the width is a ladder const
 ///   ([`Rung`]), so the pad and the one-window proof are the compiler's. The bake gets one per batch
-///   rung from [`each_batch_rung_widest_first`], which names each rung as a type: no runtime width
-///   is ever parsed into a rung, so there is no decode width to refuse;
-/// * a PREFILL width comes in through [`of_chunk`](Self::of_chunk) — a runtime quantity (the chunk
-///   ladder is a wide range), padded by the same [`pad_of_mq`] law. It CANNOT mint a `Rung`.
+///   rung, inside a [`DecodeRung`], from [`each_batch_rung_widest_first`], which names each rung as
+///   a type: no runtime width is ever parsed into a rung, so there is no decode width to refuse;
+/// * a PREFILL width has no mint: no bake pads a prompt chunk through this type. One that does
+///   applies the same [`pad_of_mq`] law at its runtime width, and cannot mint a `Rung`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PaddedMq {
     mq: QueryRowCount,
@@ -348,15 +350,6 @@ impl PaddedMq {
         }
     }
 
-    /// THE RUNTIME ARM OF THE PAD LAW — a prefill chunk's width, padded by [`pad_of_mq`]. One
-    /// spelling, so the runtime pairing of a width with its pad exists in exactly one place.
-    pub fn of_chunk(mq: u32) -> PaddedMq {
-        PaddedMq {
-            mq: QueryRowCount::of_mq(mq),
-            pad: MqPad::of_chunk(mq),
-        }
-    }
-
     /// The chunk's REAL query rows — the width the pad was computed from, by construction.
     pub const fn mq(self) -> QueryRowCount {
         self.mq
@@ -369,9 +362,36 @@ impl PaddedMq {
     }
 }
 
-/// ⭐ THE BATCH LADDER, WALKED AS TYPES: `bake` gets each batch rung's [`PaddedMq`], widest first,
-/// each minted from its [`Rung`] — so a decode bundle's width is a ladder const from where the bake
-/// iterates the ladder, and no runtime width ever becomes one.
+/// ONE BATCH RUNG, AS THE LADDER WALK HANDS IT OUT: its rows and its padded width, both read off
+/// its [`Rung`] — the only constructor. The bake lowers the rung's decode bundle at
+/// [`rows`](Self::rows); a holder cannot have a rung of a width the ladder does not bake.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecodeRung {
+    rows: std::num::NonZeroU32,
+    width: PaddedMq,
+}
+
+impl DecodeRung {
+    /// The rung `MQ`, from its type.
+    pub const fn of<const MQ: u32>(rung: Rung<MQ>) -> DecodeRung {
+        DecodeRung {
+            rows: Rung::<MQ>::ROWS,
+            width: PaddedMq::of_rung(rung),
+        }
+    }
+    /// The rung's query rows: the rows its decode bundle is lowered at.
+    pub const fn rows(self) -> std::num::NonZeroU32 {
+        self.rows
+    }
+    /// The rung's width and its pad.
+    pub const fn width(self) -> PaddedMq {
+        self.width
+    }
+}
+
+/// ⭐ THE BATCH LADDER, WALKED AS TYPES: `bake` gets each batch rung as a [`DecodeRung`], widest
+/// first, each minted from its [`Rung`] — so a decode bundle's rows are a ladder const from where
+/// the bake iterates the ladder, and no runtime width ever becomes one.
 ///
 /// The listing is the ladder as literals, verified against the pool's ladder AT COMPILE TIME: each
 /// literal instantiates [`Rung`] (membership and the one-stick pad), and the guard const pins the
@@ -387,7 +407,7 @@ impl PaddedMq {
 /// # use ktir_superdsc::sdsc_abstract::{PaddedMq, Rung};
 /// const W: PaddedMq = PaddedMq::of_rung(Rung::<3>::baked());
 /// ```
-pub fn each_batch_rung_widest_first(mut bake: impl FnMut(PaddedMq)) {
+pub fn each_batch_rung_widest_first(mut bake: impl FnMut(DecodeRung)) {
     macro_rules! batch_ladder {
         ($($w:literal),+ $(,)?) => {{
             const LISTED: &[u32] = &[$($w),+];
@@ -407,7 +427,7 @@ pub fn each_batch_rung_widest_first(mut bake: impl FnMut(PaddedMq)) {
                 }
             };
             let () = LISTING_IS_THE_LADDER_WIDEST_FIRST;
-            $(bake(PaddedMq::of_rung(Rung::<$w>::baked()));)+
+            $(bake(DecodeRung::of(Rung::<$w>::baked()));)+
         }};
     }
     batch_ladder!(32, 16, 8, 4, 2)
@@ -9410,6 +9430,15 @@ pub fn mlp_reference(
 
 #[cfg(test)]
 mod tests {
+    /// THE PAD LAW AT A PREFILL WIDTH: a runtime chunk width pads by the SAME arithmetic a rung's
+    /// does, rounding up to whole sticks — 31 pads to 64, 96 to 128, 65 to 128.
+    #[test]
+    fn the_pad_law_at_a_prefill_width() {
+        for (w, pad) in [(31u32, 64u32), (47, 64), (64, 64), (65, 128), (96, 128)] {
+            assert_eq!(super::pad_of_mq(w), pad, "prefill width {w}");
+        }
+    }
+
     use super::*;
 
     /// ⛔ A RESHAPE CANNOT BE A PLACEMENT ALIAS ON THIS DEVICE — MEASURED, not
