@@ -1541,11 +1541,11 @@ pub fn pointwise_broadcast_opspec_from_tile(
     layout: Option<&BundleLayout>,
     division: CoreDivision,
 ) -> Result<OpSpec, String> {
+    let out_row_window = out_offset.row_window();
     let (out_window, out_offset) = (
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
     );
-    let out_row_window = out_offset.row_window();
     let df = tile_op.df;
     // ⭐ THE FAMILY MINT — every operand's swept window (the per-form broadcast law,
     // `EwOperand::swept_extents`) checked against its handle's declared shape and, when a layout
