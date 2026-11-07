@@ -1608,6 +1608,17 @@ impl BatchChunking {
     /// sticks of it, or the gather has no addressing for it.
     pub const STICK: u32 = 64;
 
+    /// The fold's page-side law, stated rather than relied on: the cut is `kv_heads · 2^i` rows a
+    /// page with `2^i < GATHER_FLOOR`, so a page's share is `page_slots · head_size / 2^i`, whole
+    /// rows of a one-stick head exactly when the floor divides the page's slots. The scheduler's
+    /// block is a const, so this is a build fact.
+    const PAGE_TAKES_THE_CUT: () = assert!(
+        SchedulerBlockTokens::REFERENCE
+            .get()
+            .is_multiple_of(Self::GATHER_FLOOR),
+        "a page's slots must divide by the gather floor, or a fold cut of a page is not whole rows"
+    );
+
     /// ⛔ `seqs` AND `nkvh` ARE COUNTS, ONE OR MORE. Both divide here, so a zero is a panic at BAKE
     /// and not a wrong answer — `seqs` has divided since this function existed (`CORES / seqs`) and
     /// `nkvh` since the fold was added (`GATHER_FLOOR.div_ceil(seqs · rows_per_page)`). Every
@@ -1639,6 +1650,7 @@ impl BatchChunking {
         q_width: u32,
         head_size: u32,
     ) -> BatchChunking {
+        let () = Self::PAGE_TAKES_THE_CUT;
         let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
             let j = Self::CORES / seqs;
