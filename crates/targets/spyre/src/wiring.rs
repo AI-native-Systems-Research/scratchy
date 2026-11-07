@@ -1429,8 +1429,9 @@ const _: () = assert!(
 
 /// ⭐⭐⭐ THE GATE TABLE'S β IMAGE — the ONE `[rows, 1]` table whose chain crosses the
 /// i32→f32 convert, staged at the convert's own device sweep (front-b-noise, auditor
-/// ruling 2026-10-27). The table's reservation is [`gate_row_stride_bytes`] (two u32
-/// sticks per row), and the convert's `[rows, 64]` addressing over it is STICK-BLOCKED —
+/// ruling 2026-10-27). The table's reservation is the convert's own device width —
+/// `DeviceWidth::for_convert(1)` bytes, two u32 sticks per row — and the convert's
+/// `[rows, 64]` addressing over it is STICK-BLOCKED —
 /// row r's first stick is flat stick `r`, its second flat stick `rows + r` — so the image
 /// is the one-stick head staging (row r's gate at byte `r · 128`, the SAME head
 /// [`stage_col_stick_heads`] ever wrote, the Col operand mode's own address) followed by
@@ -1438,7 +1439,7 @@ const _: () = assert!(
 /// zero-filled reservation is deterministic — no uninitialized tail for the sweep to
 /// consume. `head_stride` is the seed words' own one-stick stride
 /// ([`col_row_stride_bytes`]); `sweep_stride` is the gate's own reservation
-/// ([`gate_row_stride_bytes`]) — both passed in so this fn stages LAWS, never
+/// (the seat's `gate_row_words`) — both passed in so this fn stages LAWS, never
 /// recomputations.
 pub fn stage_gate_sweep<const N: usize>(
     rows: usize,
@@ -1458,12 +1459,11 @@ pub fn stage_gate_sweep<const N: usize>(
 
 /// ⭐ THE GATE TABLE'S OWN ROW RESERVATION — `DeviceWidth::for_convert(1)` in i32 words
 /// (64 = two u32 sticks, 256 B), the SAME one decision the convert door sweeps, the
-/// whole-function mint reserves, and the layout's `nbytes` places — stated here so the
-/// worker's per-row write and the placement's reservation cannot drift, exactly
-/// [`col_row_stride_bytes`]'s own contract for the one-stick tables.
-pub fn gate_row_stride_bytes() -> usize {
-    DeviceWidth::for_convert(1).get() as usize * 4
-}
+/// whole-function mint reserves, and the layout's `nbytes` places — stated once on the
+/// seat itself (`gate_row_words`, minted by
+/// [`lower_subtile_tape_to_ktir::sample_seat_of_ir`]) so the worker's per-row write and
+/// the placement's reservation cannot drift, exactly [`col_row_stride_bytes`]'s own
+/// contract for the one-stick tables.
 
 /// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
 /// token draw reads FRESH EVERY DECODE STEP (the seed quadruple's four word

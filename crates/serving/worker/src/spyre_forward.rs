@@ -362,13 +362,18 @@ pub(crate) fn run_card_launch(
     // seat's five sources are placed in this bundle all the same, and the launch's completeness
     // check (`require_sources_filled`) refuses a placed source nobody wrote. The laws a middle
     // chunk stages are this request's own, so nothing is invented.
-    if let Some(seat) = b.wiring.sample_seat.as_ref() {
-        // ⭐ THE LAUNCH'S OWN ROW COUNT — the typed width ([`SeatWidth`]'s one
-        // mint), never a number spelled at a call site and never a width
-        // overwritten on a copy of the seat: a batched launch at `mq` rows
-        // binds and reads `mq` rows of the per-step seat, and a prompt-final
-        // chunk keeps the prefill rung's own row count verbatim.
-        let seat_width = SeatWidth::of_launch(seat, &rows_in, mq);
+    //
+    // ⭐ THE LAUNCH'S SEAT AND WIDTH, BOUND ONCE: the width is [`SeatWidth`]'s
+    // ONE mint for the whole launch — the staging block and both pick arms
+    // below read this one value, never a second mint — and the seat rides
+    // beside it so the pick match binds the pair as its own, never a second
+    // Option walk of the wiring.
+    let seat_launch = b
+        .wiring
+        .sample_seat
+        .as_ref()
+        .map(|seat| (seat, SeatWidth::of_launch(seat, &rows_in, mq)));
+    if let Some(&(seat, seat_width)) = &seat_launch {
         let laws: Vec<RowLaw<'_>> = match seat_laws {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
@@ -399,16 +404,17 @@ pub(crate) fn run_card_launch(
         );
     }
     log_binds(&format!("launch mq={mq} at={seq_pos}"), b.wiring, &acts);
-    // ⭐ THE SEAT IS THE PICK'S OWN MATCH — every suffix arm takes it as the
-    // match's own binding, never a second Option and never an unwrap over a
-    // guard established lines earlier: a launch whose suffix runs and whose
-    // bundle mints no draw is refused AT THE ARM, before anything stages.
-    let picked = match (want_logits, b.wiring.sample_seat) {
+    // ⭐ THE SEAT IS THE PICK'S OWN MATCH — every suffix arm takes the
+    // launch's own (seat, width) pair as the match's binding, never a second
+    // Option and never an unwrap over a guard established lines earlier: a
+    // launch whose suffix runs and whose bundle mints no draw is refused AT
+    // THE ARM, before anything stages.
+    let picked = match (want_logits, seat_launch) {
         // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read, return. The
         // minted sampler consumes the `[rows, vocab]` result on the card and leaves the idx stick in
         // its place; this arm defers the ONE raw D2H of that stick — never a logits read, never a
         // host argmax — and the caller collects it through `collect_decode_tokens`.
-        (LogitsWanted::PerRequestDeferred, Some(seat)) => {
+        (LogitsWanted::PerRequestDeferred, Some((seat, seat_width))) => {
             // ⭐ #32 (E) — THE OVERLAP PROBE'S ASK: had the PREVIOUS step's stick read already
             // landed? NOT-yet-landed is "card busy at submit".
             let card_busy_at_submit = PRIOR_READ
@@ -432,8 +438,7 @@ pub(crate) fn run_card_launch(
             let t_defer = std::time::Instant::now();
             // The readback's own byte size — the seat's typed fact (the idx
             // stick's placed row, minted once at the bake), never a
-            // recomputed `mq · 64 · 4`, at the typed launch width.
-            let seat_width = SeatWidth::of_launch(&seat, &rows_in, mq);
+            // recomputed `mq · 64 · 4`, at the launch's one typed width.
             let read = pf
                 .defer_read_tensor_ring(
                     scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
@@ -488,23 +493,17 @@ pub(crate) fn run_card_launch(
         // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
         // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
         // stick comes back raw, exactly like a decode's.
-        (LogitsWanted::LastRow, Some(seat)) => {
+        (LogitsWanted::LastRow, Some((seat, seat_width))) => {
             pf.run_step_i32(mq, seq_pos, &acts, &[], &acts_i32, StepLogits::LeftOnDevice)
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
                     ))
                 })?;
-            // The prompt-final width is the seat's own row count — the one
-            // mint's verbatim prompt case, the same fn every launch width
-            // comes from.
-            let picked = read_sampled_tokens(
-                pf,
-                &seat,
-                SeatWidth::of_launch(&seat, &rows_in, mq),
-                b.result_id as u32,
-                vocab,
-            )?;
+            // The prompt-final width is the launch's one typed width — the
+            // mint's verbatim prompt case, the same value the staging block
+            // bound the seat's rows at.
+            let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
             log_seat_readback(
                 pf,
                 &seat,
@@ -2021,24 +2020,38 @@ pub(crate) fn run_request_step(
 mod pad_clamp_tests {
     use super::*;
 
-    /// A seat at `rows` baked rows whose strides are the placement's own
-    /// derivations — the TEST re-derives them (a test may check the seat
-    /// against the law; the staging itself never does), so a drift in either
-    /// direction fails here.
+    /// The seat the BAKE'S OWN MINT mints at `rows` baked rows — built the way
+    /// the expansion builds it (`mint_sample` over a one-request lm-head graph,
+    /// read back by `sample_seat_of_ir`), never spelled field by field, so the
+    /// staging this module pins runs against the real seat's own strides: the
+    /// seat cannot drift from the law because it IS the law's own output.
     fn seat_of(rows: u32) -> scratchy_target_spyre::wiring::SampleSeat {
-        scratchy_target_spyre::wiring::SampleSeat {
-            seed_words: [901, 902, 903, 904],
-            invt: 905,
-            rows,
-            row: 0,
-            vocab: 100,
-            pad_vocab: 128,
-            seed_row_words: (scratchy_target_spyre::wiring::col_row_stride_bytes(
-                scratchy_tensors::DType::I32,
-            ) / 4) as u32,
-            gate_row_words: (scratchy_target_spyre::wiring::gate_row_stride_bytes() / 4) as u32,
-            idx_row_words: scratchy_subtile::subtile_ir::SAMPLE_BLOCK,
-        }
+        use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
+        use scratchy_subtile::subtile_ir::{
+            SampleRows, SourceShape, SubOp, lower_region, mint_sample,
+        };
+        let rows = rows as usize;
+        // K=1, vocab 5 — the one-request lm-head shape the mint admits, the
+        // same fixture the spyre crate's own mint tests pin.
+        let input = LoweringInput {
+            exported: None,
+            sources: vec![SourceShape { rows, cols: 1 }, SourceShape { rows, cols: 5 }],
+            ops: vec![OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 5,
+                    weight: GemmWeight::Dense,
+                },
+                m: rows,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+            result: 0,
+        };
+        let nz = std::num::NonZeroU32::new(64).expect("64 is a whole stick");
+        let mut minted = lower_region(&input, nz);
+        mint_sample(&mut minted, SampleRows::All);
+        scratchy_target_spyre::lower_subtile_tape_to_ktir::sample_seat_of_ir(&minted)
+            .expect("the minted graph's seat derives")
+            .expect("the mint appends exactly one Sample node")
     }
 
     /// Two live rows in a 4-row rung — slots 2 and 3 are padding — at positions 10 and 11.
@@ -2056,8 +2069,20 @@ mod pad_clamp_tests {
         laws: &[RowLaw<'_>],
         ctx: &str,
     ) {
-        let binds =
-            sample_binds(seat, SeatWidth(seat.rows as usize), laws).expect("the seat stages");
+        // The width comes through the REAL DOOR — `of_launch` over a real
+        // `LaunchRows` (a sequence of four real rows at positions 10..13, the
+        // TWO_OF_FOUR rung's own shape), never a spelled number: the staging
+        // this pin checks is the same mint every launch reads.
+        let rows_in = LaunchRows::Sequence {
+            blocks: &[],
+            rows: scratchy_target_spyre::paged_step::StepRows { start: 10, real: 4 },
+        };
+        let binds = sample_binds(
+            seat,
+            SeatWidth::of_launch(seat, &rows_in, seat.rows as usize),
+            laws,
+        )
+        .expect("the seat stages");
         let head_stride = seat.seed_row_words as usize * 4;
         assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
         for (tid, bytes) in &binds {
