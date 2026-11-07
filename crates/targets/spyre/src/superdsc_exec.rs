@@ -4482,6 +4482,18 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     .take(6)
                     .map(|(g, i)| format!("{i}:{g}"))
                     .collect();
+                // One layer's exec-bearing CBs in step order (CBs 40..80 of the step), so a
+                // layer's groups — its consumes included — can be read off one line.
+                if t.rb_steps == 60 {
+                    let layer: Vec<String> = ops
+                        .iter()
+                        .enumerate()
+                        .skip(40)
+                        .take(60)
+                        .map(|(i, e)| format!("{i}:{}/{}", e.rb.exec_cmpt_cycles(), e.rb.prep_cmpt_cycles()))
+                        .collect();
+                    eprintln!("[sdsc-rblayer] {}", layer.join(" "));
+                }
                 eprintln!(
                     "[sdsc-rbkind] fwd {} cbs {} (exec>0 {busy}) span {span} exec {exec} gap {} \
                      cycles  top-exec {} top-gap {}",
@@ -4816,14 +4828,15 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         })
     }
 
-    /// Wait out every op this card's stream holds — a sharded step's non-lead ranks, whose pick
-    /// the lead rank's read already returned, drained so the step is done on every card before the
-    /// next one stages over their shadows.
-    pub fn drain_stream(&mut self) -> Result<()> {
-        self.stream_ref()?
-            .synchronize()
-            .map_err(|e| anyhow!("drain: sync: {e}"))?;
-        // A rank drained here ran a pipelined step whose RB records nothing else reads.
+    /// ⭐ A PEER RANK'S HALF OF THE LOOP'S ONE FENCE — what a sharded step's non-lead card does when
+    /// the lead's stick read lands: take its shadow's quiet point ([`Self::quiet_shadow`], the same
+    /// door every shadow writer passes through), and nothing else. Its stream holds the step the
+    /// pipelined loop already submitted behind this one, so a whole-stream synchronize here would
+    /// fence that step too and serialize the pipeline; the collectives tie the peer's progress to
+    /// the lead's, so the lead's landed read is the step's end on every card that matters.
+    pub fn settle_peer_step(&mut self) -> Result<()> {
+        self.quiet_shadow()?;
+        // A peer's RB records — whatever of its steps has completed (`[sdsc-rbkind]`).
         if Diag::get().rb_time {
             self.rb_attribute();
         }

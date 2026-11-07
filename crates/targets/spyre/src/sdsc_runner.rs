@@ -835,12 +835,14 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// (and the shadow's quiet point), then return the bytes the transfer
     /// brought back (the runner spelling of `Executor::finish_deferred_read_raw`).
     pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
-        // Rank 0's read lands behind its step; every other rank's step is drained here too, so a
-        // step is finished on every card when its pick is back.
+        // Rank 0's read lands behind its step. Every other rank takes only its shadow's quiet point
+        // — NEVER a whole-stream drain: each peer's stream already holds the NEXT step the pipelined
+        // loop submitted, and draining it would wait that step out too, so the card would idle
+        // through every submit (measured at tp/8: busy at 1% of submits, against tp/1's 99%).
         let bytes = self.lead().finish_deferred_read_raw(read)?;
         for (r, e) in self.ranks.iter_mut() {
             if r.get() != 0 {
-                e.drain_stream()?;
+                e.settle_peer_step()?;
             }
         }
         Ok(bytes)
