@@ -311,7 +311,7 @@ mod tests {
 
     const WELL_FORMED: &str = "\
 module {
-  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {
+  tt.func public @k(%scale: f16) attributes {noinline = false} {
     %x = arith.constant dense<0.000000e+00> : tensor<64x64xf16>
     %m = \"tt.reduce\"(%x) <{axis = 1 : i32}> ({
     ^bb0(%a: f16, %b: f16):
@@ -320,7 +320,9 @@ module {
     }) : (tensor<64x64xf16>) -> tensor<64xf16>
     %one = arith.constant 1.0 : f32
     %seed = tensor.splat %one : tensor<64xf16>
-    %out = arith.addf %m, %seed : tensor<64xf16>
+    %s = tt.splat %scale : tensor<64xf16>
+    %ss = arith.mulf %seed, %s : tensor<64xf16>
+    %out = arith.addf %m, %ss : tensor<64xf16>
     tt.return
   }
 }
