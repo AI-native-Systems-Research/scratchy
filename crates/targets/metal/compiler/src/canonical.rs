@@ -38,8 +38,8 @@ use scratchy_target_metal::tape::step::{
 use scratchy_target_metal::tape::lowering::TapeHalf;
 
 use crate::steps_from_tape::{
-    Assembled, MoeBits, OpColours, Recording, RowOperand, StepRefusal, UnrolledSteps, assemble,
-    proves,
+    Assembled, MoeBits, OpColours, Recording, RowOperand, StepRefusal, UnrolledSteps, WeightRead,
+    assemble, proves,
 };
 
 /// A model's SOURCE MANIFEST: every weight family its tapes bind — a `(kind, accessor)` bundle on
@@ -66,6 +66,17 @@ impl SourceManifest {
             self.families.len() - 1
         });
         SourceIx(at as u32)
+    }
+
+    /// A row's reads, each with the family of the site it reads through. A read through no site
+    /// the manifest interned names no family a command binds, so none is kept.
+    fn reads(&self, reads: &[WeightRead]) -> Vec<(SourceIx, u32)> {
+        (reads.iter())
+            .filter_map(|(site, id)| {
+                let at = self.families.iter().position(|f| f == site)?;
+                Some((SourceIx(at as u32), *id))
+            })
+            .collect()
     }
 
     fn row(&mut self, site: &[WeightSlot]) -> Vec<RowSource> {
@@ -223,9 +234,10 @@ pub enum MlpForm {
 pub struct MetalStepFacts<'a> {
     /// `WeightId` → accessor path.
     pub weight_paths: &'a [Vec<String>],
-    /// Accessor bases whose DSL subtree declares its own `shared_expert`: that subtree owns the
-    /// shared expert, so a fused MoE's internal shared tail is disabled.
-    pub dsl_shared_expert_bases: &'a [String],
+    /// The DSL weights (`WeightId`s) whose subtree declares its own `shared_expert`: that subtree
+    /// owns the shared expert of the bank the weight is, so a fused MoE's internal shared tail is
+    /// disabled. Looked up by the weight the bank's op reads, never by its accessor base.
+    pub shared_expert_banks: &'a std::collections::BTreeSet<u32>,
     /// The embedding table's accessor base (the embed weight is not a tape source).
     pub embed_base: &'a str,
     /// The embedding's MLX-affine storage; `None` = dense.
@@ -237,8 +249,9 @@ pub struct MetalStepFacts<'a> {
 }
 
 /// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own), for the
-/// bank under accessor base `base` at a layer, its projections those of the expert body's form.
-pub type MoeExpertBits<'f> = dyn Fn(&str, LayerId, ExpertBody) -> [Option<AffineBits>; 3] + 'f;
+/// bank that DSL weight `WeightId` is (the weight its op reads) at a layer, its projections those
+/// of the expert body's form.
+pub type MoeExpertBits<'f> = dyn Fn(u32, LayerId, ExpertBody) -> [Option<AffineBits>; 3] + 'f;
 
 /// Which canonical this is, for the log and the refusals.
 #[derive(Clone, Copy)]
@@ -284,10 +297,10 @@ pub struct MetalCanonical {
 pub struct StepOperands {
     pub backbone: Vec<Vec<RowOperand>>,
     pub lm_head: Vec<Vec<RowOperand>>,
-    /// Per backbone row, then per lm_head row, the DSL weights its op reads, each with its site's
-    /// kind (`Recording::read`).
-    pub backbone_weights: Vec<Vec<(WeightKind, u32)>>,
-    pub lm_head_weights: Vec<Vec<(WeightKind, u32)>>,
+    /// Per backbone row, then per lm_head row, the DSL weights its op reads, each with the family
+    /// of the site it reads it through (`Recording::read`).
+    pub backbone_weights: Vec<Vec<(SourceIx, u32)>>,
+    pub lm_head_weights: Vec<Vec<(SourceIx, u32)>>,
 }
 
 impl StepOperands {
@@ -300,8 +313,8 @@ impl StepOperands {
         rows.get(row as usize).map_or(&[], Vec::as_slice)
     }
 
-    /// The DSL weights row `row` of `half`'s op reads.
-    pub fn weights(&self, half: TapeHalf, row: u32) -> &[(WeightKind, u32)] {
+    /// The DSL weights row `row` of `half`'s op reads, each with its site's family.
+    pub fn weights(&self, half: TapeHalf, row: u32) -> &[(SourceIx, u32)] {
         let rows = match half {
             TapeHalf::Backbone => &self.backbone_weights,
             TapeHalf::LmHead => &self.lm_head_weights,
@@ -598,8 +611,8 @@ pub fn lower_canonical(
         operands: StepOperands {
             backbone: backbone_operands,
             lm_head: rolled.lm_operands,
-            backbone_weights,
-            lm_head_weights: rolled.lm_weights,
+            backbone_weights: backbone_weights.iter().map(|r| sources.reads(r)).collect(),
+            lm_head_weights: rolled.lm_weights.iter().map(|r| sources.reads(r)).collect(),
         },
         colours: colour_count,
         result,
