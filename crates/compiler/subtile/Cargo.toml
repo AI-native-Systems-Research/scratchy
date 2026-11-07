@@ -55,6 +55,12 @@ serde_json = { workspace = true }
 # back-edge. scratchy-forward-compiler builds backend-agnostic here (no
 # metal feature), so the tests stay host-runnable on any platform.
 scratchy-forward-compiler = { path = ".." }
+# `tests/value_door_ratchet.rs` parses the compiler, tensor, layer, target and triton crates'
+# source to count #1094's remaining law asserts and value→type doors. The versions are the
+# macro crate's, so the test adds no crate to the lock.
+syn = { version = "3", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 
 # ⛔⛔⛔ RUNNING THIS CRATE'S KANI PROOFS REQUIRES `--features spyre`. EVERY HARNESS IN
 # `sdsc_abstract.rs` LIVES BEHIND `#[cfg(feature = "spyre")] pub mod sdsc_abstract;`, and `default = []`,
