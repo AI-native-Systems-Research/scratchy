@@ -83,3 +83,95 @@ pub fn geometry_sources() -> String {
         GEOMETRY_SOURCE_STEMS.join(", ")
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  SPIKE (#1094 G, arm 1): EACH CONFIG'S ROPE CLASSES AS A TYPE, AND ONE DOOR ON MODEL IDENTITY.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A model config's rope classes, as types: the build script writes one marker type per config
+/// ([`config_models`]), whose head dims are typenum unsigneds read out of that `config.json`.
+pub trait ConfigRopes {
+    /// The config's stem.
+    const STEM: &'static str;
+    /// The base class's (`rotary_local`) head dim.
+    type Base: scratchy_tensors::typed::typenum::Unsigned;
+    /// The global class's (plain `rotary`) head dim.
+    type Global: scratchy_tensors::typed::typenum::Unsigned;
+    /// The rope adapter of the config's classes, read off the two types above.
+    #[cfg(feature = "spyre")]
+    const ROPES: rope_bridge::ModelRopes;
+}
+
+/// What runs once the bake's model is a type — the consumer side of [`with_config_model`].
+pub trait OnConfigModel {
+    /// What the dispatch produces.
+    type Out;
+    /// The body, at the model's own marker type.
+    fn on_model<M: ConfigRopes>(self) -> Self::Out;
+}
+
+/// ⛔ THE DOOR ON MODEL IDENTITY: the bake's config stem → that config's marker type. The arms are
+/// every config the build script read; `None` is a stem no config states. A shape value never
+/// crosses here: what crosses is which model the bake was handed.
+pub fn with_config_model<C: OnConfigModel>(stem: &str, consumer: C) -> Option<C::Out> {
+    macro_rules! model_arms {
+        ($(($stem:literal, $ty:ident)),* $(,)?) => {
+            match stem {
+                $($stem => Some(consumer.on_model::<config_models::$ty>()),)*
+                _ => None,
+            }
+        };
+    }
+    for_each_config_model!(model_arms)
+}
+
+/// The rope bridge, type → const: each head dim a config states, as a typenum, names its own
+/// `rope_at::<HD>` instantiation. No value is matched: the impl is chosen by the type.
+#[cfg(feature = "spyre")]
+pub mod rope_bridge {
+    use ktir_superdsc::emit::EmittedOp;
+    use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, RopeAt, rope_at};
+    use scratchy_tensors::typed::typenum::{self, Unsigned};
+
+    /// One rope class's lowering.
+    pub type RopeFn = for<'a> fn(RopeAt<'a>) -> Result<Vec<EmittedOp>, Error>;
+
+    /// A head dim, as a type, with its rope instantiation.
+    pub trait RopeHd: Unsigned {
+        /// `rope_at::<Self::U32>`.
+        const ROPE: RopeFn;
+    }
+
+    macro_rules! rope_impls {
+        ($(($hd:literal, $u:ident)),* $(,)?) => {
+            $(impl RopeHd for typenum::$u {
+                const ROPE: RopeFn = rope_at::<$hd>;
+            })*
+        };
+    }
+    for_each_config_head_dim_type!(rope_impls);
+
+    /// The rope adapter the bake hands down: each class's head dim and lowering, read off the
+    /// model's marker type, so only `rope_at` is instantiated per head dim.
+    #[derive(Clone, Copy)]
+    pub struct ModelRopes {
+        /// The base class: its head dim and its lowering.
+        pub base: (u32, RopeFn),
+        /// The global class: its head dim and its lowering.
+        pub global: (u32, RopeFn),
+    }
+
+    impl ModelRopes {
+        /// The adapter of the model `M`.
+        pub const fn of<M: super::ConfigRopes>() -> Self
+        where
+            M::Base: RopeHd,
+            M::Global: RopeHd,
+        {
+            Self {
+                base: (M::Base::U32, <M::Base as RopeHd>::ROPE),
+                global: (M::Global::U32, <M::Global as RopeHd>::ROPE),
+            }
+        }
+    }
+}
