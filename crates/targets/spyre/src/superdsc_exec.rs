@@ -4482,18 +4482,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     .take(6)
                     .map(|(g, i)| format!("{i}:{g}"))
                     .collect();
-                // One layer's exec-bearing CBs in step order (CBs 40..80 of the step), so a
-                // layer's groups — its consumes included — can be read off one line.
-                if t.rb_steps == 60 {
-                    let layer: Vec<String> = ops
-                        .iter()
-                        .enumerate()
-                        .skip(40)
-                        .take(60)
-                        .map(|(i, e)| format!("{i}:{}/{}", e.rb.exec_cmpt_cycles(), e.rb.prep_cmpt_cycles()))
-                        .collect();
-                    eprintln!("[sdsc-rblayer] {}", layer.join(" "));
-                }
                 eprintln!(
                     "[sdsc-rbkind] fwd {} cbs {} (exec>0 {busy}) span {span} exec {exec} gap {} \
                      cycles  top-exec {} top-gap {}",
