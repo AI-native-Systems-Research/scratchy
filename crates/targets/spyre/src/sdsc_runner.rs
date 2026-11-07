@@ -1053,6 +1053,30 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     ///
     /// MUST be called after BOTH sessions have been prepared — prepare zero-inits and H2Ds every
     /// segment, so aliasing earlier would let the owner's prepare wipe the now-shared region.
+    /// ⭐ POINT EVERY CARD'S LANDING SLOTS AT ITS RECEIVE WINDOW, then check every rank's window
+    /// lands at one address. Called on the OWNER session once it is prepared — its weight segment
+    /// holds the window every borrower aliases. A world of one points nothing.
+    ///
+    /// # Errors
+    /// A rank whose slots will not point, or windows that land apart.
+    #[cfg(feature = "spyre-hw")]
+    pub fn point_landing_slots(
+        &mut self,
+        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+    ) -> Result<()> {
+        use ktir_superdsc::collective::World;
+        if !<T as World>::SHARDED {
+            return Ok(());
+        }
+        self.each(|e| e.point_landing_slots())?;
+        let landing =
+            crate::runtime::refuse_if_windows_apart(cards).map_err(|e| anyhow!("{e}"))?;
+        tracing::info!(
+            "[spyre-tp] every rank's receive window lands at 0x{landing:x}"
+        );
+        Ok(())
+    }
+
     pub fn alias_seg_from(&mut self, owner: &SuperDscSession<T>, seg: i64) -> Result<()> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("alias_seg: segment {seg} out of range"))?;

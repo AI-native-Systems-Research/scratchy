@@ -1360,6 +1360,9 @@ impl<T: ktir_superdsc::collective::Tp> std::error::Error for AttachRefusal<T> {}
 pub struct PeerLink<T: ktir_superdsc::collective::Tp> {
     me: Rank<T>,
     window: RecvWindow<T>,
+    /// The window's first byte as the ALLOCATOR placed it on this card — set once, by
+    /// [`point_landing_slots`], when the owning session's weight segment exists.
+    landing: std::sync::OnceLock<u64>,
 }
 
 impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
@@ -1371,6 +1374,11 @@ impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
     /// Where every peer's sends land on this card.
     pub fn window(&self) -> RecvWindow<T> {
         self.window
+    }
+
+    /// The window's first byte as the allocator placed it — `None` until [`point_landing_slots`].
+    pub fn landing(&self) -> Option<u64> {
+        self.landing.get().copied()
     }
 }
 
@@ -1423,34 +1431,131 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
                 .set_base_addr_table(tid, addr)
                 .map_err(|why| AttachRefusal::Bat { tid, why })?;
         }
-        // ⭐ ONE XSEG ENTRY PER (PEER, LANDING SLOT), EACH PROGRAMMED ONCE, AS THE tp37 CELL
-        // PROGRAMS ITS ONE: an F-send lands where its sid's entry points and nowhere else (#1009,
-        // E8a), so peer `from`'s message into slot `s` signals `Sid::of(from, s)` and this card
-        // points that entry at the slot of `from`'s block — `hal_sbf::rdma_xseg` of the slot's flat
-        // VA plus the one-flit L4 compensation, the same compensated destination
-        // `scheduler::build_rdma_send_cb` hands the send door.
-        for (from, (slot, at)) in me
-            .peers()
-            .flat_map(|from| window.slots_from(from).map(move |sa| (from, sa)))
-        {
-            let va = flex_rs::control_block_wire::Flits(
-                flex_rs::control_block_wire::VirtualAddressSbf::new(
-                    WINDOW_SEGMENT as u8,
-                    flex_rs::control_block_wire::Flits::from_bytes(at),
-                )
-                .value(),
-            )
-            .to_bytes();
-            let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
-                .map_err(AttachRefusal::Xseg)?;
-            c.card
-                .write_xseg(Sid::of(from, slot).get(), word)
-                .map_err(AttachRefusal::Xseg)?;
-        }
         // Set only here, after the card is fully programmed; `get` above saw none.
-        let _ = c.link.set(PeerLink { me, window });
+        let _ = c.link.set(PeerLink {
+            me,
+            window,
+            landing: std::sync::OnceLock::new(),
+        });
     }
     Ok(())
+}
+
+/// ⭐ POINT EVERY PEER'S LANDING SLOTS AT THIS CARD'S WINDOW — one `XSEG` entry per (peer, slot),
+/// each programmed once: an F-send lands where its sid's entry points and nowhere else (#1009, E8a),
+/// so peer `from`'s message into slot `s` signals `Sid::of(from, s)` and that entry names the slot —
+/// `hal_sbf::rdma_xseg` of the slot's flat VA plus the one-flit L4 compensation, the VA from
+/// [`flex_rs::scheduler::landing_va_bytes`], the same compose the send's own word takes.
+///
+/// ⛔ THE VA IS THE ALLOCATOR'S, SO THIS RUNS ONCE THE WINDOW IS ALLOCATED. The window is a placement
+/// in the weight segment, and where that segment's bytes ARE — the region's segment and the
+/// allocation's offset inside it — exists only once the session that OWNS it has allocated it
+/// (`window_region`; every other session aliases it). MEASURED, #1009 run 5 and again here on
+/// 2026-11-06: entries pointed at `(program seg 1, layout offset)` name an address the allocator gave
+/// to something else, and every collective runs clean over a window the peers' bytes never reach.
+///
+/// Every rank's window must land at ONE address: each send names its own window's address for its
+/// peers' ([`flex_rs::scheduler::build_rdma_send_cb`]). The cards of one process allocate one
+/// sequence, so they do; [`refuse_if_windows_apart`] checks it once every rank is pointed.
+///
+/// # Errors
+/// [`AttachRefusal`]: an unlinked card, a slot past the allocation, a second pointing at another
+/// address, or a word that will not compose or program.
+pub fn point_landing_slots<T: ktir_superdsc::collective::Tp>(
+    card: &CardRuntime<T>,
+    window_region: &DevAddr,
+) -> Result<(), AttachRefusal<T>> {
+    let Some(link) = card.link.get() else {
+        return Err(AttachRefusal::Xseg(
+            "point_landing_slots: the card is not linked".to_string(),
+        ));
+    };
+    let resolver = FlexAllocatorAddressResolver::new(
+        card.rt
+            .get_allocator()
+            .map_err(|e| AttachRefusal::Xseg(format!("allocator: {e:?}")))?,
+    );
+    let at = |offset: u64, len: u64| {
+        flex_rs::scheduler::landing_va_bytes(
+            &resolver,
+            &RdmaOperand {
+                base: window_region.0.clone(),
+                segment: WINDOW_SEGMENT as u8,
+                offset,
+            },
+            len,
+        )
+        .map_err(|e| AttachRefusal::Xseg(e.to_string()))
+    };
+    let window = link.window;
+    let landing = at(window.offset(), window.size())?;
+    if link.landing.get().is_some_and(|l| *l != landing) {
+        return Err(AttachRefusal::Xseg(format!(
+            "the window is pointed at 0x{landing:x}, but this card already pointed it at {:x?}",
+            link.landing.get()
+        )));
+    }
+    if link.landing.get().is_some() {
+        return Ok(());
+    }
+    let cap = crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    for (from, (slot, off)) in link
+        .me
+        .peers()
+        .flat_map(|from| window.slots_from(from).map(move |sa| (from, sa)))
+    {
+        // The slot's own extent: one message, or the block's remainder for its last.
+        let len = (window.block().get() - u64::from(slot.message()) * cap).min(cap);
+        let va = at(off, len)?;
+        let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
+            .map_err(AttachRefusal::Xseg)?;
+        card.card
+            .write_xseg(Sid::of(from, slot).get(), word)
+            .map_err(AttachRefusal::Xseg)?;
+    }
+    let _ = link.landing.set(landing);
+    tracing::info!(
+        "[spyre-tp] rank {}: landing slots pointed at the receive window, landing 0x{landing:x}",
+        link.me.get()
+    );
+    Ok(())
+}
+
+/// The ranks of a world placed their receive windows at different device addresses: a send names
+/// its own window's address for its peers', so this world would send where its peers do not land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsApart {
+    pub landings: Vec<Option<u64>>,
+}
+
+impl fmt::Display for WindowsApart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the ranks' receive windows land at {:x?} — every rank of a world must place its window \
+             at one address, which each send names for its peers'",
+            self.landings
+        )
+    }
+}
+
+impl std::error::Error for WindowsApart {}
+
+/// ⭐ EVERY RANK'S WINDOW AT ONE ADDRESS — checked once every card is pointed, before a step.
+///
+/// # Errors
+/// [`WindowsApart`], naming every rank's landing.
+pub fn refuse_if_windows_apart<T: ktir_superdsc::collective::Tp>(
+    cards: &PerRank<T, Arc<CardRuntime<T>>>,
+) -> Result<u64, WindowsApart> {
+    let landings: Vec<Option<u64>> = cards
+        .values()
+        .map(|c| c.link().and_then(PeerLink::landing))
+        .collect();
+    match landings.first().copied().flatten() {
+        Some(l) if landings.iter().all(|x| *x == Some(l)) => Ok(l),
+        _ => Err(WindowsApart { landings }),
+    }
 }
 
 #[cfg(test)]

@@ -4200,6 +4200,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let Some(dir) = Diag::get().tensordump.clone() else {
             return Ok(());
         };
+        // A sharded world's ranks dump apart: one directory per rank, so rank `r`'s tensors are
+        // never overwritten by another rank's of the same name.
+        let dir = match self.session() {
+            Some(me) => dir.join(format!("rank{}", me.get())),
+            None => dir,
+        };
         if self.dump.is_none() {
             let prog = dump_prog_index(&self.code.fp);
             let _ = std::fs::create_dir_all(&dir);
@@ -5994,6 +6000,29 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     /// Only THIS session's descriptor is replaced; `owner` is untouched, so aliasing prefill onto
     /// decode leaves the decode session bit-for-bit unchanged. MUST be called AFTER both sessions'
     /// prepare (which zero-inits and H2Ds every segment).
+    /// ⭐ POINT THIS CARD'S LANDING SLOTS AT THIS SESSION'S RECEIVE WINDOW — the owner session's,
+    /// once [`Self::prepare`] has allocated its weight segment (the window is a placement in it). A
+    /// world of one has no window and nothing to point.
+    ///
+    /// # Errors
+    /// An unprepared session, or the link's refusal ([`crate::runtime::point_landing_slots`]).
+    #[cfg(feature = "spyre-hw")]
+    pub fn point_landing_slots(&self) -> Result<()> {
+        if self.seat_window()?.is_none() {
+            return Ok(());
+        }
+        let region = self.seg_addr[SEG_WEIGHT.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("point_landing_slots: the weight segment is not allocated"))?;
+        crate::runtime::point_landing_slots(&self.card, region).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// The receive window this session's bundle bakes, `None` in a world of one.
+    #[cfg(feature = "spyre-hw")]
+    fn seat_window(&self) -> Result<Option<bundle::collective::RecvWindow<T>>> {
+        RankSeat::baked_window(self.code).map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))
+    }
+
     pub fn alias_seg_from(&mut self, owner: &Executor<T>, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {

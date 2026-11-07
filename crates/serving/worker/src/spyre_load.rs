@@ -2000,6 +2000,11 @@ impl SpyreWorker {
                     &spill_tids,
                 )
                 .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
+                // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
+                // placement in it, so where peers' sends land is the allocator's answer for THIS
+                // session's region — pointed before any step, and checked equal on every rank.
+                ss.point_landing_slots(&cards)
+                    .map_err(|e| werr(format!("the receive window's landing slots: {e}")))?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
                 // (see `adopt_from_owner`) because the slot it lives in cannot be aliased. Empty —
