@@ -110,6 +110,89 @@ unsafe extern "C" {
         n_tile: u32,
         stream: *mut c_void,
     ) -> i32;
+    // FP8 S4: the decode fp8 GEMV family, one prepare for the file.
+    fn scratchy_cuda_gemv_fp8_prepare() -> i32;
+    fn scratchy_cuda_gemv_fp8_abt(
+        a: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        n: u32,
+        k: u32,
+        splits: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemv_group_fp8_abt(
+        a: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        partials: *const *mut c_void,
+        n: *const u32,
+        k: u32,
+        splits: *const u32,
+        count: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gate_up_gemv_fp8(
+        a: *const c_void,
+        gate: *const c_void,
+        gate_scale: *const c_void,
+        up: *const c_void,
+        up_scale: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        n: u32,
+        k: u32,
+        splits: u32,
+        act: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_gemv_fp8(
+        a: *const c_void,
+        b: *const c_void,
+        b_scale: *const c_void,
+        topk_idx: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        m: u32,
+        top_k: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        pair_rows: u32,
+        splits: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_gate_up_gemv_fp8(
+        a: *const c_void,
+        gate: *const c_void,
+        gate_scale: *const c_void,
+        up: *const c_void,
+        up_scale: *const c_void,
+        topk_idx: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        m: u32,
+        top_k: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        splits: u32,
+        act: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemv_fp8_quant_probe(
+        a: *const c_void,
+        out: *mut c_void,
+        scale: *mut c_void,
+        k: u32,
+        splits: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemm_narrow_fp8_prepare() -> i32;
     fn scratchy_cuda_gemm_narrow_fp8_abt(
         a: *const c_void,
@@ -980,6 +1063,8 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("quant_rows_fp8", scratchy_cuda_quant_rows_fp8_prepare),
     ("gemm_fp8", scratchy_cuda_gemm_fp8_prepare),
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
+    // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
+    ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -3197,4 +3282,237 @@ pub unsafe fn gemm_narrow_group_fp8_abt(
         )
     };
     check(code, refused)
+}
+
+// FP8 S4: THE DECODE FP8 GEMVS (`kernels/gemv_fp8.cu`). The activation row is bf16, quantized in
+// each kernel's prologue exactly as [`quant_rows_fp8`] quantizes it; the weight is an
+// [`Fp8Operand`], its e4m3 bytes and per-channel f32 scales. Every output is bf16, rounded once
+// from `(q · Bᵀ) · w_scale[n] · a_scale` in f32 (split partials are scaled before the reduce adds
+// them). The split rule is the bf16 GEMV's ([`gemv_split_bf16_abt`]), with `k` a non-zero
+// multiple of 64 (`step::GEMM_FP8_K_MULTIPLE`) at most 17,408.
+
+/// Launch the fp8 GEMV `c [n] = bf16((q · bᵀ) · b_scale[n] · a_scale)`, `q` and `a_scale` the
+/// per-token quantization of `a [1, k]` bf16, at `splits` K runs (`step::gemv_splits`): at
+/// `splits > 1` each split's scaled f32 partials go to `partials` and a second launch adds them in
+/// ascending split order and rounds once. Asynchronous.
+///
+/// Refused with [`KernelError::GemvSplit`], before any pointer is touched, unless `n` is non-zero
+/// and at most `i32::MAX`, `k` a non-zero multiple of 64 at most 17,408, `splits` in `1..=16`
+/// cutting `⌈k / 256⌉` chunks into non-empty runs (`step::gemv_split_chunks`), `partials` not null
+/// above one split, and `splits · n_pad` at most `i32::MAX`.
+///
+/// # Safety
+///
+/// [`prepare_all`] must have succeeded on the current device. `a` (`k` bf16), `b` (`n·k` bytes)
+/// and `c` (`n` bf16) must be 16-byte-aligned device pointers and `b`'s scales (`n` f32) 4-byte
+/// aligned, valid for the whole kernel, `c` overlapping no input. At `splits > 1`, `partials` must
+/// be a 16-byte-aligned device pointer to `step::gemv_scratch_bytes(n, 1, splits)` bytes,
+/// overlapping no operand. `stream` must be a live `cudaStream_t` of the current device, or null
+/// for the default stream.
+pub unsafe fn gemv_fp8_abt(
+    (a, b, c): (*const c_void, Fp8Operand, *mut c_void),
+    partials: *mut c_void,
+    (n, k, splits): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape and split before it touches a pointer and catches every C++ exception.
+    let code =
+        unsafe { scratchy_cuda_gemv_fp8_abt(a, b.0, b.1, c, partials, n, k, splits, stream) };
+    check(code, KernelError::GemvSplit { n, k, splits })
+}
+
+/// [`gemv_fp8_abt`] of every member of `members` off one `a` in two launches at most: member `i`
+/// at `splits[i]`, its partials at `partials[i]`, each the bits of its own [`gemv_fp8_abt`] at that
+/// split. Refused with [`KernelError::GroupShape`] before any pointer is touched unless there are
+/// 2 or 3 members, `splits` and `partials` have one entry per member, and each member meets
+/// [`gemv_fp8_abt`]'s rule at its split. Asynchronous.
+///
+/// # Safety
+///
+/// As [`gemv_fp8_abt`]'s, for `a` and every member's weight, `c` and partials; no member's `c` or
+/// partials overlaps another's.
+pub unsafe fn gemv_group_fp8_abt(
+    a: *const c_void,
+    members: Fp8GroupOperands<'_>,
+    partials: &[*mut c_void],
+    (k, splits): (u32, &[u32]),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemv_group_fp8_abt", members, (1, k));
+    if splits.len() != members.len() || partials.len() != members.len() {
+        return Err(refused);
+    }
+    let (mut sp, mut p) = ([1u32; 3], [std::ptr::null_mut(); 3]);
+    for (i, (&si, &pi)) in splits.iter().zip(partials).take(3).enumerate() {
+        (sp[i], p[i]) = (si, pi);
+    }
+    let count = members.len() as u32;
+    // SAFETY: as above; the arrays are three long and the launcher checks the count and every
+    // member's shape before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemv_group_fp8_abt(
+            a,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            p.as_ptr(),
+            n.as_ptr(),
+            k,
+            sp.as_ptr(),
+            count,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// The fp8 gate/up GEMV: `c [n] = bf16(act(g, u))`, `g` and `u` each [`gemv_fp8_abt`]'s value
+/// before its rounding, `act` a [`crate::step::GatedOp`] code, in f32, rounded once. Under
+/// [`gemv_fp8_abt`]'s rule at `splits` for each; at `splits > 1` `partials` holds
+/// `2 · splits · n_pad` f32. Asynchronous; refused with [`KernelError::GateUpShape`] before any
+/// pointer is touched.
+///
+/// # Safety
+///
+/// As [`gemv_fp8_abt`]'s for `a`, `gate`, `up` and `c`.
+pub unsafe fn gate_up_gemv_fp8(
+    (a, gate, up): (*const c_void, Fp8Operand, Fp8Operand),
+    (c, partials): (*mut c_void, *mut c_void),
+    (n, k, splits): (u32, u32, u32),
+    act: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape, split and code before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_gate_up_gemv_fp8(
+            a, gate.0, gate.1, up.0, up.1, c, partials, n, k, splits, act, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GateUpShape {
+            kernel: "gate_up_gemv_fp8",
+            dims: [1, n, k, splits],
+        },
+    )
+}
+
+/// The gathered expert GEMV over an fp8 bank: [`expert_gemv_split_bf16`]'s pairs, rows and rule
+/// (with `k` a multiple of 64 at most 17,408), `b` expert 0's `[expert_rows, k]` e4m3 block and
+/// its `[expert_rows]` f32 scale row (of `[experts, expert_rows]`). Each pair's row is
+/// [`gemv_fp8_abt`]'s bits at the same split on its row and expert slice. Asynchronous; refused
+/// with [`KernelError::MoeShape`] `{ kernel: "expert_gemv_fp8", .. }` before any pointer is
+/// touched.
+///
+/// # Safety
+///
+/// As [`expert_gemv_split_bf16`]'s, with `b` `experts · expert_rows · k` bytes and its scales
+/// `experts · expert_rows` f32.
+pub unsafe fn expert_gemv_fp8(
+    (a, b, topk_idx): (*const c_void, Fp8Operand, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (m, top_k, n, k): (u32, u32, u32, u32),
+    (experts, expert_rows): (u32, u32),
+    (pair_rows, splits): (bool, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above.
+    let code = unsafe {
+        scratchy_cuda_expert_gemv_fp8(
+            a,
+            b.0,
+            b.1,
+            topk_idx,
+            c,
+            partials,
+            m,
+            top_k,
+            n,
+            k,
+            experts,
+            expert_rows,
+            u32::from(pair_rows),
+            splits,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "expert_gemv_fp8",
+            dims: [m, top_k, n, k],
+        },
+    )
+}
+
+/// The expert gate/up GEMV over an fp8 bank: per pair, [`gate_up_gemv_fp8`]'s fold of the gate's
+/// and the up's [`expert_gemv_fp8`] values on the token rows. Asynchronous; refused with
+/// [`KernelError::GateUpShape`] unless each meets that launcher's rule and `act` is a code.
+///
+/// # Safety
+///
+/// As [`expert_gemv_fp8`]'s for `a`, each slab, `topk_idx` and `c`; at `splits > 1`, `partials`
+/// holds `2 · splits · m · top_k · n` f32, overlapping no operand.
+pub unsafe fn expert_gate_up_gemv_fp8(
+    (a, gate, up, topk_idx): (*const c_void, Fp8Operand, Fp8Operand, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (m, top_k, n, k): (u32, u32, u32, u32),
+    (experts, expert_rows, splits): (u32, u32, u32),
+    act: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `gate_up_gemv_fp8`'s.
+    let code = unsafe {
+        scratchy_cuda_expert_gate_up_gemv_fp8(
+            a,
+            gate.0,
+            gate.1,
+            up.0,
+            up.1,
+            topk_idx,
+            c,
+            partials,
+            m,
+            top_k,
+            n,
+            k,
+            experts,
+            expert_rows,
+            splits,
+            act,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GateUpShape {
+            kernel: "expert_gate_up_gemv_fp8",
+            dims: [m.saturating_mul(top_k), n, k, splits],
+        },
+    )
+}
+
+/// Test support for `tests/gemv_fp8.rs` only: the fp8 GEMV's prologue on `a [1, k]` bf16 at
+/// `splits`, one CTA per split; split `s` stores the f32 values of its chunks' quantized elements
+/// into `out` (`⌈k / 256⌉ · 256` f32, 0 past `k`) and its scale into `scale[s]`. No `CudaStep`
+/// uses it. Refused with [`KernelError::GemvSplit`] (`n` 1) unless `k` and `splits` meet
+/// [`gemv_fp8_abt`]'s rule. Asynchronous.
+///
+/// # Safety
+///
+/// `a` must be a 16-byte-aligned device pointer to `k` bf16, `out` to `⌈k / 256⌉ · 256` f32 and
+/// `scale` to `splits` f32, valid for the whole kernel, the outputs overlapping no input. `stream`
+/// as [`gemv_fp8_abt`]'s.
+#[doc(hidden)]
+pub unsafe fn gemv_fp8_quant_probe(
+    a: *const c_void,
+    (out, scale): (*mut c_void, *mut c_void),
+    (k, splits): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe { scratchy_cuda_gemv_fp8_quant_probe(a, out, scale, k, splits, stream) };
+    check(code, KernelError::GemvSplit { n: 1, k, splits })
 }

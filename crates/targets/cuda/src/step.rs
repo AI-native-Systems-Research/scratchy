@@ -167,7 +167,7 @@ pub enum CudaStep {
     /// [`Self::GemmNarrow`] over an fp8 weight (the 27B's `in_proj_a`/`b`), as [`Self::GemmFp8`].
     GemmNarrowFp8(GemmBf16),
     /// [`Self::Gemv`] over an fp8 weight: `a` is the bf16 row, which the GEMV quantizes in its
-    /// prologue. Its kernel is S4's.
+    /// prologue (`kernels/gemv_fp8.cu`).
     GemvFp8(GemmBf16),
     /// [`Self::GemmGroup`] over fp8 weights, as [`Self::GemmFp8`] each.
     GemmGroupFp8(GemmGroupBf16),

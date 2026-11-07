@@ -22,6 +22,7 @@ pub mod common {
     pub mod mlp;
     pub mod moe_block;
     pub mod numerics;
+    pub mod watchdog;
 }
 
 use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate};
@@ -87,6 +88,7 @@ fn the_played_tapes_are_the_lowered_ones() {
 
 /// Device 0, which must be an H100; panics with the reason otherwise.
 fn h100() -> CudaDevice {
+    common::watchdog::arm();
     CudaDevice::open()
         .unwrap_or_else(|e| panic!("the `nvcc` feature's tests need an sm_90 GPU (H100): {e}"))
 }

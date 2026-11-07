@@ -138,6 +138,12 @@ required-features = ["nvcc"]
 name = "quant_rows_fp8"
 required-features = ["nvcc"]
 
+# FP8 S4: the decode fp8 GEMVs against an f64 reference, their prologue quantization against
+# `quant_rows_fp8` bit for bit, and their bit identities, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "gemv_fp8"
+required-features = ["nvcc"]
+
 # The tape player on the GPU: GEMM chains through the arena against a CPU reference.
 [[test]]
 name = "tape_player"

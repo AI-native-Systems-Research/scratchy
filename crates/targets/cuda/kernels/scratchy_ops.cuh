@@ -350,6 +350,19 @@ __device__ inline float2 fp8_quant_pre::op<float2>(const float2& x, const float2
     return float2{fp8_quant_pre::op<float>(x.x, scale.x), fp8_quant_pre::op<float>(x.y, scale.y)};
 }
 
+// One quantized element as the fp8 GEMV computes with it (FP8 S4, `gemv_fp8.cu`): `x` rounded to
+// e4m3 and widened back, `float(e4m3_satfinite(x))`. The cast is TK's scalar convertor
+// (`__nv_fp8_e4m3(float)`: round to nearest even, saturating to finite), the one byte S3's
+// `warp::copy` to an fp8 tile writes for the same `x`; the widening is exact. `x` is
+// `fp8_quant_pre`'s output, so the pair gives `quant_rows_fp8.cu`'s byte, as its value.
+struct fp8_round {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return kittens::base_types::convertor<float, kittens::fp8e4m3>::convert(
+            kittens::base_types::convertor<kittens::fp8e4m3, float>::convert(x));
+    }
+};
+
 // The MoE sort's run length: an expert's pair count rounded up to whole 128-row tiles of the
 // grouped GEMM (`op_abi::CUDA_EXPERT_TILE_ROWS`), so a tile belongs to one expert. Integer, exact.
 struct tile_pad {
@@ -417,6 +430,34 @@ __device__ static inline void rv_ternary_map(V& dst, const V& a, const V& b, con
     }
 }
 // TK-GAP(rv_ternary_map) end
+
+// TK-GAP(sv_fp8_to_rv_fl) begin
+// `warp::load` of an e4m3 shared vector into a naive f32 register vector (FP8 S4's decode GEMV,
+// approved 2026-11-06): TK at the pin has no `rv<fp8e4m3>` (`types/register/rv.cuh` static_asserts
+// it) and no `move<fp8e4m3>::lds`, so its `load` (`ops/group/memory/vec/shared_to_register.cuh`)
+// does not compile for an fp8 source. The layout is that `load`'s naive one: lane `l`'s slot `w`
+// is element `32w + l`. Slots `w` and `w + 1` widen together, `cvt.rn.f16x2.e4m3x2` on the pair
+// then f16 to f32 (`__nv_cvt_fp8x2_to_halfraw2`, then `__half22float2`, as TK's own fp4 convertor
+// in `common/base_types.cuh` writes it): exact, as every e4m3 value is an f16 and an f32. The low
+// byte is `.x`. One warp, as TK's `load`.
+template <kittens::ducks::rv::naive_layout RV, kittens::ducks::sv::all SV>
+__device__ static inline void sv_fp8_to_rv_fl(RV& dst, const SV& src) {
+    static_assert(std::is_same_v<typename SV::dtype, kittens::fp8e4m3>, "an e4m3 shared vector");
+    static_assert(std::is_same_v<typename RV::dtype, float>, "a naive f32 register vector");
+    static_assert(SV::length == RV::length && RV::length % 64 == 0, "whole pairs of 32-wide slots");
+    const int lane = kittens::laneid();
+    __syncwarp();
+#pragma unroll
+    for (int w = 0; w < RV::outer_dim; w += 2) {
+        const __nv_fp8x2_storage_t lo = src[32 * w + lane].__x;
+        const __nv_fp8x2_storage_t hi = src[32 * (w + 1) + lane].__x;
+        const __nv_fp8x2_storage_t pair = __nv_fp8x2_storage_t(lo | (hi << 8));
+        const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3)));
+        dst[w][0] = f.x;
+        dst[w + 1][0] = f.y;
+    }
+}
+// TK-GAP(sv_fp8_to_rv_fl) end
 
 }  // namespace ops
 }  // namespace scratchy

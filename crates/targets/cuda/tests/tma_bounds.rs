@@ -16,6 +16,10 @@
 //! swizzled overflow touches only the test's own padding. Built only under `nvcc`
 //! (`required-features`); no GPU fails rather than skips.
 
+pub mod common {
+    pub mod watchdog;
+}
+
 use scratchy_target_cuda::kernels::{tma_box_probe_load, tma_box_probe_store};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
@@ -42,6 +46,7 @@ fn val_box(r: usize, c: usize) -> u16 {
 }
 
 fn h100() -> CudaDevice {
+    common::watchdog::arm();
     CudaDevice::open()
         .unwrap_or_else(|e| panic!("the `nvcc` feature's tests need an sm_90 GPU (H100): {e}"))
 }

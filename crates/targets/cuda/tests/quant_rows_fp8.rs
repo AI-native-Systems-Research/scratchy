@@ -10,6 +10,7 @@
 pub mod common {
     pub mod fp8;
     pub mod numerics;
+    pub mod watchdog;
 }
 
 use common::fp8::{E4M3_MAX, e4m3_satfinite, e4m3_value, quantize_rows};
@@ -19,6 +20,7 @@ use scratchy_target_cuda::kernels::{KernelError, quant_rows_fp8};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 
 fn h100() -> CudaDevice {
+    common::watchdog::arm();
     CudaDevice::open()
         .unwrap_or_else(|e| panic!("the `nvcc` feature's tests need an sm_90 GPU (H100): {e}"))
 }

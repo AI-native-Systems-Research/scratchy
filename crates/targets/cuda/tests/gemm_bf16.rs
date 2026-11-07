@@ -9,6 +9,7 @@
 // `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
 pub mod common {
     pub mod numerics;
+    pub mod watchdog;
 }
 
 use common::numerics::{bf16_inputs, compare, mismatched_bits, reference, widen};
@@ -73,6 +74,7 @@ const SENTINEL: u16 = 0xFFFF;
 
 /// Device 0, which must be an H100; panics with the reason otherwise.
 fn h100() -> CudaDevice {
+    common::watchdog::arm();
     CudaDevice::open()
         .unwrap_or_else(|e| panic!("the `nvcc` feature's tests need an sm_90 GPU (H100): {e}"))
 }
