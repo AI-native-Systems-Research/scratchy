@@ -3138,7 +3138,9 @@ impl LandingFrame {
                 // to back — the flat landing, whatever rank the frame states. Each entry must
                 // still be whole rows of the frame (`slab % w == 0`) and the frame must re-frame
                 // exactly the gathered bytes; anything else still crosses an entry.
-                if width == stick && slab.is_multiple_of(width) && total == entries.get() as u64 * slab
+                if width == stick
+                    && slab.is_multiple_of(width)
+                    && total == entries.get() as u64 * slab
                 {
                     let rows = nz(slab / width).ok_or_else(|| FrameError::CrossesEntry {
                         entries: entries.get(),

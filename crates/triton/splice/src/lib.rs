@@ -1632,7 +1632,13 @@ impl BatchChunking {
     /// reaches the floor, the widest whole-stick cut is taken and the block slots make up the rest
     /// as before — the law stays total. At `kv_heads` rows a page this is the kv-head fold exactly;
     /// its cut is a cut of the same bytes into finer equal rows.
-    pub const fn of(seqs: u32, blocks: u32, nkvh: u32, q_width: u32, head_size: u32) -> BatchChunking {
+    pub const fn of(
+        seqs: u32,
+        blocks: u32,
+        nkvh: u32,
+        q_width: u32,
+        head_size: u32,
+    ) -> BatchChunking {
         let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
             let j = Self::CORES / seqs;
@@ -1651,8 +1657,8 @@ impl BatchChunking {
             while head_size == Self::STICK
                 && rows < Self::GATHER_FLOOR
                 && theirs * seqs * rows < Self::GATHER_FLOOR
-                && q_width % (rows * 2) == 0
-                && (q_width / (rows * 2)) % Self::STICK == 0
+                && q_width.is_multiple_of(rows * 2)
+                && (q_width / (rows * 2)).is_multiple_of(Self::STICK)
                 && q_width / (rows * 2) > 0
             {
                 rows *= 2;

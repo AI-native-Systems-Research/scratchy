@@ -2056,7 +2056,7 @@ fn note_lx_touches(
         } else {
             // A stick-plane window reaches its plane's end of each core's slice.
             let (bytes, corners) = core_slices(op, v)?;
-                let plane = u64::from(stick_plane(op, v).unwrap_or(0)) * u64::from(v.df.word_length());
+            let plane = u64::from(stick_plane(op, v).unwrap_or(0)) * u64::from(v.df.word_length());
             crate::placement::LxShare::Slices {
                 bytes: plane + bytes,
                 corners,
