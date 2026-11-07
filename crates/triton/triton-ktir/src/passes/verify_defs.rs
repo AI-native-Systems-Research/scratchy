@@ -423,8 +423,7 @@ mod tests {
     #[test]
     fn an_irfunction_use_before_its_definition_is_refused() {
         let a = Arena::new();
-        let use_first =
-            KOperation::new(&a, Some(KSsa(3)), KOpKind::ArithAddf, &[KSsa(1), KSsa(2)]);
+        let use_first = KOperation::new(&a, Some(KSsa(3)), KOpKind::ArithAddf, &[KSsa(1), KSsa(2)]);
         let def = KOperation::new(&a, Some(KSsa(2)), KOpKind::ArithAddf, &[KSsa(1), KSsa(1)]);
         let f = IRFunction {
             name: a.str("k".into()),
@@ -499,14 +498,15 @@ mod tests {
         let mut region_def = None;
         let mut region_op = 0;
         for (i, op) in top.iter().enumerate() {
-            if let Some(first) = op.regions.first() {
-                if let Some(inner) = first.ops.first() {
-                    if let Some(v) = inner.results.first() {
-                        region_def = Some(*v);
-                        region_op = i;
-                        break;
-                    }
-                }
+            if let Some(v) = op
+                .regions
+                .first()
+                .and_then(|first| first.ops.first())
+                .and_then(|inner| inner.results.first())
+            {
+                region_def = Some(*v);
+                region_op = i;
+                break;
             }
         }
         let v = region_def.expect("an op with a region whose body defines a value");
@@ -525,7 +525,8 @@ mod tests {
     /// defines: defined, but not yet -- an op's results are visible after it.
     fn break_into_forward_use(m: &mut Module) -> (String, Ssa) {
         let f = m.kernel_mut().unwrap();
-        let later = f.regions[0].ops
+        let later = f.regions[0]
+            .ops
             .iter()
             .rev()
             .find(|o| !o.results.is_empty())
