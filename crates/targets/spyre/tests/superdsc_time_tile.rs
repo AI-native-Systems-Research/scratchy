@@ -1041,6 +1041,9 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         &weight_ids,
         superdsc::ActiveCap::FULL,
         true,
+        &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+            ktir_superdsc::collective::TpWorld<1>,
+        >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(),
     )
     .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {
@@ -1058,6 +1061,9 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         Some(&layout),
         superdsc::FoldGrouping::Split,
         None,
+        &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<
+            ktir_superdsc::collective::TpWorld<1>,
+        >::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>(),
     );
     unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP") };
     assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");

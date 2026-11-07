@@ -349,12 +349,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         "rope_q32" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(32)),
             vec![256],
-            Program::Rope,
+            Program::Rope { table: None },
         ),
         "rope_kv8" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(8)),
             vec![256],
-            Program::Rope,
+            Program::Rope { table: None },
         ),
         // EMBEDDING. `Program::ScalarMul` is the kind of the one COMPUTE op (`rows * EMB_SCALE`);
         // the gather itself is addressing, and whether this crate has a door for an INDIRECT access

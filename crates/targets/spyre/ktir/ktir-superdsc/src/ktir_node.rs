@@ -251,7 +251,13 @@ pub enum Program {
     /// leg. A PURE COPY, like [`Self::LmLast`]; see
     /// [`block_copy`](crate::emit::lower_ktir_to_superdsc::block_copy).
     BlockCopy,
-    Rope,
+    /// A rotary embedding over `[rows, heads·hd]` (`kernels/rope.py`). `table` is the rotary
+    /// table its producer bound — see [`RopeTable`]: no reading of the program recovers it, since
+    /// both tables are plain operands. A producer with no model classes (a third-party Triton
+    /// kernel) states `None`.
+    Rope {
+        table: Option<RopeTable>,
+    },
     /// PAGED ATTENTION — `kernels/page_attn_head_major_decode.py` / `_prefill.py`, spyre-inference's
     /// head-major online-softmax page walk: each active block's page is read from the page index
     /// table and its K and V GATHERED from the pools (`ktdp.construct_indirect_access_tile` loads).
@@ -441,6 +447,18 @@ pub enum Program {
     WindowedRmsNorm {
         unit: bool,
     },
+}
+
+/// Which of a model's two rotary tables a [`Program::Rope`] reads: the base class's
+/// (`rotary_local`) or the global class's (plain `rotary`). A hybrid-attention model's two classes
+/// rotate at two head dims, so the class is what picks the rope's head dim — and the table is a
+/// plain operand, so only the producer that bound it can state it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RopeTable {
+    /// The base class's table (`rotary_local`).
+    Base,
+    /// The global class's table (plain `rotary`).
+    Global,
 }
 
 /// One buffer of a bundle, as the CALLER numbers it.

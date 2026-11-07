@@ -228,8 +228,16 @@ mod tests {
             assert_eq!(b.sharded.collectives.len(), 1, "one all-reduce, after down");
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, _layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, _layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<T>::of::<
+                    scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+                >(),
+            )
+            .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
             let consume_groups: Vec<_> = shifts.iter().filter_map(|s| s.tp).collect();
             assert_eq!(
@@ -264,8 +272,16 @@ mod tests {
             assert_eq!(kinds, vec![Shared::AllGather], "the result is gathered");
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-            let (ops, _) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, _) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<T>::of::<
+                    scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+                >(),
+            )
+            .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
             let consumes: Vec<_> = shifts.iter().filter_map(|s| s.tp).collect();
             assert_eq!(consumes.len(), n, "one consume group per rank");
@@ -391,8 +407,16 @@ mod tests {
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<T>::of::<
+                    scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+                >(),
+            )
+            .unwrap();
             let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
             let at = |tid: u32| {
                 let p = layout.placements[&tid];
@@ -451,8 +475,16 @@ mod tests {
             let b = tp_bake::<T>(&vocab_projection(2048, v as u32)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<T>::of::<
+                    scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+                >(),
+            )
+            .unwrap();
             let at = |tid: u32| {
                 let p = layout.placements[&tid];
                 SEGMENT_OFFSETS[p.segment] + p.offset
@@ -511,8 +543,16 @@ mod tests {
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                &scratchy_subtile::model_geometry::rope_bridge::ModelRopes::<T>::of::<
+                    scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct,
+                >(),
+            )
+            .unwrap();
             let partial = ir
                 .nodes
                 .iter()

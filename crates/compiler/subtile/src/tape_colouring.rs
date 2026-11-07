@@ -935,7 +935,7 @@ mod tests {
                 op(NORM, 1, vec![Op(1), Ext(2)]),
                 op(view(RowScale::Times(k(1)), 128), 1, vec![Op(2)]),
                 op(
-                    SubOp::rope_rotate(HeadDim::new(64)),
+                    SubOp::rope_rotate(HeadDim::new(64), crate::subtile_ir::RopeClass::Global),
                     1,
                     vec![Op(3), Ext(3), Ext(4)],
                 ),

@@ -576,6 +576,60 @@ impl PrefixCapacity {
     }
 }
 
+/// ⭐ THE QUERY ROWS THE LOWERED BUNDLE CARRIES — `m`, the bridge's `num_tokens` bound: one for a
+/// solo decode, a batch rung's rows for a batched decode, a chunk's rows for a prefill. Never zero,
+/// by its storage, so the bridge has no `max(1)` to apply.
+///
+/// Two mints: [`of_nonzero`](Self::of_nonzero), for a count that is non-zero by its type — a spyre
+/// decode rung's rows, off its `Rung<MQ>` (`sdsc_abstract::DecodeRung::rows`) — and
+/// [`of_count`](Self::of_count), for a runtime row count (a prompt chunk, a workload, the `KTIR_M`
+/// debug knob), where zero is the one row the bridge has always lowered it at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryRows(std::num::NonZeroU32);
+
+impl QueryRows {
+    /// The solo decode bundle's one row.
+    pub const SOLO: QueryRows = QueryRows(std::num::NonZeroU32::MIN);
+
+    /// The rows of a count non-zero by its type.
+    pub const fn of_nonzero(rows: std::num::NonZeroU32) -> Self {
+        Self(rows)
+    }
+
+    /// The rows of a runtime count: zero lowers as one row, the bridge's `max(1)` stated once.
+    pub const fn of_count(rows: u32) -> Self {
+        match std::num::NonZeroU32::new(rows) {
+            Some(rows) => Self(rows),
+            None => Self::SOLO,
+        }
+    }
+
+    /// The rows as the number the bridge's `num_tokens` bound and the bake's bundle keys state.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// The rotary class a rope node binds: the extern it names — `rotary_local` is the BASE class,
+/// plain `rotary` the GLOBAL one. One reading for the K rope (`rope_append`) and the query's
+/// (`rope_query`), so the two cannot disagree about which table is which class.
+fn rope_class_of(node: &crate::fuf::FufNode) -> scratchy_subtile::subtile_ir::RopeClass {
+    let local = node.inputs.iter().any(|inp| {
+        matches!(
+            inp,
+            FufInput::Extern {
+                kind: ExternKind::RotaryLocal,
+                ..
+            }
+        )
+    });
+    if local {
+        scratchy_subtile::subtile_ir::RopeClass::Base
+    } else {
+        scratchy_subtile::subtile_ir::RopeClass::Global
+    }
+}
+
 /// The one model the bridge lowers: its config params and its typed facts
 /// travel together — they are the same model, and the bake holds both.
 pub struct BridgeModel<'a> {
@@ -595,7 +649,7 @@ pub fn lower_decode_to_wavefront(
     bounds: &BTreeMap<String, u64>,
     model: &BridgeModel<'_>,
     prefix_len: PrefixCapacity,
-    num_tokens: u32,
+    rows: QueryRows,
 ) -> Result<LoweredDecode, BridgeError> {
     // The config params and the typed facts are ONE model — the bake holds them
     // together, so the bridge takes them together.
@@ -611,7 +665,7 @@ pub fn lower_decode_to_wavefront(
     // num_tokens (= query rows m): 1 = decode, >1 = batched prefill. The op row
     // dim threads through OpDesc.m / the EmbeddedHidden + cos_sin sources, so
     // overriding the bound + m here yields a valid m-row graph.
-    let m = num_tokens.max(1);
+    let m = rows.get();
     b.insert("num_tokens".into(), m as u64);
     // ⭐ THE MODEL'S ATTENTION FACTS, one value from the bake's `ModelFacts`: its constructors
     // proved the GQA grouping and hold the softmax scale, so the ops this bridge mints carry only
@@ -944,15 +998,8 @@ pub fn lower_decode_to_wavefront(
                 // them directly (no in-graph Concat-tile -> no partitioner crash).
                 let q_cols = bx.out_cols(tile, 0, "rope q cols")?;
                 let k_cols = bx.out_cols(tile, 1, "rope k cols")?;
-                let local_rope = node.inputs.iter().any(|inp| {
-                    matches!(
-                        inp,
-                        FufInput::Extern {
-                            kind: ExternKind::RotaryLocal,
-                            ..
-                        }
-                    )
-                });
+                let rope = rope_class_of(node);
+                let local_rope = rope == scratchy_subtile::subtile_ir::RopeClass::Base;
                 // ⭐ THE HEAD DIM IS THE ROTARY CLASS'S OWN, NOT THE MODEL'S. A hybrid-attention
                 // arch (gemma-4) binds TWO rotary externs: `rotary_local` names the BASE class
                 // and plain `rotary` names the GLOBAL one (head_dim 512 where the base is 256).
@@ -963,11 +1010,6 @@ pub fn lower_decode_to_wavefront(
                 // global twin (its geometry IS the model's), and the facts' global class equals
                 // the base exactly when the two classes do.
                 let attention = attn()?;
-                let rope = if local_rope {
-                    scratchy_subtile::subtile_ir::RopeClass::Base
-                } else {
-                    scratchy_subtile::subtile_ir::RopeClass::Global
-                };
                 let head_dim = rope.head_dim(attention);
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
@@ -980,7 +1022,7 @@ pub fn lower_decode_to_wavefront(
                 // writes must be THIS class's.
                 let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
                 let qi = bx.push_op(
-                    SubOp::rope_rotate(head_dim),
+                    SubOp::rope_rotate(head_dim, rope),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
                 );
                 let pairing = match node.op {
@@ -1147,21 +1189,17 @@ pub fn lower_decode_to_wavefront(
             }
             // rope_query(q, positions, rotary): the query's rotation alone — no K, no cache write.
             OpKind::RopeQuery => {
-                let head_dim = attn()?.base().head_dim();
+                // The class of the table the query names, as a K rope's is: a query naming plain
+                // `rotary` on a hybrid model (gemma-4-assistant's global layers) rotates at the
+                // global class's head dim (512), not the base's (256).
+                let rope = rope_class_of(node);
+                let local_rope = rope == scratchy_subtile::subtile_ir::RopeClass::Base;
+                let head_dim = rope.head_dim(attn()?);
                 let q = bx.input_at(tile, 0)?;
                 let q_cols = bx.out_cols(tile, 0, "rope_query q cols")?;
-                let local_rope = node.inputs.iter().any(|inp| {
-                    matches!(
-                        inp,
-                        FufInput::Extern {
-                            kind: ExternKind::RotaryLocal,
-                            ..
-                        }
-                    )
-                });
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let idx = bx.push_op(
-                    SubOp::rope_rotate(head_dim),
+                    SubOp::rope_rotate(head_dim, rope),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));

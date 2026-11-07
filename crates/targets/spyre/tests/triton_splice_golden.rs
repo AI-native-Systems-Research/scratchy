@@ -31,6 +31,18 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_target_spyre::ktir_superdsc_door::{BundleAttnParams, lower as bundle_lower};
 
+/// A model's rope classes in the one-rank world these tests lower in.
+type ModelRopes = scratchy_subtile::model_geometry::rope_bridge::ModelRopes<
+    ktir_superdsc::collective::TpWorld<1>,
+>;
+/// granite-3.1-2b-instruct's rope classes, off its config's marker type (head dim 64).
+const GRANITE_2B: ModelRopes =
+    ModelRopes::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_2bInstruct>();
+/// granite-3.1-8b-instruct's rope classes, off its config's marker type (head dim 128). The door
+/// reads them only to lower a rope; the programs here that are not ropes never do.
+const GRANITE_8B: ModelRopes =
+    ModelRopes::of::<scratchy_subtile::model_geometry::config_models::Granite3_1_8bInstruct>();
+
 /// One program through the production door as a bundle of its own — the fp8 quantize set starts
 /// empty, which is what a one-program bundle's is.
 fn door_lower(
@@ -42,7 +54,28 @@ fn door_lower(
     Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>,
     ktir_superdsc::emit::lower_ktir_to_superdsc::Error,
 > {
-    bundle_lower(k, sym, layout, attn, &mut QuantizedActivations::default())
+    door_lower_at(k, sym, layout, attn, &GRANITE_8B)
+}
+
+/// [`door_lower`], for a rope: the model whose rope classes it lowers through.
+fn door_lower_at(
+    k: &ktir_superdsc::ktir_node::KtirNode,
+    sym: &mut i64,
+    layout: Option<&ktir_superdsc::placement::BundleLayout>,
+    attn: Option<BundleAttnParams>,
+    ropes: &ModelRopes,
+) -> Result<
+    Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>,
+    ktir_superdsc::emit::lower_ktir_to_superdsc::Error,
+> {
+    bundle_lower(
+        k,
+        sym,
+        layout,
+        attn,
+        ropes,
+        &mut QuantizedActivations::default(),
+    )
 }
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 use scratchy_triton_splice::PagedRows;
@@ -1541,6 +1574,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
                 &mut s_sym,
                 Some(&layout),
                 None,
+                &GRANITE_8B,
                 &mut s_fp8,
             )
             .unwrap_or_else(|e| {
@@ -1850,23 +1884,26 @@ fn matmul_ir(m: u32, k: u32, n: u32) -> SubtileIR {
 /// The rope shapes that matter for the delivery scope: granite 2b (hd 64, the
 /// collapsed head-major form — 32 q-heads decode, 8 kv-heads decode) and 8b (hd 128,
 /// the slab form), at decode mq=1 and a prefill rung mq=31. (MQ, HEADS, HD).
-const ROPE_SHAPES: &[(u32, u32, u32)] = &[
-    (1, 32, 64),   // 2b decode, the q plane
-    (1, 8, 64),    // 2b decode, the kv plane
-    (31, 32, 64),  // 2b prefill rung
-    (1, 32, 128),  // 8b decode, the q plane
-    (1, 8, 128),   // 8b decode, the kv plane
-    (31, 32, 128), // 8b prefill rung (the slab form)
+/// `(mq, heads, model)`: each rope at its model's own (global) rope class, whose head dim the
+/// model's config states as a type.
+const ROPE_SHAPES: &[(u32, u32, ModelRopes)] = &[
+    (1, 32, GRANITE_2B),  // 2b decode, the q plane
+    (1, 8, GRANITE_2B),   // 2b decode, the kv plane
+    (31, 32, GRANITE_2B), // 2b prefill rung
+    (1, 32, GRANITE_8B),  // 8b decode, the q plane
+    (1, 8, GRANITE_8B),   // 8b decode, the kv plane
+    (31, 32, GRANITE_8B), // 8b prefill rung (the slab form)
     // The 8b's REAL prefill rung — mq=96 (the rung the card bakes) and the q
     // plane's own head count at hd=128 (32 heads = the slab form at its widest
     // head-major extent the 2b never reaches).
-    (96, 8, 128),
-    (96, 32, 128),
+    (96, 8, GRANITE_8B),
+    (96, 32, GRANITE_8B),
 ];
 
 #[test]
 fn spliced_rope_lowers_through_the_door() {
-    for &(mq, heads, hd) in ROPE_SHAPES {
+    for &(mq, heads, ropes) in ROPE_SHAPES {
+        let hd = ropes.global.0;
         for rows_are_requests in [false, true] {
             let ir = rope_ir(mq, heads, hd);
             let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
@@ -1910,11 +1947,12 @@ fn spliced_rope_lowers_through_the_door() {
             let attn_params =
                 scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams { rows_are_requests };
             let mut sym = 0i64;
-            let _emitted = door_lower(
+            let _emitted = door_lower_at(
                 spliced.ktir.as_ref().expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
                 Some(attn_params),
+                &ropes,
             )
             .unwrap_or_else(|e| {
                 panic!(
@@ -1924,6 +1962,65 @@ fn spliced_rope_lowers_through_the_door() {
             });
         }
     }
+}
+
+/// gemma-4-12b-it's rope classes, off its config's marker type: the base class (`rotary_local`)
+/// rotates at head dim 256 and the global class (plain `rotary`) at 512.
+const GEMMA_4_12B: ModelRopes =
+    ModelRopes::of::<scratchy_subtile::model_geometry::config_models::Gemma4_12bIt>();
+
+/// ⛔ A ROPE LOWERS AT ITS OWN CLASS'S HEAD DIM, OR NOT AT ALL. On a hybrid model the two classes
+/// rotate at two widths, and the class the rope binds is what picks its `rope_at` instantiation: a
+/// rope program at the base class's 256 that binds the global table (whose class rotates at 512)
+/// refuses, naming both, rather than lowering at either width. The same program binding its own
+/// base table lowers.
+#[test]
+fn a_rope_at_another_classs_head_dim_refuses() {
+    use scratchy_subtile::subtile_ir::RopeClass;
+    assert_eq!(
+        (GEMMA_4_12B.base.0, GEMMA_4_12B.global.0),
+        (256, 512),
+        "gemma-4-12b-it's config states its two rope classes"
+    );
+    let (mq, heads, hd) = (1u32, 8u32, GEMMA_4_12B.base.0);
+    let lowered = |rope: RopeClass| {
+        let ir = rope_ir_binding(mq, heads, hd, rope);
+        let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
+        let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+            &ir,
+            &weight_ids,
+            PagedRows::Sequence,
+            &[],
+        )
+        .unwrap_or_else(|e| panic!("layout minted ({rope:?}): {e}"));
+        let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+            &ir.nodes[0],
+            &ir,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("splice compiled ({rope:?}): {e}"));
+        let mut sym = 0i64;
+        door_lower_at(
+            spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program"),
+            &mut sym,
+            Some(&layout),
+            None,
+            &GEMMA_4_12B,
+        )
+        .map(|_| ())
+        .map_err(|e| e.message)
+    };
+    lowered(RopeClass::Base)
+        .unwrap_or_else(|e| panic!("a rope at its own class's head dim lowers: {e}"));
+    let why = lowered(RopeClass::Global)
+        .expect_err("a rope at the base width binding the global table must refuse");
+    assert!(
+        why.contains("Global") && why.contains("head dim 256") && why.contains("head dim 512"),
+        "the refusal names the table and both head dims, got {why:?}"
+    );
 }
 
 /// One rope node as a one-node [`SubtileIR`]: `rotate(x, cos, sin) -> out` over
@@ -1951,6 +2048,7 @@ fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
             head_dim: scratchy_ir::model_facts::HeadDim::new(hd),
+            rope: scratchy_subtile::subtile_ir::RopeClass::Global,
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],
@@ -1966,6 +2064,21 @@ fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
 }
 
 fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
+    rope_ir_binding(
+        mq,
+        heads,
+        hd,
+        scratchy_subtile::subtile_ir::RopeClass::Global,
+    )
+}
+
+/// [`rope_ir`], binding the `rope` class's rotary table.
+fn rope_ir_binding(
+    mq: u32,
+    heads: u32,
+    hd: u32,
+    rope: scratchy_subtile::subtile_ir::RopeClass,
+) -> SubtileIR {
     let tall = mq * heads;
     // t0 = x source (staged [mq*heads, hd], i.e. the [mq, heads*hd] plane reshaped),
     // t1 = cos source (head-tiled [mq*heads, hd]), t2 = sin, t3 = result.
@@ -1995,6 +2108,7 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::RopeRotate {
             head_dim: scratchy_ir::model_facts::HeadDim::new(hd),
+            rope,
             _form: std::marker::PhantomData,
         },
         inputs: vec![whole(0), whole(1), whole(2)],

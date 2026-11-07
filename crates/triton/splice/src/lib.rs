@@ -324,12 +324,25 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // and the KV-cache destinations flow through GRAPH edges — the builder's own
         // `lower_rope_node` reads `inputs[0..3]`), so the kernel consumes x/cos/sin/out
         // and the row covers BOTH `RopeAppend` and the standalone `RopeRotate`.
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => TritonKernelRow::Spliced {
-            src: include_str!("../../../targets/spyre/kernels/rope.py"),
-            file: "rope.py",
-            entry: "rope_fwd",
-            program: Program::Rope,
-        },
+        SubOp::RopeRotate { rope, .. } | SubOp::RopeAppend { rope, .. } => {
+            TritonKernelRow::Spliced {
+                src: include_str!("../../../targets/spyre/kernels/rope.py"),
+                file: "rope.py",
+                entry: "rope_fwd",
+                // The table the op's class binds: the rope door lowers the program through
+                // the model's own class, which no reading of the program recovers.
+                program: Program::Rope {
+                    table: Some(match rope {
+                        scratchy_subtile::subtile_ir::RopeClass::Base => {
+                            ktir_superdsc::ktir_node::RopeTable::Base
+                        }
+                        scratchy_subtile::subtile_ir::RopeClass::Global => {
+                            ktir_superdsc::ktir_node::RopeTable::Global
+                        }
+                    }),
+                },
+            }
+        }
         // ATTENTION SPLICES — `lower_attn` is the entry: the kernel states the same
         // three arms as constexpr-selected cases, and the door (`attn_operands`) reads
         // every fact — the q/out views, the swept rung, the scale — off the program
@@ -3566,7 +3579,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
         Program::Matmul => "matmul",
-        Program::Rope => "rope",
+        Program::Rope { .. } => "rope",
         Program::ScalarMul => "scalarmul",
         // ⭐ THE SANDWICH'S OWN STEM — `rmsnorm_s{split.id}` (the split's id, not the
         // middle norm's), main's naming law for the fused per-head norm.
