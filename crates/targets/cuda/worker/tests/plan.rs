@@ -177,6 +177,50 @@ fn a_kv_block_costs_k_and_v_per_layer() {
     assert_eq!(kv_block_bytes(&kv, 64), Some(393_216));
 }
 
+/// Each KV layer's block at its own class: Gemma 4's 30 layers, 25 sliding of 8 heads × 256 and
+/// every sixth global of 2 heads × 512, are 25 · 2 · 8 · 64 · 256 + 5 · 2 · 2 · 64 · 512 =
+/// 7,208,960 e4m3 bytes a block, 112,640 a token (class 0's geometry on every layer would be
+/// 7,864,320).
+#[test]
+fn a_kv_block_costs_each_layer_at_its_own_class() {
+    let span = ArenaSpan {
+        offset: ArenaOffset(0),
+        bytes: 0,
+    };
+    const LAYERS: [u32; 30] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29,
+    ];
+    const CLASS: [u8; 30] = [
+        0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1,
+    ];
+    let kv = KvTape {
+        layers: &LAYERS,
+        kv_heads: 8,
+        head_dim: 256,
+        block_size: 64,
+        max_blocks_per_seq: 128,
+        block_table: span,
+        slot_mapping: span,
+        sequence: span,
+        classes: &[
+            KvClass {
+                kv_heads: 8,
+                head_dim: 256,
+                window: Some(1024),
+            },
+            KvClass {
+                kv_heads: 2,
+                head_dim: 512,
+                window: None,
+            },
+        ],
+        layer_class: &CLASS,
+    };
+    assert_eq!(kv_block_bytes(&kv, 64), Some(7_208_960));
+    assert_eq!(kv_block_bytes(&kv, 1), Some(112_640));
+}
+
 #[test]
 fn only_the_e4m3_kv_cache_is_served() {
     for dtype in ["auto", "fp8", "fp8_e4m3"] {

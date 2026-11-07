@@ -17,7 +17,7 @@ use std::fmt;
 
 use scratchy_core_common::SamplingParams;
 use scratchy_layers::gdn_state::{GdnStart, GdnStep};
-use scratchy_target_cuda::tape::{KV_ELEM_BYTES, KvTape};
+use scratchy_target_cuda::tape::KvTape;
 
 /// Why a step could not be planned, or a request is refused. Every message names what to change.
 #[derive(Clone, Debug, PartialEq)]
@@ -299,13 +299,13 @@ pub fn greedy_token(row: &[u16]) -> Result<u32, PlanError> {
 }
 
 /// The bytes one KV block of `block_size` tokens costs in a pool of `kv`'s geometry: per KV
-/// layer a K and a V block of `kv_heads · block_size · head_dim` e4m3, one byte each. `None` on
-/// overflow.
+/// layer a K and a V block of its own class's `kv_heads · block_size · head_dim` e4m3, one byte
+/// each (Gemma's sliding and global layers differ), from the pool's own layout
+/// ([`KvTape::pool_layout`]). `None` on overflow.
 pub fn kv_block_bytes(kv: &KvTape, block_size: usize) -> Option<usize> {
-    [kv.kv_heads as usize, block_size, kv.head_dim as usize]
-        .into_iter()
-        .try_fold(kv.layers.len().checked_mul(2)?, |acc, f| acc.checked_mul(f))?
-        .checked_mul(KV_ELEM_BYTES as usize)
+    let (_, one_block) = kv.pool_layout(1)?;
+    let per_token = one_block.checked_div(u64::from(kv.block_size))?;
+    usize::try_from(per_token).ok()?.checked_mul(block_size)
 }
 
 /// Refuse a KV cache this worker does not have. Its cache is a fixed fact of the target, e4m3 at a

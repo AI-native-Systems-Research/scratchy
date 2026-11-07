@@ -44,6 +44,8 @@ const G08: GdnDims = GdnDims {
 };
 /// qwen3.5-9b's: 32 value heads over 16 key heads, value head `h` reading key head `h / 2`.
 const G9: GdnDims = GdnDims { nv: 32, ..G08 };
+/// Qwen3.8-27B's: 48 value heads over 16 key heads, value head `h` reading key head `h / 3`.
+const G27: GdnDims = GdnDims { nv: 48, ..G08 };
 /// The chunk lengths every stage is checked at.
 const LENGTHS: [usize; 8] = [1, 2, 63, 64, 65, 300, 1024, 2048];
 /// The lengths only the 9b geometry is also checked at: qwen3.5-9b's largest prefill bucket.
@@ -542,7 +544,11 @@ fn zeros(d: GdnDims) -> (Vec<f64>, Vec<f64>) {
 }
 
 fn name(d: GdnDims) -> &'static str {
-    if d.nv == d.nk { "0.8b" } else { "9b" }
+    match d.nv / d.nk {
+        1 => "0.8b",
+        2 => "9b",
+        _ => "27b",
+    }
 }
 
 // ── Every stage at every length, both geometries, fresh ───────────
@@ -554,7 +560,7 @@ fn name(d: GdnDims) -> &'static str {
 fn every_gdn_stage_matches_its_reference_at_every_length() {
     let device = h100();
     let mut pass = true;
-    for (d, extra) in [(G08, &[][..]), (G9, &LENGTHS_9B[..])] {
+    for (d, extra) in [(G08, &[][..]), (G9, &LENGTHS_9B[..]), (G27, &[][..])] {
         let bu = bundle(d, 0x6D00);
         let bb = upload_bundle(&device, &bu);
         // A longer sequence of the same seed: its first 2048 tokens are the shorter one's.
@@ -598,7 +604,7 @@ fn every_gdn_stage_matches_its_reference_at_every_length() {
 fn a_continued_step_starts_from_its_slot() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0x6C00);
         let bb = upload_bundle(&device, &bu);
         let x = inputs(d, 300, 0x6C01);
@@ -650,7 +656,7 @@ fn scan_misses(d: GdnDims, s: &StepOut, q_len: usize, variant: ScanVariant) -> F
 fn every_self_check_misses_by_its_margin() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0x5C00);
         let bb = upload_bundle(&device, &bu);
         let x = inputs(d, 300, 0x5C01);
@@ -717,7 +723,7 @@ fn every_self_check_misses_by_its_margin() {
                 verdict(ok)
             );
             pass &= ok;
-            if d.nv != d.nk {
+            if d.nv == G9.nv {
                 let (_, state) = zeros(d);
                 let r = scan_reference(d, &s, q_len, (&state, None, 0), ScanVariant::ModuloHeads);
                 let refs: Vec<f64> = r.o.iter().map(|p| p.0).collect();
@@ -842,7 +848,7 @@ fn a_key_heads_nan_reaches_exactly_its_two_value_heads() {
 fn a_zero_value_head_stays_exactly_zero() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0x2E00);
         let bb = upload_bundle(&device, &bu);
         let mut x = inputs(d, 300, 0x2E01);
@@ -889,7 +895,7 @@ fn a_zero_value_head_stays_exactly_zero() {
 fn padding_rows_reach_nothing() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0x9A00);
         let bb = upload_bundle(&device, &bu);
         let x = inputs(d, 100, 0x9A01);
@@ -946,7 +952,7 @@ fn padding_rows_reach_nothing() {
 fn two_chunks_are_bit_identical_to_one_forward() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0xC0C0);
         let bb = upload_bundle(&device, &bu);
         for (l1, l2) in [
@@ -1005,7 +1011,7 @@ fn two_chunks_are_bit_identical_to_one_forward() {
 fn stale_state_cannot_leak() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0x57A1);
         let bb = upload_bundle(&device, &bu);
         let x = inputs(d, 300, 0x57A2);
@@ -1401,7 +1407,7 @@ fn every_launcher_refuses_zero_dimensions_and_counts_above_int_max() {
 fn a_one_row_step_with_no_padding_is_bit_identical_to_one_forward() {
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0xDEC1);
         let bb = upload_bundle(&device, &bu);
         for l1 in [300usize, 1] {
@@ -1580,7 +1586,7 @@ fn the_scan_outputs_are_dumped_for_a_base_comparison() {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
         })
     };
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0xD0D0);
         let bb = upload_bundle(&device, &bu);
         for q_len in [1usize, 64, 300, 2048] {
@@ -1616,7 +1622,7 @@ fn the_scan_outputs_are_dumped_for_a_base_comparison() {
 fn the_scan_time_is_recorded() {
     const LAUNCHES: u32 = 20;
     let device = h100();
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0xD1D0);
         let bb = upload_bundle(&device, &bu);
         for q_len in [300usize, 4096] {
@@ -1741,7 +1747,7 @@ fn the_gdn_stage_outputs_are_dumped_for_a_base_comparison() {
         })
     };
     let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0xD2D0);
         let bb = upload_bundle(&device, &bu);
         for q_len in [1usize, 64, 300, 2048] {
@@ -1783,7 +1789,7 @@ fn the_gdn_conv_gating_and_norm_times_are_recorded() {
     const LAUNCHES: u32 = 20;
     let device = h100();
     let null = std::ptr::null_mut();
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0xD3D0);
         let bb = upload_bundle(&device, &bu);
         for q_len in [300usize, 4096] {

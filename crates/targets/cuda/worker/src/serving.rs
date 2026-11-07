@@ -34,7 +34,7 @@ use scratchy_target_cuda::runtime::{
     KvSequence, load_weights,
 };
 use scratchy_target_cuda::tape::KvTape;
-use scratchy_target_cuda::weights::{check, open_checkpoint};
+use scratchy_target_cuda::weights::{CudaWeight, check, open_checkpoint};
 use tracing::info;
 
 use crate::plan::{
@@ -57,6 +57,75 @@ pub(crate) fn create(cfg: WorkerCreateConfig) -> anyhow::Result<WorkerCreationRe
     let (hf_config, model_dir) = (model.hf_config.clone(), Some(model.dir.clone()));
     // The KV cache is e4m3, one byte an element.
     Ok((Box::new(worker), hf_config, model_dir, 1))
+}
+
+/// A weight table's device bytes by class, `[e4m3, f32 scales, bf16, GDN f32]`, from each entry's
+/// geometry (the staged layouts of `scratchy_target_cuda::weights`), padding excluded.
+fn weight_bytes_by_class(table: &[Option<CudaWeight>]) -> [u64; 4] {
+    let mut by = [0u64; 4];
+    for entry in table.iter().flatten() {
+        let (e, h, i, router) = match *entry {
+            CudaWeight::Bf16 { shape, .. } => {
+                by[2] += 2 * shape.iter().product::<u64>();
+                continue;
+            }
+            CudaWeight::GdnBundle {
+                conv_dim,
+                conv_kernel,
+                nv,
+                head_v,
+                ..
+            } => {
+                let elems = u64::from(conv_dim) * u64::from(conv_kernel)
+                    + 2 * u64::from(nv)
+                    + u64::from(head_v);
+                by[3] += 4 * elems;
+                continue;
+            }
+            CudaWeight::MoeBundle {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => {
+                let (e, h, i) = (u64::from(experts), u64::from(hidden), u64::from(inter));
+                by[2] += 2 * (e * h + 3 * e * i * h);
+                continue;
+            }
+            CudaWeight::ExpertBank {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => {
+                let (e, h, i) = (u64::from(experts), u64::from(hidden), u64::from(inter));
+                by[2] += 2 * 3 * e * i * h;
+                continue;
+            }
+            CudaWeight::Fp8 { shape, .. } => {
+                by[0] += shape.iter().product::<u64>();
+                by[1] += 4 * shape.first().copied().unwrap_or(0);
+                continue;
+            }
+            CudaWeight::Fp8MoeBundle {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => (experts, hidden, inter, true),
+            CudaWeight::Fp8ExpertBank {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => (experts, hidden, inter, false),
+        };
+        let (e, h, i) = (u64::from(e), u64::from(h), u64::from(i));
+        by[0] += 3 * e * i * h;
+        by[1] += 4 * (2 * e * i + e * h);
+        by[2] += if router { 2 * e * h } else { 0 };
+    }
+    by
 }
 
 /// Refuse, before anything loads, what this worker does not do.
@@ -349,6 +418,13 @@ impl Worker for CudaServingWorker {
             weights.len(),
             t.elapsed().as_secs_f64(),
             device.allocations(),
+        );
+        let [e4m3, scales, bf16, gdn] = weight_bytes_by_class(entry.weights);
+        let total: u64 = weights.iter().map(DeviceBuffer::bytes).sum();
+        info!(
+            "CUDA model {}: weight bytes on the device {total} (e4m3 {e4m3}, f32 scales {scales}, \
+             bf16 {bf16}, GDN f32 {gdn}; the rest is alignment)",
+            entry.stem,
         );
         let kv = entry.tapes.iter().find_map(|t| t.kv);
         let result_elems = (entry.tapes.iter())
