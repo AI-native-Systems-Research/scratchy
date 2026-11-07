@@ -8144,10 +8144,7 @@ impl<'d> Defs<'d> {
             _ => &[],
         };
         let inits = &o.operands[3.min(o.operands.len())..];
-        args.iter()
-            .copied()
-            .zip(inits.iter().copied())
-            .collect()
+        args.iter().copied().zip(inits.iter().copied()).collect()
     }
 
     fn of(&self, v: Ssa) -> Option<&'d Operation<'static>> {
@@ -8448,161 +8445,161 @@ fn assign_frames(f: &IRFunction<'static>) -> Result<Frames, Error> {
             }
             let Some(res) = o.result else { continue };
             let w: Option<World> = match o.op_type {
-            // ── THE REDUCTION: the axis it folds decides the world it writes ──
-            OpKind::LinalgReduce => Some(if folds_its_stick(o) {
-                World::Column
-            } else {
-                o.operands
-                    .first()
-                    .and_then(|&v| world.get(&v))
-                    .copied()
-                    .unwrap_or(World::Row)
-            }),
-            // ── THE BROADCAST: the sprayed result is dense, however the source is held ──
-            OpKind::LinalgBroadcast => Some(World::Row),
-            // ── THE SHAPE OPS: no element moves, so the result is held as its operand is ──
-            OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape => {
-                Some(
+                // ── THE REDUCTION: the axis it folds decides the world it writes ──
+                OpKind::LinalgReduce => Some(if folds_its_stick(o) {
+                    World::Column
+                } else {
                     o.operands
                         .first()
                         .and_then(|&v| world.get(&v))
                         .copied()
-                        .unwrap_or(World::Row),
-                )
+                        .unwrap_or(World::Row)
+                }),
+                // ── THE BROADCAST: the sprayed result is dense, however the source is held ──
+                OpKind::LinalgBroadcast => Some(World::Row),
+                // ── THE SHAPE OPS: no element moves, so the result is held as its operand is ──
+                OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape => {
+                    Some(
+                        o.operands
+                            .first()
+                            .and_then(|&v| world.get(&v))
+                            .copied()
+                            .unwrap_or(World::Row),
+                    )
+                }
+                // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs ──
+                OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul | OpKind::LinalgTranspose => {
+                    Some(World::Row)
+                }
+                // ── THE LOAD: what it reads, as its tile, its own shape, or its store states ──
+                OpKind::KtdpLoad => Some(load_world(o, &defs, &column_fed)),
+                // ── THE ELEMENTWISE FAMILY: the mixed-worlds law ──
+                OpKind::ArithAbsf
+                | OpKind::ArithAddf
+                | OpKind::ArithSubf
+                | OpKind::ArithMulf
+                | OpKind::ArithDivf
+                | OpKind::ArithRemf
+                | OpKind::ArithMinf
+                | OpKind::ArithMaxf
+                | OpKind::ArithMinnumf
+                | OpKind::ArithMaxnumf
+                | OpKind::ArithMinimumf
+                | OpKind::ArithMaximumf
+                | OpKind::ArithNegf
+                | OpKind::ArithCmpf
+                | OpKind::ArithSelect
+                | OpKind::ArithSitofp
+                | OpKind::ArithUitofp
+                | OpKind::ArithFptosi
+                | OpKind::ArithFptoui
+                | OpKind::ArithExtf
+                | OpKind::ArithTruncf
+                | OpKind::ArithConvertf
+                | OpKind::ArithBitcast
+                | OpKind::MathAbsf
+                | OpKind::MathCeil
+                | OpKind::MathCos
+                | OpKind::MathErf
+                | OpKind::MathExp
+                | OpKind::MathFloor
+                | OpKind::MathFma
+                | OpKind::MathLog
+                | OpKind::MathLog1p
+                | OpKind::MathLog2
+                | OpKind::MathPowf
+                | OpKind::MathRsqrt
+                | OpKind::MathSin
+                | OpKind::MathSqrt
+                | OpKind::MathTanh
+                | OpKind::LinalgAdd
+                | OpKind::LinalgSub
+                | OpKind::LinalgMul
+                | OpKind::LinalgDiv
+                | OpKind::LinalgMax
+                | OpKind::LinalgMin => Some(elementwise_world(f, o, &defs, &world)?),
+                // ── A VALUE THAT STATES A SHAPE BUT NO WORLD OF ITS OWN: the column lineage ──
+                OpKind::TensorSplat
+                | OpKind::RegionBb0Args
+                | OpKind::TensorExtractSlice
+                | OpKind::TensorInsertSlice
+                | OpKind::TensorFromElements
+                | OpKind::TensorGenerate
+                | OpKind::LinalgFill
+                | OpKind::LinalgGeneric
+                | OpKind::KtdpReduce
+                | OpKind::KtdpAllgather
+                | OpKind::KtdpInterTileProduce
+                | OpKind::KtdpInterTileReduce
+                | OpKind::KtdpYieldPartial
+                | OpKind::KtdpYieldReduced
+                | OpKind::ScfForall
+                | OpKind::ScfIf
+                | OpKind::ScfParallel
+                | OpKind::ScfWhile => {
+                    let column = o
+                        .result_type
+                        .and_then(|t| t.dims())
+                        .is_some_and(|d| columns.iter().any(|c| c.as_slice() == d));
+                    Some(if column { World::Column } else { World::Row })
+                }
+                // ── THE LOOP: its carried args and results were seeded BY VALUE above, each from
+                // its init — the for itself states no world of its own ──
+                OpKind::ScfFor => None,
+                // ── PLUMBING AND SCALARS: no data frame, no entry ──
+                // Integer arithmetic is addressing here (or the noise hash's i32 compute, whose
+                // values are dense); a constant is the scalar a splat reads; a tile, a view, a
+                // store, a yield or a marker states a window or a boundary, never a value's frame.
+                OpKind::ArithConstant
+                | OpKind::ArithCmpi
+                | OpKind::ArithIndexCast
+                | OpKind::ArithIndexCastui
+                | OpKind::ArithAddi
+                | OpKind::ArithSubi
+                | OpKind::ArithMuli
+                | OpKind::ArithDivsi
+                | OpKind::ArithDivui
+                | OpKind::ArithRemsi
+                | OpKind::ArithRemui
+                | OpKind::ArithExtsi
+                | OpKind::ArithExtui
+                | OpKind::ArithTrunci
+                | OpKind::ArithCeildivsi
+                | OpKind::ArithCeildivui
+                | OpKind::ArithFloordivsi
+                | OpKind::ArithShli
+                | OpKind::ArithShrsi
+                | OpKind::ArithShrui
+                | OpKind::ArithAndi
+                | OpKind::ArithOri
+                | OpKind::ArithXori
+                | OpKind::ArithMaxsi
+                | OpKind::ArithMaxui
+                | OpKind::ArithMinsi
+                | OpKind::ArithMinui
+                | OpKind::MathAbsi
+                | OpKind::TensorExtract
+                | OpKind::TensorEmpty
+                | OpKind::TensorYield
+                | OpKind::LinalgYield
+                | OpKind::LinalgIndex
+                | OpKind::FuncReturn
+                | OpKind::ScfYield
+                | OpKind::KtdpConstructMemoryView
+                | OpKind::KtdpConstructAccessTile
+                | OpKind::KtdpConstructIndirectAccessTile
+                | OpKind::KtdpConstructDistributedMemoryView
+                | OpKind::KtdpStore
+                | OpKind::KtdpGetComputeTileId
+                | OpKind::KtdpCoreid
+                | OpKind::KtdpNotYet => None,
+            };
+            if let Some(w) = w
+                && world.get(&res) != Some(&w)
+            {
+                world.insert(res, w);
+                changed = true;
             }
-            // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs ──
-            OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul | OpKind::LinalgTranspose => {
-                Some(World::Row)
-            }
-            // ── THE LOAD: what it reads, as its tile, its own shape, or its store states ──
-            OpKind::KtdpLoad => Some(load_world(o, &defs, &column_fed)),
-            // ── THE ELEMENTWISE FAMILY: the mixed-worlds law ──
-            OpKind::ArithAbsf
-            | OpKind::ArithAddf
-            | OpKind::ArithSubf
-            | OpKind::ArithMulf
-            | OpKind::ArithDivf
-            | OpKind::ArithRemf
-            | OpKind::ArithMinf
-            | OpKind::ArithMaxf
-            | OpKind::ArithMinnumf
-            | OpKind::ArithMaxnumf
-            | OpKind::ArithMinimumf
-            | OpKind::ArithMaximumf
-            | OpKind::ArithNegf
-            | OpKind::ArithCmpf
-            | OpKind::ArithSelect
-            | OpKind::ArithSitofp
-            | OpKind::ArithUitofp
-            | OpKind::ArithFptosi
-            | OpKind::ArithFptoui
-            | OpKind::ArithExtf
-            | OpKind::ArithTruncf
-            | OpKind::ArithConvertf
-            | OpKind::ArithBitcast
-            | OpKind::MathAbsf
-            | OpKind::MathCeil
-            | OpKind::MathCos
-            | OpKind::MathErf
-            | OpKind::MathExp
-            | OpKind::MathFloor
-            | OpKind::MathFma
-            | OpKind::MathLog
-            | OpKind::MathLog1p
-            | OpKind::MathLog2
-            | OpKind::MathPowf
-            | OpKind::MathRsqrt
-            | OpKind::MathSin
-            | OpKind::MathSqrt
-            | OpKind::MathTanh
-            | OpKind::LinalgAdd
-            | OpKind::LinalgSub
-            | OpKind::LinalgMul
-            | OpKind::LinalgDiv
-            | OpKind::LinalgMax
-            | OpKind::LinalgMin => Some(elementwise_world(f, o, &defs, &world)?),
-            // ── A VALUE THAT STATES A SHAPE BUT NO WORLD OF ITS OWN: the column lineage ──
-            OpKind::TensorSplat
-            | OpKind::RegionBb0Args
-            | OpKind::TensorExtractSlice
-            | OpKind::TensorInsertSlice
-            | OpKind::TensorFromElements
-            | OpKind::TensorGenerate
-            | OpKind::LinalgFill
-            | OpKind::LinalgGeneric
-            | OpKind::KtdpReduce
-            | OpKind::KtdpAllgather
-            | OpKind::KtdpInterTileProduce
-            | OpKind::KtdpInterTileReduce
-            | OpKind::KtdpYieldPartial
-            | OpKind::KtdpYieldReduced
-            | OpKind::ScfForall
-            | OpKind::ScfIf
-            | OpKind::ScfParallel
-            | OpKind::ScfWhile => {
-                let column = o
-                    .result_type
-                    .and_then(|t| t.dims())
-                    .is_some_and(|d| columns.iter().any(|c| c.as_slice() == d));
-                Some(if column { World::Column } else { World::Row })
-            }
-            // ── THE LOOP: its carried args and results were seeded BY VALUE above, each from
-            // its init — the for itself states no world of its own ──
-            OpKind::ScfFor => None,
-            // ── PLUMBING AND SCALARS: no data frame, no entry ──
-            // Integer arithmetic is addressing here (or the noise hash's i32 compute, whose
-            // values are dense); a constant is the scalar a splat reads; a tile, a view, a
-            // store, a yield or a marker states a window or a boundary, never a value's frame.
-            OpKind::ArithConstant
-            | OpKind::ArithCmpi
-            | OpKind::ArithIndexCast
-            | OpKind::ArithIndexCastui
-            | OpKind::ArithAddi
-            | OpKind::ArithSubi
-            | OpKind::ArithMuli
-            | OpKind::ArithDivsi
-            | OpKind::ArithDivui
-            | OpKind::ArithRemsi
-            | OpKind::ArithRemui
-            | OpKind::ArithExtsi
-            | OpKind::ArithExtui
-            | OpKind::ArithTrunci
-            | OpKind::ArithCeildivsi
-            | OpKind::ArithCeildivui
-            | OpKind::ArithFloordivsi
-            | OpKind::ArithShli
-            | OpKind::ArithShrsi
-            | OpKind::ArithShrui
-            | OpKind::ArithAndi
-            | OpKind::ArithOri
-            | OpKind::ArithXori
-            | OpKind::ArithMaxsi
-            | OpKind::ArithMaxui
-            | OpKind::ArithMinsi
-            | OpKind::ArithMinui
-            | OpKind::MathAbsi
-            | OpKind::TensorExtract
-            | OpKind::TensorEmpty
-            | OpKind::TensorYield
-            | OpKind::LinalgYield
-            | OpKind::LinalgIndex
-            | OpKind::FuncReturn
-            | OpKind::ScfYield
-            | OpKind::KtdpConstructMemoryView
-            | OpKind::KtdpConstructAccessTile
-            | OpKind::KtdpConstructIndirectAccessTile
-            | OpKind::KtdpConstructDistributedMemoryView
-            | OpKind::KtdpStore
-            | OpKind::KtdpGetComputeTileId
-            | OpKind::KtdpCoreid
-            | OpKind::KtdpNotYet => None,
-        };
-        if let Some(w) = w
-            && world.get(&res) != Some(&w)
-        {
-            world.insert(res, w);
-            changed = true;
-        }
         }
         if !changed {
             break;
@@ -12285,8 +12282,11 @@ mod frame_pass_tests {
             Operation::new(a, None, OpKind::ScfYield, &[body]),
         ]);
         let constant = |res: Ssa, value: i64| {
-            Operation::new(a, Some(res), OpKind::ArithConstant, &[])
-                .with_attr(a, AttrKey::Value, Attr::Int(value))
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
         };
         let f = IRFunction {
             name: "carried_worlds",
@@ -12307,7 +12307,10 @@ mod frame_pass_tests {
                 constant(step, 1),
                 Operation {
                     regions: a.regions(vec![body_ops]),
-                    result_type: Some(IrType::Tensor { dims: &[64], elem: DType::F32 }),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
                     ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
                         .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
                         .with_attr(a, AttrKey::IterArgs, Attr::Ssas(a.ssa(vec![carry])))
