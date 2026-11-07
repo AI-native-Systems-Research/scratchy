@@ -13509,10 +13509,12 @@ fn dump_wavefront_mega(
             // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
             // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
             // free here: `decode_rung_lits` sorts the ladder by width before baking it.
-            for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS
-                .into_iter()
-                .rev()
-            {
+            //
+            // ⭐ EACH RUNG IS A TYPE. The walk names every batch rung as a `Rung<MQ>` and hands its
+            // width out of that type, widest first, so a decode bundle's width is never a number the
+            // bake parsed.
+            scratchy_subtile::sdsc_abstract::each_batch_rung_widest_first(|width| {
+                let seqs = width.mq().get();
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
                     inferred,
@@ -13540,7 +13542,7 @@ fn dump_wavefront_mega(
                          batch silently runs elsewhere"
                     ),
                 }
-            }
+            });
         }
         // SuperDSC replaces the sengraph ENTIRELY: `emit_bundle` above baked the work-divided dxp bundle
         // and set `superdsc_fp`, but the SENGRAPH decode lowering is REFUSED for granite (the lm_head

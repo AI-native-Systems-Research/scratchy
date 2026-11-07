@@ -247,8 +247,8 @@ impl WindowRows {
 ///   BUILD, because [`baked`](Self::baked) evaluates a membership assert against the pool's own
 ///   ladder. The ladder and the rung type cannot drift — changing [`PagedKvPool::BATCH_RUNGS`] alone
 ///   re-decides which `Rung`s exist;
-/// * [`PAD`](Self::PAD) is [`pad_of_mq`] evaluated at compile time — the SAME law as the runtime
-///   door, called once, not respelled;
+/// * [`PAD`](Self::PAD) is [`pad_of_mq`] evaluated at compile time — the SAME law as the prefill
+///   mint ([`PaddedMq::of_chunk`]), called once, not respelled;
 /// * [`SUB_BLOCKS`](Self::SUB_BLOCKS) carries a PROOF, not just a value: every baked rung pads to
 ///   ONE stick of rows, so a decode bundle's new block is swept in exactly one [`RowWindow`] — the
 ///   emit form proven on hardware. A ladder widened past one stick (a 128-wide rung, say) stops
@@ -323,17 +323,12 @@ impl<const MQ: u32> Rung<MQ> {
 /// (the arrangement the `mq_pad` parameter swap lived in).
 ///
 /// The two mints, and the wall between them:
-/// * a DECODE width comes in through [`of_rung`](Self::of_rung) — the width is a ladder const
-///   ([`Rung`]), so the pad and the one-window proof are the compiler's;
-/// * a PREFILL width comes in through the chunk arm of [`of_bundle`](Self::of_bundle) — a runtime
-///   quantity (the chunk ladder is a wide range), padded by the same [`pad_of_mq`] law. It CANNOT
-///   mint a `Rung`: there is no value→const conversion anywhere but the dispatch's literal arms,
-///   and those arms only name ladder widths.
-///
-/// [`of_bundle`](Self::of_bundle) is the ONE parse boundary from a runtime `(mq, rows_are_requests)`
-/// pair to the law — the same boundary discipline as the head-dim door
-/// (`scratchy_subtile::model_geometry::with_config_head_dim`): a decode width the ladder does not bake
-/// is a refusal (`None` → a loud bake error at the caller), never a silent pad.
+/// * a DECODE width comes in through [`of_rung`](Self::of_rung) only — the width is a ladder const
+///   ([`Rung`]), so the pad and the one-window proof are the compiler's. The bake gets one per batch
+///   rung from [`each_batch_rung_widest_first`], which names each rung as a type: no runtime width
+///   is ever parsed into a rung, so there is no decode width to refuse;
+/// * a PREFILL width comes in through [`of_chunk`](Self::of_chunk) — a runtime quantity (the chunk
+///   ladder is a wide range), padded by the same [`pad_of_mq`] law. It CANNOT mint a `Rung`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PaddedMq {
     mq: QueryRowCount,
@@ -343,7 +338,7 @@ pub struct PaddedMq {
 impl PaddedMq {
     /// A decode rung's width and pad, from the type: `MQ` is the width, [`Rung::PAD`] the pad, and
     /// binding [`Rung::WINDOW`] here makes the one-window proof a compile-time obligation of every
-    /// rung the dispatch can name — a too-wide ladder stops the BUILD in this function.
+    /// rung the ladder walk names — a too-wide ladder stops the BUILD in this function.
     pub const fn of_rung<const MQ: u32>(rung: Rung<MQ>) -> PaddedMq {
         let _ = rung;
         let _one_window: RowWindow = Rung::<MQ>::WINDOW;
@@ -354,36 +349,12 @@ impl PaddedMq {
     }
 
     /// THE RUNTIME ARM OF THE PAD LAW — a prefill chunk's width, padded by [`pad_of_mq`]. One
-    /// spelling, module-private: both [`of_bundle`](Self::of_bundle)'s prefill arm and
-    /// [`AttnBundleRows`]'s prefill mint pad a chunk through here, so the runtime pairing of a
-    /// width with its pad exists in exactly one place.
-    fn of_chunk(mq: u32) -> PaddedMq {
+    /// spelling, so the runtime pairing of a width with its pad exists in exactly one place.
+    pub fn of_chunk(mq: u32) -> PaddedMq {
         PaddedMq {
             mq: QueryRowCount::of_mq(mq),
             pad: MqPad::of_chunk(mq),
         }
-    }
-
-    /// THE PARSE BOUNDARY from a bundle's runtime width to the pad law.
-    ///
-    /// Decode (one row, or rows that are requests): the width must be a baked ladder rung —
-    /// [`with_baked_rung`] is the one value→const door, and `None` is a decode width the ladder
-    /// does not bake: the caller refuses the bundle, loudly.
-    ///
-    /// Prefill (a multi-row prompt chunk): the runtime law, same [`pad_of_mq`] arithmetic.
-    pub fn of_bundle(mq: u32, rows_are_requests: bool) -> Option<PaddedMq> {
-        if !(rows_are_requests || mq == 1) {
-            return Some(PaddedMq::of_chunk(mq));
-        }
-        /// The pad consumer: a rung's width and pad are the type's own arithmetic.
-        struct Pad;
-        impl OnBakedRung for Pad {
-            type Out = PaddedMq;
-            fn on_rung<const MQ: u32>(self, rung: Rung<MQ>) -> PaddedMq {
-                PaddedMq::of_rung(rung)
-            }
-        }
-        with_baked_rung(mq, Pad)
     }
 
     /// The chunk's REAL query rows — the width the pad was computed from, by construction.
@@ -398,52 +369,48 @@ impl PaddedMq {
     }
 }
 
-/// ⭐ WHAT A DECODE DISPATCH ARM RUNS with the const width it named — the consumer side of
-/// [`with_baked_rung`]. The method is generic over `MQ` because that is the whole point of the
-/// door: the arm's body receives the width AS A CONST, with the [`Rung`] witness that proves the
-/// ladder bakes it, so everything it derives is the compiler's arithmetic.
-pub trait OnBakedRung {
-    /// What the dispatch produces.
-    type Out;
-    /// The arm's body, at the width the ladder named.
-    fn on_rung<const MQ: u32>(self, rung: Rung<MQ>) -> Self::Out;
-}
-
-/// THE ONE VALUE→CONST DOOR for a decode width. The match arms are the ladder as literals — the
-/// only place a runtime value can become a const — and the listing is verified against the pool's
-/// ladder AT COMPILE TIME: each arm instantiates [`Rung`] (membership), and the guard const pins
-/// the count and the strict ascent, so the six literals ARE the set `{1} ∪ BATCH_RUNGS` — growing
-/// either side alone fails the build here. `None` is a width the ladder does not bake: the caller
-/// refuses it, loudly.
+/// ⭐ THE BATCH LADDER, WALKED AS TYPES: `bake` gets each batch rung's [`PaddedMq`], widest first,
+/// each minted from its [`Rung`] — so a decode bundle's width is a ladder const from where the bake
+/// iterates the ladder, and no runtime width ever becomes one.
 ///
-/// Every dispatch routes through THIS listing ([`PaddedMq::of_bundle`]'s decode arm,
-/// [`attn_bundle_rows`]'s), so two doors cannot drift about what the ladder is.
-pub fn with_baked_rung<C: OnBakedRung>(mq: u32, consumer: C) -> Option<C::Out> {
-    macro_rules! decode_ladder {
+/// The listing is the ladder as literals, verified against the pool's ladder AT COMPILE TIME: each
+/// literal instantiates [`Rung`] (membership and the one-stick pad), and the guard const pins the
+/// listing to [`PagedKvPool::BATCH_RUNGS`] reversed, entry by entry — changing either side alone
+/// fails the build here.
+///
+/// WIDEST FIRST, because dxp compiles groups in submission order and the widest rung's per-page
+/// fold is the bake's longest group: emitted last, it was the bake's tail.
+///
+/// A width the ladder does not bake has no rung to name (E0080):
+///
+/// ```compile_fail,E0080
+/// # use ktir_superdsc::sdsc_abstract::{PaddedMq, Rung};
+/// const W: PaddedMq = PaddedMq::of_rung(Rung::<3>::baked());
+/// ```
+pub fn each_batch_rung_widest_first(mut bake: impl FnMut(PaddedMq)) {
+    macro_rules! batch_ladder {
         ($($w:literal),+ $(,)?) => {{
             const LISTED: &[u32] = &[$($w),+];
-            const LISTING_IS_EXACTLY_THE_LADDER: () = {
+            const LISTING_IS_THE_LADDER_WIDEST_FIRST: () = {
+                let ladder = PagedKvPool::BATCH_RUNGS;
                 assert!(
-                    LISTED.len() == PagedKvPool::BATCH_RUNGS.len() + 1,
-                    "the decode dispatch must list 1 plus every PagedKvPool::BATCH_RUNGS width"
+                    LISTED.len() == ladder.len(),
+                    "the batch ladder walk must list every PagedKvPool::BATCH_RUNGS width"
                 );
-                let mut i = 1;
+                let mut i = 0;
                 while i < LISTED.len() {
                     assert!(
-                        LISTED[i - 1] < LISTED[i],
-                        "the decode dispatch listing must be strictly ascending (no duplicates)"
+                        LISTED[i] == ladder[ladder.len() - 1 - i],
+                        "the batch ladder walk lists PagedKvPool::BATCH_RUNGS widest first"
                     );
                     i += 1;
                 }
             };
-            let () = LISTING_IS_EXACTLY_THE_LADDER;
-            match mq {
-                $($w => Some(consumer.on_rung(Rung::<$w>::baked())),)+
-                _ => None,
-            }
+            let () = LISTING_IS_THE_LADDER_WIDEST_FIRST;
+            $(bake(PaddedMq::of_rung(Rung::<$w>::baked()));)+
         }};
     }
-    decode_ladder!(1, 2, 4, 8, 16, 32)
+    batch_ladder!(32, 16, 8, 4, 2)
 }
 
 /// THE ATTENTION EMITTER'S MASK-BLOCK WIDTH: one fold pass is one PAGE, so the emitter's
