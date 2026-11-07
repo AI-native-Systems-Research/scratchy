@@ -375,6 +375,8 @@ struct Emission {
     sites: Vec<WeightSlot>,
     /// The arena operands its step names: what each slot its commands bind holds.
     operands: Vec<RowOperand>,
+    /// The DSL weights its op reads ([`Recording::read`]).
+    weights: Vec<(WeightKind, u32)>,
     lm_head: bool,
 }
 
@@ -420,6 +422,7 @@ fn roped_attention(rope: Emission, attention: Emission) -> Emission {
         sig,
         sites: [rope.sites, attention.sites].concat(),
         operands: [rope.operands, attention.operands].concat(),
+        weights: [rope.weights, attention.weights].concat(),
         lm_head: false,
     }
 }
@@ -437,6 +440,7 @@ fn em(step: MetalStep, reads: &[Slot], writes: &[Slot], sites: Vec<WeightSlot>) 
         sig,
         sites,
         operands: Vec::new(),
+        weights: Vec::new(),
         lm_head: false,
     }
 }
@@ -463,6 +467,10 @@ pub struct Recording<'a> {
     /// The arena operands the op being recorded has named so far: each slot its step reads or
     /// writes, and the value the colouring holds there. Drained into the op's row.
     pub named: std::cell::RefCell<Vec<RowOperand>>,
+    /// The DSL weights the op being recorded reads, each with the kind of the site that binds it:
+    /// read off its own operand's binding (`SourceBinding::Weight`), before its site's base or any
+    /// lookup of it. Drained into the op's row.
+    pub read: std::cell::RefCell<Vec<(WeightKind, u32)>>,
 }
 
 /// An arena operand of a step row: the slot its command binds, and the value held there.
@@ -506,9 +514,15 @@ impl Recording<'_> {
         let per_op = (0..self.l.input.ops.len())
             .map(|i| {
                 self.named.borrow_mut().clear();
+                self.read.borrow_mut().clear();
                 let e = self.record(i, skip)?;
                 let operands = std::mem::take(&mut *self.named.borrow_mut());
-                Ok(e.map(|e| Emission { operands, ..e }))
+                let weights = std::mem::take(&mut *self.read.borrow_mut());
+                Ok(e.map(|e| Emission {
+                    operands,
+                    weights,
+                    ..e
+                }))
             })
             .collect::<Result<_, _>>()?;
         Ok(StepRecords { head, per_op })
@@ -680,10 +694,17 @@ impl Recording<'_> {
     }
 
     fn site(&self, i: usize, kind: WeightKind, e: usize) -> Result<Vec<WeightSlot>, StepRefusal> {
-        Ok(vec![WeightSlot {
-            kind,
-            base: self.base(i, e)?,
-        }])
+        let base = self.read_base(i, kind.clone(), e)?;
+        Ok(vec![WeightSlot { kind, base }])
+    }
+
+    /// Weight operand `e`'s base ([`Self::base`]), noted as op `i` reading its DSL weight through a
+    /// site of `kind`.
+    fn read_base(&self, i: usize, kind: WeightKind, e: usize) -> Result<String, StepRefusal> {
+        if let SourceBinding::Weight { id, .. } = self.l.bindings[e] {
+            self.read.borrow_mut().push((kind, id));
+        }
+        self.base(i, e)
     }
 
     /// The rotary table a rope reads: the sliding class's when any operand binds a local cos/sin.
@@ -732,7 +753,7 @@ impl Recording<'_> {
         };
         let linear = WeightSlot {
             kind: WeightKind::Linear,
-            base: self.base(gemm, e)?,
+            base: self.read_base(gemm, WeightKind::Linear, e)?,
         };
         Ok((st::KvOffset::LinearBias(storage), Some(linear)))
     }
@@ -1097,9 +1118,11 @@ impl Recording<'_> {
         // Each head row's arena operands, as it names them.
         let row = |e: Emission| Emission {
             operands: std::mem::take(&mut *self.named.borrow_mut()),
+            weights: std::mem::take(&mut *self.read.borrow_mut()),
             ..e
         };
         self.named.borrow_mut().clear();
+        self.read.borrow_mut().clear();
         let zero = self.embedded_hidden(e);
         let base = self.facts.embed_base.to_string();
         // The embedding table's rows: a drafter reading its target's table writes its target's.
@@ -1211,7 +1234,7 @@ impl Recording<'_> {
                     let e = self.source_operand(i, g)?;
                     sites.push(WeightSlot {
                         kind: WeightKind::RmsNorm,
-                        base: self.base(i, e)?,
+                        base: self.read_base(i, WeightKind::RmsNorm, e)?,
                     });
                 }
                 sites.push(self.rotary(i));
@@ -1816,8 +1839,8 @@ impl Recording<'_> {
                     F::FusedGateUpGeluMul => MetalStep::FusedGateUpGeluMul(input, out, layer),
                     _ => MetalStep::FusedGateUpSiluMul(input, out, layer),
                 };
-                let g = self.base(gate, self.weight_of(gate)?)?;
-                let u = self.base(up, self.weight_of(up)?)?;
+                let g = self.read_base(gate, WeightKind::Linear, self.weight_of(gate)?)?;
+                let u = self.read_base(up, WeightKind::Linear, self.weight_of(up)?)?;
                 let site = vec![WeightSlot {
                     kind: WeightKind::Linear,
                     base: format!("{g}__fused__{u}"),
@@ -2609,10 +2632,13 @@ pub struct Assembled {
     pub sites: Vec<Vec<WeightSlot>>,
     /// Per row, the arena operands its step names (a loop marker: none).
     pub operands: Vec<Vec<RowOperand>>,
+    /// Per row, the DSL weights its op reads (a loop marker: none).
+    pub weights: Vec<Vec<(WeightKind, u32)>>,
     pub lm_rows: Vec<StepRow>,
     lm_sigs: Vec<HazardSig>,
     pub lm_sites: Vec<Vec<WeightSlot>>,
     pub lm_operands: Vec<Vec<RowOperand>>,
+    pub lm_weights: Vec<Vec<(WeightKind, u32)>>,
 }
 
 impl Assembled {
@@ -2647,10 +2673,12 @@ pub fn assemble(
         sigs: Vec::new(),
         sites: Vec::new(),
         operands: Vec::new(),
+        weights: Vec::new(),
         lm_rows: Vec::new(),
         lm_sigs: Vec::new(),
         lm_sites: Vec::new(),
         lm_operands: Vec::new(),
+        lm_weights: Vec::new(),
     };
     let row = |e: &Emission| match (moe, &e.raw) {
         (MoeBits::Raw, Some(raw)) => StepRow::Step(raw.clone(), e.gate),
@@ -2661,6 +2689,7 @@ pub fn assemble(
         out.sigs.push(e.sig.clone());
         out.sites.push(e.sites.clone());
         out.operands.push(e.operands.clone());
+        out.weights.push(e.weights.clone());
     }
     // ⛔ A STACK, NOT AN `Option`: gemma-4 nests a loop over its five sliding layers inside the
     // loop over its six-layer cell.
@@ -2689,30 +2718,34 @@ pub fn assemble(
                     out.sigs.insert(at, metadata);
                     out.sites.insert(at, Vec::new());
                     out.operands.insert(at, Vec::new());
+                    out.weights.insert(at, Vec::new());
                 }
             }
             TapeItem::Step(s) => {
                 let Some(e) = &records.per_op[s.source_op.0] else {
                     continue;
                 };
-                let (rows, sigs, sites, operands) = match e.lm_head {
+                let (rows, sigs, sites, operands, weights) = match e.lm_head {
                     true => (
                         &mut out.lm_rows,
                         &mut out.lm_sigs,
                         &mut out.lm_sites,
                         &mut out.lm_operands,
+                        &mut out.lm_weights,
                     ),
                     false => (
                         &mut out.rows,
                         &mut out.sigs,
                         &mut out.sites,
                         &mut out.operands,
+                        &mut out.weights,
                     ),
                 };
                 rows.push(row(e));
                 sigs.push(e.sig.clone());
                 sites.push(e.sites.clone());
                 operands.push(e.operands.clone());
+                weights.push(e.weights.clone());
             }
         }
     }

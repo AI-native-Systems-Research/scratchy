@@ -89,11 +89,12 @@ impl SourceManifest {
     }
 
     /// The model's `ModelSources` impl: one arm per family, `ix => bundle at layer`. A family
-    /// whose field holds a typed handle (`handle`: its type, by field base) is a source slot
-    /// ([`slot`]): its arm matches the slot's `IX` and reaches the field through the slot.
+    /// whose field holds a typed handle (`handle`: its type and the marker of the DSL weights it
+    /// stands in for, by field base) is a source slot ([`slot`]): its arm matches the slot's `IX`
+    /// and reaches the field through the slot.
     pub fn resolver(
         &self,
-        handle: &dyn Fn(&str) -> Option<TokenStream>,
+        handle: &dyn Fn(&str) -> Option<(TokenStream, TokenStream)>,
     ) -> Result<Resolver, UnboundKind> {
         let r = quote!(::scratchy_target_metal::tape::lowered::SourceRef);
         let ids = quote!(::scratchy_target_metal::tape::ids);
@@ -102,7 +103,7 @@ impl SourceManifest {
             let (ix, base) = (Literal::u32_unsuffixed(n), format_ident!("{}", f.base));
             // `device`: the field's device layer, copied out — a typed field's through its handle.
             let (field, device, pat) = match handle(&f.base) {
-                Some(ty) => {
+                Some((ty, weights)) => {
                     let s = slot(SourceIx(n));
                     typed.insert(SourceIx(n));
                     slots.push(quote! {
@@ -110,6 +111,7 @@ impl SourceManifest {
                         impl ::scratchy_target_metal::tape::typed::Source for #s {
                             type Model = Weights;
                             type Handle = #ty;
+                            type Weights = #weights;
                             const IX: #ids::SourceIx = #ids::SourceIx(#ix);
                             fn at(w: &Weights, layer: #ids::LayerId) -> &#ty {
                                 w.#base(layer.get())
@@ -282,6 +284,10 @@ pub struct MetalCanonical {
 pub struct StepOperands {
     pub backbone: Vec<Vec<RowOperand>>,
     pub lm_head: Vec<Vec<RowOperand>>,
+    /// Per backbone row, then per lm_head row, the DSL weights its op reads, each with its site's
+    /// kind (`Recording::read`).
+    pub backbone_weights: Vec<Vec<(WeightKind, u32)>>,
+    pub lm_head_weights: Vec<Vec<(WeightKind, u32)>>,
 }
 
 impl StepOperands {
@@ -290,6 +296,15 @@ impl StepOperands {
         let rows = match half {
             TapeHalf::Backbone => &self.backbone,
             TapeHalf::LmHead => &self.lm_head,
+        };
+        rows.get(row as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// The DSL weights row `row` of `half`'s op reads.
+    pub fn weights(&self, half: TapeHalf, row: u32) -> &[(WeightKind, u32)] {
+        let rows = match half {
+            TapeHalf::Backbone => &self.backbone_weights,
+            TapeHalf::LmHead => &self.lm_head_weights,
         };
         rows.get(row as usize).map_or(&[], Vec::as_slice)
     }
@@ -464,6 +479,7 @@ pub fn lower_canonical(
         intermediate: (consts.intermediate()).map(|i| IntermediateSize(i.get() as u32)),
         bucket_m: m as u32,
         named: Default::default(),
+        read: Default::default(),
     }
     .records()
     .map_err(Steps)?;
@@ -492,7 +508,7 @@ pub fn lower_canonical(
             RollOutcome::Rolled { peel: 0 },
             rolled.rows,
             rolled_flags,
-            (rolled.sites, rolled.operands),
+            (rolled.sites, rolled.operands, rolled.weights),
             rolled_live,
         )),
         Err(e) => {
@@ -509,7 +525,7 @@ pub fn lower_canonical(
         match candidate(items) {
             Ok((b, flags)) if cut.as_ref().is_none_or(|c| b.rows.len() < c.1.len()) => {
                 let live = b.play_live();
-                let sites = (b.sites, b.operands);
+                let sites = (b.sites, b.operands, b.weights);
                 cut = Some((RollOutcome::LayerClasses, b.rows, flags, sites, live));
             }
             Ok(_) => {}
@@ -526,7 +542,7 @@ pub fn lower_canonical(
             match candidate(&items) {
                 Ok((b, flags)) => {
                     let live = b.play_live();
-                    let sites = (b.sites, b.operands);
+                    let sites = (b.sites, b.operands, b.weights);
                     cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, sites, live));
                     break;
                 }
@@ -539,13 +555,13 @@ pub fn lower_canonical(
         roll,
         backbone,
         backbone_barriers,
-        (backbone_sites, backbone_operands),
+        (backbone_sites, backbone_operands, backbone_weights),
         (backbone_live, lm_head_live),
     ) = cut.unwrap_or((
         RollOutcome::Unrolled,
         unrolled.rows,
         unrolled_flags,
-        (unrolled.sites, unrolled.operands),
+        (unrolled.sites, unrolled.operands, unrolled.weights),
         unrolled_live,
     ));
     match roll {
@@ -582,6 +598,8 @@ pub fn lower_canonical(
         operands: StepOperands {
             backbone: backbone_operands,
             lm_head: rolled.lm_operands,
+            backbone_weights,
+            lm_head_weights: rolled.lm_weights,
         },
         colours: colour_count,
         result,
