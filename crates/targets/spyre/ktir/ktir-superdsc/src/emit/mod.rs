@@ -1950,7 +1950,7 @@ fn stick_plane(op: &OpSpec, v: &ArgView<'_>) -> Option<u32> {
     let mut lanes = (stick, stick);
     for (&d, &sc) in v.layout.iter().zip(v.scale.iter()) {
         if d == v.stick {
-            if !matches!(sc, Scale::Active) || !plan.extent(d).is_multiple_of(stick) {
+            if !sc.is_active() || !plan.extent(d).is_multiple_of(stick) {
                 return None;
             }
             if plan.per_core_extent(d) < plan.extent(d) {
@@ -1958,7 +1958,7 @@ fn stick_plane(op: &OpSpec, v: &ArgView<'_>) -> Option<u32> {
             }
             continue;
         }
-        if !matches!(sc, Scale::Active) {
+        if !sc.is_active() {
             return None;
         }
         rows *= plan.extent(d);
@@ -4087,7 +4087,7 @@ pub fn emit_sdsc(
                     .layout
                     .iter()
                     .position(|&d| d == v.stick)
-                    .is_some_and(|p| !matches!(v.scale.get(p), Some(Scale::Active) | None));
+                    .is_some_and(|p| v.scale.get(p).is_some_and(|s| !s.is_active()));
                 stick_collapsed
                     && v.offset_elems > 0
                     && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
