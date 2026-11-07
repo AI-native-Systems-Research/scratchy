@@ -5278,32 +5278,47 @@ pub fn assemble_convert_col(
         .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"))
 }
 
-/// Assemble a dtype-convert op over a ROW BAND of one side (see [`convert_opspec`]): `in_w`/`o_w`
-/// carry the band's corner and parent height when that side is a window of a taller tensor,
-/// `None` when it is a whole value at the op's own `[rows, cols]`. This is the gelu-longhand
-/// split's corner — the chain's `dl16tofp32` reads a `[rows, cols]` band of the 64/96-row
-/// parameter while its output is the whole minted piece, and the piece's `fp32todl16` reverses
-/// the roles — so ONE door serves both orientations: each side states its own window, and the
-/// door addresses each at its own corner. A band whose width is not the op's own `cols` is a
-/// build failure here (the convert's read IS the band; a wider or narrower one is a different
-/// computation), and a band spanning more than one stick declares its PARENT's row count as the
-/// `mb` device extent — the band's bytes are a stick-major tensor of the parent's, so without
-/// the declaration the walk strides the parent's column planes at the band's own fewer rows.
-/// Emit-time panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the
-/// other `assemble_*`.
-#[allow(clippy::too_many_arguments)]
+/// ⭐ ONE SIDE OF A BANDED CONVERT — the side's full-buffer handle at its own storage, and the
+/// band's own [`crate::addr::RowWindow`] (its corner and parent height) when that side is a
+/// window of a taller tensor; `w: None` is a whole side at the op's own `[rows, cols]`.
+pub struct ConvertBandSide<'a> {
+    pub h: &'a Stk<RowBlockedTag>,
+    pub w: Option<crate::addr::RowWindow>,
+}
+
+/// ⭐ THE BANDED CONVERT'S OWN STATEMENT — the band's geometry (`rows`/`cols`, the `[rows, cols]`
+/// the convert sweeps) and the convert's two sides ([`ConvertBandSide`]), built by the caller so
+/// the door takes ONE spec rather than a positional list its every reader must count.
+pub struct ConvertBand<'a> {
+    pub rows: u32,
+    pub cols: u32,
+    pub in_: ConvertBandSide<'a>,
+    pub o: ConvertBandSide<'a>,
+}
+
+/// Assemble a dtype-convert op over a ROW BAND of one side (see [`convert_opspec`]): each
+/// [`ConvertBandSide`] carries the band's corner and parent height when that side is a window of
+/// a taller tensor, `w: None` when it is a whole value at the op's own `[rows, cols]`. This is
+/// the gelu-longhand split's corner — the chain's `dl16tofp32` reads a `[rows, cols]` band of
+/// the 64/96-row parameter while its output is the whole minted piece, and the piece's
+/// `fp32todl16` reverses the roles — so ONE door serves both orientations: each side states its
+/// own window, and the door addresses each at its own corner. A band whose width is not the
+/// op's own `cols` is a build failure here (the convert's read IS the band; a wider or narrower
+/// one is a different computation), and a band spanning more than one stick declares its
+/// PARENT's row count as the `mb` device extent — the band's bytes are a stick-major tensor of
+/// the parent's, so without the declaration the walk strides the parent's column planes at the
+/// band's own fewer rows. Emit-time panic on a malformed spec = a `cargo build` error
+/// (guard-every-crash), same as the other `assemble_*`.
 pub fn assemble_convert_band(
     op_name: &str,
     op_func: &str,
-    rows: u32,
-    cols: u32,
-    in_: &Stk<RowBlockedTag>,
-    in_w: Option<crate::addr::RowWindow>,
-    o: &Stk<RowBlockedTag>,
-    o_w: Option<crate::addr::RowWindow>,
+    band: ConvertBand<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    let ConvertBand { rows, cols, in_, o } = band;
+    let ConvertBandSide { h: in_, w: in_w } = in_;
+    let ConvertBandSide { h: o, w: o_w } = o;
     // ⭐ MINTED per side, each at its own corner — the #731 law: the band side's `[rows, cols]`
     // window at its corner must fit the PARENT's full-buffer handle (`rb_df(v_rows, v_cols, df)`
     // at STORAGE), the whole side's whole `[rows, cols]` at 0 must fit the piece's own. A caller

@@ -34,9 +34,10 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_convert_band, assemble_pointwise_broadcast_off,
-    bmm_site, check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
-    pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
+    ConvertBand, ConvertBandSide, EmittedOp, In, assemble_convert, assemble_convert_band,
+    assemble_pointwise_broadcast_off, bmm_site, check_pointwise_cols, check_pointwise_cols_df,
+    emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
+    pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -3822,12 +3823,12 @@ pub fn convert(
         return Ok(vec![assemble_convert_band(
             &op_name,
             op_func,
-            rows,
-            cols,
-            &in_h,
-            in_w,
-            &out_h,
-            o_w,
+            ConvertBand {
+                rows,
+                cols,
+                in_: ConvertBandSide { h: &in_h, w: in_w },
+                o: ConvertBandSide { h: &out_h, w: o_w },
+            },
             sym_id_base,
             layout,
         )]);
