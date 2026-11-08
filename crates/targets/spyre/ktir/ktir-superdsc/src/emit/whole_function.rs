@@ -7327,8 +7327,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name, op.op_type
                 ));
             };
-            // ⭐⭐⭐ THE MINT ASKS THE FRAME TABLE — the one statement of whether this result is a
-            // column. A per-row scalar of a rank-N tile is a COLUMN: a reduction over a rank-N
+            // ⭐⭐⭐ THE MINT ASKS THE FRAME TABLE — read through `Frames::frame_of`, the one derivation of
+            // whether this result is a column. A per-row scalar of a rank-N tile is a COLUMN: a reduction over a rank-N
             // tile's last axis writes one value per row of its `[rows, cols]` flat frame, i.e. the
             // `[rows, 1]` column `assemble_reduce_seeded` writes, whatever rank the program states
             // it at (`[B, G]` for a `[B, G, PS]` tile); and a pointwise op over such a column (the
@@ -7341,36 +7341,29 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // `[rows, 1]` here exactly as the deleted provenance test did.
             let dims: [u32; 2] = match op.result_type {
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) => {
-                    match frames.world_of(f, res)? {
-                        World::Column => [dims.iter().product::<i64>() as u32, 1],
-                        World::Row if dims.len() == 2 => [dims[0] as u32, dims[1] as u32],
-                        // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
-                        // last folded into rows — the same reading [`shape_2d`] states and every consumer
-                        // of the minted buffer addresses through. Row-major, the rank-N tile and its flat
-                        // pair are the same bytes at the same offsets, so one buffer serves both; minting
-                        // the STATED shape instead (`[256, 4, 256]`) would be a `[4, 256]` buffer under
-                        // the old reading — a quarter of the footprint the flat `[1024, 256]` consumers
-                        // address. The batched paged-decode kernel's score tiles and softmax states are
-                        // all rank-3; without this arm every one of them was refused below as "states no
-                        // 2-D tensor type". Rank 2 keeps the arm above verbatim.
-                        World::Row if dims.len() > 2 => {
-                            let rows: i64 = dims[..dims.len() - 1].iter().copied().product();
-                            [rows as u32, *dims.last().expect("dims.len() > 2") as u32]
-                        }
-                        // A RANK-1 (or RANK-0) ROW VALUE KEEPS THE MINT'S OWN REFUSAL — the provenance
-                        // question ("did this value come from a row reduction?") is now the table's to
-                        // answer, and a value the table holds ROW is a `[cols]` row vector (a broadcast
-                        // source) to this door whatever its producer: `[cols, 1]` would size the buffer
-                        // correctly and address it wrong, and `[1, cols]` is no frame a minted buffer's
-                        // consumers address, so no buffer can be sized for it.
-                        World::Row => {
-                            return err(format!(
-                                "{}: `{:?}`'s result is an intermediate but states no 2-D tensor type, so \
+                    // A RANK-1 (or RANK-0) ROW VALUE KEEPS THE MINT'S OWN REFUSAL — the provenance
+                    // question ("did this value come from a row reduction?") is now the table's to
+                    // answer, and a value the table holds ROW is a `[cols]` row vector (a broadcast
+                    // source) to this door whatever its producer: `[cols, 1]` would size the buffer
+                    // correctly and address it wrong, and `[1, cols]` is no frame a minted buffer's
+                    // consumers address, so no buffer can be sized for it.
+                    if frames.world_of(f, res)? == World::Row && dims.len() < 2 {
+                        return err(format!(
+                            "{}: `{:?}`'s result is an intermediate but states no 2-D tensor type, so \
                              its footprint is unknown and no buffer can be sized for it",
-                                f.name, op.op_type
-                            ));
-                        }
+                            f.name, op.op_type
+                        ));
                     }
+                    // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
+                    // last folded into rows — the same reading [`shape_2d`] states and every consumer
+                    // of the minted buffer addresses through. Row-major, the rank-N tile and its flat
+                    // pair are the same bytes at the same offsets, so one buffer serves both; minting
+                    // the STATED shape instead (`[256, 4, 256]`) would be a `[4, 256]` buffer under
+                    // the old reading — a quarter of the footprint the flat `[1024, 256]` consumers
+                    // address. The batched paged-decode kernel's score tiles and softmax states are
+                    // all rank-3; without this arm every one of them was refused below as "states no
+                    // 2-D tensor type". Rank 2 keeps its stated frame verbatim.
+                    frames.frame_of(f, res, &dims)?
                 }
                 _ => {
                     return err(format!(
