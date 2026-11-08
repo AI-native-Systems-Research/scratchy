@@ -2415,3 +2415,183 @@ fn the_expert_gate_up_fold_is_its_chain_bit_for_bit() {
     }
     assert!(pass, "an expert gate/up fold differs from its chain");
 }
+
+// ── FP8 S8 W1: the one-row combine ─────────────────────────────────
+
+/// The combine at `hidden` (not [`HIDDEN`]): the output's `m · hidden` and whether the tail held.
+fn run_combine_at(
+    device: &CudaDevice,
+    (down, pos, scores): (&[u16], Option<&[u32]>, &[f32]),
+    (m, hidden, down_rows): (usize, usize, usize),
+) -> (Vec<u16>, bool) {
+    let db = up(device, down);
+    let pb = pos.map(|p| up_u32(device, p));
+    let sb = up_u32(
+        device,
+        &scores.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+    );
+    let out = up(device, &vec![SENTINEL; m * hidden + TAIL]);
+    // SAFETY: as `run_combine`'s, at `hidden` columns.
+    unsafe {
+        moe_combine_bf16(
+            (
+                db.ptr(),
+                pb.as_ref().map(|b| b.ptr().cast_const()),
+                sb.ptr(),
+            ),
+            out.ptr(),
+            (m as u32, TOP_K as u32, hidden as u32, down_rows as u32),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("moe_combine_bf16 launch");
+    let mut o = out.download().expect("download the output");
+    let tail = o[m * hidden..].iter().all(|&b| b == SENTINEL);
+    o.truncate(m * hidden);
+    (o, tail)
+}
+
+/// FP8 S8 W1: at `m == 1` the combine takes its one-row form (one warp per 256-column chunk), and
+/// its row is the warp-per-row kernel's bits: the same token as row 0 of an `m == 8` launch, its
+/// other seven tokens' slots at down rows past the token's own. Gathered (rows `j`) and sorted
+/// (a `pos` that repeats an expert row), at the 35B's 2,048 and Gemma's 2,816 wide, 8 slots; the
+/// scores random, and with NaN, ±inf and 0; 3 seeds each.
+#[test]
+fn the_one_row_combine_is_the_warp_combine_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for hidden in [2048usize, 2816] {
+        for seed in 0..3u64 {
+            let down_rows = 8 * TOP_K + 64;
+            let down = bf16_inputs(
+                down_rows * hidden,
+                0x0E21_0000 ^ (hidden as u64) << 8 ^ seed,
+            );
+            let mut scores8: Vec<f32> = bf16_inputs(8 * TOP_K, 0x0E22_0000 ^ seed)
+                .iter()
+                .map(|&b| bf16::from_bits(b).to_f32().abs())
+                .collect();
+            for (case, special) in [
+                ("random", None),
+                ("nan", Some(f32::NAN)),
+                ("inf", Some(f32::INFINITY)),
+                ("-inf", Some(f32::NEG_INFINITY)),
+                ("zero", Some(0.0f32)),
+            ] {
+                if let Some(v) = special {
+                    scores8[3] = v;
+                }
+                for sorted in [false, true] {
+                    // The token's slots: rows j (gathered), or a pos repeating row 5 (sorted).
+                    let pos8: Vec<u32> = (0..8 * TOP_K as u32)
+                        .map(|p| {
+                            if p < TOP_K as u32 {
+                                [5, 70, 5, 13, 40, 5, 66, 2][p as usize]
+                            } else {
+                                p
+                            }
+                        })
+                        .collect();
+                    let pos = sorted.then_some(&pos8[..]);
+                    let (one, t1) = run_combine_at(
+                        &device,
+                        (&down, pos.map(|p| &p[..TOP_K]), &scores8[..TOP_K]),
+                        (1, hidden, down_rows),
+                    );
+                    let (want, t8) =
+                        run_combine_at(&device, (&down, pos, &scores8), (8, hidden, down_rows));
+                    let m = mismatched_bits(&one, &want[..hidden]);
+                    let ok = m == 0 && t1 && t8;
+                    eprintln!(
+                        "one-row combine hidden={hidden} seed={seed} scores={case} sorted={sorted}: \
+                         vs m=8 row 0 mismatched_bits={m} tails_intact={} {}",
+                        t1 && t8,
+                        verdict(ok)
+                    );
+                    pass &= ok;
+                }
+            }
+        }
+    }
+    assert!(
+        pass,
+        "a one-row combine differs from the warp-per-row combine"
+    );
+}
+
+/// `cudaEvent_t`, declared here for the timing lines only (the runtime declares no event call).
+type CudaEvent = *mut std::ffi::c_void;
+
+unsafe extern "C" {
+    fn cudaEventCreate(event: *mut CudaEvent) -> i32;
+    fn cudaEventRecord(event: CudaEvent, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: CudaEvent) -> i32;
+    fn cudaEventElapsedTime(ms: *mut f32, start: CudaEvent, end: CudaEvent) -> i32;
+    fn cudaEventDestroy(event: CudaEvent) -> i32;
+}
+
+/// The median µs of 20 launches after 3 warm-ups, each between two CUDA events on the default
+/// stream (hot: the inputs stay in L2, as a decode step's do).
+fn event_median(mut launch: impl FnMut()) -> f64 {
+    let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event
+    // is destroyed below.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut start), 0, "cudaEventCreate");
+        assert_eq!(cudaEventCreate(&mut end), 0, "cudaEventCreate");
+    }
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let mut ms = 0.0f32;
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(cudaEventRecord(start, std::ptr::null_mut()), 0, "record");
+            launch();
+            assert_eq!(cudaEventRecord(end, std::ptr::null_mut()), 0, "record");
+            assert_eq!(cudaEventSynchronize(end), 0, "synchronize");
+            assert_eq!(cudaEventElapsedTime(&mut ms, start, end), 0, "elapsed");
+        }
+        if i >= 3 {
+            times.push(f64::from(ms) * 1e3);
+        }
+    }
+    // SAFETY: both events were created above and are no longer used.
+    unsafe {
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// Recorded, not asserted: µs per launch of the gathered combine at `m == 1` (the one-row form)
+/// and at `m == 2` (today's warp-per-row kernel on one CTA, the time W0 measured), at the 35B's
+/// 2,048 and Gemma's 2,816, 8 slots.
+#[test]
+fn the_one_row_combine_times_are_recorded() {
+    let device = h100();
+    for hidden in [2048usize, 2816] {
+        let down_rows = 2 * TOP_K;
+        let db = up(&device, &bf16_inputs(down_rows * hidden, 0x0E23_0000));
+        let sb = up_u32(&device, &[0.125f32.to_bits(); 2 * TOP_K]);
+        let out = up(&device, &vec![SENTINEL; 2 * hidden]);
+        let mut line = format!("combine time hidden={hidden} top_k={TOP_K}:");
+        for m in [1u32, 2] {
+            let us = event_median(|| {
+                // SAFETY: as `run_combine_at`'s; `down` holds 2·TOP_K rows, `out` 2 rows.
+                unsafe {
+                    moe_combine_bf16(
+                        (db.ptr(), None, sb.ptr()),
+                        out.ptr(),
+                        (m, TOP_K as u32, hidden as u32, down_rows as u32),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("a timed combine launch");
+            });
+            let kernel = if m == 1 { "one-row" } else { "warp-per-row" };
+            line += &format!(" m={m} ({kernel}) {us:.2} us;");
+        }
+        eprintln!("{line}");
+    }
+}

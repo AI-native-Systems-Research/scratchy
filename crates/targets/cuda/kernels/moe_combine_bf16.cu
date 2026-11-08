@@ -16,6 +16,12 @@
 // so each term rounds twice and is never fused: a fixed order, which #841's combine bound allows.
 // The row and score indices are read through `gl<int>` and `gl<float>` views. Every token row of
 // the bucket is written.
+//
+// THE ONE-ROW FORM (FP8 S8 W1): at `m == 1` (every decode step) the grid is one CTA, one warp of
+// which walks every chunk of the row. The launcher then launches the `ONE_ROW` instance on a grid
+// of `chunks` CTAs of one warp, warp `c` running chunk `c`'s loop unchanged: the same slots in the
+// same order, the same loads, maps and store. A chunk's sum never reads another chunk, so the
+// bits are the warp-per-row kernel's. Chosen from `m`, a constant of each step.
 
 #include "kittens.cuh"
 
@@ -57,13 +63,18 @@ struct combine_globals {
     bool sorted;
 };
 
+template <bool ONE_ROW>
 __global__ __launch_bounds__(NUM_THREADS) void moe_combine_bf16_ker(
     const __grid_constant__ combine_globals g) {
-    const int t = blockIdx.x * WARPS + kittens::warpid();
+    // The token row, and the chunks this warp writes: every chunk of row `t`, or under `ONE_ROW`
+    // (one warp a CTA) chunk `blockIdx.x` of row 0 alone.
+    const int t = ONE_ROW ? 0 : int(blockIdx.x) * WARPS + kittens::warpid();
     if (t >= g.m) {
         return;
     }
-    for (int ch = 0; ch < g.chunks; ++ch) {
+    const int ch0 = ONE_ROW ? int(blockIdx.x) : 0;
+    const int ch1 = ONE_ROW ? ch0 + 1 : g.chunks;
+    for (int ch = ch0; ch < ch1; ++ch) {
         chunk_vec acc, d;
         warp::zero(acc);
         for (int j = 0; j < g.top_k; ++j) {
@@ -87,8 +98,10 @@ __global__ __launch_bounds__(NUM_THREADS) void moe_combine_bf16_ker(
 // 0 = done; any other value = the cudaError_t of the first query that failed.
 extern "C" int scratchy_cuda_moe_combine_bf16_prepare(void) {
     cudaFuncAttributes attr;
-    if (const cudaError_t e = cudaFuncGetAttributes(&attr, moe_combine_bf16_ker); e != cudaSuccess) {
-        return static_cast<int>(e);
+    for (auto ker : {moe_combine_bf16_ker<false>, moe_combine_bf16_ker<true>}) {
+        if (const cudaError_t e = cudaFuncGetAttributes(&attr, ker); e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
     }
     return 0;
 }
@@ -131,9 +144,16 @@ extern "C" int scratchy_cuda_moe_combine_bf16(const void* down, const void* pos,
         combine_globals G{dg, pg, sg, og, int(m), int(top_k), int(hidden / uint32_t(CHUNK)),
                           sorted != 0};
         void* args[] = {&G};
+        const cudaStream_t s = static_cast<cudaStream_t>(stream);
+        if (m == 1) {
+            // One warp a CTA, one CTA a chunk.
+            const dim3 grid{hidden / uint32_t(CHUNK)}, block{uint32_t(kittens::WARP_THREADS)};
+            return static_cast<int>(
+                cudaLaunchKernel(moe_combine_bf16_ker<true>, grid, block, args, 0, s));
+        }
         const dim3 grid((m + uint32_t(WARPS) - 1) / uint32_t(WARPS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(moe_combine_bf16_ker, grid, block, args, 0,
-                                                 static_cast<cudaStream_t>(stream)));
+        return static_cast<int>(
+            cudaLaunchKernel(moe_combine_bf16_ker<false>, grid, block, args, 0, s));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
