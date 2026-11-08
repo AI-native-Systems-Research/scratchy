@@ -8172,7 +8172,7 @@ impl<'d> Defs<'d> {
                 Some(Attr::Ssas(v)) => v.to_vec(),
                 _ => o.result.into_iter().collect(),
             };
-            for (arg, init) in Self::carries(o) {
+            for (i, (arg, init)) in Self::carries(o).into_iter().enumerate() {
                 let d = shape.get(&init).cloned().or_else(|| {
                     def.get(&init)
                         .and_then(|d| d.result_type)
@@ -8182,8 +8182,14 @@ impl<'d> Defs<'d> {
                 if let Some(d) = d {
                     shape.insert(arg, d);
                 }
-                if let Some(r) = results.iter().find(|r| !shape.contains_key(r)) {
-                    shape.insert(*r, shape.get(&arg).cloned().unwrap_or_default());
+                // ⭐ THE RESULT PAIRED WITH THIS CARRY, BY INDEX — args/inits/results are
+                // arity-equal (the fold's own law), so carry `i`'s result is `results[i]`: a
+                // result never takes another carry's shape, and a carry that states no shape
+                // leaves its result unstated too — never a made-up `[]`.
+                if let Some(&r) = results.get(i) {
+                    if let Some(d) = shape.get(&arg) {
+                        shape.entry(r).or_insert(d.clone());
+                    }
                 }
             }
         }
