@@ -3681,9 +3681,11 @@ pub fn emit_sdsc(
     // The fused-epilogue's extra operand (if any): its Tensor{i} still gets a labeledDs_/primaryDsInfo_
     // entry below (it is a real tensor the on-card walk must address), but it is NOT one of THIS op's own
     // inputLabeledDs/outputLabeledDs — it belongs to the SECOND computeOp_ entry built after the loop.
-    let epilogue_arg_idx: Option<usize> = match op.op_info {
-        OpInfo::FusedEpilogue { arg_idx, .. } => Some(arg_idx),
-        _ => None,
+    let epilogue_args: [Option<usize>; 2] = match op.op_info {
+        OpInfo::FusedEpilogue {
+            arg_idx, arg2_idx, ..
+        } => [Some(arg_idx), arg2_idx],
+        _ => [None, None],
     };
 
     // ── labeledDs_ + primaryDsInfo_ (one entry per distinct Role). ──
@@ -3773,7 +3775,7 @@ pub fn emit_sdsc(
         });
         // computeOp_ wiring: `Tensor{i}-idx{i}`; the LAST arg is the output. The epilogue's own
         // operand is excluded here — the SECOND computeOp_ entry references it explicitly below.
-        if epilogue_arg_idx == Some(i) {
+        if epilogue_args.contains(&Some(i)) {
             continue;
         }
         // ⛔⛔ THE INDEX OPERAND IS NOT AN ARITHMETIC INPUT, AND THE VENDOR FIXTURE IS EXPLICIT.
@@ -4538,9 +4540,18 @@ pub fn emit_sdsc(
     // to the SAME output in place (no new HBM tensor, no separate trip). Built before `dsc` so both
     // entries share one `computeOp_` vec.
     let epilogue_compute_ops: Vec<ComputeOp> = match op.op_info {
-        OpInfo::FusedEpilogue { arg_idx, op_func } => {
+        OpInfo::FusedEpilogue {
+            arg_idx,
+            arg2_idx,
+            op_func,
+        } => {
             let out_ref = format!("Tensor{out_idx}-idx{out_idx}");
-            let epi_ref = format!("Tensor{arg_idx}-idx{arg_idx}");
+            // `bmm.ddl`'s bind order: the output, then the aux operands in order — `stridedadd`'s
+            // `[%outtensor, %resadd]`, `batchnormfwd`'s `[%outtensor, %bnA, %bnB]`.
+            let mut inputs = vec![out_ref.clone(), format!("Tensor{arg_idx}-idx{arg_idx}")];
+            if let Some(j) = arg2_idx {
+                inputs.push(format!("Tensor{j}-idx{j}"));
+            }
             vec![ComputeOp {
                 exUnit: "sfp",
                 opFuncName: op_func.name().to_string(),
@@ -4558,7 +4569,7 @@ pub fn emit_sdsc(
                 // runs in the same loop nest as its matmul, so "Inner" — the same location every
                 // other computeOp in a bundle carries — is also the semantically right value.
                 location: "Inner",
-                inputLabeledDs: vec![out_ref.clone(), epi_ref],
+                inputLabeledDs: inputs,
                 interimLabeledDs: vec![],
                 outputLabeledDs: vec![out_ref],
                 indirectAccessIndexLabeledDs: vec![],

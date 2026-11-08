@@ -1414,26 +1414,40 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             );
             seg_bytes[a] = align128(off + sz);
         }
-        // ── THE ROW-THEN-COLUMN SCALE FOLD's zero operands (`emit::row_col_scale`) ── every fp8
-        // dequant `raw·ascale[m]·ws[n]` lowers to one `layernormnorm` reading a zero per-row mean
-        // (`[m, stick]`) and a zero `β` row (`[1, n]`). Worker-bound zeros in seg0, like the clamp
-        // consts above, each sized at the widest extent any fp8 matmul in the tape states so every
-        // fold's read sits inside its placement.
-        let (rows, cols) = ir
+    }
+
+    // ── THE SCALE FOLDS' ZERO OPERANDS ── worker-bound zeros in seg0, each sized at the widest extent
+    // any of its readers states, so every fold's read sits inside its placement:
+    //   * `ZERO_ROW_TID` `[m, stick]` — the row-then-column scale fold's zero mean (`emit::row_col_scale`):
+    //     every fp8 dequant `raw·ascale[m]·ws[n]` is one `layernormnorm`;
+    //   * `ZERO_COL_TID` `[1, w]` — that fold's zero `β` row (`w = n`), AND the rotate-then-scale fold's
+    //     zero `bnB` row (`w = head_dim`): a single-position rope's `(x @ P) · sin` is the rotate
+    //     matmul's `batchnormfwd` epilogue (`rope_at`'s head-major collapse).
+    {
+        let fp8 = ir
             .nodes
             .iter()
-            .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
-            .map(|n| {
-                (
-                    n.output.region.rows.len as u64,
-                    n.output.region.cols.len as u64,
-                )
-            })
-            .fold((0, 0), |(r, c), (nr, nc)| (r.max(nr), c.max(nc)));
+            .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3);
+        let rows = fp8
+            .clone()
+            .map(|n| n.output.region.rows.len as u64)
+            .max()
+            .unwrap_or(0);
+        // Every rope class's head dim — the shared class registry above, the one list every rope
+        // reader resolves its class off — since any rope may lower at one position.
+        let cols = fp8
+            .map(|n| n.output.region.cols.len as u64)
+            .chain(rope_class_hds.iter().map(|&hd| u64::from(hd)))
+            .max()
+            .unwrap_or(0);
+        let a = SegRole::Activation.segment();
         for (tid, sz) in [
             (ZERO_ROW_TID, rows * Fp16::ELEMS_PER_STICK as u64 * 2),
             (ZERO_COL_TID, cols * 2),
         ] {
+            if sz == 0 {
+                continue;
+            }
             let off = seg_bytes[a];
             placements.insert(
                 tid,
@@ -9497,6 +9511,7 @@ mod tests {
                 broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
                 broadcast_batch: true,
             },
+            two: None,
         });
         // The epilogue operand is the one inserted BEFORE the real output (see
         // `attach_fused_epilogue`'s own doc) — for this 3-arg-input matmul (a,w,o) that is index 2.
@@ -9569,6 +9584,7 @@ mod tests {
                 broadcast_dims: &[("mb", scratchy_subtile::superdsc_opspec::Scale::RedNonStick)],
                 broadcast_batch: true,
             },
+            two: None,
         });
         let epi_idx = 2;
         let view = op.args[epi_idx].view();
@@ -9601,6 +9617,7 @@ mod tests {
                 broadcast_dims: &[],
                 broadcast_batch: false,
             },
+            two: None,
         });
         let folds = SdscFoldSet::new(op.iter.cores_used());
         let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
@@ -9637,6 +9654,72 @@ mod tests {
             .find(|l| l.dsName_ == "Tensor2")
             .expect("mask labeledDs_ entry");
         assert_eq!(mask_lds.dsType_, "OUTPUT");
+    }
+
+    /// ⭐ A TWO-OPERAND `batchnormfwd` EPILOGUE — `bmm.ddl`'s `%bn_op = ([%outtensor, %bnA, %bnB])`,
+    /// the vendor's `conv2d` + `batchnormfwd` chain (`sdsc_conv2d_coord.json`): the matmul's own
+    /// computeOp is unchanged, and the second reads `[output, bnA, bnB]` in the bind's order and
+    /// writes the output in place. Both aux operands get their own labeledDs_, and neither appears in
+    /// the matmul's input list.
+    #[test]
+    fn emit_sdsc_matmul_batchnorm_epilogue_reads_both_aux_operands_in_bind_order() {
+        use scratchy_subtile::superdsc_opspec::{EpilogueOpFunc, EpilogueOperand, EpilogueSpec};
+        let mut op = matmul_opspec(32, 64, 64, 1, "Tensor0", "Tensor1", "Tensor2").unwrap();
+        let rows = [("mb", Scale::RedNonStick)];
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
+            one: EpilogueSpec {
+                operand_name: "bnA".to_string(),
+                offset_elems: 0,
+                op_func: EpilogueOpFunc::BatchNormFwd,
+                broadcast_dims: &rows,
+                broadcast_batch: false,
+            },
+            two: Some(EpilogueOperand {
+                operand_name: "bnB".to_string(),
+                offset_elems: 0,
+                broadcast_dims: &rows,
+                broadcast_batch: false,
+            }),
+        });
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let ops = &sdsc.dscs_[0]["MatMul_0"].computeOp_;
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert_eq!(ops[0].inputLabeledDs, vec!["Tensor0-idx0", "Tensor1-idx1"]);
+        assert_eq!(ops[0].outputLabeledDs, vec!["Tensor4-idx4"]);
+        assert_eq!(ops[1].opFuncName, "batchnormfwd");
+        assert_eq!(
+            ops[1].inputLabeledDs,
+            vec!["Tensor4-idx4", "Tensor2-idx2", "Tensor3-idx3"]
+        );
+        assert_eq!(ops[1].outputLabeledDs, vec!["Tensor4-idx4"]);
+        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
+        assert_eq!(labeled.len(), 5, "activation, kernel, bnA, bnB, output");
+        for (i, name) in [(2usize, "bnA"), (3, "bnB")] {
+            let v = op.args[i].view();
+            assert_eq!(v.name, name, "aux operand {i} in order");
+            let mb = v.layout.iter().position(|&d| d == "mb").expect("mb");
+            assert_eq!(v.scale[mb], Scale::RedNonStick, "{name} is one row");
+        }
+    }
+
+    /// ⛔ THE STAGE'S ARITY IS ITS OP FUNC'S: a `batchnormfwd` handed one aux operand (or a
+    /// `stridedadd` handed two) is a build-time panic, never a computeOp with the wrong input count.
+    #[test]
+    #[should_panic(expected = "reads 2 aux operand(s)")]
+    fn a_batchnorm_epilogue_with_one_operand_is_refused() {
+        use scratchy_subtile::superdsc_opspec::{EpilogueOpFunc, EpilogueSpec};
+        let mut op = matmul_opspec(32, 64, 64, 1, "Tensor0", "Tensor1", "Tensor2").unwrap();
+        op.attach_fused_epilogue(scratchy_subtile::superdsc_opspec::EpilogueSpecs {
+            one: EpilogueSpec {
+                operand_name: "bnA".to_string(),
+                offset_elems: 0,
+                op_func: EpilogueOpFunc::BatchNormFwd,
+                broadcast_dims: &[],
+                broadcast_batch: false,
+            },
+            two: None,
+        });
     }
 
     #[test]

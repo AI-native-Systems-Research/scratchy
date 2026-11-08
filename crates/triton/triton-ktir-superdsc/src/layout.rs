@@ -539,6 +539,17 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             &mut placements,
             &mut segment_bytes,
         )?;
+        // ⭐ THE ROTATE-THEN-SCALE FOLD's zero `bnB` row `[1, hd]` — a single-position rope's
+        // `(x @ P) · sin` is the rotate matmul's `batchnormfwd` epilogue (`rope_at`), which reads it.
+        // Placed for every rope: the head dim is the output view's own, the same fact P's extent is.
+        pack(
+            name,
+            ktir_superdsc::reserved_tids::ZERO_COL_TID,
+            SegRole::Activation,
+            synth_footprint_bytes(&[1, hd], Df::Fp16),
+            &mut placements,
+            &mut segment_bytes,
+        )?;
     }
 
     // ── THE fp8 W8A8 CLAMP CONSTS ─────────────────────────────────────────────────────────────────

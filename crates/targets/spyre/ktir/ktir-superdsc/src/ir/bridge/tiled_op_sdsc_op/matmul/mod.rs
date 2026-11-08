@@ -21,7 +21,8 @@ pub(crate) mod walk;
 
 pub use assemble::{
     RowsOperand, RowsShape, assemble_matmul, assemble_matmul_batched_off,
-    assemble_matmul_batched_seeded, assemble_matmul_off, assemble_matmul_off_maybe_epilogue,
+    assemble_matmul_batched_seeded, assemble_matmul_off, assemble_matmul_off_batchnorm,
+    assemble_matmul_off_maybe_epilogue,
     assemble_matmul_off_phys_m, assemble_matmul_off_phys_m_maybe_epilogue,
     assemble_matmul_off_phys_m_with_epilogue, assemble_matmul_off_phys_m_with_epilogue_gathered,
     assemble_matmul_off_with_epilogue, assemble_matmul_placed, assemble_matmul_rows,

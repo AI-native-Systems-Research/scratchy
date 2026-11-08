@@ -2675,8 +2675,13 @@ pub enum OpInfo {
     /// derivation, it reuses the output's own proven placement with a different device name). The
     /// epilogue reads `[this op's own output, args[arg_idx]]` and writes back to the SAME output —
     /// no new HBM round trip, matching the DDL's one-`lxsu`-store-at-the-end structure.
+    ///
+    /// `arg2_idx` is the stage's SECOND aux operand — `Some` exactly for an op func whose bind reads
+    /// two ([`EpilogueOpFunc::aux_operands`] is 2: `batchnormfwd`'s `[%outtensor, %bnA, %bnB]`), so
+    /// the computeOp's input list is `[output, args[arg_idx], args[arg2_idx]]` in the bind's order.
     FusedEpilogue {
         arg_idx: usize,
+        arg2_idx: Option<usize>,
         op_func: EpilogueOpFunc,
     },
 }
@@ -2700,6 +2705,19 @@ pub struct EpilogueSpec<'a> {
 /// stages" is not a state the emitter can reach.
 pub struct EpilogueSpecs<'a> {
     pub one: EpilogueSpec<'a>,
+    /// The stage's SECOND aux operand — `Some` exactly when `one.op_func` reads two
+    /// ([`EpilogueOpFunc::aux_operands`]); [`OpSpec::attach_fused_epilogue`] refuses a mismatch.
+    pub two: Option<EpilogueOperand<'a>>,
+}
+
+/// The second aux operand of a TWO-operand epilogue stage — `batchnormfwd`'s `%bnB`. Its op func is
+/// the stage's ([`EpilogueSpec::op_func`]), so it carries only what places it: a name, an offset and
+/// a broadcast pattern over the SAME cloned output layout the first operand takes.
+pub struct EpilogueOperand<'a> {
+    pub operand_name: String,
+    pub offset_elems: u32,
+    pub broadcast_dims: &'a [(&'a str, Scale)],
+    pub broadcast_batch: bool,
 }
 
 /// The DDL `opFuncName` a fused epilogue selects — SEALED to the menu `bmm.ddl` actually exposes
@@ -2713,12 +2731,30 @@ pub enum EpilogueOpFunc {
     /// register — the shape a full-tensor (never broadcast) second operand needs, per the DDL's own
     /// `bias`/`resadd` declaring the SAME layout as `%outtensor`.
     StridedAdd,
+    /// `bmm.ddl`'s `batchnormfwd` (`%bn_op = ([%outtensor, %bnA, %bnB], [%outtensor])`): one SFP
+    /// `FMA16(acc, bnA, bnB)` in place on the matmul's own output, `bnA`/`bnB` loaded once per
+    /// output-channel stick into SFP-LRF (`bmm.ddl:195-202`, `:361-367`) — so both are ONE ROW of the
+    /// output's width, broadcast down the rows. The vendor chains it the same way onto `conv2d`
+    /// (`dcg/dcg_fe/scheduler/test/sdsc_conv2d_coord.json`: `conv2d` then `batchnormfwd` reading
+    /// `[Conv_81_out, Input2, Input3]`, the aux operands `scale_ [-1, -1, -1, 1]`).
+    BatchNormFwd,
 }
 
 impl EpilogueOpFunc {
     pub fn name(self) -> &'static str {
         match self {
             EpilogueOpFunc::StridedAdd => "stridedadd",
+            EpilogueOpFunc::BatchNormFwd => "batchnormfwd",
+        }
+    }
+
+    /// How many aux operands the op func's `bmm.ddl` bind reads beside the output — the stage's
+    /// arity, a const table row: an epilogue built with a different count is refused at
+    /// [`OpSpec::attach_fused_epilogue`].
+    pub fn aux_operands(self) -> usize {
+        match self {
+            EpilogueOpFunc::StridedAdd => 1,
+            EpilogueOpFunc::BatchNormFwd => 2,
         }
     }
 }
@@ -3970,26 +4006,66 @@ impl OpSpec {
     /// ⛔ TAKES THE WHOLE EPILOGUE AT ONCE. Assigning `self.op_info` here is the ONLY write —
     /// there is no "already has a stage" state to clobber, and [`EpilogueSpecs`] makes a second
     /// stage (which nothing has ever shipped) unrepresentable rather than runtime-rejected.
+    ///
+    /// ⛔ THE STAGE'S ARITY IS ITS OP FUNC'S: `spec.two` is `Some` exactly when
+    /// [`EpilogueOpFunc::aux_operands`] is 2. A mismatch is a `cargo build` panic here (this runs
+    /// inside `#[forward]`), never a descriptor whose second computeOp lists the wrong operand count —
+    /// which `DdlConversion::matchDdl2Dsc` would refuse at bake with a message naming only the op.
     pub fn attach_fused_epilogue(&mut self, spec: EpilogueSpecs<'_>) {
-        // The operand is inserted BEFORE the output, so the output slides one slot right —
-        // `arg_idx` is recorded as it is built, never re-derived afterwards.
-        let out_idx = self.args.len().saturating_sub(1);
-        let mut operand = self.args[out_idx].clone();
-        operand.set_name(spec.one.operand_name.clone());
-        operand.set_offset_elems(spec.one.offset_elems);
-        operand.set_is_input(true);
-        operand.set_role(Role::Output);
-        for &(dim, scale) in spec.one.broadcast_dims {
-            operand.set_scale_for_dim(dim, scale);
-        }
-        if spec.one.broadcast_batch
-            && let Some(batch_dim) = self.batch_dim_name()
-        {
-            operand.set_scale_for_dim(batch_dim, Scale::RedNonStick);
-        }
-        self.args.insert(out_idx, operand);
+        let want = spec.one.op_func.aux_operands();
+        let have = 1 + usize::from(spec.two.is_some());
+        assert_eq!(
+            have,
+            want,
+            "attach_fused_epilogue: `{}` reads {want} aux operand(s) in bmm.ddl, the spec states {have}",
+            spec.one.op_func.name()
+        );
+        // Each operand is inserted BEFORE the output, so the output slides one slot right — the
+        // indices are recorded as they are built, never re-derived afterwards.
+        let place = |this: &Self,
+                     name: &str,
+                     offset: u32,
+                     dims: &[(&str, Scale)],
+                     batch: bool|
+         -> AnyTensorArg {
+            let out_idx = this.args.len().saturating_sub(1);
+            let mut operand = this.args[out_idx].clone();
+            operand.set_name(name.to_string());
+            operand.set_offset_elems(offset);
+            operand.set_is_input(true);
+            operand.set_role(Role::Output);
+            for &(dim, scale) in dims {
+                operand.set_scale_for_dim(dim, scale);
+            }
+            if batch && let Some(batch_dim) = this.batch_dim_name() {
+                operand.set_scale_for_dim(batch_dim, Scale::RedNonStick);
+            }
+            operand
+        };
+        let first = place(
+            self,
+            &spec.one.operand_name,
+            spec.one.offset_elems,
+            spec.one.broadcast_dims,
+            spec.one.broadcast_batch,
+        );
+        let arg_idx = self.args.len().saturating_sub(1);
+        self.args.insert(arg_idx, first);
+        let arg2_idx = spec.two.map(|two| {
+            let second = place(
+                self,
+                &two.operand_name,
+                two.offset_elems,
+                two.broadcast_dims,
+                two.broadcast_batch,
+            );
+            let idx = self.args.len().saturating_sub(1);
+            self.args.insert(idx, second);
+            idx
+        });
         self.op_info = OpInfo::FusedEpilogue {
-            arg_idx: out_idx,
+            arg_idx,
+            arg2_idx,
             op_func: spec.one.op_func,
         };
     }
