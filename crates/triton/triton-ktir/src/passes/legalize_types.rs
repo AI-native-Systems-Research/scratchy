@@ -578,12 +578,12 @@ fn red_stop_on_genuine_f32<G: ddl_binds::DeviceGen>(
 /// keyed on (the DDL binds `int32tofp32` from an IEEE_INT32 input; every
 /// other row here reads f32 lanes). This is the old inline table's
 /// (opcode, din, dout) triple restated as a type: the vocabulary mapping is
-/// matched on the IR's own TYPED op kinds — a misspelled key cannot compile —
-/// with the spellings the IR carries as `Other` (they have no variant)
-/// matched on their one spelling and mapped to the typed key, so a typo
-/// there misses every row and reads as UNBOUND, fail-closed, exactly as an
-/// absent op does. The ROWS live in `ktir_core::ddl_binds`; nothing about
-/// the card is stated here.
+/// matched on the IR's own TYPED op kinds, and EVERY op this pass keys the
+/// table with is one of them — a misspelled or forgotten key cannot compile
+/// (#1158 review finding 4: the five spellings that used to ride
+/// `OpKind::Other` and match on their string are variants now, so a typo is
+/// a build error, not a silently UNBOUND op). The ROWS live in
+/// `ktir_core::ddl_binds`; nothing about the card is stated here.
 enum DeviceForm {
     /// The typed device op this ask lowers to, and the input element type
     /// its bind is keyed on.
@@ -607,19 +607,16 @@ fn device_form(op: &Op, index: &DefIndex) -> Option<DeviceForm> {
         OpKind::MathExp => DeviceForm::Op(ddl_binds::DeviceOp::Exp, DType::F32),
         OpKind::MathLog => DeviceForm::Op(ddl_binds::DeviceOp::Log, DType::F32),
         OpKind::TtBroadcast => DeviceForm::MovesData,
-        OpKind::Other(ref s) => match s.as_str() {
-            // The DDL's int32tofp32 is keyed on an IEEE_INT32 input: a sitofp
-            // from an i1 (the compare/select pattern) is a different op and
-            // has NO form.
-            "arith.sitofp" if op.operands.iter().any(|u| elem(u) == Some(DType::I32)) => {
-                DeviceForm::Op(ddl_binds::DeviceOp::Int32ToFp32, DType::I32)
-            }
-            "math.absf" => DeviceForm::Op(ddl_binds::DeviceOp::Abs, DType::F32),
-            "arith.negf" => DeviceForm::Op(ddl_binds::DeviceOp::Neg, DType::F32),
-            "math.tanh" => DeviceForm::Op(ddl_binds::DeviceOp::Tanh, DType::F32),
-            "math.rsqrt" => DeviceForm::Op(ddl_binds::DeviceOp::Rsqrt, DType::F32),
-            _ => return None,
-        },
+        // The DDL's int32tofp32 is keyed on an IEEE_INT32 input: a sitofp
+        // from an i1 (the compare/select pattern) is a different op and
+        // has NO form.
+        OpKind::ArithSitofp if op.operands.iter().any(|u| elem(u) == Some(DType::I32)) => {
+            DeviceForm::Op(ddl_binds::DeviceOp::Int32ToFp32, DType::I32)
+        }
+        OpKind::MathAbsf => DeviceForm::Op(ddl_binds::DeviceOp::Abs, DType::F32),
+        OpKind::ArithNegf => DeviceForm::Op(ddl_binds::DeviceOp::Neg, DType::F32),
+        OpKind::MathTanh => DeviceForm::Op(ddl_binds::DeviceOp::Tanh, DType::F32),
+        OpKind::MathRsqrt => DeviceForm::Op(ddl_binds::DeviceOp::Rsqrt, DType::F32),
         _ => return None,
     })
 }

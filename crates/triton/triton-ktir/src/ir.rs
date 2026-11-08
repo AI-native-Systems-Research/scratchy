@@ -77,6 +77,16 @@ pub enum OpKind {
     ArithTruncf,
     ArithIndexCast,
     ArithSelect,
+    /// `arith.negf` — the silu head's negation. A NAMED variant (the ktir-core
+    /// `OpKind` spells it `ArithNegf` too): it is a device-facts key
+    /// (`legalize_types::device_form` maps it onto `DeviceOp::Neg`), and a key
+    /// carried as a string can miss every row on a typo — the exact anti-pattern
+    /// the typed key exists to prevent (#1158 review finding 4).
+    ArithNegf,
+    /// `arith.sitofp` — the integer→float cast. Named for the same reason as
+    /// [`OpKind::ArithNegf`]: `device_form` keys the DDL's `int32tofp32` row
+    /// off it (guarded on an i32 input, the bind's own domain).
+    ArithSitofp,
 
     // --- math
     MathExp2,
@@ -84,6 +94,15 @@ pub enum OpKind {
     MathLog,
     MathLog2,
     MathSqrt,
+    /// `math.absf` — named like [`OpKind::ArithNegf`]: a `device_form` key
+    /// (`DeviceOp::Abs`).
+    MathAbsf,
+    /// `math.tanh` — named like [`OpKind::ArithNegf`]: a `device_form` key
+    /// (`DeviceOp::Tanh`).
+    MathTanh,
+    /// `math.rsqrt` — named like [`OpKind::ArithNegf`]: a `device_form` key
+    /// (`DeviceOp::Rsqrt`).
+    MathRsqrt,
 
     // --- tensor
     TensorSplat,
@@ -175,11 +194,16 @@ impl OpKind {
             ArithTruncf => "arith.truncf",
             ArithIndexCast => "arith.index_cast",
             ArithSelect => "arith.select",
+            ArithNegf => "arith.negf",
+            ArithSitofp => "arith.sitofp",
             MathExp2 => "math.exp2",
             MathExp => "math.exp",
             MathLog => "math.log",
             MathLog2 => "math.log2",
             MathSqrt => "math.sqrt",
+            MathAbsf => "math.absf",
+            MathTanh => "math.tanh",
+            MathRsqrt => "math.rsqrt",
             TensorSplat => "tensor.splat",
             TensorEmpty => "tensor.empty",
             TensorCollapseShape => "tensor.collapse_shape",
@@ -254,11 +278,16 @@ impl OpKind {
             "arith.truncf" => ArithTruncf,
             "arith.index_cast" => ArithIndexCast,
             "arith.select" => ArithSelect,
+            "arith.negf" => ArithNegf,
+            "arith.sitofp" => ArithSitofp,
             "math.exp2" => MathExp2,
             "math.exp" => MathExp,
             "math.log" => MathLog,
             "math.log2" => MathLog2,
             "math.sqrt" => MathSqrt,
+            "math.absf" => MathAbsf,
+            "math.tanh" => MathTanh,
+            "math.rsqrt" => MathRsqrt,
             "tensor.splat" => TensorSplat,
             "tensor.empty" => TensorEmpty,
             "tensor.collapse_shape" => TensorCollapseShape,
