@@ -8294,7 +8294,10 @@ fn load_world(
         None => o
             .result_type
             .and_then(|t| t.dims())
-            .is_some_and(|d| d.len() == 1 || *d.last().unwrap_or(&0) == 1),
+            // rank-1, or a degenerate trailing axis — the trailing-axis comparison is stated
+            // against the Option itself; an EMPTY stated shape answers no element, so it is
+            // not column, with no made-up default value.
+            .is_some_and(|d| d.len() == 1 || d.last() == Some(&1)),
     };
     let param = tile.and_then(|t| view_param(defs, t));
     if col_one || param.is_some_and(|p| column_fed.contains(&p)) {
