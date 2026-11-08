@@ -115,11 +115,34 @@ pub enum DeviceFamily {
     Convert,
 }
 
-/// A device op, TYPED — the table's key. One variant per opFuncName the
-/// table states a fact for; the door's string spelling is
-/// [`DeviceOp::op_func`], a property, never a second key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceOp {
+/// The device ops, spelled ONCE: the enum and its exhaustive list [`ALL`]
+/// are generated from the same token list, so a variant cannot exist
+/// without its list entry — adding one to the invocation extends `ALL` in
+/// the same breath. This is the pin: no pattern to arm, no index to
+/// renumber, no second list to forget.
+macro_rules! device_ops {
+    ($($variant:ident),* $(,)?) => {
+        /// The variant count, taken from the list itself — no literal to
+        /// go stale.
+        pub const DEVICE_OP_COUNT: usize = <[&str]>::len(&[$(stringify!($variant)),*]);
+
+        /// A device op, TYPED — the table's key. One variant per opFuncName
+        /// the table states a fact for; the door's string spelling is
+        /// [`DeviceOp::op_func`], a property, never a second key.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum DeviceOp {
+            $($variant,)*
+        }
+
+        impl DeviceOp {
+            /// Every variant, exactly once, in the spelled order — generated
+            /// from the same list as the enum itself, so it cannot go stale.
+            pub const ALL: [DeviceOp; DEVICE_OP_COUNT] = [$(DeviceOp::$variant),*];
+        }
+    };
+}
+
+device_ops!(
     // ── the pointwise family
     Add,
     Sub,
@@ -151,79 +174,9 @@ pub enum DeviceOp {
     Max,
     Min,
     AbsMax,
-}
+);
 
 impl DeviceOp {
-    /// Every variant, exactly once, in declaration order — the exhaustive
-    /// list the coverage tests iterate, so "every op states a row" is
-    /// checked over the whole enum, not a hand-picked slice of it.
-    pub const ALL: [DeviceOp; 28] = [
-        DeviceOp::Add,
-        DeviceOp::Sub,
-        DeviceOp::Multiply,
-        DeviceOp::RealDiv,
-        DeviceOp::Maximum,
-        DeviceOp::Minimum,
-        DeviceOp::Equal,
-        DeviceOp::Gelu,
-        DeviceOp::Reciprocal,
-        DeviceOp::Tanh,
-        DeviceOp::Abs,
-        DeviceOp::Neg,
-        DeviceOp::Silu,
-        DeviceOp::Exp,
-        DeviceOp::Sigmoid,
-        DeviceOp::Sqrt,
-        DeviceOp::Rsqrt,
-        DeviceOp::Mish,
-        DeviceOp::Log,
-        DeviceOp::Int32ToFp32,
-        DeviceOp::Fp32ToInt32,
-        DeviceOp::Dl16ToFp32,
-        DeviceOp::Fp32ToDl16,
-        DeviceOp::Sum,
-        DeviceOp::Mean,
-        DeviceOp::Max,
-        DeviceOp::Min,
-        DeviceOp::AbsMax,
-    ];
-
-    /// The variant's slot in [`ALL`] — one arm per variant, dense and
-    /// stable, forced exhaustive by the match: a variant added to the enum
-    /// without an index arm does not compile.
-    pub const fn index(self) -> usize {
-        match self {
-            DeviceOp::Add => 0,
-            DeviceOp::Sub => 1,
-            DeviceOp::Multiply => 2,
-            DeviceOp::RealDiv => 3,
-            DeviceOp::Maximum => 4,
-            DeviceOp::Minimum => 5,
-            DeviceOp::Equal => 6,
-            DeviceOp::Gelu => 7,
-            DeviceOp::Reciprocal => 8,
-            DeviceOp::Tanh => 9,
-            DeviceOp::Abs => 10,
-            DeviceOp::Neg => 11,
-            DeviceOp::Silu => 12,
-            DeviceOp::Exp => 13,
-            DeviceOp::Sigmoid => 14,
-            DeviceOp::Sqrt => 15,
-            DeviceOp::Rsqrt => 16,
-            DeviceOp::Mish => 17,
-            DeviceOp::Log => 18,
-            DeviceOp::Int32ToFp32 => 19,
-            DeviceOp::Fp32ToInt32 => 20,
-            DeviceOp::Dl16ToFp32 => 21,
-            DeviceOp::Fp32ToDl16 => 22,
-            DeviceOp::Sum => 23,
-            DeviceOp::Mean => 24,
-            DeviceOp::Max => 25,
-            DeviceOp::Min => 26,
-            DeviceOp::AbsMax => 27,
-        }
-    }
-
     /// The door's own spelling — the `op_func_from_str` key the emitter
     /// spells (`"multiply"`, not the DDL's `"mul"`; `"gelu"`, not
     /// `"gelufwd"`). A property of the op, read at emission; never a lookup
@@ -293,161 +246,6 @@ impl DeviceOp {
         }
     }
 }
-
-/// The exhaustiveness pin for [`DeviceOp::ALL`], tying list membership to
-/// pattern coverage at COMPILE time: this match must name every variant (a
-/// new one without an arm does not compile), and each arm asserts that `ALL`
-/// holds exactly that variant at that variant's own index — so a variant
-/// given its arm but no `ALL` entry fails here (the index runs past the
-/// list), and an entry at a stale slot fails here too. An unnamed const is
-/// eagerly evaluated, so the pin cannot sit uncompiled in the crate.
-/// The exhaustiveness pin for [`ALL`], tying list membership to pattern
-/// coverage at COMPILE time: this match must name every variant (a new
-/// one without an arm does not compile), and each arm asserts that `ALL`
-/// holds exactly that variant at that variant's own index — so a variant
-/// given its arm but no `ALL` entry fails here (the index runs past the
-/// list), and an entry at a stale slot fails here too. A pattern arm
-/// alone, without the list entry, cannot compile.
-const _: () = match DeviceOp::ALL[0] {
-    DeviceOp::Add => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Add.index()],
-        DeviceOp::Add
-    )),
-    DeviceOp::Sub => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Sub.index()],
-        DeviceOp::Sub
-    )),
-    DeviceOp::Multiply => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Multiply.index()],
-            DeviceOp::Multiply
-        ))
-    }
-    DeviceOp::RealDiv => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::RealDiv.index()],
-            DeviceOp::RealDiv
-        ))
-    }
-    DeviceOp::Maximum => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Maximum.index()],
-            DeviceOp::Maximum
-        ))
-    }
-    DeviceOp::Minimum => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Minimum.index()],
-            DeviceOp::Minimum
-        ))
-    }
-    DeviceOp::Equal => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Equal.index()],
-            DeviceOp::Equal
-        ))
-    }
-    DeviceOp::Gelu => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Gelu.index()],
-        DeviceOp::Gelu
-    )),
-    DeviceOp::Reciprocal => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Reciprocal.index()],
-            DeviceOp::Reciprocal
-        ))
-    }
-    DeviceOp::Tanh => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Tanh.index()],
-        DeviceOp::Tanh
-    )),
-    DeviceOp::Abs => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Abs.index()],
-        DeviceOp::Abs
-    )),
-    DeviceOp::Neg => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Neg.index()],
-        DeviceOp::Neg
-    )),
-    DeviceOp::Silu => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Silu.index()],
-        DeviceOp::Silu
-    )),
-    DeviceOp::Exp => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Exp.index()],
-        DeviceOp::Exp
-    )),
-    DeviceOp::Sigmoid => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Sigmoid.index()],
-            DeviceOp::Sigmoid
-        ))
-    }
-    DeviceOp::Sqrt => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Sqrt.index()],
-        DeviceOp::Sqrt
-    )),
-    DeviceOp::Rsqrt => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Rsqrt.index()],
-            DeviceOp::Rsqrt
-        ))
-    }
-    DeviceOp::Mish => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Mish.index()],
-        DeviceOp::Mish
-    )),
-    DeviceOp::Log => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Log.index()],
-        DeviceOp::Log
-    )),
-    DeviceOp::Int32ToFp32 => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Int32ToFp32.index()],
-            DeviceOp::Int32ToFp32
-        ))
-    }
-    DeviceOp::Fp32ToInt32 => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Fp32ToInt32.index()],
-            DeviceOp::Fp32ToInt32
-        ))
-    }
-    DeviceOp::Dl16ToFp32 => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Dl16ToFp32.index()],
-            DeviceOp::Dl16ToFp32
-        ))
-    }
-    DeviceOp::Fp32ToDl16 => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Fp32ToDl16.index()],
-            DeviceOp::Fp32ToDl16
-        ))
-    }
-    DeviceOp::Sum => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Sum.index()],
-        DeviceOp::Sum
-    )),
-    DeviceOp::Mean => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Mean.index()],
-        DeviceOp::Mean
-    )),
-    DeviceOp::Max => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Max.index()],
-        DeviceOp::Max
-    )),
-    DeviceOp::Min => assert!(matches!(
-        DeviceOp::ALL[DeviceOp::Min.index()],
-        DeviceOp::Min
-    )),
-    DeviceOp::AbsMax => {
-        assert!(matches!(
-            DeviceOp::ALL[DeviceOp::AbsMax.index()],
-            DeviceOp::AbsMax
-        ))
-    }
-};
 
 /// One device fact: the op, the data formats the vendor DDL binds it at,
 /// the arrangement its output carries when both operands are standard, and
@@ -796,27 +594,6 @@ mod tests {
                 output_arrangement::<Gen1>(op).is_some(),
                 "{op:?} states no arrangement row"
             );
-        }
-    }
-
-    /// `ALL` is dense and aligned with `index`: every slot holds the variant
-    /// whose index is that slot (catches doubles and gaps), and every
-    /// variant the list holds sits at its own index. Together with the
-    /// const pin — every exhaustive arm asserts its variant's `ALL` entry —
-    /// a variant without a list entry cannot compile, and a misaligned list
-    /// fails here.
-    #[test]
-    fn all_is_dense_and_sits_every_variant_at_its_own_index() {
-        for i in 0..DeviceOp::ALL.len() {
-            assert_eq!(
-                DeviceOp::ALL[i].index(),
-                i,
-                "slot {i} holds a variant that claims index {}",
-                DeviceOp::ALL[i].index()
-            );
-        }
-        for op in DeviceOp::ALL {
-            assert_eq!(DeviceOp::ALL[op.index()], op);
         }
     }
 
