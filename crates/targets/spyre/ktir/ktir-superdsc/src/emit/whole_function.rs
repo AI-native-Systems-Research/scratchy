@@ -8234,13 +8234,6 @@ impl<'d> Defs<'d> {
 /// side, so the two walks cannot disagree about which parameter a tile addresses.
 fn column_fed_params(defs: &Defs) -> std::collections::HashSet<Ssa> {
     let def_of = |v: Ssa| defs.of(v);
-    let param_of_tile = |tile: Ssa| -> Option<Ssa> {
-        let t = def_of(tile)?;
-        let view = def_of(*t.operands.first()?)?;
-        (view.op_type == OpKind::KtdpConstructMemoryView)
-            .then(|| view.operands.first().copied())
-            .flatten()
-    };
     let mut out = std::collections::HashSet::new();
     for o in defs.def.values().filter(|o| o.op_type == OpKind::KtdpStore) {
         // `ktdp.store(value, tile)`: the value is operand 0, the tile operand 1.
@@ -8252,11 +8245,23 @@ fn column_fed_params(defs: &Defs) -> std::collections::HashSet<Ssa> {
                 .and_then(|t| t.dims())
                 .is_some_and(|ds| ds.len() >= 2 && *ds.last().expect("len ≥ 2") == 1)
         });
-        if column && let Some(ptr) = param_of_tile(tile) {
+        if column && let Some(ptr) = def_of(tile).and_then(|t| view_param(defs, t)) {
             out.insert(ptr);
         }
     }
     out
+}
+
+/// The parameter a tile addresses — the memory view's pointer operand: the tile's first
+/// operand's def must be the `ktdp.construct_memory_view(param, …)` that built the tile, and
+/// the parameter is that view's first operand. One spelling, read by both the store side
+/// ([`column_fed_params`]) and the load side ([`load_world`]), so the two walks cannot disagree
+/// about which parameter a tile addresses.
+fn view_param(defs: &Defs, tile: &Operation<'static>) -> Option<Ssa> {
+    let view = tile.operands.first().and_then(|&v| defs.of(v))?;
+    (view.op_type == OpKind::KtdpConstructMemoryView)
+        .then(|| view.operands.first().copied())
+        .flatten()
 }
 
 /// ⭐ THE LOAD'S WORLD — what the load reads is a per-row column iff the tile states a one-column
@@ -8289,12 +8294,7 @@ fn load_world(
             .and_then(|t| t.dims())
             .is_some_and(|d| d.len() == 1 || *d.last().unwrap_or(&0) == 1),
     };
-    let param = tile.and_then(|t| {
-        let view = t.operands.first().and_then(|&v| def_of(v))?;
-        (view.op_type == OpKind::KtdpConstructMemoryView)
-            .then(|| view.operands.first().copied())
-            .flatten()
-    });
+    let param = tile.and_then(|t| view_param(defs, t));
     if col_one || param.is_some_and(|p| column_fed.contains(&p)) {
         World::Column
     } else {
