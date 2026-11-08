@@ -4359,14 +4359,14 @@ pub fn staggered_sources(
             // bake does not hold, refused by name here (every convert op states a row,
             // so this is unreachable for every op this tree emits).
             Lowering::Convert(kind) => match ktir_core::ddl_binds::output_arrangement::<
-                ktir_core::ddl_binds::Gen1,
+                ktir_core::ddl_binds::Baked,
             >(kind.device_op())
             {
                 Some(arr) => arr,
                 None => {
                     return err(format!(
                         "the convert {} states no arrangement row in the device-facts table \
-                         (ktir_core::ddl_binds, Gen1) — refusing to guess Standard for a fact \
+                         (ktir_core::ddl_binds, the baked generation) — refusing to guess Standard for a fact \
                          the table does not hold",
                         kind.op_func()
                     ));

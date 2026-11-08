@@ -1,17 +1,4 @@
-// Copyright 2025 The Torch-Spyre Authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
+// SPDX-License-Identifier: Apache-2.0
 //! THE DEVICE-FACTS TABLE — one const table, keyed by a TYPED device op,
 //! stating every (op, dtype, layout) fact the ladder's lowerings read.
 //!
@@ -164,6 +151,8 @@ device_ops!(
     Mish,
     Log,
     // ── the convert family
+    AddI32ToI32,
+    MulI32ToI32,
     Int32ToFp32,
     Fp32ToInt32,
     Dl16ToFp32,
@@ -202,6 +191,8 @@ impl DeviceOp {
             DeviceOp::Rsqrt => "rsqrt",
             DeviceOp::Mish => "mish",
             DeviceOp::Log => "log",
+            DeviceOp::AddI32ToI32 => "addi32toi32",
+            DeviceOp::MulI32ToI32 => "muli32toi32",
             DeviceOp::Int32ToFp32 => "int32tofp32",
             DeviceOp::Fp32ToInt32 => "fp32toint32",
             DeviceOp::Dl16ToFp32 => "dl16tofp32",
@@ -236,6 +227,7 @@ impl DeviceOp {
             | DeviceOp::Rsqrt
             | DeviceOp::Mish
             | DeviceOp::Log => DeviceFamily::Pointwise,
+            DeviceOp::AddI32ToI32 | DeviceOp::MulI32ToI32 => DeviceFamily::Pointwise,
             DeviceOp::Int32ToFp32
             | DeviceOp::Fp32ToInt32
             | DeviceOp::Dl16ToFp32
@@ -280,6 +272,14 @@ pub trait DeviceGen {
 
 /// Spyre generation 1 — the card this tree bakes today.
 pub struct Gen1;
+
+/// The generation this tree bakes for — the ONE name the bake's readers
+/// hold. `Gen1` is spelled here alone; gen2 lands as a second [`DeviceGen`]
+/// impl with its own table and this alias moves to it — a one-line change in
+/// one place, not a grep. Threading the generation as a parameter through
+/// the passes (each reader generic over `G`, the bake's entry choosing) is
+/// the generation-constants PR's work, stated in this PR's body.
+pub type Baked = Gen1;
 
 impl DeviceGen for Gen1 {
     /// GEN1'S TABLE. Every row cites the gen1 vendor templates (read on the
@@ -336,7 +336,8 @@ impl DeviceGen for Gen1 {
             op: DeviceOp::Gelu,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_parallel.ddl:26-27 gelufwd [%type_fp16] / [%type_fp32]",
+            citation: "unary_parallel.ddl:26 gelufwd [%type_fp16] (FEST) / :27 \
+                   gelufp32 [%type_fp32] with an interim tensor — TWO recipes",
         },
         DeviceOpRow {
             op: DeviceOp::Reciprocal,
@@ -348,7 +349,9 @@ impl DeviceGen for Gen1 {
             op: DeviceOp::Tanh,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_parallel.ddl:34-35 tanh [%type_fp16] / tanhfp32 [%type_fp32]",
+            citation: "unary_parallel.ddl:34 tanh [%type_fp16] (FEST, two \
+                   interims) / :35 tanhfp32 [%type_fp32] with an interim \
+                   tensor — TWO recipes",
         },
         DeviceOpRow {
             op: DeviceOp::Abs,
@@ -390,26 +393,28 @@ impl DeviceGen for Gen1 {
             op: DeviceOp::Sigmoid,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_parallel.ddl:41 sigmoid [%type_fp16, %type_fp32]",
+            citation: "unary_parallel.ddl:42 sigmoid [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Sqrt,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_parallel.ddl:42 sqrt [%type_fp16, %type_fp32]",
+            citation: "unary_parallel.ddl:43 sqrt [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Rsqrt,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_parallel.ddl:43 rsqrt [%type_fp16, %type_fp32]",
+            citation: "unary_parallel.ddl:44 rsqrt [%type_fp16, %type_fp32]",
         },
-        // ── unary_pipeline.ddl — the FEST pipeline family, FP16 ALONE ("not
-        //    possible in fp32 (FEST hardware limitation)" — the template's own
-        //    words). These ops are bound where the collapse wants them and
-        //    refused at fp32 by the RED-stop, exactly as before this table
-        //    existed; stating them here keeps the refusal a table read instead
-        //    of an absence.
+        // ── unary_pipeline.ddl — the FEST pipeline family. Mish is fp16
+        //    ALONE because the template says so in its own words ("not
+        //    possible in fp32 (FEST hardware limitation)"). Log binds BOTH:
+        //    its fp16 is the pipeline bind, and an fp32 PARALLEL bind exists
+        //    (unary_parallel.ddl:40). The row states the template fact; the
+        //    POLICY — f32 log not admitted, main's decision, no card cell
+        //    yet — lives at the reader that holds it (the RED-stop in
+        //    legalize_types names it), never as a falsified bind here.
         DeviceOpRow {
             op: DeviceOp::Mish,
             dfs: &[DdlDf::Fp16],
@@ -419,9 +424,29 @@ impl DeviceGen for Gen1 {
         },
         DeviceOpRow {
             op: DeviceOp::Log,
-            dfs: &[DdlDf::Fp16],
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_pipeline.ddl:22 log [%type_fp16]",
+            citation: "unary_pipeline.ddl:22 log [%type_fp16] (PE+SFP \
+                   pipeline) / unary_parallel.ddl:40 log [%type_fp32] \
+                   (parallel)",
+        },
+        // ── the integer broadcast ops — the MoE lanes chain's own rows (the
+        //    i32 mul/add). Bound in fp32 MODE over uint32 tensors, the value
+        //    casts' reading: the type list names the MODE, the tensor roles
+        //    carry the integer data.
+        DeviceOpRow {
+            op: DeviceOp::AddI32ToI32,
+            dfs: &[DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:28 addi32toi32 [%type_fp32] \
+                   (uint32 tensors in and out)",
+        },
+        DeviceOpRow {
+            op: DeviceOp::MulI32ToI32,
+            dfs: &[DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:30 muli32toi32 [%type_fp32] \
+                   (uint32 tensors in and out)",
         },
         // ── the value casts, for the RED-stop's projection (`arith.sitofp` from
         //    an IEEE_INT32 input). Not pointwise-door ops; they ride the convert
@@ -430,13 +455,13 @@ impl DeviceGen for Gen1 {
             op: DeviceOp::Int32ToFp32,
             dfs: &[DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_parallel.ddl:49 int32tofp32 [%type_fp32] (IEEE_INT32 in)",
+            citation: "unary_parallel.ddl:50 int32tofp32 [%type_fp32] (IEEE_INT32 in)",
         },
         DeviceOpRow {
             op: DeviceOp::Fp32ToInt32,
             dfs: &[DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "unary_parallel.ddl:50 fp32toint32 [%type_fp32] (IEEE_INT32 out)",
+            citation: "unary_parallel.ddl:51 fp32toint32 [%type_fp32] (IEEE_INT32 out)",
         },
         // ── the dl16 converts. The stagger row: the WIDEN's output is measured
         //    lane-permuted at standard addressing (probe-8, granite-2b fp8,
@@ -454,15 +479,20 @@ impl DeviceGen for Gen1 {
             op: DeviceOp::Dl16ToFp32,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Dl16ToFp32,
-            citation: "quantization_double_pad.ddl:58 dl16tofp32 (fp16 in, fp32 \
-                   out); the stagger MEASURED on card, probe-8 2026-10-26",
+            citation: "quantization_double_pad.ddl:58 dl16tofp32 — a \
+                   TYPELESS bind ([]) states no type list; the dtypes are \
+                   the CARD's (probe-8, 2026-10-26: fp16 in / fp32 out, the \
+                   lane stagger measured there)",
         },
         DeviceOpRow {
             op: DeviceOp::Fp32ToDl16,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "quantization_double_pad.ddl:59 fp32todl16 (fp32 in, fp16 \
-                   out); the inverse stagger MEASURED on card — shift −1, \
+            citation: "quantization_double_pad.ddl:59 fp32todl16 — a \
+                   TYPELESS bind ([]) states no type list; the dtypes are \
+                   the CARD's (convert-probe, 2026-11-07: fp32 in / fp16 \
+                   out, element-exact at [256,2048] and [1,2048]). The \
+                   inverse stagger MEASURED — shift −1, \
                    convert-probe 2026-11-07, element-exact at [256,2048] and \
                    [1,2048]; main stages it Standard, so this row keeps main's \
                    behavior, and moving it is the Z4 solve's PR",
@@ -477,31 +507,36 @@ impl DeviceGen for Gen1 {
             op: DeviceOp::Sum,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "summeanmaxexx2.ddl:39 / summeanmaxexx2_fp32.ddl:39 sum",
+            citation: "summeanmaxexx2.ddl:38 sum (stick) / :39 sumnonstick; \
+                   summeanmaxexx2_fp32.ddl:39 / :40",
         },
         DeviceOpRow {
             op: DeviceOp::Mean,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "summeanmaxexx2.ddl:41 / summeanmaxexx2_fp32.ddl:42 mean",
+            citation: "summeanmaxexx2.ddl:41 mean (stick) / :42 meannonstick; \
+                   summeanmaxexx2_fp32.ddl:42 / :43",
         },
         DeviceOpRow {
             op: DeviceOp::Max,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "summeanmaxexx2.ddl:44 / summeanmaxexx2_fp32.ddl:45 max",
+            citation: "summeanmaxexx2.ddl:44 max (stick) / :45 maxnonstick; \
+                   summeanmaxexx2_fp32.ddl:45 / :46",
         },
         DeviceOpRow {
             op: DeviceOp::Min,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "summeanmaxexx2.ddl:47 / summeanmaxexx2_fp32.ddl:48 min",
+            citation: "summeanmaxexx2.ddl:47 min (stick) / :48 minnonstick; \
+                   summeanmaxexx2_fp32.ddl:48 / :49",
         },
         DeviceOpRow {
             op: DeviceOp::AbsMax,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
-            citation: "summeanmaxexx2.ddl:53 / summeanmaxexx2_fp32.ddl:54 absmax",
+            citation: "summeanmaxexx2.ddl:53 absmax (stick) / :54 absmaxnonstick; \
+                   summeanmaxexx2_fp32.ddl:54 / :55",
         },
     ];
 }
@@ -548,20 +583,26 @@ mod tests {
         assert!(!binds::<Gen1>(DeviceOp::Exp, DdlDf::Fp16));
     }
 
-    /// The fp16-only pipeline family: log and mish collapse to f16 freely and
-    /// are refused at fp32.
+    /// The pipeline family, asserted as the TEMPLATES state it. Mish is
+    /// fp16 alone (the template's own words); log binds BOTH — the pipeline
+    /// fp16 and the parallel fp32. The fp32 log's ADMISSION is refused by
+    /// POLICY at the reader that holds it (the RED-stop in legalize_types
+    /// names it, pending a card cell) — the table is never falsified to
+    /// carry that policy.
     #[test]
-    fn the_fest_family_is_fp16_alone() {
-        assert!(binds::<Gen1>(DeviceOp::Log, DdlDf::Fp16));
-        assert!(!binds::<Gen1>(DeviceOp::Log, DdlDf::Fp32));
+    fn mish_is_fp16_alone_by_template_and_log_binds_both_forms() {
         assert!(binds::<Gen1>(DeviceOp::Mish, DdlDf::Fp16));
         assert!(!binds::<Gen1>(DeviceOp::Mish, DdlDf::Fp32));
+        assert!(binds::<Gen1>(DeviceOp::Log, DdlDf::Fp16));
+        assert!(binds::<Gen1>(DeviceOp::Log, DdlDf::Fp32));
     }
 
     /// The two-tensor family and the one-input family collapse to f16 as
     /// they always have: every pointwise op the enum names is bound at both
-    /// formats, except the three measured exceptions (exp is fp32-only;
-    /// log and mish are fp16-only — each has its own test above). Iterated
+    /// formats, except the measured exceptions — exp is fp32-only (measured
+    /// wrong on card through the pipeline form, cg1112), mish is fp16-only
+    /// (the template's own words), and the two integer broadcast ops run in
+    /// fp32 MODE over uint32 tensors (the value casts' reading). Iterated
     /// over the enum's own exhaustive list, not a hand-picked slice.
     #[test]
     fn every_pointwise_op_the_door_ships_is_bound_except_the_measured_exceptions() {
@@ -569,7 +610,10 @@ mod tests {
             if op.family() != DeviceFamily::Pointwise {
                 continue;
             }
-            if matches!(op, DeviceOp::Exp | DeviceOp::Log | DeviceOp::Mish) {
+            if matches!(
+                op,
+                DeviceOp::Exp | DeviceOp::Mish | DeviceOp::AddI32ToI32 | DeviceOp::MulI32ToI32
+            ) {
                 continue;
             }
             assert!(binds::<Gen1>(op, DdlDf::Fp16), "{op:?} must stay f16-bound");

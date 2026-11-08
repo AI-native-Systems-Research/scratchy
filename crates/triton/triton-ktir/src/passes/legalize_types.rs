@@ -41,8 +41,9 @@
 //! SILENT f32→f16 narrowing. An op the CARD BINDS AT FP32 lowers AS f32 -- nothing
 //! narrows, so there is nothing to refuse: the RED-stop consults the ONE shared device-facts table
 //! ([`ktir_core::ddl_binds`], keyed by the typed `DeviceOp`)
-//! and lets a bound op's f32 result stand. An op with NO fp32 bind (`math.log` --
-//! the vendor templates bind it to fp16 alone) keeps today's refusal by name:
+//! and lets a bound op's f32 result stand. `math.log` keeps today's refusal
+//! by name — a NAMED POLICY, not a template fact (the fp32 parallel bind exists,
+//! unary_parallel.ddl:40; no card cell has admitted it):
 //! emitting it would mean silently degrading it to f16, or failing at dxp. The
 //! bindings are TARGET-ABI FACTS -- a const table the pass takes as input, each row
 //! cited to the vendor DDL template and line it was read from -- never match arms,
@@ -472,8 +473,9 @@ fn step_3_remove_truncf(module: &mut Module) {
 /// SILENT f32→f16 narrowing. An op the CARD BINDS AT FP32 lowers AS f32 -- nothing
 /// narrows, so there is nothing to refuse: the RED-stop consults the ONE
 /// shared device-facts table ([`ktir_core::ddl_binds`], keyed by the typed
-/// `DeviceOp`) and lets a bound op's f32 result stand. An op with NO fp32 bind (`math.log` --
-/// the vendor templates bind it to fp16 alone) keeps today's refusal by name:
+/// `DeviceOp`) and lets a bound op's f32 result stand. `math.log` keeps today's
+/// refusal by name — a NAMED POLICY, not a template fact (the fp32 parallel bind
+/// exists, unary_parallel.ddl:40; no card cell has admitted it):
 /// emitting it would mean silently degrading it to f16, or failing at dxp. The
 /// bindings are TARGET-ABI FACTS -- a const table the pass takes as input, each row
 /// cited to the vendor DDL template and line it was read from -- never match arms,
@@ -521,9 +523,20 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
                 // or a form with no fp32 row, keeps the refusal below
                 // (fail-closed).
                 match device_form(op, &index) {
+                    // The fp32 log — a NAMED POLICY REFUSAL, not a table
+                    // fact. The parallel bind EXISTS (unary_parallel.ddl:40;
+                    // the table states it) but no card cell has admitted it,
+                    // and main refused f32 log. The policy lives HERE, at the
+                    // reader that holds it, until a card cell measures the
+                    // parallel form; the table is never falsified to carry a
+                    // policy.
+                    Some(DeviceForm::Op(ddl_binds::DeviceOp::Log, DType::F32)) => {}
                     Some(DeviceForm::Op(key, din))
                         if in_elems.contains(&din)
-                            && ddl_binds::binds::<ddl_binds::Gen1>(key, ddl_binds::DdlDf::Fp32) =>
+                            && ddl_binds::binds::<ddl_binds::Baked>(
+                                key,
+                                ddl_binds::DdlDf::Fp32,
+                            ) =>
                     {
                         continue;
                     }
@@ -541,8 +554,9 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
                         "genuine f32 compute remains after collapsing the \
                          stability-widening island -- this op's f32 result is not a \
                          transient extf/truncf artifact, and the card binds it to no \
-                         fp32 op (see ktir_core::ddl_binds; math.log is fp16-only in the \
-                         vendor templates). Refusing to silently degrade it to f16 \
+                         fp32 op (see ktir_core::ddl_binds; the fp32 log is bound at \
+                         unary_parallel.ddl:40 but not admitted — owner decision, \
+                         pending a card cell). Refusing to silently degrade it to f16 \
                          (SP-E2-03 RED-stop: f32 of an fp32-unbound op is an owner \
                          decision, not a pass code-around). The op is '{}'.",
                         op.kind.spelling()
@@ -586,6 +600,7 @@ fn device_form(op: &Op, index: &DefIndex) -> Option<DeviceForm> {
         OpKind::ArithMaxnumf => DeviceForm::Op(ddl_binds::DeviceOp::Maximum, DType::F32),
         OpKind::ArithMinnumf => DeviceForm::Op(ddl_binds::DeviceOp::Minimum, DType::F32),
         OpKind::MathExp => DeviceForm::Op(ddl_binds::DeviceOp::Exp, DType::F32),
+        OpKind::MathLog => DeviceForm::Op(ddl_binds::DeviceOp::Log, DType::F32),
         OpKind::TtBroadcast => DeviceForm::MovesData,
         OpKind::Other(ref s) => match s.as_str() {
             // The DDL's int32tofp32 is keyed on an IEEE_INT32 input: a sitofp
@@ -677,9 +692,10 @@ module {
 
     #[test]
     fn genuine_f32_compute_red_stops_by_name() {
-        // No extf anywhere, so there is no island, and math.log has NO fp32 card
-        // binding (unary_pipeline.ddl:22 binds it to fp16 alone): this f32 log is
-        // GENUINE and UNBOUND, and must be refused rather than silently degraded.
+        // No extf anywhere, so there is no island, and math.log is not
+        // admitted at fp32 (NAMED POLICY: the parallel bind exists at
+        // unary_parallel.ddl:40, no card cell yet): this f32 log is GENUINE
+        // and refused, not silently degraded.
         // (An fp32-BOUND op in the same position stays -- the fold test below.)
         let src = "\
 module {
@@ -798,7 +814,8 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        let err = run(&mut m).expect_err("math.log is fp16-only; the broadcast may not launder it");
+        let err = run(&mut m)
+            .expect_err("math.log is not admitted at fp32; the broadcast may not launder it");
         assert!(
             format!("{err}").contains("The op is 'math.log'."),
             "the refusal names the consumer, not the broadcast: {err}"
@@ -984,8 +1001,8 @@ module {
     /// reach the fptosi. Retyping that consumer would silently degrade a value the
     /// kernel stated as exactness-f32; skipping the retype leaves it genuine-f32
     /// for the RED-stop to refuse BY NAME -- fail-closed through the existing gate.
-    /// The leaking consumer is math.log, an op with NO fp32 card binding
-    /// (unary_pipeline.ddl:22): under the auditor's fp32-binding gate a leak onto
+    /// The leaking consumer is math.log, not admitted at fp32 (NAMED POLICY,
+    /// unary_parallel.ddl:40 unmeasured): under the auditor's fp32-binding gate a leak onto
     /// a BOUND op is legal (it lowers as f32 -- the fold test above), so the leak
     /// this test guards is the one onto an op the card cannot run at f32.
     #[test]
