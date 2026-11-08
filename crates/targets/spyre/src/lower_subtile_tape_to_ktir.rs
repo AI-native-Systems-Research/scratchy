@@ -784,16 +784,24 @@ fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     cols: u32,
 ) -> NodeLowering<T> {
-    use ktir_superdsc::collective::{CollectiveKind, TpConsume, World, ranks};
+    use ktir_superdsc::collective::{CollectiveKind, STICK_ELEMS, TpConsume, World, ranks};
     use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
     let x = node.inputs[0];
     let (rows, lc) = (x.region.rows.len, x.region.cols.len);
-    if cols != <T as World>::RANKS * lc {
+    let w = <T as World>::RANKS;
+    // ⭐ THE BLOCKS COVER THE WIDTH, THE LAST ONE MAYBE PADDED. Rank `r`'s block is `lc` columns
+    // at column `r·lc`, and the gathered value is the first `cols` of them — every column, at an
+    // even split; at a padded one (`tensor_parallel::split_block`), the last block's tail past the
+    // width is padding. Each rank's block is copied up to the last stick holding a real column, so
+    // nothing lands past the value's own sticks.
+    let span = cols.next_multiple_of(STICK_ELEMS);
+    if lc == 0 || (w - 1) * lc >= cols || cols > w * lc {
         return NodeLowering::Unhandled(format!(
-            "the all-gather restores {cols} columns from a {lc}-column block — not {} blocks",
-            <T as World>::RANKS
+            "the all-gather restores {cols} columns from a {lc}-column block — not {w} blocks \
+             covering it"
         ));
     }
+    let width_of = |rank: u32| lc.min(span - rank * lc);
     let fragment = match send_fragment::<T, F>(node, CollectiveKind::AllGather) {
         Ok(f) => f,
         Err(refusal) => return refusal,
@@ -803,10 +811,17 @@ fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         tensor: node.output.tensor,
         region: Region {
             rows: node.output.region.rows,
-            cols: Range::new(node.output.region.cols.start + rank * lc, lc),
+            cols: Range::new(node.output.region.cols.start + rank * lc, width_of(rank)),
         },
     };
-    let mut ops = Vec::with_capacity((<T as World>::RANKS * <T as World>::RANKS) as usize);
+    let own = |rank: u32| TensorRegion {
+        tensor: x.tensor,
+        region: Region {
+            rows: x.region.rows,
+            cols: Range::new(x.region.cols.start, width_of(rank)),
+        },
+    };
+    let mut ops = Vec::with_capacity((w * w) as usize);
     for me in ranks::<T>() {
         let consume = TpConsume {
             kind: CollectiveKind::AllGather,
@@ -817,16 +832,20 @@ fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         };
         for s in ranks::<T>() {
             let src = if s == me {
-                x
+                own(s.get())
             } else {
-                whole_block(TensorId::from_index(cut.block_tid(s) as usize), rows, lc)
+                whole_block(
+                    TensorId::from_index(cut.block_tid(s) as usize),
+                    rows,
+                    width_of(s.get()),
+                )
             };
             let name = format!("tpgather_s{}_r{}_b{}", node.id.index(), me.get(), s.get());
             match scratchy_triton_splice::lower_block_copy(
                 node,
                 src,
                 block_at(s.get()),
-                cols,
+                span,
                 &name,
             ) {
                 Ok(mut e) => {
