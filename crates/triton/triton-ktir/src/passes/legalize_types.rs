@@ -41,10 +41,11 @@
 //! SILENT f32→f16 narrowing. An op the CARD BINDS AT FP32 lowers AS f32 -- nothing
 //! narrows, so there is nothing to refuse: the RED-stop consults the ONE shared device-facts table
 //! ([`ktir_core::ddl_binds`], keyed by the typed `DeviceOp`)
-//! and lets a bound op's f32 result stand. `math.log` keeps today's refusal
-//! by name — a NAMED POLICY, not a template fact (the fp32 parallel bind exists,
-//! unary_parallel.ddl:40; no card cell has admitted it):
-//! emitting it would mean silently degrading it to f16, or failing at dxp. The
+//! and lets an ADMITTED op's f32 result stand. Admission is the row's own
+//! data (`admitted ⊆ dfs` in ktir_core::ddl_binds): `math.log` is bound at
+//! fp32 (unary_parallel.ddl:40) but its row admits fp16 alone — a NAMED
+//! POLICY as table data, not a match arm here, pending a card cell; emitting
+//! it would mean silently degrading it to f16, or failing at dxp. The
 //! bindings are TARGET-ABI FACTS -- a const table the pass takes as input, each row
 //! cited to the vendor DDL template and line it was read from -- never match arms,
 //! never an inference: an opcode absent from the table is UNBOUND at fp32, and the
@@ -511,37 +512,33 @@ fn red_stop_on_genuine_f32<G: ddl_binds::DeviceGen>(
                 // ⭐ THE FP32-BINDING GATE: an op the card binds at fp32 lowers
                 // AS f32 — nothing narrows, so there is nothing to refuse. The
                 // binding is the const table's own measured fact, cited to the
-                // vendor DDL template and line, and keyed on the FULL
-                // (opcode, operand element type, result element type) triple —
-                // `arith.sitofp` from an i1 is NOT the DDL's int32tofp32
-                // (IEEE_INT32 input), so a same-spelling different-source op is
-                // UNBOUND and the refusal below stands (fail-closed).
+                // vendor DDL template and line. The key's input half is stated
+                // ONCE, in `device_form`'s `sitofp` guard — `arith.sitofp`
+                // from an i1 is NOT the DDL's int32tofp32 (IEEE_INT32 input),
+                // so a same-spelling different-source op mints NO form and the
+                // refusal below stands (fail-closed).
                 let in_elems: Vec<DType> = op
                     .operands
                     .iter()
                     .filter_map(|u| index.type_of(*u).and_then(|ty| ty.elem()))
                     .collect();
                 // The ONE shared table (`ktir_core::ddl_binds`), read through
-                // the TYPED key: the op's device form names the row, the row's
-                // bind answers fp32, and the form's input element type is the
-                // bind's own input half (the DDL binds `int32tofp32` from an
-                // IEEE_INT32 input). Every decision here is the one the pass's
-                // old inline `FP32_CARD_BINDS` scan made — this is the
-                // re-homing of that table, not a change: an op with no form,
-                // or a form with no fp32 row, keeps the refusal below
-                // (fail-closed).
+                // the TYPED key: the op's device form names the row, and the
+                // row's own `admitted` field answers fp32. Every decision
+                // here is the one the pass's old inline `FP32_CARD_BINDS`
+                // scan made — this is the re-homing of that table, not a
+                // change: an op with no form, or a form whose row does not
+                // admit fp32, keeps the refusal below (fail-closed).
                 match device_form(op, &index) {
-                    // The fp32 log — a NAMED POLICY REFUSAL, not a table
-                    // fact. The parallel bind EXISTS (unary_parallel.ddl:40;
-                    // the table states it) but no card cell has admitted it,
-                    // and main refused f32 log. The policy lives HERE, at the
-                    // reader that holds it, until a card cell measures the
-                    // parallel form; the table is never falsified to carry a
-                    // policy.
-                    Some(DeviceForm::Op(ddl_binds::DeviceOp::Log, DType::F32)) => {}
-                    Some(DeviceForm::Op(key, din))
-                        if in_elems.contains(&din)
-                            && ddl_binds::binds::<G>(key, ddl_binds::DdlDf::Fp32) =>
+                    // ⭐ THE ONE ADMISSION READ: both questions — what the
+                    // card binds and what the ladder admits — are the row's
+                    // own data (`admitted ⊆ dfs`, stated in the table), so
+                    // the fp32 log refuses through the SAME read every other
+                    // unadmitted op refuses through: its row admits fp16
+                    // alone, pending a card cell. No op is singled out by a
+                    // match arm here.
+                    Some(DeviceForm::Op(key))
+                        if ddl_binds::admits::<G>(key, ddl_binds::DdlDf::Fp32) =>
                     {
                         continue;
                     }
@@ -574,20 +571,23 @@ fn red_stop_on_genuine_f32<G: ddl_binds::DeviceGen>(
 }
 
 /// The op's device form — the TYPED key into the ONE shared device-facts
-/// table (`ktir_core::ddl_binds`), with the INPUT element type the bind is
-/// keyed on (the DDL binds `int32tofp32` from an IEEE_INT32 input; every
-/// other row here reads f32 lanes). This is the old inline table's
-/// (opcode, din, dout) triple restated as a type: the vocabulary mapping is
-/// matched on the IR's own TYPED op kinds, and EVERY op this pass keys the
-/// table with is one of them — a misspelled or forgotten key cannot compile
+/// table (`ktir_core::ddl_binds`). This is the old inline table's (opcode,
+/// din, dout) triple restated as a type: the vocabulary mapping is matched
+/// on the IR's own TYPED op kinds, and EVERY op this pass keys the table
+/// with is one of them — a misspelled or forgotten key cannot compile
 /// (#1158 review finding 4: the five spellings that used to ride
 /// `OpKind::Other` and match on their string are variants now, so a typo is
-/// a build error, not a silently UNBOUND op). The ROWS live in
+/// a build error, not a silently UNBOUND op).
+///
+/// The key's INPUT half is stated ONCE, here, in the `sitofp` arm's guard
+/// (the DDL binds `int32tofp32` from an IEEE_INT32 input; a sitofp off an
+/// i1 is a different op and mints NO form). It is not re-derived at the
+/// reader (#1158 review finding 5): the RED-stop asks the form and the
+/// row's `admitted` field, nothing else. The ROWS live in
 /// `ktir_core::ddl_binds`; nothing about the card is stated here.
 enum DeviceForm {
-    /// The typed device op this ask lowers to, and the input element type
-    /// its bind is keyed on.
-    Op(ddl_binds::DeviceOp, DType),
+    /// The typed device op this ask lowers to.
+    Op(ddl_binds::DeviceOp),
     /// Dtype-free data movement (`tt.broadcast`): the result's dtype is the
     /// input's verbatim — never a device ask, never a bind question.
     MovesData,
@@ -598,25 +598,25 @@ enum DeviceForm {
 fn device_form(op: &Op, index: &DefIndex) -> Option<DeviceForm> {
     let elem = |u: &Ssa| index.type_of(*u).and_then(|t| t.elem());
     Some(match op.kind {
-        OpKind::ArithAddf => DeviceForm::Op(ddl_binds::DeviceOp::Add, DType::F32),
-        OpKind::ArithSubf => DeviceForm::Op(ddl_binds::DeviceOp::Sub, DType::F32),
-        OpKind::ArithMulf => DeviceForm::Op(ddl_binds::DeviceOp::Multiply, DType::F32),
-        OpKind::ArithDivf => DeviceForm::Op(ddl_binds::DeviceOp::RealDiv, DType::F32),
-        OpKind::ArithMaxnumf => DeviceForm::Op(ddl_binds::DeviceOp::Maximum, DType::F32),
-        OpKind::ArithMinnumf => DeviceForm::Op(ddl_binds::DeviceOp::Minimum, DType::F32),
-        OpKind::MathExp => DeviceForm::Op(ddl_binds::DeviceOp::Exp, DType::F32),
-        OpKind::MathLog => DeviceForm::Op(ddl_binds::DeviceOp::Log, DType::F32),
+        OpKind::ArithAddf => DeviceForm::Op(ddl_binds::DeviceOp::Add),
+        OpKind::ArithSubf => DeviceForm::Op(ddl_binds::DeviceOp::Sub),
+        OpKind::ArithMulf => DeviceForm::Op(ddl_binds::DeviceOp::Multiply),
+        OpKind::ArithDivf => DeviceForm::Op(ddl_binds::DeviceOp::RealDiv),
+        OpKind::ArithMaxnumf => DeviceForm::Op(ddl_binds::DeviceOp::Maximum),
+        OpKind::ArithMinnumf => DeviceForm::Op(ddl_binds::DeviceOp::Minimum),
+        OpKind::MathExp => DeviceForm::Op(ddl_binds::DeviceOp::Exp),
+        OpKind::MathLog => DeviceForm::Op(ddl_binds::DeviceOp::Log),
         OpKind::TtBroadcast => DeviceForm::MovesData,
         // The DDL's int32tofp32 is keyed on an IEEE_INT32 input: a sitofp
         // from an i1 (the compare/select pattern) is a different op and
         // has NO form.
         OpKind::ArithSitofp if op.operands.iter().any(|u| elem(u) == Some(DType::I32)) => {
-            DeviceForm::Op(ddl_binds::DeviceOp::Int32ToFp32, DType::I32)
+            DeviceForm::Op(ddl_binds::DeviceOp::Int32ToFp32)
         }
-        OpKind::MathAbsf => DeviceForm::Op(ddl_binds::DeviceOp::Abs, DType::F32),
-        OpKind::ArithNegf => DeviceForm::Op(ddl_binds::DeviceOp::Neg, DType::F32),
-        OpKind::MathTanh => DeviceForm::Op(ddl_binds::DeviceOp::Tanh, DType::F32),
-        OpKind::MathRsqrt => DeviceForm::Op(ddl_binds::DeviceOp::Rsqrt, DType::F32),
+        OpKind::MathAbsf => DeviceForm::Op(ddl_binds::DeviceOp::Abs),
+        OpKind::ArithNegf => DeviceForm::Op(ddl_binds::DeviceOp::Neg),
+        OpKind::MathTanh => DeviceForm::Op(ddl_binds::DeviceOp::Tanh),
+        OpKind::MathRsqrt => DeviceForm::Op(ddl_binds::DeviceOp::Rsqrt),
         _ => return None,
     })
 }

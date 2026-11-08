@@ -258,6 +258,15 @@ pub struct DeviceOpRow {
     /// The formats the bind lists. An op asked at a format not here is
     /// refused by the reader, never silently degraded.
     pub dfs: &'static [DdlDf],
+    /// The formats the LADDER ADMITS the op at — the policy half of the row,
+    /// beside the vendor fact. `admitted ⊆ dfs` always: a bind that is not
+    /// admitted is a measured owner decision (the fp32 log: bound at
+    /// unary_parallel.ddl:40, not admitted pending a card cell), and an
+    /// admission without a bind is impossible by construction. The
+    /// RED-stop (`legalize_types`) reads THIS field, never `dfs`, so "what
+    /// the card binds" and "what the ladder lets through" are both table
+    /// reads, never a match arm at a reader (#1158 review finding 5).
+    pub admitted: &'static [DdlDf],
     /// The output arrangement the op carries at standard addressing.
     pub arrangement: ElementArrangement,
     /// The vendor template and line(s) the fact was read from.
@@ -344,42 +353,49 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Add,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:25 add [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Sub,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:26 sub [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Multiply,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:27 mul [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::RealDiv,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:44 realdiv [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Maximum,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:45 maximum [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Minimum,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:46 minimum [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Equal,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:41 equal [%type_fp16, %type_fp32]",
         },
@@ -388,6 +404,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Gelu,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:26 gelufwd [%type_fp16] (FEST) / :27 \
                    gelufp32 [%type_fp32] with an interim tensor — TWO recipes",
@@ -395,12 +412,14 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Reciprocal,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:30 reciprocal [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Tanh,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:34 tanh [%type_fp16] (FEST, two \
                    interims) / :35 tanhfp32 [%type_fp32] with an interim \
@@ -409,18 +428,21 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Abs,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:36 abs [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Neg,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:37 neg [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Silu,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:38 silu [%type_fp16, %type_fp32]",
         },
@@ -437,6 +459,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Exp,
             dfs: &[DdlDf::Fp32],
+            admitted: &[DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:39 exp [%type_fp32] — fp32 ONLY; the \
                    unary_pipeline.ddl:19 fp16 exp is a FEST form this door \
@@ -445,18 +468,21 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Sigmoid,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:42 sigmoid [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Sqrt,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:43 sqrt [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
             op: DeviceOp::Rsqrt,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:44 rsqrt [%type_fp16, %type_fp32]",
         },
@@ -471,6 +497,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Mish,
             dfs: &[DdlDf::Fp16],
+            admitted: &[DdlDf::Fp16],
             arrangement: ElementArrangement::Standard,
             citation: "unary_pipeline.ddl:21 mish [%type_fp16] — not possible in \
                    fp32 (FEST hardware limitation)",
@@ -478,6 +505,12 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Log,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            // ⭐ THE ONE ROW WHERE ADMISSION NARROWS THE BIND — the policy,
+            // stated as the row's own data (#1158 review finding 5): the
+            // fp32 PARALLEL bind exists (unary_parallel.ddl:40) but no card
+            // cell has admitted it, and main refused f32 log. A card cell
+            // that measures the parallel form widens THIS field, never dfs.
+            admitted: &[DdlDf::Fp16],
             arrangement: ElementArrangement::Standard,
             citation: "unary_pipeline.ddl:22 log [%type_fp16] (PE+SFP \
                    pipeline) / unary_parallel.ddl:40 log [%type_fp32] \
@@ -490,6 +523,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::AddI32ToI32,
             dfs: &[DdlDf::Fp32],
+            admitted: &[DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:28 addi32toi32 [%type_fp32] \
                    (uint32 tensors in and out)",
@@ -497,6 +531,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::MulI32ToI32,
             dfs: &[DdlDf::Fp32],
+            admitted: &[DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:30 muli32toi32 [%type_fp32] \
                    (uint32 tensors in and out)",
@@ -507,12 +542,14 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Int32ToFp32,
             dfs: &[DdlDf::Fp32],
+            admitted: &[DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:50 int32tofp32 [%type_fp32] (IEEE_INT32 in)",
         },
         DeviceOpRow {
             op: DeviceOp::Fp32ToInt32,
             dfs: &[DdlDf::Fp32],
+            admitted: &[DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "unary_parallel.ddl:51 fp32toint32 [%type_fp32] (IEEE_INT32 out)",
         },
@@ -531,6 +568,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Dl16ToFp32,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Dl16ToFp32,
             citation: "quantization_double_pad.ddl:58 dl16tofp32 — a \
                    TYPELESS bind ([]) states no type list; the dtypes are \
@@ -540,6 +578,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Fp32ToDl16,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "quantization_double_pad.ddl:59 fp32todl16 — a \
                    TYPELESS bind ([]) states no type list; the dtypes are \
@@ -559,6 +598,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Sum,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "summeanmaxexx2.ddl:38 sum (stick) / :39 sumnonstick; \
                    summeanmaxexx2_fp32.ddl:39 / :40",
@@ -566,6 +606,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Mean,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "summeanmaxexx2.ddl:41 mean (stick) / :42 meannonstick; \
                    summeanmaxexx2_fp32.ddl:42 / :43",
@@ -573,6 +614,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Max,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "summeanmaxexx2.ddl:44 max (stick) / :45 maxnonstick; \
                    summeanmaxexx2_fp32.ddl:45 / :46",
@@ -580,6 +622,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::Min,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "summeanmaxexx2.ddl:47 min (stick) / :48 minnonstick; \
                    summeanmaxexx2_fp32.ddl:48 / :49",
@@ -587,6 +630,7 @@ impl DeviceGen for Gen1 {
         DeviceOpRow {
             op: DeviceOp::AbsMax,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "summeanmaxexx2.ddl:53 absmax (stick) / :54 absmaxnonstick; \
                    summeanmaxexx2_fp32.ddl:54 / :55",
@@ -724,6 +768,14 @@ pub fn binds<G: DeviceGen>(op: DeviceOp, df: DdlDf) -> bool {
     bound_dfs::<G>(op).contains(&df)
 }
 
+/// Whether the LADDER ADMITS `op` at `df` on `G` — the policy read, the
+/// twin of [`binds`]' vendor read. Admission never widens a bind (each row's
+/// `admitted ⊆ dfs`), so an admitted op is bound; the gap is the measured
+/// owner decision the row states (the fp32 log today).
+pub fn admits<G: DeviceGen>(op: DeviceOp, df: DdlDf) -> bool {
+    row::<G>(op).admitted.contains(&df)
+}
+
 /// The arrangement `op`'s output carries on `G` when both operands are
 /// addressed standard. There is no silent `Standard` default and no absent
 /// row to guess at — the array states one row per op by construction.
@@ -746,16 +798,40 @@ mod tests {
 
     /// The pipeline family, asserted as the TEMPLATES state it. Mish is
     /// fp16 alone (the template's own words); log binds BOTH — the pipeline
-    /// fp16 and the parallel fp32. The fp32 log's ADMISSION is refused by
-    /// POLICY at the reader that holds it (the RED-stop in legalize_types
-    /// names it, pending a card cell) — the table is never falsified to
-    /// carry that policy.
+    /// fp16 and the parallel fp32. The fp32 log's ADMISSION is the row's own
+    /// policy data (`admitted` narrows `dfs`): bound, not admitted, pending
+    /// a card cell — the vendor fact is never falsified to carry the policy.
     #[test]
-    fn mish_is_fp16_alone_by_template_and_log_binds_both_forms() {
+    fn mish_is_fp16_alone_by_template_and_log_binds_but_does_not_admit_fp32() {
         assert!(binds::<Gen1>(DeviceOp::Mish, DdlDf::Fp16));
         assert!(!binds::<Gen1>(DeviceOp::Mish, DdlDf::Fp32));
         assert!(binds::<Gen1>(DeviceOp::Log, DdlDf::Fp16));
         assert!(binds::<Gen1>(DeviceOp::Log, DdlDf::Fp32));
+        assert!(admits::<Gen1>(DeviceOp::Log, DdlDf::Fp16));
+        assert!(
+            !admits::<Gen1>(DeviceOp::Log, DdlDf::Fp32),
+            "the fp32 log is bound but not admitted — the row's policy, pending a card cell"
+        );
+    }
+
+    /// ⛔ ADMISSION NEVER WIDENS A BIND — `admitted ⊆ dfs` for EVERY row, so
+    /// the policy half of the table cannot silently let an op through at a
+    /// format the card does not bind. The fp32 log is the one row (today)
+    /// where the inclusion is strict.
+    #[test]
+    fn admission_never_widens_a_bind() {
+        let mut strict = 0;
+        for r in Gen1::DEVICE_OPS {
+            for df in r.admitted {
+                assert!(
+                    r.dfs.contains(df),
+                    "{:?} admits a format it does not bind",
+                    r.op
+                );
+            }
+            strict += (r.admitted.len() < r.dfs.len()) as usize;
+        }
+        assert_eq!(strict, 1, "the fp32 log is the one narrowed admission");
     }
 
     /// The two-tensor family and the one-input family collapse to f16 as
