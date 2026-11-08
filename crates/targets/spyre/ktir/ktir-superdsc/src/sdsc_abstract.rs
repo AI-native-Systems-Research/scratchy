@@ -3633,7 +3633,7 @@ impl AnswerRows {
     /// [`RequestIndex`], so a request past the capacity is UNSPELLABLE: no reader passes a bare
     /// request index, and the readback takes `rows().take(live)` with the live count off the
     /// launch's own slot list (an empty window's row is never read).
-    pub fn rows(self) -> impl Iterator<Item = (RequestIndex, usize)> {
+    pub fn rows(self) -> impl Iterator<Item = (RequestIndex, usize)> + ExactSizeIterator {
         (0..self.count()).map(move |r| {
             (
                 RequestIndex(r),
