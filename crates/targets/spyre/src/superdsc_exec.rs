@@ -6391,10 +6391,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// Resident capacity in slots. PAGED ONLY: what ONE REQUEST can hold — the pages
     /// it has been given. The pool is SHARED, so reporting it here would let a request
     /// run off its own pages into another's. ⚔ `None` IS "NO POOL": an UNPAGED bundle
-    /// has no pool fact to report (its former `num_blocks * 64` arm was a slots-per-block
-    /// number with no mint — a comment at the load, spelled here — whose only consumer
-    /// was a load-time log line; deriving a replacement just to print it would still be
-    /// an invented derivation, so the arm is deleted and the log says "unpaged").
+    /// has no pool fact to report.
     pub fn cap(&self) -> Option<i64> {
         self.kv.paged().map(|g| {
             let held = self.fold.block_tables.first().map_or(0, |t| t.len() as i64);

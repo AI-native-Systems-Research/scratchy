@@ -1199,9 +1199,7 @@ fn log_seat_readback(
     }
     // The f32 stick width — the launch's readback stride for the seat's f32 word
     // tables (inv_t): each row's word at its stick head. Derived from the
-    // format's own stick (the ladder's one derivation), never spelled here —
-    // stated here, at its only reader, because this fn is `spyre-hw`-gated and
-    // the module-scope spelling was dead in the emulator-only worker builds.
+    // format's own stick (the ladder's one derivation), never spelled here.
     const FP32_ELEMS_PER_STICK: usize =
         <scratchy_subtile::superdsc_opspec::Fp32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
             as usize;
