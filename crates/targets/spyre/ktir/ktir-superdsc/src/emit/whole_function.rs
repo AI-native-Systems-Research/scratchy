@@ -8371,14 +8371,28 @@ fn assign_frames(
     // statement, read here for the anchors and never re-derived.
     let (bcasts, _) = program_broadcast_chains(f)?;
     // ── THE NODE INDEX: every value the program names — every result, every operand, every
-    // argument, every carried name — except the broadcast results (not nodes: a sprayed result
-    // is held in no world). The index order is plumbing; every decision below is the program's
-    // own order.
+    // argument, every carried name — except the broadcast results (not nodes: a sprayed
+    // result is held in no world, so NO join may be stated through it). `sprayed` is
+    // stated FIRST, in its own pass over the program, and `node` skips every value in
+    // it: a spray never enters the index, so a join site that forgets the skip MISSES
+    // the index loudly rather than welding a class through a value held in no world —
+    // the skip is by construction, not by remembering. The index order is plumbing;
+    // every decision below is the program's own order.
     let mut index: std::collections::HashMap<Ssa, u32> = std::collections::HashMap::new();
     let mut sprayed: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
-    let mut node = |v: Ssa| -> u32 {
+    for o in deep.iter() {
+        if o.op_type == OpKind::LinalgBroadcast
+            && let Some(r) = o.result
+        {
+            sprayed.insert(r);
+        }
+    }
+    let mut node = |v: Ssa| {
+        if sprayed.contains(&v) {
+            return;
+        }
         let n = index.len() as u32;
-        *index.entry(v).or_insert(n)
+        index.entry(v).or_insert(n);
     };
     for (a, _) in f.arguments {
         node(*a);
@@ -8396,11 +8410,7 @@ fn assign_frames(
             node(v);
         }
         if let Some(r) = o.result {
-            if o.op_type == OpKind::LinalgBroadcast {
-                sprayed.insert(r);
-            } else {
-                node(r);
-            }
+            node(r);
         }
         if o.op_type == OpKind::ScfFor {
             if let Some(&Attr::Ssas(v)) = o.attr(AttrKey::IterArgs) {
@@ -8529,26 +8539,34 @@ fn assign_frames(
                     )
                     .map_err(as_err)?;
                 } else if let Some(&x) = o.operands.first() {
-                    uf.join(
-                        idx(res),
-                        idx(x),
-                        &format!(
-                            "{}: the leading fold `%{}` writes a tile of its operand's rows",
-                            f.name, res.0
-                        ),
-                    )
-                    .map_err(as_err)?;
+                    // A sprayed operand is held in no world — it states no class for the
+                    // fold. The fold's own anchors decide it.
+                    if !sprayed.contains(&x) {
+                        uf.join(
+                            idx(res),
+                            idx(x),
+                            &format!(
+                                "{}: the leading fold `%{}` writes a tile of its operand's rows",
+                                f.name, res.0
+                            ),
+                        )
+                        .map_err(as_err)?;
+                    }
                 }
             }
             // ── THE SHAPE OPS: no element moves ──
             FrameStatement::MovesNoElement => {
                 if let (Some(res), Some(&x)) = (res, o.operands.first()) {
-                    uf.join(
-                        idx(res),
-                        idx(x),
-                        &format!("{}: the shape op `%{}` moves no element", f.name, res.0),
-                    )
-                    .map_err(as_err)?;
+                    // A sprayed operand is held in no world — the spray states no class
+                    // for the shape op's result, however many elements it moves.
+                    if !sprayed.contains(&x) {
+                        uf.join(
+                            idx(res),
+                            idx(x),
+                            &format!("{}: the shape op `%{}` moves no element", f.name, res.0),
+                        )
+                        .map_err(as_err)?;
+                    }
                 }
             }
             // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs ──
@@ -12912,6 +12930,96 @@ mod frame_pass_tests {
                 .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "the shape-op chain keeps the frame of the value it re-shapes"
+        );
+    }
+
+    /// ⭐ A RESHAPE OF A SPRAY GETS NO WORLD THROUGH IT — a sprayed value names no frame,
+    /// so it states no equality for the ops that read it: the shape op that reshapes the
+    /// spray, and the leading fold that reduces it, join NOTHING through it, and whatever
+    /// class the spray's OTHER consumers anchor cannot reach the reshape's result across
+    /// a value held in no world. Here the same Col spray feeds a collapse (the reshape)
+    /// and a leading fold whose own class a second Col spray anchors Column — the fold
+    /// carries that anchor, the reshape stays on the row default. Measured red before
+    /// the spray stopped being a node: the collapse joined the spray's node and
+    /// inherited the fold's Column through it.
+    #[test]
+    fn a_reshape_of_a_spray_gets_no_world_through_it() {
+        let a: &'static Arena = Arena::global();
+        let (zero_, seed, src) = (Ssa(0), Ssa(1), Ssa(2));
+        let (exp, col, empty, spray) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let (rs, red) = (Ssa(7), Ssa(8));
+        let (exp2, col2, empty2, spray2) = (Ssa(9), Ssa(10), Ssa(11), Ssa(12));
+        let f = func_args(
+            a,
+            "reshape_of_spray",
+            vec![(src, &[1, 8, 4])],
+            vec![
+                zero(a, zero_),
+                tensor(a, seed, OpKind::TensorSplat, &[zero_], &[1, 8, 4]),
+                // The spray's own source chain, spelled as the softmax tail spells it —
+                // the trailing-axis spray `[1,8,4] → [1,8,4,64]` that anchors its
+                // source Column.
+                tensor(a, exp, OpKind::TensorExpandShape, &[src], &[1, 8, 4, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 8, 4, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(3)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[1, 8, 4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1, 8, 4]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(
+                    a,
+                    spray,
+                    OpKind::LinalgBroadcast,
+                    &[col, empty],
+                    &[1, 8, 4, 64],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[3])),
+                // THE RESHAPE OF THE SPRAY — the shape op under test.
+                tensor(a, rs, OpKind::TensorCollapseShape, &[spray], &[1, 8, 4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1, 8, 4]),
+                ),
+                // The SAME spray's other consumer: a leading fold of it, whose own class
+                // a second trailing spray anchors Column — the anchor the reshape must
+                // not inherit through the value they share.
+                fold_reduce(a, red, spray, seed, &[1, 8, 4], &[0]),
+                tensor(a, exp2, OpKind::TensorExpandShape, &[red], &[1, 8, 4, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 8, 4, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(3)),
+                tensor(a, col2, OpKind::TensorCollapseShape, &[exp2], &[1, 8, 4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1, 8, 4]),
+                ),
+                Operation::new(a, Some(empty2), OpKind::TensorEmpty, &[]),
+                tensor(
+                    a,
+                    spray2,
+                    OpKind::LinalgBroadcast,
+                    &[col2, empty2],
+                    &[1, 8, 4, 64],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[3])),
+            ],
+        );
+        let frames = assign_frames(&f, None).expect("the reshape states no contradiction");
+        assert_eq!(
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the fold of the spray carries the anchor its own trailing spray states"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, rs)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "a reshape of a spray gets no world through it — the row default, never the \
+             class another consumer anchored on the value they share"
         );
     }
 
