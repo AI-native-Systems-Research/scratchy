@@ -171,10 +171,24 @@ pub fn matmul_b_orientation(
     f: &IRFunction<'static>,
     op: &ktir_core::ir::Operation<'static>,
 ) -> Result<BOrient, Error> {
-    let maps = op.attributes.iter().find_map(|(k, v)| match (k, v) {
-        (AttrKey::IndexingMaps, Attr::AffineMapList(m)) => Some(*m),
+    // The maps as the matmul states them. NOT STATED is MLIR's own default (`is_plain_b` below
+    // reads it); stated in a form this proof does not read is refused by name, never treated as
+    // absent — the two are different facts about the op, and folding them would lower a matmul
+    // that tried to state its maps in the wrong form as the plain orientation from a clean bake.
+    let maps = match op.attributes.iter().find_map(|(k, v)| match k {
+        AttrKey::IndexingMaps => Some(v),
         _ => None,
-    });
+    }) {
+        None => None,
+        Some(Attr::AffineMapList(m)) => Some(*m),
+        Some(other) => {
+            return err(format!(
+                "{}: this `{:?}` states its `indexing_maps` in an unreadable form, as {other:?}, \
+                 not the affine map list the orientation proof reads",
+                f.name, op.op_type
+            ));
+        }
+    };
     // `[[d0,d2],[d1,d2],[d0,d1]]` — A row-major, B TRANSPOSED (its map ends in the reduction dim
     // d2), C row-major.
     let is_transpose_b = maps.is_some_and(|m| {
@@ -10995,6 +11009,37 @@ mod matmul_orientation_tests {
         assert!(
             e.message.contains("NEITHER") && e.message.contains("k == n"),
             "names that it is neither, and why an extent guard cannot catch it: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE UNREADABLE-FORM CONTROL: the attribute IS there, stated in a form this proof does
+    /// not read. Folding that into "not stated" would return `PlainB` from a clean bake for a
+    /// matmul that tried to state its maps — silently contracting the other way round, exactly
+    /// the defect the missing-attribute case's own comment warns about.
+    #[test]
+    fn maps_stated_in_an_unreadable_form_are_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let op = Operation::new(
+            a,
+            Some(Ssa(9)),
+            OpKind::LinalgMatmul,
+            &[Ssa(0), Ssa(1), Ssa(2)],
+        )
+        .with_attr(a, AttrKey::IndexingMaps, Attr::Int(0));
+        let f = IRFunction {
+            name: "mm_probe",
+            arguments: a.args(vec![]),
+            operations: a.ops(vec![op]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(f));
+        let op = &f.operations[0];
+        let e = matmul_b_orientation(f, op).expect_err("an unreadable form is not the default");
+        assert!(
+            e.message.contains("unreadable") && e.message.contains("indexing_maps"),
+            "names the attribute and that its form, not its absence, is the problem: {}",
             e.message
         );
     }
