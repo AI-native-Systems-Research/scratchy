@@ -498,13 +498,17 @@ pub fn lower<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
 /// (the `lower_all` rewrite, the one-op `lower`'s routing echo below, and the
 /// bake-time numeric gate's tail compare, which states the fold's last-row law
 /// against the golden) reads
-/// the SAME four conjuncts, because the width test alone was falsified by the
+/// the SAME five conjuncts, because the width test alone was falsified by the
 /// gemma-4 parity fixture (vocab 512), whose GLOBAL-layer q projection is ALSO
 /// 512 cols (4 heads × hd 128) — the fold fired on every global layer's Q, and
 /// the model's first sampled token was garbage while every width-128 tensor
 /// stayed fp16-clean. A width COLLISION is not an identity: only the tail's own
 /// rows are dead, and only the result's ancestors are the tail. The walk is
-/// [`tensor_feeds_result_through_row_local_ops`] (main's own law).
+/// [`tensor_feeds_result_through_row_local_ops`] (main's own law). The fifth
+/// conjunct names the fold's own product: a matmul whose activation is the
+/// beyond-the-graph `LAST_HIDDEN` staging is the fold's re-lowered half-2
+/// ALREADY — never a tail to fold (at m=1 the rows conjunct excluded it; at
+/// m=S the activation must).
 pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -557,6 +561,15 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     feeds_the_tail_product
         && rows > 1
         && !rows_are_requests
+        // ⭐ THE FOLD'S HALF-2 IS NEVER A TAIL TO FOLD — its activation is the
+        // reserved `LAST_HIDDEN` staging, a synthetic BEYOND the graph (an id
+        // past `ir.tensors`); a graph matmul's activation is always a graph
+        // tensor. At m=1 the rows conjunct alone excluded the half-2; at m=S
+        // this conjunct does, and no graph node changes side.
+        && node
+            .inputs
+            .first()
+            .is_some_and(|a| a.tensor.index() < ir.tensors.len())
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
 }
 
