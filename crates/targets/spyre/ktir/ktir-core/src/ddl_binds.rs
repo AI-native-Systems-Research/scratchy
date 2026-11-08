@@ -57,12 +57,13 @@
 //! ⛔ ROW COVERAGE IS A COMPILE-TIME FACT, NOT A TEST. Each generation's
 //! table is `[DeviceOpRow; DEVICE_OP_COUNT]`, indexed by `op as usize` over
 //! the SAME macro token list the enum and [`DeviceOp::ALL`] are generated
-//! from, and a const assert pins entry `i`'s key to `ALL[i]`. A missing row
-//! (short array), a duplicate (two entries naming one op — the assert fails
-//! the first index the keys disagree at), or an op added to the enum without
-//! its row is a BUILD ERROR, so the lookups below answer by indexing, never
-//! by searching an `Option` out of a slice. An op a generation does not bind
-//! is a row with `dfs: &[]` — EMPTY, stated, not absent.
+//! from, and the TRAIT'S OWN consts pin the table's laws for EVERY
+//! generation: key order (entry `i` names `ALL[i]`) and `admitted ⊆ dfs`.
+//! A missing row (short array), a duplicate (two entries naming one op), or
+//! an op added to the enum without its row is a BUILD ERROR, so the lookups
+//! below answer by indexing, never by searching an `Option` out of a slice.
+//! An op a generation does not bind is a row with `dfs: &[]` — EMPTY,
+//! stated, not absent.
 
 /// A data format a DDL `operation_bind` lists. The doors lower in these
 /// only; every other `superdsc_opspec`-style format is refused by the door
@@ -265,7 +266,7 @@ pub struct DeviceOpRow {
     /// admission without a bind is impossible by construction. The
     /// RED-stop (`legalize_types`) reads THIS field, never `dfs`, so "what
     /// the card binds" and "what the ladder lets through" are both table
-    /// reads, never a match arm at a reader (#1158 review finding 5).
+    /// reads, never a match arm at a reader.
     pub admitted: &'static [DdlDf],
     /// The output arrangement the op carries at standard addressing.
     pub arrangement: ElementArrangement,
@@ -299,12 +300,65 @@ pub trait DeviceGen {
     ///
     /// ⛔ THE ARRAY IS THE LAW: `[DeviceOpRow; DEVICE_OP_COUNT]`, one entry
     /// per variant of [`DeviceOp`], IN [`DeviceOp::ALL`] ORDER, indexed by
-    /// `op as usize` — never searched. The impl MUST be pinned by the
-    /// key-order const assert beside it (see Gen1's), so a missing,
-    /// duplicated, or misplaced row is a compile error rather than a
-    /// runtime `None` a caller has to refuse. An op this generation does
-    /// not bind is a row with `dfs: &[]`, never an absent row.
+    /// `op as usize` — never searched. The pin is the trait's own
+    /// [`Self::KEY_ORDER_PINNED`] const below, so a missing, duplicated, or
+    /// misplaced row is a compile error for EVERY impl of this trait, never
+    /// a per-impl assert to remember and never a runtime `None` a caller
+    /// has to refuse. An op this generation does not bind is a row with
+    /// `dfs: &[]`, never an absent row.
     const DEVICE_OPS: [DeviceOpRow; DEVICE_OP_COUNT];
+    /// ⛔ THE KEY-ORDER PIN, EVERY GENERATION'S — the compile-time half of
+    /// the table's law, stated ONCE here over [`Self::DEVICE_OPS`]: entry
+    /// `i` MUST state the row for `DeviceOp::ALL[i]`, the variant list the
+    /// same macro token list generates as the enum itself. A row named for
+    /// the wrong op (the duplicate-shadowing case), a missing row (a short
+    /// array cannot compile), or a variant added without its row is a BUILD
+    /// ERROR — the readers ([`row`] and its twins) read this const, so every
+    /// generation is pinned the moment anything asks it, not only the one
+    /// whose assert was copied.
+    const KEY_ORDER_PINNED: () = {
+        let mut i = 0;
+        while i < DEVICE_OP_COUNT {
+            assert!(
+                Self::DEVICE_OPS[i].op as usize == i,
+                "a device-facts table entry does not name its own ALL-order op — rows are indexed by op, never searched"
+            );
+            i += 1;
+        }
+    };
+    /// ⛔ `admitted ⊆ dfs`, EVERY GENERATION'S ROWS — admission is policy
+    /// and may only NARROW a bind (the fp32 log: bound, not admitted,
+    /// pending a card cell); an admission without a bind would let the
+    /// ladder ask the card for an op at a format it was never asked to
+    /// compute. Stated once here, over [`Self::DEVICE_OPS`], and read by
+    /// the readers beside the key-order pin — a compile error on any impl,
+    /// never a runtime test.
+    const ADMISSION_NARROWS_ONLY: () = {
+        let mut i = 0;
+        while i < DEVICE_OP_COUNT {
+            let mut a = 0;
+            while a < Self::DEVICE_OPS[i].admitted.len() {
+                let admitted = Self::DEVICE_OPS[i].admitted[a];
+                let mut d = 0;
+                let mut bound = false;
+                while d < Self::DEVICE_OPS[i].dfs.len() {
+                    if matches!(
+                        (Self::DEVICE_OPS[i].dfs[d], admitted),
+                        (DdlDf::Fp16, DdlDf::Fp16) | (DdlDf::Fp32, DdlDf::Fp32)
+                    ) {
+                        bound = true;
+                    }
+                    d += 1;
+                }
+                assert!(
+                    bound,
+                    "an admitted format is not bound — admission may never widen a bind"
+                );
+                a += 1;
+            }
+            i += 1;
+        }
+    };
     /// The card's compute cores — the count every work plan caps at (one
     /// entry per core on the gather's index stick; `MaxCores` in the work
     /// planner). The frontend's default core count is the SAME fact.
@@ -506,7 +560,7 @@ impl DeviceGen for Gen1 {
             op: DeviceOp::Log,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             // ⭐ THE ONE ROW WHERE ADMISSION NARROWS THE BIND — the policy,
-            // stated as the row's own data (#1158 review finding 5): the
+            // stated as the row's own data: the
             // fp32 PARALLEL bind exists (unary_parallel.ddl:40) but no card
             // cell has admitted it, and main refused f32 log. A card cell
             // that measures the parallel form widens THIS field, never dfs.
@@ -708,25 +762,6 @@ impl DeviceGen for Gen1 {
     const DL16TOFP32_PERMUTATION: [u8; 64] = dl16tofp32_permutation();
 }
 
-/// ⛔ GEN1'S KEY-ORDER PIN — the compile-time half of the table's law: entry
-/// `i` of [`Gen1`]'s array MUST state the row for `DeviceOp::ALL[i]`, the
-/// variant list the same macro token list generates as the enum itself. A
-/// row named for the wrong op (the duplicate-shadowing case), a missing row
-/// (a short array cannot compile), or a variant added without its row (the
-/// array length and this assert both move) is a BUILD ERROR here — the
-/// runtime uniqueness/completeness tests this replaces could only fail
-/// after the build had already shipped the wrong table.
-const _: () = {
-    let mut i = 0;
-    while i < DEVICE_OP_COUNT {
-        assert!(
-            Gen1::DEVICE_OPS[i].op as usize == i,
-            "Gen1's device-facts table entry does not name its own ALL-order op — rows are indexed by op, never searched"
-        );
-        i += 1;
-    }
-};
-
 /// The const constructor behind Gen1's
 /// [`DL16TOFP32_PERMUTATION`](DeviceGen::DL16TOFP32_PERMUTATION) — evaluated
 /// at compile time, so the table on disk IS the formula (the right rotation
@@ -749,9 +784,14 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
 
 /// The row stating `op`'s facts on generation `G` — BY INDEX, never by
 /// search: the array is one entry per variant in [`DeviceOp::ALL`] order
-/// (pinned by each impl's key-order const assert), so every op the enum
-/// names has exactly one row by construction and this cannot miss.
+/// (pinned by the trait's key-order const), so every op the enum names has
+/// exactly one row by construction and this cannot miss. The two table
+/// laws — key order and `admitted ⊆ dfs` — are read HERE, at the one door
+/// every reader goes through, so a generation is pinned the moment
+/// anything asks it.
 pub fn row<G: DeviceGen>(op: DeviceOp) -> &'static DeviceOpRow {
+    let () = G::KEY_ORDER_PINNED;
+    let () = G::ADMISSION_NARROWS_ONLY;
     &G::DEVICE_OPS[op as usize]
 }
 
@@ -814,21 +854,14 @@ mod tests {
         );
     }
 
-    /// ⛔ ADMISSION NEVER WIDENS A BIND — `admitted ⊆ dfs` for EVERY row, so
-    /// the policy half of the table cannot silently let an op through at a
-    /// format the card does not bind. The fp32 log is the one row (today)
-    /// where the inclusion is strict.
+    /// The fp32 log is the one row (today) where admission NARROWS the bind.
+    /// The inclusion law itself (`admitted ⊆ dfs`, every row, every
+    /// generation) is the trait's own const — a build error — so this test
+    /// states Gen1's POLICY datum alone.
     #[test]
-    fn admission_never_widens_a_bind() {
+    fn the_fp32_log_is_the_one_narrowed_admission() {
         let mut strict = 0;
         for r in Gen1::DEVICE_OPS {
-            for df in r.admitted {
-                assert!(
-                    r.dfs.contains(df),
-                    "{:?} admits a format it does not bind",
-                    r.op
-                );
-            }
             strict += (r.admitted.len() < r.dfs.len()) as usize;
         }
         assert_eq!(strict, 1, "the fp32 log is the one narrowed admission");
