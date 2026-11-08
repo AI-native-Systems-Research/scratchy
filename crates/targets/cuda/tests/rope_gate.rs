@@ -1171,3 +1171,175 @@ fn the_one_row_rope_times_are_recorded() {
         eprintln!("{line}");
     }
 }
+
+/// GateApply over `(rows, cols)`; the output's first `cols` and whether the tail held.
+fn run_apply_at(
+    device: &CudaDevice,
+    (a, g): (&[u16], &[u16]),
+    (rows, cols): (usize, usize),
+) -> (Vec<u16>, bool) {
+    let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+    let (ab, gb) = (up(a), up(g));
+    let out = output(device, a.len());
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `a`, `g` and `out` hold rows·cols bf16;
+    // `out` is its own allocation; null is the default stream.
+    unsafe {
+        gate_apply_bf16(
+            ab.ptr(),
+            gb.ptr(),
+            out.ptr(),
+            (rows as u32, cols as u32),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("gate_apply_bf16 launch");
+    let (all, tail) = result(&out, a.len());
+    (all[..cols].to_vec(), tail)
+}
+
+/// GateSplit of `qg` (`[rows, 2 · half_cols]`); its two outputs' first `half_cols`, and whether
+/// both tails held.
+fn run_split_at(
+    device: &CudaDevice,
+    qg: &[u16],
+    (rows, half_cols): (usize, usize),
+) -> (Vec<u16>, Vec<u16>, bool) {
+    let qgb = DeviceBuffer::upload(device, qg).expect("upload qg");
+    let (q, gate) = (
+        output(device, rows * half_cols),
+        output(device, rows * half_cols),
+    );
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `qg` holds rows·2·half_cols bf16, `q` and
+    // `gate` rows·half_cols each, their own allocations; null is the default stream.
+    unsafe {
+        gate_split_bf16(
+            qgb.ptr(),
+            q.ptr(),
+            gate.ptr(),
+            (rows as u32, half_cols as u32),
+            HD,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("gate_split_bf16 launch");
+    let ((qa, qt), (ga, gt)) = (
+        result(&q, rows * half_cols),
+        result(&gate, rows * half_cols),
+    );
+    (qa[..half_cols].to_vec(), ga[..half_cols].to_vec(), qt && gt)
+}
+
+/// FP8 S8 W1: at `rows == 1` GateApply (one CTA per 4 column tiles) and GateSplit (one CTA per
+/// head) take their one-row form, and the row is the 16-row kernel's bits, as row 0 of a 16-row
+/// and a 2-row launch. GateApply at the 27B's 6,144 and 4,096 wide and 2,112 (a partial last
+/// tile group), gates random and at ±88 and ±inf; GateSplit at the 27B's 24 heads and the 35B's
+/// 16. 3 seeds each.
+#[test]
+fn the_one_row_gates_are_the_16_row_gates_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for cols in [6144usize, 4096, 2112] {
+        for seed in 0..3u64 {
+            let a = bf16_inputs(cols, 0x0E41_0000 ^ (cols as u64) << 4 ^ seed);
+            let mut g = bf16_inputs(cols, 0x0E42_0000 ^ (cols as u64) << 4 ^ seed);
+            for (i, v) in [88.0f32, -88.0, f32::INFINITY, f32::NEG_INFINITY]
+                .into_iter()
+                .enumerate()
+            {
+                g[i] = bits(v);
+            }
+            let (one, t1) = run_apply_at(&device, (&a, &g), (1, cols));
+            let mut ok = t1;
+            let mut line = String::new();
+            for rows in [16usize, 2] {
+                let (want, t) = run_apply_at(
+                    &device,
+                    (&as_row0(&a, rows), &as_row0(&g, rows)),
+                    (rows, cols),
+                );
+                let m = mismatched_bits(&one, &want);
+                line += &format!(" vs rows={rows} mismatched_bits={m}");
+                ok &= t && m == 0;
+            }
+            eprintln!(
+                "one-row gate_apply cols={cols} seed={seed}:{line} tail_intact={t1} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    for heads in [24usize, 16] {
+        let half = heads * HD as usize;
+        for seed in 0..3u64 {
+            let qg = bf16_inputs(2 * half, 0x0E43_0000 ^ (heads as u64) << 4 ^ seed);
+            let (q1, g1, t1) = run_split_at(&device, &qg, (1, half));
+            let mut ok = t1;
+            let mut line = String::new();
+            for rows in [16usize, 2] {
+                let (q, g, t) = run_split_at(&device, &as_row0(&qg, rows), (rows, half));
+                let m = mismatched_bits(&q1, &q) + mismatched_bits(&g1, &g);
+                line += &format!(" vs rows={rows} mismatched_bits={m}");
+                ok &= t && m == 0;
+            }
+            eprintln!(
+                "one-row gate_split heads={heads} seed={seed}:{line} tails_intact={t1} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "a one-row gate differs from the 16-row gate");
+}
+
+/// Recorded, not asserted: µs per launch of GateApply (the 27B's 6,144) and GateSplit (its 24
+/// heads) at `rows == 1` (the one-row form) and `rows == 2` (today's kernel on one CTA), hot.
+#[test]
+fn the_one_row_gate_times_are_recorded() {
+    let device = h100();
+    let null = std::ptr::null_mut();
+    let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+    let cols = 6144usize;
+    let (ab, gb) = (
+        up(&bf16_inputs(2 * cols, 0x0E44_0000)),
+        up(&bf16_inputs(2 * cols, 0x0E45_0000)),
+    );
+    let out = output(&device, 2 * cols);
+    let mut line = format!("gate time gate_apply cols={cols}:");
+    for rows in [1u32, 2] {
+        let us = event_median(|| {
+            // SAFETY: as `run_apply_at`'s; every buffer holds 2 rows.
+            unsafe { gate_apply_bf16(ab.ptr(), gb.ptr(), out.ptr(), (rows, cols as u32), null) }
+                .expect("a timed gate_apply launch");
+        });
+        line += &format!(
+            " rows={rows} ({}) {us:.2} us;",
+            if rows == 1 { "one-row" } else { "16-row" }
+        );
+    }
+    eprintln!("{line}");
+    let half = 24 * HD as usize;
+    let qgb = up(&bf16_inputs(2 * 2 * half, 0x0E46_0000));
+    let (q, gate) = (output(&device, 2 * half), output(&device, 2 * half));
+    let mut line = "gate time gate_split heads=24:".to_string();
+    for rows in [1u32, 2] {
+        let us = event_median(|| {
+            // SAFETY: as `run_split_at`'s; every buffer holds 2 rows.
+            unsafe {
+                gate_split_bf16(
+                    qgb.ptr(),
+                    q.ptr(),
+                    gate.ptr(),
+                    (rows, half as u32),
+                    HD,
+                    null,
+                )
+            }
+            .expect("a timed gate_split launch");
+        });
+        line += &format!(
+            " rows={rows} ({}) {us:.2} us;",
+            if rows == 1 { "one-row" } else { "16-row" }
+        );
+    }
+    eprintln!("{line}");
+}

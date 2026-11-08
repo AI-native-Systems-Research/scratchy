@@ -2595,3 +2595,85 @@ fn the_one_row_combine_times_are_recorded() {
         eprintln!("{line}");
     }
 }
+
+/// FP8 S8 W1: at `rows == 1` the gate scale takes its one-row form (one CTA per 4 column tiles),
+/// and the row is the 16-row kernel's bits, as row 0 of a 16-row and a 2-row launch: at the 35B's
+/// 2,048, the row gate at -88, 0, 88 and random, 3 seeds.
+#[test]
+fn the_one_row_gate_scale_is_the_16_row_gate_scale_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let cols = HIDDEN;
+    for gate in [Some(-88.0f32), Some(0.0), Some(88.0), None] {
+        for seed in 0..3u64 {
+            let routed = bf16_inputs(cols, 0x0E51_0000 ^ seed);
+            let shared = bf16_inputs(cols, 0x0E52_0000 ^ seed);
+            let g = vec![gate.map_or_else(|| bf16_inputs(1, 0x0E53_0000 ^ seed)[0], bits)];
+            let row0 = |v: &[u16], rows: usize, width: usize| {
+                let mut x = v.to_vec();
+                x.resize(rows * width, 0);
+                x
+            };
+            let (one, t1) = run_gate_scale(&device, (&routed, &shared, &g), (1, cols));
+            let mut ok = t1;
+            let mut line = String::new();
+            for rows in [16usize, 2] {
+                let (want, t) = run_gate_scale(
+                    &device,
+                    (
+                        &row0(&routed, rows, cols),
+                        &row0(&shared, rows, cols),
+                        &row0(&g, rows, 1),
+                    ),
+                    (rows, cols),
+                );
+                let m = mismatched_bits(&one, &want[..cols]);
+                line += &format!(" vs rows={rows} mismatched_bits={m}");
+                ok &= t && m == 0;
+            }
+            eprintln!(
+                "one-row gate_scale cols={cols} g={gate:?} seed={seed}:{line} tail_intact={t1} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "a one-row gate scale differs from the 16-row gate scale"
+    );
+}
+
+/// Recorded, not asserted: µs per launch of the gate scale at the 35B's 2,048, `rows == 1` (the
+/// one-row form) and `rows == 2` (today's kernel on one CTA), hot.
+#[test]
+fn the_one_row_gate_scale_times_are_recorded() {
+    let device = h100();
+    let cols = HIDDEN;
+    let (rb, sb) = (
+        up(&device, &bf16_inputs(2 * cols, 0x0E54_0000)),
+        up(&device, &bf16_inputs(2 * cols, 0x0E55_0000)),
+    );
+    let gb = up(&device, &[bits(0.5); 8]);
+    let out = up(&device, &vec![SENTINEL; 2 * cols]);
+    let mut line = format!("gate_scale time cols={cols}:");
+    for rows in [1u32, 2] {
+        let us = event_median(|| {
+            // SAFETY: as `run_gate_scale`'s; `routed`, `shared`, `out` hold 2 rows, `g` 8.
+            unsafe {
+                gate_scale_bf16(
+                    (rb.ptr(), sb.ptr(), gb.ptr()),
+                    out.ptr(),
+                    (rows, cols as u32),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("a timed gate_scale launch");
+        });
+        line += &format!(
+            " rows={rows} ({}) {us:.2} us;",
+            if rows == 1 { "one-row" } else { "16-row" }
+        );
+    }
+    eprintln!("{line}");
+}

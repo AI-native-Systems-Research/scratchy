@@ -23,6 +23,10 @@
 // Shared memory: 2 stages × 2 tiles × 8 KiB, plus 1,024 bytes of alignment slack = 33,792 bytes of
 // dynamic shared memory, under the 48 KiB default, so its one-time setup (`_prepare`, in `PREPARE`)
 // only loads it.
+//
+// THE ONE-ROW FORM (FP8 S8 W1): at `rows == 1` (every decode step) the one warp walks every head.
+// The launcher then launches the `ONE_ROW` instance on `heads` CTAs, CTA `h` copying head `h`
+// alone with today's per-head code. A copy, bit for bit either way. Chosen from `rows`.
 
 #include "kittens.cuh"
 
@@ -60,6 +64,7 @@ static_assert(SMEM_TILES == 32768, "2 stages x 2 tiles x 8 KiB");
 constexpr int SPLIT_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(SPLIT_SMEM_BYTES <= 48 * 1024, "under the default dynamic shared memory limit");
 
+template <bool ONE_ROW>
 __global__ __launch_bounds__(NUM_THREADS, 1) void gate_split_bf16_ker(const __grid_constant__ split_globals g) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
@@ -67,7 +72,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gate_split_bf16_ker(const __gr
     tile(&g_smem)[STAGES] = al.allocate<tile, STAGES>();
     __shared__ kittens::semaphore arrived[STAGES];
 
-    const int row_block = blockIdx.x;
+    // Under `ONE_ROW` the one row block is every CTA's, and CTA `h` copies head `h` alone.
+    const int row_block = ONE_ROW ? 0 : int(blockIdx.x);
+    const int first = ONE_ROW ? int(blockIdx.x) : 0;
+    const int heads = ONE_ROW ? 1 : g.heads;
     if (warp::laneid() == 0) {
         for (int s = 0; s < STAGES; s++) {
             init_semaphore(arrived[s], 0, 1);
@@ -76,8 +84,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gate_split_bf16_ker(const __gr
     __syncwarp();
 
     // Head `h`'s query and gate tiles into stage `h % 2`.
-    auto issue = [&](int h) {
-        const int stage = h % STAGES;
+    // The walk's `k`-th head, head `first + k`, into stage `k % STAGES`.
+    auto issue = [&](int k) {
+        const int stage = k % STAGES, h = first + k;
         warp::tma::expect_bytes(arrived[stage], 2 * sizeof(tile));
         warp::tma::load_async(q_smem[stage], g.qg, coord<tile>{0, 0, row_block, 2 * h},
                               arrived[stage]);
@@ -85,16 +94,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gate_split_bf16_ker(const __gr
                               arrived[stage]);
     };
     issue(0);
-    for (int h = 0; h < g.heads; h++) {
-        const int stage = h % STAGES;
+    for (int k = 0; k < heads; k++) {
+        const int stage = k % STAGES, h = first + k;
         // The other stage's previous stores must have read its tiles before the next loads
         // overwrite them.
         warp::tma::store_async_read_wait();
         __syncwarp();
-        if (h + 1 < g.heads) {
-            issue(h + 1);
+        if (k + 1 < heads) {
+            issue(k + 1);
         }
-        wait(arrived[stage], (h / STAGES) % 2);
+        wait(arrived[stage], (k / STAGES) % 2);
         coord<tile> at = {0, 0, row_block, h};
         warp::tma::store_async(g.q, q_smem[stage], at);
         warp::tma::store_async(g.gate, g_smem[stage], at);
@@ -111,8 +120,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gate_split_bf16_ker(const __gr
 // 0 = done; any other value = the cudaError_t of the first query that failed.
 extern "C" int scratchy_cuda_gate_split_bf16_prepare(void) {
     cudaFuncAttributes attr;
-    if (const cudaError_t e = cudaFuncGetAttributes(&attr, gate_split_bf16_ker); e != cudaSuccess) {
-        return static_cast<int>(e);
+    for (auto ker : {gate_split_bf16_ker<false>, gate_split_bf16_ker<true>}) {
+        if (const cudaError_t e = cudaFuncGetAttributes(&attr, ker); e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
     }
     return 0;
 }
@@ -149,10 +160,15 @@ extern "C" int scratchy_cuda_gate_split_bf16(const void* qg, void* q, void* gate
         row_gl ggl{gp, nullptr, nullptr, size_t(rows), size_t(half_cols)};
         split_globals G{qgg, qgl, ggl, int(half_cols / head_dim)};
         void* args[] = {&G};
+        const cudaStream_t s = static_cast<cudaStream_t>(stream);
+        if (rows == 1) {
+            const dim3 grid{uint32_t(G.heads)}, block{uint32_t(NUM_THREADS)};
+            return static_cast<int>(cudaLaunchKernel(gate_split_bf16_ker<true>, grid, block, args,
+                                                     SPLIT_SMEM_BYTES, s));
+        }
         const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(gate_split_bf16_ker, grid, block, args,
-                                                 SPLIT_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
+        return static_cast<int>(cudaLaunchKernel(gate_split_bf16_ker<false>, grid, block, args,
+                                                 SPLIT_SMEM_BYTES, s));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
