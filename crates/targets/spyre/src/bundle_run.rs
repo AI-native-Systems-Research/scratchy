@@ -664,7 +664,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
                     );
                 }
                 let cols = elems / rows;
-                if rows > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as usize) {
+                if rows > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as u64) {
                     bail!(
                         "stick:t{tid}={rows}: {cols} columns is not a whole number of \
                          {FP16_ELEMS_PER_STICK}-lane sticks, so the stick-major map would leave holes \
@@ -673,7 +673,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
                 }
                 Ok((rows > 1).then_some((rows as usize, cols as usize)))
             }
-            None if elems > FP16_ELEMS_PER_STICK as usize => bail!(
+            None if elems > FP16_ELEMS_PER_STICK as u64 => bail!(
                 "t{tid} ({what}) spans {elems} fp16 elements — more than one \
                  {FP16_ELEMS_PER_STICK}-lane stick — and no \
                  `stick:t{tid}=<rows>` states the row count the descriptors address it with. The device \
@@ -934,7 +934,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
                     bail!("synth:{name}@{r}: {elems} fp16 elements do not divide into {r} rows");
                 }
                 let cols = elems / *r;
-                if *r > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as usize) {
+                if *r > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as u64) {
                     bail!(
                         "synth:{name}@{r}: {cols} columns is not a whole number of \
                          {FP16_ELEMS_PER_STICK}-lane sticks"
@@ -946,7 +946,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
                     ieee
                 }
             }
-            None if elems > FP16_ELEMS_PER_STICK as usize => bail!(
+            None if elems > FP16_ELEMS_PER_STICK as u64 => bail!(
                 "synth:{name} spans {elems} fp16 elements — more than one \
                  {FP16_ELEMS_PER_STICK}-lane stick — and no \
                  `synth:{name}@<rows>=<path>` states the row count the descriptors address it with. \
