@@ -97,7 +97,7 @@ fn the_flat_read_past_the_first_stick_is_phantom_validity() {
     .expect("nonzero heads");
     let hist = KvHistory::contiguous(p);
     let buf = decode_batch_prefix_mask_f16(shape, one_request_fold(p as u32), &[hist], MASK_NEG);
-    let rows = (nqh * 1) as usize; // mq = 1: one request, `nqh` head rows
+    let rows = nqh as usize; // mq = 1: one request, `nqh` head rows
     for c in 64..rows * 64 {
         // Flat column `c` is head row `c/64`'s slot `c%64` of stick 0: the head row's own
         // validity, so it is VALID (0.0) wherever `c%64 < p`, exactly where the broadcast law
