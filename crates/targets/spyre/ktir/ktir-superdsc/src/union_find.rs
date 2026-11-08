@@ -48,6 +48,8 @@ use std::fmt::Debug;
 /// The solve's own refusals — the only ways a stated constraint set can be
 /// inconsistent. Typed facts, worded once by the [`std::fmt::Display`] impl; the
 /// caller adapts that wording into its own error (the frame pass's one adapter).
+/// `Debug` is derived for `unwrap` in tests, not as a second wording.
+#[derive(Debug)]
 pub enum Refusal<A> {
     /// A join would weld two differently-anchored classes into one — the one join
     /// states two absolutes for one class. Names the op that stated EACH anchor.
