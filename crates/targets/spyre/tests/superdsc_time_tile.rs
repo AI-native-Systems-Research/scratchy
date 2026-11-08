@@ -269,7 +269,8 @@ fn reduce_and_multiop_invariants() {
          rmxn+rmg tail (5 → 4)"
     );
     assert!(
-        ops.iter().all(|o| o.op_name != "rmxn_g" && o.op_name != "rmg_g"),
+        ops.iter()
+            .all(|o| o.op_name != "rmxn_g" && o.op_name != "rmg_g"),
         "the two tail multiplies are GONE — `x·rinv·γ` is one layernormnorm"
     );
     assert!(
