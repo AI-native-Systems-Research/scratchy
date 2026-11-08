@@ -8177,8 +8177,8 @@ impl<'d> Defs<'d> {
                 // result never takes another carry's shape, and a carry that states no shape
                 // leaves its result unstated too — never a made-up `[]`.
                 if let Some(&r) = results.get(i) {
-                    if let Some(d) = shape.get(&arg) {
-                        shape.entry(r).or_insert(d.clone());
+                    if let Some(d) = shape.get(&arg).cloned() {
+                        shape.entry(r).or_insert(d);
                     }
                 }
             }
