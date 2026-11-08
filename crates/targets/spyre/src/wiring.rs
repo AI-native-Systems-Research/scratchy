@@ -21,7 +21,7 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
-use crate::lower_subtile_tape_to_superdsc::{DeviceWidth, row_footprint_bytes};
+use crate::lower_subtile_tape_to_superdsc::row_footprint_bytes;
 pub use ktir_superdsc::element_arrangement::{
     DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
@@ -1429,8 +1429,9 @@ const _: () = assert!(
 
 /// ⭐⭐⭐ THE GATE TABLE'S β IMAGE — the ONE `[rows, 1]` table whose chain crosses the
 /// i32→f32 convert, staged at the convert's own device sweep (front-b-noise, auditor
-/// ruling 2026-10-27). The table's reservation is [`gate_row_stride_bytes`] (two u32
-/// sticks per row), and the convert's `[rows, 64]` addressing over it is STICK-BLOCKED —
+/// ruling 2026-10-27). The table's reservation is the convert's own device width —
+/// `DeviceWidth::for_convert(1)` bytes, two u32 sticks per row — and the convert's
+/// `[rows, 64]` addressing over it is STICK-BLOCKED —
 /// row r's first stick is flat stick `r`, its second flat stick `rows + r` — so the image
 /// is the one-stick head staging (row r's gate at byte `r · 128`, the SAME head
 /// [`stage_col_stick_heads`] ever wrote, the Col operand mode's own address) followed by
@@ -1438,7 +1439,7 @@ const _: () = assert!(
 /// zero-filled reservation is deterministic — no uninitialized tail for the sweep to
 /// consume. `head_stride` is the seed words' own one-stick stride
 /// ([`col_row_stride_bytes`]); `sweep_stride` is the gate's own reservation
-/// ([`gate_row_stride_bytes`]) — both passed in so this fn stages LAWS, never
+/// (the seat's `gate_row_words`) — both passed in so this fn stages LAWS, never
 /// recomputations.
 pub fn stage_gate_sweep<const N: usize>(
     rows: usize,
@@ -1454,15 +1455,6 @@ pub fn stage_gate_sweep<const N: usize>(
     let mut out = stage_col_stick_heads::<N>(rows, head_stride, elem);
     out.resize(rows * sweep_stride, 0);
     out
-}
-
-/// ⭐ THE GATE TABLE'S OWN ROW RESERVATION — `DeviceWidth::for_convert(1)` in i32 words
-/// (64 = two u32 sticks, 256 B), the SAME one decision the convert door sweeps, the
-/// whole-function mint reserves, and the layout's `nbytes` places — stated here so the
-/// worker's per-row write and the placement's reservation cannot drift, exactly
-/// [`col_row_stride_bytes`]'s own contract for the one-stick tables.
-pub fn gate_row_stride_bytes() -> usize {
-    DeviceWidth::for_convert(1).get() as usize * 4
 }
 
 /// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
@@ -1518,6 +1510,17 @@ pub struct SampleSeat {
     pub vocab: u32,
     /// `sample_pad_vocab(vocab)` — the width the f32 tables share.
     pub pad_vocab: u32,
+    /// ⭐ THE IDX STICK'S OWN ROW SIZE in i32 words — the readback's typed
+    /// byte law. The mint re-points the rung's result at the draw's idx
+    /// stick, a `[rows, SAMPLE_BLOCK]` SenUint32 placement, and this is that
+    /// stick's own PLACED WIDTH in words (one u32 word per element — not the
+    /// `row_footprint_bytes` reservation, whose occupancy pad is a
+    /// weight-streaming fact the readback never reads): the worker's
+    /// readback reads `rows · idx_row_words · 4` bytes of it and addresses
+    /// row r's lane 0 at the stick's own placed width — never a recomputed
+    /// `64 · 4`. Minted once at the bake ([`sample_seat_of_ir`]), exactly
+    /// `seed_row_words`'s own contract.
+    pub idx_row_words: u32,
     /// Every seed word table's ROW STRIDE in i32 words on the CARD — the
     /// placement's own reservation law for a `[rows, 1]` SenUint32 table
     /// (`row_footprint_bytes(1, SenUint32) / 4`, a whole 32-element u32
@@ -1536,9 +1539,8 @@ pub struct SampleSeat {
     /// law ever stated, because the convert's `[rows, 64]` addressing is
     /// stick-blocked (row r's first stick is flat stick `r`) — and the
     /// widened words past the head are the sweep's own padding: converted,
-    /// never read. Staged by [`stage_gate_sweep`]; the worker checks it
-    /// against [`gate_row_stride_bytes`] the same way `seed_row_words` is
-    /// checked against [`col_row_stride_bytes`].
+    /// never read. Staged by [`stage_gate_sweep`] — the worker stages at
+    /// this stride directly, the seat's own fact.
     pub gate_row_words: u32,
 }
 

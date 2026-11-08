@@ -2202,6 +2202,17 @@ pub fn sample_seat_of_ir<F: RopeForm>(
             // layout's `nbytes` reserves and the door sweeps, stated here on the
             // seat so the worker's staging and the placement cannot drift.
             let gate_row_words = DeviceWidth::for_convert(1).get();
+            // ⭐ THE IDX STICK'S OWN ROW SIZE — the readback's typed byte law.
+            // The mint re-points the rung's result at the Sample node's own
+            // output, the `[rows, SAMPLE_BLOCK]` SenUint32 idx stick, and the
+            // readback reads that stick's own PLACED ROW: one u32 word per
+            // element, so the seat states the placed width itself in words —
+            // the worker's readback size and its per-row addressing both read
+            // this one fact, never a recomputed `64 · 4`. (NOT
+            // `row_footprint_bytes`: the footprint's occupancy pad is a
+            // WEIGHT-STREAMING reservation — the readback reads the placed
+            // row, never the pad, so the two deliberately differ.)
+            let idx_row_words = ir.tensors[node.output.tensor.index()].cols;
             Ok(Some(crate::wiring::SampleSeat {
                 seed_words,
                 invt: node.inputs[5].tensor.index() as u32,
@@ -2214,6 +2225,7 @@ pub fn sample_seat_of_ir<F: RopeForm>(
                 pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
                 seed_row_words,
                 gate_row_words,
+                idx_row_words,
             }))
         }
     }
