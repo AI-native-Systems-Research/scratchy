@@ -70,7 +70,7 @@ pub fn run<G: ddl_binds::DeviceGen>(module: &mut Module) -> Result<()> {
     step_2_collapse_island(module, &protected);
     step_2b_island_constants(module, &protected);
     step_3_remove_truncf(module);
-    red_stop_on_genuine_f32(module, &protected)
+    red_stop_on_genuine_f32::<G>(module, &protected)
 }
 
 /// ⭐ THE f32 VALUES THAT REACH AN `arith.fptosi` — the exactness island, PROTECTED.
@@ -484,7 +484,12 @@ fn step_3_remove_truncf(module: &mut Module) {
 /// cited to the vendor DDL template and line it was read from -- never match arms,
 /// never an inference: an opcode absent from the table is UNBOUND at fp32, and the
 /// refusal stands (fail-closed).
-fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<()> {
+/// The RED-stop's consult is generation-generic like its caller — `G`
+/// threads from `run`, which the bake's entry instantiates.
+fn red_stop_on_genuine_f32<G: ddl_binds::DeviceGen>(
+    module: &Module,
+    protected: &HashSet<Ssa>,
+) -> Result<()> {
     // The operand-element-type half of the binding key: `type_of` covers every
     // def and block arg, so the gate can ask what an f32 result was fed.
     let index = module.def_index();
@@ -646,7 +651,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m).expect("the island must collapse with no residual f32");
+        run::<ddl_binds::Baked>(&mut m).expect("the island must collapse with no residual f32");
         let c = m.census();
         let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
         assert_eq!(get("arith.extf"), 0, "step 1 removes every widening cast");
@@ -706,7 +711,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        let e = run(&mut m).unwrap_err();
+        let e = run::<ddl_binds::Baked>(&mut m).unwrap_err();
         assert!(e.message.contains("genuine f32 compute remains"), "got {e}");
         assert!(e.message.contains("owner decision"), "got {e}");
         assert!(
@@ -740,7 +745,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m).expect("every op in the fold is fp32-bound on the card");
+        run::<ddl_binds::Baked>(&mut m).expect("every op in the fold is fp32-bound on the card");
         let c = m.census();
         let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
         // The whole fold stands at f32 -- no op was retyped, collapsed, or refused.
@@ -784,7 +789,8 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m).expect("tt.broadcast moves data — nothing narrows, nothing to refuse");
+        run::<ddl_binds::Baked>(&mut m)
+            .expect("tt.broadcast moves data — nothing narrows, nothing to refuse");
         let b = m
             .ops_deep()
             .into_iter()
@@ -814,7 +820,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        let err = run(&mut m)
+        let err = run::<ddl_binds::Baked>(&mut m)
             .expect_err("math.log is not admitted at fp32; the broadcast may not launder it");
         assert!(
             format!("{err}").contains("The op is 'math.log'."),
@@ -842,7 +848,8 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        let err = run(&mut m).expect_err("sitofp off i1 has no int32tofp32 bind");
+        let err =
+            run::<ddl_binds::Baked>(&mut m).expect_err("sitofp off i1 has no int32tofp32 bind");
         assert!(
             format!("{err}").contains("The op is 'arith.sitofp'."),
             "the refusal names the op: {err}"
@@ -863,7 +870,8 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m).expect("sitofp off i32 is int32tofp32, the bind's own domain");
+        run::<ddl_binds::Baked>(&mut m)
+            .expect("sitofp off i32 is int32tofp32, the bind's own domain");
     }
 
     #[test]
@@ -881,7 +889,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m).expect("the memref is out of scope, not a residual");
+        run::<ddl_binds::Baked>(&mut m).expect("the memref is out of scope, not a residual");
         let view = m
             .ops_deep()
             .into_iter()
@@ -927,7 +935,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m).expect("the island is legal; the churn still collapses");
+        run::<ddl_binds::Baked>(&mut m).expect("the island is legal; the churn still collapses");
         let c = m.census();
         let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
         // The TWO island extfs stand; the churn's one is gone; the churn's truncf
@@ -1019,7 +1027,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        let e = run(&mut m).unwrap_err();
+        let e = run::<ddl_binds::Baked>(&mut m).unwrap_err();
         assert!(e.message.contains("genuine f32 compute remains"), "got {e}");
         assert!(
             e.message.contains("math.log"),
@@ -1055,7 +1063,8 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m).expect("the comparison is island-read; its operands stay f32");
+        run::<ddl_binds::Baked>(&mut m)
+            .expect("the comparison is island-read; its operands stay f32");
         // The score chain's extf head SURVIVES with its f32 widen type: without the
         // sweep it is removed as churn (its result is on no f32 value path to the
         // fptosi) and the score collapses to f16.
@@ -1108,7 +1117,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        let e = run(&mut m).unwrap_err();
+        let e = run::<ddl_binds::Baked>(&mut m).unwrap_err();
         assert!(e.message.contains("genuine f32 compute remains"), "got {e}");
     }
 }
