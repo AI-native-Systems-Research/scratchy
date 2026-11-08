@@ -12076,20 +12076,35 @@ mod frame_pass_tests {
         }
     }
 
-    /// A `linalg.reduce` over `x` with a stated fold axis — `Dimensions = [axes]`, the running
-    /// max's own spelling when the axis is the stick.
+    /// The splat's own producer — `ArithConstant() Value=Float(0.0)` with a scalar type, the
+    /// operand every `tensor.splat` takes (the granite-2b dump's `%91 = ArithConstant()` /
+    /// `%92 = TensorSplat(%91)`, probe-wfdump/wfdump.stderr:162-163).
+    fn zero(a: &'static Arena, res: Ssa) -> Operation<'static> {
+        Operation {
+            result_type: Some(IrType::Scalar(DType::F32)),
+            ..Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(0.0),
+            )
+        }
+    }
+
+    /// A `linalg.reduce` over `x` seeded by `init`, with its combine and fold axis stated — the
+    /// rmsnorm's own spelling in the granite-2b dump (`%61 = LinalgReduce(%30, %92)
+    /// ReduceFn=Op(ArithAddf) Dimensions=IntList([1])`, probe-wfdump/wfdump.stderr:164): data and
+    /// init as the two operands, the combine and the axis as attrs.
     fn fold_reduce(
         a: &'static Arena,
         res: Ssa,
         x: Ssa,
+        init: Ssa,
         dims: &'static [i64],
         axes: &'static [i64],
     ) -> Operation<'static> {
-        tensor(a, res, OpKind::LinalgReduce, &[x], dims).with_attr(
-            a,
-            AttrKey::Dimensions,
-            Attr::IntList(axes),
-        )
+        tensor(a, res, OpKind::LinalgReduce, &[x, init], dims)
+            .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf))
+            .with_attr(a, AttrKey::Dimensions, Attr::IntList(axes))
     }
 
     fn func(
@@ -12112,14 +12127,18 @@ mod frame_pass_tests {
     #[test]
     fn a_stick_fold_writes_a_column_a_leading_fold_keeps_the_operands_world() {
         let a: &'static Arena = Arena::global();
-        let (scalar, dense, red, lead) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (scalar, dense, red, lead, seed64, seed128) =
+            (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
         let f = func(
             a,
             "reduce_worlds",
             vec![
+                zero(a, scalar),
                 tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
-                fold_reduce(a, red, dense, &[64], &[1]),
-                fold_reduce(a, lead, dense, &[128], &[0]),
+                tensor(a, seed64, OpKind::TensorSplat, &[scalar], &[64]),
+                tensor(a, seed128, OpKind::TensorSplat, &[scalar], &[128]),
+                fold_reduce(a, red, dense, seed64, &[64], &[1]),
+                fold_reduce(a, lead, dense, seed128, &[128], &[0]),
             ],
         );
         let frames = assign_frames(&f).expect("both folds state their worlds");
@@ -12152,9 +12171,10 @@ mod frame_pass_tests {
             a,
             "walk_carried_seed",
             vec![
+                zero(a, scalar),
                 tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
                 tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
-                fold_reduce(a, red, dense, &[64], &[1]),
+                fold_reduce(a, red, dense, seed, &[64], &[1]),
             ],
         );
         let frames = assign_frames(&f).expect("the seed states its world through the lineage");
@@ -12178,9 +12198,10 @@ mod frame_pass_tests {
             a,
             "column_spray",
             vec![
+                zero(a, scalar),
                 tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
                 tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
-                fold_reduce(a, red, dense, &[64], &[1]),
+                fold_reduce(a, red, dense, seed, &[64], &[1]),
                 Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
                 tensor(a, bc, OpKind::LinalgBroadcast, &[seed, empty], &[64, 128]),
             ],
@@ -12204,9 +12225,10 @@ mod frame_pass_tests {
             a,
             "softmax_max",
             vec![
+                zero(a, scalar),
                 tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
                 tensor(a, m, OpKind::TensorSplat, &[scalar], &[64]),
-                fold_reduce(a, red, dense, &[64], &[1]),
+                fold_reduce(a, red, dense, m, &[64], &[1]),
                 tensor(a, res, OpKind::ArithMaxf, &[m, dense], &[64, 128]),
             ],
         );
@@ -12230,6 +12252,7 @@ mod frame_pass_tests {
             a,
             "mixed_world",
             vec![
+                zero(a, scalar),
                 tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
                 tensor(a, odd, OpKind::TensorSplat, &[scalar], &[32]),
                 tensor(a, res, OpKind::ArithAddf, &[dense, odd], &[64, 128]),
@@ -12246,8 +12269,10 @@ mod frame_pass_tests {
     }
 
     /// ⭐ THE LOAD'S WORLD IS WHAT IT READS — the tile's own column extent for a direct window
-    /// (the same fact `windowed_region` reads), stated by the tile with no result type on the
-    /// load itself.
+    /// (the same fact `windowed_region` reads), stated by the tile; the load states its result
+    /// type too (the dump's own spelling — `%54 = KtdpLoad(%80) ... ty=Some(Tensor { dims:
+    /// [2048] })`, probe-wfdump/wfdump.stderr:169), and the tile's statement is the one that
+    /// holds.
     #[test]
     fn a_load_takes_its_tiles_column_extent() {
         let a: &'static Arena = Arena::global();
@@ -12261,7 +12286,7 @@ mod frame_pass_tests {
                     result_type: Some(IrType::AccessTile { dims: &[64, 1] }),
                     ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
                 },
-                Operation::new(a, Some(load), OpKind::KtdpLoad, &[tile]),
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[64, 1]),
             ]),
             grid: (1, 1, 1),
             return_type: None,
@@ -12280,19 +12305,21 @@ mod frame_pass_tests {
     #[test]
     fn a_store_fed_column_load_reads_the_parameter_as_one() {
         let a: &'static Arena = Arena::global();
-        let (p, view, tile, val, store, load) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let (p, view, tile, val, store, load, scalar) =
+            (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6));
         let f = IRFunction {
             name: "store_fed_column",
             arguments: a.args(vec![(p, IrType::Index)]),
             operations: a.ops(vec![
-                tensor(a, val, OpKind::TensorSplat, &[Ssa(9)], &[64, 1]),
+                zero(a, scalar),
+                tensor(a, val, OpKind::TensorSplat, &[scalar], &[64, 1]),
                 Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
                 Operation {
                     result_type: Some(IrType::AccessTile { dims: &[64] }),
                     ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
                 },
                 Operation::new(a, Some(store), OpKind::KtdpStore, &[val, tile]),
-                Operation::new(a, Some(load), OpKind::KtdpLoad, &[tile]),
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[64]),
             ]),
             grid: (1, 1, 1),
             return_type: None,
@@ -12331,9 +12358,10 @@ mod frame_pass_tests {
             name: "carried_worlds",
             arguments: a.args(vec![(p, IrType::Index)]),
             operations: a.ops(vec![
+                zero(a, scalar),
                 tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
                 tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
-                fold_reduce(a, red, dense, &[64], &[1]),
+                fold_reduce(a, red, dense, seed, &[64], &[1]),
                 Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
                 Operation {
                     result_type: Some(IrType::AccessTile { dims: &[64] }),
