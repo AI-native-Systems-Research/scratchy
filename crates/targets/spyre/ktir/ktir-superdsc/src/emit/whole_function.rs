@@ -1419,6 +1419,20 @@ fn indirect_tile_of(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
     })
 }
 
+/// The `ktdp.store` that writes a value into a parameter — NOT one through an indirect access
+/// tile, which is a scatter ([`indirect_store_of`]'s business), and not one reading the value
+/// through a shape op ([`stored_through_shape`]'s business).
+fn plain_store_of<'f>(
+    f: &'f IRFunction<'static>,
+    v: Option<Ssa>,
+) -> Option<&'f ktir_core::ir::Operation<'static>> {
+    f.operations.iter().find(|s| {
+        s.op_type == OpKind::KtdpStore
+            && s.operands.first().copied() == v
+            && !indirect_tile_of(f, s.operands.get(1).copied())
+    })
+}
+
 /// ⭐ THE SCATTER A VALUE IS STORED THROUGH — `res`, or a shape op that moves no byte of it, written
 /// by a `ktdp.store` through an indirect access tile: its rows land on the rows of the destination
 /// parameter its index names. `None` when no such store reads it.
@@ -1427,18 +1441,11 @@ fn indirect_store_of(
     res: Ssa,
 ) -> Result<Option<super::lower_ktir_to_superdsc::RowScatter>, Error> {
     let f = &k.func;
-    let dims = |v: Ssa| -> Vec<i64> {
-        f.ops_deep()
-            .into_iter()
-            .find(|o| o.result == Some(v))
-            .and_then(|o| o.result_type)
-            .and_then(|t| t.dims())
-            .map(<[i64]>::to_vec)
-            .unwrap_or_default()
-    };
     // Through a shape op only when it moves no byte: one that does is a relayout, and the scatter
-    // reads its result (the reshape's own stick permute).
-    let reshaped = f
+    // reads its result (the reshape's own stick permute). Both shapes must be STATED — a pair
+    // nobody stated passes `same_card_bytes` with neither side proven, so [`stated_dims`] refuses
+    // the value that states no tensor type rather than read it as an empty shape.
+    let reshaped = match f
         .operations
         .iter()
         .find(|o| {
@@ -1448,7 +1455,10 @@ fn indirect_store_of(
             ) && o.operands.first() == Some(&res)
         })
         .and_then(|o| o.result)
-        .filter(|&v| same_card_bytes(&dims(res), &dims(v)));
+    {
+        Some(v) if same_card_bytes(&stated_dims(f, res)?, &stated_dims(f, v)?) => Some(v),
+        _ => None,
+    };
     let Some(store) = f.operations.iter().find(|s| {
         s.op_type == OpKind::KtdpStore
             && (s.operands.first() == Some(&res) || s.operands.first().copied() == reshaped)
@@ -4956,16 +4966,10 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name, op.op_type, r.tid
                 ));
             }
-            let def_dims = |v: Ssa| -> Vec<i64> {
-                f.operations
-                    .iter()
-                    .find(|o| o.result == Some(v))
-                    .and_then(|o| o.result_type)
-                    .and_then(|t| t.dims())
-                    .map(<[i64]>::to_vec)
-                    .unwrap_or_default()
-            };
-            let (mut from, to) = (def_dims(src), def_dims(res));
+            // The shapes both sides state — a value that states no tensor type is refused by name
+            // ([`stated_dims`]), never read as an empty one: an unstated pair would pass the
+            // moves-bytes gate below and claim the reframe preserved bytes nobody proved.
+            let (mut from, to) = (stated_dims(f, src)?, stated_dims(f, res)?);
             // A GATHER FROM A ROW-OUTERMOST BUFFER (the paged cache's allocation,
             // [`BundleLayout::allocate_row_outermost`]) is held as the page gather lands it —
             // one-stick sub-rows, its slabs' own row-major bytes — whatever shape the load states.
@@ -7183,40 +7187,24 @@ fn lower_function_folded<T: crate::collective::Tp>(
         // ⭐ A STORE THROUGH AN INDIRECT TILE IS A SCATTER, NOT THIS OP's OUTPUT: the value is an
         // intermediate, and [`indirect_store_of`] copies it to the rows its index names after the op
         // writes it (spyre-inference's `out.index_copy_(0, query_row_index, attn)`).
-        let stores_of = |v: Option<Ssa>| {
-            f.operations.iter().find(|s| {
-                s.op_type == OpKind::KtdpStore
-                    && s.operands.first().copied() == v
-                    && !indirect_tile_of(f, s.operands.get(1).copied())
-            })
-        };
-        let op_dims: Vec<i64> = op
-            .result_type
-            .and_then(|t| t.dims())
-            .map(<[i64]>::to_vec)
-            .unwrap_or_default();
         // Stored through a shape op: the op writes the stored parameter's bytes in its OWN frame.
+        // [`stored_through_shape`] attempts that path whole — the shape op, the store reading its
+        // result, and the byte proof — only when the direct store is missing, and refuses by name
+        // when a live through-path's shapes are unstated: a pair nobody stated passes
+        // `same_card_bytes` with neither side proven.
         let mut through_shape = false;
-        let mut stored = stores_of(op.result).or_else(|| {
-            let res = op.result?;
-            let shape = f.operations.iter().find(|o| {
-                matches!(
-                    o.op_type,
-                    OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
-                ) && o.operands.first() == Some(&res)
-            })?;
-            // Only through a shape op that moves no byte: one that does is a stick permute, which
-            // the shape op's own arm lowers into the stored parameter.
-            let shape_dims = shape
-                .result_type
-                .and_then(|t| t.dims())
-                .map(<[i64]>::to_vec)
-                .unwrap_or_default();
-            same_card_bytes(&op_dims, &shape_dims).then_some(())?;
-            let s = stores_of(shape.result);
-            through_shape = s.is_some();
-            s
-        });
+        let mut op_dims: Vec<i64> = Vec::new();
+        let mut stored = match plain_store_of(f, op.result) {
+            Some(s) => Some(s),
+            None => match stored_through_shape(f, op)? {
+                Some((store, dims)) => {
+                    through_shape = true;
+                    op_dims = dims;
+                    Some(store)
+                }
+                None => None,
+            },
+        };
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
         // the dot's result is never stored directly: without this arm the walk would mint it an
@@ -9275,6 +9263,67 @@ fn heads_inner_pair<T: crate::collective::Tp>(
     ))
 }
 
+/// The shape a value states for its own bytes — its defining op's result type (at any region
+/// depth, `ops_deep`), or the function's own argument type for a value with no definer. A value
+/// that states no tensor type anywhere is REFUSED by name, never read as an empty one: the
+/// card-bytes proofs below compare two of these, and a pair nobody stated passes every one of
+/// them as "the same bytes" — a scatter reading through a reshape, a store claimed through a
+/// shape op, a reframe of a relayout — from a clean bake. A STATED rank-0 tensor is `[]` and
+/// compares honestly; it is the UNSTATED shape that must not default.
+fn stated_dims(f: &IRFunction<'static>, v: Ssa) -> Result<Vec<i64>, Error> {
+    let stated = f
+        .ops_deep()
+        .into_iter()
+        .find(|o| o.result == Some(v))
+        .and_then(|o| o.result_type)
+        .or_else(|| f.arguments.iter().find(|(s, _)| *s == v).map(|(_, t)| *t));
+    let Some(dims) = stated.and_then(|t| t.dims()) else {
+        return err(format!(
+            "{}: %{} states no tensor type, so whether a shape op re-frames it or moves its \
+             bytes cannot be decided",
+            f.name, v.0
+        ));
+    };
+    Ok(dims.to_vec())
+}
+
+/// The shape op a store may read this op's result through — the result's own shape op when it
+/// moves no byte of it (`same_card_bytes`), so the op writes the stored parameter's bytes in its
+/// OWN frame. The path is attempted WHOLE: no result, no shape op reading it, no store reading
+/// the shape op's result, or a reframe that moves bytes (a stick permute the shape op's own arm
+/// lowers into the stored parameter instead) each leave it unclaimed, `Ok(None)`. A path that IS
+/// claimed with a shape nobody stated on either side is REFUSED by name ([`stated_dims`]): an
+/// unstated pair passes `same_card_bytes` with neither side proven.
+fn stored_through_shape<'f>(
+    f: &'f IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Result<Option<(&'f ktir_core::ir::Operation<'static>, Vec<i64>)>, Error> {
+    let Some(res) = op.result else {
+        return Ok(None);
+    };
+    let Some(shape) = f.operations.iter().find(|o| {
+        matches!(
+            o.op_type,
+            OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+        ) && o.operands.first() == Some(&res)
+    }) else {
+        return Ok(None);
+    };
+    let Some(shape_res) = shape.result else {
+        return Ok(None);
+    };
+    // The through-path is attempted only where the old walk claimed it: when a store actually
+    // reads the shape op's result. Otherwise nothing is claimed through the shape op, and there
+    // is no byte-preservation to prove.
+    let Some(store) = plain_store_of(f, Some(shape_res)) else {
+        return Ok(None);
+    };
+    // Only through a shape op that moves no byte: one that does is a stick permute, which the
+    // shape op's own arm lowers into the stored parameter.
+    let (op_dims, shape_dims) = (stated_dims(f, res)?, stated_dims(f, shape_res)?);
+    Ok(same_card_bytes(&op_dims, &shape_dims).then_some((store, op_dims)))
+}
+
 /// Whether two shapes of one value are the SAME BYTES on the card: every element at the same address
 /// in both stick-major flat frames (`(c / stick)·(rows·stick) + r·stick + c % stick`, a row padded to
 /// whole sticks). True for equal frames, and for a re-framing that keeps every row one stick wide or
@@ -10874,6 +10923,152 @@ mod swept_window_law_tests {
     fn the_fold_leader_is_its_own_class() {
         assert_eq!(FrameLaw::of(Lowering::Silu, true), FrameLaw::FoldLeader);
         assert_eq!(FrameLaw::of(Lowering::Silu, false), FrameLaw::Pointwise);
+    }
+}
+
+/// The card-bytes proofs' own fixtures: [`stated_dims`], [`plain_store_of`] and
+/// [`stored_through_shape`] — the refusal of a shape nobody stated, and the controls that keep
+/// it from eating real programs.
+#[cfg(test)]
+mod card_bytes_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    fn tensor(dims: &[i64]) -> IrType<'static> {
+        IrType::Tensor {
+            dims: Box::leak(dims.to_vec().into_boxed_slice()),
+            elem: ktir_core::dtypes::DType::F16,
+        }
+    }
+
+    /// The store-through-shape probe: `%5` defined by an `arith.mulf` (its type stated only when
+    /// `op_type` is `Some`), read by a `tensor.reshape` to `%6` (its type stated only when
+    /// `shape_type` is `Some`), stored from `%6` by a `ktdp.store` when `with_store`.
+    fn probe(
+        op_type: Option<IrType<'static>>,
+        shape_type: Option<IrType<'static>>,
+        with_store: bool,
+    ) -> (&'static IRFunction<'static>, &'static Operation<'static>) {
+        let a: &'static Arena = Arena::global();
+        let op = Operation {
+            result_type: op_type,
+            ..Operation::new(a, Some(Ssa(5)), OpKind::ArithMulf, &[Ssa(0), Ssa(1)])
+        };
+        let reshape = Operation {
+            result_type: shape_type,
+            ..Operation::new(a, Some(Ssa(6)), OpKind::TensorReshape, &[Ssa(5)])
+        };
+        let mut ops = vec![op, reshape];
+        if with_store {
+            ops.push(Operation::new(
+                a,
+                None,
+                OpKind::KtdpStore,
+                &[Ssa(6), Ssa(7)],
+            ));
+        }
+        let f = IRFunction {
+            name: "store_probe",
+            arguments: a.args(vec![]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        (Box::leak(Box::new(f)), Box::leak(Box::new(op)))
+    }
+
+    /// ⛔ THE DEFECT THIS COMMITS CLOSES: a store IS claimed through a shape op whose shapes
+    /// nobody stated. Before [`stated_dims`], both sides read as `[]`, `same_card_bytes([], [])`
+    /// claimed "the same bytes", and the walk framed the op's output in a frame neither side of
+    /// the reshape had proven. The refusal names the value and the missing fact.
+    #[test]
+    fn an_unstated_shape_a_store_is_claimed_through_is_refused_by_name() {
+        let (f, op) = probe(None, None, true);
+        let e = stored_through_shape(f, op)
+            .expect_err("a live through-path with unstated shapes is refused, not defaulted");
+        assert!(
+            e.message.contains("states no tensor type"),
+            "names the missing fact: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("%5"),
+            "names the value that states it: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE OVER-REFUSAL CONTROL, one variable from the case above: the store is gone. Nothing
+    /// is claimed through the reshape, so there is no byte-preservation to prove, and the
+    /// unstated pair must leave the path unclaimed — the old walk's own control flow, kept.
+    #[test]
+    fn an_unstated_pair_no_store_claims_is_left_unclaimed() {
+        let (f, op) = probe(None, None, false);
+        assert!(
+            stored_through_shape(f, op).expect("no live path").is_none(),
+            "the refusal fires only where the old walk claimed the store"
+        );
+    }
+
+    /// ⛔ A STATED RANK-0 TENSOR IS `[]`, NOT AN UNKNOWN: the near-miss that keeps the refusal
+    /// from eating real scalars. A scalar reshaped as a scalar moves no byte, and the proof
+    /// says so honestly — both shapes stated, both empty.
+    #[test]
+    fn a_stated_rank_zero_pair_is_decided_not_refused() {
+        let (f, op) = probe(Some(tensor(&[])), Some(tensor(&[])), true);
+        assert!(
+            stored_through_shape(f, op)
+                .expect("a stated pair is decided")
+                .is_some(),
+            "[] and [] are the same one element"
+        );
+    }
+
+    /// The accepting case: both shapes stated, equal frames — the same card bytes, and the
+    /// through-path is claimed with the op's own dims.
+    #[test]
+    fn a_stated_same_bytes_pair_claims_the_path() {
+        let (f, op) = probe(Some(tensor(&[2, 64])), Some(tensor(&[2, 64])), true);
+        let (store, dims) = stored_through_shape(f, op)
+            .expect("a stated pair is decided")
+            .expect("equal frames move no byte");
+        assert_eq!(store.op_type, OpKind::KtdpStore);
+        assert_eq!(dims, vec![2, 64]);
+    }
+
+    /// A stated pair that MOVES bytes: `[1, 64]` is a row, `[64, 1]` is a column — the same
+    /// elements at different stick-major addresses, a stick permute. The path stays unclaimed
+    /// (`Ok(None)`, the shape op's own arm lowers the store), never refused: both sides stated
+    /// their facts and the proof answered.
+    #[test]
+    fn a_stated_pair_that_moves_bytes_is_unclaimed_not_refused() {
+        let (f, op) = probe(Some(tensor(&[1, 64])), Some(tensor(&[64, 1])), true);
+        assert!(
+            stored_through_shape(f, op)
+                .expect("a stated pair is decided")
+                .is_none(),
+            "the bytes provably move; the shape op's own arm lowers the store"
+        );
+    }
+
+    /// A value with no definer is stated by the SIGNATURE: the function's own argument type is
+    /// a shape source, so an argument never reads as the empty default.
+    #[test]
+    fn a_function_arguments_own_type_states_its_shape() {
+        let a: &'static Arena = Arena::global();
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(IRFunction {
+            name: "arg_probe",
+            arguments: a.args(vec![(Ssa(0), tensor(&[3, 5]))]),
+            operations: a.ops(vec![]),
+            grid: (1, 1, 1),
+            return_type: None,
+        }));
+        assert_eq!(
+            stated_dims(f, Ssa(0)).expect("the signature states the shape"),
+            vec![3, 5]
+        );
     }
 }
 
