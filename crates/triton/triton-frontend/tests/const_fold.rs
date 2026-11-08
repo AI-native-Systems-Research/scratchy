@@ -534,3 +534,66 @@ fn a_many_chunk_decode_batch_keeps_its_rescale_chain() {
         "rescale, probabilities and the slots' merge"
     );
 }
+
+/// `page_attn_head_major_decode_kernel` -- one sequence's decode -- at granite-3.1-2b's tp/8
+/// head slice (one kv head, four query heads) walking `blocks` blocks.
+fn sequence_decode(blocks: i128) -> Module {
+    let mut signature = HashMap::new();
+    for (k, v) in [
+        ("query", "*fp16"),
+        ("query_row_index", "*i32"),
+        ("k_pages", "*fp16"),
+        ("v_pages", "*fp16"),
+        ("page_index_table", "*i32"),
+        ("kv_row_pool", "*i32"),
+        ("mask_stack", "*fp16"),
+        ("out", "*fp16"),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::parse(v).expect("spec"));
+    }
+    let mut constexprs = HashMap::new();
+    for (k, v) in [
+        ("NUM_TOKENS", Val::Int(1)),
+        ("NUM_HEADS", Val::Int(4)),
+        ("NUM_KV_HEADS", Val::Int(1)),
+        ("HEAD_SIZE", Val::Int(64)),
+        ("BLOCK_SIZE", Val::Int(128)),
+        ("NUM_PAGES", Val::Int(256)),
+        ("NUM_BLOCKS", Val::Int(blocks)),
+        ("SCALE", Val::Float(0.125)),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+    }
+    let spec = KernelSpec {
+        kernel: "page_attn_head_major_decode_kernel".to_string(),
+        signature,
+        constexprs,
+        file: "page_attn_head_major_decode.py".to_string(),
+    };
+    let src = common::fixture_src("spyre/page_attn_head_major_decode");
+    let mut m = codegen::compile(&src, &spec, Target::spyre()).expect("compiles");
+    opt::make_ttir(&mut m).expect("make_ttir");
+    m
+}
+
+/// The same law on the one-sequence decode kernel, whose walk is one block at the shortest
+/// rungs: the folds are over ops, so every kernel whose walk the promotion removes gets them.
+#[test]
+fn a_one_block_sequence_decode_drops_its_rescale_chain() {
+    let m = sequence_decode(1);
+    assert_eq!(count(&m, "scf.for"), 0);
+    assert_eq!(computing(&m, "rescale"), Vec::<String>::new());
+    assert_eq!(computing(&m, "tile_sum"), Vec::<String>::new());
+    assert_eq!(count(&m, "arith.negf"), 0);
+    assert_eq!(count(&m, "math.exp"), 1);
+    assert_eq!(count(&m, "arith.mulf"), 1);
+}
+
+#[test]
+fn a_many_block_sequence_decode_keeps_its_rescale_chain() {
+    let m = sequence_decode(2);
+    assert_eq!(count(&m, "scf.for"), 1);
+    assert_eq!(computing(&m, "rescale").len(), 6);
+    assert_eq!(count(&m, "math.exp"), 2);
+}
