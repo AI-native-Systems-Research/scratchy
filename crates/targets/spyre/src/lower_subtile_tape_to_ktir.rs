@@ -2255,10 +2255,6 @@ pub fn sample_seat_of_ir<F: RopeForm>(
                 row: node.inputs[0].tensor.index() as u32,
                 vocab,
                 pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
-                // The idx stick's row width: the pick's OWN placed column
-                // count, read off the mint's output tensor — the placement's
-                // fact, never a spelled lane count at the worker's readback.
-                idx_row_words: ir.tensors[node.output.tensor.index()].cols,
                 seed_row_words,
                 gate_row_words,
                 idx_row_words,
