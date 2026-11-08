@@ -92,6 +92,10 @@ fn opfunc_names_are_dxp_recognized() {
         "equal",
         "notequal",
         "where3",
+        // The device's fused normalise-and-affine (`layernormnorm.ddl:15`'s own bind spelling;
+        // the vendor fixture `ddc/ddl_templates/test/sdsc_layernormnorm.json` carries it) — the
+        // row-then-column scale fold's target.
+        "layernormnorm",
     ];
     // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY OPS COULD GO MISSING. `OpFunc` has 31
     // variants; this loop names 25. A new variant is NOT an E0004 here, so it joins the emitter
@@ -129,6 +133,7 @@ fn opfunc_names_are_dxp_recognized() {
         OpFunc::Equal,
         OpFunc::NotEqual,
         OpFunc::Where3,
+        OpFunc::LayerNormNorm,
     ] {
         assert!(
             RECOGNIZED.contains(&f.name()),

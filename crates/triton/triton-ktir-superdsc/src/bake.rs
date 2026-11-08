@@ -355,14 +355,20 @@ pub fn write_placements(
         .placements
         .contains_key(&ktir_superdsc::reserved_tids::FP8_INV448_TID)
     {
-        use ktir_superdsc::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
+        use ktir_superdsc::reserved_tids::{
+            FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID, ZERO_COL_TID, ZERO_ROW_TID,
+        };
         // Rewrite the closing brace to append the block, keeping the JSON valid.
         s.truncate(s.len() - "  ]\n}\n".len());
         s.push_str("  ],\n  \"fp8_consts\": [\n");
+        // The scale fold's zero mean and zero β ride the same block: a uniform value the launcher
+        // fills across the whole placement, exactly like the clamp bounds.
         let rows = [
             (FP8_POS448_TID, 448.0),
             (FP8_NEG448_TID, -448.0),
             (FP8_INV448_TID, 1.0 / 448.0),
+            (ZERO_ROW_TID, 0.0),
+            (ZERO_COL_TID, 0.0),
         ];
         for (i, (tid, v)) in rows.iter().enumerate() {
             let _ = writeln!(

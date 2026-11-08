@@ -190,8 +190,8 @@ pub use ktir_superdsc::reserved_tids::{
     RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
     SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
-    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
-    reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
+    ZERO_COL_TID, ZERO_ROW_TID, identity_class_tid, is_kernel_table_class_tid, kct_resident_tid,
+    oproj_headmajor_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -1400,6 +1400,40 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         let a = SegRole::Activation.segment();
         let sz = Fp16::ELEMS_PER_STICK as u64 * 2; // [1, stick] fp16
         for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
+            let off = seg_bytes[a];
+            placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Activation,
+                    segment: a,
+                    bank: 0,
+                    offset: off,
+                    size: sz,
+                },
+            );
+            seg_bytes[a] = align128(off + sz);
+        }
+        // ── THE ROW-THEN-COLUMN SCALE FOLD's zero operands (`emit::row_col_scale`) ── every fp8
+        // dequant `raw·ascale[m]·ws[n]` lowers to one `layernormnorm` reading a zero per-row mean
+        // (`[m, stick]`) and a zero `β` row (`[1, n]`). Worker-bound zeros in seg0, like the clamp
+        // consts above, each sized at the widest extent any fp8 matmul in the tape states so every
+        // fold's read sits inside its placement.
+        let (rows, cols) = ir
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+            .map(|n| {
+                (
+                    n.output.region.rows.len as u64,
+                    n.output.region.cols.len as u64,
+                )
+            })
+            .fold((0, 0), |(r, c), (nr, nc)| (r.max(nr), c.max(nc)));
+        for (tid, sz) in [
+            (ZERO_ROW_TID, rows * Fp16::ELEMS_PER_STICK as u64 * 2),
+            (ZERO_COL_TID, cols * 2),
+        ] {
             let off = seg_bytes[a];
             placements.insert(
                 tid,

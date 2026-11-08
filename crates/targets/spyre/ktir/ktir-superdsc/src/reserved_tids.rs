@@ -445,8 +445,25 @@ pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
 /// reads is (SENUINT32-tagged i32 bytes) — see [`PAGED_STEP_BASE`].
 pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
+/// ⭐ THE ROW-THEN-COLUMN SCALE FOLD's TWO ZERO OPERANDS — `layernormnorm`'s `mean` and `β`
+/// ([`crate::superdsc_opspec::OpFunc::LayerNormNorm`]), staged all-zero so the device op computes
+/// exactly the two broadcast multiplies it replaces ([`crate::emit::row_col_scale`]).
+///
+/// ⛔ TWO, NOT ONE, BECAUSE THEY ARE READ AT TWO SHAPES: the mean is one value per ROW (a
+/// `[rows, stick]` per-row scalar, the same form the per-row scale takes) and `β` is one ROW of the
+/// output's width (`[1, cols]`, the same form `γ` takes). A single buffer would need the larger of
+/// the two footprints and two read laws over one placement. Each is placed at the widest extent the
+/// bundle's folds state (`zero_row_fills` / `zero_col_fills`), so every fold reads inside its own.
+///
+/// A NEW REGION, below `tp_recv`'s floor — in tids no artifact has ever carried — for the reason
+/// [`KV_BLOCK_INDEX_TID`] states: the sentinel region is full, and sliding a region to make room
+/// would repoint ids already baked into artifacts.
+pub const ZERO_ROW_TID: u32 = TP_RECV_TID - TP_WINDOW_CUTS * TP_MAX_WORLD;
+/// The `β` zero row — see [`ZERO_ROW_TID`].
+pub const ZERO_COL_TID: u32 = ZERO_ROW_TID - 1;
+
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 9] = [
+pub const RESERVED_REGIONS: [TidRegion; 10] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -517,6 +534,13 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
         name: "tp_recv",
         base: TP_RECV_TID,
         slots: TP_WINDOW_CUTS * TP_MAX_WORLD,
+    },
+    // ⭐ THE ROW-THEN-COLUMN SCALE FOLD's zero operands — see [`ZERO_ROW_TID`]. Below `tp_recv`'s
+    // floor, in tids no artifact has ever carried.
+    TidRegion {
+        name: "scale_fold_zeros",
+        base: ZERO_ROW_TID,
+        slots: 2,
     },
 ];
 
@@ -632,6 +656,8 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
     assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
+    assert!(reserved_region("scale_fold_zeros").base == ZERO_ROW_TID);
+    assert!(reserved_region("scale_fold_zeros").floor() == ZERO_COL_TID);
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {

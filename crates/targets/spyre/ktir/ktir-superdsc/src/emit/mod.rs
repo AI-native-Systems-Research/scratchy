@@ -51,6 +51,7 @@ pub mod loop_fold;
 /// entry point the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
 pub mod lx_plan;
+pub mod row_col_scale;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
 /// whole kernel (a Triton-derived `IRFunction` holding an MLP's two projections and its silu, or a
@@ -7233,6 +7234,7 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         // exx2_fwd.smc (updatelibrary.cpp). The `exx2_zeromean` spelling ddc can rewrite to
         // is a distinct enum with NO smc-table entry — see `exx2_consts`' doc.
         "exx2" => OpFunc::Exx2,
+        "layernormnorm" => OpFunc::LayerNormNorm,
         "identity" => OpFunc::Identity,
         "maximum" => OpFunc::Maximum,
         "minimum" => OpFunc::Minimum,

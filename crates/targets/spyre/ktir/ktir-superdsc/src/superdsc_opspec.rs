@@ -1634,6 +1634,23 @@ pub enum OpFunc {
     /// mq>1 fp32 `mean(x²)` island keeps its elementary chain). Guarded at build time in
     /// `reduce_opspec_df`.
     Exx2,
+    /// ⭐ `layernormnorm` — the device's fused normalise-and-affine (`layernormnorm.ddl`, its one
+    /// fp16 bind; runtime `OpFuncs::LAYERNORM_NORM` → `layernorm_norm_fwd.smc`,
+    /// `updatelibrary.cpp:95`). FIVE inputs, in the bind's order — `x`, `mean` (one value per
+    /// row), `scale` (one value per row), `γ` (one row), `β` (one row) — and its dataflow is, per
+    /// element:
+    ///
+    /// ```text
+    ///   d   = FNMS(scale, mean, 0)          PE   (= −scale·mean, held per row)
+    ///   t   = FMA16(x, scale, d)            PE   (= x·scale − scale·mean)
+    ///   out = FMA16(t, γ, β)                SFP  (= t·γ + β)
+    /// ```
+    ///
+    /// The ROW-THEN-COLUMN SCALE fold ([`crate::emit::row_col_scale`]) reaches it with `mean = 0`
+    /// and `β = 0` — the staged zero rows [`crate::reserved_tids::ZERO_ROW_TID`] /
+    /// [`crate::reserved_tids::ZERO_COL_TID`] — where the chain is `round(round(x·r)·g)`: the two
+    /// broadcast multiplies it replaces, one rounding each, in their order.
+    LayerNormNorm,
     /// `identity` — an elementwise copy (sfp unit). Used by in-bundle attention to
     /// GQA-replicate the new chunk's K/V (nkvh→nqh heads) via sliced-read /
     /// offset-write copies, and as a generic relayout/move.
@@ -1818,6 +1835,10 @@ impl OpFunc {
             // rewrites to at useZeroMean=1 is a distinct enum with NO smc-table entry — see
             // the variant's doc for the full chain of evidence.
             OpFunc::Exx2 => "exx2",
+            // `layernormnorm.ddl:15`'s own `operation_bind` spelling, the `opFuncName` of the vendor
+            // fixture `ddc/ddl_templates/test/sdsc_layernormnorm.json`, and torch-spyre's own
+            // op-name list (`_inductor/constants.py:155`).
+            OpFunc::LayerNormNorm => "layernormnorm",
             OpFunc::Identity => "identity",
             OpFunc::Maximum => "maximum",
             OpFunc::Minimum => "minimum",
@@ -1959,6 +1980,9 @@ impl OpFunc {
             // state is internal, so passing an accumulator makes it unmatchable exactly like the
             // fused scale above.
             OpFunc::TopKIndex | OpFunc::TopKValue => Some(1),
+            // `layernormnorm.ddl:15` binds `[%inptensor, %exx2out, %lnsout, %lnA, %lnB]` — FIVE
+            // inputs (`x`, the per-row mean, the per-row scale, γ, β), one output, no seed.
+            OpFunc::LayerNormNorm => Some(5),
             _ => None,
         }
     }

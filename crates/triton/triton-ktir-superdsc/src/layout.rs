@@ -573,6 +573,28 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
                 &mut segment_bytes,
             )?;
         }
+        // ⭐ THE ROW-THEN-COLUMN SCALE FOLD's zero mean `[m, stick]` and zero `β` `[1, n]`
+        // (`emit::row_col_scale`) — the fp8 dequant lowers to one `layernormnorm` reading both. Sized
+        // off the OUTPUT region the program states (the matmul's `[m, n]`), the same view the door
+        // reads `m` and `n` from, so the fold's reads sit inside these placements.
+        if let Some(out) = r.iter().find(|reg| reg.is_out) {
+            for (tid, dims) in [
+                (
+                    ktir_superdsc::reserved_tids::ZERO_ROW_TID,
+                    [out.v_rows, Df::Fp16.elems_per_stick()],
+                ),
+                (ktir_superdsc::reserved_tids::ZERO_COL_TID, [1, out.v_cols]),
+            ] {
+                pack(
+                    name,
+                    tid,
+                    SegRole::Activation,
+                    synth_footprint_bytes(&dims, Df::Fp16),
+                    &mut placements,
+                    &mut segment_bytes,
+                )?;
+            }
+        }
     }
 
     // ⛔⛔⛔ THE GATHER'S INDEX BUFFER CANNOT END FLUSH AT ITS SEGMENT'S HIGH-WATER, AND THE DEVICE

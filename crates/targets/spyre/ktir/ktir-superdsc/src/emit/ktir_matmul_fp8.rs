@@ -673,11 +673,30 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         let folds = SdscFoldSet::new(spec.iter.cores_used());
         emit_sdsc_tiled(&opn("fq_mm"), &spec, &folds, sym_id_base, layout)?
     });
-    // dequant: out = raw · a_scale (per-row) · w_scale[n] (per-col). `ascale` is [m,stk] (one scale per
-    // query row) read via `col` (out-broadcast over N, row r→row r) — per-row-correct for m>1,
-    // byte-identical at decode m=1. `w_scale` is [1,n] per-CHANNEL; for m>1 it broadcasts over the m
-    // query rows (`mb`, mirroring rmsnorm's gamma multiply) — a plain `full` would demand m distinct
-    // rows from the 1-row w_scale.
+    // dequant: out = raw · a_scale (per-row) · w_scale[n] (per-col) — the ROW-THEN-COLUMN SCALE
+    // fold's own pattern ([`super::row_col_scale`]): `raw` is this chain's own product and the
+    // dequant is its only reader, and the interior `raw · a_scale` is read by the second multiply
+    // alone, so where the one shape predicate holds the pair is ONE `layernormnorm`. Where it does
+    // not, the chain is left unclaimed and lowers as the two multiplies it states.
+    if let Ok(shape) = super::row_col_scale::RowColScale::of(m, n) {
+        ops.push(super::row_col_scale::assemble(
+            &opn("fq_dq_op"),
+            shape,
+            super::row_col_scale::RowColOperands {
+                x: &raw,
+                row_scale: &ascale,
+                col_scale: &ws_name,
+                out: &out,
+            },
+            sym_id_base,
+            layout,
+        )?);
+        return Ok(ops);
+    }
+    // The unclaimed form. `ascale` is [m,stk] (one scale per query row) read via `col` (out-broadcast
+    // over N, row r→row r). `w_scale` is [1,n] per-CHANNEL; for m>1 it broadcasts over the m query
+    // rows (`mb`, mirroring rmsnorm's gamma multiply) — a plain `full` would demand m distinct rows
+    // from the 1-row w_scale.
     let ascale_h = rb(&ascale, m, stk);
     let raw_h = rb(&raw, m, n);
     let dqa_h = rb(&dqa, m, n);
@@ -751,7 +770,79 @@ mod tests {
         for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
             place(tid, 1, Fp16::ELEMS_PER_STICK, SegRole::Activation, &mut l);
         }
+        // The dequant fold's zero mean `[m, stick]` and zero β `[1, n]` — the producer's own
+        // placement law (`compute_bundle_layout`'s fp8 block).
+        place(
+            crate::reserved_tids::ZERO_ROW_TID,
+            m,
+            Fp16::ELEMS_PER_STICK,
+            SegRole::Activation,
+            &mut l,
+        );
+        place(
+            crate::reserved_tids::ZERO_COL_TID,
+            1,
+            n,
+            SegRole::Activation,
+            &mut l,
+        );
         l
+    }
+
+    /// ⭐ THE DEQUANT IS ONE `layernormnorm` — the row-then-column scale fold claimed — reading the
+    /// matmul's own product, the per-row `ascale`, the per-channel `ws` and the two staged zeros, in
+    /// the DDL's operand order; the two multiplies it replaces are not emitted.
+    #[test]
+    fn the_dequant_is_one_layernormnorm_over_the_ddl_operand_order() {
+        for (m, k, n) in [(1u32, 256, 128), (32, 2048, 4096)] {
+            let l = fp8_layout(m, k, n);
+            let mut q = QuantizedActivations::default();
+            let ops = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+                &facts(),
+                m,
+                k,
+                n,
+                &mut 0,
+                Some(&l),
+                &mut q,
+            )
+            .expect("the fp8 chain emits");
+            let dq: Vec<_> = ops
+                .iter()
+                .filter(|o| o.op_name.ends_with("fq_dq_op"))
+                .collect();
+            assert_eq!(dq.len(), 1, "m={m} n={n}: one fused dequant");
+            assert!(
+                !ops.iter()
+                    .any(|o| o.op_name.ends_with("fq_dqa_op") || o.op_name.ends_with("fq_dqw_op")),
+                "m={m} n={n}: the two dequant multiplies are folded away"
+            );
+            let reads: Vec<&str> = dq[0]
+                .arg_bindings
+                .iter()
+                .filter(|b| b.is_input)
+                .map(|b| b.buffer.as_str())
+                .collect();
+            let raw = crate::placement::syn(Some(&l), PlaceId::Act(10).synth(SynthRole::FqRaw));
+            let ascale = crate::placement::syn(Some(&l), PlaceId::Act(7).synth(SynthRole::FqAscale));
+            let want = [
+                raw,
+                act_name(crate::reserved_tids::ZERO_ROW_TID),
+                ascale,
+                act_name(9),
+                act_name(crate::reserved_tids::ZERO_COL_TID),
+            ];
+            assert_eq!(
+                reads,
+                want.iter().map(String::as_str).collect::<Vec<_>>(),
+                "m={m} n={n}: x, mean, scale, γ, β"
+            );
+            assert_eq!(
+                dq[0].dsc().dscs_[0].values().next().map(|d| d.computeOp_[0].opFuncName.clone()),
+                Some("layernormnorm".to_string()),
+                "m={m} n={n}: the device op"
+            );
+        }
     }
 
     fn facts() -> Fp8Facts {
