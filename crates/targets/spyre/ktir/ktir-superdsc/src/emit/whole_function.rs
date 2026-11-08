@@ -45,7 +45,7 @@
 use ktir_core::attrkey::AttrKey;
 use ktir_core::dtypes::DType;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
-use ktir_core::opkind::OpKind;
+use ktir_core::opkind::{FrameLaw, OpKind};
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
 use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind, Scratch};
@@ -8126,7 +8126,7 @@ impl Frames {
     }
 }
 
-/// Whether a `linalg.reduce` folds its input's LAST axis — the pass's `LinalgReduce` arm's own
+/// Whether a `linalg.reduce` folds its input's LAST axis — the pass's reduction arm's own
 /// predicate: such a reduce writes one value per stick row, a [`World::Column`], while a fold of
 /// any other axis (the leading `J` of a decode batch's block slots) writes a tile of the input's
 /// own rows.
@@ -8488,9 +8488,14 @@ fn assign_frames(
     // ── THE ONE PASS, in the program's own order ──
     for o in deep.iter() {
         let res = o.result;
-        match o.op_type {
-            // ── THE BROADCAST: the sprayed result is not a node; the spray's own anchors ──
-            OpKind::LinalgBroadcast => {
+        // The law each op states is the op's own property ([`OpKind::frame_law`]) —
+        // exhaustive, stated once, never re-derived here: a new op kind that states no
+        // law is a compile error in the vocabulary, never a silent resolution in the
+        // solve. The integer pointwise kinds join their operands exactly as the float
+        // ones do.
+        match o.op_type.frame_law() {
+            // ── THE SPRAY: the sprayed result is not a node; the spray's own anchors ──
+            FrameLaw::Spray => {
                 let Some(res) = res else { continue };
                 let Some(b) = bcasts.get(&res) else { continue };
                 match b.axis {
@@ -8525,7 +8530,7 @@ fn assign_frames(
                 }
             }
             // ── THE REDUCTION: the axis it folds decides the world it writes ──
-            OpKind::LinalgReduce => {
+            FrameLaw::Reduction => {
                 let Some(res) = res else { continue };
                 if folds_its_stick(o) {
                     uf.anchor(
@@ -8551,7 +8556,7 @@ fn assign_frames(
                 }
             }
             // ── THE SHAPE OPS: no element moves ──
-            OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape => {
+            FrameLaw::MovesNoElement => {
                 if let (Some(res), Some(&x)) = (res, o.operands.first()) {
                     uf.join(
                         idx(res),
@@ -8563,7 +8568,7 @@ fn assign_frames(
                 }
             }
             // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs ──
-            OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul | OpKind::LinalgTranspose => {
+            FrameLaw::DenseTile => {
                 if let Some(res) = res {
                     uf.anchor(
                         idx(res),
@@ -8577,7 +8582,7 @@ fn assign_frames(
                 }
             }
             // ── THE LOAD: the world its tile, shape, or store states ──
-            OpKind::KtdpLoad => {
+            FrameLaw::Load => {
                 if let Some(res) = res {
                     uf.anchor(
                         idx(res),
@@ -8590,51 +8595,9 @@ fn assign_frames(
                     .map_err(as_err)?;
                 }
             }
-            // ── THE ELEMENTWISE FAMILY: the mixed-worlds law, as joins ──
-            OpKind::ArithAbsf
-            | OpKind::ArithAddf
-            | OpKind::ArithSubf
-            | OpKind::ArithMulf
-            | OpKind::ArithDivf
-            | OpKind::ArithRemf
-            | OpKind::ArithMinf
-            | OpKind::ArithMaxf
-            | OpKind::ArithMinnumf
-            | OpKind::ArithMaxnumf
-            | OpKind::ArithMinimumf
-            | OpKind::ArithMaximumf
-            | OpKind::ArithNegf
-            | OpKind::ArithCmpf
-            | OpKind::ArithSelect
-            | OpKind::ArithSitofp
-            | OpKind::ArithUitofp
-            | OpKind::ArithFptosi
-            | OpKind::ArithFptoui
-            | OpKind::ArithExtf
-            | OpKind::ArithTruncf
-            | OpKind::ArithConvertf
-            | OpKind::ArithBitcast
-            | OpKind::MathAbsf
-            | OpKind::MathCeil
-            | OpKind::MathCos
-            | OpKind::MathErf
-            | OpKind::MathExp
-            | OpKind::MathFloor
-            | OpKind::MathFma
-            | OpKind::MathLog
-            | OpKind::MathLog1p
-            | OpKind::MathLog2
-            | OpKind::MathPowf
-            | OpKind::MathRsqrt
-            | OpKind::MathSin
-            | OpKind::MathSqrt
-            | OpKind::MathTanh
-            | OpKind::LinalgAdd
-            | OpKind::LinalgSub
-            | OpKind::LinalgMul
-            | OpKind::LinalgDiv
-            | OpKind::LinalgMax
-            | OpKind::LinalgMin => {
+            // ── THE ELEMENTWISE FAMILY: the mixed-worlds law, as joins — float and
+            // integer pointwise alike, the casts and the comparisons with them ──
+            FrameLaw::Elementwise => {
                 let Some(res) = res else { continue };
                 let Some(res_dims) = o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec)
                 else {
@@ -8694,12 +8657,12 @@ fn assign_frames(
                     }
                 }
             }
-            // ── EVERYTHING ELSE states no equality and no absolute of its own: a splat, a
-            // slice, a region arg, a collective, a generated tile — plain nodes, joined by
-            // their consumers or resolved by the one default. The loop's own carries were
-            // joined above; plumbing (tiles, views, stores, yields, integer addressing) names
-            // no data frame. ──
-            _ => {}
+            // ── UNSTATED states no equality and no absolute of its own: a splat, a
+            // slice, a region arg, a constant, a collective, a generated tile — plain
+            // nodes, joined by their consumers or resolved by the one default. The
+            // loop's own carries were joined above; plumbing (tiles, views, stores,
+            // yields) names no data frame. ──
+            FrameLaw::Unstated => {}
         }
     }
     // ── THE SOLUTION: every node's world — its component's anchor, or [`UNSTATED_IS`]. ──

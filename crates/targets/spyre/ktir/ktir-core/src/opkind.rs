@@ -243,6 +243,38 @@ pub enum OpKind {
     TensorYield,
 }
 
+/// What an operation states about its result's frame — the law the frame solve
+/// applies to the op, stated once here and never re-derived by a reader. The
+/// solve (one pass over the program) turns each law into the equalities and
+/// anchors it names; the classification is a property of the op, like
+/// [`OpKind::dialect`], so a variant that forgets to state its law is a
+/// compile error, never a silent default at a reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FrameLaw {
+    /// Reads its operands lane for lane: the result holds each operand's own
+    /// lanes at the result's count, so the solve joins it with every
+    /// same-shaped operand. A scalar operand names no frame; an operand
+    /// holding one value per result row is deferred to the solved frame.
+    Elementwise,
+    /// Moves no element: the result is its operand's value, restated at
+    /// another shape — the solve joins it with its operand.
+    MovesNoElement,
+    /// Writes a dense tile of rows — the solve anchors it to the flat frame.
+    DenseTile,
+    /// The axis it folds decides the frame it writes: a fold of the last axis
+    /// writes one value per row; a fold of any other axis writes a tile of
+    /// its operand's rows.
+    Reduction,
+    /// A spray: addressing, not data — the solve anchors its source by the
+    /// axis it sprays and holds no frame for the result.
+    Spray,
+    /// A load: the frame its own tile, shape, or store states.
+    Load,
+    /// States no equality and no absolute of its own — the solve joins it by
+    /// its consumers or resolves it through the one default.
+    Unstated,
+}
+
 /// The dialect an [`OpKind`] belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
@@ -383,6 +415,141 @@ impl OpKind {
             OpKind::TensorReshape => Dialect::Tensor,
             OpKind::TensorSplat => Dialect::Tensor,
             OpKind::TensorYield => Dialect::Tensor,
+        }
+    }
+
+    /// The frame law this operation states — exhaustive over the vocabulary,
+    /// no default arm: a new variant that states no law is a compile error
+    /// here, never a silent resolution at a reader.
+    pub const fn frame_law(self) -> FrameLaw {
+        match self {
+            // ── THE ELEMENTWISE FAMILY: reads its operands lane for lane — every arith
+            // and math pointwise op, float AND integer, the comparisons and the casts,
+            // states the one law. ──
+            OpKind::ArithAbsf
+            | OpKind::ArithAddf
+            | OpKind::ArithAddi
+            | OpKind::ArithAndi
+            | OpKind::ArithBitcast
+            | OpKind::ArithCeildivsi
+            | OpKind::ArithCeildivui
+            | OpKind::ArithCmpf
+            | OpKind::ArithCmpi
+            | OpKind::ArithConvertf
+            | OpKind::ArithDivf
+            | OpKind::ArithDivsi
+            | OpKind::ArithDivui
+            | OpKind::ArithExtf
+            | OpKind::ArithExtsi
+            | OpKind::ArithExtui
+            | OpKind::ArithFloordivsi
+            | OpKind::ArithFptosi
+            | OpKind::ArithFptoui
+            | OpKind::ArithIndexCast
+            | OpKind::ArithIndexCastui
+            | OpKind::ArithMaxf
+            | OpKind::ArithMaximumf
+            | OpKind::ArithMaxnumf
+            | OpKind::ArithMaxsi
+            | OpKind::ArithMaxui
+            | OpKind::ArithMinf
+            | OpKind::ArithMinimumf
+            | OpKind::ArithMinnumf
+            | OpKind::ArithMinsi
+            | OpKind::ArithMinui
+            | OpKind::ArithMulf
+            | OpKind::ArithMuli
+            | OpKind::ArithNegf
+            | OpKind::ArithOri
+            | OpKind::ArithRemf
+            | OpKind::ArithRemsi
+            | OpKind::ArithRemui
+            | OpKind::ArithSelect
+            | OpKind::ArithShli
+            | OpKind::ArithShrsi
+            | OpKind::ArithShrui
+            | OpKind::ArithSitofp
+            | OpKind::ArithSubf
+            | OpKind::ArithSubi
+            | OpKind::ArithTruncf
+            | OpKind::ArithTrunci
+            | OpKind::ArithUitofp
+            | OpKind::ArithXori
+            | OpKind::MathAbsf
+            | OpKind::MathAbsi
+            | OpKind::MathCeil
+            | OpKind::MathCos
+            | OpKind::MathErf
+            | OpKind::MathExp
+            | OpKind::MathFloor
+            | OpKind::MathFma
+            | OpKind::MathLog
+            | OpKind::MathLog1p
+            | OpKind::MathLog2
+            | OpKind::MathPowf
+            | OpKind::MathRsqrt
+            | OpKind::MathSin
+            | OpKind::MathSqrt
+            | OpKind::MathTanh
+            | OpKind::LinalgAdd
+            | OpKind::LinalgDiv
+            | OpKind::LinalgMax
+            | OpKind::LinalgMin
+            | OpKind::LinalgMul
+            | OpKind::LinalgSub => FrameLaw::Elementwise,
+            // ── THE SHAPE OPS: no element moves. ──
+            OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape => {
+                FrameLaw::MovesNoElement
+            }
+            // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs. ──
+            OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul | OpKind::LinalgTranspose => {
+                FrameLaw::DenseTile
+            }
+            // ── THE REDUCTION: the axis it folds decides the world it writes. ──
+            OpKind::LinalgReduce => FrameLaw::Reduction,
+            // ── THE SPRAY: a broadcast is addressing, not data. ──
+            OpKind::LinalgBroadcast => FrameLaw::Spray,
+            // ── THE LOAD: the world its tile, shape, or store states. ──
+            OpKind::KtdpLoad => FrameLaw::Load,
+            // ── EVERYTHING ELSE states no equality and no absolute of its own: a
+            // constant, a splat, a slice, a region arg, a collective, a generated
+            // tile, plumbing (tiles, views, stores, yields, the loop's own
+            // machinery) — joined by consumers or resolved by the one default. ──
+            OpKind::ArithConstant
+            | OpKind::FuncReturn
+            | OpKind::KtdpAllgather
+            | OpKind::KtdpConstructAccessTile
+            | OpKind::KtdpConstructDistributedMemoryView
+            | OpKind::KtdpConstructIndirectAccessTile
+            | OpKind::KtdpConstructMemoryView
+            | OpKind::KtdpCoreid
+            | OpKind::KtdpGetComputeTileId
+            | OpKind::KtdpInterTileProduce
+            | OpKind::KtdpInterTileReduce
+            | OpKind::KtdpNotYet
+            | OpKind::KtdpReduce
+            | OpKind::KtdpStore
+            | OpKind::KtdpYieldPartial
+            | OpKind::KtdpYieldReduced
+            | OpKind::LinalgFill
+            | OpKind::LinalgGeneric
+            | OpKind::LinalgIndex
+            | OpKind::LinalgYield
+            | OpKind::RegionBb0Args
+            | OpKind::ScfFor
+            | OpKind::ScfForall
+            | OpKind::ScfIf
+            | OpKind::ScfParallel
+            | OpKind::ScfWhile
+            | OpKind::ScfYield
+            | OpKind::TensorEmpty
+            | OpKind::TensorExtract
+            | OpKind::TensorExtractSlice
+            | OpKind::TensorFromElements
+            | OpKind::TensorGenerate
+            | OpKind::TensorInsertSlice
+            | OpKind::TensorSplat
+            | OpKind::TensorYield => FrameLaw::Unstated,
         }
     }
 }
