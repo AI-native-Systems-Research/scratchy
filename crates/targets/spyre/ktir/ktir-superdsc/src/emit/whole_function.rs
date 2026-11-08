@@ -8243,7 +8243,9 @@ fn column_fed_params(defs: &Defs) -> std::collections::HashSet<Ssa> {
         let column = def_of(value).is_some_and(|d| {
             d.result_type
                 .and_then(|t| t.dims())
-                .is_some_and(|ds| ds.len() >= 2 && *ds.last().expect("len ≥ 2") == 1)
+                // rank ≥ 2 with a one-element trailing axis — the trailing-axis comparison is
+                // stated against the Option itself, so no panic path and no made-up default.
+                .is_some_and(|ds| ds.len() >= 2 && ds.last() == Some(&1))
         });
         if column && let Some(ptr) = def_of(tile).and_then(|t| view_param(defs, t)) {
             out.insert(ptr);
