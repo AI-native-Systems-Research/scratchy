@@ -2116,6 +2116,7 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
             // gather's block copies address a column block the same way at any total width
             // (stick-major places a column by its stick and row alone).
             SubOp::AllGather { .. } => {
+                #[cfg(feature = "spyre")]
                 if matches!(suffix, SampleRows::Folded { .. }) {
                     fold_gathered_tail(graph, t);
                 }
@@ -2193,6 +2194,7 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
 /// them is that row: the gather's operand is then a whole one-row tensor, contiguous, and the fold
 /// writes its m=1 product into exactly it. (A tail with no gather — every one-rank graph — keeps
 /// its declared rows: its row 0 is read locally, never sent.)
+#[cfg(feature = "spyre")]
 fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId) {
     let mut tail = vec![gathered];
     let mut t = graph
