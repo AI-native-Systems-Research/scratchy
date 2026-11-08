@@ -8534,7 +8534,8 @@ fn assign_frames(
                 f.name, c.arg.0
             );
             uf.join(idx(c.arg)?, idx(c.init)?, &why).map_err(as_err)?;
-            uf.join(idx(c.arg)?, idx(c.yielded)?, &why).map_err(as_err)?;
+            uf.join(idx(c.arg)?, idx(c.yielded)?, &why)
+                .map_err(as_err)?;
             uf.join(idx(c.arg)?, idx(c.result)?, &why).map_err(as_err)?;
         }
     }
@@ -12768,9 +12769,15 @@ mod frame_pass_tests {
                 // own result — a source the flat count proof ACCEPTS (its 8192 elements are
                 // the result's 8192 leading-product rows), so the chase admits the spray and
                 // binds `src` to the sprayed `%7`.
-                tensor(a, outer, OpKind::LinalgBroadcast, &[bc, empty], &[64, 128, 2])
-                    .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[2]))
-                    .with_attr(a, AttrKey::Shape, Attr::IntList(&[64, 128, 2])),
+                tensor(
+                    a,
+                    outer,
+                    OpKind::LinalgBroadcast,
+                    &[bc, empty],
+                    &[64, 128, 2],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[2]))
+                .with_attr(a, AttrKey::Shape, Attr::IntList(&[64, 128, 2])),
             ],
         );
         let e = match assign_frames(&f, None) {
@@ -12782,7 +12789,11 @@ mod frame_pass_tests {
             "names the sprayed source: {}",
             e.message
         );
-        assert!(e.message.contains("%7"), "names the inner spray: {}", e.message);
+        assert!(
+            e.message.contains("%7"),
+            "names the inner spray: {}",
+            e.message
+        );
     }
 
     /// ⛔ A CARRY SEEDED BY A SPRAY IS REFUSED BY NAME, NEVER A MAP PANIC. The folded carry's
