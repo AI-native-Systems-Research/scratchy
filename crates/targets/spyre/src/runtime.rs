@@ -1119,6 +1119,9 @@ pub use flex_rs::address::{ByteOffset, ByteSize};
 /// this one module.
 pub use flex_rs::compute::ComputeWireBatch;
 pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
+/// The world's placement the worker builds from its cards' ([`CardRuntime::cpus`]) and pins its
+/// load and decode-loop threads to.
+pub use flex_rs::numa::WorldCpus;
 
 /// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that

@@ -340,6 +340,73 @@ impl CardCpus {
     }
 }
 
+/// ⭐ WHERE A WORLD'S SHARED HOST THREADS RUN: the decode loop that drives every rank, and the
+/// load thread that builds every rank's sessions and their host buffers. Read from the world's
+/// cards ([`WorldCpus::of`], rank 0 first); a thread pins itself with
+/// [`WorldCpus::pin_current_thread`]. Each card's own threads (its response worker, its rank's
+/// submit thread, its bring-up thread) still run on that card's node ([`CardCpus`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldCpus {
+    /// Every card sits on one node: the shared threads run there, beside all of them.
+    OneNode(CardCpus),
+    /// The cards sit on more than one node. No node is near every card, so the shared threads
+    /// and the buffers they first touch run on rank 0's card's node, and each card's own buffers
+    /// stay on its own node (its own threads touch them).
+    Spans {
+        /// Rank 0's card's placement, which the shared threads take.
+        rank0: CardCpus,
+    },
+    /// No card has a node: there is nothing nearer to run on, and nothing pins.
+    NoNode,
+}
+
+impl WorldCpus {
+    /// The world's placement from its cards' placements, rank 0 first.
+    pub fn of<'a>(cards: impl IntoIterator<Item = &'a CardCpus>) -> Self {
+        let mut cards = cards.into_iter();
+        let Some(rank0) = cards.next() else {
+            return Self::NoNode;
+        };
+        let mut one_node = true;
+        let mut any_node = rank0.node().is_some();
+        for c in cards {
+            one_node &= c.node() == rank0.node();
+            any_node |= c.node().is_some();
+        }
+        match (any_node, one_node) {
+            (false, _) => Self::NoNode,
+            (true, true) => Self::OneNode(rank0.clone()),
+            (true, false) => Self::Spans {
+                rank0: rank0.clone(),
+            },
+        }
+    }
+
+    /// ⭐ RUN THE CALLING THREAD WHERE THE WORLD'S SHARED WORK RUNS: the one node every card sits
+    /// on, or rank 0's when the cards span nodes. With no node it does nothing.
+    ///
+    /// # Errors
+    /// The kernel refused the affinity call, by name.
+    pub fn pin_current_thread(&self) -> Result<(), PinError> {
+        match self {
+            Self::OneNode(c) | Self::Spans { rank0: c } => c.pin_current_thread(),
+            Self::NoNode => Ok(()),
+        }
+    }
+}
+
+impl fmt::Display for WorldCpus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OneNode(c) => write!(f, "every card on one node: {c}"),
+            Self::Spans { rank0 } => {
+                write!(f, "the cards span nodes; shared work on rank 0's: {rank0}")
+            }
+            Self::NoNode => write!(f, "no card has a NUMA node"),
+        }
+    }
+}
+
 impl fmt::Display for CardCpus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
@@ -615,6 +682,38 @@ mod tests {
         .unwrap();
         assert_eq!(p.no_node(), Some(NoNode::FirmwareReportsNone));
         assert_eq!(p.pin_current_thread(), Ok(()));
+    }
+
+    #[test]
+    fn a_world_on_one_node_runs_there() {
+        let a = place("1\n", "36-71\n", "0-143");
+        let w = WorldCpus::of([&a, &a.clone(), &a.clone()]);
+        assert_eq!(w, WorldCpus::OneNode(a));
+    }
+
+    #[test]
+    fn a_world_across_nodes_runs_its_shared_work_on_rank_0s_node() {
+        let a = place("0\n", "0-35\n", "0-143");
+        let b = place("1\n", "36-71\n", "0-143");
+        assert_eq!(
+            WorldCpus::of([&b, &a]),
+            WorldCpus::Spans { rank0: b.clone() }
+        );
+        assert_eq!(WorldCpus::of([&a, &b]), WorldCpus::Spans { rank0: a });
+        // A card with no node beside one with a node also spans.
+        assert_eq!(
+            WorldCpus::of([&b, &CardCpus::NO_DEVICE]),
+            WorldCpus::Spans { rank0: b }
+        );
+    }
+
+    #[test]
+    fn a_world_with_no_node_pins_nothing() {
+        let none = place("-1\n", "", "0-143");
+        let w = WorldCpus::of([&none, &CardCpus::NO_DEVICE]);
+        assert_eq!(w, WorldCpus::NoNode);
+        assert_eq!(w.pin_current_thread(), Ok(()));
+        assert_eq!(WorldCpus::of([]), WorldCpus::NoNode);
     }
 
     #[test]

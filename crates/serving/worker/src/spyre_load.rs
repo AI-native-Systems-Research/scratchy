@@ -1236,6 +1236,9 @@ impl SpyreWorker {
         // assignment under spyre-hw, where the block always runs).
         #[cfg(feature = "spyre-hw")]
         let pool_stride_bytes_v: Option<u64>;
+        // Where the shared host threads run, read from the cards when they join (below).
+        #[cfg(feature = "spyre-hw")]
+        let world_cpus_v: scratchy_target_spyre::runtime::WorldCpus;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1390,6 +1393,16 @@ impl SpyreWorker {
                         .map_err(|e| werr(format!("open Spyre card {}: {e}", r.get())))
                 })?;
                 let cards: &'static Cards = Box::leak(Box::new(opened));
+                // ⭐ THIS THREAD BUILDS EVERY SESSION, so it runs where the world's shared work
+                // runs before the first one is built: each session's host copies and the
+                // activation shadows faulted in below are allocated and first touched there.
+                let world_cpus =
+                    scratchy_target_spyre::runtime::WorldCpus::of(cards.values().map(|c| c.cpus()));
+                world_cpus
+                    .pin_current_thread()
+                    .map_err(|e| werr(format!("the load thread: {e}")))?;
+                info!("[spyre-worker] load and decode-loop threads: {world_cpus}");
+                world_cpus_v = world_cpus;
                 // ⭐ THE CARDS' P2P LINK, BEFORE THE FIRST SESSION LOADS. A sharded world's decode
                 // bundle bakes its receive window for that world; every card's base-address table
                 // gets every peer's card and its `XSEG` entries every peer's landing slots, so every
@@ -2725,6 +2738,8 @@ impl SpyreWorker {
                 stride
             },
             served_context: served_context_v,
+            #[cfg(feature = "spyre-hw")]
+            world_cpus: world_cpus_v,
         })
     }
 }

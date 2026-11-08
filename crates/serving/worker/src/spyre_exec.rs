@@ -771,6 +771,19 @@ impl Worker for SpyreWorker {
     /// ⭐ #32 (c4) — THE DOOR LANDS: this worker's steps may now hand their collect to the
     /// engine's drain thread. Every step still runs the same submit → defer → drain; the door
     /// only decides WHERE the drain runs.
+    /// The decode-loop thread runs where the world's shared work runs (`Loaded::world_cpus`). Before
+    /// a load there are no cards, and nothing to place.
+    #[cfg(feature = "spyre-hw")]
+    fn pin_driving_thread(&self) -> ExecutorResult<()> {
+        match self.model.as_ref() {
+            Some(m) => m
+                .world_cpus
+                .pin_current_thread()
+                .map_err(|e| werr(format!("the decode-loop thread: {e}"))),
+            None => Ok(()),
+        }
+    }
+
     #[cfg(feature = "spyre-hw")]
     fn set_drain_door(&mut self, door: scratchy_serving_engine::core_client::DrainDoor) {
         self.drain_door = Some(door);

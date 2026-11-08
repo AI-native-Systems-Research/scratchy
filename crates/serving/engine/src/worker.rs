@@ -321,6 +321,13 @@ pub trait Worker: Send {
     /// that never defers has nothing to knock on.
     fn set_drain_door(&mut self, _door: crate::core_client::DrainDoor) {}
 
+    /// Run the calling thread where this worker's devices want the thread that drives its steps
+    /// (the executor trait's [`crate::executor::Executor::pin_driving_thread`], through to the
+    /// worker that owns the devices). Default: nothing to place.
+    fn pin_driving_thread(&self) -> ExecutorResult<()> {
+        Ok(())
+    }
+
     /// ⭐ #32 (C) — A KNOCK: drain the in-flight queue until `cell` is filled.
     /// The worker's own spelling of the executor trait's hook — the drain's
     /// pop is the single authority over which drain owns a step. Default
