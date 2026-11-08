@@ -8328,20 +8328,25 @@ fn elementwise_world(
             continue;
         };
         let n: i64 = d.iter().product();
-        if n == 1 {
-            // A scalar is the same value in every frame.
-            continue;
-        }
         let w = world.get(&v).copied().unwrap_or(World::Row);
         if n == res_numel {
-            // LANE-FOR-LANE: the result takes its world. A column read at the result's own count
-            // is the column frame both sides can honor, so a column lane wins — the result keeps
-            // the per-row reading.
+            // LANE-FOR-LANE, AT EVERY COUNT — the check comes first: an operand is a broadcast
+            // SCALAR only when it is narrower than the result (`n == 1` beside a wider result),
+            // and at the result's own count — 1 included, the M=1 decode normalizer chain
+            // (`%45 = ArithMulf(%61, %44)`, both `[1]`, `%61` the `[1, 2048]` stick fold's
+            // column, wfdump.stderr:165-167) — the operand is a lane and the result takes its
+            // world. Skipping the scalar first dropped the fold's column at the chain's first
+            // elementwise op, and the chase's Col spray then disagreed with the table. A column
+            // read at the result's own count is the column frame both sides can honor, so a
+            // column lane wins — the result keeps the per-row reading.
             lane = Some(if w == World::Column || lane == Some(World::Column) {
                 World::Column
             } else {
                 World::Row
             });
+        } else if n == 1 {
+            // A scalar beside a wider result: the same value in every frame.
+            continue;
         } else if w == World::Column && n == i64::from(res_rows) {
             // One scalar per result row — the `In::col` reading, consumed by the operand mode.
         } else if def_of(v).is_some_and(|d| d.op_type == OpKind::LinalgBroadcast) {
@@ -12413,5 +12418,77 @@ mod frame_pass_tests {
             World::Column,
             "the loop returns the carry it holds"
         );
+    }
+
+    /// ⭐ THE LANE CHECK COMES FIRST, AT EVERY COUNT — the M=1 decode normalizer chain, spelled
+    /// from the granite-2b dump verbatim (probe-wfdump/wfdump.stderr:164-172): the `[1, 2048]`
+    /// stick fold's column (`%61`) flows through `%45 = ArithMulf(%61, %44)` and `%49 =
+    /// ArithAddf(%45, %48)` to `%51 = MathRsqrt(%49)` — every link `[1]`, both operands and the
+    /// result the same count — and is then sprayed along `Col` (`%56 = LinalgBroadcast(%93)
+    /// Dimensions=[1]` → `[1, 2048]`). An operand is a broadcast SCALAR only when it is narrower
+    /// than the result; at the result's own count — 1 included — it is a lane, so the chain keeps
+    /// the fold's column and the chase's axis and the table agree. Skipping the scalar first
+    /// dropped the column at `%45` and the cross-check refused every model's rmsnorm.
+    #[test]
+    fn a_normalizer_chain_at_count_one_keeps_the_folds_column() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, x, sq, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (eps1, eps2, mul, add, inv) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9));
+        let (exp, col, empty, bc) = (Ssa(10), Ssa(11), Ssa(12), Ssa(13));
+        let f = func(
+            a,
+            "m1_normalizer",
+            vec![
+                zero(a, scalar),
+                tensor(a, x, OpKind::TensorSplat, &[scalar], &[1, 2048]),
+                tensor(a, sq, OpKind::ArithMulf, &[x, x], &[1, 2048]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[1]),
+                fold_reduce(a, red, sq, seed, &[1], &[1]),
+                tensor(a, eps1, OpKind::TensorSplat, &[scalar], &[1]),
+                tensor(a, eps2, OpKind::TensorSplat, &[scalar], &[1]),
+                tensor(a, mul, OpKind::ArithMulf, &[red, eps1], &[1]),
+                tensor(a, add, OpKind::ArithAddf, &[mul, eps2], &[1]),
+                tensor(a, inv, OpKind::MathRsqrt, &[add], &[1]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[inv], &[1, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[1]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[col, empty], &[1, 2048]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+            ],
+        );
+        let frames = assign_frames(&f).expect("the chain states its world at every link");
+        assert_eq!(
+            frames.world_of(mul),
+            World::Column,
+            "the fold's column is a lane at count 1, not a skipped scalar"
+        );
+        assert_eq!(
+            frames.world_of(add),
+            World::Column,
+            "the add keeps the lane it reads"
+        );
+        assert_eq!(
+            frames.world_of(inv),
+            World::Column,
+            "the rsqrt keeps the lane it reads — the value the chase sprays along Col"
+        );
+        assert_eq!(
+            frames.world_of(bc),
+            World::Row,
+            "the sprayed result is dense, however its source is held"
+        );
+        let (bcasts, _) =
+            program_broadcast_chains(&f).expect("the spray states its axis and its shape");
+        cross_check_chase(f.name, &bcasts, &frames)
+            .expect("the chase's Col axis and the table's column world are one fact");
     }
 }
