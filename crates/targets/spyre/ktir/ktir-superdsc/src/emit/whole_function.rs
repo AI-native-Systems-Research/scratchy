@@ -8150,18 +8150,24 @@ impl<'d> Defs<'d> {
         // seeded from the ONE `LoopFold` the flattening handed back — without this, a carried
         // result read as an operand (`attn_s8`'s `%260 = ArithSubf(%246, %259)`, `%246` the max
         // carry's result) states no shape and no lane could be read at all.
+        // The shape an init states — off the program's statement of it, or off the init's own
+        // def. One spelling, read by both seeds below: the for's own carries and the flattened
+        // function's `LoopFold`. The map is a PARAMETER, not a capture — the seeds mutate it.
+        let init_dims = |shape: &std::collections::HashMap<Ssa, Vec<i64>>, init: Ssa| {
+            shape.get(&init).cloned().or_else(|| {
+                def.get(&init)
+                    .and_then(|d| d.result_type)
+                    .and_then(|t| t.dims())
+                    .map(<[i64]>::to_vec)
+            })
+        };
         for o in f.ops_deep().iter().filter(|o| o.op_type == OpKind::ScfFor) {
             let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
                 Some(Attr::Ssas(v)) => v.to_vec(),
                 _ => o.result.into_iter().collect(),
             };
             for (i, (arg, init)) in Self::carries(o).into_iter().enumerate() {
-                let d = shape.get(&init).cloned().or_else(|| {
-                    def.get(&init)
-                        .and_then(|d| d.result_type)
-                        .and_then(|t| t.dims())
-                        .map(<[i64]>::to_vec)
-                });
+                let d = init_dims(&shape, init);
                 if let Some(d) = d {
                     shape.insert(arg, d);
                 }
@@ -8178,12 +8184,7 @@ impl<'d> Defs<'d> {
         }
         if let Some(fold) = fold {
             for c in &fold.carried {
-                let d = shape.get(&c.init).cloned().or_else(|| {
-                    def.get(&c.init)
-                        .and_then(|d| d.result_type)
-                        .and_then(|t| t.dims())
-                        .map(<[i64]>::to_vec)
-                });
+                let d = init_dims(&shape, c.init);
                 if let Some(d) = d {
                     shape.insert(c.arg, d.clone());
                     shape.insert(c.result, d.clone());
