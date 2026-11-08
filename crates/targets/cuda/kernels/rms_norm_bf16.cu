@@ -424,7 +424,8 @@ int launch(const void* x, const void* gain, void* y, const void* other, void* su
                   col_tiles, float(cols), eps,       gain_offset};
     void* args[] = {&G};
     if (rows == 1) {
-        const dim3 grid(uint32_t(col_tiles)), block(NUM_THREADS);
+        // Braces: `grid(uint32_t(col_tiles))` parses as a function declaration.
+        const dim3 grid{uint32_t(col_tiles)}, block{NUM_THREADS};
         return static_cast<int>(cudaLaunchKernel(rms_norm_one_row_ker<FORM>, grid, block, args,
                                                  RMS_SMEM_BYTES, stream));
     }
