@@ -626,13 +626,17 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     paged_rows: scratchy_triton_splice::PagedRows,
+    // The graph's query extents, minted by the bake — threaded, never re-derived here:
+    // a registry walk that minted its own pair from graph rows would agree with the
+    // graph yet state the wrong per-request width the day a packed prefill arrives.
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<Vec<f32>, SuperDscError> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
     let mut registry = scalar_registry(ir);
     let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
     for node in &ir.nodes {
         let NodeLowering::Ops(ops) =
-            lower_one_node::<T, F>(node, ir, ActiveCap::FULL, rows_are_requests)
+            lower_one_node::<T, F>(node, ir, ActiveCap::FULL, rows_are_requests, query_rows)
         else {
             continue;
         };
@@ -771,6 +775,9 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // ⭐ WHAT THE ROWS ARE — one sequence's, or a decode batch's: the paged step's sources differ.
     paged_rows: scratchy_triton_splice::PagedRows,
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
+    // The graph's query extents, minted by the bake — threaded to the registry walk below,
+    // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -1598,7 +1605,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
     //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
-    let scalarmul_scales = bundle_registry::<T, F>(ir, paged_rows)?;
+    let scalarmul_scales = bundle_registry::<T, F>(ir, paged_rows, query_rows)?;
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -3805,7 +3812,10 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     covering: Option<&std::collections::HashSet<u64>>,
     prefill: Option<&PrefillGate>,
-    active_cap: ActiveCap,
+    // The rung under test, whole — its sweep AND its query extents, one fact (clippy's
+    // argument budget is the forcing function, but the rung was already the unit every
+    // gate message names; the probe reads `rung.active_cap` / `rung.query_rows`).
+    rung: &GateRung<'_>,
     seed: &dyn Fn(u32) -> usize,
     // The rank this probe stages — `None` for the one-rank gate. A chained head's decompose
     // tables are this rank's vocabulary block (`LoadConst::build`).
@@ -3845,8 +3855,8 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
     // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
     // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
-    let staggered =
-        crate::lower_subtile_tape_to_ktir::staggered_of_ir::<T, F>(ir).map_err(|e| e.0)?;
+    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir::<T, F>(ir, rung.query_rows)
+        .map_err(|e| e.0)?;
     let load_consts =
         crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
     let load_const_tids: std::collections::HashSet<u32> =
@@ -3925,7 +3935,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // chunk's rows are one sequence's (the bake's `rows_are_requests`).
     let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
-        active_cap,
+        rung.active_cap,
         scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
     )
     .map_err(|e| e.0)?;
@@ -4152,6 +4162,10 @@ pub struct GateRung<'a> {
     /// The rung's sweep — its paged walk ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]),
     /// so the gate stages the step against the reach the bundle was baked with.
     pub active_cap: ActiveCap,
+    /// The rung's query extents — the pair the bake minted for the graph under test
+    /// ([`scratchy_subtile::sdsc_abstract::QueryExtent`]), so the gate lowers the
+    /// graph's nodes under the SAME extents the bundle was baked with.
+    pub query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
     /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
     /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
     /// ranks at once ([`numeric_gate_sharded`]).
@@ -4412,6 +4426,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             fp,
             cap,
             active_cap: rung.active_cap,
+            query_rows: rung.query_rows,
             shards,
             scope,
         });
@@ -4431,7 +4446,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         weight_ids,
         covering,
         prefill,
-        rung.active_cap,
+        rung,
         &|tid| tid as usize,
         None,
     )?;
@@ -5042,9 +5057,14 @@ struct ShardedGate<'a, T: ktir_superdsc::collective::Tp, F: RopeForm> {
     covering: Option<&'a std::collections::HashSet<u64>>,
     tainted: &'a std::collections::HashSet<u32>,
     prefill: Option<&'a PrefillGate>,
+    // The rung's own facts, carried loose — fp, cap, the sweep, the query extents — plus
+    // the shard law as its OWN typed field: `shards: &[SourceShard]`, not an Option to
+    // recover from the rung. The sharded gate cannot be BUILT without its shards, so
+    // nothing on this path unwraps.
     fp: &'a str,
     cap: u32,
     active_cap: ActiveCap,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
     shards: &'a [scratchy_subtile::tensor_parallel::SourceShard],
     scope: String,
 }
@@ -5082,6 +5102,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         fp,
         cap,
         active_cap,
+        query_rows,
         shards,
         scope,
     } = gate;
@@ -5096,6 +5117,16 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             Some(_) => tid as usize + r * RANK_STREAM,
         }
     };
+    // The probe lowers under the rung's sweep and query extents — the same GateRung
+    // shape the one-rank gate hands it, wrapped (never unwrapped) with this gate's own
+    // typed shard slice.
+    let probe_rung = GateRung {
+        fp,
+        cap,
+        active_cap,
+        query_rows,
+        shards: Some(shards),
+    };
     let mut probes: Vec<GateProbe> = Vec::with_capacity(ranks.len());
     for me in &ranks {
         probes.push(stage_gate_probe::<T, F>(
@@ -5103,7 +5134,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             weight_ids,
             covering,
             prefill,
-            active_cap,
+            &probe_rung,
             &seed(me.get() as usize),
             Some(*me),
         )?);
@@ -8794,6 +8825,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -8801,6 +8833,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
         weight_ids,
         active_cap,
         rows_are_requests,
+        query_rows,
     )
 }
 
@@ -8820,6 +8853,19 @@ mod tests {
     // after the retarget those assemblers are reached from tests alone, so the import belongs here
     // rather than in the lowering's own prelude.
     use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+
+    /// The extent pair the lowering calls below state for their graphs: one request of
+    /// the graph's own row count — the S=1 prefill pair. None of these fixtures carries
+    /// an `AttnDecode`; the pair still must describe the graph it is handed, and it does.
+    fn one_request_of(rows: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
+        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rows)
+                .expect("the fixture's row count is nonzero"),
+            scratchy_subtile::sdsc_abstract::RungCap::ONE,
+        )
+        .expect("one request's rows fit a u32")
+    }
+
     // ⭐ SAME REASON, WIDER: the whole SuperDSC EMITTER is now `ktir_superdsc::emit`, so every name
     // below is reached from these tests alone and none of them belongs in the lowering's prelude.
     // The tests stayed here deliberately — they pin laws of the emitter as this crate CALLS it (the
@@ -9183,6 +9229,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(4),
         )
         .expect("a layout for a plain matmul bundle");
 
@@ -9300,6 +9347,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("plain lays out");
         let l_minted = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
@@ -9307,6 +9355,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("the minted graph lays out");
 
@@ -9403,6 +9452,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(4),
         )
         .expect("the minted graph lays out");
 
@@ -9795,6 +9845,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
+                one_request_of(m),
             )
             .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
@@ -9841,6 +9892,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(mq),
         )
         .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all::<
@@ -9928,6 +9980,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
@@ -9942,6 +9995,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("the fp16 layout mints");
         let p = layout
@@ -10023,6 +10077,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            one_request_of(1),
         )
         .expect("two-fp8-matmul lowering");
         let quantizes = ops
@@ -10111,6 +10166,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            one_request_of(1),
         )
         .expect("the folded residual shape lowers");
 
@@ -10186,6 +10242,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            one_request_of(1),
         )
         .expect("the refused residual shape still lowers");
 
@@ -10665,6 +10722,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
@@ -10681,6 +10739,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
+            one_request_of(1),
         )
         .expect("the wiring is a registry and never runs the budget pass");
         assert_eq!(
@@ -10974,8 +11033,14 @@ mod tests {
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_request_of(1),
+            )
+            .unwrap();
             // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
             let groups: Vec<bundle::LaunchGroup<'static, T>> =
                 launch_index(&ops, FoldGrouping::Split)

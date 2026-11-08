@@ -19,6 +19,7 @@ use std::num::NonZeroU32;
 
 use ktir_superdsc::ktir_node::ActiveCap;
 use scratchy_subtile::fixtures::mlp_sublayer;
+use scratchy_subtile::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
 use scratchy_subtile::subtile_ir::lower_region;
 use scratchy_target_spyre::bundle_code::collective::{Rank, TpWorld};
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
@@ -28,6 +29,15 @@ use scratchy_target_spyre::tp_plan::tp_bake;
 /// The world the consumes are dumped for — any `TpWorld<N>`: the protocol is the same law at every
 /// width.
 type W = TpWorld<2>;
+
+/// The extent pair both graphs below state: these fixtures are ONE request of ONE row.
+fn one_row_one_request() -> QueryExtent {
+    QueryExtent::of_baked_rung(
+        RungWidth::of_baked_rows(1).expect("the fixtures' row count is nonzero"),
+        RungCap::ONE,
+    )
+    .expect("one row at one request fits a u32")
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args_os()
@@ -39,8 +49,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ir = lower_region(&bake.sharded.local, NonZeroU32::new(128).ok_or("128 != 0")?);
     // The sublayer's gemm weights: gate, up, down.
     let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-    let (ops, layout) = lower_graph_to_superdsc::<W, _>(&ir, &weight_ids, ActiveCap::FULL, false)
-        .map_err(|e| format!("the sharded sublayer does not lower: {e:?}"))?;
+    let (ops, layout) = lower_graph_to_superdsc::<W, _>(
+        &ir,
+        &weight_ids,
+        ActiveCap::FULL,
+        false,
+        one_row_one_request(),
+    )
+    .map_err(|e| format!("the sharded sublayer does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
         .filter(|e| e.tp_consume.is_some())
@@ -78,8 +94,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroU32::new(128).ok_or("128 != 0")?,
     );
     let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-    let (ops, _) = lower_graph_to_superdsc::<W, _>(&ir, &weight_ids, ActiveCap::FULL, false)
-        .map_err(|e| format!("the sharded projection does not lower: {e:?}"))?;
+    let (ops, _) = lower_graph_to_superdsc::<W, _>(
+        &ir,
+        &weight_ids,
+        ActiveCap::FULL,
+        false,
+        one_row_one_request(),
+    )
+    .map_err(|e| format!("the sharded projection does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
         .filter(|e| e.tp_consume.is_some())

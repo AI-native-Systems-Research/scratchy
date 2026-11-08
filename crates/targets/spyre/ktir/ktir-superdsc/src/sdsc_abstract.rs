@@ -3493,6 +3493,114 @@ impl RungWidth {
     }
 }
 
+/// SEQUENCES A PREFILL RUNG HOLDS — the S axis of the prefill ladder.
+///
+/// A prefill rung is keyed by TWO quantities that both fit a bare `u32`: its chunk WIDTH
+/// ([`RungWidth`] — rows of one sequence's chunk) and how many SEQUENCES it packs. The packed
+/// rung's non-attention tape runs at `width · cap` rows (the decode rungs' own device — the
+/// same tape at a wider row count), so a width handed where a capacity is read bakes a rung
+/// at 2·w rows for one sequence and silently doubles every chunk. Typed apart, as the decode
+/// ladder's own keyed-by-type lesson demands (its `RungSeqs`): three lists once shared a bare
+/// `u32` and two quantities were mixed type-safely by mistake.
+///
+/// ONE is today's every rung — one sequence per chunk, the only shape the bake emits until
+/// the packed prefill rung (M2) lands. Selection reads (per-request width, live sequence
+/// count) against the (width, cap) pairs: the smallest rung holding both.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct RungCap(NonZeroU32);
+
+impl RungCap {
+    /// A BAKED sequence count, read from the bake's own artifacts — a ladder entry. The
+    /// worker-side source. The bake's codegen is the one caller: a ladder literal states its
+    /// rung's capacity as this type (today always `RungCap::ONE`), and nothing on the host
+    /// mints a capacity a bake never stated.
+    pub const fn of_baked_seqs(seqs: u32) -> Option<RungCap> {
+        match NonZeroU32::new(seqs) {
+            Some(n) => Some(RungCap(n)),
+            None => None,
+        }
+    }
+
+    /// ONE sequence — today's every rung, and the value the S = 1 axis bakes at.
+    pub const ONE: RungCap = RungCap(NonZeroU32::MIN);
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The sequence count as a host-side extent — the arithmetic exit.
+    pub const fn count(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+/// THE ATTENTION QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, never a division of the
+/// graph's rows.
+///
+/// A packed prefill rung's graph runs `width · capacity` rows, but its attention kernel serves ONE
+/// request's `width` rows per request (the reference's own law: the varlen batch is one query
+/// buffer, attention is called once per sequence with `PADDED_QUERY_LEN = aligned_s` —
+/// `spyre_attn.py`'s `_run_page_attn`/`_build_query_row_tables`). The two counts were one `mq`
+/// until S > 1, and the splice spent it as BOTH extents; this type is the pair that separates them.
+///
+/// ⛔ MINTED ONCE, FROM THE RUNG — [`Self::of_baked_rung`] is the only mint, and the graph's row
+/// count is the product HELD by the type, not a division any reader performs: nothing may recover
+/// the per-request width by dividing graph rows back (a width a later reader re-derived could
+/// disagree with the one the bake minted). The splice CHECKS the held product against the graph it
+/// lowers and refuses by name on disagreement, so a mint that does not describe the graph is a
+/// bake refusal, never a silently-wrong extent.
+///
+/// The decode mints state their own true pair — every row a request's one token: per-request one
+/// row, requests the baked row count — which the decode and batch kernel arms read exactly as they
+/// read the graph's rows today (one row per request means the two agree by construction).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QueryExtent {
+    /// One request's query rows — the prefill chunk width the rung bakes.
+    per_request: RungWidth,
+    /// How many requests the rung packs — the S axis.
+    requests: RungCap,
+    /// `per_request · requests`, minted once and held: the graph's own row count. The mint checks
+    /// the product, so this is a read, never a recompute.
+    rows: RungWidth,
+}
+
+impl QueryExtent {
+    /// THE MINT — the rung's own pair. `None` only when the product does not fit a `u32` (a rung
+    /// wider than four billion rows is a bake bug, named by the caller that holds the rung).
+    pub const fn of_baked_rung(per_request: RungWidth, requests: RungCap) -> Option<Self> {
+        match per_request.get().checked_mul(requests.get()) {
+            Some(rows) => match RungWidth::of_baked_rows(rows) {
+                Some(w) => Some(Self {
+                    per_request,
+                    requests,
+                    rows: w,
+                }),
+                // `rows` is nonzero whenever `checked_mul` returned `Some` over nonzero factors,
+                // so this arm is unreachable; it exists because `of_baked_rows` states the
+                // nonzero law and the const context cannot `debug_assert` it away.
+                None => None,
+            },
+            None => None,
+        }
+    }
+
+    /// One request's query rows — the prefill kernel's `PADDED_QUERY_LEN` and its walk's extent.
+    pub const fn per_request(self) -> RungWidth {
+        self.per_request
+    }
+
+    /// How many requests the rung packs.
+    pub const fn requests(self) -> RungCap {
+        self.requests
+    }
+
+    /// The graph's row count — `per_request · requests`, held since the mint. The whole-batch
+    /// query buffer's `NUM_TOKENS`.
+    pub const fn graph_rows(self) -> RungWidth {
+        self.rows
+    }
+}
+
 /// REQUESTS ACTUALLY LIVE THIS STEP — what the scheduler admitted, BEFORE padding to a rung.
 ///
 /// Distinct from [`RungWidth`]: a 3-live step runs the 4-row rung, so the two differ on the very

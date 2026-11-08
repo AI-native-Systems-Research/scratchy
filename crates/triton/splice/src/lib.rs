@@ -1940,6 +1940,13 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     ir: &SubtileIR<F>,
     scale_site: AttnScaleSite,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, minted once at the bake and
+    // never divided back out of the graph's rows. The PREFILL arm spends it as the kernel's two
+    // extents (`NUM_TOKENS` = the graph's rows, `PADDED_QUERY_LEN` = one request's width) and as
+    // the walk's extent; the DECODE and BATCH arms read the graph's rows exactly as they did
+    // before (one row per request, so the pair's product IS the row count by construction). The
+    // agreement check below refuses a mint that does not describe the graph being lowered.
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     paged_rows: PagedRows,
 ) -> Result<EmittedOp<T>, String> {
     let batch = paged_rows == PagedRows::Batch;
@@ -2016,6 +2023,22 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let hd = HeadWidth::of_whole_sticks(g.head_dim().get());
     let scale = scale_site.scale(*attention);
     let mq = node.output.region.rows.len;
+    // ⭐ THE PAIR MEETS THE GRAPH HERE, ONCE — the mint's held product must be this graph's own row
+    // count, or the mint describes a different rung than the one being lowered. A disagreement is a
+    // REFUSAL by name (a bake bug, caught at the splice), never a silently-wrong extent: nothing
+    // downstream may divide `mq` back to a per-request width, so this is the one place the two are
+    // proven to agree.
+    if query_rows.graph_rows().get() != mq {
+        return Err(format!(
+            "triton splice: AttnDecode t{}: the graph's {} row(s) are not the extent pair's \
+             {} (per-request {} × {} request(s)) — the mint does not describe the graph it lowers",
+            node.output.tensor.index(),
+            mq,
+            query_rows.graph_rows().get(),
+            query_rows.per_request().get(),
+            query_rows.requests().get(),
+        ));
+    }
     let kv_width = nkvh * hd.get();
     let pages = pool_pages(ir, &node.inputs[1], kv_width, "K")?;
     if pool_pages(ir, &node.inputs[2], kv_width, "V")? != pages {
@@ -2026,7 +2049,17 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     }
     whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
     whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
-    let blocks = walk_pages(pages, mq, active_cap);
+    // ⭐ THE WALK'S EXTENT IS PER-REQUEST FOR A PREFILL CHUNK, THE GRAPH'S ROWS FOR THE BATCHED
+    // KERNELS. The prefill kernel walks ONE request's pages — at one request the two are the same
+    // number, which is why one `mq` served until S > 1; a packed rung's walk must cover one
+    // request's `width` rows of its own record, not `width · S` rows of both records fused. The
+    // decode kernel (one query row) and the batched kernel (the request axis carried inside one
+    // launch) keep the graph's row count, exactly as before.
+    let blocks = if batch || decode {
+        walk_pages(pages, mq, active_cap)
+    } else {
+        walk_pages(pages, query_rows.per_request().get(), active_cap)
+    };
     let tids = PagedStepTids::RESERVED;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
@@ -2137,7 +2170,11 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         ("NUM_BLOCKS", blocks),
     ];
     if !decode {
-        sizes.push(("PADDED_QUERY_LEN", mq));
+        // ⭐ ONE REQUEST'S QUERY WIDTH, NOT THE GRAPH'S ROWS — the kernel gathers `P` rows through
+        // `query_row_index` (a per-request table) and scatters them back through the same rows, so
+        // its padded query length is the rung's per-request width. At one request the two agree,
+        // which is why one `mq` served until S > 1.
+        sizes.push(("PADDED_QUERY_LEN", query_rows.per_request().get()));
     }
     for (k, v) in sizes {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -4155,6 +4192,49 @@ mod production_ktir_dump {
                 )
             };
             v.push((name, src, spec(file, entry, &ptrs, &ces), vec![1]));
+        }
+        // ── and the PREFILL kernel at a PACKED rung's split extents (M2's S=2 shape, stated at the
+        // splice level): `NUM_TOKENS` is the graph's rows (two requests of 64) while
+        // `PADDED_QUERY_LEN` and the walk are ONE request's 64 rows — the two extents
+        // [`QueryExtent`] separates, compiled at the pair a (64, 2) rung mints. The walk is the
+        // rung's own law at `ActiveCap::NONE` (a start==0 chunk: the pages its own per-request
+        // rows fill), stated by the same [`walk_pages`] the splice bakes it with.
+        {
+            let ptrs: Vec<(&str, &str)> = vec![
+                ("query", "*fp16"),
+                ("query_row_index", "*i32"),
+                ("k_pages", "*fp16"),
+                ("v_pages", "*fp16"),
+                ("page_index_table", "*i32"),
+                ("mask_stack", "*fp16"),
+                ("out", "*fp16"),
+            ];
+            let blocks = walk_pages(4, 64, ktir_superdsc::ktir_node::ActiveCap::NONE);
+            let ces = vec![
+                ("NUM_TOKENS", Val::Int(128)),
+                ("NUM_HEADS", Val::Int(32)),
+                ("NUM_KV_HEADS", Val::Int(8)),
+                ("HEAD_SIZE", Val::Int(64)),
+                (
+                    "BLOCK_SIZE",
+                    Val::Int(i128::from(SchedulerBlockTokens::REFERENCE.get())),
+                ),
+                ("NUM_PAGES", Val::Int(4)),
+                ("NUM_BLOCKS", Val::Int(i128::from(blocks))),
+                ("PADDED_QUERY_LEN", Val::Int(64)),
+                ("SCALE", Val::Float(0.125)),
+            ];
+            v.push((
+                "paged_attn_prefill_packed",
+                PAGED_PREFILL,
+                spec(
+                    "page_attn_head_major_prefill.py",
+                    "page_attn_head_major_prefill_kernel",
+                    &ptrs,
+                    &ces,
+                ),
+                vec![1],
+            ));
         }
         // ...and `batched_decode_head_major` over that pool, the chunkings a decode batch rung
         // states (`BatchChunking::of`): 4 sequences on the 4-page rung (one chunk), on the 64-page

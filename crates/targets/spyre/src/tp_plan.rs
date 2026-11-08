@@ -103,6 +103,18 @@ mod tests {
         };
     }
 
+    /// The extent pair every `lower_graph_*` call below states for its graph: these fixtures are
+    /// ONE request of ONE row (m=1, no AttnDecode — the pair still must describe the graph it is
+    /// handed, and it does: one row, one request).
+    fn one_row_one_request() -> scratchy_subtile::sdsc_abstract::QueryExtent {
+        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                .expect("the fixtures' row count is nonzero"),
+            scratchy_subtile::sdsc_abstract::RungCap::ONE,
+        )
+        .expect("one row at one request fits a u32")
+    }
+
     /// One rank: no collective, no window — the tp=1 identity at the plan's level.
     #[test]
     fn one_rank_needs_no_window() {
@@ -154,7 +166,13 @@ mod tests {
             let mut operands = Vec::new();
             for node in ir.nodes.iter().filter(|n| matches!(n.op, SubOp::AllReduce)) {
                 operands.push(PlaceId::Act(node.inputs[0].tensor.index() as u32));
-                match lower_one_node::<T, _>(node, &ir, ActiveCap::FULL, false) {
+                match lower_one_node::<T, _>(
+                    node,
+                    &ir,
+                    ActiveCap::FULL,
+                    false,
+                    one_row_one_request(),
+                ) {
                     NodeLowering::Ops(v) => ops.extend(v),
                     NodeLowering::Unhandled(why) => panic!("the collective did not lower: {why}"),
                     NodeLowering::HostRouted(k) => panic!("the collective was host-routed: {k}"),
@@ -234,8 +252,14 @@ mod tests {
             assert_eq!(b.sharded.collectives.len(), 1, "one all-reduce, after down");
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, _layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, _layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_row_one_request(),
+            )
+            .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
             let consume_groups: Vec<_> = shifts.iter().filter_map(|s| s.tp).collect();
             assert_eq!(
@@ -270,8 +294,14 @@ mod tests {
             assert_eq!(kinds, vec![Shared::AllGather], "the result is gathered");
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-            let (ops, _) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, _) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_row_one_request(),
+            )
+            .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
             let consumes: Vec<_> = shifts.iter().filter_map(|s| s.tp).collect();
             assert_eq!(consumes.len(), n, "one consume group per rank");
@@ -397,8 +427,14 @@ mod tests {
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_row_one_request(),
+            )
+            .unwrap();
             let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
             let at = |tid: u32| {
                 let p = layout.placements[&tid];
@@ -457,8 +493,14 @@ mod tests {
             let b = tp_bake::<T>(&vocab_projection(2048, v as u32)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_row_one_request(),
+            )
+            .unwrap();
             let at = |tid: u32| {
                 let p = layout.placements[&tid];
                 SEGMENT_OFFSETS[p.segment] + p.offset
@@ -517,8 +559,14 @@ mod tests {
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_row_one_request(),
+            )
+            .unwrap();
             let partial = ir
                 .nodes
                 .iter()
@@ -576,8 +624,14 @@ mod tests {
             let b = tp_bake::<T>(&vocab_projection(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32].into_iter().collect();
-            let (ops, _) =
-                lower_graph_to_ktir::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, _) = lower_graph_to_ktir::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_row_one_request(),
+            )
+            .unwrap();
             let groups = ktir_groups(&ops, FoldGrouping::Split, None).unwrap();
             let consumes: Vec<_> = groups.iter().filter(|g| g.kv.tp.is_some()).collect();
             assert_eq!(consumes.len(), n, "one consume group per rank");
@@ -627,6 +681,7 @@ mod tests {
                 weight_ids,
                 scratchy_triton_splice::PagedRows::Sequence,
                 &[],
+                one_row_one_request(),
             )
             .expect("the sublayer lays out")
         }
