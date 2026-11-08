@@ -3557,15 +3557,17 @@ fn teacher_forced_walk<F: RopeForm>(
                     shape,
                 );
                 // ⭐ A FOLDED tail tid states the FOLD'S OWN LAW here too: the
-                // program's product is ONE row (row 0 of the readback — the
-                // stick above it is sized by the IR and never written), so the
-                // row compares the emulator's row 0 against this walk's LAST
+                // program's product is S rows (rows 0..S of the readback —
+                // the stick above them is sized by the IR and never written;
+                // every golden today is one request, so S = 1 and the product
+                // is row 0 alone), so the row compares the emulator's row 0
+                // against this walk's LAST
                 // row (the `selector_lastrow_col` extraction the lowering
                 // pins). The teacher still pins — the fold's own pin: the
-                // program wrote ONE row, row 0, the row the fold's consumers
-                // read (the Sample's `SampleRows::Folded` region is rows
-                // 0..1), so the emulator's row 0 is pinned there and rows 1..
-                // stay as the walk computed them (the program never wrote
+                // program wrote S rows starting at row 0, the rows the fold's
+                // consumers read (the Sample's `SampleRows::Folded` region is
+                // rows 0..S), so the emulator's row 0 is pinned there and rows
+                // 1.. stay as the walk computed them (the program never wrote
                 // them, and the fold law of every downstream folded tid reads
                 // the walk's LAST row). Without this pin the walk's Sample
                 // re-drew from the WALK's row 0 — the FIRST prompt

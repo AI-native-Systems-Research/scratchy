@@ -1081,9 +1081,8 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // The tables are tape sources the expansion stages at load (functions of
         // the vocab alone); the splice binds them positionally, exactly as it
         // binds silumul's gate and up. `lower_all`, not `lower`: a prefill rung's
-        // draw reads the FOLDED tail's one row (the same `node_at_one_row` law
-        // the tail's ScalarMul and TanhSoftCap get), which is `lower_all`'s
-        // interception.
+        // draw reads the FOLDED tail's answer rows (the `[S, vocab]` window the
+        // mint states on the node), which is `lower_all`'s machinery.
         SubOp::Sample { .. } => {
             match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
                 Ok(ops) => Ops(ops),

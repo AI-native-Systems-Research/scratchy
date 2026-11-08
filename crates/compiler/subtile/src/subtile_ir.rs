@@ -1860,18 +1860,28 @@ pub struct SampleMint {
 /// states (`is_prefill_lm_head_tail`), handed to the mint by the caller and
 /// never re-derived here. A DECODE graph computes every result row (the solo
 /// rung's one, a batch rung's one per request); a PREFILL graph's lm-head tail
-/// is FOLDED to one row (the emitter re-lowers the matmul at m=1 over the last
-/// prompt row, `lower_prefill_lm_head_fold`), so the draw serves that one row.
+/// is FOLDED to the rung's answer rows (the emitter re-lowers the matmul at
+/// m=S over the requests' last prompt rows, `lower_prefill_lm_head_fold`), so
+/// the draw serves exactly those S rows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SampleRows {
     /// Every result row is computed and drawn — the decode rungs.
     All,
-    /// The folded lm-head row alone — the prefill rungs. The Sample node reads
-    /// the region the fold writes (the tail matmul's own one-row output region,
-    /// the same `one_row` law the emitter's re-lowering keeps), and the seat,
-    /// the idx stick and every per-row operand sit at rows = 1 — the proven
-    /// solo-decode shape.
-    Folded,
+    /// The folded lm-head rows alone — the prefill rungs, one per request
+    /// window: the rung's own request CAPACITY, the same `RungCap` the
+    /// attention's extent pair mints (never a division of the graph's rows).
+    /// The Sample node reads the region the fold writes — the tail matmul's
+    /// own `[S, vocab]` output window, rows `0..S` of the `[mq, vocab]`
+    /// storage (the same window law the emitter's re-lowering keeps) — and
+    /// the seat, the idx stick and every per-row operand sit at rows = S.
+    /// At `S = 1` this is the proven solo-decode shape, byte-identical. An
+    /// empty window's row is a pad row the fold wrote from the staging and
+    /// the readback never takes (it draws `rows().take(live)`, live off the
+    /// launch's slot list).
+    Folded {
+        /// The rung's request capacity — the count the answer rows mint.
+        requests: crate::sdsc_abstract::RungCap,
+    },
 }
 
 /// Append the token draw to a graph — every rung's own row count, the solo m=1
@@ -1879,8 +1889,9 @@ pub enum SampleRows {
 /// per-step staged sources (the seed quadruple's four `[rows, 1]` i32 word
 /// tables, invt), twenty staged-table sources, the result tail chain's
 /// tensors widened to `[rows, PAD_V]`, the `Sample` node
-/// reading the widened block (every row on a decode rung; the folded row alone
-/// on a prefill rung — [`SampleRows`]), and the graph's RESULT re-pointed to
+/// reading the widened block (every row on a decode rung; the folded answer
+/// rows alone on a prefill rung — [`SampleRows`]), and the graph's RESULT
+/// re-pointed to
 /// the node's idx stick. Pure graph surgery — the GATE (which rungs mint, and
 /// which rows their suffix computes) is the caller's fact; this fn states only
 /// its own invariants and panics on their violation, which at expansion time
@@ -1931,16 +1942,16 @@ pub enum SampleRows {
 /// count (the solo rung at 1, a batched rung at its baked width), so each
 /// graph (and its bundle's seg4) carries its own padded block — the mint
 /// reads the row count off the result tensor and never assumes one. A prefill
-/// rung mints at the FOLDED row's 1 whatever its `mq` (the suffix computes one
-/// logits row; a draw at `mq` would read rows nobody wrote and break the
-/// kernel's grid law).
+/// rung mints at the FOLDED rung's own request capacity whatever its `mq` (the
+/// suffix computes S logits rows; a draw at `mq` would read rows nobody wrote
+/// and break the kernel's grid law).
 pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) -> SampleMint {
     let result_rows = graph.tensors[graph.result.index()].rows;
     let vocab = graph.tensors[graph.result.index()].cols;
     let pad_vocab = sample_pad_vocab(vocab);
     let rows = match suffix {
         SampleRows::All => result_rows,
-        SampleRows::Folded => 1,
+        SampleRows::Folded { requests } => requests.get(),
     };
     assert!(
         rows >= 1,
@@ -2079,7 +2090,7 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
     // Widen the RESULT TAIL CHAIN to the padded width — the whole chain, per
     // the mint's own law above. The ROWS are untouched: the rung keeps its own
     // row count, and the fold (the emitter's own `lower_prefill_lm_head_fold`)
-    // is the one that states the one-row tail on a prefill rung.
+    // is the one that states the S-row tail on a prefill rung.
     loop {
         graph.tensors[t.index()].cols = pad_vocab;
         let node = graph
@@ -2126,15 +2137,16 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
     };
     let mut inputs = Vec::with_capacity(26);
     // The logits the draw reads: the whole result block on an All graph, and
-    // the ONE row the folded tail writes on a Folded graph — row 0, the row
-    // `lower_prefill_lm_head_fold`'s m=1 matmul writes (the result tensor's
-    // DECLARED shape stays [mq, vocab]; only this region states the fold).
+    // the [S, vocab] window the folded tail writes on a Folded graph — rows
+    // 0..S, the rows `lower_prefill_lm_head_fold`'s m=S matmul writes (the
+    // result tensor's DECLARED shape stays [mq, vocab]; only this region
+    // states the fold). At S = 1 the window is row 0 alone, byte-identical.
     inputs.push(match suffix {
         SampleRows::All => whole(graph.result),
-        SampleRows::Folded => TensorRegion {
+        SampleRows::Folded { .. } => TensorRegion {
             tensor: graph.result,
             region: Region {
-                rows: Range::new(0, 1),
+                rows: Range::new(0, rows),
                 cols: Range::new(0, pad_vocab),
             },
         },
@@ -6833,5 +6845,106 @@ mod tests {
             "an all-NaN row draws the sentinel: G·4096 + 4160, at vocab 5 (G = 0) 4160"
         );
         assert!(sample_sentinel(5) >= 5, "the sentinel is past the vocab");
+    }
+}
+
+mod sample_rows_tests {
+    use super::*;
+    use crate::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
+    use crate::sdsc_abstract::RungCap;
+
+    /// A one-op lm-head graph — the final projection of `m` hidden rows onto a
+    /// 5-wide vocabulary, the same shape `argmax_mint_lower` pins the splice seat
+    /// with — handed to `lower_region`.
+    fn lm_head(m: u32) -> SubtileIR<NeoX> {
+        let input = LoweringInput {
+            exported: None,
+            sources: vec![
+                SourceShape { rows: 1, cols: 1 },
+                SourceShape { rows: 1, cols: 5 },
+            ],
+            ops: vec![OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 5,
+                    weight: GemmWeight::Dense,
+                },
+                m,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+            result: 0,
+        };
+        lower_region(&input, std::num::NonZeroU32::new(64).unwrap())
+    }
+
+    /// ⭐ THE FOLDED MINT READS THE RUNG'S OWN REQUEST COUNT — k = 1, 2 and 3
+    /// (3 is not a power of two), each over the same 8-row graph: the draw's
+    /// `rows`, its idx-stick output, and every per-row seat sit at k, the logits
+    /// region it reads is rows 0..k of the result tensor's own [mq, pad_vocab]
+    /// storage (the [S, vocab] window the folded tail writes — row 0 alone at
+    /// k = 1), and the result tensor's DECLARED shape stays [mq, vocab] — only
+    /// the region states the fold. No count is special-cased: the k = 1 case is
+    /// this same assertion at one.
+    #[test]
+    fn the_folded_mint_reads_the_rungs_request_count() {
+        let mq = 8u32;
+        for k in [1u32, 2, 3] {
+            let mut g = lm_head(mq);
+            let cap = RungCap::of_baked_seqs(k).expect("a nonzero request count");
+            let mint = mint_sample(&mut g, SampleRows::Folded { requests: cap });
+            assert_eq!(mint.rows, k, "the draw serves k = {k} rows");
+            let sample = g
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, SubOp::Sample { .. }))
+                .expect("the mint appended the draw");
+            let SubOp::Sample { rows, .. } = sample.op else {
+                unreachable!("the filter matched a Sample")
+            };
+            assert_eq!(rows, k, "the node's own row count is k = {k}");
+            let logits = &sample.inputs[0];
+            assert_eq!(
+                (logits.region.rows.start, logits.region.rows.len),
+                (0, k),
+                "the draw reads rows 0..k of the logits storage at k = {k}"
+            );
+            assert_eq!(
+                g.tensors[logits.tensor.index()].rows,
+                mq,
+                "the result tensor's DECLARED rows stay mq — only the region states the fold"
+            );
+            assert_eq!(
+                (
+                    sample.output.region.rows.start,
+                    sample.output.region.rows.len
+                ),
+                (0, k),
+                "the idx stick holds k = {k} picks"
+            );
+            assert_eq!(g.result, sample.output.tensor, "the answer re-point holds");
+            // The per-row seat: the seed quadruple's first word table is a
+            // [k, 1] i32 source, one row per request.
+            let seed = g.tensors[mint.seed_words[0].index()];
+            assert_eq!(
+                (seed.rows, seed.cols),
+                (k, 1),
+                "the per-row seat sits at k = {k} rows"
+            );
+        }
+    }
+
+    /// The ALL mint is unchanged by the count law: it reads the result tensor's
+    /// own rows, whatever they are.
+    #[test]
+    fn the_all_mint_reads_the_result_rows() {
+        let mq = 8u32;
+        let mut g = lm_head(mq);
+        let mint = mint_sample(&mut g, SampleRows::All);
+        assert_eq!(mint.rows, mq);
+        let sample = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::Sample { .. }))
+            .expect("the mint appended the draw");
+        assert_eq!(sample.inputs[0].region.rows.len, mq);
     }
 }

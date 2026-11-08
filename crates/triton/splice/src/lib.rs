@@ -663,19 +663,13 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
         let at_tail = node_at_tail_rows(node, tail_requests(query_rows));
         return lower_one(&at_tail, ir, rows_are_requests).map(|e| vec![e]);
     }
-    // ⭐ AND THE TOKEN DRAW'S ROW INPUT IS THE FOLDED TAIL'S ONE ROW — the same
-    // `node_at_one_row` law the tail's ScalarMul and TanhSoftCap get: the mint
-    // states the prefill draw at rows = 1 reading the result's row 0 (the row
-    // the fold writes), so the kernel is handed the whole one-row region at
-    // corner 0. The gate is the mint's own typed fact — a one-row region of a
-    // taller tensor — never a model name or a rung label.
-    if let SubOp::Sample { .. } = &node.op
-        && node.inputs[0].region.rows.len == 1
-        && ir.tensors[node.inputs[0].tensor.index()].rows > 1
-    {
-        let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
-    }
+    // ⭐ THE TOKEN DRAW NEEDS NO ARM OF ITS OWN — the mint states its window:
+    // `mint_sample`'s Folded arm reads the rung's request count and hands the
+    // node the `[S, vocab]` region the folded tail writes (row 0 alone at
+    // S = 1), so the ordinary one-op row below lowers the draw as minted and
+    // the splice never re-derives the window (the draw's kernel view IS the
+    // region — both corners 0, extents free — the law `lower_one`'s
+    // whole-region guard already states for it).
     // ⭐ A KV WRITER IS TWO PROGRAMS: the rotation (`rope.py`, the node's own output) and the paged
     // write that scatters the rotated K and the V into the pools (`reshape_and_cache_head_major.py`) — spyre-
     // inference's `do_kv_cache_update`, run before the step's attention reads the pages.
@@ -688,38 +682,11 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
 }
 
-/// Main's own `node_at_one_row`, verbatim law: slice the FIRST row (the region's
-/// own `rows.start`, length 1) of the input and the output — the mint's one-row
-/// draw's addressing (the minted prefill sample reads row 0 of a taller storage).
-fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
-    node: &SubtileNode<F>,
-) -> SubtileNode<F> {
-    let one_row = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
-        scratchy_subtile::subtile_ir::TensorRegion {
-            tensor: tr.tensor,
-            region: scratchy_subtile::subtile_ir::Region {
-                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, 1),
-                cols: tr.region.cols,
-            },
-        }
-    };
-    let mut inputs = node.inputs.clone();
-    if let Some(a) = inputs.first_mut() {
-        *a = one_row(a);
-    }
-    SubtileNode {
-        id: node.id,
-        op: node.op,
-        inputs,
-        output: one_row(&node.output),
-    }
-}
-
 /// The folded lm-head tail's own row window — the FIRST `s` rows (the region's own
 /// `rows.start`, length `s`) of the input and the output, where `s` is the rung's
 /// request CAPACITY: the folded tail writes the `[S, vocab]` prefix of the `[mq, vocab]`
 /// logits storage (request r's row is row r), so its consumers run over exactly those
-/// rows. At `s = 1` this is main's own `node_at_one_row` law, byte-identical.
+/// rows. At `s = 1` this is main's own one-row law, byte-identical.
 fn node_at_tail_rows<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     s: u32,
@@ -1257,10 +1224,10 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         // prefix of the `[mq, vocab]` logits storage, a legal prefix view), and the front end's chunker never tiles this
         // op (its chunk set is the elementwise/scalarmul/silumul family), so a column
         // window never arises. The draw's kernel is the same law: its view is the
-        // region — the minted prefill draw reads row 0 of the `[mq, pad_vocab]`
-        // storage at rows = 1, a legal prefix view — and every operand the draw
-        // binds (the per-row pair, the nine tables, the idx stick) is whole at
-        // corner 0.
+        // region — the minted prefill draw reads rows 0..S of the `[mq, pad_vocab]`
+        // storage (row 0 alone at S = 1), a legal prefix view — and every operand
+        // the draw binds (the per-row pair, the nine tables, the idx stick) is
+        // whole at corner 0.
         let states_neither_corner =
             matches!(&node.op, SubOp::TanhSoftCap { .. } | SubOp::Sample { .. });
         if states_neither_corner {
