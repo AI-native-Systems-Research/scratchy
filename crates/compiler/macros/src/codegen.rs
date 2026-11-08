@@ -14447,8 +14447,8 @@ fn dump_wavefront_mega(
                         );
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
                         // continuation chunk on a sharded session runs on ITS world's prefix rung.
-                        if let Some(shards) = tp_sources.as_deref() {
-                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                        if tp_sources.is_some() {
+                            let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
                                 scratchy_target_spyre::bundle_code::collective::Build,
                             >(
                                 &lwd_p,
@@ -14461,6 +14461,8 @@ fn dump_wavefront_mega(
                                      is malformed — {e:?}"
                                 )
                             });
+                            // The rung's OWN slice laws, as the prefix-free ladder passes its own:
+                            // a prompt's rows are staged whole, never the decode's gathered row.
                             let (_, fx) = emit_bundle_deferred_sharded(
                                 &tp_lwd,
                                 format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
@@ -14469,7 +14471,7 @@ fn dump_wavefront_mega(
                                 Some(m),
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 1,
-                                Some(shards),
+                                Some(&sf_p.sources),
                             );
                             commit_bake(&sharded_world, &tp_lwd, fx);
                         }
