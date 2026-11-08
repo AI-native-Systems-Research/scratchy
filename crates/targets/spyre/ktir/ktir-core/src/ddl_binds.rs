@@ -615,7 +615,7 @@ impl DeviceGen for Gen1 {
     const LX_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
 
     /// SIDS = 64: senlib-rs `BASE_ADDR_TABLE_ENTRIES: usize = 64`
-    /// (snt1p0.rs:232) — the same 64 its `Tid::new` refuses to exceed.
+    /// (snt1p0.rs:246) — the same 64 its `Tid::new` refuses to exceed.
     const MAX_SIDS: u32 = 64;
 
     /// RDMA = 4 MiB per message: the vendor's per-message RDMA window
@@ -626,7 +626,7 @@ impl DeviceGen for Gen1 {
 
     /// SEGMENTS = 7: the executor's ≤7-packed-segment model over the
     /// device's VA segments — senlib-rs states 8 VA segments for snt1p0
-    /// (snt1p0.rs:~545) and the executor model packs 7.
+    /// (snt1p0.rs:545) and the executor model packs 7.
     const NUM_SEGMENTS: usize = 7;
 
     /// One segment = 16 GiB: senlib-rs `XLAT_LEN_MAX_FLITS: u64 = 1 << 27`
