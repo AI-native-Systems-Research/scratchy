@@ -8140,7 +8140,10 @@ struct CarryNames {
 }
 
 impl<'d> Defs<'d> {
-    fn new(f: &'d IRFunction<'static>, fold: Option<&super::loop_fold::LoopFold>) -> Self {
+    fn new(
+        f: &'d IRFunction<'static>,
+        fold: Option<&super::loop_fold::LoopFold>,
+    ) -> Result<Self, Error> {
         let mut def = std::collections::HashMap::new();
         for o in f.ops_deep() {
             if let Some(r) = o.result {
@@ -8172,7 +8175,7 @@ impl<'d> Defs<'d> {
             })
         };
         for o in f.ops_deep().iter().filter(|o| o.op_type == OpKind::ScfFor) {
-            for c in Self::carries(o) {
+            for c in Self::carries(f, o)? {
                 // A carry whose init the for does not state seeds no shape — the truncation
                 // the old args/inits zip spelled, now stated by the quad's own `Option`.
                 let Some(init) = c.init else { continue };
@@ -8201,13 +8204,14 @@ impl<'d> Defs<'d> {
                 }
             }
         }
-        Defs { def, shape }
+        Ok(Defs { def, shape })
     }
 
     /// A `scf.for` carry's four names — its arg, init, yield and result name ONE buffer
     /// (the fold's own law, `loop_fold`). A name the for does not state is `None`; no
-    /// carry is ever silently paired with another carry's name.
-    fn carries(o: &'d Operation<'static>) -> Vec<CarryNames> {
+    /// carry is ever silently paired with another carry's name. An attr the for states
+    /// in a form the walk does not read is refused by name — never treated as absent.
+    fn carries(f: &IRFunction<'_>, o: &'d Operation<'static>) -> Result<Vec<CarryNames>, Error> {
         let args: &[Ssa] = match o.attr(AttrKey::IterArgs) {
             Some(Attr::Ssas(v)) => v,
             _ => &[],
@@ -8215,20 +8219,27 @@ impl<'d> Defs<'d> {
         let inits = &o.operands[3.min(o.operands.len())..];
         let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
             Some(Attr::Ssas(v)) => v.to_vec(),
-            _ => o.result.into_iter().collect(),
+            None => o.result.into_iter().collect(),
+            Some(other) => {
+                return err(format!(
+                    "{}: a scf.for states its ResultNames as {other:?}, not the name list \
+                     the walk pairs with its carries",
+                    f.name
+                ));
+            }
         };
         let body = o.regions.first().copied().unwrap_or(&[]);
         let yields: Option<&[Ssa]> = body
             .split_last()
             .and_then(|(y, _)| (y.op_type == OpKind::ScfYield).then_some(y.operands));
-        (0..args.len())
+        Ok((0..args.len())
             .map(|i| CarryNames {
                 arg: args[i],
                 init: inits.get(i).copied(),
                 yielded: yields.and_then(|y| y.get(i)).copied(),
                 result: results.get(i).copied(),
             })
-            .collect()
+            .collect())
     }
 
     fn of(&self, v: Ssa) -> Option<&'d Operation<'static>> {
@@ -8405,7 +8416,7 @@ fn assign_frames(
     fold: Option<&super::loop_fold::LoopFold>,
 ) -> Result<Frames, Error> {
     let deep = f.ops_deep();
-    let defs = Defs::new(f, fold);
+    let defs = Defs::new(f, fold)?;
     let column_fed = column_fed_params(&defs);
     // The spray facts: which source each broadcast sprays, and along what axis — the chase's own
     // statement, read here for the anchors and never re-derived.
@@ -8453,7 +8464,7 @@ fn assign_frames(
             node(r);
         }
         if o.op_type == OpKind::ScfFor {
-            for c in Defs::carries(o) {
+            for c in Defs::carries(f, o)? {
                 node(c.arg);
                 if let Some(r) = c.result {
                     node(r);
@@ -8476,7 +8487,7 @@ fn assign_frames(
         if o.op_type != OpKind::ScfFor {
             continue;
         }
-        for (i, c) in Defs::carries(o).into_iter().enumerate() {
+        for (i, c) in Defs::carries(f, o)?.into_iter().enumerate() {
             let why = format!(
                 "{}: the walk carries %{}/{} — its arg, init, yield and result are one buffer",
                 f.name, c.arg.0, i
@@ -12661,6 +12672,60 @@ mod frame_pass_tests {
                 .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the loop returns the carry it holds"
+        );
+    }
+
+    /// ⭐ A FOR STATING ITS RESULTNAMES IN A FORM THE WALK DOES NOT READ IS REFUSED BY NAME —
+    /// the census discipline: a for that states NO ResultNames (`None`) has its results as
+    /// the names, and a for that states a DIFFERENT attr variant is malformed. The two facts
+    /// are not one default: the malformed case is a refusal naming the function and the
+    /// attr it found — never a silent empty name list paired against the carries.
+    #[test]
+    fn a_for_stating_unreadable_result_names_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, seed) = (Ssa(0), Ssa(1));
+        let (lb, ub, step, iv, carry, red, lres) =
+            (Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6), Ssa(7), Ssa(8));
+        let body_ops = a.ops(vec![
+            fold_reduce(a, red, seed, carry, &[64], &[1]),
+            Operation::new(a, None, OpKind::ScfYield, &[red]),
+        ]);
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
+        };
+        let f = func(
+            a,
+            "unreadable_result_names",
+            vec![
+                zero(a, scalar),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![body_ops]),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Ssas(a.ssa(vec![carry])))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Int(0))
+                },
+            ],
+        );
+        let Err(e) = assign_frames(&f, None) else {
+            panic!("a scf.for stating its ResultNames as an Int is not a name list");
+        };
+        assert!(
+            e.message.contains("unreadable_result_names") && e.message.contains("ResultNames"),
+            "the refusal names the function and the attr it found: {}",
+            e.message
         );
     }
 
