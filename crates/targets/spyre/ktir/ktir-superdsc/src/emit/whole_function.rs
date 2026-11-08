@@ -8129,6 +8129,16 @@ struct Defs<'d> {
     shape: std::collections::HashMap<Ssa, Vec<i64>>,
 }
 
+/// A `scf.for` carry's four names — arg, init, yielded, result — as [`Defs::carries`] states
+/// them. The names the for does not state are `None`; the quads are index-paired, so a name is
+/// never silently read as another carry's.
+struct CarryNames {
+    arg: Ssa,
+    init: Option<Ssa>,
+    yielded: Option<Ssa>,
+    result: Option<Ssa>,
+}
+
 impl<'d> Defs<'d> {
     fn new(f: &'d IRFunction<'static>, fold: Option<&super::loop_fold::LoopFold>) -> Self {
         let mut def = std::collections::HashMap::new();
@@ -8162,21 +8172,20 @@ impl<'d> Defs<'d> {
             })
         };
         for o in f.ops_deep().iter().filter(|o| o.op_type == OpKind::ScfFor) {
-            let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
-                Some(Attr::Ssas(v)) => v.to_vec(),
-                _ => o.result.into_iter().collect(),
-            };
-            for (i, (arg, init)) in Self::carries(o).into_iter().enumerate() {
+            for c in Self::carries(o) {
+                // A carry whose init the for does not state seeds no shape — the truncation
+                // the old args/inits zip spelled, now stated by the quad's own `Option`.
+                let Some(init) = c.init else { continue };
                 let d = init_dims(&shape, init);
                 if let Some(d) = d {
-                    shape.insert(arg, d);
+                    shape.insert(c.arg, d);
                 }
                 // ⭐ THE RESULT PAIRED WITH THIS CARRY, BY INDEX — args/inits/results are
                 // arity-equal (the fold's own law), so carry `i`'s result is `results[i]`: a
                 // result never takes another carry's shape, and a carry that states no shape
                 // leaves its result unstated too — never a made-up `[]`.
-                if let Some(&r) = results.get(i)
-                    && let Some(d) = shape.get(&arg).cloned()
+                if let Some(r) = c.result
+                    && let Some(d) = shape.get(&c.arg).cloned()
                 {
                     shape.entry(r).or_insert(d);
                 }
@@ -8195,16 +8204,31 @@ impl<'d> Defs<'d> {
         Defs { def, shape }
     }
 
-    /// A `scf.for`'s carried args paired with their inits — `IterArgs` over `operands[3..]`,
-    /// the walk's own correspondence (`loop_fold`). One spelling, read by the shape seeds here
-    /// and the world seeds in [`assign_frames`].
-    fn carries(o: &'d Operation<'static>) -> Vec<(Ssa, Ssa)> {
+    /// A `scf.for` carry's four names — its arg, init, yield and result name ONE buffer
+    /// (the fold's own law, `loop_fold`). A name the for does not state is `None`; no
+    /// carry is ever silently paired with another carry's name.
+    fn carries(o: &'d Operation<'static>) -> Vec<CarryNames> {
         let args: &[Ssa] = match o.attr(AttrKey::IterArgs) {
             Some(Attr::Ssas(v)) => v,
             _ => &[],
         };
         let inits = &o.operands[3.min(o.operands.len())..];
-        args.iter().copied().zip(inits.iter().copied()).collect()
+        let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
+            Some(Attr::Ssas(v)) => v.to_vec(),
+            _ => o.result.into_iter().collect(),
+        };
+        let body = o.regions.first().copied().unwrap_or(&[]);
+        let yields: Option<&[Ssa]> = body
+            .split_last()
+            .and_then(|(y, _)| (y.op_type == OpKind::ScfYield).then_some(y.operands));
+        (0..args.len())
+            .map(|i| CarryNames {
+                arg: args[i],
+                init: inits.get(i).copied(),
+                yielded: yields.and_then(|y| y.get(i)).copied(),
+                result: results.get(i).copied(),
+            })
+            .collect()
     }
 
     fn of(&self, v: Ssa) -> Option<&'d Operation<'static>> {
@@ -8429,13 +8453,9 @@ fn assign_frames(
             node(r);
         }
         if o.op_type == OpKind::ScfFor {
-            if let Some(&Attr::Ssas(v)) = o.attr(AttrKey::IterArgs) {
-                for &a in v {
-                    node(a);
-                }
-            }
-            if let Some(&Attr::Ssas(v)) = o.attr(AttrKey::ResultNames) {
-                for &r in v {
+            for c in Defs::carries(o) {
+                node(c.arg);
+                if let Some(r) = c.result {
                     node(r);
                 }
             }
@@ -8448,38 +8468,25 @@ fn assign_frames(
     // bake error verbatim — one adapter, no re-wording.
     let as_err = |e: String| Error { message: e };
     // ── THE WALK'S CARRIES, when the function still states its loop: the for's own
-    // correspondence — `IterArgs` over `operands[3..]`, the `ResultNames`, and the body's
-    // trailing `scf.yield` (the same law [`loop_fold::flatten` proves and drops). ──
+    // correspondence — arg, init, yield and result, stated once by [`Defs::carries`]
+    // (the same law [`loop_fold::flatten`] proves and drops). ──
     for o in deep.iter() {
         if o.op_type != OpKind::ScfFor {
             continue;
         }
-        let args: Vec<Ssa> = match o.attr(AttrKey::IterArgs) {
-            Some(Attr::Ssas(v)) => v.to_vec(),
-            _ => Vec::new(),
-        };
-        let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
-            Some(Attr::Ssas(v)) => v.to_vec(),
-            _ => o.result.into_iter().collect(),
-        };
-        let inits: Vec<Ssa> = o.operands[3.min(o.operands.len())..].to_vec();
-        let body = o.regions.first().copied().unwrap_or(&[]);
-        let yields: Option<&[Ssa]> = body
-            .split_last()
-            .and_then(|(y, _)| (y.op_type == OpKind::ScfYield).then_some(y.operands));
-        for i in 0..args.len() {
+        for (i, c) in Defs::carries(o).into_iter().enumerate() {
             let why = format!(
                 "{}: the walk carries %{}/{} — its arg, init, yield and result are one buffer",
-                f.name, args[i].0, i
+                f.name, c.arg.0, i
             );
-            if let Some(&init) = inits.get(i) {
-                uf.join(idx(args[i]), idx(init), &why).map_err(as_err)?;
+            if let Some(init) = c.init {
+                uf.join(idx(c.arg), idx(init), &why).map_err(as_err)?;
             }
-            if let Some(y) = yields.and_then(|y| y.get(i)) {
-                uf.join(idx(args[i]), idx(*y), &why).map_err(as_err)?;
+            if let Some(y) = c.yielded {
+                uf.join(idx(c.arg), idx(y), &why).map_err(as_err)?;
             }
-            if let Some(&r) = results.get(i) {
-                uf.join(idx(args[i]), idx(r), &why).map_err(as_err)?;
+            if let Some(r) = c.result {
+                uf.join(idx(c.arg), idx(r), &why).map_err(as_err)?;
             }
         }
     }
@@ -8702,12 +8709,7 @@ fn assign_frames(
                  is the `In::col` reading, and only the column frame supplies it. The device's \
                  pointwise modes address a lane-for-lane tile, one scalar per row, and a stated \
                  spray; this operand is none of them, so its frame is named rather than guessed",
-                f.name,
-                c.op.op_type,
-                c.operand.0,
-                c.operand_numel,
-                c.res_numel,
-                c.res_rows
+                f.name, c.op.op_type, c.operand.0, c.operand_numel, c.res_numel, c.res_rows
             ));
         }
     }
