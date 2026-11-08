@@ -26,22 +26,6 @@ use crate::spyre_worker::*;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 
-/// The f32 stick width — the launch's readback stride for the seat's f32 word
-/// tables (inv_t): each row's word at its stick head. Derived from the
-/// format's own stick (the ladder's one derivation), never spelled here.
-const FP32_ELEMS_PER_STICK: usize =
-    <scratchy_subtile::superdsc_opspec::Fp32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
-        as usize;
-
-/// The u32 stick width — the same readback stride for the seat's I32 word
-/// tables (the hash chain's uniform tables). The u32 and f32 sticks are both
-/// 32 lanes today, but they are TWO laws (one per format), each read from its
-/// own format — a stick widening that moved one and not the other must move
-/// its own reader, not both by accident of a shared literal.
-const U32_ELEMS_PER_STICK: usize =
-    <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
-        as usize;
-
 /// ⭐ #32 (c3) — A SUBMITTED DECODE STEP: the launch is on the card, the
 /// idx-stick read is enqueued, nothing collected. Everything the collect half
 /// needs to turn the ring slot back into tokens. The RUNG INDEX travels beside
@@ -1213,6 +1197,14 @@ fn log_seat_readback(
             }
         }
     }
+    // The f32 stick width — the launch's readback stride for the seat's f32 word
+    // tables (inv_t): each row's word at its stick head. Derived from the
+    // format's own stick (the ladder's one derivation), never spelled here —
+    // stated here, at its only reader, because this fn is `spyre-hw`-gated and
+    // the module-scope spelling was dead in the emulator-only worker builds.
+    const FP32_ELEMS_PER_STICK: usize =
+        <scratchy_subtile::superdsc_opspec::Fp32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
     let invt: Vec<f32> = match le_words(session, seat.invt, rows * FP32_ELEMS_PER_STICK) {
         Ok(ws) => (0..rows)
             .map(|r| ws.get(r * FP32_ELEMS_PER_STICK).copied().unwrap_or(0))
@@ -1224,6 +1216,14 @@ fn log_seat_readback(
         }
     };
     // The hash chain's uniform tables at row 0's and row 1's stick heads.
+    // The u32 stick width is the same readback stride for the seat's I32 word
+    // tables. The u32 and f32 sticks are both 32 lanes today, but they are TWO
+    // laws (one per format), each read from its own format — a stick widening
+    // that moved one and not the other must move its own reader, not both by
+    // accident of a shared literal.
+    const U32_ELEMS_PER_STICK: usize =
+        <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
     let mut hash = String::new();
     for (name, operand) in [("hc1", 10u8), ("hc2", 11), ("hc3", 12), ("c256", 13)] {
         match uniform(consts, operand) {
