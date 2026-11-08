@@ -3601,6 +3601,54 @@ impl QueryExtent {
     }
 }
 
+/// ⭐ THE PREFILL TAIL'S ANSWER ROWS — one per request window of a packed prefill rung: request
+/// `r`'s answer row is `r·w + selector_lastrow_col(w)`, its window's last BAKED row — the row
+/// whose hidden the lm-head fold extracts, [`selector_lastrow_col`]'s own law stated per
+/// request. Minted ONCE, from the graph's [`QueryExtent`] at the bake; every tail site reads
+/// it, none re-derives a row. The host's window law ([`crate::paged_step`]'s `RowSpan::last`)
+/// states the SAME law at the slot — the two are one statement in two spellings, pinned equal
+/// by fixture, never two laws that agree by accident.
+///
+/// At one request (`S = 1`, every rung today) `row(0)` is `selector_lastrow_col(w)` with
+/// `w = mq` — exactly today's single-row law, so every tail site is byte-identical there.
+///
+/// ⛔ THE COUNT IS THE RUNG'S CAPACITY, NOT THE LAUNCH'S LIVE REQUESTS — this is the bake's
+/// own statement of the rung's windows. A launch that seats fewer requests than the rung
+/// packs leaves EMPTY WINDOWS (no request's), which produce NO answer rows: the readback reads
+/// the LIVE request count off the launch's own slot list and maps pick `r` to slot `r` by
+/// order. The bake names the rows; the launch names how many are read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AnswerRows {
+    extent: QueryExtent,
+}
+
+impl AnswerRows {
+    /// ⭐ THE ONE MINT — the graph's QueryExtent, the same pair the attention's extents read:
+    /// one `(w, S)` statement per rung, three readers, one bake fact.
+    pub const fn of_extent(extent: QueryExtent) -> Self {
+        Self { extent }
+    }
+
+    /// Request `r`'s answer row — `r·w + selector_lastrow_col(w)`: window `r`'s last BAKED
+    /// row. THE one law; no tail site computes a row any other way.
+    pub const fn row(self, r: usize) -> usize {
+        r * self.extent.per_request().get() as usize
+            + selector_lastrow_col(self.extent.per_request().get() as usize)
+    }
+
+    /// How many answer rows the rung bakes — the request count `S` (the capacity, not the
+    /// launch's live requests; see the type's doc).
+    pub const fn count(self) -> usize {
+        self.extent.requests().count()
+    }
+
+    /// The extent the rows were minted from — the tail's agreement check against the graph it
+    /// lowers, the same check the attention's extents take.
+    pub const fn extent(self) -> QueryExtent {
+        self.extent
+    }
+}
+
 /// REQUESTS ACTUALLY LIVE THIS STEP — what the scheduler admitted, BEFORE padding to a rung.
 ///
 /// Distinct from [`RungWidth`]: a 3-live step runs the 4-row rung, so the two differ on the very
@@ -9617,6 +9665,43 @@ mod tests {
             Some(STK),
             "the layouts agree only within the first stick; element {STK} is the first to move"
         );
+    }
+
+    /// ⭐ THE PREFILL TAIL'S ANSWER ROWS — one per request window: request `r`'s is its window's
+    /// last BAKED row, `r·w + selector_lastrow_col(w)`. At one request (every rung today) that
+    /// is exactly today's single-row law `selector_lastrow_col(mq)` — the S = 1 identity every
+    /// tail site is byte-identical by. The count is the rung's CAPACITY, never a launch's live
+    /// requests: an empty window produces no answer row.
+    #[test]
+    fn answer_rows_are_the_windows_last_baked_rows() {
+        // S = 1 — today's law, unchanged: one window of the rung's whole width.
+        let one = AnswerRows::of_extent(
+            QueryExtent::of_baked_rung(RungWidth::of_baked_rows(8).unwrap(), RungCap::ONE).unwrap(),
+        );
+        assert_eq!(one.count(), 1);
+        assert_eq!(one.row(0), selector_lastrow_col(8));
+        assert_eq!(
+            one.row(0),
+            selector_lastrow_col(one.extent().graph_rows().get() as usize),
+            "at S = 1 the answer row is today's selector_lastrow_col(mq)"
+        );
+        // A PACKED RUNG — (w, S) = (4, 3): each request's window's last baked row.
+        let packed = AnswerRows::of_extent(
+            QueryExtent::of_baked_rung(
+                RungWidth::of_baked_rows(4).unwrap(),
+                RungCap::of_baked_seqs(3).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(packed.count(), 3);
+        assert_eq!((packed.row(0), packed.row(1), packed.row(2)), (3, 7, 11));
+        for r in 0..packed.count() {
+            let w = packed.extent().per_request().get() as usize;
+            assert!(
+                packed.row(r) >= r * w && packed.row(r) < (r + 1) * w,
+                "request {r}'s answer row is inside its own window"
+            );
+        }
     }
 
     #[test]
