@@ -2116,7 +2116,7 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
             // gather's block copies address a column block the same way at any total width
             // (stick-major places a column by its stick and row alone).
             SubOp::AllGather { .. } => {
-                if suffix == SampleRows::Folded {
+                if matches!(suffix, SampleRows::Folded { .. }) {
                     fold_gathered_tail(graph, t);
                 }
                 break;
