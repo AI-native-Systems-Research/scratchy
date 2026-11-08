@@ -8430,10 +8430,10 @@ fn assign_frames(
     // argument, every carried name — except the broadcast results (not nodes: a sprayed
     // result is held in no world, so NO join may be stated through it). `sprayed` is
     // stated FIRST, in its own pass over the program, and `node` skips every value in
-    // it: a spray never enters the index, so a join site that forgets the skip MISSES
-    // the index loudly rather than welding a class through a value held in no world —
-    // the skip is by construction, not by remembering. The index order is plumbing;
-    // every decision below is the program's own order.
+    // it: a spray never enters the index, so a join site that forgets the skip is REFUSED
+    // BY NAME at the read (`idx` below) rather than welding a class through a value held
+    // in no world — the skip is by construction, not by remembering. The index order is
+    // plumbing; every decision below is the program's own order.
     let mut index: std::collections::HashMap<Ssa, u32> = std::collections::HashMap::new();
     let mut sprayed: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
     for o in deep.iter() {
@@ -8479,7 +8479,25 @@ fn assign_frames(
     }
     let mut uf: crate::union_find::UnionFind<World> =
         crate::union_find::UnionFind::with_len(index.len());
-    let idx = |v: Ssa| index[&v];
+    // ⭐ THE READ STATES THE LAW: a sprayed value is held in no world, so NO join or anchor
+    // may be stated through it — and the node index holds no slot for it. `idx` refuses the
+    // read BY NAME, naming the sprayed value, instead of missing the index with a bare map
+    // panic: the arms that may meet a sprayed operand (the reduction, the shape ops, the
+    // elementwise lanes) skip it before asking, and a site that does not — a carry seeded
+    // by a spray, a spray whose own source is a spray — learns the spray, not a key error.
+    let idx = |v: Ssa| -> Result<u32, Error> {
+        if sprayed.contains(&v) {
+            err(format!(
+                "{}: `%{}` is the result of a `linalg.broadcast` — a sprayed value the frame \
+                 solve holds in NO world, so no join or anchor may be stated through it. The site \
+                 that read it must skip it as the reduction, the shape ops, and the elementwise \
+                 lanes do, or address it through its spray's own operand mode",
+                f.name, v.0
+            ))
+        } else {
+            Ok(index[&v])
+        }
+    };
     // The union-find's own refusals are typed facts, worded once by their Display —
     // one adapter renders that wording into the bake error, no re-wording.
     let as_err = |e: crate::union_find::Refusal<World>| Error {
@@ -8498,13 +8516,13 @@ fn assign_frames(
                 f.name, c.arg.0, i
             );
             if let Some(init) = c.init {
-                uf.join(idx(c.arg), idx(init), &why).map_err(as_err)?;
+                uf.join(idx(c.arg)?, idx(init)?, &why).map_err(as_err)?;
             }
             if let Some(y) = c.yielded {
-                uf.join(idx(c.arg), idx(y), &why).map_err(as_err)?;
+                uf.join(idx(c.arg)?, idx(y)?, &why).map_err(as_err)?;
             }
             if let Some(r) = c.result {
-                uf.join(idx(c.arg), idx(r), &why).map_err(as_err)?;
+                uf.join(idx(c.arg)?, idx(r)?, &why).map_err(as_err)?;
             }
         }
     }
@@ -8515,9 +8533,9 @@ fn assign_frames(
                 "{}: the walk carries %{} — its arg, init, yield and result are one buffer",
                 f.name, c.arg.0
             );
-            uf.join(idx(c.arg), idx(c.init), &why).map_err(as_err)?;
-            uf.join(idx(c.arg), idx(c.yielded), &why).map_err(as_err)?;
-            uf.join(idx(c.arg), idx(c.result), &why).map_err(as_err)?;
+            uf.join(idx(c.arg)?, idx(c.init)?, &why).map_err(as_err)?;
+            uf.join(idx(c.arg)?, idx(c.yielded)?, &why).map_err(as_err)?;
+            uf.join(idx(c.arg)?, idx(c.result)?, &why).map_err(as_err)?;
         }
     }
     // ── THE DEFERRED `In::col` CHECKS: one value per result row, decided after the solve. ──
@@ -8539,7 +8557,7 @@ fn assign_frames(
                     // One value per output row is only possible in the column frame.
                     BcastAxis::Col => uf
                         .anchor(
-                            idx(b.src),
+                            idx(b.src)?,
                             World::Column,
                             &format!(
                                 "{}: the trailing-axis spray of `%{}` states one value per output \
@@ -8553,7 +8571,7 @@ fn assign_frames(
                         ..
                     }) => uf
                         .anchor(
-                            idx(b.src),
+                            idx(b.src)?,
                             World::Column,
                             &format!(
                                 "{}: the per-row scalars' spray of `%{}` states one value per row",
@@ -8571,7 +8589,7 @@ fn assign_frames(
                 let Some(res) = res else { continue };
                 if folds_its_stick(f, res, o)? {
                     uf.anchor(
-                        idx(res),
+                        idx(res)?,
                         World::Column,
                         &format!(
                             "{}: the stick fold `%{}` writes one value per row",
@@ -8584,8 +8602,8 @@ fn assign_frames(
                     // fold. The fold's own anchors decide it.
                     if !sprayed.contains(&x) {
                         uf.join(
-                            idx(res),
-                            idx(x),
+                            idx(res)?,
+                            idx(x)?,
                             &format!(
                                 "{}: the leading fold `%{}` writes a tile of its operand's rows",
                                 f.name, res.0
@@ -8602,8 +8620,8 @@ fn assign_frames(
                     // for the shape op's result, however many elements it moves.
                     if !sprayed.contains(&x) {
                         uf.join(
-                            idx(res),
-                            idx(x),
+                            idx(res)?,
+                            idx(x)?,
                             &format!("{}: the shape op `%{}` moves no element", f.name, res.0),
                         )
                         .map_err(as_err)?;
@@ -8614,7 +8632,7 @@ fn assign_frames(
             FrameStatement::DenseTile => {
                 if let Some(res) = res {
                     uf.anchor(
-                        idx(res),
+                        idx(res)?,
                         World::Row,
                         &format!(
                             "{}: the contraction `%{}` writes a dense tile",
@@ -8628,7 +8646,7 @@ fn assign_frames(
             FrameStatement::Load => {
                 if let Some(res) = res {
                     uf.anchor(
-                        idx(res),
+                        idx(res)?,
                         load_world(o, &defs, &column_fed),
                         &format!(
                             "{}: the load `%{}` reads the frame its tile states",
@@ -8670,8 +8688,8 @@ fn assign_frames(
                         // `[1, 2048]` stick fold's column): the operand and the result are one
                         // frame.
                         uf.join(
-                            idx(res),
-                            idx(v),
+                            idx(res)?,
+                            idx(v)?,
                             &format!(
                                 "{}: `{:?}` reads `%{}` lane for lane — one frame",
                                 f.name, o.op_type, v.0
@@ -12710,6 +12728,117 @@ mod frame_pass_tests {
             "the frame refusal is the world refusal, inherited: {}",
             e.message
         );
+    }
+
+    /// ⛔ A SPRAY OF A SPRAY IS REFUSED BY NAME, NEVER A MAP PANIC. The flat `Col` form's source
+    /// proof is a COUNT — one source element per result row — so it holds for a source that is
+    /// ITSELF a broadcast's result: the `[64, 128]` inner spray re-sprayed over a rank-3
+    /// trailing axis is admitted by the chase, which binds its `src` to the sprayed inner
+    /// result. The spray arm's own anchor then reads the index for a value the node index
+    /// holds no slot for — and the law is stated at the read (`idx`): the anchor is refused
+    /// by name, naming the sprayed value, never the bare map panic the index miss was.
+    #[test]
+    fn a_broadcast_of_a_broadcast_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (exp, col, empty, bc, outer) = (Ssa(4), Ssa(5), Ssa(6), Ssa(7), Ssa(8));
+        let f = func(
+            a,
+            "spray_of_spray",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                fold_reduce(a, red, dense, seed, &[64], &[1]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[red], &[64, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[64, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[64]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[64]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[col, empty], &[64, 128]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+                // The OUTER spray: rank-3 trailing-axis (`Col`, flat), over the inner spray's
+                // own result — a source the flat count proof ACCEPTS (its 8192 elements are
+                // the result's 8192 leading-product rows), so the chase admits the spray and
+                // binds `src` to the sprayed `%7`.
+                tensor(a, outer, OpKind::LinalgBroadcast, &[bc, empty], &[64, 128, 2])
+                    .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[2]))
+                    .with_attr(a, AttrKey::Shape, Attr::IntList(&[64, 128, 2])),
+            ],
+        );
+        let e = match assign_frames(&f, None) {
+            Ok(_) => panic!("a spray's own source is held in no world — no anchor through it"),
+            Err(e) => e,
+        };
+        assert!(
+            e.message.contains("result of a `linalg.broadcast`"),
+            "names the sprayed source: {}",
+            e.message
+        );
+        assert!(e.message.contains("%7"), "names the inner spray: {}", e.message);
+    }
+
+    /// ⛔ A CARRY SEEDED BY A SPRAY IS REFUSED BY NAME, NEVER A MAP PANIC. The folded carry's
+    /// join reads arg ≡ init ≡ yielded ≡ result — one buffer — and an init that is a
+    /// broadcast's result is a sprayed value the node index holds no slot for. The join is
+    /// refused by name, naming the sprayed seed, never the bare map panic the index miss was.
+    #[test]
+    fn a_carry_seeded_by_a_broadcast_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, red) = (Ssa(0), Ssa(1), Ssa(2));
+        let (exp, col, empty, bc) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let (arg, res) = (Ssa(7), Ssa(8));
+        let f = func(
+            a,
+            "walk_seeded_by_spray",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                // The body's own spelling: the reduce sits inside the loop, seeded by the
+                // CARRIED ARG (the buffer), and its column is what the spray re-expands.
+                fold_reduce(a, red, dense, arg, &[64], &[1]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[red], &[64, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[64, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[64]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[64]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[col, empty], &[64, 128]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+            ],
+        );
+        // The carried init is the spray's own result — the value the join would weld the
+        // loop's buffer to, held in no world.
+        let fold = fold_of(vec![crate::emit::loop_fold::Carried {
+            arg,
+            init: bc,
+            yielded: red,
+            result: res,
+            seed: 0.0,
+        }]);
+        let e = match assign_frames(&f, Some(&fold)) {
+            Ok(_) => panic!("a sprayed seed is held in no world — no carry through it"),
+            Err(e) => e,
+        };
+        assert!(
+            e.message.contains("result of a `linalg.broadcast`"),
+            "names the sprayed seed: {}",
+            e.message
+        );
+        assert!(e.message.contains("%6"), "names the spray: {}", e.message);
     }
 
     /// ⭐ A COLUMN READ BESIDE ITS LANES IS CONSUMED — the softmax walk body's `max(m, x)`: the
