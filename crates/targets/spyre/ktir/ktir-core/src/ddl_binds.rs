@@ -267,11 +267,15 @@ pub struct DeviceOpRow {
 /// that disagrees with the table is a compile error, not a silent drift.
 /// That this pin is not vacuous is itself a fixture:
 ///
-/// ```compile_fail
-/// // A WRONG COPY of Gen1's core count must fail to build. This doctest
-/// // states 31 where the table states 32; the assert below is the same
-/// // form every reader's pin takes, so its failure here proves the pin
-/// // distinguishes values — an assert that cannot fail protects nothing.
+/// ```compile_fail,E0080
+/// // A WRONG COPY of Gen1's core count must fail to build, FOR THAT REASON
+/// // (E0080, the const-eval failure of the assert). This doctest states 31
+/// // where the table states 32; the assert below is the same form every
+/// // reader's pin takes, so its failure here proves the pin distinguishes
+/// // values — an assert that cannot fail protects nothing. The pinned code
+/// // is checked by CI's nightly-compile-fail-codes job, which runs this
+/// // crate's doctests (`cargo +nightly test --doc -p ktir-core`); stable
+/// // runs it too whenever `cargo test -p ktir-core --doc` runs.
 /// const WRONG_COPY_OF_GEN1_CORES: u32 = 31;
 /// const _: () = assert!(
 ///     <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORES

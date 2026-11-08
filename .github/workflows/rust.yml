@@ -589,6 +589,11 @@ jobs:
   #   scratchy-tensors       src/typed.rs
   #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
   #   scratchy-target-spyre  src/runtime.rs     (gated on `spyre-hw`)
+  #   ktir-core              src/ddl_binds.rs   (the wrong-copy fixture:
+  #                                              a copy of a generation
+  #                                              constant that disagrees
+  #                                              with the table must fail
+  #                                              the const pin, E0080)
   # `spyre-hw` pulls flex-rs, whose C++ shim needs the Spyre SDK; the shim is
   # skipped as in the check-only jobs. Nothing links it: the crate's only
   # runnable doctests are these compile_fail ones.
@@ -610,7 +615,7 @@ jobs:
       - name: Doctests (compile_fail error codes)
         env:
           SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal -p scratchy-target-spyre --features scratchy-target-spyre/spyre-hw
+        run: cargo +nightly test --doc -p ktir-core -p scratchy-tensors -p scratchy-target-metal -p scratchy-target-spyre --features scratchy-target-spyre/spyre-hw
 
   fmt:
     name: Format
