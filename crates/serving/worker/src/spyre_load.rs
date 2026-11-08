@@ -2094,7 +2094,7 @@ impl SpyreWorker {
                     "[spyre-worker] sendnn: SUPERDSC dxp session ready (fp={fp}, vocab {vocab}, \
                      kv_dim {kv_dim}, num_blocks {num_blocks}, cap {} slots, paged={} \
                      page_slots={}, pmask reserves {:?} column(s))",
-                    ss.cap
+                    ss.cap()
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "unpaged (no pool)".to_string()),
                     paged,
