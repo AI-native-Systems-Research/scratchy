@@ -45,7 +45,7 @@
 use ktir_core::attrkey::AttrKey;
 use ktir_core::dtypes::DType;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
-use ktir_core::opkind::{FrameLaw, OpKind};
+use ktir_core::opkind::{FrameStatement, OpKind};
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
 use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind, Scratch};
@@ -8488,14 +8488,14 @@ fn assign_frames(
     // ── THE ONE PASS, in the program's own order ──
     for o in deep.iter() {
         let res = o.result;
-        // The law each op states is the op's own property ([`OpKind::frame_law`]) —
+        // The law each op states is the op's own property ([`OpKind::frame_statement`]) —
         // exhaustive, stated once, never re-derived here: a new op kind that states no
         // law is a compile error in the vocabulary, never a silent resolution in the
         // solve. The integer pointwise kinds join their operands exactly as the float
         // ones do.
-        match o.op_type.frame_law() {
+        match o.op_type.frame_statement() {
             // ── THE SPRAY: the sprayed result is not a node; the spray's own anchors ──
-            FrameLaw::Spray => {
+            FrameStatement::Spray => {
                 let Some(res) = res else { continue };
                 let Some(b) = bcasts.get(&res) else { continue };
                 match b.axis {
@@ -8530,7 +8530,7 @@ fn assign_frames(
                 }
             }
             // ── THE REDUCTION: the axis it folds decides the world it writes ──
-            FrameLaw::Reduction => {
+            FrameStatement::Reduction => {
                 let Some(res) = res else { continue };
                 if folds_its_stick(o) {
                     uf.anchor(
@@ -8556,7 +8556,7 @@ fn assign_frames(
                 }
             }
             // ── THE SHAPE OPS: no element moves ──
-            FrameLaw::MovesNoElement => {
+            FrameStatement::MovesNoElement => {
                 if let (Some(res), Some(&x)) = (res, o.operands.first()) {
                     uf.join(
                         idx(res),
@@ -8568,7 +8568,7 @@ fn assign_frames(
                 }
             }
             // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs ──
-            FrameLaw::DenseTile => {
+            FrameStatement::DenseTile => {
                 if let Some(res) = res {
                     uf.anchor(
                         idx(res),
@@ -8582,7 +8582,7 @@ fn assign_frames(
                 }
             }
             // ── THE LOAD: the world its tile, shape, or store states ──
-            FrameLaw::Load => {
+            FrameStatement::Load => {
                 if let Some(res) = res {
                     uf.anchor(
                         idx(res),
@@ -8597,7 +8597,7 @@ fn assign_frames(
             }
             // ── THE ELEMENTWISE FAMILY: the mixed-worlds law, as joins — float and
             // integer pointwise alike, the casts and the comparisons with them ──
-            FrameLaw::Elementwise => {
+            FrameStatement::Elementwise => {
                 let Some(res) = res else { continue };
                 let Some(res_dims) = o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec)
                 else {
@@ -8662,7 +8662,7 @@ fn assign_frames(
             // nodes, joined by their consumers or resolved by the one default. The
             // loop's own carries were joined above; plumbing (tiles, views, stores,
             // yields) names no data frame. ──
-            FrameLaw::Unstated => {}
+            FrameStatement::Unstated => {}
         }
     }
     // ── THE SOLUTION: every node's world — its component's anchor, or [`UNSTATED_IS`]. ──

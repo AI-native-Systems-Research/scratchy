@@ -250,7 +250,7 @@ pub enum OpKind {
 /// [`OpKind::dialect`], so a variant that forgets to state its law is a
 /// compile error, never a silent default at a reader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FrameLaw {
+pub enum FrameStatement {
     /// Reads its operands lane for lane: the result holds each operand's own
     /// lanes at the result's count, so the solve joins it with every
     /// same-shaped operand. A scalar operand names no frame; an operand
@@ -421,7 +421,7 @@ impl OpKind {
     /// The frame law this operation states — exhaustive over the vocabulary,
     /// no default arm: a new variant that states no law is a compile error
     /// here, never a silent resolution at a reader.
-    pub const fn frame_law(self) -> FrameLaw {
+    pub const fn frame_statement(self) -> FrameStatement {
         match self {
             // ── THE ELEMENTWISE FAMILY: reads its operands lane for lane — every arith
             // and math pointwise op, float AND integer, the comparisons and the casts,
@@ -496,21 +496,21 @@ impl OpKind {
             | OpKind::LinalgMax
             | OpKind::LinalgMin
             | OpKind::LinalgMul
-            | OpKind::LinalgSub => FrameLaw::Elementwise,
+            | OpKind::LinalgSub => FrameStatement::Elementwise,
             // ── THE SHAPE OPS: no element moves. ──
             OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape => {
-                FrameLaw::MovesNoElement
+                FrameStatement::MovesNoElement
             }
             // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs. ──
             OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul | OpKind::LinalgTranspose => {
-                FrameLaw::DenseTile
+                FrameStatement::DenseTile
             }
             // ── THE REDUCTION: the axis it folds decides the world it writes. ──
-            OpKind::LinalgReduce => FrameLaw::Reduction,
+            OpKind::LinalgReduce => FrameStatement::Reduction,
             // ── THE SPRAY: a broadcast is addressing, not data. ──
-            OpKind::LinalgBroadcast => FrameLaw::Spray,
+            OpKind::LinalgBroadcast => FrameStatement::Spray,
             // ── THE LOAD: the world its tile, shape, or store states. ──
-            OpKind::KtdpLoad => FrameLaw::Load,
+            OpKind::KtdpLoad => FrameStatement::Load,
             // ── EVERYTHING ELSE states no equality and no absolute of its own: a
             // constant, a splat, a slice, a region arg, a collective, a generated
             // tile, plumbing (tiles, views, stores, yields, the loop's own
@@ -549,7 +549,7 @@ impl OpKind {
             | OpKind::TensorGenerate
             | OpKind::TensorInsertSlice
             | OpKind::TensorSplat
-            | OpKind::TensorYield => FrameLaw::Unstated,
+            | OpKind::TensorYield => FrameStatement::Unstated,
         }
     }
 }
