@@ -49,6 +49,7 @@ use flex_rs::dma::{
 };
 use flex_rs::flex_config::DeviceKind;
 use flex_rs::memory_region::{DomainId, MemoryType};
+use flex_rs::numa::{CardCpus, PinError, PlacementError};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, HardwareSubmit, QueueCapacitySource,
@@ -75,6 +76,10 @@ use flex_rs::topology::populate_domain_topology;
 /// `flex_rs::scheduler` module doc).
 pub struct CardRuntime<T: ktir_superdsc::collective::Tp> {
     card: Arc<flex_rs::senlib_ffi::Card>,
+    /// ⭐ THE CPUS THIS CARD'S HOST THREADS RUN ON — its NUMA node's, read from sysfs at open
+    /// (`flex_rs::numa`). Its response worker, its rank's submit thread and its bring-up thread
+    /// each pin themselves to it first.
+    cpus: CardCpus,
     memory: CardMemory,
     rt: Arc<RuntimeContext>,
     /// This card's p2p link, when it runs one rank of a sharded world — set once, by
@@ -87,6 +92,7 @@ impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CardRuntime")
             .field("pci", &self.card.pci())
+            .field("cpus", &self.cpus)
             .field("memory", &self.memory)
             .finish_non_exhaustive()
     }
@@ -103,6 +109,11 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     ///
     /// Returned BY VALUE: the caller is the card's one owner, and every session and executor on it
     /// borrows it (`&'c CardRuntime<T>`), so the compiler checks that none outlives its card.
+    ///
+    /// ⭐ THE CALLING THREAD IS THE CARD'S BRING-UP THREAD: it is pinned to the card's NUMA node
+    /// before anything is opened, so the host buffers bring-up touches first land on that node.
+    /// Open each card on its own thread (as the worker does) and each thread lands on its card's
+    /// node.
     pub fn open(index: u32) -> Result<Self, HwError> {
         let pci = flex_rs::senlib_ffi::pcie_address_for_card(index);
         if pci.is_empty() {
@@ -115,6 +126,9 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     }
 
     fn build(index: u32, pci: &str) -> Result<Self, BringUpError> {
+        let cpus = CardCpus::read(pci).map_err(BringUpError::Placement)?;
+        cpus.pin_current_thread().map_err(BringUpError::Pin)?;
+        tracing::info!("[spyre-card] card {index} ({pci}): host threads on {cpus}");
         let card = flex_rs::senlib_ffi::Card::open(pci).map_err(BringUpError::Open)?;
         // Real single on-card domain, sized off the card's actual HBM capacity and RCU core count —
         // `flex::populateDomainTopology` (`device_memory_topology.cpp`), ported natively as
@@ -132,7 +146,8 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
 
         let addr_resolver: Arc<dyn DeviceAddressResolver> =
             Arc::new(FlexAllocatorAddressResolver::new(allocator.clone()));
-        let hw: Arc<dyn HardwareSubmit> = Arc::new(SenlibHardwareSubmit::new(card.clone()));
+        let hw: Arc<dyn HardwareSubmit> =
+            Arc::new(SenlibHardwareSubmit::new(card.clone(), cpus.clone()));
         let capacity: Arc<dyn QueueCapacitySource> =
             Arc::new(SenlibQueueCapacity::new(card.clone()));
         // `PfIommuMapper::new` derives the page size itself via `sysconf(_SC_PAGESIZE)`, matching
@@ -153,6 +168,7 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
         let rt = RuntimeContext::create(DeviceId(i64::from(index)), scheduler, allocator);
         Ok(Self {
             card,
+            cpus,
             memory,
             rt,
             link: std::sync::OnceLock::new(),
@@ -162,6 +178,12 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     /// The senlib card this runtime drives.
     pub fn card(&self) -> &Arc<flex_rs::senlib_ffi::Card> {
         &self.card
+    }
+
+    /// The CPUs this card's host threads run on — its NUMA node's, read at [`Self::open`]. A
+    /// thread that drives this card calls `pin_current_thread` on it first.
+    pub fn cpus(&self) -> &CardCpus {
+        &self.cpus
     }
 
     /// This card's key in the RB telemetry ring (`flex_rs::rb_telemetry::RbTiming::source`) —
@@ -371,6 +393,10 @@ pub enum BringUpError {
     AllocatorInit(FlexAllocatorError),
     /// `create_scheduler` refused the device kind / chip.
     Scheduler(SchedulerFactoryError),
+    /// The card's NUMA placement could not be read from sysfs.
+    Placement(PlacementError),
+    /// The bring-up thread could not be run on the card's NUMA node.
+    Pin(PinError),
 }
 
 impl fmt::Display for BringUpError {
@@ -383,6 +409,8 @@ impl fmt::Display for BringUpError {
             Self::Memory(e) => write!(f, "card memory capacity: {e}"),
             Self::AllocatorInit(e) => write!(f, "{e}"),
             Self::Scheduler(e) => write!(f, "{e}"),
+            Self::Placement(e) => write!(f, "card NUMA placement: {e}"),
+            Self::Pin(e) => write!(f, "bring-up thread: {e}"),
         }
     }
 }
@@ -1091,6 +1119,9 @@ pub use flex_rs::address::{ByteOffset, ByteSize};
 /// this one module.
 pub use flex_rs::compute::ComputeWireBatch;
 pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
+/// The world's placement the worker builds from its cards' ([`CardRuntime::cpus`]) and pins its
+/// load and decode-loop threads to.
+pub use flex_rs::numa::WorldCpus;
 
 /// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that

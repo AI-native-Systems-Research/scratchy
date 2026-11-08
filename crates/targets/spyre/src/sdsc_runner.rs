@@ -489,6 +489,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     /// independent, and run serially the last card starts a whole `W - 1` submits after the first,
     /// stalling every collective that waits on it (measured at tp/8: ~2.2 ms a rank, the eighth
     /// card's doorbell 18 ms into the step). A world of one runs on the caller's thread.
+    ///
+    /// Each rank's thread runs on its card's NUMA node (`CardRuntime::cpus`) before it touches the
+    /// card: its doorbell and its host writes stay on the card's socket.
     fn each_parallel<R: Send>(
         &mut self,
         f: impl Fn(&mut Executor<'c, T>) -> Result<R> + Sync,
@@ -499,14 +502,25 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         }
         let f = &f;
         std::thread::scope(|scope| {
-            let handles: Vec<_> = self
+            let handles = self
                 .ranks
                 .iter_mut()
                 .map(|(r, e)| {
-                    scope
-                        .spawn(move || f(e).map_err(|err| err.context(format!("rank {}", r.get()))))
+                    // Named `SubmitR<rank>`, so the thread's placement can be read per rank.
+                    std::thread::Builder::new()
+                        .name(format!("SubmitR{}", r.get()))
+                        .spawn_scoped(scope, move || {
+                            let pinned = e
+                                .card_cpus()
+                                .pin_current_thread()
+                                .map_err(anyhow::Error::from);
+                            pinned
+                                .and_then(|()| f(e))
+                                .map_err(|err| err.context(format!("rank {}", r.get())))
+                        })
+                        .map_err(|err| anyhow!("rank {}: spawn its submit thread: {err}", r.get()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             handles
                 .into_iter()
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))

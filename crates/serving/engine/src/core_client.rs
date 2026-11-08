@@ -265,6 +265,13 @@ fn executor_bg_loop(
     rx: std::sync::mpsc::Receiver<PipelineMsg>,
     tx: std::sync::mpsc::SyncSender<PipelineResult>,
 ) {
+    // First act: run where the executor's devices want their driver. A refusal ends the thread
+    // by name; the client's next receive reports the thread gone.
+    if let Err(e) = executor.pin_driving_thread() {
+        tracing::error!("executor thread: {e}");
+        executor.shutdown();
+        return;
+    }
     while let Ok(msg) = rx.recv() {
         match msg {
             PipelineMsg::Step(sched) => {

@@ -16,6 +16,8 @@
 //! - `multi_device`         — RDMA/HDMA peer-to-peer exchange, barrier/broadcast
 //!   rendezvous, bitmask/bitset bookkeeping, cross-port P2P mapping (#550
 //!   re-add; transport bottoms out on `senlib_ffi`'s multi-device section)
+//! - `numa`                 — a card's NUMA node and CPUs (sysfs), and the pin its host
+//!   threads take (scratchy's own; the vendor runtime does not place its threads)
 //! - `device_memory_allocator` — DeviceMemoryAllocation, DeviceMemoryAllocator (senlib boundary)
 //! - `allocator`            — AllocationDirective, FlexAllocator
 //! - `runtime`              — RuntimeContext, initializeRuntime, getFlexRuntimeContext
@@ -65,6 +67,7 @@ pub mod host_interface;
 pub mod iommu;
 pub mod memory_region;
 pub mod multi_device;
+pub mod numa;
 pub mod rb_telemetry;
 pub mod runtime;
 pub mod scheduler;

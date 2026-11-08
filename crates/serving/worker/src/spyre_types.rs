@@ -527,6 +527,11 @@ pub(crate) struct Loaded {
     /// own limit), which the pool the bake placed must hold: a declaration past the pool is refused at
     /// load, never clamped. `usize::MAX` on the emulator (no cap).
     pub(crate) served_context: usize,
+    /// ⭐ WHERE THIS WORKER'S SHARED HOST THREADS RUN — the load thread (pinned when the cards
+    /// join) and the decode-loop thread (pinned as its first act, `Worker::pin_driving_thread`):
+    /// the node every card sits on, or rank 0's when they span nodes.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) world_cpus: scratchy_target_spyre::runtime::WorldCpus,
 }
 
 /// Per-request generation state the worker keeps beside `InputBatch`.
