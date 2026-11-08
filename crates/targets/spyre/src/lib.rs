@@ -25,10 +25,6 @@ pub use scratchy_spyre_bundle as bundle_code;
 /// Run a bundle this binary did not bake — see the module docs.
 #[cfg(feature = "spyre-hw")]
 pub mod bundle_run;
-/// COPIES of the driver's generation constants (senlib-rs, with
-/// path:line), const-asserted equal to the baked device-facts table —
-/// copies, not a dependency; see the module doc.
-pub mod copied_senlib_values;
 /// dxp's compiled groups, kept across builds under a key that names the compiler as well as the input.
 pub mod dxp_cache;
 /// Where a launched op reads and writes KV: the shim launch loop's per-op, per-page offset

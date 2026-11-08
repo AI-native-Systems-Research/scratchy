@@ -261,27 +261,17 @@ pub struct DeviceOpRow {
 /// `Gen1` is today's only implementor; `Gen2` will be a second impl with
 /// its own citations, not an edit here.
 ///
-/// A wrong copy of a constant does not build: every reader pins what it
-/// reads against the table (the spyre-target crate pins the same constants
-/// against senlib's own names), and the pin is a `const` assert — a value
-/// that disagrees with the table is a compile error, not a silent drift.
-/// That this pin is not vacuous is itself a fixture:
-///
-/// ```compile_fail,E0080
-/// // A WRONG COPY of Gen1's core count must fail to build, FOR THAT REASON
-/// // (E0080, the const-eval failure of the assert). This doctest states 31
-/// // where the table states 32; the assert below is the same form every
-/// // reader's pin takes, so its failure here proves the pin distinguishes
-/// // values — an assert that cannot fail protects nothing. The pinned code
-/// // is checked by CI's nightly-compile-fail-codes job, which runs this
-/// // crate's doctests (`cargo +nightly test --doc -p ktir-core`); stable
-/// // runs it too whenever `cargo test -p ktir-core --doc` runs.
-/// const WRONG_COPY_OF_GEN1_CORES: u32 = 31;
-/// const _: () = assert!(
-///     <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORES
-///         == WRONG_COPY_OF_GEN1_CORES
-/// );
-/// ```
+/// A reader cannot drift from the table: the constants are read through
+/// these associated consts, so there is no second spelling of a value to
+/// get wrong. What is NOT claimed here is a pin against senlib itself —
+/// scratchy does not build-depend on senlib-chip, and a module of
+/// hand-refreshed senlib literals compared against this table tested the
+/// typist, not the silicon ("two literals in one repo"); it is deleted.
+/// The one cross-crate pin that compares two things the build actually
+/// compiles is `scratchy-target-spyre`'s `runtime.rs`, which const-asserts
+/// [`DeviceGen::FLIT_BYTES`] against `flex_rs::control_block_wire::Flits::BYTES`.
+/// The follow-up is a direct dependency on senlib-chip's public half once
+/// it is CI-fetchable, at which point a senlib change fails the build.
 pub trait DeviceGen {
     /// This generation's device-facts table — the one statement of its
     /// card's (op, dtype, layout) facts, read by `legalize_types`
