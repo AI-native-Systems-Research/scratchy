@@ -4352,10 +4352,10 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
         // program spells one (the chain's source is what the consumer binds); otherwise off the
         // ONE frame assignment, whose load arm is the same degenerate-column read this
         // classifier used to re-derive here.
-        let resolved = |v: Ssa| -> (Ssa, bool) {
+        let resolved = |v: Ssa| -> Result<(Ssa, bool), Error> {
             match bcasts.get(&v) {
-                Some(b) => (b.src, b.axis == BcastAxis::Col),
-                None => (v, frames.world_of(v) == World::Column),
+                Some(b) => Ok((b.src, b.axis == BcastAxis::Col)),
+                None => Ok((v, frames.world_of(f, v)? == World::Column)),
             }
         };
         // `arr` is mutated inside the marking loop below, so this is a fn taking the map rather
@@ -4394,14 +4394,14 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
             | Lowering::Node(Program::Elementwise(_)) => {
                 let mut out = ElementArrangement::Standard;
                 for v in &raw_in {
-                    let (src, order_free) = resolved(*v);
+                    let (src, order_free) = resolved(*v)?;
                     if !order_free && staggered(&arr, src) {
                         out = ElementArrangement::Dl16ToFp32;
                     }
                 }
                 if out == ElementArrangement::Dl16ToFp32 {
                     for v in &raw_in {
-                        let (src, order_free) = resolved(*v);
+                        let (src, order_free) = resolved(*v)?;
                         if order_free || staggered(&arr, src) {
                             continue;
                         }
@@ -4441,7 +4441,7 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
             // correct. Refused by name rather than lowered as the nearest arrangement.
             _ => {
                 for v in &raw_in {
-                    let (src, order_free) = resolved(*v);
+                    let (src, order_free) = resolved(*v)?;
                     if !order_free && staggered(&arr, src) {
                         return err(format!(
                             "{}: a staggered value reaches `{:?}`, whose addressing is not \
@@ -4457,17 +4457,19 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
         };
         // ⛔ A CONVERT'S OWN STAGGERED INPUT is a composition of two arrangements the table
         // does not state — refused before the output's row is applied.
-        if matches!(program, Lowering::Convert(_))
-            && raw_in
-                .first()
-                .is_some_and(|v| staggered(&arr, resolved(*v).0))
-        {
-            return err(format!(
-                "{}: a staggered value enters a dtype-convert — the composition of the stagger \
-                 with the convert's own output arrangement is not a fact the const table \
-                 states, so it is refused rather than guessed. Reduce before the convert",
-                f.name
-            ));
+        if matches!(program, Lowering::Convert(_)) {
+            if let Some(&v) = raw_in.first() {
+                let (src, _) = resolved(v)?;
+                if staggered(&arr, src) {
+                    return err(format!(
+                        "{}: a staggered value enters a dtype-convert — the composition of the \
+                         stagger with the convert's own output arrangement is not a fact the \
+                         const table states, so it is refused rather than guessed. Reduce \
+                         before the convert",
+                        f.name
+                    ));
+                }
+            }
         }
         if let Some(r) = op.result {
             arr.insert(r, out_arr);
@@ -6861,7 +6863,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // neighbouring regions' extents are. There is no second road: if this choice and the
             // regions disagree, the degenerate check below names it, and the four-scope gate
             // proves the equivalence on every scope main ran.
-            let axis = spray_operand_axis(&frames, in_values[i], axis, bcast_counts[i])?;
+            let axis = spray_operand_axis(f, &frames, in_values[i], axis, bcast_counts[i])?;
             if bcast_axes[i] != Some(axis) {
                 bcast_axes[i] = Some(axis);
                 // The flat presentation described the `Mb` reading; the row-split addresses the
@@ -7347,7 +7349,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // `[rows, 1]` here exactly as the deleted provenance test did.
             let dims: [u32; 2] = match op.result_type {
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) => {
-                    match frames.world_of(res) {
+                    match frames.world_of(f, res)? {
                         World::Column => [dims.iter().product::<i64>() as u32, 1],
                         World::Row if dims.len() == 2 => [dims[0] as u32, dims[1] as u32],
                         // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
@@ -8054,6 +8056,11 @@ enum World {
     Row,
 }
 
+/// A class nothing anchors has no lanes of its own, so it reads the same in every frame; `Row`
+/// is the dense frame. THE ONE DEFAULT the solve resolves an unanchored class through — the only
+/// value passed at the resolve site, so no reader can state a second one.
+const UNSTATED_IS: World = World::Row;
+
 /// The frame pass's anchor label — the frame pass states equalities only, so the unit weight
 /// cannot move it ([`crate::union_find`]).
 impl crate::union_find::Anchor<()> for World {
@@ -8074,13 +8081,23 @@ struct Frames {
 }
 
 impl Frames {
-    /// The world of `v`. A value the pass holds no world for is the row world, and after the
-    /// solve that domain is STATED, not assumed: every value the program names is a node, and
-    /// an unanchored class resolving the one row default is a decision, not a gap — so no
-    /// entry means the value is plumbing the solve never indexed (a view, a store, a marker),
-    /// which states a window or a boundary, never a data frame.
-    fn world_of(&self, v: Ssa) -> World {
-        self.world.get(&v).copied().unwrap_or(World::Row)
+    /// The world of `v` — the one answer the solve stated, refused by name when it stated none.
+    /// After the solve that domain is STATED, not assumed: every value the program names is a
+    /// node, and an unanchored class resolving [`UNSTATED_IS`] is a decision, not a gap — so no
+    /// entry means the solve indexed no class for the value at all, and its lanes are a
+    /// question the pass was not asked. Named rather than silently read as a row: the old
+    /// default answered it anyway, and a reader pointing at a value nobody framed would have
+    /// addressed it lane-for-lane on a fact nobody stated.
+    fn world_of(&self, f: &IRFunction<'static>, v: Ssa) -> Result<World, Error> {
+        match self.world.get(&v) {
+            Some(&w) => Ok(w),
+            None => err(format!(
+                "{}: `%{}` carries no frame fact — the solve indexed no class for it. A value \
+                 the pass never indexed is stated through other means (plumbing, a view, a \
+                 store), and a world asked of it is a reader pointing at the wrong value",
+                f.name, v.0
+            )),
+        }
     }
 
     /// The `[rows, cols]` frame `v` is held in, at `dims` — the value's own stated shape, the same
@@ -8098,7 +8115,7 @@ impl Frames {
                 f.name, v.0
             ));
         }
-        Ok(match self.world_of(v) {
+        Ok(match self.world_of(f, v)? {
             World::Column => [dims.iter().product::<i64>() as u32, 1],
             World::Row => flat_frame(dims),
         })
@@ -8681,15 +8698,15 @@ fn assign_frames(
             _ => {}
         }
     }
-    // ── THE SOLUTION: every node's world — its component's anchor, or the one row default. ──
+    // ── THE SOLUTION: every node's world — its component's anchor, or [`UNSTATED_IS`]. ──
     let mut world: std::collections::HashMap<Ssa, World> = std::collections::HashMap::new();
     for (v, &i) in index.iter() {
-        world.insert(*v, uf.resolve(i, World::Row));
+        world.insert(*v, uf.resolve(i, UNSTATED_IS));
     }
     let frames = Frames { world, sprayed };
     // ── THE DEFERRED `In::col` CHECKS — only the column frame supplies one value per row. ──
     for (o, v, n, res_numel, res_rows) in per_row {
-        let have = frames.world_of(v);
+        let have = frames.world_of(f, v)?;
         if have != World::Column {
             return err(format!(
                 "{}: `{:?}` reads %{} — {} elements in the {have:?} world — beside its other \
@@ -8726,8 +8743,9 @@ fn assign_frames(
 /// `Y(Spray::outer(N))` at every decode bucket; the one `Mb` it keeps is a one-row `[1, 128]`
 /// source. The `c_len`-keyed region promotion main needed (and its `v_rows > 1` guard) is
 /// DELETED — the solved world decides, and nothing else does. No third default: an unanchored
-/// source resolves through the one row default like every other class.
+/// source resolves through [`UNSTATED_IS`] like every other class.
 fn spray_operand_axis(
+    f: &IRFunction<'static>,
     frames: &Frames,
     src: Ssa,
     axis: BcastAxis,
@@ -8735,7 +8753,7 @@ fn spray_operand_axis(
 ) -> Result<BcastAxis, Error> {
     match axis {
         BcastAxis::Col | BcastAxis::Y(_) => Ok(axis),
-        BcastAxis::Mb => Ok(match frames.world_of(src) {
+        BcastAxis::Mb => Ok(match frames.world_of(f, src)? {
             World::Row => BcastAxis::Mb,
             World::Column => BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(count)),
         }),
@@ -12281,7 +12299,9 @@ mod frame_pass_tests {
         );
         let frames = assign_frames(&f, None).expect("both folds state their worlds");
         assert_eq!(
-            frames.world_of(red),
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the stick fold writes one value per stick row"
         );
@@ -12293,7 +12313,9 @@ mod frame_pass_tests {
             "the column presents as [numel, 1]"
         );
         assert_eq!(
-            frames.world_of(lead),
+            frames
+                .world_of(&f, lead)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "a leading fold writes a tile of the input's own rows"
         );
@@ -12331,7 +12353,9 @@ mod frame_pass_tests {
         let frames =
             assign_frames(&f, Some(&fold)).expect("the seed states its world by the carry");
         assert_eq!(
-            frames.world_of(seed),
+            frames
+                .world_of(&f, seed)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the seed is the column the carried buffer holds, however early it is spelled"
         );
@@ -12378,7 +12402,9 @@ mod frame_pass_tests {
         );
         let frames = assign_frames(&f, None).expect("the spray states its own world");
         assert_eq!(
-            frames.world_of(bc),
+            frames
+                .world_of(&f, bc)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "the sprayed result is dense; the SOURCE's column is the source's own row"
         );
@@ -12424,7 +12450,9 @@ mod frame_pass_tests {
         let frames = assign_frames(&f, Some(&fold))
             .expect("the per-row column beside its lanes is a reading");
         assert_eq!(
-            frames.world_of(res),
+            frames
+                .world_of(&f, res)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "the consumed column sets no frame; the lanes' world is the result's"
         );
@@ -12483,7 +12511,9 @@ mod frame_pass_tests {
         };
         let frames = assign_frames(&f, None).expect("the tile states the window");
         assert_eq!(
-            frames.world_of(load),
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "a one-column window reads the per-row column"
         );
@@ -12516,7 +12546,9 @@ mod frame_pass_tests {
         };
         let frames = assign_frames(&f, None).expect("the store states the parameter's world");
         assert_eq!(
-            frames.world_of(load),
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the rank-1 tile restates the window; the [N, 1] store names the column"
         );
@@ -12583,32 +12615,44 @@ mod frame_pass_tests {
         let frames =
             assign_frames(&f, None).expect("the carry and the load both state their worlds");
         assert_eq!(
-            frames.world_of(load),
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "a [64] tile states a row vector's window"
         );
         assert_eq!(
-            frames.world_of(row),
+            frames
+                .world_of(&f, row)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "the row's elementwise keeps the lane it reads"
         );
         assert_eq!(
-            frames.world_of(carry),
+            frames
+                .world_of(&f, carry)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the carry is the class its body's stick fold anchors — not its shape's"
         );
         assert_eq!(
-            frames.world_of(seed),
+            frames
+                .world_of(&f, seed)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the init is the same buffer the loop carries"
         );
         assert_eq!(
-            frames.world_of(red),
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the body's stick fold writes one value per stick row"
         );
         assert_eq!(
-            frames.world_of(lres),
+            frames
+                .world_of(&f, lres)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the loop returns the carry it holds"
         );
@@ -12661,22 +12705,30 @@ mod frame_pass_tests {
         );
         let frames = assign_frames(&f, None).expect("the chain states its world at every link");
         assert_eq!(
-            frames.world_of(mul),
+            frames
+                .world_of(&f, mul)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the fold's column is a lane at count 1, not a skipped scalar"
         );
         assert_eq!(
-            frames.world_of(add),
+            frames
+                .world_of(&f, add)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the add keeps the lane it reads"
         );
         assert_eq!(
-            frames.world_of(inv),
+            frames
+                .world_of(&f, inv)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the rsqrt keeps the lane it reads — the value the chase sprays along Col"
         );
         assert_eq!(
-            frames.world_of(bc),
+            frames
+                .world_of(&f, bc)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "the sprayed result is dense, however its source is held"
         );
@@ -12815,22 +12867,30 @@ mod frame_pass_tests {
         let frames =
             assign_frames(&f, Some(&fold)).expect("the tail states its world at every link");
         assert_eq!(
-            frames.world_of(sub260),
+            frames
+                .world_of(&f, sub260)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the centered scores are the per-row class the Col spray states"
         );
         assert_eq!(
-            frames.world_of(exp261),
+            frames
+                .world_of(&f, exp261)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the exp keeps the lane it reads"
         );
         assert_eq!(
-            frames.world_of(mul263),
+            frames
+                .world_of(&f, mul263)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the scale's product keeps the lane"
         );
         assert_eq!(
-            frames.world_of(red291),
+            frames
+                .world_of(&f, red291)
+                .expect("the solve indexed a class for every value the program names"),
             World::Column,
             "the leading-axis fold keeps the operand's class — one value per row of it"
         );
@@ -12881,12 +12941,16 @@ mod frame_pass_tests {
         );
         let frames = assign_frames(&f, None).expect("the twin states its world");
         assert_eq!(
-            frames.world_of(red),
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "a class nothing anchors as a column resolves the one row default"
         );
         assert_eq!(
-            frames.world_of(col),
+            frames
+                .world_of(&f, col)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "the shape-op chain keeps the frame of the value it re-shapes"
         );
@@ -12993,7 +13057,9 @@ mod frame_pass_tests {
         };
         let frames = assign_frames(&f, None).expect("the one-row load states its world");
         assert_eq!(
-            frames.world_of(load),
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
             World::Row,
             "a one-row window is the row world"
         );
@@ -13005,7 +13071,7 @@ mod frame_pass_tests {
             BcastAxis::Mb,
             "the chase keeps the one-row source's Mb verbatim"
         );
-        let axis = spray_operand_axis(&frames, b.src, b.axis, b.count)
+        let axis = spray_operand_axis(&f, &frames, b.src, b.axis, b.count)
             .expect("the mode choice is a law, not a guess");
         assert_eq!(
             axis,
@@ -13024,6 +13090,10 @@ mod frame_pass_tests {
     /// one states the law's whole table, including the counts.
     #[test]
     fn the_spray_mode_reads_the_solved_world_not_the_regions() {
+        // The mode choice names the value it refuses on, so even a hand-built table carries a
+        // function to name — the values below are both indexed, so it is never read.
+        let a: &'static Arena = Arena::global();
+        let f = func(a, "the mode choice", vec![]);
         let mut world = std::collections::HashMap::new();
         world.insert(Ssa(0), World::Column);
         world.insert(Ssa(1), World::Row);
@@ -13033,24 +13103,25 @@ mod frame_pass_tests {
         };
         // Mb over the COLUMN world — the probe's `%296` reading, at every bucket count:
         assert_eq!(
-            spray_operand_axis(&frames, Ssa(0), BcastAxis::Mb, 32).expect("the law states it"),
+            spray_operand_axis(&f, &frames, Ssa(0), BcastAxis::Mb, 32).expect("the law states it"),
             BcastAxis::Y(crate::emit::lower_ktir_to_superdsc::Spray::outer(32)),
             "a leading spray over the column is the outer row-split at the stated count"
         );
         // Mb over the ROW world — the probe's one surviving site, the one-row [1, 128] source:
         assert_eq!(
-            spray_operand_axis(&frames, Ssa(1), BcastAxis::Mb, 32).expect("the law states it"),
+            spray_operand_axis(&f, &frames, Ssa(1), BcastAxis::Mb, 32).expect("the law states it"),
             BcastAxis::Mb,
             "a leading spray over the row is In::mb — the solved world, not a guard"
         );
         // Col and the row-splits pass through verbatim — the solve anchored their sources,
         // so a clash was already refused at anchor time, naming the op that stated each.
         assert_eq!(
-            spray_operand_axis(&frames, Ssa(1), BcastAxis::Col, 32).expect("the law states it"),
+            spray_operand_axis(&f, &frames, Ssa(1), BcastAxis::Col, 32).expect("the law states it"),
             BcastAxis::Col
         );
         assert_eq!(
             spray_operand_axis(
+                &f,
                 &frames,
                 Ssa(1),
                 BcastAxis::Y(crate::emit::lower_ktir_to_superdsc::Spray::outer(8)),
