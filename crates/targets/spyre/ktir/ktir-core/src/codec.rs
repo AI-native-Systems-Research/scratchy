@@ -810,6 +810,10 @@ mod e4m3_fast_path_tests {
         if a == 0.0 {
             return sign;
         }
+        // The card's top (`super::f32_to_e4m3`'s doc): `[448, 464)` rounds to 448, `[464, ∞]` is NaN.
+        if a >= 464.0 {
+            return sign | 0x7F;
+        }
         if a >= 448.0 {
             return sign | 0x7E;
         }
@@ -1001,11 +1005,19 @@ fn e4m3_to_f32_compute(byte: u8) -> f32 {
     sign * mag
 }
 
-/// Encode one `f32` to a `float8_e4m3fn` byte, round-to-nearest-even, saturating at ±448.
+/// Encode one `f32` to a `float8_e4m3fn` byte, round-to-nearest-even — THE CARD'S `qfp8ch`, byte
+/// for byte, including past the finite range.
 ///
-/// ⛔ SATURATES RATHER THAN OVERFLOWING TO INF, because e4m3fn has no inf: the encoding that would
-/// be one is NaN. A value past the maximum is clamped to the largest finite magnitude, which is
-/// what makes a quantize step lossy-but-finite instead of poisoning the tile.
+/// ⛔⛔⛔ NO SATURATION, BECAUSE THE CARD DOES NOT SATURATE. MEASURED on the card (granite tp/8
+/// pod, one `qfp8ch` descriptor over every finite fp16 value in `[448, 65504]`, its negation and
+/// `±inf`): a value that ROUNDS to `±448` — everything below the midpoint `464` to the next grid
+/// step `480`, which e4m3fn does not have — is `0x7E`/`0xFE`; everything at or past `464`, `±inf`
+/// included, is the NaN encoding `0x7F`/`0xFF`. This encoder used to clamp every magnitude past 448
+/// to `0x7E`, which made the EMULATOR's numeric gate pass a program the card answers with NaN: the
+/// convert is lossy-but-finite on one executor and poisons the tile on the other. A program must
+/// state its own clamp to ±448 before an e4m3 convert (the W8A8 chain's `clip`, the MoE kernel's
+/// `tl.minimum`/`tl.maximum`), and with this encoder the emulator sees what the card sees when it
+/// does not. The fixture table is `fp8_e4m3_codec.rs::the_encoder_is_the_cards_qfp8ch`.
 pub fn f32_to_e4m3(v: f32) -> u8 {
     if v.is_nan() {
         return 0x7F;
@@ -1015,8 +1027,14 @@ pub fn f32_to_e4m3(v: f32) -> u8 {
     if a == 0.0 {
         return sign;
     }
-    const MAX: f32 = 448.0;
-    if a >= MAX {
+    // The finite range ends at 448 (`0x7E`), and the next step e4m3fn would have is 480, which is
+    // the NaN encoding. Round-to-nearest therefore sends `[448, 464)` to 448 and `[464, ∞]` to
+    // NaN — the tie at exactly 464 rounds to the EVEN mantissa, `111`, which is NaN (measured).
+    const NAN_FROM: f32 = 464.0;
+    if a >= NAN_FROM {
+        return sign | 0x7F;
+    }
+    if a >= 448.0 {
         return sign | 0x7E; // exp 1111, mant 110 — the largest finite
     }
     // Subnormal range: below 2^-6, the grid is a multiple of 2^-9.
