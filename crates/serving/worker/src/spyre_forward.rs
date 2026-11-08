@@ -338,6 +338,7 @@ pub(crate) fn run_card_launch(
         staged: None,
         acts: Vec::with_capacity(fsteps.len()),
         acts_i32: Vec::new(),
+        seeds: Vec::new(),
         card_owned_sticks: Vec::new(),
         launched: false,
     };
@@ -357,6 +358,7 @@ pub(crate) fn run_card_launch(
     }
     let acts = launcher.acts;
     let mut acts_i32 = launcher.acts_i32;
+    let seeds = launcher.seeds;
     // ⭐ EVERY LAUNCH OF A BUNDLE THAT MINTS THE DRAW BINDS ITS SAMPLER SEAT, every row of it,
     // before anything runs — a MIDDLE prompt chunk included. Its suffix is skipped, but the
     // seat's five sources are placed in this bundle all the same, and the launch's completeness
@@ -425,11 +427,12 @@ pub(crate) fn run_card_launch(
                 .as_ref()
                 .is_some_and(|s| !s.fired());
             let t_bind = std::time::Instant::now();
-            pf.stage_step_acts(&acts, &[], &acts_i32).map_err(|e| {
-                werr(format!(
-                    "superdsc decode stage (mq={mq}, at={seq_pos}): {e}"
-                ))
-            })?;
+            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc decode stage (mq={mq}, at={seq_pos}): {e}"
+                    ))
+                })?;
             let t_submit = std::time::Instant::now();
             pf.submit_step(mq, seq_pos).map_err(|e| {
                 werr(format!(
@@ -484,24 +487,40 @@ pub(crate) fn run_card_launch(
         }
         // A middle prompt chunk: no suffix runs and nothing is read back.
         (LogitsWanted::None, _) => {
-            pf.run_step_i32(mq, seq_pos, &acts, &[], &acts_i32, StepLogits::Discarded)
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
+            pf.run_step_i32(
+                mq,
+                seq_pos,
+                &acts,
+                &[],
+                &acts_i32,
+                &seeds,
+                StepLogits::Discarded,
+            )
+            .map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                ))
+            })?;
             None
         }
         // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
         // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
         // stick comes back raw, exactly like a decode's.
         (LogitsWanted::LastRow, Some((seat, seat_width))) => {
-            pf.run_step_i32(mq, seq_pos, &acts, &[], &acts_i32, StepLogits::LeftOnDevice)
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
+            pf.run_step_i32(
+                mq,
+                seq_pos,
+                &acts,
+                &[],
+                &acts_i32,
+                &seeds,
+                StepLogits::LeftOnDevice,
+            )
+            .map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                ))
+            })?;
             // The prompt-final width is the launch's one typed width — the
             // mint's verbatim prompt case, the same value the staging block
             // bound the seat's rows at.
@@ -586,6 +605,12 @@ pub(crate) struct ForwardLauncher<'a> {
     /// from [`Self::acts`] because they need a DIFFERENT shadow write: a value is re-encoded to the
     /// card's fp16 (`ieee_to_sen_bytes`), an index must be copied verbatim.
     pub(crate) acts_i32: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>,
+    /// ⭐ THE CHAIN'S SEEDS — per rank, so not in [`Self::acts_i32`]: every card of a sharded world
+    /// binds its own vocabulary block's words (`SuperDscSession::stage_step_acts_seeded`).
+    pub(crate) seeds: Vec<(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        scratchy_target_spyre::forward_tape::ChainSeed,
+    )>,
     /// ⭐⭐⭐ THE STICKS THIS LAUNCH HANDS TO THE CARD — filled by the ChainSeed skip below.
     /// An `OnCard` launch's sticks are the CARD'S: the previous step's ChainStage writes them,
     /// and the executor's persistent bind maps must let them go, or every later submit's
@@ -694,16 +719,11 @@ impl scratchy_subtile::host_tape::Launcher for ForwardLauncher<'_> {
             scratchy_target_spyre::forward_tape::Staged::I32(bytes) => {
                 self.acts_i32.push((tensor, bytes));
             }
-            // ⭐ THE CHAIN'S SEED — raw u32 lane values, LE words verbatim through
-            // the same raw-integer bind the index table rides (the staging door's
-            // law: LE bytes are the device encoding for raw integer words), never
-            // the IEEE→SEN convert an f16 arm would run.
-            scratchy_target_spyre::forward_tape::Staged::U32(v) => {
-                let mut bytes = Vec::with_capacity(v.len() * 4);
-                for w in v.iter() {
-                    bytes.extend_from_slice(&w.to_le_bytes());
-                }
-                self.acts_i32.push((tensor, bytes));
+            // ⭐ THE CHAIN'S SEED — per rank: the session builds each card's words from its own
+            // vocabulary block at the bind, raw u32 LE through the same raw-integer channel the
+            // index table rides, never the IEEE→SEN convert an f16 arm would run.
+            scratchy_target_spyre::forward_tape::Staged::ChainSeed(seed) => {
+                self.seeds.push((tensor, seed));
             }
         }
         Ok(())
@@ -1641,9 +1661,12 @@ pub(crate) fn forward_chunk(
                 let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
                 let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
                 let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
-                let s_words = scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows);
+                // The emulator plays a world of one: the whole table.
+                let block = scratchy_subtile::subtile_ir::ChainBlock::whole(chain.block);
+                let s_words =
+                    scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows, block);
                 let l_words =
-                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows);
+                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows, block);
                 dynamic.push((
                     chain.s_src as u64,
                     s_words.iter().map(|&w| w as f32).collect(),
@@ -2186,6 +2209,7 @@ mod pad_clamp_tests {
             k: 3,
             hidden: 2048,
             replaces: 7,
+            block: 65536,
         };
         let shape = ForwardShape {
             rows: 1,
@@ -2219,12 +2243,13 @@ mod pad_clamp_tests {
                 staged: None,
                 acts: Vec::new(),
                 acts_i32: Vec::new(),
+                seeds: Vec::new(),
                 card_owned_sticks: Vec::new(),
                 launched: false,
             };
             play(&HostTape { steps: &ftape }, &mut launcher).expect("the decode tape plays");
             assert!(launcher.launched, "the tape must reach its device step");
-            (launcher.card_owned_sticks, launcher.acts_i32)
+            (launcher.card_owned_sticks, launcher.seeds)
         };
 
         // OnCard: the two ChainSeed steps stage nothing and the skip names EXACTLY the
@@ -2254,6 +2279,26 @@ mod pad_clamp_tests {
             host_i32.len(),
             2,
             "the s and the l seed both stage through the raw channel"
+        );
+        // ⭐ EACH RANK'S SEED IS ITS OWN BLOCK'S. With the table cut into two 32768-column blocks,
+        // token 1318 is rank 0's: rank 0 seeds its slab and lane, rank 1 the sentinel's zero row.
+        type W2 = scratchy_target_spyre::bundle_code::collective::TpWorld<2>;
+        let (r0, r1) = (
+            scratchy_target_spyre::bundle_code::collective::Rank::<W2>::of::<0>(),
+            scratchy_target_spyre::bundle_code::collective::Rank::<W2>::of::<1>(),
+        );
+        let mut split = host_i32[1].1.clone();
+        split.chain.block = 32768;
+        let alone = host_i32[1].1.words::<W2>(None);
+        assert_eq!(
+            split.words(Some(r0)),
+            alone,
+            "the owner seeds the token's own ramp"
+        );
+        assert_eq!(
+            split.words(Some(r1)),
+            scratchy_subtile::subtile_ir::chain_l_sentinel_ramp(chain.hidden),
+            "a rank that does not hold the token seeds the zero row"
         );
     }
 }

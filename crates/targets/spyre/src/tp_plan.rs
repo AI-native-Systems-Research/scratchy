@@ -65,8 +65,8 @@ pub struct TpBake<T: Tp> {
 /// Shard `input` for world `T` and size the receive window its collectives need.
 pub fn tp_bake<T: Tp>(input: &LoweringInput) -> Result<TpBake<T>, TpBakeRefusal> {
     let () = T::CHECKED;
-    let sharded =
-        tensor_parallel::shard::<T>(input, SPYRE_SPLIT_GRANULE, &[]).map_err(TpBakeRefusal::Shard)?;
+    let sharded = tensor_parallel::shard::<T>(input, SPYRE_SPLIT_GRANULE, &[])
+        .map_err(TpBakeRefusal::Shard)?;
     let shapes = tensor_parallel::op_shapes(&sharded.local);
     let mut widest_cols: Option<u32> = None;
     for (collective, c) in sharded.collectives.iter().enumerate() {

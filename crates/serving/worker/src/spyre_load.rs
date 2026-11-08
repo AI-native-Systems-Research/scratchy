@@ -1054,7 +1054,9 @@ impl SpyreWorker {
                 .iter()
                 .chain(wirings.prefill.iter().flat_map(|p| p.load_consts.iter()));
             for &(tid, kind) in consts {
-                let (bytes, dt, shape) = kind.build();
+                // The emulator serves one card: no rank's block, the whole table.
+                let (bytes, dt, shape) =
+                    kind.build::<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>(None);
                 match staged.get(&tid) {
                     Some(prev) if *prev != bytes => {
                         return Err(werr(format!(

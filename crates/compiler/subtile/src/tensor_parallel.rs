@@ -1341,10 +1341,12 @@ mod tests {
     fn the_handoff_facts_follow_their_ops() {
         use crate::fixtures::front_end_lowered;
         let lowered = front_end_lowered(one_layer_input());
-        let (one, _) = shard_lowered::<TpWorld<1>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
+        let (one, _) =
+            shard_lowered::<TpWorld<1>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
         assert_eq!(format!("{one:?}"), format!("{lowered:?}"));
 
-        let (two, sf) = shard_lowered::<TpWorld<2>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
+        let (two, sf) =
+            shard_lowered::<TpWorld<2>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
         assert_eq!(two.op_tiles.len(), two.input.ops.len());
         assert_eq!(two.op_expansion.len(), two.input.ops.len());
         for (i, &k) in sf.op_map.iter().enumerate() {
@@ -1518,5 +1520,122 @@ mod tests {
             shard::<TpWorld<2>>(&input, SplitGranule::of::<64>(), &[bad]).unwrap_err(),
             ShardRefusal::MalformedGather { gather: bad }
         );
+    }
+
+    /// ⭐ THE CHAINED HEAD OVER THE SPLIT TABLE, END TO END. The two-rank forward is lowered and
+    /// the chain minted onto it exactly as onto a one-rank decode: the gather reads this rank's
+    /// column block of the table (the projection's own), the analysis's all-reduce is its rows'
+    /// one reader, and the block the mint reports is the rank's columns. Each rank then stages its
+    /// own block's decompose — the token's slab and lane on its owner, the sentinel's zero row on
+    /// the other rank — and both ranks' logits are the unsharded forward's with the token's row
+    /// staged by the host.
+    #[test]
+    fn the_chained_head_over_a_split_table_is_the_unsharded_forward() {
+        use crate::subtile_ir::{
+            ChainBlock, Range, Region, SubtileId, SubtileNode, TensorId, TensorRegion, chain_l_row,
+            chain_l_seed, chain_s_row, chain_s_seed, chain_slab_entries, mint_embed_chain,
+        };
+        // A whole pick group (4096 lanes), the draw's own law for the pad the tables span.
+        let vocab = 4096u32;
+        type W = TpWorld<2>;
+        let (input, gather) = tied_head_input(vocab);
+        let sf = shard::<W>(&input, SplitGranule::of::<64>(), &[gather]).unwrap();
+        let mut g = lower_region(&sf.local, NB);
+        let whole = |t: TensorId, s: TensorShape| TensorRegion {
+            tensor: t,
+            region: Region {
+                rows: Range::new(0, s.rows),
+                cols: Range::new(0, s.cols),
+            },
+        };
+        // The draw's stand-in: an op output, one row per request, answering pick 0 (the chain's
+        // own tests own the draw; here the stage needs only an answerable pick).
+        let logits = g.result;
+        let pick = TensorId::from_index(g.tensors.len());
+        let pick_shape = g.shape(logits);
+        g.tensors.push(pick_shape);
+        g.nodes.push(SubtileNode {
+            id: SubtileId::from_index(g.nodes.len()),
+            op: SubOp::ScalarMul { scale: 0.0 },
+            inputs: vec![whole(logits, pick_shape)],
+            output: whole(pick, pick_shape),
+        });
+        g.result = pick;
+        let lc = vocab / W::RANKS;
+        let mint = mint_embed_chain(&mut g, TensorId::from_index(gather.row), pick, vocab);
+        assert_eq!(mint.block, lc, "the gather reads this rank's block");
+        let SubOp::EmbedRowGather { .. } = g.nodes[0].op else {
+            panic!("the chain's gather is the forward's first op")
+        };
+        assert_eq!(
+            g.nodes[0].inputs[2].tensor,
+            TensorId::from_index(gather.table)
+        );
+        let rows = g.nodes[0].output.tensor;
+        let readers: Vec<bool> = g
+            .nodes
+            .iter()
+            .filter(|n| n.inputs.iter().any(|i| i.tensor == rows))
+            .map(|n| matches!(n.op, SubOp::AllReduce))
+            .collect();
+        assert_eq!(
+            readers,
+            vec![true],
+            "the gathered rows' one reader is the analysis's all-reduce"
+        );
+
+        // The reference: the one-rank forward with the token's column staged as its row.
+        let token = 3000u32;
+        let mut full = sources_of(&input);
+        let h = input.sources[0].cols as usize;
+        full[gather.row] = (0..h)
+            .map(|k| full[gather.table][k * vocab as usize + token as usize])
+            .collect();
+        let gr = lower_region(&input, NB);
+        let refs: Vec<&[f32]> = full.iter().map(|v| v.as_slice()).collect();
+        let reference = eval_dag(&gr, &refs)[gr.result.index()].clone();
+
+        // Each rank: its slices, then its own block's sticks and tables.
+        let k = chain_slab_entries(h as u64) as u32;
+        let words = |v: Vec<u32>| -> Vec<f32> { v.into_iter().map(|x| x as f32).collect() };
+        let tab_rows = g.shape(TensorId::from_index(mint.s_stick.index() + 2)).rows;
+        let per_rank = |r: Rank<W>| -> Vec<Vec<f32>> {
+            let block = ChainBlock::of_rank(lc, r);
+            let mut srcs: Vec<Vec<f32>> = full
+                .iter()
+                .zip(&input.sources)
+                .zip(&sf.sources)
+                .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r))
+                .collect();
+            srcs.push(words(chain_s_seed(k, &[token], 1, block)));
+            srcs.push(words(chain_l_seed(&[token], h as u32, 1, block)));
+            srcs.push(
+                (0..tab_rows)
+                    .flat_map(|t| words(chain_s_row(k, t, block)))
+                    .collect(),
+            );
+            srcs.push(
+                (0..tab_rows)
+                    .flat_map(|t| words(chain_l_row(t, h as u32, block)))
+                    .collect(),
+            );
+            srcs
+        };
+        let gathered_logits = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::ScalarMul { scale } if scale == 0.0))
+            .expect("the draw's stand-in")
+            .inputs[0]
+            .tensor;
+        let bufs = eval_ranks(&g, crate::subtile_ir::AttnScaleSite::InKernel, per_rank);
+        for (r, b) in bufs.iter().enumerate() {
+            let worst = b[gathered_logits.index()]
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-4, "rank {r}'s logits off by {worst}");
+        }
     }
 }

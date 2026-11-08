@@ -320,7 +320,8 @@ fn regenerate_sampler_fixture() {
             else {
                 panic!("the sampler binds only its own tables, got {kind:?}");
             };
-            let (_, dt, shape) = kind.build();
+            let (_, dt, shape) =
+                kind.build::<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>(None);
             // The production staging's bytes for this operand in LOGICAL order (before any
             // stagger), pinned by hash: the test's own table must hash to exactly this.
             let (logical, _, _) = scratchy_target_spyre::wiring::sample_staged_tables(vocab, rows)
