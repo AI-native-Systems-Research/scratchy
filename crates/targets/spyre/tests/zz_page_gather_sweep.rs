@@ -575,6 +575,7 @@ fn paged_program(frame: Frame, entries: u64, slab: u64, pages: u64) -> KtirNode 
         ],
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     }

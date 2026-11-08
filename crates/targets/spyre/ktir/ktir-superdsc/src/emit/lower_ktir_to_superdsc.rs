@@ -5728,10 +5728,23 @@ pub fn lmlast<T: crate::collective::Tp>(
             out.tid
         ));
     }
-    // `mq` and the row come from the SOURCE's own view + window: the buffer is `[mq, hidden]` and the
-    // program takes ONE row of it, at `r_start`.
+    // ⭐ THE ROWS COME FROM THE NODE'S OWN STATEMENT — `KtirNode::answer_rows`, minted by the
+    // producer from the rung's extent pair. Neither view states the row LAW (which row of each
+    // request's window is the answer row), and re-deriving `r·w + (w−1)` here would divide `mq`
+    // back apart — the one derivation the extent pair exists to make unnecessary. So the door
+    // refuses by name when the producer stated none, and takes each request's row from the ONE
+    // statement.
+    let answers = k.answer_rows.ok_or_else(|| Error {
+        message: format!(
+            "{name}: states no `answer_rows`. The extraction takes one answer row per request \
+             window — the rung's own `r·w + (w−1)` law — which neither the `[mq, hidden]` source \
+             view nor the `[S, hidden]` staging view states. The producer that built the tail must \
+             state it, the same way it states `node_out_tid`."
+        ),
+    })?;
+    // `mq` and `hidden` come from the SOURCE's own view: the buffer is `[mq, hidden]` and the
+    // program takes one row of it per request window.
     let (mq, hidden) = (src.v_rows, src.v_cols);
-    let row = src.r_start;
     let stk = Fp16::ELEMS_PER_STICK;
     if hidden % stk != 0 {
         return err(format!(
@@ -5739,9 +5752,27 @@ pub fn lmlast<T: crate::collective::Tp>(
              a run of whole stick-groups — the per-stick extraction cannot address it"
         ));
     }
+    // ⭐ THE STATEMENT MEETS THE VIEWS HERE — the rows' extent pair must describe THIS program's
+    // source (`w·S == mq`) and THIS program's staging (`S` rows), or the producer stated the rows
+    // of a different rung than the one the door is emitting. A disagreement is a REFUSAL by name,
+    // the same agreement check the splice runs before minting.
+    let extent = answers.extent();
+    if extent.graph_rows().get() != mq || answers.count() as u32 != out.v_rows {
+        return err(format!(
+            "{name}: the stated answer rows are {} row(s) of a {}-row source (per-request {} × {} \
+             request(s)), but the program takes `[{mq}, {hidden}]` into a `[{}, {}]` staging — the \
+             rows do not describe the program they lower",
+            answers.count(),
+            extent.graph_rows().get(),
+            extent.per_request().get(),
+            extent.requests().get(),
+            out.v_rows,
+            out.v_cols,
+        ));
+    }
     // The WINDOW is one SINGLE STICK — `regions` reports the first access tile, and the extraction's
     // tiles are `[1, stk]` by construction (that is the whole point: one stick-group per op). What must
-    // be whole-row is the DESTINATION BUFFER, `[1, hidden]`.
+    // be whole-row is the DESTINATION BUFFER, `[S, hidden]`.
     if src.r_len != 1 || src.c_len != stk || out.r_len != 1 || out.c_len != stk {
         return err(format!(
             "{name}: takes `[{}, {}]` into `[{}, {}]` — each copy is one `[1, {stk}]` stick-group, \
@@ -5749,47 +5780,64 @@ pub fn lmlast<T: crate::collective::Tp>(
             src.r_len, src.c_len, out.r_len, out.c_len,
         ));
     }
-    if out.v_rows != 1 || out.v_cols != hidden {
+    if out.v_cols != hidden {
         return err(format!(
-            "{name}: destination buffer is `[{}, {}]` — the last-row staging is `[1, hidden]` for the \
-             `[{mq}, {hidden}]` source it is extracted from",
+            "{name}: destination buffer is `[{}, {}]` — the last-row staging is `[S, hidden]` for \
+             the `[{mq}, {hidden}]` source it is extracted from",
             out.v_rows, out.v_cols,
         ));
     }
-    if row >= mq {
-        return err(format!(
-            "{name}: row {row} is outside the `[{mq}, {hidden}]` source — the row is \
-             `selector_lastrow_col(mq)`, which is `mq - 1`"
-        ));
+    for (req, row) in answers.rows() {
+        if row as u32 >= mq {
+            return err(format!(
+                "{name}: request {}'s answer row {row} is outside the `[{mq}, {hidden}]` source — \
+                 the row is its window's last baked row, `r·w + (w−1)`",
+                req.get()
+            ));
+        }
     }
+    let s = out.v_rows;
     if let Some(l) = layout {
-        l.synth(PlaceId::Act(out.tid), &[1, hidden]);
+        l.synth(PlaceId::Act(out.tid), &[s, hidden]);
     }
     // ⭐ TRUE EXTENTS, not the `[1, stk]`/`rbo` staging annotations: the source IS the `[mq, hidden]`
-    // prompt buffer and the destination IS the `[1, hidden]` staging the synth above reserves, so the
+    // prompt buffer and the destination IS the `[S, hidden]` staging the synth above reserves, so the
     // handles state the buffers the corners below address — the mint's bound. The stick walk's last
-    // window ends exactly at `mq*hidden` / `hidden` elements respectively.
+    // window ends exactly at `mq*hidden` / `S*hidden` elements respectively.
     let src_name = rb(&src.name(), mq, hidden);
-    let dst = rb(&out.name(), 1, hidden);
-    Ok((0..hidden / stk)
-        .map(|j| {
+    let dst = rb(&out.name(), s, hidden);
+    Ok(answers
+        .rows()
+        .flat_map(|(req, row)| (0..hidden / stk).map(move |j| (req, row, j)))
+        .map(|(req, row, j)| {
             assemble_pointwise_broadcast_off(
-                &format!("lmlast{j}_o{owner}"),
+                // ⛔ NAMED AFTER THE STICK-PLANE ROW THE COPY WRITES — `j·S + r` of the destination's
+                // `[.., stk]` staging, the same row the corner below addresses. At `S = 1` that is
+                // `j` alone, so every name is byte-identical to the single-row law's
+                // `lmlast{j}_o{owner}`; at `S > 1` the plane row is a bijection over `(j, r)`, so
+                // every copy keeps its own name.
+                &format!("lmlast{}_o{owner}", j * s + req.get()),
                 "identity",
                 crate::sdsc_abstract::RowCount::of_token_rows(1),
                 crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
                 &[In::sliced(
                     &src_name,
                     // row `j*mq + row` of a `[.., stk]` staging — a corner, not a product.
-                    crate::addr::rc_of((j + 1) * mq + row + 1, stk, j * mq + row, 0, Df::Fp16),
+                    crate::addr::rc_of(
+                        (j + 1) * mq + row as u32 + 1,
+                        stk,
+                        j * mq + row as u32,
+                        0,
+                        Df::Fp16,
+                    ),
                 )
                 .ew()],
                 &dst,
-                // Column `j*stk` of the single-row `[1, hidden]` last-hidden staging — a corner on
-                // that tensor, not a product. At one row the stick plane term is 0, so this is the
-                // same address either way; saying it as a coordinate keeps the last hand-built offset
-                // in this file from being the one nobody notices.
-                crate::addr::rc_of(1, hidden, 0, j * stk, Df::Fp16),
+                // Row `r`, column `j*stk` of the `[S, hidden]` last-hidden staging — a corner on
+                // that tensor, not a product. At one request the row term is 0, so this is the
+                // same address the single-row law stated; saying it as a coordinate keeps the last
+                // hand-built offset in this file from being the one nobody notices.
+                crate::addr::rc_of(s, hidden, req.get() as u32, j * stk, Df::Fp16),
                 sym_id_base,
                 layout,
             )
