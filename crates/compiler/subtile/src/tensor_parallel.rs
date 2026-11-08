@@ -1121,6 +1121,37 @@ pub fn shard_lowered<T: World>(
     Ok((out, sharded))
 }
 
+/// ⭐ ONE STAGED COPY, ONE CUT. Every bundle of a sharded world reads the weights the world stages
+/// ONCE per rank, so a staged source (a weight, its scale, a bundle tensor) that two forwards both
+/// bind must be cut alike by both analyses. `first` and `second` pair each forward's source
+/// bindings with its slice laws ([`ShardedForward::sources`]); the first staged binding they cut
+/// apart is refused, naming the binding and both cuts. A per-step input (a gathered row, a prompt's
+/// rows, a cache) is each bundle's own and is not compared.
+pub fn staged_cut_apart<'a>(
+    first: (&'a [crate::handoff::SourceBinding], &'a [SourceShard]),
+    second: (&'a [crate::handoff::SourceBinding], &'a [SourceShard]),
+) -> Option<(&'a crate::handoff::SourceBinding, SourceShard, SourceShard)> {
+    use crate::handoff::SourceBinding as B;
+    second
+        .0
+        .iter()
+        .zip(second.1)
+        .filter(|(b, _)| {
+            matches!(
+                b,
+                B::Weight { .. } | B::WeightScale { .. } | B::BundleTensor { .. }
+            )
+        })
+        .find_map(|(b, &cut)| {
+            first
+                .0
+                .iter()
+                .zip(first.1)
+                .find(|(fb, _)| *fb == b)
+                .and_then(|(_, &other)| (other != cut).then_some((b, other, cut)))
+        })
+}
+
 /// An element the slice law can cut: a value with a ZERO, for the ranks that hold none of a
 /// [`SourceShard::Partial`] value. The host reference's `f32`, and a loader's raw element bytes
 /// (`[u8; N]`, any width).
@@ -1840,6 +1871,41 @@ mod tests {
             SourceShard::ColBlocks { .. } | SourceShard::RowBlocks { .. }
         )));
         sharded_equals_unsharded_at::<W>(&input, g);
+    }
+
+    /// One staged weight, two forwards: cut alike, nothing is refused; cut apart (the decode's
+    /// table by columns, a rung's whole), the binding and both cuts are named. A per-step input
+    /// cut apart (the decode's gathered row, a prompt's whole rows) is each bundle's own.
+    #[test]
+    fn a_staged_weight_cut_apart_is_refused() {
+        use crate::handoff::SourceBinding as B;
+        let w = B::Weight { id: 7, index: None };
+        let bindings = [B::EmbeddedHidden, w.clone()];
+        let decode = [SourceShard::Partial, SourceShard::Cols];
+        assert_eq!(
+            staged_cut_apart(
+                (&bindings, &decode),
+                (&bindings, &[SourceShard::Whole, SourceShard::Cols])
+            ),
+            None,
+            "a per-step row cut apart is each bundle's own"
+        );
+        assert_eq!(
+            staged_cut_apart(
+                (&bindings, &decode),
+                (&bindings, &[SourceShard::Whole, SourceShard::Whole])
+            ),
+            Some((&w, SourceShard::Cols, SourceShard::Whole))
+        );
+        // The two forwards' bindings need not share an order: a weight is matched by what it is.
+        let rung = [w.clone(), B::EmbeddedHidden];
+        assert_eq!(
+            staged_cut_apart(
+                (&bindings, &decode),
+                (&rung, &[SourceShard::Rows, SourceShard::Whole])
+            ),
+            Some((&w, SourceShard::Cols, SourceShard::Rows))
+        );
     }
 
     /// The padded laws cut whole buffers into blocks and zero what lies past the source.
