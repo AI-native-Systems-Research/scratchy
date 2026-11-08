@@ -720,7 +720,7 @@ fn the_walk_refuses_one_program_touching_two_same_class_pins() {
     // One program's descriptors are one SDSC phase (the citations schedule per node, one
     // phase each), so both pins live in the SAME phase with no phase boundary between
     // their touches for a shared slot to alternate across: refused outright, both named.
-    let per_prog = vec![("rms_pair".to_string(), 10)];
+    let per_prog = vec![("rms_pair".to_string(), 8)];
     let err = superdsc::walk_lx_slot_alternation(
         &ops,
         &per_prog,
