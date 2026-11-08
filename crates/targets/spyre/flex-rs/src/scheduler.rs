@@ -1875,7 +1875,7 @@ impl HardwareSubmit for SenlibHardwareSubmit {
     }
 
     fn telemetry_key(&self) -> usize {
-        std::sync::Arc::as_ptr(&self.card) as usize
+        self.card.telemetry_key()
     }
 }
 

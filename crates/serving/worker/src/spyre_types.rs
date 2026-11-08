@@ -22,15 +22,19 @@ use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
 pub(crate) type World = scratchy_target_spyre::bundle_code::collective::Build;
 
-/// A session over the build's world: one executor per rank of [`World`].
+/// A session over the build's world: one executor per rank of [`World`], each BORROWING its card
+/// for `'static` — the loaded model lives for the process, and so do the cards it runs on (the
+/// loader opens them once and hands out `&'static Cards`; see `load_inner`).
 #[cfg(feature = "spyre-hw")]
-pub(crate) type SuperDscSession = scratchy_target_spyre::sdsc_runner::SuperDscSession<World>;
+pub(crate) type SuperDscSession =
+    scratchy_target_spyre::sdsc_runner::SuperDscSession<'static, World>;
 
-/// The build's cards, one per rank of [`World`].
+/// The build's cards, one per rank of [`World`] — OWNED here, once, for the process; every session
+/// borrows them.
 #[cfg(feature = "spyre-hw")]
 pub(crate) type Cards = scratchy_target_spyre::bundle_code::collective::PerRank<
     World,
-    std::sync::Arc<scratchy_target_spyre::runtime::CardRuntime<World>>,
+    scratchy_target_spyre::runtime::CardRuntime<World>,
 >;
 
 /// One layer's KV pools: the K and V cache tensors its paged attention gathers from and its KV

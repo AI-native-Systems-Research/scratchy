@@ -682,7 +682,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     // One kernel on one card: the first card senlib enumerates.
     let card = crate::runtime::CardRuntime::open(0).map_err(|e| anyhow!("open card 0: {e}"))?;
     let mut exec = crate::superdsc_exec::Executor::load(
-        card,
+        &card,
         code,
         // ⛔ NOT ZERO. These three are a MODEL's geometry, and a single-kernel bundle has none — but a
         // zero pool leaves the runtime configuring a device with no KV region at all, and the launch

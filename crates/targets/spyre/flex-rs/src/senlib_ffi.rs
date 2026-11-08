@@ -798,6 +798,15 @@ impl Card {
         &self.pci
     }
 
+    /// This card's key in the RB telemetry ring ([`crate::rb_telemetry::RbTiming::source`]): the
+    /// card's own address. A `Card` is opened into its one shared home and never moves out of it,
+    /// so the address is fixed for the card's life and distinct between the cards one process
+    /// holds open. The submitter records under it and every reader drains under it — one
+    /// definition, so the two cannot disagree.
+    pub fn telemetry_key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     /// The raw handle, for this crate's FFI calls only. Null only for a [`Card::detached`] test
     /// card, which every shim entry point refuses by name ("null card").
     pub(crate) fn raw(&self) -> *mut c_void {
