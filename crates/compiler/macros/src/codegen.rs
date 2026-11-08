@@ -10304,7 +10304,6 @@ fn emit_superdsc_wiring(
                         row: #row,
                         vocab: #vocab,
                         pad_vocab: #pad_vocab,
-                        idx_row_words: #idx_row_words,
                         seed_row_words: #seed_row_words,
                         gate_row_words: #gate_row_words,
                         idx_row_words: #idx_row_words,
