@@ -1423,19 +1423,21 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //   * `ZERO_COL_TID` `[1, w]` — that fold's zero `β` row (`w = n`), AND the rotate-then-scale fold's
     //     zero `bnB` row (`w = head_dim`): a single-position rope's `(x @ P) · sin` is the rotate
     //     matmul's `batchnormfwd` epilogue (`rope_at`'s head-major collapse).
+    //   * and BOTH for the gained rmsnorm's tail — `x · rinv[:, None] · γ[None, :]` is the same
+    //     row-then-column scale fold (`assemble_rmsnorm`), at the norm's own `[rows, cols]`.
     {
-        let fp8 = ir
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3);
-        let rows = fp8
+        let scaled = ir.nodes.iter().filter(|n| {
+            (matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+                || matches!(n.op, SubOp::RmsNorm { .. })
+        });
+        let rows = scaled
             .clone()
             .map(|n| n.output.region.rows.len as u64)
             .max()
             .unwrap_or(0);
         // Every rope class's head dim — the shared class registry above, the one list every rope
         // reader resolves its class off — since any rope may lower at one position.
-        let cols = fp8
+        let cols = scaled
             .map(|n| n.output.region.cols.len as u64)
             .chain(rope_class_hds.iter().map(|&hd| u64::from(hd)))
             .max()

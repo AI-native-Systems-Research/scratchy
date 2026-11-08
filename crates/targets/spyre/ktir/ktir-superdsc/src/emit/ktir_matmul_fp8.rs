@@ -685,6 +685,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
             super::row_col_scale::RowColOperands {
                 x: &raw,
                 row_scale: &ascale,
+                row_scale_lane: crate::addr::DevOff::ZERO,
                 col_scale: &ws_name,
                 out: &out,
             },

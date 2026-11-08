@@ -213,6 +213,50 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     //    allocate through the ordinary slice-offset machinery — and because `rinv` is LX-pinned,
     //    that byte lands BYTE-exact in the reader's lxlu address (see the `synth_lx_op_local` note above
     //    for why the same offset on HBM is silently floored to element 0).
+    // 6. OnePlusScale: gw = gamma + 1 — ONE `add` over the stored row with the
+    //    `[1,1]`-broadcast offset (the eps operand mode), filling the `[1,cols]`
+    //    `Gw` row the gain multiply reads. The stored gamma is never rewritten.
+    //    Emitted BEFORE the normalise-and-gain tail, which reads the row it fills.
+    let gw_ones_h = ones_const.map(|c| (rb(&gw, 1, cols), rb(c, 1, stk)));
+    if let Some((gw_handle, ones)) = &gw_ones_h {
+        ops.push(pw2(
+            &format!("rmga_{prefix}"),
+            "add",
+            RowCount::of_token_rows(1),
+            BlockCols::of_feature_cols(cols),
+            In::mb(&gamma),
+            In::scalar(ones),
+            gw_handle,
+            sym_id_base,
+            layout,
+        )); // gw = γ + 1
+    }
+    let gain_name = match &gw_ones_h {
+        Some((gw_handle, _)) => gw_handle.name().to_string(),
+        None => gamma.name().to_string(),
+    };
+    // ⭐ THE TAIL IS THE ROW-THEN-COLUMN SCALE FOLD (`emit::row_col_scale`): `x · r[:, None]` then
+    //    `· g[None, :]`, where `xn` is minted here and read by the gain multiply alone. Claimed where
+    //    the fold's one shape predicate holds; the two multiplies stand otherwise.
+    if let Ok(shape) = crate::emit::row_col_scale::RowColScale::of(rows, cols) {
+        ops.push(
+            crate::emit::row_col_scale::assemble(
+                &format!("rmxg_{prefix}"),
+                shape,
+                crate::emit::row_col_scale::RowColOperands {
+                    x: x.name(),
+                    row_scale: rinv.name(),
+                    row_scale_lane: crate::addr::DevOff::from_view_step(8),
+                    col_scale: &gain_name,
+                    out: out.name(),
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| e.0)?,
+        );
+        return Ok(ops);
+    }
     ops.push(pw2(
         &format!("rmxn_{prefix}"),
         "multiply",
@@ -224,36 +268,14 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         sym_id_base,
         layout,
     ));
-    // 6. OnePlusScale: gw = gamma + 1 — ONE `add` over the stored row with the
-    //    `[1,1]`-broadcast offset (the eps operand mode), filling the `[1,cols]`
-    //    `Gw` row the gain multiply reads. The stored gamma is never rewritten.
-    //    The handles are hoisted OUT of the arm because `In::mb` borrows: the
-    //    multiply's operand must outlive the `match` that minted it.
-    let gw_ones_h = ones_const.map(|c| (rb(&gw, 1, cols), rb(c, 1, stk)));
-    let gamma_operand = match &gw_ones_h {
-        Some((gw_handle, ones)) => {
-            ops.push(pw2(
-                &format!("rmga_{prefix}"),
-                "add",
-                RowCount::of_token_rows(1),
-                BlockCols::of_feature_cols(cols),
-                In::mb(&gamma),
-                In::scalar(ones),
-                gw_handle,
-                sym_id_base,
-                layout,
-            )); // gw = γ + 1
-            In::mb(gw_handle)
-        }
-        None => In::mb(&gamma),
-    };
+    let gain_h = rb(&gain_name, 1, cols);
     ops.push(pw2(
         &format!("rmg_{prefix}"),
         "multiply",
         t_rows,
         f_cols,
         In::full(&xn),
-        gamma_operand,
+        In::mb(&gain_h),
         &out,
         sym_id_base,
         layout,

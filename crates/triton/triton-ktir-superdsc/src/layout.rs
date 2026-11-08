@@ -542,6 +542,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // ⭐ THE ROTATE-THEN-SCALE FOLD's zero `bnB` row `[1, hd]` — a single-position rope's
         // `(x @ P) · sin` is the rotate matmul's `batchnormfwd` epilogue (`rope_at`), which reads it.
         // Placed for every rope: the head dim is the output view's own, the same fact P's extent is.
+        // A single-kernel bundle holds ONE program, so no other fold has placed this tid here.
         pack(
             name,
             ktir_superdsc::reserved_tids::ZERO_COL_TID,
@@ -584,10 +585,13 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
                 &mut segment_bytes,
             )?;
         }
-        // ⭐ THE ROW-THEN-COLUMN SCALE FOLD's zero mean `[m, stick]` and zero `β` `[1, n]`
-        // (`emit::row_col_scale`) — the fp8 dequant lowers to one `layernormnorm` reading both. Sized
-        // off the OUTPUT region the program states (the matmul's `[m, n]`), the same view the door
-        // reads `m` and `n` from, so the fold's reads sit inside these placements.
+    }
+    // ⭐ THE ROW-THEN-COLUMN SCALE FOLD's zero mean `[m, stick]` and zero `β` `[1, n]`
+    // (`emit::row_col_scale`) — the fp8 dequant AND the gained rmsnorm's tail lower to one
+    // `layernormnorm` reading both. Sized off the OUTPUT region the program states (the matmul's or
+    // the norm's `[rows, cols]`), the same view the door reads the extents from, so the fold's reads
+    // sit inside these placements.
+    if r.iter().any(|reg| reg.is_fp8) || matches!(node.program, Program::RmsNorm) {
         if let Some(out) = r.iter().find(|reg| reg.is_out) {
             for (tid, dims) in [
                 (

@@ -95,8 +95,11 @@ impl RowColScale {
 pub struct RowColOperands<'a> {
     /// `x`, `[rows, cols]`.
     pub x: &'a str,
-    /// `r`, one value per row at element 0 of each row's stick: `[rows, stick]`.
+    /// `r`, one value per row of a `[rows, stick]` per-row-scalar tensor, read at element
+    /// `row_scale_lane` of each row's stick (0 for the fp8 `ascale`; 8 for the rmsnorm's `rinv`, the
+    /// exx2 output's E[x²] half — a lane select, byte-exact only on an LX-pinned operand).
     pub row_scale: &'a str,
+    pub row_scale_lane: crate::addr::DevOff,
     /// `g`, one row: `[1, cols]`.
     pub col_scale: &'a str,
     /// `out`, `[rows, cols]`.
@@ -133,7 +136,7 @@ pub fn assemble<T: crate::collective::Tp>(
     let inputs = [
         super::In::full(&x).ew(),
         super::In::col(&mean).ew(),
-        super::In::col(&scale).ew(),
+        super::In::col_at(&scale, o.row_scale_lane).ew(),
         super::In::mb(&gamma).ew(),
         super::In::mb(&beta).ew(),
     ];
