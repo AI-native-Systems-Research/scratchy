@@ -4558,6 +4558,7 @@ mod production_ktir_dump {
             "sample_fwd_b1" | "sample_fwd_b2" | "sample_fwd_b32" => Program::Sample,
             "paged_attn_decode"
             | "paged_attn_prefill"
+            | "paged_attn_prefill_packed"
             | "paged_attn_decode_pool"
             | "paged_attn_prefill_walk"
             | "paged_attn_decode_hd128"
