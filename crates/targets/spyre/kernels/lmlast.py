@@ -73,7 +73,11 @@ def lmlast_fwd(desc_src, desc_dst,  #
     # `[1, 64]` tile per `(r, j)`, the form the door's `lmlast` arm checks. Request
     # `r`'s answer row is `r·W + W-1` — its window's last BAKED row.
     for r in tl.range(0, S, 1):
-        row = r * W + W - 1
+        # `(W - 1)` parenthesised so the subtraction is a CONSTEXPR fold in the
+        # frontend — bound to the runtime sum instead, it lowers to an
+        # `arith.subi` the TTIR adapter has no form for (and should not need:
+        # the row law's offset is a bake-time constant).
+        row = r * W + (W - 1)
         for j in tl.range(0, N_STICKS, 1):
             v = src_desc.load([row, j * 64])
             dst_desc.store([r, j * 64], v)
