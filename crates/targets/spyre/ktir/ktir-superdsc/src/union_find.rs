@@ -45,6 +45,56 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+/// The solve's own refusals — the only ways a stated constraint set can be
+/// inconsistent. Typed facts, worded once by the [`std::fmt::Display`] impl; the
+/// caller adapts that wording into its own error (the frame pass's one adapter).
+pub enum Refusal<A> {
+    /// A join would weld two differently-anchored classes into one — the one join
+    /// states two absolutes for one class. Names the op that stated EACH anchor.
+    JoinOfTwoAnchors {
+        /// The first component's anchor, and the op that stated it.
+        left: (A, String),
+        /// The second component's anchor, and the op that stated it.
+        right: (A, String),
+        /// The join that stated the two sides are one value.
+        join: String,
+    },
+    /// A component already anchored, anchored differently again. Names the op that
+    /// stated EACH anchor.
+    AnchorStatedTwice {
+        /// The anchor the class already holds, and the op that stated it.
+        held: (A, String),
+        /// The new, different anchor, and the op that stated it.
+        stated: (A, String),
+    },
+}
+
+impl<A: Copy + Eq + Debug> std::fmt::Display for Refusal<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::JoinOfTwoAnchors {
+                left: (va, wa),
+                right: (vb, wb),
+                join,
+            } => write!(
+                f,
+                "a join of two anchored classes: `{wa}` anchors one side at {va:?} and \
+                 `{wb}` anchors the other at {vb:?}, but `{join}` states they are one value — \
+                 there is no one anchor satisfying all three"
+            ),
+            Refusal::AnchorStatedTwice {
+                held: (v, w),
+                stated: (val, why),
+            } => write!(
+                f,
+                "a class anchored two ways: `{w}` anchors it at {v:?} and `{why}` anchors it \
+                 at {val:?} — there is no one value for the class; the op that stated each is \
+                 named"
+            ),
+        }
+    }
+}
+
 /// One constraint solve: a forest of nodes (the caller's values, indexed `0..n`), the
 /// equalities its constraints stated, and the anchors its absolutes pinned. `A` is
 /// the label a component can be anchored to — the frame pass's [`World`]-like
@@ -83,7 +133,7 @@ impl<A: Copy + Eq + Debug> UnionFind<A> {
     /// stated it. A join that would weld two differently-anchored components into one
     /// is the bake error, both anchors named. The second side's root is attached
     /// under the first's, always.
-    pub fn join(&mut self, a: u32, b: u32, why: &str) -> Result<(), String> {
+    pub fn join(&mut self, a: u32, b: u32, why: &str) -> Result<(), Refusal<A>> {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra == rb {
@@ -92,16 +142,16 @@ impl<A: Copy + Eq + Debug> UnionFind<A> {
             return Ok(());
         }
         // ⛔ TWO ANCHORED COMPONENTS JOIN ONLY WHEN THE ANCHORS AGREE — otherwise the
-        // one join states two absolutes for one class, and the error names the op
+        // one join states two absolutes for one class, and the refusal names the op
         // that stated EACH.
         if let (Some((va, wa)), Some((vb, wb))) = (self.anchors.get(&ra), self.anchors.get(&rb))
             && va != vb
         {
-            return Err(format!(
-                "a join of two anchored classes: `{wa}` anchors one side at {va:?} and \
-                 `{wb}` anchors the other at {vb:?}, but `{why}` states they are one value — \
-                 there is no one anchor satisfying all three",
-            ));
+            return Err(Refusal::JoinOfTwoAnchors {
+                left: (*va, wa.clone()),
+                right: (*vb, wb.clone()),
+                join: why.to_string(),
+            });
         }
         self.parent[rb as usize] = ra;
         self.why[rb as usize] = why.to_string();
@@ -123,16 +173,15 @@ impl<A: Copy + Eq + Debug> UnionFind<A> {
     /// `val`, labelled by the op that stated it. A component already anchored
     /// differently is the bake error, naming the op that stated EACH anchor. The
     /// first anchor stated for a class is the one it keeps.
-    pub fn anchor(&mut self, x: u32, val: A, why: &str) -> Result<(), String> {
+    pub fn anchor(&mut self, x: u32, val: A, why: &str) -> Result<(), Refusal<A>> {
         let root = self.find(x);
         if let Some((v, w)) = self.anchors.get(&root)
             && *v != val
         {
-            return Err(format!(
-                "a class anchored two ways: `{w}` anchors it at {v:?} and `{why}` anchors it at \
-                 {val:?} — there is no one value for the class; the op that stated each is \
-                 named",
-            ));
+            return Err(Refusal::AnchorStatedTwice {
+                held: (*v, w.clone()),
+                stated: (val, why.to_string()),
+            });
         }
         self.anchors
             .entry(root)
@@ -197,6 +246,7 @@ mod union_find_tests {
         let Err(e) = uf.join(0, 2, "a lane between them") else {
             panic!("a join of two differently-anchored classes must refuse");
         };
+        let e = e.to_string();
         assert!(
             e.contains("a col spray of the source") && e.contains("the matmul writes a row"),
             "names the op that stated each anchor: {e}"
@@ -211,6 +261,7 @@ mod union_find_tests {
         let Err(e) = uf.anchor(1, World::Row, "the second anchor") else {
             panic!("a second, different anchor on one class must refuse");
         };
+        let e = e.to_string();
         assert!(
             e.contains("the first anchor") && e.contains("the second anchor"),
             "names both: {e}"

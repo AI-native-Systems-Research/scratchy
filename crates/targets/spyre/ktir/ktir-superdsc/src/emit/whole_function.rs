@@ -8464,9 +8464,11 @@ fn assign_frames(
     let mut uf: crate::union_find::UnionFind<World> =
         crate::union_find::UnionFind::with_len(index.len());
     let idx = |v: Ssa| index[&v];
-    // The union-find's own refusal (a two-anchors clash) is the
-    // bake error verbatim — one adapter, no re-wording.
-    let as_err = |e: String| Error { message: e };
+    // The union-find's own refusals are typed facts, worded once by their Display —
+    // one adapter renders that wording into the bake error, no re-wording.
+    let as_err = |e: crate::union_find::Refusal<World>| Error {
+        message: e.to_string(),
+    };
     // ── THE WALK'S CARRIES, when the function still states its loop: the for's own
     // correspondence — arg, init, yield and result, stated once by [`Defs::carries`]
     // (the same law [`loop_fold::flatten`] proves and drops). ──
