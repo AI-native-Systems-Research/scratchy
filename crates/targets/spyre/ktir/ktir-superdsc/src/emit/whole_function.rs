@@ -8210,7 +8210,8 @@ impl<'d> Defs<'d> {
     /// A `scf.for` carry's four names — its arg, init, yield and result name ONE buffer
     /// (the fold's own law, `loop_fold`). A name the for does not state is `None`; no
     /// carry is ever silently paired with another carry's name. An attr the for states
-    /// in a form the walk does not read is refused by name — never treated as absent.
+    /// in a form the walk does not read is refused by name — never treated as absent —
+    /// and so is a for that states no body region: never read as an empty one.
     fn carries(f: &IRFunction<'_>, o: &'d Operation<'static>) -> Result<Vec<CarryNames>, Error> {
         let args: &[Ssa] = match o.attr(AttrKey::IterArgs) {
             Some(Attr::Ssas(v)) => v,
@@ -8228,7 +8229,14 @@ impl<'d> Defs<'d> {
                 ));
             }
         };
-        let body = o.regions.first().copied().unwrap_or(&[]);
+        // A for with no body region is refused, never read as an empty one — the walk reads
+        // the body's trailing scf.yield, and a for that states no body states no yield.
+        let Some(body) = o.regions.first().copied() else {
+            return err(format!(
+                "{}: a scf.for states no body region — the walk reads its trailing scf.yield",
+                f.name
+            ));
+        };
         let yields: Option<&[Ssa]> = body
             .split_last()
             .and_then(|(y, _)| (y.op_type == OpKind::ScfYield).then_some(y.operands));
@@ -12725,6 +12733,54 @@ mod frame_pass_tests {
         assert!(
             e.message.contains("unreadable_result_names") && e.message.contains("ResultNames"),
             "the refusal names the function and the attr it found: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ A FOR STATING NO BODY REGION IS REFUSED BY NAME — never read as an empty one. The
+    /// walk reads the body's trailing scf.yield to pair each carry's yield with its arg, and
+    /// a for that states no body states no yield: an empty body read as one would pair every
+    /// carry with `None` silently, the same folded default the ResultNames refusal splits.
+    #[test]
+    fn a_for_stating_no_body_region_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, seed) = (Ssa(0), Ssa(1));
+        let (lb, ub, step, iv, carry, lres) = (Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6), Ssa(7));
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
+        };
+        let f = func(
+            a,
+            "no_body_region",
+            vec![
+                zero(a, scalar),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![]),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Ssas(a.ssa(vec![carry])))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Ssas(a.ssa(vec![lres])))
+                },
+            ],
+        );
+        let Err(e) = assign_frames(&f, None) else {
+            panic!("a scf.for stating no body region states no yield to pair with its carries");
+        };
+        assert!(
+            e.message.contains("no_body_region") && e.message.contains("no body region"),
+            "the refusal names the function and the missing body: {}",
             e.message
         );
     }
