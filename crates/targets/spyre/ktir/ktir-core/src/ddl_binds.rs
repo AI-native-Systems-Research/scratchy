@@ -905,10 +905,7 @@ mod tests {
                 binds::<Gen1>(op, DdlDf::Fp32),
                 "{op:?} must stay fp32-bound"
             );
-            assert_eq!(
-                output_arrangement::<Gen1>(op),
-                ElementArrangement::Standard
-            );
+            assert_eq!(output_arrangement::<Gen1>(op), ElementArrangement::Standard);
         }
     }
 }
