@@ -382,8 +382,13 @@ pub struct SynthAlloc {
     pub sizes: std::collections::BTreeMap<String, u64>,
 }
 
-/// LX scratchpad size per core: 2 MiB (`sysdef.cpp:587`, `lxSize = 2L*1024*1024`).
-pub const LX_SIZE: u64 = 2 * 1024 * 1024;
+/// LX scratchpad size per core — the SAME fact `superdsc_opspec`'s
+/// `LX_CAPACITY_BYTES` states, READ from the baked generation's table
+/// (the vendor's own `sysdef.h:169 lxCap` default and torch-spyre's
+/// confirmation under its citation; `sysdef.cpp:587`'s `lxSize =
+/// 2L*1024*1024` restates the same 2 MiB). One fact, one spelling.
+pub const LX_SIZE: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::LX_CAPACITY_BYTES;
 
 /// ⭐ THE CEILING EVERY PINNED LX ADDRESS + FOOTPRINT MUST FIT UNDER — the frontend's end of the LX
 /// split, [`crate::superdsc_opspec::FRONTEND_LX_END`] (1,625,344 B), not the 2 MiB scratchpad. dxp

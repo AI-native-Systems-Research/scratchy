@@ -4242,6 +4242,12 @@ mod tests {
     /// reserves `int64_t(memCapacity * (1 - DXP_LX_FRAC_AVAIL))` per core, where `memCapacity` is
     /// `sysdef.cpp:211`'s `lxCap - 64 * 1024` and `DXP_LX_FRAC_AVAIL` defaults to 0.2. The tracker rounds it
     /// up to 128 bytes. That boundary is the LX landing floor measured on card: stick 12698.
+    ///
+    /// The `2 * 1024 * 1024` below is a deliberate INDEPENDENT ORACLE — dbo's
+    /// own `lxSize` input restated from its source, not a read of
+    /// `LX_CAPACITY_BYTES` — so the test recomputes the formula from the
+    /// vendor's stated inputs and would catch a wrong table value, not
+    /// mirror it.
     #[test]
     fn the_frontend_lx_end_is_dbos_reservation() {
         let lx_cap: u64 = 2 * 1024 * 1024;
