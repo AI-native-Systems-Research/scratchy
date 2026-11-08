@@ -12,7 +12,8 @@
 //! runs is the dxp-compiled SuperDSC bundle.
 
 use crate::superdsc_exec::{
-    DeferredRead, Executor, KvDim, Logits, LogitsRead, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
+    DeferredRead, Executor, KvDim, Logits, LogitsRead, NewTokens, PageSlots, PoolPages, SegIdx,
+    SeqPos, Vocab,
 };
 use anyhow::{Result, anyhow, bail};
 use scratchy_subtile::sdsc_abstract::{
@@ -138,9 +139,14 @@ pub struct SuperDscSession<'c, T: ktir_superdsc::collective::Tp> {
     pub vocab: usize,
     /// Resident capacity in slots (= the longest context THIS request can hold).
     pub cap: usize,
-    /// PAGED: pages in the SHARED pool, and positions per page (0 ⇒ not paged).
-    pub pool_pages: usize,
-    pub page_slots: usize,
+    /// ⭐ THE PAGED POOL'S OWN GEOMETRY — pages in the SHARED pool, and positions per page — held
+    /// exactly when the bundle declared a paged pool. `None` IS the unpaged meaning (no pool, no
+    /// pages to count): the zeroed `usize` pair this replaces, and the `paged` flag that stood
+    /// beside it, were sentinels for this absence, which every reader re-derived as `> 0`.
+    /// Load-time callers pair it with [`Self::pmask_slots`]: unpaged, the attention sweeps the
+    /// whole `cap`, so a `cap` past the mask's placement is unservable and must be refused
+    /// rather than staged either way.
+    pub paged: Option<(PoolPages, PageSlots)>,
     /// One resident K/V row width (= kv_heads·head_dim).
     pub kv_dim: usize,
     /// ⛔ THE BROADCAST PREFIX MASK'S EXTENT, from the bundle's own placement — see
@@ -148,10 +154,6 @@ pub struct SuperDscSession<'c, T: ktir_superdsc::collective::Tp> {
     /// read back at), and using it for the mask is what over-bound the mask by 4x on every prompt.
     /// `None` ⇒ the bundle placed no broadcast mask, and staging one must be REFUSED, not guessed.
     pub pmask_slots: Option<usize>,
-    /// Whether this bundle's ops read KV through the PAGED pool — see [`Executor::is_paged`]. Load-time
-    /// callers pair it with [`Self::pmask_slots`]: unpaged, the attention sweeps the whole `cap`, so a
-    /// `cap` past the mask's placement is unservable and must be refused rather than staged either way.
-    pub paged: bool,
 }
 
 /// One card's resident weights, `(source id, device bytes, dtype, shape)` each.
@@ -449,11 +451,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         Ok(Self {
             vocab: exec.vocab.0,
             cap: exec.cap() as usize,
-            pool_pages: exec.pool_pages().0 as usize,
-            page_slots: exec.page_slots().0 as usize,
+            paged: exec.pool_pages().zip(exec.page_slots()),
             kv_dim: exec.kv_dim.0,
             pmask_slots: exec.pmask_slots(),
-            paged: exec.is_paged(),
             ranks,
         })
     }
@@ -514,14 +514,20 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         })
     }
 
-    /// Whether this bundle's resident cache is PAGED.
+    /// Whether this bundle's resident cache is PAGED — the geometry's presence itself, not a
+    /// flag kept beside it.
     pub fn is_paged(&self) -> bool {
-        self.page_slots > 0
+        self.paged.is_some()
     }
 
-    /// Positions a request can hold given the `pages` it was assigned.
+    /// Positions a request can hold given the `pages` it was assigned. Unpaged, `0` — the exact
+    /// behavior the zeroed sentinel carried, stated by the case itself rather than by a zero
+    /// read out of a field that means "there is no pool".
     pub fn context_for_pages(&self, pages: usize) -> usize {
-        pages * self.page_slots
+        match self.paged {
+            Some((_, slots)) => pages * slots.0.get() as usize,
+            None => 0,
+        }
     }
 
     /// Declare how many BLOCKS the staged prefix mask has, so the fold can refuse a pass that would
@@ -650,7 +656,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         if pages.is_empty() {
             bail!("set_block_table: empty page map — a request needs at least one page");
         }
-        let pool_pages = self.pool_pages;
+        let pool_pages = match self.paged {
+            Some((p, _)) => p.0 as usize,
+            None => 0,
+        };
         self.each(|e| {
             e.set_block_table(
                 crate::fold_plan::RowIdx::from_launch_row(slot.get() as u64),

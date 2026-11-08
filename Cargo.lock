@@ -3467,6 +3467,7 @@ dependencies = [
  "objc2-metal",
  "proc-macro2",
  "rayon",
+ "scratchy-core-common",
  "scratchy-core-config",
  "scratchy-core-model",
  "scratchy-forward-compiler",

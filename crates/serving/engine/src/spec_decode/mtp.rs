@@ -321,7 +321,7 @@ pub struct StepRows<'a> {
     pub block_table_stride: usize,
     /// Each sequence's blocks.
     pub block_ids: &'a [Vec<u32>],
-    pub block_size: usize,
+    pub block_size: scratchy_core_common::KvBlockTokens,
     /// Each sequence's prompt length: its tokens before its reply.
     pub prompt_lens: &'a [u32],
     /// Each sequence's tokens so far, its prompt and its reply: where a prefill of it ends.
@@ -342,7 +342,7 @@ impl StepRows<'_> {
 
     /// Sequence `i`'s KV slot for position `p`; `u32::MAX` (no write) past its blocks.
     fn slot(&self, i: usize, p: usize) -> u32 {
-        let bs = self.block_size;
+        let bs = self.block_size.get();
         (self.block_ids[i].get(p / bs)).map_or(u32::MAX, |&b| (b as usize * bs + p % bs) as u32)
     }
 }
@@ -832,7 +832,7 @@ mod tests {
                 block_table: &[3, 0, 5, 0],
                 block_table_stride: 2,
                 block_ids: &self.block_ids,
-                block_size: 16,
+                block_size: scratchy_core_common::KvBlockTokens::new(16).expect("16 > 0"),
                 // `a`'s prompt its first 8 tokens, its reply the 3 after; `b`'s 8-token prompt.
                 prompt_lens: &[8, 8],
                 history_lens: &[11, 8],
@@ -889,7 +889,7 @@ mod tests {
                 block_table: &[3, 0, 5, 0, 7, 0],
                 block_table_stride: 2,
                 block_ids: &self.block_ids,
-                block_size: 16,
+                block_size: scratchy_core_common::KvBlockTokens::new(16).expect("16 > 0"),
                 prompt_lens: &[8, 8, 3],
                 history_lens: &[11, 8, 6],
                 sampled: &self.sampled,

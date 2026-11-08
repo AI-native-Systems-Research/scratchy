@@ -105,7 +105,7 @@ impl LaunchRows<'_> {
     /// The live rows — a sequence's real tokens, or a batch's sequences.
     fn live(&self) -> usize {
         match self {
-            LaunchRows::Sequence { rows, .. } => rows.real,
+            LaunchRows::Sequence { rows, .. } => rows.real.get(),
             LaunchRows::Batch { seqs } => seqs.len(),
         }
     }
@@ -123,7 +123,7 @@ impl LaunchRows<'_> {
     /// The live row a bound row `r` takes its token from.
     fn live_of(&self, r: usize) -> usize {
         match self {
-            LaunchRows::Sequence { rows, .. } => r.min(rows.real.max(1) - 1),
+            LaunchRows::Sequence { rows, .. } => r.min(rows.real.get() - 1),
             LaunchRows::Batch { seqs } => {
                 if r < seqs.len() {
                     r
@@ -1397,7 +1397,12 @@ pub(crate) fn superdsc_forward_chunk(
         let out = run_card_launch(
             LaunchRows::Sequence {
                 blocks: &blocks,
-                rows: StepRows { start: pos, real },
+                rows: StepRows::new(pos, real).ok_or_else(|| {
+                    werr(
+                        "superdsc prefill: a chunk of zero real rows — the chunker staged no chunk"
+                            .to_string(),
+                    )
+                })?,
             },
             sh,
             sess,
@@ -1707,7 +1712,11 @@ pub(crate) fn forward_chunk(
         let step = b
             .paged
             .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
-        let rows = scratchy_target_spyre::paged_step::StepRows { start, real: n };
+        let rows = scratchy_target_spyre::paged_step::StepRows::new(start, n).ok_or_else(|| {
+            werr(format!(
+                "request {id}: a decode step of zero rows — no token to run"
+            ))
+        })?;
         let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
             .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
         session

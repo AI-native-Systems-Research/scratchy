@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use scratchy_core_common::KvBlockTokens;
 use scratchy_core_config::{SchedulerConfig, SchedulerPolicy};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_serving_engine::core_client::InprocClient;
@@ -232,11 +233,20 @@ fn resolve_num_layers(hf_config: &HfModelConfig) -> usize {
 /// superdsc pool's page is `PagedKvPool::POOL_PAGE_SLOTS` = 256. The mismatch was inert only because the
 /// worker IGNORED the scheduler's block ids and allocated pages from a free list of its own — which is
 /// the same "two allocators for one resource" that made prefix caching impossible. Ask the backend.
-fn effective_block_size(configured: usize, device: &str) -> usize {
+///
+/// 🛑 ONE MINT, ONE VALUE, END TO END. The configured size is minted ONCE, as [`KvBlockTokens`], at
+/// the door where the CLI's number is read ([`initialize_core`]) — the zero refusal lives there, by
+/// name, once — and this function selects the backend's typed
+/// [`WorkerFactory::required_block_size`] over that mint and answers IN THE TYPE. It used to
+/// answer a bare `usize`, so the typed factory value round-tripped through it and was re-minted
+/// (with a second zero refusal) where `init_cache` handed it to
+/// [`Worker::kv_block_bytes`] — two mints of one value, a guard apiece. There is no second
+/// mint below the door now: `init_cache`, `compute_kv_blocks` and `Worker::kv_block_bytes`
+/// all take the type, so block == page holds because there is ONE value, not two mints of one.
+fn effective_block_size(configured: KvBlockTokens, device: &str) -> KvBlockTokens {
     inventory::iter::<&dyn WorkerFactory>()
         .find(|f| f.matches(device))
         .and_then(|f| f.required_block_size())
-        .map(|b| b.get())
         .unwrap_or(configured)
 }
 
@@ -407,6 +417,7 @@ fn create_worker(
     speculation: &Speculation,
     model_path: String,
     progress: Option<&Arc<crate::progress::StartupProgress>>,
+    block_size: KvBlockTokens,
 ) -> Result<WorkerCreationResult> {
     use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
 
@@ -417,8 +428,10 @@ fn create_worker(
         dtype: config.dtype.clone(),
         hf_token: config.hf_token.clone(),
         // The backend's own page size when it has one (see `effective_block_size`); a mismatch
-        // between this and the scheduler's block size silently corrupts KV slots.
-        block_size: effective_block_size(config.block_size, &config.device),
+        // between this and the scheduler's block size silently corrupts KV slots. The one
+        // resolved value, minted once in `initialize_core` — the same one the scheduler gets,
+        // AS the type: the worker and the scheduler hold one value, not two copies of a number.
+        block_size,
         // The REQUEST, not a resolved number: `None` lets the worker resolve
         // the width itself (device tier / memory-affordable GDN slots), while
         // `Some(n)` pins every worker-side consumer to the caller's ask.
@@ -494,7 +507,7 @@ fn create_worker(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn init_cache(
     mut worker: Box<dyn Worker>,
-    block_size: usize,
+    block_size: KvBlockTokens,
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     gpu_memory_utilization: f64,
@@ -581,7 +594,7 @@ fn init_cache(
     // the backend's kernels address no further than `kv_max_addressable_tokens` (metal
     // hybrid SWA: the sliding class's block-table row; spyre: what its pool funds and its
     // mask baked) — the affordable is the narrower of the two.
-    let pool_tokens = num_gpu_blocks * block_size;
+    let pool_tokens = num_gpu_blocks * block_size.get();
     let reach = worker.kv_max_addressable_tokens();
     let affordable = reach.unwrap_or(usize::MAX).min(pool_tokens);
     let effective_max_model_len = match scratchy_serving_engine::gpu_budget::resolve_served_context(
@@ -600,7 +613,7 @@ fn init_cache(
                      run is refused here instead. Lower --max-model-len to about {affordable}, or raise \
                      --gpu-memory-utilization to grow the cache.",
                 num_gpu_blocks,
-                block_size,
+                block_size.get(),
                 pool_tokens,
                 reach
                     .map(|r| format!(", the backend's kernels address at most {r}"))
@@ -613,7 +626,7 @@ fn init_cache(
                     "max_model_len unset: serving {served} of the model's {max_model_len} — what the KV \
                          cache just built funds ({} block(s) × {} tokens{})",
                     num_gpu_blocks,
-                    block_size,
+                    block_size.get(),
                     reach
                         .map(|r| format!(", backend addressable to {r}"))
                         .unwrap_or_default(),
@@ -1442,8 +1455,21 @@ fn initialize_core(
         }))
     });
 
+    // ⭐ THE CONFIGURED KV BLOCK SIZE, MINTED ONCE — this is the door where the CLI's number is
+    // read. Everything below ([`create_worker`], [`init_cache`], `compute_kv_blocks`,
+    // [`Worker::kv_block_bytes`]) takes the type, so nothing re-mints this value and the ONE
+    // zero refusal lives here, by name.
+    let configured = KvBlockTokens::new(config.block_size).context(
+        "--block-size is zero — one KV block holds at least one token, so the scheduler's \
+         `slot = block_id * block_size + offset` has no block to name",
+    )?;
+    // The backend's own page size when it declares one, so the scheduler's block allocator
+    // (slot = block_id * block_size + offset) addresses the same slots the pool uses. The same
+    // resolved value reaches `create_worker`'s WorkerCreateConfig — one value, not two mints.
+    let block_size = effective_block_size(configured, &config.device);
+
     let (mut worker, hf_config, model_dir, model_dtype) =
-        create_worker(config, speculation, model_path, progress)?;
+        create_worker(config, speculation, model_path, progress, block_size)?;
 
     if let Some(arch) = worker.architecture() {
         info!("Resolved model architecture: {}", arch);
@@ -1468,11 +1494,6 @@ fn initialize_core(
     if let Some(pb) = progress {
         pb.set_stage("Initializing KV cache");
     }
-    // The backend's page size when it declares one, so the scheduler's block allocator
-    // (slot = block_id * block_size + offset) addresses the same slots the pool uses. Must match
-    // `create_worker`'s WorkerCreateConfig block_size — both go through `effective_block_size`.
-    let block_size = effective_block_size(config.block_size, &config.device);
-
     let (
         mut worker,
         available_memory,
@@ -1508,7 +1529,7 @@ fn initialize_core(
         num_gpu_blocks
     );
 
-    let kv_cache_tokens = num_gpu_blocks * block_size;
+    let kv_cache_tokens = num_gpu_blocks * block_size.get();
     info!("KV cache size: {} tokens", kv_cache_tokens);
     info!(
         "Maximum concurrency for {} tokens per request: {:.2}x",
@@ -2105,7 +2126,7 @@ fn try_load_chat_template(model_dir: &Path) -> Result<Option<ChatTemplate>> {
 /// the block count is simply `available / bytes_per_block`.
 fn compute_num_blocks(
     available_bytes: usize,
-    block_size: usize,
+    block_size: KvBlockTokens,
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     _gpu_memory_utilization: f64,
@@ -2126,7 +2147,7 @@ fn compute_num_blocks(
     let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * elem_bytes;
     blocks_within(
         available_bytes,
-        block_size * num_layers * bytes_per_token_per_layer,
+        block_size.get() * num_layers * bytes_per_token_per_layer,
     )
 }
 
@@ -2195,7 +2216,7 @@ fn device_is_cpu(device: &str, spyre_backend: bool) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn compute_kv_blocks(
     available_bytes: usize,
-    block_size: usize,
+    block_size: KvBlockTokens,
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     utilization: f64,
@@ -2501,7 +2522,14 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 4, 0.9, "auto");
+        let blocks = compute_num_blocks(
+            4 * 1024 * 1024 * 1024,
+            KvBlockTokens::new(16).expect("16 > 0"),
+            &config,
+            4,
+            0.9,
+            "auto",
+        );
         assert!(blocks >= 16);
     }
 
@@ -2515,8 +2543,22 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_f32 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 4, 0.9, "auto");
-        let blocks_f16 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 2, 0.9, "auto");
+        let blocks_f32 = compute_num_blocks(
+            4 * 1024 * 1024 * 1024,
+            KvBlockTokens::new(16).expect("16 > 0"),
+            &config,
+            4,
+            0.9,
+            "auto",
+        );
+        let blocks_f16 = compute_num_blocks(
+            4 * 1024 * 1024 * 1024,
+            KvBlockTokens::new(16).expect("16 > 0"),
+            &config,
+            2,
+            0.9,
+            "auto",
+        );
         assert!(blocks_f16 > blocks_f32);
         // F16 should give approximately 2x the blocks.
         assert!((blocks_f16 as f64 / blocks_f32 as f64 - 2.0).abs() < 0.1);
@@ -2525,7 +2567,14 @@ mod tests {
     #[test]
     fn test_compute_num_blocks_zero_dim() {
         let config = HfModelConfig::default();
-        let blocks = compute_num_blocks(1024, 16, &config, 4, 0.9, "auto");
+        let blocks = compute_num_blocks(
+            1024,
+            KvBlockTokens::new(16).expect("16 > 0"),
+            &config,
+            4,
+            0.9,
+            "auto",
+        );
         // Should fall back to 1024.
         assert_eq!(blocks, 1024);
     }
@@ -2547,14 +2596,15 @@ mod tests {
         // ~ what the metal worker reports: the shared pages + the TurboQuant global store.
         let block_bytes = page * group_size + 297_472;
         for budget in [3usize << 30, 22 << 30] {
+            let bs = KvBlockTokens::new(16).expect("16 > 0");
             let (num_blocks, hybrid) =
-                compute_kv_blocks(budget, 16, &config, 2, 0.9, "auto", Some(block_bytes), true);
+                compute_kv_blocks(budget, bs, &config, 2, 0.9, "auto", Some(block_bytes), true);
             let (pool, groups) = hybrid.expect("gemma4 takes the hybrid layout");
             assert_eq!(num_blocks, budget / block_bytes, "budget {budget}");
             assert_eq!(pool, num_blocks, "scheduler and worker size one pool");
             assert_eq!(groups.len(), 6, "1 full + 5 sliding groups");
             // No worker cost: the dense shared pages alone.
-            let (dense, _) = compute_kv_blocks(budget, 16, &config, 2, 0.9, "auto", None, true);
+            let (dense, _) = compute_kv_blocks(budget, bs, &config, 2, 0.9, "auto", None, true);
             assert_eq!(dense, budget / (page * group_size), "budget {budget}");
         }
     }
@@ -2571,8 +2621,9 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_full = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 2, 0.9, "auto");
-        let blocks_half = compute_num_blocks(2 * 1024 * 1024 * 1024, 16, &config, 2, 0.9, "auto");
+        let bs = KvBlockTokens::new(16).expect("16 > 0");
+        let blocks_full = compute_num_blocks(4 * 1024 * 1024 * 1024, bs, &config, 2, 0.9, "auto");
+        let blocks_half = compute_num_blocks(2 * 1024 * 1024 * 1024, bs, &config, 2, 0.9, "auto");
         let ratio = blocks_half as f64 / blocks_full as f64;
         assert!((ratio - 0.5).abs() < 0.01, "ratio was {ratio}");
     }

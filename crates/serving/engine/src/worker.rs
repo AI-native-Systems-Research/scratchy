@@ -124,14 +124,20 @@ pub trait Worker: Send {
         None
     }
 
-    /// Bytes one block of `block_size` tokens costs in this worker's KV pool,
+    /// Bytes one block of `block` tokens costs in this worker's KV pool,
     /// when that is not the dense row the engine derives from the HF config
     /// (`layers × 2 × kv_heads × head_dim × dtype`): a metal model built with
     /// TurboQuant stores packed codes, and a hybrid-SWA model's block is a page
     /// in each group-shared tensor plus its TurboQuant global store. The engine
     /// sizes `num_gpu_blocks` from the memory budget by this instead. `None` =
     /// the dense row. Valid after `load_model`.
-    fn kv_block_bytes(&self, _block_size: usize) -> Option<usize> {
+    ///
+    /// ⭐ THE BLOCK ARRIVES TYPED, as the scheduler's own [`KvBlockTokens`] — for a
+    /// backend that declares [`required_block_size`](WorkerFactory::required_block_size)
+    /// it is the very value the backend declared (`effective_block_size` threads the
+    /// declaration through), so "a block is this pool's page" is a fact of construction
+    /// the type carries, not a number each impl re-asserts against its own constant.
+    fn kv_block_bytes(&self, _block: scratchy_core_common::KvBlockTokens) -> Option<usize> {
         None
     }
 

@@ -110,9 +110,11 @@ pub struct KvDim(pub usize);
 /// Physical pages in the resident pool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PoolPages(pub i64);
-/// Positions per page.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct PageSlots(pub i64);
+/// Positions per page — NONZERO BY MINT: its only producer is the geometry latch, which
+/// latches an op that declares more than zero slots, so a paged geometry's page count divides
+/// without a defense and an unpaged session has no page count at all ([`KvGeometry::Unpaged`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageSlots(pub std::num::NonZeroI64);
 /// An ABSOLUTE sequence position — how many positions are already resident for this forward.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SeqPos(pub i64);
@@ -793,14 +795,75 @@ struct Rolled {
 }
 
 /// The paged-KV geometry the BUNDLE declares (an op carrying `kv_page_slots` was emitted against
-/// the paged pool), so a paged bundle can never be driven by the unpaged address path.
-#[derive(Clone, Copy, Default)]
-struct KvGeometry {
-    paged: bool,
+/// the paged pool), so a paged bundle can never be driven by the unpaged address path — and the
+/// UNPAGED case carries no pool facts at all, which the type states where the zeroed `Default`
+/// and every reader's `.max(1)` defense used to say it at runtime.
+#[derive(Clone, Copy)]
+enum KvGeometry {
+    Unpaged,
+    Paged(PoolGeometry),
+}
+
+/// One pool page's stride across layers — the addressing law the baked value carries, stated as
+/// its two cases. The value's domain is `{0} ∪ positive` BY THE PRODUCER'S OWN CONSTRUCTION
+/// (the reroll pass computes a max of per-layer placement ENDS — `offset + size`, non-negative —
+/// with `unwrap_or(0)`), so the latch's classification is TOTAL AND LOSSLESS: `NonZeroU64::new(v)`
+/// is `Some(s)` exactly when `v = s > 0` and `None` exactly when `v = 0`. The case names what the
+/// value MEANS, it does not re-prove the bake: `Unrolled` IS the stride-0 law — an unrolled
+/// bundle, or a rolled one whose reroll summed no paged KV — and `Strided` is the baked
+/// `Σ n_c · stride_c` every layer of one page spans.
+#[derive(Clone, Copy)]
+enum Stride {
+    Unrolled,
+    Strided(std::num::NonZeroU64),
+}
+
+impl Stride {
+    /// The byte stride — `0` on the stride-0 law, the baked page stride on `Strided`. The
+    /// lossless inverse of the latch's classification: no clamp, no fallback, nothing refused.
+    fn bytes(self) -> u64 {
+        match self {
+            Stride::Unrolled => 0,
+            Stride::Strided(n) => n.get(),
+        }
+    }
+}
+
+/// One pool's geometry — every field a fact the latch stated when it saw an op declare a paged
+/// pool. Page slots are nonzero by mint ([`PageSlots`]); the stride is the baked `Σ n_c·stride_c`
+/// classified by its own domain ([`Stride`]).
+#[derive(Clone, Copy)]
+struct PoolGeometry {
     page_slots: PageSlots,
     /// Bytes per page = all layers of one page.
-    page_stride_bytes: u64,
+    page_stride: Stride,
     pool_pages: PoolPages,
+}
+
+impl KvGeometry {
+    /// The pool geometry when the bundle declared one.
+    fn paged(&self) -> Option<&PoolGeometry> {
+        match self {
+            KvGeometry::Unpaged => None,
+            KvGeometry::Paged(g) => Some(g),
+        }
+    }
+
+    /// ⭐ THE STAND-IN GEOMETRY a SYNTHETIC session addresses — the CB gates' synthetic folds and
+    /// the replay player's canvas math, which must name distinct pages whether or not this
+    /// session has any. The session's own page slots and stride when it has them; a page of one
+    /// slot and one byte when it does not — an unpaged bundle, or one on the stride-0 law
+    /// ([`Stride::Unrolled`]), whose stand-in pages sit one byte apart. ONE statement, shared by
+    /// every site that used to re-derive it as a per-site `.max(1)`.
+    fn synthetic(&self) -> (bool, i64, u64) {
+        match self {
+            KvGeometry::Unpaged => (false, 1, 1),
+            KvGeometry::Paged(g) => match g.page_stride {
+                Stride::Unrolled => (true, g.page_slots.0.get(), 1),
+                Stride::Strided(n) => (true, g.page_slots.0.get(), n.get()),
+            },
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1346,7 +1409,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             keyed: BTreeMap::new(),
             staged: BTreeMap::new(),
             const_fp32_ids: BTreeSet::new(),
-            kv: KvGeometry::default(),
+            kv: KvGeometry::Unpaged,
             fold: SessionKv::default(),
             block_table_set: false,
             prepared: false,
@@ -1589,7 +1652,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// the page). seg2 is then sized `pool_pages * page_stride` at RUNTIME rather than from the
     /// manifest, which is what makes the servable context an allocation instead of a baked constant.
     fn latch_paged_geometry(&mut self) {
-        let mut page_slots = 0i64;
+        let mut page_slots: Option<std::num::NonZeroI64> = None;
         // A rung holds ONE `Ops` PER ATTENTION CLASS (the roll split by class), so the ladder's
         // contribution to the sweep is the rungs' class vectors FLATTENED — the same `&Ops` items
         // `lists()` yields.
@@ -1599,25 +1662,30 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .chain(self.body_rungs.iter().flat_map(|(_, o)| o))
         {
             for o in ops {
-                if o.kv.page_slots > 0 {
-                    page_slots = o.kv.page_slots as i64;
+                // The >0 test IS the mint: a nonzero page count is a fact the op states, and
+                // `PageSlots` carries it from here on, so no reader re-proves it.
+                if let Some(ps) = std::num::NonZeroI64::new(o.kv.page_slots as i64) {
+                    page_slots = Some(ps);
                 }
             }
         }
-        if page_slots == 0 {
+        let Some(page_slots) = page_slots else {
             return;
-        }
+        };
         // ⭐ THE PAGE STRIDE IS BAKED, NOT DERIVED. It used to be `iters × kv_stride`, which is
         // only right while every layer has the same KV geometry — a hybrid model's classes do not,
         // and the emitter's `kv_page_stride` already sums every class's extent (`Σ n_c·stride_c`),
         // proven against the placements. 0 on an UNROLLED bundle (no reroll meta) is the same value
         // the old `iters × kv_stride` formula produced there (0 × 0), and the geometry latch below
-        // runs identically — an unrolled paged bundle keeps its pre-split behavior whole.
-        let page_stride_bytes = self.rolled.as_ref().map_or(0, |r| r.kv_page_stride);
-        self.kv = KvGeometry {
-            paged: true,
+        // runs identically — an unrolled paged bundle keeps its pre-split behavior whole. The
+        // CLASSIFICATION into [`Stride`] is total and lossless over the value's own domain (see
+        // the enum): the case states which addressing law the value carries, nothing re-proved.
+        let page_stride =
+            std::num::NonZeroU64::new(self.rolled.as_ref().map_or(0, |r| r.kv_page_stride))
+                .map_or(Stride::Unrolled, Stride::Strided);
+        let geom = PoolGeometry {
             page_slots: PageSlots(page_slots),
-            page_stride_bytes,
+            page_stride,
             pool_pages: PoolPages(if self.num_blocks.0 > 0 {
                 self.num_blocks.0
             } else {
@@ -1625,22 +1693,23 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }),
         };
         self.fold.paged = true;
-        self.fold.page_slots = fold_plan::PageSlots::per_page(page_slots);
-        self.fold.page_stride_bytes = Bytes(self.kv.page_stride_bytes);
+        self.fold.page_slots = fold_plan::PageSlots::per_page(geom.page_slots.0.get());
+        self.fold.page_stride_bytes = Bytes(geom.page_stride.bytes());
         // CREATE-TIME IDENTITY MAP. A session forwarded before any `set_block_table` addresses
         // logical page n as physical page n, which is what the unpaged path did.
-        let ident: Vec<i64> = (0..self.kv.pool_pages.0).collect();
+        let ident: Vec<i64> = (0..geom.pool_pages.0).collect();
         self.install_page_map(RowIdx::from_launch_row(0), SeqPos(0), &ident);
         self.block_table_set = false;
         debug!(
             "[sdsc-superdsc] PAGED KV: page={} slots, page_stride={} B, pool={} pages ({:.1} MB) \
              => {} positions of context available to one request",
-            self.kv.page_slots.0,
-            self.kv.page_stride_bytes,
-            self.kv.pool_pages.0,
-            (self.kv.pool_pages.0 as u64 * self.kv.page_stride_bytes) as f64 / 1048576.0,
-            self.kv.pool_pages.0 * self.kv.page_slots.0,
+            geom.page_slots.0.get(),
+            geom.page_stride.bytes(),
+            geom.pool_pages.0,
+            (geom.pool_pages.0 as u64 * geom.page_stride.bytes()) as f64 / 1048576.0,
+            geom.pool_pages.0 * geom.page_slots.0.get(),
         );
+        self.kv = KvGeometry::Paged(geom);
     }
 
     fn lists(&self) -> Vec<&Ops<T>> {
@@ -2563,8 +2632,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             };
             // PAGED: the manifest sizes seg2 for ONE page — that is the point, no baked pool — so
             // the POOL extent is decided here, at run time.
-            if i == SEG_KV.get() && self.kv.paged && !self.seg_borrowed[i] {
-                let pool = self.kv.pool_pages.0 as u64 * self.kv.page_stride_bytes;
+            if i == SEG_KV.get()
+                && !self.seg_borrowed[i]
+                && let Some(g) = self.kv.paged()
+            {
+                let pool = g.pool_pages.0 as u64 * g.page_stride.bytes();
                 bytes = bytes.max(pool);
             }
             self.seg_addr[i] = Some(
@@ -2653,7 +2725,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // ops) and read by the device; nothing on the host needs a copy, and sizing one to the
             // pool cost 960 MB of RSS (3.84 GB at a 1024-slot page) to mirror bytes the host never
             // looks at. Two owners of the KV is also the shape that produced the block-table bug.
-            if i == SEG_KV.get() && self.kv.paged {
+            if i == SEG_KV.get() && self.kv.paged().is_some() {
                 continue;
             }
             let need = self.seg_addr[i]
@@ -2695,7 +2767,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // The KV pool has NO host mirror to send (see the sizing loop), so it is zeroed
             // separately and in chunks by `zero_seg`. DMA'ing from the empty vector here would be a
             // null source for a pool-sized transfer.
-            if i == SEG_KV.get() && self.kv.paged {
+            if i == SEG_KV.get() && self.kv.paged().is_some() {
                 continue;
             }
             let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
@@ -2732,7 +2804,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // as found holds non-finite words, which no additive mask cancels: MEASURED on the card with
         // the pool unfilled, 8,253 of them in page 0. A session that borrows the pool takes the
         // owner's zeroed region by alias.
-        if self.kv.paged
+        if self.kv.paged().is_some()
             && !self.seg_borrowed[SEG_KV.get()]
             && !(reserve_only && is_resident_seg(SEG_KV.get()))
         {
@@ -2851,11 +2923,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// bundle that was never baked paged has no fold ops for a paged shape to exercise.
     fn check_cb_plan_parity(&self) -> Result<()> {
         let stream = self.stream_ref()?;
-        let per = self.kv.page_slots.0.max(1);
+        let (paged, per, stride) = self.kv.synthetic();
         let fold = SessionKv {
-            paged: self.kv.paged,
+            paged,
             page_slots: fold_plan::PageSlots::per_page(per),
-            page_stride_bytes: Bytes(self.kv.page_stride_bytes.max(1)),
+            page_stride_bytes: Bytes(stride),
             // Two rows of three pages each — the rows AGREE about how many they hold (a uniform
             // sweep exists) and neither row holds the other's pages (a per-request shift is real,
             // not zero).
@@ -2942,11 +3014,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // recipe, shared with the player, that picks a slot with room on both sides for the
         // differentials and the off-sample steps: mid-page, off every slab boundary, never
         // slot 0 of a page.
-        let r_patch = cb_plan::canvas_slot(per, self.kv.paged);
+        let r_patch = cb_plan::canvas_slot(per, paged);
         let fold1 = SessionKv {
-            paged: self.kv.paged,
+            paged,
             page_slots: fold_plan::PageSlots::per_page(per),
-            page_stride_bytes: Bytes(self.kv.page_stride_bytes.max(1)),
+            page_stride_bytes: Bytes(stride),
             block_tables: vec![vec![0, 1, 2]],
             request_positions: RowCursors::bound(vec![2 * per + r_patch.unwrap_or(1)]),
             fold_requests: 1,
@@ -2963,7 +3035,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // clips. Nothing probes past it anymore — the patch model has no page
         // term (the boundary step walks; see `StepScalars`), so this base is
         // only where the canvas and every off-sample render sit.
-        let page_c = Bytes(2 * self.kv.page_stride_bytes.max(1));
+        let page_c = Bytes(2 * stride);
         let mk1 = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
             byte_off: off,
             slot_pos: SeqPos(2 * per + r_patch.unwrap_or(1)),
@@ -2976,7 +3048,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // image's page span. `canvas_room` is the ONE law, shared with the player — a page
         // too narrow for it (or one no canvas slot fits at all) skips the leg loudly; every
         // shipped bundle's page is 2048 slots.
-        let patch_room = r_patch.is_some_and(|r| cb_plan::canvas_room(per, self.kv.paged, r));
+        let patch_room = r_patch.is_some_and(|r| cb_plan::canvas_room(per, paged, r));
         if !patch_room {
             debug!(
                 "[sdsc-cbplan] patch gate SKIPPED: no canvas slot with sampling room fits a \
@@ -3415,7 +3487,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// else produced garbage from their second token.
     fn select_body_paged(&mut self, valid_len: i64, n_fold_pages: i64) -> Result<BodySel> {
         let reqs = self.fold_requests_or_1();
-        let single_page = !self.kv.paged || (n_fold_pages <= 1 && reqs <= 1);
+        let single_page = self.kv.paged().is_none() || (n_fold_pages <= 1 && reqs <= 1);
         if single_page {
             if !self.body_rungs_fused.is_empty() {
                 for (i, (swept, _)) in self.body_rungs_fused.iter().enumerate() {
@@ -5188,7 +5260,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // the body the host staged for IS the body launched.
             let n_fold_pages = self.n_fold_pages(seq_pos);
             let sel = self.step_body(seq_pos)?.sel;
-            let base = self.page_base_for_write(seq_pos);
+            let base = self.page_base_for_write(seq_pos)?;
             // UNROLLED: one body over the whole model (class 0 — an unrolled bundle has no class
             // split), and an unrolled bundle has no layer boundary to bank on — its weights are one
             // region by construction (`bank_weight_segment` refuses to bank without layer classes),
@@ -5207,7 +5279,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // differ, and the resident KV is shared.
         let n_fold_pages = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
-        let base = self.page_base_for_write(seq_pos);
+        let base = self.page_base_for_write(seq_pos)?;
         // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in true layer
         // order, each naming its body's CLASS and the segment shifts the launch applies — no
         // `v·stride`, no `v / layers_per_bank`, no class base to add. The bake PROVED every row
@@ -5284,7 +5356,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if !Diag::get().is_quiet() || fold_plan::fold_requests(&self.fold) != 1 {
             return Ok(None);
         }
-        let per = self.kv.page_slots.0.max(1);
+        let (paged, per, _) = self.kv.synthetic();
         // ⭐ THE PAGE-BOUNDARY STEP WALKS. `pos % per == 0` writes slot 0 of a
         // page no image of this key ever rendered — a WRITE-BASE move, and a
         // moved write base is not affine in the patch model's scalars: a
@@ -5298,7 +5370,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // (n = 0) has no page behind it. One step per page takes the walk;
         // every step between boundaries writes the image's own page and
         // replays.
-        if self.kv.paged && seq_pos.0 % per == 0 {
+        if paged && seq_pos.0 % per == 0 {
             debug!(
                 "[sdsc-replay] page-boundary step {} walks: slot 0 of a new page is a \
                  write-base move, not a patchable one",
@@ -5308,14 +5380,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         let n = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
-        let Some(r) = cb_plan::canvas_slot(per, self.kv.paged) else {
+        let Some(r) = cb_plan::canvas_slot(per, paged) else {
             debug!(
                 "[sdsc-replay] walking every step: no canvas slot fits a {per}-slot page, so no \
                  image can be derived for this session"
             );
             return Ok(None);
         };
-        if !cb_plan::canvas_room(per, self.kv.paged, r) {
+        if !cb_plan::canvas_room(per, paged, r) {
             debug!(
                 "[sdsc-replay] walking every step: a {per}-slot page leaves no off-sample room \
                  around canvas slot {r}, so no slab-crossing proof fits — no image is derived"
@@ -5328,8 +5400,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // them all. The write base is the page holding it — a RESIDENT page,
         // unlike the boundary step's brand-new one, so the reference always
         // reads a page the block table already names.
-        let pos_c = if self.kv.paged { (n - 1) * per + r } else { r };
-        let page_c = self.page_base_for_write(SeqPos(pos_c));
+        let pos_c = if paged { (n - 1) * per + r } else { r };
+        let page_c = self.page_base_for_write(SeqPos(pos_c))?;
         let key = StepImageKey {
             sel,
             n_fold_pages: n,
@@ -5349,7 +5421,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // write page is not among them and cannot move between two replayed
         // steps of one image: both write the image's own page (the boundary
         // step that would move it walked, above).
-        let scalars = cb_plan::step_scalars(self.kv.paged, per, seq_pos.0);
+        let scalars = cb_plan::step_scalars(paged, per, seq_pos.0);
         // The stamp closure: patches the body rows onto the backend's canvas
         // copy, then stamps the leased tags over the render-time ones. The
         // fixed rows are skipped by `follows_step` — see `RowReplay`.
@@ -5604,23 +5676,36 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// never hit it), and it read as a "2048 wall" only because `max_num_batched_tokens`' 2048 default
     /// truncated long prompts to exactly 2048 — a page multiple.
     fn n_fold_pages(&self, seq_pos: SeqPos) -> i64 {
-        if self.kv.paged {
-            let per = self.kv.page_slots.0.max(1);
-            (seq_pos.0 + per - 1) / per
-        } else {
-            1
+        match self.kv.paged() {
+            Some(g) => {
+                let per = g.page_slots.0.get();
+                (seq_pos.0 + per - 1) / per
+            }
+            None => 1,
         }
     }
 
     /// The byte base of the page this step's WRITE lands in (request 0's — a batched step installs
     /// per-request maps and the per-op request tag selects among them inside `fold_plan`).
-    fn page_base_for_write(&self, seq_pos: SeqPos) -> Bytes {
-        if !self.kv.paged {
-            return Bytes(0);
-        }
-        let lp = seq_pos.0 / self.kv.page_slots.0.max(1);
-        RowPage::of(&self.fold, RowIdx::from_launch_row(0), lp)
-            .map_or(Bytes(0), |rp| fold_plan::page_base_bytes(&self.fold, rp))
+    ///
+    /// ⛔ THE PAGE MUST BE HELD. The staging door (`paged_step::check`) proves the request's
+    /// blocks cover every position this step writes, so a write whose page is not held is a
+    /// staging/geometry disagreement, not a condition to paper over: the old `map_or(Bytes(0))`
+    /// silently pointed the write at the NULL page — row 0's keys, exactly the wrong-page read
+    /// [`RowPage::of`]'s `Option` exists to name. It is refused here, naming the page.
+    fn page_base_for_write(&self, seq_pos: SeqPos) -> Result<Bytes> {
+        let Some(g) = self.kv.paged() else {
+            return Ok(Bytes(0));
+        };
+        let lp = seq_pos.0 / g.page_slots.0.get();
+        let rp = RowPage::of(&self.fold, RowIdx::from_launch_row(0), lp).ok_or_else(|| {
+            anyhow!(
+                "the write at position {} lands in page {lp}, which this request does not hold \
+                 — the staging that sized its block table is wrong",
+                seq_pos.0
+            )
+        })?;
+        Ok(fold_plan::page_base_bytes(&self.fold, rp))
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -6251,13 +6336,15 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
     pub fn is_paged(&self) -> bool {
-        self.kv.paged
+        self.kv.paged().is_some()
     }
-    pub fn pool_pages(&self) -> PoolPages {
-        self.kv.pool_pages
+    /// The pool's page count — `None` when the bundle is unpaged (there is no pool to count).
+    pub fn pool_pages(&self) -> Option<PoolPages> {
+        self.kv.paged().map(|g| g.pool_pages)
     }
-    pub fn page_slots(&self) -> PageSlots {
-        self.kv.page_slots
+    /// Positions per page — `None` when the bundle is unpaged.
+    pub fn page_slots(&self) -> Option<PageSlots> {
+        self.kv.paged().map(|g| g.page_slots)
     }
 
     /// ⛔⛔⛔ THE COLUMNS THE BROADCAST PREFIX MASK RESERVES — **READ OFF THE PLACEMENT THE BIND GUARD
@@ -6279,7 +6366,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// `fold_plan::page_base_bytes` multiplies a block-table entry by, so it is also the number the
     /// gather's index unit must divide. `0` for an unpaged bundle.
     pub fn kv_page_stride_bytes(&self) -> u64 {
-        self.kv.page_stride_bytes
+        self.kv.paged().map_or(0, |g| g.page_stride.bytes())
     }
 
     pub fn pmask_slots(&self) -> Option<usize> {
@@ -6293,9 +6380,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// The pool is SHARED, so reporting it here would let a request run off its own pages into
     /// another's.
     pub fn cap(&self) -> i64 {
-        if self.kv.paged {
+        if let Some(g) = self.kv.paged() {
             let held = self.fold.block_tables.first().map_or(0, |t| t.len() as i64);
-            held * self.kv.page_slots.0
+            held * g.page_slots.0.get()
         } else {
             self.num_blocks.0 * 64
         }
@@ -6310,17 +6397,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// KV. The `row` is likewise the bundle's to bound — row `ROWS` of one kv head is row 0 of the
     /// next — so a refusal from `fold_plan` is forwarded, never dropped.
     pub fn set_block_table(&mut self, req: RowIdx, pos: SeqPos, pages: &[i64]) -> Result<()> {
-        if !self.kv.paged {
+        let Some(g) = self.kv.paged() else {
             bail!("set_block_table on a NON-PAGED bundle — refused");
-        }
+        };
         if pages.is_empty() {
             bail!("set_block_table: empty page list");
         }
         for (i, &p) in pages.iter().enumerate() {
-            if p < 0 || p >= self.kv.pool_pages.0 {
+            if p < 0 || p >= g.pool_pages.0 {
                 bail!(
                     "set_block_table: page {p} (entry {i}) outside the {}-page pool — refused",
-                    self.kv.pool_pages.0
+                    g.pool_pages.0
                 );
             }
         }

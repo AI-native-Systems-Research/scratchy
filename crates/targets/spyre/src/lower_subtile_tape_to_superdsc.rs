@@ -3886,10 +3886,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .flatten()
         .collect();
     let step_rows = match (prefill, paged) {
-        (Some(pg), _) => crate::paged_step::StepRows {
-            start: 0,
-            real: pg.mq as usize,
-        },
+        (Some(pg), _) => crate::paged_step::StepRows::new(0, pg.mq as usize).expect(
+            "the prefill wiring's rung holds no query rows — the bake cannot stage its step",
+        ),
         (None, Some(p)) => {
             let cached = ir
                 .nodes
@@ -3902,12 +3901,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 })
                 .max()
                 .unwrap_or(0);
-            crate::paged_step::StepRows {
-                start: cached.min(p.capacity().saturating_sub(1)),
-                real: 1,
-            }
+            crate::paged_step::StepRows::one_at(cached.min(p.capacity().saturating_sub(1)))
         }
-        (None, None) => crate::paged_step::StepRows { start: 0, real: 1 },
+        (None, None) => crate::paged_step::StepRows::one_at(0),
     };
     // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
     // every page through the table rather than at its block's own index, and the pages the step

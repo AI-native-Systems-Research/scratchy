@@ -2907,10 +2907,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
     .expect("the paged step derives")
     .expect("the graph has attention");
     let mq = s.mq as usize;
-    let rows = StepRows {
-        start: cached,
-        real: mq,
-    };
+    let rows = StepRows::new(cached, mq).expect("the golden step holds its query rows");
     let blocks: Vec<u32> = (0..step.pages).rev().collect();
     let (q_width, kv_width, hd) = ((nqh * hd) as usize, (nkvh * hd) as usize, hd as usize);
     let kc = attn_stimulus(cached * kv_width, 2, 6.0);

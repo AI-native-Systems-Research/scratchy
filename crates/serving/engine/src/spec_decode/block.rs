@@ -508,7 +508,7 @@ mod tests {
                 block_table: &[],
                 block_table_stride: 0,
                 block_ids: &[],
-                block_size: 16,
+                block_size: scratchy_core_common::KvBlockTokens::new(16).expect("16 > 0"),
                 prompt_lens: &[],
                 history_lens: &self.history,
                 sampled: &self.sampled,
