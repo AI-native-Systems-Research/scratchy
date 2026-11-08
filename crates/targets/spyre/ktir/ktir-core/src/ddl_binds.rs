@@ -52,8 +52,17 @@
 //! ⛔ EVERY ROW IS A MEASURED FACT, read directly from the vendor templates
 //! on the card pod (2026-11-07, `/opt/ibm/spyre/deeptools/share/ddc/`
 //! `ddl_templates/`): the citation names the template and line. Nothing is
-//! inferred from a composition or from another op's bind, and a `DeviceOp`
-//! with no row is UNBOUND at every format — fail-closed, the refusal stands.
+//! inferred from a composition or from another op's bind.
+//!
+//! ⛔ ROW COVERAGE IS A COMPILE-TIME FACT, NOT A TEST. Each generation's
+//! table is `[DeviceOpRow; DEVICE_OP_COUNT]`, indexed by `op as usize` over
+//! the SAME macro token list the enum and [`DeviceOp::ALL`] are generated
+//! from, and a const assert pins entry `i`'s key to `ALL[i]`. A missing row
+//! (short array), a duplicate (two entries naming one op — the assert fails
+//! the first index the keys disagree at), or an op added to the enum without
+//! its row is a BUILD ERROR, so the lookups below answer by indexing, never
+//! by searching an `Option` out of a slice. An op a generation does not bind
+//! is a row with `dfs: &[]` — EMPTY, stated, not absent.
 
 /// A data format a DDL `operation_bind` lists. The doors lower in these
 /// only; every other `superdsc_opspec`-style format is refused by the door
@@ -278,7 +287,15 @@ pub trait DeviceGen {
     /// (RED-stop) and the arrangement propagation today; the island
     /// collapse and pointwise-door consults that land next read the same
     /// rows.
-    const DEVICE_OPS: &'static [DeviceOpRow];
+    ///
+    /// ⛔ THE ARRAY IS THE LAW: `[DeviceOpRow; DEVICE_OP_COUNT]`, one entry
+    /// per variant of [`DeviceOp`], IN [`DeviceOp::ALL`] ORDER, indexed by
+    /// `op as usize` — never searched. The impl MUST be pinned by the
+    /// key-order const assert beside it (see Gen1's), so a missing,
+    /// duplicated, or misplaced row is a compile error rather than a
+    /// runtime `None` a caller has to refuse. An op this generation does
+    /// not bind is a row with `dfs: &[]`, never an absent row.
+    const DEVICE_OPS: [DeviceOpRow; DEVICE_OP_COUNT];
     /// The card's compute cores — the count every work plan caps at (one
     /// entry per core on the gather's index stick; `MaxCores` in the work
     /// planner). The frontend's default core count is the SAME fact.
@@ -319,9 +336,9 @@ pub type Baked = Gen1;
 
 impl DeviceGen for Gen1 {
     /// GEN1'S TABLE. Every row cites the gen1 vendor templates (read on the
-    /// card pod, 2026-11-07) and line; a `DeviceOp` with no row is unbound
-    /// at every format — fail-closed.
-    const DEVICE_OPS: &'static [DeviceOpRow] = &[
+    /// card pod, 2026-11-07) and line; an op gen1 does not bind is a row
+    /// with `dfs: &[]` — stated, never absent.
+    const DEVICE_OPS: [DeviceOpRow; DEVICE_OP_COUNT] = [
         // ── broadcast_ops.ddl — the two-tensor pointwise family, every row
         //    bound at BOTH fp16 and fp32.
         DeviceOpRow {
@@ -343,12 +360,6 @@ impl DeviceGen for Gen1 {
             citation: "broadcast_ops.ddl:27 mul [%type_fp16, %type_fp32]",
         },
         DeviceOpRow {
-            op: DeviceOp::Equal,
-            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
-            arrangement: ElementArrangement::Standard,
-            citation: "broadcast_ops.ddl:41 equal [%type_fp16, %type_fp32]",
-        },
-        DeviceOpRow {
             op: DeviceOp::RealDiv,
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
@@ -365,6 +376,12 @@ impl DeviceGen for Gen1 {
             dfs: &[DdlDf::Fp16, DdlDf::Fp32],
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:46 minimum [%type_fp16, %type_fp32]",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Equal,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:41 equal [%type_fp16, %type_fp32]",
         },
         // ── unary_parallel.ddl — the one-input family, most rows bound at both
         //    formats (the fp32 rows ride an internal tensor).
@@ -647,6 +664,25 @@ impl DeviceGen for Gen1 {
     const DL16TOFP32_PERMUTATION: [u8; 64] = dl16tofp32_permutation();
 }
 
+/// ⛔ GEN1'S KEY-ORDER PIN — the compile-time half of the table's law: entry
+/// `i` of [`Gen1`]'s array MUST state the row for `DeviceOp::ALL[i]`, the
+/// variant list the same macro token list generates as the enum itself. A
+/// row named for the wrong op (the duplicate-shadowing case), a missing row
+/// (a short array cannot compile), or a variant added without its row (the
+/// array length and this assert both move) is a BUILD ERROR here — the
+/// runtime uniqueness/completeness tests this replaces could only fail
+/// after the build had already shipped the wrong table.
+const _: () = {
+    let mut i = 0;
+    while i < DEVICE_OP_COUNT {
+        assert!(
+            Gen1::DEVICE_OPS[i].op as usize == i,
+            "Gen1's device-facts table entry does not name its own ALL-order op — rows are indexed by op, never searched"
+        );
+        i += 1;
+    }
+};
+
 /// The const constructor behind Gen1's
 /// [`DL16TOFP32_PERMUTATION`](DeviceGen::DL16TOFP32_PERMUTATION) — evaluated
 /// at compile time, so the table on disk IS the formula (the right rotation
@@ -667,33 +703,32 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
     table
 }
 
-/// The row stating `op`'s facts on generation `G`, or `None` when no row
-/// names it — UNBOUND, fail-closed: the caller refuses, never degrades.
-pub fn row<G: DeviceGen>(op: DeviceOp) -> Option<&'static DeviceOpRow> {
-    G::DEVICE_OPS.iter().find(|r| r.op == op)
+/// The row stating `op`'s facts on generation `G` — BY INDEX, never by
+/// search: the array is one entry per variant in [`DeviceOp::ALL`] order
+/// (pinned by each impl's key-order const assert), so every op the enum
+/// names has exactly one row by construction and this cannot miss.
+pub fn row<G: DeviceGen>(op: DeviceOp) -> &'static DeviceOpRow {
+    &G::DEVICE_OPS[op as usize]
 }
 
-/// The formats `op` is bound at on `G`, or `None` when no row names it —
-/// UNBOUND, fail-closed: the caller refuses, never degrades.
-pub fn bound_dfs<G: DeviceGen>(op: DeviceOp) -> Option<&'static [DdlDf]> {
-    row::<G>(op).map(|r| r.dfs)
+/// The formats `op` is bound at on `G`. An op the generation does not bind
+/// answers `&[]` — EMPTY, stated by its row, never absent: the caller
+/// refuses by name, never degrades.
+pub fn bound_dfs<G: DeviceGen>(op: DeviceOp) -> &'static [DdlDf] {
+    row::<G>(op).dfs
 }
 
-/// Whether `op` is bound at `df` on `G`. An absent row is unbound at every
-/// format: `false`, and the caller refuses by name.
+/// Whether `op` is bound at `df` on `G`. An unbound op is `false` at every
+/// format, and the caller refuses by name.
 pub fn binds<G: DeviceGen>(op: DeviceOp, df: DdlDf) -> bool {
-    bound_dfs::<G>(op).is_some_and(|dfs| dfs.contains(&df))
+    bound_dfs::<G>(op).contains(&df)
 }
 
 /// The arrangement `op`'s output carries on `G` when both operands are
-/// addressed standard, or `None` when no row names it. There is NO silent
-/// `Standard` default here — a missing row is a fact the caller does not
-/// hold, and the caller refuses by name rather than guessing (main's old
-/// table defaulted silently; every convert op now states a row, so the
-/// refusal is unreachable for every op this tree emits and the behavior is
-/// unchanged).
-pub fn output_arrangement<G: DeviceGen>(op: DeviceOp) -> Option<ElementArrangement> {
-    row::<G>(op).map(|r| r.arrangement)
+/// addressed standard. There is no silent `Standard` default and no absent
+/// row to guess at — the array states one row per op by construction.
+pub fn output_arrangement<G: DeviceGen>(op: DeviceOp) -> ElementArrangement {
+    row::<G>(op).arrangement
 }
 
 #[cfg(test)]
@@ -750,38 +785,11 @@ mod tests {
         }
     }
 
-    /// Every op the enum names states a row — iterated over the enum's own
-    /// exhaustive list, so a variant added without a row fails HERE, not
-    /// silently in a reader.
-    #[test]
-    fn every_op_in_the_enum_states_a_row() {
-        for op in DeviceOp::ALL {
-            assert!(
-                Gen1::DEVICE_OPS.iter().any(|r| r.op == op),
-                "{op:?} states no row"
-            );
-            assert!(
-                output_arrangement::<Gen1>(op).is_some(),
-                "{op:?} states no arrangement row"
-            );
-        }
-    }
-
-    /// ⛔ NO TWO ROWS NAME ONE OP — a duplicate would shadow the first and
-    /// silently change a bind. With the typed key, this is also the
-    /// misspelling guard: a row's key is an enum value, so a typo cannot
-    /// compile, and this test pins that only one row exists per op.
-    #[test]
-    fn no_two_rows_name_one_op() {
-        for (i, a) in Gen1::DEVICE_OPS.iter().enumerate() {
-            for b in Gen1::DEVICE_OPS.iter().skip(i + 1) {
-                assert!(a.op != b.op, "{a:?} and {b:?} share one op key");
-            }
-        }
-    }
-
     /// Every row's op spells a non-empty door key, states its family, and
-    /// carries a citation — the row's own shape, pinned.
+    /// carries a citation — the row's own shape, pinned. (Row coverage and
+    /// uniqueness are no longer tests: the array is one entry per variant
+    /// in `ALL` order, pinned by the key-order const assert, so a missing
+    /// or duplicated row is a build error.)
     #[test]
     fn every_row_carries_a_spelling_a_family_and_a_citation() {
         for r in Gen1::DEVICE_OPS {
@@ -792,22 +800,18 @@ mod tests {
     }
 
     /// The dl16 stagger row: the widen's output is the measured permuted
-    /// arrangement; the narrow-back's is not (yet) — the propagation's own
-    /// refusal guards it.
+    /// arrangement; the narrow-back's is not (yet) — main's behavior, kept
+    /// until the Z4 solve's own PR moves it (see the row's citation).
     #[test]
     fn the_dl16_stagger_row_is_the_widen_alone() {
         assert_eq!(
             output_arrangement::<Gen1>(DeviceOp::Dl16ToFp32),
-            Some(ElementArrangement::Dl16ToFp32)
+            ElementArrangement::Dl16ToFp32
         );
         assert_eq!(
             output_arrangement::<Gen1>(DeviceOp::Fp32ToDl16),
-            Some(ElementArrangement::Standard)
+            ElementArrangement::Standard
         );
-        // No silent default: a row-less op answers `None` and the caller
-        // refuses. Every DeviceOp variant states a row today, so `None` is
-        // unreachable for every op the enum names — the Option is the API's
-        // honesty for the first op that lands without one.
     }
 
     /// THE MoE ROW: the max reduce is bound at BOTH formats (the fp16 and
@@ -827,7 +831,7 @@ mod tests {
             );
             assert_eq!(
                 output_arrangement::<Gen1>(op),
-                Some(ElementArrangement::Standard)
+                ElementArrangement::Standard
             );
         }
     }

@@ -4368,21 +4368,11 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
             // reduction's answer is a function of the multiset, so the stagger ends here.
             Lowering::Reduce(_) => ElementArrangement::Standard,
             // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table
-            // row. NO SILENT DEFAULT — a convert whose op states no row is a fact the
-            // bake does not hold, refused by name here (every convert op states a row,
-            // so this is unreachable for every op this tree emits).
+            // row — one row per op by construction (the table is an array keyed by the
+            // op, pinned at its length), so there is no absent row to guess a default
+            // for and nothing to refuse here.
             Lowering::Convert(kind) => {
-                match ktir_core::ddl_binds::output_arrangement::<G>(kind.device_op()) {
-                    Some(arr) => arr,
-                    None => {
-                        return err(format!(
-                            "the convert {} states no arrangement row in the device-facts table \
-                         (ktir_core::ddl_binds, the generation this propagation runs for) — refusing to guess \
-                         Standard for a fact the table does not hold",
-                            kind.op_func()
-                        ));
-                    }
-                }
+                ktir_core::ddl_binds::output_arrangement::<G>(kind.device_op())
             }
             // POINTWISE — the stagger propagates through it, and every same-width operand that
             // is read lane-for-lane must agree with the output's arrangement.
