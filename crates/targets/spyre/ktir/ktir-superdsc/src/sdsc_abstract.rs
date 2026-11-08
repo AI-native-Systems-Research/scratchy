@@ -6622,7 +6622,7 @@ impl ChunkScratch {
     /// serving choice — not a derivation from the core count. The gather's
     /// `ENTRIES_PER_OP == MAX_CORES` law (see `lx_form`) is about the copy's
     /// index stick, a different fact that does not fix the page count.
-
+    ///
     /// ⭐ THE ONE-REQUEST DECODE LADDER — one baked body per chunk width, in pages, ascending. The
     /// runtime picks the smallest rung covering the live context (`select_body`'s own law over each
     /// rung's swept `pages * POOL_PAGE_SLOTS`), and the chunk's tail pages repeat the last real page under a
