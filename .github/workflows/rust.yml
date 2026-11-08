@@ -554,6 +554,13 @@ jobs:
       # import deleted with MatmulStaging, the usage left in
       # zz_a_one_row_matmul_fills_every_core.rs) — main could not compile that test
       # binary and no check was red. This leg is the compile cover for that class.
+      # The same gap at clippy: the test step below compiles ktir-superdsc's test
+      # targets, but no step LINTS them (the triton clippy is the five re-host
+      # crates, the workspace clippy has no --all-targets), so lint debt piled
+      # unseen — main was red in this leg nobody ran (chain_stage_program's
+      # nine positional args, an identity op in the broadcast-prefix-row test).
+      - name: Clippy (spyre ktir-superdsc, all targets)
+        run: cargo clippy -p ktir-superdsc --all-targets -- -D warnings
       - name: Test (spyre ktir-superdsc + bundle)
         run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
       # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
