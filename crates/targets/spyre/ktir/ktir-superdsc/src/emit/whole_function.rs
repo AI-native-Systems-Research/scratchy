@@ -7363,7 +7363,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     // address. The batched paged-decode kernel's score tiles and softmax states are
                     // all rank-3; without this arm every one of them was refused below as "states no
                     // 2-D tensor type". Rank 2 keeps its stated frame verbatim.
-                    frames.frame_of(f, res, &dims)?
+                    frames.frame_of(f, res, dims)?
                 }
                 _ => {
                     return err(format!(
