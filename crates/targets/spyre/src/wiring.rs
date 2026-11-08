@@ -147,8 +147,9 @@ pub struct BakeFacts {
     pub uses_ones_reduce: bool,
     /// Length in f32 elements of that placement (`size / 2`). The fp8-prefill L2 amax enlarges
     /// ONES to `[max(hidden, max fp8-K), stick]`, so binding only `hidden * 64` would leave
-    /// down_proj's tail rows reading adjacent seg0 consts. 0 when unplaced.
-    pub ones_reduce_len: usize,
+    /// down_proj's tail rows reading adjacent seg0 consts. `None` when unplaced — a placed
+    /// `ONES_REDUCE` is at least a full stick of pairs, so `None` is exactly "unplaced".
+    pub ones_reduce_len: Option<std::num::NonZeroUsize>,
     /// The bundle placed `IDENTITY_TID` — the KV cachewr / GQA-replicate matmul-by-identity.
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
@@ -160,7 +161,7 @@ impl BakeFacts {
     /// ask. ⛔ NOT A DEFAULT FOR THE CARD PATH: `require_identity` refuses this on decode.
     pub const NONE: BakeFacts = BakeFacts {
         uses_ones_reduce: false,
-        ones_reduce_len: 0,
+        ones_reduce_len: None,
         uses_identity: false,
         scalarmul_scales: &[],
     };
@@ -171,7 +172,7 @@ impl BakeFacts {
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
-            ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
+            ones_reduce_len: ones.and_then(|p| std::num::NonZeroUsize::new((p.size / 2) as usize)),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
@@ -2133,9 +2134,9 @@ pub struct ConstantEnv {
     pub mq_pad: usize,
     /// From the bundle's own placements, not a runtime flag.
     pub uses_ones_reduce: bool,
-    /// Baked `ONES_REDUCE` placement length in f32 elements; 0 ⇒ fall back to
+    /// Baked `ONES_REDUCE` placement length in f32 elements; `None` ⇒ fall back to
     /// `hidden` × the fp16 stick (one stick per hidden column).
-    pub ones_reduce_len: usize,
+    pub ones_reduce_len: Option<std::num::NonZeroUsize>,
     /// From the bundle's own placements.
     pub uses_identity: bool,
     /// ⭐ THE KERNEL-TABLE CLASS SETS (see [`Wiring::rope_class_hds`]). The tables themselves are
@@ -2318,10 +2319,9 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
         // one stick per hidden column leaves the tail rows reading adjacent
         // seg0 consts. The stick is Fp16's own (the ladder's derivation), never
         // a spelled 64.
-        let len = if env.ones_reduce_len > 0 {
-            env.ones_reduce_len
-        } else {
-            h * FP16_ELEMS_PER_STICK as usize
+        let len = match env.ones_reduce_len {
+            Some(len) => len.get(),
+            None => h * FP16_ELEMS_PER_STICK as usize,
         };
         out.push((sd::ONES_REDUCE_TID, ConstValues::Fill { value: 1.0, len }));
     }
@@ -2580,7 +2580,7 @@ mod constant_tape_tests {
             head_dim: 64,
             mq_pad: 64,
             uses_ones_reduce: true,
-            ones_reduce_len: 0,
+            ones_reduce_len: None,
             uses_identity: true,
             rows,
             scalarmul_scales: &[1.5, 2.5],
