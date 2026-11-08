@@ -1026,6 +1026,13 @@ pub struct Wiring {
 /// (the tape's ChainSeed steps replaced the EmbedRow push), stated once at
 /// the mint and read by the layout stamp's resident excuse and the bake's
 /// binding-check arm; the worker never names it.
+///
+/// `block` is the table columns one rank's gather reads (the mint's own `block`): the widened
+/// table's pad at a world of one, a rank's vocabulary block when the projection is split. With the
+/// rank a session plays as, it is the rank's [`ChainBlock`] ([`chain_block`]) — the one fact the
+/// tables and the seeds both decompose a pick through.
+///
+/// [`ChainBlock`]: scratchy_subtile::subtile_ir::ChainBlock
 #[derive(Clone, Copy, Debug)]
 pub struct ChainWiring {
     pub s_src: u32,
@@ -1033,6 +1040,25 @@ pub struct ChainWiring {
     pub k: u32,
     pub hidden: u32,
     pub replaces: u32,
+    pub block: u32,
+}
+
+/// ⭐ THE BLOCK A SESSION'S CHAINED HEAD GATHERS — `width` columns at the origin of the rank `me`
+/// plays as; the whole table for a session that plays no rank of a sharded world (`None`, the
+/// executor's own [`RankSeat`] alone). Bound at load from the session's own seat, never baked: one
+/// bake serves every rank, and the rank lives only in the bytes each rank stages (its tables, its
+/// seeds).
+///
+/// [`RankSeat`]: crate::superdsc_exec::RankSeat
+pub fn chain_block<T: crate::bundle_code::collective::World>(
+    width: u32,
+    me: Option<crate::bundle_code::collective::Rank<T>>,
+) -> scratchy_subtile::subtile_ir::ChainBlock {
+    use scratchy_subtile::subtile_ir::ChainBlock;
+    me.map_or_else(
+        || ChainBlock::whole(width),
+        |r| ChainBlock::of_rank(width, r),
+    )
 }
 
 /// ⭐ THE GRAPH'S OWN CHAIN FACT — read once off the mint by `chain_of_ir`
@@ -1096,10 +1122,14 @@ pub enum LoadConst {
     /// at the mint beside it — the l-tab's LANE RAMP
     /// `64·(i mod (hidden/64)) + (t&63)` reads its entry count from it), so
     /// the staging is self-contained: the fill never re-derives either.
+    ///
+    /// `block` is the mint's own block width ([`ChainWiring::block`]); the rank's origin is bound
+    /// when the session stages the table ([`Self::build`]'s `me`).
     ChainStageTable {
         pad_vocab: u32,
         k: u32,
         hidden: u32,
+        block: u32,
         operand: u8,
     },
 }
@@ -1111,7 +1141,13 @@ impl LoadConst {
     /// on one leg only). PURE IN THE ARRANGEMENT: a `Dl16ToFp32` entry's bytes
     /// come out already permuted into the stagger the consuming island reads,
     /// so every leg that calls here stages identical bytes by construction.
-    pub fn build(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+    ///
+    /// `me` is the rank the staging session plays as (`None` alone): the chain's tables are its
+    /// rank's [`chain_block`]; every other kind is the same on every rank.
+    pub fn build<T: crate::bundle_code::collective::World>(
+        &self,
+        me: Option<crate::bundle_code::collective::Rank<T>>,
+    ) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
         match *self {
             LoadConst::SampleTable {
                 vocab,
@@ -1147,12 +1183,14 @@ impl LoadConst {
                 pad_vocab,
                 k,
                 hidden,
+                block,
                 operand,
             } => {
-                let (bytes, dt, shape) = chain_staged_tables(pad_vocab, k, hidden)
-                    .into_iter()
-                    .nth((operand - 1) as usize)
-                    .expect("the mint emits operand 1..=2 — the registry's own row");
+                let (bytes, dt, shape) =
+                    chain_staged_tables(pad_vocab, k, hidden, chain_block(block, me))
+                        .into_iter()
+                        .nth((operand - 1) as usize)
+                        .expect("the mint emits operand 1..=2 — the registry's own row");
                 (bytes, dt, shape)
             }
         }
@@ -1189,8 +1227,11 @@ impl LoadConst {
     /// pointwise island reads; a one-word-per-row table has no lane stream to
     /// permute, and a mark on one is a mint/propagation disagreement — refuse
     /// it, never permute the rows' words.
-    pub fn card_bytes(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
-        let (bytes, dt, shape) = self.build();
+    pub fn card_bytes<T: crate::bundle_code::collective::World>(
+        &self,
+        me: Option<crate::bundle_code::collective::Rank<T>>,
+    ) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        let (bytes, dt, shape) = self.build(me);
         // Only the sampler's own tables carry the uniform-col class; every
         // other kind — the chain's decompose ramps — falls through VERBATIM,
         // and a second such kind arrives here by this match failing to
@@ -1334,6 +1375,13 @@ pub fn stage_col_stick_heads<const N: usize>(
 /// BEFORE any consumer of the sentinel rows runs, so those rows are bus
 /// safety, never a value the forward reads.
 ///
+/// ⭐ A RANK'S TABLES ARE ITS BLOCK'S (`block`, the session's [`chain_block`]).
+/// At a world of one the block is the whole widened table and the rows above
+/// are exact. When the vocabulary projection is split, a row whose pick another
+/// rank holds stages the sentinel's values too — this rank's ZERO addend,
+/// which the analysis's all-reduce sums with the owner's row — and an owned
+/// pick decomposes at its column within the block.
+///
 /// ⛔ THE WORDS ARE THE DEVICE ENCODING — SENUINT32 lane values as u32 LE
 /// words, `DType::I32`. The staging door for I32 consts is the VERBATIM
 /// one (`raw_ids`' law: LE bytes are the device encoding for raw integer
@@ -1342,6 +1390,7 @@ pub fn chain_staged_tables(
     pad_vocab: u32,
     k: u32,
     hidden: u32,
+    block: scratchy_subtile::subtile_ir::ChainBlock,
 ) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     // The mint stated k; the fill TRUSTS it — and a k outside the law's
     // window would not mis-fill, it would UNNAME (k = 0 dies a divide-by-
@@ -1360,14 +1409,16 @@ pub fn chain_staged_tables(
         pad_vocab as usize + scratchy_subtile::subtile_ir::SAMPLE_SENTINEL_OFFSET as usize + 1;
     let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
     // The stab row is the LANE PATTERN, not a splat: lane i names entry
-    // k·(t>>6) + (i mod k) of the weight's slab-major staging. Past
-    // pad_vocab the base clamps to s = 0, so every lane stays a quarter of
-    // slab 0 — the clamp's bus safety under the entry-word encoding.
+    // k·s + (i mod k) of the weight's slab-major staging, `s` the pick's slab
+    // within the rank's block (`chain_s_row`, the one spelling the seeds
+    // share). A pick the block does not hold — past the pad at a world of
+    // one, outside the rank's columns when the table is split — clamps to
+    // s = 0, so every lane stays a quarter of slab 0: the clamp's bus safety
+    // under the entry-word encoding.
     let mut stab = Vec::with_capacity(rows * lanes * 4);
     for t in 0..rows as u32 {
-        let base = if t < pad_vocab { k * (t >> 6) } else { 0 };
-        for i in 0..lanes as u32 {
-            stab.extend_from_slice(&(base + i % k).to_le_bytes());
+        for w in scratchy_subtile::subtile_ir::chain_s_row(k, t, block) {
+            stab.extend_from_slice(&w.to_le_bytes());
         }
     }
     // The ltab row is the pick's WHOLE LANE RAMP, not a splat: word `i` names
@@ -1382,11 +1433,7 @@ pub fn chain_staged_tables(
     let l_words = l_sticks * lanes;
     let mut ltab = Vec::with_capacity(rows * l_words * 4);
     for t in 0..rows as u32 {
-        let row = if t < pad_vocab {
-            scratchy_subtile::subtile_ir::chain_l_stick_ramp(t & 63, hidden)
-        } else {
-            scratchy_subtile::subtile_ir::chain_l_sentinel_ramp(hidden)
-        };
+        let row = scratchy_subtile::subtile_ir::chain_l_row(t, hidden, block);
         // The fill and the shape are ONE law: the ramp is self-sized at the
         // stick count, so a row's length IS the placement's word count —
         // asserted here, never trusted, so the two cannot drift by a silent
@@ -1989,7 +2036,10 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
     }
     let w = T::RANKS;
     let divides = match shard {
-        SourceShard::Whole => true,
+        SourceShard::Whole
+        | SourceShard::Partial
+        | SourceShard::ColBlocks { .. }
+        | SourceShard::RowBlocks { .. } => true,
         SourceShard::Rows => rows.is_multiple_of(w),
         SourceShard::Cols => cols.is_multiple_of(w),
         SourceShard::HeadRows { heads } => {
@@ -2013,7 +2063,10 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
         match shard {
             SourceShard::Rows => (disk, SourceShard::Cols),
             SourceShard::Cols => (disk, SourceShard::Rows),
-            SourceShard::Whole => (disk, SourceShard::Whole),
+            SourceShard::ColBlocks { block } => (disk, SourceShard::RowBlocks { block }),
+            SourceShard::RowBlocks { block } => (disk, SourceShard::ColBlocks { block }),
+            // Rank 0 holds the value and every other rank zeros, in either byte order.
+            SourceShard::Whole | SourceShard::Partial => (disk, shard),
             SourceShard::HeadRows { .. } => return Err(SliceRefusal::HeadSplitGemm { id }),
         }
     } else {
@@ -2782,6 +2835,24 @@ mod tp_slice_tests {
             cut_source_bytes::<W2>(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
             Ok(vec![4, 5, 6, 7])
         );
+    }
+
+    /// An uneven vocabulary's padded N-split (`ColBlocks`) is a row block of the disk bytes like
+    /// the even one, the last rank's rows past the vocabulary staged zero — the columns its local
+    /// projection computes and the all-gather crops.
+    #[test]
+    fn a_padded_block_stages_zeros_past_the_source() {
+        let (r0, r1) = (Rank::<W2>::of::<0>(), Rank::<W2>::of::<1>());
+        // Logical [k=2, n=3]; on disk [n=3, k=2], element (n, k) = 10·n + k.
+        let disk: Vec<u8> = (0..3u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let block = SourceShard::ColBlocks {
+            block: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let cut = |me| cut_source_bytes::<W2>(block, me, 7, disk.clone(), 1, (2, 3), true);
+        assert_eq!(cut(r0), Ok(vec![0, 1, 10, 11]));
+        assert_eq!(cut(r1), Ok(vec![20, 21, 0, 0]));
     }
 
     /// Every cut it cannot make byte-exactly is refused by name.

@@ -9104,6 +9104,62 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 ///
 /// The manifest is still emitted (the KTIR emulator's session takes it), so both answers exist at
 /// bake and this costs one parse per model.
+/// ⭐ THE ROW A TIED DECODE STEP GATHERS — the `RowGather` the sharding analysis reads for a
+/// forward whose input row the chained head fills: a tied model's decode, its embedded-hidden
+/// source read on device out of the vocabulary projection's own table at the token the previous
+/// step drew. `mint_embed_chain` builds that gather on the lowered graph; the analysis needs only
+/// the fact, and places the row's all-reduce where it is first read whole when the table splits.
+/// A prefill forward's rows are the prompt's, staged whole by the host, and an untied model's
+/// decode does not chain: both state none. `decode` is the predicate the chain's mint runs under
+/// (a decode rung, never a prefill one), so the two cannot disagree about which bakes chain.
+/// ⭐ A RUNG OF THE SHARDED WORLD READS THE DECODE'S STAGED WEIGHTS — one copy per rank, cut by the
+/// decode's slice laws — so a rung whose own analysis cuts a staged source differently would read
+/// the wrong slice. That is a BUILD error, naming the bundle, the binding and both cuts
+/// (`tensor_parallel::staged_cut_apart`).
+#[cfg(feature = "spyre")]
+fn refuse_if_staged_cut_apart(
+    stem: &str,
+    bundle: &str,
+    decode: (
+        &[scratchy_subtile::handoff::SourceBinding],
+        &[scratchy_subtile::tensor_parallel::SourceShard],
+    ),
+    rung: (
+        &[scratchy_subtile::handoff::SourceBinding],
+        &[scratchy_subtile::tensor_parallel::SourceShard],
+    ),
+) {
+    if let Some((binding, decode_cut, rung_cut)) =
+        scratchy_subtile::tensor_parallel::staged_cut_apart(decode, rung)
+    {
+        panic!(
+            "[spyre-tp] {stem}: {bundle} cuts {binding:?} as {rung_cut:?}, but the world's decode \
+             cuts it as {decode_cut:?} — one staged copy per rank cannot be both"
+        );
+    }
+}
+
+#[cfg(feature = "spyre")]
+fn chained_row_gathers(
+    lwd: &crate::to_wavefront::LoweredDecode,
+    model: &ModelParams,
+    decode: bool,
+) -> Vec<scratchy_subtile::tensor_parallel::RowGather> {
+    if !(decode && tie_word_embeddings(model)) {
+        return Vec::new();
+    }
+    let row = lwd
+        .bindings
+        .iter()
+        .position(|b| matches!(b, scratchy_subtile::handoff::SourceBinding::EmbeddedHidden));
+    match (row, lwd.input.vocab_table()) {
+        (Some(row), Some(table)) => {
+            vec![scratchy_subtile::tensor_parallel::RowGather { row, table }]
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(feature = "spyre")]
 fn refuse_if_wiring_disagrees_with_manifest(
     stem: &str,
@@ -9469,17 +9525,20 @@ fn load_const_entry_tokens(
             pad_vocab,
             k,
             hidden,
+            block,
             operand,
         } => {
             let pad_vocab = proc_macro2::Literal::u32_unsuffixed(pad_vocab);
             let k = proc_macro2::Literal::u32_unsuffixed(k);
             let hidden = proc_macro2::Literal::u32_unsuffixed(hidden);
+            let block = proc_macro2::Literal::u32_unsuffixed(block);
             let operand = proc_macro2::Literal::u8_unsuffixed(operand);
             quote! {
                 ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
                     pad_vocab: #pad_vocab,
                     k: #k,
                     hidden: #hidden,
+                    block: #block,
                     operand: #operand,
                 }
             }
@@ -10266,6 +10325,7 @@ fn emit_superdsc_wiring(
             let k = u32l(chain.k);
             let hidden = u32l(chain.hidden);
             let replaces = u32l(chain.replaces);
+            let block = u32l(chain.block);
             quote! {
                 ::scratchy_target_spyre::forward_tape::ForwardPhase::Decode {
                     chain: ::scratchy_target_spyre::wiring::ChainWiring {
@@ -10274,6 +10334,7 @@ fn emit_superdsc_wiring(
                         k: #k,
                         hidden: #hidden,
                         replaces: #replaces,
+                        block: #block,
                     },
                 }
             }
@@ -12092,6 +12153,23 @@ fn dump_wavefront_mega(
                     // fall to. Every width mints (the solo rung, every batch-ladder
                     // rung, the symbolic CB batch alike): the chain is the decode path,
                     // not a wide-batch extra.
+                    // ⛔ A PARTIAL ROW IS A CHAIN'S, AND A PREFILL HAS NO CHAIN. A source the
+                    // analysis cut as a gathered row's partial sum is filled by the chain's
+                    // per-rank gather; a prefill rung stages its rows whole from the host, so the
+                    // all-reduce would sum the prompt's rows once per rank.
+                    if is_prefill
+                        && let Some(e) = shards.and_then(|s| {
+                            s.iter().position(|c| {
+                                *c == scratchy_subtile::tensor_parallel::SourceShard::Partial
+                            })
+                        })
+                    {
+                        panic!(
+                            "[spyre-tp] {base}: source t{e} is a gathered row's partial sum, but a \
+                             prefill rung mints no chained head to gather it — the forward was \
+                             sharded with a decode's row gather"
+                        );
+                    }
                     if !is_prefill {
                         if !tied {
                             panic!(
@@ -13713,6 +13791,7 @@ fn dump_wavefront_mega(
             >(
                 &lowered,
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                &chained_row_gathers(&lowered, model, true),
             )
             .unwrap_or_else(|e| {
                 panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank forward is malformed — {e:?}")
@@ -13748,9 +13827,23 @@ fn dump_wavefront_mega(
                     .collect()
             };
             for (k, c) in sf.collectives.iter().enumerate() {
+                let reads = match c.reads {
+                    scratchy_subtile::lower::InputRef::Op(r) => r,
+                    // A gathered row's partial sum: the gather is its contraction.
+                    scratchy_subtile::lower::InputRef::Ext(e) => {
+                        eprintln!(
+                            "[spyre-tp] {stem}: collective {k}: {:?} at op {} reading source t{e} \
+                             ({:?}), a row gathered from a column-split table",
+                            c.kind,
+                            c.op,
+                            tp_lwd.bindings.get(e),
+                        );
+                        continue;
+                    }
+                };
                 // The contraction behind the read: back along the first operand through the
                 // weightless ops between it and the collective (granite's residual multiplier).
-                let mut at = c.reads;
+                let mut at = reads;
                 while weights_of(at).is_empty() {
                     match tp_lwd.input.ops[at].inputs.first() {
                         Some(scratchy_subtile::lower::InputRef::Op(p)) => at = *p,
@@ -13762,41 +13855,42 @@ fn dump_wavefront_mega(
                      contracted at op {} ({:?}) over [{}]",
                     c.kind,
                     c.op,
-                    c.reads,
-                    tp_lwd.input.ops[c.reads].op,
+                    reads,
+                    tp_lwd.input.ops[reads].op,
                     at,
                     tp_lwd.input.ops[at].op,
                     weights_of(at).join(", ")
                 );
             }
-            if gathers > 0 && tie_word_embeddings(model) {
-                // ⛔ A VISIBLE SKIP, NAMING ITS ONE CAUSE: the decode rung's chained head gathers
-                // the drawn token's embedding row on device from the TIED table — the lm head's
-                // own staged weight — and here the analysis split that weight by vocabulary, so
-                // each rank holds half the rows a draw can name. The rank-aware chain (each rank
-                // gathers its share, a non-owner's row zero, the shares summed) is not built yet,
-                // and the chain is the only decode path, so this model ships its one-rank world.
-                println!(
-                    "cargo:warning=[spyre-tp] {stem}: no tp={TP_WORLD} bundle — its lm head splits by \
-                     vocabulary ({gathers} all-gather), and the decode chained head reads that \
-                     tied table whole; the rank-aware chained head is not built yet"
+            // ⭐ A VOCABULARY-SPLIT HEAD SHIPS ITS WORLD. The decode's chained head gathers the
+            // drawn token's row from the lm head's own table, which the analysis split by columns
+            // with the head; the gather fact (`chained_row_gathers`) made that row a partial sum the
+            // analysis reduces, and each rank's chain gathers its own block (`mint_embed_chain`
+            // over the split tail, the rank's `ChainBlock` in its tables and seeds).
+            for g in &sf.gathered {
+                eprintln!(
+                    "[spyre-tp] {stem}: the decode's input row t{} is gathered from the \
+                     column-split table t{} — each rank gathers its own vocabulary block",
+                    g.row, g.table
                 );
-                None
-            } else {
-                let (_, fx) = emit_bundle_deferred_sharded(
-                    &tp_lwd,
-                    format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
-                    prefix_len.get(),
-                    None,
-                    None,
-                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                    primary_m,
-                    Some(&sf.sources),
-                );
-                commit_bake(&sharded_world, &tp_lwd, fx);
-                Some(sf.sources)
             }
+            let (_, fx) = emit_bundle_deferred_sharded(
+                &tp_lwd,
+                format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
+                prefix_len.get(),
+                None,
+                None,
+                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                primary_m,
+                Some(&sf.sources),
+            );
+            commit_bake(&sharded_world, &tp_lwd, fx);
+            Some(sf.sources)
         };
+        // The decode's source bindings, named apart: every later rung of the sharded world checks
+        // its cuts against them (`refuse_if_staged_cut_apart`), and the prefill ladder's own
+        // per-width lowering is also called `lowered`.
+        let decode_bindings = &lowered.bindings;
         // ── DECODE CAP BUCKETS (KTIR emulator path) ───────────────────────────────────────────────
         // The emulator masks over the WHOLE prefix cache each step (decode is O(capacity)), so a
         // single big-cap program makes every short-context token pay the max-context cost. Bake the
@@ -13910,18 +14004,26 @@ fn dump_wavefront_mega(
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD: a sharded session serves every live
                         // request count on its own world's rung, never the one-rank ladder's.
                         if let Some(shards) = tp_sources.as_deref() {
-                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
-                                scratchy_target_spyre::bundle_code::collective::Build,
-                            >(
-                                &lwd_b,
-                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                            )
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank decode batch \
-                                     seqs={seqs} is malformed — {e:?}"
+                            let (tp_lwd, sf_b) =
+                                scratchy_subtile::tensor_parallel::shard_lowered::<
+                                    scratchy_target_spyre::bundle_code::collective::Build,
+                                >(
+                                    &lwd_b,
+                                    scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                    &chained_row_gathers(&lwd_b, model, true),
                                 )
-                            });
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "[spyre-tp] {stem}: the {TP_WORLD}-rank decode batch \
+                                     seqs={seqs} is malformed — {e:?}"
+                                    )
+                                });
+                            refuse_if_staged_cut_apart(
+                                stem,
+                                &format!("ktir_decode_tp{TP_WORLD}_{stem_id} seqs={seqs}"),
+                                (&lowered.bindings, shards),
+                                (&lwd_b.bindings, &sf_b.sources),
+                            );
                             let (_, fx) = emit_bundle_deferred_sharded(
                                 &tp_lwd,
                                 format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
@@ -13930,7 +14032,7 @@ fn dump_wavefront_mega(
                                 None,
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 seqs,
-                                Some(shards),
+                                Some(&sf_b.sources),
                             );
                             commit_bake(&sharded_world, &tp_lwd, fx);
                         }
@@ -14271,16 +14373,23 @@ fn dump_wavefront_mega(
                     let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
                     // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
                     // world ships whole or not at all.
-                    let tp2 = tp_sources.is_some().then(|| {
+                    let tp2 = tp_sources.as_deref().map(|decode_cuts| {
                         let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
                             scratchy_target_spyre::bundle_code::collective::Build,
                         >(
                             &lwd_p,
                             scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                            &[],
                         )
                         .unwrap_or_else(|e| {
                             panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank prefill m={pl} is malformed — {e:?}")
                         });
+                        refuse_if_staged_cut_apart(
+                            stem,
+                            &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} m={pl}"),
+                            (decode_bindings, decode_cuts),
+                            (&lwd_p.bindings, &sf_p.sources),
+                        );
                         let (_, fx) = bake_rung_sharded(
                             &tp_lwd,
                             format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
@@ -14382,12 +14491,13 @@ fn dump_wavefront_mega(
                         );
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
                         // continuation chunk on a sharded session runs on ITS world's prefix rung.
-                        if let Some(shards) = tp_sources.as_deref() {
-                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                        if let Some(decode_cuts) = tp_sources.as_deref() {
+                            let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
                                 scratchy_target_spyre::bundle_code::collective::Build,
                             >(
                                 &lwd_p,
                                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                &[],
                             )
                             .unwrap_or_else(|e| {
                                 panic!(
@@ -14395,6 +14505,14 @@ fn dump_wavefront_mega(
                                      is malformed — {e:?}"
                                 )
                             });
+                            // The rung's OWN slice laws, as the prefix-free ladder passes its own:
+                            // a prompt's rows are staged whole, never the decode's gathered row.
+                            refuse_if_staged_cut_apart(
+                                stem,
+                                &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} prefix m={m}"),
+                                (decode_bindings, decode_cuts),
+                                (&lwd_p.bindings, &sf_p.sources),
+                            );
                             let (_, fx) = emit_bundle_deferred_sharded(
                                 &tp_lwd,
                                 format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
@@ -14403,7 +14521,7 @@ fn dump_wavefront_mega(
                                 Some(m),
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 1,
-                                Some(shards),
+                                Some(&sf_p.sources),
                             );
                             commit_bake(&sharded_world, &tp_lwd, fx);
                         }
@@ -14931,6 +15049,31 @@ fn dump_wavefront_mega(
                         S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
                         S::Rows => quote! { ::scratchy_target_spyre::wiring::SourceShard::Rows },
                         S::Cols => quote! { ::scratchy_target_spyre::wiring::SourceShard::Cols },
+                        S::Partial => {
+                            quote! { ::scratchy_target_spyre::wiring::SourceShard::Partial }
+                        }
+                        S::ColBlocks { block } | S::RowBlocks { block } => {
+                            let b = proc_macro2::Literal::u32_unsuffixed(block.get());
+                            let block = quote! {
+                                match ::core::num::NonZeroU32::new(#b) {
+                                    ::core::option::Option::Some(n) => n,
+                                    ::core::option::Option::None => panic!("an empty block"),
+                                }
+                            };
+                            if matches!(s, S::ColBlocks { .. }) {
+                                quote! {
+                                    ::scratchy_target_spyre::wiring::SourceShard::ColBlocks {
+                                        block: #block,
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    ::scratchy_target_spyre::wiring::SourceShard::RowBlocks {
+                                        block: #block,
+                                    }
+                                }
+                            }
+                        }
                         S::HeadRows { heads } => {
                             let h = proc_macro2::Literal::u32_unsuffixed(heads.get());
                             quote! {

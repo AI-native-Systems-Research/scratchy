@@ -915,6 +915,21 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
+        self.stage_step_acts_seeded(activations, activations_f16, activations_i32, &[])
+    }
+
+    /// [`Self::stage_step_acts`] plus the chained head's seeds — the one host input that is NOT
+    /// the same on every card: rank `r` binds the words of ITS OWN vocabulary block
+    /// ([`crate::forward_tape::ChainSeed::words`]), the block its staged tables were built for,
+    /// by the rank its executor plays as. Raw LE u32 words, through the same verbatim channel
+    /// the index tables ride.
+    pub fn stage_step_acts_seeded(
+        &mut self,
+        activations: &[crate::wiring::Bind],
+        activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        seeds: &[(crate::bundle_code::PlaceId, crate::forward_tape::ChainSeed)],
+    ) -> Result<()> {
         // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
         // breakdown): this loop runs BEFORE predict, so it is invisible to the
         // preamble_h2d/compute/logits_d2h split. For batched prefill it converts ~300k f32
@@ -960,6 +975,23 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
                 e.bind_input_raw(bind);
             }
         }
+        for (id, seed) in seeds {
+            for e in self.ranks.values_mut() {
+                let bytes: Vec<u8> = seed
+                    .words(e.tp_identity())
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                let n = bytes.len();
+                let bind = e.place_raw(*id, bytes).ok_or_else(|| {
+                    anyhow!(
+                        "bind: the chain seed '{id}' ({n} B) has no placement in this bundle or \
+                         does not fit the one it has — an unstaged stick gathers the wrong row"
+                    )
+                })?;
+                e.bind_input_raw(bind);
+            }
+        }
         if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
             eprintln!(
                 "[sdsc-host] bind_loop={:.2} ms  ({} acts, {bind_elems} f32->sen, {} f16 acts, \
@@ -985,6 +1017,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
         self.stage_step_acts(activations, activations_f16, activations_i32)?;
+        self.run_staged_step(n_new, seq_pos, logits)
+    }
+
+    /// Run the step whatever the shadow holds — every input already staged
+    /// ([`Self::stage_step_acts`] / [`Self::stage_step_acts_seeded`]).
+    pub fn run_staged_step(
+        &mut self,
+        n_new: usize,
+        seq_pos: usize,
+        logits: StepLogits,
+    ) -> Result<Option<Vec<f32>>> {
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         let want = match logits {
             StepLogits::ReadBack => LogitsRead::ReadBack,

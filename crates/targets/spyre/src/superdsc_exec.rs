@@ -1412,6 +1412,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         self.seat.identity()
     }
 
+    /// The rank this executor plays as — `None` alone. What the host stages per rank reads it:
+    /// the chained head's tables and seeds are its rank's vocabulary block.
+    pub fn tp_identity(&self) -> Option<bundle::collective::Rank<T>> {
+        self.session()
+    }
+
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
         // A bank index the session has no region for would silently fall back to another bank's
         // base, which is a whole program reading the wrong weights. Check every launch's bank and
@@ -2108,7 +2114,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             );
         }
         for &(tid, kind) in consts {
-            let (bytes, dt, _shape) = kind.card_bytes();
+            // The chain's decompose tables are this rank's vocabulary block's (`chain_block`).
+            let (bytes, dt, _shape) = kind.card_bytes(self.session());
             let id = bundle::PlaceId::Act(tid);
             if kind.is_uniform_col() {
                 let placed = self.places.get(&id).map(|p| p.size);

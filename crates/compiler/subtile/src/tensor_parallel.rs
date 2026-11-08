@@ -31,6 +31,26 @@
 //! — gets the all-reduce. The vocabulary projection N-splits and the forward's result demands a
 //! whole value, so the lm head gets the all-gather.
 //!
+//! # The padded block
+//!
+//! A split is even — `W` equal blocks of whole granules — everywhere but one place: the
+//! vocabulary projection that computes the forward's result (through its logit epilogues), whose
+//! width need not divide (granite's 49155). There each rank holds `ceil(N / W)` columns rounded up
+//! to whole granules ([`split_block`]), the last rank's block zero-padded
+//! ([`SourceShard::ColBlocks`]). Padding is taken only there because the result's one reader is
+//! the all-gather that crops it off ([`SubOp::AllGather`]'s `cols` is the real width): no op ever
+//! reads a padded column as a value.
+//!
+//! # Gathered rows
+//!
+//! A front end may state a source as ROWS GATHERED FROM ANOTHER SOURCE's columns ([`RowGather`]):
+//! an embedding lookup whose indices the forward does not carry (a decode step's input row, read
+//! out of the tied embedding table at the token the previous step drew). A gather is a contraction
+//! with a one-hot vector over the table's columns, so the contraction rule applies to it: when the
+//! table splits by columns, each rank can gather only the columns it holds — zero for an index
+//! outside its block — and the row is a [`Placement::Partial`] sum. Its first consumer that needs
+//! the whole row gets the all-reduce, exactly as a K-split projection's does.
+//!
 //! # Invariants the output carries
 //!
 //! - At `W = 1` [`shard`] is the identity: same ops, same sources, no collective.
@@ -123,6 +143,16 @@ pub enum SourceShard {
     Cols,
     /// Rank `r` loads head block `r` of every token's `heads` rows.
     HeadRows { heads: NonZeroU32 },
+    /// Every rank holds a same-shaped addend and the value is their sum — a [`RowGather`]'s rows
+    /// over a column-split table. Loaded from a whole value, rank 0 holds it and every other rank
+    /// zeros, so the sum is the value.
+    Partial,
+    /// Rank `r` loads columns `[r·block, (r+1)·block)` — zeros past the source's width: the
+    /// padded block of an N-split whose width does not divide ([`split_block`]).
+    ColBlocks { block: NonZeroU32 },
+    /// Rank `r` loads rows `[r·block, (r+1)·block)` — zeros past the source's height: a padded
+    /// split's per-channel scale, and its gemm weight's transposed (on-disk) form.
+    RowBlocks { block: NonZeroU32 },
 }
 
 impl SourceShard {
@@ -137,7 +167,7 @@ impl SourceShard {
     pub fn local_shape<T: World>(self, s: SourceShape) -> SourceShape {
         let w = T::RANKS;
         match self {
-            Self::Whole => s,
+            Self::Whole | Self::Partial => s,
             Self::Rows | Self::HeadRows { .. } => SourceShape {
                 rows: s.rows / w,
                 cols: s.cols,
@@ -146,8 +176,25 @@ impl SourceShard {
                 rows: s.rows,
                 cols: s.cols / w,
             },
+            Self::ColBlocks { block } => SourceShape {
+                rows: s.rows,
+                cols: block.get(),
+            },
+            Self::RowBlocks { block } => SourceShape {
+                rows: block.get(),
+                cols: s.cols,
+            },
         }
     }
+}
+
+/// ⭐ THE PADDED BLOCK LAW — each rank's share of an `extent` split `W` ways when `extent` does not
+/// divide into `W` blocks of whole granules: `ceil(extent / W)` rounded up to whole granules, so
+/// every rank's block is a layout the target addresses and the blocks cover the extent, the last
+/// one zero-padded. `None` when the law leaves nothing to split (one block covers the extent).
+pub fn split_block<T: World>(extent: u32, granule: SplitGranule) -> Option<NonZeroU32> {
+    let block = extent.div_ceil(T::RANKS).next_multiple_of(granule.get());
+    NonZeroU32::new(block).filter(|b| b.get() < extent)
 }
 
 /// Which collective a [`CollectiveSite`] is.
@@ -157,17 +204,28 @@ pub enum CollectiveKind {
     AllGather,
 }
 
-/// One collective the analysis wove in: the local op it is, and the local op whose output it
-/// reads.
+/// One collective the analysis wove in: the local op it is, and the value it reads — a local op's
+/// output, or a partial source ([`SourceShard::Partial`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollectiveSite {
     pub op: usize,
-    pub reads: usize,
+    pub reads: InputRef,
     pub kind: CollectiveKind,
 }
 
-/// The two inputs [`shard`] refuses. Both are defects of the INPUT, not shapes the analysis
-/// could not shard (those are replicated).
+/// ⭐ A SOURCE THAT IS ANOTHER SOURCE'S COLUMNS, GATHERED — stated by the front end, because the
+/// indices are not in the forward: row `i` of `row` (`[m, k]`) is column `idx_i` of `table`
+/// (`[k, n]`), for indices something outside the forward chose (the host's prompt tokens, or the
+/// previous step's device pick). See the module docs: over a column-split table it is a partial
+/// sum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowGather {
+    pub row: usize,
+    pub table: usize,
+}
+
+/// The inputs [`shard`] refuses. All are defects of the INPUT, not shapes the analysis could not
+/// shard (those are replicated).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShardRefusal {
     /// The front end stated a collective. Only the analysis places them; a stated one would be a
@@ -177,6 +235,9 @@ pub enum ShardRefusal {
     /// through its view. Gathering it would need a strided all-gather no target lowers, and no
     /// arch states this shape.
     HeadRowsEscape { op: usize },
+    /// A [`RowGather`] whose sources are not a `[m, k]` row over a `[k, n]` table, or whose row
+    /// is gathered twice.
+    MalformedGather { gather: RowGather },
 }
 
 /// The forward every rank runs, and how each rank loads its sources.
@@ -192,6 +253,9 @@ pub struct ShardedForward<T: World> {
     pub collectives: Vec<CollectiveSite>,
     /// Per op of the input forward: the placement its local op produces.
     pub placements: Vec<Placement>,
+    /// The stated [`RowGather`]s whose table split by columns — each one's row is
+    /// [`SourceShard::Partial`], and whoever fills it on a rank gathers only that rank's columns.
+    pub gathered: Vec<RowGather>,
     /// The world every rank of which runs [`Self::local`].
     pub world: core::marker::PhantomData<T>,
 }
@@ -210,7 +274,15 @@ struct Weave<'a, T: World> {
     op_map: Vec<usize>,
     /// The whole-placed local op standing for input op `j`, once a collective made one.
     whole_of: Vec<Option<usize>>,
+    /// The same, for a partial source.
+    whole_of_src: Vec<Option<usize>>,
     collectives: Vec<CollectiveSite>,
+    /// Per input op: its split is a padded block ([`SourceShard::ColBlocks`]) — readable only by
+    /// the ops that carry it to the result.
+    padded: Vec<bool>,
+    /// The vocabulary projection computing the forward's result, when it ends with one: the one
+    /// contraction whose N-split may pad.
+    result_projection: Option<usize>,
 }
 
 /// What one op's rule decided: the local op to emit, its output placement, its operands, and
@@ -245,6 +317,16 @@ impl<T: World> Weave<'_, T> {
         }
     }
 
+    /// Where operand `r` lives: its producer's placement, or a source's — whole unless it is a
+    /// gathered row's partial sum.
+    fn place_of(&self, r: InputRef) -> Placement {
+        match r {
+            InputRef::Op(j) => self.place[j],
+            InputRef::Ext(e) if self.src[e] == Some(SourceShard::Partial) => Placement::Partial,
+            InputRef::Ext(_) => Placement::Whole,
+        }
+    }
+
     /// Whether `extent` splits into `W` blocks that are each a whole number of granules.
     fn splits(&self, extent: u32) -> bool {
         extent.is_multiple_of(T::RANKS * self.granule)
@@ -260,18 +342,75 @@ impl<T: World> Weave<'_, T> {
                 heads.get().is_multiple_of(T::RANKS)
                     && self.input.sources[e].rows.is_multiple_of(heads.get())
             }
+            SourceShard::Partial
+            | SourceShard::ColBlocks { .. }
+            | SourceShard::RowBlocks { .. } => true,
         };
         fits && self.src[e].is_none_or(|s| s == want)
     }
 
+    /// How contraction `i`'s `n` output columns split, when they do: the local width and the
+    /// weight's and a per-channel scale's slice laws (`(cols law, rows law)`). Even everywhere; the
+    /// padded block ([`split_block`]) only for the result's projection.
+    fn n_split(&self, i: usize, n: u32) -> Option<(u32, SourceShard, SourceShard)> {
+        if self.splits(n) {
+            return Some((n / T::RANKS, SourceShard::Cols, SourceShard::Rows));
+        }
+        if self.result_projection != Some(i) {
+            return None;
+        }
+        let block = split_block::<T>(n, SplitGranule(NonZeroU32::new(self.granule)?))?;
+        Some((
+            block.get(),
+            SourceShard::ColBlocks { block },
+            SourceShard::RowBlocks { block },
+        ))
+    }
+
     /// The local operand standing for `r` in a WHOLE placement — the edge where the analysis
     /// weaves a collective in, once per value however many consumers demand it. A source is
-    /// already whole (it is loaded by its slice law), so only an op's output can need one.
+    /// loaded whole by its slice law unless it is a gathered row's partial sum, which is reduced
+    /// here exactly as a K-split projection's output is.
     fn whole(&mut self, r: InputRef) -> Result<InputRef, ShardRefusal> {
         match r {
             InputRef::Op(j) => self.whole_op(j).map(InputRef::Op),
+            InputRef::Ext(e) if self.place_of(r) == Placement::Partial => {
+                if let Some(k) = self.whole_of_src[e] {
+                    return Ok(InputRef::Op(k));
+                }
+                let at = self.weave(
+                    SubOp::AllReduce,
+                    CollectiveKind::AllReduce,
+                    r,
+                    self.input.sources[e].rows,
+                );
+                self.whole_of_src[e] = Some(at);
+                Ok(InputRef::Op(at))
+            }
             InputRef::Ext(_) => Ok(r),
         }
+    }
+
+    /// Push collective `op` reading the local value `reads` (`m` rows) and record its site.
+    fn weave(
+        &mut self,
+        op: SubOp<crate::subtile_ir::NeoX, crate::subtile_ir::Arch>,
+        kind: CollectiveKind,
+        reads: InputRef,
+        m: u32,
+    ) -> usize {
+        let at = self.ops.len();
+        self.ops.push(OpDesc {
+            op,
+            m,
+            inputs: vec![reads],
+        });
+        self.collectives.push(CollectiveSite {
+            op: at,
+            reads,
+            kind,
+        });
+        at
     }
 
     /// [`Self::whole`] of input op `j`'s output: the local op computing it whole — its own local
@@ -293,18 +432,8 @@ impl<T: World> Weave<'_, T> {
         if let Some(k) = self.whole_of[j] {
             return Ok(k);
         }
-        let reads = self.op_map[j];
-        let at = self.ops.len();
-        self.ops.push(OpDesc {
-            op,
-            m: self.input.ops[j].m,
-            inputs: vec![InputRef::Op(reads)],
-        });
-        self.collectives.push(CollectiveSite {
-            op: at,
-            reads,
-            kind,
-        });
+        let reads = InputRef::Op(self.op_map[j]);
+        let at = self.weave(op, kind, reads, self.input.ops[j].m);
         self.whole_of[j] = Some(at);
         Ok(at)
     }
@@ -322,19 +451,28 @@ impl<T: World> Weave<'_, T> {
         let desc = &self.input.ops[i];
         let (op, refs) = (desc.op, desc.inputs.clone());
         let mut inputs = Vec::with_capacity(refs.len());
-        let mut adopt = Vec::new();
         for r in refs {
-            if let InputRef::Ext(e) = r {
-                adopt.push((e, SourceShard::Whole));
-            }
             inputs.push(self.whole(r)?);
         }
+        let adopt = Self::whole_sources(&inputs);
         Ok(Decision {
             op,
             out: Placement::Whole,
             inputs,
             adopt,
         })
+    }
+
+    /// The sources a decision reads as they are, loaded whole. A partial source never appears:
+    /// [`Self::whole`] already stood its all-reduce in for it.
+    fn whole_sources(inputs: &[InputRef]) -> Vec<(usize, SourceShard)> {
+        inputs
+            .iter()
+            .filter_map(|r| match r {
+                InputRef::Ext(e) => Some((*e, SourceShard::Whole)),
+                InputRef::Op(_) => None,
+            })
+            .collect()
     }
 
     /// Whole sources adopted by everything but the listed operand positions.
@@ -375,23 +513,23 @@ impl<T: World> Weave<'_, T> {
         };
         let scale = desc.inputs.get(2).copied();
         let k = self.operand_shape(act).1;
-        let act_place = match act {
-            InputRef::Op(j) => self.place[j],
-            InputRef::Ext(_) => Placement::Whole,
-        };
+        let act_place = self.place_of(act);
         // The per-channel scale follows N along whichever of its axes is N long.
+        let split = self.n_split(i, n);
         let scale_on_n = |me: &Self| -> Option<(usize, SourceShard)> {
             let InputRef::Ext(se) = scale? else {
                 return None;
             };
+            let (_, cols_law, rows_law) = split?;
             let (sr, sc) = me.src_shape(se);
             let shard = if sr == n && sc != n {
-                SourceShard::Rows
+                rows_law
             } else {
-                SourceShard::Cols
+                cols_law
             };
             Some((se, shard))
         };
+        let act_padded = matches!(act, InputRef::Op(j) if self.padded[j]);
         let group_ok = |kk: u32| match weight {
             GemmWeight::Affine { affine } => kk.is_multiple_of(affine.group().get()),
             GemmWeight::Dense | GemmWeight::Fp8Dynamic => true,
@@ -399,7 +537,8 @@ impl<T: World> Weave<'_, T> {
         match act_place {
             // A split reduced axis: each rank contracts its K block — the result is partial.
             Placement::Split(Axis::Cols)
-                if self.can_adopt(we, SourceShard::Rows)
+                if !act_padded
+                    && self.can_adopt(we, SourceShard::Rows)
                     && group_ok(k / T::RANKS)
                     && scale.is_none_or(|s| match s {
                         InputRef::Ext(se) => self.can_adopt(se, SourceShard::Whole),
@@ -434,31 +573,30 @@ impl<T: World> Weave<'_, T> {
             _ => {
                 let act_whole = self.whole(act)?;
                 let scale_shard = scale_on_n(self);
-                let n_split = self.splits(n)
-                    && self.can_adopt(we, SourceShard::Cols)
-                    && scale_shard.is_none_or(|(se, s)| self.can_adopt(se, s));
+                let n_split = split.filter(|&(_, cols_law, _)| {
+                    self.can_adopt(we, cols_law)
+                        && scale_shard.is_none_or(|(se, s)| self.can_adopt(se, s))
+                });
                 let mut inputs = vec![act_whole, desc.inputs[1]];
                 if let Some(s) = scale {
                     inputs.push(s);
                 }
-                if n_split {
-                    let mut adopt = vec![(we, SourceShard::Cols)];
+                if let Some((local_n, cols_law, _)) = n_split {
+                    let mut adopt = vec![(we, cols_law)];
                     adopt.extend(scale_shard);
                     Ok(Decision {
-                        op: SubOp::MatmulTile {
-                            n: n / T::RANKS,
-                            weight,
-                        },
+                        op: SubOp::MatmulTile { n: local_n, weight },
                         out: Placement::Split(Axis::Cols),
                         inputs,
                         adopt,
                     })
                 } else {
+                    let adopt = Self::whole_sources(&inputs);
                     Ok(Decision {
                         op: desc.op,
                         out: Placement::Whole,
                         inputs,
-                        adopt: self.ext_whole_except(i, &[]),
+                        adopt,
                     })
                 }
             }
@@ -493,12 +631,18 @@ impl<T: World> Weave<'_, T> {
                 Placement::Partial => linear,
                 Placement::Split(_) => true,
             });
+        // A padded value's sources would need its padded block, and a padded column is never a
+        // value: it is carried only through source-free ops (the logit epilogues).
+        let padded = desc
+            .inputs
+            .iter()
+            .any(|r| matches!(r, InputRef::Op(j) if self.padded[*j]));
         let carried = agreed.and_then(|p| {
             let mut adopt = Vec::new();
             for r in &desc.inputs {
                 match self.follow(p, out, *r) {
                     Follow::Votes => {}
-                    Follow::Adopts(e, s) if self.can_adopt(e, s) => adopt.push((e, s)),
+                    Follow::Adopts(e, s) if !padded && self.can_adopt(e, s) => adopt.push((e, s)),
                     Follow::Adopts(..) | Follow::Blocks => return None,
                 }
             }
@@ -522,6 +666,8 @@ impl<T: World> Weave<'_, T> {
             // A narrower op operand (a broadcast row or column) would have to be whole, and no
             // non-whole placement is carried past a whole broadcast operand here.
             InputRef::Op(_) => Follow::Blocks,
+            // A partial source votes for nothing: its whole form is an all-reduce.
+            InputRef::Ext(_) if self.place_of(r) == Placement::Partial => Follow::Blocks,
             InputRef::Ext(e) => {
                 let (rows, cols) = self.src_shape(e);
                 match p {
@@ -686,6 +832,7 @@ impl<T: World> Weave<'_, T> {
             match r {
                 InputRef::Op(j) => {
                     me.place[j] == Placement::Split(Axis::Cols)
+                        && !me.padded[j]
                         && (me.shape[j].1 / T::RANKS).is_multiple_of(hd)
                 }
                 InputRef::Ext(e) => {
@@ -737,7 +884,9 @@ impl<T: World> Weave<'_, T> {
         let decided = match (self.place[j], rows) {
             (Placement::Partial, _) => Some((desc.op, Placement::Partial)),
             (Placement::Split(Axis::Cols), RowScale::Times(heads))
-                if in_cols == heads.get() * cols && heads.get().is_multiple_of(w) =>
+                if !self.padded[j]
+                    && in_cols == heads.get() * cols
+                    && heads.get().is_multiple_of(w) =>
             {
                 NonZeroU32::new(heads.get() / w).map(|lh| {
                     (
@@ -782,11 +931,28 @@ pub fn op_shapes(input: &LoweringInput) -> Vec<(u32, u32)> {
     shape
 }
 
+/// The vocabulary projection computing `input`'s result — an arity-2 contraction under
+/// single-input logit epilogues (a scale, a softcap) — as an op index.
+fn result_projection(input: &LoweringInput) -> Option<usize> {
+    let table = input.vocab_table()?;
+    let mut at = input.result;
+    loop {
+        let od = &input.ops[at];
+        match (od.op, od.inputs.as_slice()) {
+            (SubOp::MatmulTile { .. }, &[_, InputRef::Ext(w)]) if w == table => return Some(at),
+            (SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. }, &[InputRef::Op(j)]) => at = j,
+            _ => return None,
+        }
+    }
+}
+
 /// Weave tensor parallelism into `input`: the forward every rank of world `T` runs, each source's
-/// slice law, and every collective the dataflow demands. See the module docs.
+/// slice law, and every collective the dataflow demands. `gathers` are the sources the front end
+/// states as gathered rows ([`RowGather`]). See the module docs.
 pub fn shard<T: World>(
     input: &LoweringInput,
     granule: SplitGranule,
+    gathers: &[RowGather],
 ) -> Result<ShardedForward<T>, ShardRefusal> {
     let () = T::NONEMPTY;
     let n = input.ops.len();
@@ -801,8 +967,40 @@ pub fn shard<T: World>(
         ops: Vec::with_capacity(n),
         op_map: Vec::with_capacity(n),
         whole_of: vec![None; n],
+        whole_of_src: vec![None; input.sources.len()],
         collectives: Vec::new(),
+        padded: Vec::with_capacity(n),
+        result_projection: result_projection(input),
     };
+    // ⭐ THE GATHER'S RULE, DECIDED BEFORE ITS ROW IS READ. A row is read by the forward's first
+    // ops, its table by the vocabulary projection at the end; the row's placement is the table's
+    // column split, so that split is taken here, by the same test the projection's N-split uses
+    // ([`Weave::splits`] on the table's columns), and the projection finds its weight already cut
+    // the way it would cut it.
+    let mut gathered = Vec::new();
+    for &g in gathers {
+        let (Some(row), Some(table)) = (input.sources.get(g.row), input.sources.get(g.table))
+        else {
+            return Err(ShardRefusal::MalformedGather { gather: g });
+        };
+        if row.cols != table.rows || g.row == g.table || wv.src[g.row].is_some() {
+            return Err(ShardRefusal::MalformedGather { gather: g });
+        }
+        // The table's column law is the projection's own when the table is the result
+        // projection's weight (padded where that one pads), else the even law.
+        let projection = wv
+            .result_projection
+            .filter(|&p| input.ops[p].inputs.get(1) == Some(&InputRef::Ext(g.table)));
+        let law = match projection {
+            Some(p) => wv.n_split(p, table.cols).map(|(_, cols_law, _)| cols_law),
+            None => wv.splits(table.cols).then_some(SourceShard::Cols),
+        };
+        if let Some(law) = law.filter(|l| T::SHARDED && wv.can_adopt(g.table, *l)) {
+            wv.src[g.table] = Some(law);
+            wv.src[g.row] = Some(SourceShard::Partial);
+            gathered.push(g);
+        }
+    }
     for i in 0..n {
         let d = if !T::SHARDED {
             // ⭐ THE IDENTITY AT W = 1, by construction rather than by every rule happening to
@@ -827,6 +1025,20 @@ pub fn shard<T: World>(
             );
             wv.src[e] = Some(s);
         }
+        // Padded: a contraction whose local width is not an even share of its own, or an op
+        // carrying a padded operand's split on.
+        let split_cols = d.out == Placement::Split(Axis::Cols);
+        let pads = match (d.op, input.ops[i].op) {
+            (SubOp::MatmulTile { n: local, .. }, SubOp::MatmulTile { n, .. }) => {
+                local * T::RANKS != n
+            }
+            _ => false,
+        };
+        let inherits = input.ops[i]
+            .inputs
+            .iter()
+            .any(|r| matches!(r, InputRef::Op(j) if wv.padded[*j]));
+        wv.padded.push(split_cols && (pads || inherits));
         wv.op_map.push(wv.ops.len());
         wv.ops.push(OpDesc {
             op: d.op,
@@ -860,6 +1072,7 @@ pub fn shard<T: World>(
         op_map: wv.op_map,
         collectives: wv.collectives,
         placements: wv.place,
+        gathered,
         world: core::marker::PhantomData,
     })
 }
@@ -873,8 +1086,9 @@ pub fn shard<T: World>(
 pub fn shard_lowered<T: World>(
     lowered: &crate::handoff::LoweredDecode,
     granule: SplitGranule,
+    gathers: &[RowGather],
 ) -> Result<(crate::handoff::LoweredDecode, ShardedForward<T>), ShardRefusal> {
-    let sharded = shard::<T>(&lowered.input, granule)?;
+    let sharded = shard::<T>(&lowered.input, granule, gathers)?;
     let n_local = sharded.local.ops.len();
     let at = |i: usize| sharded.op_map[i];
     let mut op_tiles = vec![None; n_local];
@@ -907,9 +1121,55 @@ pub fn shard_lowered<T: World>(
     Ok((out, sharded))
 }
 
+/// ⭐ ONE STAGED COPY, ONE CUT. Every bundle of a sharded world reads the weights the world stages
+/// ONCE per rank, so a staged source (a weight, its scale, a bundle tensor) that two forwards both
+/// bind must be cut alike by both analyses. `first` and `second` pair each forward's source
+/// bindings with its slice laws ([`ShardedForward::sources`]); the first staged binding they cut
+/// apart is refused, naming the binding and both cuts. A per-step input (a gathered row, a prompt's
+/// rows, a cache) is each bundle's own and is not compared.
+pub fn staged_cut_apart<'a>(
+    first: (&'a [crate::handoff::SourceBinding], &'a [SourceShard]),
+    second: (&'a [crate::handoff::SourceBinding], &'a [SourceShard]),
+) -> Option<(&'a crate::handoff::SourceBinding, SourceShard, SourceShard)> {
+    use crate::handoff::SourceBinding as B;
+    second
+        .0
+        .iter()
+        .zip(second.1)
+        .filter(|(b, _)| {
+            matches!(
+                b,
+                B::Weight { .. } | B::WeightScale { .. } | B::BundleTensor { .. }
+            )
+        })
+        .find_map(|(b, &cut)| {
+            first
+                .0
+                .iter()
+                .zip(first.1)
+                .find(|(fb, _)| *fb == b)
+                .and_then(|(_, &other)| (other != cut).then_some((b, other, cut)))
+        })
+}
+
+/// An element the slice law can cut: a value with a ZERO, for the ranks that hold none of a
+/// [`SourceShard::Partial`] value. The host reference's `f32`, and a loader's raw element bytes
+/// (`[u8; N]`, any width).
+pub trait SliceElement: Copy {
+    const ZERO: Self;
+}
+
+impl SliceElement for f32 {
+    const ZERO: Self = 0.0;
+}
+
+impl<const N: usize> SliceElement for [u8; N] {
+    const ZERO: Self = [0; N];
+}
+
 /// THE SLICE LAW: rank `rank`'s share of a source of `shape` under `shard`. One function, read
 /// by the loader that stages a rank's weights and by [`eval_ranks`]' reference alike.
-pub fn slice_source<E: Copy, T: World>(
+pub fn slice_source<E: SliceElement, T: World>(
     full: &[E],
     shape: SourceShape,
     shard: SourceShard,
@@ -920,6 +1180,8 @@ pub fn slice_source<E: Copy, T: World>(
     debug_assert_eq!(full.len(), rows * cols, "source buffer vs its shape");
     match shard {
         SourceShard::Whole => full.to_vec(),
+        SourceShard::Partial if r == 0 => full.to_vec(),
+        SourceShard::Partial => vec![E::ZERO; full.len()],
         SourceShard::Rows => {
             let lr = rows / w;
             full[r * lr * cols..(r + 1) * lr * cols].to_vec()
@@ -941,6 +1203,34 @@ pub fn slice_source<E: Copy, T: World>(
                 .flat_map(|t| {
                     let first = t * h + r * lh;
                     full[first * cols..(first + lh) * cols].iter().copied()
+                })
+                .collect()
+        }
+        SourceShard::ColBlocks { block } => {
+            let b = block.get() as usize;
+            (0..rows)
+                .flat_map(|i| {
+                    (r * b..(r + 1) * b).map(move |c| {
+                        if c < cols {
+                            full[i * cols + c]
+                        } else {
+                            E::ZERO
+                        }
+                    })
+                })
+                .collect()
+        }
+        SourceShard::RowBlocks { block } => {
+            let b = block.get() as usize;
+            (r * b..(r + 1) * b)
+                .flat_map(|i| {
+                    (0..cols).map(move |c| {
+                        if i < rows {
+                            full[i * cols + c]
+                        } else {
+                            E::ZERO
+                        }
+                    })
                 })
                 .collect()
         }
@@ -974,17 +1264,26 @@ pub fn eval_collective<F: RopeForm>(
             }
             sum
         }
-        SubOp::AllGather { .. } => {
+        SubOp::AllGather { cols } => {
             let parts: Vec<(Vec<f32>, u32, u32)> = ranks
                 .iter()
                 .map(|b| gather(&node.inputs[0], graph, b))
                 .collect();
             let (rows, lc) = (parts[0].1 as usize, parts[0].2 as usize);
-            let mut all = Vec::with_capacity(rows * lc * ranks.len());
+            let cols = cols as usize;
+            assert!(
+                lc * ranks.len() >= cols,
+                "{} blocks of {lc} columns cannot restore {cols}",
+                ranks.len()
+            );
+            let mut all = Vec::with_capacity(rows * cols);
             for i in 0..rows {
+                let row_start = all.len();
                 for p in &parts {
                     all.extend_from_slice(&p.0[i * lc..(i + 1) * lc]);
                 }
+                // A padded last block's tail past the real width is cropped off.
+                all.truncate(row_start + cols);
             }
             all
         }
@@ -1075,7 +1374,7 @@ mod tests {
     #[test]
     fn one_rank_is_the_identity() {
         let input = one_layer_input();
-        let sf = shard::<TpWorld<1>>(&input, SplitGranule::of::<64>()).unwrap();
+        let sf = shard::<TpWorld<1>>(&input, SplitGranule::of::<64>(), &[]).unwrap();
         assert!(sf.collectives.is_empty());
         assert!(sf.sources.iter().all(|s| *s == SourceShard::Whole));
         assert_eq!(sf.local.ops.len(), input.ops.len());
@@ -1089,7 +1388,7 @@ mod tests {
     #[test]
     fn a_decode_layer_shards_as_megatron_from_the_dataflow_alone() {
         let input = one_layer_input();
-        let sf = shard::<TpWorld<4>>(&input, SplitGranule::of::<64>()).unwrap();
+        let sf = shard::<TpWorld<4>>(&input, SplitGranule::of::<64>(), &[]).unwrap();
         use SourceShard::*;
         // Sources: x, rms0, q, k, v, cos, sin, kc, vc, o, rms1, gate, up, down.
         assert_eq!(
@@ -1105,7 +1404,10 @@ mod tests {
         );
         // Each all-reduce reads a K-split projection and feeds a residual add.
         for c in &sf.collectives {
-            assert!(matches!(sf.local.ops[c.reads].op, SubOp::MatmulTile { .. }));
+            let InputRef::Op(reads) = c.reads else {
+                panic!("an all-reduce reading a source in a forward that gathers no row")
+            };
+            assert!(matches!(sf.local.ops[reads].op, SubOp::MatmulTile { .. }));
             let feeds_add = sf.local.ops.iter().any(|o| {
                 matches!(o.op, SubOp::Elementwise(crate::subtile_ir::EwKind::Add))
                     && o.inputs.contains(&InputRef::Op(c.op))
@@ -1131,7 +1433,7 @@ mod tests {
             let bufs = eval_dag(&g, &refs);
             bufs[g.result.index()].clone()
         };
-        let sf = shard::<T>(&input, SplitGranule::of::<64>()).unwrap();
+        let sf = shard::<T>(&input, SplitGranule::of::<64>(), &[]).unwrap();
         let g = lower_region(&sf.local, NB);
         let per_rank = |r: Rank<T>| -> Vec<Vec<f32>> {
             full.iter()
@@ -1181,7 +1483,7 @@ mod tests {
     #[test]
     fn an_unsplittable_attention_is_replicated_not_refused() {
         let input = one_layer_input();
-        let sf = shard::<TpWorld<16>>(&input, SplitGranule::of::<1>()).unwrap();
+        let sf = shard::<TpWorld<16>>(&input, SplitGranule::of::<1>(), &[]).unwrap();
         assert!(kinds(&sf).contains(&CollectiveKind::AllGather));
         sharded_equals_unsharded_at::<TpWorld<16>>(&input, SplitGranule::of::<1>());
     }
@@ -1191,7 +1493,7 @@ mod tests {
         let gr = lower_region(input, NB);
         let refs: Vec<&[f32]> = full.iter().map(|v| v.as_slice()).collect();
         let reference = eval_dag(&gr, &refs)[gr.result.index()].clone();
-        let sf = shard::<T>(input, g).unwrap();
+        let sf = shard::<T>(input, g, &[]).unwrap();
         let gl = lower_region(&sf.local, NB);
         let per_rank = |r: Rank<T>| -> Vec<Vec<f32>> {
             full.iter()
@@ -1217,10 +1519,12 @@ mod tests {
     fn the_handoff_facts_follow_their_ops() {
         use crate::fixtures::front_end_lowered;
         let lowered = front_end_lowered(one_layer_input());
-        let (one, _) = shard_lowered::<TpWorld<1>>(&lowered, SplitGranule::of::<64>()).unwrap();
+        let (one, _) =
+            shard_lowered::<TpWorld<1>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
         assert_eq!(format!("{one:?}"), format!("{lowered:?}"));
 
-        let (two, sf) = shard_lowered::<TpWorld<2>>(&lowered, SplitGranule::of::<64>()).unwrap();
+        let (two, sf) =
+            shard_lowered::<TpWorld<2>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
         assert_eq!(two.op_tiles.len(), two.input.ops.len());
         assert_eq!(two.op_expansion.len(), two.input.ops.len());
         for (i, &k) in sf.op_map.iter().enumerate() {
@@ -1251,8 +1555,387 @@ mod tests {
         });
         input.result = last + 1;
         assert!(matches!(
-            shard::<TpWorld<2>>(&input, SplitGranule::of::<64>()),
+            shard::<TpWorld<2>>(&input, SplitGranule::of::<64>(), &[]),
             Err(ShardRefusal::StatedCollective { .. })
         ));
+    }
+
+    /// The tied-embedding decode step: a decode layer under a final norm and a vocabulary
+    /// projection whose table is also where the layer's input row came from — `x` (source 0) is
+    /// stated as gathered from the table's columns.
+    fn tied_head_input(vocab: u32) -> (LoweringInput, RowGather) {
+        use crate::subtile_ir::GainConvention;
+        let mut input = crate::fixtures::one_layer_input_shaped(256, 128, 512, 64);
+        let h = input.sources[0].cols;
+        let gain = input.sources.len();
+        input.sources.push(SourceShape { rows: 1, cols: h });
+        let table = input.sources.len();
+        input.sources.push(SourceShape {
+            rows: h,
+            cols: vocab,
+        });
+        let norm = input.ops.len();
+        input.ops.push(OpDesc {
+            op: SubOp::RmsNorm {
+                eps: 1e-5,
+                gain: GainConvention::Scale,
+            },
+            m: 1,
+            inputs: vec![InputRef::Op(input.result), InputRef::Ext(gain)],
+        });
+        input.ops.push(OpDesc {
+            op: SubOp::MatmulTile {
+                n: vocab,
+                weight: GemmWeight::Dense,
+            },
+            m: 1,
+            inputs: vec![InputRef::Op(norm), InputRef::Ext(table)],
+        });
+        input.result = norm + 1;
+        (input, RowGather { row: 0, table })
+    }
+
+    /// ⭐ A GATHER IS A CONTRACTION. With the vocabulary table split by columns, the row gathered
+    /// out of it is a partial sum — the owner's column, zero on every other rank — and the
+    /// analysis reduces it exactly where the forward first reads it whole, as it reduces a
+    /// K-split projection: one all-reduce of the input row, the projection's all-gather at the
+    /// result, and the table cut ONCE, by columns, for both readers.
+    #[test]
+    fn a_row_gathered_from_a_split_table_is_reduced_where_it_is_first_read_whole() {
+        type W = TpWorld<2>;
+        let (input, gather) = tied_head_input(1024);
+        let sf = shard::<W>(&input, SplitGranule::of::<64>(), &[gather]).unwrap();
+        assert_eq!(sf.gathered, vec![gather]);
+        assert_eq!(sf.sources[gather.row], SourceShard::Partial);
+        assert_eq!(sf.sources[gather.table], SourceShard::Cols);
+        let first = sf.collectives[0];
+        assert_eq!(
+            (first.kind, first.reads),
+            (CollectiveKind::AllReduce, InputRef::Ext(gather.row))
+        );
+        let last = sf.collectives.last().unwrap();
+        assert_eq!(last.kind, CollectiveKind::AllGather);
+        assert_eq!(sf.local.result, last.op);
+        // The row is reduced once, however many ops read it whole.
+        let reduces_row = sf
+            .collectives
+            .iter()
+            .filter(|c| c.reads == InputRef::Ext(gather.row))
+            .count();
+        assert_eq!(reduces_row, 1);
+
+        // Every rank gathers the drawn token's column out of the block it holds — the column
+        // itself on its owner, zero elsewhere — and the forward is the unsharded one.
+        let token = 700;
+        let mut full = sources_of(&input);
+        let (h, vocab) = (input.sources[0].cols as usize, 1024usize);
+        full[gather.row] = (0..h)
+            .map(|k| full[gather.table][k * vocab + token])
+            .collect();
+        let gr = lower_region(&input, NB);
+        let refs: Vec<&[f32]> = full.iter().map(|v| v.as_slice()).collect();
+        let reference = eval_dag(&gr, &refs)[gr.result.index()].clone();
+        let gl = lower_region(&sf.local, NB);
+        let lc = vocab / W::RANKS as usize;
+        let per_rank = |r: Rank<W>| -> Vec<Vec<f32>> {
+            let mut srcs: Vec<Vec<f32>> = full
+                .iter()
+                .zip(&input.sources)
+                .zip(&sf.sources)
+                .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r))
+                .collect();
+            let origin = r.get() as usize * lc;
+            srcs[gather.row] = if (origin..origin + lc).contains(&token) {
+                let block = &srcs[gather.table];
+                (0..h).map(|k| block[k * lc + token - origin]).collect()
+            } else {
+                vec![0.0; h]
+            };
+            srcs
+        };
+        let bufs = eval_ranks(&gl, crate::subtile_ir::AttnScaleSite::InKernel, per_rank);
+        for (r, b) in bufs.iter().enumerate() {
+            let worst = b[gl.result.index()]
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-4, "rank {r}'s logits off by {worst}");
+        }
+        assert_eq!(bufs[0][gl.result.index()], bufs[1][gl.result.index()]);
+    }
+
+    /// At one rank a stated gather changes nothing: the identity is unconditional.
+    #[test]
+    fn one_rank_ignores_a_stated_gather() {
+        let (input, gather) = tied_head_input(1024);
+        let sf = shard::<TpWorld<1>>(&input, SplitGranule::of::<64>(), &[gather]).unwrap();
+        assert!(sf.gathered.is_empty() && sf.collectives.is_empty());
+        assert_eq!(format!("{:?}", sf.local), format!("{input:?}"));
+    }
+
+    /// A table that does not split leaves its row whole on every rank: nothing to reduce.
+    #[test]
+    fn a_row_gathered_from_a_whole_table_stays_whole() {
+        // One 64-column granule covers the whole vocabulary: no block law splits it.
+        let (input, gather) = tied_head_input(64);
+        let sf = shard::<TpWorld<2>>(&input, SplitGranule::of::<64>(), &[gather]).unwrap();
+        assert!(sf.gathered.is_empty());
+        assert_eq!(sf.sources[gather.row], SourceShard::Whole);
+        assert!(
+            sf.collectives
+                .iter()
+                .all(|c| c.reads != InputRef::Ext(gather.row))
+        );
+    }
+
+    /// A gather whose row is not as wide as its table is tall names no lookup, and is refused.
+    #[test]
+    fn a_malformed_gather_is_refused() {
+        let (input, _) = tied_head_input(1024);
+        // Source 3 is the k projection `[256, 128]`; source 5 is `cos`, `[1, 64]`.
+        let bad = RowGather { row: 5, table: 3 };
+        assert_eq!(
+            shard::<TpWorld<2>>(&input, SplitGranule::of::<64>(), &[bad]).unwrap_err(),
+            ShardRefusal::MalformedGather { gather: bad }
+        );
+    }
+
+    /// ⭐ THE CHAINED HEAD OVER THE SPLIT TABLE, END TO END. The two-rank forward is lowered and
+    /// the chain minted onto it exactly as onto a one-rank decode: the gather reads this rank's
+    /// column block of the table (the projection's own), the analysis's all-reduce is its rows'
+    /// one reader, and the block the mint reports is the rank's columns. Each rank then stages its
+    /// own block's decompose — the token's slab and lane on its owner, the sentinel's zero row on
+    /// the other rank — and both ranks' logits are the unsharded forward's with the token's row
+    /// staged by the host.
+    fn chained_head_over_a_split_table(vocab: u32, token: u32) {
+        use crate::subtile_ir::{
+            ChainBlock, Range, Region, SubtileId, SubtileNode, TensorId, TensorRegion, chain_l_row,
+            chain_l_seed, chain_s_row, chain_s_seed, chain_slab_entries, mint_embed_chain,
+        };
+        type W = TpWorld<2>;
+        let (input, gather) = tied_head_input(vocab);
+        let sf = shard::<W>(&input, SplitGranule::of::<64>(), &[gather]).unwrap();
+        let mut g = lower_region(&sf.local, NB);
+        let whole = |t: TensorId, s: TensorShape| TensorRegion {
+            tensor: t,
+            region: Region {
+                rows: Range::new(0, s.rows),
+                cols: Range::new(0, s.cols),
+            },
+        };
+        // The draw's stand-in: an op output, one row per request, answering pick 0 (the chain's
+        // own tests own the draw; here the stage needs only an answerable pick).
+        let logits = g.result;
+        let pick = TensorId::from_index(g.tensors.len());
+        let pick_shape = g.shape(logits);
+        g.tensors.push(pick_shape);
+        g.nodes.push(SubtileNode {
+            id: SubtileId::from_index(g.nodes.len()),
+            op: SubOp::ScalarMul { scale: 0.0 },
+            inputs: vec![whole(logits, pick_shape)],
+            output: whole(pick, pick_shape),
+        });
+        g.result = pick;
+        let lc = match sf.sources[gather.table] {
+            SourceShard::Cols => vocab / W::RANKS,
+            SourceShard::ColBlocks { block } => block.get(),
+            other => panic!("the table is cut by columns, not {other:?}"),
+        };
+        let mint = mint_embed_chain(&mut g, TensorId::from_index(gather.row), pick, vocab);
+        assert_eq!(mint.block, lc, "the gather reads this rank's block");
+        let SubOp::EmbedRowGather { .. } = g.nodes[0].op else {
+            panic!("the chain's gather is the forward's first op")
+        };
+        assert_eq!(
+            g.nodes[0].inputs[2].tensor,
+            TensorId::from_index(gather.table)
+        );
+        let rows = g.nodes[0].output.tensor;
+        let readers: Vec<bool> = g
+            .nodes
+            .iter()
+            .filter(|n| n.inputs.iter().any(|i| i.tensor == rows))
+            .map(|n| matches!(n.op, SubOp::AllReduce))
+            .collect();
+        assert_eq!(
+            readers,
+            vec![true],
+            "the gathered rows' one reader is the analysis's all-reduce"
+        );
+
+        // The reference: the one-rank forward with the token's column staged as its row.
+        let mut full = sources_of(&input);
+        let h = input.sources[0].cols as usize;
+        full[gather.row] = (0..h)
+            .map(|k| full[gather.table][k * vocab as usize + token as usize])
+            .collect();
+        let gr = lower_region(&input, NB);
+        let refs: Vec<&[f32]> = full.iter().map(|v| v.as_slice()).collect();
+        let reference = eval_dag(&gr, &refs)[gr.result.index()].clone();
+
+        // Each rank: its slices, then its own block's sticks and tables.
+        let k = chain_slab_entries(h as u64) as u32;
+        let words = |v: Vec<u32>| -> Vec<f32> { v.into_iter().map(|x| x as f32).collect() };
+        let tab_rows = g.shape(TensorId::from_index(mint.s_stick.index() + 2)).rows;
+        let per_rank = |r: Rank<W>| -> Vec<Vec<f32>> {
+            let block = ChainBlock::of_rank(lc, r);
+            let mut srcs: Vec<Vec<f32>> = full
+                .iter()
+                .zip(&input.sources)
+                .zip(&sf.sources)
+                .map(|((buf, shape), shard)| slice_source(buf, *shape, *shard, r))
+                .collect();
+            srcs.push(words(chain_s_seed(k, &[token], 1, block)));
+            srcs.push(words(chain_l_seed(&[token], h as u32, 1, block)));
+            srcs.push(
+                (0..tab_rows)
+                    .flat_map(|t| words(chain_s_row(k, t, block)))
+                    .collect(),
+            );
+            srcs.push(
+                (0..tab_rows)
+                    .flat_map(|t| words(chain_l_row(t, h as u32, block)))
+                    .collect(),
+            );
+            srcs
+        };
+        let gathered_logits = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::ScalarMul { scale } if scale == 0.0))
+            .expect("the draw's stand-in")
+            .inputs[0]
+            .tensor;
+        let bufs = eval_ranks(&g, crate::subtile_ir::AttnScaleSite::InKernel, per_rank);
+        for (r, b) in bufs.iter().enumerate() {
+            let worst = b[gathered_logits.index()]
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-4, "rank {r}'s logits off by {worst}");
+        }
+    }
+
+    /// The chain over an even split (4096 columns, two blocks of 2048) and a padded one (4000
+    /// columns, two blocks of 2048 — the last holding 1952 real ones), the token in the second
+    /// rank's block both times. Each vocabulary is a whole pick group's pad (4096), the draw's own
+    /// law for the extent its tables span.
+    #[test]
+    fn the_chained_head_over_a_split_table_is_the_unsharded_forward() {
+        chained_head_over_a_split_table(4096, 3000);
+    }
+
+    #[test]
+    fn the_chained_head_over_a_padded_table_is_the_unsharded_forward() {
+        chained_head_over_a_split_table(4000, 3000);
+    }
+
+    /// ⭐ AN UNEVEN VOCABULARY PADS ITS LAST BLOCK. 1000 columns do not split into two blocks of
+    /// whole 64-column granules; the result's projection splits anyway, each rank holding
+    /// `ceil(1000 / 2)` rounded up to 512 columns (the last 24 of rank 1's zero), and the
+    /// all-gather the result demands crops them off. The forward is the unsharded one.
+    #[test]
+    fn an_uneven_vocabulary_pads_its_last_block() {
+        type W = TpWorld<2>;
+        let (input, gather) = tied_head_input(1000);
+        let g = SplitGranule::of::<64>();
+        let sf = shard::<W>(&input, g, &[]).unwrap();
+        let block = NonZeroU32::new(512).unwrap();
+        assert_eq!(split_block::<W>(1000, g), Some(block));
+        assert_eq!(sf.sources[gather.table], SourceShard::ColBlocks { block });
+        let last = sf.collectives.last().unwrap();
+        assert_eq!(sf.local.result, last.op);
+        assert!(matches!(
+            sf.local.ops[last.op].op,
+            SubOp::AllGather { cols: 1000 }
+        ));
+        sharded_equals_unsharded_at::<W>(&input, g);
+    }
+
+    /// Padding is the result's alone: an MLP 500 wide does not split into whole granules, and
+    /// its gate and up projections stay whole — a padded column there would be read as a value
+    /// by the activation and the down projection.
+    #[test]
+    fn an_uneven_width_inside_the_forward_is_replicated_not_padded() {
+        type W = TpWorld<2>;
+        let input = crate::fixtures::one_layer_input_shaped(256, 128, 500, 64);
+        let g = SplitGranule::of::<64>();
+        let sf = shard::<W>(&input, g, &[]).unwrap();
+        // Sources 11 and 12 are gate and up.
+        assert_eq!(sf.sources[11], SourceShard::Whole);
+        assert_eq!(sf.sources[12], SourceShard::Whole);
+        assert!(sf.sources.iter().all(|s| !matches!(
+            s,
+            SourceShard::ColBlocks { .. } | SourceShard::RowBlocks { .. }
+        )));
+        sharded_equals_unsharded_at::<W>(&input, g);
+    }
+
+    /// One staged weight, two forwards: cut alike, nothing is refused; cut apart (the decode's
+    /// table by columns, a rung's whole), the binding and both cuts are named. A per-step input
+    /// cut apart (the decode's gathered row, a prompt's whole rows) is each bundle's own.
+    #[test]
+    fn a_staged_weight_cut_apart_is_refused() {
+        use crate::handoff::SourceBinding as B;
+        let w = B::Weight { id: 7, index: None };
+        let bindings = [B::EmbeddedHidden, w.clone()];
+        let decode = [SourceShard::Partial, SourceShard::Cols];
+        assert_eq!(
+            staged_cut_apart(
+                (&bindings, &decode),
+                (&bindings, &[SourceShard::Whole, SourceShard::Cols])
+            ),
+            None,
+            "a per-step row cut apart is each bundle's own"
+        );
+        assert_eq!(
+            staged_cut_apart(
+                (&bindings, &decode),
+                (&bindings, &[SourceShard::Whole, SourceShard::Whole])
+            ),
+            Some((&w, SourceShard::Cols, SourceShard::Whole))
+        );
+        // The two forwards' bindings need not share an order: a weight is matched by what it is.
+        let rung = [w.clone(), B::EmbeddedHidden];
+        assert_eq!(
+            staged_cut_apart(
+                (&bindings, &decode),
+                (&rung, &[SourceShard::Rows, SourceShard::Whole])
+            ),
+            Some((&w, SourceShard::Cols, SourceShard::Rows))
+        );
+    }
+
+    /// The padded laws cut whole buffers into blocks and zero what lies past the source.
+    #[test]
+    fn the_padded_slice_laws_zero_past_the_source() {
+        type W = TpWorld<2>;
+        let (r0, r1) = (Rank::<W>::of::<0>(), Rank::<W>::of::<1>());
+        let block = NonZeroU32::new(2).unwrap();
+        // [2, 3]: 0 1 2 / 3 4 5.
+        let full = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let shape = SourceShape { rows: 2, cols: 3 };
+        let cols = SourceShard::ColBlocks { block };
+        assert_eq!(
+            slice_source(&full, shape, cols, r0),
+            vec![0.0, 1.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            slice_source(&full, shape, cols, r1),
+            vec![2.0, 0.0, 5.0, 0.0]
+        );
+        // [3, 2]: 0 1 / 2 3 / 4 5.
+        let shape = SourceShape { rows: 3, cols: 2 };
+        let rows = SourceShard::RowBlocks { block };
+        assert_eq!(
+            slice_source(&full, shape, rows, r0),
+            vec![0.0, 1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            slice_source(&full, shape, rows, r1),
+            vec![4.0, 5.0, 0.0, 0.0]
+        );
     }
 }

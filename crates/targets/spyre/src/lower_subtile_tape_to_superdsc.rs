@@ -2462,9 +2462,14 @@ pub(crate) struct StagedWeightView<'a> {
     /// graph OUTPUT stages that output's INITIAL bytes — the ops overwrite
     /// them wherever they compute — so the reference legs take them through
     /// [`Self::stage_load_consts`] at buffer init instead, never through the
-    /// read-time channel.
-    pub load_consts: &'a [(u32, crate::wiring::LoadConst)],
+    /// read-time channel. Each entry is already BUILT (`LoadConst::build`) for
+    /// the rank the probe stages — a chained head's tables are its rank's
+    /// vocabulary block — so the view carries no rank of its own.
+    pub load_consts: &'a [BuiltConst],
 }
+
+/// One load-time constant, built for its staging rank: `(tid, bytes, dtype)`.
+pub(crate) type BuiltConst = (u32, Vec<u8>, scratchy_tensors::DType);
 
 impl StagedWeightView<'_> {
     /// The f32 image of staged weight `tid` in the LOGICAL `[rows, cols]`
@@ -2527,12 +2532,12 @@ impl StagedWeightView<'_> {
     /// covering slice left unallocated is skipped with it — nothing bound
     /// reads it.
     pub(crate) fn stage_load_consts(&self, bufs: &mut [Vec<f32>], floor: usize) {
-        for &(tid, kind) in self.load_consts {
+        for (tid, bytes, dt) in self.load_consts {
+            let (tid, dt) = (*tid, *dt);
             let i = tid as usize;
             if i < floor || i >= bufs.len() || bufs[i].is_empty() {
                 continue;
             }
-            let (bytes, dt, _shape) = kind.build();
             let vals: Vec<f32> = match dt {
                 scratchy_tensors::DType::F16 => bytes
                     .as_chunks::<2>()
@@ -3727,7 +3732,7 @@ struct GateProbe {
     view_bytes: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)>,
     gemm: std::collections::HashSet<u32>,
     scale_rows: std::collections::HashSet<u32>,
-    load_consts: Vec<(u32, crate::wiring::LoadConst)>,
+    load_consts: Vec<BuiltConst>,
     staged_rope: std::collections::HashMap<u32, Vec<f32>>,
     sources: Vec<(u64, Vec<f32>, Vec<usize>)>,
 }
@@ -3740,6 +3745,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     prefill: Option<&PrefillGate>,
     active_cap: ActiveCap,
     seed: &dyn Fn(u32) -> usize,
+    // The rank this probe stages — `None` for the one-rank gate. A chained head's decompose
+    // tables are this rank's vocabulary block (`LoadConst::build`).
+    seat: Option<crate::bundle_code::collective::Rank<T>>,
 ) -> Result<GateProbe, String> {
     // ── The fold list the scales manifest's skip set states ──
     let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
@@ -3782,10 +3790,13 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let load_const_tids: std::collections::HashSet<u32> =
         load_consts.iter().map(|&(tid, _)| tid).collect();
     let weights_ref = emu_weights.clone();
+    let mut built: Vec<BuiltConst> = Vec::with_capacity(load_consts.len());
     for &(tid, kind) in &load_consts {
-        let (bytes, dt, shape) = kind.build();
+        let (bytes, dt, shape) = kind.build(seat);
+        built.push((tid, bytes.clone(), dt));
         emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
     }
+    let load_consts = built;
     // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
     // states (`eval_golden_buffers`' seat block), staged into the session at
     // the operands' TRUE dtypes so neither rides `run_step`'s f16-only
@@ -4357,9 +4368,15 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         load_consts,
         staged_rope,
         sources,
-    } = stage_gate_probe::<T, F>(ir, weight_ids, covering, prefill, rung.active_cap, &|tid| {
-        tid as usize
-    })?;
+    } = stage_gate_probe::<T, F>(
+        ir,
+        weight_ids,
+        covering,
+        prefill,
+        rung.active_cap,
+        &|tid| tid as usize,
+        None,
+    )?;
     let view = StagedWeightView {
         bytes: &view_bytes,
         gemm: &gemm,
@@ -5030,6 +5047,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             prefill,
             active_cap,
             &seed(me.get() as usize),
+            Some(*me),
         )?);
     }
     let golden_index = GoldenIndex::of(ir);
