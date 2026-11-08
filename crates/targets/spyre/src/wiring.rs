@@ -154,6 +154,11 @@ pub struct BakeFacts {
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
     pub scalarmul_scales: &'static [f32],
+    /// The row-then-column scale fold's two zero operands (`ZERO_ROW_TID`, `ZERO_COL_TID`), in f16
+    /// elements — each placement's own size, so the bind fills exactly the bytes the bake reserved.
+    /// 0 when unplaced (a bundle with no fp8 dequant).
+    pub zero_row_len: usize,
+    pub zero_col_len: usize,
 }
 
 impl BakeFacts {
@@ -164,6 +169,8 @@ impl BakeFacts {
         ones_reduce_len: None,
         uses_identity: false,
         scalarmul_scales: &[],
+        zero_row_len: 0,
+        zero_col_len: 0,
     };
 
     /// Read them off the generated layout.
@@ -180,6 +187,12 @@ impl BakeFacts {
                 // emit-side type and cannot outlive this call, so it is not a case to serve.
                 std::borrow::Cow::Owned(_) => &[],
             },
+            zero_row_len: layout
+                .place_of_tid(sd::ZERO_ROW_TID)
+                .map_or(0, |p| (p.size / 2) as usize),
+            zero_col_len: layout
+                .place_of_tid(sd::ZERO_COL_TID)
+                .map_or(0, |p| (p.size / 2) as usize),
         }
     }
 
@@ -228,6 +241,8 @@ impl BakeFacts {
             rope_class_hds: w.rope_class_hds,
             attn_class_hds: w.attn_class_hds,
             rms_invcols: w.rms_invcols,
+            zero_row_len: self.zero_row_len,
+            zero_col_len: self.zero_col_len,
         }
     }
 }
@@ -2163,6 +2178,9 @@ pub struct ConstantEnv {
     /// as a subslice rather than copied into a fresh `vec![sc]` per scale per forward. The array
     /// is already a `static` the macro emitted onto the layout, so the borrow is real.
     pub scalarmul_scales: &'static [f32],
+    /// See [`BakeFacts::zero_row_len`] — the placements' own element counts, 0 when unplaced.
+    pub zero_row_len: usize,
+    pub zero_col_len: usize,
 }
 
 // ── THE CONSTANTS THAT ARE LITERALLY CONSTANT ───────────────────────────────
@@ -2297,6 +2315,17 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     out.push((sd::FP8_POS448_TID, ConstValues::Borrowed(&FP8_POS448)));
     out.push((sd::FP8_NEG448_TID, ConstValues::Borrowed(&FP8_NEG448)));
     out.push((sd::FP8_INV448_TID, ConstValues::Borrowed(&FP8_INV448)));
+    // The row-then-column scale fold's zero mean and zero β — bound iff placed, at the placement's
+    // own length (an unplaced zero is never read; a short one would leave the tail of the read
+    // whatever the segment held, a nonzero mean or β that is not this fold's function).
+    for (tid, len) in [
+        (sd::ZERO_ROW_TID, env.zero_row_len),
+        (sd::ZERO_COL_TID, env.zero_col_len),
+    ] {
+        if len > 0 {
+            out.push((tid, ConstValues::Fill { value: 0.0, len }));
+        }
+    }
 
     // Multi-row rmsnorm only: at rows == 1 the reduce is a plain reduce-MAX and
     // neither constant is read (a decode bundle still PLACES `RMS_INVCOLS`,
@@ -2590,7 +2619,42 @@ mod constant_tape_tests {
             rope_class_hds: &[64],
             attn_class_hds: &[64],
             rms_invcols: Vec::leak(vec![1.0f32 / 2048.0; 64]),
+            // A bundle with an fp8 dequant fold: both zeros placed.
+            zero_row_len: 64,
+            zero_col_len: 2048,
         }
+    }
+
+    /// ⭐ THE FOLD's ZEROS ARE BOUND AT THEIR PLACEMENTS' OWN LENGTHS, AND ONLY WHEN PLACED. A short
+    /// bind would leave a tail of whatever the segment held — a nonzero mean or β, which is not the
+    /// fold's function — and binding an unplaced tid would be a write to no tensor.
+    #[test]
+    fn the_scale_fold_zeros_bind_at_their_placements_and_only_when_placed() {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        let consts = synthetic_constants(&env(1));
+        let find = |tid: u32| consts.iter().find(|(t, _)| *t == tid).map(|(_, v)| v);
+        for (tid, len) in [(sd::ZERO_ROW_TID, 64), (sd::ZERO_COL_TID, 2048)] {
+            match find(tid) {
+                Some(ConstValues::Fill { value, len: l }) => {
+                    assert_eq!(*value, 0.0, "t{tid} binds zeros");
+                    assert_eq!(*l, len, "t{tid} binds its placement's length");
+                }
+                Some(_) => panic!("t{tid}: want a zero fill, got a table"),
+                None => panic!("t{tid}: placed but not bound"),
+            }
+        }
+        let unplaced = ConstantEnv {
+            zero_row_len: 0,
+            zero_col_len: 0,
+            ..env(1)
+        };
+        let consts = synthetic_constants(&unplaced);
+        assert!(
+            !consts
+                .iter()
+                .any(|(t, _)| *t == sd::ZERO_ROW_TID || *t == sd::ZERO_COL_TID),
+            "an unplaced zero binds nothing"
+        );
     }
 
     /// ⭐ THE EQUIVALENCE THAT MAKES THE PORT SAFE: playing the constant tape
