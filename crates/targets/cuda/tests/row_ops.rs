@@ -1097,3 +1097,323 @@ fn the_add_norm_folds_are_their_chains_bit_for_bit() {
     }
     assert!(pass, "an add-norm fold differs from its chain");
 }
+
+// ── FP8 S8 W1: the one-row norms ───────────────────────────────────
+
+/// The four norm forms, one launch each over `(rows, cols)`: `x` (and `b`, the addend or the
+/// residual), `g`, `offset`. Returns the output(s) of row 0 and whether every tail held:
+/// `[y]`, or `[sum, y]` for `ADD_NORM`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NormForm {
+    Norm,
+    Unit,
+    AddNorm,
+    NormAdd,
+}
+
+fn run_form(
+    device: &CudaDevice,
+    form: NormForm,
+    (x, b, g): (&[u16], &[u16], &[u16]),
+    (rows, cols): (usize, usize),
+    offset: f32,
+    pad: usize,
+) -> (Vec<Vec<u16>>, bool) {
+    // `pad` elements of SENTINEL before each input and output: the same row at another address.
+    let up = |v: &[u16]| {
+        let mut h = vec![SENTINEL; pad];
+        h.extend_from_slice(v);
+        DeviceBuffer::upload(device, &h).expect("upload")
+    };
+    let (xb, bb, gb) = (up(x), up(b), up(g));
+    let n = rows * cols;
+    let (y, sum) = (output(device, pad + n), output(device, pad + n));
+    let at = |d: &DeviceBuffer| d.ptr().wrapping_byte_add(2 * pad);
+    let dims = (rows as u32, cols as u32);
+    let null = std::ptr::null_mut();
+    // SAFETY: cudaMalloc pointers are 256-byte aligned and `pad` is a multiple of 8 bf16 (16
+    // bytes); every buffer holds `pad` + rows·cols elements (gains `pad` + cols) past its start;
+    // each output is its own allocation; null is the default stream.
+    let r = unsafe {
+        match form {
+            NormForm::Norm => rms_norm_bf16(at(&xb), at(&gb), at(&y), dims, EPS, offset, null),
+            NormForm::Unit => rms_norm_unit_bf16(at(&xb), at(&y), dims, EPS, null),
+            NormForm::AddNorm => add_rms_norm_bf16(
+                (at(&xb), at(&bb)),
+                at(&gb),
+                (at(&sum), at(&y)),
+                dims,
+                (EPS, offset),
+                null,
+            ),
+            NormForm::NormAdd => norm_add_bf16(
+                (at(&xb), at(&bb)),
+                at(&gb),
+                at(&y),
+                dims,
+                (EPS, offset),
+                null,
+            ),
+        }
+    };
+    r.expect("a norm launch");
+    let take = |d: &DeviceBuffer| {
+        let (all, tail) = result(d, pad + n);
+        let head = all[..pad].iter().all(|&v| v == SENTINEL);
+        (all[pad..pad + cols].to_vec(), tail && head)
+    };
+    let (yr, yt) = take(&y);
+    if form == NormForm::AddNorm {
+        let (sr, st) = take(&sum);
+        (vec![sr, yr], yt && st)
+    } else {
+        (vec![yr], yt)
+    }
+}
+
+/// `row` as row 0 of `rows` rows, the others zero.
+fn as_row0(row: &[u16], rows: usize) -> Vec<u16> {
+    let mut v = row.to_vec();
+    v.resize(rows * row.len(), 0);
+    v
+}
+
+/// The widths of the three FP8 models' norms (27B 5,120 and its 6,144 GDN out; 35B 2,048;
+/// Gemma 2,816 and its 256/512 head norms; the 128-wide q/k norms), a power of two each side, and
+/// two partial last tiles.
+const ONE_ROW_COLS: [usize; 12] = [
+    128, 256, 512, 704, 1024, 2048, 2112, 2816, 4096, 5120, 6144, 8192,
+];
+
+/// FP8 S8 W1 Step A: at `rows == 1` every norm form (the norm, the unit norm, `ADD_NORM` with its
+/// sum, `NORM_ADD`) takes the one-row kernel (`col_tiles` CTAs), and its output is the 16-row
+/// kernel's bits for the same row: the row as row 0 of a 16-row launch, and of a 2-row launch,
+/// both today's kernel. At every width in [`ONE_ROW_COLS`], gain offsets 0 and 1, 3 seeds, plus an
+/// all-zero row and a row of ±65,504 (whose squares overflow to inf, as today). Every output's
+/// tail is intact.
+#[test]
+fn the_one_row_norms_are_the_16_row_norms_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let forms = [
+        NormForm::Norm,
+        NormForm::Unit,
+        NormForm::AddNorm,
+        NormForm::NormAdd,
+    ];
+    for cols in ONE_ROW_COLS {
+        let mut rows_in: Vec<(String, Vec<u16>, Vec<u16>)> = (0..3u64)
+            .map(|s| {
+                let seed = 0x0E01_0000 ^ (cols as u64) << 8 ^ s;
+                (
+                    format!("seed{s}"),
+                    bf16_inputs(cols, seed),
+                    bf16_inputs(cols, seed ^ 0x55),
+                )
+            })
+            .collect();
+        rows_in.push(("zeros".into(), vec![0; cols], vec![0; cols]));
+        let big: Vec<u16> = (0..cols)
+            .map(|c| bits(if c % 2 == 0 { 65504.0 } else { -65504.0 }))
+            .collect();
+        rows_in.push(("max".into(), big.clone(), big));
+        for (what, x, b) in &rows_in {
+            for offset in [SCALE, ONE_PLUS_SCALE] {
+                let g = match offset {
+                    SCALE => bf16_inputs(cols, 0x0E02_0000 ^ cols as u64),
+                    _ => centred_gains(cols, 0x0E03_0000 ^ cols as u64),
+                };
+                for form in forms {
+                    if form == NormForm::Unit && offset != SCALE {
+                        continue;
+                    }
+                    let (one, t1) = run_form(&device, form, (x, b, &g), (1, cols), offset, 0);
+                    let mut ok = t1;
+                    let mut line = String::new();
+                    for rows in [16usize, 2] {
+                        let (want, t) = run_form(
+                            &device,
+                            form,
+                            (&as_row0(x, rows), &as_row0(b, rows), &g),
+                            (rows, cols),
+                            offset,
+                            0,
+                        );
+                        let m: usize = one
+                            .iter()
+                            .zip(&want)
+                            .map(|(o, w)| mismatched_bits(o, w))
+                            .sum();
+                        line += &format!(" vs rows={rows} mismatched_bits={m}");
+                        ok &= t && m == 0;
+                    }
+                    eprintln!(
+                        "one-row {form:?} cols={cols} offset={offset} {what}:{line} tails_intact={t1} {}",
+                        verdict(ok)
+                    );
+                    pass &= ok;
+                }
+            }
+        }
+    }
+    assert!(pass, "a one-row norm differs from the 16-row norm");
+}
+
+/// The one-row norms repeat bit for bit, and give the same bits at another buffer address (the
+/// inputs and outputs shifted by 64 elements), at the three models' widths.
+#[test]
+fn the_one_row_norms_repeat_and_ignore_placement() {
+    let device = h100();
+    let mut pass = true;
+    for cols in [2048usize, 2816, 5120] {
+        let x = bf16_inputs(cols, 0x0E04_0000 ^ cols as u64);
+        let b = bf16_inputs(cols, 0x0E05_0000 ^ cols as u64);
+        let g = centred_gains(cols, 0x0E06_0000 ^ cols as u64);
+        for form in [
+            NormForm::Norm,
+            NormForm::Unit,
+            NormForm::AddNorm,
+            NormForm::NormAdd,
+        ] {
+            let first = run_form(&device, form, (&x, &b, &g), (1, cols), ONE_PLUS_SCALE, 0);
+            let again = run_form(&device, form, (&x, &b, &g), (1, cols), ONE_PLUS_SCALE, 0);
+            let moved = run_form(&device, form, (&x, &b, &g), (1, cols), ONE_PLUS_SCALE, 64);
+            let diff = |a: &[Vec<u16>], b: &[Vec<u16>]| -> usize {
+                a.iter().zip(b).map(|(x, y)| mismatched_bits(x, y)).sum()
+            };
+            let (r, p) = (diff(&first.0, &again.0), diff(&first.0, &moved.0));
+            let ok = r == 0 && p == 0 && first.1 && again.1 && moved.1;
+            eprintln!(
+                "one-row {form:?} cols={cols}: repeat mismatched_bits={r} moved mismatched_bits={p} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "a one-row norm did not repeat, or depends on its address"
+    );
+}
+
+/// `cudaEvent_t`, declared here for the timing lines only (the runtime declares no event call).
+type CudaEvent = *mut std::ffi::c_void;
+
+unsafe extern "C" {
+    fn cudaEventCreate(event: *mut CudaEvent) -> i32;
+    fn cudaEventRecord(event: CudaEvent, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: CudaEvent) -> i32;
+    fn cudaEventElapsedTime(ms: *mut f32, start: CudaEvent, end: CudaEvent) -> i32;
+    fn cudaEventDestroy(event: CudaEvent) -> i32;
+    fn cudaMemsetAsync(
+        dst: *mut std::ffi::c_void,
+        value: i32,
+        bytes: usize,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+/// The bytes cleared before a cold run: twice the H100's 50 MiB L2.
+const SCRUB_BYTES: usize = 128 << 20;
+
+/// The median µs of 20 launches after 3 warm-ups, each between two CUDA events on the default
+/// stream; `scrub` (when given) cleared before each, so the row is read from DRAM, not L2.
+fn event_median(scrub: Option<&DeviceBuffer>, mut launch: impl FnMut()) -> f64 {
+    let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event
+    // is destroyed below.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut start), 0, "cudaEventCreate");
+        assert_eq!(cudaEventCreate(&mut end), 0, "cudaEventCreate");
+    }
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let mut ms = 0.0f32;
+        // SAFETY: as above; `scrub` is a live allocation of `SCRUB_BYTES`.
+        unsafe {
+            if let Some(s) = scrub {
+                assert_eq!(
+                    cudaMemsetAsync(s.ptr(), i, SCRUB_BYTES, std::ptr::null_mut()),
+                    0
+                );
+            }
+            assert_eq!(cudaEventRecord(start, std::ptr::null_mut()), 0, "record");
+            launch();
+            assert_eq!(cudaEventRecord(end, std::ptr::null_mut()), 0, "record");
+            assert_eq!(cudaEventSynchronize(end), 0, "synchronize");
+            assert_eq!(cudaEventElapsedTime(&mut ms, start, end), 0, "elapsed");
+        }
+        if i >= 3 {
+            times.push(f64::from(ms) * 1e3);
+        }
+    }
+    // SAFETY: both events were created above and are no longer used.
+    unsafe {
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// Recorded, not asserted (W1's prototype gate reads it): µs per launch of each norm form at
+/// `rows == 1` (the one-row kernel) and at `rows == 2` (today's 16-row kernel on one CTA, the
+/// time W0 measured in the tape), hot and with L2 cleared, at the three models' widths.
+#[test]
+fn the_one_row_norm_times_are_recorded() {
+    let device = h100();
+    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
+    for cols in [2048usize, 2816, 5120, 6144] {
+        let x = bf16_inputs(2 * cols, 0x0E07_0000 ^ cols as u64);
+        let b = bf16_inputs(2 * cols, 0x0E08_0000 ^ cols as u64);
+        let g = centred_gains(cols, 0x0E09_0000 ^ cols as u64);
+        let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+        let (xb, bb, gb) = (up(&x), up(&b), up(&g));
+        let (y, sum) = (output(&device, 2 * cols), output(&device, 2 * cols));
+        for form in [NormForm::Norm, NormForm::AddNorm, NormForm::NormAdd] {
+            let mut line = format!("norm time {form:?} cols={cols}:");
+            for rows in [1u32, 2] {
+                let dims = (rows, cols as u32);
+                let launch = || {
+                    let null = std::ptr::null_mut();
+                    // SAFETY: as `run_form`'s with no padding; every buffer holds 2·cols.
+                    let r = unsafe {
+                        match form {
+                            NormForm::Norm => rms_norm_bf16(
+                                xb.ptr(),
+                                gb.ptr(),
+                                y.ptr(),
+                                dims,
+                                EPS,
+                                ONE_PLUS_SCALE,
+                                null,
+                            ),
+                            NormForm::AddNorm => add_rms_norm_bf16(
+                                (xb.ptr(), bb.ptr()),
+                                gb.ptr(),
+                                (sum.ptr(), y.ptr()),
+                                dims,
+                                (EPS, ONE_PLUS_SCALE),
+                                null,
+                            ),
+                            _ => norm_add_bf16(
+                                (xb.ptr(), bb.ptr()),
+                                gb.ptr(),
+                                y.ptr(),
+                                dims,
+                                (EPS, SCALE),
+                                null,
+                            ),
+                        }
+                    };
+                    r.expect("a timed norm launch");
+                };
+                let hot = event_median(None, launch);
+                let cold = event_median(Some(&scrub), launch);
+                let kernel = if rows == 1 { "one-row" } else { "16-row" };
+                line += &format!(" rows={rows} ({kernel}) hot {hot:.2} us cold {cold:.2} us;");
+            }
+            eprintln!("{line}");
+        }
+    }
+}

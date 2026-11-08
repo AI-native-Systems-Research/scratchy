@@ -1306,6 +1306,10 @@ pub unsafe fn gemm_col64_bf16_abt(
 // ThunderKittens' host code (a tensor-map encode), `KernelError::HostException`. Each is a
 // ThunderKittens 16-row tile kernel whose dynamic shared memory is over the default 48 KiB, so
 // each is in `PREPARE`, which must have run on the current device first.
+//
+// At `rows == 1` the four RMSNorm launchers (the norm, the unit norm, and the add-norm folds) take
+// `kernels/rms_norm_bf16.cu`'s one-row form (FP8 S8 W1): one CTA per 256-column tile, each
+// computing the row's sum of squares in the 16-row kernel's order, so the bits are its bits.
 
 /// Launch the bf16 RMSNorm: `y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps) · (gain_offset +
 /// gain[c])`, `x` and `y` `[rows, cols]`, `gain` `[cols]`, in f32 with one bf16 rounding per

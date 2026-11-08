@@ -51,6 +51,23 @@
 // is no longer fused into its sum (`mul`, then `row_sum`): one more rounding per element, within
 // the bound's 2⁻⁸.
 //
+// THE ONE-ROW FORM (`rms_norm_one_row_ker<FORM>`, FP8 S8 W1): at `rows == 1` (every decode step)
+// the 16-row kernel is one CTA walking the whole row on one SM. The launcher then takes this
+// kernel instead, the same bits on `col_tiles` CTAs, chosen from `rows` alone (a constant of each
+// step), with no cross-CTA read and no scratch:
+//   - CTA `c` owns column tile `c`. Its 4 warps each take the tiles `w, w + 4, …` of the row as
+//     the 16-row kernel's do, and build `part_w` the same way: tile `t`'s sum of squares by the
+//     same `warp::load`, `warp::mul` and 3-operand `warp::row_sum(part, x², part)`, in ascending
+//     `t`. Then the four `part_w` are added in warp order, `rms_inv`, all as the 16-row kernel.
+//     So every CTA computes the row's `inv` itself, in today's order: the same bits on every CTA.
+//     The cost is that each CTA reads the whole row (and, under `ADD_NORM`, `b`): L2 traffic of
+//     `col_tiles · 2 · cols` bytes, which a one-row norm affords.
+//   - Then CTA `c`'s warp 0 runs pass 2 on tile `c` only: the 16-row kernel's pass-2 body, the
+//     same TK ops in the same order. `ADD_NORM`'s sum is stored by the owner too.
+//   - A one-row tile is still `st_bf<16, 256, false>`: rows 1..15 of the box are past the
+//     array's one row, so they read zeros and store nothing (TK-1's R1 gate), as the 16-row
+//     kernel's padding rows do. So each element's arithmetic is unchanged.
+//
 // Built with `--use_fast_math` (build.rs): `rsqrtf` is the approximate reciprocal square root, as
 // before. Shared memory: 4 warps × 2 stages × (two 8 KiB tiles and a 512-byte gain vector), and
 // the four 64-byte sums, plus 1,024 bytes of alignment slack, set once by
@@ -255,9 +272,143 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_bf16_ker(
     warp::tma::store_async_wait();
 }
 
-// Build the views and launch `rms_norm_bf16_ker<FORM>`. Can throw (a tensor-map encode); the
-// caller catches. `gain` is never read under `UNIT`, `other` only by the residual folds and `sum`
-// only by `ADD_NORM`, but every view is still built (the callers give a valid address).
+// `rows == 1`: CTA `blockIdx.x` owns column tile `blockIdx.x`. Pass 1 is the 16-row kernel's, on
+// the one row block: every CTA computes the whole row's `inv` in the same order. Pass 2 is the
+// 16-row kernel's on the owned tile only, by warp 0.
+template <int FORM>
+__global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_one_row_ker(
+    const __grid_constant__ rms_globals g) {
+    constexpr bool GAIN = FORM != UNIT;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    tile(&x_smem)[WARPS][STAGES] = al.allocate<tile, WARPS, STAGES>();
+    tile(&o_smem)[WARPS][STAGES] = al.allocate<tile, WARPS, STAGES>();
+    gain_vec(&g_smem)[WARPS][STAGES] = al.allocate<gain_vec, WARPS, STAGES>();
+    sums_vec(&sums)[WARPS] = al.allocate<sums_vec, WARPS>();
+    __shared__ kittens::semaphore arrived[WARPS][STAGES];
+    __shared__ kittens::semaphore owned;
+
+    const int w = kittens::warpid();
+    const int t_own = blockIdx.x;
+    const int mine = (g.col_tiles - w + WARPS - 1) / WARPS;
+    if (warp::laneid() == 0) {
+        for (int s = 0; s < STAGES; s++) {
+            init_semaphore(arrived[w][s], 0, 1);
+        }
+        if (w == 0) {
+            init_semaphore(owned, 0, 1);
+        }
+    }
+    __syncwarp();
+    // Pass 1's load `i` of this warp's `mine` tiles, the 16-row kernel's `issue` at `i < mine`.
+    auto issue = [&](int i) {
+        const int stage = i % STAGES, t = w + i * WARPS;
+        coord<tile> at = {0, 0, 0, t};
+        warp::tma::expect_bytes(arrived[w][stage],
+                                sizeof(tile) + (FORM == ADD_NORM ? sizeof(tile) : 0));
+        warp::tma::load_async(x_smem[w][stage], g.x, at, arrived[w][stage]);
+        if constexpr (FORM == ADD_NORM) {
+            warp::tma::load_async(o_smem[w][stage], g.other, at, arrived[w][stage]);
+        }
+    };
+
+    // Pass 1: this warp's sums of squares, the 16-row kernel's loop with no sum store.
+    row_values part;
+    warp::zero(part);
+    if (mine > 0) {
+        issue(0);
+    }
+    for (int i = 0; i < mine; i++) {
+        const int stage = i % STAGES;
+        __syncwarp();
+        if (i + 1 < mine) {
+            issue(i + 1);
+        }
+        wait(arrived[w][stage], (i / STAGES) % 2);
+        acc_tile x;
+        warp::load(x, x_smem[w][stage]);
+        if constexpr (FORM == ADD_NORM) {
+            acc_tile b;
+            warp::load(b, o_smem[w][stage]);
+            warp::add(x, x, b);
+            round_bf16(x);
+        }
+        warp::mul(x, x, x);
+        warp::row_sum(part, x, part);
+    }
+    warp::store(sums[w], part);
+    warpgroup::sync(SUMS_BARRIER);
+    // The four partial sums in warp order, as the 16-row kernel; then `inv`.
+    row_values total, other;
+    warp::load(total, sums[0]);
+    for (int v = 1; v < WARPS; v++) {
+        warp::load(other, sums[v]);
+        warp::add(total, total, other);
+    }
+    row_values inv;
+    warp::div(inv, total, g.cols);
+    warp::bin_op<scratchy::ops::rms_inv>(inv, inv, g.eps);
+    if (w != 0) {
+        return;
+    }
+
+    // Pass 2 on the owned tile only: the 16-row kernel's pass-2 body, on stage 0's tiles (pass 1
+    // waited on every load it issued, so none is in flight) and its own semaphore.
+    __syncwarp();
+    {
+        coord<tile> at = {0, 0, 0, t_own};
+        constexpr bool OTHER = FORM == ADD_NORM || FORM == NORM_ADD;
+        warp::tma::expect_bytes(owned, sizeof(tile) + (OTHER ? sizeof(tile) : 0) +
+                                           (GAIN ? sizeof(gain_vec) : 0));
+        warp::tma::load_async(x_smem[0][0], g.x, at, owned);
+        if constexpr (OTHER) {
+            warp::tma::load_async(o_smem[0][0], g.other, at, owned);
+        }
+        if constexpr (GAIN) {
+            coord<gain_vec> gat = {0, 0, 0, t_own};
+            warp::tma::load_async(g_smem[0][0], g.gain, gat, owned);
+        }
+    }
+    wait(owned, 0);
+    acc_tile x;
+    warp::load(x, x_smem[0][0]);
+    if constexpr (FORM == ADD_NORM) {
+        acc_tile b;
+        warp::load(b, o_smem[0][0]);
+        warp::add(x, x, b);
+        round_bf16(x);
+        // The owner stores the tile's sum, as the 16-row kernel's pass 1 does: the same rounded
+        // bits. Through its own tile, so pass 2's `x` stays in registers.
+        warp::store(o_smem[0][1], x);
+        __syncwarp();
+        coord<tile> sat = {0, 0, 0, t_own};
+        warp::tma::store_async(g.sum, o_smem[0][1], sat);
+    }
+    warp::mul_row(x, x, inv);
+    if constexpr (GAIN) {
+        col_values gain;
+        warp::load(gain, g_smem[0][0]);
+        warp::add(gain, gain, g.gain_offset);
+        warp::mul_col(x, x, gain);
+    }
+    if constexpr (FORM == NORM_ADD) {
+        acc_tile r;
+        round_bf16(x);
+        warp::load(r, o_smem[0][0]);
+        warp::add(x, x, r);
+    }
+    warp::store(x_smem[0][1], x);
+    __syncwarp();
+    coord<tile> at = {0, 0, 0, t_own};
+    warp::tma::store_async(g.y, x_smem[0][1], at);
+    warp::tma::store_async_wait();
+}
+
+// Build the views and launch `rms_norm_bf16_ker<FORM>`, or at `rows == 1` the one-row form
+// `rms_norm_one_row_ker<FORM>` (`col_tiles` CTAs, the same bits). Can throw (a tensor-map
+// encode); the caller catches. `gain` is never read under `UNIT`, `other` only by the residual
+// folds and `sum` only by `ADD_NORM`, but every view is still built (the callers give a valid
+// address).
 template <int FORM>
 int launch(const void* x, const void* gain, void* y, const void* other, void* sum, uint32_t rows,
            uint32_t cols, float eps, float gain_offset, cudaStream_t stream) {
@@ -272,6 +423,11 @@ int launch(const void* x, const void* gain, void* y, const void* other, void* su
     rms_globals G{view(x),  gg,        view(y),     view(other), view(sum),
                   col_tiles, float(cols), eps,       gain_offset};
     void* args[] = {&G};
+    if (rows == 1) {
+        const dim3 grid(uint32_t(col_tiles)), block(NUM_THREADS);
+        return static_cast<int>(cudaLaunchKernel(rms_norm_one_row_ker<FORM>, grid, block, args,
+                                                 RMS_SMEM_BYTES, stream));
+    }
     const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
     return static_cast<int>(
         cudaLaunchKernel(rms_norm_bf16_ker<FORM>, grid, block, args, RMS_SMEM_BYTES, stream));
@@ -284,14 +440,16 @@ bool refused(uint32_t rows, uint32_t cols) {
 
 }  // namespace
 
-// The kernel's one-time setup: allow the four forms `RMS_SMEM_BYTES` of dynamic shared memory on
-// the current device (the default limit is 48 KB). Run once per device before any launch
-// (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
+// The kernel's one-time setup: allow the four forms, and their one-row instances, `RMS_SMEM_BYTES`
+// of dynamic shared memory on the current device (the default limit is 48 KB). Run once per device
+// before any launch (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
 //
 // 0 = done; any other value = the first cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_rms_norm_bf16_prepare(void) {
-    for (auto ker : {rms_norm_bf16_ker<NORM>, rms_norm_bf16_ker<UNIT>,
-                     rms_norm_bf16_ker<ADD_NORM>, rms_norm_bf16_ker<NORM_ADD>}) {
+    for (auto ker : {rms_norm_bf16_ker<NORM>, rms_norm_bf16_ker<UNIT>, rms_norm_bf16_ker<ADD_NORM>,
+                     rms_norm_bf16_ker<NORM_ADD>, rms_norm_one_row_ker<NORM>,
+                     rms_norm_one_row_ker<UNIT>, rms_norm_one_row_ker<ADD_NORM>,
+                     rms_norm_one_row_ker<NORM_ADD>}) {
         const cudaError_t e =
             cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, RMS_SMEM_BYTES);
         if (e != cudaSuccess) {
