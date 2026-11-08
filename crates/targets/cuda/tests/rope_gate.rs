@@ -929,3 +929,245 @@ fn rope_bf16_proportional_matches_the_cpu_reference() {
         "the proportional rope is out of bound, a pass-through lane moved, or a refusal wrote"
     );
 }
+
+// ── FP8 S8 W1: the one-row rope and gates ──────────────────────────
+
+/// `row` as row 0 of `rows` rows, the others zero.
+fn as_row0(row: &[u16], rows: usize) -> Vec<u16> {
+    let mut v = row.to_vec();
+    v.resize(rows * row.len(), 0);
+    v
+}
+
+/// The rope launch, any shape and pairing; the output's first `cols` and whether the tail held.
+fn run_rope_paired(
+    device: &CudaDevice,
+    (x, table): (&[u16], &[u16]),
+    (rows, cols): (usize, usize),
+    (head_dim, rot_dim, pairing): (u32, u32, scratchy_target_cuda::step::RopePairing),
+) -> (Vec<u16>, bool) {
+    use scratchy_target_cuda::kernels::rope_paired_bf16;
+    let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+    let (xb, tb) = (up(x), up(table));
+    let out = output(device, x.len());
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `x` and `out` hold rows·cols bf16, the
+    // table rows·rot_dim; `out` is its own allocation; null is the default stream.
+    unsafe {
+        rope_paired_bf16(
+            xb.ptr(),
+            tb.ptr(),
+            out.ptr(),
+            (rows as u32, cols as u32),
+            (head_dim, rot_dim, pairing),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("rope_paired_bf16 launch");
+    let (all, tail) = result(&out, x.len());
+    (all[..cols].to_vec(), tail)
+}
+
+/// FP8 S8 W1: at `rows == 1` the rope takes its one-row form (one CTA per head), and its output is
+/// the 16-row kernel's bits for the same row, as row 0 of a 16-row and of a 2-row launch. The
+/// three instances at the FP8 models' shapes: `<64, false>` at the 27B's 24 + 4 heads of 256 and
+/// the 35B's 16 + 2; `<256, false>` at Gemma's 16 heads of 256 (its sliding q) and 8 (its k);
+/// `<128, true>` at Gemma's 16 and 2 global heads of 512. Positions 0, 1, 191 and 8,191, 3 seeds.
+#[test]
+fn the_one_row_rope_is_the_16_row_rope_bit_for_bit() {
+    use scratchy_target_cuda::rotary::rotary_rows_with_freq_dim;
+    use scratchy_target_cuda::step::RopePairing;
+    let device = h100();
+    let mut pass = true;
+    // (what, heads, head_dim, rot_dim, pairing, theta)
+    let shapes = [
+        (
+            "27b q+k <64>",
+            28u32,
+            HD,
+            R,
+            RopePairing::HalfRotated,
+            THETA,
+        ),
+        ("35b q+k <64>", 18, HD, R, RopePairing::HalfRotated, THETA),
+        (
+            "gemma q <256>",
+            16,
+            FULL,
+            FULL,
+            RopePairing::HalfRotated,
+            THETA_LOCAL,
+        ),
+        (
+            "gemma k <256>",
+            8,
+            FULL,
+            FULL,
+            RopePairing::HalfRotated,
+            THETA_LOCAL,
+        ),
+        (
+            "gemma global q <128,half>",
+            16,
+            G_HD,
+            G_ROT,
+            RopePairing::HalfHead,
+            THETA_GLOBAL,
+        ),
+        (
+            "gemma global k <128,half>",
+            2,
+            G_HD,
+            G_ROT,
+            RopePairing::HalfHead,
+            THETA_GLOBAL,
+        ),
+    ];
+    for (what, heads, hd, rot, pairing, theta) in shapes {
+        let cols = (heads * hd) as usize;
+        for pos in [0u32, 1, 191, 8191] {
+            let table = match pairing {
+                RopePairing::HalfHead => rotary_rows_with_freq_dim(&[pos], rot, hd, theta),
+                _ => rotary_rows(&[pos], rot, theta),
+            };
+            for seed in 0..3u64 {
+                let x = bf16_inputs(
+                    cols,
+                    0x0E11_0000 ^ (cols as u64) << 20 ^ (pos as u64) << 4 ^ seed,
+                );
+                let dims = (hd, rot, pairing);
+                let (one, t1) = run_rope_paired(&device, (&x, &table), (1, cols), dims);
+                let mut ok = t1;
+                let mut line = String::new();
+                for rows in [16usize, 2] {
+                    let (want, t) = run_rope_paired(
+                        &device,
+                        (&as_row0(&x, rows), &as_row0(&table, rows)),
+                        (rows, cols),
+                        dims,
+                    );
+                    let m = mismatched_bits(&one, &want);
+                    line += &format!(" vs rows={rows} mismatched_bits={m}");
+                    ok &= t && m == 0;
+                }
+                eprintln!(
+                    "one-row rope {what} pos={pos} seed={seed}:{line} tail_intact={t1} {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "a one-row rope differs from the 16-row rope");
+}
+
+/// `cudaEvent_t`, declared here for the timing lines only (the runtime declares no event call).
+type CudaEvent = *mut std::ffi::c_void;
+
+unsafe extern "C" {
+    fn cudaEventCreate(event: *mut CudaEvent) -> i32;
+    fn cudaEventRecord(event: CudaEvent, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: CudaEvent) -> i32;
+    fn cudaEventElapsedTime(ms: *mut f32, start: CudaEvent, end: CudaEvent) -> i32;
+    fn cudaEventDestroy(event: CudaEvent) -> i32;
+}
+
+/// The median µs of 20 launches after 3 warm-ups, each between two CUDA events on the default
+/// stream (hot: the inputs stay in L2, as a decode step's activations do).
+fn event_median(mut launch: impl FnMut()) -> f64 {
+    let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event
+    // is destroyed below.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut start), 0, "cudaEventCreate");
+        assert_eq!(cudaEventCreate(&mut end), 0, "cudaEventCreate");
+    }
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let mut ms = 0.0f32;
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(cudaEventRecord(start, std::ptr::null_mut()), 0, "record");
+            launch();
+            assert_eq!(cudaEventRecord(end, std::ptr::null_mut()), 0, "record");
+            assert_eq!(cudaEventSynchronize(end), 0, "synchronize");
+            assert_eq!(cudaEventElapsedTime(&mut ms, start, end), 0, "elapsed");
+        }
+        if i >= 3 {
+            times.push(f64::from(ms) * 1e3);
+        }
+    }
+    // SAFETY: both events were created above and are no longer used.
+    unsafe {
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// Recorded, not asserted: µs per launch of the rope at `rows == 1` (the one-row form) and at
+/// `rows == 2` (today's 16-row kernel on one CTA, the time W0 measured), at the shapes above.
+#[test]
+fn the_one_row_rope_times_are_recorded() {
+    use scratchy_target_cuda::kernels::rope_paired_bf16;
+    use scratchy_target_cuda::rotary::rotary_rows_with_freq_dim;
+    use scratchy_target_cuda::step::RopePairing;
+    let device = h100();
+    let shapes = [
+        (
+            "27b q+k <64>",
+            28u32,
+            HD,
+            R,
+            RopePairing::HalfRotated,
+            THETA,
+        ),
+        ("35b q+k <64>", 18, HD, R, RopePairing::HalfRotated, THETA),
+        (
+            "gemma q <256>",
+            16,
+            FULL,
+            FULL,
+            RopePairing::HalfRotated,
+            THETA_LOCAL,
+        ),
+        (
+            "gemma global q <128,half>",
+            16,
+            G_HD,
+            G_ROT,
+            RopePairing::HalfHead,
+            THETA_GLOBAL,
+        ),
+    ];
+    for (what, heads, hd, rot, pairing, theta) in shapes {
+        let cols = (heads * hd) as usize;
+        let table = match pairing {
+            RopePairing::HalfHead => rotary_rows_with_freq_dim(&[191, 192], rot, hd, theta),
+            _ => rotary_rows(&[191, 192], rot, theta),
+        };
+        let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+        let (xb, tb) = (up(&bf16_inputs(2 * cols, 0x0E12_0000)), up(&table));
+        let out = output(&device, 2 * cols);
+        let mut line = format!("rope time {what} cols={cols}:");
+        for rows in [1u32, 2] {
+            let us = event_median(|| {
+                // SAFETY: as `run_rope_paired`'s; every buffer holds 2 rows.
+                unsafe {
+                    rope_paired_bf16(
+                        xb.ptr(),
+                        tb.ptr(),
+                        out.ptr(),
+                        (rows, cols as u32),
+                        (hd, rot, pairing),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("a timed rope launch");
+            });
+            let kernel = if rows == 1 { "one-row" } else { "16-row" };
+            line += &format!(" rows={rows} ({kernel}) {us:.2} us;");
+        }
+        eprintln!("{line}");
+    }
+}

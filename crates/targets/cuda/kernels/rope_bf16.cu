@@ -66,6 +66,13 @@
 // KiB and the table's 4 KiB, plus the slack = 37,888 bytes, under the default too. The `<64,
 // false>` and `<256, false>` instantiations are the code above, unchanged: `HALF_HEAD` only picks
 // the unit's and the pair's box counts, which are those instantiations' own constants.
+//
+// THE ONE-ROW FORM (FP8 S8 W1): at `rows == 1` (every decode step) the one 16-row block is one CTA
+// walking every head's units in turn. The launcher then launches the `ONE_ROW` instantiation on a
+// grid of `heads` CTAs, CTA `blockIdx.y` walking only head `blockIdx.y`'s units (`i` from `h ·
+// head_units`), with each unit's code unchanged: the same loads, maps and stores in the same
+// order. No element depends on another head's, so the bits are the 16-row kernel's (each CTA
+// loads the table's box itself). Chosen from `rows` alone, a constant of each step.
 
 #include "kittens.cuh"
 
@@ -130,7 +137,7 @@ struct rope_globals {
     int head_units;
 };
 
-template <int ROT, bool HALF_HEAD>
+template <int ROT, bool HALF_HEAD, bool ONE_ROW = false>
 __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_constant__ rope_globals g) {
     constexpr int BOXES = rope_shape<ROT, HALF_HEAD>::BOXES;
     constexpr int TABLE_BOXES = rope_shape<ROT, HALF_HEAD>::TABLE_BOXES;
@@ -143,6 +150,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
     __shared__ kittens::semaphore table_arrived;
 
     const int row_block = blockIdx.x;
+    // The units this CTA walks: the row's, or under `ONE_ROW` head `blockIdx.y`'s alone. Unit `i`
+    // keeps its row-wide index, so its boxes and its rotated-or-not test are the 16-row kernel's.
+    const int first = ONE_ROW ? int(blockIdx.y) * g.head_units : 0;
+    const int last = ONE_ROW ? first + g.head_units : g.row_units;
+    const int units = last - first;
     if (warp::laneid() == 0) {
         for (int s = 0; s < STAGES; s++) {
             init_semaphore(arrived[s], 0, 1);
@@ -155,17 +167,18 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
     for (int b = 0; b < TABLE_BOXES; b++) {
         warp::tma::load_async(t_smem[b], g.table, coord<box>{0, 0, row_block, b}, table_arrived);
     }
-    // Unit `i` of the row block (boxes `i · BOXES ..`) into stage `i % STAGES`.
-    auto issue = [&](int i) {
-        const int stage = i % STAGES;
+    // The walk's `k`-th unit (unit `first + k` of the row block, boxes `(first + k) · BOXES ..`)
+    // into stage `k % STAGES`.
+    auto issue = [&](int k) {
+        const int stage = k % STAGES, i = first + k;
         warp::tma::expect_bytes(arrived[stage], BOXES * sizeof(box));
         for (int b = 0; b < BOXES; b++) {
             warp::tma::load_async(x_smem[stage][b], g.x, coord<box>{0, 0, row_block, i * BOXES + b},
                                   arrived[stage]);
         }
     };
-    for (int i = 0; i < STAGES - 1 && i < g.row_units; i++) {
-        issue(i);
+    for (int k = 0; k < STAGES - 1 && k < units; k++) {
+        issue(k);
     }
 
     wait(table_arrived, 0);
@@ -182,16 +195,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
         s.tiles[0][1] = t.tiles[0][3];
     }
 
-    for (int i = 0; i < g.row_units; i++) {
-        const int stage = i % STAGES;
-        // Unit `i + STAGES − 1` lands in the stage unit `i − 1` was stored from, the newest store:
-        // it must have read the stage before that load overwrites it.
+    for (int k = 0; k < units; k++) {
+        const int stage = k % STAGES, i = first + k;
+        // The walk's unit `k + STAGES − 1` lands in the stage unit `k − 1` was stored from, the
+        // newest store: it must have read the stage before that load overwrites it.
         warp::tma::store_async_read_wait();
         __syncwarp();
-        if (i + STAGES - 1 < g.row_units) {
-            issue(i + STAGES - 1);
+        if (k + STAGES - 1 < units) {
+            issue(k + STAGES - 1);
         }
-        wait(arrived[stage], (i / STAGES) % 2);
+        wait(arrived[stage], (k / STAGES) % 2);
         if (i % g.head_units == 0) {
             if constexpr (ROT == 64) {
                 box_rt x;
@@ -249,7 +262,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
     warp::tma::store_async_wait();
 }
 
-// Launch the `<ROT, HALF_HEAD>` instantiation over the launcher's checked shape.
+// Launch the `<ROT, HALF_HEAD>` instantiation over the launcher's checked shape: at `rows == 1`
+// its one-row form, one CTA per head.
 template <int ROT, bool HALF_HEAD>
 int launch_rope(bf16* xp, bf16* tp, bf16* op, uint32_t rows, uint32_t cols, uint32_t head_dim,
                 cudaStream_t stream) {
@@ -262,6 +276,12 @@ int launch_rope(bf16* xp, bf16* tp, bf16* op, uint32_t rows, uint32_t cols, uint
     box_gl og{op, nullptr, nullptr, size_t(rows), size_t(cols)};
     rope_globals G{xg, tg, og, int(cols / UNIT), int(head_dim / UNIT)};
     void* args[] = {&G};
+    if (rows == 1) {
+        const dim3 grid{1u, cols / head_dim}, block{uint32_t(NUM_THREADS)};
+        return static_cast<int>(cudaLaunchKernel(rope_bf16_ker<ROT, HALF_HEAD, true>, grid, block,
+                                                 args, rope_shape<ROT, HALF_HEAD>::SMEM_BYTES,
+                                                 stream));
+    }
     const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
     return static_cast<int>(cudaLaunchKernel(rope_bf16_ker<ROT, HALF_HEAD>, grid, block, args,
                                              rope_shape<ROT, HALF_HEAD>::SMEM_BYTES, stream));
@@ -289,6 +309,12 @@ extern "C" int scratchy_cuda_rope_bf16_prepare(void) {
     }
     if (const cudaError_t e = cudaFuncGetAttributes(&attr, rope_bf16_ker<128, true>); e != cudaSuccess) {
         return static_cast<int>(e);
+    }
+    for (auto ker : {rope_bf16_ker<64, false, true>, rope_bf16_ker<256, false, true>,
+                     rope_bf16_ker<128, true, true>}) {
+        if (const cudaError_t e = cudaFuncGetAttributes(&attr, ker); e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
     }
     return 0;
 }
