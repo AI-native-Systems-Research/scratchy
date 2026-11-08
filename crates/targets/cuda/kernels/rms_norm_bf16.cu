@@ -348,60 +348,62 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_one_row_ker(
     row_values inv;
     warp::div(inv, total, g.cols);
     warp::bin_op<scratchy::ops::rms_inv>(inv, inv, g.eps);
-    if (w != 0) {
-        return;
-    }
-
-    // Pass 2 on the owned tile only: the 16-row kernel's pass-2 body, on stage 0's tiles (pass 1
-    // waited on every load it issued, so none is in flight) and its own semaphore.
-    __syncwarp();
-    {
-        coord<tile> at = {0, 0, 0, t_own};
-        constexpr bool OTHER = FORM == ADD_NORM || FORM == NORM_ADD;
-        warp::tma::expect_bytes(owned, sizeof(tile) + (OTHER ? sizeof(tile) : 0) +
-                                           (GAIN ? sizeof(gain_vec) : 0));
-        warp::tma::load_async(x_smem[0][0], g.x, at, owned);
-        if constexpr (OTHER) {
-            warp::tma::load_async(o_smem[0][0], g.other, at, owned);
-        }
-        if constexpr (GAIN) {
-            coord<gain_vec> gat = {0, 0, 0, t_own};
-            warp::tma::load_async(g_smem[0][0], g.gain, gat, owned);
-        }
-    }
-    wait(owned, 0);
-    acc_tile x;
-    warp::load(x, x_smem[0][0]);
-    if constexpr (FORM == ADD_NORM) {
-        acc_tile b;
-        warp::load(b, o_smem[0][0]);
-        warp::add(x, x, b);
-        round_bf16(x);
-        // The owner stores the tile's sum, as the 16-row kernel's pass 1 does: the same rounded
-        // bits. Through its own tile, so pass 2's `x` stays in registers.
-        warp::store(o_smem[0][1], x);
+    // Pass 2 is warp 0's alone, in a branch rather than after an early return of warps 1-3: with an
+    // exit between `inv`'s product and its `+ eps`, ptxas sank the bottom packed row's add below
+    // it, and that pair stopped contracting into the 16-row kernel's FFMA (the H100 SASS at
+    // 6b6a32f7). Here `inv` is formed in one block, as the 16-row kernel forms it.
+    if (w == 0) {
+        // Pass 2 on the owned tile only: the 16-row kernel's pass-2 body, on stage 0's tiles (pass 1
+        // waited on every load it issued, so none is in flight) and its own semaphore.
         __syncwarp();
-        coord<tile> sat = {0, 0, 0, t_own};
-        warp::tma::store_async(g.sum, o_smem[0][1], sat);
+        {
+            coord<tile> at = {0, 0, 0, t_own};
+            constexpr bool OTHER = FORM == ADD_NORM || FORM == NORM_ADD;
+            warp::tma::expect_bytes(owned, sizeof(tile) + (OTHER ? sizeof(tile) : 0) +
+                                               (GAIN ? sizeof(gain_vec) : 0));
+            warp::tma::load_async(x_smem[0][0], g.x, at, owned);
+            if constexpr (OTHER) {
+                warp::tma::load_async(o_smem[0][0], g.other, at, owned);
+            }
+            if constexpr (GAIN) {
+                coord<gain_vec> gat = {0, 0, 0, t_own};
+                warp::tma::load_async(g_smem[0][0], g.gain, gat, owned);
+            }
+        }
+        wait(owned, 0);
+        acc_tile x;
+        warp::load(x, x_smem[0][0]);
+        if constexpr (FORM == ADD_NORM) {
+            acc_tile b;
+            warp::load(b, o_smem[0][0]);
+            warp::add(x, x, b);
+            round_bf16(x);
+            // The owner stores the tile's sum, as the 16-row kernel's pass 1 does: the same rounded
+            // bits. Through its own tile, so pass 2's `x` stays in registers.
+            warp::store(o_smem[0][1], x);
+            __syncwarp();
+            coord<tile> sat = {0, 0, 0, t_own};
+            warp::tma::store_async(g.sum, o_smem[0][1], sat);
+        }
+        warp::mul_row(x, x, inv);
+        if constexpr (GAIN) {
+            col_values gain;
+            warp::load(gain, g_smem[0][0]);
+            warp::add(gain, gain, g.gain_offset);
+            warp::mul_col(x, x, gain);
+        }
+        if constexpr (FORM == NORM_ADD) {
+            acc_tile r;
+            round_bf16(x);
+            warp::load(r, o_smem[0][0]);
+            warp::add(x, x, r);
+        }
+        warp::store(x_smem[0][1], x);
+        __syncwarp();
+        coord<tile> at = {0, 0, 0, t_own};
+        warp::tma::store_async(g.y, x_smem[0][1], at);
+        warp::tma::store_async_wait();
     }
-    warp::mul_row(x, x, inv);
-    if constexpr (GAIN) {
-        col_values gain;
-        warp::load(gain, g_smem[0][0]);
-        warp::add(gain, gain, g.gain_offset);
-        warp::mul_col(x, x, gain);
-    }
-    if constexpr (FORM == NORM_ADD) {
-        acc_tile r;
-        round_bf16(x);
-        warp::load(r, o_smem[0][0]);
-        warp::add(x, x, r);
-    }
-    warp::store(x_smem[0][1], x);
-    __syncwarp();
-    coord<tile> at = {0, 0, 0, t_own};
-    warp::tma::store_async(g.y, x_smem[0][1], at);
-    warp::tma::store_async_wait();
 }
 
 // Build the views and launch `rms_norm_bf16_ker<FORM>`, or at `rows == 1` the one-row form

@@ -1417,3 +1417,109 @@ fn the_one_row_norm_times_are_recorded() {
         }
     }
 }
+
+/// The rows of the large one-row bit test, per width: 400 rows of the five model widths is about
+/// 8.1 M outputs per form, so a 2-per-million flip (S5's d512 signature) shows.
+const ONE_ROW_MANY: usize = 400;
+
+/// FP8 S8 W1: at the three FP8 models' widths (2,048, 2,816, 4,096, 5,120, 6,144), every form of
+/// [`ONE_ROW_MANY`] distinct random rows, each launched alone at `rows == 1` (the one-row kernel)
+/// against the same rows as one `rows == 400` launch (today's 16-row kernel), row for row:
+/// `mismatched_bits=0` over about 8 M outputs a form, `ADD_NORM`'s sum included. One upload per
+/// width and form; each one-row launch reads its row in place, at its offset in that upload.
+#[test]
+fn the_one_row_norms_match_the_16_row_norms_over_millions_of_outputs() {
+    let device = h100();
+    let mut pass = true;
+    let null = std::ptr::null_mut();
+    for form in [
+        NormForm::Norm,
+        NormForm::Unit,
+        NormForm::AddNorm,
+        NormForm::NormAdd,
+    ] {
+        let (mut outputs, mut mismatched) = (0usize, 0usize);
+        for cols in [2048usize, 2816, 4096, 5120, 6144] {
+            let n = ONE_ROW_MANY * cols;
+            let seed = 0x0E0A_0000 ^ (cols as u64) << 4 ^ form as u64;
+            let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+            let (x, b) = (bf16_inputs(n, seed), bf16_inputs(n, seed ^ 0x5A5A));
+            let g = centred_gains(cols, seed ^ 0xA5A5);
+            let (xb, bb, gb) = (up(&x), up(&b), up(&g));
+            // Today's kernel over all rows at once, and the one-row kernel once per row.
+            let (y16, s16) = (output(&device, n), output(&device, n));
+            let (y1, s1) = (output(&device, n), output(&device, n));
+            let at = |d: &DeviceBuffer, r: usize| d.ptr().wrapping_byte_add(2 * r * cols);
+            let launch = |rows: usize, r: usize, (y, s): (&DeviceBuffer, &DeviceBuffer)| {
+                let dims = (rows as u32, cols as u32);
+                // SAFETY: cudaMalloc pointers are 256-byte aligned and every row starts at a
+                // multiple of 2·cols bytes (cols a multiple of 256), so 16-byte aligned; rows
+                // `r .. r + rows` lie inside each `ONE_ROW_MANY · cols` buffer; each output is its
+                // own allocation; null is the default stream.
+                let res = unsafe {
+                    match form {
+                        NormForm::Norm => rms_norm_bf16(
+                            at(&xb, r),
+                            gb.ptr(),
+                            at(y, r),
+                            dims,
+                            EPS,
+                            ONE_PLUS_SCALE,
+                            null,
+                        ),
+                        NormForm::Unit => rms_norm_unit_bf16(at(&xb, r), at(y, r), dims, EPS, null),
+                        NormForm::AddNorm => add_rms_norm_bf16(
+                            (at(&xb, r), at(&bb, r)),
+                            gb.ptr(),
+                            (at(s, r), at(y, r)),
+                            dims,
+                            (EPS, ONE_PLUS_SCALE),
+                            null,
+                        ),
+                        NormForm::NormAdd => norm_add_bf16(
+                            (at(&xb, r), at(&bb, r)),
+                            gb.ptr(),
+                            at(y, r),
+                            dims,
+                            (EPS, SCALE),
+                            null,
+                        ),
+                    }
+                };
+                res.expect("a norm launch");
+            };
+            launch(ONE_ROW_MANY, 0, (&y16, &s16));
+            for r in 0..ONE_ROW_MANY {
+                launch(1, r, (&y1, &s1));
+            }
+            let (want, wt) = result(&y16, n);
+            let (got, gt) = result(&y1, n);
+            let mut m = mismatched_bits(&got, &want);
+            let mut tails = wt && gt;
+            outputs += n;
+            if form == NormForm::AddNorm {
+                let (sw, swt) = result(&s16, n);
+                let (sg, sgt) = result(&s1, n);
+                m += mismatched_bits(&sg, &sw);
+                tails &= swt && sgt;
+                outputs += n;
+            }
+            mismatched += m;
+            let ok = m == 0 && tails;
+            eprintln!(
+                "one-row {form:?} cols={cols}: {ONE_ROW_MANY} rows, mismatched_bits={m} \
+                 tails_intact={tails} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+        eprintln!(
+            "one-row {form:?}: {outputs} outputs, mismatched_bits={mismatched} {}",
+            verdict(mismatched == 0)
+        );
+    }
+    assert!(
+        pass,
+        "a one-row norm differs from the 16-row norm on some row"
+    );
+}
