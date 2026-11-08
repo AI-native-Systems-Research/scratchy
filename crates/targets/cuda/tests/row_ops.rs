@@ -1523,3 +1523,116 @@ fn the_one_row_norms_match_the_16_row_norms_over_millions_of_outputs() {
         "a one-row norm differs from the 16-row norm on some row"
     );
 }
+
+// ── FP8 S8 W1: the one-row pointwise maps ──────────────────────────
+
+/// FP8 S8 W1: at `rows == 1` the scale, the layer scale and the soft-cap take their one-row form
+/// (one CTA per 4 column tiles), and the row is the 16-row kernel's bits, as row 0 of a 16-row and
+/// a 2-row launch: the soft-cap at Gemma's 262,144 logits and at 2,816, in place and not, over
+/// logits in ±64 and with ±inf, NaN and ±65,504; the layer scale and the scale at Gemma's 2,816
+/// (and 704, a partial last group of tiles), 3 seeds.
+#[test]
+fn the_one_row_maps_are_the_16_row_maps_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let extremes = |cols: usize| -> Vec<u16> {
+        let special = [
+            bits(f32::INFINITY),
+            bits(f32::NEG_INFINITY),
+            0x7FC0,
+            bits(65504.0),
+            bits(-65504.0),
+            0x8000,
+            0,
+        ];
+        (0..cols).map(|c| special[c % special.len()]).collect()
+    };
+    let cases = [
+        ("soft_cap", Pointwise::SoftCap(GEMMA_CAP), GEMMA_VOCAB),
+        ("soft_cap", Pointwise::SoftCap(GEMMA_CAP), GEMMA_HIDDEN),
+        (
+            "layer_scale",
+            Pointwise::LayerScale(bits(0.3125)),
+            GEMMA_HIDDEN,
+        ),
+        ("layer_scale", Pointwise::LayerScale(bits(0.3125)), 704),
+        ("scale", Pointwise::Scale(gemma_scale()), GEMMA_HIDDEN),
+        ("scale", Pointwise::Scale(gemma_scale()), 704),
+    ];
+    for (what, which, cols) in cases {
+        let mut rows_in: Vec<(String, Vec<u16>)> = (0..3u64)
+            .map(|s| {
+                (
+                    format!("seed{s}"),
+                    logits(cols, 0x0E31_0000 ^ (cols as u64) << 4 ^ s),
+                )
+            })
+            .collect();
+        rows_in.push(("extremes".into(), extremes(cols)));
+        for (label, x) in &rows_in {
+            for in_place in [false, true] {
+                let (one, t1) = run_pointwise(&device, which, x, (1, cols as u32), in_place);
+                let mut ok = t1;
+                let mut line = String::new();
+                for rows in [16usize, 2] {
+                    let mut x16 = x.clone();
+                    x16.resize(rows * cols, 0);
+                    let (want, t) =
+                        run_pointwise(&device, which, &x16, (rows as u32, cols as u32), in_place);
+                    let m = mismatched_bits(&one, &want[..cols]);
+                    line += &format!(" vs rows={rows} mismatched_bits={m}");
+                    ok &= t && m == 0;
+                }
+                eprintln!(
+                    "one-row {what} cols={cols} {label} in_place={in_place}:{line} tail_intact={t1} {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "a one-row pointwise map differs from the 16-row map");
+}
+
+/// Recorded, not asserted: µs per launch of the soft-cap, the layer scale and the scale at
+/// `rows == 1` (the one-row form) and `rows == 2` (today's kernel on one CTA, the time W0
+/// measured), hot.
+#[test]
+fn the_one_row_map_times_are_recorded() {
+    let device = h100();
+    let null = std::ptr::null_mut();
+    for (what, which, cols) in [
+        ("soft_cap", Pointwise::SoftCap(GEMMA_CAP), GEMMA_VOCAB),
+        (
+            "layer_scale",
+            Pointwise::LayerScale(bits(0.3125)),
+            GEMMA_HIDDEN,
+        ),
+        ("scale", Pointwise::Scale(gemma_scale()), GEMMA_HIDDEN),
+    ] {
+        let xb = DeviceBuffer::upload(&device, &logits(2 * cols, 0x0E32_0000)).expect("upload x");
+        let out = output(&device, 2 * cols);
+        let wb = DeviceBuffer::upload(&device, &[bits(0.3125); 8]).expect("upload w");
+        let mut line = format!("map time {what} cols={cols}:");
+        for rows in [1u32, 2] {
+            let dims = (rows, cols as u32);
+            let us = event_median(None, || {
+                // SAFETY: as `run_pointwise`'s; `x` and `out` hold 2 rows, `w` 8 bf16.
+                unsafe {
+                    match which {
+                        Pointwise::Scale(s) => scale_bf16(xb.ptr(), out.ptr(), dims, s, null),
+                        Pointwise::LayerScale(_) => {
+                            layer_scale_bf16(xb.ptr(), wb.ptr(), out.ptr(), dims, null)
+                        }
+                        Pointwise::SoftCap(c) => soft_cap_bf16(xb.ptr(), out.ptr(), dims, c, null),
+                        Pointwise::RmsNormUnit => unreachable!("not timed here"),
+                    }
+                }
+                .expect("a timed map launch");
+            });
+            let kernel = if rows == 1 { "one-row" } else { "16-row" };
+            line += &format!(" rows={rows} ({kernel}) {us:.2} us;");
+        }
+        eprintln!("{line}");
+    }
+}

@@ -29,11 +29,19 @@
 // next tile's prefetch reads other addresses. Any other overlap of `out` and `x` is not allowed.
 //
 // No reduction: each element's result depends on its own input only, so the bits do not depend on
-// the launch shape or on `out == x`. Built with `--use_fast_math` (build.rs): f32 subnormals are
-// flushed to zero, `x / cap` is the fast division and `tanhf` the intrinsic `__tanhf`. Shared
-// memory: 4 warps × 2 stages × 8 KiB, plus 1,024 bytes of alignment slack = 66,560 bytes of dynamic
-// shared memory, set once for the three instantiations by `scratchy_cuda_pointwise_bf16_prepare`
-// (in `PREPARE`).
+// the launch shape or on `out == x`.
+//
+// THE ONE-ROW FORM (FP8 S8 W1): at `rows == 1` (every decode step) the grid is one CTA whose 4
+// warps walk the whole row (Gemma's final soft-cap: 1,024 tiles, 668 us on the H100). The
+// launcher then launches the `ONE_ROW` instance on `ceil(col_tiles / 4)` CTAs, CTA `c`'s warp `w`
+// taking tile `4c + w` alone with today's per-tile code. In place stays safe: each element is
+// still read and written by one warp through one shared tile. Chosen from `rows`.
+//
+// Built with `--use_fast_math` (build.rs): f32 subnormals are flushed to zero, `x / cap` is the
+// fast division and `tanhf` the intrinsic `__tanhf`. Shared memory: 4 warps × 2 stages × 8 KiB,
+// plus 1,024 bytes of alignment slack = 66,560 bytes of dynamic shared memory, set once for the
+// three instantiations, and their one-row instances, by `scratchy_cuda_pointwise_bf16_prepare` (in
+// `PREPARE`).
 
 #include "kittens.cuh"
 #include "scratchy_ops.cuh"
@@ -86,7 +94,7 @@ static_assert(SMEM_TILES == 65536, "4 warps x 2 stages x 8 KiB");
 constexpr int PW_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(PW_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
-template <int OP>
+template <int OP, bool ONE_ROW = false>
 __global__ __launch_bounds__(NUM_THREADS, 1) void pointwise_bf16_ker(
     const __grid_constant__ pw_globals g) {
     extern __shared__ int __shm[];
@@ -95,7 +103,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void pointwise_bf16_ker(
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
 
     const int w = kittens::warpid();
-    const int row_block = blockIdx.x;
+    // Under `ONE_ROW` the one row block is every CTA's, and CTA `c`'s warp `w` has tile `4c + w`.
+    const int row_block = ONE_ROW ? 0 : int(blockIdx.x);
+    const int first = ONE_ROW ? int(blockIdx.x) * WARPS + w : w;
     if (warp::laneid() == 0) {
         for (int s = 0; s < STAGES; s++) {
             init_semaphore(arrived[w][s], 0, 1);
@@ -109,14 +119,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void pointwise_bf16_ker(
         param = base_types::convertor<float, bf16>::convert(g.w[{0, 0, 0, 0}]);
     }
 
-    // This warp's tiles `w, w + 4, …`; the `i`-th of them is in stage `i % 2`.
+    // This warp's tiles `first, first + 4, …` (one under `ONE_ROW`); the `i`-th is in stage
+    // `i % 2`.
     auto issue = [&](int i) {
         const int stage = i % STAGES;
-        coord<tile> at = {0, 0, row_block, w + i * WARPS};
+        coord<tile> at = {0, 0, row_block, first + i * WARPS};
         warp::tma::expect_bytes(arrived[w][stage], sizeof(tile));
         warp::tma::load_async(x_smem[w][stage], g.x, at, arrived[w][stage]);
     };
-    const int mine = (g.col_tiles - w + WARPS - 1) / WARPS;
+    const int mine = ONE_ROW ? int(first < g.col_tiles)
+                             : (g.col_tiles - w + WARPS - 1) / WARPS;
     if (mine > 0) {
         issue(0);
     }
@@ -139,7 +151,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void pointwise_bf16_ker(
         }
         warp::store(x_smem[w][stage], x);
         __syncwarp();
-        coord<tile> at = {0, 0, row_block, w + i * WARPS};
+        coord<tile> at = {0, 0, row_block, first + i * WARPS};
         warp::tma::store_async(g.out, x_smem[w][stage], at);
     }
     warp::tma::store_async_wait();
@@ -163,8 +175,15 @@ int launch(const void* x, const void* w, void* out, uint32_t rows, uint32_t cols
     row_gl xg{xp, nullptr, nullptr, size_t(rows), size_t(cols)};
     row_gl og{op, nullptr, nullptr, size_t(rows), size_t(cols)};
     scalar_gl wg{wp, nullptr, nullptr, nullptr, size_t(1)};
-    pw_globals G{xg, og, wg, int((cols + uint32_t(COLS) - 1) / uint32_t(COLS)), param};
+    const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+    pw_globals G{xg, og, wg, col_tiles, param};
     void* args[] = {&G};
+    if (rows == 1) {
+        const dim3 grid{uint32_t(col_tiles + WARPS - 1) / uint32_t(WARPS)},
+            block{uint32_t(NUM_THREADS)};
+        return static_cast<int>(cudaLaunchKernel(pointwise_bf16_ker<OP, true>, grid, block, args,
+                                                 PW_SMEM_BYTES, stream));
+    }
     const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
     return static_cast<int>(
         cudaLaunchKernel(pointwise_bf16_ker<OP>, grid, block, args, PW_SMEM_BYTES, stream));
@@ -179,7 +198,8 @@ int launch(const void* x, const void* w, void* out, uint32_t rows, uint32_t cols
 // 0 = done; any other value = the first cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_pointwise_bf16_prepare(void) {
     for (auto ker : {pointwise_bf16_ker<SCALE>, pointwise_bf16_ker<LAYER_SCALE>,
-                     pointwise_bf16_ker<SOFT_CAP>}) {
+                     pointwise_bf16_ker<SOFT_CAP>, pointwise_bf16_ker<SCALE, true>,
+                     pointwise_bf16_ker<LAYER_SCALE, true>, pointwise_bf16_ker<SOFT_CAP, true>}) {
         const cudaError_t e =
             cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, PW_SMEM_BYTES);
         if (e != cudaSuccess) {
