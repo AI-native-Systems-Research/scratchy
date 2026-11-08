@@ -4205,6 +4205,10 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
     // order-freeness question — does this operand supply one scalar per output row? — is the
     // value's WORLD, and the pass is its one answer.
     let frames = assign_frames(f)?;
+    // And the chains that resolved an operand to its SOURCE are pinned to that answer before any
+    // arrangement is marked: a chase whose axis disagrees with the source's world is a refusal,
+    // not a reconciliation that picks a side.
+    cross_check_chase(f.name, &bcasts, &frames)?;
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -4632,6 +4636,10 @@ fn lower_function_folded<T: crate::collective::Tp>(
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
+    // ⭐ AND THE CHASE'S AXIS IS PINNED TO THE TABLE before any operand is addressed: a chain whose
+    // axis disagrees with the source's world in the frame assignment is a refusal naming the value,
+    // the axis and the world — never a reconciliation that picks a side.
+    cross_check_chase(f.name, &bcasts, &frames)?;
     // THE EQUALITY MASKS, read before the walk for the same reason the silus are: the device's
     // `OpFunc::Equal` is ONE op and KTIR spells it as two (`cmpf` + `uitofp`), so the comparison
     // is chain-interior and the RETYPE is the terminal this walk lowers. See
@@ -7318,62 +7326,50 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name, op.op_type
                 ));
             };
-            // ⭐⭐⭐ A PER-ROW SCALAR OF A RANK-N TILE IS A COLUMN — a reduction over a rank-N
+            // ⭐⭐⭐ THE MINT ASKS THE FRAME TABLE — the one statement of whether this result is a
+            // column. A per-row scalar of a rank-N tile is a COLUMN: a reduction over a rank-N
             // tile's last axis writes one value per row of its `[rows, cols]` flat frame, i.e. the
             // `[rows, 1]` column `assemble_reduce_seeded` writes, whatever rank the program states
             // it at (`[B, G]` for a `[B, G, PS]` tile); and a pointwise op over such a column (the
             // running max's `max`, the rescale's `exp`) keeps it one. Framed `[numel, 1]`, not the
-            // stated shape's own `[B, G]`, which would be a different stick per row.
-            let numel: Option<i64> = op
-                .result_type
-                .and_then(|t| t.dims())
-                .filter(|d| d.len() >= 2)
-                .map(|d| d.iter().product());
-            let per_row_scalar = numel.is_some_and(|n| {
-                matches!(program, Lowering::Reduce(_))
-                    || per_op
-                        .iter()
-                        .any(|r| !r.is_out && r.c_len == 1 && i64::from(r.r_len) == n)
-            });
-            let dims = match op.result_type {
-                _ if per_row_scalar => [numel.expect("just checked") as u32, 1],
-                Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
-                    [dims[0] as u32, dims[1] as u32]
-                }
-                // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
-                // last folded into rows — the same reading [`shape_2d`] states and every consumer
-                // of the minted buffer addresses through. Row-major, the rank-N tile and its flat
-                // pair are the same bytes at the same offsets, so one buffer serves both; minting
-                // the STATED shape instead (`[256, 4, 256]`) would be a `[4, 256]` buffer under
-                // the old reading — a quarter of the footprint the flat `[1024, 256]` consumers
-                // address. The batched paged-decode kernel's score tiles and softmax states are
-                // all rank-3; without this arm every one of them was refused below as "states no
-                // 2-D tensor type". Rank 2 keeps the arm above verbatim.
-                Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() > 2 => {
-                    let rows: i64 = dims[..dims.len() - 1].iter().copied().product();
-                    [rows as u32, *dims.last().expect("dims.len() > 2") as u32]
-                }
-                // A RANK-1 INTERMEDIATE IS `[rows, 1]` WHEN ITS VALUE CAME FROM A ROW REDUCTION, and
-                // that is decided by PROVENANCE rather than by this op's kind.
-                //
-                // `linalg.reduce` over the trailing axis of `[rows, cols]` yields `[rows]` — one value
-                // per row, exactly the `[rows, 1]` accumulator `assemble_reduce_seeded` writes. A
-                // decoder's rmsnorm then keeps that column shape through `ms = sum(x*x) * INV_D` and
-                // `rsqrt(ms + eps)`, so the SAME footprint is right for every pointwise op along that
-                // chain — but for the same reason it is NOT right for a rank-1 value that is a `[cols]`
-                // ROW vector (a broadcast source), where `[cols, 1]` would size the buffer correctly
-                // and address it wrong.
-                //
-                // The discriminator is therefore the INPUT's own column extent, which is already known
-                // here: a reduce writes `c_len == 1`, so anything reading a one-column tile is on the
-                // reduction's side of the program. A reduce's own result qualifies by its kind because
-                // it has no such input to consult.
-                Some(ktir_core::irtype::IrType::Tensor { dims, .. })
-                    if dims.len() == 1
-                        && (matches!(program, Lowering::Reduce(_))
-                            || per_op.iter().any(|r| !r.is_out && r.c_len == 1)) =>
-                {
-                    [dims[0] as u32, 1]
+            // stated shape's own `[B, G]`, which would be a different stick per row. The deleted
+            // `per_row_scalar` read this fact off THIS op's own inputs — a second derivation that
+            // could disagree with the pass (and with the chase, and with the classifier); the
+            // table's world is now the only answer, at every rank: a rank-1 column provenance
+            // (`linalg.reduce` over the trailing axis, kept through the rmsnorm chain) mints
+            // `[rows, 1]` here exactly as the deleted provenance test did.
+            let dims: [u32; 2] = match op.result_type {
+                Some(ktir_core::irtype::IrType::Tensor { dims, .. }) => {
+                    match frames.world_of(res) {
+                        World::Column => [dims.iter().product::<i64>() as u32, 1],
+                        World::Row if dims.len() == 2 => [dims[0] as u32, dims[1] as u32],
+                        // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
+                        // last folded into rows — the same reading [`shape_2d`] states and every consumer
+                        // of the minted buffer addresses through. Row-major, the rank-N tile and its flat
+                        // pair are the same bytes at the same offsets, so one buffer serves both; minting
+                        // the STATED shape instead (`[256, 4, 256]`) would be a `[4, 256]` buffer under
+                        // the old reading — a quarter of the footprint the flat `[1024, 256]` consumers
+                        // address. The batched paged-decode kernel's score tiles and softmax states are
+                        // all rank-3; without this arm every one of them was refused below as "states no
+                        // 2-D tensor type". Rank 2 keeps the arm above verbatim.
+                        World::Row if dims.len() > 2 => {
+                            let rows: i64 = dims[..dims.len() - 1].iter().copied().product();
+                            [rows as u32, *dims.last().expect("dims.len() > 2") as u32]
+                        }
+                        // A RANK-1 (or RANK-0) ROW VALUE KEEPS THE MINT'S OWN REFUSAL — the provenance
+                        // question ("did this value come from a row reduction?") is now the table's to
+                        // answer, and a value the table holds ROW is a `[cols]` row vector (a broadcast
+                        // source) to this door whatever its producer: `[cols, 1]` would size the buffer
+                        // correctly and address it wrong, and `[1, cols]` is no frame a minted buffer's
+                        // consumers address, so no buffer can be sized for it.
+                        World::Row => {
+                            return err(format!(
+                                "{}: `{:?}`'s result is an intermediate but states no 2-D tensor type, so \
+                             its footprint is unknown and no buffer can be sized for it",
+                                f.name, op.op_type
+                            ));
+                        }
+                    }
                 }
                 _ => {
                     return err(format!(
@@ -8075,6 +8071,49 @@ impl Frames {
             World::Row => flat_frame(dims),
         }
     }
+}
+
+/// ⭐ THE CHASE'S AXIS IS PINNED TO THE TABLE'S WORLD. [`program_broadcast_chains`] proves, by
+/// walking outward from each `linalg.broadcast`, which source it sprays and along what axis; the
+/// frame pass states the same source's world independently. The two are statements of ONE fact —
+/// does this source supply one scalar per row? — so a program where they disagree is a program
+/// whose broadcast chain and whose pointwise/mint classification cannot both be true. It is
+/// REFUSED here, never reconciled: the refusal names the value, the axis and the world, and the
+/// fix is whichever derivation was wrong, found by reading the program — not a side picked for
+/// it. Called by every entry that consults the chains ([`staggered_sources`] and
+/// [`lower_function_folded`]), so a disagreement fails whichever door the program enters first.
+fn cross_check_chase(
+    name: &str,
+    bcasts: &std::collections::HashMap<Ssa, Bcast>,
+    frames: &Frames,
+) -> Result<(), Error> {
+    for (v, b) in bcasts {
+        let want = match b.axis {
+            // `Col` and a per-row-scalar `Y` spray one scalar per row: columns.
+            BcastAxis::Col
+            | BcastAxis::Y(super::lower_ktir_to_superdsc::Spray {
+                of: super::lower_ktir_to_superdsc::SprayOf::RowScalars,
+                ..
+            }) => World::Column,
+            // `Mb` and a tile `Y` spray whole flat rows: the row world.
+            BcastAxis::Mb
+            | BcastAxis::Y(super::lower_ktir_to_superdsc::Spray {
+                of: super::lower_ktir_to_superdsc::SprayOf::Tile,
+                ..
+            }) => World::Row,
+        };
+        let have = frames.world_of(b.src);
+        if have != want {
+            return err(format!(
+                "{}: the broadcast chase holds `%{}` sprayed from `%{}` along {:?}, but the \
+                 frame pass holds the source {:?} — the axis and the world are two statements \
+                 of one fact (does this source supply one scalar per row?), and they disagree, \
+                 so the program is refused rather than one of them believed",
+                name, v.0, b.src.0, b.axis, have
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a `linalg.reduce` folds its input's LAST axis — the pass's `LinalgReduce` arm's own
