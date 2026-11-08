@@ -6861,13 +6861,14 @@ mod sample_rows_tests {
     use crate::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 
     /// A one-op lm-head graph — the final projection of `m` hidden rows onto a
-    /// 5-wide vocabulary, the same shape `argmax_mint_lower` pins the splice seat
-    /// with — handed to `lower_region`.
+    /// 5-wide vocabulary (the activation source carries the `m` rows
+    /// `lower_region` registers), the same shape `argmax_mint_lower` pins the
+    /// splice seat with — handed to `lower_region`.
     fn lm_head(m: u32) -> SubtileIR<NeoX> {
         let input = LoweringInput {
             exported: None,
             sources: vec![
-                SourceShape { rows: 1, cols: 1 },
+                SourceShape { rows: m, cols: 1 },
                 SourceShape { rows: 1, cols: 5 },
             ],
             ops: vec![OpDesc {
