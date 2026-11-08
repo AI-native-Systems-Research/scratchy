@@ -3609,8 +3609,8 @@ impl QueryExtent {
 /// states the SAME law at the slot — the two are one statement in two spellings, pinned equal
 /// by fixture, never two laws that agree by accident.
 ///
-/// At one request (`S = 1`, every rung today) `row(0)` is `selector_lastrow_col(w)` with
-/// `w = mq` — exactly today's single-row law, so every tail site is byte-identical there.
+/// At one request (`S = 1`, every rung today) the first of `rows()` is `selector_lastrow_col(w)`
+/// with `w = mq` — exactly today's single-row law, so every tail site is byte-identical there.
 ///
 /// ⛔ THE COUNT IS THE RUNG'S CAPACITY, NOT THE LAUNCH'S LIVE REQUESTS — this is the bake's
 /// own statement of the rung's windows. A launch that seats fewer requests than the rung
@@ -3629,11 +3629,18 @@ impl AnswerRows {
         Self { extent }
     }
 
-    /// Request `r`'s answer row — `r·w + selector_lastrow_col(w)`: window `r`'s last BAKED
-    /// row. THE one law; no tail site computes a row any other way.
-    pub const fn row(self, r: usize) -> usize {
-        r * self.extent.per_request().get() as usize
-            + selector_lastrow_col(self.extent.per_request().get() as usize)
+    /// The rung's answer rows, one per packed window, in request order — the ONLY mint of a
+    /// [`RequestIndex`], so a request past the capacity is UNSPELLABLE: no reader passes a bare
+    /// request index, and the readback takes `rows().take(live)` with the live count off the
+    /// launch's own slot list (an empty window's row is never read).
+    pub fn rows(self) -> impl Iterator<Item = (RequestIndex, usize)> {
+        (0..self.count()).map(move |r| {
+            (
+                RequestIndex(r),
+                r * self.extent.per_request().get() as usize
+                    + selector_lastrow_col(self.extent.per_request().get() as usize),
+            )
+        })
     }
 
     /// How many answer rows the rung bakes — the request count `S` (the capacity, not the
@@ -3646,6 +3653,19 @@ impl AnswerRows {
     /// lowers, the same check the attention's extents take.
     pub const fn extent(self) -> QueryExtent {
         self.extent
+    }
+}
+
+/// A request of a packed rung's windows — minted only by [`AnswerRows::rows`], never spelled
+/// by a caller, so an index past the rung's capacity cannot reach a row law.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestIndex(usize);
+
+impl RequestIndex {
+    /// The request's slot in the rung's window order — the readback's pick order, by which the
+    /// launch's slot list seats its requests.
+    pub const fn get(self) -> usize {
+        self.0
     }
 }
 
@@ -4599,7 +4619,7 @@ impl CausalKey {
 /// ROW is the same fact, and this is its SINGLE SOURCE OF TRUTH — shared by the emitter's copy offsets
 /// and the Kani proof (`selector_lastrow_picks_last_row`). A wrong row feeds the WRONG token's hidden to
 /// the lm_head → a wrong first generated token, with everything downstream still perfectly fluent.
-pub fn selector_lastrow_col(m: usize) -> usize {
+pub const fn selector_lastrow_col(m: usize) -> usize {
     m - 1
 }
 
@@ -9679,10 +9699,15 @@ mod tests {
             QueryExtent::of_baked_rung(RungWidth::of_baked_rows(8).unwrap(), RungCap::ONE).unwrap(),
         );
         assert_eq!(one.count(), 1);
-        assert_eq!(one.row(0), selector_lastrow_col(8));
         assert_eq!(
-            one.row(0),
-            selector_lastrow_col(one.extent().graph_rows().get() as usize),
+            one.rows().map(|(_, row)| row).collect::<Vec<_>>(),
+            vec![selector_lastrow_col(8)]
+        );
+        assert_eq!(
+            one.rows().map(|(_, row)| row).collect::<Vec<_>>(),
+            vec![selector_lastrow_col(
+                one.extent().graph_rows().get() as usize
+            )],
             "at S = 1 the answer row is today's selector_lastrow_col(mq)"
         );
         // A PACKED RUNG — (w, S) = (4, 3): each request's window's last baked row.
@@ -9694,14 +9719,20 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(packed.count(), 3);
-        assert_eq!((packed.row(0), packed.row(1), packed.row(2)), (3, 7, 11));
-        for r in 0..packed.count() {
+        assert_eq!(
+            packed.rows().map(|(_, row)| row).collect::<Vec<_>>(),
+            vec![3, 7, 11]
+        );
+        for (req, row) in packed.rows() {
             let w = packed.extent().per_request().get() as usize;
+            let r = req.get();
             assert!(
-                packed.row(r) >= r * w && packed.row(r) < (r + 1) * w,
+                row >= r * w && row < (r + 1) * w,
                 "request {r}'s answer row is inside its own window"
             );
         }
+        // The readback shape: only the LIVE requests' rows are read.
+        assert_eq!(packed.rows().take(1).count(), 1);
     }
 
     #[test]
