@@ -81,7 +81,7 @@ pub enum OpKind {
     /// `OpKind` spells it `ArithNegf` too): it is a device-facts key
     /// (`legalize_types::device_form` maps it onto `DeviceOp::Neg`), and a key
     /// carried as a string can miss every row on a typo — the exact anti-pattern
-    /// the typed key exists to prevent (#1158 review finding 4).
+    /// the typed key exists to prevent.
     ArithNegf,
     /// `arith.sitofp` — the integer→float cast. Named for the same reason as
     /// [`OpKind::ArithNegf`]: `device_form` keys the DDL's `int32tofp32` row

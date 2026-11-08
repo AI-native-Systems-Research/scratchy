@@ -574,15 +574,13 @@ fn red_stop_on_genuine_f32<G: ddl_binds::DeviceGen>(
 /// table (`ktir_core::ddl_binds`). This is the old inline table's (opcode,
 /// din, dout) triple restated as a type: the vocabulary mapping is matched
 /// on the IR's own TYPED op kinds, and EVERY op this pass keys the table
-/// with is one of them — a misspelled or forgotten key cannot compile
-/// (#1158 review finding 4: the five spellings that used to ride
-/// `OpKind::Other` and match on their string are variants now, so a typo is
-/// a build error, not a silently UNBOUND op).
+/// with is one of them — a misspelled or forgotten key cannot compile, so a
+/// typo is a build error, not a silently UNBOUND op.
 ///
 /// The key's INPUT half is stated ONCE, here, in the `sitofp` arm's guard
 /// (the DDL binds `int32tofp32` from an IEEE_INT32 input; a sitofp off an
 /// i1 is a different op and mints NO form). It is not re-derived at the
-/// reader (#1158 review finding 5): the RED-stop asks the form and the
+/// reader: the RED-stop asks the form and the
 /// row's `admitted` field, nothing else. The ROWS live in
 /// `ktir_core::ddl_binds`; nothing about the card is stated here.
 enum DeviceForm {
