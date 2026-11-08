@@ -1878,6 +1878,12 @@ pub enum SampleRows {
     /// empty window's row is a pad row the fold wrote from the staging and
     /// the readback never takes (it draws `rows().take(live)`, live off the
     /// launch's slot list).
+    ///
+    /// ⛔ GATED ON `spyre`, LIKE THE `RungCap` IT CARRIES: the fold is the
+    /// spyre emitter's own law (metal's sampler never folds a prefill tail),
+    /// and the ktir graph — `sdsc_abstract`'s home — is out of every metal
+    /// and cuda build, so the count's one type lives past this gate with it.
+    #[cfg(feature = "spyre")]
     Folded {
         /// The rung's request capacity — the count the answer rows mint.
         requests: crate::sdsc_abstract::RungCap,
@@ -1951,6 +1957,7 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
     let pad_vocab = sample_pad_vocab(vocab);
     let rows = match suffix {
         SampleRows::All => result_rows,
+        #[cfg(feature = "spyre")]
         SampleRows::Folded { requests } => requests.get(),
     };
     assert!(
@@ -2143,6 +2150,7 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
     // states the fold). At S = 1 the window is row 0 alone, byte-identical.
     inputs.push(match suffix {
         SampleRows::All => whole(graph.result),
+        #[cfg(feature = "spyre")]
         SampleRows::Folded { .. } => TensorRegion {
             tensor: graph.result,
             region: Region {
@@ -6851,7 +6859,6 @@ mod tests {
 mod sample_rows_tests {
     use super::*;
     use crate::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
-    use crate::sdsc_abstract::RungCap;
 
     /// A one-op lm-head graph — the final projection of `m` hidden rows onto a
     /// 5-wide vocabulary, the same shape `argmax_mint_lower` pins the splice seat
@@ -6884,8 +6891,10 @@ mod sample_rows_tests {
     /// k = 1), and the result tensor's DECLARED shape stays [mq, vocab] — only
     /// the region states the fold. No count is special-cased: the k = 1 case is
     /// this same assertion at one.
+    #[cfg(feature = "spyre")]
     #[test]
     fn the_folded_mint_reads_the_rungs_request_count() {
+        use crate::sdsc_abstract::RungCap;
         let mq = 8u32;
         for k in [1u32, 2, 3] {
             let mut g = lm_head(mq);
