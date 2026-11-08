@@ -8106,12 +8106,23 @@ impl Frames {
 /// Whether a `linalg.reduce` folds its input's LAST axis — the pass's reduction arm's own
 /// predicate: such a reduce writes one value per stick row, a [`World::Column`], while a fold of
 /// any other axis (the leading `J` of a decode batch's block slots) writes a tile of the input's
-/// own rows.
-fn folds_its_stick(o: &Operation<'_>) -> bool {
-    let rank = o.result_type.and_then(|t| t.dims()).map_or(0, <[i64]>::len);
-    o.attributes.iter().any(
+/// own rows. Which axis the fold is, is the RANK's own fact: a reduce that states no shaped
+/// result is REFUSED by name, never read as rank 0 — rank 0 is not "unknown", it is a stated
+/// rank-0, and an unstated one must not anchor `World::Column` by matching `Dimensions == [0]`.
+fn folds_its_stick(f: &IRFunction<'static>, res: Ssa, o: &Operation<'_>) -> Result<bool, Error> {
+    let rank = match o.result_type.and_then(|t| t.dims()) {
+        Some(dims) => dims.len(),
+        None => {
+            return err(format!(
+                "{}: the reduce `%{}` states no shaped result, so which axis it folds — its \
+                 input's own stick axis or a leading one — cannot be decided",
+                f.name, res.0
+            ));
+        }
+    };
+    Ok(o.attributes.iter().any(
         |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [rank as i64]),
-    )
+    ))
 }
 
 /// Every value's defining operation, by result — the ONE index the frame pass and its helpers
@@ -8582,7 +8593,7 @@ fn assign_frames(
             // ── THE REDUCTION: the axis it folds decides the world it writes ──
             FrameStatement::Reduction => {
                 let Some(res) = res else { continue };
-                if folds_its_stick(o) {
+                if folds_its_stick(f, res, o)? {
                     uf.anchor(
                         idx(res),
                         World::Column,
@@ -12583,6 +12594,40 @@ mod frame_pass_tests {
             World::Row,
             "a leading fold writes a tile of the input's own rows"
         );
+    }
+
+    /// ⛔ THE RANK DEFAULT THIS COMMITS CLOSES: a reduce stating NO shaped result used to read
+    /// as rank 0, so `Dimensions=[0]` matched `[rank]` and the fold anchored `World::Column`
+    /// without proof — a leading-axis fold of an unstated-rank reduce was misclassified from a
+    /// clean bake. Which axis a fold folds is the RANK's own fact, and it is refused by name:
+    /// rank 0 is not "unknown", it is a stated rank-0.
+    #[test]
+    fn a_reduce_stating_no_shaped_result_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let unstated = Operation::new(a, Some(red), OpKind::LinalgReduce, &[dense, seed])
+            .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf))
+            .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[0]));
+        let f = func(
+            a,
+            "reduce_unstated",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                unstated,
+            ],
+        );
+        let e = match assign_frames(&f, None) {
+            Ok(_) => panic!("the fold axis is the rank's own fact, refused when unstated"),
+            Err(e) => e,
+        };
+        assert!(
+            e.message.contains("states no shaped result"),
+            "names the missing fact: {}",
+            e.message
+        );
+        assert!(e.message.contains("%3"), "names the reduce: {}", e.message);
     }
 
     /// ⭐ THE CARRY'S INIT IS THE COLUMN IT SEEDS — the walk's carried init is a splat whose dims
