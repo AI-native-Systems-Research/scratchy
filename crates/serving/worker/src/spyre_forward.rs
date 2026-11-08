@@ -487,40 +487,26 @@ pub(crate) fn run_card_launch(
         }
         // A middle prompt chunk: no suffix runs and nothing is read back.
         (LogitsWanted::None, _) => {
-            pf.run_step_i32(
-                mq,
-                seq_pos,
-                &acts,
-                &[],
-                &acts_i32,
-                &seeds,
-                StepLogits::Discarded,
-            )
-            .map_err(|e| {
-                werr(format!(
-                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                ))
-            })?;
+            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                    ))
+                })?;
             None
         }
         // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
         // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
         // stick comes back raw, exactly like a decode's.
         (LogitsWanted::LastRow, Some((seat, seat_width))) => {
-            pf.run_step_i32(
-                mq,
-                seq_pos,
-                &acts,
-                &[],
-                &acts_i32,
-                &seeds,
-                StepLogits::LeftOnDevice,
-            )
-            .map_err(|e| {
-                werr(format!(
-                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                ))
-            })?;
+            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                    ))
+                })?;
             // The prompt-final width is the launch's one typed width — the
             // mint's verbatim prompt case, the same value the staging block
             // bound the seat's rows at.

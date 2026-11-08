@@ -765,11 +765,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        seeds: &[(crate::bundle_code::PlaceId, crate::forward_tape::ChainSeed)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.stage_step_acts_seeded(activations, activations_f16, activations_i32, seeds)?;
-        self.run_staged_step(n_new, seq_pos, logits)
+        self.run_step_inner(
+            n_new,
+            seq_pos,
+            activations,
+            activations_f16,
+            activations_i32,
+            logits,
+        )
     }
 
     /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
@@ -1015,8 +1020,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         self.run_staged_step(n_new, seq_pos, logits)
     }
 
-    /// Run the step whatever the shadow holds — every input already staged.
-    fn run_staged_step(
+    /// Run the step whatever the shadow holds — every input already staged
+    /// ([`Self::stage_step_acts`] / [`Self::stage_step_acts_seeded`]).
+    pub fn run_staged_step(
         &mut self,
         n_new: usize,
         seq_pos: usize,
