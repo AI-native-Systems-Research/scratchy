@@ -8063,14 +8063,6 @@ enum World {
 /// value passed at the resolve site, so no reader can state a second one.
 const UNSTATED_IS: World = World::Row;
 
-/// The frame pass's anchor label — the frame pass states equalities only, so the unit weight
-/// cannot move it ([`crate::union_find`]).
-impl crate::union_find::Anchor<()> for World {
-    fn rides(self, (): ()) -> Self {
-        self
-    }
-}
-
 /// Every value's [`World`], minted once by [`assign_frames`].
 struct Frames {
     world: std::collections::HashMap<Ssa, World>,
@@ -8427,10 +8419,10 @@ fn assign_frames(
             }
         }
     }
-    let mut uf: crate::union_find::UnionFind<(), World> =
+    let mut uf: crate::union_find::UnionFind<World> =
         crate::union_find::UnionFind::with_len(index.len());
     let idx = |v: Ssa| index[&v];
-    // The union-find's own refusals (a two-paths disagreement, a two-anchors clash) are the
+    // The union-find's own refusal (a two-anchors clash) is the
     // bake error verbatim — one adapter, no re-wording.
     let as_err = |e: String| Error { message: e };
     // ── THE WALK'S CARRIES, when the function still states its loop: the for's own
@@ -8459,13 +8451,13 @@ fn assign_frames(
                 f.name, args[i].0, i
             );
             if let Some(&init) = inits.get(i) {
-                uf.join(idx(args[i]), idx(init), (), &why).map_err(as_err)?;
+                uf.join(idx(args[i]), idx(init), &why).map_err(as_err)?;
             }
             if let Some(y) = yields.and_then(|y| y.get(i)) {
-                uf.join(idx(args[i]), idx(*y), (), &why).map_err(as_err)?;
+                uf.join(idx(args[i]), idx(*y), &why).map_err(as_err)?;
             }
             if let Some(&r) = results.get(i) {
-                uf.join(idx(args[i]), idx(r), (), &why).map_err(as_err)?;
+                uf.join(idx(args[i]), idx(r), &why).map_err(as_err)?;
             }
         }
     }
@@ -8476,11 +8468,9 @@ fn assign_frames(
                 "{}: the walk carries %{} — its arg, init, yield and result are one buffer",
                 f.name, c.arg.0
             );
-            uf.join(idx(c.arg), idx(c.init), (), &why).map_err(as_err)?;
-            uf.join(idx(c.arg), idx(c.yielded), (), &why)
-                .map_err(as_err)?;
-            uf.join(idx(c.arg), idx(c.result), (), &why)
-                .map_err(as_err)?;
+            uf.join(idx(c.arg), idx(c.init), &why).map_err(as_err)?;
+            uf.join(idx(c.arg), idx(c.yielded), &why).map_err(as_err)?;
+            uf.join(idx(c.arg), idx(c.result), &why).map_err(as_err)?;
         }
     }
     // ── THE DEFERRED `In::col` CHECKS: one value per result row, decided after the solve. ──
@@ -8546,7 +8536,6 @@ fn assign_frames(
                     uf.join(
                         idx(res),
                         idx(x),
-                        (),
                         &format!(
                             "{}: the leading fold `%{}` writes a tile of its operand's rows",
                             f.name, res.0
@@ -8561,7 +8550,6 @@ fn assign_frames(
                     uf.join(
                         idx(res),
                         idx(x),
-                        (),
                         &format!("{}: the shape op `%{}` moves no element", f.name, res.0),
                     )
                     .map_err(as_err)?;
@@ -8631,7 +8619,6 @@ fn assign_frames(
                         uf.join(
                             idx(res),
                             idx(v),
-                            (),
                             &format!(
                                 "{}: `{:?}` reads `%{}` lane for lane — one frame",
                                 f.name, o.op_type, v.0
