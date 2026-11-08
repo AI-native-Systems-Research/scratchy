@@ -399,7 +399,7 @@ mod tests {
             },
             max_model_len: 4096,
             num_gpu_blocks: 1024,
-            block_size: 16,
+            block_size: scratchy_core_common::KvBlockTokens::new(16).expect("16 > 0"),
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,

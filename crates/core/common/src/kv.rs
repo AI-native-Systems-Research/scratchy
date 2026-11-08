@@ -53,6 +53,30 @@ impl KvBlockTokens {
     pub fn get(self) -> usize {
         self.0.get()
     }
+
+    /// The block size a backend's own `NonZeroU32` page constant states — the LOSSLESS, TOTAL
+    /// widening of a fact the backend has already proven (`SchedulerBlockTokens::REFERENCE`):
+    /// every `u32` is a `usize` on every target this builds for, and a nonzero one stays
+    /// nonzero. This is the typed conversion between the two block-size types, NOT a mint —
+    /// `new` stays the one classifier of a raw `usize`, at the engine's one door.
+    pub const fn from_nonzero_u32(tokens: std::num::NonZeroU32) -> KvBlockTokens {
+        KvBlockTokens(match NonZeroUsize::new(tokens.get() as usize) {
+            Some(v) => v,
+            None => panic!("a nonzero u32 is nonzero as a usize"),
+        })
+    }
+
+    /// The PAGE-UNIFICATION SCALE — `self × ratio`, `None` when `ratio` is zero. A unified KV
+    /// layout computes a full-attention layer's block size as `base × (max_page / page)`, where
+    /// the quotient is the MAX over the pages divided by one of them — ≥ 1 by the producer's own
+    /// construction — so the `None` names a violated domain, not a fact anyone checks at
+    /// runtime: the product of a nonzero token count and a positive ratio is nonzero, and this
+    /// is the type's one multiplicative construction, stated where the ratio's `≥ 1` is proven.
+    pub fn times(self, ratio: usize) -> Option<KvBlockTokens> {
+        Some(KvBlockTokens(NonZeroUsize::new(
+            self.0.get().checked_mul(ratio)?,
+        )?))
+    }
 }
 
 /// A TOKEN COUNT WHOSE KEYS SIT AT ITS TOKEN POSITIONS — the prefix of a request that a token-indexed

@@ -23,7 +23,7 @@ use scratchy_core_common::kv::{CacheableTokens, KvExtent, KvSlotSpan};
 use scratchy_core_common::{Request, RequestStatus, SamplingParams};
 use scratchy_core_config::SchedulerConfig;
 
-use super::core::{KVCacheManagerOps, Scheduler, SimpleBlockTracker};
+use super::core::{KVCacheManagerOps, Scheduler, SimpleBlockTracker, kbt};
 use super::interface::SchedulerInterface;
 
 const BLOCK: usize = 256;
@@ -94,7 +94,7 @@ fn run_wave(report: WorkerReport) -> Wave {
         long_prefill_token_threshold: 0,
         ..Default::default()
     };
-    let tracker = SimpleBlockTracker::with_caching(POOL_BLOCKS, BLOCK);
+    let tracker = SimpleBlockTracker::with_caching(POOL_BLOCKS, kbt(BLOCK));
     let tracker: Box<dyn KVCacheManagerOps> = match report {
         WorkerReport::TokenAddressed => Box::new(tracker),
         WorkerReport::SharedWriteSlot => Box::new(tracker.sharing_one_write_slot()),
@@ -240,7 +240,7 @@ fn a_preempted_request_is_readmitted_as_a_request_that_holds_nothing() {
     let mut sched = Scheduler::new(
         &cfg,
         8192,
-        Box::new(SimpleBlockTracker::with_caching(3, 16)),
+        Box::new(SimpleBlockTracker::with_caching(3, kbt(16))),
     );
     let req = |id: &str, base: u32| {
         Request::new(

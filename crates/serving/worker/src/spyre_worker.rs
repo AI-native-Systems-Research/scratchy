@@ -191,9 +191,12 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
     /// walks (`paged_step::SchedulerBlockTokens::REFERENCE.get()`, its kernels' `BLOCK_SIZE`), the one constant the bake sized
     /// the pools by.
     fn required_block_size(&self) -> Option<scratchy_core_common::KvBlockTokens> {
-        scratchy_core_common::KvBlockTokens::new(
-            scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.as_usize(),
-        )
+        // The typed conversion of the bake's own block constant — NOT a mint: `REFERENCE` is
+        // nonzero by its own `const` construction, and widening a `NonZeroU32` to the engine's
+        // block-size type is lossless and total, so no `usize` is ever classified here.
+        Some(scratchy_core_common::KvBlockTokens::from_nonzero_u32(
+            scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.nz(),
+        ))
     }
 
     fn create(

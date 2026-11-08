@@ -253,7 +253,7 @@ pub trait SpecDecodeBackend {
         _model: ModelHandle,
         _kv_pool: KvPoolHandle,
         _req_iter0: &ForwardArgmaxRequest<'_>,
-        _block_size: usize,
+        _block_size: scratchy_core_common::KvBlockTokens,
         _k: usize,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
         Err(BackendError::NotImplemented("forward_chain_k"))

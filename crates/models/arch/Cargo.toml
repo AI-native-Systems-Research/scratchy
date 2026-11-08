@@ -797,6 +797,7 @@ half = { workspace = true }
 # ForwardDeviceHandle in the universal carrier parity gate
 # (tests/carrier_parity.rs). compute_hybrid_kv_layout (shared with the
 # worker) builds gemma4-style hybrid KV pools in the same gate.
+scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 serde_json = { workspace = true }
 # tests/metal_o2_logits.rs (the runtime logits oracle): local Hub-cache lookup, the tokenizer,

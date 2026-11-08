@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 
 use scratchy_core_common::multimodal::MultimodalData;
 use scratchy_core_common::{
-    BlockKind, HybridKvStores, KvBackedBlocks, KvBacking, Request, RequestStatus,
+    BlockKind, HybridKvStores, KvBackedBlocks, KvBacking, KvBlockTokens, Request, RequestStatus,
 };
 use scratchy_core_config::{SchedulerConfig, SchedulerPolicy, SpansConfig};
 use tracing::warn;
@@ -31,6 +31,13 @@ use super::output::{
 use super::recurrent_state::{SnapshotBudget, StateSnapshots};
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
 use super::shared_memory::SharedMemory;
+
+/// Test-only mint of a block size — production code takes [`KvBlockTokens`] from the engine's
+/// one door and never mints it; tests state their own facts.
+#[cfg(test)]
+pub(crate) fn kbt(n: usize) -> KvBlockTokens {
+    KvBlockTokens::new(n).expect("a test block size is nonzero")
+}
 
 /// ⭐ HOW FAR BEFORE A PROMPT'S END ITS RECURRENT-STATE SNAPSHOT SITS.
 ///
@@ -144,8 +151,8 @@ pub trait KVCacheManagerOps: Send {
     /// Total number of blocks.
     fn num_total_blocks(&self) -> usize;
 
-    /// Block size (tokens per block).
-    fn block_size(&self) -> usize;
+    /// Block size (tokens per block) — the one typed value from the engine's door.
+    fn block_size(&self) -> KvBlockTokens;
 
     /// KV cache usage as a fraction in `[0.0, 1.0]`.
     fn usage(&self) -> f64;
@@ -238,7 +245,7 @@ pub trait KVCacheManagerOps: Send {
 ///   `reversed(req_blocks)` in `SingleTypeKVCacheManager.free()`).
 pub struct SimpleBlockTracker {
     total_blocks: usize,
-    block_size: usize,
+    block_size: KvBlockTokens,
 
     /// THE WORKER'S LAST POOL-WIDE KV REACH — the deepest slot any live request will occupy, and therefore
     /// the slot a batched step's shared write lands at or before. `None` on every backend whose keys sit at
@@ -476,8 +483,8 @@ struct SwaGroup {
     window: usize,
     /// This group's KV block size. Page-unified across groups (gemma4: full
     /// group = 32, sliding groups = 16) so every group draws from the one
-    /// shared pool.
-    block_size: usize,
+    /// shared pool — typed, so a group's size is never re-minted from a usize.
+    block_size: KvBlockTokens,
     /// The block space this group's IDs number: the store its KV lives in
     /// (`HybridKvStores`). Groups in one store share a space.
     space: usize,
@@ -527,11 +534,11 @@ impl SwaGroup {
     /// keeps.
     fn prefix_blocks(&self, p: usize) -> std::ops::Range<usize> {
         let lo = if self.is_sliding {
-            p.saturating_sub(self.window) / self.block_size
+            p.saturating_sub(self.window) / self.block_size.get()
         } else {
             0
         };
-        lo..p.div_ceil(self.block_size)
+        lo..p.div_ceil(self.block_size.get())
     }
 
     /// The global group — the (first) full group, else group 0. Its block size
@@ -545,7 +552,8 @@ impl SwaGroup {
     /// (vLLM's `num_tokens - 1` cap). The P the lookup checks the sliding
     /// windows at is then the P the scheduler runs, because the scheduler's
     /// full-hit back-off never fires on this path.
-    fn max_reusable_prefix(num_tokens: usize, global_bs: usize) -> usize {
+    fn max_reusable_prefix(num_tokens: usize, global_bs: KvBlockTokens) -> usize {
+        let global_bs = global_bs.get();
         num_tokens.saturating_sub(1) / global_bs * global_bs
     }
 }
@@ -553,7 +561,7 @@ impl SwaGroup {
 impl SimpleBlockTracker {
     /// Create a new block tracker with the given number of GPU blocks and
     /// block size.
-    pub fn new(num_gpu_blocks: usize, block_size: usize) -> Self {
+    pub fn new(num_gpu_blocks: usize, block_size: KvBlockTokens) -> Self {
         Self {
             kv_pool_reach: None,
             step_reach: scratchy_core_common::KvSlotSpan::NONE,
@@ -615,7 +623,7 @@ impl SimpleBlockTracker {
     pub fn enable_hybrid(
         &mut self,
         num_blocks: usize,
-        groups: Vec<(bool, usize, usize)>,
+        groups: Vec<(bool, usize, KvBlockTokens)>,
         stores: HybridKvStores,
     ) {
         assert!(
@@ -623,8 +631,9 @@ impl SimpleBlockTracker {
             "enable_hybrid: need >= 2 blocks (null + data)"
         );
         assert!(!groups.is_empty(), "enable_hybrid: at least one group");
-        for &(is_sliding, window, block_size) in &groups {
-            assert!(block_size > 0, "enable_hybrid: block_size must be > 0");
+        for &(is_sliding, window, _block_size) in &groups {
+            // The block size's `> 0` is the type, not an assert — the layout
+            // that minted it proved it when it scaled the group's page.
             assert!(
                 !is_sliding || window > 0,
                 "enable_hybrid: sliding group needs window > 0"
@@ -716,7 +725,7 @@ impl SimpleBlockTracker {
     }
 
     /// Create a new block tracker with prefix caching enabled.
-    pub fn with_caching(num_gpu_blocks: usize, block_size: usize) -> Self {
+    pub fn with_caching(num_gpu_blocks: usize, block_size: KvBlockTokens) -> Self {
         let mut tracker = Self::new(num_gpu_blocks, block_size);
         tracker.enable_caching = true;
         tracker
@@ -794,7 +803,7 @@ impl SimpleBlockTracker {
     #[cfg(test)]
     pub fn with_spans_config(
         num_gpu_blocks: usize,
-        block_size: usize,
+        block_size: KvBlockTokens,
         spans_config: SpansConfig,
     ) -> Self {
         let mut tracker = Self::new(num_gpu_blocks, block_size);
@@ -834,7 +843,7 @@ impl SimpleBlockTracker {
     fn build_mm_extras(
         mm: Option<&MultimodalData>,
         blocks: std::ops::Range<usize>,
-        block_size: usize,
+        block_size: KvBlockTokens,
     ) -> Option<Vec<Vec<u64>>> {
         let mm = mm?;
         if mm.images.is_empty() || blocks.is_empty() {
@@ -846,8 +855,10 @@ impl SimpleBlockTracker {
                 Some(img) => img,
                 None => continue,
             };
-            let start_blk = (ph.offset / block_size).max(blocks.start);
-            let end_blk = (ph.offset + ph.length).div_ceil(block_size).min(blocks.end);
+            let start_blk = (ph.offset / block_size.get()).max(blocks.start);
+            let end_blk = (ph.offset + ph.length)
+                .div_ceil(block_size.get())
+                .min(blocks.end);
             if start_blk >= end_blk {
                 continue;
             }
@@ -962,7 +973,7 @@ impl SimpleBlockTracker {
         all_tokens: &[u32],
         annotations: Option<&scratchy_core_common::BlockAnnotations>,
         mm: Option<&MultimodalData>,
-        block_size: usize,
+        block_size: KvBlockTokens,
     ) -> Vec<u64> {
         let mut hashes = Vec::new();
         self.extend_block_hashes(&mut hashes, all_tokens, annotations, mm, block_size);
@@ -979,9 +990,9 @@ impl SimpleBlockTracker {
         all_tokens: &[u32],
         annotations: Option<&scratchy_core_common::BlockAnnotations>,
         mm: Option<&MultimodalData>,
-        block_size: usize,
+        block_size: KvBlockTokens,
     ) {
-        let num_full_blocks = all_tokens.len() / block_size;
+        let num_full_blocks = all_tokens.len() / block_size.get();
         let first = hashes.len();
         if first >= num_full_blocks {
             return;
@@ -990,8 +1001,8 @@ impl SimpleBlockTracker {
         hashes.reserve(num_full_blocks - first);
         let mut parent_hash = hashes.last().copied().unwrap_or(Self::NONE_HASH);
         for i in first..num_full_blocks {
-            let start = i * block_size;
-            let end = start + block_size;
+            let start = i * block_size.get();
+            let end = start + block_size.get();
             let block_tokens = &all_tokens[start..end];
             let tokens_before = &all_tokens[..start];
             // Annotations are keyed by block index at the CONFIG block size
@@ -1002,7 +1013,7 @@ impl SimpleBlockTracker {
             // Index by the block's TOKEN offset instead — block-size-independent
             // (`first_token` in the annotation is a token index too, so
             // `is_span_first_block` stays exact).
-            let ann_idx = start / self.block_size;
+            let ann_idx = start / self.block_size.get();
             let kind = annotations.and_then(|a| a.get(&ann_idx).copied());
             let extras: &[u64] = (mm_extras.as_ref())
                 .map(|v| v[i - first].as_slice())
@@ -1418,7 +1429,7 @@ impl SimpleBlockTracker {
         request: &Request,
         g: usize,
         grp: SwaGroup,
-        global_bs: usize,
+        global_bs: KvBlockTokens,
     ) {
         if !grp.is_sliding {
             return; // full attention never frees
@@ -1444,7 +1455,7 @@ impl SimpleBlockTracker {
         {
             // Only WHOLE skipped blocks are freed (// block_size floor); the
             // partial block straddling the window edge is retained.
-            let num_skipped_blocks = (num_skipped_tokens / grp.block_size).min(blocks.len());
+            let num_skipped_blocks = (num_skipped_tokens / grp.block_size.get()).min(blocks.len());
             for i in (0..num_skipped_blocks).rev() {
                 if blocks[i] == Self::NULL_BLOCK {
                     // Already nulled — usually by a prior call (contiguous
@@ -1582,7 +1593,7 @@ impl SimpleBlockTracker {
                 let needed = if total_tokens == 0 {
                     0
                 } else {
-                    total_tokens.div_ceil(grp.block_size)
+                    total_tokens.div_ceil(grp.block_size.get())
                 };
                 new_per_group[g] = needed.saturating_sub(tables[g].len());
                 new_per_space[grp.space] += new_per_group[g];
@@ -1609,7 +1620,7 @@ impl SimpleBlockTracker {
                 .allocations
                 .get_mut(&request.request_id)
                 .expect("entry just inserted");
-            *held = total_tokens.div_ceil(groups[0].block_size);
+            *held = total_tokens.div_ceil(groups[0].block_size.get());
             tables.clone()
         };
         // Register full-block hashes (group-namespaced) for any NEWLY full,
@@ -1641,7 +1652,7 @@ impl SimpleBlockTracker {
                 if total_tokens == 0 {
                     0
                 } else {
-                    total_tokens.div_ceil(g.block_size)
+                    total_tokens.div_ceil(g.block_size.get())
                 }
             })
             .collect();
@@ -1689,7 +1700,7 @@ impl SimpleBlockTracker {
             tables[g] = table;
         }
 
-        let held = total_tokens.div_ceil(groups[0].block_size);
+        let held = total_tokens.div_ceil(groups[0].block_size.get());
         self.allocations
             .insert(request.request_id.clone(), (tables.clone(), held));
 
@@ -1860,7 +1871,7 @@ impl SimpleBlockTracker {
         let max_p = SwaGroup::max_reusable_prefix(all_tokens.len(), global_bs);
         let mut chosen_p = 0usize;
         for blocks in (0..=global_contig).rev() {
-            let p = blocks * global_bs;
+            let p = blocks * global_bs.get();
             if p > max_p {
                 continue;
             }
@@ -1885,7 +1896,7 @@ impl SimpleBlockTracker {
         let mut tables: Vec<Vec<usize>> = Vec::with_capacity(groups.len());
         for (g, grp) in groups.iter().enumerate() {
             let hits = &group_hits[g];
-            let computed_blocks = chosen_p.div_ceil(grp.block_size);
+            let computed_blocks = chosen_p.div_ceil(grp.block_size.get());
             // Post-gap span reuse is restricted to the GLOBAL (full) group: the
             // worker's reused_block_idxs path is global-group-indexed, and a
             // sliding block reused past its window would be out-of-window at the
@@ -1917,7 +1928,7 @@ impl SimpleBlockTracker {
             "[CACHE-HYBRID] req={} P={} tokens ({} global blocks of {} hit)",
             request.request_id,
             chosen_p,
-            chosen_p / global_bs.max(1),
+            chosen_p / global_bs.get(),
             global_contig,
         );
 
@@ -1988,8 +1999,9 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         //
         // `kv_extent` is `None` for every backend whose KV is token-addressed (metal), and both
         // lines are then exactly the arithmetic they always were.
-        let block = scratchy_core_common::KvBlockTokens::new(self.block_size)
-            .expect("a KV block holds at least one token");
+        // The block size is HELD as its type — this site once re-minted it from the
+        // `usize` field with an `expect`; the field is the minted value now.
+        let block = self.block_size;
         let writing = num_new_tokens + num_lookahead_tokens;
         // ⭐ THE STEP'S REACH APPLIES TO **RUNNING** REQUESTS TOO — the window a per-request report cannot close.
         // A request's `kv_extent` was reported by the worker at the END of an earlier step, so it cannot know
@@ -2065,7 +2077,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // must not be re-read after the mutation either.
         let num_hashable_full_blocks = match request.kv_extent {
             Some(e) => e.hashable_full_blocks(block, total_tokens),
-            None => total_tokens / self.block_size,
+            None => total_tokens / self.block_size.get(),
         };
 
         // Hybrid sliding-window models: one null-padded block table per group
@@ -2326,12 +2338,8 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // that registers hashes. Sealing a request whose keys spread past its token count would promise a
         // later request blocks covering a masked hole.
         let num_full_blocks = match request.kv_extent {
-            Some(e) => e.hashable_full_blocks(
-                scratchy_core_common::KvBlockTokens::new(self.block_size)
-                    .expect("a KV block holds at least one token"),
-                all_tokens.len(),
-            ),
-            None => all_tokens.len() / self.block_size,
+            Some(e) => e.hashable_full_blocks(self.block_size, all_tokens.len()),
+            None => all_tokens.len() / self.block_size.get(),
         };
 
         let (block_ids_groups, _) = match self.allocations.get(&request.request_id) {
@@ -2433,7 +2441,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             for hash in &hashes {
                 if let Some(&block_id) = self.block_hash_to_id.get(hash) {
                     matched_block_ids.push(block_id);
-                    num_matched_tokens += self.block_size as u32;
+                    num_matched_tokens += self.block_size.get() as u32;
                 } else {
                     break;
                 }
@@ -2475,7 +2483,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 None => break,
             }
         }
-        let contiguous_tokens = (matched_block_ids.len() * self.block_size) as u32;
+        let contiguous_tokens = (matched_block_ids.len() * self.block_size.get()) as u32;
 
         tracing::info!(
             "[CACHE] req={} spans (contiguous-only): {}/{} blocks hit, {} computed tokens",
@@ -2536,7 +2544,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         self.total_blocks
     }
 
-    fn block_size(&self) -> usize {
+    fn block_size(&self) -> KvBlockTokens {
         self.block_size
     }
 
@@ -2568,7 +2576,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         kv_hit_tokens: u32,
     ) -> Option<RecurrentPrefixPlan> {
         let rec = self.recurrent.as_ref()?;
-        let bs = self.block_size;
+        let bs = self.block_size.get();
         // ⛔ Span annotations RELOCATE KV, which a scan state cannot follow, and a vision prompt
         // runs its encoder only on its first prefill step: neither resumes nor snapshots.
         if request.block_annotations.is_some() || request.mm_data.is_some() {
@@ -2938,7 +2946,7 @@ impl Scheduler {
         scheduler_config: &SchedulerConfig,
         max_model_len: usize,
         num_gpu_blocks: usize,
-        block_size: usize,
+        block_size: KvBlockTokens,
     ) -> Self {
         let kv_cache = Box::new(SimpleBlockTracker::new(num_gpu_blocks, block_size));
         Self::new(scheduler_config, max_model_len, kv_cache)
@@ -3642,7 +3650,7 @@ impl SchedulerInterface for Scheduler {
                 // generated).
                 let num_computed_tokens =
                     if num_cached_tokens as usize >= total_tokens && num_cached_tokens > 0 {
-                        let bs = self.kv_cache.block_size();
+                        let bs = self.kv_cache.block_size().get();
                         (((num_cached_tokens as usize) / bs).saturating_sub(1) * bs) as u32
                     } else {
                         num_cached_tokens
@@ -3663,7 +3671,7 @@ impl SchedulerInterface for Scheduler {
                 // are merely waiting on transient capacity (those keep the
                 // normal preempt/retry path below).
                 let num_total_blocks = self.kv_cache.num_total_blocks();
-                let block_size = self.kv_cache.block_size().max(1);
+                let block_size = self.kv_cache.block_size().get();
                 let required_blocks = num_new_tokens_raw.div_ceil(block_size);
                 if num_computed_tokens == 0 && required_blocks > num_total_blocks {
                     warn!(
@@ -4055,7 +4063,7 @@ mod tests {
     #[test]
     fn test_empty_schedule() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         let output = sched.schedule();
         assert_eq!(output.total_num_scheduled_tokens, 0);
@@ -4066,7 +4074,7 @@ mod tests {
     #[test]
     fn test_add_and_schedule_single_request() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         let req = make_request("r1", 10);
         sched.add_request(req);
@@ -4086,7 +4094,7 @@ mod tests {
     #[test]
     fn test_schedule_multiple_requests() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.add_request(make_request("r2", 20));
@@ -4105,7 +4113,7 @@ mod tests {
             enable_chunked_prefill: true,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.add_request(make_request("r2", 10));
@@ -4125,7 +4133,7 @@ mod tests {
             enable_chunked_prefill: true,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.add_request(make_request("r2", 10));
@@ -4146,7 +4154,7 @@ mod tests {
             enable_chunked_prefill: false,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.add_request(make_request("r2", 10));
@@ -4177,7 +4185,7 @@ mod tests {
         };
         // 4096 blocks × 16 = 65k tokens of pool: the 5874-token prompt (368
         // blocks) must never come near the never-fits guard.
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 4096, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 4096, kbt(16));
 
         sched.add_request(make_request("r1", 5874));
 
@@ -4228,7 +4236,7 @@ mod tests {
             ..Default::default()
         };
         // 4 blocks of size 16 = 64-token total KV capacity.
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 100_000, 4, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 100_000, 4, kbt(16));
 
         // 200-token prompt needs ceil(200/16) = 13 blocks > 4 total. Never fits.
         sched.add_request(make_request("toolong", 200));
@@ -4270,7 +4278,7 @@ mod tests {
             ..Default::default()
         };
         // 8 blocks of size 16 = 128-token capacity.
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 100_000, 8, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 100_000, 8, kbt(16));
 
         // 100-token prompt needs ceil(100/16) = 7 blocks <= 8 total. Fits.
         sched.add_request(make_request("ok", 100));
@@ -4287,7 +4295,7 @@ mod tests {
     #[test]
     fn test_request_lifecycle() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Add request.
         sched.add_request(make_request("r1", 10));
@@ -4312,7 +4320,7 @@ mod tests {
     #[test]
     fn test_finish_nonexistent_request() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         let finished = sched.finish_requests(&["nonexistent"], RequestStatus::FinishedAborted);
         assert!(finished.is_empty());
@@ -4321,7 +4329,7 @@ mod tests {
     #[test]
     fn test_finish_waiting_request() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
 
@@ -4342,7 +4350,7 @@ mod tests {
             ..Default::default()
         };
         // Only 4 blocks of size 16 = 64 tokens total.
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 4, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 4, kbt(16));
 
         // Add requests that together need more than 4 blocks.
         sched.add_request(make_request("r1", 16)); // 1 block
@@ -4370,7 +4378,7 @@ mod tests {
             ..Default::default()
         };
         // Very limited blocks: only 2 blocks of size 16 = 32 tokens.
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, kbt(16));
 
         // First step: schedule r1 (16 tokens, 1 block).
         sched.add_request(make_request("r1", 16));
@@ -4392,7 +4400,7 @@ mod tests {
     #[test]
     fn test_pause_all() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.set_pause_state(PauseState::PausedAll);
@@ -4405,7 +4413,7 @@ mod tests {
     #[test]
     fn test_pause_new() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Schedule r1 normally first.
         sched.add_request(make_request("r1", 10));
@@ -4430,7 +4438,7 @@ mod tests {
     #[test]
     fn test_shutdown() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.add_request(make_request("r2", 20));
@@ -4446,7 +4454,7 @@ mod tests {
     #[test]
     fn test_reset_prefix_cache_with_running_requests() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         let _output = sched.schedule();
@@ -4458,7 +4466,7 @@ mod tests {
     #[test]
     fn test_reset_prefix_cache_without_running_requests() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // No running requests -- should succeed.
         assert!(sched.reset_prefix_cache());
@@ -4475,7 +4483,7 @@ mod tests {
             long_prefill_token_threshold: 50,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Request with 200 prompt tokens.
         sched.add_request(make_request("r1", 200));
@@ -4495,7 +4503,7 @@ mod tests {
             enable_chunked_prefill: true,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Request with 50 prompt tokens -- needs multiple steps.
         sched.add_request(make_request("r1", 50));
@@ -4518,7 +4526,7 @@ mod tests {
     #[test]
     fn test_has_requests_with_finished() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         let _output = sched.schedule();
@@ -4547,7 +4555,7 @@ mod tests {
             policy: SchedulerPolicy::Priority,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Add a low-priority request first, then a high-priority one.
         sched.add_request(make_priority_request("r_low", 10, 10, 1.0));
@@ -4577,7 +4585,7 @@ mod tests {
             policy: SchedulerPolicy::Priority,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // The high-priority request should be scheduled first.
         sched.add_request(make_priority_request("r_low", 10, 10, 1.0));
@@ -4593,7 +4601,7 @@ mod tests {
     #[test]
     fn test_get_request() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 5));
         assert!(sched.get_request("r1").is_some());
@@ -4604,7 +4612,7 @@ mod tests {
     #[test]
     fn test_get_request_mut() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 5));
         if let Some(req) = sched.get_request_mut("r1") {
@@ -4616,7 +4624,7 @@ mod tests {
     #[test]
     fn test_append_output_tokens() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 5));
 
@@ -4636,7 +4644,7 @@ mod tests {
     #[test]
     fn test_append_output_tokens_nonexistent() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Appending to a nonexistent request should not panic.
         sched.append_output_tokens("nonexistent", &[1, 2, 3]);
@@ -4646,19 +4654,19 @@ mod tests {
 
     #[test]
     fn test_simple_block_tracker_usage_empty() {
-        let tracker = SimpleBlockTracker::new(100, 16);
+        let tracker = SimpleBlockTracker::new(100, kbt(16));
         assert!((tracker.usage() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_simple_block_tracker_usage_zero_blocks() {
-        let tracker = SimpleBlockTracker::new(0, 16);
+        let tracker = SimpleBlockTracker::new(0, kbt(16));
         assert!((tracker.usage() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_simple_block_tracker_usage_after_alloc() {
-        let mut tracker = SimpleBlockTracker::new(100, 16);
+        let mut tracker = SimpleBlockTracker::new(100, kbt(16));
         // Allocate a request needing 2 blocks (32 tokens / 16 block_size).
         let req = make_request("r1", 32);
         tracker.allocate_slots(&req, 32, 0, &[]);
@@ -4668,7 +4676,7 @@ mod tests {
 
     #[test]
     fn test_simple_block_tracker_usage_after_free() {
-        let mut tracker = SimpleBlockTracker::new(100, 16);
+        let mut tracker = SimpleBlockTracker::new(100, kbt(16));
         let req = make_request("r1", 32);
         tracker.allocate_slots(&req, 32, 0, &[]);
         tracker.free("r1");
@@ -4682,7 +4690,7 @@ mod tests {
     #[test]
     fn requests_one_at_a_time_reach_only_the_blocks_they_need() {
         let mut tracker =
-            SimpleBlockTracker::with_caching(1000, 16).with_kv_backing(KvBacking::OnFirstUse);
+            SimpleBlockTracker::with_caching(1000, kbt(16)).with_kv_backing(KvBacking::OnFirstUse);
         let mut highest = 0;
         for r in 0..40u32 {
             let prompt: Vec<u32> = (0..64).map(|t| r * 1000 + t).collect();
@@ -4726,7 +4734,7 @@ mod tests {
     /// uniform path keeps vLLM's order: a fresh block before a cached one, so the cache lasts.
     #[test]
     fn allocated_kv_keeps_the_cache_ahead_of_fresh_blocks() {
-        let mut tracker = SimpleBlockTracker::with_caching(1000, 16);
+        let mut tracker = SimpleBlockTracker::with_caching(1000, kbt(16));
         let mut ids = Vec::new();
         for r in 0..3u32 {
             let prompt: Vec<u32> = (0..64).map(|t| r * 1000 + t).collect();
@@ -4752,7 +4760,7 @@ mod tests {
     #[test]
     fn test_scheduler_kv_cache_usage() {
         let cfg = test_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Initially empty.
         assert!((sched.kv_cache_usage() - 0.0).abs() < f64::EPSILON);
@@ -4799,7 +4807,7 @@ mod tests {
     #[test]
     fn test_async_placeholder_increment_on_decode() {
         let cfg = async_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Add request, schedule prefill (non-chunked).
         sched.add_request(make_request("r1", 10));
@@ -4831,7 +4839,7 @@ mod tests {
     #[test]
     fn test_async_placeholder_decrement_on_output() {
         let cfg = async_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule(); // prefill
@@ -4854,7 +4862,7 @@ mod tests {
         // update_from_output in between must not double-schedule the
         // same position.
         let cfg = async_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
 
@@ -4891,7 +4899,7 @@ mod tests {
     #[test]
     fn test_async_max_tokens_guard_prevents_over_scheduling() {
         let cfg = async_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Request with only 2 max_tokens.
         sched.add_request(make_request_with_max("r1", 10, 2));
@@ -4926,7 +4934,7 @@ mod tests {
             ..Default::default()
         };
         // 3 blocks of size 8 = 24 tokens of KV capacity.
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 3, 8);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 3, kbt(8));
 
         // Schedule r1 (8 tokens = 1 block) and r2 (8 tokens = 1 block).
         sched.add_request(make_request("r1", 8));
@@ -4979,7 +4987,7 @@ mod tests {
     fn test_async_placeholder_saturating_decrement() {
         // Ensure decrement never underflows.
         let cfg = async_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule(); // prefill
@@ -4993,7 +5001,7 @@ mod tests {
     fn test_sync_mode_no_placeholders() {
         // Verify that without async_scheduling, placeholders are never set.
         let cfg = test_scheduler_config(); // async_scheduling = None (false)
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule(); // prefill
@@ -5016,7 +5024,7 @@ mod tests {
     fn test_prefix_cache_basic() {
         // Two requests with the same 32-token prompt should share cached blocks.
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(100, kbt(block_size));
 
         // Make a 32-token prompt (2 full blocks).
         let prompt: Vec<u32> = (0..32).collect();
@@ -5076,7 +5084,7 @@ mod tests {
     fn test_prefix_cache_partial_match() {
         // Request with longer prompt should match the shared prefix.
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(100, kbt(block_size));
 
         // First request: 32 tokens.
         let prompt32: Vec<u32> = (0..32).collect();
@@ -5117,7 +5125,7 @@ mod tests {
     #[test]
     fn test_prefix_cache_no_match_different_prompt() {
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(100, kbt(block_size));
 
         let prompt_a: Vec<u32> = (0..32).collect();
         let mut r1 = Request::new(
@@ -5158,7 +5166,7 @@ mod tests {
     fn test_prefix_cache_eviction_under_pressure() {
         // With limited blocks, cached blocks get evicted FIFO.
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(4, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(4, kbt(block_size));
 
         // Fill all 4 blocks with r1 (64 tokens).
         let prompt64: Vec<u32> = (0..64).collect();
@@ -5205,7 +5213,7 @@ mod tests {
     #[test]
     fn test_prefix_cache_reset() {
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(100, kbt(block_size));
 
         let prompt: Vec<u32> = (0..32).collect();
         let mut r1 = Request::new(
@@ -5250,7 +5258,7 @@ mod tests {
         // When allocating for a request with cached prefix, the cached block IDs
         // should appear in the allocation.
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(100, kbt(block_size));
 
         let prompt: Vec<u32> = (0..32).collect();
         let mut r1 = Request::new(
@@ -5303,7 +5311,7 @@ mod tests {
         // Verify that block IDs are recycled and stay within bounds.
         // With 4 blocks, serve many sequential requests — IDs must stay in 0..4.
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::new(4, block_size);
+        let mut tracker = SimpleBlockTracker::new(4, kbt(block_size));
 
         for round in 0..20 {
             let prompt: Vec<u32> = (0..16).collect();
@@ -5365,10 +5373,10 @@ mod tests {
 
     // gemma4-shaped tracker WITH caching: 1 full (bs 32) + 1 sliding (W=64, bs 16).
     fn caching_hybrid(pool: usize, window: usize) -> SimpleBlockTracker {
-        let mut t = SimpleBlockTracker::with_caching(pool, 16);
+        let mut t = SimpleBlockTracker::with_caching(pool, kbt(16));
         t.enable_hybrid(
             pool,
-            vec![(false, 0, 32), (true, window, 16)],
+            vec![(false, 0, kbt(32)), (true, window, kbt(16))],
             HybridKvStores::Shared,
         );
         t
@@ -5405,10 +5413,10 @@ mod tests {
 
     // `caching_hybrid`, the global group's KV in a store of its own.
     fn caching_hybrid_apart(pool: usize, window: usize) -> SimpleBlockTracker {
-        let mut t = SimpleBlockTracker::with_caching(pool, 16);
+        let mut t = SimpleBlockTracker::with_caching(pool, kbt(16));
         t.enable_hybrid(
             pool,
-            vec![(false, 0, 32), (true, window, 16)],
+            vec![(false, 0, kbt(32)), (true, window, kbt(16))],
             HybridKvStores::GlobalApart,
         );
         t
@@ -5491,7 +5499,7 @@ mod tests {
         // Manually register ONLY the full group's first 2 blocks (64 tokens),
         // leaving the sliding group with no hits → joint P must be 0.
         let r1 = hybrid_req("r1", 128);
-        let full_hashes = t.hash_all_blocks_bs(&r1.all_token_ids, None, None, 32);
+        let full_hashes = t.hash_all_blocks_bs(&r1.all_token_ids, None, None, kbt(32));
         // Pretend two full blocks are cached at fake ids 5,6 but NO sliding.
         t.ref_cnt[5] = 0;
         t.ref_cnt[6] = 0;
@@ -5555,8 +5563,8 @@ mod tests {
         // partial block.
         for stores in [HybridKvStores::Shared, HybridKvStores::GlobalApart] {
             let reuse = |reply_len| {
-                let mut t = SimpleBlockTracker::with_caching(512, 16);
-                t.enable_hybrid(512, vec![(false, 0, 32), (true, 64, 16)], stores);
+                let mut t = SimpleBlockTracker::with_caching(512, kbt(16));
+                t.enable_hybrid(512, vec![(false, 0, kbt(32)), (true, 64, kbt(16))], stores);
                 hybrid_reuse_after_reply(t, 200, reply_len)
             };
             assert_eq!(reuse(8), 192, "{stores:?} short reply");
@@ -5574,12 +5582,12 @@ mod tests {
         for stores in [HybridKvStores::Shared, HybridKvStores::GlobalApart] {
             let run = |caching: bool| {
                 let mut t = if caching {
-                    SimpleBlockTracker::with_caching(512, 16)
+                    SimpleBlockTracker::with_caching(512, kbt(16))
                 } else {
-                    SimpleBlockTracker::new(512, 16)
+                    SimpleBlockTracker::new(512, kbt(16))
                 };
-                let mut groups = vec![(false, 0usize, 32usize)];
-                groups.extend(std::iter::repeat_n((true, 64usize, 16usize), 5));
+                let mut groups = vec![(false, 0usize, kbt(32))];
+                groups.extend(std::iter::repeat_n((true, 64usize, kbt(16)), 5));
                 t.enable_hybrid(512, groups, stores);
                 let mut r1 = hybrid_req("r1", 200);
                 t.allocate_slots(&r1, 200, 0, &[]).unwrap();
@@ -5656,8 +5664,8 @@ mod tests {
         let window = 64usize; // 4 blocks
         let win_blocks = window.div_ceil(bs); // 4
         let pool = 4096usize; // a big pool: FIFO would climb toward 4096
-        let mut tracker = SimpleBlockTracker::new(pool, bs);
-        tracker.enable_hybrid(pool, vec![(true, window, bs)], HybridKvStores::Shared); // one sliding group
+        let mut tracker = SimpleBlockTracker::new(pool, kbt(bs));
+        tracker.enable_hybrid(pool, vec![(true, window, kbt(bs))], HybridKvStores::Shared); // one sliding group
 
         let mut r = swa_test_request("r1", bs);
         let mut max_seen = 0usize;
@@ -5695,8 +5703,8 @@ mod tests {
         let window = 64usize;
         let win_blocks = window.div_ceil(bs);
         let pool = 4096usize;
-        let mut tracker = SimpleBlockTracker::with_caching(pool, bs);
-        tracker.enable_hybrid(pool, vec![(true, window, bs)], HybridKvStores::Shared);
+        let mut tracker = SimpleBlockTracker::with_caching(pool, kbt(bs));
+        tracker.enable_hybrid(pool, vec![(true, window, kbt(bs))], HybridKvStores::Shared);
 
         let mut r = hybrid_req("r1", 200);
         tracker.allocate_slots(&r, 200, 0, &[]).expect("prefill");
@@ -5988,10 +5996,14 @@ mod tests {
         // shared pool. Per-group tables, null-padding of skipped head slots,
         // distinct in-window physical blocks (no aliasing), full never frees.
         let pool = 256usize;
-        let mut t = SimpleBlockTracker::new(pool, 16);
+        let mut t = SimpleBlockTracker::new(pool, kbt(16));
         t.enable_hybrid(
             pool,
-            vec![(false, 0, 32), (true, 64, 16), (true, 64, 16)],
+            vec![
+                (false, 0, kbt(32)),
+                (true, 64, kbt(16)),
+                (true, 64, kbt(16)),
+            ],
             HybridKvStores::Shared,
         );
 
@@ -6056,10 +6068,14 @@ mod tests {
         let full = 320usize.div_ceil(32); // 10
         let sld = 320usize.div_ceil(16); // 20
         let demand = full + 2 * sld; // 50
-        let groups = vec![(false, 0usize, 32usize), (true, 64, 16), (true, 64, 16)];
+        let groups = vec![
+            (false, 0usize, kbt(32)),
+            (true, 64, kbt(16)),
+            (true, 64, kbt(16)),
+        ];
 
         // Pool = demand + 1 (the held null block) fits exactly.
-        let mut t = SimpleBlockTracker::new(demand + 1, 16);
+        let mut t = SimpleBlockTracker::new(demand + 1, kbt(16));
         t.enable_hybrid(demand + 1, groups.clone(), HybridKvStores::Shared);
         let mut r = swa_test_request("r1", 16);
         r.num_computed_tokens = 0;
@@ -6070,7 +6086,7 @@ mod tests {
         assert_eq!(t.num_free_blocks(), 0, "exact fit consumes the pool");
 
         // One block short → reject (atomic cross-group check, no partial alloc).
-        let mut t2 = SimpleBlockTracker::new(demand, 16);
+        let mut t2 = SimpleBlockTracker::new(demand, kbt(16));
         t2.enable_hybrid(demand, groups, HybridKvStores::Shared);
         let mut r2 = swa_test_request("r2", 16);
         r2.num_computed_tokens = 0;
@@ -6098,7 +6114,7 @@ mod tests {
             ..Default::default()
         };
         let kv: Box<dyn KVCacheManagerOps> =
-            Box::new(SimpleBlockTracker::with_caching(100, block_size));
+            Box::new(SimpleBlockTracker::with_caching(100, kbt(block_size)));
         let mut sched = Scheduler::new(&cfg, 8192, kv);
 
         // 32-token prompt = 2 full blocks with block_size=16.
@@ -6167,7 +6183,7 @@ mod tests {
         // Same as above but with caching — evicted cached blocks must also
         // produce IDs within bounds.
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(4, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(4, kbt(block_size));
 
         for round in 0..20 {
             // Each request uses a different prompt so no cache hits.
@@ -6215,7 +6231,7 @@ mod tests {
     fn test_spec_decode_tokens_scheduled() {
         // Verify that spec_token_ids are included in the scheduling output.
         let cfg = spec_decode_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule(); // prefill
@@ -6239,7 +6255,7 @@ mod tests {
     fn test_spec_decode_tokens_cleared_after_schedule() {
         // After scheduling, spec_token_ids should be cleared.
         let cfg = spec_decode_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule(); // prefill
@@ -6267,7 +6283,7 @@ mod tests {
             num_lookahead_tokens: 5,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 2));
         sched.schedule(); // prefill (2 tokens)
@@ -6305,8 +6321,8 @@ mod tests {
         let cfg_spec = spec_decode_scheduler_config(); // lookahead=5
 
         // Use very limited blocks to see the difference.
-        let mut sched_no = Scheduler::with_simple_blocks(&cfg_no_spec, 8192, 2, 16);
-        let mut sched_sp = Scheduler::with_simple_blocks(&cfg_spec, 8192, 2, 16);
+        let mut sched_no = Scheduler::with_simple_blocks(&cfg_no_spec, 8192, 2, kbt(16));
+        let mut sched_sp = Scheduler::with_simple_blocks(&cfg_spec, 8192, 2, kbt(16));
 
         // Add a request that fills nearly all blocks during prefill.
         sched_no.add_request(make_request("r1", 15));
@@ -6343,7 +6359,7 @@ mod tests {
     fn test_spec_decode_mixed_batch() {
         // Some requests have spec tokens, some don't.
         let cfg = spec_decode_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.add_request(make_request("r2", 10));
@@ -6389,7 +6405,7 @@ mod tests {
         // num_computed_tokens when spec decode drafts are rejected.
         // This matches Python's scheduler.update_from_output().
         let cfg = spec_decode_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule(); // prefill: num_computed_tokens = 10
@@ -6421,7 +6437,7 @@ mod tests {
     fn test_spec_decode_rewind_all_rejected() {
         // All drafts rejected: rewind by full draft count.
         let cfg = spec_decode_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule(); // prefill: num_computed = 10
@@ -6445,7 +6461,7 @@ mod tests {
     fn test_spec_decode_rewind_none_rejected() {
         // All drafts accepted: no rewind needed.
         let cfg = spec_decode_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 10));
         sched.schedule();
@@ -6484,7 +6500,7 @@ mod tests {
         // populate new_token_ids in CachedRequestData so non-last PP stages
         // can embed the correct token.
         let cfg = pp_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         // Add request with 10 prompt tokens.
         sched.add_request(make_request("r1", 10));
@@ -6519,7 +6535,7 @@ mod tests {
     fn test_pp_new_token_ids_multiple_decode_steps() {
         // Verify new_token_ids is correct across multiple decode steps.
         let cfg = pp_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 5));
 
@@ -6553,7 +6569,7 @@ mod tests {
     fn test_pp_new_token_ids_multiple_requests() {
         // Verify new_token_ids works with multiple concurrent requests.
         let cfg = pp_scheduler_config();
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 5));
         sched.add_request(make_request("r2", 5));
@@ -6583,7 +6599,7 @@ mod tests {
     fn test_pp_no_new_token_ids_without_pp() {
         // Without use_pp, new_token_ids should be empty.
         let cfg = test_scheduler_config(); // use_pp = false
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 5));
         sched.schedule();
@@ -6608,7 +6624,7 @@ mod tests {
             use_pp: true,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, kbt(16));
 
         sched.add_request(make_request("r1", 5));
         sched.schedule();
@@ -6625,7 +6641,7 @@ mod tests {
     fn test_decode_blocks_cached_after_preemption() {
         // After preemption, decode blocks should be recoverable from the cache.
         let block_size = 16;
-        let mut tracker = SimpleBlockTracker::with_caching(20, block_size);
+        let mut tracker = SimpleBlockTracker::with_caching(20, kbt(block_size));
 
         // 32-token prompt + 32 decode tokens = 64 tokens = 4 full blocks.
         let prompt: Vec<u32> = (0..32).collect();
@@ -6689,7 +6705,7 @@ mod tests {
             enable_chunked_prefill: true,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, kbt(16));
 
         sched.add_request(make_request("r1", 16));
         sched.add_request(make_request("r2", 16));
@@ -6729,7 +6745,7 @@ mod tests {
             enable_chunked_prefill: true,
             ..Default::default()
         };
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, kbt(16));
 
         sched.add_request(make_request("r1", 16));
         sched.add_request(make_request("r2", 16));
@@ -6758,7 +6774,7 @@ mod tests {
     #[test]
     fn test_block_free_reverse_order() {
         // 4 blocks of size 4 — exactly fits a 16-token request.
-        let mut tracker = SimpleBlockTracker::new(4, 4);
+        let mut tracker = SimpleBlockTracker::new(4, kbt(4));
         let req = make_request("r1", 16);
 
         let alloc = tracker
@@ -6800,7 +6816,7 @@ mod tests {
             ..Default::default()
         };
         // 2 blocks of 16 tokens each.
-        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, kbt(16));
 
         sched.add_request(make_request("r1", 16));
         sched.add_request(make_request("r2", 16));
@@ -6864,7 +6880,7 @@ mod tests {
     fn test_span_hash_all_blocks_chains_parents() {
         // hash_all_blocks chains parent hashes, so the same block content
         // at different positions produces different hashes.
-        let tracker = SimpleBlockTracker::new(16, 4);
+        let tracker = SimpleBlockTracker::new(16, kbt(4));
         let tokens: Vec<u32> = (0..12).collect(); // 3 full blocks of size 4
         let hashes = tracker.hash_all_blocks(&tokens, None, None);
         assert_eq!(hashes.len(), 3);
@@ -6882,7 +6898,7 @@ mod tests {
     #[test]
     fn test_span_relocatable_resets_parent_hash() {
         let cfg = spans_config_enabled();
-        let tracker = SimpleBlockTracker::with_spans_config(16, 4, cfg);
+        let tracker = SimpleBlockTracker::with_spans_config(16, kbt(4), cfg);
 
         // Block 1 is its OWN single-block relocatable span (first_token = 4, the
         // block's own first token, so it is the span's FIRST block). Under
@@ -6908,7 +6924,7 @@ mod tests {
     #[test]
     fn test_span_prefixed_includes_context() {
         let cfg = spans_config_enabled();
-        let tracker = SimpleBlockTracker::with_spans_config(16, 4, cfg);
+        let tracker = SimpleBlockTracker::with_spans_config(16, kbt(4), cfg);
 
         // Block 1 annotated as Prefixed should differ when preceded
         // by different tokens.
@@ -6932,7 +6948,7 @@ mod tests {
         // Simulate: preload doc_a, then query [doc_a, doc_b, query].
         // doc_a's block should be a cache hit for the second request.
         let cfg = spans_config_enabled();
-        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, kbt(4), cfg);
 
         let doc_a: Vec<u32> = vec![100, 101, 102, 103]; // relocatable block
         let doc_b: Vec<u32> = vec![200, 201, 202, 203]; // relocatable block
@@ -7007,7 +7023,7 @@ mod tests {
         // so contiguous-only is exactly the safe subset it needs. (Re-enabling
         // post-gap relocation is gated behind the non-aligned rope-on-read fix.)
         let cfg = spans_config_enabled();
-        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, kbt(4), cfg);
 
         let doc_a: Vec<u32> = vec![100, 101, 102, 103];
         let doc_b: Vec<u32> = vec![200, 201, 202, 203];
@@ -7094,7 +7110,7 @@ mod tests {
         // Same block content at different positions should produce different hashes.
         let tracker = SimpleBlockTracker::with_spans_config(
             16,
-            4,
+            kbt(4),
             SpansConfig::default(), // disabled
         );
         // [A, B] and [B, A] — block content is the same but order differs.
@@ -7122,7 +7138,7 @@ mod tests {
         // 5. Outer request with same 8 tokens → full cache hit on both blocks
 
         let cfg = spans_config_enabled();
-        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, kbt(4), cfg);
 
         let prompt: Vec<u32> = vec![10, 20, 30, 40, 50, 60]; // 6 tokens
         let mut req = Request::new(
@@ -7218,7 +7234,7 @@ mod tests {
         // Volatile blocks go to the front of the free queue (evicted first).
         // Normal blocks go to the back.
         let cfg = spans_config_enabled();
-        let mut tracker = SimpleBlockTracker::with_spans_config(4, 4, cfg);
+        let mut tracker = SimpleBlockTracker::with_spans_config(4, kbt(4), cfg);
 
         // Fill all 4 blocks with 2 requests.
         let req_normal = Request::new(
@@ -7278,7 +7294,7 @@ mod tests {
         // After free_volatile, the cache mapping (hash→block_id) still exists.
         // A request arriving before eviction should get a cache hit.
         let cfg = spans_config_enabled();
-        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, kbt(4), cfg);
 
         let tokens: Vec<u32> = vec![10, 20, 30, 40];
         let req1 = Request::new(
@@ -7323,7 +7339,7 @@ mod tests {
         // Outer: same 16 tokens as prefix, then more → all 4 inner blocks cached
 
         let cfg = spans_config_enabled();
-        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, kbt(4), cfg);
 
         // Inner: 8-token prompt = 2 full blocks.
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -7419,7 +7435,7 @@ mod tests {
         // If SealPadProcessor didn't pad (e.g. request stopped before EOS),
         // seal() only registers full blocks. The partial last block is lost.
         let cfg = spans_config_enabled();
-        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, kbt(4), cfg);
 
         // 6 tokens = 1 full block + 2 partial.
         let prompt: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
@@ -7468,7 +7484,7 @@ mod tests {
         // token sequences, regardless of how those tokens arrived (prompt vs
         // prompt+output). This is the fundamental invariant for cache hits.
         let cfg = spans_config_enabled();
-        let tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+        let tracker = SimpleBlockTracker::with_spans_config(64, kbt(4), cfg);
 
         // Inner's all_token_ids: prompt [1,2,3,4,5,6,7,8] + output [100,2,0,0]
         let inner_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 2, 0, 0];
@@ -7521,9 +7537,9 @@ mod tests {
             HybridKvStores::Shared => 2634usize,
             HybridKvStores::GlobalApart => 2300,
         };
-        let mut tracker = SimpleBlockTracker::new(pool, 16);
-        let mut groups = vec![(false, 0usize, 32usize)];
-        groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
+        let mut tracker = SimpleBlockTracker::new(pool, kbt(16));
+        let mut groups = vec![(false, 0usize, kbt(32))];
+        groups.extend(std::iter::repeat_n((true, 1024usize, kbt(16)), 5));
         tracker.enable_hybrid(pool, groups, stores);
         let mut sched = Scheduler::new(&cfg, 32768, Box::new(tracker));
         let (num_reqs, prompt_len, max_tokens) = (12usize, 512u32, 128u32);
@@ -7620,7 +7636,7 @@ mod tests {
     fn evicting_an_older_copy_of_a_block_keeps_the_newer_ones_mapping() {
         // Two requests compute the same prefix into blocks of their own; the second's
         // registration moves the mapping. Recycling the FIRST copy must not delete it.
-        let mut t = SimpleBlockTracker::with_caching(4, 16);
+        let mut t = SimpleBlockTracker::with_caching(4, kbt(16));
         let b1 = t
             .allocate_slots(&make_request("r1", 32), 32, 0, &[])
             .unwrap()[0]
@@ -7700,7 +7716,7 @@ mod tests {
     /// it fails they are no hits, and those of the step before it, which came back, still are.
     #[test]
     fn a_failed_steps_blocks_are_no_prefix_cache_hits() {
-        let mut t = SimpleBlockTracker::with_caching(16, 16);
+        let mut t = SimpleBlockTracker::with_caching(16, kbt(16));
         let mut r = make_request("r1", 64);
         let ran = t.new_step_starts();
         t.allocate_slots(&r, 32, 0, &[]).unwrap();
@@ -7728,7 +7744,7 @@ mod tests {
     /// it fails with it, and the blocks it wrote are no hits either. A bystander's still are.
     #[test]
     fn a_request_admitted_onto_a_failed_steps_blocks_fails_with_it() {
-        let mut t = SimpleBlockTracker::with_caching(32, 16);
+        let mut t = SimpleBlockTracker::with_caching(32, kbt(16));
         let failed = t.new_step_starts();
         t.allocate_slots(&make_request("r1", 64), 64, 0, &[])
             .unwrap();
@@ -7760,7 +7776,7 @@ mod tests {
     /// its step failing finds them all the same, and the request admitted onto them.
     #[test]
     fn a_request_freed_before_its_step_failed_is_forgotten_all_the_same() {
-        let mut t = SimpleBlockTracker::with_caching(32, 16);
+        let mut t = SimpleBlockTracker::with_caching(32, kbt(16));
         let failed = t.new_step_starts();
         t.allocate_slots(&make_request("r1", 64), 64, 0, &[])
             .unwrap();
@@ -7781,7 +7797,7 @@ mod tests {
     /// the failed step's to write.
     #[test]
     fn a_failed_requests_blocks_registered_behind_its_step_go_too() {
-        let mut t = SimpleBlockTracker::with_caching(16, 16);
+        let mut t = SimpleBlockTracker::with_caching(16, kbt(16));
         let mut r = make_request("r1", 63);
         let ran = t.new_step_starts();
         t.allocate_slots(&r, 63, 0, &[]).unwrap();
@@ -7810,7 +7826,7 @@ mod tests {
     /// place. The block is its writer's: the step failing leaves it cached, and its writer runs on.
     #[test]
     fn a_failed_step_leaves_the_cached_block_it_recomputes() {
-        let mut t = SimpleBlockTracker::with_caching(16, 16);
+        let mut t = SimpleBlockTracker::with_caching(16, kbt(16));
         let ran = t.new_step_starts();
         t.allocate_slots(&make_request("p", 64), 64, 0, &[])
             .unwrap();
@@ -7837,8 +7853,8 @@ mod tests {
     #[test]
     fn a_failed_steps_blocks_are_no_hybrid_prefix_cache_hits() {
         for stores in BOTH_STORES {
-            let mut t = SimpleBlockTracker::with_caching(64, 16);
-            t.enable_hybrid(64, vec![(false, 0, 32), (true, 1024, 16)], stores);
+            let mut t = SimpleBlockTracker::with_caching(64, kbt(16));
+            t.enable_hybrid(64, vec![(false, 0, kbt(32)), (true, 1024, kbt(16))], stores);
             let mut r = hybrid_req("r1", 128);
             let ran = t.new_step_starts();
             t.allocate_slots(&r, 64, 0, &[]).unwrap();
@@ -7856,8 +7872,8 @@ mod tests {
     /// A gemma-4-shaped tracker with a window no prompt here leaves: one full group (bs 32) and
     /// one sliding group (bs 16).
     fn wide_window_hybrid(stores: HybridKvStores) -> SimpleBlockTracker {
-        let mut t = SimpleBlockTracker::with_caching(64, 16);
-        t.enable_hybrid(64, vec![(false, 0, 32), (true, 1024, 16)], stores);
+        let mut t = SimpleBlockTracker::with_caching(64, kbt(16));
+        t.enable_hybrid(64, vec![(false, 0, kbt(32)), (true, 1024, kbt(16))], stores);
         t
     }
 
@@ -7966,7 +7982,8 @@ mod tests {
     /// onto its blocks fails with it, and the next copy of the prompt computes it from scratch.
     #[test]
     fn a_failed_step_takes_the_requests_admitted_onto_its_blocks() {
-        let kv: Box<dyn KVCacheManagerOps> = Box::new(SimpleBlockTracker::with_caching(100, 16));
+        let kv: Box<dyn KVCacheManagerOps> =
+            Box::new(SimpleBlockTracker::with_caching(100, kbt(16)));
         let mut sched = Scheduler::new(&test_scheduler_config(), 8192, kv);
         sched.add_request(make_request("r1", 64));
         let failed = sched.schedule();
@@ -7984,7 +8001,8 @@ mod tests {
     /// the step failing still forgets its blocks.
     #[test]
     fn a_request_aborted_while_its_step_was_in_flight_is_forgotten_when_it_fails() {
-        let kv: Box<dyn KVCacheManagerOps> = Box::new(SimpleBlockTracker::with_caching(100, 16));
+        let kv: Box<dyn KVCacheManagerOps> =
+            Box::new(SimpleBlockTracker::with_caching(100, kbt(16)));
         let mut sched = Scheduler::new(&test_scheduler_config(), 8192, kv);
         sched.add_request(make_request("r1", 64));
         let failed = sched.schedule();
@@ -8019,11 +8037,11 @@ mod tests {
             ..Default::default()
         };
         let mut tracker = match caching {
-            true => SimpleBlockTracker::with_caching(pool, 16),
-            false => SimpleBlockTracker::new(pool, 16),
+            true => SimpleBlockTracker::with_caching(pool, kbt(16)),
+            false => SimpleBlockTracker::new(pool, kbt(16)),
         };
-        let mut groups = vec![(false, 0usize, 32usize)];
-        groups.extend(std::iter::repeat_n((true, 1024usize, 16usize), 5));
+        let mut groups = vec![(false, 0usize, kbt(32))];
+        groups.extend(std::iter::repeat_n((true, 1024usize, kbt(16)), 5));
         tracker.enable_hybrid(pool, groups, stores);
         Scheduler::new(&cfg, 32768, Box::new(tracker.with_kv_backing(backing)))
     }
@@ -8060,7 +8078,7 @@ mod tests {
     /// 8 blocks of 10 bytes — an 80-byte budget — in granules of 4, and up to 4 snapshot slots of
     /// 20 bytes, a unit each: a pool where KV and the snapshots compete.
     fn shared() -> SimpleBlockTracker {
-        SimpleBlockTracker::with_caching(8, 16).with_state_snapshots(SnapshotBudget {
+        SimpleBlockTracker::with_caching(8, kbt(16)).with_state_snapshots(SnapshotBudget {
             kv_block_bytes: 10,
             kv_granule_blocks: std::num::NonZeroUsize::new(4).unwrap(),
             slot_bytes: 20,
@@ -8177,7 +8195,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_goes_with_the_block_it_ends_at() {
-        let mut t = SimpleBlockTracker::with_caching(4, 16).with_state_snapshots(apart(2));
+        let mut t = SimpleBlockTracker::with_caching(4, kbt(16)).with_state_snapshots(apart(2));
         let a = alloc(&mut t, &prompt_blocks("a", 4, 1)).unwrap();
         let key = t.block_id_to_hash[&a[2]];
         assert_eq!(t.reserve_snapshot(key, 48, "a"), Some(0));
@@ -8256,8 +8274,9 @@ mod tests {
             long_prefill_token_threshold: 0,
             ..Default::default()
         };
-        let kv: Box<dyn KVCacheManagerOps> =
-            Box::new(SimpleBlockTracker::with_caching(1000, 16).with_state_snapshots(apart(slots)));
+        let kv: Box<dyn KVCacheManagerOps> = Box::new(
+            SimpleBlockTracker::with_caching(1000, kbt(16)).with_state_snapshots(apart(slots)),
+        );
         Scheduler::new(&cfg, 8192, kv)
     }
 
@@ -8309,7 +8328,7 @@ mod tests {
         let sliding = SwaGroup {
             is_sliding: true,
             window: 1024,
-            block_size: 16,
+            block_size: kbt(16),
             space: 0,
         };
         for (g, table) in tables.iter().enumerate().skip(1) {
@@ -8587,7 +8606,7 @@ mod tests {
         // hashing all its tokens gives: across relocatable and prefixed span blocks (annotated by
         // token offset at the config block size) and image placeholders, at both block sizes.
         use scratchy_core_common::multimodal::{ImageData, PlaceholderRange};
-        let t = SimpleBlockTracker::with_caching(64, 16);
+        let t = SimpleBlockTracker::with_caching(64, kbt(16));
         let tokens: Vec<u32> = (0..400u32).map(|i| i * 7 % 251).collect();
         let mut ann = std::collections::BTreeMap::new();
         ann.insert(3, BlockKind::Relocatable { first_token: 48 });
@@ -8617,8 +8636,8 @@ mod tests {
             for step in [1usize, 7, 37, 5, 64, 13, 100, 3, 170] {
                 len = (len + step).min(tokens.len());
                 let seen = &tokens[..len];
-                t.extend_block_hashes(&mut hashes, seen, Some(&ann), Some(&mm), block_size);
-                let full = t.hash_all_blocks_bs(seen, Some(&ann), Some(&mm), block_size);
+                t.extend_block_hashes(&mut hashes, seen, Some(&ann), Some(&mm), kbt(block_size));
+                let full = t.hash_all_blocks_bs(seen, Some(&ann), Some(&mm), kbt(block_size));
                 assert_eq!(hashes, full, "block size {block_size}, {len} tokens");
             }
             assert_eq!(hashes.len(), tokens.len() / block_size);
@@ -8631,8 +8650,8 @@ mod tests {
         // ends holding exactly the hashes a full rehash of its tokens gives, each in-window block
         // registered under its own.
         for stores in BOTH_STORES {
-            let mut t = SimpleBlockTracker::with_caching(512, 16);
-            t.enable_hybrid(512, vec![(false, 0, 32), (true, 64, 16)], stores);
+            let mut t = SimpleBlockTracker::with_caching(512, kbt(16));
+            t.enable_hybrid(512, vec![(false, 0, kbt(32)), (true, 64, kbt(16))], stores);
             let mut r = hybrid_req("r1", 200);
             t.allocate_slots(&r, 200, 0, &[]).unwrap();
             r.num_computed_tokens = 200;
@@ -8706,7 +8725,7 @@ mod tests {
             unit_slots: std::num::NonZeroUsize::MIN,
             max_slots: 3,
         };
-        let kv = SimpleBlockTracker::with_caching(10, 16).with_state_snapshots(budget);
+        let kv = SimpleBlockTracker::with_caching(10, kbt(16)).with_state_snapshots(budget);
         let mut sched = Scheduler::new(&cfg, 8192, Box::new(kv));
         let saved = |sched: &mut Scheduler, id: &str, prompt: Vec<u32>| {
             sched.add_request(request_with(id, prompt));
@@ -9152,7 +9171,7 @@ mod tests {
         };
         // r0 (1 block) + r1 (600 tokens, 38 blocks) fill the pool exactly.
         let kv: Box<dyn KVCacheManagerOps> =
-            Box::new(SimpleBlockTracker::with_caching(39, 16).with_state_snapshots(apart(4)));
+            Box::new(SimpleBlockTracker::with_caching(39, kbt(16)).with_state_snapshots(apart(4)));
         let mut sched = Scheduler::new(&cfg, 8192, kv);
         let long = |id: &str, n: usize| {
             let mut r = make_request(id, n);
@@ -9219,7 +9238,7 @@ mod tests {
             ..Default::default()
         };
         let kv: Box<dyn KVCacheManagerOps> =
-            Box::new(SimpleBlockTracker::with_caching(79, 16).with_state_snapshots(apart(4)));
+            Box::new(SimpleBlockTracker::with_caching(79, kbt(16)).with_state_snapshots(apart(4)));
         let mut sched = Scheduler::new(&cfg, 8192, kv);
         sched.add_request(make_request("r1", 600));
         prefill_and_finish(&mut sched, "r1");

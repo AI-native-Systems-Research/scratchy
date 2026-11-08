@@ -429,8 +429,9 @@ fn create_worker(
         hf_token: config.hf_token.clone(),
         // The backend's own page size when it has one (see `effective_block_size`); a mismatch
         // between this and the scheduler's block size silently corrupts KV slots. The one
-        // resolved value, minted once in `initialize_core` — the same one the scheduler gets.
-        block_size: block_size.get(),
+        // resolved value, minted once in `initialize_core` — the same one the scheduler gets,
+        // AS the type: the worker and the scheduler hold one value, not two copies of a number.
+        block_size,
         // The REQUEST, not a resolved number: `None` lets the worker resolve
         // the width itself (device tier / memory-affordable GDN slots), while
         // `Some(n)` pins every worker-side consumer to the caller's ask.
@@ -1639,7 +1640,7 @@ fn initialize_core(
         },
         max_model_len,
         num_gpu_blocks,
-        block_size: block_size.get(),
+        block_size,
         engine_index: 0,
         async_scheduling: use_async_scheduling,
         use_spec_decode: speculation.is_on(),
@@ -2272,7 +2273,7 @@ fn compute_kv_blocks(
     }
     match scratchy_core_config::compute_hybrid_kv_layout(
         &geom,
-        block_size.get(),
+        block_size,
         available_bytes,
         elem_bytes,
     ) {
@@ -2521,7 +2522,14 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 4, 0.9, "auto");
+        let blocks = compute_num_blocks(
+            4 * 1024 * 1024 * 1024,
+            KvBlockTokens::new(16).expect("16 > 0"),
+            &config,
+            4,
+            0.9,
+            "auto",
+        );
         assert!(blocks >= 16);
     }
 
@@ -2535,8 +2543,22 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_f32 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 4, 0.9, "auto");
-        let blocks_f16 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 2, 0.9, "auto");
+        let blocks_f32 = compute_num_blocks(
+            4 * 1024 * 1024 * 1024,
+            KvBlockTokens::new(16).expect("16 > 0"),
+            &config,
+            4,
+            0.9,
+            "auto",
+        );
+        let blocks_f16 = compute_num_blocks(
+            4 * 1024 * 1024 * 1024,
+            KvBlockTokens::new(16).expect("16 > 0"),
+            &config,
+            2,
+            0.9,
+            "auto",
+        );
         assert!(blocks_f16 > blocks_f32);
         // F16 should give approximately 2x the blocks.
         assert!((blocks_f16 as f64 / blocks_f32 as f64 - 2.0).abs() < 0.1);

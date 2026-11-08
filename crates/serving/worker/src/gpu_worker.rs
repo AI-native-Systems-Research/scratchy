@@ -791,7 +791,7 @@ fn kv_pool_tensors(
 #[cfg(feature = "metal")]
 fn hybrid_kv_layout(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
-    block_size: usize,
+    block_size: scratchy_core_common::KvBlockTokens,
     elem_bytes: usize,
 ) -> Option<scratchy_core_config::HybridKvLayout> {
     let elems = model.per_layer_kv_token_elems()?;
@@ -820,7 +820,7 @@ fn hybrid_kv_layout(
 #[cfg(feature = "metal")]
 fn uniform_turboquant(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
-    block_size: usize,
+    block_size: scratchy_core_common::KvBlockTokens,
 ) -> bool {
     model.kv_codec().is_turboquant()
         && hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_none()
@@ -833,7 +833,7 @@ fn uniform_turboquant(
 #[cfg(feature = "metal")]
 fn target_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
-    block_size: usize,
+    block_size: scratchy_core_common::KvBlockTokens,
 ) -> usize {
     if let Some(layout) = hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES) {
         let shared_pages = layout.page_size_bytes * layout.group_size;
@@ -859,13 +859,13 @@ fn target_block_bytes(
                 );
     }
     if uniform_turboquant(model, block_size) {
-        block_size.saturating_mul(pool_bytes_per_token(
+        block_size.get().saturating_mul(pool_bytes_per_token(
             model,
             model.kv_codec(),
             METAL_KV_ELEM_BYTES,
         ))
     } else {
-        kv_per_block_bytes(model, block_size)
+        kv_per_block_bytes(model, block_size.get())
     }
 }
 
@@ -1181,7 +1181,7 @@ impl MetalWorker {
     /// CLI override → HF `max_position_embeddings` → 4096.
     fn kv_block_cap(&self, num_blocks: usize) -> usize {
         self.max_model_len()
-            .div_ceil(self.config.block_size.max(1))
+            .div_ceil(self.config.block_size.get())
             .min(num_blocks)
             .max(1)
     }
@@ -3061,7 +3061,12 @@ impl MetalWorker {
                 scratchy_forward_compiler::KvCodec::Dense => return Vec::new(),
             };
             let (heads, head_dim) = (m.num_key_value_heads() as usize, m.head_dim() as usize);
-            let b = scratchy_target_metal::turboquant::TqBlockBytes::of(bs, heads, head_dim, bits);
+            let b = scratchy_target_metal::turboquant::TqBlockBytes::of(
+                bs.get(),
+                heads,
+                head_dim,
+                bits,
+            );
             vec![b.packed, b.norms, b.scratch]
         };
         let dense_target = !uniform_turboquant(model, bs);
@@ -3074,10 +3079,10 @@ impl MetalWorker {
         let draft_block = match draft {
             Some(d) => {
                 store_bytes.extend(match dense_draft {
-                    true => vec![draft_store_block_bytes(d, bs)],
+                    true => vec![draft_store_block_bytes(d, bs.get())],
                     false => turboquant_stores(d),
                 });
-                draft_block_bytes(d, bs, self.draft_scratch())
+                draft_block_bytes(d, bs.get(), self.draft_scratch())
             }
             None => 0,
         };
@@ -3166,7 +3171,8 @@ impl MetalWorker {
         // pool has no group sharing).
         let (num_tensors_draft, layer_to_tensor_draft) = kv_pool_tensors(model.as_ref(), None);
         let num_chunks_total_draft = draft_blocks.div_ceil(blocks_per_chunk);
-        let block_bytes_draft = draft_store_block_bytes(model.as_ref(), self.config.block_size);
+        let block_bytes_draft =
+            draft_store_block_bytes(model.as_ref(), self.config.block_size.get());
 
         // A TurboQuant draft's dense rows are never read (its KV binds the TurboQuant scratch), so
         // its pool is a one-chunk seed, as the target's (`initialize_cache`).
@@ -3215,7 +3221,7 @@ impl MetalWorker {
             KvCachePool::new_metal_chunked(
                 num_layers_draft,
                 draft_blocks,
-                self.config.block_size,
+                self.config.block_size.get(),
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
                 draft_block_cap,
@@ -3249,7 +3255,7 @@ impl MetalWorker {
             t_pool.elapsed(),
             model.num_hidden_layers(),
             draft_blocks,
-            self.config.block_size,
+            self.config.block_size.get(),
             blocks_per_chunk,
             num_gpu_blocks,
         );
@@ -3661,7 +3667,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         model: ::scratchy_serving_engine::spec_decode::ModelHandle,
         kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
-        _block_size: usize,
+        _block_size: ::scratchy_core_common::KvBlockTokens,
         k: usize,
     ) -> Result<Vec<Vec<u32>>, ::scratchy_serving_engine::spec_decode::BackendError> {
         use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
@@ -3815,7 +3821,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 );
             }
         };
-        Ok(kv_per_block_bytes(model_ref, self.config.block_size))
+        Ok(kv_per_block_bytes(model_ref, self.config.block_size.get()))
     }
 }
 
@@ -6307,12 +6313,11 @@ impl Worker for MetalWorker {
         // in `determine_available_memory` divides by.
         // A Gated-DeltaNet hybrid's dense pool holds its attention layers alone, which the
         // engine's every-layer row would overcount.
-        let block_size = block.get();
         let model = self.model.as_deref()?;
-        (uniform_turboquant(model, block_size)
-            || hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_some()
+        (uniform_turboquant(model, block)
+            || hybrid_kv_layout(model, block, METAL_KV_ELEM_BYTES).is_some()
             || model.kv_cache_layers().is_some())
-        .then(|| target_block_bytes(model, block_size))
+        .then(|| target_block_bytes(model, block))
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {
@@ -6756,7 +6761,7 @@ impl Worker for MetalWorker {
         info!(
             "ScratchyWorker(metal): KV block-table capacity (max_blocks_per_seq) = {pool_block_cap} \
              (max_model_len-derived, pool {num_gpu_blocks} blocks × {} tokens/block)",
-            self.config.block_size,
+            self.config.block_size.get(),
         );
 
         // Hand newly-created KV cache buffers to the SHARED residency
@@ -6787,14 +6792,14 @@ impl Worker for MetalWorker {
         let num_layers_for_pool = model.num_hidden_layers() as usize;
         let num_chunks_total = num_gpu_blocks.div_ceil(blocks_per_chunk);
         let per_block_elems = (model.num_key_value_heads() as usize)
-            * self.config.block_size
+            * self.config.block_size.get()
             * (model.head_dim() as usize);
         // Hybrid-attention-geometry arches (Gemma4): per-layer
         // kv_heads*head_dim from the macro-emitted IR walk; each layer's
         // buffers and pool chunks size to their own class.
         let per_layer_block_elems: Option<Vec<usize>> = model
             .per_layer_kv_token_elems()
-            .map(|v| v.iter().map(|e| e * self.config.block_size).collect());
+            .map(|v| v.iter().map(|e| e * self.config.block_size.get()).collect());
         let elem_bytes = cache_dtype.size_bytes();
         let chunk_bytes_logical = blocks_per_chunk * per_block_elems * elem_bytes;
 
@@ -6808,7 +6813,7 @@ impl Worker for MetalWorker {
         self.kv_full_block_size = hybrid_layout
             .as_ref()
             .map(|l| l.full_block_size())
-            .unwrap_or(self.config.block_size);
+            .unwrap_or(self.config.block_size.get());
         self.kv_is_hybrid = hybrid_layout.is_some();
 
         // Slot s ↔ tensor s/2 (K at s%2==0, V at s%2==1) — must match the
@@ -6890,7 +6895,7 @@ impl Worker for MetalWorker {
             KvCachePool::new_metal_chunked(
                 num_layers_for_pool,
                 num_gpu_blocks,
-                self.config.block_size,
+                self.config.block_size.get(),
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
                 pool_block_cap,
@@ -6970,7 +6975,7 @@ impl Worker for MetalWorker {
             "ScratchyWorker(metal): KV cache initialized: {} layers × {} blocks × {} tokens",
             model.num_hidden_layers(),
             num_gpu_blocks,
-            self.config.block_size,
+            self.config.block_size.get(),
         );
         self.kv_cache = Some(pool);
 
@@ -7301,7 +7306,7 @@ impl Worker for MetalWorker {
             .filter(|m| uniform_turboquant(*m, self.config.block_size))
             .map(|m| {
                 scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
-                    * kv_per_block_bytes(m, self.config.block_size)
+                    * kv_per_block_bytes(m, self.config.block_size.get())
             })
             .sum::<usize>();
         // `total` already folds in `gpu_memory_utilization` (and the KV floor's fixed point
@@ -7321,7 +7326,7 @@ impl Worker for MetalWorker {
             Some(target) if target.per_layer_kv_token_elems().is_none() => {
                 let draft = self.draft_model.as_deref();
                 let draft_pb = (draft.filter(|_| self.draft_keeps_kv()))
-                    .map_or(0, |d| draft_block_bytes(d, bs, self.draft_scratch()));
+                    .map_or(0, |d| draft_block_bytes(d, bs.get(), self.draft_scratch()));
                 let pair = target_block_bytes(target, bs) + draft_pb;
                 kv_left(self.metal_peak_activation_estimate(None, None, Some(budget(total)), 1)?)
                     / pair.max(1)
@@ -7371,7 +7376,7 @@ impl Worker for MetalWorker {
             let t_pb = target_block_bytes(target.as_ref(), bs);
             let d_pb = match self.draft_keeps_kv() {
                 false => 0,
-                true => draft_block_bytes(draft.as_ref(), bs, self.draft_scratch()),
+                true => draft_block_bytes(draft.as_ref(), bs.get(), self.draft_scratch()),
             };
             let denom = t_pb.saturating_add(d_pb).max(1);
             // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
@@ -7738,7 +7743,7 @@ impl Worker for MetalWorker {
         let full_block_size = if self.kv_full_block_size > 0 {
             self.kv_full_block_size
         } else {
-            block_size
+            block_size.get()
         };
 
         // Reactive KV (2b): grow the chunked pool to back every block
@@ -7954,10 +7959,10 @@ impl Worker for MetalWorker {
                 let block_ids = &sliding[i];
                 for t in 0..q_len {
                     let abs_pos = tokens_before + t;
-                    let block_idx = abs_pos / block_size;
-                    let offset = abs_pos % block_size;
+                    let block_idx = abs_pos / block_size.get();
+                    let offset = abs_pos % block_size.get();
                     if block_idx < block_ids.len() {
-                        sm.write(block_ids[block_idx] * block_size + offset, false);
+                        sm.write(block_ids[block_idx] * block_size.get() + offset, false);
                     } else {
                         sm.skip();
                     }
@@ -8442,7 +8447,7 @@ impl Worker for MetalWorker {
                     full: &attn.block_ids,
                     full_block_size,
                     sliding: &attn.sliding_groups,
-                    sliding_block_size: block_size,
+                    sliding_block_size: block_size.get(),
                 },
                 head_passes.as_ref(),
                 &req_ids_in_order,
@@ -8604,7 +8609,7 @@ impl Worker for MetalWorker {
             } else {
                 Vec::new()
             };
-            let spec9_block_size: usize = self.config.block_size;
+            let spec9_block_size: usize = self.config.block_size.get();
 
             if phase8_parallel_lockstep {
                 // Snapshot of inputs the lockstep thread needs.
