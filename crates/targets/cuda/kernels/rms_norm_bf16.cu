@@ -345,13 +345,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_one_row_ker(
         warp::load(other, sums[v]);
         warp::add(total, total, other);
     }
-    row_values inv;
-    warp::div(inv, total, g.cols);
-    warp::bin_op<scratchy::ops::rms_inv>(inv, inv, g.eps);
-    // Pass 2 is warp 0's alone, in a branch rather than after an early return of warps 1-3: with an
-    // exit between `inv`'s product and its `+ eps`, ptxas sank the bottom packed row's add below
-    // it, and that pair stopped contracting into the 16-row kernel's FFMA (the H100 SASS at
-    // 6b6a32f7). Here `inv` is formed in one block, as the 16-row kernel forms it.
+    // `inv` as the 16-row kernel's SASS forms it in every form: MUFU.RCP of `cols`, one FFMA
+    // `total · rcp + eps`, MUFU.RSQ (`scratchy::ops::rms_inv_fused`). Left to ptxas, this kernel's
+    // `ADD_NORM` instance kept the bottom packed row's product and `+ eps` apart (the H100 SASS at
+    // 6b6a32f7 and a5b097c9: an FMUL, then an FADD past the warps' branch), even without an early
+    // return; the explicit FFMA makes both rows that FFMA.
+    row_values rcp, inv;
+    warp::one(rcp);
+    warp::div(rcp, rcp, g.cols);
+    scratchy::ops::rv_ternary_map<scratchy::ops::rms_inv_fused>(inv, total, rcp, g.eps);
+    // Pass 2 is warp 0's alone.
     if (w == 0) {
         // Pass 2 on the owned tile only: the 16-row kernel's pass-2 body, on stage 0's tiles (pass 1
         // waited on every load it issued, so none is in flight) and its own semaphore.

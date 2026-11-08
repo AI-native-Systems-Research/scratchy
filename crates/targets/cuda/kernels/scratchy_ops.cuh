@@ -65,6 +65,32 @@ __device__ inline float2 rms_inv::op<float2>(const float2& m, const float2& eps)
     return float2{rms_inv::op<float>(m.x, eps.x), rms_inv::op<float>(m.y, eps.y)};
 }
 
+// The one-row RMSNorm's `inv` (`kernels/rms_norm_bf16.cu`'s `rms_norm_one_row_ker`), written out
+// as the 16-row kernel's SASS computes `rms_inv(total / cols, eps)` in all four forms on the H100:
+// `rcp(cols)` (one MUFU.RCP: `warp::div` by a scalar under `--use_fast_math`), then `total · rcp +
+// eps` contracted into one FFMA, then MUFU.RSQ. Left to ptxas in the one-row `ADD_NORM` instance,
+// the bottom packed row's product and `+ eps` stayed apart (an FMUL, then an FADD past the warps'
+// branch); with the FFMA explicit here (`fmaf`, one rounding) both rows are that FFMA. `rcp` is
+// the caller's, `1 / cols` from `warp::div` of ones, the same MUFU.RCP. Applied through
+// `rv_ternary_map`, so its `float2` form runs on both packed rows.
+struct rms_inv_fused {
+    template <typename T>
+    static __device__ inline T op(const T& total, const T& rcp, const float& eps) {
+        return rsqrtf(fmaf(total, rcp, eps));
+    }
+};
+template <>
+__device__ inline float rms_inv_fused::op<float>(const float& total, const float& rcp,
+                                                 const float& eps) {
+    return rsqrtf(fmaf(total, rcp, eps));
+}
+template <>
+__device__ inline float2 rms_inv_fused::op<float2>(const float2& total, const float2& rcp,
+                                                   const float& eps) {
+    return float2{rms_inv_fused::op<float>(total.x, rcp.x, eps),
+                  rms_inv_fused::op<float>(total.y, rcp.y, eps)};
+}
+
 // SwiGLU's activation: `g / (1 + e^(−g)) · u`, the expression the plain-CUDA kernel computed. For
 // `g ≤ −88`, `__expf(−g)` overflows to +inf and the result is a signed zero, never NaN.
 struct silu_mul {
