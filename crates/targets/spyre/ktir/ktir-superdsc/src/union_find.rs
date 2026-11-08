@@ -137,14 +137,14 @@ impl<W: Group, A: Anchor<W>> UnionFind<W, A> {
         // ⛔ TWO ANCHORED COMPONENTS JOIN ONLY WHEN THE ANCHORS AGREE through the
         // edge — otherwise the one join states two absolutes for one class, and the
         // error names the op that stated EACH.
-        if let (Some((va, wa)), Some((vb, wb))) = (self.anchors.get(&ra), self.anchors.get(&rb)) {
-            if va.rides(edge) != *vb {
-                return Err(format!(
-                    "a join of two anchored classes: `{wa}` anchors one side at {va:?} and \
-                     `{wb}` anchors the other at {vb:?}, but `{why}` states they are one value — \
-                     there is no one anchor satisfying all three",
-                ));
-            }
+        if let (Some((va, wa)), Some((vb, wb))) = (self.anchors.get(&ra), self.anchors.get(&rb))
+            && va.rides(edge) != *vb
+        {
+            return Err(format!(
+                "a join of two anchored classes: `{wa}` anchors one side at {va:?} and \
+                 `{wb}` anchors the other at {vb:?}, but `{why}` states they are one value — \
+                 there is no one anchor satisfying all three",
+            ));
         }
         self.parent[rb as usize] = ra;
         self.off[rb as usize] = edge;
@@ -181,9 +181,9 @@ impl<W: Group, A: Anchor<W>> UnionFind<W, A> {
                  named",
             ));
         }
-        if !self.anchors.contains_key(&root) {
-            self.anchors.insert(root, (at_root, why.to_string()));
-        }
+        self.anchors
+            .entry(root)
+            .or_insert_with(|| (at_root, why.to_string()));
         Ok(())
     }
 

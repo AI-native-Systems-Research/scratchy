@@ -8169,7 +8169,7 @@ impl<'d> Defs<'d> {
                 if let Some(d) = d {
                     shape.insert(arg, d);
                 }
-                if let Some(r) = results.iter().find(|r| shape.get(r).is_none()) {
+                if let Some(r) = results.iter().find(|r| !shape.contains_key(r)) {
                     shape.insert(*r, shape.get(&arg).cloned().unwrap_or_default());
                 }
             }
