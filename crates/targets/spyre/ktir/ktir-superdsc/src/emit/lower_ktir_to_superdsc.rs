@@ -5816,7 +5816,7 @@ pub fn lmlast<T: crate::collective::Tp>(
                 // `j` alone, so every name is byte-identical to the single-row law's
                 // `lmlast{j}_o{owner}`; at `S > 1` the plane row is a bijection over `(j, r)`, so
                 // every copy keeps its own name.
-                &format!("lmlast{}_o{owner}", j * s as usize + req.get()),
+                &format!("lmlast{}_o{owner}", (j * s) as usize + req.get()),
                 "identity",
                 crate::sdsc_abstract::RowCount::of_token_rows(1),
                 crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
