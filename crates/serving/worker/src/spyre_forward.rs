@@ -2326,8 +2326,12 @@ mod idx_stick_tests {
         let mut words = vec![0i32; rows * ROW_WORDS];
         for (r, &p) in picks.iter().enumerate() {
             for c in 0..ROW_WORDS {
-                let off =
-                    scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, ROW_WORDS], 1, &[r, c], stk);
+                let off = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                    &[rows, ROW_WORDS],
+                    1,
+                    &[r, c],
+                    stk,
+                );
                 words[off] = p as i32;
             }
         }
