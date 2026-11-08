@@ -154,6 +154,75 @@ pub enum DeviceOp {
 }
 
 impl DeviceOp {
+    /// Every variant, exactly once, in declaration order — the exhaustive
+    /// list the coverage tests iterate, so "every op states a row" is
+    /// checked over the whole enum, not a hand-picked slice of it.
+    pub const ALL: [DeviceOp; 28] = [
+        DeviceOp::Add,
+        DeviceOp::Sub,
+        DeviceOp::Multiply,
+        DeviceOp::RealDiv,
+        DeviceOp::Maximum,
+        DeviceOp::Minimum,
+        DeviceOp::Equal,
+        DeviceOp::Gelu,
+        DeviceOp::Reciprocal,
+        DeviceOp::Tanh,
+        DeviceOp::Abs,
+        DeviceOp::Neg,
+        DeviceOp::Silu,
+        DeviceOp::Exp,
+        DeviceOp::Sigmoid,
+        DeviceOp::Sqrt,
+        DeviceOp::Rsqrt,
+        DeviceOp::Mish,
+        DeviceOp::Log,
+        DeviceOp::Int32ToFp32,
+        DeviceOp::Fp32ToInt32,
+        DeviceOp::Dl16ToFp32,
+        DeviceOp::Fp32ToDl16,
+        DeviceOp::Sum,
+        DeviceOp::Mean,
+        DeviceOp::Max,
+        DeviceOp::Min,
+        DeviceOp::AbsMax,
+    ];
+
+    /// The exhaustiveness pin for [`ALL`]: this match names every variant,
+    /// so a variant added to the enum without being listed in `ALL` (and
+    /// given its arm here) is a non-exhaustive match — a compile error, not
+    /// a silently-passing coverage test.
+    const _ALL_NAMES_EVERY_VARIANT: () = match DeviceOp::ALL[0] {
+        DeviceOp::Add
+        | DeviceOp::Sub
+        | DeviceOp::Multiply
+        | DeviceOp::RealDiv
+        | DeviceOp::Maximum
+        | DeviceOp::Minimum
+        | DeviceOp::Equal
+        | DeviceOp::Gelu
+        | DeviceOp::Reciprocal
+        | DeviceOp::Tanh
+        | DeviceOp::Abs
+        | DeviceOp::Neg
+        | DeviceOp::Silu
+        | DeviceOp::Exp
+        | DeviceOp::Sigmoid
+        | DeviceOp::Sqrt
+        | DeviceOp::Rsqrt
+        | DeviceOp::Mish
+        | DeviceOp::Log
+        | DeviceOp::Int32ToFp32
+        | DeviceOp::Fp32ToInt32
+        | DeviceOp::Dl16ToFp32
+        | DeviceOp::Fp32ToDl16
+        | DeviceOp::Sum
+        | DeviceOp::Mean
+        | DeviceOp::Max
+        | DeviceOp::Min
+        | DeviceOp::AbsMax => {}
+    };
+
     /// The door's own spelling — the `op_func_from_str` key the emitter
     /// spells (`"multiply"`, not the DDL's `"mul"`; `"gelu"`, not
     /// `"gelufwd"`). A property of the op, read at emission; never a lookup
@@ -536,32 +605,54 @@ mod tests {
     }
 
     /// The two-tensor family and the one-input family collapse to f16 as
-    /// they always have: every one of them is f16-bound.
+    /// they always have: every pointwise op the enum names is bound at both
+    /// formats, except the three measured exceptions (exp is fp32-only;
+    /// log and mish are fp16-only — each has its own test above). Iterated
+    /// over the enum's own exhaustive list, not a hand-picked slice.
     #[test]
-    fn every_pointwise_op_the_door_ships_is_f16_bound_except_exp() {
-        for op in [
-            DeviceOp::Silu,
-            DeviceOp::Gelu,
-            DeviceOp::Multiply,
-            DeviceOp::Add,
-            DeviceOp::Sub,
-            DeviceOp::Neg,
-            DeviceOp::Rsqrt,
-            DeviceOp::Sqrt,
-            DeviceOp::Abs,
-            DeviceOp::Reciprocal,
-            DeviceOp::Sigmoid,
-            DeviceOp::Tanh,
-            DeviceOp::RealDiv,
-            DeviceOp::Maximum,
-            DeviceOp::Minimum,
-            DeviceOp::Equal,
-        ] {
+    fn every_pointwise_op_the_door_ships_is_bound_except_the_measured_exceptions() {
+        for op in DeviceOp::ALL {
+            if op.family() != DeviceFamily::Pointwise {
+                continue;
+            }
+            if matches!(op, DeviceOp::Exp | DeviceOp::Log | DeviceOp::Mish) {
+                continue;
+            }
             assert!(binds::<Gen1>(op, DdlDf::Fp16), "{op:?} must stay f16-bound");
             assert!(
                 binds::<Gen1>(op, DdlDf::Fp32),
                 "{op:?} must stay fp32-bound"
             );
+        }
+    }
+
+    /// Every op the enum names states a row — iterated over the enum's own
+    /// exhaustive list, so a variant added without a row fails HERE, not
+    /// silently in a reader.
+    #[test]
+    fn every_op_in_the_enum_states_a_row() {
+        for op in DeviceOp::ALL {
+            assert!(
+                Gen1::DEVICE_OPS.iter().any(|r| r.op == op),
+                "{op:?} states no row"
+            );
+            assert!(
+                output_arrangement::<Gen1>(op).is_some(),
+                "{op:?} states no arrangement row"
+            );
+        }
+    }
+
+    /// `ALL` lists every variant exactly once — the typed length pins the
+    /// count, and this pins distinctness, so together with the
+    /// exhaustiveness match on the enum there is no way to list a variant
+    /// twice or drop one for another.
+    #[test]
+    fn all_lists_every_variant_once() {
+        for (i, a) in DeviceOp::ALL.iter().enumerate() {
+            for b in DeviceOp::ALL.iter().skip(i + 1) {
+                assert!(a != b, "{a:?} is listed twice in ALL");
+            }
         }
     }
 
@@ -614,13 +705,10 @@ mod tests {
     /// the arrangement never escapes through it.
     #[test]
     fn the_reduce_family_is_bound_at_both_formats() {
-        for op in [
-            DeviceOp::Sum,
-            DeviceOp::Mean,
-            DeviceOp::Max,
-            DeviceOp::Min,
-            DeviceOp::AbsMax,
-        ] {
+        for op in DeviceOp::ALL {
+            if op.family() != DeviceFamily::Reduce {
+                continue;
+            }
             assert!(binds::<Gen1>(op, DdlDf::Fp16), "{op:?} must stay f16-bound");
             assert!(
                 binds::<Gen1>(op, DdlDf::Fp32),
@@ -630,7 +718,6 @@ mod tests {
                 output_arrangement::<Gen1>(op),
                 Some(ElementArrangement::Standard)
             );
-            assert_eq!(op.family(), DeviceFamily::Reduce);
         }
     }
 }
