@@ -18,6 +18,7 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
+use scratchy_subtile::sdsc_abstract::QueryExtent;
 use scratchy_subtile::subtile_ir::chain_slab_entries;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
@@ -875,6 +876,10 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`: whether this bundle's rows are separate requests.
     rows_are_requests: bool,
+    // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(per-request width, requests)`, minted once at
+    // the bake ([`QueryExtent::of_baked_rung`]) and threaded down to the attention splice beside
+    // `active_cap`. Only `AttnDecode` spends it; every other op reads the graph's rows.
+    query_rows: QueryExtent,
 ) -> NodeLowering<T> {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
@@ -1162,6 +1167,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 ir,
                 scale_site,
                 active_cap,
+                query_rows,
                 scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
             ) {
                 Ok(e) => Ops(vec![e]),
@@ -1202,6 +1208,8 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
+    // The rung's query extent pair — threaded to the attention splice ([`lower_one_node`]).
+    query_rows: QueryExtent,
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     // GLOBAL ≤7-segment memory layout (task #55) computed ONCE for the whole bundle.
     // Every op resolves each tensor's HBM address from this (by `t{id}` name) so a
@@ -1217,6 +1225,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &[],
+        query_rows,
     )?;
     let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
@@ -1232,7 +1241,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests) {
+        match lower_one_node(node, ir, active_cap, rows_are_requests, query_rows) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1275,9 +1284,10 @@ pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    query_rows: QueryExtent,
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
-        lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests)?;
+        lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests, query_rows)?;
     // The fact no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     let attn_params = attn_bundle_params(ir, rows_are_requests);
@@ -1647,6 +1657,10 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
+    // The graph's query extents, minted by the bake — threaded to the registry and node walks
+    // below, never re-derived from graph rows: a walk that minted its own pair would agree
+    // with the graph yet state the wrong per-request width the day a packed prefill arrives.
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
     // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
@@ -1661,7 +1675,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let _ = weight_ids;
     let registries = WiringRegistries {
         scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry::<T, F>(
-            ir, paged_rows,
+            ir, paged_rows, query_rows,
         )?,
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
@@ -1707,7 +1721,8 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         ir.nodes
             .par_iter()
             .map(|node| {
-                let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false) {
+                let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows)
+                {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
                     // still occupies a position in the node order, so it contributes an empty entry.
@@ -2111,6 +2126,9 @@ fn chain_block_cols<F: RopeForm>(gather: &SubtileNode<F>, ir: &SubtileIR<F>) -> 
 /// sample kernel itself compiles once.
 pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
+    // The graph's query extents, minted by the bake — threaded to the node walk, never
+    // re-derived from graph rows (see [`graph_wiring`]'s own parameter note).
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<
     std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
     SuperDscError,
@@ -2121,7 +2139,7 @@ pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .iter()
         .filter(|n| matches!(n.op, SubOp::Sample { .. }))
     {
-        let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false) {
+        let ops = match lower_one_node::<T, F>(node, ir, ActiveCap::FULL, false, query_rows) {
             NodeLowering::Ops(v) => v,
             NodeLowering::HostRouted(_) => continue,
             NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
@@ -2365,6 +2383,8 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     active_cap: ActiveCap,
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
+    // The rung's query extent pair — threaded to the attention splice ([`lower_one_node`]).
+    query_rows: QueryExtent,
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     let _pc = crate::pc::Pc::start("producer");
@@ -2384,7 +2404,12 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     //
     // The one perf gate that outlived it here (a decode batch must not split `mb`) is gone as well: it
     // was scoped to this lowering, the descriptors are built later in `emit_bundle`, so it never reached
-    // one, and the form it asked for measured slower on the card (`matmul/dims.rs`).
+    // one, and the form it asked for measured slower on the card (`matmul/dims.rs`). The extent half
+    // landed as the pair: [`QueryExtent`] states the rung's `(per-request width, requests)`, minted once
+    // at the bake. The KIND stays the separate `rows_are_requests` bool above because the pair cannot
+    // carry it alone: a decode batch mints `(1 row, m)` and a packed prefill rung will mint
+    // `(w, S)` — both per-request width > 1 pairs in general, differing only in whether one launch
+    // serves the requests as a batch or the rung relaunches per request.
     // ⭐ THE LAYER STRUCTURE FIRST, because the layout needs it: a weight BANK boundary may only fall
     // on a LAYER boundary, and `compute_bundle_layout` is where the weight segment is packed. Same
     // tape, same `ComputeInput::External::per_layer` the walk below reads — collected once, here.
@@ -2399,6 +2424,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &per_layer_ext,
+        query_rows,
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
@@ -2811,7 +2837,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                         group_weight_banks[seg].insert(p.bank);
                     }
                 }
-                match lower_one_node(n, ir, active_cap, rows_are_requests) {
+                match lower_one_node(n, ir, active_cap, rows_are_requests, query_rows) {
                     NodeLowering::Ops(v) => {
                         if seg == 0 {
                             prefix.extend(v);

@@ -77,6 +77,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
@@ -134,6 +135,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
         assert!(
@@ -206,6 +208,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
         assert!(
@@ -268,6 +271,7 @@ fn spliced_silumul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
@@ -361,6 +365,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        pair_of_one_request(1),
     )
     .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
@@ -462,6 +467,7 @@ fn spliced_elementwise_lowers_through_the_door() {
                 &weight_ids,
                 PagedRows::Sequence,
                 &[],
+                pair_of_one_request(m),
             )
             .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
@@ -573,6 +579,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
@@ -1117,6 +1124,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
@@ -1173,6 +1181,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        pair_of_one_request(1),
     )
     .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
@@ -1458,6 +1467,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        pair_of_one_request(m),
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
@@ -1513,6 +1523,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(mq),
         )
         .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
@@ -1590,6 +1601,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
@@ -1877,6 +1889,7 @@ fn spliced_rope_lowers_through_the_door() {
                 &weight_ids,
                 PagedRows::Sequence,
                 &[],
+                pair_of_one_request(mq),
             )
             .unwrap_or_else(|e| {
                 panic!("layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
@@ -2500,6 +2513,8 @@ fn a_sliding_window_attention_is_refused() {
         &ir,
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         s.active_cap(),
+        // One request of the graph's `mq` rows — the walk this refusal gates.
+        pair_of_one_request(s.mq),
         PagedRows::Sequence,
     ) else {
         panic!("a sliding window must be refused");
@@ -2532,6 +2547,8 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
         &ir,
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         small.active_cap(),
+        // The one-request decode's own pair: one row that is one request.
+        batch_pair_of_one_row_each(small.mq),
         PagedRows::Batch,
     ) else {
         panic!("a chunk gathering the whole pool must be refused");
@@ -2550,6 +2567,8 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
         &ir,
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         big.active_cap(),
+        // The one-request decode's own pair: one row that is one request.
+        batch_pair_of_one_row_each(big.mq),
         PagedRows::Batch,
     )
     .expect("a pool wider than one chunk splices");
@@ -2567,6 +2586,8 @@ fn the_paged_attention_splices_with_its_contract() {
             &ir,
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
             s.active_cap(),
+            // One request of the graph's `mq` rows — the S=1 extent pair.
+            pair_of_one_request(s.mq),
             PagedRows::Sequence,
         );
         // ⛔ A PRE-POPULATED CACHE IS REFUSED: the walk reads the step's keys from the pools, and
@@ -2802,6 +2823,97 @@ fn spliced_paged_step_executes_the_real_programs() {
     }
 }
 
+/// ⭐⭐ THE EXTENT PAIR MEETS THE GRAPH — the S=2 shape M2's packed prefill rung will bake, at the
+/// splice's own boundary, WITHOUT running it (the numeric cell is the later step's): a 128-row
+/// graph minted `(64, 2)` SPLICES — `NUM_TOKENS` stays the graph's 128 rows while
+/// `PADDED_QUERY_LEN` and the walk become one request's 64 (the compile fixture in the splice's
+/// own roster states that exact constexpr pair) — and a mint whose held product is NOT the
+/// graph's rows is REFUSED BY NAME, the one place the two are proven to agree. The S=1 spelling
+/// (`(128, ONE)`) splices the same graph too: at one request the two extents agree, which is why
+/// one `mq` served until now.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn the_extent_pair_meets_the_graph_at_the_splice() {
+    let s = AttnShape {
+        geom: (32, 8, 64),
+        mq: 128,
+        cap: 2 * scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get(),
+        rung: u32::MAX, // ActiveCap::NONE — a start==0 chunk, the packed rung's own walk
+        rope_appended: true,
+    };
+    let ir = attn_ir(s, 0.125f32);
+    let attn = &ir.nodes[1];
+    let splice = |pair: scratchy_subtile::sdsc_abstract::QueryExtent| {
+        scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+            attn,
+            &ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            pair,
+            PagedRows::Sequence,
+        )
+    };
+    // The S=2 mint: two requests of 64 rows over the 128-row graph.
+    let packed = scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(64)
+            .expect("the rung's width is nonzero"),
+        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(2)
+            .expect("the rung's capacity is nonzero"),
+    )
+    .expect("128 rows fit a u32");
+    let e = splice(packed)
+        .unwrap_or_else(|e| panic!("the packed (64, 2) mint splices the 128-row graph: {e}"));
+    assert!(
+        e.ktir
+            .as_ref()
+            .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn)),
+        "the packed mint is the prefill walk's own program"
+    );
+    // The S=1 mint of the SAME graph — one request of all 128 rows — still splices.
+    splice(pair_of_one_request(128))
+        .unwrap_or_else(|e| panic!("the S=1 mint splices the same graph: {e}"));
+    // ⛔ AND A MINT THAT DOES NOT DESCRIBE THE GRAPH IS REFUSED, BY NAME, with both extents
+    // stated — never a silently-wrong `PADDED_QUERY_LEN`.
+    let mismatch = scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(64)
+            .expect("the rung's width is nonzero"),
+        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(3)
+            .expect("the rung's capacity is nonzero"),
+    )
+    .expect("192 rows fit a u32");
+    let err = splice(mismatch)
+        .err()
+        .expect("a 192-row mint does not describe a 128-row graph");
+    assert!(
+        err.contains("the graph's 128 row(s) are not the extent pair's 192"),
+        "the refusal names both extents: {err}"
+    );
+}
+
+/// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows.
+#[cfg(feature = "spyre-emu")]
+fn pair_of_one_request(mq: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
+    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(mq)
+            .expect("the shape's row count is nonzero"),
+        scratchy_subtile::sdsc_abstract::RungCap::ONE,
+    )
+    .expect("one request's rows fit a u32")
+}
+
+/// The extent pair a BATCH walk states: `rows` rows that are `rows` requests, one row
+/// each — the pair's held product is the graph's row count, which the batched kernel
+/// arm reads.
+#[cfg(feature = "spyre-emu")]
+fn batch_pair_of_one_row_each(rows: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
+    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
+        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(rows)
+            .expect("the batch's sequence count is nonzero"),
+    )
+    .expect("the batch's rows fit a u32")
+}
+
 /// `n` values uniform in `[-amp, amp)` from a fixed LCG — a stimulus both sides read as the same
 /// f16 bytes (the session narrows each to f16; the reference reads the narrowed value back).
 #[cfg(feature = "spyre-emu")]
@@ -2842,6 +2954,9 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
             &ir,
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
             s.active_cap(),
+            // One request of the graph's `mq` rows — the S=1 extent pair this walk's
+            // constexprs state (`NUM_TOKENS` = mq, `PADDED_QUERY_LEN` = mq).
+            pair_of_one_request(s.mq),
             PagedRows::Sequence,
         )
         .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
@@ -3121,6 +3236,10 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
             &ir,
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
             s.active_cap(),
+            // The batch's own pair: `mq` rows that are `mq` requests — one row each
+            // (the batched kernel arm reads the graph's rows, which the pair's held
+            // product states).
+            batch_pair_of_one_row_each(s.mq),
             PagedRows::Batch,
         )
         .unwrap_or_else(|e| panic!("the batched walk spliced {at}: {e}")),
@@ -3527,6 +3646,8 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
                 &ir,
                 scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
                 s.active_cap(),
+                // One request of the graph's `mq` rows — the flat walk's own pair.
+                pair_of_one_request(mq),
                 PagedRows::Sequence,
             )
             .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
@@ -3637,6 +3758,7 @@ fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        pair_of_one_request(m),
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
     let node = &ir.nodes[0];

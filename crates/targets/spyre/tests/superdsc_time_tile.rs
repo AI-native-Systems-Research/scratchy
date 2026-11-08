@@ -1034,16 +1034,35 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     // LOWERED descriptor, and the bundle off the PROGRAMS.
     let ir = single_matmul_ir(64, 16384, 2048);
     let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-    let (programs, layout) = superdsc::lower_graph_to_ktir::<
-        ktir_superdsc::collective::TpWorld<1>,
-        _,
-    >(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
-    .expect("KTIR for a 64x16384x2048 matmul");
+    let (programs, layout) =
+        superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+            &ir,
+            &weight_ids,
+            superdsc::ActiveCap::FULL,
+            true,
+            // The graph's own extent pair: 64 rows that are 64 requests — one row each.
+            scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+                scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                    .expect("one row is nonzero"),
+                scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(64)
+                    .expect("64 requests is nonzero"),
+            )
+            .expect("64 rows fit a u32"),
+        )
+        .expect("KTIR for a 64x16384x2048 matmul");
     let (dscs, _) = superdsc::lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
         &ir,
         &weight_ids,
         superdsc::ActiveCap::FULL,
         true,
+        // Same pair as the KTIR half above: 64 requests of one row.
+        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                .expect("one row is nonzero"),
+            scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(64)
+                .expect("64 requests is nonzero"),
+        )
+        .expect("64 rows fit a u32"),
     )
     .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {

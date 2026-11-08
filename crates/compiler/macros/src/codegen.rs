@@ -12048,6 +12048,47 @@ fn dump_wavefront_mega(
                 // spyre-inference decodes it with the batched kernel at one sequence (its sequence
                 // buckets start at 1). Every other reader of the fact short-circuits at one row.
                 let rows_are_requests = !is_prefill;
+                // ⭐ THE QUERY'S EXTENT PAIR, MINTED ONCE FROM THE RUNG — the rung's own
+                // `(per-request width, requests)`, never a division of the graph's rows. A
+                // prefill chunk is ONE request however many positions it spans (its pair is
+                // `(mq, ONE)`); a decode rung's every row is a request's one token (its pair
+                // is `(1 row, decode_rows)`). The attention splice spends the pair as the
+                // kernel's two extents and checks its held product against the graph it
+                // lowers — the one place the mint and the graph are proven to agree.
+                // ONE match on the one fact (`prefill_mq`'s presence IS `is_prefill`), one
+                // named bake panic for the whole mint: a half that does not name a baked
+                // rung — a zero or overflowing count, or a product past u32 — is refused
+                // here, never defaulted. (The u32 parameters `prefill_mq` / `decode_rows`
+                // are the missing source type: the rung walks should hand the closure a
+                // `RungWidth` / `RungCap` directly, follow-up.)
+                //
+                // ⭐ A SYMBOLIC BATCH TAPE states its width through `seq_sym`: the CB decode
+                // emission lowers at `CB_BATCH_TEMPLATE` rows (a batch SYMBOL the DEM
+                // resolves at runtime) while passing `decode_rows = 1` on purpose — its
+                // `DecodeRung` effect and slot discriminators read the CONCRETE rung
+                // count, which the symbolic tape does not have. Each arm says which
+                // source states the width for which kind of tape: a prefill — symbolic
+                // or concrete — takes its width from `prefill_mq` (one request however
+                // many positions), a symbolic decode batch from its symbol's template,
+                // a concrete decode rung from `decode_rows`.
+                let (per_request, requests) = match (prefill_mq, seq_sym) {
+                    (Some(mq), _) => (mq, 1u32),
+                    (None, Some((_, width))) => (1u32, width),
+                    (None, None) => (1u32, decode_rows),
+                };
+                let query_rows = (|| {
+                    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+                        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(per_request)?,
+                        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(requests)?,
+                    )
+                })()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{base}: the rung's query extents (per-request {per_request} row(s), \
+                         {requests} request(s)) do not name a baked rung — a zero or \
+                         overflowing count is a bake bug, named here at the mint"
+                    )
+                });
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
                 // rung whose reroll fails PANICS (no rung may fail to lower), but this
                 // closure's KTIR emission and wiring stamp run AFTER the reroll and
@@ -12279,6 +12320,7 @@ fn dump_wavefront_mega(
                     &weight_ids,
                     active_cap,
                     scratchy_target_spyre::paged_step::PagedRows::of_requests(rows_are_requests),
+                    query_rows,
                 ) {
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
@@ -12355,6 +12397,7 @@ fn dump_wavefront_mega(
                                 active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
                                 // start==0 chunk, FULL for the continuation bundle.
                                 rows_are_requests,
+                                query_rows,
                             ) {
                                 Ok(rolled) => {
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
@@ -12698,6 +12741,7 @@ fn dump_wavefront_mega(
                                                         &weight_ids,
                                                         rung,
                                                         rows_are_requests,
+                                                        query_rows,
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
                                                         // card bakes the ROLLED body, the emulator the
@@ -13141,6 +13185,7 @@ fn dump_wavefront_mega(
                                                     fp: &bfp,
                                                     cap,
                                                     active_cap,
+                                                    query_rows,
                                                     shards,
                                                 };
                                                 // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
