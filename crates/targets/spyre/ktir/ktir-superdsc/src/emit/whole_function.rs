@@ -4208,7 +4208,7 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
     // And the chains that resolved an operand to its SOURCE are pinned to that answer before any
     // arrangement is marked: a chase whose axis disagrees with the source's world is a refusal,
     // not a reconciliation that picks a side.
-    cross_check_chase(f.name, &bcasts, &frames)?;
+    cross_check_chase(f, &bcasts, &frames)?;
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -4639,7 +4639,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
     // ⭐ AND THE CHASE'S AXIS IS PINNED TO THE TABLE before any operand is addressed: a chain whose
     // axis disagrees with the source's world in the frame assignment is a refusal naming the value,
     // the axis and the world — never a reconciliation that picks a side.
-    cross_check_chase(f.name, &bcasts, &frames)?;
+    cross_check_chase(f, &bcasts, &frames)?;
     // THE EQUALITY MASKS, read before the walk for the same reason the silus are: the device's
     // `OpFunc::Equal` is ONE op and KTIR spells it as two (`cmpf` + `uitofp`), so the comparison
     // is chain-interior and the RETYPE is the terminal this walk lowers. See
@@ -8083,11 +8083,19 @@ impl Frames {
 /// it. Called by every entry that consults the chains ([`staggered_sources`] and
 /// [`lower_function_folded`]), so a disagreement fails whichever door the program enters first.
 fn cross_check_chase(
-    name: &str,
+    f: &IRFunction<'static>,
     bcasts: &std::collections::HashMap<Ssa, Bcast>,
     frames: &Frames,
 ) -> Result<(), Error> {
-    for (v, b) in bcasts {
+    // ⭐ PROGRAM ORDER, NEVER HASHMAP ORDER — which disagreement a refusal names is a fact of
+    // the program, not of the iteration: the same bake must name the same spray on every run
+    // and every pod (measured: the four-scope's granite-2b fp16 leg named `%272` from `%261`
+    // while the fp8 leg named `%282` from `%291` — two live disagreements in one function,
+    // picked between by hash order). The broadcasts are walked as the program spells them;
+    // the map is a lookup, never the order.
+    for o in f.ops_deep() {
+        let Some(v) = o.result else { continue };
+        let Some(b) = bcasts.get(&v) else { continue };
         let want = match b.axis {
             // `Col` and a per-row-scalar `Y` spray one scalar per row: columns.
             BcastAxis::Col
@@ -8109,7 +8117,7 @@ fn cross_check_chase(
                  frame pass holds the source {:?} — the axis and the world are two statements \
                  of one fact (does this source supply one scalar per row?), and they disagree, \
                  so the program is refused rather than one of them believed",
-                name, v.0, b.src.0, b.axis, have
+                f.name, v.0, b.src.0, b.axis, have
             ));
         }
     }
@@ -12488,7 +12496,7 @@ mod frame_pass_tests {
         );
         let (bcasts, _) =
             program_broadcast_chains(&f).expect("the spray states its axis and its shape");
-        cross_check_chase(f.name, &bcasts, &frames)
+        cross_check_chase(&f, &bcasts, &frames)
             .expect("the chase's Col axis and the table's column world are one fact");
     }
 }
