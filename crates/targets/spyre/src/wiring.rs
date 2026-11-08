@@ -21,7 +21,7 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
-use crate::lower_subtile_tape_to_superdsc::row_footprint_bytes;
+use crate::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, row_footprint_bytes};
 pub use ktir_superdsc::element_arrangement::{
     DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
@@ -147,8 +147,9 @@ pub struct BakeFacts {
     pub uses_ones_reduce: bool,
     /// Length in f32 elements of that placement (`size / 2`). The fp8-prefill L2 amax enlarges
     /// ONES to `[max(hidden, max fp8-K), stick]`, so binding only `hidden * 64` would leave
-    /// down_proj's tail rows reading adjacent seg0 consts. 0 when unplaced.
-    pub ones_reduce_len: usize,
+    /// down_proj's tail rows reading adjacent seg0 consts. `None` when unplaced — a placed
+    /// `ONES_REDUCE` is at least a full stick of pairs, so `None` is exactly "unplaced".
+    pub ones_reduce_len: Option<std::num::NonZeroUsize>,
     /// The bundle placed `IDENTITY_TID` — the KV cachewr / GQA-replicate matmul-by-identity.
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
@@ -160,7 +161,7 @@ impl BakeFacts {
     /// ask. ⛔ NOT A DEFAULT FOR THE CARD PATH: `require_identity` refuses this on decode.
     pub const NONE: BakeFacts = BakeFacts {
         uses_ones_reduce: false,
-        ones_reduce_len: 0,
+        ones_reduce_len: None,
         uses_identity: false,
         scalarmul_scales: &[],
     };
@@ -171,7 +172,7 @@ impl BakeFacts {
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
-            ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
+            ones_reduce_len: ones.and_then(|p| std::num::NonZeroUsize::new((p.size / 2) as usize)),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
@@ -1477,6 +1478,18 @@ const _: () = assert!(
     "the entry cap: CHAIN_IDX_BLOCK (the u32 index stick's width) must equal \
      CopyDims::ENTRIES_PER_OP (the IBR ceiling) — one stick, two spellings"
 );
+// ⭐ AND THE PIN AGAINST THE LADDER'S OWN DERIVATION: CHAIN_IDX_BLOCK is the leaf
+// crate's one honest copy of the SENUINT32 stick width (the leaf cannot depend on
+// ktir-superdsc, where the DataFormat table derives it). Both sides compile in this
+// one build, so a drift in either spelling fails it here — never at a device read.
+const _: () = assert!(
+    scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as u64
+        == <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as u64,
+    "the u32 index stick: the leaf crate's CHAIN_IDX_BLOCK must equal the ladder's \
+     SenUint32 ELEMS_PER_STICK — one stick, one copy each side of the crate edge, \
+     pinned here"
+);
 
 /// ⭐⭐⭐ THE GATE TABLE'S β IMAGE — the ONE `[rows, 1]` table whose chain crosses the
 /// i32→f32 convert, staged at the convert's own device sweep (front-b-noise, auditor
@@ -2121,9 +2134,9 @@ pub struct ConstantEnv {
     pub mq_pad: usize,
     /// From the bundle's own placements, not a runtime flag.
     pub uses_ones_reduce: bool,
-    /// Baked `ONES_REDUCE` placement length in f32 elements; 0 ⇒ fall back to
-    /// `hidden * 64`.
-    pub ones_reduce_len: usize,
+    /// Baked `ONES_REDUCE` placement length in f32 elements; `None` ⇒ fall back to
+    /// `hidden` × the fp16 stick (one stick per hidden column).
+    pub ones_reduce_len: Option<std::num::NonZeroUsize>,
     /// From the bundle's own placements.
     pub uses_identity: bool,
     /// ⭐ THE KERNEL-TABLE CLASS SETS (see [`Wiring::rope_class_hds`]). The tables themselves are
@@ -2161,11 +2174,12 @@ pub struct ConstantEnv {
 // [`ConstValues`] is what lets the list hold them beside the computed ones.
 
 /// RMSNorm Newton-rsqrt bound: 0.5, exact in fp16.
-static RMS_HALF: [f32; 64] = [0.5; 64];
+static RMS_HALF: [f32; FP16_ELEMS_PER_STICK as usize] = [0.5; FP16_ELEMS_PER_STICK as usize];
 /// fp8 E4M3 clamp bounds and the `qfp8ch` amax reciprocal.
-static FP8_POS448: [f32; 64] = [448.0; 64];
-static FP8_NEG448: [f32; 64] = [-448.0; 64];
-static FP8_INV448: [f32; 64] = [1.0 / 448.0; 64];
+static FP8_POS448: [f32; FP16_ELEMS_PER_STICK as usize] = [448.0; FP16_ELEMS_PER_STICK as usize];
+static FP8_NEG448: [f32; FP16_ELEMS_PER_STICK as usize] = [-448.0; FP16_ELEMS_PER_STICK as usize];
+static FP8_INV448: [f32; FP16_ELEMS_PER_STICK as usize] =
+    [1.0 / 448.0; FP16_ELEMS_PER_STICK as usize];
 
 /// A constant's values: BORROWED from the binary when the value is known ahead
 /// of the run, OWNED while it is still computed at load.
@@ -2302,11 +2316,12 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     if reductions && env.uses_ones_reduce {
         // Bind the FULL baked placement length: the fp8-prefill L2 amax enlarges
         // ONES to cover down_proj (K = intermediate > hidden), and binding only
-        // `hidden*64` leaves the tail rows reading adjacent seg0 consts.
-        let len = if env.ones_reduce_len > 0 {
-            env.ones_reduce_len
-        } else {
-            h * 64
+        // one stick per hidden column leaves the tail rows reading adjacent
+        // seg0 consts. The stick is Fp16's own (the ladder's derivation), never
+        // a spelled 64.
+        let len = match env.ones_reduce_len {
+            Some(len) => len.get(),
+            None => h * FP16_ELEMS_PER_STICK as usize,
         };
         out.push((sd::ONES_REDUCE_TID, ConstValues::Fill { value: 1.0, len }));
     }
@@ -2565,7 +2580,7 @@ mod constant_tape_tests {
             head_dim: 64,
             mq_pad: 64,
             uses_ones_reduce: true,
-            ones_reduce_len: 0,
+            ones_reduce_len: None,
             uses_identity: true,
             rows,
             scalarmul_scales: &[1.5, 2.5],

@@ -554,6 +554,13 @@ jobs:
       # import deleted with MatmulStaging, the usage left in
       # zz_a_one_row_matmul_fills_every_core.rs) — main could not compile that test
       # binary and no check was red. This leg is the compile cover for that class.
+      # The same gap at clippy: the test step below compiles ktir-superdsc's test
+      # targets, but no step LINTS them (the triton clippy is the five re-host
+      # crates, the workspace clippy has no --all-targets), so lint debt piled
+      # unseen — main was red in this leg nobody ran (chain_stage_program's
+      # nine positional args, an identity op in the broadcast-prefix-row test).
+      - name: Clippy (spyre ktir-superdsc, all targets)
+        run: cargo clippy -p ktir-superdsc --all-targets -- -D warnings
       - name: Test (spyre ktir-superdsc + bundle)
         run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
       # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
@@ -582,6 +589,10 @@ jobs:
   #   scratchy-tensors       src/typed.rs
   #   scratchy-target-metal  src/tape/typed.rs  (objc2 ⇒ macOS runner)
   #   scratchy-target-spyre  src/runtime.rs     (gated on `spyre-hw`)
+  # ktir-core's former E0080 wrong-copy fixture is deleted: it asserted a
+  # `31` it declared inside itself, which proves only that `assert!` fails
+  # in const context. ktir-core stays on the line below — it has no
+  # doctests left, so the run is a no-op for it and covers the rest.
   # `spyre-hw` pulls flex-rs, whose C++ shim needs the Spyre SDK; the shim is
   # skipped as in the check-only jobs. Nothing links it: the crate's only
   # runnable doctests are these compile_fail ones.
@@ -603,7 +614,7 @@ jobs:
       - name: Doctests (compile_fail error codes)
         env:
           SCRATCHY_SKIP_SENDNN_CXX: "1"
-        run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal -p scratchy-target-spyre --features scratchy-target-spyre/spyre-hw
+        run: cargo +nightly test --doc -p ktir-core -p scratchy-tensors -p scratchy-target-metal -p scratchy-target-spyre --features scratchy-target-spyre/spyre-hw
 
   fmt:
     name: Format

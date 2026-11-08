@@ -543,10 +543,15 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
         O::ArithTruncf => KOpKind::ArithTruncf,
         O::ArithIndexCast => KOpKind::ArithIndexCast,
         O::ArithSelect => KOpKind::ArithSelect,
+        O::ArithNegf => KOpKind::ArithNegf,
+        O::ArithSitofp => KOpKind::ArithSitofp,
         O::MathExp => KOpKind::MathExp,
         O::MathLog => KOpKind::MathLog,
         O::MathLog2 => KOpKind::MathLog2,
         O::MathSqrt => KOpKind::MathSqrt,
+        O::MathAbsf => KOpKind::MathAbsf,
+        O::MathTanh => KOpKind::MathTanh,
+        O::MathRsqrt => KOpKind::MathRsqrt,
         O::TensorSplat => KOpKind::TensorSplat,
         O::TensorEmpty => KOpKind::TensorEmpty,
         O::TensorCollapseShape => KOpKind::TensorCollapseShape,
@@ -597,7 +602,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
         // OUR TYPE'S ESCAPE HATCH IS NOT THEIR GAP.
         //
         // Our `OpKind` models 64 spellings; theirs models 123. So an op we carry as
-        // `Other("arith.negf")` is one THEIR TYPE NAMES PROPERLY, and reporting it as
+        // `Other("math.floor")` is one THEIR TYPE NAMES PROPERLY, and reporting it as
         // "no variant in their OpKind" -- which the first version of this arm did -- blames
         // the consumer for our own escape hatch. The right answer is to name their variant.
         //
@@ -605,9 +610,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
         // short because step 2 of the retype collapses our interior onto a generic
         // name-based IR, after which this whole arm becomes the only op lookup there is.
         O::Other(s) => match s.as_str() {
-            "arith.negf" => KOpKind::ArithNegf,
             "arith.cmpf" => KOpKind::ArithCmpf,
-            "arith.sitofp" => KOpKind::ArithSitofp,
             "arith.fptosi" => KOpKind::ArithFptosi,
             "arith.uitofp" => KOpKind::ArithUitofp,
             // ⭐ RESTORED (#813 review). ab6f7ccc2d cut this arm with the v5 integer-combine
@@ -627,10 +630,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
             "arith.trunci" => KOpKind::ArithTrunci,
             "arith.ori" => KOpKind::ArithOri,
             "arith.xori" => KOpKind::ArithXori,
-            "math.rsqrt" => KOpKind::MathRsqrt,
-            "math.tanh" => KOpKind::MathTanh,
             "math.floor" => KOpKind::MathFloor,
-            "math.absf" => KOpKind::MathAbsf,
             "math.log" => KOpKind::MathLog,
             "linalg.transpose" => KOpKind::LinalgTranspose,
             "linalg.broadcast" => KOpKind::LinalgBroadcast,

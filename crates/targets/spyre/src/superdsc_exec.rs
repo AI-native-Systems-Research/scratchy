@@ -2325,6 +2325,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // it follows the RESIDENT rule exactly: a session that binds nothing gets a placeholder
         // because an owner's region will replace it.
         for b in 0..self.weight_bank_bytes.len() {
+            // A HOST placeholder allowance, NOT the flit: an empty or borrowed bank
+            // gets a minimal host buffer so the vec exists — nothing in the device
+            // law ties this number to the stick (an owner's region replaces it).
             let bytes = if reserve_only || self.seg_borrowed[SEG_WEIGHT.get()] {
                 128
             } else {
@@ -2656,6 +2659,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // banks (a bank is aliasable BECAUSE it holds only weights, placed identically in every
         // bundle), so allocating the full extent here would reserve tens of GB only to drop it.
         for b in 0..self.weight_bank_bytes.len() {
+            // A HOST placeholder allowance, NOT the flit (see the host-buffer twin
+            // of this loop above): a borrowed bank gets a minimal alloc so the
+            // address exists — an owner's region replaces it.
             let bytes = if self.seg_borrowed[SEG_WEIGHT.get()] {
                 128
             } else {
@@ -6382,16 +6388,15 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
     }
 
-    /// Resident capacity in slots. PAGED: what ONE REQUEST can hold — the pages it has been given.
-    /// The pool is SHARED, so reporting it here would let a request run off its own pages into
-    /// another's.
-    pub fn cap(&self) -> i64 {
-        if let Some(g) = self.kv.paged() {
+    /// Resident capacity in slots. PAGED ONLY: what ONE REQUEST can hold — the pages
+    /// it has been given. The pool is SHARED, so reporting it here would let a request
+    /// run off its own pages into another's. ⚔ `None` IS "NO POOL": an UNPAGED bundle
+    /// has no pool fact to report.
+    pub fn cap(&self) -> Option<i64> {
+        self.kv.paged().map(|g| {
             let held = self.fold.block_tables.first().map_or(0, |t| t.len() as i64);
             held * g.page_slots.0.get()
-        } else {
-            self.num_blocks.0 * 64
-        }
+        })
     }
 
     /// Install request `req`'s logical→physical page map, its POOL ROW, and the position its next

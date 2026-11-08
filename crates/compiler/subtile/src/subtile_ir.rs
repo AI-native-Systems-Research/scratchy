@@ -2229,6 +2229,14 @@ fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId)
 /// ONE derivation for every reader: the registry's `[ustick]` out-cols
 /// class, the mint's persistent sources and fresh output, and the host
 /// reference's stick width.
+///
+/// ⚠ ONE HONEST COPY, PINNED WHERE BOTH SIDES ARE VISIBLE: this value IS the
+/// ladder's `<SenUint32 as DataFormat>::ELEMS_PER_STICK`, but this crate is
+/// the LEAF and cannot depend on ktir-superdsc where that format table lives
+/// — so it is spelled here once and const-pinned equal to the ladder's
+/// derivation in `scratchy-target-spyre`'s wiring (both crates compile in
+/// one build, so a drift in either fails the build). The same shape as the
+/// senlib copies' pin.
 pub const CHAIN_IDX_BLOCK: u32 = 32;
 
 // ⭐ THE PICK'S OWN LAWS ARE THE SAMPLER'S, NEVER A SECOND COPY: the pad

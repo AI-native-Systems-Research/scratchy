@@ -1684,7 +1684,9 @@ impl SpyreWorker {
                 let n_consts =
                     scratchy_target_spyre::wiring::synthetic_constants(&df.constant_env(
                         &wirings.decode,
-                        64,
+                        // The emitter's own row pad (one stick) — the ONE home
+                        // (`mq_pad`), never a second spelling of the stick here.
+                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::mq_pad(1),
                         scratchy_target_spyre::wiring::StagedRows::ONE,
                     ))
                     .len();
@@ -2092,7 +2094,12 @@ impl SpyreWorker {
                     "[spyre-worker] sendnn: SUPERDSC dxp session ready (fp={fp}, vocab {vocab}, \
                      kv_dim {kv_dim}, num_blocks {num_blocks}, cap {} slots, paged={} \
                      page_slots={}, pmask reserves {:?} column(s))",
-                    ss.cap, paged, page_slots, ss.pmask_slots,
+                    ss.cap()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "unpaged (no pool)".to_string()),
+                    paged,
+                    page_slots,
+                    ss.pmask_slots,
                 );
                 // ── SHARE seg2 (the resident KV) between the PREFILL and DECODE sessions ──
                 // Both bundles place seg2 identically by construction (kc/vc at nqh·hd·cap·2, the

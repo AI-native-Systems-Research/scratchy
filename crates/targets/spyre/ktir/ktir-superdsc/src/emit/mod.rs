@@ -9357,21 +9357,54 @@ mod chain_stage_tests {
     /// state; the payload carries it, the door never derives it.
     const HIDDEN: u32 = 128;
 
+    /// The chain-stage program's nine stated facts, ONE argument — the legal
+    /// geometry's values are the canonical `ChainStageShapes::CANON`, and each
+    /// refusal states only the fact it takes off the class (struct update
+    /// syntax), so a reader sees the ONE wrong fact per probe.
+    struct ChainStageShapes {
+        pick: (i64, i64),
+        s: (i64, i64),
+        l: (i64, i64),
+        stab: (i64, i64),
+        ltab: (i64, i64),
+        out: (i64, i64),
+        pad_vocab: u32,
+        table_rows: u32,
+        hidden: u32,
+    }
+
+    impl ChainStageShapes {
+        /// The legal geometry: the argmax pick stick, the u32 index sticks, the
+        /// payload's own table extents, the door tests' toy hidden.
+        const CANON: ChainStageShapes = ChainStageShapes {
+            pick: PICK,
+            s: USTICK,
+            l: USTICK,
+            stab: TABLES,
+            ltab: TABLES,
+            out: USTICK,
+            pad_vocab: PAD_VOCAB,
+            table_rows: TABLE_ROWS,
+            hidden: HIDDEN,
+        };
+    }
+
     /// One KTIR program shaped like the spyre emitter's mint: parameters 0..5 are (pick,
     /// s stick, l stick, s table, l table, s-value out), each with a memory view and an
     /// access tile of its whole buffer, one load off the pick tile and one store through
     /// the out tile.
-    fn chain_stage_program(
-        pick_shape: (i64, i64),
-        s_shape: (i64, i64),
-        l_shape: (i64, i64),
-        stab_shape: (i64, i64),
-        ltab_shape: (i64, i64),
-        out_shape: (i64, i64),
-        pad_vocab: u32,
-        table_rows: u32,
-        hidden: u32,
-    ) -> KtirNode {
+    fn chain_stage_program(shapes: &ChainStageShapes) -> KtirNode {
+        let ChainStageShapes {
+            pick: pick_shape,
+            s: s_shape,
+            l: l_shape,
+            stab: stab_shape,
+            ltab: ltab_shape,
+            out: out_shape,
+            pad_vocab,
+            table_rows,
+            hidden,
+        } = *shapes;
         let a: &'static Arena = Arena::global();
         let shape = |op: Operation<'static>, s: (i64, i64)| {
             op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![s.0, s.1])))
@@ -9516,9 +9549,7 @@ mod chain_stage_tests {
     }
 
     fn whole_program() -> KtirNode {
-        chain_stage_program(
-            PICK, USTICK, USTICK, TABLES, TABLES, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
-        )
+        chain_stage_program(&ChainStageShapes::CANON)
     }
 
     fn lower(
@@ -9566,17 +9597,10 @@ mod chain_stage_tests {
     /// refused by name.
     #[test]
     fn a_pick_stick_off_the_argmax_class_is_refused() {
-        let e = refusal(&chain_stage_program(
-            (1, 32),
-            USTICK,
-            USTICK,
-            TABLES,
-            TABLES,
-            USTICK,
-            PAD_VOCAB,
-            TABLE_ROWS,
-            HIDDEN,
-        ));
+        let e = refusal(&chain_stage_program(&ChainStageShapes {
+            pick: (1, 32),
+            ..ChainStageShapes::CANON
+        }));
         assert!(
             e.contains("the pick stick t301 states [1, 32]"),
             "names the pick stick and its shape, got: {e}"
@@ -9592,17 +9616,10 @@ mod chain_stage_tests {
     /// is refused naming WHICH one is wrong.
     #[test]
     fn a_destination_off_the_ustick_class_is_refused_and_named() {
-        let e = refusal(&chain_stage_program(
-            PICK,
-            (1, 64),
-            USTICK,
-            TABLES,
-            TABLES,
-            USTICK,
-            PAD_VOCAB,
-            TABLE_ROWS,
-            HIDDEN,
-        ));
+        let e = refusal(&chain_stage_program(&ChainStageShapes {
+            s: (1, 64),
+            ..ChainStageShapes::CANON
+        }));
         assert!(
             e.contains("the persistent s stick t302 states [1, 64]"),
             "names the persistent s stick and its shape, got: {e}"
@@ -9611,17 +9628,10 @@ mod chain_stage_tests {
             e.contains("the u32 index-stick class"),
             "names the class the destination must carry, got: {e}"
         );
-        let e = refusal(&chain_stage_program(
-            PICK,
-            USTICK,
-            USTICK,
-            TABLES,
-            TABLES,
-            (1, 64),
-            PAD_VOCAB,
-            TABLE_ROWS,
-            HIDDEN,
-        ));
+        let e = refusal(&chain_stage_program(&ChainStageShapes {
+            out: (1, 64),
+            ..ChainStageShapes::CANON
+        }));
         assert!(
             e.contains("the s-value output t307 states [1, 64]"),
             "names the OUTPUT when that is the wrong one, got: {e}"
@@ -9637,9 +9647,10 @@ mod chain_stage_tests {
     #[test]
     fn a_table_off_the_staged_extent_is_refused_and_named() {
         let short = (TABLE_ROWS as i64 - 1, 32);
-        let e = refusal(&chain_stage_program(
-            PICK, USTICK, USTICK, short, TABLES, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
-        ));
+        let e = refusal(&chain_stage_program(&ChainStageShapes {
+            stab: short,
+            ..ChainStageShapes::CANON
+        }));
         assert!(
             e.contains("the s decompose table t305 states [8256, 32]"),
             "names the s table, its tid, and its stated shape, got: {e}"
@@ -9648,9 +9659,10 @@ mod chain_stage_tests {
             e.contains("[8257, 32]"),
             "names the payload's own stated extent, got: {e}"
         );
-        let e = refusal(&chain_stage_program(
-            PICK, USTICK, USTICK, TABLES, short, USTICK, PAD_VOCAB, TABLE_ROWS, HIDDEN,
-        ));
+        let e = refusal(&chain_stage_program(&ChainStageShapes {
+            ltab: short,
+            ..ChainStageShapes::CANON
+        }));
         assert!(
             e.contains("the l decompose table t306 states [8256, 32]"),
             "names the l table when THAT is the wrong one, got: {e}"

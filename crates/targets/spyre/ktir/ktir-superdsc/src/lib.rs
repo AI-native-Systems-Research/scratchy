@@ -95,6 +95,11 @@ pub mod superdsc_error;
 /// Typed FRONTEND core for the SuperDSC emitter — `OpSpec`/`TensorArg`/`WorkPlan` and the sealed
 /// witnesses that make the historical SDSC bug classes unrepresentable rather than runtime-checked.
 pub mod superdsc_opspec;
+/// ⭐ THE CONSTRAINT SOLVE'S ONE UNION-FIND — weighted joins (a group: the frame pass's
+/// equalities, the element-arrangement solve's mod-4 lane shifts), per-component anchors
+/// with first-op-wins naming, and the one unanchored default. Every class-bearing solve in
+/// the crate lowers through it; no reader re-derives a class the solve already stated.
+pub mod union_find;
 /// THE WIRE LAYER — `Dsc`/`SdscOp` and the whole `#[derive(Serialize)]` family, the three fp8
 /// nested-fold generators, and the HBM segment constants. The SuperDSC TYPE itself: this is the
 /// JSON dxp reads, and the typed core in [`superdsc_opspec`] lowers into it.

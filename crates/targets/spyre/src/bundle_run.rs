@@ -37,6 +37,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, STICK_BYTES};
+
 /// One `placements.json` entry.
 #[derive(Debug, serde::Deserialize)]
 struct PlaceRow {
@@ -109,7 +111,8 @@ fn dev_order(rows: usize, cols: usize) -> Vec<usize> {
     let mut v = vec![0usize; rows * cols];
     for r in 0..rows {
         for c in 0..cols {
-            v[(c / 64) * (rows * 64) + r * 64 + (c % 64)] = r * cols + c;
+            let stk = FP16_ELEMS_PER_STICK as usize;
+            v[(c / stk) * (rows * stk) + r * stk + (c % stk)] = r * cols + c;
         }
     }
     v
@@ -297,11 +300,13 @@ fn bind_raw<T: ktir_superdsc::collective::Tp>(
     Ok(())
 }
 
-/// Tensor ids at or above this are the producer's RESERVED DEVICE CONSTANTS, not kernel parameters —
-/// `ktir_superdsc::reserved_tids` places them by counting down from `u32::MAX`. They are bound as
-/// weights (staged once) rather than declared as per-run sources, because the executor's source model
-/// is the contiguous id range `0..n`.
-const RESERVED_TID_FLOOR: u32 = u32::MAX - 1024;
+// Tensor ids at or above the reserved floor are the producer's RESERVED DEVICE
+// CONSTANTS, not kernel parameters — `ktir_superdsc::reserved_tids` places them by
+// counting down from `u32::MAX`, and states the range's floor there
+// (`RESERVED_TID_FLOOR`, the one spelling). They are bound as weights (staged once)
+// rather than declared as per-run sources, because the executor's source model is the
+// contiguous id range `0..n`.
+use ktir_superdsc::reserved_tids::RESERVED_TID_FLOOR;
 
 /// One bundle off disk runs on one card: a world of one.
 type Alone = ktir_superdsc::collective::TpWorld<1>;
@@ -659,18 +664,21 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
                     );
                 }
                 let cols = elems / rows;
-                if rows > 1 && !cols.is_multiple_of(64) {
+                if rows > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as u64) {
                     bail!(
-                        "stick:t{tid}={rows}: {cols} columns is not a whole number of 64-lane \
-                         sticks, so the stick-major map would leave holes it cannot fill"
+                        "stick:t{tid}={rows}: {cols} columns is not a whole number of \
+                         {FP16_ELEMS_PER_STICK}-lane sticks, so the stick-major map would leave holes \
+                         it cannot fill"
                     );
                 }
                 Ok((rows > 1).then_some((rows as usize, cols as usize)))
             }
-            None if elems > 64 => bail!(
-                "t{tid} ({what}) spans {elems} fp16 elements — more than one 64-lane stick — and no \
+            None if elems > FP16_ELEMS_PER_STICK as u64 => bail!(
+                "t{tid} ({what}) spans {elems} fp16 elements — more than one \
+                 {FP16_ELEMS_PER_STICK}-lane stick — and no \
                  `stick:t{tid}=<rows>` states the row count the descriptors address it with. The device \
-                 layout is stick-major, (c/64)·rows·128 + r·128 + (c%64)·2, so binding this row-major \
+                 layout is stick-major, (c/{FP16_ELEMS_PER_STICK})·rows·{STICK_BYTES} + \
+                 r·{STICK_BYTES} + (c%{FP16_ELEMS_PER_STICK})·2, so binding this row-major \
                  would return a wrong answer that looks right: MEASURED 0.0193 within_2pct on \
                  rmsnorm_granite, exactly the (r, r) diagonal tiles correct. Pass `stick:t{tid}=1` if \
                  the tensor really is one row — that map is the identity."
@@ -926,9 +934,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
                     bail!("synth:{name}@{r}: {elems} fp16 elements do not divide into {r} rows");
                 }
                 let cols = elems / *r;
-                if *r > 1 && !cols.is_multiple_of(64) {
+                if *r > 1 && !cols.is_multiple_of(FP16_ELEMS_PER_STICK as u64) {
                     bail!(
-                        "synth:{name}@{r}: {cols} columns is not a whole number of 64-lane sticks"
+                        "synth:{name}@{r}: {cols} columns is not a whole number of \
+                         {FP16_ELEMS_PER_STICK}-lane sticks"
                     );
                 }
                 if *r > 1 {
@@ -937,8 +946,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
                     ieee
                 }
             }
-            None if elems > 64 => bail!(
-                "synth:{name} spans {elems} fp16 elements — more than one 64-lane stick — and no \
+            None if elems > FP16_ELEMS_PER_STICK as u64 => bail!(
+                "synth:{name} spans {elems} fp16 elements — more than one \
+                 {FP16_ELEMS_PER_STICK}-lane stick — and no \
                  `synth:{name}@<rows>=<path>` states the row count the descriptors address it with. \
                  Pass `@1` if it really is one row; that map is the identity."
             ),

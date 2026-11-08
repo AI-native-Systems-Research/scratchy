@@ -46,8 +46,12 @@ use std::num::NonZeroU32;
 // Hardware constants (dd2). Single source of truth shared with the wire module.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Spyre dd2: 32 cores.
-pub const MAX_CORES: u32 = 32;
+/// Spyre dd2: the core count — READ from the baked generation's table
+/// (`<Baked as DeviceGen>::CORES`, senlib's `RCU_CORES` = 32 under its
+/// citation). The literal is spelled once, in Gen1's impl; this name stays
+/// because the work planner feeds it to const contexts
+/// (`MaxCores::<MAX_CORES>`) that read a named const.
+pub const MAX_CORES: u32 = <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORES;
 /// Corelets declared per core in the FRONTEND SDSC = 1 (matches torch-spyre's
 /// `compute_ops.py` `coreletFoldProp_`={factor_:1} / `numCoreletsUsed_`:1). The
 /// L3 scheduler decides the real corelet split — the frontend does NOT
@@ -64,10 +68,13 @@ pub const ACTIVE_CORELETS: u32 = 1;
 // matmul is handed to dxp whole and dxp stages it (measured).
 // ───────────────────────────────────────────────────────────────────────────
 
-/// LX scratchpad bytes PER CORE on dd2 = 2 MiB. Confirmed against torch-spyre
-/// `scratchpad/allocator.py:305` (`size = int((2 << 20) * (1.0 - dxp_lx_frac_avail))`)
-/// and `sentient_dd2_sysconfig.json`.
-pub const LX_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
+/// LX scratchpad bytes PER CORE on dd2 = 2 MiB — READ from the baked
+/// generation's table (`<Baked as DeviceGen>::LX_CAPACITY_BYTES`), which
+/// states the vendor's own default (`sysdef.h:169 lxCap = 2 * 1024 * 1024`)
+/// and the torch-spyre confirmation (`scratchpad/allocator.py:305`,
+/// `sentient_dd2_sysconfig.json`) under its citation.
+pub const LX_CAPACITY_BYTES: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::LX_CAPACITY_BYTES;
 
 /// LX live-set budget for fused-segment planning: SEVEN EIGHTHS of the per-core
 /// LX ([`LX_CAPACITY_BYTES`]) — the 7/8 leaves headroom for a node's transient
@@ -202,6 +209,16 @@ pub fn rows_per_block(cols: u32, live: u32) -> u32 {
 /// Sealed data-format trait carrying the per-stick element count. fp16 = 64
 /// elems / 128 B stick. (fp32 = 32, fp8/int8 = 128 — present for completeness;
 /// the emitter is fp16-only today.)
+///
+/// ⭐ THE STICK WIDTH IS THE DEVICE'S OWN QUOTIENT LAW, not a per-format
+/// literal: the vendor states `getNumElemsInStick = (STICK_BYTESIZE << 3) >>
+/// bitWidth` (util/sendefs/dataType.h:22-24, with `#define STICK_BYTESIZE
+/// 128` at :9) — elems per stick = the baked generation's `FLIT_BYTES` /
+/// this format's `WORD_LENGTH` — and its `dataFormatToStickSize` map
+/// (util/sendefs/sendefs.h:65-72) holds exactly that quotient for all
+/// twelve of its rows, packed int2/int4 included. Every impl below derives
+/// `ELEMS_PER_STICK` by that law, and `superdsc_opspec::tests` pins each
+/// derived value against the vendor map's own row.
 pub trait DataFormat: private::SealedDf {
     const ELEMS_PER_STICK: u32;
     /// DeepTools `dataFormat_` string.
@@ -219,7 +236,10 @@ pub trait DataFormat: private::SealedDf {
 #[derive(Clone, Copy, Debug)]
 pub enum Fp16 {}
 impl DataFormat for Fp16 {
-    const ELEMS_PER_STICK: u32 = 64;
+    // 64 = Gen1's 128-B flit / 2-B word (the stick law on the trait's doc).
+    const ELEMS_PER_STICK: u32 =
+        (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES
+            / Self::WORD_LENGTH as u64) as u32;
     const NAME: &'static str = "SEN169_FP16";
     const WORD_LENGTH: u32 = 2;
     const DF: Df = Df::Fp16;
@@ -233,7 +253,10 @@ impl DataFormat for Fp16 {
 #[derive(Clone, Copy, Debug)]
 pub enum Fp32 {}
 impl DataFormat for Fp32 {
-    const ELEMS_PER_STICK: u32 = 32;
+    // 32 = Gen1's 128-B flit / 4-B word (the stick law on the trait's doc).
+    const ELEMS_PER_STICK: u32 =
+        (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES
+            / Self::WORD_LENGTH as u64) as u32;
     const NAME: &'static str = "IEEE_FP32";
     const WORD_LENGTH: u32 = 4;
     const DF: Df = Df::Fp32;
@@ -252,7 +275,11 @@ impl DataFormat for Fp32 {
 #[derive(Clone, Copy, Debug)]
 pub enum SenInt8 {}
 impl DataFormat for SenInt8 {
-    const ELEMS_PER_STICK: u32 = 128;
+    // 128 = Gen1's 128-B flit / 1-B word, the packed int8 residency (the
+    // stick law on the trait's doc).
+    const ELEMS_PER_STICK: u32 =
+        (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES
+            / Self::WORD_LENGTH as u64) as u32;
     const NAME: &'static str = "SENINT8";
     const WORD_LENGTH: u32 = 1; // 1 byte/elem — the packed int8 residency (½ f16 = the bandwidth win)
     const DF: Df = Df::SenInt8;
@@ -268,7 +295,11 @@ impl DataFormat for SenInt8 {
 #[derive(Clone, Copy, Debug)]
 pub enum Fp8 {}
 impl DataFormat for Fp8 {
-    const ELEMS_PER_STICK: u32 = 128;
+    // 128 = Gen1's 128-B flit / 1-B word, the packed fp8 residency (the
+    // stick law on the trait's doc).
+    const ELEMS_PER_STICK: u32 =
+        (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES
+            / Self::WORD_LENGTH as u64) as u32;
     const NAME: &'static str = "SEN143_FP8";
     const WORD_LENGTH: u32 = 1; // 1 byte/elem — packed fp8 residency (½ f16 = the ÷2 bandwidth win)
     const DF: Df = Df::Fp8;
@@ -302,7 +333,10 @@ impl DataFormat for Fp8 {
 #[derive(Clone, Copy, Debug)]
 pub enum SenUint32 {}
 impl DataFormat for SenUint32 {
-    const ELEMS_PER_STICK: u32 = 32;
+    // 32 = Gen1's 128-B flit / 4-B word (the stick law on the trait's doc).
+    const ELEMS_PER_STICK: u32 =
+        (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES
+            / Self::WORD_LENGTH as u64) as u32;
     const NAME: &'static str = "SENUINT32";
     const WORD_LENGTH: u32 = 4;
     const DF: Df = Df::SenUint32;
@@ -4185,11 +4219,35 @@ impl OpSpec {
 mod tests {
     use super::*;
 
+    /// ⭐ THE DERIVED STICK WIDTHS ARE THE VENDOR MAP'S OWN ROWS. Every
+    /// `ELEMS_PER_STICK` is derived by the device's quotient law (the trait
+    /// doc's citation); this pins each derived value against the row the
+    /// vendor's own `dataFormatToStickSize` map states
+    /// (util/sendefs/sendefs.h:65-72, read on the card pod 2026-11-08):
+    /// SEN169_FP16 64.0, IEEE_FP32 32.0, SEN143_FP8 128.0, SENINT8 128.0,
+    /// SENUINT32 32.0. A wrong flit size or word length fails HERE, at the
+    /// derivation's own pin — the quotient is the device's law, not a
+    /// formula that happens to fit.
+    #[test]
+    fn the_derived_stick_widths_are_the_vendor_map_rows() {
+        assert_eq!(<Fp16 as DataFormat>::ELEMS_PER_STICK, 64);
+        assert_eq!(<Fp32 as DataFormat>::ELEMS_PER_STICK, 32);
+        assert_eq!(<Fp8 as DataFormat>::ELEMS_PER_STICK, 128);
+        assert_eq!(<SenInt8 as DataFormat>::ELEMS_PER_STICK, 128);
+        assert_eq!(<SenUint32 as DataFormat>::ELEMS_PER_STICK, 32);
+    }
+
     /// ⭐ THE FRONTEND's LX END IS dbo's OWN RESERVATION, recomputed from the formula's named inputs rather
     /// than read back from the constant. `reserveFrontendLx` (`dbo/src/Transforms/ProgramLayout.cpp:81-98`)
     /// reserves `int64_t(memCapacity * (1 - DXP_LX_FRAC_AVAIL))` per core, where `memCapacity` is
     /// `sysdef.cpp:211`'s `lxCap - 64 * 1024` and `DXP_LX_FRAC_AVAIL` defaults to 0.2. The tracker rounds it
     /// up to 128 bytes. That boundary is the LX landing floor measured on card: stick 12698.
+    ///
+    /// The `2 * 1024 * 1024` below is a deliberate INDEPENDENT ORACLE — dbo's
+    /// own `lxSize` input restated from its source, not a read of
+    /// `LX_CAPACITY_BYTES` — so the test recomputes the formula from the
+    /// vendor's stated inputs and would catch a wrong table value, not
+    /// mirror it.
     #[test]
     fn the_frontend_lx_end_is_dbos_reservation() {
         let lx_cap: u64 = 2 * 1024 * 1024;

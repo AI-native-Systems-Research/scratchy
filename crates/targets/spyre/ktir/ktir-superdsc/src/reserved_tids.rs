@@ -21,6 +21,14 @@
 /// synthesize + bind the fixed matrix each step. Chosen far above any real tensor id.
 pub const ROPE_P_TID: u32 = u32::MAX - 1;
 
+/// ⭐ THE RESERVED RANGE'S OWN FLOOR — tensor ids at or above this are the producer's
+/// RESERVED DEVICE CONSTANTS, not kernel parameters. The regions above count down from
+/// `u32::MAX`; this const states where the reserved space ends, with headroom for the
+/// regions that exist and any the ladder adds. ONE home (it lived as a private literal
+/// in the bundle runner before): the runner that must decide "reserved vs parameter"
+/// reads it here, so the range's extent and its use cannot drift apart.
+pub const RESERVED_TID_FLOOR: u32 = u32::MAX - 1024;
+
 /// RESERVED tensor id for the attention `scale` constant (`1/sqrt(head_dim)`), a
 /// `[1,1]` fp16 the worker synthesizes + binds (seg1). Shared across all layers.
 pub const ATTN_SCALE_TID: u32 = u32::MAX - 2;
