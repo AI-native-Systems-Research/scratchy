@@ -32,10 +32,8 @@ use flex_rs::scheduler::{
     FlexAllocatorAddressResolver, HardwareSubmit, PipelineId, SchedulerBackendConfig,
     SenlibHardwareSubmit, SenlibQueueCapacity, create_scheduler,
 };
-use flex_rs::senlib_ffi::{
-    flex_senlib_device_memory_size, flex_shim_init_runtime, sen_pci_card_count,
-};
-use flex_rs::stream::{RuntimeStreamMode, RuntimeStreamPriority};
+use flex_rs::senlib_ffi::{Card, pcie_address_for_card, sen_pci_card_count};
+use flex_rs::stream::{DeviceId, RuntimeStreamMode, RuntimeStreamPriority};
 use flex_rs::topology::populate_domain_topology;
 
 /// Drain budget. The vendor waits 5 s on its own shutdown marker
@@ -81,45 +79,42 @@ fn cancelled_marker_on_card() {
     );
 
     // ── Refusal guard 2: real senlib bring-up must succeed. ──
-    // The cardless link stub makes this fail (init returns nonzero); real
-    // hardware returns 0. Device 0: the same single-PF bring-up the card
-    // surface uses (`flex_shim_init_runtime` only ever opens a PF).
-    let rc = unsafe { flex_shim_init_runtime(0) };
-    assert!(
-        rc == 0,
-        "REFUSED (not silently passed): flex_shim_init_runtime(0) returned {rc} — the real \
-         senlib device did not come up, so the on-card contract cannot be observed here."
-    );
+    // The first card senlib enumerates, opened by its PCI address (the same
+    // address-keyed open the card surface uses).
+    let pci = pcie_address_for_card(0);
+    let card = Card::open(&pci).unwrap_or_else(|e| {
+        panic!(
+            "REFUSED (not silently passed): Card::open({pci}) failed — {e}. The real senlib \
+             device did not come up, so the on-card contract cannot be observed here."
+        )
+    });
 
     // ── The real bring-up, exactly the card surface's own sequence (all
     // public API): topology from the card's actual HBM/core counts, a real
     // FlexAllocator, the Real scheduler backend, a RuntimeContext + stream. ──
-    let device_memory_size = unsafe { flex_senlib_device_memory_size() };
-    assert!(
-        device_memory_size > 0,
-        "REFUSED: the card reports 0 device memory — bring-up did not yield a usable device"
-    );
+    let device_memory_size = card.memory_bytes().unwrap_or_else(|e| {
+        panic!("REFUSED: the card reports no device memory ({e}) — bring-up did not yield a usable device")
+    });
     let topo = populate_domain_topology(device_memory_size);
     let allocator = Arc::new(Mutex::new(
         FlexAllocator::new(
             FlexAllocatorInit::default(),
             topo,
-            DeviceMemoryAllocator::new(DEVICE_ALIGNMENT),
+            DeviceMemoryAllocator::new(card.clone(), DEVICE_ALIGNMENT),
         )
         .expect("FlexAllocator::new must succeed on a real card"),
     ));
     let addr_resolver: Arc<dyn flex_rs::scheduler::DeviceAddressResolver> =
         Arc::new(FlexAllocatorAddressResolver::new(allocator.clone()));
-    let hw = Arc::new(SenlibHardwareSubmit::new());
-    let capacity = Arc::new(SenlibQueueCapacity);
-    let iommu_mapper = PfIommuMapper::new();
+    let hw = Arc::new(SenlibHardwareSubmit::new(card.clone()));
+    let capacity = Arc::new(SenlibQueueCapacity::new(card.clone()));
+    let iommu_mapper = PfIommuMapper::new(card.clone());
     let scheduler = create_scheduler(
         &DeviceKind::Pf,
         SchedulerBackendConfig::Real(hw.clone(), capacity, addr_resolver, iommu_mapper),
     )
     .expect("create_scheduler(Real) must succeed on a real card");
-    let context = RuntimeContext::create(None, scheduler, allocator)
-        .expect("RuntimeContext::create must succeed on a real card");
+    let context = RuntimeContext::create(DeviceId(0), scheduler, allocator);
     let _stream_id = context
         .create_stream(
             RuntimeStreamPriority::Normal,

@@ -1389,10 +1389,16 @@ impl StickLayout {
     }
     /// A FLAT row-major `[rows, cols]` tensor (stick NOT on the last re-tiled dim). fp16.
     pub fn flat(rows: usize, cols: usize) -> Self {
+        Self::flat_df(rows, cols, Df::Fp16)
+    }
+    /// [`flat`](Self::flat) with an EXPLICIT device format — the fp32 flat data/accum the
+    /// long-reduce split's partial handles declare (a partial carries the reduce's own df,
+    /// never the fp16 the un-parameterised door hardcodes).
+    pub(crate) fn flat_df(rows: usize, cols: usize, df: Df) -> Self {
         StickLayout {
             rows,
             cols,
-            df: Df::Fp16,
+            df,
             kind: StickKind::Flat,
         }
     }
@@ -3710,6 +3716,12 @@ impl RowCount {
     /// The real query rows — a per-head or per-tensor `mq`-row sweep.
     pub const fn of_query_rows(mq: QueryRowCount) -> RowCount {
         RowCount(mq.get())
+    }
+    /// A run of `sticks` whole stick columns of a `rows`-row tensor, read as the tall-narrow
+    /// `[sticks · rows, stick]` tensor it IS in memory (stick-major: each stick column is `rows`
+    /// contiguous sticks) — a block copy's one sweep.
+    pub const fn of_stick_column_rows(sticks: u32, rows: u32) -> RowCount {
+        RowCount(sticks * rows)
     }
     /// Residual-stream token rows — outside the attention row-and-width run.
     pub const fn of_token_rows(rows: u32) -> RowCount {

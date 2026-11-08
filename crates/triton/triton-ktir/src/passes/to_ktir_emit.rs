@@ -1509,11 +1509,19 @@ pub fn lower<'a>(m: &Module, a: &'a Arena) -> Result<IRFunction<'a>> {
     let mut fresh = Fresh(m.next_ssa);
     let operations = lower_block(&region.ops, a, &mut fresh)?;
 
-    Ok(IRFunction {
+    let out = IRFunction {
         name,
         arguments: a.args(arguments),
         operations,
         grid,
         return_type: None,
-    })
+    };
+    // THE KTIR BOUNDARY. This is the program the consumers see; the producer is
+    // verified before handing it over, exactly as each pass above the boundary
+    // is. A use that resolves to no result, argument, carry or block argument
+    // here is a defect of THIS emission -- or of the module it was fed, caught
+    // already by the drivers -- and it is refused HERE, not by whichever
+    // consumer happens to chase the value.
+    crate::passes::verify_defs::verify_irfunction_defs(&out, PASS).map_err(|v| v.refusal())?;
+    Ok(out)
 }

@@ -28,7 +28,7 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 use scratchy_target_spyre::superdsc_bake::{ChunkExplore, GroupId, SealedGroup};
 
 /// A dense projection as every granite layer emits it: an unbatched fp16 matmul, no gather.
-fn dense_matmul() -> emit::EmittedOp {
+fn dense_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     superdsc::assemble_matmul(
         "matmul_o7",
         256,
@@ -44,7 +44,7 @@ fn dense_matmul() -> emit::EmittedOp {
 
 /// The token-plane gathered expert gemm, built the way the MoE door builds it: fp16 geometry, every
 /// operand but the output and the index painted fp8, gathered through `of_expert_planes`.
-fn gathered_expert_matmul() -> emit::EmittedOp {
+fn gathered_expert_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let mut spec = matmul_opspec_off_operands_phys_gathered::<Fp16>(
         MatM::of_token_rows(96),
         MatN::of_out_features(64),
@@ -77,7 +77,7 @@ fn gathered_expert_matmul() -> emit::EmittedOp {
 
 /// A KERNEL-LESS gather — the vendor's `identity` copy, roles `{OUTPUT, KERNEL_IDX}`. It reads
 /// through an index too, but it is not the shape the explorer refuses.
-fn gather_copy() -> emit::EmittedOp {
+fn gather_copy() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let spec = gather_copy_opspec(
         "KtPool",
         "KtScratch",
@@ -105,13 +105,15 @@ fn gather_copy() -> emit::EmittedOp {
     emit::emit_sdsc_tiled("gather_o3", &spec, &folds, &mut 0, None).expect("the gather copy emits")
 }
 
-fn groups(ops: &[emit::EmittedOp]) -> Vec<superdsc::GroupInput> {
+fn groups(
+    ops: &[emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+) -> Vec<superdsc::GroupInput> {
     superdsc::render_dxp_input(ops, superdsc::FoldGrouping::Split).expect("the groups render")
 }
 
 /// The explorer setting each group's dxp child is spawned with: the render sealed exactly as the
 /// bake's submit site seals it.
-fn submitted(ops: &[emit::EmittedOp]) -> Vec<ChunkExplore> {
+fn submitted(ops: &[emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>]) -> Vec<ChunkExplore> {
     groups(ops)
         .iter()
         .map(|g| {

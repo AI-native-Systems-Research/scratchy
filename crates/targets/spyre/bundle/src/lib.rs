@@ -37,6 +37,10 @@
 /// The DeepTools `processComputeOnHostCommand` port, run at BUILD time — see [`correction`].
 pub mod correction;
 
+/// Tensor parallelism's control-block pipeline as baked data: the world, the rank, the receive
+/// window, the sids and the send → wait → consume ring — see [`collective`].
+pub mod collective;
+
 /// Re-exported so the `inventory::submit!` the macro emits into each arch crate resolves through the
 /// same path as the types it submits — the arch crate need not depend on `inventory` itself.
 pub use inventory;
@@ -356,7 +360,7 @@ pub enum FoldRows {
 /// A group that carries any of these is a SINGLETON at every group size, because the shift is applied
 /// once to the whole group — `group_ranges` breaks a run at such a trip for exactly that reason.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct KvShifts {
+pub struct KvShifts<T: ktir_superdsc::collective::Tp> {
     /// seg2 shift per write slot, for a group that writes one token into the KV cache. `0` for a group
     /// that needs no slot shift.
     pub slot_stride_bytes: u32,
@@ -387,6 +391,11 @@ pub struct KvShifts {
     pub gathered: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
+    /// ⭐ `Some` iff this group is a COLLECTIVE'S CONSUME. Its launch is preceded by this rank's send
+    /// of the operand fragment — an F-send control block, device p2p RDMA — and the wait for the
+    /// peer's ([`collective::cb_pipeline`]), and it reads the receive window — a weight-segment
+    /// placement no per-layer weight shift or bank may move. Always `None` in a world of one.
+    pub tp: Option<collective::TpConsume<T>>,
     /// ⭐ A WALK'S BLOCK BODY — this group is the `scf.for` page walk's one body, built at trip 0: the
     /// runtime launches it [`Walk::trips`] times, the activation segment (the step's page table and
     /// mask stack) shifted [`Walk::step_bytes`] further each time, and nothing else. A bake fact — the
@@ -404,7 +413,7 @@ pub struct Walk {
     pub step_bytes: u32,
 }
 
-impl KvShifts {
+impl<T: ktir_superdsc::collective::Tp> KvShifts<T> {
     /// Does this group write one token into the KV cache? DERIVED from the stride, so a stride and its
     /// flag cannot disagree.
     pub const fn slot_write(self) -> bool {
@@ -414,6 +423,21 @@ impl KvShifts {
     /// Does this group restickify a Kᵀ slab? Derived, for the same reason.
     pub const fn slab_write(self) -> bool {
         self.slab_stride_bytes > 0
+    }
+
+    /// ⭐ WHERE THIS LAUNCH'S WEIGHT SLOT RESOLVES — `(byte shift, bank)` from the layer's own
+    /// `(layer_shift, layer_bank)`.
+    ///
+    /// ⛔ A CONSUME IS NEVER SHIFTED OR BANKED. Its weight-segment operand is the receive window, ONE
+    /// placement in the base region where the peer's send lands; a rolled body hands layer `v` a
+    /// weight base shifted by `v · weight_stride`, and a banked launch resolves the slot through
+    /// another region entirely — either one aims the consume at bytes no send ever wrote. Every
+    /// other group takes the layer's own pair unchanged.
+    pub const fn weight_slot(self, layer_shift: u64, layer_bank: usize) -> (u64, usize) {
+        match self.tp {
+            None => (layer_shift, layer_bank),
+            Some(_) => (0, 0),
+        }
     }
 }
 
@@ -467,9 +491,9 @@ pub struct LaunchProgram<'a> {
 /// edit; it was an env read until the two values were measured to give DIFFERENT OUTPUT at width 8.
 // NOT `Eq`: a group carries its PROGRAMS, and a program carries float constants.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct LaunchGroup<'a> {
+pub struct LaunchGroup<'a, T: ktir_superdsc::collective::Tp> {
     /// What the launch shifts this program's segment bases by.
-    pub kv: KvShifts,
+    pub kv: KvShifts<T>,
     /// ⭐⭐⭐ THE PROGRAMS THIS LAUNCH RUNS, IN ORDER — the group's KTIR, constructed by the lowering
     /// and baked here as const data. A launch group IS its programs.
     ///
@@ -493,7 +517,7 @@ pub struct LaunchGroup<'a> {
     pub correction: Cow<'a, [u8]>,
 }
 
-impl LaunchGroup<'_> {
+impl<T: ktir_superdsc::collective::Tp> LaunchGroup<'_, T> {
     /// ⭐⭐⭐⭐⭐ WHERE THIS PROGRAM SITS INSIDE ITS OWN ALLOCATION AND HOW BIG THAT ALLOCATION IS — ONE
     /// value, minted from [`Self::job_bin_ptr`] alone.
     ///
@@ -747,19 +771,19 @@ impl<'a> RerollMeta<'a> {
 /// ONE baked SuperDSC bundle: its memory plan, its launch index, its compiled device programs, and
 /// — when it is a re-rolled body — the layer-loop parameters and the siblings that complete it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct BundleCode<'a> {
+pub struct BundleCode<'a, T: ktir_superdsc::collective::Tp> {
     /// Content fingerprint — this bundle's identity, and how a sibling names it.
     pub fp: Cow<'a, str>,
     /// The memory plan every launch addresses through.
     pub layout: BundleLayout<'a>,
     /// This bundle's launches, IN LAUNCH ORDER. EMPTY on a cardless build (no `dxp_standalone` to
     /// run), which is why [`have_device_code`] exists.
-    pub groups: Cow<'a, [LaunchGroup<'a>]>,
+    pub groups: Cow<'a, [LaunchGroup<'a, T>]>,
     /// `Some` ⇒ this bundle is a re-rolled BODY (one layer).
     pub reroll: Option<RerollMeta<'a>>,
 }
 
-impl<'a> BundleCode<'a> {
+impl<'a, T: ktir_superdsc::collective::Tp> BundleCode<'a, T> {
     /// ⭐ THE FOLD-ROW REGIME THIS BUNDLE DECLARES — what the launch derives its intermediate-segment
     /// rebase stride from.
     ///
@@ -788,25 +812,44 @@ impl<'a> BundleCode<'a> {
     }
 }
 
-inventory::collect!(BundleCode<'static>);
-
-/// The bundle registered under `fp`, if this binary carries it.
-pub fn bundle(fp: &str) -> Option<&'static BundleCode<'static>> {
-    inventory::iter::<BundleCode<'static>>().find(|b| b.fp == fp)
+/// ⭐ ONE REGISTERED BUNDLE, OF ITS OWN WORLD. A bundle's world is its type, so the registry holds
+/// each one type-erased and a lookup names its world: [`bundle::<T>`] finds only the bundles that
+/// are `BundleCode<'static, T>`, so a bundle baked for one world is never found by a session of
+/// another — there is no world field to compare, and no lookup to refuse.
+///
+/// `#[forward]` submits `RegisteredBundle { code: &BundleCode::<'static, W> { … } }` for its one
+/// world `W`.
+pub struct RegisteredBundle {
+    pub code: &'static (dyn core::any::Any + Send + Sync),
 }
 
-/// The bundle a [`SiblingFp`] names — the whole of "resolve a sibling".
-pub fn sibling(fp: &SiblingFp<'_>) -> Option<&'static BundleCode<'static>> {
+inventory::collect!(RegisteredBundle);
+
+/// Every bundle of world `T` the binary carries.
+fn registered<T: collective::Tp>() -> impl Iterator<Item = &'static BundleCode<'static, T>> {
+    inventory::iter::<RegisteredBundle>
+        .into_iter()
+        .filter_map(|r| r.code.downcast_ref::<BundleCode<'static, T>>())
+}
+
+/// The bundle of world `T` registered under `fp`, if this binary carries it.
+pub fn bundle<T: collective::Tp>(fp: &str) -> Option<&'static BundleCode<'static, T>> {
+    registered::<T>().find(|b| b.fp == fp)
+}
+
+/// The bundle a [`SiblingFp`] names — the whole of "resolve a sibling". A sibling is of its
+/// bundle's world.
+pub fn sibling<T: collective::Tp>(fp: &SiblingFp<'_>) -> Option<&'static BundleCode<'static, T>> {
     if fp.is_none() {
         return None;
     }
-    bundle(fp.as_str())
+    bundle::<T>(fp.as_str())
 }
 
-/// Is any dxp-compiled device code in this binary? False for every cardless build, where the emit
-/// had no `dxp_standalone` to run.
-pub fn have_device_code() -> bool {
-    inventory::iter::<BundleCode<'static>>().any(|b| !b.groups.is_empty())
+/// Is any dxp-compiled device code of world `T` in this binary? False for every cardless build,
+/// where the emit had no `dxp_standalone` to run.
+pub fn have_device_code<T: collective::Tp>() -> bool {
+    registered::<T>().any(|b| !b.groups.is_empty())
 }
 
 /// Where the NUMERIC-BISECTION GOLDEN for `fp` lives — written by the emit under
@@ -829,10 +872,8 @@ pub fn dbg_golden_dir(fp: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Every registered fingerprint, for diagnostics that need to say what IS here.
-pub fn registered_fps() -> Vec<&'static str> {
-    let mut v: Vec<&str> = inventory::iter::<BundleCode<'static>>()
-        .map(|b| b.fp.as_ref())
-        .collect();
+pub fn registered_fps<T: collective::Tp>() -> Vec<&'static str> {
+    let mut v: Vec<&str> = registered::<T>().map(|b| b.fp.as_ref()).collect();
     v.sort_unstable();
     v
 }
@@ -915,7 +956,7 @@ mod tests {
             fp: Cow::Borrowed("fp"),
             layout: BundleLayout::default(),
             groups: Cow::Borrowed(&[
-                LaunchGroup {
+                LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
                     kv: KvShifts {
                         slot_stride_bytes: 128,
                         ..KvShifts::default()
@@ -1160,6 +1201,7 @@ mod place_id_tests {
             FqMm,
             FqRaw,
             FqAmaxP(0),
+            ReducePartial(0),
             Sq16,
             Mean,
             Meps,
@@ -1211,5 +1253,43 @@ mod place_id_tests {
             let a = PlaceId::Act(tid).to_string();
             assert!(!a.contains('_'), "an act's spelling has no role part: {a}");
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use collective::TpWorld;
+
+    fn find<T: collective::Tp>(fp: &str, among: &[RegisteredBundle]) -> bool {
+        among
+            .iter()
+            .filter_map(|r| r.code.downcast_ref::<BundleCode<'static, T>>())
+            .any(|b| b.fp == fp)
+    }
+
+    fn leaked<T: collective::Tp>(fp: &'static str) -> RegisteredBundle {
+        RegisteredBundle {
+            code: Box::leak(Box::new(BundleCode::<'static, T> {
+                fp: Cow::Borrowed(fp),
+                layout: BundleLayout::default(),
+                groups: Cow::Borrowed(&[]),
+                reroll: None,
+            })),
+        }
+    }
+
+    /// A lookup finds a bundle only in its own world: the world is the bundle's type, read by the
+    /// same downcast [`bundle`] reads the registry through.
+    #[test]
+    fn a_bundle_is_found_only_in_its_own_world() {
+        let among = [leaked::<TpWorld<1>>("one"), leaked::<TpWorld<4>>("four")];
+        assert!(find::<TpWorld<1>>("one", &among));
+        assert!(find::<TpWorld<4>>("four", &among));
+        assert!(!find::<TpWorld<4>>("one", &among));
+        assert!(!find::<TpWorld<1>>("four", &among));
+        assert!(!find::<TpWorld<2>>("four", &among));
+        // Nothing is registered under a test binary's inventory for these fingerprints.
+        assert!(bundle::<TpWorld<4>>("four").is_none());
     }
 }

@@ -32,6 +32,9 @@ scratchy-spyre-bundle = { path = "../../targets/spyre/bundle", optional = true }
 # `RowsExtern` — which host-staged buffer a `LoadRows` reads — is one type across every IR: the
 # `Instruction`, this crate's `SubOp`, the metal step. scratchy-ir never reaches back here.
 scratchy-ir = { path = "../ir" }
+# The tensor-parallel world as a type: `tensor_parallel::shard` is generic over it, and the spyre
+# collective protocol names the same type.
+scratchy-tp-world = { path = "../../core/tp-world" }
 scratchy-tensors = { path = "../../tensors" }
 # `half::f16` for the HOST REFERENCE's fp16-island round trips (the sampler's
 # Gumbel draw rounds through IEEE binary16 at each f16 boundary — eval_dag is
@@ -55,6 +58,12 @@ serde_json = { workspace = true }
 # back-edge. scratchy-forward-compiler builds backend-agnostic here (no
 # metal feature), so the tests stay host-runnable on any platform.
 scratchy-forward-compiler = { path = ".." }
+# `tests/value_door_ratchet.rs` parses the compiler, tensor, layer, target and triton crates'
+# source to count #1094's remaining law asserts and value→type doors. The versions are the
+# macro crate's, so the test adds no crate to the lock.
+syn = { version = "3", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 
 # ⛔⛔⛔ RUNNING THIS CRATE'S KANI PROOFS REQUIRES `--features spyre`. EVERY HARNESS IN
 # `sdsc_abstract.rs` LIVES BEHIND `#[cfg(feature = "spyre")] pub mod sdsc_abstract;`, and `default = []`,

@@ -71,7 +71,9 @@ use serde_json::json;
 /// from one value and a missing field is a failed index rather than a silently-passed `Option`.
 fn emit(member: OpFunc, geom: TopKGeom) -> Result<serde_json::Value, String> {
     let mut sid = -1i64;
-    let e = try_assemble_topk("topk", member, geom, "sxt", "six", &mut sid, None)?;
+    let e = try_assemble_topk::<ktir_superdsc::collective::TpWorld<1>>(
+        "topk", member, geom, "sxt", "six", &mut sid, None,
+    )?;
     Ok(serde_json::to_value(&e.op).unwrap())
 }
 
@@ -214,8 +216,10 @@ fn the_fixture_geometry_emits_the_fixture_contract() {
 #[test]
 fn the_generic_op_keeps_the_truthy_string_and_the_omitted_row() {
     let mut sid = -1i64;
-    let e = try_assemble_transpose("ctrl", 64, 512, "t_in", "t_out", &mut sid, None)
-        .expect("a splittable transpose emits");
+    let e = try_assemble_transpose::<ktir_superdsc::collective::TpWorld<1>>(
+        "ctrl", 64, 512, "t_in", "t_out", &mut sid, None,
+    )
+    .expect("a splittable transpose emits");
     let j = serde_json::to_value(&e.op).unwrap();
     let generic = &j["dscs_"][0]["ctrl"];
     assert_eq!(

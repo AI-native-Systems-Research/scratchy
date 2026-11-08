@@ -411,6 +411,7 @@ fn program_kind_tokens(
         Program::Matmul => quote! { __KProgram::Matmul },
         Program::Sample => quote! { __KProgram::Sample },
         Program::LmLast => quote! { __KProgram::LmLast },
+        Program::BlockCopy => quote! { __KProgram::BlockCopy },
         Program::Rope => quote! { __KProgram::Rope },
         Program::PagedAttn => quote! { __KProgram::PagedAttn },
         Program::PagedKvWrite => quote! { __KProgram::PagedKvWrite },
@@ -521,6 +522,11 @@ fn synth_role_tokens(
         R::FqAmaxP(j) => {
             let j = proc_macro2::Literal::u32_unsuffixed(j);
             quote! { #path::FqAmaxP(#j) }
+        }
+        // The long-reduce partial slot — indexed like the four above, same reason.
+        R::ReducePartial(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::ReducePartial(#j) }
         }
         R::GatherKtLx(i) => {
             let i = proc_macro2::Literal::u32_unsuffixed(i);

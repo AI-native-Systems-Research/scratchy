@@ -1111,6 +1111,7 @@ impl WorkPlan {
                 return Ok(Some(TimeTile {
                     count: time,
                     dim: self.iter_sym(tiled_dim),
+                    sticks: stick_count,
                     _seal: (),
                 }));
             }
@@ -1247,6 +1248,10 @@ impl WorkPlan {
 pub struct TimeTile {
     count: u32,
     dim: IterSym,
+    /// The per-core STICK COUNT of the tiled dim at the mint — `count` divides it by the
+    /// search's own law (every non-divisor is skipped above), carried so a consumer can
+    /// state whole-stick slices per trip without re-deriving or re-checking divisibility.
+    sticks: u32,
     // Private unit field so external code cannot brace-construct one.
     _seal: (),
 }
@@ -1258,6 +1263,34 @@ impl TimeTile {
     /// The tiled iteration-space dim (a key of the op's `WorkPlan`).
     pub fn dim(&self) -> IterSym {
         self.dim
+    }
+    /// The trips and the stick count they divide, as ONE typed witness — see
+    /// [`DividedSticks`].
+    pub fn divided_sticks(&self) -> DividedSticks {
+        DividedSticks {
+            trips: self.count,
+            sticks: self.sticks,
+        }
+    }
+}
+
+/// ⭐ A (trips, sticks) pair where `trips` DIVIDES `sticks` — minted only inside
+/// [`WorkPlan::time_tile_for_lx`]'s divisor search, where every non-divisor is skipped before
+/// a `TimeTile` exists, so "each trip covers a whole number of the dim's own sticks" is
+/// carried by the type and never re-checked (or re-derived) at a consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DividedSticks {
+    trips: u32,
+    sticks: u32,
+}
+impl DividedSticks {
+    /// The number of trips (`> 1` — a `TimeTile` is only minted for a split).
+    pub fn trips(&self) -> u32 {
+        self.trips
+    }
+    /// The whole sticks each trip covers — exact, by the mint's own divisibility law.
+    pub fn sticks_per_trip(&self) -> u32 {
+        self.sticks / self.trips
     }
 }
 
@@ -1339,6 +1372,18 @@ pub enum Scale {
     RedStick,
 }
 impl Scale {
+    /// The dim is present in the output (`Active`), not reduced away. The one
+    /// spelling of the test the emitters make per operand dim — every reducer
+    /// asks the same question, so it is a method on the sealed enum, exhaustive
+    /// (a new variant is a compile error here, not a silently-wrong `matches!`
+    /// at a site that forgot to grow).
+    pub const fn is_active(&self) -> bool {
+        match self {
+            Scale::Active => true,
+            Scale::RedNonStick | Scale::RedStick => false,
+        }
+    }
+
     /// The JSON `scale_` integer.
     pub fn to_i64(self) -> i64 {
         match self {
@@ -2976,8 +3021,9 @@ pub enum LandingFrame {
         rows: NonZeroU32,
         w: StickExtent<Fp16>,
     },
-    /// Rank-2 `[T, w]` with one entry or a one-stick width — the landing IS the frame's own
-    /// bytes (a single stick column), no permute follows.
+    /// Rank-2 `[T, w]` with one entry or a one-stick width, or a rank ≥ 3 frame one stick wide
+    /// whose blocks span several entries — the landing IS the frame's own bytes (a single stick
+    /// column), no permute follows.
     Flat {
         entries: NonZeroU32,
         rows: NonZeroU32,
@@ -3086,6 +3132,23 @@ impl LandingFrame {
                 .checked_div(block)
                 .filter(|_| slab.is_multiple_of(block));
             let Some(blocks_per_entry) = blocks_per_entry else {
+                // ⭐ AT ONE STICK WIDE NO FRAME CROSSES AN ENTRY IN ITS BYTES. A one-stick
+                // stick-major `[rows, w]` block IS its rows, one after another, so a block that
+                // spans several gathered entries is byte for byte those entries' rows landed back
+                // to back — the flat landing, whatever rank the frame states. Each entry must
+                // still be whole rows of the frame (`slab % w == 0`) and the frame must re-frame
+                // exactly the gathered bytes; anything else still crosses an entry.
+                if width == stick
+                    && slab.is_multiple_of(width)
+                    && total == entries.get() as u64 * slab
+                {
+                    let rows = nz(slab / width).ok_or_else(|| FrameError::CrossesEntry {
+                        entries: entries.get(),
+                        slab,
+                        frame: to.to_vec(),
+                    })?;
+                    return Ok(LandingFrame::Flat { entries, rows, w });
+                }
                 return Err(FrameError::CrossesEntry {
                     entries: entries.get(),
                     slab,
@@ -4109,6 +4172,12 @@ impl OpSpec {
     /// `emit_sdsc`.
     pub fn time(&self) -> u32 {
         self.time_tile.map(|t| t.count()).unwrap_or(1)
+    }
+
+    /// The time-tile's trips AND the stick count they divide, as one typed witness — `None`
+    /// when the op is not time-tiled (one trip, nothing divided). See [`DividedSticks`].
+    pub fn time_divided(&self) -> Option<DividedSticks> {
+        self.time_tile.map(|t| t.divided_sticks())
     }
 }
 

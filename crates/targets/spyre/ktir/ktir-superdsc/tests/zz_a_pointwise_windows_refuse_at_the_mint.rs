@@ -40,9 +40,9 @@ fn add(
     b: &Stk<RowBlockedTag>,
     o: &Stk<RowBlockedTag>,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let mut sym = 0i64;
-    assemble_pointwise_broadcast_off(
+    assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
         "add_test",
         "add",
         RowCount::of_token_rows(rows),
@@ -81,7 +81,9 @@ fn layout_placing(entries: &[(u32, u64)]) -> BundleLayout {
 
 /// The panic text out of a refused build — the assemblers panic with `format!`ed refusal
 /// messages, so the refusal is observable as the payload.
-fn refused(r: Result<EmittedOp, Box<dyn std::any::Any + Send>>) -> String {
+fn refused(
+    r: Result<EmittedOp<ktir_superdsc::collective::TpWorld<1>>, Box<dyn std::any::Any + Send>>,
+) -> String {
     let payload = match r {
         Ok(_) => panic!("the build was accepted — the refusal under test did not fire"),
         Err(p) => p,
@@ -176,7 +178,7 @@ fn a_broadcast_last_row_scalar_past_the_end_refuses() {
     let o = rb("t_o", rows, 2048);
     let build = |b: In<'_, RowBlockedTag>| {
         let mut sym = 0i64;
-        assemble_pointwise_broadcast_off(
+        assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
             "mul_test",
             "multiply",
             RowCount::of_token_rows(rows),
@@ -217,7 +219,7 @@ fn a_sub_stick_lane_select_stays_legal() {
     let a = rb("t_x", rows, 2048);
     let o = rb("t_o", rows, 2048);
     let mut sym = 0i64;
-    let built = assemble_pointwise_broadcast_off(
+    let built = assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
         "mul_test",
         "multiply",
         RowCount::of_token_rows(rows),
@@ -247,7 +249,7 @@ fn a_wider_per_row_broadcast_refuses() {
     let o = rb("t_o", rows, 2048);
     let mut sym = 0i64;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assemble_pointwise_broadcast_off(
+        assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
             "mul_test",
             "multiply",
             RowCount::of_token_rows(rows),

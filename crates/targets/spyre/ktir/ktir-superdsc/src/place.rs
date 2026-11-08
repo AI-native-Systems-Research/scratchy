@@ -52,6 +52,12 @@ pub enum SynthRole {
     /// before the `maximum` combine folds them into [`FqAmax`]. Indexed (like `Blk`) because the number
     /// of partials is the reduce's own time-tile count, known only at bake.
     FqAmaxP(u32),
+    /// ⭐ ONE SEEDED-REDUCE PARTIAL SLOT — the `[rows, stick]` result a SINGLE time-slice of a
+    /// long reduce produced, before the per-kind combine folds them into the reduce's own accum.
+    /// Indexed (like [`Self::FqAmaxP`]) because the number of partials is the reduce's own
+    /// time-tile count, known only at bake. Minted by the ONE long-reduce split body
+    /// (`reduce::assemble_reduce_split`), under the reduce's own place — never per caller.
+    ReducePartial(u32),
     // ── rmsnorm scratch ──
     Sq16,
     Mean,
@@ -205,6 +211,7 @@ impl fmt::Display for SynthRole {
             Self::FqMm => f.write_str("fq_mm"),
             Self::FqRaw => f.write_str("fq_raw"),
             Self::FqAmaxP(j) => write!(f, "fq_amaxp{j}"),
+            Self::ReducePartial(j) => write!(f, "redp{j}"),
             Self::Sq16 => f.write_str("sq16"),
             Self::Mean => f.write_str("mean"),
             Self::Meps => f.write_str("meps"),

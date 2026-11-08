@@ -191,14 +191,10 @@ fn main() {
                 // indexes row `off_h * N_TOK + start_m * BLOCK_M` — head outermost.
                 _ => RopeRows::HeadMajor,
             };
-            Some(triton_ktir_superdsc::drive_rope(
-                &node,
-                hd,
-                n_tok,
-                h * hd,
-                rows,
-                false,
-                layout.as_ref(),
+            Some(triton_ktir_superdsc::drive_rope::<
+                ktir_superdsc::collective::TpWorld<1>,
+            >(
+                &node, hd, n_tok, h * hd, rows, false, layout.as_ref()
             ))
         }
         _ => None,

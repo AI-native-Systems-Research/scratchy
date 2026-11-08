@@ -727,6 +727,10 @@ mod tests {
             page_slots: 4,
             rows: 3,
             nkvh: 2,
+            // Two kv heads of one query head each, one stick a head: the fold's own floor law
+            // (`BatchChunking::of`) leaves these fixtures at their kv-head cut.
+            q_width: 128,
+            head_size: 64,
             walk: 4,
             paged_rows: PagedRows::Sequence,
         }

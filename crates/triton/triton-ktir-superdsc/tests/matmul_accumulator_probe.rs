@@ -249,7 +249,7 @@ fn pv_program(acc: Acc) -> KtirNode {
 /// equal JSON are the same program on the card.
 fn descriptors_of(k: &KtirNode) -> Result<String, String> {
     let mut sid = 0i64;
-    let ops = lower_function(
+    let ops = lower_function::<ktir_superdsc::collective::TpWorld<1>>(
         k,
         None,
         &mut sid,

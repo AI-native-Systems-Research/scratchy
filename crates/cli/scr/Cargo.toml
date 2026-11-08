@@ -158,6 +158,10 @@ model = { package = "scratchy-models", path = "../../models/arch", optional = tr
 # features forward to scratchy-models (this same `model` instance), so this is
 # a regular-dependency edge, not a build-dependency one.
 spec = { package = "scratchy-spec", path = "../../models/spec", optional = true }
+# Purely for CLI feature-reachability, like `spec`: `--features tp/2` bakes the two-rank
+# tensor-parallel world of every selected model. scratchy-tp's features forward to scratchy-models
+# (this same `model` instance).
+tp = { package = "scratchy-tp", path = "../../models/tp", optional = true }
 scratchy-bench = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

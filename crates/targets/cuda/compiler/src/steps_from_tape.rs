@@ -218,7 +218,10 @@ pub fn lower_step(
         | L::DraftContextKv { .. }
         | L::DraftWindowStore
         | L::DraftWindowLoad
-        | L::DraftSelect => Err(CanonicalRefusal::NotLowered {
+        | L::DraftSelect
+        // The collectives: CUDA runs one rank, so the analysis inserts none here.
+        | L::AllReduce
+        | L::AllGather { .. } => Err(CanonicalRefusal::NotLowered {
             step: s.step,
             op: op.name(),
         }),

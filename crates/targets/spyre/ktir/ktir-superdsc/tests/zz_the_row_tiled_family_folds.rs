@@ -331,7 +331,10 @@ fn layout_for(k: &KtirNode, view: (i64, i64)) -> BundleLayout {
     l
 }
 
-fn lowered(k: &KtirNode, view: (i64, i64)) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn lowered(
+    k: &KtirNode,
+    view: (i64, i64),
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
     let layout = layout_for(k, view);
     let mut sid = 0i64;
     lower_function(
@@ -345,7 +348,9 @@ fn lowered(k: &KtirNode, view: (i64, i64)) -> Result<Vec<ktir_superdsc::emit::Em
 }
 
 /// The `dscs_[0]` entry of an emitted op — the descriptor the assertions read.
-fn dsc(op: &ktir_superdsc::emit::EmittedOp) -> &ktir_superdsc::wire::Dsc {
+fn dsc(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> &ktir_superdsc::wire::Dsc {
     op.dsc()
         .dscs_
         .first()
@@ -478,7 +483,7 @@ fn a_column_chunked_pair_is_not_a_row_family() {
     // 2 B = 8192, the second stick-group's base. The same corner on both ops would state the
     // same addresses; the fold's one descriptor would state them once.
     fn per_tensor_addresses(
-        op: &ktir_superdsc::emit::EmittedOp,
+        op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
     ) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> {
         let mut out = std::collections::BTreeMap::new();
         for n in &dsc(op).scheduleTree_ {

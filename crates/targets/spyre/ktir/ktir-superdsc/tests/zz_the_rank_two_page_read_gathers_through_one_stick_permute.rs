@@ -258,7 +258,9 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
     l
 }
 
-fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn emitted(
+    k: &KtirNode,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
     let layout = layout_for(k);
     let mut sid = 0i64;
     lower_function(
@@ -272,7 +274,9 @@ fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> 
 }
 
 /// The one gather op's `N_` — its iteration extents `[mb: entries, y: blocks, x: rows, out: cols]`.
-fn gather_n(op: &ktir_superdsc::emit::EmittedOp) -> serde_json::Value {
+fn gather_n(
+    op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+) -> serde_json::Value {
     let json = serde_json::to_value(op.op.as_ref().expect("a descriptor")).expect("json");
     json["dscs_"][0]
         .as_object()

@@ -336,23 +336,60 @@ fn transposed_b_is_placeable(
 pub struct RmsNormChain {
     /// The normalised tensor — squared, reduced, and scaled.
     pub x: Ssa,
-    /// The learned gain the chain's last multiply applies (`n1` / `gamma`).
-    pub gamma: Ssa,
+    /// The chain's GAIN leg — the last factor of `x · rsqrt(mean(x²)+eps) · gain`. A norm's gain
+    /// is one of exactly two things: a learned row (reached through its own rank plumbing, with
+    /// its OnePlusScale offset), or the identity — the chain closes at the normalising multiply
+    /// and `gain = 1`. The gainless form is the SAME op with a different gain value, not a
+    /// different shape this door refuses.
+    pub gain: GainLeg,
     /// The final `arith.mulf`'s result: what the fused program produces.
     pub out: Ssa,
     /// The epsilon this chain's own `arith.addf` adds — read per chain, because
     /// `program_rmsnorm_eps` requires ONE root in the whole function and a decoder has two.
     pub eps: f32,
-    /// The OnePlusScale gain offset, when the chain's gain leg is `(1 + gamma)` rather than
-    /// `gamma`: ONE `arith.addf` over the loaded row with a splatted constant, consumed by the
-    /// chain exactly as the rank plumbing is. `None` is the Scale convention (no addf); the only
-    /// admitted value is 1.0 — `GainConvention::from_offset`'s own law, refused by name otherwise.
-    /// Read per chain the way [`super::lower_ktir_to_superdsc::rmsnorm`]'s `program_gain_offset`
-    /// reads it, so the two doors cannot state different formulas for one program.
-    pub ones: Option<f32>,
     /// Every intermediate the fused op never materialises, so `lower_function` lowers NOTHING for
     /// them. The final multiply is not here: it is the op that BECOMES the fused program.
     pub consumed: Vec<Ssa>,
+}
+
+impl RmsNormChain {
+    /// The OnePlusScale gain offset — `Some(1.0)` where the gain leg is `1 + gamma`, `None` for
+    /// the Scale convention and for the identity gain. The ONE place the leg is matched for its
+    /// offset: the walk's classification, the emission's `Lowering::RmsNorm` arm and
+    /// `triton-ktir-superdsc`'s registry planner all read it from here, so no reader can state a
+    /// different formula for one program. The offset carries no field of its own — the `+1` IS
+    /// [`GainLeg::OnePlusScale`]'s meaning, and this match is the one site that states the
+    /// constant the registry stage needs.
+    pub fn gain_offset(&self) -> Option<f32> {
+        match self.gain {
+            GainLeg::OnePlusScale(_) => Some(1.0),
+            GainLeg::Scale(_) | GainLeg::Identity => None,
+        }
+    }
+}
+
+/// A norm's gain — the values the chain's last factor can be. The two learned forms are two
+/// VARIANTS, not one variant with an offset field: the `(1 + w)` convention's `+1` is stated by
+/// which variant the leg closed as, never by an `f32` the reader must check — a value other
+/// than the convention's own 1.0 is a producer bug the recogniser refuses BY NAME, not a value
+/// this type carries for a reader to re-validate.
+#[derive(Clone, Debug)]
+pub enum GainLeg {
+    /// The learned gain row the chain's last multiply applies (`n1` / `gamma`), HF's plain
+    /// `weight` convention — no offset addf on the leg. Read per chain the way
+    /// [`super::lower_ktir_to_superdsc::rmsnorm`]'s `program_gain_offset` reads it, so the two
+    /// doors cannot state different formulas for one program.
+    Scale(Ssa),
+    /// The `(1 + gamma)` gain row — ONE `arith.addf` over the loaded row with a splatted 1.0
+    /// (the OnePlusScale convention, `rmsnorm.py`'s `rmsnorm_oneplus_fwd`), consumed by the
+    /// chain exactly as the rank plumbing is. The offset is this variant's MEANING, not a
+    /// field: the emission adds the constant where it needs it, never a value read back off
+    /// the leg.
+    OnePlusScale(Ssa),
+    /// The identity gain: `out = x · rsqrt(mean(x²)+eps)` with no gain multiply at all. The
+    /// normalising multiply is the chain's terminal and its result is the fused program's
+    /// output — the same device body the per-`Program` door `rmsnorm_unit` emits.
+    Identity,
 }
 
 /// Read EVERY rmsnorm chain off the program, or say why what is there is not one.
@@ -545,103 +582,160 @@ fn rmsnorm_chain_from(
             f.name
         ));
     };
-    consumed.push(scaled);
-    // `· gamma` — the learned gain, itself reached through its own rank plumbing.
-    let Some(gain_mul) = sole_reader(scaled) else {
-        return err(format!(
-            "{}: nothing reads `x · rsqrt(...)`. `Program::RmsNorm` applies a learned gain; a \
-             normalisation with none is not the shape this door lowers.",
-            f.name
-        ));
-    };
-    if gain_mul.op_type != OpKind::ArithMulf {
-        return err(format!(
-            "{}: `x · rsqrt(...)` is read by `{:?}` rather than by the gain multiply",
-            f.name, gain_mul.op_type
-        ));
-    }
-    let Some(gain_src) = gain_mul.operands.iter().copied().find(|&s| s != scaled) else {
-        return err(format!(
-            "{}: the rmsnorm's gain multiply squares its input",
-            f.name
-        ));
-    };
-    // Walk BACK through the gain's rank plumbing to the value a `Region` can be found for.
-    let mut gamma = gain_src;
-    for _ in 0..3 {
-        let Some(d) = def_of(gamma) else { break };
-        if !matches!(
-            d.op_type,
-            OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
-        ) {
-            break;
-        }
-        consumed.push(gamma);
-        let Some(src) = d.operands.first().copied() else {
-            break;
+    // `· gain` — the chain's gain leg, and IDENTITY IS ONE OF ITS VALUES. The leg is claimed as a
+    // learned row ONLY when the normalising multiply's sole `arith.mulf` reader has, as its other
+    // operand, a ROW gain — `gamma` or `1+gamma`, ONE `[1, cols]` row read down the rows (the one
+    // shape predicate, stated over the leg's own shapes — see the row claim below; the multiply's
+    // own extent coherence pins the row's width to the norm's `cols`). ANY other reader of the
+    // normalised value — a store, a residual add, several readers, none at all, or a multiply by
+    // an activation, a scalar, or a dense `[rows, cols]` tensor — closes the leg as the IDENTITY:
+    // `out = x · rsqrt(mean(x²)+eps)` with `gain = 1`, the same norm the per-`Program` door's
+    // `rmsnorm_unit` lowers, and that multiply (when there is one) lowers op by op against the
+    // fused program's output. The normalising multiply is then the chain's TERMINAL and `scaled`
+    // its OUTPUT: not interior, so it may have any number of readers.
+    let (gain, out) = 'gain: {
+        let gain_mul = match sole_reader(scaled) {
+            Some(g) if g.op_type == OpKind::ArithMulf => g,
+            _ => break 'gain (GainLeg::Identity, scaled),
         };
-        gamma = src;
-    }
-    // ⭐ THE GAIN LEG'S OWN `(1 + w)` ADDF — the OnePlusScale convention (`rmsnorm.py`'s
-    // `rmsnorm_oneplus_fwd`), consumed by the chain the same way the rank plumbing is. The
-    // back-walk above stops AT the addf (it is not rank plumbing), and without this arm the addf
-    // would reach the walk as an `Elementwise(Add)` with a splat operand — a form the walk's own
-    // operand resolution refuses, so a oneplus program could not lower at all. ONE addf over the
-    // loaded row with a splatted constant: the constant must be the convention's own 1.0
-    // (`GainConvention::from_offset` admits 0.0 and 1.0 only, and 0.0 is stated as NO addf), and
-    // anything else is a producer bug refused by name — the same law the per-`Program` door's
-    // `program_gain_offset` arm states. An addf of another shape (no splat, two tensors) is not
-    // this convention and is left for the operand resolution to name, exactly as before this arm
-    // existed.
-    let mut ones = None;
-    if let Some(d) = def_of(gamma)
-        && d.op_type == OpKind::ArithAddf
-    {
-        let mut splat = None;
-        let mut row = None;
-        for &s in d.operands.iter() {
-            match splat_value(s) {
-                Some(v) => splat = Some(v),
-                None => row = Some(s),
+        let Some(gain_src) = gain_mul.operands.iter().copied().find(|&s| s != scaled) else {
+            // `x̂ · x̂` — the other operand is an activation, not a gain.
+            break 'gain (GainLeg::Identity, scaled);
+        };
+        // The leg's own consumed values, committed only if the row broadcast is proven — an
+        // unclaimed leg leaves every one of these ops to the walk.
+        let mut leg = vec![scaled];
+        // Walk BACK through the gain's rank plumbing to the value a `Region` can be found for.
+        let mut gamma = gain_src;
+        for _ in 0..3 {
+            let Some(d) = def_of(gamma) else { break };
+            if !matches!(
+                d.op_type,
+                OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
+            ) {
+                break;
             }
+            leg.push(gamma);
+            let Some(src) = d.operands.first().copied() else {
+                break;
+            };
+            gamma = src;
         }
-        if let (Some(v), Some(r)) = (splat, row) {
-            if v != 1.0 {
-                return err(format!(
-                    "{}: the rmsnorm's gain leg adds {v}, not 1.0 — `GainConvention::from_offset` \
-                     admits 0.0 (Scale, no addf) and 1.0 (OnePlusScale) only, so a program \
-                     stating any other offset is a producer bug",
-                    f.name
-                ));
-            }
-            ones = Some(1.0);
-            consumed.push(gamma);
-            gamma = r;
-            // The row's own rank plumbing, if it states any — the same three-op walk as the
-            // gain's, run on the addf's other side.
-            for _ in 0..3 {
-                let Some(dd) = def_of(gamma) else { break };
-                if !matches!(
-                    dd.op_type,
-                    OpKind::TensorExpandShape
-                        | OpKind::TensorCollapseShape
-                        | OpKind::LinalgBroadcast
-                ) {
-                    break;
+        // ⭐ THE GAIN LEG'S OWN `(1 + w)` ADDF — the OnePlusScale convention (`rmsnorm.py`'s
+        // `rmsnorm_oneplus_fwd`), consumed by the chain the same way the rank plumbing is. The
+        // back-walk above stops AT the addf (it is not rank plumbing), and without this arm the
+        // addf would reach the walk as an `Elementwise(Add)` with a splat operand — a form the
+        // walk's own operand resolution refuses, so a oneplus program could not lower at all.
+        // ONE addf over the loaded row with a splatted constant: the constant must be the
+        // convention's own 1.0 (`GainConvention::from_offset` admits 0.0 and 1.0 only, and
+        // 0.0 is stated as NO addf), and anything else is a producer bug refused by name —
+        // the same law the per-`Program` door's `program_gain_offset` arm states. An addf of
+        // another shape (no splat, two tensors) is not this convention and is left for the
+        // operand resolution to name, exactly as before this arm existed.
+        let mut oneplus = false;
+        if let Some(d) = def_of(gamma)
+            && d.op_type == OpKind::ArithAddf
+        {
+            let mut splat = None;
+            let mut row = None;
+            for &s in d.operands.iter() {
+                match splat_value(s) {
+                    Some(v) => splat = Some(v),
+                    None => row = Some(s),
                 }
-                consumed.push(gamma);
-                let Some(src) = dd.operands.first().copied() else {
-                    break;
-                };
-                gamma = src;
+            }
+            if let (Some(v), Some(r)) = (splat, row) {
+                if v != 1.0 {
+                    return err(format!(
+                        "{}: the rmsnorm's gain leg adds {v}, not 1.0 — `GainConvention::from_offset` \
+                         admits 0.0 (Scale, no addf) and 1.0 (OnePlusScale) only, so a program \
+                         stating any other offset is a producer bug",
+                        f.name
+                    ));
+                }
+                oneplus = true;
+                leg.push(gamma);
+                gamma = r;
+                // The row's own rank plumbing, if it states any — the same three-op walk as the
+                // gain's, run on the addf's other side.
+                for _ in 0..3 {
+                    let Some(dd) = def_of(gamma) else { break };
+                    if !matches!(
+                        dd.op_type,
+                        OpKind::TensorExpandShape
+                            | OpKind::TensorCollapseShape
+                            | OpKind::LinalgBroadcast
+                    ) {
+                        break;
+                    }
+                    leg.push(gamma);
+                    let Some(src) = dd.operands.first().copied() else {
+                        break;
+                    };
+                    gamma = src;
+                }
             }
         }
-    }
-    let Some(out) = gain_mul.result else {
-        return err(format!(
-            "{}: the rmsnorm's gain multiply has no result",
-            f.name
-        ));
+        // ⛔ THE ROW CLAIM — stated over the leg's OWN shapes, never over how the spray is
+        // spelled. A gain row is a `[1, cols]` row: rank 2, degenerate leading dim, read by the
+        // multiply lane for lane down the rows. The spray reaches that read one of two ways,
+        // BOTH of which the leg states by shape:
+        //
+        // * EXPLICIT, any row count: a `linalg.broadcast` on the leg classified `Mb` by
+        //   [`program_broadcast_chains`] — the row sprayed down the rows (the classification is
+        //   shared with the walk's own broadcast resolution, never re-derived here).
+        // * DEGENERATE, the one-row tile: at `rows == 1` the spray's extent IS 1, so the
+        //   broadcast is the identity function and the producer FOLDS it (`to_ktir` refuses a
+        //   no-op broadcast by name). The row is still a row — the `tensor.expand_shape` that
+        //   raised the loaded `[cols]` to `[1, cols]` is on the leg, and its degenerate
+        //   leading dim IS the row-ness the explicit form's broadcast states.
+        //
+        // The disjunction is one law, not a shape special-case: "the multiply's other operand
+        // is one `[1, cols]` row", proved by whichever form the program states. A leg with
+        // neither — a splatted scalar, an activation, a dense `[rows, cols]` tensor — is not a
+        // gain, and the chain closes gainless above.
+        let (bcasts, _) = program_broadcast_chains(f)?;
+        // `leg[0]` is `scaled` — the normalised `[rows, cols]` tile, itself `[1, cols]` on the
+        // one-row tile — so the row check reads the gain's OWN values, `leg[1..]`. The shape is
+        // read wherever the producer states it: the op's result type, or the `expand_shape`'s
+        // own `TargetShape` when the type is unstated.
+        let row = |v: Ssa| {
+            def_of(v).is_some_and(|d| {
+                let dims: Option<&[i64]> = match &d.result_type {
+                    Some(ktir_core::irtype::IrType::Tensor { dims, .. }) => Some(*dims),
+                    _ => d.attributes.iter().find_map(|(k, val)| match (k, val) {
+                        (AttrKey::TargetShape, Attr::IntList(t)) => Some(*t),
+                        _ => None,
+                    }),
+                };
+                matches!(dims, Some([1, _]))
+            })
+        };
+        if !leg.iter().skip(1).any(|&v| row(v))
+            && !leg
+                .iter()
+                .any(|v| bcasts.get(v).is_some_and(|b| b.axis == BcastAxis::Mb))
+        {
+            break 'gain (GainLeg::Identity, scaled);
+        }
+        let Some(out) = gain_mul.result else {
+            return err(format!(
+                "{}: the rmsnorm's gain multiply has no result",
+                f.name
+            ));
+        };
+        consumed.extend(leg);
+        // The convention is WHICH VARIANT the leg closed as — the `(1 + w)` addf is
+        // [`GainLeg::OnePlusScale`]'s own meaning, and its absence is [`GainLeg::Scale`]; the
+        // offset constant itself is never a field a reader re-validates.
+        (
+            if oneplus {
+                GainLeg::OnePlusScale(gamma)
+            } else {
+                GainLeg::Scale(gamma)
+            },
+            out,
+        )
     };
 
     // ⛔ THE DIVISOR IS `1/cols` FOR THIS TILE, CHECKED NUMERICALLY. `mean` is `sum/N`; a multiplier
@@ -685,10 +779,9 @@ fn rmsnorm_chain_from(
 
     Ok(Some(RmsNormChain {
         x,
-        gamma,
+        gain,
         out,
         eps: eps as f32,
-        ones,
         consumed,
     }))
 }
@@ -717,6 +810,14 @@ fn rmsnorm_chain_from(
 /// The mis-shaped-silu report keeps its full force INSIDE the chain: once the head
 /// test passes, every link must close or the function is refused.
 pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulChain>, Error> {
+    // ⭐ A CHAIN THE GELU RECOGNISER CLOSED IS NOT A MIS-SHAPEN SILU. The two longhands share
+    // their head — `negf`, read by `exp`, read by an `addf` over a splat — so the gelu chain's
+    // negate reaches this loop too, and the silu proof would refuse it at the divide's numerator
+    // (`x/(1+e^-2u)`'s numerator is the cubic's base, not the negated value). That refusal
+    // describes a SILU attempt with a wrong link; a closed gelu is a different function the gelu
+    // recogniser already owns, so its interiors are skipped here and lowered by nothing but the
+    // one `OpFunc::Gelu` they fold into.
+    let gelus = program_gelu_chains(f)?;
     let mut out = Vec::new();
     for neg in f
         .operations
@@ -727,6 +828,9 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
         // no reader, several readers, or one reader of any other kind — is not this
         // fusion's negf, and `silu_mul_chain_from` below is never entered for it.
         let Some(neg_v) = neg.result else { continue };
+        if gelus.iter().any(|c| c.consumed.contains(&neg_v)) {
+            continue;
+        }
         let deep = f.ops_deep();
         let mut readers = deep.iter().copied().filter(|o| o.operands.contains(&neg_v));
         let head = readers.next();
@@ -750,6 +854,310 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
         out.push(silu_mul_chain_from(f, neg)?);
     }
     Ok(out)
+}
+
+/// THE TANH-FORM GELU LONGHAND, as the ONE device op it is — `OpFunc::Gelu`, dxp `"gelufwd"`.
+///
+/// # WHY THIS RECOGNISER EXISTS, AND WHY IT IS THE SILU RECOGNISER'S OWN ARGUMENT
+///
+/// [`Program::SiluMul`]'s doc states the general law and this is its second instance: the AIU
+/// has the function as a primitive — the SFP constant table ships the tanh polynomial — and
+/// KTIR's `math.*` set does not, so the producer writes the longhand. The kernel spells it
+/// through the sigmoid identity because the frontend's `tl.math` surface has no `tanh`
+/// (`elementwise.py`'s `gelu_fwd`): `1 + tanh(u) = 2/(1 + e^-2u)`, so
+///
+/// ```text
+/// gelu(x) = 0.5·x·(1 + tanh(u))  =  x / (1 + e^-2u),   u = √(2/π)·(x + 0.044715·x³)
+/// ```
+///
+/// and `σ(2u) = ½(1 + tanh u)` is an exact identity in real arithmetic — the chain computes
+/// EXACTLY the function `OpFunc::Gelu` computes, at the program's own f16 precision. That is
+/// what makes the fold legal: the chain IS the op, not an approximation of it.
+///
+/// # IT PROVES THE MATCH; IT DOES NOT PATTERN-GUESS
+///
+/// Two discriminators do the real work, and both are stated over ops and values only:
+///
+/// * **the divide's numerator is the cubic's base.** `x/(1+e^-2u(x))` is `gelu(x)`;
+///   `y/(1+e^-2u(x))` for any other `y` is a different function with the same op kinds in the
+///   same order. This is [`SiluMulChain`]'s own discriminator turned to gelu's question — and
+///   it is what keeps the two recognisers apart on their shared head, since silu's numerator is
+///   the negated value itself.
+/// * **the constants are pinned to the device op's definition.** The cubic's `0.044715` and the
+///   scale `2·√(2/π)` are the polynomial `"gelufwd"` evaluates, compared at the program's own
+///   precision — the f16 image, exactly the law the rmsnorm divisor check states.
+///
+/// # ⛔ REFUSED BY NAME VS LEFT UNCLAIMED — THE SPLIT IS THE FOLD LAW'S OWN
+///
+/// A chain whose structure closes but whose PINNED CONSTANT is off recognisably attempts the
+/// tanh gelu and is REFUSED, naming the link and both values — lowering it as `"gelu"` would
+/// substitute a different polynomial for the one the program states. Everything that is a
+/// DIFFERENT FUNCTION rather than a broken gelu is LEFT UNCLAIMED (`Ok(None)`) and lowers op by
+/// op: a numerator that is not the cubic's base, an added constant other than the 1 of
+/// `1+e^-x`, a cubic whose leaves are not `{const, x, x, x}`, or any interior with a second
+/// reader (the fold destroys the interiors, exactly as the silu fusion does — see
+/// [`silu_mul_chain_from`]'s `ops_deep` note).
+#[derive(Clone, Debug)]
+pub struct GeluChain {
+    /// The value the cubic's base and the divide's numerator both are — the fused op's ONE
+    /// tensor input.
+    pub x: Ssa,
+    /// The terminal divide's result — the value the one `OpFunc::Gelu` produces and the rest
+    /// of the program consumes.
+    pub out: Ssa,
+    /// The cubic's multiplies, the `x + c·x³` add, the scale multiply, the negate, the exp and
+    /// the `1 + e` add — every intermediate the fused op never materialises, so the walk must
+    /// lower NOTHING for them. The terminal divide is deliberately not in here: it is the op
+    /// that BECOMES the fused program, the same convention [`SiluMulChain`] keeps.
+    pub consumed: Vec<Ssa>,
+}
+
+/// `0.044715` — the tanh-form gelu's cubic coefficient, the value `OpFunc::Gelu`'s polynomial
+/// and this fold both pin.
+const GELU_CUBIC: f64 = 0.044_715;
+/// `2·√(2/π)` = `1.5957691216057308…` — the scale the tanh form's argument carries, pinned by
+/// the same law.
+const GELU_SCALE: f64 = 1.595_769_121_605_730_8;
+
+/// Read EVERY tanh-form gelu longhand off the program, or say why one of them is broken.
+///
+/// The head test is the silu recogniser's own: a `negf` claimed only where its ONE reader is
+/// `math.exp` and the exp feeds an `addf`. An empty `Vec` means no negf is a gelu head —
+/// nothing here claims to be one, and every negf keeps its own meaning. `Err` means a chain
+/// whose structure closed but whose pinned constant is off: a recognisable gelu attempt that
+/// must not be lowered as `"gelu"` with a different polynomial inside.
+pub fn program_gelu_chains(f: &IRFunction<'static>) -> Result<Vec<GeluChain>, Error> {
+    let mut out = Vec::new();
+    for neg in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::ArithNegf)
+    {
+        // THE HEAD TEST, verbatim from the silu recogniser: exactly one reader, and it is
+        // `math.exp`. A negation nothing reads, several ops read, or one other op reads is the
+        // program's own negation — not this fold's head.
+        let Some(neg_v) = neg.result else { continue };
+        let deep = f.ops_deep();
+        let mut readers = deep.iter().copied().filter(|o| o.operands.contains(&neg_v));
+        let head = readers.next();
+        if readers.next().is_some() || head.is_none_or(|o| o.op_type != OpKind::MathExp) {
+            continue;
+        }
+        // ⭐ AND THE `exp` FEEDS A SIGMOID'S `1 + e`, exactly as a silu's does — the two
+        // longhands share this island, and the divide's numerator is what tells them apart.
+        let Some(exp_v) = head.and_then(|o| o.result) else {
+            continue;
+        };
+        if !deep
+            .iter()
+            .any(|o| o.op_type == OpKind::ArithAddf && o.operands.contains(&exp_v))
+        {
+            continue;
+        }
+        if let Some(c) = gelu_chain_from(f, neg)? {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Prove (or disclaim) ONE gelu longhand from its head negate. `Ok(None)` is every
+/// different-function shape — the chain is left unclaimed and lowers op by op. `Err` is a
+/// closed structure whose pinned constant is off, refused by name with both values.
+fn gelu_chain_from(
+    f: &IRFunction<'static>,
+    neg: &ktir_core::ir::Operation<'static>,
+) -> Result<Option<GeluChain>, Error> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    // `ops_deep`, NOT `f.operations`, for the same correctness reason the silu proof states: the
+    // fold DESTROYS every interior, so a reader inside a region is a reader of a value nothing
+    // would write. Free for a straight-line producer, where the two lists are the same.
+    let deep = f.ops_deep();
+    // The ops that read `v` in the deep list, so exclusivity is PROVEN rather than assumed.
+    let readers = |v: Ssa| {
+        deep.iter()
+            .copied()
+            .filter(move |o: &&ktir_core::ir::Operation<'static>| o.operands.contains(&v))
+    };
+    // Exactly one op of kind `want` reads `v`, or `None` — the link a chain must have, without
+    // the silu reader's by-name refusal, because a gelu head that does not continue is a
+    // different function left unclaimed rather than a broken gelu.
+    let link = |v: Ssa, want: OpKind| -> Option<&ktir_core::ir::Operation<'static>> {
+        let found: Vec<_> = readers(v).collect();
+        match found.as_slice() {
+            [one] if one.op_type == want => Some(one),
+            _ => None,
+        }
+    };
+
+    let (Some(v), Some(neg_v)) = (neg.operands.first().copied(), neg.result) else {
+        return err(format!(
+            "{}: `arith.negf` with no operand or no result",
+            f.name
+        ));
+    };
+
+    // ── FORWARD: negf -> exp -> 1 + e -> divide ──────────────────────────────────────────────
+    // The head test proved the negf's sole reader is the exp; the exp's sole reader must be the
+    // sigmoid's `addf`.
+    let Some(exp) = link(neg_v, OpKind::MathExp) else {
+        return Ok(None);
+    };
+    let Some(e) = exp.result else {
+        return Ok(None);
+    };
+    let Some(add) = link(e, OpKind::ArithAddf) else {
+        return Ok(None);
+    };
+    // ⛔ THE ADDED CONSTANT IS THE 1 OF `1+e^-x` — and any other constant is a DIFFERENT
+    // function, not a broken gelu, so it is left unclaimed rather than refused.
+    let Some(&one_ssa) = add.operands.iter().find(|&&s| s != e) else {
+        return Ok(None);
+    };
+    let Some(one) = splat_value(one_ssa) else {
+        return Ok(None);
+    };
+    if one != 1.0 {
+        return Ok(None);
+    }
+    let Some(d) = add.result else {
+        return Ok(None);
+    };
+    let Some(div) = link(d, OpKind::ArithDivf) else {
+        return Ok(None);
+    };
+    // The sigmoid's sum is the DIVIDE'S DENOMINATOR — `x/(1+e)` — never its numerator.
+    let [x, den] = div.operands[..] else {
+        return Ok(None);
+    };
+    if den != d {
+        return Ok(None);
+    }
+    let Some(out) = div.result else {
+        return err(format!("{}: `arith.divf` with no result", f.name));
+    };
+
+    // ── BACKWARD: v = scale · (x + cubic) ────────────────────────────────────────────────────
+    // The scale multiply: one splatted operand (the constant, checked once the structure
+    // closes), one tensor operand — the sum.
+    let Some(v_op) = def_of(v) else {
+        return Ok(None);
+    };
+    if v_op.op_type != OpKind::ArithMulf || v_op.operands.len() != 2 {
+        return Ok(None);
+    }
+    let (k_ssa, s) = match v_op.operands {
+        [a, b] if splat_value(*a).is_some() => (*a, *b),
+        [a, b] if splat_value(*b).is_some() => (*b, *a),
+        _ => return Ok(None),
+    };
+    let Some(s_op) = def_of(s) else {
+        return Ok(None);
+    };
+    if s_op.op_type != OpKind::ArithAddf || s_op.operands.len() != 2 {
+        return Ok(None);
+    }
+    // ⛔ THE SUM'S BASE IS THE DIVIDE'S NUMERATOR — the discriminator. `x + c·x³` over any other
+    // base, or a numerator that is not the cubic's base, is a different function.
+    let [a, b] = s_op.operands[..] else {
+        return Ok(None);
+    };
+    let cubic = if a == x {
+        b
+    } else if b == x {
+        a
+    } else {
+        return Ok(None);
+    };
+    // The cubic: a multiply tree whose leaves are exactly {one splat, x, x, x} — any
+    // association, because the leaves are the function and the association is not. Each
+    // interior multiply must have exactly ONE reader (the parent the walk arrived from), since
+    // the fold destroys it.
+    let mut leaves: Vec<Ssa> = Vec::new();
+    let mut interiors: Vec<Ssa> = Vec::new();
+    let mut stack = vec![cubic];
+    while let Some(cur) = stack.pop() {
+        // A leaf needs no defining op — `x` is a function ARGUMENT (or any value this
+        // function did not compute here), and the splat is a `tensor.splat`, not a multiply.
+        // Only a MULTIPLY continues the tree.
+        match def_of(cur) {
+            Some(op) if op.op_type == OpKind::ArithMulf => {
+                if readers(cur).count() != 1 {
+                    return Ok(None);
+                }
+                interiors.push(cur);
+                stack.extend(op.operands.iter().copied());
+            }
+            _ => leaves.push(cur),
+        }
+    }
+    let splats: Vec<f64> = leaves.iter().filter_map(|&l| splat_value(l)).collect();
+    if leaves.len() != 4 || splats.len() != 1 || leaves.iter().filter(|&&l| l == x).count() != 3 {
+        return Ok(None);
+    }
+    let c_val = splats[0];
+    let Some(k_val) = splat_value(k_ssa) else {
+        return Ok(None);
+    };
+    // The sum, the scale multiply and the head negate each have exactly one reader — proven by
+    // the links above for the exp island's `e` and `d`; counted here for the backward walk's
+    // `s` and `v` and the negate's own result, whose readers no link enumerated.
+    if readers(s).count() != 1 || readers(v).count() != 1 || readers(neg_v).count() != 1 {
+        return Ok(None);
+    }
+
+    // ── THE PINNED CONSTANTS — structure closed, so an off value is a REFUSED GELU, not an
+    // unclaimed function. Compared at the program's own precision: an f16-typed program states
+    // each constant as its f16 image, exactly the law the rmsnorm divisor check states, so the
+    // image is what the pin is compared against.
+    let f16_image = |w: f64| {
+        ktir_core::codec::f16_units_to_f32(&ktir_core::codec::f32_to_f16_units(&[w as f32]))[0]
+    };
+    if c_val as f32 != f16_image(GELU_CUBIC) {
+        return err(format!(
+            "{}: the gelu longhand's cubic coefficient is {c_val}, but `OpFunc::Gelu`'s tanh \
+             polynomial pins {} (f16 image {}). Lowering it as `gelu` would substitute a \
+             DIFFERENT polynomial for the one the program states.",
+            f.name,
+            GELU_CUBIC,
+            f16_image(GELU_CUBIC)
+        ));
+    }
+    if k_val as f32 != f16_image(GELU_SCALE) {
+        return err(format!(
+            "{}: the gelu longhand's scale is {k_val}, but the tanh form's argument is \
+             2·√(2/π)·(x + 0.044715·x³) and `OpFunc::Gelu` pins {} (f16 image {}). Lowering it \
+             as `gelu` would substitute a DIFFERENT polynomial for the one the program states.",
+            f.name,
+            GELU_SCALE,
+            f16_image(GELU_SCALE)
+        ));
+    }
+
+    interiors.push(s);
+    interiors.push(v);
+    interiors.push(neg_v);
+    interiors.push(e);
+    interiors.push(d);
+    Ok(Some(GeluChain {
+        x,
+        out,
+        consumed: interiors,
+    }))
 }
 
 /// A gathered table's `[rows, cols]` — the gather's tile's data view.
@@ -895,32 +1303,32 @@ impl<'a> HeadMajorCopies<'a> {
     }
 
     /// Stick `s` of every head, block to head-major.
-    fn to_heads(
+    fn to_heads<T: crate::collective::Tp>(
         &self,
         name: &str,
         sym_id_base: &mut i64,
         layout: &BundleLayout,
-    ) -> Result<Vec<super::EmittedOp>, Error> {
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
         self.copies(name, true, sym_id_base, layout)
     }
 
     /// Stick `s` of every head, head-major to block.
-    fn to_block(
+    fn to_block<T: crate::collective::Tp>(
         &self,
         name: &str,
         sym_id_base: &mut i64,
         layout: &BundleLayout,
-    ) -> Result<Vec<super::EmittedOp>, Error> {
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
         self.copies(name, false, sym_id_base, layout)
     }
 
-    fn copies(
+    fn copies<T: crate::collective::Tp>(
         &self,
         name: &str,
         to_heads: bool,
         sym_id_base: &mut i64,
         layout: &BundleLayout,
-    ) -> Result<Vec<super::EmittedOp>, Error> {
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
         use crate::ir::bridge::tiled_op_sdsc_op::{StickRuns, assemble_stick_runs_copy};
         let stick = crate::work::FP16_ELEMS_PER_STICK;
         let (a, b, n) = (self.a, self.b, self.sticks);
@@ -1301,6 +1709,10 @@ enum Lowering {
     /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
     /// filling the scale registry was not.
     RmsNorm(f32, Option<f32>),
+    /// A fused `x · rsqrt(mean(x²)+eps)` — the chain whose gain leg closed as the identity. The
+    /// same device body the per-`Program` door's `rmsnorm_unit` emits, reached by the walk the
+    /// same way the gained form is.
+    RmsNormUnit(f32),
     /// A dtype-CONVERT cast — `arith.extf` f16→f32 (`dl16tofp32`) or `arith.fptosi` f32→i32
     /// (`fp32toint32`) — the vendor's own convert `OpFunc`s, 1:1 in (op kind, element pair).
     /// Local rather than a `Program` variant for the same reason `Reduce` is: a bare convert is
@@ -2937,6 +3349,214 @@ fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
         .map_or(logical, |x| x.r_len)
 }
 
+/// ⭐⭐⭐⭐⭐ A POINTWISE OP's PARAMETER TILE STATES ITS OWN WINDOW AS ITS EXTENT — the tile's
+/// `r_cover` is the hull of the stores THIS op's emission covers, never the parameter's whole
+/// view inherited through the elementwise op (#1112's row split: the gelu longhand's head block
+/// loads and stores `[0, 42)` of a 64-row parameter, and the inherited `(0, 64)` cover made the
+/// load look whole-view — so the mint could not see the window and the terminal took the
+/// parameter's 64-row basis while its honestly-windowed intermediates could not reach it).
+///
+/// A VALUE's extent is its PRODUCER's window, stated over ops and values only. With the cover
+/// the tile's own window:
+///
+/// * [`band_rows_of`] — the law that already sizes a banded op's mint at the sweep — sees the
+///   row-split window and sizes the intermediate at the PIECE (`[42, …]` for a 42-row block),
+///   exactly as the column side has always minted a column-chunked op's piece at the chunk;
+/// * the extents law ([`OperandView::of`]) reads the window form, so a whole-view sibling and
+///   a windowed tile admit at the WINDOW basis, and the terminal's out region gives
+///   [`pointwise_rows`] the store's own height — the descriptor computes the rows the program
+///   states, never the parameter's unstated remainder.
+///
+/// TWO EXCEPTIONS, BOTH THE PRODUCER's OWN STATEMENT: a BANDED tile (`band.is_some()`) keeps
+/// the band its launch's corner spelled — that cover is the launch's own tiling, not an
+/// inherited parameter view; and the ROW FOLD'S LEADER keeps the parameter's cover, because
+/// the fold PROVED the family's stores tile the view exactly, which makes that cover the hull
+/// of every member's store — the one whole-view basis a multi-block program honestly states.
+/// The leader's exception is applied at the two call sites (the walk's input and out
+/// presentations, gated on [`FrameLaw::Pointwise`]), never here, so no other reader of
+/// `region_for_operand` — the fold's own proof included — can inherit it by accident.
+///
+/// ⛔ BYTE-IDENTICAL FOR EVERY PROGRAM THAT BAKES TODAY: a whole-view tile's cover is its own
+/// window already (`r_len == v_rows` at row 0); a column-chunked tile sits at row 0 for all
+/// its view's rows; a banded tile is exempt; the fold's members never present (they are
+/// skipped at the loop top) and its leader is exempt at the call sites. Only the row-split
+/// class changes, and no member of it lowered before — it refused at the extents law. The
+/// seal is the four-granite bundle-identity gate: every folded family goes through the exempt
+/// leader unchanged.
+fn at_own_extent(r: Region) -> Region {
+    if r.band.is_none() {
+        Region {
+            r_cover: (r.r_start, r.r_start.saturating_add(r.r_len)),
+            ..r
+        }
+    } else {
+        r
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE TILE'S KIND, AS A TYPE — how an op maps its operands' flat `[rows, cols]`
+/// frames to its result's. ONE derivation ([`FrameLaw::of`], from the op's own lowering kind
+/// and the fold's proof), consulted by every mint law that needs it, so no two sites can
+/// disagree about what op this is. The tile's BANDED-ness is not a variant here because it is
+/// not a fact of the op: it is the region's own `Option<RowBand>`, already typed, and every
+/// law below reads it where it reads the region.
+///
+/// * [`FrameLaw::Pointwise`] — the kinds that lower through the pointwise bodies and are not
+///   the fold's leader: the result's flat frame IS each operand's (same rows, same cols), so
+///   a parameter tile states its OWN window as its extent ([`at_own_extent`]'s strip) and the
+///   mint's swept-window law demands the result type's rows equal the sweep's (#1112's row
+///   split: the `[0, 42)` block of a 64-row parameter is a 42-row piece, and the equality is
+///   the law that keeps the piece honest).
+/// * [`FrameLaw::FoldLeader`] — the row fold's leader: the fold PROVED the family's stores
+///   tile the parameter's view, so its tiles keep the parameter's cover as the proven hull —
+///   the one whole-view basis a multi-block program honestly states.
+/// * [`FrameLaw::OwnLaw`] — the op maps frames by its own semantics: a banded launch's band,
+///   a contraction's `[m, n]` output, a reduction's `[rows, 1]` column, a rank-3 transpose's
+///   re-fold — the SAME elements at different flat rows (a `[8, 128, 64]` operand sweeps 1024
+///   rows, its `[8, 64, 128]` result states 512; at square swapped axes the two agree, which
+///   is why an hd-128 pool passes where an hd-64 one refuses). Both sides are the program's
+///   own statement, so the mint keeps the region the walk states and demands NO row equality
+///   between them: the equality would assert the op preserves the flat frame, and this class
+///   is exactly the ops that do not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameLaw {
+    Pointwise,
+    FoldLeader,
+    OwnLaw,
+}
+
+impl FrameLaw {
+    /// The ONE derivation: the op's own lowering kind, and whether the row fold proved this op
+    /// the family's leader. Nothing else inputs, so no site re-derives it. ⛔ The match is
+    /// EXHAUSTIVE OVER BOTH ENUMS WITH NO `_` ARM: a new op kind is a compile error here
+    /// until it is classified, never silently `OwnLaw`.
+    fn of(program: Lowering, fold_leader: bool) -> FrameLaw {
+        if fold_leader {
+            return FrameLaw::FoldLeader;
+        }
+        match program {
+            // ⭐ PRESERVING — the kinds that lower through the pointwise bodies: the result's
+            // flat frame IS each operand's, so the tile's own window is its extent and the
+            // swept-window equality is a true law of the op.
+            Lowering::Silu
+            | Lowering::ScalarMul(_)
+            | Lowering::BoundScalarMul(_)
+            | Lowering::Convert(_)
+            | Lowering::ScalarBinary(..)
+            | Lowering::Node(Program::Elementwise(_)) => FrameLaw::Pointwise,
+
+            // ⭐ OWN LAW — every arm names WHY the op maps the frame by its own semantics:
+            // the fold reorders rows (a rank-3 transpose re-folds the SAME elements to
+            // different flat rows — `[8, 128, 64]` sweeps 1024, its `[8, 64, 128]` result
+            // states 512), so no row equality is demanded and the mint keeps the region the
+            // walk states.
+            Lowering::BatchTranspose { .. } => FrameLaw::OwnLaw,
+            // a contraction — the output frame is the `[b·m, n]` product, not either
+            // operand's sweep.
+            Lowering::BatchMatmul { .. } => FrameLaw::OwnLaw,
+            // rows collapse — a reduction writes one value per row.
+            Lowering::Reduce(_) => FrameLaw::OwnLaw,
+            // a fused reduction chain — the mean collapses rows inside the fusion. The UNIT
+            // form (the identity gain, #1112) is the same reduce-then-scale with the multiply
+            // elided: the mean still collapses rows, so it keeps this class.
+            Lowering::RmsNorm(..) | Lowering::RmsNormUnit(_) => FrameLaw::OwnLaw,
+            // SENUINT32 sticks — the integer class is addressed in the card's own integer
+            // form, not the fp16 flat frame these laws read.
+            Lowering::IntBinary(_) => FrameLaw::OwnLaw,
+
+            Lowering::Node(p) => match p {
+                // (the walk's own derivation of this kind is the `Pointwise` arm above; the
+                // inner match restates it because exhaustiveness is per match)
+                Program::Elementwise(_) => FrameLaw::Pointwise,
+                // the producer-stated fused kind — the walk re-derives the chain as
+                // `Lowering::Silu` when it proves it, and an unproven statement keeps the
+                // region the walk states.
+                Program::SiluMul => FrameLaw::OwnLaw,
+                // reduction chains — the mean collapses rows (per-head windows for the
+                // windowed form).
+                Program::RmsNorm | Program::RmsNormUnit | Program::WindowedRmsNorm { .. } => {
+                    FrameLaw::OwnLaw
+                }
+                // a longhand chain fused at the door — the cap's mint is its own arm's.
+                Program::TanhSoftCap => FrameLaw::OwnLaw,
+                // the multiplier is a bound `[1]` weight broadcast on both dims — the
+                // emission addresses it at its own basis, and a producer-stated `ScalarMul`
+                // is the same registry-const shape.
+                Program::ScalarWeightMul | Program::ScalarMul => FrameLaw::OwnLaw,
+                // the fold re-lays the buffer — `[r_in, c_in] → [r_out, c_out]` preserves the
+                // flat element sequence and nothing else; the 2-D block transpose reorders
+                // rows outright.
+                Program::Reshape | Program::Transpose => FrameLaw::OwnLaw,
+                // a contraction.
+                Program::Matmul => FrameLaw::OwnLaw,
+                // rows collapse — the extraction writes one row; the draw's twenty-seven
+                // parameters are staged sticks and whole rows, no windowed tile among them.
+                // BlockCopy is the all-gather consume's leg, a pure copy like LmLast: the whole
+                // source into a column block of the destination, by its own law.
+                Program::LmLast | Program::Sample | Program::BlockCopy => FrameLaw::OwnLaw,
+                // a banded launch — per-core tiles over positions, the band the launch's own.
+                Program::Rope => FrameLaw::OwnLaw,
+                // the page walk and the pool scatter — gathered and scattered rows, the
+                // pools' own frames.
+                Program::PagedAttn | Program::PagedKvWrite => FrameLaw::OwnLaw,
+                // door-assembled gather legs — the index sticks' own frames.
+                Program::EmbedRowGather { .. } | Program::ChainStage { .. } => FrameLaw::OwnLaw,
+            },
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE SWEPT-WINDOW LAW — the two refusals that keep a plain sweep honest, factored
+/// as ONE fn so its class scoping is stated once and tested as a unit:
+///
+/// * ONE VALUE stating two frames — swept operands of the SAME value (`tid`) whose views
+///   disagree: the piece's bytes are the sweep's, and one value behind two views names two
+///   different tensors for one sweep, so the mint cannot pick. Every class: this one is
+///   about the SWEEP's own consistency, not the result frame. Two DIFFERENT values each
+///   state the sweep in their own frame — the split piece's minted `[42, cols]` beside the
+///   64-row parameter's load of the same window — and the door places each (the piece
+///   whole, the load a row band of its parent); refusing that pair was refusing the split
+///   itself (#1112's Convert corner).
+/// * a POINTWISE op's result type whose rows are not the sweep's — [`FrameLaw::Pointwise`]'s
+///   own law, because that class preserves the flat frame and the result type's rows ARE the
+///   sweep's (#1112's row split: the `[0, 42)` block of a 64-row parameter is a 42-row
+///   piece, and the equality is the law that keeps the piece honest). An
+///   [`FrameLaw::OwnLaw`] op maps frames by its own semantics — the rank-3 transpose
+///   re-folds the SAME elements to different flat rows (`[8, 128, 64]` sweeps 1024, its
+///   `[8, 64, 128]` result states 512; square swapped axes agree, which is why an hd-128
+///   pool passes where an hd-64 one refuses) — so no equality is demanded of it and its
+///   mint keeps the region the walk states.
+fn swept_window_agrees(
+    name: &str,
+    kind: OpKind,
+    law: FrameLaw,
+    dims: [u32; 2],
+    first: Region,
+    swept: &[Region],
+) -> Result<(), Error> {
+    for (i, a) in swept.iter().enumerate() {
+        for b in swept.iter().skip(i + 1) {
+            if a.tid == b.tid && a.v_rows != b.v_rows {
+                return err(format!(
+                    "{name}: `{kind:?}`'s swept operands state one window (rows [{}, {})) over \
+                     DIFFERENT views ({} and {} rows) — the minted piece is the sweep the \
+                     program states, and one value behind two views names two different tensors \
+                     for one sweep",
+                    a.r_start, a.r_len, a.v_rows, b.v_rows
+                ));
+            }
+        }
+    }
+    if dims[0] != first.r_len && law == FrameLaw::Pointwise {
+        return err(format!(
+            "{name}: `{kind:?}`'s result type states {} row(s) while its operands sweep {} — \
+             the minted piece is the sweep the program states, and the two disagree",
+            dims[0], first.r_len
+        ));
+    }
+    Ok(())
+}
+
 /// The ONE band a set of inputs states, refusing disagreement: an op sweeps one band,
 /// and a mint between two differently-banded inputs would size to whichever it saw
 /// first. `None` when no input is banded — the ordinary case, byte-identical to before.
@@ -3011,6 +3631,11 @@ enum RowFoldKind {
     /// separate kind from [`RowFoldKind::SiluMul`] because the two differ in ARITY even where a
     /// terminal's op kind does not: one folded descriptor stands for one, never a mix.
     BareSilu,
+    /// A recognised gelu chain's terminal divide — the tanh-form longhand's one `"gelu"`, one
+    /// input. A kind of its own for the same law: the 1:1 map would call the divide a
+    /// `RealDiv` and fold it as one, addressing the chain-interior `1 + e^-2u` as a second
+    /// input the fold destroyed.
+    Gelu,
     /// A bare pointwise op, discriminated by its own `OpKind` (an `arith.addf` is not an
     /// `arith.mulf`, and a mulf the splat/bound readers claim is not bare — see [`classify_row_fold`]).
     Elementwise(OpKind),
@@ -3027,6 +3652,7 @@ enum RowFoldKind {
 struct FoldAnalyses<'a> {
     silus: &'a [SiluMulChain],
     rmsnorms: &'a [RmsNormChain],
+    gelus: &'a [GeluChain],
     gathered_loads: &'a std::collections::HashMap<Ssa, usize>,
 }
 
@@ -3041,7 +3667,10 @@ fn classify_row_fold(
 ) -> Option<RowFoldKind> {
     let f = &k.func;
     let FoldAnalyses {
-        silus, rmsnorms, ..
+        silus,
+        rmsnorms,
+        gelus,
+        ..
     } = analyses;
     // The loop's own precedence, in the loop's own order: chain terminals first (silu, then rms —
     // an rms terminal is NOT foldable), then the mulf tiebreaks, then the 1:1 map.
@@ -3069,6 +3698,12 @@ fn classify_row_fold(
         .any(|c| c.up.is_none() && Some(c.mul) == op.result)
     {
         return Some(RowFoldKind::BareSilu);
+    }
+    // A gelu chain's terminal divide — the same law the bare silu's states: the chain reader
+    // proved the longhand, so the family kind is the chain's `"gelu"`, never the divide's own
+    // `RealDiv`.
+    if gelus.iter().any(|c| Some(c.out) == op.result) {
+        return Some(RowFoldKind::Gelu);
     }
     match program_of(op.op_type) {
         Some(Program::Elementwise(_)) => Some(RowFoldKind::Elementwise(op.op_type)),
@@ -3141,6 +3776,7 @@ fn row_tiled_family(
     let FoldAnalyses {
         silus,
         rmsnorms: _,
+        gelus,
         gathered_loads,
     } = analyses;
     let consts = super::lower_ktir_to_superdsc::index_constants(f);
@@ -3273,6 +3909,15 @@ fn row_tiled_family(
                         ));
                     }
                 }
+            }
+            RowFoldKind::Gelu => {
+                let Some(c) = gelus.iter().find(|c| Some(c.out) == term.result) else {
+                    return err(format!(
+                        "{}: a gelu family member whose terminal is not a recognised chain",
+                        f.name
+                    ));
+                };
+                vec![c.x]
             }
             RowFoldKind::Elementwise(_) => {
                 term.operands.iter().copied().take(leader_n_in).collect()
@@ -3549,6 +4194,7 @@ pub fn staggered_sources(
     // disagree about which op is which — the classification below is the walk's own, verbatim.
     let silus = program_silu_mul_chains(f)?;
     let rmsnorms = program_rmsnorm_chains(f)?;
+    let gelus = program_gelu_chains(f)?;
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
     let equal_masks = program_equal_masks(f)?;
 
@@ -3559,12 +4205,14 @@ pub fn staggered_sources(
         if op.result.is_some_and(|r| {
             silus.iter().any(|c| c.consumed.contains(&r))
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
+                || gelus.iter().any(|c| c.consumed.contains(&r))
                 || bcast_consumed.contains(&r)
                 || equal_masks.consumed.contains(&r)
         }) {
             continue;
         }
         let terminal = silus.iter().find(|c| op.result == Some(c.mul));
+        let gelu = gelus.iter().find(|c| op.result == Some(c.out));
         let reduce = (op.op_type == OpKind::LinalgReduce)
             .then(|| reduce_kind_of(op))
             .flatten();
@@ -3592,7 +4240,16 @@ pub fn staggered_sources(
                     Lowering::Node(Program::Elementwise(Elementwise::Silu))
                 }
             })
-            .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
+            .or(rms.map(|c| match c.gain {
+                GainLeg::Scale(_) | GainLeg::OnePlusScale(_) => {
+                    Lowering::RmsNorm(c.eps, c.gain_offset())
+                }
+                GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
+            }))
+            // The gelu longhand's terminal divide — the one `OpFunc::Gelu` the chain IS, over
+            // the chain's own `x` rather than the divide's operands (the denominator is the
+            // chain-interior `1 + e^-2u` the fused op never materialises).
+            .or(gelu.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Gelu))))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or(bound_scale.map(Lowering::BoundScalarMul))
@@ -3609,6 +4266,7 @@ pub fn staggered_sources(
             Lowering::Reduce(_) => 1,
             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
             Lowering::RmsNorm(..) => 2,
+            Lowering::RmsNormUnit(_) => 1,
             Lowering::Convert(_) => 1,
             Lowering::Node(Program::Matmul) => 2,
             Lowering::Node(Program::Elementwise(e)) => {
@@ -3625,22 +4283,33 @@ pub fn staggered_sources(
             Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
-        let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale) {
+        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect`
+        // below would re-state the match's own fact as a runtime check.
+        let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
-                vec![c.x, c.gamma]
+                match c.gain {
+                    // The two tensors the recogniser proved, walked back through the rank
+                    // plumbing to values a `Region` exists for.
+                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
+                    // The identity gain is the constant 1 — not a parameter.
+                    GainLeg::Identity => vec![c.x],
+                }
             }
             _ if equal.is_some() => {
                 let (a, b) = equal.expect("just matched");
                 vec![a, b]
             }
-            (Some(c), _, _) => match c.up {
+            // The gelu's one input is the chain's own `x` — the value the cubic's base and the
+            // divide's numerator both are — never the divide's own operands.
+            (_, _, _, Some(g)) => vec![g.x],
+            (Some(c), _, _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
                 None => vec![c.gate],
             },
-            (None, Some((_, tensor)), _) => vec![tensor],
-            (None, None, Some(b)) => vec![b.tensor],
-            (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, Some((_, tensor)), _, _) => vec![tensor],
+            (None, None, Some(b), _) => vec![b.tensor],
+            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
         // One input's (SOURCE, ORDER-FREENESS). The ruling's semantics are a SHAPE fact, not a
         // spelling fact: an operand that supplies ONE SCALAR PER OUTPUT ROW is order-free — a
@@ -3695,6 +4364,7 @@ pub fn staggered_sources(
             | Lowering::ScalarMul(_)
             | Lowering::BoundScalarMul(_)
             | Lowering::RmsNorm(..)
+            | Lowering::RmsNormUnit(_)
             | Lowering::Node(Program::Elementwise(_)) => {
                 let mut out = ElementArrangement::Standard;
                 for v in &raw_in {
@@ -3800,13 +4470,13 @@ pub fn staggered_sources(
 /// lowering one program alone passes a fresh one.
 ///
 /// [`QuantizedActivations`]: super::ktir_matmul_fp8::QuantizedActivations
-pub fn lower_function(
+pub fn lower_function<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     lower_function_folded(k, layout, sym_id_base, headmajor, None, quantized)
 }
 
@@ -3820,12 +4490,12 @@ pub fn lower_function(
 /// A ONE-TRIP walk states no loop at all — the front end promotes it to its body (MLIR's
 /// `SimplifyTrivialLoops`), the carried values read as their splatted inits — and lowers as the
 /// straight-line program it is.
-pub fn lower_walk(
+pub fn lower_walk<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let flat = super::loop_fold::flatten(k)?;
     let (node, fold) = match &flat {
         Some(flat) => (&flat.node, Some(&flat.fold)),
@@ -3840,7 +4510,7 @@ pub fn lower_walk(
         // The probe is a dry run: it learns the slicing from the set as the real lowering will
         // see it, and leaves the bundle's set as it found it.
         let mut sym = *sym_id_base;
-        lower_function_folded(
+        lower_function_folded::<T>(
             node,
             Some(probe),
             &mut sym,
@@ -3880,14 +4550,14 @@ pub fn lower_walk(
     Ok(ops)
 }
 
-fn lower_function_folded(
+fn lower_function_folded<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     sym_id_base: &mut i64,
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     fold: Option<&super::loop_fold::LoopFold>,
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
     let mut lowered = 0usize;
@@ -3950,6 +4620,10 @@ fn lower_function_folded(
     // device tid and a spurious slot moves every later constant's address. Recognising the chain makes
     // that multiply chain-interior, so the divisor never reaches the registry at all.
     let rmsnorms = program_rmsnorm_chains(f)?;
+    // THE GELU CHAINS, read before the walk for the same reason the silus are: the device has
+    // `OpFunc::Gelu` and KTIR has no op for it, so the tanh-form longhand is the only spelling a
+    // producer HAS — and the one `"gelu"` descriptor is the chain, not a decomposition of it.
+    let gelus = program_gelu_chains(f)?;
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
@@ -3998,6 +4672,7 @@ fn lower_function_folded(
     let analyses = FoldAnalyses {
         silus: &silus,
         rmsnorms: &rmsnorms,
+        gelus: &gelus,
         gathered_loads: &gathered_loads,
     };
     // ⭐ THE INTEGER COMPUTE SET — [`integer_compute_of`]'s own doc states the fixpoint. Read once
@@ -4200,6 +4875,10 @@ fn lower_function_folded(
             head_major_skip.contains(&r)
                 || silus.iter().any(|c| c.consumed.contains(&r))
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
+                // A gelu chain's interior — the cubic, the sum, the scale, the negate, the exp,
+                // the `1+e` — lowered by nothing: the one `Elementwise(Gelu)` the terminal
+                // divide below stands for IS the chain.
+                || gelus.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
                 // An equality mask's `arith.cmpf`: the fold destroyed the i1, and the `uitofp`
@@ -5451,6 +6130,9 @@ fn lower_function_folded(
         // operands (which are `silu(gate)` and up). Everything else keeps the 1:1 map exactly as
         // before.
         let terminal = silus.iter().find(|c| op.result == Some(c.mul));
+        // A gelu chain's terminal divide — `Some` where THIS op is the one `"gelu"` the chain
+        // folds into, exactly as a silu chain's terminal is the one `silumul`/`silu`.
+        let gelu = gelus.iter().find(|c| op.result == Some(c.out));
         // A `linalg.reduce`'s combiner is an ATTRIBUTE, not its op kind, so the kind is read off the op
         // beside the 1:1 map rather than from it — and it is carried HERE rather than as a `Program`
         // variant, because `Program` is matched exhaustively by consumers outside this crate and a bare
@@ -5823,7 +6505,18 @@ fn lower_function_folded(
                     Lowering::Node(Program::Elementwise(Elementwise::Silu))
                 }
             })
-            .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
+            .or(rms.map(|c| match c.gain {
+                GainLeg::Scale(_) | GainLeg::OnePlusScale(_) => {
+                    Lowering::RmsNorm(c.eps, c.gain_offset())
+                }
+                GainLeg::Identity => Lowering::RmsNormUnit(c.eps),
+            }))
+            // The gelu longhand's terminal divide — the one `OpFunc::Gelu` the chain IS, over
+            // the chain's own `x` rather than the divide's operands (the denominator is the
+            // chain-interior `1 + e^-2u` the fused op never materialises). Without this arm the
+            // 1:1 map would call the divide `Elementwise(RealDiv)` and address the destroyed
+            // `1 + e^-2u` as its second input.
+            .or(gelu.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Gelu))))
             .or(reduce.map(Lowering::Reduce))
             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
             .or(bound_scale.map(Lowering::BoundScalarMul))
@@ -5875,6 +6568,8 @@ fn lower_function_folded(
             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
             // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
             Lowering::RmsNorm(..) => 2,
+            // x alone; the identity gain is the constant 1, not a parameter.
+            Lowering::RmsNormUnit(_) => 1,
             // A dtype-convert reads ONE tensor; the formats ride the `OpFunc`
             // (`convert_dtypes`), never the operand list.
             Lowering::Convert(_) => 1,
@@ -5898,12 +6593,20 @@ fn lower_function_folded(
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
-        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale) {
+        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect` below
+        // would re-state the match's own fact as a runtime check.
+        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
             // The two tensors the rmsnorm recogniser proved, walked back through the rank plumbing to
             // values a `Region` exists for.
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
-                vec![c.x, c.gamma]
+                match c.gain {
+                    // The two tensors the recogniser proved, walked back through the rank
+                    // plumbing to values a `Region` exists for.
+                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
+                    // The identity gain is the constant 1 — not a parameter.
+                    GainLeg::Identity => vec![c.x],
+                }
             }
             // THE EQUALITY MASK's inputs are the comparison's own two operands, not the retype's
             // (the retype reads the i1 the fold destroys). The broadcast resolution below then
@@ -5912,7 +6615,10 @@ fn lower_function_folded(
                 let (a, b) = equal.expect("just matched");
                 vec![a, b]
             }
-            (Some(c), _, _) => match c.up {
+            // The gelu's one input is the chain's own `x` — the value the cubic's base and the
+            // divide's numerator both are — never the divide's own operands.
+            (_, _, _, Some(g)) => vec![g.x],
+            (Some(c), _, _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
                 // The bare form's one input is the gate; the divide's other operand is the
                 // chain-interior `1 + e^-x`, which the fused op never materialises.
@@ -5920,15 +6626,15 @@ fn lower_function_folded(
             },
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
-            (None, Some((_, tensor)), _) => vec![tensor],
+            (None, Some((_, tensor)), _, _) => vec![tensor],
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
-            (None, None, Some(b)) => vec![b.tensor],
+            (None, None, Some(b), _) => vec![b.tensor],
             // A splatted-constant binary's tensor side, wherever the splat sits.
-            (None, None, None) if scalar_binary.is_some() => {
+            (None, None, None, _) if scalar_binary.is_some() => {
                 vec![scalar_binary.expect("just matched").2]
             }
-            (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
         // A BROADCAST OPERAND READS ITS SOURCE. The chain minted no buffer (it emitted no op), so the
@@ -5977,6 +6683,11 @@ fn lower_function_folded(
         // broadcast family's blocks do not tile the view the same way and the broadcast arms
         // address operands at their own extent). The analysis itself bails on everything that is
         // not a row-blocked family, so a single-window or column-chunked program never enters it.
+        //
+        // ⭐ THE ROW FOLD'S LEADER — the one op this iteration whose tiles keep the parameter's
+        // cover as the family's proven hull (see [`FrameLaw`] below and
+        // [`row_tiled_family`]'s own doc). Set by the gate, read by the two presentation sites.
+        let mut fold_leader = false;
         if bcast_axes.iter().all(Option::is_none)
             && matches!(
                 program,
@@ -5989,7 +6700,16 @@ fn lower_function_folded(
             && let Some(members) = row_tiled_family(k, op, kind, &in_values, n_in, &analyses)?
         {
             row_fold_skip.extend(members);
+            fold_leader = true;
         }
+        // ⭐⭐⭐⭐⭐ THE TILE'S KIND AS A TYPE ([`FrameLaw`]) — derived ONCE here from the op's
+        // own lowering kind and the fold's proof, and read by the two presentation sites and
+        // the mint's swept-window law, so every law that needs to know how this op maps flat
+        // frames consults one derivation: the pointwise kinds present each tile at the window
+        // the tile itself states ([`at_own_extent`]'s strip), the fold's leader keeps the
+        // parameter's cover as the family's proven hull, and every other op maps frames by
+        // its own semantics and keeps the region the walk states.
+        let frame_law = FrameLaw::of(program, fold_leader);
 
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
         // ⭐ WHICH OPERANDS ARE PARAMETER-BACKED, kept BESIDE the regions because a `Region` cannot
@@ -6027,6 +6747,14 @@ fn lower_function_folded(
             };
             match region_for_operand(k, *v)? {
                 Some(r) => {
+                    // ⭐ A POINTWISE OP's LOAD STATES ITS OWN WINDOW AS ITS EXTENT
+                    // ([`at_own_extent`]) — the parameter's cover is evidence only where a fold
+                    // proved the family tiles the view, which is `fold_leader`'s one case.
+                    let r = if frame_law == FrameLaw::Pointwise {
+                        at_own_extent(r)
+                    } else {
+                        r
+                    };
                     per_op.push(present(r)?);
                     from_parameter.push(true);
                 }
@@ -6082,9 +6810,44 @@ fn lower_function_folded(
         // would read one column and spray it — a silent wrong answer with no shape error anywhere. The
         // pointwise arm downstream selects its operand mode from THIS extent, so pinning the two
         // together here is what stops the axis and the addressing from drifting apart.
-        for (i, axis) in bcast_axes.iter().enumerate() {
-            let Some(axis) = *axis else { continue };
+        for i in 0..bcast_axes.len() {
+            let Some(axis) = bcast_axes[i] else { continue };
             let r = per_op[i];
+            // ⭐ A ROW VECTOR HELD AS A STICK COLUMN, SPRAYED DOWN A TILE HELD AS A STICK COLUMN, IS
+            // THE OUTER ROW-SPLIT OF THE COLUMN — an addressing identity, not a new mode. The row
+            // reductions keep per-row scalars one a stick row (`[n, 1]`), so a leading-axis combine
+            // of such scalars (a decode batch's `J`-slot merge at ONE kv head: `[J, 1, 1, G] ->
+            // [1, 1, G]`, the unit kv axis folded) holds its one semantic row of `G` values as the
+            // column `[G, 1]`, and the consumer's own tile `[J, 1, 1, G]` as the column `[J·G, 1]`.
+            // Row-major the result's element `(j, g)` sits at `j·G + g` and the source's `g` at
+            // `g`, which is exactly the `Y` outer spray of the `[G, 1]` column `J` times. Stated over
+            // the REGIONS alone: a whole one-stick-column source of `mb` rows beside a dense
+            // one-stick-column operand of `y·mb` rows, `y > 1`. The consumer's want check and the
+            // `split_rows` frame law re-prove the cover before any operand is built.
+            let axis = match axis {
+                BcastAxis::Mb
+                    if r.c_len == 1
+                        && r.c_start == 0
+                        && r.r_start == 0
+                        && r.r_len == r.v_rows
+                        && r.v_rows > 1 =>
+                {
+                    let dense_rows = (0..per_op.len().min(bcast_axes.len()))
+                        .filter(|&j| j != i && bcast_axes[j].is_none())
+                        .map(|j| per_op[j])
+                        .find(|d| d.c_len == 1 && d.r_len > r.r_len && d.r_len % r.r_len == 0)
+                        .map(|d| d.r_len / r.r_len);
+                    match dense_rows {
+                        Some(y) if y > 1 => {
+                            let ax = BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(y));
+                            bcast_axes[i] = Some(ax);
+                            ax
+                        }
+                        _ => axis,
+                    }
+                }
+                other => other,
+            };
             let degenerate = match axis {
                 BcastAxis::Col => r.c_len == 1,
                 // One row of its view: the whole view at one row, or a one-row window of a taller
@@ -6639,6 +7402,47 @@ fn lower_function_folded(
                 .map(|(_, r)| *r)
                 .collect();
             let dims = [band_rows_of(&swept, dims[0]), dims[1]];
+            // ⭐⭐⭐⭐⭐ THE SWEPT-WINDOW LAW — an intermediate is minted at the PIECE its
+            // producing op sweeps. The sizing is not stated here at all: [`at_own_extent`]
+            // presents a pointwise op's windowed tiles at their own windows, so
+            // [`band_rows_of`] — the law that already sizes a banded op's mint at the sweep —
+            // sizes the row-split piece (`[42, …]` for one block of a 64-row program), exactly
+            // as the column side has always minted a column-chunked op's piece at its chunk,
+            // and the region constructed below is the ordinary whole-view region at those
+            // dims: a value's extent is its PRODUCER's window, never a parameter's cover
+            // inherited through the elementwise op. The refusals that keep the sweep honest
+            // where its pieces agree are [`swept_window_agrees`]'s own law, consulted here
+            // with this op's [`FrameLaw`]; a family whose swept windows DISAGREE (a
+            // contraction's activation and kernel, sweeping `m` and `k`), an empty sweep, or
+            // a banded one states no plain window and keeps the mint's own law for the op's
+            // body to judge, exactly as before. The view half of that law is ONE VALUE's: a
+            // minted piece is its own value at the piece's height and a parameter's load is a
+            // window of the parameter's view, so the two state the sweep in different frames
+            // without contradiction — what refuses is ONE VALUE behind two views.
+            //
+            // ⛔ BYTE-IDENTICAL FOR EVERY MINT THAT BAKES TODAY: a whole-view swept family has
+            // `r_len == v_rows` and `dims[0] == r_len`, so neither refusal fires and the mint
+            // states the region it always did; a banded family keeps the band law above; a
+            // windowed sweep minted no buffer before — it refused at the extents law (#1112's
+            // MISSING-LOWERING), which is the class this law exists to lower; and every
+            // OwnLaw op keeps the mint it always had, its equality demand never consulted.
+            let plain_window: Option<Region> =
+                if swept.is_empty() || swept.iter().any(|r| r.band.is_some()) {
+                    None
+                } else {
+                    let first = swept[0];
+                    if !swept
+                        .iter()
+                        .all(|r| r.r_start == first.r_start && r.r_len == first.r_len)
+                    {
+                        None
+                    } else {
+                        Some(first)
+                    }
+                };
+            if let Some(first) = plain_window {
+                swept_window_agrees(f.name, op.op_type, frame_law, dims, first, &swept)?;
+            }
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
@@ -6749,6 +7553,10 @@ fn lower_function_folded(
             // would drop the typed fact and the second op's inputs would look whole-view
             // again, minting `[1, ·]` while its per-row operands are `[B, ·]`.
             let band = band_of(f.name, &per_op)?;
+            // The minted region is the ordinary whole-view region at the piece's dims — the
+            // piece the swept window stated (`band_rows_of` above), never a window of a taller
+            // view: the buffer is the value, and its rows are the rows the producing op
+            // writes.
             let r = Region {
                 tid,
                 v_rows: dims[0],
@@ -6959,6 +7767,15 @@ fn lower_function_folded(
             ));
         };
         o = windowed_region(k, o, tile)?;
+        // ⭐ A POINTWISE OP's STORE STATES ITS OWN WINDOW AS ITS EXTENT ([`at_own_extent`]) —
+        // the terminal's row basis is then the window it stores (the gelu longhand's `[0, 42)`
+        // head block of a 64-row output), never the parameter's whole view: a value's extent
+        // comes from its PRODUCER's window, and the one op that may widen it past the store's
+        // own tile is the row fold's leader, whose family proof made the parameter's cover the
+        // hull of every member's store.
+        if frame_law == FrameLaw::Pointwise {
+            o = at_own_extent(o);
+        }
         o.is_out = true;
         // ⭐ THROUGH A SHAPE OP THAT MOVES NO BYTE, THE OUTPUT IS READ IN THE OP'S OWN FRAME — the
         // same card bytes, framed as the op's operands are: a decode batch of one's `[1, KV, G, D]`
@@ -7054,17 +7871,22 @@ fn lower_function_folded(
     // that grew a compute op is a NEW producer form, and lowering its compute while silently not
     // running the copy half would emit a program whose stores are never written — so that case
     // refuses here rather than half-lowering.
-    if k.program == Program::LmLast {
+    if matches!(k.program, Program::LmLast | Program::BlockCopy) {
         if lowered > 0 {
             return err(format!(
-                "{}: an LmLast program with {lowered} compute op(s) — the last-row extraction is a \
-                 PURE COPY (loads and stores only), so a compute op here means the producer's form \
-                 changed and the copy half must be re-derived for it, not skipped",
-                f.name
+                "{}: a {:?} program with {lowered} compute op(s) — a copy is a PURE COPY (loads \
+                 and stores only), so a compute op here means the producer's form changed and the \
+                 copy half must be re-derived for it, not skipped",
+                f.name, k.program
             ));
         }
         let r = regions(k)?;
-        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
+        return match k.program {
+            Program::BlockCopy => {
+                super::lower_ktir_to_superdsc::block_copy(f.name, &r, sym_id_base, layout)
+            }
+            _ => super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout),
+        };
     }
     if lowered == 0 && !scatters {
         return err(format!(
@@ -7161,7 +7983,10 @@ fn stored_whole(k: &KtirNode, value: Ssa, held: Region) -> Result<Option<Region>
 /// clean launch and wrong bytes downstream (granite-3.1-8b's batch-of-one attention: the output
 /// projection read an output no op wrote, "Fraryning000…"). So the lowering refuses, naming the
 /// parameter, any direct store whose parameter no emitted op writes.
-fn every_store_is_written(k: &KtirNode, out: &[super::EmittedOp]) -> Result<(), Error> {
+fn every_store_is_written<T: crate::collective::Tp>(
+    k: &KtirNode,
+    out: &[super::EmittedOp<T>],
+) -> Result<(), Error> {
     let f = &k.func;
     let written: std::collections::BTreeSet<&str> = out
         .iter()
@@ -7550,7 +8375,7 @@ impl Permuted {
 }
 
 /// One stick permute between `src` and `dst` ([`crate::ir::bridge::tiled_op_sdsc_op::StickPermute`]).
-fn permute(
+fn permute<T: crate::collective::Tp>(
     name: &str,
     src: &Region,
     dst: &Region,
@@ -7562,7 +8387,7 @@ fn permute(
     direction: crate::ir::bridge::tiled_op_sdsc_op::StickPermute,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<super::EmittedOp, Error> {
+) -> Result<super::EmittedOp<T>, Error> {
     let base = block.map_or(0, |b| b * rows * sticks * crate::work::FP16_ELEMS_PER_STICK);
     let op_name = match block {
         None => format!("permute_o{}", dst.tid),
@@ -7603,7 +8428,7 @@ struct HeadBlock {
 /// rows of every head). `into_heads` lays the block out as per-head rows; otherwise the reverse. A
 /// head one stick wide is one stick permute; wider, the per-head rows go row-major through `mid` first
 /// (two permutes, [`HeadRows`]'s two).
-fn heads_inner_relayout(
+fn heads_inner_relayout<T: crate::collective::Tp>(
     name: &str,
     (src, dst, mid): (&Region, &Region, Option<&Region>),
     HeadBlock {
@@ -7614,7 +8439,7 @@ fn heads_inner_relayout(
     into_heads: bool,
     sym_id_base: &mut i64,
     layout: &BundleLayout,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::StickPermute::{RowToStick, StickToRow};
     let (block, per_head) = (
         Permuted::whole((rows, heads * sticks)),
@@ -7690,7 +8515,7 @@ struct Minter<'a> {
 /// [`heads_inner_relayout`] into a buffer minted for `key` (and, for heads wider than a stick, the
 /// row-major scratch it goes through): the head-major pair under the prompt trip's division. Returns
 /// the relayout and the result's region.
-fn heads_inner_pair(
+fn heads_inner_pair<T: crate::collective::Tp>(
     m: Minter<'_>,
     key: Ssa,
     name: &str,
@@ -7698,7 +8523,7 @@ fn heads_inner_pair(
     block: HeadBlock,
     into_heads: bool,
     sym_id_base: &mut i64,
-) -> Result<(Vec<super::EmittedOp>, Region), Error> {
+) -> Result<(Vec<super::EmittedOp<T>>, Region), Error> {
     let tid = mint_inter(m.k, m.layout, m.floor, key);
     let dst = if into_heads {
         stick_major_region(tid, block.rows * block.heads, block.sticks, m.layout)
@@ -7880,7 +8705,7 @@ struct BundleFacts<'q> {
 /// Every body here is unchanged and unaware it is being called per-op rather than per-function:
 /// `split_out` filters the list by `is_out`, and this list holds exactly one output and that op's
 /// inputs, so its arity check passes for the reason it was written to.
-fn emit_one(
+fn emit_one<T: crate::collective::Tp>(
     name: &str,
     program: Lowering,
     per_op: &[Region],
@@ -7888,7 +8713,7 @@ fn emit_one(
     layout: Option<&BundleLayout>,
     proof: WalkProof<'_>,
     bundle: BundleFacts<'_>,
-) -> Result<Vec<super::EmittedOp>, Error> {
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let WalkProof {
         b_orient,
         gather,
@@ -7963,6 +8788,19 @@ fn emit_one(
                 name,
                 eps,
                 ones,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        // THE FUSED GAINLESS RMSNORM — the chain whose gain leg closed as the identity. `per_op`
+        // is `[x, out]`, `rmsnorm_unit_at`'s own `split_out(.., 1)` order; the body is the SAME
+        // `assemble_rmsnorm_unit` the per-`Program` door emits, so the two doors cannot state
+        // different formulas for one norm.
+        Lowering::RmsNormUnit(eps) => {
+            return super::lower_ktir_to_superdsc::rmsnorm_unit_at(
+                name,
+                eps,
                 per_op,
                 sym_id_base,
                 layout,
@@ -8130,17 +8968,17 @@ fn emit_one(
 /// [`GatherEmit`] rather than as three more arguments — the walk owns one of these, threading it
 /// to every materialization. `floor` is [`lower_function`]'s node-derived tid bound, carried so
 /// this mint honors it like the walk's own does.
-struct GatherEmit<'a> {
+struct GatherEmit<'a, T: crate::collective::Tp> {
     sym_id_base: &'a mut i64,
-    out: &'a mut Vec<super::EmittedOp>,
+    out: &'a mut Vec<super::EmittedOp<T>>,
     floor: u32,
     inter: &'a mut std::collections::HashMap<Ssa, Region>,
 }
 
-fn gathered_matmul_materializes(
+fn gathered_matmul_materializes<T: crate::collective::Tp>(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
-    emit: &mut GatherEmit<'_>,
+    emit: &mut GatherEmit<'_, T>,
     g: Gather,
     gathered_input: usize,
     in_values: &[Ssa],
@@ -9158,6 +9996,166 @@ mod presented_flat_tests {
     }
 }
 
+/// THE SWEPT-WINDOW LAW, as a unit: the equality demand is [`FrameLaw::Pointwise`]'s own,
+/// and the re-folding class — the 2b decode's rank-3 transpose — admits its sweep.
+#[cfg(test)]
+mod swept_window_law_tests {
+    use super::*;
+
+    fn reg(rows: u32, cols: u32) -> Region {
+        Region {
+            tid: 0,
+            v_rows: rows,
+            v_cols: cols,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            c_cover: (0, cols),
+            is_out: false,
+            is_fp8: false,
+            band: None,
+        }
+    }
+
+    /// ⭐ THE 2b DECODE'S OWN SHAPE, from the `paged_attn_decode_pool` KTIR dump: the rank-3
+    /// transpose's operand `[8, 128, 64]` folds to a `[1024, 64]` window while its
+    /// `[8, 64, 128]` result type folds to `[512, 128]` — the SAME 65536 elements at
+    /// different flat rows, which is the op's own semantics, so the law admits it. 4b359d05c8
+    /// demanded the equality of every class and refused three of the four gate scopes here.
+    #[test]
+    fn a_rank3_transpose_refold_admits_its_sweep() {
+        let swept = [reg(1024, 64)];
+        let law = FrameLaw::of(
+            Lowering::BatchTranspose {
+                batch: 8,
+                input: super::super::lower_ktir_to_superdsc::BatchFrame::Flat,
+            },
+            false,
+        );
+        assert_eq!(
+            law,
+            FrameLaw::OwnLaw,
+            "the derivation classifies the re-fold"
+        );
+        swept_window_agrees(
+            "paged_attn_decode_pool",
+            OpKind::LinalgTranspose,
+            law,
+            [512, 128],
+            swept[0],
+            &swept,
+        )
+        .expect("the re-fold is the transpose's own semantics, not a wrong link");
+    }
+
+    /// ⛔ #1112's LEAK CLASS STILL REFUSES — a pointwise op's result type stating rows the
+    /// sweep does not (the output handle's 42-row view over the block's 64-row sweep): the
+    /// pointwise class preserves the flat frame, so the disagreement names a wrong link.
+    #[test]
+    fn a_pointwise_row_mismatch_still_refuses() {
+        let swept = [reg(64, 128)];
+        let law = FrameLaw::of(
+            Lowering::Node(Program::Elementwise(Elementwise::Mul)),
+            false,
+        );
+        assert_eq!(law, FrameLaw::Pointwise);
+        let Err(m) = swept_window_agrees(
+            "gelu_longhand",
+            OpKind::LinalgGeneric,
+            law,
+            [42, 128],
+            swept[0],
+            &swept,
+        ) else {
+            panic!("a 42-row result type over a 64-row sweep is the leak the law exists for");
+        };
+        assert!(
+            m.message
+                .contains("result type states 42 row(s) while its operands sweep 64"),
+            "names the arithmetic: {:?}",
+            m.message
+        );
+    }
+
+    /// ⛔ THE SWEEP'S OWN CONSISTENCY IS EVERY CLASS's LAW — ONE VALUE over two views names
+    /// two different tensors behind one sweep, whatever the op does with the frame. Both
+    /// regions here are the SAME value (`tid` 0), so the pair is the contradiction the law
+    /// refuses.
+    #[test]
+    fn one_value_over_two_views_refuses_for_every_class() {
+        let first = reg(64, 128);
+        let other = Region {
+            v_rows: 32,
+            ..reg(64, 128)
+        };
+        let law = FrameLaw::of(
+            Lowering::BatchTranspose {
+                batch: 8,
+                input: super::super::lower_ktir_to_superdsc::BatchFrame::Flat,
+            },
+            false,
+        );
+        let Err(m) = swept_window_agrees(
+            "p",
+            OpKind::LinalgTranspose,
+            law,
+            [64, 128],
+            first,
+            &[first, other],
+        ) else {
+            panic!("one value behind two views names two different tensors");
+        };
+        assert!(
+            m.message.contains("DIFFERENT views (64 and 32 rows)"),
+            "names the two views: {:?}",
+            m.message
+        );
+    }
+
+    /// ⭐ TWO VALUES EACH STATE THE SWEEP IN THEIR OWN FRAME — the gelu longhand's split
+    /// Mulf (#1112's Convert corner): the converted 42-row PIECE (its own value, minted at
+    /// the piece's height) beside the 64-row PARAMETER's load of the same window `[0, 42)`.
+    /// One window, two views, TWO VALUES — each operand's frame is its own, the door places
+    /// each (the piece whole, the load a row band of its parent), and the law admits it.
+    #[test]
+    fn two_values_each_state_the_sweep_in_their_own_frame() {
+        let piece = reg(42, 4096);
+        let load = Region {
+            tid: 5,
+            v_rows: 64,
+            r_len: 42,
+            r_cover: (0, 64),
+            ..reg(42, 4096)
+        };
+        let law = FrameLaw::of(
+            Lowering::Node(Program::Elementwise(Elementwise::Mul)),
+            false,
+        );
+        assert_eq!(law, FrameLaw::Pointwise);
+        swept_window_agrees(
+            "gelu_longhand",
+            OpKind::ArithMulf,
+            law,
+            [42, 4096],
+            piece,
+            &[piece, load],
+        )
+        .expect("two values each state the sweep in their own frame — the split's own pairing");
+    }
+
+    /// THE FOLD'S LEADER IS ITS OWN CLASS, AND THE PROOF OUTRANKS THE KIND — a silu that the
+    /// row fold proved the family's leader keeps the parameter's cover as the proven hull
+    /// (`FoldLeader`, never `Pointwise`, so the strip does not touch its tiles); unproven,
+    /// the same kind is the pointwise body it is.
+    #[test]
+    fn the_fold_leader_is_its_own_class() {
+        assert_eq!(FrameLaw::of(Lowering::Silu, true), FrameLaw::FoldLeader);
+        assert_eq!(FrameLaw::of(Lowering::Silu, false), FrameLaw::Pointwise);
+    }
+}
+
 /// WHICH CONTRACTION FORM a `linalg.matmul` states, and the two this door lowers.
 #[cfg(test)]
 mod matmul_orientation_tests {
@@ -9702,5 +10700,782 @@ mod block_landing_law_tests {
             None,
             "a block one stick wide is the flat frame's own bytes, at any batch count"
         );
+    }
+}
+
+/// ⭐ THE GAIN LEG'S OWN LAW — a norm's gain is a `GainLeg`, and identity is one of its values.
+///
+/// The chain reader used to refuse a normalisation with no gain multiply ("a normalisation with
+/// none is not the shape this door lowers"), which turned every gainless norm — the
+/// `rmsnormunit_s8` the gemma-4 head-norm sandwich spells — into a build error. The law is now
+/// ONE fact with three spellings: the gain leg is claimed as a learned row ONLY for a
+/// ROW-BROADCAST operand (`BcastAxis::Mb`), `1+gamma` included; ANY other reader of the
+/// normalised value closes the leg as the identity and the chain still fuses. This suite pins
+/// each value of that law: the two gained spellings, the gainless one, the three near-misses
+/// that must close gainless rather than claim the leg (an activation, a scalar, a dense
+/// `[rows, cols]` tensor), and the neighbour fold (`ScalarMul`) the gainless close must not
+/// steal from.
+#[cfg(test)]
+mod rmsnorm_gain_leg_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// What the gain multiply's OTHER operand is, when there is one.
+    #[derive(Clone, Copy, Debug)]
+    enum Gain {
+        /// `n1[None, :]` — a `[1, cols]` row sprayed down the rows: the learned gain.
+        Row,
+        /// `1 + n1[None, :]` — the OnePlusScale convention's own addf over the row.
+        OnePlusRow,
+        /// No gain multiply at all: the normalised value is stored direct.
+        None,
+        /// `x̂ · <another activation>` — a computed tile, not a gain.
+        Activation,
+        /// `x̂ · <splatted constant>` — a scalar, not a gain.
+        Scalar,
+        /// `x̂ · <a dense [rows, cols] argument>` — a full tile, not a gain.
+        Dense,
+    }
+
+    /// The chain the reader walks, at `[64, 128]` (cols a power of two, so `1/cols` is exact):
+    /// `sq = x·x`, `red = sum(sq)`, `ms = red · (1/128)`, `add = ms + eps`, `root = rsqrt(add)`,
+    /// `scaled = x · root`, then the gain leg `gain` selects. `%0` is `x`; the other SSA numbers
+    /// are assigned in emission order.
+    fn norm(gain: Gain) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let x = Ssa(0);
+        let (c_eps, sp_eps, c_inv, sp_inv) = (Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (sq, red, ms, add, root, scaled) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10));
+        let mut ops = vec![
+            Operation::new(a, Some(c_eps), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1e-6),
+            ),
+            Operation::new(a, Some(sp_eps), OpKind::TensorSplat, &[c_eps]),
+            Operation::new(a, Some(c_inv), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0 / 128.0),
+            ),
+            Operation::new(a, Some(sp_inv), OpKind::TensorSplat, &[c_inv]),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[64, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sq), OpKind::ArithMulf, &[x, x])
+            },
+            Operation::new(a, Some(red), OpKind::LinalgReduce, &[sq]).with_attr(
+                a,
+                AttrKey::ReduceFn,
+                Attr::Op(OpKind::ArithAddf),
+            ),
+            Operation::new(a, Some(ms), OpKind::ArithMulf, &[red, sp_inv]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[ms, sp_eps]),
+            Operation::new(a, Some(root), OpKind::MathRsqrt, &[add]),
+            Operation::new(a, Some(scaled), OpKind::ArithMulf, &[x, root]),
+        ];
+        // The gain leg, and what finally reads the chain's output.
+        let mut extra_args = vec![];
+        match gain {
+            Gain::None => {
+                // The normalised value is stored direct — the gainless spelling.
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[scaled]));
+            }
+            Gain::Activation => {
+                // `x̂ · (x·x)` — the other operand is computed, never broadcast: not a gain.
+                let act = Ssa(11);
+                ops.push(Operation::new(a, Some(act), OpKind::ArithMulf, &[x, x]));
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(12)),
+                    OpKind::ArithMulf,
+                    &[scaled, act],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(12)]));
+            }
+            Gain::Scalar => {
+                // `x̂ · 2.0` — a splatted constant, the ScalarMul neighbour's own shape.
+                let (c, sp) = (Ssa(11), Ssa(12));
+                ops.push(
+                    Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                        a,
+                        AttrKey::Value,
+                        Attr::Float(2.0),
+                    ),
+                );
+                ops.push(Operation::new(a, Some(sp), OpKind::TensorSplat, &[c]));
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(13)),
+                    OpKind::ArithMulf,
+                    &[scaled, sp],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(13)]));
+            }
+            Gain::Dense => {
+                // `x̂ · %d` — a dense [rows, cols] argument, read lane for lane: not a gain.
+                let d = Ssa(11);
+                extra_args.push((d, IrType::Index));
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(12)),
+                    OpKind::ArithMulf,
+                    &[scaled, d],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(12)]));
+            }
+            Gain::Row | Gain::OnePlusRow => {
+                // `n1[None, :]` spelled the way the producer does: (the OnePlusScale addf over
+                // the loaded row, when the convention states one,) then expand to `[1, 128]`,
+                // collapse, and broadcast `Dimensions=[0]` down the rows.
+                extra_args.push((Ssa(15), IrType::Index));
+                let mut row = Ssa(15);
+                if let Gain::OnePlusRow = gain {
+                    // `w = load + 1.0` — the OnePlusScale addf over the row, BEFORE the spray.
+                    let (c1, sp1, w) = (Ssa(16), Ssa(17), Ssa(18));
+                    ops.push(
+                        Operation::new(a, Some(c1), OpKind::ArithConstant, &[]).with_attr(
+                            a,
+                            AttrKey::Value,
+                            Attr::Float(1.0),
+                        ),
+                    );
+                    ops.push(Operation::new(a, Some(sp1), OpKind::TensorSplat, &[c1]));
+                    ops.push(Operation::new(a, Some(w), OpKind::ArithAddf, &[row, sp1]));
+                    row = w;
+                }
+                let (exp, col, emp, bc) = (Ssa(11), Ssa(12), Ssa(13), Ssa(14));
+                ops.push(
+                    Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[row]).with_attr(
+                        a,
+                        AttrKey::TargetShape,
+                        Attr::IntList(&[1, 128]),
+                    ),
+                );
+                ops.push(
+                    Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[exp]).with_attr(
+                        a,
+                        AttrKey::TargetShape,
+                        Attr::IntList(&[128]),
+                    ),
+                );
+                ops.push(Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]));
+                ops.push(
+                    Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[col, emp])
+                        .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[0]))
+                        .with_attr(a, AttrKey::Shape, Attr::IntList(&[64, 128])),
+                );
+                ops.push(Operation::new(
+                    a,
+                    Some(Ssa(19)),
+                    OpKind::ArithMulf,
+                    &[scaled, bc],
+                ));
+                ops.push(Operation::new(a, None, OpKind::KtdpStore, &[Ssa(19)]));
+            }
+        }
+        let mut args = vec![(x, IrType::Index)];
+        args.extend(extra_args);
+        IRFunction {
+            name: "rmsnorm_gain_probe",
+            arguments: a.args(args),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    fn chains(gain: Gain) -> Vec<RmsNormChain> {
+        program_rmsnorm_chains(&norm(gain)).unwrap_or_else(|e| {
+            panic!(
+                "the {gain:?} chain must recognise, not refuse: {}",
+                e.message
+            )
+        })
+    }
+
+    /// THE CONTROL (gained, Scale): `x̂ · gamma` with `gamma` a row broadcast claims the leg.
+    #[test]
+    fn a_row_broadcast_gain_is_claimed() {
+        let cs = chains(Gain::Row);
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        let c = &cs[0];
+        assert!(
+            matches!(c.gain, GainLeg::Scale(_)),
+            "the row broadcast claims the leg, Scale convention"
+        );
+        assert_eq!(c.out, Ssa(19), "the gain multiply's result is the output");
+        assert!(
+            c.consumed.contains(&Ssa(10)),
+            "the normalised value is interior when a gain is claimed"
+        );
+    }
+
+    /// THE CONTROL (gained, OnePlusScale): `x̂ · (1 + gamma)` claims the leg with the offset.
+    #[test]
+    fn a_oneplus_row_gain_is_claimed_with_the_offset() {
+        let cs = chains(Gain::OnePlusRow);
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        let c = &cs[0];
+        assert!(
+            matches!(c.gain, GainLeg::OnePlusScale(_)),
+            "the oneplus row claims the leg as OnePlusScale — the offset is the variant's meaning"
+        );
+        assert_eq!(c.out, Ssa(19), "the gain multiply's result is the output");
+    }
+
+    /// THE MATCH (gainless): no gain multiply, the normalised value stored direct — the chain
+    /// closes as the identity and STILL fuses.
+    #[test]
+    fn a_norm_with_no_gain_closes_as_the_identity() {
+        let cs = chains(Gain::None);
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        let c = &cs[0];
+        assert!(
+            matches!(c.gain, GainLeg::Identity),
+            "the gainless spelling closes as the identity, not a refusal"
+        );
+        assert_eq!(
+            c.out,
+            Ssa(10),
+            "the normalising multiply is the terminal; its result is the output"
+        );
+        assert!(
+            !c.consumed.contains(&Ssa(10)),
+            "the output is not interior — the fused program produces it"
+        );
+    }
+
+    /// NEAR-MISS (activation): `x̂ · <a computed tile>` is not a gain — the leg closes as the
+    /// identity and the multiply is left to the walk.
+    #[test]
+    fn a_gain_multiply_by_an_activation_closes_gainless() {
+        let cs = chains(Gain::Activation);
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "an activation operand is not a gain"
+        );
+        assert_eq!(
+            cs[0].out,
+            Ssa(10),
+            "the chain's terminal is the normalising multiply"
+        );
+    }
+
+    /// NEAR-MISS (scalar): `x̂ · 2.0` is the ScalarMul neighbour's own shape — the leg closes as
+    /// the identity and the scalar multiply is left to the walk to lower as a `ScalarMul`, never
+    /// stolen as a gain.
+    #[test]
+    fn a_gain_multiply_by_a_scalar_closes_gainless() {
+        let cs = chains(Gain::Scalar);
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "a splatted scalar is not a gain — the ScalarMul neighbour keeps its op"
+        );
+    }
+
+    /// NEAR-MISS (dense): `x̂ · <a [rows, cols] argument>` reads lane for lane — not a gain.
+    #[test]
+    fn a_gain_multiply_by_a_dense_tile_closes_gainless() {
+        let cs = chains(Gain::Dense);
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "a dense operand is not a gain"
+        );
+    }
+
+    /// THE NEIGHBOUR FOLD: a plain `tile · splat` with no norm around it recognises NO chain —
+    /// the gainless close must not turn every scalar multiply into a fused rmsnorm.
+    #[test]
+    fn a_scalar_mul_with_no_norm_is_not_a_chain() {
+        let a: &'static Arena = Arena::global();
+        let (x, c, sp, m) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let ops = vec![
+            Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(2.0),
+            ),
+            Operation::new(a, Some(sp), OpKind::TensorSplat, &[c]),
+            Operation::new(a, Some(m), OpKind::ArithMulf, &[x, sp]),
+        ];
+        let f = IRFunction {
+            name: "scalarmul_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let cs = program_rmsnorm_chains(&f).expect("no rsqrt, no refusal");
+        assert!(
+            cs.is_empty(),
+            "a scalar multiply with no norm is not a chain"
+        );
+    }
+
+    /// ⭐ THE DEGENERATE SPRAY (the one-row tile, the decode form): at `rows == 1` the row's
+    /// broadcast is the identity function, the producer FOLDS it, and the leg is the loaded row
+    /// plus its `expand_shape` to `[1, cols]` — NO `linalg.broadcast` anywhere. The row claim
+    /// must hold on the expand's own `[1, cols]` shape, or every decode-bucket norm flips to
+    /// the unit form and the gained bundles move (the g2bfp8 gate's measured diff).
+    #[test]
+    fn a_one_row_tile_gain_without_a_broadcast_is_claimed() {
+        let a: &'static Arena = Arena::global();
+        let x = Ssa(0);
+        let (c_eps, sp_eps, c_inv, sp_inv) = (Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (sq, red, ms, add, root, scaled) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10));
+        let (row, exp, out) = (Ssa(15), Ssa(16), Ssa(17));
+        let ops = vec![
+            Operation::new(a, Some(c_eps), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1e-6),
+            ),
+            Operation::new(a, Some(sp_eps), OpKind::TensorSplat, &[c_eps]),
+            Operation::new(a, Some(c_inv), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0 / 128.0),
+            ),
+            Operation::new(a, Some(sp_inv), OpKind::TensorSplat, &[c_inv]),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[1, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sq), OpKind::ArithMulf, &[x, x])
+            },
+            Operation::new(a, Some(red), OpKind::LinalgReduce, &[sq]).with_attr(
+                a,
+                AttrKey::ReduceFn,
+                Attr::Op(OpKind::ArithAddf),
+            ),
+            Operation::new(a, Some(ms), OpKind::ArithMulf, &[red, sp_inv]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[ms, sp_eps]),
+            Operation::new(a, Some(root), OpKind::MathRsqrt, &[add]),
+            Operation::new(a, Some(scaled), OpKind::ArithMulf, &[x, root]),
+            // `w[None, :]` on a one-row tile: the expand to `[1, 128]` and NOTHING else — the
+            // extent-1 spray is a no-op the producer folds, so no broadcast op exists.
+            Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[row]).with_attr(
+                a,
+                AttrKey::TargetShape,
+                Attr::IntList(&[1, 128]),
+            ),
+            Operation::new(a, Some(out), OpKind::ArithMulf, &[scaled, exp]),
+            Operation::new(a, None, OpKind::KtdpStore, &[out]),
+        ];
+        let f = IRFunction {
+            name: "rmsnorm_one_row_probe",
+            arguments: a.args(vec![(x, IrType::Index), (row, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let cs = program_rmsnorm_chains(&f)
+            .unwrap_or_else(|e| panic!("the one-row chain must recognise: {}", e.message));
+        assert_eq!(cs.len(), 1, "one rsqrt heads one chain");
+        assert!(
+            matches!(cs[0].gain, GainLeg::Scale(_)),
+            "the `[1, cols]` expand states the row on its own shape — no broadcast needed"
+        );
+        assert_eq!(cs[0].out, out, "the gain multiply's result is the output");
+    }
+
+    /// NEAR-MISS on the SAME one-row tile: `x̂ · <a splatted [1, cols] constant>` — the splat is
+    /// not rank plumbing, so the leg carries no `[1, cols]` value of the row's own and the
+    /// chain closes gainless, never stealing the ScalarMul neighbour's op.
+    #[test]
+    fn a_one_row_tile_splat_closes_gainless() {
+        let a: &'static Arena = Arena::global();
+        let x = Ssa(0);
+        let (c_eps, sp_eps, c_inv, sp_inv) = (Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (sq, red, ms, add, root, scaled) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10));
+        let (c2, sp2, out) = (Ssa(11), Ssa(12), Ssa(13));
+        let ops = vec![
+            Operation::new(a, Some(c_eps), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1e-6),
+            ),
+            Operation::new(a, Some(sp_eps), OpKind::TensorSplat, &[c_eps]),
+            Operation::new(a, Some(c_inv), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0 / 128.0),
+            ),
+            Operation::new(a, Some(sp_inv), OpKind::TensorSplat, &[c_inv]),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[1, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sq), OpKind::ArithMulf, &[x, x])
+            },
+            Operation::new(a, Some(red), OpKind::LinalgReduce, &[sq]).with_attr(
+                a,
+                AttrKey::ReduceFn,
+                Attr::Op(OpKind::ArithAddf),
+            ),
+            Operation::new(a, Some(ms), OpKind::ArithMulf, &[red, sp_inv]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[ms, sp_eps]),
+            Operation::new(a, Some(root), OpKind::MathRsqrt, &[add]),
+            Operation::new(a, Some(scaled), OpKind::ArithMulf, &[x, root]),
+            Operation::new(a, Some(c2), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(2.0),
+            ),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: &[1, 128],
+                    elem: DType::F16,
+                }),
+                ..Operation::new(a, Some(sp2), OpKind::TensorSplat, &[c2])
+            },
+            Operation::new(a, Some(out), OpKind::ArithMulf, &[scaled, sp2]),
+            Operation::new(a, None, OpKind::KtdpStore, &[out]),
+        ];
+        let f = IRFunction {
+            name: "rmsnorm_one_row_splat_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let cs = program_rmsnorm_chains(&f)
+            .unwrap_or_else(|e| panic!("the one-row splat chain must recognise: {}", e.message));
+        assert_eq!(cs.len(), 1);
+        assert!(
+            matches!(cs[0].gain, GainLeg::Identity),
+            "a splatted constant is not a gain even on the one-row tile"
+        );
+    }
+}
+
+/// THE GELU LONGHAND'S FIXTURES — the match, one near-miss per proof arm (each asserting
+/// REFUSED vs UNCLAIMED, the fold law's own split), and the neighbour controls that keep the
+/// silu recogniser and this one off each other's chains.
+#[cfg(test)]
+mod gelu_chain_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// What the divide's numerator is — [`Num::X`] is the cubic's base and makes it gelu;
+    /// [`Num::Other`] is a value outside the chain, so the numerator arm fires and the chain is
+    /// left unclaimed.
+    #[derive(Clone, Copy)]
+    enum Num {
+        X,
+        Other,
+    }
+
+    /// The inner term's degree — [`Deg::Cubic`] leaves `{const, x, x, x}`;
+    /// [`Deg::Square`] leaves `{const, x, x}`, a different function left unclaimed.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Deg {
+        Cubic,
+        Square,
+    }
+
+    /// The tanh-form gelu longhand exactly as the spliced kernel spells it (all f16, the
+    /// constants at their f16 images): `x/(1+e^-2u)`, `u = √(2/π)·(x + c·x³)` — with the one
+    /// link under test varied per case. `x` is `%0`; `%1` is a second argument the near-misses
+    /// read instead.
+    fn chain(
+        cubic: f64,
+        scale: f64,
+        add_const: f64,
+        num: Num,
+        deg: Deg,
+        second_reader: bool,
+    ) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (x, y) = (Ssa(0), Ssa(1));
+        let (c1, sp1) = (Ssa(2), Ssa(3));
+        let (ck, spk) = (Ssa(4), Ssa(5));
+        let (cc, spc) = (Ssa(6), Ssa(7));
+        let (m0, m1, m2) = (Ssa(8), Ssa(9), Ssa(10));
+        let (s, v, n, e, d, g) = (Ssa(11), Ssa(12), Ssa(13), Ssa(14), Ssa(15), Ssa(16));
+        let splat = |res: Ssa, val: Ssa| Operation::new(a, Some(res), OpKind::TensorSplat, &[val]);
+        let konst = |res: Ssa, val: f64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(val),
+            )
+        };
+        // `c·x^n` — `((x·c)·x)·x` for the cubic, the kernel's own association (the leaf law
+        // owns any); the square keeps one multiply fewer.
+        let inner = |ops: &mut Vec<Operation<'static>>| {
+            ops.push(Operation::new(a, Some(m0), OpKind::ArithMulf, &[x, spc]));
+            if deg == Deg::Cubic {
+                ops.push(Operation::new(a, Some(m1), OpKind::ArithMulf, &[m0, x]));
+                ops.push(Operation::new(a, Some(m2), OpKind::ArithMulf, &[m1, x]));
+            } else {
+                ops.push(Operation::new(a, Some(m1), OpKind::ArithMulf, &[m0, x]));
+            }
+        };
+        let top = if deg == Deg::Cubic { m2 } else { m1 };
+        let mut ops = vec![
+            konst(c1, add_const),
+            splat(sp1, c1),
+            konst(ck, scale),
+            splat(spk, ck),
+            konst(cc, cubic),
+            splat(spc, cc),
+        ];
+        inner(&mut ops);
+        ops.push(Operation::new(a, Some(s), OpKind::ArithAddf, &[x, top]));
+        ops.push(Operation::new(a, Some(v), OpKind::ArithMulf, &[s, spk]));
+        ops.push(Operation::new(a, Some(n), OpKind::ArithNegf, &[v]));
+        ops.push(Operation::new(a, Some(e), OpKind::MathExp, &[n]));
+        ops.push(Operation::new(a, Some(d), OpKind::ArithAddf, &[e, sp1]));
+        let numerator = match num {
+            Num::X => x,
+            Num::Other => y,
+        };
+        ops.push(Operation::new(
+            a,
+            Some(g),
+            OpKind::ArithDivf,
+            &[numerator, d],
+        ));
+        ops.push(Operation::new(a, None, OpKind::KtdpStore, &[g]));
+        if second_reader {
+            // A second reader of the inner term's top multiply — the fold would destroy it, so
+            // the chain does not close.
+            let top_res = top;
+            ops.push(Operation::new(
+                a,
+                Some(Ssa(17)),
+                OpKind::ArithMulf,
+                &[top_res, y],
+            ));
+        }
+        IRFunction {
+            name: "gelu_probe",
+            arguments: a.args(vec![(x, IrType::Index), (y, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// The matching chain, at the constants' f16 images (what an f16-typed program states).
+    fn matching() -> IRFunction<'static> {
+        chain(
+            0.044_708_251_953_125,
+            1.595_703_125,
+            1.0,
+            Num::X,
+            Deg::Cubic,
+            false,
+        )
+    }
+
+    /// THE CONTROL. Without this passing, every refusal below could be a broken builder rather
+    /// than a working guard.
+    #[test]
+    fn the_matching_chain_is_recognised_as_one_gelu() {
+        let f = matching();
+        let cs = program_gelu_chains(&f).expect("the matching chain must be recognised");
+        assert_eq!(cs.len(), 1, "one `arith.negf` heads one chain");
+        let c = &cs[0];
+        assert_eq!(
+            c.x,
+            Ssa(0),
+            "the input is the cubic's base — the divide's numerator"
+        );
+        assert_eq!(
+            c.out,
+            Ssa(16),
+            "the terminal divide's result is what the program produces"
+        );
+        assert_eq!(
+            c.consumed.len(),
+            8,
+            "the cubic's three multiplies, the sum, the scale, the negate, the exp and the `1+e` \
+             are consumed by the fold and must be lowered by nothing"
+        );
+        for interior in [
+            Ssa(8),
+            Ssa(9),
+            Ssa(10),
+            Ssa(11),
+            Ssa(12),
+            Ssa(13),
+            Ssa(14),
+            Ssa(15),
+        ] {
+            assert!(
+                c.consumed.contains(&interior),
+                "t{interior:?} is chain-interior"
+            );
+        }
+        assert!(
+            !c.consumed.contains(&c.out),
+            "the terminal is the op that BECOMES the gelu, never its own interior"
+        );
+    }
+
+    /// ⛔ REFUSED BY NAME: the structure closed — head, `1+e`, divide over the cubic's base —
+    /// but the cubic's coefficient is not the polynomial `OpFunc::Gelu` pins, so lowering it as
+    /// `gelu` would substitute a different polynomial and report success.
+    #[test]
+    fn a_cubic_constant_off_at_f16_precision_is_refused_and_both_values_named() {
+        let e = program_gelu_chains(&chain(0.045, 1.595_703_125, 1.0, Num::X, Deg::Cubic, false))
+            .expect_err("a closed chain with an off cubic constant must refuse");
+        assert!(
+            e.message.contains("cubic coefficient"),
+            "the refusal names the link: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("0.045") && e.message.contains("0.044"),
+            "the refusal names both values: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ REFUSED BY NAME: the scale is not `2·√(2/π)`, so the argument is a different
+    /// polynomial's.
+    #[test]
+    fn a_scale_off_at_f16_precision_is_refused_and_both_values_named() {
+        let e = program_gelu_chains(&chain(
+            0.044_708_251_953_125,
+            1.6,
+            1.0,
+            Num::X,
+            Deg::Cubic,
+            false,
+        ))
+        .expect_err("a closed chain with an off scale must refuse");
+        assert!(
+            e.message.contains("scale"),
+            "the refusal names the link: {}",
+            e.message
+        );
+    }
+
+    /// LEFT UNCLAIMED: `y/(1+e^-2u(x))` for `y ≠ x` is a different function with the same op
+    /// kinds — it lowers op by op, never as `gelu`.
+    #[test]
+    fn a_numerator_that_is_not_the_cubic_base_is_left_unclaimed() {
+        let cs = program_gelu_chains(&chain(
+            0.044_708_251_953_125,
+            1.595_703_125,
+            1.0,
+            Num::Other,
+            Deg::Cubic,
+            false,
+        ))
+        .expect("a different function is not an error");
+        assert!(cs.is_empty(), "no chain claims a divide over another value");
+    }
+
+    /// LEFT UNCLAIMED: `x/(c+e)` for `c ≠ 1` is not the sigmoid identity, so it is not the tanh
+    /// form at all.
+    #[test]
+    fn an_added_constant_other_than_one_is_left_unclaimed() {
+        let cs = program_gelu_chains(&chain(
+            0.044_708_251_953_125,
+            1.595_703_125,
+            2.0,
+            Num::X,
+            Deg::Cubic,
+            false,
+        ))
+        .expect("a different function is not an error");
+        assert!(cs.is_empty(), "no chain claims `x/(2+e)`");
+    }
+
+    /// LEFT UNCLAIMED: `c·x²` in the inner term is a different polynomial — the leaf law
+    /// `{const, x, x, x}` is what makes it gelu's cubic.
+    #[test]
+    fn a_squared_inner_term_is_left_unclaimed() {
+        let cs = program_gelu_chains(&chain(
+            0.044_708_251_953_125,
+            1.595_703_125,
+            1.0,
+            Num::X,
+            Deg::Square,
+            false,
+        ))
+        .expect("a different function is not an error");
+        assert!(cs.is_empty(), "no chain claims a squared inner term");
+    }
+
+    /// LEFT UNCLAIMED: a second reader of an interior would read a value the fused `gelu` never
+    /// materialises, so the chain does not close — the fold law's `ops_deep` exclusivity.
+    #[test]
+    fn an_interior_with_a_second_reader_is_left_unclaimed() {
+        let cs = program_gelu_chains(&chain(
+            0.044_708_251_953_125,
+            1.595_703_125,
+            1.0,
+            Num::X,
+            Deg::Cubic,
+            true,
+        ))
+        .expect("an unshared-exclusive chain is not an error");
+        assert!(cs.is_empty(), "no chain destroys a twice-read interior");
+    }
+
+    /// NEIGHBOUR CONTROL: the silu longhand — the same exp island with the divide's numerator
+    /// the negated value itself — is NOT a gelu, and the gelu recogniser leaves it alone.
+    #[test]
+    fn the_gelu_recogniser_leaves_a_silu_chain_alone() {
+        let a: &'static Arena = Arena::global();
+        let (x, c1, sp) = (Ssa(0), Ssa(1), Ssa(2));
+        let (neg, exp, add, div) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let ops = vec![
+            Operation::new(a, Some(c1), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(1.0),
+            ),
+            Operation::new(a, Some(sp), OpKind::TensorSplat, &[c1]),
+            Operation::new(a, Some(neg), OpKind::ArithNegf, &[x]),
+            Operation::new(a, Some(exp), OpKind::MathExp, &[neg]),
+            Operation::new(a, Some(add), OpKind::ArithAddf, &[exp, sp]),
+            Operation::new(a, Some(div), OpKind::ArithDivf, &[x, add]),
+            Operation::new(a, None, OpKind::KtdpStore, &[div]),
+        ];
+        let f = IRFunction {
+            name: "silu_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let gelus = program_gelu_chains(&f).expect("a silu is not a gelu error");
+        assert!(gelus.is_empty(), "the gelu recogniser claims no silu");
+        let silus = program_silu_mul_chains(&f).expect("the silu still recognises its own");
+        assert_eq!(silus.len(), 1, "the silu chain is still recognised");
+    }
+
+    /// NEIGHBOUR CONTROL, THE OTHER DIRECTION: a closed gelu chain reaches the SILU recogniser's
+    /// head too — the two longhands share `negf -> exp -> 1+e` — and without the skip the silu
+    /// proof would refuse it at the divide's numerator, killing the walk on a program that is
+    /// a perfectly good gelu.
+    #[test]
+    fn the_silu_recogniser_leaves_a_closed_gelu_chain_alone() {
+        let f = matching();
+        let silus = program_silu_mul_chains(&f).expect("a gelu is not a mis-shaped silu");
+        assert!(
+            silus.is_empty(),
+            "the silu recogniser neither claims nor refuses the gelu chain"
+        );
+        let gelus = program_gelu_chains(&f).expect("the gelu is still recognised");
+        assert_eq!(gelus.len(), 1, "and the gelu recogniser owns it");
     }
 }

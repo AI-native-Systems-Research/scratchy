@@ -276,8 +276,8 @@ impl Payload {
 /// ⛔ SHORT IS LEGITIMATE for a raw bind where it is not for an fp16 one, so this does NOT demand the
 /// exact size the arms below do — `place_raw`'s own doc records the activations that bind less than
 /// their placement on purpose (a pmask's one broadcast row, the index table's one pass block).
-fn bind_raw(
-    exec: &mut crate::superdsc_exec::Executor,
+fn bind_raw<T: ktir_superdsc::collective::Tp>(
+    exec: &mut crate::superdsc_exec::Executor<T>,
     tid: u32,
     bytes: Vec<u8>,
     how: &str,
@@ -302,6 +302,9 @@ fn bind_raw(
 /// weights (staged once) rather than declared as per-run sources, because the executor's source model
 /// is the contiguous id range `0..n`.
 const RESERVED_TID_FLOOR: u32 = u32::MAX - 1024;
+
+/// One bundle off disk runs on one card: a world of one.
+type Alone = ktir_superdsc::collective::TpWorld<1>;
 
 pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     // ── The producer's launch map ──
@@ -456,7 +459,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);
-    let mut groups: Vec<crate::bundle_code::LaunchGroup<'static>> = Vec::new();
+    let mut groups: Vec<crate::bundle_code::LaunchGroup<'static, Alone>> = Vec::new();
     for gd in &group_dirs {
         let gcode = gd.join("spyreCodeDir");
         let gimg = std::fs::read(gcode.join("init_binary.bin"))
@@ -485,7 +488,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
 
     // `Executor::load` takes `&'static` because a baked bundle IS static data in the binary. This one
     // came off disk, so it is leaked deliberately: the process runs one bundle and exits.
-    let code: &'static crate::bundle_code::BundleCode<'static> =
+    let code: &'static crate::bundle_code::BundleCode<'static, Alone> =
         Box::leak(Box::new(crate::bundle_code::BundleCode {
             fp: std::borrow::Cow::Owned(
                 dir.file_name()
@@ -676,7 +679,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         }
     };
 
+    // One kernel on one card: the first card senlib enumerates.
+    let card = crate::runtime::CardRuntime::open(0).map_err(|e| anyhow!("open card 0: {e}"))?;
     let mut exec = crate::superdsc_exec::Executor::load(
+        card,
         code,
         // ⛔ NOT ZERO. These three are a MODEL's geometry, and a single-kernel bundle has none — but a
         // zero pool leaves the runtime configuring a device with no KV region at all, and the launch

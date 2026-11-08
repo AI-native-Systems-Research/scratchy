@@ -27,11 +27,14 @@
 //! moments are computed in, E[x] simply unread), taking the chain from 6 descriptors to 5.
 //! See [`OpFunc::Exx2`]'s doc for the full wire contract.
 
-use super::reduce::assemble_reduce_seeded;
-use crate::emit::{EmittedOp, In, pw1, pw2, rb};
+use super::reduce::{
+    ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
+    assemble_reduce_seeded, assemble_reduce_split,
+};
+use crate::emit::{EmittedOp, In, op_func_from_str, pw1, pw2, rb};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
-use crate::superdsc_opspec::{DataFormat, Fp16};
+use crate::superdsc_opspec::{DataFormat, Df, Fp16};
 
 /// Assemble torch-spyre's `spyre_rms_norm` decomposition for one node: `x[rows,cols]`,
 /// `gamma[1,cols]`, `eps_const` a bound `[1,stick]` config constant → `out[rows,cols]`.
@@ -44,7 +47,7 @@ use crate::superdsc_opspec::{DataFormat, Fp16};
 /// `xn + xn·w` rewrite. `None` is the Scale convention: no add, the multiply
 /// reads the stored gamma, byte-identical to the form before the row existed.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_rmsnorm(
+pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     prefix: &str,
     rows: u32,
     cols: u32,
@@ -55,10 +58,10 @@ pub fn assemble_rmsnorm(
     ones_const: Option<&str>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp> {
+) -> Result<Vec<EmittedOp<T>>, String> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     // The op's operand SPELLING, rendered from the identity the layout is keyed by.
     let out_s = out_id.to_string();
     let out = out_s.as_str();
@@ -137,16 +140,41 @@ pub fn assemble_rmsnorm(
     //    `exx2scale` const (same channel the mean reduce's `scaling_factor` used), and
     //    `useZeroMean` stays the RAW 0 — the vendor's production spelling (the =1 rewrite names
     //    an op the runtime smc table cannot resolve) — see OpInfo::Exx2Scale.
-    ops.push(assemble_reduce_seeded(
-        &format!("rmmean_{prefix}"),
-        "exx2",
-        rows,
-        cols,
-        &x,
-        &mean,
+    // THE ONE PROBE-AND-SPLIT BODY owns the long form: a hidden width too wide for one LX pass
+    // splits into single-shot slices and their running combine; a fitting one (every shipped
+    // row count) is this family's own single descriptor below, unchanged.
+    let rmmean_op = format!("rmmean_{prefix}");
+    let split = assemble_reduce_split(
+        ReduceSplit::new(
+            &rmmean_op,
+            ReduceGeometry::new(
+                op_func_from_str("exx2"),
+                rows,
+                cols,
+                Df::Fp16,
+                layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+            )?,
+            ReduceDataLeg::whole(&x),
+            ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
+            out_id,
+        )?,
         sym_id_base,
         layout,
-    ));
+    )?;
+    if let Some(split) = split {
+        ops.extend(split);
+    } else {
+        ops.push(assemble_reduce_seeded(
+            &rmmean_op,
+            "exx2",
+            rows,
+            cols,
+            &x,
+            &mean,
+            sym_id_base,
+            layout,
+        ));
+    }
     // 2. E[x²] + eps  (the `+ eps` inside torch.rsqrt). `mean` holds both half-stick values, so
     //    elements [0..8) compute E[x]+eps and the pad elements compute over stale bytes — both
     //    unread (the tail reads element 8 only), the same computed-but-unread padding class the
@@ -230,7 +258,7 @@ pub fn assemble_rmsnorm(
         sym_id_base,
         layout,
     ));
-    ops
+    Ok(ops)
 }
 
 /// Assemble the GAINLESS rmsnorm — `x[rows,cols]`, `eps_const` a bound `[1,stick]`
@@ -247,7 +275,7 @@ pub fn assemble_rmsnorm(
 /// form mints no `Xn`, because the normalising multiply's result is the output
 /// buffer, not a synthetic intermediate.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_rmsnorm_unit(
+pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     prefix: &str,
     rows: u32,
     cols: u32,
@@ -256,10 +284,10 @@ pub fn assemble_rmsnorm_unit(
     eps_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp> {
+) -> Result<Vec<EmittedOp<T>>, String> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     let out_s = out_id.to_string();
     let out = out_s.as_str();
     let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
@@ -302,16 +330,40 @@ pub fn assemble_rmsnorm_unit(
         sym_id_base,
         layout,
     )); // sq16 = x²
-    ops.push(assemble_reduce_seeded(
-        &format!("rmmean_{prefix}"),
-        "mean",
-        rows,
-        cols,
-        &sq16,
-        &mean,
+    // THE ONE PROBE-AND-SPLIT BODY owns the long form here too — the same body, the same
+    // question, never a second spelling of the split law.
+    let rmmean_op = format!("rmmean_{prefix}");
+    let split = assemble_reduce_split(
+        ReduceSplit::new(
+            &rmmean_op,
+            ReduceGeometry::new(
+                op_func_from_str("mean"),
+                rows,
+                cols,
+                Df::Fp16,
+                layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
+            )?,
+            ReduceDataLeg::whole(&sq16),
+            ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
+            out_id,
+        )?,
         sym_id_base,
         layout,
-    ));
+    )?;
+    if let Some(split) = split {
+        ops.extend(split);
+    } else {
+        ops.push(assemble_reduce_seeded(
+            &rmmean_op,
+            "mean",
+            rows,
+            cols,
+            &sq16,
+            &mean,
+            sym_id_base,
+            layout,
+        ));
+    }
     ops.push(pw2(
         &format!("rmeps_{prefix}"),
         "add",
@@ -347,7 +399,7 @@ pub fn assemble_rmsnorm_unit(
         sym_id_base,
         layout,
     ));
-    ops
+    Ok(ops)
 }
 
 /// Assemble the tanh soft cap — `x[rows,cols]`, `cap_const` a bound `[1,1]`
@@ -365,7 +417,7 @@ pub fn assemble_rmsnorm_unit(
 /// mints, so it takes a `SynthRole` (`Tanhc`) and is reserved through the
 /// layout exactly as `Sq16` is — placed, never aliased.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_tanhsoftcap(
+pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     prefix: &str,
     rows: u32,
     cols: u32,
@@ -374,9 +426,9 @@ pub fn assemble_tanhsoftcap(
     cap_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp> {
+) -> Vec<EmittedOp<T>> {
     use crate::place::SynthRole as R;
-    let mut ops: Vec<EmittedOp> = Vec::new();
+    let mut ops: Vec<EmittedOp<T>> = Vec::new();
     let out_s = out_id.to_string();
     let out = out_s.as_str();
     let tanhc = crate::placement::syn(layout, out_id.synth(R::Tanhc)); // tanh(x/cap) [rows, cols]

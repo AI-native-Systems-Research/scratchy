@@ -16,12 +16,13 @@
 
 use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit::{EmittedOp, emit_sdsc_tiled};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::ScalingExtent;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
     ReduceDivision, ReduceOffSpec, reduce_opspec_off, reduce_opspec_off_divided, win_reduce_accum,
     win_reduce_data,
 };
 use ktir_superdsc::sdsc_abstract::{BlockCols, RowBlockedTag, RowCount, StickLayout, Stk};
-use ktir_superdsc::superdsc_opspec::{OpFunc, OpSpec, SdscFoldSet};
+use ktir_superdsc::superdsc_opspec::{Df, OpFunc, OpSpec, SdscFoldSet};
 
 const ROWS: u32 = 32;
 const COLS: u32 = 10240;
@@ -53,20 +54,34 @@ fn spec(op: OpFunc, division: ReduceDivision) -> Result<OpSpec, String> {
         DevOff::ZERO,
         rows,
         cols,
+        Df::Fp16,
         "test: the score reduce",
     )?;
-    let accum = win_reduce_accum(None, &accum_stk, DevOff::ZERO, rows, "test: the row max")?;
+    let accum = win_reduce_accum(
+        None,
+        &accum_stk,
+        DevOff::ZERO,
+        rows,
+        Df::Fp16,
+        "test: the row max",
+    )?;
     reduce_opspec_off_divided(ReduceOffSpec {
         op,
         rows: ROWS,
         cols: COLS,
         data,
         accum,
+        df: Df::Fp16,
         division,
+        scaling: ScalingExtent::whole(COLS),
     })
 }
 
-fn emit_divided(op: OpFunc, name: &str, division: ReduceDivision) -> EmittedOp {
+fn emit_divided(
+    op: OpFunc,
+    name: &str,
+    division: ReduceDivision,
+) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let spec = spec(op, division).unwrap_or_else(|e| panic!("{name}: {e}"));
     let folds = SdscFoldSet::new(spec.iter.cores_used());
     let mut sym = 0i64;
@@ -74,11 +89,11 @@ fn emit_divided(op: OpFunc, name: &str, division: ReduceDivision) -> EmittedOp {
         .unwrap_or_else(|e| panic!("{name}: {}", e.0))
 }
 
-fn emit(op: OpFunc, name: &str) -> EmittedOp {
+fn emit(op: OpFunc, name: &str) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     emit_divided(op, name, ReduceDivision::ReducedAxis)
 }
 
-fn json(e: &EmittedOp) -> serde_json::Value {
+fn json(e: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>) -> serde_json::Value {
     serde_json::to_value(&e.op).unwrap()
 }
 
@@ -164,10 +179,20 @@ fn the_row_division_is_unchanged() {
             DevOff::ZERO,
             rows,
             cols,
+            Df::Fp16,
             "test: the plain form",
         )
         .unwrap(),
-        win_reduce_accum(None, &accum_stk, DevOff::ZERO, rows, "test: the plain form").unwrap(),
+        win_reduce_accum(
+            None,
+            &accum_stk,
+            DevOff::ZERO,
+            rows,
+            Df::Fp16,
+            "test: the plain form",
+        )
+        .unwrap(),
+        Df::Fp16,
     )
     .unwrap();
     assert_eq!(spec.iter.splits(), plain.iter.splits());

@@ -109,6 +109,9 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         // Spyre's token draw and chained head (the spyre bake's mints; CUDA never lowers them):
         // each writes its own fresh buffer, metal's row.
         L::Sample { .. } | L::EmbedRowGather { .. } | L::ChainStage { .. } => FRESH,
+        // The collectives (tensor parallelism's; CUDA runs one rank, so the analysis inserts none
+        // here): each writes the whole value into a buffer of its own, metal's row.
+        L::AllReduce | L::AllGather { .. } => FRESH,
         // A DFlash2 drafter's ops (#1015; metal only, CUDA never lowers them): metal's rows. The
         // convolution and attention read across; the capture, the context commit, the window
         // store and load, and the proposals write over their operand 0.

@@ -262,6 +262,9 @@ pub fn convert(m: &ttir::Module) -> Result<Module> {
     for f in &m.funcs {
         out.ops.push(func(m, f)?);
     }
+    // The producer is verified like every pass after it: a ttir use that maps to
+    // a value nothing here defines is a defect of THIS conversion, named as such.
+    crate::passes::verify_defs::verify_module_defs(&out, PASS).map_err(|v| v.refusal())?;
     Ok(out)
 }
 

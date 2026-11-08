@@ -7,9 +7,9 @@
 //! stages the paged step's tables from that table (`scratchy_target_spyre::paged_step`).
 
 #[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::manifest::SengraphBundle;
+use crate::spyre_types::SuperDscSession;
 #[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::sdsc_runner::SuperDscSession;
+use scratchy_target_spyre::manifest::SengraphBundle;
 
 /// EVERY PRINT-ONLY FLAG THIS FILE READS ON A PER-STEP OR PER-LAUNCH PATH, RESOLVED ONCE PER PROCESS.
 ///

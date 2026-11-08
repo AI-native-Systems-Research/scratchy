@@ -319,29 +319,15 @@ fn rule_dim(c: &Carrier<'_>, name: &str, rule: &DerivedRule) -> Result<Dim, Stri
     })
 }
 
-/// An arch.json `expr` param as a dim: sums, products, quotients and literals. A difference or a
-/// root is refused by name: a dim the types cannot hold is never approximated.
+/// An arch.json `expr` param as a dim ([`ParamExpr::dim`]). A difference or a root is refused by
+/// name: a dim the types cannot hold is never approximated.
 fn expr_dim(c: &Carrier<'_>, name: &str, e: &ParamExpr) -> Result<Dim, String> {
-    Ok(match e {
-        ParamExpr::Bound(b) => Dim::Bound(b.clone()),
-        ParamExpr::Lit(n) => Dim::Lit(*n),
-        ParamExpr::Mul(a, b) => canonical_mul(vec![expr_dim(c, name, a)?, expr_dim(c, name, b)?]),
-        ParamExpr::Div(a, b) => Dim::Div(
-            Box::new(expr_dim(c, name, a)?),
-            Box::new(expr_dim(c, name, b)?),
-        ),
-        ParamExpr::FloorDiv(a, b) => Dim::FloorDiv(
-            Box::new(expr_dim(c, name, a)?),
-            Box::new(expr_dim(c, name, b)?),
-        ),
-        ParamExpr::Add(a, b) => canonical_add(vec![expr_dim(c, name, a)?, expr_dim(c, name, b)?]),
-        ParamExpr::Sub(..) | ParamExpr::Sqrt(_) => {
-            return Err(format!(
-                "{}: the arch.json param `{name}` (`{e:?}`) is a dim the types cannot hold \
-                 (a difference or root)",
-                c.file
-            ));
-        }
+    e.dim().ok_or_else(|| {
+        format!(
+            "{}: the arch.json param `{name}` (`{e:?}`) is a dim the types cannot hold \
+             (a difference or root)",
+            c.file
+        )
     })
 }
 

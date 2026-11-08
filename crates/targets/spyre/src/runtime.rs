@@ -13,12 +13,28 @@
 //! - STREAM CREATION IS SERIALIZED — see the ⛔ doc on [`Stream::create`].
 //! - Session-lifetime device handles are leaked ON PURPOSE at their drop sites (`OpProg`/
 //!   `Executor` in [`crate::superdsc_exec`]) — see the ⛔ doc on [`DevAddr`].
-//! - One process-wide `RuntimeContext`, built lazily by [`init_runtime`] / [`Stream::create`] /
-//!   [`DevAddr::alloc`], over the real senlib scheduler.
+//! - No process-wide card: one [`CardRuntime`] per open card, over the real senlib scheduler, and
+//!   every stream and allocation names the `CardRuntime` it acts on.
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+
+// ⭐ THE COLLECTIVE PLAN'S TWO WIRE FACTS ARE THE RUNTIME'S. The bundle crate is a leaf and cannot
+// name flex-rs, so it declares the message cap and the flit itself; this is the one place both
+// crates are in scope, and a disagreement fails the build here rather than cutting a fragment the
+// card refuses or misaligning a window.
+const _: () = {
+    assert!(
+        crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES
+            == flex_rs::scheduler::P2P_RDMA_WINDOW_SIZE
+    );
+    assert!(
+        crate::bundle_code::collective::FLIT_BYTES == flex_rs::control_block_wire::Flits::BYTES
+    );
+};
+
+use crate::bundle_code::collective::{PerRank, Rank, RecvWindow, Sid, WINDOW_SEGMENT};
 
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
@@ -36,149 +52,149 @@ use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, HardwareSubmit, QueueCapacitySource,
-    SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
-    build_compute_cb, create_scheduler,
+    RdmaOperand, RdmaSendParams, SchedulerBackendConfig, SchedulerFactoryError,
+    SenlibHardwareSubmit, SenlibQueueCapacity, build_compute_cb, build_rdma_send_cb,
+    create_scheduler,
 };
 use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
 use flex_rs::stream::{
-    RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, SchedulerError,
-    StreamId,
+    DeviceId, RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority,
+    SchedulerError, StreamId,
 };
 use flex_rs::topology::populate_domain_topology;
 
-type RuntimeInit = Result<Arc<RuntimeContext>, Arc<BringUpError>>;
-
-fn runtime_cell() -> &'static Mutex<Option<RuntimeInit>> {
-    static CELL: OnceLock<Mutex<Option<RuntimeInit>>> = OnceLock::new();
-    CELL.get_or_init(|| Mutex::new(None))
-}
-
-/// Idempotent bring-up: real senlib device init (`flex_shim_init_runtime`)
-/// then a real `RuntimeContext` over a `Pf` backend + a real `FlexAllocator`
-/// whose address resolution is `FlexAllocatorAddressResolver` (production —
-/// see the `flex_rs::scheduler` module doc).
+/// ⭐ ONE OPEN SPYRE CARD AND THE FLEX RUNTIME DRIVING IT. Nothing card-scoped is process-global:
+/// every stream, allocation and capacity query goes through the `CardRuntime` it acts on, and a
+/// process that drives several cards holds several (senlib serves them all in one process —
+/// nickm5 held 8 open and linked at once, 2026-11-06). A one-card process is the same code with
+/// one `CardRuntime`.
 ///
-/// Single on-card domain (`DomainId(0)`), unconditionally: nothing in this codebase has ever
-/// asked the topology which domain is real, and this module does not invent a multi-domain
-/// topology query that has no call site anywhere else.
-fn build_runtime() -> Result<Arc<RuntimeContext>, BringUpError> {
-    let rc = unsafe { flex_rs::senlib_ffi::flex_shim_init_runtime(0) };
-    if rc != 0 {
-        return Err(BringUpError::ShimInit(rc));
+/// Built by [`CardRuntime::open`]: the card by PCI address (`flex_rs::senlib_ffi::Card::open`),
+/// its capacity read from the card, then a real `RuntimeContext` over a `Pf` backend and a real
+/// `FlexAllocator` whose address resolution is `FlexAllocatorAddressResolver` (production — see the
+/// `flex_rs::scheduler` module doc).
+pub struct CardRuntime<T: ktir_superdsc::collective::Tp> {
+    card: Arc<flex_rs::senlib_ffi::Card>,
+    memory: CardMemory,
+    rt: Arc<RuntimeContext>,
+    /// This card's p2p link, when it runs one rank of a sharded world — set once, by
+    /// [`link_peers`]. A card's `XSEG` entries point at one window's slots, so the card holds at
+    /// most one link for its life.
+    link: std::sync::OnceLock<PeerLink<T>>,
+}
+
+impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CardRuntime")
+            .field("pci", &self.card.pci())
+            .field("memory", &self.memory)
+            .finish_non_exhaustive()
     }
-
-    // Real single on-card domain, sized off the card's actual HBM capacity
-    // and RCU core count — `flex::populateDomainTopology`
-    // (`device_memory_topology.cpp`), ported natively as
-    // `topology::populate_domain_topology`. A hardcoded placeholder here once
-    // mis-sized the domain and caused a real `FlexAllocator` OOM during
-    // hardware testing — the capacity must come from the card, not a literal.
-    // SAFETY: `flex_shim_init_runtime` above already succeeded, so the
-    // device handle this reads from is live.
-    let device_memory_size = unsafe { flex_rs::senlib_ffi::flex_senlib_device_memory_size() };
-    let topo = populate_domain_topology(device_memory_size);
-
-    let init = FlexAllocatorInit::default();
-    let dma = DeviceMemoryAllocator::new(flex_rs::allocator::DEVICE_ALIGNMENT);
-    let allocator = Arc::new(Mutex::new(
-        FlexAllocator::new(init, topo, dma).map_err(BringUpError::AllocatorInit)?,
-    ));
-
-    let addr_resolver: Arc<dyn DeviceAddressResolver> =
-        Arc::new(FlexAllocatorAddressResolver::new(allocator.clone()));
-    let hw: Arc<dyn HardwareSubmit> = Arc::new(SenlibHardwareSubmit::new());
-    let capacity: Arc<dyn QueueCapacitySource> = Arc::new(SenlibQueueCapacity);
-    // `PfIommuMapper::new()` derives the page size itself via `sysconf(_SC_PAGESIZE)`,
-    // matching the real C++'s `PfIommuMapper::PfIommuMapper`'s
-    // `page_size_(common::page_size())` (`pf_iommu_mapper.cpp:41-42`).
-    let iommu_mapper = flex_rs::iommu::PfIommuMapper::new();
-    // `DeviceKind::Pf` is hardcoded, not read from `RuntimeConfig::flex_device()`:
-    // `flex_shim_init_runtime` above (the real senlib bring-up call) itself
-    // only ever opens a PF device (`senlib::v2::SenPci::pf()`,
-    // unconditionally, in cxx-shim/senlib_ffi.cpp) — there is no VF/MOCK
-    // bring-up path here yet for a config-selected `DeviceKind` to route to.
-    // `create_scheduler` still earns its keep over the old hardcoded
-    // `Backend::Pf(PfBackend::new(...))`: it's the one call site that
-    // checks `SPYRE_CHIP` against what `RuntimeSchedulerFactory` actually
-    // supports (`1P0`), which nothing here checked before.
-    let scheduler = create_scheduler(
-        &DeviceKind::Pf,
-        SchedulerBackendConfig::Real(hw, capacity, addr_resolver, iommu_mapper),
-    )
-    .map_err(BringUpError::Scheduler)?;
-
-    RuntimeContext::create(None, scheduler, allocator).map_err(BringUpError::Context)
 }
 
-fn get_or_init_runtime() -> Result<Arc<RuntimeContext>, Arc<BringUpError>> {
-    let mut guard = runtime_cell().lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        // The failure is cached on purpose: bring-up costs seconds, so a card that refused once
-        // must not be re-probed by every subsequent `Stream::create` / `DevAddr::alloc`.
-        *guard = Some(build_runtime().map_err(Arc::new));
-    }
-    guard.as_ref().unwrap().clone()
-}
-
-/// Bring the process-wide flex runtime up (idempotent, ~5.7s cold). `Err` carries the
-/// bring-up failure verbatim.
-pub fn init_runtime() -> Result<(), HwError> {
-    get_or_init_runtime().map(|_| ()).map_err(HwError::BringUp)
-}
-
-/// Kick the runtime bring-up on a detached background thread (overlaps host weight load).
-pub fn prewarm_runtime() {
-    std::thread::spawn(|| {
-        if let Err(e) = get_or_init_runtime() {
-            tracing::error!("prewarm failed (prepare will report it): {e}");
+impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
+    /// Open card `index` of the cards senlib enumerates (its PCI address resolved by senlib, then
+    /// opened BY THAT ADDRESS, so the card opened is the card named) and bring its runtime up
+    /// (~5.7 s cold).
+    ///
+    /// Single on-card domain (`DomainId(0)`), unconditionally: nothing in this codebase has ever
+    /// asked the topology which domain is real, and this module does not invent a multi-domain
+    /// topology query that has no call site anywhere else.
+    pub fn open(index: u32) -> Result<Arc<Self>, HwError> {
+        let pci = flex_rs::senlib_ffi::pcie_address_for_card(index);
+        if pci.is_empty() {
+            return Err(HwError::BringUp(Arc::new(BringUpError::NoSuchCard {
+                index,
+                cards: flex_rs::senlib_ffi::sen_pci_card_count(),
+            })));
         }
-    });
-}
+        Self::build(index, &pci).map_err(|e| HwError::BringUp(Arc::new(e)))
+    }
 
-/// Tear the whole RuntimeContext down — the one-shot leak probe. BREAKS every live session.
-///
-/// Also drops this module's cached handle, so the next [`init_runtime`] / [`Stream::create`] /
-/// [`DevAddr::alloc`] rebuilds a fresh runtime rather than failing `NotCreated` against the dead
-/// context for the rest of the process.
-pub fn runtime_reset() -> Result<(), HwError> {
-    RuntimeContext::reset().map_err(HwError::Reset)?;
-    *runtime_cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
-    Ok(())
+    fn build(index: u32, pci: &str) -> Result<Arc<Self>, BringUpError> {
+        let card = flex_rs::senlib_ffi::Card::open(pci).map_err(BringUpError::Open)?;
+        // Real single on-card domain, sized off the card's actual HBM capacity and RCU core count —
+        // `flex::populateDomainTopology` (`device_memory_topology.cpp`), ported natively as
+        // `topology::populate_domain_topology`. A hardcoded placeholder here once mis-sized the
+        // domain and caused a real `FlexAllocator` OOM during hardware testing — the capacity must
+        // come from the card, not a literal.
+        let memory = CardMemory(card.memory_bytes().map_err(BringUpError::Memory)?);
+        let topo = populate_domain_topology(memory.0);
+
+        let init = FlexAllocatorInit::default();
+        let dma = DeviceMemoryAllocator::new(card.clone(), flex_rs::allocator::DEVICE_ALIGNMENT);
+        let allocator = Arc::new(Mutex::new(
+            FlexAllocator::new(init, topo, dma).map_err(BringUpError::AllocatorInit)?,
+        ));
+
+        let addr_resolver: Arc<dyn DeviceAddressResolver> =
+            Arc::new(FlexAllocatorAddressResolver::new(allocator.clone()));
+        let hw: Arc<dyn HardwareSubmit> = Arc::new(SenlibHardwareSubmit::new(card.clone()));
+        let capacity: Arc<dyn QueueCapacitySource> =
+            Arc::new(SenlibQueueCapacity::new(card.clone()));
+        // `PfIommuMapper::new` derives the page size itself via `sysconf(_SC_PAGESIZE)`, matching
+        // the real C++'s `PfIommuMapper::PfIommuMapper`'s `page_size_(common::page_size())`
+        // (`pf_iommu_mapper.cpp:41-42`).
+        let iommu_mapper = flex_rs::iommu::PfIommuMapper::new(card.clone());
+        // `DeviceKind::Pf` is hardcoded, not read from `RuntimeConfig::flex_device()`:
+        // `Card::open` (the real senlib bring-up call) only ever opens a PF device
+        // (`SenPci::pf(addr)`, in cxx-shim/senlib_ffi.cpp) — there is no VF/MOCK bring-up path
+        // here for a config-selected `DeviceKind` to route to. `create_scheduler` still checks
+        // `SPYRE_CHIP` against what `RuntimeSchedulerFactory` actually supports (`1P0`).
+        let scheduler = create_scheduler(
+            &DeviceKind::Pf,
+            SchedulerBackendConfig::Real(hw, capacity, addr_resolver, iommu_mapper),
+        )
+        .map_err(BringUpError::Scheduler)?;
+
+        let rt = RuntimeContext::create(DeviceId(i64::from(index)), scheduler, allocator);
+        Ok(Arc::new(Self {
+            card,
+            memory,
+            rt,
+            link: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// The senlib card this runtime drives.
+    pub fn card(&self) -> &Arc<flex_rs::senlib_ffi::Card> {
+        &self.card
+    }
+
+    /// This card's key in the RB telemetry ring (`flex_rs::rb_telemetry::RbTiming::source`) —
+    /// the same identity its hardware submitter records completions under.
+    pub fn telemetry_key(&self) -> usize {
+        Arc::as_ptr(&self.card) as usize
+    }
+
+    /// This card's p2p link, when it runs one rank of a sharded world ([`link_peers`]).
+    pub fn link(&self) -> Option<&PeerLink<T>> {
+        self.link.get()
+    }
+
+    /// The flex `RuntimeContext` driving this card — for flex-level probes that drive the runtime's
+    /// own types directly (`examples/shared_host_pool_probe.rs`).
+    pub fn context(&self) -> &Arc<RuntimeContext> {
+        &self.rt
+    }
+
+    /// THE CARD'S REAL MEMORY CAPACITY, read from the card at [`Self::open`] — the one
+    /// [`CardMemory`] constructor. A card that cannot report its capacity does not open, so a
+    /// caller holding a `CardRuntime` never has a capacity to guess.
+    pub fn memory(&self) -> CardMemory {
+        self.memory
+    }
+
+    /// Tear this card's RuntimeContext down — the one-shot leak probe. BREAKS every live session
+    /// on this card: their streams and allocations answer `NotCreated` from here on.
+    pub fn reset(&self) -> Result<(), HwError> {
+        self.rt.reset().map_err(HwError::Reset)
+    }
 }
 
 /// `flex::PROG_OFFSET_BASE` — the device VA base every `job_bin_ptr` is rebased by at launch.
 pub fn prog_offset_base() -> u64 {
     flex_rs::compute::PROG_OFFSET_BASE.0
-}
-
-/// THE OPEN CARD'S REAL MEMORY CAPACITY IN BYTES, or `None` if the device cannot be brought up.
-///
-/// The same `flex_senlib_device_memory_size()` ([`DeviceHandle::GetDmpaSize`]) that
-/// [`build_runtime`] sizes the allocator's single domain from — exposed so callers that must size a
-/// device-resident allocation (the superdsc paged KV pool) can ask the CARD instead of guessing.
-///
-/// 🛑 GUESSING IS THE BUG THIS EXISTS TO KILL, AND IT HAS ALREADY BEEN PAID FOR ONCE. `build_runtime`
-/// used a 32 GiB placeholder and a real `FlexAllocator` OOM on hardware is what found it. The KV pool
-/// then repeated the mistake one layer up with an 8 GiB constant of its own, which is why a bare
-/// `scr serve` refused to start over arithmetic that never involved the card.
-///
-/// `None` rather than a plausible default ON PURPOSE: a caller that cannot learn the real capacity
-/// must say so, not substitute a number that will size an allocation the card may not be able to
-/// serve. Bring-up is idempotent (`flex_shim_init_runtime` is `std::call_once` on the C++ side), so
-/// this is safe to call before or after any other runtime use.
-pub fn device_memory_bytes() -> Option<CardMemory> {
-    // Reuse the ONE bring-up path: `build_runtime` is what the rest of this module goes through, and
-    // its `flex_shim_init_runtime` is the documented prerequisite for the capacity call. Going
-    // through it (rather than calling `flex_shim_init_runtime` directly) also means a capacity query
-    // can never be the thing that races a half-built runtime into existence.
-    get_or_init_runtime().ok()?;
-    // SAFETY: `get_or_init_runtime` succeeded above, so `flex_shim_init_runtime` returned 0 and the
-    // cached `flex::DeviceHandle` this reads from is live — exactly the precondition the extern
-    // declaration documents.
-    let bytes = unsafe { flex_rs::senlib_ffi::flex_senlib_device_memory_size() };
-    // The FFI returns 0 (and logs) when the handle is not live. Zero is not a capacity, and a
-    // caller must not divide a pool out of it.
-    (bytes > 0).then_some(CardMemory(bytes))
 }
 
 /// ⛔⛔⛔ THE CARD'S OWN MEMORY CAPACITY — AND THE ONLY THING A KV BUDGET MAY BE DERIVED FROM.
@@ -197,7 +213,7 @@ pub fn device_memory_bytes() -> Option<CardMemory> {
 /// `flex_senlib_device_memory_size()` and a `u64` written `8 * 1024 * 1024 * 1024` are the same
 /// type. So they are not the same type any more.
 ///
-/// The private field is the whole guard: [`device_memory_bytes`] is the ONLY constructor in the
+/// The private field is the whole guard: [`CardRuntime::open`] is the ONLY constructor in the
 /// crate, and it can only answer from `DeviceHandle::GetDmpaSize()`. A future literal cannot be
 /// spent where a `CardMemory` is demanded — `8 * 1024 * 1024 * 1024` does not typecheck as one — so
 /// re-introducing a hardcoded KV budget is a BUILD ERROR, not a silently mis-sized pool. That is the
@@ -232,7 +248,7 @@ impl CardMemory {
     /// the two quantities an allocation actually has to fit.
     ///
     /// Deliberately not `From<u64>`/`new`: the value leaves this type freely, but nothing outside
-    /// `device_memory_bytes` can put one IN.
+    /// [`CardRuntime::open`] can put one IN.
     pub const fn bytes(self) -> u64 {
         self.0
     }
@@ -295,8 +311,7 @@ pub enum HwError {
     OverrunsRegion { len: u64, region: u64 },
     /// The stream no longer exists in its runtime: destroyed, or the `RuntimeContext` was reset.
     StreamGone,
-    /// Constructing the process-wide runtime failed. The failure is cached, so every later
-    /// caller reports the same bring-up refusal.
+    /// Opening a card's runtime failed.
     BringUp(Arc<BringUpError>),
     /// `RuntimeContext::create_stream` refused the new stream.
     StreamCreate(RuntimeContextError),
@@ -305,7 +320,7 @@ pub enum HwError {
     /// `RuntimeContext::reset` refused.
     Reset(RuntimeContextError),
     /// Rendering compute-CB wire images OFF the submit path refused — the CB
-    /// encoder cannot express an operand ([`Stream::render_compute_batch`]).
+    /// encoder cannot express an operand ([`Stream::render_batch`]).
     /// Never a submission: nothing was sent to the device.
     CbRender(SchedulerError),
     /// A #606 pooled copy ([`Stream::pooled_copy_on_compute`]) was refused by the
@@ -339,26 +354,31 @@ impl fmt::Display for HwError {
 }
 impl std::error::Error for HwError {}
 
-/// Why the process-wide runtime could not be constructed — the refusing layer's own error.
+/// Why a card's runtime could not be constructed — the refusing layer's own error.
 #[derive(Debug)]
 pub enum BringUpError {
-    /// `flex_shim_init_runtime` — the senlib device init — returned a nonzero rc.
-    ShimInit(i32),
+    /// senlib enumerates no card at `index`.
+    NoSuchCard { index: u32, cards: i64 },
+    /// `Card::open` refused: senlib could not open the card, or opened a different one.
+    Open(String),
+    /// The open card could not report its memory capacity.
+    Memory(String),
     /// `FlexAllocator::new` refused the domain topology.
     AllocatorInit(FlexAllocatorError),
     /// `create_scheduler` refused the device kind / chip.
     Scheduler(SchedulerFactoryError),
-    /// `RuntimeContext::create` refused.
-    Context(RuntimeContextError),
 }
 
 impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ShimInit(rc) => write!(f, "flex_shim_init_runtime failed: rc={rc}"),
+            Self::NoSuchCard { index, cards } => {
+                write!(f, "no Spyre card {index}: senlib enumerates {cards}")
+            }
+            Self::Open(e) => write!(f, "card open: {e}"),
+            Self::Memory(e) => write!(f, "card memory capacity: {e}"),
             Self::AllocatorInit(e) => write!(f, "{e}"),
             Self::Scheduler(e) => write!(f, "{e}"),
-            Self::Context(e) => write!(f, "{e}"),
         }
     }
 }
@@ -512,8 +532,7 @@ pub struct Stream {
 
 /// ⛔⛔⛔ STREAM CREATION IS SERIALIZED, AND IT IS NOT A PERFORMANCE HEDGE.
 ///
-/// `Stream::create` lazily initialises the process-wide flex runtime ([`init_runtime`]) and then
-/// calls `RuntimeContext::create_stream`. The prefill ladder builds its rungs IN PARALLEL —
+/// `Stream::create` calls `RuntimeContext::create_stream`. The prefill ladder builds its rungs IN PARALLEL —
 /// measured on granite-3.1-8b: `prefill ladder: 20 rung(s) ready in 6.19s wall — built in parallel`
 /// — so twenty-odd threads enter that function at once on every load.
 ///
@@ -522,8 +541,7 @@ pub struct Stream {
 /// `Executor::prepare` ← `SuperDscSession::new_inner`), so nothing can be caught or retried, and
 /// the process dies before serving a single token, taking a `scr batch` run's output file with it.
 ///
-/// A concurrent lazy-init plus a runtime call with no documented thread-safety is the shape of that
-/// abort, so the calls are taken one at a time. The cost is bounded and small — 20 creations against
+/// A concurrent runtime call with no documented thread-safety is the shape of that abort, so the calls are taken one at a time. The cost is bounded and small — 20 creations against
 /// a 6.19 s parallel build — and correctness here is not tradeable: an aborted load is a lost run.
 static STREAM_CREATE: Mutex<()> = Mutex::new(());
 
@@ -533,8 +551,11 @@ impl Stream {
     /// are user-owned and order through their own submissions; the hazard tracker's conservative
     /// Compute address sets would cross-edge concurrent sessions sharing resident weights into
     /// full serialization. Delegates to [`Self::create_with`].
-    pub fn create() -> Result<Stream, HwError> {
+    pub fn create<T: ktir_superdsc::collective::Tp>(
+        card: &CardRuntime<T>,
+    ) -> Result<Stream, HwError> {
         Self::create_with(
+            card,
             RuntimeStreamPriority::Normal,
             RuntimeStreamMode::StrictOrdering,
             false,
@@ -549,7 +570,8 @@ impl Stream {
     /// direction). This is the shape for concurrent pipelines over shared device memory —
     /// `OP_ORDERING` streams whose cross-stream ordering the tracker carries instead of a
     /// host-side lock; see `examples/hazard_concurrency.rs`, the #546 concurrency leg.
-    pub fn create_with(
+    pub fn create_with<T: ktir_superdsc::collective::Tp>(
+        card: &CardRuntime<T>,
         priority: RuntimeStreamPriority,
         mode: RuntimeStreamMode,
         track_hazards: bool,
@@ -557,7 +579,7 @@ impl Stream {
         // A poisoned lock still serializes (nothing is protected but the CALL), so recover rather than
         // panic: a panic here would turn one thread's failure into the whole load's.
         let _serialize = STREAM_CREATE.lock().unwrap_or_else(|e| e.into_inner());
-        let rt = get_or_init_runtime().map_err(HwError::BringUp)?;
+        let rt = card.rt.clone();
         let id = rt
             .create_stream(priority, mode, track_hazards)
             .map_err(HwError::StreamCreate)?;
@@ -928,32 +950,22 @@ impl Stream {
     /// JobPlanStepCompute (the resident binary runs by its bootstrap address; dxp does not
     /// apply `tensor_byte_offsets` to per-op addresses). Widening this to a general batch
     /// door means growing [`BatchedCompute`], not a new method.
-    pub fn compute_batch(
+    fn compute_batch<'l>(
         &self,
-        launches: &[BatchedCompute],
+        launches: impl Iterator<Item = &'l BatchedCompute>,
         pipeline_barrier: bool,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
-        let params: Vec<ComputeParams> = launches
-            .iter()
-            .map(|l| {
-                ComputeParams::new(
-                    l.prog.0.clone(),
-                    l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
-                    KernelName(String::new()),
-                    BootstrapOffset(l.bootstrap_offset),
-                    Vec::new(),
-                )
-            })
-            .collect();
+        let params: Vec<ComputeParams> = launches.map(BatchedCompute::params).collect();
         stream
             .launch_compute_batch(params, pipeline_barrier, None)
             .map_err(HwError::Stream)
     }
 
-    /// Render the wire bytes of a compute batch WITHOUT submitting it (#603
+    /// Render the wire bytes of a staged batch WITHOUT submitting it (#603
     /// PR2's image-render door): the same `flex_rs::scheduler::build_compute_cb`
-    /// the submit path runs per CB, over the same resolver TYPE the Pf backend
+    /// the submit path runs per compute CB, and `build_rdma_send_cb` for a
+    /// collective's send, over the same resolver TYPE the Pf backend
     /// resolves with (`FlexAllocatorAddressResolver` on the runtime's own
     /// allocator — the very `Arc` `build_runtime` handed the backend, so the
     /// region map both read is one map), at CALLER-chosen tags. Tags only
@@ -966,9 +978,9 @@ impl Stream {
     /// (`superdsc_exec::Executor::prepare`) renders one step's batch both the
     /// walk way and the CbPlan way THROUGH THIS ONE DOOR, so what it compares
     /// is exactly what the device would be handed.
-    pub fn render_compute_batch(
+    pub fn render_batch(
         &self,
-        launches: &[BatchedCompute],
+        items: &[BatchedCb],
         first_tag: u32,
     ) -> Result<Vec<ControlBlockWire>, HwError> {
         let resolver = FlexAllocatorAddressResolver::new(
@@ -976,29 +988,69 @@ impl Stream {
                 .get_allocator()
                 .map_err(|e| HwError::Alloc(AllocError::Context(e)))?,
         );
-        let mut cbs = Vec::with_capacity(launches.len());
-        for (i, l) in launches.iter().enumerate() {
-            let params = ComputeParams::new(
-                l.prog.0.clone(),
-                l.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
-                KernelName(String::new()),
-                BootstrapOffset(l.bootstrap_offset),
-                Vec::new(),
-            );
-            cbs.push(
-                build_compute_cb(&resolver, &params, ResponseTag(first_tag + i as u32))
+        let compute = |l: &BatchedCompute, tag: ResponseTag| {
+            build_compute_cb(&resolver, &l.params(), tag).map_err(HwError::CbRender)
+        };
+        let mut cbs = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let tag = ResponseTag(first_tag + i as u32);
+            cbs.push(match item {
+                BatchedCb::Compute(l) => compute(l, tag)?,
+                BatchedCb::Consume(l) => compute(l, tag)?.with_ctrl_barrier(),
+                // ⭐ THE SEND WAITS FOR ITS PRODUCER: the barrier keeps the DMA engine from
+                // reading the operand before the compute that writes it has retired.
+                BatchedCb::Send(s) => build_rdma_send_cb(&resolver, &s.params(), tag, s.barrier)
                     .map_err(HwError::CbRender)?,
-            );
+                // The wait is the scheduler submit's own CB (`submit_p2p_rdma_wait`): the Rdma10
+                // wdone-barrier words, sync set, on an empty segment table.
+                BatchedCb::Wait { sids } => ControlBlockWire::p2p_rdma_wait(
+                    tag,
+                    flex_rs::hal_sbf::rdma10_wdone_wait(
+                        &sids.iter().map(|&s| u64::from(s)).collect::<Vec<_>>(),
+                        true,
+                    )
+                    .map_err(|e| HwError::CbRender(format!("rdma10_wdone_wait: {e}").into()))?,
+                ),
+            });
         }
         Ok(cbs)
     }
 
+    /// Submit a staged batch as ONE doorbell. A batch of plain compute launches takes
+    /// `Self::compute_batch`, the door it always took; a batch that carries a collective's
+    /// control blocks is rendered through [`Self::render_batch`] and submitted as wires
+    /// ([`Self::compute_wires`]) with the leased tags stamped on, so the sends, waits and consumes
+    /// ride the same FIFO as the compute that produces and consumes their bytes.
+    pub fn submit_batch(&self, items: &[BatchedCb], pipeline_barrier: bool) -> Result<(), HwError> {
+        if items.iter().all(|i| matches!(i, BatchedCb::Compute(_))) {
+            return self.compute_batch(
+                items.iter().filter_map(|i| match i {
+                    BatchedCb::Compute(l) => Some(l),
+                    _ => None,
+                }),
+                pipeline_barrier,
+            );
+        }
+        let canvas = Arc::new(self.render_batch(items, 0)?);
+        self.compute_wires(
+            ComputeWireBatch {
+                canvas,
+                patch: Box::new(|tags, cbs| {
+                    for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
+                        cb.set_tag(*tag);
+                    }
+                }),
+            },
+            pipeline_barrier,
+        )
+    }
+
     /// #603 PR2's replay submit door — the write side of
-    /// [`Self::render_compute_batch`]'s images: submit a canvas the render
+    /// [`Self::render_batch`]'s images: submit a canvas the render
     /// door produced (and the prepare gates proved) as ONE doorbell, with
     /// the batch's stamp closure applying the step's patches and the
     /// pool-leased tags to the copy the backend takes under the submission
-    /// lock. Same one-operation shape as [`Self::compute_batch`] — one
+    /// lock. Same one-operation shape as `Self::compute_batch` — one
     /// barrier decision (`pipeline_barrier` is the OR of the step's per-op
     /// host fences), one fence, one capacity gate, in-flight accounting per
     /// CB — so the step is ordered on the ring exactly as its per-rung
@@ -1036,7 +1088,7 @@ pub use flex_rs::address::{ByteOffset, ByteSize};
 pub use flex_rs::compute::ComputeWireBatch;
 pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 
-/// One entry of a [`Stream::compute_batch`] list — the owned handles one compute launch
+/// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that
 /// builds it; see `compute_batch`'s ⛔ note. Field semantics match [`Stream::compute`]'s
 /// parameters of the same names.
@@ -1047,6 +1099,79 @@ pub struct BatchedCompute {
     pub tensor_allocs: Vec<DevAddr>,
     /// Offset within the program allocation where kernel execution begins.
     pub bootstrap_offset: u64,
+}
+
+impl BatchedCompute {
+    /// The launch's parameters — `kernel_name=""` and no tensor byte offsets, the one shape every
+    /// batched launch takes (see `Stream::compute_batch`).
+    fn params(&self) -> ComputeParams {
+        ComputeParams::new(
+            self.prog.0.clone(),
+            self.tensor_allocs.iter().map(|a| a.0.clone()).collect(),
+            KernelName(String::new()),
+            BootstrapOffset(self.bootstrap_offset),
+            Vec::new(),
+        )
+    }
+}
+
+/// One control block of a staged batch ([`Stream::submit_batch`], [`Stream::render_batch`]).
+pub enum BatchedCb {
+    /// A compute launch.
+    Compute(BatchedCompute),
+    /// A collective's consume: the compute launch with its CTRL barrier bit set, so it cannot start
+    /// before the write-done wait in front of it retires (#1007 §3).
+    Consume(BatchedCompute),
+    /// A collective's F-send into the peer's receive window.
+    Send(RdmaSend),
+    /// Wait for one message from each of several peers to land: one write-done count on each sid
+    /// the PEERS signal for that message's landing slot — the wdone barrier's own sid set.
+    Wait { sids: Vec<u8> },
+}
+
+/// One end of a send, addressed as the launch it is aimed from addresses it: the allocation backing
+/// program segment `segment` for that launch, and the byte offset inside it.
+pub struct RdmaEnd {
+    pub base: DevAddr,
+    pub segment: u8,
+    pub offset: u64,
+}
+
+/// ONE MESSAGE of a collective's F-send, its endpoints still allocations (rendered by
+/// `flex_rs::scheduler::build_rdma_send_cb`).
+pub struct RdmaSend {
+    /// The SENDING rank's write-done sid.
+    pub sid: u8,
+    /// The peer's BAT index.
+    pub dest_tid: u8,
+    pub bytes: crate::bundle_code::collective::WireBytes,
+    pub source: RdmaEnd,
+    pub window: RdmaEnd,
+    /// This message's place in its send's run.
+    pub place: flex_rs::scheduler::RunPlace,
+    /// Whether this send waits for everything ahead of it to retire (the CTRL barrier). The FIRST
+    /// send of a collective takes it — its operand is the compute just before it — and every later
+    /// send of the same collective reads that same operand, already waited for, so it rides the
+    /// FIFO behind the first without a barrier of its own.
+    pub barrier: bool,
+}
+
+impl RdmaSend {
+    fn params(&self) -> RdmaSendParams {
+        let end = |e: &RdmaEnd| RdmaOperand {
+            base: e.base.0.clone(),
+            segment: e.segment,
+            offset: e.offset,
+        };
+        RdmaSendParams {
+            sid: self.sid,
+            dest_tid: self.dest_tid,
+            length: flex_rs::control_block_wire::TransferSize(self.bytes.get()),
+            source: end(&self.source),
+            window: end(&self.window),
+            place: self.place,
+        }
+    }
 }
 
 /// One chunk's identity — what a shifted or sliced sub-address is built from. The fields are
@@ -1074,7 +1199,7 @@ pub struct Chunk0 {
 ///
 /// `Clone` is a descriptor refcount bump and nothing more: the field is an `Arc`, the
 /// underlying device memory is never freed (see above), so two handles describe the same
-/// allocation exactly as one handle and a borrow do. The batch door ([`Stream::compute_batch`])
+/// allocation exactly as one handle and a borrow do. The batch door ([`Stream::submit_batch`])
 /// needs it — a batch item outlives the loop that built its shifted bases, so it must own its
 /// handles instead of borrowing them.
 #[derive(Clone)]
@@ -1083,8 +1208,12 @@ pub struct DevAddr(Arc<CompositeAddress>);
 impl DevAddr {
     /// Allocate `nbytes` of device memory of the given [`MemoryType`]. The region is never freed
     /// (see the struct doc); this handle describes it.
-    pub fn alloc(nbytes: ByteSize, kind: MemoryType) -> Result<DevAddr, HwError> {
-        let rt = get_or_init_runtime().map_err(HwError::BringUp)?;
+    pub fn alloc<T: ktir_superdsc::collective::Tp>(
+        card: &CardRuntime<T>,
+        nbytes: ByteSize,
+        kind: MemoryType,
+    ) -> Result<DevAddr, HwError> {
+        let rt = &card.rt;
         let directive = AllocationDirective::new(
             flex_rs::domain::PlacementPolicy::Bind,
             vec![DomainId(0)],
@@ -1177,6 +1306,269 @@ impl DevAddr {
             size: len,
             domain: c0.domain,
         }))
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  The p2p link — tensor parallelism's one load-time fact
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Why a sharded world's cards could not be linked. Each is a load refusal: a topology without
+/// device p2p RDMA is refused, never served over the host.
+#[derive(Debug)]
+pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
+    /// Two ranks were handed the same card.
+    SameCard { card: String },
+    /// A card is already linked, as another rank or for another window.
+    AlreadyLinked {
+        card: String,
+        linked: (Rank<T>, RecvWindow<T>),
+        asked: (Rank<T>, RecvWindow<T>),
+    },
+    /// A peer card's region-2 bus address could not be read.
+    PeerRegion(String),
+    /// A base-address-table entry could not be installed.
+    Bat { tid: u8, why: String },
+    /// A landing slot's xseg word did not compose, or its `XSEG` entry could not be programmed.
+    Xseg(String),
+}
+
+impl<T: ktir_superdsc::collective::Tp> fmt::Display for AttachRefusal<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SameCard { card } => write!(
+                f,
+                "two ranks were handed the same card ({card}) — a rank cannot send to itself"
+            ),
+            Self::AlreadyLinked {
+                card,
+                linked,
+                asked,
+            } => write!(
+                f,
+                "the card at {card} is linked as {linked:?} and cannot link again as {asked:?} — one \
+                 card's XSEG entries point at one window's slots, so every bundle it runs shares \
+                 one window"
+            ),
+            Self::PeerRegion(e) => write!(f, "a peer card's region 2 could not be read: {e}"),
+            Self::Bat { tid, why } => write!(f, "base-address-table entry {tid}: {why}"),
+            Self::Xseg(e) => write!(f, "programming a landing slot's XSEG entry failed: {e}"),
+        }
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> std::error::Error for AttachRefusal<T> {}
+
+/// ⭐ ONE CARD'S P2P LINK — tensor parallelism's one load-time fact per card: which rank the card
+/// runs as and where its peer's sends land. Minted only by [`link_peers`], which installs every
+/// peer card's region-2 address in this card's base-address table (device p2p RDMA — never host
+/// DMA) and points this card's `XSEG` entry for each of the peer's landing slots at that slot of
+/// the receive window. A session on a linked card has done both, so its sends have somewhere to
+/// land and its waits have something to count.
+///
+/// ONE PER CARD, held by its [`CardRuntime`]: the card's `XSEG` entries point at one window's slots,
+/// so every bundle the card runs (decode, prefill, every rung) lands its peer's sends in the one
+/// window the link programmed — [`crate::superdsc_exec::Executor::load`] refuses a bundle whose
+/// window is elsewhere.
+#[derive(Debug)]
+pub struct PeerLink<T: ktir_superdsc::collective::Tp> {
+    me: Rank<T>,
+    window: RecvWindow<T>,
+    /// The window's first byte as the ALLOCATOR placed it on this card — set once, by
+    /// [`point_landing_slots`], when the owning session's weight segment exists.
+    landing: std::sync::OnceLock<u64>,
+}
+
+impl<T: ktir_superdsc::collective::Tp> PeerLink<T> {
+    /// The rank this card runs as.
+    pub fn identity(&self) -> Rank<T> {
+        self.me
+    }
+
+    /// Where every peer's sends land on this card.
+    pub fn window(&self) -> RecvWindow<T> {
+        self.window
+    }
+
+    /// The window's first byte as the allocator placed it — `None` until [`point_landing_slots`].
+    pub fn landing(&self) -> Option<u64> {
+        self.landing.get().copied()
+    }
+}
+
+/// Link a sharded world's cards — `cards.get(r)` runs rank `r` of world `T` — for sends landing
+/// in `window` on every card. One process, every card: each card's base-address table gets every
+/// peer's region-2 address (entry `tid = peer rank`), and for every peer `s` its `XSEG` entry for
+/// each of `s`'s landing slots (`Sid::of(s, slot)`) points at that slot of `s`'s block of its own
+/// window. Linking a card again as the same rank for the same window keeps the link it has.
+///
+/// # Errors
+/// [`AttachRefusal`], by name.
+pub fn link_peers<T: ktir_superdsc::collective::Tp>(
+    cards: &PerRank<T, Arc<CardRuntime<T>>>,
+    window: RecvWindow<T>,
+) -> Result<(), AttachRefusal<T>> {
+    for (r, a) in cards.iter() {
+        if cards
+            .iter()
+            .any(|(p, b)| p.get() < r.get() && b.card.pci() == a.card.pci())
+        {
+            return Err(AttachRefusal::SameCard {
+                card: a.card.pci().to_string(),
+            });
+        }
+    }
+    let region2: PerRank<T, u64> = PerRank::try_from_fn(|r| {
+        flex_rs::senlib_ffi::pci_addr_for_region(cards.get(r).card.pci(), 2)
+    })
+    .map_err(AttachRefusal::PeerRegion)?;
+    for (me, c) in cards.iter() {
+        if let Some(link) = c.link.get() {
+            if (link.me, link.window) == (me, window) {
+                continue;
+            }
+            return Err(AttachRefusal::AlreadyLinked {
+                card: c.card.pci().to_string(),
+                linked: (link.me, link.window),
+                asked: (me, window),
+            });
+        }
+        // ⭐ THE SYMMETRIC BAT, AS THE tp37 CELL INSTALLS IT (#1008): entry `tid` — a peer's rank,
+        // the destination every send names (`cb_plan::base_addr_entry`) — holds that peer card's
+        // region-2 PCI address, from senlib's own region-address door (the vendor's
+        // `initialize_p2p_address_table` value source), for the card the address names, never an
+        // enumeration order.
+        for peer in me.peers() {
+            let addr = *region2.get(peer);
+            let tid = crate::cb_plan::base_addr_entry(peer);
+            c.card
+                .set_base_addr_table(tid, addr)
+                .map_err(|why| AttachRefusal::Bat { tid, why })?;
+        }
+        // Set only here, after the card is fully programmed; `get` above saw none.
+        let _ = c.link.set(PeerLink {
+            me,
+            window,
+            landing: std::sync::OnceLock::new(),
+        });
+    }
+    Ok(())
+}
+
+/// ⭐ POINT EVERY PEER'S LANDING SLOTS AT THIS CARD'S WINDOW — one `XSEG` entry per (peer, slot),
+/// each programmed once: an F-send lands where its sid's entry points and nowhere else (#1009, E8a),
+/// so peer `from`'s message into slot `s` signals `Sid::of(from, s)` and that entry names the slot —
+/// `hal_sbf::rdma_xseg` of the slot's flat VA plus the one-flit L4 compensation, the VA from
+/// [`flex_rs::scheduler::landing_va_bytes`], the same compose the send's own word takes.
+///
+/// ⛔ THE VA IS THE ALLOCATOR'S, SO THIS RUNS ONCE THE WINDOW IS ALLOCATED. The window is a placement
+/// in the weight segment, and where that segment's bytes ARE — the region's segment and the
+/// allocation's offset inside it — exists only once the session that OWNS it has allocated it
+/// (`window_region`; every other session aliases it). MEASURED, #1009 run 5 and again here on
+/// 2026-11-06: entries pointed at `(program seg 1, layout offset)` name an address the allocator gave
+/// to something else, and every collective runs clean over a window the peers' bytes never reach.
+///
+/// Every rank's window must land at ONE address: each send names its own window's address for its
+/// peers' ([`flex_rs::scheduler::build_rdma_send_cb`]). The cards of one process allocate one
+/// sequence, so they do; [`refuse_if_windows_apart`] checks it once every rank is pointed.
+///
+/// # Errors
+/// [`AttachRefusal`]: an unlinked card, a slot past the allocation, a second pointing at another
+/// address, or a word that will not compose or program.
+pub fn point_landing_slots<T: ktir_superdsc::collective::Tp>(
+    card: &CardRuntime<T>,
+    window_region: &DevAddr,
+) -> Result<(), AttachRefusal<T>> {
+    let Some(link) = card.link.get() else {
+        return Err(AttachRefusal::Xseg(
+            "point_landing_slots: the card is not linked".to_string(),
+        ));
+    };
+    let resolver = FlexAllocatorAddressResolver::new(
+        card.rt
+            .get_allocator()
+            .map_err(|e| AttachRefusal::Xseg(format!("allocator: {e:?}")))?,
+    );
+    let at = |offset: u64, len: u64| {
+        flex_rs::scheduler::landing_va_bytes(
+            &resolver,
+            &RdmaOperand {
+                base: window_region.0.clone(),
+                segment: WINDOW_SEGMENT as u8,
+                offset,
+            },
+            len,
+        )
+        .map_err(|e| AttachRefusal::Xseg(e.to_string()))
+    };
+    let window = link.window;
+    let landing = at(window.offset(), window.size())?;
+    if link.landing.get().is_some_and(|l| *l != landing) {
+        return Err(AttachRefusal::Xseg(format!(
+            "the window is pointed at 0x{landing:x}, but this card already pointed it at {:x?}",
+            link.landing.get()
+        )));
+    }
+    if link.landing.get().is_some() {
+        return Ok(());
+    }
+    let cap = crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES;
+    for (from, (slot, off)) in link
+        .me
+        .peers()
+        .flat_map(|from| window.slots_from(from).map(move |sa| (from, sa)))
+    {
+        // The slot's own extent: one message, or the block's remainder for its last.
+        let len = (window.block().get() - u64::from(slot.message()) * cap).min(cap);
+        let va = at(off, len)?;
+        let word = flex_rs::hal_sbf::rdma_xseg(va + flex_rs::control_block_wire::Flits::BYTES)
+            .map_err(AttachRefusal::Xseg)?;
+        card.card
+            .write_xseg(Sid::of(from, slot).get(), word)
+            .map_err(AttachRefusal::Xseg)?;
+    }
+    let _ = link.landing.set(landing);
+    tracing::info!(
+        "[spyre-tp] rank {}: landing slots pointed at the receive window, landing 0x{landing:x}",
+        link.me.get()
+    );
+    Ok(())
+}
+
+/// The ranks of a world placed their receive windows at different device addresses: a send names
+/// its own window's address for its peers', so this world would send where its peers do not land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsApart {
+    pub landings: Vec<Option<u64>>,
+}
+
+impl fmt::Display for WindowsApart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the ranks' receive windows land at {:x?} — every rank of a world must place its window \
+             at one address, which each send names for its peers'",
+            self.landings
+        )
+    }
+}
+
+impl std::error::Error for WindowsApart {}
+
+/// ⭐ EVERY RANK'S WINDOW AT ONE ADDRESS — checked once every card is pointed, before a step.
+///
+/// # Errors
+/// [`WindowsApart`], naming every rank's landing.
+pub fn refuse_if_windows_apart<T: ktir_superdsc::collective::Tp>(
+    cards: &PerRank<T, Arc<CardRuntime<T>>>,
+) -> Result<u64, WindowsApart> {
+    let landings: Vec<Option<u64>> = cards
+        .values()
+        .map(|c| c.link().and_then(PeerLink::landing))
+        .collect();
+    match landings.first().copied().flatten() {
+        Some(l) if landings.iter().all(|x| *x == Some(l)) => Ok(l),
+        _ => Err(WindowsApart { landings }),
     }
 }
 

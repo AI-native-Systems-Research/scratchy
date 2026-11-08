@@ -49,6 +49,11 @@ pub struct RbTiming {
     /// pipeline. On the async pipelines the field is direction spelled out; the direction and
     /// the pipeline agree there by construction (`submit_dma` derives one from the other).
     pub dma: Option<DmaDirection>,
+    /// Which hardware completed it — [`crate::scheduler::HardwareSubmit::telemetry_key`] of the
+    /// response worker's own submitter, one per card. One process drives several cards (a
+    /// tensor-parallel world), and a card's session drains ITS card's records alone
+    /// ([`drain_source`]); `0` for a submitter with no card (tests).
+    pub source: usize,
     /// The decoded response block itself — the vendor's `PendingRequest` carried the RB too, and
     /// this way the card-measured phase accessors
     /// ([`ResponseBlockWire::exec_cmpt_cycles`] and siblings) have exactly one definition. This
@@ -110,6 +115,16 @@ pub fn drain() -> Vec<RbTiming> {
     ring().lock().unwrap_or_else(|e| e.into_inner()).drain()
 }
 
+/// Take the recorded timings of ONE hardware source ([`RbTiming::source`]), leaving every other
+/// source's in the ring — a card's session drains its own card's CBs and never a peer's.
+pub fn drain_source(source: usize) -> Vec<RbTiming> {
+    let mut r = ring().lock().unwrap_or_else(|e| e.into_inner());
+    let (mine, rest): (VecDeque<RbTiming>, VecDeque<RbTiming>) =
+        r.deque.drain(..).partition(|e| e.source == source);
+    r.deque = rest;
+    mine.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,12 +145,14 @@ mod tests {
     fn record_then_drain_returns_entries_and_empties() {
         let mut ring = RbRing::with_cap(8);
         ring.record(RbTiming {
+            source: 0,
             id: 1,
             pipeline: PipelineId::Compute,
             dma: None,
             rb: rb_with([1, 2, 3, 4, 5], 6),
         });
         ring.record(RbTiming {
+            source: 0,
             id: 2,
             pipeline: PipelineId::AsyncDmaI,
             dma: Some(DmaDirection::HostToDevice),
@@ -146,12 +163,14 @@ mod tests {
             drained,
             vec![
                 RbTiming {
+                    source: 0,
                     id: 1,
                     pipeline: PipelineId::Compute,
                     dma: None,
                     rb: rb_with([1, 2, 3, 4, 5], 6),
                 },
                 RbTiming {
+                    source: 0,
                     id: 2,
                     pipeline: PipelineId::AsyncDmaI,
                     dma: Some(DmaDirection::HostToDevice),
@@ -167,6 +186,7 @@ mod tests {
         let mut ring = RbRing::with_cap(16);
         for i in 0..24u64 {
             ring.record(RbTiming {
+                source: 0,
                 id: i,
                 pipeline: PipelineId::Compute,
                 dma: None,

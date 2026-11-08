@@ -583,7 +583,12 @@ fn paged_program(frame: Frame, entries: u64, slab: u64, pages: u64) -> KtirNode 
 /// Read the walk's chosen arm off its OWN emission — the gather ops' names and iteration spaces,
 /// and the restickify's one permute — never re-derived from the predicates. A landing that does
 /// not match the cell's stated frame FAILS the dump. Returns the tid the runner reads back.
-fn classify(ops: &[EmittedOp], frame: Frame, entries: u64, slab: u64) -> Result<u32, String> {
+fn classify(
+    ops: &[EmittedOp<ktir_superdsc::collective::TpWorld<1>>],
+    frame: Frame,
+    entries: u64,
+    slab: u64,
+) -> Result<u32, String> {
     // The gather ops: `gather_o{tid}` (one op) or `gather{n}_o{tid}` (chunk n, entries past the
     // index stick). The head-major staging front's `gather{c}_{i}_o{tid}` copies are NOT this
     // arm's (an underscored chunk AND run index) and no cell here states one.
@@ -593,7 +598,8 @@ fn classify(ops: &[EmittedOp], frame: Frame, entries: u64, slab: u64) -> Result<
             .is_some_and(|(mid, _)| mid.is_empty() || mid.chars().all(|c| c.is_ascii_digit())),
         None => false,
     };
-    let gathers: Vec<&EmittedOp> = ops.iter().filter(|o| is_gather(&o.op_name)).collect();
+    let gathers: Vec<&EmittedOp<ktir_superdsc::collective::TpWorld<1>>> =
+        ops.iter().filter(|o| is_gather(&o.op_name)).collect();
     let Some(first) = gathers.first() else {
         return Err("the walk emitted no gather op".into());
     };
@@ -616,7 +622,7 @@ fn classify(ops: &[EmittedOp], frame: Frame, entries: u64, slab: u64) -> Result<
     );
     // The restickify's one whole stick permute — present only at a rank-2 multi-stick
     // multi-entry frame, and then the runner reads ITS destination (the frame's own column).
-    let permutes: Vec<&EmittedOp> = ops
+    let permutes: Vec<&EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = ops
         .iter()
         .filter(|o| o.op_name.starts_with("permute"))
         .collect();
@@ -741,7 +747,12 @@ fn classify(ops: &[EmittedOp], frame: Frame, entries: u64, slab: u64) -> Result<
 
 /// Write the bundle (`group_0/` + `placements.json`) and the manifest. `ops: None` ⇒ the cell is
 /// MISSING-LOWERING: only `cell.json` is written, exactly as the bake would refuse the function.
-fn write_cell(dir: &std::path::Path, l: &BundleLayout, ops: Option<&Vec<EmittedOp>>, cell: &Cell) {
+fn write_cell(
+    dir: &std::path::Path,
+    l: &BundleLayout,
+    ops: Option<&Vec<EmittedOp<ktir_superdsc::collective::TpWorld<1>>>>,
+    cell: &Cell,
+) {
     if let Some(ops) = ops.filter(|o| !o.is_empty()) {
         superdsc::write_dxp_input(dir, ops, superdsc::FoldGrouping::Split)
             .unwrap_or_else(|e| panic!("{}: write_dxp_input: {e}", dir.display()));

@@ -365,7 +365,7 @@ fn gather_copy_cores(
 
 /// [`gather_copy_opspec`] + `emit_sdsc_tiled` — the ONE assembler for the gather's copy, so the op the
 /// fold launches and the descriptor the tests read are the same construction.
-pub fn assemble_gather_copy(
+pub fn assemble_gather_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -378,7 +378,7 @@ pub fn assemble_gather_copy(
     index: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     // ⛔ ALL THREE EXTENTS FROM THE SCRATCH, AS ONE VALUE, NOT THREE REACHES. `mb` is the copy's own
     // extent, the index's live entry count and the scratch's row count; `out` is the pool's stick; the
     // `page` the walk pins is the `page` the index declares. They were three separate calls here
@@ -715,7 +715,7 @@ pub struct PageGatherRows<'a> {
 }
 
 /// [`page_gather_copy_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_page_gather_copy(
+pub fn assemble_page_gather_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -728,7 +728,7 @@ pub fn assemble_page_gather_copy(
     }: PageGatherRows<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let gathered = match words {
         GatheredWords::Fp16 => 0,
         GatheredWords::SenUint32 { .. } => 1,
@@ -937,7 +937,7 @@ pub fn index_select_opspec(
 }
 
 /// [`index_select_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_index_select(
+pub fn assemble_index_select<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -945,7 +945,7 @@ pub fn assemble_index_select(
     page: IndexSelectPage,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = index_select_opspec(src, dst, gather, page)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1055,14 +1055,14 @@ pub fn expand_blocks_opspec(
 }
 
 /// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_expand_blocks(
+pub fn assemble_expand_blocks<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
     blocks: ExpandedBlocks,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = expand_blocks_opspec(src, dst, blocks)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1169,7 +1169,7 @@ pub struct StickPermuteSpec {
 }
 
 /// [`stick_permute_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_stick_permute(
+pub fn assemble_stick_permute<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -1183,7 +1183,7 @@ pub fn assemble_stick_permute(
     }: StickPermuteSpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let mut op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
     if src_elems > 0 {
         op.args[0].set_offset_elems(src_elems);
@@ -1285,14 +1285,14 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
 }
 
 /// [`stick_runs_copy_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_stick_runs_copy(
+pub fn assemble_stick_runs_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
     runs: StickRuns,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = stick_runs_copy_opspec(src, dst, runs)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1312,7 +1312,7 @@ pub struct ScatterCopySpec {
 }
 
 /// [`scatter_copy_opspec`] + `emit_sdsc_tiled` — the one assembler for a scattered copy.
-pub fn assemble_scatter_copy(
+pub fn assemble_scatter_copy<T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
@@ -1320,7 +1320,7 @@ pub fn assemble_scatter_copy(
     spec: ScatterCopySpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, String> {
+) -> Result<EmittedOp<T>, String> {
     let op = scatter_copy_opspec(src, dst, scatter, spec)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1541,6 +1541,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     layout: Option<&BundleLayout>,
     division: CoreDivision,
 ) -> Result<OpSpec, String> {
+    let out_row_window = out_offset.row_window();
     let (out_window, out_offset) = (
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
@@ -1611,12 +1612,27 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // integer: the window's planes are whole `[rows, 64]` planes of the parent at the parent's plane stride,
     // so the `[rows, cols]` stick-major view from its corner reaches the parent's bytes
     // (`tests/zz_a_whole_stick_column_window_is_stick_major.rs`).
+    //
+    // ⭐ A ROW BAND OF A TALLER PARENT ([`crate::addr::RowWindow`], carried as
+    // `EwOperand::row_window` / `out_row_window`) is a stick-major corner TOO, for the same
+    // reason at the parent's own height: the band's `[rows, cols]` planes are whole planes of
+    // the PARENT at the parent's plane stride, so the stick-major view from the band's corner
+    // reaches the parent's bytes — with the parent's row count declared as the `mb` device
+    // extent (see `mk` below) so the walk strides those planes at the parent's pitch, never at
+    // the band's own fewer rows'. And a multi-stick band must be rank-2 even at `rows == 1`:
+    // a rank-3 flat walk of a window wider than one stick mis-strides the parent's column
+    // planes, which is why `any_row_window` joins the `rows > 1` clause.
+    let any_row_window =
+        out_row_window.is_some() || inputs.iter().any(|i| i.row_window().is_some());
     let stickmajor = !head_major
-        && rows > 1
+        && (rows > 1 || any_row_window)
         && cols > Fp16::ELEMS_PER_STICK
-        && (out_window || block_aligned(out_offset))
+        && (out_window || out_row_window.is_some() || block_aligned(out_offset))
         && inputs.iter().all(|i| {
-            i.out_broadcast() || i.is_stick_major_window_for(rows) || block_aligned(i.col_offset())
+            i.out_broadcast()
+                || i.is_stick_major_window_for(rows)
+                || i.row_window().is_some()
+                || block_aligned(i.col_offset())
         });
     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
     // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
@@ -1726,54 +1742,71 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // `["mb", "y", "out"]`, the caller passing the scale in the same order via
     // [`EwOperand::scale_sprayed`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
-    let mk =
-        |is_input: bool, name: &str, scale: [Scale; 3], off: u32| -> Result<AnyTensorArg, String> {
-            if stickmajor {
-                Ok(AnyTensorArg::R2(
-                    TensorArg::<2>::new(
-                        is_input,
-                        name.to_string(),
-                        Role::Output,
-                        [scale[0], scale[1]],
-                        device_dims_r2,
-                        ["mb", "out"],
-                        "out",
-                        Allocation::Hbm,
-                    )
-                    .map_err(|e| e.0)?
-                    .with_offset(off)
-                    .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32)),
-                ))
-            } else {
-                Ok(AnyTensorArg::R3({
-                    let t = TensorArg::<3>::new(
-                        is_input,
-                        name.to_string(),
-                        Role::Output,
-                        scale,
-                        device_dims,
-                        match spray {
-                            Some(order) => order.layout(),
-                            None => ["mb", "out", "y"],
-                        },
-                        "out",
-                        Allocation::Hbm,
-                    )
-                    .map_err(|e| e.0)?
-                    .with_offset(off)
-                    .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32));
-                    // A spray's two row dims go to dxp innermost first.
+    //
+    // `dev_rows` declares a ROW-WINDOW operand's PARENT row count as the `mb` device extent
+    // (the caller passes it only when the window spans more than one stick — a one-stick window
+    // never crosses a column plane and needs no declaration): the band's bytes are a
+    // stick-major tensor of the parent's, so the walk must stride the parent's column planes
+    // at the parent's `parent_rows·lanes` pitch, never at the band's own fewer rows'.
+    let mk = |is_input: bool,
+              name: &str,
+              scale: [Scale; 3],
+              off: u32,
+              dev_rows: Option<u32>|
+     -> Result<AnyTensorArg, String> {
+        if stickmajor {
+            let t = TensorArg::<2>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [scale[0], scale[1]],
+                device_dims_r2,
+                ["mb", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(off)
+            .with_df(df)
+            .with_row_blocked(matches!(df, Df::Fp32));
+            let t = match dev_rows {
+                Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                None => t,
+            };
+            Ok(AnyTensorArg::R2(t))
+        } else {
+            Ok(AnyTensorArg::R3({
+                let t = TensorArg::<3>::new(
+                    is_input,
+                    name.to_string(),
+                    Role::Output,
+                    scale,
+                    device_dims,
                     match spray {
-                        Some(order) => t
-                            .with_device_order(order.device_layout())
-                            .map_err(|e| e.0)?,
-                        None => t,
-                    }
-                }))
-            }
-        };
+                        Some(order) => order.layout(),
+                        None => ["mb", "out", "y"],
+                    },
+                    "out",
+                    Allocation::Hbm,
+                )
+                .map_err(|e| e.0)?
+                .with_offset(off)
+                .with_df(df)
+                .with_row_blocked(matches!(df, Df::Fp32));
+                let t = match dev_rows {
+                    Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                    None => t,
+                };
+                // A spray's two row dims go to dxp innermost first.
+                match spray {
+                    Some(order) => t
+                        .with_device_order(order.device_layout())
+                        .map_err(|e| e.0)?,
+                    None => t,
+                }
+            }))
+        }
+    };
     let mut args = Vec::with_capacity(inputs.len() + 1);
     for inp in inputs {
         args.push(mk(
@@ -1784,6 +1817,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 None => inp.scale(),
             },
             inp.col_offset(),
+            inp.row_window()
+                .filter(|w| !w.spans_one_stick())
+                .map(|w| w.parent_rows()),
         )?);
     }
     // The OUTPUT may write to a COLUMN SLICE of its tensor (`out_offset` cols in →
@@ -1796,6 +1832,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
         o_name,
         [Scale::Active, Scale::Active, Scale::Active],
         out_offset,
+        out_row_window
+            .filter(|w| !w.spans_one_stick())
+            .map(|w| w.parent_rows()),
     )?);
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     Ok(OpSpec {
@@ -1821,7 +1860,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
 /// [`pointwise_broadcast_opspec_from_tile`]'s doc for why they are not re-derived from
 /// `tile_op.dims`).
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
+pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: KindTag>(
     op_name: &str,
     tile_op: &TileOp,
     op_func: &'static str,
@@ -1832,7 +1871,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
     out_offset: impl Into<OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let out_offset = out_offset.into();
     let o_name = o.name();
     let head_major = O::kind() == StickKind::Flat;
@@ -1888,7 +1927,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
 /// `assemble_pointwise_seeded` TAKING AN ALREADY-LOWERED `TileOp` instead of raw `rows`/`cols` — the
 /// TileIR→SdscOp entry point for a caller that already built its `TileOp` (no re-derivation of
 /// shape) hands it here instead of unpacking it back into `rows`/`cols` first.
-pub fn assemble_pointwise_seeded_from_tile(
+pub fn assemble_pointwise_seeded_from_tile<T: crate::collective::Tp>(
     op_name: &str,
     tile_op: &TileOp,
     op_func: &'static str,
@@ -1896,7 +1935,7 @@ pub fn assemble_pointwise_seeded_from_tile(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp {
+) -> EmittedOp<T> {
     let op = pointwise_opspec_from_tile(
         tile_op,
         op_func_from_str(op_func),
@@ -2004,7 +2043,7 @@ mod stick_permute_tests {
         l.declare_arrangement(&src, StickLayout::row_blocked(32, 128))
             .expect("the producer's stick-major [32, 128]");
         let mut sym = 0i64;
-        assemble_stick_permute(
+        assemble_stick_permute::<crate::collective::TpWorld<1>>(
             "permute_o2",
             &src,
             &dst,
@@ -2031,7 +2070,7 @@ mod stick_permute_tests {
         let l = layout();
         let (rows, out) = (act_name(2), act_name(1));
         let mut sym = 0i64;
-        assemble_stick_permute(
+        assemble_stick_permute::<crate::collective::TpWorld<1>>(
             "permute_o1",
             &rows,
             &out,
@@ -2354,7 +2393,7 @@ mod index_select_tests {
         // `LandingOffset::after(7, ...)` — seven entries already landed, each one block.
         let dst_offset = |entries: u32, dst: crate::superdsc_opspec::LandingOffset| -> u32 {
             let mut sym = 0i64;
-            let op = assemble_index_select(
+            let op = assemble_index_select::<crate::collective::TpWorld<1>>(
                 "gather_o1",
                 &act_name(1),
                 &act_name(2),
@@ -2438,7 +2477,7 @@ mod index_select_tests {
         // ONE block, two sticks wide: the (4, 1, 128) case itself — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2468,7 +2507,7 @@ mod index_select_tests {
         // declaration it must NOT make is the authority's refusal.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2503,7 +2542,7 @@ mod index_select_tests {
     fn one_blocks_landing_two_sticks_wide_declares_its_blocks_frame() {
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2536,7 +2575,7 @@ mod index_select_tests {
         // ONE block in total: one entry, one block, two sticks wide — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2560,7 +2599,7 @@ mod index_select_tests {
         // SEVERAL blocks: one entry, 8 blocks, two sticks wide — the view's own flat frame.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2595,7 +2634,7 @@ mod index_select_tests {
     fn a_one_stick_landing_keeps_the_flat_frame() {
         let l = gathered(8, 128, 64);
         let mut sym = 0i64;
-        assemble_index_select(
+        assemble_index_select::<crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),

@@ -15,5 +15,7 @@ spyre = []
 
 [dependencies]
 scratchy-tensors = { path = "../../tensors" }
+# The tensor-parallel world, as the type a rank's share of the attention is taken for.
+scratchy-tp-world = { path = "../../core/tp-world" }
 scratchy-layers = { path = "../../layers" }
 scratchy-quantizations = { path = "../../models/quantization" }   # AffineQuantEmbedding in WeightAccessors::affine_quant_embedding_at

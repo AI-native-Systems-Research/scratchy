@@ -706,11 +706,26 @@ impl BundleLayout {
             if self.lx_core_local(name) {
                 // A STICK-PLANE window — whole planes of the tensor's own rows — sits at that plane
                 // of every core's slice (`emit::stick_plane`), which the read law bounds by the pin.
-                let plane = u64::from(layout.rows as u32) * layout.df.elems_per_stick() as u64;
+                let stick = layout.df.elems_per_stick() as u64;
+                let plane = u64::from(layout.rows as u32) * stick;
                 let plane_window = layout.kind == StickKind::RowBlocked
                     && rows as usize == layout.rows
                     && off_elems.is_multiple_of(plane.max(1));
-                if off_elems != 0 && !plane_window {
+                // ⭐ A ROW BLOCK OF A ONE-STICK TENSOR IS A PLANE TOO. One stick wide, a stick-major
+                // tensor's bytes are its rows in order, so a window of whole rows at a whole-row
+                // offset is the same kind of view a stick plane is: the tensor cut into equal blocks
+                // of `rows` rows, the window block `off / (rows · stick)` of them. Each core holding
+                // every block's share of its rows holds that block's share at block · per-core rows ·
+                // stick into its slice — the offset `emit::stick_plane` computes from the op's own
+                // division, which the core-local read law then holds every op of the tensor to.
+                let block = u64::from(rows) * stick;
+                let row_block = layout.kind == StickKind::RowBlocked
+                    && layout.cols as u64 == stick
+                    && cols as u64 == stick
+                    && rows > 0
+                    && (layout.rows as u64).is_multiple_of(u64::from(rows))
+                    && off_elems.is_multiple_of(block);
+                if off_elems != 0 && !plane_window && !row_block {
                     return Err(format!(
                         "{what}: core-local LX tensor '{name}' windowed at element {off_elems} — \
                          each core's slice sits at the pin, and only a whole stick plane of its \

@@ -392,12 +392,21 @@ pub fn col_of(rows: u32, cols: u32, c: u32, df: Df) -> DevOff {
 pub struct ColWindow {
     corner: DevOff,
     rows: u32,
+    /// The window's own column index in the parent (a whole stick, by [`col_window_of`]'s mint) —
+    /// carried so a caller can state further whole-stick windows of the SAME parent as offsets of
+    /// this one, without re-deriving the base from the corner.
+    col: u32,
 }
 
 impl ColWindow {
     /// The corner as a device offset — the same element [`col_of`] gives.
     pub fn dev(self) -> DevOff {
         self.corner
+    }
+
+    /// The window's own whole-stick column index in the parent.
+    pub fn column(self) -> u32 {
+        self.col
     }
 
     /// Whether a `[rows, ·]` view from this corner is the window's stick-major tensor: the parent's plane
@@ -422,17 +431,98 @@ pub fn col_window_of(rows: u32, full: u32, c: u32, df: Df) -> Result<ColWindow, 
     Ok(ColWindow {
         corner: col_of(rows, full, c, df),
         rows,
+        col: c,
+    })
+}
+
+/// ⭐ THE CORNER OF A ROW BAND — a `[rows, width]` window at a row (and whole-stick column)
+/// corner of a stick-major `[parent_rows, full]` tensor, carried as a [`DevOff`] plus the two
+/// facts the door needs to address the PARENT's strides: the parent's own row count and the
+/// window's width.
+///
+/// A row band is not a column window: the parent strides its column planes `parent_rows·lanes`
+/// apart while a window of fewer rows would stride its own `rows·lanes`, so the window's bytes
+/// are a stick-major tensor of the PARENT's, reached by declaring the parent's row count as the
+/// operand's `mb` device extent ([`TensorArg::with_device_extent`]) — the same law the batched
+/// decode's per-request pass uses to iterate one row while the operand's heads stay `mq` rows
+/// apart. A window at most ONE STICK wide never crosses a plane, so its own stick-major layout
+/// coincides with the parent's inside that plane and it needs no declaration — the card-proven
+/// rotate-half form, byte for byte.
+///
+/// [`TensorArg::with_device_extent`]: crate::superdsc_opspec::TensorArg::with_device_extent
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RowWindow {
+    corner: DevOff,
+    parent_rows: u32,
+    width: u32,
+    df: Df,
+}
+
+impl RowWindow {
+    /// The corner as a device element offset — the same element `rc_of` gives.
+    pub fn dev(self) -> DevOff {
+        self.corner
+    }
+
+    /// The parent's own row count — the extent the `mb` device extent declares, so the operand
+    /// strides its column planes at the parent's `parent_rows·lanes`, never at the window's own
+    /// fewer rows' pitch.
+    pub fn parent_rows(self) -> u32 {
+        self.parent_rows
+    }
+
+    /// The window's own width in elements.
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Whether the window fits inside ONE column plane of the parent (`width ≤ lanes`): a
+    /// one-stick window never crosses a plane boundary, so its own stick-major layout is the
+    /// parent's within that plane and it needs no device-extent declaration. A multi-stick
+    /// window MUST be declared at [`Self::parent_rows`] or its second plane mis-strides.
+    pub fn spans_one_stick(self) -> bool {
+        self.width <= self.df.elems_per_stick()
+    }
+}
+
+/// The [`RowWindow`] at `(r, c)` of a stick-major `[parent_rows, full]` tensor, `width` elements
+/// wide. `Err` when `c` is not a whole stick, for the same reason [`col_window_of`] refuses one:
+/// a sub-stick corner sits mid-plane.
+pub fn row_window_of(
+    parent_rows: u32,
+    full: u32,
+    r: u32,
+    c: u32,
+    width: u32,
+    df: Df,
+) -> Result<RowWindow, String> {
+    let lanes = df.elems_per_stick();
+    if !c.is_multiple_of(lanes) {
+        return Err(format!(
+            "row window at column {c} of a [{parent_rows}, {full}] tensor is not a whole \
+             {lanes}-lane stick — a sub-stick corner sits mid-plane, so no stick-major \
+             presentation of the parent reaches the window's bytes"
+        ));
+    }
+    Ok(RowWindow {
+        corner: rc_of(parent_rows, full, r, c, df),
+        parent_rows,
+        width,
+        df,
     })
 }
 
 /// Where an elementwise op WRITES its output — the output twin of an input's `In::sliced` /
-/// `In::col_window`. Either a plain [`DevOff`] (a whole-tensor corner, a per-head block, a RoPE half) or a
-/// [`ColWindow`] (a whole-stick column window of a same-rows stick-major tensor). Built only from those two,
-/// so whether the door may present the op stick-major is carried by type, not by testing the offset.
+/// `In::col_window` / `In::row_window`. Either a plain [`DevOff`] (a whole-tensor corner, a
+/// per-head block, a RoPE half), a [`ColWindow`] (a whole-stick column window of a same-rows
+/// stick-major tensor), or a [`RowWindow`] (a row band of a taller stick-major tensor). Built
+/// only from those three, so whether the door may present the op stick-major — and at whose row
+/// count — is carried by type, not by testing the offset.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OutCorner {
     At(DevOff),
     Window(ColWindow),
+    Row(RowWindow),
 }
 
 impl OutCorner {
@@ -444,6 +534,7 @@ impl OutCorner {
         match self {
             OutCorner::At(d) => d.into_raw_elems(),
             OutCorner::Window(w) => w.dev().into_raw_elems(),
+            OutCorner::Row(w) => w.dev().into_raw_elems(),
         }
     }
 
@@ -451,6 +542,14 @@ impl OutCorner {
     /// ([`ColWindow::is_stick_major_for`]).
     pub fn is_stick_major_window_for(self, rows: u32) -> bool {
         matches!(self, OutCorner::Window(w) if w.is_stick_major_for(rows))
+    }
+
+    /// The [`RowWindow`] this corner carries, if it is a row band of a taller parent.
+    pub fn row_window(self) -> Option<RowWindow> {
+        match self {
+            OutCorner::Row(w) => Some(w),
+            _ => None,
+        }
     }
 }
 
@@ -463,6 +562,12 @@ impl From<DevOff> for OutCorner {
 impl From<ColWindow> for OutCorner {
     fn from(w: ColWindow) -> OutCorner {
         OutCorner::Window(w)
+    }
+}
+
+impl From<RowWindow> for OutCorner {
+    fn from(w: RowWindow) -> OutCorner {
+        OutCorner::Row(w)
     }
 }
 
