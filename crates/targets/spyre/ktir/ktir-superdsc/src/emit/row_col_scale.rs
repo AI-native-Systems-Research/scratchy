@@ -140,8 +140,16 @@ pub fn assemble<T: crate::collective::Tp>(
         super::In::mb(&gamma).ew(),
         super::In::mb(&beta).ew(),
     ];
-    super::mint_ew_output(op_name, &out, 0, rows, cols, crate::superdsc_opspec::Df::Fp16, layout)
-        .map_err(SuperDscError)?;
+    super::mint_ew_output(
+        op_name,
+        &out,
+        0,
+        rows,
+        cols,
+        crate::superdsc_opspec::Df::Fp16,
+        layout,
+    )
+    .map_err(SuperDscError)?;
     let mut op = super::pointwise_broadcast_opspec_df(
         OpFunc::LayerNormNorm,
         rows,
@@ -244,7 +252,14 @@ mod tests {
     #[test]
     fn the_column_first_order_rounds_differently() {
         let mut found = false;
-        let vals = [1.0f32 + 1.0 / 512.0, 3.0 + 1.0 / 256.0, 0.333, 7.77, 1.0e-3, 123.4];
+        let vals = [
+            1.0f32 + 1.0 / 512.0,
+            3.0 + 1.0 / 256.0,
+            0.333,
+            7.77,
+            1.0e-3,
+            123.4,
+        ];
         'outer: for &x in &vals {
             for &r in &vals {
                 for &g in &vals {

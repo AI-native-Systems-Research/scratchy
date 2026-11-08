@@ -5132,22 +5132,22 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         }
         // rot = x[rows,hd] @ P[hd,hd] — the same P kernel for every row (m=rows GEMM, k=n=hd).
         if !fold_rs {
-        ops.push(assemble_matmul_off(
-            &format!("rope_rot_o{t}"),
-            crate::sdsc_abstract::MatM::of_head_major_rows(rows),
-            crate::sdsc_abstract::MatN::of_head_dim(hdw),
-            crate::sdsc_abstract::MatK::of_head_dim(hdw),
-            crate::sdsc_abstract::MatY::unbatched(),
-            form,
-            &rb(&x, rows, hd),
-            crate::addr::DevOff::ZERO,
-            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-            crate::addr::DevOff::ZERO,
-            &rb(&rot, rows, hd),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
-        ));
+            ops.push(assemble_matmul_off(
+                &format!("rope_rot_o{t}"),
+                crate::sdsc_abstract::MatM::of_head_major_rows(rows),
+                crate::sdsc_abstract::MatN::of_head_dim(hdw),
+                crate::sdsc_abstract::MatK::of_head_dim(hdw),
+                crate::sdsc_abstract::MatY::unbatched(),
+                form,
+                &rb(&x, rows, hd),
+                crate::addr::DevOff::ZERO,
+                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                crate::addr::DevOff::ZERO,
+                &rb(&rot, rows, hd),
+                crate::addr::DevOff::ZERO,
+                sym_id_base,
+                layout,
+            ));
         }
         let hh = |name: &str| fl(name, rows, hd);
         // One row of angles shared by every head at mq==1; per-row above that.
@@ -11802,7 +11802,8 @@ mod rope_rotsin_fold_tests {
             .collect();
         assert!(
             reads.contains(&crate::place::act_name(3).as_str())
-                && reads.contains(&crate::place::act_name(crate::reserved_tids::ZERO_COL_TID).as_str()),
+                && reads
+                    .contains(&crate::place::act_name(crate::reserved_tids::ZERO_COL_TID).as_str()),
             "bnA is sin, bnB the staged zero row: {reads:?}"
         );
     }

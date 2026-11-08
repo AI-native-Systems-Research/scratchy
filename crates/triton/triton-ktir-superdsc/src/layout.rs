@@ -591,24 +591,24 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // `layernormnorm` reading both. Sized off the OUTPUT region the program states (the matmul's or
     // the norm's `[rows, cols]`), the same view the door reads the extents from, so the fold's reads
     // sit inside these placements.
-    if r.iter().any(|reg| reg.is_fp8) || matches!(node.program, Program::RmsNorm) {
-        if let Some(out) = r.iter().find(|reg| reg.is_out) {
-            for (tid, dims) in [
-                (
-                    ktir_superdsc::reserved_tids::ZERO_ROW_TID,
-                    [out.v_rows, Df::Fp16.elems_per_stick()],
-                ),
-                (ktir_superdsc::reserved_tids::ZERO_COL_TID, [1, out.v_cols]),
-            ] {
-                pack(
-                    name,
-                    tid,
-                    SegRole::Activation,
-                    synth_footprint_bytes(&dims, Df::Fp16),
-                    &mut placements,
-                    &mut segment_bytes,
-                )?;
-            }
+    if (r.iter().any(|reg| reg.is_fp8) || matches!(node.program, Program::RmsNorm))
+        && let Some(out) = r.iter().find(|reg| reg.is_out)
+    {
+        for (tid, dims) in [
+            (
+                ktir_superdsc::reserved_tids::ZERO_ROW_TID,
+                [out.v_rows, Df::Fp16.elems_per_stick()],
+            ),
+            (ktir_superdsc::reserved_tids::ZERO_COL_TID, [1, out.v_cols]),
+        ] {
+            pack(
+                name,
+                tid,
+                SegRole::Activation,
+                synth_footprint_bytes(&dims, Df::Fp16),
+                &mut placements,
+                &mut segment_bytes,
+            )?;
         }
     }
 

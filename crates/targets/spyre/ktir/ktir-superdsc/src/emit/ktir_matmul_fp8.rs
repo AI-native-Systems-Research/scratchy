@@ -832,7 +832,8 @@ mod tests {
                 .map(|b| b.buffer.as_str())
                 .collect();
             let raw = crate::placement::syn(Some(&l), PlaceId::Act(10).synth(SynthRole::FqRaw));
-            let ascale = crate::placement::syn(Some(&l), PlaceId::Act(7).synth(SynthRole::FqAscale));
+            let ascale =
+                crate::placement::syn(Some(&l), PlaceId::Act(7).synth(SynthRole::FqAscale));
             let want = [
                 raw,
                 act_name(crate::reserved_tids::ZERO_ROW_TID),
@@ -846,7 +847,10 @@ mod tests {
                 "m={m} n={n}: x, mean, scale, γ, β"
             );
             assert_eq!(
-                dq[0].dsc().dscs_[0].values().next().map(|d| d.computeOp_[0].opFuncName.clone()),
+                dq[0].dsc().dscs_[0]
+                    .values()
+                    .next()
+                    .map(|d| d.computeOp_[0].opFuncName.clone()),
                 Some("layernormnorm".to_string()),
                 "m={m} n={n}: the device op"
             );
