@@ -8605,11 +8605,9 @@ fn assign_frames(
                     // ⭐ A STATED SPRAY EXPLAINS ITS OWN MISMATCH — checked BEFORE the lane
                     // rule: a broadcast result at the result's own count is the spray the
                     // consumer addresses through its mode, not a lane (the attn_s8 tail's Mb
-                    // spray was read as the lane and the tail mis-held Row).
-                    if defs
-                        .of(v)
-                        .is_some_and(|d| d.op_type == OpKind::LinalgBroadcast)
-                    {
+                    // spray was read as the lane and the tail mis-held Row). `sprayed` is the
+                    // one spelling of that fact — stated where the node index is built.
+                    if sprayed.contains(&v) {
                         continue;
                     }
                     let Some(d) = defs.dims_of(v) else {
