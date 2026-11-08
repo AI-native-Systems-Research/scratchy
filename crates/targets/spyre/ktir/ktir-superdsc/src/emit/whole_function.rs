@@ -8353,6 +8353,23 @@ fn load_world(
 ///
 /// ⭐ DETERMINISM: the walk is the program's own order (`ops_deep`); joins attach the second
 /// side's root under the first's; the maps are lookups, never iteration order.
+/// ⭐ A DEFERRED `In::col` CHECK — one operand of a pointwise op that reads one value per result
+/// row (`operand_numel == res_rows` elements beside a `res_numel`-element result), collected by
+/// the pass and decided after the closed solve: only the column frame supplies it. Every field
+/// is one the refusal names — the op, the operand, and both counts.
+struct PerRowCheck<'a, 'o> {
+    /// The pointwise op reading the operand — the refusal names the op.
+    op: &'a Operation<'o>,
+    /// The operand that reads one value per result row.
+    operand: Ssa,
+    /// The operand's element count.
+    operand_numel: i64,
+    /// The result's element count.
+    res_numel: i64,
+    /// The result's flat-frame rows.
+    res_rows: u32,
+}
+
 fn assign_frames(
     f: &IRFunction<'static>,
     fold: Option<&super::loop_fold::LoopFold>,
@@ -8473,7 +8490,7 @@ fn assign_frames(
         }
     }
     // ── THE DEFERRED `In::col` CHECKS: one value per result row, decided after the solve. ──
-    let mut per_row: Vec<(&Operation<'_>, Ssa, i64, i64, u32)> = Vec::new();
+    let mut per_row: Vec<PerRowCheck<'_, '_>> = Vec::new();
     // ── THE ONE PASS, in the program's own order ──
     for o in deep.iter() {
         let res = o.result;
@@ -8635,7 +8652,13 @@ fn assign_frames(
                     } else if n == i64::from(res_rows) {
                         // One value per result row — the `In::col` reading, consumed by the
                         // operand mode; the check is DEFERRED to the closed solve.
-                        per_row.push((o, v, n, res_numel, res_rows));
+                        per_row.push(PerRowCheck {
+                            op: o,
+                            operand: v,
+                            operand_numel: n,
+                            res_numel,
+                            res_rows,
+                        });
                     } else {
                         return err(format!(
                             "{}: `{:?}` reads %{} — {} elements — beside its other operands for \
@@ -8664,16 +8687,21 @@ fn assign_frames(
     }
     let frames = Frames { world, sprayed };
     // ── THE DEFERRED `In::col` CHECKS — only the column frame supplies one value per row. ──
-    for (o, v, n, res_numel, res_rows) in per_row {
-        let have = frames.world_of(f, v)?;
+    for c in per_row {
+        let have = frames.world_of(f, c.operand)?;
         if have != World::Column {
             return err(format!(
                 "{}: `{:?}` reads %{} — {} elements in the {have:?} world — beside its other \
-                 operands for a {res_numel}-element result of {} rows: one value per result row \
+                 operands for a {}-element result of {} rows: one value per result row \
                  is the `In::col` reading, and only the column frame supplies it. The device's \
                  pointwise modes address a lane-for-lane tile, one scalar per row, and a stated \
                  spray; this operand is none of them, so its frame is named rather than guessed",
-                f.name, o.op_type, v.0, n, res_rows
+                f.name,
+                c.op.op_type,
+                c.operand.0,
+                c.operand_numel,
+                c.res_numel,
+                c.res_rows
             ));
         }
     }
