@@ -2370,14 +2370,14 @@ fn program_broadcast_chains(
                     .as_ref()
                     .and_then(|t| t.dims().map(|d| d.to_vec()))
             });
-        let rank = res_dims.as_ref().map(Vec::len);
-        let Some(rank) = rank else {
+        let Some(res_dims) = res_dims else {
             return err(format!(
                 "{}: `linalg.broadcast` states no shaped result, so its rank — the frame the \
                  `Dimensions` axis is read in — is unknown",
                 f.name
             ));
         };
+        let rank = res_dims.len();
         // ⭐⭐⭐ THE FOLD: A UNIT-EXTENT RESULT AXIS THE BROADCAST DOES NOT SPRAY IS INVISIBLE TO
         // THE FLAT FRAME. The flat frame folds every axis but the last into its rows, so a
         // result axis of extent 1 that is NOT in `Dimensions` moves no element and names no
@@ -2396,12 +2396,9 @@ fn program_broadcast_chains(
         // counts — rows, numel — which a unit axis cannot change), and every read below — the
         // rank, the leading run, the sprayed extents, the admission's split frame, both covers
         // — is the FOLDED frame, one statement of the shape for the whole classification.
-        let (res_dims, dims, rank): (Option<Vec<i64>>, Vec<i64>, usize) = if rank > 2 {
-            let s = res_dims
-                .as_ref()
-                .expect("rank is Some only when res_dims is");
-            let keeps = |i: usize| s[i] != 1 || dims.contains(&(i as i64));
-            let folded: Vec<i64> = s
+        let (res_dims, dims, rank): (Vec<i64>, Vec<i64>, usize) = if rank > 2 {
+            let keeps = |i: usize| res_dims[i] != 1 || dims.contains(&(i as i64));
+            let folded: Vec<i64> = res_dims
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| keeps(*i))
@@ -2410,7 +2407,7 @@ fn program_broadcast_chains(
             let folded_dims: Vec<i64> = dims
                 .iter()
                 .map(|&d| {
-                    d - s
+                    d - res_dims
                         .iter()
                         .enumerate()
                         .take(d as usize)
@@ -2419,7 +2416,7 @@ fn program_broadcast_chains(
                 })
                 .collect();
             let rank = folded.len();
-            (Some(folded), folded_dims, rank)
+            (folded, folded_dims, rank)
         } else {
             (res_dims, dims.to_vec(), rank)
         };
@@ -2454,10 +2451,7 @@ fn program_broadcast_chains(
                         .all(|(i, &d)| d == i as i64) =>
             {
                 let k = ds.len() - 1;
-                let count: i64 = res_dims
-                    .as_ref()
-                    .map(|s| s[..k].iter().product())
-                    .unwrap_or(0);
+                let count: i64 = res_dims[..k].iter().product();
                 if count <= 1 {
                     return err(format!(
                         "{}: `linalg.broadcast` adds the leading run {:?} and the stick axis of a \
@@ -2480,7 +2474,7 @@ fn program_broadcast_chains(
             // (the source's rows ARE the result's rows before it) is proved after the walk-back,
             // as the outer spray's is.
             (r, [d]) if r > 2 && *d as usize == r - 2 && *d > 0 => {
-                match res_dims.as_ref().and_then(|s| s.get(*d as usize)) {
+                match res_dims.get(*d as usize) {
                     Some(&y) if y > 1 => (
                         BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::inner(y as u32)),
                         false,
@@ -2815,17 +2809,7 @@ fn program_broadcast_chains(
                 // axis is invisible to the flat frame, so the split is proved in the folded
                 // one; re-reading the attribute here would state the pre-fold shape and the
                 // two statements of the split would disagree by exactly the folded axes).
-                let Some(s) = res_dims.clone() else {
-                    return err(format!(
-                        "{}: `linalg.broadcast` sprays a rank > 2 source of {} flat rows down its \
-                         LEADING axis but states no shaped result, so the row-split frame — the \
-                         `[y, mb, ..]` the leading dim would have to name — cannot be proven. The \
-                         `mb` operand mode addresses ONE row once and the row-split mode needs the \
-                         spray count, so neither can be chosen for it",
-                        f.name,
-                        source_rows.unwrap_or(0)
-                    ));
-                };
+                let s = &res_dims;
                 // The spray count: the leading axes the broadcast adds, folded; the source's rows must
                 // then be the rest of the row axes, folded.
                 let lead = dims.len().min(s.len());
@@ -2891,14 +2875,14 @@ fn program_broadcast_chains(
             let source_rows = def_of(cursor)
                 .and_then(super::lower_ktir_to_superdsc::shape_2d)
                 .map(|(r, _)| r as i64);
-            let before: Option<i64> = res_dims
-                .as_ref()
-                .map(|s| s[..s.len().saturating_sub(2)].iter().product());
-            if source_rows.is_none() || source_rows != before {
+            let before: i64 = res_dims[..res_dims.len().saturating_sub(2)]
+                .iter()
+                .product();
+            if source_rows != Some(before) {
                 return err(format!(
                     "{}: `linalg.broadcast` sprays its second-to-last axis {} times over a source \
                      of {source_rows:?} flat rows, but the result's rows before that axis are \
-                     {before:?} — the inner row spray repeats each SOURCE row in place, so the \
+                     {before} — the inner row spray repeats each SOURCE row in place, so the \
                      two must be the same rows, or the copies read rows the source does not have",
                     f.name, sp.count
                 ));
@@ -2914,13 +2898,14 @@ fn program_broadcast_chains(
             let numel = def_of(cursor)
                 .and_then(super::lower_ktir_to_superdsc::shape_2d)
                 .map(|(r, c)| i64::from(r) * i64::from(c));
-            let rows: Option<i64> = res_dims.as_ref().map(|s| {
-                s[..s.len().saturating_sub(1)].iter().product::<i64>() / i64::from(sp.count)
-            });
-            if numel.is_none() || numel != rows {
+            let rows: i64 = res_dims[..res_dims.len().saturating_sub(1)]
+                .iter()
+                .product::<i64>()
+                / i64::from(sp.count);
+            if numel != Some(rows) {
                 return err(format!(
                     "{}: `linalg.broadcast` sprays {numel:?} per-row values down {} leading \
-                     copies of {rows:?} rows each — one value per row is the cover, or the read \
+                     copies of {rows} rows each — one value per row is the cover, or the read \
                      reaches values the source does not have",
                     f.name, sp.count
                 ));
@@ -3000,17 +2985,13 @@ fn program_broadcast_chains(
         }
         // ⭐ THE SPRAY COUNT — the product of the extents the broadcast itself sprays, read on
         // the folded frame the classification read (a unit non-spray axis is invisible to it, so
-        // the pre-fold extents would state the wrong `y`). An unsprayed or unstated extent
-        // contributes 1 — the count is read only where the mode choice re-routes a leading spray
-        // to a row-split, and the admissions that mint `Y` directly compute their own.
-        let count: u32 = res_dims
-            .as_ref()
-            .map(|s| {
-                dims.iter()
-                    .filter_map(|&d| s.get(d as usize).copied())
-                    .product::<i64>()
-            })
-            .unwrap_or(1)
+        // the pre-fold extents would state the wrong `y`). An unsprayed extent contributes 1 —
+        // the count is read only where the mode choice re-routes a leading spray to a row-split,
+        // and the admissions that mint `Y` directly compute their own.
+        let count: u32 = dims
+            .iter()
+            .filter_map(|&d| res_dims.get(d as usize).copied())
+            .product::<i64>()
             .max(1) as u32;
         map.insert(
             res,
@@ -4340,33 +4321,29 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
             Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
-        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect`
-        // below would re-state the match's own fact as a runtime check.
-        let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
-            _ if rms.is_some() => {
-                let c = rms.expect("just matched");
-                match c.gain {
-                    // The two tensors the recogniser proved, walked back through the rank
-                    // plumbing to values a `Region` exists for.
-                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
-                    // The identity gain is the constant 1 — not a parameter.
-                    GainLeg::Identity => vec![c.x],
-                }
-            }
-            _ if equal.is_some() => {
-                let (a, b) = equal.expect("just matched");
-                vec![a, b]
-            }
+        // The recognised chains ride the scrutinee so their arms BIND them — a guard plus an
+        // `expect` below would re-state the match's own fact as a runtime check.
+        let raw_in: Vec<Ssa> = match (rms, equal, gelu, terminal, scalar, bound_scale) {
+            (Some(c), ..) => match c.gain {
+                // The two tensors the recogniser proved, walked back through the rank
+                // plumbing to values a `Region` exists for.
+                GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
+                // The identity gain is the constant 1 — not a parameter.
+                GainLeg::Identity => vec![c.x],
+            },
+            (None, Some((a, b)), ..) => vec![a, b],
             // The gelu's one input is the chain's own `x` — the value the cubic's base and the
             // divide's numerator both are — never the divide's own operands.
-            (_, _, _, Some(g)) => vec![g.x],
-            (Some(c), _, _, _) => match c.up {
+            (None, None, Some(g), ..) => vec![g.x],
+            (None, None, None, Some(c), ..) => match c.up {
                 Some(up) => vec![c.gate, up],
                 None => vec![c.gate],
             },
-            (None, Some((_, tensor)), _, _) => vec![tensor],
-            (None, None, Some(b), _) => vec![b.tensor],
-            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, None, None, None, Some((_, tensor)), _) => vec![tensor],
+            (None, None, None, None, None, Some(b)) => vec![b.tensor],
+            (None, None, None, None, None, None) => {
+                op.operands.iter().copied().take(n_in).collect()
+            }
         };
         // One input's (SOURCE, ORDER-FREENESS). The ruling's semantics are a SHAPE fact, not a
         // spelling fact: an operand that supplies ONE SCALAR PER OUTPUT ROW is order-free — a
@@ -6638,32 +6615,34 @@ fn lower_function_folded<T: crate::collective::Tp>(
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
-        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect` below
-        // would re-state the match's own fact as a runtime check.
-        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
+        // Every recognised chain rides the scrutinee so its arm BINDS it — a guard plus an `expect`
+        // below would re-state the match's own fact as a runtime check.
+        let in_values: Vec<Ssa> = match (
+            rms,
+            equal,
+            gelu,
+            terminal,
+            scalar,
+            bound_scale,
+            scalar_binary,
+        ) {
             // The two tensors the rmsnorm recogniser proved, walked back through the rank plumbing to
             // values a `Region` exists for.
-            _ if rms.is_some() => {
-                let c = rms.expect("just matched");
-                match c.gain {
-                    // The two tensors the recogniser proved, walked back through the rank
-                    // plumbing to values a `Region` exists for.
-                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
-                    // The identity gain is the constant 1 — not a parameter.
-                    GainLeg::Identity => vec![c.x],
-                }
-            }
+            (Some(c), ..) => match c.gain {
+                // The two tensors the recogniser proved, walked back through the rank
+                // plumbing to values a `Region` exists for.
+                GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
+                // The identity gain is the constant 1 — not a parameter.
+                GainLeg::Identity => vec![c.x],
+            },
             // THE EQUALITY MASK's inputs are the comparison's own two operands, not the retype's
             // (the retype reads the i1 the fold destroys). The broadcast resolution below then
             // applies to them exactly as it would to a spelled two-tensor op's.
-            _ if equal.is_some() => {
-                let (a, b) = equal.expect("just matched");
-                vec![a, b]
-            }
+            (None, Some((a, b)), ..) => vec![a, b],
             // The gelu's one input is the chain's own `x` — the value the cubic's base and the
             // divide's numerator both are — never the divide's own operands.
-            (_, _, _, Some(g)) => vec![g.x],
-            (Some(c), _, _, _) => match c.up {
+            (None, None, Some(g), ..) => vec![g.x],
+            (None, None, None, Some(c), ..) => match c.up {
                 Some(up) => vec![c.gate, up],
                 // The bare form's one input is the gate; the divide's other operand is the
                 // chain-interior `1 + e^-x`, which the fused op never materialises.
@@ -6671,15 +6650,15 @@ fn lower_function_folded<T: crate::collective::Tp>(
             },
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
-            (None, Some((_, tensor)), _, _) => vec![tensor],
+            (None, None, None, None, Some((_, tensor)), ..) => vec![tensor],
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
-            (None, None, Some(b), _) => vec![b.tensor],
+            (None, None, None, None, None, Some(b), _) => vec![b.tensor],
             // A splatted-constant binary's tensor side, wherever the splat sits.
-            (None, None, None, _) if scalar_binary.is_some() => {
-                vec![scalar_binary.expect("just matched").2]
+            (None, None, None, None, None, None, Some((_, _, tensor))) => vec![tensor],
+            (None, None, None, None, None, None, None) => {
+                op.operands.iter().copied().take(n_in).collect()
             }
-            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
         // A BROADCAST OPERAND READS ITS SOURCE. The chain minted no buffer (it emitted no op), so the
@@ -7043,7 +7022,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
         } else {
             false
         };
-        if op_gather.is_some()
+        if let Some((g, _, _)) = op_gather
             && !gathered_b
             && !matches!(
                 program,
@@ -7057,10 +7036,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                  would emit a descriptor reading the table DIRECTLY at its base, which is the right \
                  shape and the wrong rows, from a clean bake. Give the gathered operand its own \
                  `ScalarMul` node, or add the index to the assembler this op needs.",
-                f.name,
-                op.op_type,
-                op_gather.map_or(0, |(g, _, _)| g.value_tid),
-                op_gather.map_or(0, |(g, _, _)| g.index_tid),
+                f.name, op.op_type, g.value_tid, g.index_tid,
             ));
         }
 
