@@ -8176,10 +8176,10 @@ impl<'d> Defs<'d> {
                 // arity-equal (the fold's own law), so carry `i`'s result is `results[i]`: a
                 // result never takes another carry's shape, and a carry that states no shape
                 // leaves its result unstated too — never a made-up `[]`.
-                if let Some(&r) = results.get(i) {
-                    if let Some(d) = shape.get(&arg).cloned() {
-                        shape.entry(r).or_insert(d);
-                    }
+                if let Some(&r) = results.get(i)
+                    && let Some(d) = shape.get(&arg).cloned()
+                {
+                    shape.entry(r).or_insert(d);
                 }
             }
         }
