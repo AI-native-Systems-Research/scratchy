@@ -4457,19 +4457,21 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
         };
         // ⛔ A CONVERT'S OWN STAGGERED INPUT is a composition of two arrangements the table
         // does not state — refused before the output's row is applied.
-        if matches!(program, Lowering::Convert(_)) {
-            if let Some(&v) = raw_in.first() {
+        let convert_input_staggered = match (program, raw_in.first()) {
+            (Lowering::Convert(_), Some(&v)) => {
                 let (src, _) = resolved(v)?;
-                if staggered(&arr, src) {
-                    return err(format!(
-                        "{}: a staggered value enters a dtype-convert — the composition of the \
-                         stagger with the convert's own output arrangement is not a fact the \
-                         const table states, so it is refused rather than guessed. Reduce \
-                         before the convert",
-                        f.name
-                    ));
-                }
+                staggered(&arr, src)
             }
+            _ => false,
+        };
+        if convert_input_staggered {
+            return err(format!(
+                "{}: a staggered value enters a dtype-convert — the composition of the \
+                 stagger with the convert's own output arrangement is not a fact the \
+                 const table states, so it is refused rather than guessed. Reduce \
+                 before the convert",
+                f.name
+            ));
         }
         if let Some(r) = op.result {
             arr.insert(r, out_arr);
@@ -8082,6 +8084,8 @@ struct Frames {
 
 impl Frames {
     /// The world of `v` — the one answer the solve stated, refused by name when it stated none.
+    /// ⭐ THE SPRAYED RESULT IS HELD IN NO WORLD ([`Frames::sprayed`]): a world asked of one is
+    /// the bake error naming the spray — the one predicate, stated here for [`frame_of`] too.
     /// After the solve that domain is STATED, not assumed: every value the program names is a
     /// node, and an unanchored class resolving [`UNSTATED_IS`] is a decision, not a gap — so no
     /// entry means the solve indexed no class for the value at all, and its lanes are a
@@ -8089,6 +8093,15 @@ impl Frames {
     /// default answered it anyway, and a reader pointing at a value nobody framed would have
     /// addressed it lane-for-lane on a fact nobody stated.
     fn world_of(&self, f: &IRFunction<'static>, v: Ssa) -> Result<World, Error> {
+        if self.sprayed.contains(&v) {
+            return err(format!(
+                "{}: `%{}` is a `linalg.broadcast` result — a spray is addressing, not data, so \
+                 it is held in no world of its own; the consumer reads its source through the \
+                 spray's operand mode. A world asked of the sprayed result is a reader pointing \
+                 at the wrong value",
+                f.name, v.0
+            ));
+        }
         match self.world.get(&v) {
             Some(&w) => Ok(w),
             None => err(format!(
@@ -8103,18 +8116,9 @@ impl Frames {
     /// The `[rows, cols]` frame `v` is held in, at `dims` — the value's own stated shape, the same
     /// dims its producer's result type states: the column's `[numel, 1]`, or the flat frame.
     /// ⭐ THE SPRAYED RESULT IS NOT HELD IN ANY FRAME — it is addressing, not data, and the
-    /// consumer reads its SOURCE through the spray's mode. A frame asked of one is the bake
-    /// error naming it, never a silently-read row.
+    /// consumer reads its SOURCE through the spray's mode. A frame asked of one is [`world_of`]'s
+    /// refusal, inherited — never a silently-read row.
     fn frame_of(&self, f: &IRFunction<'static>, v: Ssa, dims: &[i64]) -> Result<[u32; 2], Error> {
-        if self.sprayed.contains(&v) {
-            return err(format!(
-                "{}: `%{}` is a `linalg.broadcast` result — a spray is addressing, not data, so \
-                 it is held in no world of its own; the consumer reads its source through the \
-                 spray's operand mode. A frame asked of the sprayed result is a reader pointing \
-                 at the wrong value",
-                f.name, v.0
-            ));
-        }
         Ok(match self.world_of(f, v)? {
             World::Column => [dims.iter().product::<i64>() as u32, 1],
             World::Row => flat_frame(dims),
@@ -12369,8 +12373,8 @@ mod frame_pass_tests {
 
     /// ⭐ A BROADCAST RESULT IS DENSE HOWEVER ITS SOURCE IS HELD — the spray writes every lane,
     /// so the sprayed value is held in NO world of its own (the softmax walk's folded max
-    /// expanded back over the lanes): asking its frame is the bake error, and the plumbing
-    /// default it gets is the row.
+    /// expanded back over the lanes): asking its world or its frame is the bake error, named —
+    /// never the deleted silent row.
     #[test]
     fn a_broadcast_result_is_dense_however_its_source_is_held() {
         let a: &'static Arena = Arena::global();
@@ -12401,19 +12405,28 @@ mod frame_pass_tests {
             ],
         );
         let frames = assign_frames(&f, None).expect("the spray states its own world");
+        // The source keeps the column the spray reads — the spray addresses it, never replaces it.
         assert_eq!(
             frames
-                .world_of(&f, bc)
+                .world_of(&f, col)
                 .expect("the solve indexed a class for every value the program names"),
-            World::Row,
-            "the sprayed result is dense; the SOURCE's column is the source's own row"
+            World::Column,
+            "the SOURCE's column is the source's own row"
+        );
+        let Err(e) = frames.world_of(&f, bc) else {
+            panic!("a broadcast result is held in no world of its own");
+        };
+        assert!(
+            e.message.contains("`linalg.broadcast` result"),
+            "the refusal names the sprayed result: {}",
+            e.message
         );
         let Err(e) = frames.frame_of(&f, bc, &[64, 128]) else {
             panic!("a broadcast result is held in no world of its own");
         };
         assert!(
             e.message.contains("`linalg.broadcast` result"),
-            "the refusal names the sprayed result: {}",
+            "the frame refusal is the world refusal, inherited: {}",
             e.message
         );
     }
@@ -12725,12 +12738,14 @@ mod frame_pass_tests {
             World::Column,
             "the rsqrt keeps the lane it reads — the value the chase sprays along Col"
         );
-        assert_eq!(
-            frames
-                .world_of(&f, bc)
-                .expect("the solve indexed a class for every value the program names"),
-            World::Row,
-            "the sprayed result is dense, however its source is held"
+        let Err(e) = frames.world_of(&f, bc) else {
+            panic!("a broadcast result is held in no world of its own");
+        };
+        assert!(
+            e.message.contains("`linalg.broadcast` result"),
+            "the sprayed result is dense, however its source is held — held in no world, \
+             refused by name: {}",
+            e.message
         );
         // The chase's Col axis and the solved column world are ONE fact now — the Col spray's
         // ANCHOR is the chase's own statement — so there is no second check to run: the anchor
