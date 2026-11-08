@@ -138,7 +138,9 @@ pub struct SuperDscSession<'c, T: ktir_superdsc::collective::Tp> {
     /// Logits column count.
     pub vocab: usize,
     /// Resident capacity in slots (= the longest context THIS request can hold).
-    pub cap: usize,
+    /// `None` ⇒ the bundle is UNPAGED: no pool fact exists to report (see
+    /// [`Executor::cap`]).
+    pub cap: Option<usize>,
     /// ⭐ THE PAGED POOL'S OWN GEOMETRY — pages in the SHARED pool, and positions per page — held
     /// exactly when the bundle declared a paged pool. `None` IS the unpaged meaning (no pool, no
     /// pages to count): the zeroed `usize` pair this replaces, and the `paged` flag that stood
@@ -450,7 +452,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         let exec = ranks.first();
         Ok(Self {
             vocab: exec.vocab.0,
-            cap: exec.cap() as usize,
+            cap: exec.cap().map(|c| c as usize),
             paged: exec.pool_pages().zip(exec.page_slots()),
             kv_dim: exec.kv_dim.0,
             pmask_slots: exec.pmask_slots(),

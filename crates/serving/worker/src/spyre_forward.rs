@@ -26,6 +26,22 @@ use crate::spyre_worker::*;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 
+/// The f32 stick width — the launch's readback stride for the seat's f32 word
+/// tables (inv_t): each row's word at its stick head. Derived from the
+/// format's own stick (the ladder's one derivation), never spelled here.
+const FP32_ELEMS_PER_STICK: usize =
+    <scratchy_subtile::superdsc_opspec::Fp32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
+
+/// The u32 stick width — the same readback stride for the seat's I32 word
+/// tables (the hash chain's uniform tables). The u32 and f32 sticks are both
+/// 32 lanes today, but they are TWO laws (one per format), each read from its
+/// own format — a stick widening that moved one and not the other must move
+/// its own reader, not both by accident of a shared literal.
+const U32_ELEMS_PER_STICK: usize =
+    <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
+
 /// ⭐ #32 (c3) — A SUBMITTED DECODE STEP: the launch is on the card, the
 /// idx-stick read is enqueued, nothing collected. Everything the collect half
 /// needs to turn the ring slot back into tokens. The RUNG INDEX travels beside
@@ -1010,10 +1026,11 @@ fn sample_binds(
 /// lane 0 of a 64-lane padded row. Any word at or past `vocab` is the sampler's
 /// sentinel — refuse it, never sample it.
 ///
-/// ⭐ THE STICK IS SCATTERED, NOT ROW-MAJOR. A `[rows, 64]` SENUINT32 placement
-/// stores rows INTERLEAVED at the format's own 32-element stick — `dev_off_stk`
+/// ⭐ THE STICK IS SCATTERED, NOT ROW-MAJOR. A `[rows, W]` SENUINT32 placement
+/// (W the seat's minted `idx_row_words`) stores rows INTERLEAVED at the
+/// format's own 32-element stick — `dev_off_stk`
 /// with `SenUint32::ELEMS_PER_STICK` — so row r's lane 0 is word `r·32`, NOT
-/// `r·64`: measured on the card (probe, 2-row rung: each 64-word physical block
+/// `r·W`: measured on the card (probe, 2-row rung: each 64-word physical block
 /// held `32×row0's idx` then `32×row1's idx`, both blocks identical), where the
 /// row-major stride handed EVERY row row 0's pick. At `rows = 1` the scattered
 /// offset is 0 and the solo readback is byte-identical.
@@ -1196,9 +1213,9 @@ fn log_seat_readback(
             }
         }
     }
-    let invt: Vec<f32> = match le_words(session, seat.invt, rows * 32) {
+    let invt: Vec<f32> = match le_words(session, seat.invt, rows * FP32_ELEMS_PER_STICK) {
         Ok(ws) => (0..rows)
-            .map(|r| ws.get(r * 32).copied().unwrap_or(0))
+            .map(|r| ws.get(r * FP32_ELEMS_PER_STICK).copied().unwrap_or(0))
             .map(|w| f32::from_bits(w as u32))
             .collect(),
         Err(e) => {
@@ -1219,11 +1236,14 @@ fn log_seat_readback(
                 // launch addresses actually holds the constant (a staged
                 // one-word stream leaves rows past 0 reading ZERO).
                 let trows = trows.max(rows);
-                match le_words(session, tid, trows * 32) {
+                match le_words(session, tid, trows * U32_ELEMS_PER_STICK) {
                     Ok(ws) => {
                         let w0 = ws.first().copied().unwrap_or(-1);
                         let r1 = if trows > 1 {
-                            format!("/r1=0x{:08X}", ws.get(32).copied().unwrap_or(-1))
+                            format!(
+                                "/r1=0x{:08X}",
+                                ws.get(U32_ELEMS_PER_STICK).copied().unwrap_or(-1)
+                            )
                         } else {
                             String::new()
                         };
@@ -1745,7 +1765,7 @@ pub(crate) fn forward_chunk(
         // share one session, so every tensor is resident at the WIDEST program's row count: a
         // one-row decode step had its outputs decoded at the prefill's `m`. The result is the one
         // readback — `vocab` of the logits row, or, for a rung that draws (its result re-pointed at
-        // the idx stick, `[rows, 64]`), the whole stick (`0`).
+        // the idx stick, `[rows, W]` at the seat's minted width), the whole stick (`0`).
         let result_elems = if b.sample_seat.is_some() { 0 } else { vocab };
         let wanted: std::collections::HashMap<u64, usize> =
             std::iter::once((b.result_id as u64, result_elems)).collect();

@@ -732,6 +732,18 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
 /// THE KV POOLS — every attention's K and V cache tensors, each once, in layer order: what a card
 /// bake places in the KV segment ([`compute_bundle_layout`]) and an emulator bake leaves to the
 /// emulator, which holds them as the KTIR's own buffers.
+/// ⭐ THE EMITTER'S ROW PAD — `mq` rows padded up to whole fp16 sticks. THE one
+/// home of the pad every row-count statement takes: the emitter's own placement
+/// of the attention zero tensor (`compute_bundle_layout`, `mq_pad` off the
+/// widest `AttnDecode`), and the worker's launch (`spyre_forward`'s
+/// stick-padded row count for the constants' tables, `spyre_load`'s load-time
+/// tape check). The stick is [`Fp16`]'s own — a row count that is not whole
+/// fp16 sticks is not a shape this ladder places, and the launch's whole-stick
+/// refusal on `hidden` checks the same fact.
+pub fn mq_pad(mq: usize) -> usize {
+    mq.div_ceil(Fp16::ELEMS_PER_STICK as usize) * Fp16::ELEMS_PER_STICK as usize
+}
+
 pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
     let mut pools: Vec<u32> = Vec::new();
     for n in &ir.nodes {
@@ -1301,19 +1313,19 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // own bind restores. Recorded because that false story invites a "fix" that merely reorders
         // binds, which would leave the over-bind in place.
         //
-        // Derive the extent from the WIDEST AttnDecode in the tape. `div_ceil` keeps it at exactly one
+        // Derive the extent from the WIDEST AttnDecode in the tape, through the emitter's own
+        // ONE pad home ([`mq_pad`]). `div_ceil` keeps it at exactly one
         // stick for every mq<=64 (decode's mq=1 included), so previously-baked bundles are unchanged.
         let mqp_z = ir
             .nodes
             .iter()
             .filter_map(|n| match &n.op {
-                SubOp::AttnDecode { .. } => Some(n.output.region.rows.len as u64),
+                SubOp::AttnDecode { .. } => Some(n.output.region.rows.len as usize),
                 _ => None,
             })
             .max()
-            .unwrap_or(1)
-            .div_ceil(Fp16::ELEMS_PER_STICK as u64)
-            * Fp16::ELEMS_PER_STICK as u64;
+            .unwrap_or(1);
+        let mqp_z = mq_pad(mqp_z) as u64;
         let off = seg_bytes[seg];
         let sz = mqp_z * hd * 2;
         placements.insert(
