@@ -173,13 +173,14 @@ fn ces_override(what: &str) -> HashMap<String, Val> {
 /// the FUSED quantize head, one `batchmatmulfp8`, and ONE fused dequant. The head is the
 /// device's own `quantscalepertokenfp8` (the abs→amax→amaxfl→ascale run folded into one
 /// opform, its 1/448 constant family riding `constantInfo_` instead of tensor operands), the
+/// scale is the device's own `realdiv` (the reciprocal+mul pair folded into one op), the
 /// clamp tail is the device's own `clip` (the ±448 minimum/maximum pair folded the same way),
 /// and the dequant `raw·ascale[m]·ws[n]` is the device's own `layernormnorm` at zero mean and
-/// zero β (the row-then-column scale fold): 7 ops, in emission order
-/// qspt→invs→sc→clip→qfp8ch→batchmatmulfp8→dq. A bake that emits a plain
+/// zero β (the row-then-column scale fold): 6 ops, in emission order
+/// qspt→sc→clip→qfp8ch→batchmatmulfp8→dq. A bake that emits a plain
 /// `batchmatmul` would be the f16 door reached with an fp8 weight, which is exactly the
 /// silent reinterpretation this suite exists to prevent — and a bake that emits the
-/// UNFUSED 12-op chain would mean the constant fold silently reverted, so the six subsumed
+/// UNFUSED 12-op chain would mean the constant fold silently reverted, so the nine subsumed
 /// opforms are asserted ABSENT, not just the fused ones present (the vacuous-green trap:
 /// counting only the fused ops leaves a partial revert green).
 #[test]
@@ -187,7 +188,6 @@ fn the_canonical_fp8_kernel_bakes_and_emits_the_w8a8_chain() {
     let names = drive(&sig_fp8(), &ces(), &[1]).expect("the canonical fp8 kernel bakes");
     let expected = [
         "fq_qspt_op",
-        "fq_invs_op",
         "fq_sc_op",
         "fq_clip_op",
         "fq_afp8_op",
@@ -203,24 +203,25 @@ fn the_canonical_fp8_kernel_bakes_and_emits_the_w8a8_chain() {
         "fq_ascale_op",
         "fq_chi_op",
         "fq_cl_op",
+        "fq_invs_op",
     ];
     assert!(
         names.len() == expected.len(),
-        "the W8A8 chain is 7 ops (qspt→invs→sc→clip→qfp8ch→batchmatmulfp8→dq); got \
+        "the W8A8 chain is 6 ops (qspt→sc→clip→qfp8ch→batchmatmulfp8→dq); got \
          {}: {names:?}",
         names.len()
     );
     // The chain IN ORDER: each op must sit at a strictly later position than the one
     // before it — a membership check alone would let a reordered or interleaved chain
     // pass, and the order is part of the contract (the quantize head feeds the matmul,
-    // the matmul feeds both dequant multiplies).
+    // the matmul feeds the fused dequant).
     let mut at = 0;
     for want in expected {
         match names[at..].iter().position(|n| n.ends_with(want)) {
             Some(i) => at += i + 1,
             None => panic!(
-                "the W8A8 chain is 7 ops (qspt→invs→sc→clip→qfp8ch→batchmatmulfp8→dq), in \
-                 order; `{want}` is missing or out of order: {names:?}"
+                "the W8A8 chain is 6 ops (qspt→sc→clip→qfp8ch→batchmatmulfp8→dq), in order; \
+                 `{want}` is missing or out of order: {names:?}"
             ),
         }
     }
@@ -228,8 +229,9 @@ fn the_canonical_fp8_kernel_bakes_and_emits_the_w8a8_chain() {
         assert!(
             !names.iter().any(|n| n.ends_with(gone)),
             "`{gone}` was subsumed by the fused opforms (`quantscalepertokenfp8` took \
-             abs→amax→amaxfl→ascale; `clip` took the ±448 pair; `layernormnorm` took the \
-             dqa→dqw dequant pair) and must not be emitted anymore: {names:?}"
+             abs→amax→amaxfl→ascale; `realdiv` took the reciprocal+mul pair; `clip` took the \
+             ±448 pair; `layernormnorm` took the dqa→dqw dequant pair) and must not be emitted \
+             anymore: {names:?}"
         );
     }
 }

@@ -264,8 +264,8 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
             // ⛔ IT IS SHAPED EXACTLY LIKE THE REDUCE IT REPLACES, which is why it goes through the
             // reduce assembler and not a new one: input `[m, k]`, output `[m, stick]` — the DDL's
             // `%global_layout_output` drops the reduce dim its `%global_layout_input` carries, so the
-            // output IS the per-token scale. `invs` below still reciprocates it (the DDL keeps its own
-            // reciprocal INTERNAL, so it is not an operand we can read), and `sc/chi/cl/afp8` still
+            // output IS the per-token scale. The `realdiv` below divides by it (the DDL keeps its own
+            // reciprocal INTERNAL, so it is not an operand we can read), and `sc/cl/afp8` still
             // build the `[m,k]` fp8 tensor. 4 ops → 1, ×4 activations a layer = 12 of the 51 glue ops
             // that are 67% of a bs=1 decode layer.
             //
@@ -427,30 +427,37 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
             // premise (fixing K-cache inf) is already fixed elsewhere is unjustified risk with no
             // upside. Reverted to the simple, single unblocked reduce — decode already proves this form
             // works (m=1 always takes this path); prefill (m>1) now takes it too.
-            let invs_h = rb(&invs, m, stk);
-            ops.push(pw1(
-                &opn("fq_invs_op"),
-                "reciprocal",
-                m_rows,
-                scale_cols,
-                In::full(&ascale_h),
-                &invs_h,
-                sym_id_base,
-                layout,
-            ));
-            // scaled = act·invs; clamp to [-448,448] (torch-spyre's `quantize_fp8_with_scale` ALWAYS clamps).
+            // ⭐⭐⭐⭐⭐ scaled = act / ascale IS THE DEVICE'S OWN `realdiv` — ONE op where the chain
+            // emitted two (`reciprocal` of the scale, then `mul` of the activation by it).
+            //
+            // `broadcast_ops.ddl:347-360` realizes `realdiv(in1, in2)` as the SFP `RECIPROCAL`
+            // opaque over `in2` into `%reciprocal_tensor` (`:23`, an `sfplrf` register — on-chip),
+            // then `FMUL(in1, 1/in2)`. The opaque is the SAME one the standalone `reciprocal`
+            // runs (`unary_parallel.ddl:675-700`: identical op, constants and internal registers),
+            // so `1/s` is bit-identical; the product is `FMUL(x, r)` where the old `mul` was
+            // `MACC(x, r, 0)` (`broadcast_ops.ddl:265`). Both round the one product once; they
+            // differ only in the sign of an exact zero (`-0·r + 0 = +0` against `-0·r = -0`), and
+            // `qfp8ch` then the matmul read ±0 as the same value. The divisor is the per-row scale
+            // read out-broadcast (`In::col`), the operand mode the attention finalize's
+            // `out / sum` already runs through this same `realdiv` (`lower_ktir_to_superdsc.rs`
+            // `BcastAxis::Col`).
+            //
+            // ⛔ `invs` IS NO LONGER MATERIALISED. Its `synth` reservation above stays, for the
+            // reason `absx`/`amax`/`amaxfl`/`chi`'s do: `BundleLayout::synth` is a bump allocator.
+            let _ = &invs;
             let sc_h = rb(&sc, m, k);
             ops.push(pw2(
                 &opn("fq_sc_op"),
-                "mul",
+                "realdiv",
                 m_rows,
                 k_cols,
                 In::full(&rb(&a_name, m, k)),
-                In::col(&invs_h),
+                In::col(&ascale_h),
                 &sc_h,
                 sym_id_base,
                 layout,
             ));
+            // Clamp to [-448,448] (torch-spyre's `quantize_fp8_with_scale` ALWAYS clamps).
             // ⭐⭐⭐⭐⭐ THE CLAMP IS THE DEVICE'S OWN `clip` OP — ONE input, computing
             // `FMIN(FMAX(x, clipMin), clipMax)` (`unary_pipeline.ddl:370-377` PE stage, `:472-479` SFP
             // stage) — the same min/max pair the two ops it replaces encoded, so the swap is
@@ -907,6 +914,97 @@ mod tests {
             "{}",
             refused.0
         );
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE ACTIVATION SCALE IS ONE `realdiv`, AND IT IS THE `mul` IT REPLACED IN EVERY
+    /// FACT BUT ITS OPERATION.
+    ///
+    /// The chain used to emit `fq_invs_op = reciprocal(ascale)` then `fq_sc_op = mul(act,
+    /// col(invs))`; it now emits `fq_sc_op = realdiv(act, col(ascale))`, whose DDL body is the
+    /// same SFP `RECIPROCAL` opaque then `FMUL` (`broadcast_ops.ddl:347-360` against
+    /// `unary_parallel.ddl:675-700`). So the fixture pins, at decode (m=1) and prefill (m=31):
+    ///   · no `reciprocal` op is emitted, and `fq_invs_op` is gone;
+    ///   · `fq_sc_op` is a `realdiv` whose divisor binding is the per-row `ascale` itself;
+    ///   · its descriptor is BYTE-IDENTICAL to a `mul` over the same operands (same handles,
+    ///     same `In::col` broadcast of the one-stick scale) save the `opFuncName` — the windows,
+    ///     the split, the out-broadcast `RedStick` scale, every address. The divide changes the
+    ///     operation and nothing else, which is what makes it the old pair's fold.
+    #[test]
+    fn the_activation_scale_is_one_realdiv_with_the_muls_own_windows() {
+        for (m, k, n) in [(1u32, 2048, 256), (31, 2048, 256)] {
+            let l = fp8_layout(m, k, n);
+            let mut quantized = QuantizedActivations::default();
+            let ops = matmul_fp8_descriptors::<crate::collective::TpWorld<1>>(
+                &facts(),
+                m,
+                k,
+                n,
+                &mut 0,
+                Some(&l),
+                &mut quantized,
+            )
+            .expect("the fp8 chain emits");
+            let op_func = |o: &EmittedOp<crate::collective::TpWorld<1>>| {
+                o.dsc().dscs_[0]
+                    .values()
+                    .next()
+                    .expect("one dsc")
+                    .computeOp_[0]
+                    .opFuncName
+                    .clone()
+            };
+            assert!(
+                !ops.iter().any(|o| o.op_name.ends_with("fq_invs_op")),
+                "m={m}: the reciprocal leg is folded into the divide"
+            );
+            assert!(
+                !ops.iter().any(|o| op_func(o) == "reciprocal"),
+                "m={m}: no reciprocal is emitted"
+            );
+            let sc = ops
+                .iter()
+                .find(|o| o.op_name.ends_with("fq_sc_op"))
+                .expect("the scaled activation is emitted");
+            assert_eq!(op_func(sc), "realdiv", "m={m}: the scale is one divide");
+            let ascale = syn(Some(&l), PlaceId::Act(7).synth(SynthRole::FqAscale));
+            let ins: Vec<&str> = sc
+                .arg_bindings
+                .iter()
+                .filter(|b| b.is_input)
+                .map(|b| b.buffer.as_str())
+                .collect();
+            assert_eq!(
+                ins,
+                vec![act_name(7).as_str(), ascale.as_str()],
+                "m={m}: the divide reads the activation over the per-row scale itself"
+            );
+            // The `mul` the old chain ran, over the SAME operands — only the op differs.
+            let stk = Fp16::ELEMS_PER_STICK;
+            let sc_name = syn(Some(&l), PlaceId::Act(7).synth(SynthRole::FqSc));
+            let as_mul: EmittedOp<crate::collective::TpWorld<1>> = pw2(
+                &sc.op_name,
+                "mul",
+                crate::sdsc_abstract::RowCount::of_token_rows(m),
+                crate::sdsc_abstract::BlockCols::of_feature_cols(k),
+                In::full(&rb(&act_name(7), m, k)),
+                In::col(&rb(&ascale, m, stk)),
+                &rb(&sc_name, m, k),
+                &mut 0,
+                Some(&l),
+            );
+            let mut want = serde_json::to_value(as_mul.dsc()).expect("the mul serializes");
+            let got = serde_json::to_value(sc.dsc()).expect("the divide serializes");
+            let name = sc.op_name.as_str();
+            assert_eq!(
+                want["dscs_"][0][name]["computeOp_"][0]["opFuncName"], "mul",
+                "the sibling is the old mul"
+            );
+            want["dscs_"][0][name]["computeOp_"][0]["opFuncName"] = "realdiv".into();
+            assert_eq!(
+                got, want,
+                "m={m}: the divide's descriptor is the mul's, op aside"
+            );
+        }
     }
 
     /// ⭐⭐⭐⭐⭐ THE QUANT-CHAIN REDUCE AT AN LX-OVERFLOWING GEOMETRY STAYS SINGLE-SHOT.
