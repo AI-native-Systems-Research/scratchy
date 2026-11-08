@@ -4158,9 +4158,13 @@ mod production_ktir_dump {
         ));
         // ── lmlast.py: the extraction, one entry per request count — k = 1, 2 and 3 (3 is
         // not a power of two), each at w = 5 so MQ is the pair's own product. ──
-        for s in [1i128, 2, 3] {
+        for (name, s) in [
+            ("lmlast_fwd_s1", 1i128),
+            ("lmlast_fwd_s2", 2),
+            ("lmlast_fwd_s3", 3),
+        ] {
             v.push((
-                "lmlast_fwd",
+                name,
                 LMLAST,
                 spec(
                     "lmlast.py",
@@ -4550,7 +4554,7 @@ mod production_ktir_dump {
             "rmsnormunit_fwd" => Program::RmsNormUnit,
             "scalarwmul_fwd" => Program::ScalarWeightMul,
             "reshape_fwd" => Program::Reshape,
-            "lmlast_fwd" => Program::LmLast,
+            "lmlast_fwd_s1" | "lmlast_fwd_s2" | "lmlast_fwd_s3" => Program::LmLast,
             "windowedrmsnorm_gained_fwd" | "windowedrmsnorm_oneplus_fwd" => {
                 Program::WindowedRmsNorm { unit: false }
             }
