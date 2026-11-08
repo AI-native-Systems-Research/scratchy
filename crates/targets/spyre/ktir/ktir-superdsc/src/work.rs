@@ -11,12 +11,21 @@
 //! ⛔ THE SPYRE MODEL, NOT THE KTIR EMITTER'S. 256 MB/core span and a 64-element fp16 stick; the
 //! `pick_k`/`n_block` formulas in the KTIR emitter are H100's and are the wrong hardware.
 
-use crate::superdsc_opspec::{Df, ItDim, MAX_CORES, WorkPlan};
+use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, MAX_CORES, WorkPlan};
 use std::collections::BTreeMap;
 
-pub const CORELETS_PER_CORE: u32 = 2;
-pub const STICK_BYTES: u32 = 128;
-pub const FP16_ELEMS_PER_STICK: u32 = 64; // 128 B / 2 B
+/// Corelets per compute tile — READ from the baked generation's table
+/// (`<Baked as DeviceGen>::CORELETS`, the vendor's own default, under its
+/// citation).
+pub const CORELETS_PER_CORE: u32 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORELETS;
+/// One stick's bytes — the baked generation's flit (`FLIT_BYTES`, under its
+/// citation): a stick is one flit wide.
+pub const STICK_BYTES: u32 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES as u32;
+/// The fp16 stick width — the device's own stick-law derivation
+/// (`DataFormat`'s doc), not a literal.
+pub const FP16_ELEMS_PER_STICK: u32 = <Fp16 as DataFormat>::ELEMS_PER_STICK;
 pub const MAX_SPAN_BYTES: u64 = 256 * 1024 * 1024;
 
 // ───────────────────────────────────────────────────────────────────────────

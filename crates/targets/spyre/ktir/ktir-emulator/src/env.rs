@@ -103,10 +103,24 @@ impl ConvertModel {
     /// a fused Metal map window, and both ask here, so the two paths a window can
     /// take cannot disagree on which widens permute.
     pub fn widen_staggers(self, from: Option<DType>, to: Option<DType>) -> bool {
+        // The emulator's ONE entry into the table: it consumes the generation
+        // the bake baked for, it does not choose one — `Baked` is named here
+        // alone, and the consult itself is generic over `G` below.
+        self.widen_staggers_for_generation::<ktir_core::ddl_binds::Baked>(from, to)
+    }
+
+    /// The consult, generic over the generation `G` — the same reader shape
+    /// the bake's readers take (`legalize_types::run`, `staggered_sources`);
+    /// the entry above chooses the baked generation once.
+    pub fn widen_staggers_for_generation<G: ktir_core::ddl_binds::DeviceGen>(
+        self,
+        from: Option<DType>,
+        to: Option<DType>,
+    ) -> bool {
         self == ConvertModel::Card
             && from == Some(DType::F16)
             && to == Some(DType::F32)
-            && ktir_core::ddl_binds::output_arrangement::<ktir_core::ddl_binds::Baked>(
+            && ktir_core::ddl_binds::output_arrangement::<G>(
                 ktir_core::ddl_binds::DeviceOp::Dl16ToFp32,
             )
             .is_some_and(|a| a == ktir_core::ddl_binds::ElementArrangement::Dl16ToFp32)

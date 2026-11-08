@@ -6617,6 +6617,12 @@ impl ChunkScratch {
     /// reaches the same depth with a chunk of 32 smaller pages walked over several in-program trips.
     pub const PAGES_MAX: u32 = 64;
 
+    /// NOT a generation constant: 64 pages is the SERVED CONTEXT DEPTH (64
+    /// pages × 256 slots = 16384 tokens, the shipped `--max-model-len`), a
+    /// serving choice — not a derivation from the core count. The gather's
+    /// `ENTRIES_PER_OP == MAX_CORES` law (see `lx_form`) is about the copy's
+    /// index stick, a different fact that does not fix the page count.
+
     /// ⭐ THE ONE-REQUEST DECODE LADDER — one baked body per chunk width, in pages, ascending. The
     /// runtime picks the smallest rung covering the live context (`select_body`'s own law over each
     /// rung's swept `pages * POOL_PAGE_SLOTS`), and the chunk's tail pages repeat the last real page under a

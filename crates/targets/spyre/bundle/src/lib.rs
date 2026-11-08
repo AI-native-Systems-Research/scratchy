@@ -113,8 +113,11 @@ impl SweptCols {
 //  Placements — the memory plan
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The ≤7-packed-segment executor model: one device region per occupied segment.
-pub const NUM_SEGMENTS: usize = 7;
+/// The ≤7-packed-segment executor model: one device region per occupied segment —
+/// READ from the baked generation's table (`<Baked as DeviceGen>::NUM_SEGMENTS`,
+/// senlib's 8 VA segments with the executor packing 7, under its citation).
+pub const NUM_SEGMENTS: usize =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::NUM_SEGMENTS;
 
 /// ⛔⛔⛔ THE BYTES ONE SEGMENT MAY HOLD — because "one device region per occupied segment" (above)
 /// is not just a mental model, it is an ALLOCATION, and a flex region is capped at 16 GiB
@@ -130,8 +133,12 @@ pub const NUM_SEGMENTS: usize = 7;
 /// (`requested_bytes=17365082112, free_space_bytes=103048964224`) because the free space is spread
 /// across the five regions the request cannot reach. Every byte in that sum is a compile-time
 /// constant of the bundle, so the refusal belongs at `cargo build`, naming the segment — see
-/// `audit_layout_addresses`.
-pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// `audit_layout_addresses`. READ from the baked generation's table
+/// (`<Baked as DeviceGen>::MAX_SEGMENT_BYTES`, senlib's `XLAT_LEN_MAX_FLITS`
+/// = 2^27 flits of 128 B, under its citation); the flex-rs pin this crate
+/// already carried stays.
+pub const MAX_SEGMENT_BYTES: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::MAX_SEGMENT_BYTES;
 
 /// WHAT A LAUNCH'S PROGRAM COMPUTES, and the pointwise kinds it names — re-exported for the same
 /// reason as [`PlaceId`]: [`LaunchProgram::program`] carries the kind, so the token emitter

@@ -145,6 +145,7 @@ pub mod passes;
 pub mod text;
 
 pub use ir::{Module, Op, OpKind, Ssa};
+use ktir_core::ddl_binds;
 
 /// Every way this crate refuses.
 ///
@@ -206,8 +207,11 @@ pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
         ("make_ktir:distribute_work", |m, g| {
             passes::distribute_work::run(m, g)
         }),
+        // The BAKE'S ENTRY chooses the generation ONCE: every reader below is
+        // generic over `G`, and this row — the one place the pipeline enters
+        // them — names the baked generation.
         ("make_ktir:legalize_types", |m, _| {
-            passes::legalize_types::run(m)
+            passes::legalize_types::run::<ddl_binds::Baked>(m)
         }),
         ("make_ktir:canonicalize", |m, _| {
             passes::canonicalize::run(m)

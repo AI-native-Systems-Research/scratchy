@@ -50,15 +50,24 @@ use crate::superdsc_opspec::{DataFormat, Fp16};
 /// The widest single p2p message, in bytes — the vendor's per-message RDMA window
 /// (`pf_runtime_scheduler.cpp:50`'s `P2P_RDMA_WINDOW_SIZE`, flex-rs
 /// `scheduler::P2P_RDMA_WINDOW_SIZE`, which the target crate pins equal): one F-send moves at most
-/// this many bytes, and a longer send is a run of messages.
-pub const RDMA_MESSAGE_CAP_BYTES: u64 = 4 * 1024 * 1024;
+/// this many bytes, and a longer send is a run of messages. The value is READ
+/// from the baked generation's table (the vendor's per-message RDMA window,
+/// under its citation there).
+pub const RDMA_MESSAGE_CAP_BYTES: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::RDMA_MESSAGE_CAP_BYTES;
 
 /// One flit, the unit every CB address and length field counts in (flex-rs
-/// `control_block_wire::Flits::BYTES`, which the target crate pins equal).
-pub const FLIT_BYTES: u64 = 128;
+/// `control_block_wire::Flits::BYTES`, which the target crate pins equal) —
+/// READ from the baked generation's table (senlib's `FLIT_SHIFT` = 7 and the
+/// vendor's `STICK_BYTESIZE` = 128, under its citation).
+pub const FLIT_BYTES: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES;
 
-/// How many write-done sids a card has.
-pub const MAX_SIDS: u32 = 64;
+/// How many write-done sids a card has — READ from the baked generation's
+/// table (`<Baked as DeviceGen>::MAX_SIDS`, senlib's
+/// `BASE_ADDR_TABLE_ENTRIES` = 64, under its citation).
+pub const MAX_SIDS: u32 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::MAX_SIDS;
 
 /// The elements of one fp16 stick.
 pub const STICK_ELEMS: u32 = <Fp16 as DataFormat>::ELEMS_PER_STICK;

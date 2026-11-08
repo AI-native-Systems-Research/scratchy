@@ -58,7 +58,10 @@ use std::collections::{HashMap, HashSet};
 
 const PASS: &str = "LegalizeTypes";
 
-pub fn run(module: &mut Module) -> Result<()> {
+/// Generic over the device generation `G` — the bake's entry chooses it ONCE
+/// (`make_ktir`'s pipeline row names `ddl_binds::Baked`); this pass never
+/// chooses a generation itself.
+pub fn run<G: ddl_binds::DeviceGen>(module: &mut Module) -> Result<()> {
     // THE FPTOSI ISLAND FIRST, while every extf still stands: the protected set is a
     // backward slice over VALUES, and step 1 below erases the casts whose results it
     // must be able to see through.
@@ -533,10 +536,7 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
                     Some(DeviceForm::Op(ddl_binds::DeviceOp::Log, DType::F32)) => {}
                     Some(DeviceForm::Op(key, din))
                         if in_elems.contains(&din)
-                            && ddl_binds::binds::<ddl_binds::Baked>(
-                                key,
-                                ddl_binds::DdlDf::Fp32,
-                            ) =>
+                            && ddl_binds::binds::<G>(key, ddl_binds::DdlDf::Fp32) =>
                     {
                         continue;
                     }

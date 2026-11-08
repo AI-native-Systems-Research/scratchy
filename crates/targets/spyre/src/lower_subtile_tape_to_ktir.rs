@@ -1722,10 +1722,12 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     // emitted descriptors cannot disagree about which buffers carry the
                     // stagger. Refused here (a build error naming the program) rather than
                     // staged wrong on the card.
-                    let staggered = ktir_superdsc::emit::whole_function::staggered_sources(&k)
-                        .map_err(|e| SuperDscError(e.message))?
-                        .into_iter()
-                        .collect::<Vec<_>>();
+                    let staggered = ktir_superdsc::emit::whole_function::staggered_sources::<
+                        ktir_core::ddl_binds::Baked,
+                    >(&k)
+                    .map_err(|e| SuperDscError(e.message))?
+                    .into_iter()
+                    .collect::<Vec<_>>();
                     let mask = match k.mask {
                         // ⭐ THE CAPACITY IS THE K POOL's: the paged walk's parameters are `[q, out,
                         // k pool, v pool, page table, mask]`, and the K pool is the layer's K cache
@@ -2127,7 +2129,7 @@ pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         for e in ops {
             let Some(k) = e.ktir else { continue };
             out.extend(
-                ktir_superdsc::emit::whole_function::staggered_sources(&k)
+                ktir_superdsc::emit::whole_function::staggered_sources::<ktir_core::ddl_binds::Baked>(&k)
                     .map_err(|e| SuperDscError(e.message))?,
             );
         }

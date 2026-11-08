@@ -4182,7 +4182,10 @@ pub(super) fn mint_floor(k: &KtirNode) -> u32 {
 /// Returns the marked parameters: buffer tid → the arrangement to stage. Parameters the pass
 /// never marks stay [`ElementArrangement::Standard`], and the map is EMPTY for every program
 /// with no staggered convert — a decoder layer changes nothing.
-pub fn staggered_sources(
+/// Generic over the generation `G` — the BAKE names it once at its entry
+/// (`staggered_sources::<Baked>` in `lower_subtile_tape_to_ktir`); this
+/// pass never chooses a generation itself.
+pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
     k: &KtirNode,
 ) -> Result<std::collections::BTreeMap<u32, crate::element_arrangement::ElementArrangement>, Error>
 {
@@ -4358,20 +4361,19 @@ pub fn staggered_sources(
             // row. NO SILENT DEFAULT — a convert whose op states no row is a fact the
             // bake does not hold, refused by name here (every convert op states a row,
             // so this is unreachable for every op this tree emits).
-            Lowering::Convert(kind) => match ktir_core::ddl_binds::output_arrangement::<
-                ktir_core::ddl_binds::Baked,
-            >(kind.device_op())
-            {
-                Some(arr) => arr,
-                None => {
-                    return err(format!(
-                        "the convert {} states no arrangement row in the device-facts table \
-                         (ktir_core::ddl_binds, the baked generation) — refusing to guess Standard for a fact \
-                         the table does not hold",
-                        kind.op_func()
-                    ));
+            Lowering::Convert(kind) => {
+                match ktir_core::ddl_binds::output_arrangement::<G>(kind.device_op()) {
+                    Some(arr) => arr,
+                    None => {
+                        return err(format!(
+                            "the convert {} states no arrangement row in the device-facts table \
+                         (ktir_core::ddl_binds, the generation this propagation runs for) — refusing to guess \
+                         Standard for a fact the table does not hold",
+                            kind.op_func()
+                        ));
+                    }
                 }
-            },
+            }
             // POINTWISE — the stagger propagates through it, and every same-width operand that
             // is read lane-for-lane must agree with the output's arrangement.
             Lowering::Silu

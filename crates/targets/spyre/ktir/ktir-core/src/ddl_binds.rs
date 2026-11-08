@@ -255,12 +255,29 @@ pub struct DeviceOpRow {
     pub citation: &'static str,
 }
 
-/// A device GENERATION. The marker trait: each generation states its own
-/// device-facts table (and, in the modules that carry them, its own
-/// constants — stick width, core count, LX budget, page geometry); a
-/// lowering reads them through the generation it bakes for, never as free
-/// constants. `Gen1` is today's only implementor; `Gen2` will be a second
-/// impl with its own citations, not an edit here.
+/// A device GENERATION. Each generation states its own device facts — the
+/// op/dtype/layout table AND the geometry constants below — so a lowering
+/// reads them through the generation it bakes for, never as free constants.
+/// `Gen1` is today's only implementor; `Gen2` will be a second impl with
+/// its own citations, not an edit here.
+///
+/// A wrong copy of a constant does not build: every reader pins what it
+/// reads against the table (the spyre-target crate pins the same constants
+/// against senlib's own names), and the pin is a `const` assert — a value
+/// that disagrees with the table is a compile error, not a silent drift.
+/// That this pin is not vacuous is itself a fixture:
+///
+/// ```compile_fail
+/// // A WRONG COPY of Gen1's core count must fail to build. This doctest
+/// // states 31 where the table states 32; the assert below is the same
+/// // form every reader's pin takes, so its failure here proves the pin
+/// // distinguishes values — an assert that cannot fail protects nothing.
+/// const WRONG_COPY_OF_GEN1_CORES: u32 = 31;
+/// const _: () = assert!(
+///     <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORES
+///         == WRONG_COPY_OF_GEN1_CORES
+/// );
+/// ```
 pub trait DeviceGen {
     /// This generation's device-facts table — the one statement of its
     /// card's (op, dtype, layout) facts, read by `legalize_types`
@@ -268,6 +285,33 @@ pub trait DeviceGen {
     /// collapse and pointwise-door consults that land next read the same
     /// rows.
     const DEVICE_OPS: &'static [DeviceOpRow];
+    /// The card's compute cores — the count every work plan caps at (one
+    /// entry per core on the gather's index stick; `MaxCores` in the work
+    /// planner). The frontend's default core count is the SAME fact.
+    const CORES: u32;
+    /// Corelets per compute tile.
+    const CORELETS: u32;
+    /// Per-core LX scratchpad, in bytes.
+    const LX_CAPACITY_BYTES: u64;
+    /// How many write-done sids a card holds.
+    const MAX_SIDS: u32;
+    /// The widest single p2p message, in bytes — a longer send is a run of
+    /// messages.
+    const RDMA_MESSAGE_CAP_BYTES: u64;
+    /// Segments of the executor's packed-segment model.
+    const NUM_SEGMENTS: usize;
+    /// The bytes one segment may hold.
+    const MAX_SEGMENT_BYTES: u64;
+    /// One flit, in bytes — the unit every CB address and length field
+    /// counts in, and (by the device's own stick law) the width of every
+    /// format's stick: elems per stick = `FLIT_BYTES / element size`.
+    const FLIT_BYTES: u64;
+    /// This generation's `dl16tofp32` lane permutation:
+    /// `DL16TOFP32_PERMUTATION[i]` is the buffer position logical lane `i`
+    /// of a 64-element block occupies in a staggered buffer. A const
+    /// table, not a derivation — the staging over it lives in
+    /// `ktir-superdsc`'s `element_arrangement`.
+    const DL16TOFP32_PERMUTATION: [u8; 64];
 }
 
 /// Spyre generation 1 — the card this tree bakes today.
@@ -275,10 +319,8 @@ pub struct Gen1;
 
 /// The generation this tree bakes for — the ONE name the bake's readers
 /// hold. `Gen1` is spelled here alone; gen2 lands as a second [`DeviceGen`]
-/// impl with its own table and this alias moves to it — a one-line change in
-/// one place, not a grep. Threading the generation as a parameter through
-/// the passes (each reader generic over `G`, the bake's entry choosing) is
-/// the generation-constants PR's work, stated in this PR's body.
+/// impl with its own table and constants, and this alias moves to it — a
+/// one-line change in one place, not a grep.
 pub type Baked = Gen1;
 
 impl DeviceGen for Gen1 {
@@ -539,6 +581,96 @@ impl DeviceGen for Gen1 {
                    summeanmaxexx2_fp32.ddl:54 / :55",
         },
     ];
+
+    /// GEN1'S GEOMETRY. Every constant cites the device's own statement —
+    /// the vendor's deeptools headers (read on the card pod, 2026-11-08)
+    /// and senlib-rs's snt1p0 table — and the spyre-target crate pins the
+    /// numerics it can against senlib's own names, so a wrong copy here is
+    /// a build failure there.
+    ///
+    /// deeptools paths below are on the card pod
+    /// (`/opt/ibm/spyre/deeptools/include/...`); senlib-rs paths are
+    /// `~/git/senlib-rs/crates/chip/src/generation/snt1p0.rs`.
+    ///
+    /// CORES = 32: senlib-rs `RCU_CORES: u32 = 32` (snt1p0.rs:225,
+    /// "probe-pinned at 32 on snt1p0 silicon; chip geometry, not a
+    /// per-card discovery") and the vendor `SenSystemDef`'s own default
+    /// `core = 32` (sys-arch-spec/sysdef.h:169).
+    const CORES: u32 = 32;
+
+    /// CORELETS = 2: the vendor `SenSystemDef`'s own default
+    /// `corelets = 2` (sys-arch-spec/sysdef.h:169).
+    const CORELETS: u32 = 2;
+
+    /// LX = 2 MiB per core: the vendor `SenSystemDef`'s own default
+    /// `lxCap = 2 * 1024 * 1024` (sys-arch-spec/sysdef.h:169); confirmed
+    /// against torch-spyre `scratchpad/allocator.py:305` and
+    /// `sentient_dd2_sysconfig.json` (the citation the old literal site
+    /// carried). No senlib name exists for the LX — senlib is the
+    /// host/wire layer; the LX is device-internal.
+    const LX_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
+
+    /// SIDS = 64: senlib-rs `BASE_ADDR_TABLE_ENTRIES: usize = 64`
+    /// (snt1p0.rs:232) — the same 64 its `Tid::new` refuses to exceed.
+    const MAX_SIDS: u32 = 64;
+
+    /// RDMA = 4 MiB per message: the vendor's per-message RDMA window
+    /// (`P2P_RDMA_WINDOW_SIZE`, pf_runtime_scheduler.cpp:50; flex-rs's
+    /// `scheduler::P2P_RDMA_WINDOW_SIZE`, which the target crate pins
+    /// equal).
+    const RDMA_MESSAGE_CAP_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// SEGMENTS = 7: the executor's ≤7-packed-segment model over the
+    /// device's VA segments — senlib-rs states 8 VA segments for snt1p0
+    /// (snt1p0.rs:~545) and the executor model packs 7.
+    const NUM_SEGMENTS: usize = 7;
+
+    /// One segment = 16 GiB: senlib-rs `XLAT_LEN_MAX_FLITS: u64 = 1 << 27`
+    /// (snt1p0.rs:535 — "a stored length of zero is the field maximum,
+    /// 2^27 flits (16 GiB)") at 128 B per flit; flex-rs's
+    /// `MAX_REGION_BYTES`, which the target crate pins equal.
+    const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+    /// FLIT = 128 B: senlib-rs `FLIT_SHIFT: u32 = 7` (snt1p0.rs:292) and
+    /// the vendor's own `#define STICK_BYTESIZE 128`
+    /// (util/sendefs/dataType.h:9) — the flit and the stick are the same
+    /// width, which is the stick law the per-format stick widths derive
+    /// from: `getNumElemsInStick = (STICK_BYTESIZE << 3) >> bitWidth`
+    /// (dataType.h:22-24), i.e. elems per stick = FLIT_BYTES / element
+    /// size, for EVERY format (the vendor's `dataFormatToStickSize` map —
+    /// util/sendefs/sendefs.h:65-72 — holds exactly that quotient for all
+    /// twelve of its rows, packed int2/int4 included).
+    const FLIT_BYTES: u64 = 128;
+
+    /// GEN1'S `dl16tofp32` LANE PERMUTATION — measured on the card
+    /// (2026-10-26, granite-2b fp8, probe-8): within each 64-element block
+    /// of the f32 word stream, the sixteen 4-lane groups permute by a
+    /// 1-bit RIGHT rotation of the 4-bit group index — logical lane `4g+r`
+    /// lands at buffer position `4·ror(g)+r`, `ror(g) = (g>>1) |
+    /// ((g&1)<<3)`. The staging over this table stays in ktir-superdsc's
+    /// `element_arrangement`; only the table itself moved here, so a
+    /// generation is one impl with its own measured permutation.
+    const DL16TOFP32_PERMUTATION: [u8; 64] = dl16tofp32_permutation();
+}
+
+/// The const constructor behind Gen1's
+/// [`DL16TOFP32_PERMUTATION`](DeviceGen::DL16TOFP32_PERMUTATION) — evaluated
+/// at compile time, so the table on disk IS the formula (the right rotation
+/// of the 4-bit group index), stated once.
+const fn dl16tofp32_permutation() -> [u8; 64] {
+    let mut table = [0u8; 64];
+    let mut g = 0;
+    while g < 16 {
+        // ror(g) = (g >> 1) | ((g & 1) << 3) — a 1-bit right rotation of the 4-bit group index.
+        let rotated = (g >> 1) | ((g & 1) << 3);
+        let mut r = 0;
+        while r < 4 {
+            table[g * 4 + r] = (rotated * 4 + r) as u8;
+            r += 1;
+        }
+        g += 1;
+    }
+    table
 }
 
 /// The row stating `op`'s facts on generation `G`, or `None` when no row

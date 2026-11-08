@@ -33,32 +33,18 @@
 /// a standard one where order matters) fire at EXPANSION, which is a `cargo build` error.
 ///
 /// The enum lives in [`ktir_core::ddl_binds`] beside the device-facts table whose rows state
-/// which op's output carries which arrangement; this module keeps the measured permutation and
-/// the staging over it, and re-exports the type so this crate's paths stand.
+/// which op's output carries which arrangement; this module keeps the STAGING over the measured
+/// permutation (the table itself is Gen1's, in the device-facts table's home) and re-exports the
+/// type so this crate's paths stand.
 pub use ktir_core::ddl_binds::ElementArrangement;
 
 /// The 64-entry permutation: `PERMUTATION[i]` is the BUFFER POSITION logical lane `i` of a
 /// 64-element block occupies in a [`ElementArrangement::Dl16ToFp32`] buffer. A const table, not
-/// a derivation — the stager that writes lane `i` reads this row and never computes.
-pub const DL16TOFP32_PERMUTATION: [u8; 64] = dl16tofp32_permutation();
-
-/// The const constructor behind [`DL16TOFP32_PERMUTATION`] — evaluated at compile time, so the
-/// table on disk IS the formula (the right rotation of the 4-bit group index), stated once.
-const fn dl16tofp32_permutation() -> [u8; 64] {
-    let mut table = [0u8; 64];
-    let mut g = 0;
-    while g < 16 {
-        // ror(g) = (g >> 1) | ((g & 1) << 3) — a 1-bit right rotation of the 4-bit group index.
-        let rotated = (g >> 1) | ((g & 1) << 3);
-        let mut r = 0;
-        while r < 4 {
-            table[g * 4 + r] = (rotated * 4 + r) as u8;
-            r += 1;
-        }
-        g += 1;
-    }
-    table
-}
+/// a derivation — the stager that writes lane `i` reads this row and never computes. The table
+/// is GEN1'S OWN (`<Baked as DeviceGen>::DL16TOFP32_PERMUTATION`, the device-facts table's
+/// home, with its measurement citation); this module keeps the STAGING over it.
+pub const DL16TOFP32_PERMUTATION: [u8; 64] =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::DL16TOFP32_PERMUTATION;
 
 // ⭐ THE ARRANGEMENT FACT'S HOME — [`ktir_core::ddl_binds::DEVICE_OPS`]: each row states the
 // arrangement its op's output carries when both operands are addressed standard, and

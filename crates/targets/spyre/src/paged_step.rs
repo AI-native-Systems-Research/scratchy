@@ -221,7 +221,9 @@ fn check(step: &PagedStep, blocks: &[u32], rows: &StepRows) -> Result<(), PagedS
 }
 
 /// `INT32_ELEMS_PER_STICK` — a page index table row's width.
-pub const INT32_ELEMS_PER_STICK: usize = 32;
+pub const INT32_ELEMS_PER_STICK: usize =
+    <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
 
 /// The page index table: `[walk, INT32_ELEMS_PER_STICK]` int32, row `i` holding block `i`'s page at
 /// column 0 — `table[:, 0] = block_table[s, :walk]`, the block table's own zeros past the request's
