@@ -8347,6 +8347,23 @@ fn load_world(
     }
 }
 
+/// ⭐ A DEFERRED `In::col` CHECK — one operand of a pointwise op that reads one value per result
+/// row (`operand_numel == res_rows` elements beside a `res_numel`-element result), collected by
+/// the pass and decided after the closed solve: only the column frame supplies it. Every field
+/// is one the refusal names — the op, the operand, and both counts.
+struct PerRowCheck<'a, 'o> {
+    /// The pointwise op reading the operand — the refusal names the op.
+    op: &'a Operation<'o>,
+    /// The operand that reads one value per result row.
+    operand: Ssa,
+    /// The operand's element count.
+    operand_numel: i64,
+    /// The result's element count.
+    res_numel: i64,
+    /// The result's flat-frame rows.
+    res_rows: u32,
+}
+
 /// ⭐⭐⭐⭐⭐ THE ONE FRAME ASSIGNMENT — a CONSTRAINT SOLVE over [`crate::union_find`]: the program
 /// STATES equalities and absolutes, the solve closes them, and every value's [`World`] is the
 /// solution. One pass in the program's own order — no fixpoint, because a join is order-free:
@@ -8399,23 +8416,6 @@ fn load_world(
 ///
 /// ⭐ DETERMINISM: the walk is the program's own order (`ops_deep`); joins attach the second
 /// side's root under the first's; the maps are lookups, never iteration order.
-/// ⭐ A DEFERRED `In::col` CHECK — one operand of a pointwise op that reads one value per result
-/// row (`operand_numel == res_rows` elements beside a `res_numel`-element result), collected by
-/// the pass and decided after the closed solve: only the column frame supplies it. Every field
-/// is one the refusal names — the op, the operand, and both counts.
-struct PerRowCheck<'a, 'o> {
-    /// The pointwise op reading the operand — the refusal names the op.
-    op: &'a Operation<'o>,
-    /// The operand that reads one value per result row.
-    operand: Ssa,
-    /// The operand's element count.
-    operand_numel: i64,
-    /// The result's element count.
-    res_numel: i64,
-    /// The result's flat-frame rows.
-    res_rows: u32,
-}
-
 fn assign_frames(
     f: &IRFunction<'static>,
     fold: Option<&super::loop_fold::LoopFold>,
