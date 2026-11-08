@@ -351,28 +351,19 @@ pub fn write_placements(
     // reciprocal to `recip(0) = inf`). The VALUES are the device's own E4M3 constants,
     // fixed by the format, not by any model or launch — so they are written out here for
     // the launcher to bind, the same treatment `scalarmul_scales` gets.
-    //
-    // The scale folds' zeros (`ZERO_ROW_TID`, `ZERO_COL_TID` — the fp8 dequant's zero mean and zero
-    // β, a single-position rope's zero `bnB`) ride the same block: a uniform value the launcher
-    // fills across the whole placement, exactly like the clamp bounds. Each row is written iff its
-    // tensor is placed, so the block states exactly the constants this bundle reads.
-    use ktir_superdsc::reserved_tids::{
-        FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID, ZERO_COL_TID, ZERO_ROW_TID,
-    };
-    let rows: Vec<(u32, f32)> = [
-        (FP8_POS448_TID, 448.0),
-        (FP8_NEG448_TID, -448.0),
-        (FP8_INV448_TID, 1.0 / 448.0),
-        (ZERO_ROW_TID, 0.0),
-        (ZERO_COL_TID, 0.0),
-    ]
-    .into_iter()
-    .filter(|(tid, _)| layout.placements.contains_key(tid))
-    .collect();
-    if !rows.is_empty() {
+    if layout
+        .placements
+        .contains_key(&ktir_superdsc::reserved_tids::FP8_INV448_TID)
+    {
+        use ktir_superdsc::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
         // Rewrite the closing brace to append the block, keeping the JSON valid.
         s.truncate(s.len() - "  ]\n}\n".len());
         s.push_str("  ],\n  \"fp8_consts\": [\n");
+        let rows = [
+            (FP8_POS448_TID, 448.0),
+            (FP8_NEG448_TID, -448.0),
+            (FP8_INV448_TID, 1.0 / 448.0),
+        ];
         for (i, (tid, v)) in rows.iter().enumerate() {
             let _ = writeln!(
                 s,

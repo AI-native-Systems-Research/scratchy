@@ -116,7 +116,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
 /// ⭐ THE `(1 + w)` CONVENTION'S OWN DOOR GATE — the OnePlusScale row end to end:
 /// the splice compiles `rmsnorm_oneplus_fwd`, the census gives 1.0 a registry slot
 /// (the epsilon's own mechanism), and the door emits the `rmga_` add ahead of the
-/// `rmxg_` normalise-and-gain — the same formula the program runs, op for op. The SCALE
+/// `rmg_` gain multiply — the same formula the program runs, op for op. The SCALE
 /// CONTROL below pins the other half of the row's law: a Scale-only model pushes
 /// NO 1.0 into the registry (the nothing-is-seeded law) and emits NO `rmga_` op —
 /// byte-identical to the form before the row existed.
@@ -175,9 +175,9 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         .unwrap_or_else(|e| panic!("oneplus program lowered (m={m} c={c}): {}", e.message));
 
         // THE OP CENSUS — the fixture's output is t2, so the chain's prefixes are
-        // `o2`: the `rmga_o2` add must be present AND ahead of the `rmxg_o2` fused
-        // normalise-and-gain (the add fills the Gw row its γ operand reads; the
-        // reverse order would read the stored row).
+        // `o2`: the `rmga_o2` add must be present AND ahead of the `rmg_o2` gain
+        // multiply (the add fills the Gw row the multiply reads; the reverse order
+        // would read the stored row).
         let t = 2;
         let add = emitted
             .iter()
@@ -190,12 +190,12 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             });
         let mul = emitted
             .iter()
-            .position(|op| op.op_name == format!("rmxg_o{t}"))
-            .unwrap_or_else(|| panic!("no rmxg_o{t} in the oneplus chain (m={m} c={c})"));
+            .position(|op| op.op_name == format!("rmg_o{t}"))
+            .unwrap_or_else(|| panic!("no rmg_o{t} in the oneplus chain (m={m} c={c})"));
         assert!(
             add < mul,
-            "rmga_o{t} must precede rmxg_o{t} (m={m} c={c}): the add fills the Gw row the \
-             fused tail reads"
+            "rmga_o{t} must precede rmg_o{t} (m={m} c={c}): the add fills the Gw row the \
+             multiply reads"
         );
 
         // THE SCALE CONTROL — the same shape under Scale: no 1.0 in the registry,
