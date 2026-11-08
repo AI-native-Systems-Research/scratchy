@@ -508,7 +508,7 @@ pub(crate) fn run_card_launch(
             let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
             log_seat_readback(
                 pf,
-                &seat,
+                seat,
                 b.wiring.load_consts,
                 &picked,
                 &format!("prefill-final mq={mq} at={seq_pos}"),
@@ -2032,7 +2032,6 @@ mod pad_clamp_tests {
         use scratchy_subtile::subtile_ir::{
             SampleRows, SourceShape, SubOp, lower_region, mint_sample,
         };
-        let rows = rows as usize;
         // K=1, vocab 5 — the one-request lm-head shape the mint admits, the
         // same fixture the spyre crate's own mint tests pin.
         let input = LoweringInput {
