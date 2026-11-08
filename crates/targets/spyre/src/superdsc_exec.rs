@@ -1651,6 +1651,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .collect()
     }
 
+    /// The CPUs this session's card's host threads run on (its NUMA node's): a thread that
+    /// submits this session's steps pins itself to them first.
+    pub fn card_cpus(&self) -> &flex_rs::numa::CardCpus {
+        self.card.cpus()
+    }
+
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Binding
     // ──────────────────────────────────────────────────────────────────────────────────────────

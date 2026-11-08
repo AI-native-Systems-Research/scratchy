@@ -1520,6 +1520,12 @@ pub trait HardwareSubmit: Send + Sync {
     fn telemetry_key(&self) -> usize {
         0
     }
+
+    /// The CPUs this hardware's response worker runs on: its card's NUMA node
+    /// ([`crate::numa`]). No node for hardware with no card.
+    fn cpus(&self) -> crate::numa::CardCpus {
+        crate::numa::CardCpus::NO_DEVICE
+    }
 }
 
 /// Proof that `outstanding` response slots have been taken from senlib and not
@@ -1759,13 +1765,16 @@ pub struct SenlibHardwareSubmit {
     rbs_scratch: Mutex<Vec<crate::senlib_ffi::SenlibResponseBlockSbf>>,
     /// The card whose queues this submits to and drains.
     card: Arc<crate::senlib_ffi::Card>,
+    /// The card's NUMA node's CPUs, read when the card opened.
+    cpus: crate::numa::CardCpus,
 }
 
 impl SenlibHardwareSubmit {
-    pub fn new(card: Arc<crate::senlib_ffi::Card>) -> Self {
+    pub fn new(card: Arc<crate::senlib_ffi::Card>, cpus: crate::numa::CardCpus) -> Self {
         Self {
             rbs_scratch: Mutex::new(Vec::new()),
             card,
+            cpus,
         }
     }
 }
@@ -1876,6 +1885,10 @@ impl HardwareSubmit for SenlibHardwareSubmit {
 
     fn telemetry_key(&self) -> usize {
         self.card.telemetry_key()
+    }
+
+    fn cpus(&self) -> crate::numa::CardCpus {
+        self.cpus.clone()
     }
 }
 
@@ -2167,6 +2180,9 @@ pub struct ResponseWorker {
     global_pr_id: std::sync::atomic::AtomicU64,
     global_pr_batch_id: std::sync::atomic::AtomicU64,
     worker_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set when the completion thread could not run on its card's NUMA node: it never polls,
+    /// so every submit is refused with this, by name.
+    start_refused: std::sync::OnceLock<String>,
 }
 
 /// The per-pipeline response tallies `ParseResponseBlocks` accumulates while it
@@ -2211,6 +2227,7 @@ impl ResponseWorker {
             .value()
             .max(1);
         let fail_secs = RuntimeConfig::response_worker_timeout_seconds().value();
+        let cpus = hw.cpus();
         let (wakeup_tx, wakeup_rx) = std::sync::mpsc::channel();
         let mut pending_requests =
             Vec::with_capacity((max_pending_requests + TagPool::TAG_OFFSET as u64) as usize);
@@ -2243,21 +2260,38 @@ impl ResponseWorker {
             global_pr_id: std::sync::atomic::AtomicU64::new(0),
             global_pr_batch_id: std::sync::atomic::AtomicU64::new(0),
             worker_thread: Mutex::new(None),
+            start_refused: std::sync::OnceLock::new(),
         });
         // `worker_thread_(&ResponseWorker::ResponseCompletionThread, this)`.
         // A `Weak` upgrade stands in for the C++ raw `this`: the worker owns
         // no strong reference, so a dropped `ResponseWorker` ends the thread
         // instead of keeping itself alive forever through an Arc cycle.
         let weak = Arc::downgrade(&worker);
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::sync_channel(1);
         let handle = std::thread::Builder::new()
             // `pthread_setname_np(pthread_self(), "RspWrk0")`.
             .name("RspWrk0".to_string())
             .spawn(move || {
-                if let Some(me) = weak.upgrade() {
+                // First act: run on the card's NUMA node (`crate::numa`).
+                let pinned = cpus.pin_current_thread();
+                let polls = pinned.is_ok();
+                if pinned_tx.send(pinned).is_ok()
+                    && polls
+                    && let Some(me) = weak.upgrade()
+                {
                     me.response_completion_thread();
                 }
             })
             .expect("ResponseWorker: failed to spawn ResponseCompletionThread");
+        let started = match pinned_rx.recv() {
+            Ok(pinned) => pinned.map_err(|e| e.to_string()),
+            Err(_) => Err("RspWrk0 ended before it ran on its node".to_string()),
+        };
+        if let Err(why) = started {
+            worker
+                .start_refused
+                .get_or_init(|| format!("ResponseWorker: {why}"));
+        }
         *worker
             .worker_thread
             .lock()
@@ -2390,6 +2424,9 @@ impl ResponseWorker {
     /// `MaxCbsExceeded`); the third returns a plain
     /// `Status::RUNTIME_ERROR("Shutdown in process")`.
     fn precheck(&self, num_cbs: u64, qm: QueuingMode) -> Result<(), SchedulerError> {
+        if let Some(why) = self.start_refused.get() {
+            return Err(mock_error(why));
+        }
         if num_cbs == 0 {
             return Err(mock_error(
                 "ResponseWorker::Precheck: NoCbs (zero control blocks submitted)",

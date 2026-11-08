@@ -776,6 +776,8 @@ impl SpyreWorker {
                                 r.get()
                             ))
                         })?;
+                    // The card's bring-up thread: `open` first runs it on the card's NUMA node,
+                    // so the host buffers bring-up touches land there.
                     Ok(std::thread::spawn(move || {
                         scratchy_target_spyre::runtime::CardRuntime::<World>::open(index)
                     }))
