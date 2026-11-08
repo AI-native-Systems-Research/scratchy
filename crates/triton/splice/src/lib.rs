@@ -74,7 +74,7 @@
 //! needs more than that is refused LOUDLY, naming the kernel capability that must land.
 //! The historical items (windowed regions, LX row-blocking, the odd-N vocab matmul, the
 //! prefill lm-head fold) have all LANDED — their kernels state the corner (`C_START`),
-//! the row blocks, the device width, and the fold (`lmlast.py` + the m=1 tail); what
+//! the row blocks, the device width, and the fold (`lmlast.py` + the m=S tail); what
 //! remains is whatever the current guards name, which is the honest work list.
 //!
 //! ⭐ ROPE SPLICES — the module-header claim that it could not was OVERSTATED, audited
@@ -580,10 +580,10 @@ fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
 }
 
 /// EVERY OP THE SPLICE EMITS FOR ONE NODE. Every kind is one op except the prefill
-/// lm-head tail, whose fold is TWO — the last-row extraction (its own program, the
-/// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul — exactly the
-/// shape of main's `lower_prefill_lm_head_at_m1`, which the fold kernel must
-/// reproduce.
+/// lm-head tail, whose fold is TWO — the answer-row extraction (its own program, the
+/// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=S matmul — main's
+/// `lower_prefill_lm_head_at_m1` shape, stated at the rung's own request count
+/// (exactly m=1 there, byte-identical).
 pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -628,26 +628,27 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     }
     // ⭐ THE LOGITS SCALARMUL IS THE TAIL'S SECOND HALF — main's own law
     // (`lower_scalarmul_node(&node_at_one_row(node), …)` under the same
-    // `is_prefill_lm_head_tail`): the m>1 matmul above it is folded to the m=1
-    // tail that writes ONE logits row, so the scale must run over that one row
-    // too. Left un-folded it scales mq × vocab logits of which mq−1 rows were
-    // never written — row 0 is still right (which is why text A/Bs pass), but
-    // the device pays mq−1 rows of reads of unwritten logits for nothing.
+    // `is_prefill_lm_head_tail`), stated at the rung's own request count: the
+    // m>1 matmul above it is folded to the m=S tail that writes S logits rows,
+    // so the scale must run over those S rows too. Left un-folded it scales
+    // mq × vocab logits of which mq−S rows were never written — row 0 is still
+    // right (which is why text A/Bs pass), but the device pays mq−S rows of
+    // reads of unwritten logits for nothing.
     if let SubOp::ScalarMul { .. } = &node.op
         && is_prefill_lm_head_tail
     {
-        let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+        let at_tail = node_at_tail_rows(node, tail_requests(query_rows));
+        return lower_one(&at_tail, ir, rows_are_requests).map(|e| vec![e]);
     }
     // ⭐ AND THE LOGITS TANH-SOFTCAP IS THE TAIL'S THIRD KIND — the same
-    // `node_at_one_row` law (main gives TanhSoftCap the fold ScalarMul has): the
-    // softcap sits ON the logits, so the folded tail caps ONE row of them instead
-    // of mq rows of which mq−1 were never written.
+    // `node_at_tail_rows` law (main gives TanhSoftCap the fold ScalarMul has):
+    // the softcap sits ON the logits, so the folded tail caps the S written rows
+    // of them instead of mq rows of which mq−S were never written.
     if let SubOp::TanhSoftCap { .. } = &node.op
         && is_prefill_lm_head_tail
     {
-        let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+        let at_tail = node_at_tail_rows(node, tail_requests(query_rows));
+        return lower_one(&at_tail, ir, rows_are_requests).map(|e| vec![e]);
     }
     // ⭐ AND THE TOKEN DRAW'S ROW INPUT IS THE FOLDED TAIL'S ONE ROW — the same
     // `node_at_one_row` law the tail's ScalarMul and TanhSoftCap get: the mint
@@ -675,8 +676,8 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
 }
 
 /// Main's own `node_at_one_row`, verbatim law: slice the FIRST row (the region's
-/// own `rows.start`, length 1) of the input and the output — the m=1 tail's
-/// addressing, which the folded matmul's output row 0 matches.
+/// own `rows.start`, length 1) of the input and the output — the mint's one-row
+/// draw's addressing (the minted prefill sample reads row 0 of a taller storage).
 fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
 ) -> SubtileNode<F> {
@@ -699,6 +700,45 @@ fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
         inputs,
         output: one_row(&node.output),
     }
+}
+
+/// The folded lm-head tail's own row window — the FIRST `s` rows (the region's own
+/// `rows.start`, length `s`) of the input and the output, where `s` is the rung's
+/// request CAPACITY: the folded tail writes the `[S, vocab]` prefix of the `[mq, vocab]`
+/// logits storage (request r's row is row r), so its consumers run over exactly those
+/// rows. At `s = 1` this is main's own `node_at_one_row` law, byte-identical.
+fn node_at_tail_rows<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    s: u32,
+) -> SubtileNode<F> {
+    let s_rows = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+        scratchy_subtile::subtile_ir::TensorRegion {
+            tensor: tr.tensor,
+            region: scratchy_subtile::subtile_ir::Region {
+                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, s),
+                cols: tr.region.cols,
+            },
+        }
+    };
+    let mut inputs = node.inputs.clone();
+    if let Some(a) = inputs.first_mut() {
+        *a = s_rows(a);
+    }
+    SubtileNode {
+        id: node.id,
+        op: node.op,
+        inputs,
+        output: s_rows(&node.output),
+    }
+}
+
+/// The folded tail's own row count — the rung's request capacity `S` off the extent
+/// pair the walk hands every lowering. The tail writes `S` rows on every launch of the
+/// rung, including the empty windows a launch seated fewer requests leaves (their
+/// logits rows are pads, never read); the readback takes the live count off the
+/// launch's own slot list.
+fn tail_requests(query_rows: ktir_superdsc::sdsc_abstract::QueryExtent) -> u32 {
+    query_rows.requests().get()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1126,7 +1166,7 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         ));
     };
     // ⛔ THE LM-HEAD TAIL'S FOLD IS `lower_all`'s now — the vocab-wide m>1 matmul is
-    // rewritten THERE (last-row extraction + the re-lowered m=1 matmul), so a
+    // rewritten THERE (answer-row extraction + the re-lowered m=S matmul), so a
     // MatmulTile reaching THIS one-op body as the tail means the one-op `lower`
     // was called where the walk's `lower_all` belongs. The test is the FULL
     // [`is_prefill_lm_head_tail`] — width, m>1, rows-not-requests, AND the
@@ -1171,9 +1211,9 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
     // `store_region` state, so the door reads the SAME region off the spliced
     // program. AND THE MATMUL FAMILY SPELLS ITS OWN ROW-0 WINDOW: `matmul.py` /
     // `matmul_fp8.py` state `M_TOTAL` (the output tensor's row extent) with the
-    // `[M, N]` tile at row 0 — the prefill lm-head fold's m=1 tail, whose activation
-    // is the LAST_HIDDEN synthetic and whose output is row 0 of the `[mq, vocab]`
-    // logits storage. Every OTHER row states ONE whole-tensor tile at corner 0 and
+    // `[M, N]` tile at row 0 — the prefill lm-head fold's m=S tail, whose activation
+    // is the LAST_HIDDEN synthetic and whose output is the `[S, vocab]` prefix of
+    // the `[mq, vocab]` logits storage. Every OTHER row states ONE whole-tensor tile at corner 0 and
     // cannot name a window, so the refusal stands for it (rope regions are whole in
     // production today), and this guard reads the REGION, not the op kind, so a
     // front-end change that windows any other op's regions reproduces the same
@@ -1200,8 +1240,8 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         // ⭐ THE TANH-SOFTCAP AND THE TOKEN DRAW STATE NEITHER CORNER — the softcap
         // kernel's view IS the region (`[M, N]`, tiles from row 0 / column 0), so BOTH
         // corners must be 0 while the extents are free: the prefill lm-head fold
-        // re-lowers the vocab-wide softcap at m=1 (row 0 of the `[mq, vocab]` logits
-        // storage, a legal prefix view), and the front end's chunker never tiles this
+        // re-lowers the vocab-wide softcap at m=S (the `[S, vocab]`
+        // prefix of the `[mq, vocab]` logits storage, a legal prefix view), and the front end's chunker never tiles this
         // op (its chunk set is the elementwise/scalarmul/silumul family), so a column
         // window never arises. The draw's kernel is the same law: its view is the
         // region — the minted prefill draw reads row 0 of the `[mq, pad_vocab]`
@@ -1347,9 +1387,12 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
 ///    `lmlast{j}_o{tid}` after it, the same suffix the tail matmul's `matmul_o{tid}`
 ///    uses, so the whole tail reads as one node's — and `answer_rows` = the rows
 ///    themselves, the ONE statement the door's copies take each request's row from.
-/// 2. THE MATMUL — the SAME node at m=1, reading the staging at row 0, through the
-///    ordinary matmul row (`lower_one`). At m=1 the tail is exactly the shape the
-///    PROVEN decode path lowers, fp8 chain included.
+/// 2. THE MATMUL — the SAME node at m=S, reading the staging's whole `[S, hidden]`
+///    and writing the `[S, vocab]` prefix of the `[mq, vocab]` logits storage
+///    (request r's logits row is row r), through the ordinary matmul row
+///    (`lower_one`, `M_TOTAL` naming the storage while the store takes the `[S, n]`
+///    tile at row 0). At `S = 1` the tail is exactly the shape the PROVEN decode
+///    path lowers, fp8 chain included — byte-identical, the same one-row window.
 ///
 /// ⛔ THE ROWS ARE THE EXTENT PAIR'S OWN, STATED ONCE — not `rows.start + mq - 1`:
 /// the extraction addresses the buffer the tape takes to be exactly `[mq, hidden]`
@@ -1491,29 +1534,29 @@ fn lower_prefill_lm_head_fold<
     let mut extract = EmittedOp::bare(xname);
     extract.ktir = Some(k);
 
-    // ── Half 2: the SAME node at m=1, reading the staging at row 0. ──
-    let mut at_m1 = node.clone();
-    let one_row = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+    // ── Half 2: the SAME node at m=S, reading the staging's whole [S, hidden] ──
+    let mut at_ms = node.clone();
+    let s_rows = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
         scratchy_subtile::subtile_ir::TensorRegion {
             tensor: tr.tensor,
             region: SubRegion {
-                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, 1),
+                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, s),
                 cols: tr.region.cols,
             },
         }
     };
-    at_m1.inputs[0] = scratchy_subtile::subtile_ir::TensorRegion {
+    at_ms.inputs[0] = scratchy_subtile::subtile_ir::TensorRegion {
         tensor: scratchy_subtile::subtile_ir::TensorId::from_index(last_hidden as usize),
         region: SubRegion {
-            rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+            rows: scratchy_subtile::subtile_ir::Range::new(0, s),
             cols: scratchy_subtile::subtile_ir::Range::new(0, hidden),
         },
     };
-    if let Some(w) = at_m1.inputs.get_mut(1) {
-        *w = one_row(w);
+    if let Some(w) = at_ms.inputs.get_mut(1) {
+        *w = s_rows(w);
     }
-    at_m1.output = one_row(&at_m1.output);
-    let matmul = lower_one(&at_m1, ir, false)?;
+    at_ms.output = s_rows(&at_ms.output);
+    let matmul = lower_one(&at_ms, ir, false)?;
 
     Ok(vec![extract, matmul])
 }
@@ -2638,8 +2681,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // ONE tile, the whole region — `KtirFunc::matmul`'s own whole-region law
             // (one linalg.matmul, no K loop). `M_TOTAL` names the OUTPUT TENSOR's row
             // extent (the storage the descriptor addresses) while the store takes the
-            // `[M, N]` tile at row 0 — the prefill lm-head fold's m=1 tail, whose
-            // output is row 0 of the `[mq, vocab]` logits storage.
+            // `[M, N]` tile at row 0 — the prefill lm-head fold's m=S tail, whose
+            // output is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage.
             // ⛔ `N` IS THE DEVICE WIDTH — the door's own padding law, stated here so
             // the view/tile name the storage every consumer addresses: the card writes
             // `n_dev` columns (`out_width_the_weight_holds`'s staged-weight contract),
@@ -3164,7 +3207,7 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok((n_total, c_start))
 }
 
-/// THE MATMUL'S WINDOW FACTS — the row-0 window form the prefill lm-head fold's m=1
+/// THE MATMUL'S WINDOW FACTS — the row-0 window form the prefill lm-head fold's m=S
 /// tail states: the out descriptor names the OUTPUT TENSOR's row extent (`M_TOTAL`,
 /// the storage the layout reserved) while the store takes the `[M, N]` tile at row 0,
 /// and the activation names its own `[M, K]` window. A whole-region node answers
@@ -3172,7 +3215,7 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 ///
 /// ⛔ THE ROW CORNER MUST BE 0 — the door's `base_addressed` refuses a nonzero row
 /// corner on both the activation and the output, and no matmul kernel in this family
-/// spells one. The fold's m=1 tail is row 0 of the `[mq, vocab]` logits storage, so
+/// spells one. The fold's m=S tail is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage, so
 /// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
 /// silently mis-address.
 /// ⭐ THE WIDTH A DENSE MATMUL'S PROGRAM STATES FOR ITS OUTPUT — the width its READERS address.

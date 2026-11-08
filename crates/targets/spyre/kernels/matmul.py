@@ -84,9 +84,10 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
     # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — the out
     # descriptor's shape is the OUTPUT TENSOR's `[M_TOTAL, N]` (the storage the
     # layout reserved, N the device width), while the store takes the `[M, N]`
-    # tile at row 0: the prefill lm-head fold re-lowers the tail at m=1 over the
-    # LAST_HIDDEN staging, and its output is row 0 of the `[mq, vocab]` logits
-    # storage. A whole-region node states `M_TOTAL = M`, so nothing changes for it.
+    # tile at row 0: the prefill lm-head fold re-lowers the tail at m=S over the
+    # LAST_HIDDEN staging, and its output is the `[S, vocab]` prefix of the
+    # `[mq, vocab]` logits storage (row 0 alone at S = 1). A whole-region node
+    # states `M_TOTAL = M`, so nothing changes for it.
     a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_M, BLOCK_K])
