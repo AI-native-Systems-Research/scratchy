@@ -5991,6 +5991,7 @@ mod tests {
     /// row of a taller stick-major tensor is not contiguous). A decode rung's every row is a
     /// request's, and its gather keeps them all. Shown on a 4-row rung both ways.
     #[test]
+    #[cfg(feature = "spyre")]
     fn a_folded_tail_gathers_its_one_row() {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let input = crate::lower::LoweringInput {
@@ -6041,7 +6042,12 @@ mod tests {
             )
         };
         // Folded: a whole one-row tensor all the way down — the gather's operand is contiguous.
-        assert_eq!(rows_of_gather(SampleRows::Folded), (1, 1, 1));
+        assert_eq!(
+            rows_of_gather(SampleRows::Folded {
+                requests: crate::sdsc_abstract::RungCap::ONE
+            }),
+            (1, 1, 1)
+        );
         assert_eq!(rows_of_gather(SampleRows::All), (4, 4, 4));
     }
 
