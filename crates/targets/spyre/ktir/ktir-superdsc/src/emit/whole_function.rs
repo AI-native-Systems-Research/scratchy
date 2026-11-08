@@ -8215,7 +8215,15 @@ impl<'d> Defs<'d> {
     fn carries(f: &IRFunction<'_>, o: &'d Operation<'static>) -> Result<Vec<CarryNames>, Error> {
         let args: &[Ssa] = match o.attr(AttrKey::IterArgs) {
             Some(Attr::Ssas(v)) => v,
-            _ => &[],
+            // A for that states no iter_args carries nothing — the plain for, legitimate.
+            None => &[],
+            Some(other) => {
+                return err(format!(
+                    "{}: a scf.for states its IterArgs as {other:?}, not the carry-arg name \
+                     list the walk pairs with its inits",
+                    f.name
+                ));
+            }
         };
         let inits = &o.operands[3.min(o.operands.len())..];
         let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
@@ -12781,6 +12789,55 @@ mod frame_pass_tests {
         assert!(
             e.message.contains("no_body_region") && e.message.contains("no body region"),
             "the refusal names the function and the missing body: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ A FOR STATING ITS ITERARGS IN A FORM THE WALK DOES NOT READ IS REFUSED BY NAME —
+    /// the same census split as the ResultNames refusal: a for that states NO iter_args is
+    /// the plain for that carries nothing (legitimate), and a for that states a DIFFERENT
+    /// attr variant is malformed — refused by name, never silently read as a for with no
+    /// carries while its inits and ResultNames state some.
+    #[test]
+    fn a_for_stating_unreadable_iter_args_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, seed) = (Ssa(0), Ssa(1));
+        let (lb, ub, step, iv, lres) = (Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
+        };
+        let f = func(
+            a,
+            "unreadable_iter_args",
+            vec![
+                zero(a, scalar),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![]),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Int(0))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Ssas(a.ssa(vec![lres])))
+                },
+            ],
+        );
+        let Err(e) = assign_frames(&f, None) else {
+            panic!("a scf.for stating its IterArgs as an Int is not a carry-arg name list");
+        };
+        assert!(
+            e.message.contains("unreadable_iter_args") && e.message.contains("IterArgs"),
+            "the refusal names the function and the attr it found: {}",
             e.message
         );
     }
