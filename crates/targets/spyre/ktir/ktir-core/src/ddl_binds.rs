@@ -224,154 +224,6 @@ impl DeviceOp {
         }
     }
 
-    /// The exhaustiveness pin for [`ALL`], tying list membership to pattern
-    /// coverage at COMPILE time: this match must name every variant (a new
-    /// one without an arm does not compile), and each arm asserts that `ALL`
-    /// holds exactly that variant at that variant's own index — so a variant
-    /// given its arm but no `ALL` entry fails here (the index runs past the
-    /// list), and an entry at a stale slot fails here too. A pattern arm
-    /// alone, without the list entry, cannot compile.
-    const _ALL_LISTS_EVERY_VARIANT: () = match DeviceOp::ALL[0] {
-        DeviceOp::Add => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Add.index()],
-            DeviceOp::Add
-        )),
-        DeviceOp::Sub => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Sub.index()],
-            DeviceOp::Sub
-        )),
-        DeviceOp::Multiply => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Multiply.index()],
-                DeviceOp::Multiply
-            ))
-        }
-        DeviceOp::RealDiv => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::RealDiv.index()],
-                DeviceOp::RealDiv
-            ))
-        }
-        DeviceOp::Maximum => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Maximum.index()],
-                DeviceOp::Maximum
-            ))
-        }
-        DeviceOp::Minimum => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Minimum.index()],
-                DeviceOp::Minimum
-            ))
-        }
-        DeviceOp::Equal => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Equal.index()],
-                DeviceOp::Equal
-            ))
-        }
-        DeviceOp::Gelu => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Gelu.index()],
-            DeviceOp::Gelu
-        )),
-        DeviceOp::Reciprocal => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Reciprocal.index()],
-                DeviceOp::Reciprocal
-            ))
-        }
-        DeviceOp::Tanh => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Tanh.index()],
-            DeviceOp::Tanh
-        )),
-        DeviceOp::Abs => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Abs.index()],
-            DeviceOp::Abs
-        )),
-        DeviceOp::Neg => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Neg.index()],
-            DeviceOp::Neg
-        )),
-        DeviceOp::Silu => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Silu.index()],
-            DeviceOp::Silu
-        )),
-        DeviceOp::Exp => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Exp.index()],
-            DeviceOp::Exp
-        )),
-        DeviceOp::Sigmoid => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Sigmoid.index()],
-                DeviceOp::Sigmoid
-            ))
-        }
-        DeviceOp::Sqrt => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Sqrt.index()],
-            DeviceOp::Sqrt
-        )),
-        DeviceOp::Rsqrt => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Rsqrt.index()],
-                DeviceOp::Rsqrt
-            ))
-        }
-        DeviceOp::Mish => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Mish.index()],
-            DeviceOp::Mish
-        )),
-        DeviceOp::Log => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Log.index()],
-            DeviceOp::Log
-        )),
-        DeviceOp::Int32ToFp32 => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Int32ToFp32.index()],
-                DeviceOp::Int32ToFp32
-            ))
-        }
-        DeviceOp::Fp32ToInt32 => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Fp32ToInt32.index()],
-                DeviceOp::Fp32ToInt32
-            ))
-        }
-        DeviceOp::Dl16ToFp32 => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Dl16ToFp32.index()],
-                DeviceOp::Dl16ToFp32
-            ))
-        }
-        DeviceOp::Fp32ToDl16 => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::Fp32ToDl16.index()],
-                DeviceOp::Fp32ToDl16
-            ))
-        }
-        DeviceOp::Sum => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Sum.index()],
-            DeviceOp::Sum
-        )),
-        DeviceOp::Mean => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Mean.index()],
-            DeviceOp::Mean
-        )),
-        DeviceOp::Max => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Max.index()],
-            DeviceOp::Max
-        )),
-        DeviceOp::Min => assert!(matches!(
-            DeviceOp::ALL[DeviceOp::Min.index()],
-            DeviceOp::Min
-        )),
-        DeviceOp::AbsMax => {
-            assert!(matches!(
-                DeviceOp::ALL[DeviceOp::AbsMax.index()],
-                DeviceOp::AbsMax
-            ))
-        }
-    };
-
     /// The door's own spelling — the `op_func_from_str` key the emitter
     /// spells (`"multiply"`, not the DDL's `"mul"`; `"gelu"`, not
     /// `"gelufwd"`). A property of the op, read at emission; never a lookup
@@ -441,6 +293,161 @@ impl DeviceOp {
         }
     }
 }
+
+/// The exhaustiveness pin for [`DeviceOp::ALL`], tying list membership to
+/// pattern coverage at COMPILE time: this match must name every variant (a
+/// new one without an arm does not compile), and each arm asserts that `ALL`
+/// holds exactly that variant at that variant's own index — so a variant
+/// given its arm but no `ALL` entry fails here (the index runs past the
+/// list), and an entry at a stale slot fails here too. An unnamed const is
+/// eagerly evaluated, so the pin cannot sit uncompiled in the crate.
+/// The exhaustiveness pin for [`ALL`], tying list membership to pattern
+/// coverage at COMPILE time: this match must name every variant (a new
+/// one without an arm does not compile), and each arm asserts that `ALL`
+/// holds exactly that variant at that variant's own index — so a variant
+/// given its arm but no `ALL` entry fails here (the index runs past the
+/// list), and an entry at a stale slot fails here too. A pattern arm
+/// alone, without the list entry, cannot compile.
+const _: () = match DeviceOp::ALL[0] {
+    DeviceOp::Add => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Add.index()],
+        DeviceOp::Add
+    )),
+    DeviceOp::Sub => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Sub.index()],
+        DeviceOp::Sub
+    )),
+    DeviceOp::Multiply => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Multiply.index()],
+            DeviceOp::Multiply
+        ))
+    }
+    DeviceOp::RealDiv => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::RealDiv.index()],
+            DeviceOp::RealDiv
+        ))
+    }
+    DeviceOp::Maximum => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Maximum.index()],
+            DeviceOp::Maximum
+        ))
+    }
+    DeviceOp::Minimum => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Minimum.index()],
+            DeviceOp::Minimum
+        ))
+    }
+    DeviceOp::Equal => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Equal.index()],
+            DeviceOp::Equal
+        ))
+    }
+    DeviceOp::Gelu => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Gelu.index()],
+        DeviceOp::Gelu
+    )),
+    DeviceOp::Reciprocal => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Reciprocal.index()],
+            DeviceOp::Reciprocal
+        ))
+    }
+    DeviceOp::Tanh => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Tanh.index()],
+        DeviceOp::Tanh
+    )),
+    DeviceOp::Abs => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Abs.index()],
+        DeviceOp::Abs
+    )),
+    DeviceOp::Neg => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Neg.index()],
+        DeviceOp::Neg
+    )),
+    DeviceOp::Silu => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Silu.index()],
+        DeviceOp::Silu
+    )),
+    DeviceOp::Exp => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Exp.index()],
+        DeviceOp::Exp
+    )),
+    DeviceOp::Sigmoid => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Sigmoid.index()],
+            DeviceOp::Sigmoid
+        ))
+    }
+    DeviceOp::Sqrt => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Sqrt.index()],
+        DeviceOp::Sqrt
+    )),
+    DeviceOp::Rsqrt => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Rsqrt.index()],
+            DeviceOp::Rsqrt
+        ))
+    }
+    DeviceOp::Mish => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Mish.index()],
+        DeviceOp::Mish
+    )),
+    DeviceOp::Log => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Log.index()],
+        DeviceOp::Log
+    )),
+    DeviceOp::Int32ToFp32 => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Int32ToFp32.index()],
+            DeviceOp::Int32ToFp32
+        ))
+    }
+    DeviceOp::Fp32ToInt32 => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Fp32ToInt32.index()],
+            DeviceOp::Fp32ToInt32
+        ))
+    }
+    DeviceOp::Dl16ToFp32 => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Dl16ToFp32.index()],
+            DeviceOp::Dl16ToFp32
+        ))
+    }
+    DeviceOp::Fp32ToDl16 => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::Fp32ToDl16.index()],
+            DeviceOp::Fp32ToDl16
+        ))
+    }
+    DeviceOp::Sum => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Sum.index()],
+        DeviceOp::Sum
+    )),
+    DeviceOp::Mean => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Mean.index()],
+        DeviceOp::Mean
+    )),
+    DeviceOp::Max => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Max.index()],
+        DeviceOp::Max
+    )),
+    DeviceOp::Min => assert!(matches!(
+        DeviceOp::ALL[DeviceOp::Min.index()],
+        DeviceOp::Min
+    )),
+    DeviceOp::AbsMax => {
+        assert!(matches!(
+            DeviceOp::ALL[DeviceOp::AbsMax.index()],
+            DeviceOp::AbsMax
+        ))
+    }
+};
 
 /// One device fact: the op, the data formats the vendor DDL binds it at,
 /// the arrangement its output carries when both operands are standard, and
