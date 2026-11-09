@@ -1636,3 +1636,85 @@ fn the_one_row_map_times_are_recorded() {
         eprintln!("{line}");
     }
 }
+
+/// `add_bf16` of `a` and `b` (`[rows, cols]`) into an output of `rows · cols + TAIL` [`SENTINEL`]; the
+/// output and whether the tail held.
+fn run_add(
+    device: &CudaDevice,
+    a: &[u16],
+    b: &[u16],
+    (rows, cols): (u32, u32),
+) -> (Vec<u16>, bool) {
+    let len = rows as usize * cols as usize;
+    let (ab, bb) = (
+        DeviceBuffer::upload(device, a).expect("a"),
+        DeviceBuffer::upload(device, b).expect("b"),
+    );
+    let out = DeviceBuffer::upload(device, &vec![SENTINEL; len + TAIL]).expect("out");
+    // SAFETY: `a` and `b` hold `len` bf16, `out` `len + TAIL`, each its own allocation; the
+    // download waits for the default stream.
+    unsafe {
+        add_bf16(
+            ab.ptr().cast_const(),
+            bb.ptr().cast_const(),
+            out.ptr(),
+            (rows, cols),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("add_bf16");
+    let o = out.download().expect("download");
+    (o[..len].to_vec(), o[len..].iter().all(|&x| x == SENTINEL))
+}
+
+/// FP8 S8 W4a: the one-row add (`add_bf16_ker<true>`, W1's one-row grid, the 35B's 40 residual
+/// adds) is the 16-row add's row 0, bit for bit, at the 35B's 2,048 and the 27B's 5,120 (and 704, a
+/// partial last group of tiles), 3 seeds and a row of ±inf, NaN, ±65,504 and ±0 in both operands.
+#[test]
+fn the_one_row_add_is_the_16_row_add_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let special = [
+        bits(f32::INFINITY),
+        bits(f32::NEG_INFINITY),
+        0x7FC0,
+        bits(65504.0),
+        bits(-65504.0),
+        0x8000,
+        0,
+    ];
+    for cols in [2048usize, 5120, 704] {
+        let mut cases: Vec<(String, Vec<u16>, Vec<u16>)> = (0..3u64)
+            .map(|s| {
+                let seed = 0x0E41_0000 ^ (cols as u64) << 4 ^ s;
+                (
+                    format!("seed{s}"),
+                    bf16_inputs(cols, seed),
+                    bf16_inputs(cols, seed ^ 0x99),
+                )
+            })
+            .collect();
+        cases.push((
+            "extremes".into(),
+            (0..cols).map(|c| special[c % special.len()]).collect(),
+            (0..cols)
+                .map(|c| special[(c / 7) % special.len()])
+                .collect(),
+        ));
+        for (label, a, b) in &cases {
+            let (one, t1) = run_add(&device, a, b, (1, cols as u32));
+            let (mut a16, mut b16) = (a.clone(), b.clone());
+            a16.resize(16 * cols, 0);
+            b16.resize(16 * cols, 0);
+            let (want, t16) = run_add(&device, &a16, &b16, (16, cols as u32));
+            let m = mismatched_bits(&one, &want[..cols]);
+            let ok = t1 && t16 && m == 0;
+            eprintln!(
+                "one-row add cols={cols} {label}: vs rows=16 mismatched_bits={m} tail_intact={t1} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "the one-row add differs from the 16-row add");
+}

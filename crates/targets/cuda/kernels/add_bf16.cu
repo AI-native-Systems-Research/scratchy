@@ -61,6 +61,12 @@ static_assert(SMEM_TILES == 131072, "4 warps x 2 stages x 2 operands x 8 KiB");
 constexpr int EW_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(EW_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+// THE ONE-ROW FORM (FP8 S8 W4a, the 35B's 40 residual adds no GEMV takes): at `rows == 1` the
+// grid above is one CTA walking the whole row. `ONE_ROW` takes `pointwise_bf16.cu`'s W1 one-row
+// grid instead, chosen from `rows` alone: CTA `c`'s warp `w` owns tile `4c + w` of the one row
+// block, and runs the loop body above on it. Each element is the same one f32 add and rounding, so
+// the bits are the 16-row kernel's.
+template <bool ONE_ROW = false>
 __global__ __launch_bounds__(NUM_THREADS, 1) void add_bf16_ker(const __grid_constant__ ew_globals g) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
@@ -69,7 +75,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void add_bf16_ker(const __grid_cons
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
 
     const int w = kittens::warpid();
-    const int row_block = blockIdx.x;
+    const int row_block = ONE_ROW ? 0 : int(blockIdx.x);
+    const int first = ONE_ROW ? int(blockIdx.x) * WARPS + w : w;
     if (warp::laneid() == 0) {
         for (int s = 0; s < STAGES; s++) {
             init_semaphore(arrived[w][s], 0, 1);
@@ -77,15 +84,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void add_bf16_ker(const __grid_cons
     }
     __syncwarp();
 
-    // This warp's tiles `w, w + 4, …`; the `i`-th of them is in stage `i % 2`.
+    // This warp's tiles `first, first + 4, …` (one under `ONE_ROW`); the `i`-th of them is in stage
+    // `i % 2`.
     auto issue = [&](int i) {
         const int stage = i % STAGES;
-        coord<tile> at = {0, 0, row_block, w + i * WARPS};
+        coord<tile> at = {0, 0, row_block, first + i * WARPS};
         warp::tma::expect_bytes(arrived[w][stage], 2 * sizeof(tile));
         warp::tma::load_async(a_smem[w][stage], g.a, at, arrived[w][stage]);
         warp::tma::load_async(b_smem[w][stage], g.b, at, arrived[w][stage]);
     };
-    const int mine = (g.col_tiles - w + WARPS - 1) / WARPS;
+    const int mine = ONE_ROW ? int(first < g.col_tiles) : (g.col_tiles - w + WARPS - 1) / WARPS;
     if (mine > 0) {
         issue(0);
     }
@@ -105,7 +113,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void add_bf16_ker(const __grid_cons
         warp::add(x, x, y);
         warp::store(a_smem[w][stage], x);
         __syncwarp();
-        coord<tile> at = {0, 0, row_block, w + i * WARPS};
+        coord<tile> at = {0, 0, row_block, first + i * WARPS};
         warp::tma::store_async(g.out, a_smem[w][stage], at);
     }
     warp::tma::store_async_wait();
@@ -119,8 +127,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void add_bf16_ker(const __grid_cons
 //
 // 0 = done; any other value = the cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_add_bf16_prepare(void) {
-    return static_cast<int>(cudaFuncSetAttribute(
-        add_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, EW_SMEM_BYTES));
+    for (auto ker : {add_bf16_ker<false>, add_bf16_ker<true>}) {
+        const cudaError_t e =
+            cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, EW_SMEM_BYTES);
+        if (e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    return 0;
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -150,11 +164,19 @@ extern "C" int scratchy_cuda_add_bf16(const void* a, const void* b, void* out, u
         row_gl ag{ap, nullptr, nullptr, size_t(rows), size_t(cols)};
         row_gl bg{bp, nullptr, nullptr, size_t(rows), size_t(cols)};
         row_gl og{op, nullptr, nullptr, size_t(rows), size_t(cols)};
-        ew_globals G{ag, bg, og, int((cols + uint32_t(COLS) - 1) / uint32_t(COLS))};
+        const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+        ew_globals G{ag, bg, og, col_tiles};
         void* args[] = {&G};
-        const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(add_bf16_ker, grid, block, args, EW_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
+        const cudaStream_t s = static_cast<cudaStream_t>(stream);
+        if (rows == 1) {
+            const dim3 grid{uint32_t(col_tiles + WARPS - 1) / uint32_t(WARPS)},
+                block{uint32_t(NUM_THREADS)};
+            return static_cast<int>(
+                cudaLaunchKernel(add_bf16_ker<true>, grid, block, args, EW_SMEM_BYTES, s));
+        }
+        const dim3 grid{(rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)}, block{uint32_t(NUM_THREADS)};
+        return static_cast<int>(
+            cudaLaunchKernel(add_bf16_ker<false>, grid, block, args, EW_SMEM_BYTES, s));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
