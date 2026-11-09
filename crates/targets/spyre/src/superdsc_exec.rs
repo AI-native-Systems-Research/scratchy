@@ -194,7 +194,7 @@ struct StepImageData {
     rows: Vec<RowReplay>,
     /// One label per CB of `canvas` (`cb_plan::CbPlan::cb_labels`, per row, concatenated): what a
     /// replayed step's response blocks are attributed to, since a replay records no launch
-    /// sequence of its own (`Timers::rb_seq` is the walk's).
+    /// sequence of its own (`Executor::rb_seq` is the walk's).
     labels: Vec<String>,
 }
 
@@ -505,12 +505,6 @@ struct Timers {
     /// Cumulative `rb_cbs` at the last periodic report — the count jumps a whole forward at a
     /// time (~162 CBs), so a plain `is_multiple_of` would skip its own thresholds and never fire.
     rb_reported: u64,
-    /// `SCRATCHY_SDSC_RB_TIME`'s launch sequence: one entry per compute launch this forward, in
-    /// launch order — ((rung length, op index), label). Lives here, not on the executor, because
-    /// the launch loop holds `self` immutably across the stream reference. Cleared at the start of
-    /// every `predict` and zipped against the telemetry ring's id-sorted op entries (compute CBs
-    /// minus the DMA crossings) after the step's synchronize; see [`rb_attribute`].
-    rb_seq: Vec<((usize, usize), String)>,
     forwards: i64,
     // ── #603 PR2 2c — the replay player's own decomposition. Recorded
     // UNCONDITIONALLY (a handful of Instants and counters per STEP, not per
@@ -1054,6 +1048,17 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
     /// and its own op counter. `None` unless the env gate is set.
     dump: Option<TensorDump>,
+    /// ⭐ THIS CARD'S `SCRATCHY_SDSC_RB_TIME` LAUNCH SEQUENCE: one entry per compute CB this card
+    /// submitted this forward, in submission order — ((rung length, op index), label). It is the
+    /// card's own, as the telemetry ring it is zipped against is (`rb_telemetry::drain_source` of
+    /// this card's key): the session that pushes a launch is the one that reads it back, so a rank
+    /// can neither take another's launches nor find its own taken. Cleared at the start of every
+    /// forward and taken by [`Self::rb_attribute`] after the step's synchronize.
+    ///
+    /// ⛔ IT WAS ONE PROCESS-WIDE `Vec` FOR EVERY CARD, and at tp/8 that is eight sessions sharing
+    /// it: the first rank to attribute drained all eight ranks' launches (6,896 = 8 × 862 against
+    /// its own 852 CBs) and the other seven found none, so no rank's per-op table printed.
+    rb_seq: Vec<((usize, usize), String)>,
 
     // ── #603 PR2 2c — the replay player ──
     /// Cached step images, keyed by (body, resident page count, fold shape) —
@@ -1422,6 +1427,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             staged_host: false,
             n_weights_staged: 0,
             dump: None,
+            rb_seq: Vec::new(),
             step_images: StepImageCache::default(),
             seat,
         };
@@ -3651,6 +3657,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             || d.optrace
             || d.tensordump.is_some());
         let mut pending: Vec<PendingLaunch> = Vec::new();
+        // This walk's launch sequence, appended to the session's own once the walk ends: the walk
+        // holds a borrow of the session's stream across every push, so it records into a local.
+        let mut rb_seq: Vec<((usize, usize), String)> = Vec::new();
         // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
         // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
         // fences on the first true barrier and waits on nothing after; the ring stays FIFO).
@@ -3802,7 +3811,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     // op index) so prefix/body/suffix op numbers cannot average into each other.
                     // Recorded before the collect branch so a batched rung's ops land here in the
                     // same submission order its single doorbell emits them in.
-                    timers().rb_seq.push(((ops.len(), oi), op.label()));
+                    rb_seq.push(((ops.len(), oi), op.label()));
                 }
 
                 // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
@@ -3975,6 +3984,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
             }
         }
+        self.rb_seq.append(&mut rb_seq);
         Ok(())
     }
 
@@ -4442,11 +4452,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// — the one the step already performs, no extra drain — the ring holds exactly this
     /// forward's CBs. Op compute entries (DMA crossings excluded by
     /// [`flex_rs::rb_telemetry::RbTiming::dma`]) sorted by
-    /// submission id zip 1:1 against [`Timers::rb_seq`], which the launch loop filled in the same
+    /// submission id zip 1:1 against [`Executor::rb_seq`], which the launch loop filled in the same
     /// order. This is the attribution `group_time`/`prefix_time` pay ~11% of decode to estimate,
     /// read for free instead.
     fn rb_attribute(&mut self) {
-        let seq = std::mem::take(&mut timers().rb_seq);
+        let seq = std::mem::take(&mut self.rb_seq);
         let mut entries = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         let mut t = timers();
         t.rb_steps += 1;
@@ -4669,7 +4679,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if d.rb_time {
             let _ = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         }
-        timers().rb_seq.clear();
+        self.rb_seq.clear();
 
         // The stream is PERSISTENT: the scheduler retires each op's fence from its per-stream
         // deque the moment that fence resolves (SchedulerState::retire_fence), so nothing
@@ -5475,12 +5485,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 seq_pos.0
             )));
         }
-        let mut t = timers();
         // The replayed step's launch sequence, for `rb_attribute`'s zip: every canvas CB is a
         // compute CB in submission order, named by the plan it was proven equal to. Keyed by
         // (image length, CB index), so a replayed step's CBs never average into a walked rung's.
         if Diag::get().rb_time {
-            t.rb_seq.extend(
+            self.rb_seq.extend(
                 image
                     .data
                     .labels
@@ -5489,6 +5498,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     .map(|(i, l)| ((cbs, i), format!("replay {l}"))),
             );
         }
+        let mut t = timers();
         t.replay_steps += 1;
         t.replay_cbs += cbs as u64;
         t.replay_sites += image
