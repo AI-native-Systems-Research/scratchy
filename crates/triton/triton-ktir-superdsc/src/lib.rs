@@ -743,7 +743,8 @@ module {
     #[test]
     fn the_door_reads_what_the_pass_mints() {
         let mut m = triton_ktir::text::parse::parse(AFFINE).expect("parse the witness");
-        triton_ktir::passes::to_ktir::run(&mut m, &[4, 4]).expect("to_ktir mints the corner");
+        triton_ktir::passes::to_ktir::run(&mut m, &triton_ktir::LaunchGrid::xy::<4, 4>())
+            .expect("to_ktir mints the corner");
 
         // The pass's own chain assertion, restated: the tile's row corner IS the mint — a `muli`
         // over a UNARY `index_cast` of the landmark.
@@ -857,7 +858,7 @@ mod rope_from_the_fixture {
             triton_frontend::codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
         triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
         let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
-        let grid = vec![4, 8];
+        let grid = triton_ktir::LaunchGrid::xy::<4, 8>();
         triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
         triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
         node_for(&m, Program::Rope).expect("node_for")
@@ -1116,7 +1117,7 @@ mod decoder_from_the_fixture {
             triton_frontend::codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
         triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
         let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
-        let grid = vec![1];
+        let grid = triton_ktir::LaunchGrid::ONE;
         triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
         triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
         // The kind is stated because the signature demands one; the whole-function door never reads
@@ -1252,7 +1253,7 @@ mod paged_score_from_the_fixture {
             triton_frontend::codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
         triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
         let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
-        let grid = vec![1];
+        let grid = triton_ktir::LaunchGrid::ONE;
         triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
         triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
         node_for(&m, Program::Matmul).expect("node_for")

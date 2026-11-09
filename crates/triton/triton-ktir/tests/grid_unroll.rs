@@ -34,7 +34,7 @@ fn run_pipeline(config: &str) -> Module {
 
 /// The fixture's grid extent, which is the position count the unroll must emit.
 fn positions(config: &str) -> i64 {
-    grid(config).iter().product()
+    grid(config).programs()
 }
 
 /// THE UNROLL ITSELF: N copies, collapsed grid, no landmark left, every load tile's
@@ -152,7 +152,7 @@ fn a_whole_node_body_is_untouched_by_the_unroll() {
         .expect("grid attr");
     assert_eq!(
         g,
-        grid("swiglu_mlp"),
+        grid("swiglu_mlp").extents(),
         "swiglu_mlp's grid must be untouched: its position never reaches a load corner"
     );
 }

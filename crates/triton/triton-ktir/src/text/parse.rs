@@ -323,7 +323,7 @@ impl Parser {
             // `tt.get_program_id x : i32` -- the AXIS IS A BARE KEYWORD, not an
             // attribute. Reading it as an attribute leaves every axis at 0, and
             // DistributeWork then sees a single-axis kernel where there are two: the
-            // multi-axis RED-stop never fires and the grid silently linearizes wrong.
+            // axis-past-the-grid refusal never fires and the grid silently linearizes wrong.
             OpKind::TtGetProgramId => {
                 let axis = match rest.trim_start().chars().next() {
                     Some('x') => 0,

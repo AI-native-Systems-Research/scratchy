@@ -20,6 +20,7 @@
 mod common;
 
 use common::*;
+use triton_ktir::LaunchGrid;
 use triton_ktir::text::parse;
 
 /// The C++ verifier's message, verbatim, as the golden records it.
@@ -71,7 +72,7 @@ fn a_one_stick_tile_is_planned_as_single_corelet_and_matches_the_cpp() {
         let mut m = parse::parse(&golden(config, "0_ttir.mlir"))
             .unwrap_or_else(|e| panic!("{config}: the ttir golden must parse: {e}"));
         // vector_add / mul launch a 1-D grid of N/BLOCK = 1024/64 = 16 blocks.
-        triton_ktir::make_ktir(&mut m, &[16]).unwrap_or_else(|e| {
+        triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<16>()).unwrap_or_else(|e| {
             panic!(
                 "{config}: a one-stick tile must now be planned as single_corelet, not \
                  refused -- the C++ fix at PlanCorelets.cpp:744 is what this port follows. \
@@ -162,7 +163,7 @@ fn the_same_kernel_at_two_sticks_is_accepted() {
             "%c64_i32 = arith.constant 128 : i32",
         );
     let mut m = parse::parse(&ttir).expect("the widened ttir must parse");
-    triton_ktir::make_ktir(&mut m, &[8]).unwrap_or_else(|e| {
+    triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<8>()).unwrap_or_else(|e| {
         panic!(
             "TWO sticks must be accepted, or the one-stick refusal is not what it \
              claims to be about: {e}"
@@ -223,15 +224,15 @@ fn every_refusal_names_its_pass_and_says_something() {
                 "module {\n  tt.func public @k(%p: !tt.ptr<f16>) attributes {noinline = false} {\n    %x = tt.load %p : tensor<64xf16>\n    tt.return\n  }\n}\n",
             )
             .unwrap();
-            triton_ktir::make_ktir(&mut m, &[1]).unwrap_err()
+            triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<1>()).unwrap_err()
         },
-        // A multi-axis grid with no extents.
+        // A two-axis kernel launched at a one-axis grid.
         {
             let mut m = parse::parse(
                 "module {\n  tt.func public @k(%p: !tt.ptr<f16>) attributes {noinline = false} {\n    %a = tt.get_program_id x : i32\n    %b = tt.get_program_id y : i32\n    tt.return\n  }\n}\n",
             )
             .unwrap();
-            triton_ktir::make_ktir(&mut m, &[]).unwrap_err()
+            triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<4>()).unwrap_err()
         },
         // Genuine f32 compute.
         {
@@ -239,7 +240,7 @@ fn every_refusal_names_its_pass_and_says_something() {
                 "module {\n  tt.func public @k(%p: !tt.ptr<f16>) attributes {noinline = false} {\n    %a = arith.constant dense<1.000000e+00> : tensor<64xf32>\n    %b = arith.addf %a, %a : tensor<64xf32>\n    tt.return\n  }\n}\n",
             )
             .unwrap();
-            triton_ktir::make_ktir(&mut m, &[1]).unwrap_err()
+            triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<1>()).unwrap_err()
         },
     ];
     for r in cases {
@@ -280,7 +281,7 @@ fn every_refusal_names_its_pass_and_says_something() {
 #[test]
 fn the_runtime_extent_path_matches_the_cpp() {
     let mut m = parse::parse(&golden("vector_add", "0_ttir.mlir")).expect("parses");
-    triton_ktir::make_ktir(&mut m, &[16]).expect("lowers");
+    triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<16>()).expect("lowers");
     let golden_m = parse::parse(&golden("vector_add", "1_ktir.mlir")).expect("parses");
 
     let casts = |x: &triton_ktir::ir::Module| {

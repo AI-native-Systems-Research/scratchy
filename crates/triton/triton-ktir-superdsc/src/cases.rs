@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use ktir_superdsc::ktir_node::{Elementwise, Program};
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
+use triton_ktir::LaunchGrid;
 
 /// Every configuration name `case` answers to, so a consumer can sweep them rather than
 /// restating the list. Order is the table's own.
@@ -143,7 +144,7 @@ pub fn kernel_spec(
 ///
 /// The constexprs and grid are the SAME VALUES as `test/experiment1/index.json` and
 /// `pure_rust_ktir.rs`'s case table. `Program` is stated, not inferred -- see the crate docs.
-pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
+pub fn case(name: &str) -> Option<(KernelSpec, LaunchGrid, Program)> {
     Some(match name {
         "rmsnorm_granite" => (
             spec(
@@ -162,7 +163,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("INV_D", Val::Float(1.0 / 4096.0)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::RmsNorm,
         ),
         // THE SAME NORM AT 32 ROWS -- the control for the `mb` FOLD.
@@ -192,7 +193,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("INV_D", Val::Float(1.0 / 4096.0)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::RmsNorm,
         ),
         // SWIGLU AT TWO BLOCKINGS, to separate two problems that look like one.
@@ -213,7 +214,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 SWIGLU,
                 &swiglu_ce(128, 256, 64, 128),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         "swiglu_mlp_flat" => (
@@ -223,7 +224,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 SWIGLU,
                 &swiglu_ce(128, 256, 256, 128),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         // GRANITE WIDTH, FLAT. D_FF=12800, so this states a [64, 12800] f16 extent = 1.56 MiB --
@@ -239,7 +240,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 SWIGLU,
                 &swiglu_ce(4096, 12800, 12800, 4096),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         // SWIGLU AS `pure_rust_ktir.rs` STATES IT -- the BLOCKED forms, kept beside the flat ones
@@ -251,7 +252,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 SWIGLU,
                 &swiglu_ce_m(16, 128, 256, 128, 64),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         "swiglu_mlp_granite" => (
@@ -261,7 +262,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 SWIGLU,
                 &swiglu_ce(4096, 12800, 64, 4096),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         // ⭐⭐ GRANITE WIDTH AT THE BLOCKING WHOSE TILES ACTUALLY FIT A 2 MiB LX, which is the
@@ -329,7 +330,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 SWIGLU,
                 &swiglu_ce(4096, 12800, 64, 2048),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         // ROPE. THE GRID IS ONE WORK ITEM PER TOKEN POSITION -- `vec![N_TOK]` -- and it is ONE
@@ -348,12 +349,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // (`H * HEAD_DIM`), which is exactly what `drive_rope` cross-checks against the output view.
         "rope_q32" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(32)),
-            vec![256],
+            LaunchGrid::x::<256>(),
             Program::Rope,
         ),
         "rope_kv8" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(8)),
-            vec![256],
+            LaunchGrid::x::<256>(),
             Program::Rope,
         ),
         // EMBEDDING. `Program::ScalarMul` is the kind of the one COMPUTE op (`rows * EMB_SCALE`);
@@ -390,7 +391,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 EMBEDDING,
                 &embedding_ce(256, 64),
             ),
-            vec![4],
+            LaunchGrid::x::<4>(),
             Program::ScalarMul,
         ),
         "embedding_granite_bm128" => (
@@ -400,7 +401,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 EMBEDDING,
                 &embedding_ce(256, 128),
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::ScalarMul,
         ),
         // ⭐⭐⭐ THE ACCEPTING SIDE, AND THE ONE CONFIGURATION THAT MAKES THE GUARD A GUARD RATHER THAN
@@ -419,7 +420,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 EMBEDDING,
                 &embedding_ce(32, 32),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::ScalarMul,
         ),
         // THE DECODER BLOCK -- 12 matmuls in one function for one layer, 24 for two, so it is the
@@ -435,7 +436,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ptrs_one(),
                 &dec_ce(64),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         "decoder_layer_one_flat" => (
@@ -445,7 +446,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ptrs_one(),
                 &dec_ce(256),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         "decoder_two_layers" => (
@@ -455,7 +456,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ptrs_two(),
                 &dec_ce(64),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         "decoder_two_layers_flat" => (
@@ -465,7 +466,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &dec_ptrs_two(),
                 &dec_ce(256),
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         // ⭐ fp8 W8A8 AT THE SMALL TWIN'S SHAPES -- the whole contract is the four
@@ -496,7 +497,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("BLOCK_N", Val::Int(128)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         // ⭐ RUNG 3, THE MEASUREMENT. The kernel is `mul` with the second pointer
@@ -526,7 +527,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*fp16"), ("c_ptr", "*fp16"), ("scale", "fp16")],
                 &[("n", Val::Int(1024)), ("BLOCK", Val::Int(64))],
             ),
-            vec![16],
+            LaunchGrid::x::<16>(),
             Program::Elementwise(Elementwise::Mul),
         ),
         // ⭐ RUNG 2 IN TWO DIMENSIONS. `mul_scale_small` states the per-core uniform
@@ -559,7 +560,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
             ),
             // M / BLOCK_M: the grid tiles `a`'s rows exactly, one row band per core.
-            vec![8],
+            LaunchGrid::x::<8>(),
             Program::Matmul,
         ),
         // ⭐⭐⭐ RUNG 4 OF THE ADDRESS-PROVENANCE LADDER, THE MEASUREMENT: `q @ gather(k,
@@ -597,7 +598,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("HEAD_DIM", Val::Int(64)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Matmul,
         ),
         // ⭐ PROBE-ONLY (front-b-noise): the noise-hash standalone — see the ALL-list
@@ -635,7 +636,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("NUM_ROWS", Val::Int(4 * 8 * 64)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::PagedKvWrite,
         ),
         // ⭐ spyre-inference's `page_attn_head_major_prefill_kernel` over the same 20-token prompt
@@ -668,7 +669,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("SCALE", Val::Float(0.125)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::PagedAttn,
         ),
         "hash_noise" => (
@@ -697,7 +698,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
                 &[("PAD_V", Val::Int(1048576)), ("B", Val::Int(1))],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Sample,
         ),
         // ⭐ THE INT-BCAST PROBE (front-b-noise, ruling (b)): three pointers — `a` the
@@ -713,7 +714,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(1))],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Sample,
         ),
         // ⭐ THE INT-MUL-BCAST PROBE (front-b-noise, the wall-5 (B) ruling): the add
@@ -731,7 +732,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(1))],
             ),
-            vec![1],
+            LaunchGrid::ONE,
             Program::Sample,
         ),
         // ⭐ THE INT MULTI-ROW PROBES (front-b-noise, auditor GO 2026-10-27): four cells
@@ -752,7 +753,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmr_col_add" => (
@@ -762,7 +763,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmr_dense_mul" => (
@@ -772,7 +773,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmr_col_mul" => (
@@ -782,7 +783,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         // ⭐ THE INT MB PROBES (front-b-noise wall 10, auditor GO 2026-10-27): the
@@ -803,7 +804,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmb_mul" => (
@@ -813,7 +814,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         // ⭐ THE WIDE TWINS — production PAD_V, the per-core slice width the
@@ -828,7 +829,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmb_wide_mul" => (
@@ -838,7 +839,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         // ⭐ THE MB×COL PROBES — the PRODUCTION form of the hash's multiply:
@@ -854,7 +855,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmb_col_mul" => (
@@ -864,7 +865,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmb_wide_col_add" => (
@@ -874,7 +875,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "intmb_wide_col_mul" => (
@@ -884,7 +885,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-27, ruling (a)): the
@@ -937,7 +938,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         "sample_noise_b8" => (
@@ -973,7 +974,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 ],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(8))],
             ),
-            vec![8],
+            LaunchGrid::x::<8>(),
             Program::Sample,
         ),
         // ⭐ THE FP32 TWIN of `intmr_col_add` (wall-9 emission diff, auditor order
@@ -987,7 +988,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*fp32"), ("b_ptr", "*fp32"), ("o_ptr", "*fp32")],
                 &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         // ⭐ THE WIDE TWIN (wall-9 width leg, auditor order 2026-10-27T02:5xZ): the
@@ -1006,7 +1007,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*fp32"), ("b_ptr", "*fp32"), ("o_ptr", "*fp32")],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         // ⭐ THE REDUCE-CHAIN TWIN (wall-9, auditor order after the wide leg
@@ -1024,7 +1025,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*fp32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         // ⭐ THE α CELL BASE (front-b-noise convert-door wall, auditor order
@@ -1048,7 +1049,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                 &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
                 &[("PAD_V", Val::Int(32)), ("B", Val::Int(2))],
             ),
-            vec![2],
+            LaunchGrid::x::<2>(),
             Program::Sample,
         ),
         _ => return None,
@@ -1240,16 +1241,12 @@ mod tests {
     #[test]
     fn every_configuration_names_a_fixture_that_exists() {
         for name in super::ALL {
-            let (spec, grid, _) = super::case(name).expect("a name from ALL");
+            // The grid is a `LaunchGrid`: every extent is positive by type.
+            let (spec, _, _) = super::case(name).expect("a name from ALL");
             assert!(
                 std::path::Path::new(&spec.file).is_file(),
                 "`{name}` names `{}`, which is not a file",
                 spec.file
-            );
-            assert!(!grid.is_empty(), "`{name}` has an empty grid");
-            assert!(
-                grid.iter().all(|&e| e > 0),
-                "`{name}` has a non-positive grid extent"
             );
         }
     }

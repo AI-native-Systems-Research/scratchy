@@ -297,8 +297,8 @@ fn nested_windows(op: &Op) -> bool {
 /// landmark), and before `unroll_grid_positions` -- whose fire gate exempts a corner
 /// the recognizer claims, which is what lets an all-uniform grid keep its launch
 /// instead of paying the clone protocol.
-pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
-    let n = grid.iter().product::<i64>();
+pub fn run(module: &mut Module, grid: &crate::LaunchGrid) -> Result<()> {
+    let n = grid.programs();
     // One position: the corner IS the position, and `fold_unit_grid_tile_id` has
     // already made it a constant.
     if n <= 1 {
@@ -521,7 +521,7 @@ module {
     #[test]
     fn a_div_rem_corner_that_is_affine_over_the_launch_rewrites_to_the_uniform_spelling() {
         let mut m = parse::parse(AFFINE).unwrap();
-        run(&mut m, &[4, 4]).unwrap();
+        run(&mut m, &crate::LaunchGrid::xy::<4, 4>()).unwrap();
         let (row, _col) = tile_of(&m);
         let index = m.def_index();
         let landmark = m.kernel().unwrap().regions[0]
@@ -563,9 +563,9 @@ module {
     #[test]
     fn a_second_run_mints_nothing() {
         let mut m = parse::parse(AFFINE).unwrap();
-        run(&mut m, &[4, 4]).unwrap();
+        run(&mut m, &crate::LaunchGrid::xy::<4, 4>()).unwrap();
         let after_first = m.census();
-        run(&mut m, &[4, 4]).unwrap();
+        run(&mut m, &crate::LaunchGrid::xy::<4, 4>()).unwrap();
         assert_eq!(
             m.census(),
             after_first,
@@ -583,7 +583,7 @@ module {
             "    %c2 = arith.constant 2 : i32\n    %g = arith.divsi %y, %c2 : i32\n    %gh = arith.muli %g, %c256 : i32\n    %corner = arith.addi %gh, %m : i32",
         );
         let mut m = parse::parse(&src).unwrap();
-        run(&mut m, &[4, 4]).unwrap();
+        run(&mut m, &crate::LaunchGrid::xy::<4, 4>()).unwrap();
         let (row, _) = tile_of(&m);
         let index = m.def_index();
         let landmark = m.kernel().unwrap().regions[0]
@@ -614,7 +614,7 @@ module {
             "    %corner = arith.muli %x, %c64 : i32",
         );
         let mut m = parse::parse(&src).unwrap();
-        run(&mut m, &[4, 4]).unwrap();
+        run(&mut m, &crate::LaunchGrid::xy::<4, 4>()).unwrap();
         let (row, _) = tile_of(&m);
         let index = m.def_index();
         let landmark = m.kernel().unwrap().regions[0]
@@ -644,7 +644,7 @@ module {
             "    %c32 = arith.constant 32 : index\n    %o = arith.addi %tid, %c32 : index\n    %oc = arith.index_cast %o : index to i32\n    %corner = arith.muli %oc, %c64 : i32",
         );
         let mut m = parse::parse(&src).unwrap();
-        run(&mut m, &[4, 4]).unwrap();
+        run(&mut m, &crate::LaunchGrid::xy::<4, 4>()).unwrap();
         let f = m.kernel().unwrap();
         let body = &f.regions[0].ops;
         let index = m.def_index();
@@ -730,7 +730,7 @@ module {
             .replace("    return\n", "    }\n    return\n");
         let mut m = parse::parse(&src).unwrap();
         let before = m.census();
-        run(&mut m, &[4, 4]).unwrap();
+        run(&mut m, &crate::LaunchGrid::xy::<4, 4>()).unwrap();
         assert_eq!(
             m.census(),
             before,

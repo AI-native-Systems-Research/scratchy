@@ -45,8 +45,8 @@ pub fn has(config: &str, stage: &str) -> bool {
 
 /// The launch grid a config was generated with, read from its own `grid.txt` so the
 /// test cannot drift from the golden.
-pub fn grid(config: &str) -> Vec<i64> {
-    golden(config, "grid.txt")
+pub fn grid(config: &str) -> triton_ktir::LaunchGrid {
+    let extents: Vec<i64> = golden(config, "grid.txt")
         .trim()
         .split(',')
         .filter(|s| !s.is_empty())
@@ -54,7 +54,9 @@ pub fn grid(config: &str) -> Vec<i64> {
             s.parse()
                 .expect("grid.txt holds a comma-separated integer list")
         })
-        .collect()
+        .collect();
+    triton_ktir::LaunchGrid::of_extents(&extents)
+        .unwrap_or_else(|e| panic!("{config}: grid.txt states no launch grid: {e}"))
 }
 
 /// A census as a sorted `name=count` list, for a one-line assertion.

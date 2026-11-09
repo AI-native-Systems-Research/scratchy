@@ -29,7 +29,7 @@ fn main() {
 
     let ttir = std::fs::read_to_string(goldens.join("0_ttir.mlir"))
         .unwrap_or_else(|e| panic!("cannot read {}'s ttir: {e}", args[0]));
-    let grid: Vec<i64> = std::fs::read_to_string(goldens.join("grid.txt"))
+    let extents: Vec<i64> = std::fs::read_to_string(goldens.join("grid.txt"))
         .unwrap_or_else(|e| panic!("cannot read {}'s grid: {e}", args[0]))
         .trim()
         .split(',')
@@ -39,6 +39,8 @@ fn main() {
                 .expect("grid.txt is a comma-separated integer list")
         })
         .collect();
+    let grid = triton_ktir::LaunchGrid::of_extents(&extents)
+        .unwrap_or_else(|e| panic!("the grid states no launch grid: {e}"));
 
     let mut m = parse::parse(&ttir).unwrap_or_else(|e| panic!("ttir: {e}"));
     triton_ktir::make_ktir(&mut m, &grid).unwrap_or_else(|e| panic!("make_ktir refused: {e}"));

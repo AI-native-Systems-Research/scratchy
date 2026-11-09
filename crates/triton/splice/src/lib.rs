@@ -105,6 +105,7 @@ use scratchy_subtile::subtile_ir::{
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
+use triton_ktir::LaunchGrid;
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -1009,7 +1010,7 @@ fn lower_sandwich_node<
         signature,
         constexprs,
     };
-    let module = compile_kernel(src, &spec, &[1])?;
+    let module = compile_kernel(src, &spec, &LaunchGrid::ONE)?;
     // The synthetic node: the NORM's op (so `mint`'s `program_stem` answers the
     // sandwich's own `rmsnorm` stem), the SPLIT's id (the naming law), and the
     // bindings in the kernel's parameter order — the split's source, the gamma row
@@ -1479,7 +1480,7 @@ fn lower_prefill_lm_head_fold<
         signature: signature.clone(),
         constexprs: constexprs.clone(),
     };
-    let module = compile_kernel(src, &spec, &[1])?;
+    let module = compile_kernel(src, &spec, &LaunchGrid::ONE)?;
     let extraction_node = SubtileNode {
         id: node.id,
         op: node.op,
@@ -1592,7 +1593,7 @@ pub fn lower_block_copy<
         signature,
         constexprs,
     };
-    let module = compile_kernel(src_py, &spec, &[1])?;
+    let module = compile_kernel(src_py, &spec, &LaunchGrid::ONE)?;
     let copy = SubtileNode {
         id: node.id,
         op: node.op,
@@ -2195,7 +2196,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             constexprs,
             file: file.to_string(),
         };
-        let module = compile_kernel(src, &spec, &[1])?;
+        let module = compile_kernel(src, &spec, &LaunchGrid::ONE)?;
         let positional = triton_ktir_superdsc::node_for(&module, program)
             .map_err(|e| format!("triton splice: node_for: {e}"))?;
         let k = rebind(
@@ -2261,7 +2262,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         constexprs,
         file: file.to_string(),
     };
-    let module = compile_kernel(src, &spec, &[1])?;
+    let module = compile_kernel(src, &spec, &LaunchGrid::ONE)?;
     let positional = triton_ktir_superdsc::node_for(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     let mut bindings = vec![
@@ -2384,7 +2385,7 @@ pub fn lower_kv_write<
         constexprs,
         file: file.to_string(),
     };
-    let module = compile_kernel(src, &spec, &[1])?;
+    let module = compile_kernel(src, &spec, &LaunchGrid::ONE)?;
     let positional = triton_ktir_superdsc::node_for(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     let t =
@@ -3317,33 +3318,37 @@ fn blocks_of(rows: u32, cols: u32, live: u32) -> (u32, u32, u32) {
 }
 
 /// The launch grid. The builder's programs are `(gx, gy) = (1, 1)` for every pointwise
-/// kind; the kernel is compiled at the same grid the case table states (`vec![1]`).
+/// kind; the kernel is compiled at the same grid the case table states (`LaunchGrid::ONE`).
 fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     _ir: &SubtileIR<F>,
-) -> Result<Vec<i64>, String> {
+) -> Result<LaunchGrid, String> {
     match &node.op {
-        SubOp::RmsNorm { .. } => Ok(vec![1]),
-        SubOp::SiluMul => Ok(vec![1]),
-        SubOp::MatmulTile { .. } => Ok(vec![1]),
-        SubOp::Elementwise(_) => Ok(vec![1]),
-        SubOp::ScalarMul { .. } => Ok(vec![1]),
+        SubOp::RmsNorm { .. } => Ok(LaunchGrid::ONE),
+        SubOp::SiluMul => Ok(LaunchGrid::ONE),
+        SubOp::MatmulTile { .. } => Ok(LaunchGrid::ONE),
+        SubOp::Elementwise(_) => Ok(LaunchGrid::ONE),
+        SubOp::ScalarMul { .. } => Ok(LaunchGrid::ONE),
         // ONE WORK ITEM: the position loop is a constant-trip `tl.range` inside the
         // kernel, unrolled by the ladder (`to_ktir::unroll_constant_trip_loops`), so the
         // spliced program is straight-line like the builder's — no grid axis at all.
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(vec![1]),
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(LaunchGrid::ONE),
         // The same one-work-item law: the row blocks are in-kernel tiles. The MoE
         // sub-ops have no grid row any more — the registry refuses them before the
         // splice (the MoE lowers only from `kernels/moe.py` through KTIR).
         SubOp::TanhSoftCap { .. }
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
-        | SubOp::Reshape { .. } => Ok(vec![1]),
+        | SubOp::Reshape { .. } => Ok(LaunchGrid::ONE),
         // ⭐ ONE PROGRAM PER REQUEST ROW: the sampler's grid is the rung's
         // own row count — 1 on the solo rung, the batched rung's baked width
         // on every batch rung. Every per-row operand is a `[B, ·]` descriptor
         // this program's own row indexes (`[pid, 0]`).
-        SubOp::Sample { rows, .. } => Ok(vec![i64::from(*rows)]),
+        SubOp::Sample { rows, .. } => std::num::NonZeroU32::new(*rows)
+            .map(LaunchGrid::X)
+            .ok_or_else(|| {
+                "triton splice: a sampler over zero rows launches no program".to_string()
+            }),
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
         // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
@@ -3367,7 +3372,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 fn compile_kernel(
     src: &str,
     spec: &KernelSpec,
-    grid: &[i64],
+    grid: &LaunchGrid,
 ) -> Result<triton_ktir::ir::Module, String> {
     /// The memo. The key is [`memo_key`]'s canonical `String`, so it needs no `Hash`/`Ord` on
     /// `ArgSpec`/`Val` and is deterministic in construction.
@@ -3419,7 +3424,7 @@ impl<T: Clone> Memo<T> {
 
 /// THE CANONICAL KEY of one (source, spec, grid) compile — `None` for a spec this key cannot
 /// spell injectively, which sits it out of every memo keyed on it.
-fn memo_key(src: &str, spec: &KernelSpec, grid: &[i64]) -> Option<String> {
+fn memo_key(src: &str, spec: &KernelSpec, grid: &LaunchGrid) -> Option<String> {
     use std::collections::BTreeMap;
     // ⛔ THE SOURCE TEXT IS PART OF THE KEY, not the file path: `read_kernel` re-reads
     // the `.py` from disk on every call and the bake runs inside ONE build-script
@@ -3484,7 +3489,7 @@ fn memo_key(src: &str, spec: &KernelSpec, grid: &[i64]) -> Option<String> {
         key.push('\u{1}');
     }
     key.push('\0');
-    for g in grid {
+    for g in grid.extents() {
         key.push_str(&format!("g{g}\u{1}"));
     }
     key.push('\0');
@@ -3497,7 +3502,7 @@ fn memo_key(src: &str, spec: &KernelSpec, grid: &[i64]) -> Option<String> {
 fn compile_kernel_uncached(
     src: &str,
     spec: &KernelSpec,
-    grid: &[i64],
+    grid: &LaunchGrid,
 ) -> Result<triton_ktir::ir::Module, String> {
     let mut tt = triton_frontend::codegen::compile(src, spec, Target::spyre())
         .map_err(|e| format!("triton splice: {}: {e}", spec.file))?;
@@ -3868,7 +3873,7 @@ mod production_ktir_dump {
     /// One entry per (kernel file, entry point) — the multi-entry files (`elementwise.py`,
     /// `rmsnorm.py`, `windowedrmsnorm.py`, `matmul.py`, `page_attn_head_major_*.py`) state every entry, so a
     /// guard that only one arm trips is itself covered.
-    fn entries() -> Vec<(&'static str, &'static str, KernelSpec, Vec<i64>)> {
+    fn entries() -> Vec<(&'static str, &'static str, KernelSpec, LaunchGrid)> {
         // The whole-region pointwise constants every `blocks_of(1, c, live)` answers.
         let ew = |file: &str, kernel: &str, ptrs: &[(&str, &str)], live: u32| {
             let (block_m, n_blocks, tail_h) = blocks_of(1, 2048, live);
@@ -3888,7 +3893,7 @@ mod production_ktir_dump {
                 ],
             )
         };
-        let mut v: Vec<(&'static str, &'static str, KernelSpec, Vec<i64>)> = Vec::new();
+        let mut v: Vec<(&'static str, &'static str, KernelSpec, LaunchGrid)> = Vec::new();
         // ── rmsnorm.py: the Scale arm and the (1 + w) form's own spec. ──
         for entry in ["rmsnorm_fwd", "rmsnorm_oneplus_fwd"] {
             let mut ces = vec![
@@ -3917,7 +3922,7 @@ mod production_ktir_dump {
                     ],
                     &ces,
                 ),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ── matmul.py (Dense): N is the DEVICE width, the arm's own padding law. ──
@@ -3943,7 +3948,7 @@ mod production_ktir_dump {
                     ("M_TOTAL", Val::Int(1)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── matmul_fp8.py: the arity-3 twin, LOGICAL widths (the arm's own early-return
         // door is not pad-idempotent), one whole-region tile. ──
@@ -3969,7 +3974,7 @@ mod production_ktir_dump {
                     ("M_TOTAL", Val::Int(1)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── elementwise.py: every binary entry plus both unary acts. ──
         for (entry, ptrs, live) in [
@@ -4015,7 +4020,7 @@ mod production_ktir_dump {
                 entry,
                 ELEMENTWISE,
                 ew("elementwise.py", entry, ptrs, live),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ── silumul.py: the [M, N] gate·up product, whole-region single tile. ──
@@ -4032,7 +4037,7 @@ mod production_ktir_dump {
                 ],
                 SILU_MUL_LIVE_TILES,
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── scalarmul.py: the WINDOW is the device width — `for_pointwise` on both N and
         // N_TOTAL, the arm's own law. ──
@@ -4058,7 +4063,7 @@ mod production_ktir_dump {
                         ("SCALE", Val::Float(8.0)),
                     ],
                 ),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ── rope.py: a whole-region node — R_START = 0, Y_TOTAL = MQ·H. ──
@@ -4083,7 +4088,7 @@ mod production_ktir_dump {
                     ("R_START", Val::Int(0)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── tanhsoftcap.py: the vocab-wide cap, three live tiles. ──
         {
@@ -4105,7 +4110,7 @@ mod production_ktir_dump {
                         ("TAIL_H", Val::Int(i128::from(tail_h))),
                     ],
                 ),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ── rmsnormunit.py: the rmsnorm arm's constants minus the weight. ──
@@ -4124,7 +4129,7 @@ mod production_ktir_dump {
                     ("INV_D", Val::Float(1.0 / 128.0)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── scalarwmul.py: `w` is a RUNTIME fp16 SCALAR, not a descriptor. ──
         v.push((
@@ -4136,7 +4141,7 @@ mod production_ktir_dump {
                 &[("desc_x", "*fp16"), ("w", "fp16"), ("desc_o", "*fp16")],
                 &[("M", Val::Int(1)), ("N", Val::Int(2048))],
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── reshape.py: both sides whole sticks, element count preserved. ──
         v.push((
@@ -4154,7 +4159,7 @@ mod production_ktir_dump {
                     ("N_STICKS", Val::Int(16)),
                 ],
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── lmlast.py: the extraction, one entry per request count — k = 1, 2 and 3 (3 is
         // not a power of two), each at w = 5 so MQ is the pair's own product. ──
@@ -4178,7 +4183,7 @@ mod production_ktir_dump {
                         ("N_STICKS", Val::Int(32)),
                     ],
                 ),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ── windowedrmsnorm.py: all three entries of the one body. ──
@@ -4213,7 +4218,7 @@ mod production_ktir_dump {
                 entry,
                 WINDOWEDRMSNORM,
                 spec("windowedrmsnorm.py", entry, ptrs, &ces),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ── spyre-inference's paged step: `page_attn_head_major_decode` (one query row) and
@@ -4271,7 +4276,7 @@ mod production_ktir_dump {
                     "page_attn_head_major_prefill_kernel",
                 )
             };
-            v.push((name, src, spec(file, entry, &ptrs, &ces), vec![1]));
+            v.push((name, src, spec(file, entry, &ptrs, &ces), LaunchGrid::ONE));
         }
         // ── and the PREFILL kernel at a PACKED rung's split extents (M2's S=2 shape, stated at the
         // splice level): `NUM_TOKENS` is the graph's rows (two requests of 64) while
@@ -4313,7 +4318,7 @@ mod production_ktir_dump {
                     &ptrs,
                     &ces,
                 ),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ...and `batched_decode_head_major` over that pool, the chunkings a decode batch rung
@@ -4364,7 +4369,7 @@ mod production_ktir_dump {
                         ("SCALE", Val::Float(0.125)),
                     ],
                 ),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // A decode step's write (8 kv heads, one store per head), one below the scatter floor (2
@@ -4401,7 +4406,7 @@ mod production_ktir_dump {
                         ),
                     ],
                 ),
-                vec![1],
+                LaunchGrid::ONE,
             ));
         }
         // ── moe.py / moe_prefill.py: the MoE numeric tests' golden geometry — the
@@ -4442,7 +4447,7 @@ mod production_ktir_dump {
             "moe_fwd",
             MOE,
             spec("moe.py", "moe_fwd", moe_ptrs, &moe_ces("M", 1)),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // `moe_prefill.py`'s signature: `moe.py`'s first twelve, then the dense route
         // (`desc_dense`) — no id/scratch sticks, the route is dense in the prompt form.
@@ -4469,7 +4474,7 @@ mod production_ktir_dump {
                 ],
                 &moe_ces("T", 16),
             ),
-            vec![1],
+            LaunchGrid::ONE,
         ));
         // ── sample_fwd.py: the token draw at solo and batched grids — the sampler this
         // proof guards, and the ONE kernel the grid-[B] fix is allowed to move. The
@@ -4508,9 +4513,9 @@ mod production_ktir_dump {
                 ("idx_ptr", "*i32"),
             ];
             for (name, b, grid) in [
-                ("sample_fwd_b1", 1i128, vec![1i64]),
-                ("sample_fwd_b2", 2, vec![2]),
-                ("sample_fwd_b32", 32, vec![32]),
+                ("sample_fwd_b1", 1i128, LaunchGrid::ONE),
+                ("sample_fwd_b2", 2, LaunchGrid::x::<2>()),
+                ("sample_fwd_b32", 32, LaunchGrid::x::<32>()),
             ] {
                 v.push((
                     name,
@@ -4949,7 +4954,7 @@ mod walk_on_the_card {
             constexprs,
             file: file.to_string(),
         };
-        let module = compile_kernel(src, &spec, &[1]).expect("the walk compiles");
+        let module = compile_kernel(src, &spec, &LaunchGrid::ONE).expect("the walk compiles");
         triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
     }
 
@@ -5174,7 +5179,8 @@ mod walk_on_the_card {
             constexprs,
             file: file.to_string(),
         };
-        let module = compile_kernel(src, &spec, &[1]).expect("the batched walk compiles");
+        let module =
+            compile_kernel(src, &spec, &LaunchGrid::ONE).expect("the batched walk compiles");
         let node =
             triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints");
         (node, c)
@@ -6560,7 +6566,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             constexprs,
             file: "two_pages.py".to_string(),
         };
-        let module = compile_kernel(&src, &spec, &[1]).expect("the kernel compiles");
+        let module = compile_kernel(&src, &spec, &LaunchGrid::ONE).expect("the kernel compiles");
         let node =
             triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the program mints");
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the program places");
@@ -6641,7 +6647,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             constexprs,
             file: file.to_string(),
         };
-        let module = compile_kernel(src, &spec, &[1]).expect("the write compiles");
+        let module = compile_kernel(src, &spec, &LaunchGrid::ONE).expect("the write compiles");
         let node = triton_ktir_superdsc::node_for(&module, Program::PagedKvWrite)
             .expect("the write mints");
         let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the write places");

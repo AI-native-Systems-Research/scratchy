@@ -76,7 +76,7 @@ struct Case {
     name: &'static str,
     fixture: &'static str,
     spec: KernelSpec,
-    grid: Vec<i64>,
+    grid: triton_ktir::LaunchGrid,
     target: Target,
     expect: Expect,
 }
@@ -308,7 +308,7 @@ fn cases() -> Vec<Case> {
             name: "attention_flash_noncausal",
             fixture: "attention_flash",
             spec: spec("attention_flash", "attn_fwd", attn, &attn_ce(1)),
-            grid: vec![4, 4],
+            grid: triton_ktir::LaunchGrid::xy::<4, 4>(),
             // The oracle HAS the `f16 / f16 -> f32` promotion this backend turns off for
             // Spyre, and attention's epilogue is the one bare f16 divide in any fixture.
             // `tests/divergence.rs` in triton-frontend asserts the difference is exactly
@@ -325,7 +325,7 @@ fn cases() -> Vec<Case> {
             name: "attention_flash_causal",
             fixture: "attention_flash",
             spec: spec("attention_flash", "attn_fwd", attn, &attn_ce(3)),
-            grid: vec![4, 4],
+            grid: triton_ktir::LaunchGrid::xy::<4, 4>(),
             target: Target::upstream_gpu(),
             expect: Expect::OnlyTheTransposedDotWeight,
         },
@@ -338,7 +338,7 @@ fn cases() -> Vec<Case> {
                 swiglu,
                 &swiglu_ce(128, 256, 128),
             ),
-            grid: vec![1],
+            grid: triton_ktir::LaunchGrid::ONE,
             target: Target::spyre(),
             // ⛔ THE TWO PROJECTION WEIGHTS ARE TRANSPOSED DOT OPERANDS. Same one decision as
             // attention, but the SwiGLU goldens fold the transpose into the memory VIEW as well as
@@ -357,7 +357,7 @@ fn cases() -> Vec<Case> {
                 swiglu,
                 &swiglu_ce(4096, 12800, 4096),
             ),
-            grid: vec![1],
+            grid: triton_ktir::LaunchGrid::ONE,
             target: Target::spyre(),
             expect: Expect::OnlyTheTransposedDotWeight,
         },
@@ -370,7 +370,7 @@ fn cases() -> Vec<Case> {
                 swiglu,
                 &swiglu_ce(128, 256, 64),
             ),
-            grid: vec![1],
+            grid: triton_ktir::LaunchGrid::ONE,
             target: Target::spyre(),
             // ⛔ As `swiglu_mlp_small`, except that the K-tiled inner loop states the weight
             // tile's two corners as `arith.index_cast`s of its block arguments rather than as tile
@@ -396,7 +396,7 @@ fn cases() -> Vec<Case> {
                     ("EMB_SCALE", Val::Float(12.0)),
                 ],
             ),
-            grid: vec![2],
+            grid: triton_ktir::LaunchGrid::x::<2>(),
             target: Target::spyre(),
             // WAS the one gap, and the `Expect::DiffersOn` machinery is what closed it: it
             // failed with "now MATCHES ... update `Expect`" the moment the
@@ -423,7 +423,7 @@ fn cases() -> Vec<Case> {
                     ("EMB_SCALE", Val::Float(12.0)),
                 ],
             ),
-            grid: vec![4],
+            grid: triton_ktir::LaunchGrid::x::<4>(),
             target: Target::spyre(),
             expect: Expect::Matches,
         },
@@ -446,7 +446,7 @@ fn cases() -> Vec<Case> {
                     ("INV_D", Val::Float(1.0 / 4096.0)),
                 ],
             ),
-            grid: vec![1],
+            grid: triton_ktir::LaunchGrid::ONE,
             target: Target::spyre(),
             expect: Expect::Matches,
         },
@@ -484,7 +484,7 @@ fn cases() -> Vec<Case> {
             name: "rope_q32",
             fixture: "rope",
             spec: spec("rope", "rope_fwd", rope, &rope_ce(32)),
-            grid: vec![256],
+            grid: triton_ktir::LaunchGrid::x::<256>(),
             target: Target::spyre(),
             expect: Expect::DiffersOn("census/arith.divui"),
         },
@@ -492,7 +492,7 @@ fn cases() -> Vec<Case> {
             name: "rope_kv8",
             fixture: "rope",
             spec: spec("rope", "rope_fwd", rope, &rope_ce(8)),
-            grid: vec![256],
+            grid: triton_ktir::LaunchGrid::x::<256>(),
             target: Target::spyre(),
             expect: Expect::DiffersOn("census/arith.divui"),
         },
@@ -520,7 +520,7 @@ fn cases() -> Vec<Case> {
                 ]),
                 &dec_ce(),
             ),
-            grid: vec![1],
+            grid: triton_ktir::LaunchGrid::ONE,
             target: Target::spyre(),
             // ⛔ THE ROPE'D K IS A TRANSPOSED DOT OPERAND THAT IS **COMPUTED**, NOT LOADED, so
             // there is no access tile for the C++ to fold into and it leaves the `tt.trans`
@@ -564,7 +564,7 @@ fn cases() -> Vec<Case> {
                 ]),
                 &dec_ce(),
             ),
-            grid: vec![1],
+            grid: triton_ktir::LaunchGrid::ONE,
             target: Target::spyre(),
             expect: Expect::OnlyTheTransposedDotWeight,
         },

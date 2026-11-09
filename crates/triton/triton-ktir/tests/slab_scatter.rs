@@ -14,6 +14,7 @@
 //! for a write under `desc.scatter`'s floor of 8 rows (`reshape_and_cache_head_major.py`'s row-at-a-time arm).
 
 use std::collections::HashMap;
+use triton_ktir::LaunchGrid;
 
 use triton_frontend::codegen::{self, ArgSpec, KernelSpec};
 use triton_frontend::opt;
@@ -49,7 +50,7 @@ fn to_ktdp(src: &str) -> Result<Module, String> {
     let mut tt = codegen::compile(src, &spec, Target::spyre()).map_err(|e| e.to_string())?;
     opt::make_ttir(&mut tt).map_err(|e| e.to_string())?;
     let mut m = from_ttir::convert(&tt).map_err(|e| e.to_string())?;
-    triton_ktir::make_ktir(&mut m, &[1]).map_err(|e| e.to_string())?;
+    triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<1>()).map_err(|e| e.to_string())?;
     Ok(m)
 }
 

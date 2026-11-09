@@ -146,6 +146,7 @@ pub mod text;
 
 pub use ir::{Module, Op, OpKind, Ssa};
 use ktir_core::ddl_binds;
+use std::num::NonZeroU32;
 
 /// Every way this crate refuses.
 ///
@@ -178,9 +179,110 @@ impl std::fmt::Display for Refusal {
 
 pub type Result<T> = std::result::Result<T, Refusal>;
 
+/// ⭐ THE LAUNCH GRID A KERNEL IS COMPILED AT — one, two or three program-id axes,
+/// fastest-varying first (Triton's `grid`, `program_id(0)` the first extent), every
+/// extent at least one by type.
+///
+/// It is a required argument of the pipeline ([`make_ktir`], `to_ktir::run`): the
+/// caller that launches the kernel states it, so nothing downstream infers a block
+/// count from the IR or refuses for want of one. Its rank is the caller's statement of
+/// how many axes the kernel reads; a kernel reading an axis past it is refused by
+/// `DistributeWork`, naming both.
+///
+/// A literal grid is [`LaunchGrid::x`] / [`LaunchGrid::xy`] / [`LaunchGrid::xyz`],
+/// whose zero extent fails const evaluation; a grid read from outside the program (a
+/// fixture's `grid.txt`, a command line) is [`LaunchGrid::of_extents`], the one place
+/// such a list is checked.
+///
+/// ```compile_fail,E0080
+/// let _ = triton_ktir::LaunchGrid::xy::<4, 0>();
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LaunchGrid {
+    X(NonZeroU32),
+    XY(NonZeroU32, NonZeroU32),
+    XYZ(NonZeroU32, NonZeroU32, NonZeroU32),
+}
+
+impl LaunchGrid {
+    /// One program: the grid every whole-node kernel launches at.
+    pub const ONE: LaunchGrid = LaunchGrid::X(NonZeroU32::MIN);
+
+    const fn nz(n: u32) -> NonZeroU32 {
+        match NonZeroU32::new(n) {
+            Some(v) => v,
+            None => panic!("a launch-grid extent is at least one program"),
+        }
+    }
+
+    /// A one-axis literal grid of `X` programs.
+    pub const fn x<const X: u32>() -> LaunchGrid {
+        LaunchGrid::X(const { Self::nz(X) })
+    }
+
+    /// A two-axis literal grid, `X` fastest.
+    pub const fn xy<const X: u32, const Y: u32>() -> LaunchGrid {
+        LaunchGrid::XY(const { Self::nz(X) }, const { Self::nz(Y) })
+    }
+
+    /// A three-axis literal grid, `X` fastest.
+    pub const fn xyz<const X: u32, const Y: u32, const Z: u32>() -> LaunchGrid {
+        LaunchGrid::XYZ(
+            const { Self::nz(X) },
+            const { Self::nz(Y) },
+            const { Self::nz(Z) },
+        )
+    }
+
+    /// A grid read from outside the program — a fixture's `grid.txt`, a command line.
+    ///
+    /// # Errors
+    /// No extent, more than three, or one that is not a positive `u32`.
+    pub fn of_extents(extents: &[i64]) -> Result<LaunchGrid> {
+        let axis = |e: i64| {
+            u32::try_from(e)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| {
+                    Refusal::new(
+                        "LaunchGrid",
+                        format!("a launch-grid extent is a positive u32 program count; got {e}"),
+                    )
+                })
+        };
+        match *extents {
+            [x] => Ok(LaunchGrid::X(axis(x)?)),
+            [x, y] => Ok(LaunchGrid::XY(axis(x)?, axis(y)?)),
+            [x, y, z] => Ok(LaunchGrid::XYZ(axis(x)?, axis(y)?, axis(z)?)),
+            _ => Err(Refusal::new(
+                "LaunchGrid",
+                format!(
+                    "a launch grid has one to three axes (Triton's program_id 0..=2); got {} \
+                     extents {extents:?}",
+                    extents.len()
+                ),
+            )),
+        }
+    }
+
+    /// The extents, fastest-varying axis first — one per stated axis.
+    pub fn extents(&self) -> Vec<i64> {
+        match *self {
+            LaunchGrid::X(x) => vec![x.get().into()],
+            LaunchGrid::XY(x, y) => vec![x.get().into(), y.get().into()],
+            LaunchGrid::XYZ(x, y, z) => vec![x.get().into(), y.get().into(), z.get().into()],
+        }
+    }
+
+    /// The program count — the product of the extents.
+    pub fn programs(&self) -> i64 {
+        self.extents().iter().product()
+    }
+}
+
 /// One pass of a pipeline table: a named step plus the function that runs it.
 /// Both drivers' tables are `[(name, Pass); N]`, walked by one runner.
-pub type Pass = fn(&mut Module, &[i64]) -> Result<()>;
+pub type Pass = fn(&mut Module, &LaunchGrid) -> Result<()>;
 
 /// Run `make_ktir`'s pipeline, in `make_ktir`'s order, on a ttir value.
 ///
@@ -190,13 +292,12 @@ pub type Pass = fn(&mut Module, &[i64]) -> Result<()>;
 ///
 /// `grid` is the launch grid, fastest-varying axis first -- the same list
 /// `spyre.passes.add_ktir_lowering(pm, list(options.grid))` threads into the C++
-/// pipeline. An empty grid keeps `DistributeWork`'s single-axis heuristic, and a
-/// multi-axis kernel then RED-stops rather than guessing a block count.
+/// pipeline, stated by the caller as a [`LaunchGrid`].
 /// One runner, one pipeline table: each row is a pass, and the runner runs the
 /// SSA verifier after EVERY entry, so no pass can be added to `make_ktir`
 /// without a verify line following it and none can be quietly skipped. A row's
 /// comment says why the pass sits where it sits.
-pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
+pub fn make_ktir(module: &mut Module, grid: &LaunchGrid) -> Result<()> {
     let pipeline: [(&'static str, Pass); 7] = [
         ("make_ktir:dot_to_linalg", |m, _| {
             passes::dot_to_linalg::run(m)
@@ -228,4 +329,38 @@ pub fn make_ktir(module: &mut Module, grid: &[i64]) -> Result<()> {
         passes::verify_defs::verify_module_defs(module, name).map_err(|v| v.refusal())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod launch_grid_tests {
+    use super::LaunchGrid;
+
+    /// The one boundary a grid read from outside the program crosses: one to three
+    /// positive extents, fastest first, and nothing else.
+    #[test]
+    fn a_grid_from_outside_is_one_to_three_positive_extents() {
+        assert_eq!(LaunchGrid::of_extents(&[16]), Ok(LaunchGrid::x::<16>()));
+        assert_eq!(
+            LaunchGrid::of_extents(&[2, 4]),
+            Ok(LaunchGrid::xy::<2, 4>())
+        );
+        assert_eq!(
+            LaunchGrid::of_extents(&[2, 4, 3]),
+            Ok(LaunchGrid::xyz::<2, 4, 3>())
+        );
+        for bad in [&[][..], &[0], &[4, -1], &[1, 2, 3, 4], &[1 << 33]] {
+            assert!(
+                LaunchGrid::of_extents(bad).is_err(),
+                "{bad:?} is no launch grid"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grid_states_its_extents_and_program_count() {
+        let g = LaunchGrid::xy::<2, 4>();
+        assert_eq!(g.extents(), vec![2, 4]);
+        assert_eq!(g.programs(), 8);
+        assert_eq!(LaunchGrid::ONE.extents(), vec![1]);
+    }
 }

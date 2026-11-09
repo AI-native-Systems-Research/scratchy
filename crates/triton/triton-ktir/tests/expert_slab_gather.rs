@@ -19,6 +19,7 @@
 //! silent-misread class this test exists to rule out.
 
 use std::collections::HashMap;
+use triton_ktir::LaunchGrid;
 
 use triton_frontend::codegen::{self, ArgSpec, KernelSpec};
 use triton_frontend::opt;
@@ -68,7 +69,7 @@ fn to_ktdp() -> Result<Module, String> {
     let mut tt = codegen::compile(&src, &spec(file), Target::spyre()).map_err(|e| e.to_string())?;
     opt::make_ttir(&mut tt).map_err(|e| e.to_string())?;
     let mut m = from_ttir::convert(&tt).map_err(|e| e.to_string())?;
-    triton_ktir::make_ktir(&mut m, &[1]).map_err(|e| e.to_string())?;
+    triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<1>()).map_err(|e| e.to_string())?;
     Ok(m)
 }
 
@@ -134,7 +135,7 @@ fn ladder(src: &str, sig: &[(&str, &str)]) -> Result<Module, String> {
     let mut tt = codegen::compile(src, &spec, Target::spyre()).expect("the front end admits it");
     opt::make_ttir(&mut tt).expect("make_ttir");
     let mut m = from_ttir::convert(&tt).expect("from_ttir");
-    triton_ktir::make_ktir(&mut m, &[1]).map_err(|e| e.to_string())?;
+    triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<1>()).map_err(|e| e.to_string())?;
     Ok(m)
 }
 

@@ -54,7 +54,9 @@ fn ttir(config: &str) -> String {
 
 /// The module the handoff sees: parsed, `make_ktir`, `to_ktir`. Panics rather than returning
 /// an error, because a fixture that cannot reach the handoff is measuring nothing.
-fn converted(config: &str, grid: &[i64]) -> triton_ktir::Module {
+fn converted(config: &str, extents: &[i64]) -> triton_ktir::Module {
+    let grid = &triton_ktir::LaunchGrid::of_extents(extents)
+        .unwrap_or_else(|e| panic!("{config}: the case states no launch grid: {e}"));
     let mut m = triton_ktir::text::parse::parse(&ttir(config))
         .unwrap_or_else(|e| panic!("{config}: ttir must parse: {e}"));
     triton_ktir::make_ktir(&mut m, grid)

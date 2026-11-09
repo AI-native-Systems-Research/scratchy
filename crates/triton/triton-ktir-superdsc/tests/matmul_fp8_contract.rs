@@ -56,6 +56,7 @@ use std::path::PathBuf;
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 use triton_frontend::{codegen, opt};
+use triton_ktir::LaunchGrid;
 
 /// The fixture's path — `crates/triton/test-fixtures/matmul_fp8.py`.
 fn fixture() -> String {
@@ -99,7 +100,7 @@ fn sig_with_w(w: &str) -> HashMap<String, codegen::ArgSpec> {
 fn drive(
     sig: &HashMap<String, codegen::ArgSpec>,
     ces: &HashMap<String, Val>,
-    grid: &[i64],
+    grid: &LaunchGrid,
 ) -> Result<Vec<String>, String> {
     drive_src(&fixture(), sig, ces, grid)
 }
@@ -112,7 +113,7 @@ fn drive_src(
     src: &str,
     sig: &HashMap<String, codegen::ArgSpec>,
     ces: &HashMap<String, Val>,
-    grid: &[i64],
+    grid: &LaunchGrid,
 ) -> Result<Vec<String>, String> {
     // The constexpr parameters need their `constexpr` signature entries too — `cases::spec`
     // does the same, or codegen refuses the kernel for parameters with no signature row.
@@ -144,7 +145,7 @@ fn drive_src(
 /// The refusal names the gap, not a stage — every control asserts on a SUBSTRING so the
 /// check survives message wording but not meaning.
 fn refuses_with(what: &str, needle: &str) {
-    match drive(&sig_fp8(), &ces_override(what), &[1]) {
+    match drive(&sig_fp8(), &ces_override(what), &LaunchGrid::x::<1>()) {
         Ok(names) => panic!(
             "{what}: BAKED ({} ops) — the door lowered a kernel that violates the \
              W8A8 contract it assumes",
@@ -183,7 +184,8 @@ fn ces_override(what: &str) -> HashMap<String, Val> {
 /// counting only the fused ops leaves a partial revert green).
 #[test]
 fn the_canonical_fp8_kernel_bakes_and_emits_the_w8a8_chain() {
-    let names = drive(&sig_fp8(), &ces(), &[1]).expect("the canonical fp8 kernel bakes");
+    let names =
+        drive(&sig_fp8(), &ces(), &LaunchGrid::x::<1>()).expect("the canonical fp8 kernel bakes");
     let expected = [
         "fq_qspt_op",
         "fq_invs_op",
@@ -247,7 +249,7 @@ fn the_canonical_fp8_kernel_bakes_and_emits_the_w8a8_chain() {
 /// silently routing to the next one.
 #[test]
 fn an_f16_weight_with_a_scale_parameter_is_refused_before_the_door() {
-    let err = match drive(&sig_with_w("*fp16"), &ces(), &[1]) {
+    let err = match drive(&sig_with_w("*fp16"), &ces(), &LaunchGrid::x::<1>()) {
         Ok(names) => panic!(
             "BAKED ({} ops) — an f16 W with a w_scale parameter must not lower through \
              the W8A8 door or the f16 door unverified",
@@ -313,7 +315,7 @@ fn an_fp8_weight_with_the_scale_dropped_is_refused_by_the_counts() {
     // other guard this control may meet. Both are correct; assert on the counts one
     // with the width one as the accepted alternative.
     let _ = &mut sig;
-    let err = match drive_src(&src, &sig, &ces(), &[1]) {
+    let err = match drive_src(&src, &sig, &ces(), &LaunchGrid::x::<1>()) {
         Ok(names) => panic!(
             "BAKED ({} ops) — an fp8 W with no dequant multiply lowered through a door \
              that applies w_scale whatever the kernel says",
@@ -345,7 +347,7 @@ fn a_mulf_not_on_the_scale_load_is_refused_naming_the_epilogue() {
     // shapes happen to agree, which is exactly the setting where a broadcast-based
     // confusion would pass silently. The mulf chain check must still catch it: the
     // multiplied value is not the ws load.
-    let err = match drive_src(&src, &sig_fp8(), &ces(), &[1]) {
+    let err = match drive_src(&src, &sig_fp8(), &ces(), &LaunchGrid::x::<1>()) {
         Ok(names) => panic!(
             "BAKED ({} ops) — a kernel multiplying by the activation instead of the \
              w_scale row was lowered as if it dequantized correctly",
@@ -377,7 +379,7 @@ fn a_swapped_scale_and_output_is_refused_by_positional_binding() {
             "    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N],",
             "    o_desc = tl.make_tensor_descriptor(desc_ws, shape=[M, N],",
         );
-    let err = match drive_src(&src, &sig_fp8(), &ces(), &[1]) {
+    let err = match drive_src(&src, &sig_fp8(), &ces(), &LaunchGrid::x::<1>()) {
         Ok(names) => panic!(
             "BAKED ({} ops) — a kernel storing through the scale buffer and reading its \
              scale from the output lowered without the positional binding firing",

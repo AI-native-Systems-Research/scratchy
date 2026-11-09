@@ -35,13 +35,11 @@
 
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
-use crate::{Refusal, Result};
+use crate::{LaunchGrid, Refusal, Result};
 use std::collections::HashMap;
 
 const PASS: &str = "DistributeWork";
 
-/// Default grid extent / compute-tile count for the 1-D scope.
-const DEFAULT_NUM_BLOCKS: i64 = 64;
 /// The frontend's default core count — the SAME fact ktir-superdsc's
 /// `MAX_CORES` states, READ from the one table (`<Baked as DeviceGen>::CORES`,
 /// senlib's `RCU_CORES` = 32, under its citation): the producer and the
@@ -49,7 +47,7 @@ const DEFAULT_NUM_BLOCKS: i64 = 64;
 const DEFAULT_NUM_CORES: i64 =
     <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORES as i64;
 
-pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
+pub fn run(module: &mut Module, grid: &LaunchGrid) -> Result<()> {
     // One function per module in this backend; the C++ walks every
     // FunctionOpInterface, which is the same thing here.
     let func_indices: Vec<usize> = module
@@ -65,7 +63,7 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
     Ok(())
 }
 
-fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Result<()> {
+fn distribute_in_function(module: &mut Module, fi: usize, grid: &LaunchGrid) -> Result<()> {
     // --- Step 0: collect the program-id ops, grouped by axis.
     //
     // Several reads of the SAME axis are fine (and common after inlining); what
@@ -112,46 +110,24 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
         return Ok(()); // single-program kernel: nothing to distribute
     }
 
-    let mut extents: Vec<i64> = grid.to_vec();
+    // The caller's stated grid (positive extents by type). Its rank is the caller's
+    // statement of the axes the kernel reads, so an axis past it is the one mismatch
+    // left to name.
+    let mut extents: Vec<i64> = grid.extents();
     let multi_axis = by_axis.len() > 1 || max_axis != 0;
-
-    // A multi-axis kernel needs real extents; there is nothing in the IR to derive
-    // them from, and the fallback placeholder would silently cover the wrong number
-    // of blocks. FAIL CLOSED.
-    if multi_axis && extents.is_empty() {
+    if (extents.len() as i64) <= max_axis {
         return Err(Refusal::new(
             PASS,
             format!(
-                "this kernel reads {} distinct program-id axes (highest axis {max_axis}), \
-                 so the launch grid cannot be inferred from the IR; pass the per-axis \
-                 extents via the `grid` option (fastest-varying axis first, e.g. \
-                 grid=4,32). Refusing to guess: a wrong block count produces a silently \
-                 wrong result rather than an error",
-                by_axis.len()
+                "`grid` has {} extent(s) but the kernel reads program-id axis \
+                 {max_axis}; supply an extent for every axis used",
+                extents.len()
             ),
         ));
     }
-    if !extents.is_empty() {
-        if (extents.len() as i64) <= max_axis {
-            return Err(Refusal::new(
-                PASS,
-                format!(
-                    "`grid` has {} extent(s) but the kernel reads program-id axis \
-                     {max_axis}; supply an extent for every axis used",
-                    extents.len()
-                ),
-            ));
-        }
-        if extents.iter().any(|g| *g <= 0) {
-            return Err(Refusal::new(
-                PASS,
-                "`grid` extents must all be positive; got a non-positive extent",
-            ));
-        }
-        // Only the axes the kernel actually reads take part in the walk. Trailing
-        // declared-but-unread axes would inflate the block count.
-        extents.truncate((max_axis + 1) as usize);
-    }
+    // Only the axes the kernel actually reads take part in the walk. Trailing
+    // declared-but-unread axes would inflate the block count.
+    extents.truncate((max_axis + 1) as usize);
 
     // The anchor is the FIRST program-id in program order: it fixes the insertion
     // point and the span of body ops to hoist.
@@ -159,15 +135,9 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
 
     // --- Step 2: loop bounds. lb = core_id, ub = num_blocks, step = num_cores.
     //
-    // When `grid` is supplied it is AUTHORITATIVE: the loop walks the linearized
-    // grid, so the bound is the product of the extents of the axes actually read.
-    // Otherwise fall back to the pre-existing single-axis heuristic, unchanged, so
-    // banked emissions stay byte-identical.
-    let num_blocks_val = if !extents.is_empty() {
-        extents.iter().product()
-    } else {
-        heuristic_num_blocks(module, fi, anchor)
-    };
+    // The stated grid is AUTHORITATIVE: the loop walks the linearized grid, so the
+    // bound is the product of the extents of the axes actually read.
+    let num_blocks_val: i64 = extents.iter().product();
 
     let hint = module.ops[fi].regions[0].ops[anchor]
         .result()
@@ -311,43 +281,6 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
     Ok(())
 }
 
-/// SP-E4-09c, kept because the banked single-axis emissions depend on it.
-///
-/// The first `construct_memory_view` carries the global rows (`sizes[0]` = GM);
-/// the first `construct_access_tile` carries the per-program block rows
-/// (`shape[0]` = BM). A grid of GM/BM blocks distributes over the compute tiles at
-/// step = num_cores. Only override when GM > BM (a genuine multi-block grid) and BM
-/// divides GM -- otherwise keep the placeholder so existing paths are byte-unchanged.
-fn heuristic_num_blocks(module: &Module, fi: usize, anchor: usize) -> i64 {
-    let block = &module.ops[fi].regions[0].ops;
-    let mut gm = 0i64;
-    let mut bm = 0i64;
-    let terminator = block.len().saturating_sub(1);
-    for op in block.iter().take(terminator).skip(anchor + 1) {
-        if op.kind == OpKind::KtdpConstructMemoryView
-            && gm == 0
-            && let Some(Attr::IntList(s)) = op.attr(&AttrKey::Shape)
-            && let Some(first) = s.first()
-            && *first > 0
-        {
-            gm = *first;
-        }
-        if op.kind == OpKind::KtdpConstructAccessTile
-            && bm == 0
-            && let Some(d) = op.result_type().and_then(|t| t.dims())
-            && let Some(first) = d.first()
-            && *first > 0
-        {
-            bm = *first;
-        }
-    }
-    if gm > 0 && bm > 0 && gm > bm && gm % bm == 0 {
-        gm / bm
-    } else {
-        DEFAULT_NUM_BLOCKS
-    }
-}
-
 /// The per-core work loop: its lower bound traces one definition hop to
 /// `ktdp.get_compute_tile_id`. THE LANDMARK CONTRACT, shared with `PlanCorelets`
 /// so the two cannot disagree about which loop is the work loop.
@@ -406,7 +339,7 @@ module {
     #[test]
     fn a_two_axis_grid_linearizes_with_the_redundant_modulo_dropped() {
         let mut m = parse::parse(TWO_AXIS).unwrap();
-        run(&mut m, &[2, 4]).unwrap();
+        run(&mut m, &LaunchGrid::xy::<2, 4>()).unwrap();
         let f = m.kernel().unwrap();
         let top: Vec<&str> = f.regions[0].ops.iter().map(|o| o.kind.spelling()).collect();
         assert_eq!(
@@ -456,7 +389,7 @@ module {
     #[test]
     fn the_loops_lower_bound_is_the_landmark() {
         let mut m = parse::parse(TWO_AXIS).unwrap();
-        run(&mut m, &[2, 4]).unwrap();
+        run(&mut m, &LaunchGrid::xy::<2, 4>()).unwrap();
         let forr = m
             .ops_deep()
             .into_iter()
@@ -471,20 +404,9 @@ module {
     }
 
     #[test]
-    fn a_multi_axis_kernel_without_a_grid_is_refused_by_name() {
-        let mut m = parse::parse(TWO_AXIS).unwrap();
-        let e = run(&mut m, &[]).unwrap_err();
-        assert!(
-            e.message.contains("cannot be inferred from the IR"),
-            "got {e}"
-        );
-        assert!(e.message.contains("Refusing to guess"), "got {e}");
-    }
-
-    #[test]
     fn a_grid_too_short_for_the_axes_read_is_refused_by_name() {
         let mut m = parse::parse(TWO_AXIS).unwrap();
-        let e = run(&mut m, &[2]).unwrap_err();
+        let e = run(&mut m, &LaunchGrid::x::<2>()).unwrap_err();
         assert!(
             e.message.contains("supply an extent for every axis used"),
             "got {e}"
@@ -504,7 +426,7 @@ module {
 }
 ";
         let mut m = parse::parse(src).unwrap();
-        run(&mut m, &[16]).unwrap();
+        run(&mut m, &LaunchGrid::x::<16>()).unwrap();
         let forr = m
             .ops_deep()
             .into_iter()

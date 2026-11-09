@@ -109,7 +109,7 @@ pub struct Lowered {
     /// The launch contract the configuration was compiled at, kept so a test can read the
     /// `tl.constexpr`s it derived its tolerance from rather than restating them.
     pub spec: KernelSpec,
-    pub grid: Vec<i64>,
+    pub grid: triton_ktir::LaunchGrid,
     /// The clone protocol's staging contract (`spyre.partition_clones`), empty unless
     /// `unroll_grid_positions` fired: the arguments after the kernel's own parameters, each
     /// one position's window of a grid-partitioned parameter. [`execute`] stages them from

@@ -62,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
-use crate::{Refusal, Result};
+use crate::{LaunchGrid, Refusal, Result};
 
 const PASS: &str = "spyre-to-ktir";
 
@@ -89,23 +89,10 @@ fn is_scheduler_dialect(ns: &str) -> bool {
     )
 }
 
-pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
-    // THE LAUNCH GRID IS REQUIRED. `grid` on the emitted `func.func` is what the
-    // scheduler reads to know how many compute tiles the kernel spans; inventing an
-    // extent would silently schedule the wrong number of blocks.
-    if grid.is_empty() {
-        return Err(refuse(
-            "the launch grid is required (pass grid=<extents>, fastest-varying axis \
-             first, as for spyre-distribute-work). The scheduler reads a `grid` \
-             attribute off the function and there is nothing in KTIR to derive it from, \
-             so it is not guessed",
-        ));
-    }
-    for e in grid {
-        if *e <= 0 {
-            return Err(refuse(format!("grid extent must be positive; got {e}")));
-        }
-    }
+pub fn run(module: &mut Module, grid: &LaunchGrid) -> Result<()> {
+    // THE LAUNCH GRID IS THE CALLER'S, by type ([`LaunchGrid`]). `grid` on the emitted
+    // `func.func` is what the scheduler reads to know how many compute tiles the kernel
+    // spans, and nothing in KTIR could derive it.
 
     // THE PIPELINE IS A TABLE, and one runner walks it: each row is a step,
     // and the runner runs the SSA verifier after EVERY entry, so no step can
@@ -116,7 +103,7 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
         // `!tt.ptr` to index are index-to-index and fold away, and the body rewrites then
         // run on a `func.func`.
         ("spyre-to-ktir:convert_func", |m, g| {
-            convert_func(m, g.iter().product())
+            convert_func(m, g.programs())
         }),
         ("spyre-to-ktir:drop_corelet_plans", |m, _| {
             drop_corelet_plans(m);
@@ -3364,7 +3351,7 @@ fn verify_only_scheduler_dialects(module: &Module) -> Result<()> {
 /// stage calls THIS, and gets `ktir_core` or a refusal.
 pub fn lower<'a>(
     module: &mut Module,
-    grid: &[i64],
+    grid: &LaunchGrid,
     arena: &'a ktir_core::arena::Arena,
 ) -> Result<ktir_core::ir::IRFunction<'a>> {
     run(module, grid)?;
@@ -3403,7 +3390,7 @@ module {
 
     #[test]
     fn the_flash_alpha_seed_folds_to_the_first_block_fast_path() {
-        let m = run_on(ALPHA, &[1]).unwrap();
+        let m = run_on(ALPHA, &LaunchGrid::x::<1>()).unwrap();
         // The whole seed chain collapses: no subf, no exp, and the mulf/addf on
         // the chain are gone too (1.0*alpha forwards to alpha, +0 forwards).
         let ops = m.ops_deep();
@@ -3433,7 +3420,7 @@ module {
         assert!(zero_splat, "a splat(0) survives as trip 1's fast-path seed");
     }
 
-    fn run_on(src: &str, grid: &[i64]) -> Result<Module> {
+    fn run_on(src: &str, grid: &LaunchGrid) -> Result<Module> {
         let mut m = parse::parse(src).unwrap();
         run(&mut m, grid)?;
         Ok(m)
@@ -3454,11 +3441,9 @@ module {
 ";
 
     #[test]
-    fn the_grid_is_required_and_lands_flat_on_the_function() {
-        let e = run_on(REDUCE, &[]).unwrap_err();
-        assert!(e.message.contains("the launch grid is required"), "got {e}");
+    fn the_grid_lands_flat_on_the_function() {
         // 2 x 4 delinearized upstream -> the FLAT extent 8 is the faithful form.
-        let m = run_on(REDUCE, &[2, 4]).unwrap();
+        let m = run_on(REDUCE, &LaunchGrid::xy::<2, 4>()).unwrap();
         let f = m
             .ops
             .iter()
@@ -3469,14 +3454,14 @@ module {
 
     #[test]
     fn a_pointer_argument_is_retyped_to_index() {
-        let m = run_on(REDUCE, &[8]).unwrap();
+        let m = run_on(REDUCE, &LaunchGrid::x::<8>()).unwrap();
         let f = m.ops.iter().find(|o| o.kind == OpKind::FuncFunc).unwrap();
         assert_eq!(f.regions[0].args[0].1, IrType::Index);
     }
 
     #[test]
     fn a_reduce_becomes_a_generic_with_a_reduction_iterator_and_the_right_identity() {
-        let m = run_on(REDUCE, &[8]).unwrap();
+        let m = run_on(REDUCE, &LaunchGrid::x::<8>()).unwrap();
         let g = m
             .ops_deep()
             .into_iter()
@@ -3520,7 +3505,7 @@ module {
     #[test]
     fn a_combiner_with_no_known_identity_is_refused_rather_than_seeded() {
         let src = REDUCE.replace("arith.maxnumf", "arith.divf");
-        let e = run_on(&src, &[8]).unwrap_err();
+        let e = run_on(&src, &LaunchGrid::x::<8>()).unwrap_err();
         assert!(
             e.message.contains("has no known identity element"),
             "got {e}"
@@ -3539,7 +3524,7 @@ module {
   }
 }
 ";
-        let m = run_on(src, &[8]).unwrap();
+        let m = run_on(src, &LaunchGrid::x::<8>()).unwrap();
         let g = m
             .ops_deep()
             .into_iter()
@@ -3598,7 +3583,7 @@ module {
     /// type the op actually produces -- and no `tt.*` survives.
     #[test]
     fn a_reshape_becomes_tensor_reshape_with_the_target_from_its_result_type() {
-        let m = run_on(RESHAPE, &[8]).unwrap();
+        let m = run_on(RESHAPE, &LaunchGrid::x::<8>()).unwrap();
         let r = m
             .ops_deep()
             .into_iter()
@@ -3628,7 +3613,7 @@ module {
     #[test]
     fn a_numel_changing_reshape_is_refused() {
         let src = RESHAPE.replacen("-> tensor<8x512xf16>", "-> tensor<8x511xf16>", 1);
-        let e = run_on(&src, &[8]).unwrap_err();
+        let e = run_on(&src, &LaunchGrid::x::<8>()).unwrap_err();
         assert!(
             e.message
                 .contains("the element count is the one thing a reshape must preserve"),
@@ -3641,13 +3626,13 @@ module {
     #[test]
     fn a_dtype_changing_reshape_is_refused() {
         let src = RESHAPE.replacen("-> tensor<8x512xf16>", "-> tensor<8x512xf32>", 1);
-        let e = run_on(&src, &[8]).unwrap_err();
+        let e = run_on(&src, &LaunchGrid::x::<8>()).unwrap_err();
         assert!(e.message.contains("a silently mistyped tile"), "got {e}");
     }
 
     #[test]
     fn nothing_triton_survives_and_the_guard_names_the_dialect() {
-        let m = run_on(REDUCE, &[8]).unwrap();
+        let m = run_on(REDUCE, &LaunchGrid::x::<8>()).unwrap();
         for op in m.ops_deep() {
             assert!(
                 !op.kind.spelling().starts_with("tt."),
@@ -3666,7 +3651,7 @@ module {
         bad.ops[0].regions[0]
             .ops
             .push(Op::new(OpKind::Other("tt.histogram".into())));
-        let e = run(&mut bad, &[8]).unwrap_err();
+        let e = run(&mut bad, &LaunchGrid::x::<8>()).unwrap_err();
         assert!(
             e.message.contains("which the scheduler does not register"),
             "got {e}"
@@ -3707,7 +3692,7 @@ module {
   }
 }
 ";
-        let m = run_on(src, &[64]).expect("a multi-trip loop lowers by unrolling");
+        let m = run_on(src, &LaunchGrid::x::<64>()).expect("a multi-trip loop lowers by unrolling");
 
         // THE LOOP IS GONE.
         assert!(
@@ -3809,7 +3794,8 @@ module {
   }
 }
 ";
-        let e = run_on(src, &[70]).expect_err("an uneven trip count has no straight-line form");
+        let e = run_on(src, &LaunchGrid::x::<70>())
+            .expect_err("an uneven trip count has no straight-line form");
         for needle in ["70 work items", "32 compute tiles", "3 trips", "the rest 2"] {
             assert!(
                 e.message.contains(needle),
@@ -3834,7 +3820,7 @@ module {
   }
 }
 ";
-        let m = run_on(src, &[8]).unwrap();
+        let m = run_on(src, &LaunchGrid::x::<8>()).unwrap();
         assert!(
             !m.ops_deep().iter().any(|o| o.kind == OpKind::ScfFor),
             "the grid loop is folded away"
@@ -3886,7 +3872,7 @@ module {
 
     #[test]
     fn a_splat_of_an_argument_becomes_a_load_backed_tensor_splat() {
-        let m = run_on(SPLAT_ARG, &[1]).unwrap();
+        let m = run_on(SPLAT_ARG, &LaunchGrid::x::<1>()).unwrap();
         let ops = m.ops_deep();
         let splat = ops
             .iter()
@@ -3980,7 +3966,7 @@ module {
 
     #[test]
     fn a_splat_of_a_non_float_scalar_argument_is_refused_by_name() {
-        let e = run_on(SPLAT_ARG_I32, &[1]).unwrap_err();
+        let e = run_on(SPLAT_ARG_I32, &LaunchGrid::x::<1>()).unwrap_err();
         assert!(e.message.contains("no bind spelling"), "got {e:?}");
     }
 
@@ -4002,7 +3988,7 @@ module {
     #[test]
     fn a_splat_of_an_interior_value_is_refused_by_name() {
         let mut m = parse::parse(SPLAT_INTERIOR).unwrap();
-        let err = run(&mut m, &[1]).unwrap_err();
+        let err = run(&mut m, &LaunchGrid::x::<1>()).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not a function argument"),

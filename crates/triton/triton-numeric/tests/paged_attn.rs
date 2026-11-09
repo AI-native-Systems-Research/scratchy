@@ -14,6 +14,7 @@
 //! ```
 
 use std::collections::HashMap;
+use triton_ktir::LaunchGrid;
 
 use ktir_core::arena::Arena;
 use ktir_core::ir::IRFunction;
@@ -37,9 +38,9 @@ fn lower(src: &str, spec: &KernelSpec) -> IRFunction<'static> {
     opt::make_ttir(&mut tt).unwrap_or_else(|e| panic!("make_ttir refused the kernel: {e}"));
     let mut m = triton_ktir::from_ttir::convert(&tt)
         .unwrap_or_else(|e| panic!("from_ttir refused the kernel: {e}"));
-    triton_ktir::make_ktir(&mut m, &[1])
+    triton_ktir::make_ktir(&mut m, &LaunchGrid::x::<1>())
         .unwrap_or_else(|e| panic!("make_ktir refused the kernel: {e}"));
-    triton_ktir::passes::to_ktir::run(&mut m, &[1])
+    triton_ktir::passes::to_ktir::run(&mut m, &LaunchGrid::x::<1>())
         .unwrap_or_else(|e| panic!("to_ktir refused the kernel: {e}"));
     triton_ktir::passes::to_ktir_emit::lower(&m, Arena::global())
         .unwrap_or_else(|e| panic!("to_ktir_emit refused the kernel: {e}"))

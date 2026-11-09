@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn a_well_formed_module_passes() {
         let mut m = parse::parse(WELL_FORMED).unwrap();
-        crate::passes::to_ktir::run(&mut m, &[8]).unwrap();
+        crate::passes::to_ktir::run(&mut m, &crate::LaunchGrid::x::<8>()).unwrap();
         verify_module_defs(&m, "test").unwrap();
     }
 
@@ -467,7 +467,7 @@ mod tests {
     fn a_pre_broken_module_names_the_first_step_that_ran() {
         let mut m = parse::parse(WELL_FORMED).unwrap();
         break_one_operand(&mut m);
-        let e = crate::passes::to_ktir::run(&mut m, &[8]).unwrap_err();
+        let e = crate::passes::to_ktir::run(&mut m, &crate::LaunchGrid::x::<8>()).unwrap_err();
         assert_eq!(e.pass, "spyre-to-ktir:convert_func", "got {e}");
     }
 
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn a_lowered_irfunction_from_a_real_module_passes() {
         let mut m = parse::parse(WELL_FORMED).unwrap();
-        crate::passes::to_ktir::run(&mut m, &[8]).unwrap();
+        crate::passes::to_ktir::run(&mut m, &crate::LaunchGrid::x::<8>()).unwrap();
         let a = Arena::new();
         let f = crate::passes::to_ktir_emit::lower(&m, &a).unwrap();
         verify_irfunction_defs(&f, "test").unwrap();

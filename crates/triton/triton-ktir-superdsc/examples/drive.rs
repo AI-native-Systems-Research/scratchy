@@ -75,7 +75,7 @@ fn main() {
         std::process::exit(2);
     }
     let (config, program_s) = (&args[0], &args[2]);
-    let grid: Vec<i64> = args[1]
+    let extents: Vec<i64> = args[1]
         .split(',')
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
@@ -84,6 +84,8 @@ fn main() {
                 .expect("grid is a comma-separated integer list")
         })
         .collect();
+    let grid = triton_ktir::LaunchGrid::of_extents(&extents)
+        .unwrap_or_else(|e| panic!("the grid states no launch grid: {e}"));
     let Some(program) = program_from(program_s) else {
         eprintln!("unknown program `{program_s}`");
         std::process::exit(2);
