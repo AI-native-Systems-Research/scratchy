@@ -33,9 +33,9 @@ use crate::superdsc_opspec::{
     StickExtent, TensorArg, USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
 };
 use crate::wire::{
-    AddrFold, AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs,
-    LayoutInfo, MemOrg, SdscFolds, SdscOp, StageParam, build_coordinates, core_dsc_schedule,
-    gen_coord_info_value, segment_base,
+    AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs, LayoutInfo,
+    MemOrg, ScheduleTree, SdscFolds, SdscOp, StageParam, build_coordinates, core_dsc_schedule,
+    segment_base,
 };
 use crate::work::{FP16_ELEMS_PER_STICK, core_to_wk_slice, distribute_cores};
 use std::collections::BTreeMap;
@@ -3260,7 +3260,8 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
                     .iter_mut()
                     .find(|n| n.ldsIdx_ as usize == ti)
                 {
-                    divide_out_coordinate(&mut node.coordinates_, tiled_dim, out_per_time, eps);
+                    node.coordinates_
+                        .divide_tiled_dim(tiled_dim, out_per_time, eps);
                 }
             }
         }
@@ -3314,43 +3315,6 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         time,
         affine_strides,
     ))
-}
-
-/// Divide the `out`-dim `coordInfo` of a tiled AllocNode by `time`: the
-/// gen_coord_info_value `size` (Affine alpha_ + elem_arr_0/elem_arr_1) for the
-/// tiled stick dim must reflect the PER-TIME extent `out_per_time`, not the full
-/// per-core extent. Mirrors compute_ops.py reading `iteration_space[dim] //
-/// work_slices[dim]` AFTER coarse_tile divided the iteration space.
-fn divide_out_coordinate(
-    coords: &mut serde_json::Value,
-    tiled_dim: &str,
-    out_per_time: i64,
-    eps: i64,
-) {
-    let Some(ci) = coords.get_mut("coordInfo").and_then(|c| c.as_object_mut()) else {
-        return;
-    };
-    let Some(entry) = ci.get_mut(tiled_dim) else {
-        return;
-    };
-    // The stick-dim variant (elemArr==2): rebuild it with the new per-time size.
-    // size==alpha_[0] and the elem_arr_1 factor == size/eps (non-reduction stick).
-    let nsplits = entry
-        .get("folds")
-        .and_then(|f| f.get("dim_prop_attr"))
-        .and_then(|a| a.get(0))
-        .and_then(|c| c.get("factor_"))
-        .and_then(|f| f.as_i64())
-        .unwrap_or(1);
-    *entry = gen_coord_info_value(
-        out_per_time,
-        nsplits,
-        eps,
-        /*is_stick_dim=*/ true,
-        /*is_stick_reduction=*/ false,
-        /*group_stride=*/
-        eps, // time-tiled rewrite is the natural-stride path (not a RowBlocked reduce)
-    );
 }
 
 /// Like [`set_iter_dim`] but takes an already-i64 value (for the divided
@@ -3856,17 +3820,15 @@ pub fn emit_sdsc(
     // starts at its work-slice byte offset. Distinct args never alias (distinct
     // segments); cores of the same OUTPUT never alias (distinct work-slices) — we
     // ASSERT both below.
-    let mut tree: Vec<AllocNode> = Vec::new();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // Collision guard: collect every (output) byte address emitted; any duplicate
     // is two cores writing the same byte = silently-wrong → build `Err`.
     let mut out_addr_seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    for (i, v) in views.iter().enumerate() {
+    // ONE NODE PER OPERAND — `ScheduleTree::of_operands` walks the op's own operand list, which
+    // `OpSpec::new` made non-empty, and hands each node the tree's address mint.
+    let tree = ScheduleTree::of_operands(op, folds, |i, mint| {
+        let v = &views[i];
         let comp = v.allocation.component();
         let name = format!("allocate-Tensor{i}_{comp}");
-        if !seen.insert(name.clone()) {
-            continue;
-        }
         // This operand's side of a gathered access, if the op declares one. Derived from the op's
         // single `Option`, never from a per-operand flag, so the index and value sides cannot
         // disagree about which pair they belong to.
@@ -4179,7 +4141,7 @@ pub fn emit_sdsc(
                 }
             }
         }
-        let addr = AddrFold::new(&per_core, folds);
+        let addr = mint.concrete(&per_core);
         // The order dxp reads this view's dims in, innermost first, as positions in `v.layout` — set
         // only where it is not `v.layout`'s (`TensorArg::with_device_order`).
         let device_from = v.device_positions();
@@ -4193,7 +4155,7 @@ pub fn emit_sdsc(
                 v.name, v.device_order, v.layout
             )));
         }
-        tree.push(AllocNode {
+        Ok(AllocNode {
             nodeType_: "allocate",
             name_: name,
             prev_: String::new(),
@@ -4208,7 +4170,7 @@ pub fn emit_sdsc(
             //    VariableDefinition.cpp:303`
             // — 34360262656 being the operand's real BYTE ADDRESS, read as a symbol id. `Some(1)` says
             // "the start address in `startAddressCoreCorelet_.data_` is a symbol id, resolve it", and
-            // ours holds a concrete address (`AddrFold::new`, not `AddrFold::symbolic`). The two must
+            // ours holds a concrete address (`AddrMint::concrete`, not `AddrMint::symbolic`). The two must
             // agree, and the flag was set without the address ever changing.
             //
             // ⛔ AND THE FIX IS TO DROP THE FLAG, NOT TO MINT A SYMBOL, because the two vendor fixtures
@@ -4379,8 +4341,8 @@ pub fn emit_sdsc(
             startAddressCoreCorelet_: addr,
             backGapCore_: None,
             coordinates_: coordinates,
-        });
-    }
+        })
+    })?;
 
     // ⭐⭐⭐ AN OP FUNC WHOSE DDL READS NAMED EXTERNAL CONSTANTS SUPPLIES THEM HERE — `constantInfo_`,
     // NOT `opConsts`, and it REPLACES whatever the generic path would have written.
@@ -4519,6 +4481,7 @@ pub fn emit_sdsc(
         _ => Vec::new(),
     };
 
+    let (core_fold, corelet_fold) = (tree.core_fold(), tree.corelet_fold());
     let dsc = Dsc {
         numCoresUsed_: cores,
         numCoreletsUsed_: folds.corelet_fold(),
@@ -4657,14 +4620,9 @@ pub fn emit_sdsc(
             }],
             data_: BTreeMap::from([("[0]".to_string(), "0".to_string())]),
         },
-        coreFoldProp_: FoldProp {
-            factor_: folds.core_fold() as i64,
-            label_: "core",
-        },
-        coreletFoldProp_: FoldProp {
-            factor_: folds.corelet_fold() as i64,
-            label_: "corelet",
-        },
+        // Off the tree its allocate nodes were minted from — one fold set for both.
+        coreFoldProp_: core_fold,
+        coreletFoldProp_: corelet_fold,
         numCoresUsed_: cores,
         // coreIdToDsc_ MUST span exactly the cores the op USES (`cores`), NOT a fixed
         // MAX_CORES — torch-spyre uses `range(num_cores)` (compute_ops.py:527). With

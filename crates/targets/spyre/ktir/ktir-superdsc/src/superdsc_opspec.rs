@@ -16,7 +16,7 @@
 //!   carries no corelet field at all (corelet is the const [`ACTIVE_CORELETS`]).
 //! * (c) a `startAddr` fold whose `[core,corelet]` factors disagree with the
 //!   declared `coreFoldProp_`/`coreletFoldProp_` — [`SdscFoldSet`] is the single
-//!   source of truth for all fold factors and [`AddrFold::new`] copies them from
+//!   source of truth for all fold factors and [`crate::wire::AddrMint`] copies them from
 //!   it; there is no public field setter to diverge them.
 //! * (d) a `scale_`/`device_dims`/layout rank mismatch — [`TensorArg`] is generic
 //!   over the device rank `const D: usize`, so `scale: [Scale; D]`,
@@ -1352,7 +1352,7 @@ pub fn assert_df_stick_multiple(elems: u32, df: Df) -> Result<(), String> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// (c) SdscFoldSet — the single source of truth for fold factors; AddrFold::new.
+// (c) SdscFoldSet — the single source of truth for fold factors; wire::AddrMint.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// The fold factors for one SuperDSC op: `coreFold = num_cores`, `coreletFold =

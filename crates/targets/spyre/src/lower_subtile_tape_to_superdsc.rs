@@ -8447,9 +8447,10 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         }
     }
 
-    // ⛔⛔⛔ main's FOUR POST-LOWERING GUARDS, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
+    // ⛔⛔⛔ main's POST-LOWERING ALIASING GUARD, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
     //
-    // All four are `lower_graph_to_superdsc`/`emit_bundle_inner`'s own text, and all four went SILENT
+    // It is `lower_graph_to_superdsc`/`emit_bundle_inner`'s own text, and it (with three dxp-shape
+    // guards since made unwritable by the wire types) went SILENT
     // when the lowering moved here: they read `EmittedOp::op` and `EmittedOp::time`, which main's walk
     // had already filled by the time they ran. On this path the ops reaching `emit_bundle_inner` carry
     // a KTIR program and NOTHING ELSE — `EmittedOp::bare` sets `op: None` and `time: 1` — so the
@@ -8467,69 +8468,11 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                 e.op_name, e.time
             )));
         }
-        // GUARD (priority-1, from OBSERVED on-card failure 2026-06-25): dxp_standalone
-        // throws `DtException: allocNode (dsc2.cpp:3999)` when a dsc has an empty
-        // scheduleTree_ — the per-tensor HBM allocate nodes are REQUIRED. Refuse to
-        // bake a scheduleTree_-less op at BUILD time rather than dxp-crash on-card.
-        for e in &sdsc_ops {
-            let name = &e.op_name;
-            let op = e.dsc();
-            for dsc_map in &op.dscs_ {
-                for (dname, dsc) in dsc_map {
-                    if dsc.scheduleTree_.is_empty() {
-                        return Err(SuperDscError(format!(
-                            "op {name} (dsc {dname}): empty scheduleTree_ — dxp_standalone \
-                         DtException's at allocNode (dsc2.cpp:3999) without the per-tensor HBM \
-                         allocate nodes. Emit them via the page_coalesce HBM coloring (task #50) \
-                         before baking."
-                        )));
-                    }
-                    // GUARD (priority-1, OBSERVED on-card 2026-06-25): an AllocNode with
-                    // an empty `coordinates_.coordInfo` makes the scheduler throw
-                    // `DtException: "There must be at least one valid candidate."`
-                    // (L3DlOpsScheduler.cpp:1195) — the per-dim tile-folds are required.
-                    for an in &dsc.scheduleTree_ {
-                        let empty_coord = an
-                            .coordinates_
-                            .get("coordInfo")
-                            .and_then(|c| c.as_object())
-                            .map(|o| o.is_empty())
-                            .unwrap_or(true);
-                        if empty_coord {
-                            return Err(SuperDscError(format!(
-                                "op {name} (dsc {dname}, alloc {}): empty coordinates_.coordInfo — \
-                             dxp's scheduler DtException's ('at least one valid candidate', \
-                             L3DlOpsScheduler.cpp:1195) without the per-dim tile-folds. Emit the \
-                             coordInfo (core_fold/corelet_fold/elem_arr from the work-division) \
-                             before baking.",
-                                an.name_
-                            )));
-                        }
-                        // GUARD (priority-1, from OBSERVED on-card crash 2026-06-25):
-                        // the startAddressCoreCorelet_ fold's [core,corelet] factors
-                        // MUST equal the SDSC's declared coreFoldProp_/coreletFoldProp_
-                        // sizes, else the FoldManager import throws "Different
-                        // cardinality between json and caller" (foldInfrastructure.h:2775).
-                        let attrs = &an.startAddressCoreCorelet_.dim_prop_attr;
-                        let core_ok =
-                            attrs.first().map(|f| f.factor_) == Some(op.coreFoldProp_.factor_);
-                        let corelet_ok =
-                            attrs.get(1).map(|f| f.factor_) == Some(op.coreletFoldProp_.factor_);
-                        if !core_ok || !corelet_ok {
-                            return Err(SuperDscError(format!(
-                                "op {name} (alloc {}): startAddressCoreCorelet_ fold factors \
-                             [{:?}] disagree with coreFoldProp_={} / coreletFoldProp_={} — dxp \
-                             FoldManager throws 'Different cardinality' (foldInfrastructure.h:2775).",
-                                an.name_,
-                                attrs.iter().map(|f| f.factor_).collect::<Vec<_>>(),
-                                op.coreFoldProp_.factor_,
-                                op.coreletFoldProp_.factor_
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+        // The three dxp-shape guards that followed (an empty `scheduleTree_`, an empty `coordInfo`,
+        // and start-fold factors that disagree with `coreFoldProp_`/`coreletFoldProp_`) are now
+        // unwritable: `wire::ScheduleTree` is built one node per operand of an op that always has an
+        // output, `wire::Coordinates` only by `build_coordinates` over an operand, and both the nodes'
+        // start folds and the op's fold props come from the tree's one fold set.
     } // pc:guards
 
     // ⭐ THE OP-LOCAL SLOT ALTERNATION WALK — #645 fix (a)'s guard on same-class sharing, at the
