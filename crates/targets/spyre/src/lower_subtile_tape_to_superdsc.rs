@@ -7500,7 +7500,11 @@ impl<T: ktir_superdsc::collective::Tp> NamedBundle<T> {
 
     /// Hand the device compiler every group it does not already hold, under this name. The dump
     /// root rides along: staging is what writes the bundle's dxp input where a build asked for it.
-    fn stage(self, plan: &BundleLayout, dump: DumpRoot<'_>) -> Result<EmittedBundle<T>, SuperDscError> {
+    fn stage(
+        self,
+        plan: &BundleLayout,
+        dump: DumpRoot<'_>,
+    ) -> Result<EmittedBundle<T>, SuperDscError> {
         match self {
             Self::Ready(b) => Ok(b),
             Self::Rendered {
