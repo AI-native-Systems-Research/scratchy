@@ -2218,7 +2218,10 @@ struct SubmitScratchLease<'a> {
 impl<'a> SubmitScratchLease<'a> {
     fn take(worker: &'a ResponseWorker, num_cbs: u64) -> SubmitScratchLease<'a> {
         let (mut leases, mut tags) = std::mem::take(
-            &mut *worker.submit_scratch.lock().unwrap_or_else(|p| p.into_inner()),
+            &mut *worker
+                .submit_scratch
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
         );
         leases.clear();
         leases.reserve(num_cbs as usize);
@@ -2238,7 +2241,11 @@ impl Drop for SubmitScratchLease<'_> {
         // early-return semantics the local-`Vec` version had.
         self.leases.clear();
         self.tags.clear();
-        let mut pool = self.worker.submit_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        let mut pool = self
+            .worker
+            .submit_scratch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // At most one submit is inside `prepare_cbs` at a time (see the
         // field's doc), so the pool is empty here; if it ever is not, the
         // buffers simply drop instead of corrupting anyone.
@@ -2580,9 +2587,7 @@ impl ResponseWorker {
             scratch.leases.push(self.tag_pool.acquire());
         }
         scratch.tags.clear();
-        scratch
-            .tags
-            .extend(scratch.leases.iter().map(|l| l.tag()));
+        scratch.tags.extend(scratch.leases.iter().map(|l| l.tag()));
 
         let batch_id = self.global_pr_batch_id.fetch_add(1, Ordering::AcqRel) + 1;
         // "Capture baseline timestamp once for entire batch - all CBs share
@@ -4370,7 +4375,12 @@ fn submit_to_hardware(
         for _ in 0..num_cbs {
             state.dec_in_flight(pipeline);
         }
-        if let Some(cb) = gate.user_cb.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        if let Some(cb) = gate
+            .user_cb
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             cb(Err(e));
         }
     }
@@ -4414,7 +4424,11 @@ impl GroupedSubmit {
             *self.hw_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(cb) = self.user_cb.lock().unwrap_or_else(|p| p.into_inner()).take()
+            && let Some(cb) = self
+                .user_cb
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
         {
             let err = self
                 .hw_error
