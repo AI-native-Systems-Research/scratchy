@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use dioxus::prelude::*;
 
 use crate::carbon::{
-    Alignment, ContentPanel, Definition, Heading, Section, Stack, TabItem, Tabs, TabsKind, Tile,
-    TipHeading,
+    Alignment, ContentPanel, Definition, Fold, Heading, Section, Stack, TabItem, Tabs, TabsKind,
+    Tile, TipHeading,
 };
 use crate::charts::{RATIO_STEPS, ScaleFit, ratio_scale, ratio_step};
 
@@ -196,6 +196,11 @@ pub(super) fn section(
     // The summary's columns: the lineup's classes, where the runs record one; else every model
     // shown, a column each.
     let summary_columns = summary_grid(&ran, machines);
+    let open_loop = (ran.iter()).any(|(chip, stems)| {
+        (stems.iter()).any(|stem| {
+            machines[chip].latest(stem).is_some_and(|e| tasks::open_loop(e.m, dataset))
+        })
+    });
     let timelines: Vec<(&str, Vec<(String, Element)>)> = (chips.iter())
         .map(|&chip| (chip, dataset_timelines(dataset, all, chip, &ran)))
         .filter(|(_, cs)| !cs.is_empty())
@@ -214,6 +219,7 @@ pub(super) fn section(
             }
             {summary_map(dataset, &id, &ran, machines, &summary_columns)}
             {older_runs(&ran, machines)}
+            {tasks::table_notes(open_loop)}
         }
     };
     rsx! {
@@ -611,23 +617,28 @@ fn provenance(mr: &MachineRuns, stem: &str, chip: &str) -> Element {
         .collect();
     rsx! {
         Stack { gap: 2,
-            strong { "{stem} on {chip}" }
-            p { "{cores} · {mc.memory_gb} GB unified memory · macOS {mc.macos}" }
             p {
-                a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
-                " · {m.quant.as_deref().unwrap_or(\"default\")}"
-                if let Some(rev) = m.model_files.as_ref().and_then(|f| f.revision.as_deref()) {
-                    " · files "
-                    a { href: "https://huggingface.co/{m.model_id}/tree/{rev}", code { "{&rev[..rev.len().min(8)]}" } }
-                }
-                "{build} · run {run.generated_utc.date()}, "
-                code { "{run.repo.sha8()}" }
+                strong { "{stem} on {chip} · run {run.generated_utc.date()}, " code { "{run.repo.sha8()}" } }
                 if let Some(verdict) = parity(m) {
                     " · {verdict} " {parity_info()}
                 }
             }
-            if !served.is_empty() {
-                p { "Served as: {served.join(\"; \")}." }
+            Fold { title: "Setup",
+                Stack { gap: 2,
+                    p { "{cores} · {mc.memory_gb} GB unified memory · macOS {mc.macos}" }
+                    p {
+                        a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
+                        " · {m.quant.as_deref().unwrap_or(\"default\")}"
+                        if let Some(rev) = m.model_files.as_ref().and_then(|f| f.revision.as_deref()) {
+                            " · files "
+                            a { href: "https://huggingface.co/{m.model_id}/tree/{rev}", code { "{&rev[..rev.len().min(8)]}" } }
+                        }
+                        "{build}"
+                    }
+                    if !served.is_empty() {
+                        p { "Served as: {served.join(\"; \")}." }
+                    }
+                }
             }
             if !declined.is_empty() {
                 p { "Declined before serving: {declined.join(\"; \")}." }

@@ -4274,6 +4274,25 @@ mod tests {
         assert!(!rag.contains("Older than the machine"), "the newest");
     }
 
+    /// A section's table notes are said once, under its summary, however many pairs it has, and
+    /// a timed row's accuracy says it is not scored.
+    #[test]
+    fn a_sections_table_notes_are_said_once() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE, REQUESTS_FIXTURE]);
+        runs[1].machine.chip = "Apple M4 Max".to_string().try_into().unwrap();
+        for c in (runs.iter_mut().flat_map(|r| r.models[0].tasks.iter_mut().flatten()))
+            .filter(|c| c.workload == "rag")
+        {
+            c.timed_answers = true;
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("on Apple M4 Max") && html.contains("on Apple M3 Pro"), "two pairs");
+        assert_eq!(html.matches("Accuracy: the share of tasks answered right").count(), 1);
+        assert_eq!(html.matches("J/request and J/token: the energy").count(), 1);
+        assert!(html.contains("timed, not scored"));
+    }
+
     #[test]
     fn a_machine_that_did_not_run_a_dataset_has_a_button_saying_so() {
         // The M3 Pro ran rag; the grid-only M5 Max ran no dataset, and still has its buttons.
@@ -4362,6 +4381,12 @@ mod tests {
         assert!(html.contains("2782be51"), "its files revision");
         assert!(html.contains("scratchy build 17 s"), "its build time");
         assert!(html.contains("53 MiB binary"), "its binary size");
+        // The heading keeps the model, machine, run and commit; the rest is folded under Setup,
+        // before the runs on this machine.
+        let at = |t: &str| html.find(t).unwrap_or_else(|| panic!("no {t}"));
+        assert!(html.contains("gpt-oss-20b on Apple M3 Pro · run 2026-11-02"), "the heading");
+        assert!(at("title=\"Setup\"") < at("36 GB unified memory"), "the machine is folded");
+        assert!(at("36 GB unified memory") < at("Runs on this machine"));
         // The runs on this machine.
         assert!(html.contains("Runs on this machine"));
         assert!(html.contains("f9dc285a"), "its commit");

@@ -112,6 +112,12 @@ fn mostly_capped(c: &TaskCell) -> bool {
         .is_some_and(|n| n > 0 && 2 * c.capped_answers.unwrap_or(0) > n)
 }
 
+/// Whether most of a cell's answers opened as reasoning, scored as answers they are not.
+fn mostly_thinking(c: &TaskCell) -> bool {
+    c.completed
+        .is_some_and(|n| n > 0 && 2 * c.thinking_answers.unwrap_or(0) > n)
+}
+
 /// Whether most of a cell's requests failed: its times are the few that answered, its accuracy
 /// counts the failures wrong, and its energy spreads the time it ran over requests never served.
 pub fn mostly_failed(c: &TaskCell) -> bool {
@@ -123,12 +129,11 @@ fn usable(c: &TaskCell) -> bool {
     !mostly_capped(c) && !mostly_failed(c)
 }
 
-/// Accuracy, where it is like for like: none for a cell whose answers opened as reasoning, one
-/// most of whose answers ran to their cap, which read as wrong without being answers, or one most
-/// of whose requests failed.
+/// Accuracy, where it is like for like: none for a cell most of whose answers opened as
+/// reasoning, or ran to their cap, which read as wrong without being answers, or most of whose
+/// requests failed.
 fn accuracy(c: &TaskCell) -> Option<f64> {
-    c.accuracy
-        .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && usable(c))
+    c.accuracy.filter(|_| !mostly_thinking(c) && usable(c))
 }
 
 /// How many times faster scratchy is to its first token than the rival: none where either mostly
@@ -228,7 +233,7 @@ fn right(c: &TaskCell) -> String {
         );
     }
     let Some(a) = accuracy(c) else {
-        return "—".to_string();
+        return held_back(c).unwrap_or_else(|| "—".to_string());
     };
     let whole = match c.num_tasks {
         Some(n) if n >= FIRM_ACCURACY_TASKS => format!("{} of {n}", pct(Some(a))),
@@ -239,6 +244,36 @@ fn right(c: &TaskCell) -> String {
         Some(hops) => format!("{whole} ({hops})"),
         None => whole,
     }
+}
+
+/// Why a cell shows no accuracy, where the page knows: a timed cell's answers are forced to one
+/// length and never scored; a scored cell most of whose answers ran to their cap, or opened as
+/// reasoning, is held back, with how many.
+fn held_back(c: &TaskCell) -> Option<String> {
+    if c.timed_answers {
+        return Some("timed, not scored".to_string());
+    }
+    c.accuracy?;
+    let of = c.num_tasks.or(c.completed).unwrap_or(0);
+    if mostly_capped(c) {
+        return Some(format!("ran to its cap: {} of {of}", c.capped_answers.unwrap_or(0)));
+    }
+    let thinking = c.thinking_answers.unwrap_or(0);
+    mostly_thinking(c).then(|| format!("opened as reasoning: {thinking} of {of}"))
+}
+
+/// Why a pair's cells have no ratio, where it is the rival's doing: most of its requests failed.
+/// None where the ratios stand or are left out for the reasons the notes give.
+fn no_ratio(_ours: &TaskCell, theirs: &TaskCell) -> Option<String> {
+    mostly_failed(theirs).then(|| {
+        let done = theirs.completed.unwrap_or(0) as usize;
+        let sent = done + theirs.failed.unwrap_or(0) as usize;
+        format!(
+            "rival: {} of {} answered",
+            crate::thousands(done),
+            crate::thousands(sent)
+        )
+    })
 }
 
 /// A MuSiQue cell's accuracy by hop count, where it recorded one: "2-hop 52%, 3-hop 43%, 4-hop 38%".
@@ -289,8 +324,6 @@ fn table(m: &Model, only: Option<&str>) -> Element {
     let mut cells = ours;
     let rank = |w: &str| ORDER.iter().position(|o| *o == w).unwrap_or(ORDER.len());
     cells.sort_by_key(|c| (rank(&c.workload), c.conc));
-    // The open-loop note, only where the run timed its cells open loop (`--open-loop`).
-    let open_loop = cells.iter().any(|c| c.load.as_deref() == Some("rate"));
     rsx! {
         Table {
             headers: [
@@ -306,6 +339,7 @@ fn table(m: &Model, only: Option<&str>) -> Element {
                     let ttft = them.and_then(|(_, r)| ttft_times(c, r));
                     let total = them.and_then(|(_, r)| total_times(c, r));
                     let spent = them.and_then(|(_, r)| energy_times(c, r));
+                    let why = them.and_then(|(_, r)| no_ratio(c, r));
                     // A borrowed rival says which run it is from, as the grid's borrowed engines do.
                     let vs = them.map_or_else(
                         || "—".to_string(),
@@ -333,19 +367,31 @@ fn table(m: &Model, only: Option<&str>) -> Element {
                                 TableCell { colspan: 8, "no answers" }
                             }
                             TableCell { "{vs}" }
-                            TableCell { "{x(ttft)}" }
-                            TableCell { "{x(total)}" }
-                            TableCell { "{x(spent)}" }
+                            if let Some(why) = why {
+                                TableCell { colspan: 3, "{why}" }
+                            } else {
+                                TableCell { "{x(ttft)}" }
+                                TableCell { "{x(total)}" }
+                                TableCell { "{x(spent)}" }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// What a dataset's table columns mean, said once under the section's summary, not under every
+/// pair's table: accuracy and why it is held back, energy, and, where any cell shown was timed
+/// open loop (`--open-loop`), its load.
+pub fn table_notes(open_loop: bool) -> Element {
+    rsx! {
         p { style: "font-size: 0.875rem",
             "Accuracy: the share of tasks answered right, a failed request or an answer that ran to \
              its cap counted wrong; none on a cell whose answers are forced to one length, so its \
-             times compare across engines, as every cell at a users count is; left out where most answers ran to their cap. A cell most of whose requests failed shows \
-             how many answered, and no accuracy, energy or ratio on either side. ~ marks one over fewer \
+             times compare across engines, as every cell at a users count is; left out where most answers ran to their cap or opened as reasoning, the cell saying which \
+             and how many. A cell most of whose requests failed shows how many answered, and no accuracy, energy or ratio on either side. ~ marks one over fewer \
              than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
              indicative only. The second total ratio is shown only where both engines' answers were \
              about one length."
@@ -365,6 +411,11 @@ fn table(m: &Model, only: Option<&str>) -> Element {
             }
         }
     }
+}
+
+/// Whether any of a model's `dataset` cells was timed open loop: the load note's condition.
+pub fn open_loop(m: &Model, dataset: &str) -> bool {
+    (Engine::Scratchy.tasks(m).iter()).any(|c| of_dataset(c, dataset) && c.load.as_deref() == Some("rate"))
 }
 
 /// One dataset overview square: the users count, the workload, and how many times faster
@@ -538,6 +589,52 @@ mod tests {
         assert_eq!(ttft_times(&few, &whole), Some(1.0));
     }
 
+    /// A cell with no accuracy says why in its place: a timed cell is never scored, and a scored
+    /// one held back says how many answers ran to their cap or opened as reasoning.
+    #[test]
+    fn a_held_back_accuracy_says_why() {
+        let cell = |v: serde_json::Value| -> TaskCell { serde_json::from_value(v).unwrap() };
+        let timed = cell(serde_json::json!({"workload": "rag", "conc": 1, "completed": 8,
+            "timed_answers": true, "thinking_answers": 8}));
+        assert_eq!(right(&timed), "timed, not scored");
+        let capped = cell(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+            "completed": 400, "num_tasks": 400, "accuracy": 0.1, "capped_answers": 331,
+            "thinking_answers": 0}));
+        assert_eq!(right(&capped), "ran to its cap: 331 of 400");
+        let thought = cell(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+            "completed": 400, "num_tasks": 400, "accuracy": 0.1, "capped_answers": 10,
+            "thinking_answers": 378}));
+        assert_eq!(right(&thought), "opened as reasoning: 378 of 400");
+        // Both: the cap first, the one a reader can act on.
+        let both = cell(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+            "completed": 400, "num_tasks": 400, "accuracy": 0.1, "capped_answers": 331,
+            "thinking_answers": 378}));
+        assert_eq!(right(&both), "ran to its cap: 331 of 400");
+        // One answer of many opening as reasoning holds nothing back.
+        let one = cell(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+            "completed": 2415, "num_tasks": 2415, "accuracy": 0.4766, "capped_answers": 43,
+            "thinking_answers": 1}));
+        assert_eq!(right(&one), "48% of 2415");
+        // A cell from before timed cells said so, with no accuracy: a dash, as before.
+        let old = cell(serde_json::json!({"workload": "rag", "conc": 1, "completed": 8}));
+        assert_eq!(right(&old), "—");
+    }
+
+    /// The ratio against a rival most of whose requests failed says so, in place of a ratio.
+    #[test]
+    fn a_ratio_against_a_failed_rival_says_why() {
+        let cell = |done: u32, failed: u32| -> TaskCell {
+            serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+                "completed": done, "failed": failed, "median_ttft_ms": 100.0}))
+            .unwrap()
+        };
+        assert_eq!(
+            no_ratio(&cell(2415, 0), &cell(9, 2406)).as_deref(),
+            Some("rival: 9 of 2,415 answered")
+        );
+        assert_eq!(no_ratio(&cell(2415, 0), &cell(2415, 0)), None);
+    }
+
     /// A MuSiQue cell that recorded its accuracy by hop count shows each beside the whole, in hop
     /// order; one from before shows the whole alone.
     #[test]
@@ -573,6 +670,7 @@ mod tests {
             num_tasks: Some(8),
             load: None,
             request_rate: None,
+            timed_answers: false,
             timed_out: false,
             median_tpot_ms: None,
             output_throughput: None,
@@ -679,6 +777,7 @@ mod tests {
             num_tasks: Some(4),
             load: None,
             request_rate: None,
+            timed_answers: false,
             timed_out: false,
             median_tpot_ms: None,
             output_throughput: None,
