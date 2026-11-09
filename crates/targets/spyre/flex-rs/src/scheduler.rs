@@ -69,7 +69,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1757,12 +1757,6 @@ impl DeviceAddressResolver for FlexAllocatorAddressResolver {
 /// `LaunchCbs` for ALL pipelines, not one per pipeline), and being the
 /// single consumer of `Rbi()` is `ResponseCompletionThread`'s job.
 pub struct SenlibHardwareSubmit {
-    /// Scratch for `ReceiveResponsesSBF`'s out-parameter — the senlib-format
-    /// twin of `ResponseWorker::rbs_`. Grown to the caller's requested batch
-    /// size on first use and reused, since only the one
-    /// `ResponseCompletionThread` ever drains (the mutex exists because the
-    /// trait method takes `&self`, not because there is real contention).
-    rbs_scratch: Mutex<Vec<crate::senlib_ffi::SenlibResponseBlockSbf>>,
     /// The card whose queues this submits to and drains.
     card: Arc<crate::senlib_ffi::Card>,
     /// The card's NUMA node's CPUs, read when the card opened.
@@ -1771,11 +1765,7 @@ pub struct SenlibHardwareSubmit {
 
 impl SenlibHardwareSubmit {
     pub fn new(card: Arc<crate::senlib_ffi::Card>, cpus: crate::numa::CardCpus) -> Self {
-        Self {
-            rbs_scratch: Mutex::new(Vec::new()),
-            card,
-            cpus,
-        }
+        Self { card, cpus }
     }
 }
 
@@ -1796,13 +1786,15 @@ impl HardwareSubmit for SenlibHardwareSubmit {
                 "SenlibHardwareSubmit: no ControlBlockInterface for this pipeline (shim not initialized)",
             ));
         };
-        let wire: Vec<crate::senlib_ffi::SenlibControlBlockSbf> =
-            cbs.iter().copied().map(Into::into).collect();
+        // Zero-copy: `ControlBlockWire` IS `SenlibControlBlockSbf` (same
+        // `#[repr(C)]` [u8; 128], asserted in `control_blocks_as_sbf`) — the
+        // batch goes to senlib as-is, no per-launch `Vec` re-collect.
+        let wire = crate::senlib_ffi::control_blocks_as_sbf(cbs);
         // Propagate rather than panic: the real `:1268` call is unguarded, so a
         // senlib throw unwinds into `schedule`'s `catch(...)` and fails the
         // request. Swallowing it (the original port) left the caller waiting out
         // its full timeout on a CB the hardware never received.
-        crate::senlib_ffi::cbi_queue_control_blocks_sbf(cbi, &wire).map_err(|e| {
+        crate::senlib_ffi::cbi_queue_control_blocks_sbf(cbi, wire).map_err(|e| {
             mock_error(&format!(
                 "SenlibHardwareSubmit: senlib QueueControlBlocksSBF failed (CB not submitted): {e}"
             ))
@@ -1822,16 +1814,9 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         let Some(rbi) = rbi.into_live() else {
             return (0, ResponseCredit::none());
         };
-        let mut scratch = self.rbs_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if scratch.len() < out.len() {
-            scratch.resize(
-                out.len(),
-                crate::senlib_ffi::SenlibResponseBlockSbf { bytes: [0; 64] },
-            );
-        }
         let n = match crate::senlib_ffi::rbi_receive_responses_sbf(
             rbi,
-            &mut scratch[..out.len()],
+            crate::senlib_ffi::response_blocks_as_sbf_mut(out),
             min_count,
         ) {
             Ok(n) => n,
@@ -1842,9 +1827,6 @@ impl HardwareSubmit for SenlibHardwareSubmit {
                 return (0, ResponseCredit::none());
             }
         };
-        for (dst, src) in out.iter_mut().zip(scratch.iter()).take(n as usize) {
-            *dst = src.decode();
-        }
         (n, ResponseCredit::received(n))
     }
 
@@ -1990,6 +1972,33 @@ pub struct PendingRequest {
 /// and then moved out of exactly one of them at a time by `IssueCallback`.
 pub type CallbackFn = Arc<dyn Fn(&PendingRequest) + Send + Sync>;
 
+/// What a `pending_requests_` slot invokes when its CB completes. The live
+/// submit path always passes a [`GroupedSubmit`] — the group IS the
+/// callback, stored by `Arc` with no per-submit closure allocation (manual
+/// `impl Fn` is unstable, so the slot names the group explicitly instead).
+/// `Fn` covers everything else: bespoke completions and the test rigs.
+pub(crate) enum SlotCallback {
+    Group(Arc<GroupedSubmit>),
+    Fn(CallbackFn),
+}
+
+impl Clone for SlotCallback {
+    fn clone(&self) -> Self {
+        // Both arms are `Arc` clones — refcount bumps, never allocations;
+        // `ProcessTags` copies the callback into every slot of a batch.
+        match self {
+            SlotCallback::Group(g) => SlotCallback::Group(g.clone()),
+            SlotCallback::Fn(cb) => SlotCallback::Fn(cb.clone()),
+        }
+    }
+}
+
+impl From<CallbackFn> for SlotCallback {
+    fn from(cb: CallbackFn) -> Self {
+        SlotCallback::Fn(cb)
+    }
+}
+
 /// The mutable half of one `pending_requests_` slot.
 struct PendingRequestData {
     id: u64,
@@ -2008,7 +2017,7 @@ struct PendingRequestData {
     completion_time_point: Option<Instant>,
     control_block: Option<ControlBlockWire>,
     response_block: Option<crate::control_block_wire::ResponseBlockWire>,
-    callback_fn: Option<CallbackFn>,
+    callback_fn: Option<SlotCallback>,
     node_name: String,
     /// The tag lease naming this slot for as long as it is ISSUED. Dropping
     /// it IS `ReturnTags`' `available_tags_.enqueue_bulk(...)` — see
@@ -2103,12 +2112,7 @@ impl DrainScratch {
     fn new(max_pending_requests: u64) -> Self {
         let n = max_pending_requests as usize;
         Self {
-            rbs: vec![
-                crate::control_block_wire::ResponseBlockWire::from_bytes(
-                    &[0u8; crate::control_block_wire::RB_NUM_BYTES]
-                );
-                n
-            ],
+            rbs: vec![crate::control_block_wire::ResponseBlockWire::ZERO; n],
             tags_to_be_returned: vec![ResponseTag(0); n],
         }
     }
@@ -2183,7 +2187,83 @@ pub struct ResponseWorker {
     /// Set when the completion thread could not run on its card's NUMA node: it never polls,
     /// so every submit is refused with this, by name.
     start_refused: std::sync::OnceLock<String>,
+    /// Recycled CB batch buffers — the steady-state zero-alloc submit path.
+    /// `take_cb_buffer` hands one to a build closure, `launch_cbs` returns it
+    /// after the doorbell (the buffer is dead the moment
+    /// `QueueControlBlocksSBF` returns; the slots keep their own copies).
+    /// Depth-capped so a pathological batch size cannot pin unbounded memory.
+    cb_recycle: Mutex<Vec<Vec<ControlBlockWire>>>,
+    /// Recycled `prepare_cbs` scratch (the tag-lease list and the tag list it
+    /// feeds to the builder) — see [`SubmitScratchLease`]. One pair is
+    /// enough: `prepare_cbs` runs under `submission_mtx` on the regular
+    /// path, and the calibration path's single-producer contract replaces
+    /// the lock, so at most one submit is ever inside `prepare_cbs`.
+    submit_scratch: Mutex<(Vec<TagLease>, Vec<ResponseTag>)>,
+    /// The single-thread mode's inline drain scratch, kept across submits
+    /// (see [`ResponseWorker::drain_inline`]). `None` only while a drain is
+    /// running. Unused in multi-thread mode — the completion thread keeps
+    /// its own local scratch.
+    drain_scratch: Mutex<Option<DrainScratch>>,
 }
+
+/// `prepare_cbs`'s borrowed scratch: the tag-lease list and the tag list,
+/// taken from the worker's pool and returned by `Drop` on EVERY path —
+/// success, build failure, or a refused tag — so no early return can leak
+/// the buffers or skip returning unconsumed leases to the tag pool (their
+/// own `Drop` does that, as it did when they lived in a local `Vec`).
+struct SubmitScratchLease<'a> {
+    worker: &'a ResponseWorker,
+    leases: Vec<TagLease>,
+    tags: Vec<ResponseTag>,
+}
+
+impl<'a> SubmitScratchLease<'a> {
+    fn take(worker: &'a ResponseWorker, num_cbs: u64) -> SubmitScratchLease<'a> {
+        let (mut leases, mut tags) = std::mem::take(
+            &mut *worker
+                .submit_scratch
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        leases.clear();
+        leases.reserve(num_cbs as usize);
+        tags.reserve(num_cbs as usize);
+        Self {
+            worker,
+            leases,
+            tags,
+        }
+    }
+}
+
+impl Drop for SubmitScratchLease<'_> {
+    fn drop(&mut self) {
+        // Clearing the leases drops any that were never published — each
+        // one's own `Drop` returns its tag to the pool, exactly the
+        // early-return semantics the local-`Vec` version had.
+        self.leases.clear();
+        self.tags.clear();
+        let mut pool = self
+            .worker
+            .submit_scratch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // At most one submit is inside `prepare_cbs` at a time (see the
+        // field's doc), so the pool is empty here; if it ever is not, the
+        // buffers simply drop instead of corrupting anyone.
+        if pool.0.is_empty() {
+            pool.0 = std::mem::take(&mut self.leases);
+        }
+        if pool.1.is_empty() {
+            pool.1 = std::mem::take(&mut self.tags);
+        }
+    }
+}
+
+/// How many recycled CB batch buffers the worker keeps. One per in-flight
+/// submit is the natural ceiling; a small fixed depth covers pipelined
+/// submitters and stays O(KB) even at 128 B per CB.
+const CB_RECYCLE_DEPTH: usize = 8;
 
 /// The per-pipeline response tallies `ParseResponseBlocks` accumulates while it
 /// walks a drain's response blocks, and then spends on `FreeResponses` — one per
@@ -2253,6 +2333,9 @@ impl ResponseWorker {
             skip_launch: RuntimeConfig::response_worker_skip_launch().value(),
             hw,
             submission_mtx: Mutex::new(()),
+            cb_recycle: Mutex::new(Vec::new()),
+            submit_scratch: Mutex::new((Vec::new(), Vec::new())),
+            drain_scratch: Mutex::new(None),
             stop_threads: AtomicBool::new(false),
             force_shutdown: AtomicBool::new(false),
             wakeup_tx,
@@ -2345,9 +2428,33 @@ impl ResponseWorker {
     /// profiler on this path (`qm != CALIBRATION` gating `PROFILER_START`
     /// and the response-side profiler copy); the profiler is one of the
     /// not-ported telemetry members, so that skip is vacuous here.
-    pub fn queue_cbs(
+    /// Take a recycled CB batch buffer (empty, possibly with retained
+    /// capacity) for a build closure to fill — the allocation-free steady
+    /// state of the submit path.
+    pub fn take_cb_buffer(&self) -> Vec<ControlBlockWire> {
+        self.cb_recycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Return a CB batch buffer to the recycle pool after `launch_cbs` has
+    /// handed its contents to the hardware. Clearing first is what makes the
+    /// buffer safe to hand out again: `ControlBlockWire` is plain bytes with
+    /// no drop glue, but a stale CB in a reused buffer would be a silent
+    /// wrong-submit if a build closure ever failed to overwrite every slot.
+    fn recycle_cb_buffer(&self, cbs: &mut Vec<ControlBlockWire>) {
+        cbs.clear();
+        let mut pool = self.cb_recycle.lock().unwrap_or_else(|p| p.into_inner());
+        if pool.len() < CB_RECYCLE_DEPTH {
+            pool.push(std::mem::take(cbs));
+        }
+    }
+
+    pub(crate) fn queue_cbs(
         &self,
-        cb_fn: CallbackFn,
+        cb_fn: impl Into<SlotCallback>,
         num_cbs: u64,
         pipeline: PipelineId,
         qm: QueuingMode,
@@ -2361,6 +2468,7 @@ impl ResponseWorker {
         // is on the regular path (see the `launch_result?` note below): the
         // error propagates and the already-published `pending_requests_`
         // slots are left for `CheckPendingJobTimeouts`.
+        let cb_fn = cb_fn.into();
         if qm == QueuingMode::Calibration {
             self.precheck(num_cbs, qm)?;
             let batch = self.prepare_cbs(&cb_fn, num_cbs, pipeline, qm, dma, build)?;
@@ -2371,10 +2479,7 @@ impl ResponseWorker {
             // identical to the regular path's below (which by then has
             // already dropped the lock).
             if self.single_thread_optimized && !self.skip_launch {
-                let mut scratch = DrainScratch::new(self.max_pending_requests);
-                while self.num_pending_requests.load(Ordering::Acquire) > 0 {
-                    self.fetch_and_parse_response_blocks(&mut scratch);
-                }
+                self.drain_inline();
             }
             return Ok(());
         }
@@ -2408,12 +2513,28 @@ impl ResponseWorker {
         // received" (`response_worker.cpp:540-547`). `ResponseCompletionThread`
         // returns immediately in this mode, so this thread IS the consumer.
         if self.single_thread_optimized && !self.skip_launch {
-            let mut scratch = DrainScratch::new(self.max_pending_requests);
-            while self.num_pending_requests.load(Ordering::Acquire) > 0 {
-                self.fetch_and_parse_response_blocks(&mut scratch);
-            }
+            self.drain_inline();
         }
         Ok(())
+    }
+
+    /// "Single-threaded mode: poll synchronously until all responses
+    /// received" (`response_worker.cpp:540-547`) — the submit thread IS the
+    /// consumer. The drain scratch (a 64 B x max_pending_requests response
+    /// block array plus its tag list — megabytes at real config) is kept on
+    /// the worker and reused across submits instead of being re-allocated
+    /// per `QueueCbs`: the background completion thread owns its own local
+    /// one, and in this mode there is no background thread, so this pool
+    /// serves exactly the one draining thread.
+    fn drain_inline(&self) {
+        let mut slot = self.drain_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        let mut scratch = slot
+            .take()
+            .unwrap_or_else(|| DrainScratch::new(self.max_pending_requests));
+        while self.num_pending_requests.load(Ordering::Acquire) > 0 {
+            self.fetch_and_parse_response_blocks(&mut scratch);
+        }
+        *slot = Some(scratch);
     }
 
     /// Port of `ResponseWorker::Precheck` (`response_worker.cpp:552-571`).
@@ -2450,7 +2571,7 @@ impl ResponseWorker {
     /// consumer is the profiler's baseline timestamp) are not ported.
     fn prepare_cbs(
         &self,
-        cb_fn: &CallbackFn,
+        cb_fn: &SlotCallback,
         num_cbs: u64,
         pipeline: PipelineId,
         qm: QueuingMode,
@@ -2460,12 +2581,16 @@ impl ResponseWorker {
         // "Acquire tags from the available pool (may block if pool
         // exhausted)" — the real `while(tags_fetched < num_ctbs)` loop over
         // `try_dequeue_bulk_from_producer`, with the same "Still waiting to
-        // fetch tags" warning (in `TagPool::acquire`).
-        let mut leases: Vec<TagLease> = Vec::with_capacity(num_cbs as usize);
+        // fetch tags" warning (in `TagPool::acquire`). The lease and tag
+        // lists ride recycled buffers (see `SubmitScratchLease`); the guard
+        // returns them — and, on an early return, every unconsumed lease
+        // (whose own drop hands its tag back to the pool) — on every path.
+        let mut scratch = SubmitScratchLease::take(self, num_cbs);
         for _ in 0..num_cbs {
-            leases.push(self.tag_pool.acquire());
+            scratch.leases.push(self.tag_pool.acquire());
         }
-        let tags: Vec<ResponseTag> = leases.iter().map(|l| l.tag()).collect();
+        scratch.tags.clear();
+        scratch.tags.extend(scratch.leases.iter().map(|l| l.tag()));
 
         let batch_id = self.global_pr_batch_id.fetch_add(1, Ordering::AcqRel) + 1;
         // "Capture baseline timestamp once for entire batch - all CBs share
@@ -2475,7 +2600,7 @@ impl ResponseWorker {
         // `cbr->SpecializeTags(raw_tags)` — wrapped so a failure becomes
         // `RAS::RESPONSEWORKER::SpecializeTagsFailed`. `leases` is still
         // owned here, so an early return returns every tag to the pool.
-        let mut cbs = build(&tags)?;
+        let mut cbs = build(&scratch.tags)?;
         if cbs.len() as u64 != num_cbs {
             return Err(mock_error(&format!(
                 "ResponseWorker::PrepareCbs: builder produced {} control blocks for {num_cbs} tags",
@@ -2498,7 +2623,7 @@ impl ResponseWorker {
             first.set_edep(1);
         }
 
-        for (i, lease) in leases.into_iter().enumerate() {
+        for (i, lease) in scratch.leases.drain(..).enumerate() {
             let local_tag = lease.tag().0 as usize;
             // "Validate tag is within bounds before accessing
             // pending_requests_" (`ProcessTags`, `:585-590`) — `RAS::…::InvalidTag`.
@@ -2551,8 +2676,8 @@ impl ResponseWorker {
     /// `submitToHardware`'s `QueueCbs(wrapped_callback, cbr, pipeline)` —
     /// leaves it at its `false` default.
     fn launch_cbs(&self, batch: PreparedBatch) -> Result<(), SchedulerError> {
-        let (cbs, pipeline) = batch.into_parts();
-        let cbs = cbs.as_slice();
+        let (mut cbs, pipeline) = batch.into_parts();
+        let cbs_slice = cbs.as_slice();
         let num_cbs = cbs.len() as u64;
         let prev_pending = self
             .num_pending_requests
@@ -2565,7 +2690,7 @@ impl ResponseWorker {
         if self.skip_launch {
             // `FLEX_RESPONSE_WORKER_SKIP_LAUNCH`: mark every CB SKIPPED and
             // fire its callback inline, without touching hardware.
-            for cb in cbs {
+            for cb in cbs_slice {
                 let local_tag = cb.tag().0 as usize;
                 if local_tag >= self.pending_requests.len() {
                     tracing::error!(
@@ -2580,11 +2705,12 @@ impl ResponseWorker {
             }
             self.num_pending_requests
                 .fetch_sub(num_cbs, Ordering::AcqRel);
+            self.recycle_cb_buffer(&mut cbs);
             return Ok(());
         }
 
         let launch_time = Instant::now();
-        for cb in cbs {
+        for cb in cbs_slice {
             let local_tag = cb.tag().0 as usize;
             if let Some(slot) = self.pending_requests.get(local_tag) {
                 slot.data
@@ -2594,8 +2720,12 @@ impl ResponseWorker {
             }
         }
         // ONE doorbell for the whole batch, and let a submission failure
-        // propagate (see `queue_cbs`).
-        self.hw.queue_control_blocks(pipeline, cbs)
+        // propagate (see `queue_cbs`). The buffer is dead the moment the
+        // doorbell returns — every slot already holds its own CB copy — so it
+        // goes back to the recycle pool on every path, success or failure.
+        let launch_result = self.hw.queue_control_blocks(pipeline, cbs_slice);
+        self.recycle_cb_buffer(&mut cbs);
+        launch_result
     }
 
     /// Port of `ResponseWorker::FetchResponseBlocks` (`response_worker.cpp:904-956`).
@@ -2810,7 +2940,8 @@ impl ResponseWorker {
             (cb_fn, snapshot)
         };
         match cb_fn {
-            Some(cb_fn) => cb_fn(&snapshot),
+            Some(SlotCallback::Group(group)) => group.member_completed(&snapshot),
+            Some(SlotCallback::Fn(cb_fn)) => cb_fn(&snapshot),
             None => tracing::warn!(
                 id = snapshot.id,
                 "IssueCallback: no callback for PendingRequest"
@@ -3664,7 +3795,7 @@ mod response_worker_tests {
 
         let err = worker
             .queue_cbs(
-                Arc::new(|_pr: &PendingRequest| {}),
+                Arc::new(|_pr: &PendingRequest| {}) as CallbackFn,
                 1,
                 PipelineId::Compute,
                 QueuingMode::Calibration,
@@ -4205,49 +4336,22 @@ fn submit_to_hardware(
         state.inc_in_flight(pipeline);
     }
 
-    let call_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let hw_error = Arc::new(Mutex::new(None::<CbCompleteError>));
-    let user_cb = Arc::new(Mutex::new(Some(callback)));
-
-    let state_for_cb = state.clone();
-    let hw_error_for_cb = hw_error.clone();
-    let user_cb_for_cb = user_cb.clone();
-    let cb_fn: CallbackFn = Arc::new(move |pr: &PendingRequest| {
-        // "Track how many times this callback has been invoked."
-        let current_count = call_count.fetch_add(1, Ordering::AcqRel) + 1;
-
-        // onCbComplete's own status check (`:437-447`) — deliberately NOT
-        // `EvalResponseBlockStatus`, which is what the *graph* scheduler and
-        // the data-transfer paths use: this one treats TIMED_OUT, cancel, and
-        // any status other than `RB_GOOD` as a hardware error.
-        if let Some(e) = eval_cb_complete_status(pr).failure() {
-            tracing::warn!("Response block error: {e}");
-            *hw_error_for_cb.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-        }
-
-        // `recordPipelineProfiler`'s `--{compute,dmai,dmao}_in_flight_`.
-        state_for_cb.dec_in_flight(pipeline);
-
-        // "Call the completion callback only when all CBs are done."
-        if current_count == num_cbs
-            && let Some(cb) = user_cb_for_cb
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-        {
-            let err = hw_error_for_cb
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
-            match err {
-                Some(e) => cb(Err(Box::new(e))),
-                None => cb(Ok(())),
-            }
-        }
-    });
+    // ONE shared cell per submit, not three: the countdown, the hardware
+    // error, and the user callback all live behind this single `Arc` — and
+    // the group is its own `CallbackFn` (see its `Fn` impl), so the whole
+    // submit costs ONE allocation where the original port spent three
+    // separate `Arc<Mutex<..>>`/atomic cells plus a closure.
+    // The countdown also subsumes the `num_cbs == 1` case for free: a single
+    // CB's one invocation is trivially the last.
+    let gate = Arc::new(GroupedSubmit::new(
+        num_cbs,
+        callback,
+        state.clone(),
+        pipeline,
+    ));
 
     if let Err(e) = worker.queue_cbs(
-        cb_fn,
+        SlotCallback::Group(gate.clone()),
         num_cbs,
         pipeline,
         QueuingMode::Regular,
@@ -4263,9 +4367,109 @@ fn submit_to_hardware(
         for _ in 0..num_cbs {
             state.dec_in_flight(pipeline);
         }
-        if let Some(cb) = user_cb.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        if let Some(cb) = gate
+            .user_cb
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             cb(Err(e));
         }
+    }
+}
+
+/// The per-`submit_to_hardware` completion group: the CB countdown, the first
+/// hardware error seen by any CB in the group, and the user callback, behind
+/// one allocation. `user_cb` is `Option` so exactly one of the completion
+/// path and the queue-failure path can take it — the queue-failure taker wins
+/// a race against a late timeout-reaped callback, which then finds `None`
+/// and does nothing, matching the previous three-cell layout's behavior.
+///
+/// The group also IS its own [`CallbackFn`]: it carries the submit's
+/// in-flight accounting and pipeline, so `submit_to_hardware` hands the ONE
+/// `Arc` out twice (group + per-CB callback) instead of allocating a second
+/// `Arc` for a closure that captured clones of the same three things.
+pub(crate) struct GroupedSubmit {
+    remaining: std::sync::atomic::AtomicU64,
+    hw_error: Mutex<Option<SchedulerError>>,
+    user_cb: Mutex<Option<CompletionCallback>>,
+    /// The submit's in-flight counter, drained one per member by `call`.
+    state: Arc<SchedulerState>,
+    /// The pipeline the submit's CBs ride — which counter `call` drains.
+    pipeline: PipelineId,
+}
+
+impl GroupedSubmit {
+    fn new(
+        num_cbs: u64,
+        callback: CompletionCallback,
+        state: Arc<SchedulerState>,
+        pipeline: PipelineId,
+    ) -> Self {
+        Self {
+            remaining: std::sync::atomic::AtomicU64::new(num_cbs),
+            hw_error: Mutex::new(None),
+            user_cb: Mutex::new(Some(callback)),
+            state,
+            pipeline,
+        }
+    }
+
+    /// Grow the group — a DMA transfer's per-chunk increments on top of the
+    /// submitter's sentinel, taken before the chunk is queued so a chunk that
+    /// completes while the loop is still queuing cannot drop the count to
+    /// zero early.
+    fn add(&self, n: u64) {
+        self.remaining.fetch_add(n, Ordering::AcqRel);
+    }
+
+    /// `if(--(*pending) == 0) (*cb)(ep);`: record the error (the most recent
+    /// one wins, which is the last member to complete whenever there is at
+    /// most one failure), count one member down, and fire the callback exactly
+    /// once when the group drains.
+    fn settle(&self, err: Option<SchedulerError>) {
+        if let Some(e) = err {
+            *self.hw_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(cb) = self
+                .user_cb
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+        {
+            let err = self
+                .hw_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            match err {
+                Some(e) => cb(Err(e)),
+                None => cb(Ok(())),
+            }
+        }
+    }
+
+    /// One member CB of this submit completed: evaluate its response block,
+    /// drain its in-flight accounting, count it down. This is `onCbComplete`
+    /// (`response_worker.cpp:437-447`) as a method on the group it reports
+    /// to — `submit_to_hardware`'s per-CB closure is now a one-line forward
+    /// to this, capturing nothing but the group's own `Arc`.
+    fn member_completed(&self, pr: &PendingRequest) {
+        // onCbComplete's own status check (`:437-447`) — deliberately NOT
+        // `EvalResponseBlockStatus`, which is what the *graph* scheduler and
+        // the data-transfer paths use: this one treats TIMED_OUT, cancel, and
+        // any status other than `RB_GOOD` as a hardware error.
+        let hw_err = eval_cb_complete_status(pr)
+            .failure()
+            .inspect(|e| tracing::warn!("Response block error: {e}"))
+            .map(|e| Box::new(e) as SchedulerError);
+
+        // `recordPipelineProfiler`'s `--{compute,dmai,dmao}_in_flight_`.
+        self.state.dec_in_flight(self.pipeline);
+
+        // "Call the completion callback only when all CBs are done."
+        self.settle(hw_err);
     }
 }
 
@@ -4540,44 +4744,49 @@ impl DmaBuf {
     }
 }
 
-/// Port of `flex::DmaBufPool` (`scheduler_config.hpp:90-105`): the shared
-/// completion state of one multi-chunk transfer plus the recycled buffer
-/// queue. `pending` starts at 1 — "a sentinel held by the submitter", which
-/// `submitDma` drops after the last chunk has been QUEUED, so a transfer
-/// whose chunks all complete before the loop finishes still fires its
-/// callback exactly once.
+/// `flex::DmaBufPool`'s buffer half (`scheduler_config.hpp:90-105`), hoisted
+/// from per-transfer to backend lifetime: `DataTransferBufferCount` boxed
+/// `DmaBuf`s — shadow buffers and IOMMU mappings included — created once on
+/// first use and recycled across transfers. A transfer's completion
+/// accounting lives in the [`GroupedSubmit`] `submit_dma` starts at 1, not
+/// here; the C++ pool mixed the two, which is why it (and its multi-MB shadow
+/// allocations) died with every transfer.
 struct DmaBufPool {
     avail_bufs: Mutex<VecDeque<Box<DmaBuf>>>,
     avail_cv: Condvar,
-    pending: AtomicI64,
-    cb: Mutex<Option<CompletionCallback>>,
-    /// The `std::exception_ptr` a completing chunk forwards to
-    /// `(*cb)(ep)`. The real code hands the pool's callback whichever `ep`
-    /// belonged to the LAST chunk to complete; this keeps the most recent one
-    /// seen, which is the same thing whenever there is at most one failure.
-    error: Mutex<Option<SchedulerError>>,
+    /// How many buffers this pool has ever created — the cap on allocation,
+    /// not on population (quarantine replacements bypass it, keeping the
+    /// population constant for transfers still blocked in `acquire`).
+    created: AtomicU64,
 }
 
 impl DmaBufPool {
-    fn new(cb: CompletionCallback) -> Arc<Self> {
-        Arc::new(Self {
+    fn new() -> Self {
+        Self {
             avail_bufs: Mutex::new(VecDeque::new()),
             avail_cv: Condvar::new(),
-            pending: AtomicI64::new(1),
-            cb: Mutex::new(Some(cb)),
-            error: Mutex::new(None),
-        })
+            created: AtomicU64::new(0),
+        }
     }
 
-    /// `pool->avail_bufs.wait_dequeue(chunk_buf)` — block until a chunk
-    /// completes and hands its buffer back. This is the real backpressure on
-    /// how many chunks of one transfer are in flight at once:
-    /// `RuntimeConfig::DataTransferBufferCount()`.
-    fn wait_dequeue(&self) -> Box<DmaBuf> {
+    /// `pool->avail_bufs.wait_dequeue(chunk_buf)`: a recycled buffer if one
+    /// has come back, a fresh one while the pool is under
+    /// `RuntimeConfig::DataTransferBufferCount()`, else block until a chunk
+    /// completes and hands its buffer back. That blocking is the real
+    /// backpressure on how many chunks of one transfer are in flight at once.
+    /// The flag says whether the buffer is fresh — what `setup_dma_buf` uses
+    /// to force the shadow-buffer allocation instead of reusing the previous
+    /// occupant's.
+    fn acquire(&self) -> (Box<DmaBuf>, bool) {
         let mut avail = self.avail_bufs.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(buf) = avail.pop_front() {
-                return buf;
+                return (buf, false);
+            }
+            let limit = RuntimeConfig::data_transfer_buffer_count().value();
+            if self.created.load(Ordering::Acquire) < limit {
+                self.created.fetch_add(1, Ordering::AcqRel);
+                return (Box::new(DmaBuf::new()), true);
             }
             let (guard, _timeout) = self
                 .avail_cv
@@ -4602,22 +4811,6 @@ impl DmaBufPool {
             .unwrap_or_else(|e| e.into_inner())
             .push_back(buf);
         self.avail_cv.notify_one();
-    }
-
-    /// `if(--(*pending) == 0) (*cb)(ep);`
-    fn release(&self, err: Option<SchedulerError>) {
-        if let Some(e) = err {
-            *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-        }
-        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(cb) = self.cb.lock().unwrap_or_else(|p| p.into_inner()).take()
-        {
-            let err = self.error.lock().unwrap_or_else(|p| p.into_inner()).take();
-            match err {
-                Some(e) => cb(Err(e)),
-                None => cb(Ok(())),
-            }
-        }
     }
 }
 
@@ -4652,6 +4845,8 @@ pub struct PfBackend {
     /// `DmaBuf`: once parked, un-parking is unconstructable rather than merely
     /// undone-by-convention.
     dma_quarantine: Arc<Mutex<Vec<QuarantinedBuf>>>,
+    /// The backend-lifetime DMA chunk buffer pool — see [`DmaBufPool`].
+    dma_bufs: Arc<DmaBufPool>,
 }
 
 /// One iteration of `submitDma`'s chunking loop: where this piece starts in the
@@ -4682,6 +4877,7 @@ impl PfBackend {
             iommu_mapper,
             response_worker: std::sync::OnceLock::new(),
             dma_quarantine: Arc::new(Mutex::new(Vec::new())),
+            dma_bufs: Arc::new(DmaBufPool::new()),
         }
     }
 
@@ -4704,8 +4900,7 @@ impl PfBackend {
         dma: &DmaParams,
         resolved_chunk: &ResolvedChunk,
         chunk: DmaChunk,
-        bufs_created: &mut u64,
-        pool: &Arc<DmaBufPool>,
+        group: &Arc<GroupedSubmit>,
     ) -> Result<(), SchedulerError> {
         let DmaChunk {
             hmva,
@@ -4715,15 +4910,9 @@ impl PfBackend {
             pipeline,
         } = chunk;
         let to_device = dma.direction() == DmaDirection::HostToDevice;
-        // `bool new_buf = bufs_created < RuntimeConfig::DataTransferBufferCount();`
-        let new_buf = *bufs_created < RuntimeConfig::data_transfer_buffer_count().value();
-        let mut chunk_buf = if new_buf {
-            *bufs_created += 1;
-            Box::new(DmaBuf::new())
-        } else {
-            // "Waiting for DMA chunk buffer to free up."
-            pool.wait_dequeue()
-        };
+        // "Waiting for DMA chunk buffer to free up." — the backend's pool
+        // recycles buffers (and their shadow allocations) across transfers.
+        let (mut chunk_buf, new_buf) = self.dma_bufs.acquire();
 
         chunk_buf.setup_dma_buf(
             DmaBufRequest {
@@ -4742,9 +4931,11 @@ impl PfBackend {
 
         // `++(*pool->pending);` before submitting, so a chunk that completes
         // while the loop is still queuing cannot drop the count to zero.
-        pool.pending.fetch_add(1, Ordering::AcqRel);
-        let pool_for_cb = pool.clone();
+        group.add(1);
+        let pool_for_cb = self.dma_bufs.clone();
+        let group_for_cb = group.clone();
         let quarantine = self.dma_quarantine.clone();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -4781,7 +4972,7 @@ impl PfBackend {
                     // allocate/map path from scratch. It has never been handed
                     // to hardware, hence the other constructor.
                     pool_for_cb.enqueue(Box::new(DmaBuf::new()), CbRetired::never_submitted());
-                    pool_for_cb.release(result.err());
+                    group_for_cb.settle(result.err());
                     return;
                 };
                 // "For D2H with an unaligned shadow buffer, copy result back
@@ -4805,17 +4996,19 @@ impl PfBackend {
                     }
                 }
                 pool_for_cb.enqueue(chunk_buf, retired);
-                pool_for_cb.release(result.err());
+                group_for_cb.settle(result.err());
             }),
             |tags| {
-                Ok(vec![build_dma_cb_chunk(
+                let mut cbs = worker.take_cb_buffer();
+                cbs.push(build_dma_cb_chunk(
                     resolved_chunk,
                     dma,
                     offset_bytes,
                     cur_size,
                     host_addr,
                     tags[0],
-                )?])
+                )?);
+                Ok(cbs)
             },
         );
         Ok(())
@@ -4879,8 +5072,11 @@ impl SchedulerBackend for PfBackend {
             !(hmva_base as u64).is_multiple_of(self.iommu_mapper.alignment() as u64);
         let max_buf_size = RuntimeConfig::data_transfer_buffer_size().value().max(1);
 
-        let pool = DmaBufPool::new(callback);
-        let mut bufs_created = 0u64;
+        // The transfer's completion group: `pending` starts at 1 — "a
+        // sentinel held by the submitter", dropped after the last chunk has
+        // been QUEUED, so a transfer whose chunks all complete before the
+        // loop finishes still fires its callback exactly once.
+        let group = Arc::new(GroupedSubmit::new(1, callback, state.clone(), pipeline));
         let mut remaining = total_size;
         let mut offset = 0u64;
         while remaining != 0 {
@@ -4896,15 +5092,14 @@ impl SchedulerBackend for PfBackend {
                     buf_unaligned,
                     pipeline,
                 },
-                &mut bufs_created,
-                &pool,
+                &group,
             ) {
                 // The real `submitDmaChunk` throws (IOMMU mapping failure,
                 // CB build failure), which unwinds out of `submitDma` and is
                 // caught by `RuntimeScheduler::schedule`. Stop queuing and
-                // report through the pool so the already-queued chunks still
+                // report through the group so the already-queued chunks still
                 // get to complete first.
-                pool.release(Some(e));
+                group.settle(Some(e));
                 return;
             }
             remaining -= cur_size;
@@ -4912,7 +5107,7 @@ impl SchedulerBackend for PfBackend {
         }
         // "Decrement pending count; if all chunks already completed, invoke
         // callback now."
-        pool.release(None);
+        group.settle(None);
     }
 
     /// Port of `PfRuntimeScheduler::submitCompute` (`pf_runtime_scheduler.cpp:231-259`):
@@ -4925,6 +5120,7 @@ impl SchedulerBackend for PfBackend {
         callback: CompletionCallback,
     ) {
         let resolver = self.addr_resolver.as_ref();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -4932,7 +5128,11 @@ impl SchedulerBackend for PfBackend {
             SubmitShape::ops(PipelineId::Compute),
             1,
             callback,
-            |tags| Ok(vec![build_compute_cb(resolver, op, tags[0])?]),
+            |tags| {
+                let mut cbs = worker.take_cb_buffer();
+                cbs.push(build_compute_cb(resolver, op, tags[0])?);
+                Ok(cbs)
+            },
         );
     }
 
@@ -4949,6 +5149,7 @@ impl SchedulerBackend for PfBackend {
         callback: CompletionCallback,
     ) {
         let resolver = self.addr_resolver.as_ref();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -4957,7 +5158,8 @@ impl SchedulerBackend for PfBackend {
             ops.len() as u64,
             callback,
             |tags| {
-                let mut cbs = Vec::with_capacity(ops.len());
+                let mut cbs = worker.take_cb_buffer();
+                cbs.reserve(ops.len());
                 for (i, (op, tag)) in ops.iter().zip(tags.iter()).enumerate() {
                     cbs.push(
                         build_compute_cb(resolver, op, *tag).map_err(|e| {
@@ -4982,6 +5184,7 @@ impl SchedulerBackend for PfBackend {
         batch: &ComputeWireBatch,
         callback: CompletionCallback,
     ) {
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -4990,7 +5193,13 @@ impl SchedulerBackend for PfBackend {
             batch.canvas.len() as u64,
             callback,
             |tags| {
-                let mut cbs = batch.canvas.as_ref().clone();
+                // The canvas is shared and immortal, so its bytes are copied
+                // once per submit into a RECYCLED buffer (zero-alloc; the copy
+                // itself is required — patching the shared canvas in place
+                // would race concurrent submits) and the leased tags are
+                // stamped onto the copy.
+                let mut cbs = worker.take_cb_buffer();
+                cbs.extend_from_slice(batch.canvas.as_ref());
                 (batch.patch)(tags, &mut cbs);
                 Ok(cbs)
             },
@@ -5011,6 +5220,7 @@ impl SchedulerBackend for PfBackend {
             FillPipeline::Dmao => PipelineId::AsyncDmaO,
         };
         let resolver = self.addr_resolver.as_ref();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5018,7 +5228,11 @@ impl SchedulerBackend for PfBackend {
             SubmitShape::ops(pipeline),
             1,
             callback,
-            |tags| Ok(vec![build_fill_cb(resolver, fill, tags[0])?]),
+            |tags| {
+                let mut cbs = worker.take_cb_buffer();
+                cbs.push(build_fill_cb(resolver, fill, tags[0])?);
+                Ok(cbs)
+            },
         );
     }
 
@@ -5107,6 +5321,7 @@ impl SchedulerBackend for PfBackend {
         let num_cbs = words_per_chunk.len() as u64;
         let segment = u32::from(resolved.segment);
         let region_paddr = resolved.xlat_base();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5115,7 +5330,8 @@ impl SchedulerBackend for PfBackend {
             num_cbs,
             callback,
             |tags| {
-                let mut cbs = Vec::with_capacity(tags.len());
+                let mut cbs = worker.take_cb_buffer();
+                cbs.reserve(tags.len());
                 for (i, tag) in tags.iter().enumerate() {
                     cbs.push(
                         ControlBlockWire::p2p_rdma_send(
@@ -5150,6 +5366,7 @@ impl SchedulerBackend for PfBackend {
         callback: CompletionCallback,
     ) {
         let sids: Vec<u64> = params.sid_list.iter().map(|&s| u64::from(s)).collect();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5163,7 +5380,9 @@ impl SchedulerBackend for PfBackend {
                         "PfRuntimeScheduler::submitP2PRdmaWait: the wait door refused — {e}"
                     ))
                 })?;
-                Ok(vec![ControlBlockWire::p2p_rdma_wait(tags[0], words)])
+                let mut cbs = worker.take_cb_buffer();
+                cbs.push(ControlBlockWire::p2p_rdma_wait(tags[0], words));
+                Ok(cbs)
             },
         );
     }
@@ -5284,6 +5503,7 @@ impl SchedulerBackend for VfBackend {
             }
         };
         let resolver = self.addr_resolver.as_ref();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5291,7 +5511,11 @@ impl SchedulerBackend for VfBackend {
             SubmitShape::dma(pipeline, dma.direction()),
             1,
             callback,
-            |tags| Ok(vec![build_dma_cb(resolver, dma, host_addr, tags[0])?]),
+            |tags| {
+                let mut cbs = worker.take_cb_buffer();
+                cbs.push(build_dma_cb(resolver, dma, host_addr, tags[0])?);
+                Ok(cbs)
+            },
         );
     }
     fn submit_compute(
@@ -5301,6 +5525,7 @@ impl SchedulerBackend for VfBackend {
         callback: CompletionCallback,
     ) {
         let resolver = self.addr_resolver.as_ref();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5308,7 +5533,11 @@ impl SchedulerBackend for VfBackend {
             SubmitShape::ops(PipelineId::Compute),
             1,
             callback,
-            |tags| Ok(vec![build_compute_cb(resolver, op, tags[0])?]),
+            |tags| {
+                let mut cbs = worker.take_cb_buffer();
+                cbs.push(build_compute_cb(resolver, op, tags[0])?);
+                Ok(cbs)
+            },
         );
     }
     /// The multi-CB form of [`Self::submit_compute`] — same shape as PF's
@@ -5321,6 +5550,7 @@ impl SchedulerBackend for VfBackend {
         callback: CompletionCallback,
     ) {
         let resolver = self.addr_resolver.as_ref();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5329,7 +5559,8 @@ impl SchedulerBackend for VfBackend {
             ops.len() as u64,
             callback,
             |tags| {
-                let mut cbs = Vec::with_capacity(ops.len());
+                let mut cbs = worker.take_cb_buffer();
+                cbs.reserve(ops.len());
                 for (i, (op, tag)) in ops.iter().zip(tags.iter()).enumerate() {
                     cbs.push(
                         build_compute_cb(resolver, op, *tag).map_err(|e| {
@@ -5350,6 +5581,7 @@ impl SchedulerBackend for VfBackend {
         batch: &ComputeWireBatch,
         callback: CompletionCallback,
     ) {
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5358,7 +5590,13 @@ impl SchedulerBackend for VfBackend {
             batch.canvas.len() as u64,
             callback,
             |tags| {
-                let mut cbs = batch.canvas.as_ref().clone();
+                // The canvas is shared and immortal, so its bytes are copied
+                // once per submit into a RECYCLED buffer (zero-alloc; the copy
+                // itself is required — patching the shared canvas in place
+                // would race concurrent submits) and the leased tags are
+                // stamped onto the copy.
+                let mut cbs = worker.take_cb_buffer();
+                cbs.extend_from_slice(batch.canvas.as_ref());
                 (batch.patch)(tags, &mut cbs);
                 Ok(cbs)
             },
@@ -5376,6 +5614,7 @@ impl SchedulerBackend for VfBackend {
             FillPipeline::Dmao => PipelineId::AsyncDmaO,
         };
         let resolver = self.addr_resolver.as_ref();
+        let worker = self.response_worker().clone();
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5383,7 +5622,11 @@ impl SchedulerBackend for VfBackend {
             SubmitShape::ops(pipeline),
             1,
             callback,
-            |tags| Ok(vec![build_fill_cb(resolver, fill, tags[0])?]),
+            |tags| {
+                let mut cbs = worker.take_cb_buffer();
+                cbs.push(build_fill_cb(resolver, fill, tags[0])?);
+                Ok(cbs)
+            },
         );
     }
     /// Real `VfRuntimeScheduler::submitP2PRdmaSend` (`vf_runtime_scheduler.cpp:317-321`)
