@@ -1652,3 +1652,119 @@ fn the_bf16_gemv_residual_epilogue_is_the_gemv_then_the_add_bit_for_bit() {
         "a bf16 GEMV's residual epilogue differs from the GEMV then the add"
     );
 }
+
+/// The normed narrow GEMMs are the one-row norm then today's narrow GEMM, bit for bit: the 35B's
+/// GDN a/b group (2,048 → 32 + 32, the WGMMA kernel, A's row 0 rewritten in shared memory) and its
+/// one-column shared-expert gate (2,048 → 1, the warp kernel), gain offset 0 and 1, on random,
+/// all-zero and ±65,504 rows. `mismatched_bits=0`.
+#[test]
+fn the_normed_narrow_gemms_are_the_norm_then_the_gemm_bit_for_bit() {
+    use scratchy_target_cuda::kernels::{
+        gemm_narrow_bf16_ends, gemm_narrow_group_bf16_abt, gemm_narrow_group_bf16_ends,
+    };
+    let device = h100();
+    let mut pass = true;
+    let k = 2048u32;
+    let ku = k as usize;
+    for offset in [0.0f32, 1.0] {
+        let gb = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x4F00)).expect("gain");
+        let ends = Ends {
+            gain: gb.ptr().cast_const(),
+            eps: W4_EPS,
+            gain_offset: offset,
+            residual: std::ptr::null(),
+        };
+        let ns = [32u32, 32];
+        let ws: Vec<DeviceBuffer> = (ns.iter().enumerate())
+            .map(|(i, &n)| {
+                DeviceBuffer::upload(&device, &bf16_inputs(n as usize * ku, 0x4F01 ^ i as u64))
+                    .expect("w")
+            })
+            .collect();
+        let gate = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x4F02)).expect("gate");
+        for (row, x) in w4_rows(ku, 0x4F10) {
+            let xb = DeviceBuffer::upload(&device, &x).expect("x");
+            let y = w4_norm(&device, &xb, &gb, k, offset);
+            // The a/b group on the WGMMA kernel.
+            let group = |a: &DeviceBuffer, e: Option<Ends>| {
+                let outs: Vec<DeviceBuffer> = (ns.iter())
+                    .map(|&n| {
+                        DeviceBuffer::upload(&device, &vec![SENTINEL; n as usize]).expect("c")
+                    })
+                    .collect();
+                let members: Vec<(*const std::ffi::c_void, *mut std::ffi::c_void, u32)> =
+                    (ws.iter().zip(&outs).zip(&ns))
+                        .map(|((w, c), &n)| (w.ptr().cast_const(), c.ptr(), n))
+                        .collect();
+                // SAFETY: each member's weight and output are their own allocations; `a` k bf16.
+                unsafe {
+                    match e {
+                        Some(e) => gemm_narrow_group_bf16_ends(
+                            a.ptr().cast_const(),
+                            &members,
+                            (1, k),
+                            e,
+                            std::ptr::null_mut(),
+                        ),
+                        None => gemm_narrow_group_bf16_abt(
+                            a.ptr().cast_const(),
+                            &members,
+                            (1, k),
+                            std::ptr::null_mut(),
+                        ),
+                    }
+                }
+                .expect("narrow group");
+                outs.iter()
+                    .map(|c| c.download().expect("c"))
+                    .collect::<Vec<_>>()
+            };
+            let (f, c) = (group(&xb, Some(ends)), group(&y, None));
+            let bad: usize = f.iter().zip(&c).map(|(a, b)| mismatched_bits(a, b)).sum();
+            eprintln!(
+                "W4 normed gemm_narrow_group 35B GDN a/b n={ns:?} offset={offset} row={row}: \
+                 mismatched_bits={bad} {}",
+                if bad == 0 { "PASS" } else { "FAIL" }
+            );
+            pass &= bad == 0;
+            // The one-column gate on the warp kernel.
+            let one = |a: &DeviceBuffer, e: Option<Ends>| {
+                w4_out(&device, 1, |c| {
+                    // SAFETY: `a` k bf16, `gate` k bf16, `c` 1 + TAIL bf16.
+                    unsafe {
+                        match e {
+                            Some(e) => gemm_narrow_bf16_ends(
+                                a.ptr().cast_const(),
+                                gate.ptr().cast_const(),
+                                c,
+                                (1, 1, k),
+                                e,
+                                std::ptr::null_mut(),
+                            ),
+                            None => gemm_narrow_bf16_abt(
+                                a.ptr().cast_const(),
+                                gate.ptr().cast_const(),
+                                c,
+                                (1, 1, k),
+                                std::ptr::null_mut(),
+                            ),
+                        }
+                    }
+                })
+            };
+            let (f, c) = (one(&xb, Some(ends)), one(&y, None));
+            let bad = mismatched_bits(&f.0, &c.0);
+            eprintln!(
+                "W4 normed gemm_narrow n=1 35B shared gate offset={offset} row={row}: \
+                 mismatched_bits={bad} tail={} {}",
+                f.1,
+                if bad == 0 && f.1 { "PASS" } else { "FAIL" }
+            );
+            pass &= bad == 0 && f.1;
+        }
+    }
+    assert!(
+        pass,
+        "a normed narrow GEMM differs from the norm then the GEMM"
+    );
+}

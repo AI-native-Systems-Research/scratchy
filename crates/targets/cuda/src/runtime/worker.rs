@@ -635,12 +635,15 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
     }
     // shortcut: a fused norm or residual add (FP8 S8 W4a) on a kernel that does not compute it yet
     // is refused, so no launch ever drops one; upgrade by giving that kernel its ends. The fp8 and
-    // bf16 GEMVs (dense, group, gate/up, expert, the one-row router) compute both.
+    // bf16 GEMVs (dense, group, gate/up, expert, the one-row router) compute both, the narrow
+    // GEMMs their norm (a narrow residual is refused by its launcher).
     let computes_ends = match *s {
         CudaStep::GemvFp8(_)
         | CudaStep::GemvGroupFp8(_)
         | CudaStep::Gemv(_)
         | CudaStep::GemvGroup(_)
+        | CudaStep::GemmNarrow(_)
+        | CudaStep::GemmNarrowGroup(_)
         | CudaStep::ExpertGemv(_)
         | CudaStep::ExpertGateUpAct(_) => true,
         CudaStep::GateUpAct(g) => matches!(g.kernel, GateUpKernel::GemvFp8 | GateUpKernel::Gemv),
@@ -1631,12 +1634,26 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
                 }
                 CudaStep::GemmNarrow(GemmBf16 {
-                    a, b, c, m, n, k, ..
+                    a,
+                    b,
+                    c,
+                    m,
+                    n,
+                    k,
+                    ends,
                 }) => {
                     let b = weights[b.0 as usize].ptr();
-                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
+                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`), and the
+                    // norm's gain (`k`, `validate`).
                     unsafe {
-                        kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                        kernels::gemm_narrow_bf16_ends(
+                            slot(a),
+                            b,
+                            slot(c),
+                            (m, n, k),
+                            Self::ends(weights, slot, ends),
+                            stream.0,
+                        )
                     }
                 }
                 CudaStep::Gemv(GemmBf16 {
@@ -1692,12 +1709,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         .flatten()
                         .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
                         .collect();
-                    // SAFETY: as the `GemmGroup` arm's.
+                    // SAFETY: as the `GemmGroup` arm's, and the norm's gain (`k`, `validate`).
                     unsafe {
-                        kernels::gemm_narrow_group_bf16_abt(
+                        kernels::gemm_narrow_group_bf16_ends(
                             slot(g.a),
                             &members,
                             (g.m, g.k),
+                            Self::ends(weights, slot, g.ends),
                             stream.0,
                         )
                     }

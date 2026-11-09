@@ -48,6 +48,7 @@
 // semaphores are static shared memory.
 
 #include "kittens.cuh"
+#include "scratchy_ops.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -82,6 +83,14 @@ using plain_tile = st_bf<TILE, TILE, false>;
 using operand_gl = gl<bf16, 1, 1, -1, -1, tile, plain_tile>;
 // C `[m, n]`: the plain tensor map only.
 using output_gl = gl<bf16, 1, 1, -1, -1, plain_tile>;
+// FP8 S8 W4a, the one-row prologue norm: A's row as 256-element chunks (their vector tensor map),
+// the norm's gain `[1, k]` (no map), and the shared row (a normed `k` at most `NORM_CHUNKS`
+// chunks; the norm's tile views of chunk `t` read the 15 after it, `scratchy_ops.cuh`).
+using chunk_sv = sv_bf<256>;
+using row_gl = gl<bf16, 1, 1, -1, -1, chunk_sv>;
+using gain_gl = gl<bf16, 1, 1, -1, -1>;
+constexpr int NORM_CHUNKS = 24;
+constexpr int ROW_CHUNKS = NORM_CHUNKS + 15;
 
 struct narrow_globals {
     operand_gl a;
@@ -91,14 +100,26 @@ struct narrow_globals {
     int m;
     int k_tiles;
     bool tail;
+    // FP8 S8 W4a: at `m == 1`, the prologue norm when `norm` (A's row `arow` normalised in shared
+    // memory, `rms_norm_one_row_ker`'s bits, then written over row 0 of each A tile before its
+    // WGMMA), its `gain`, `eps`, `offset` and `cols` (`k`), and the row's `chunks`.
+    row_gl arow;
+    gain_gl gain;
+    float eps;
+    float offset;
+    float cols;
+    int chunks;
+    int norm;
 };
 
 constexpr size_t SMEM_TILES = STAGES * (CONSUMER_WARPGROUPS + 1) * sizeof(tile) +
                               (CONSUMER_WARPGROUPS + 1) * sizeof(plain_tile) +
                               CONSUMER_WARPGROUPS * sizeof(plain_tile);
 static_assert(SMEM_TILES == 139264, "4 stages of two A and one B, three tail tiles, two C tiles");
+// The prologue norm's row (FP8 S8 W4a), after the tiles, so their offsets are unchanged.
+constexpr size_t SMEM_ROW = size_t(ROW_CHUNKS) * sizeof(chunk_sv);
 // The tiles plus the slack `tma_swizzle_allocator` may spend aligning the first to 1024 bytes.
-constexpr int NARROW_SMEM_BYTES = int(SMEM_TILES) + 1024;
+constexpr int NARROW_SMEM_BYTES = int(SMEM_TILES + SMEM_ROW) + 1024;
 static_assert(NARROW_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
 // A narrow CTA's shared tiles: the A and B ring, the tails and the C tiles, in the order the
@@ -109,6 +130,9 @@ struct narrow_smem {
     plain_tile (&a_tail)[CONSUMER_WARPGROUPS];
     plain_tile& b_tail;
     plain_tile (&c_smem)[CONSUMER_WARPGROUPS];
+    // The prologue norm's row and the four warp parts (FP8 S8 W4a).
+    chunk_sv (&row)[ROW_CHUNKS];
+    scratchy::ops::norm_parts (&parts)[4];
 };
 
 // One CTA of one narrow GEMM over `g`'s views and `sm`'s tiles: output rows `128 · row_cta ..`.
@@ -128,15 +152,34 @@ __device__ inline void narrow_cta(const narrow_globals& g, const narrow_smem& sm
     const int live = min(CONSUMER_WARPGROUPS, (g.m - row_tile0 * TILE + TILE - 1) / TILE);
     const int warpgroupid = threadIdx.x / kittens::WARPGROUP_THREADS;
 
-    __shared__ kittens::semaphore arrived[STAGES], done[STAGES], tail_arrived;
+    __shared__ kittens::semaphore arrived[STAGES], done[STAGES], tail_arrived, row_arrived;
     if (threadIdx.x == 0) {
         for (int s = 0; s < STAGES; s++) {
             init_semaphore(arrived[s], 0, 1);
             init_semaphore(done[s], live, 0);
         }
         init_semaphore(tail_arrived, 0, 1);
+        init_semaphore(row_arrived, 0, 1);
     }
     __syncthreads();
+    // FP8 S8 W4a: the prologue norm, every thread of the CTA (`m == 1`: the one CTA). Warp 0
+    // TMA-loads A's row as chunks; the CTA normalises it in place (`scratchy_ops.cuh`'s
+    // `row_norm_inv` and `row_norm_apply`, `rms_norm_one_row_ker`'s bits). A uniform branch.
+    if (g.norm) {
+        const int w = kittens::warpid();
+        if (w == 0) {
+            warp::tma::expect_bytes(row_arrived, uint32_t(g.chunks * sizeof(chunk_sv)));
+            for (int c = 0; c < g.chunks; c++) {
+                warp::tma::load_async(sm.row[c], g.arow, {0, 0, 0, c}, row_arrived);
+            }
+        }
+        wait(row_arrived, 0);
+        const float inv = scratchy::ops::row_norm_inv(sm.row, sm.parts, g.chunks, g.cols, g.eps, w,
+                                                      [] { __syncthreads(); });
+        scratchy::ops::row_norm_apply(sm.row, g.gain, g.chunks, inv, g.offset, w,
+                                      NUM_THREADS / kittens::WARP_THREADS);
+        __syncthreads();
+    }
 
     if (warpgroupid == PRODUCER_WARPGROUP) {
         // The producer: one warp loads the tails first (their tiles are their own), then K tile
@@ -173,6 +216,19 @@ __device__ inline void narrow_cta(const narrow_globals& g, const narrow_smem& sm
         for (int j = 0; j < g.k_tiles; j++) {
             const int stage = j % STAGES;
             wait(arrived[stage], (j / STAGES) % 2);
+            if (g.norm) {
+                // FP8 S8 W4a: row 0 of the A tile (the one row) is the normed row's K tile `j`,
+                // written through the tile's swizzled accessor; then the generic-proxy writes are
+                // made visible to the tensor cores (`warpgroup::mma_fence`, TK's `wgmma.fence` and
+                // `fence.proxy.async`) and the warpgroup meets, as S5's widened K tiles.
+                const int t = warpgroup::laneid();
+                if (t < TILE) {
+                    const int e = j * TILE + t;
+                    a_smem[stage][warpgroupid][{0, t}] = sm.row[e / 256][e % 256];
+                }
+                warpgroup::mma_fence();
+                warpgroup::sync(warpgroupid + 1);
+            }
             warpgroup::mma_ABt(acc, a_smem[stage][warpgroupid], b_smem[stage]);
             // The WGMMA reads shared memory and writes `acc` asynchronously: wait for it before
             // releasing the stage, and before anything else reads `acc`.
@@ -212,7 +268,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_bf16_ker(
     st_bf<TILE, TILE, false>& b_tail = al.allocate<plain_tile>();
     st_bf<TILE, TILE, false>(&c_smem)[CONSUMER_WARPGROUPS] =
         al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
-    narrow_cta(g, narrow_smem{a_smem, b_smem, a_tail, b_tail, c_smem}, blockIdx.x);
+    chunk_sv(&row_s)[ROW_CHUNKS] = al.allocate<chunk_sv, ROW_CHUNKS>();
+    __shared__ sv_fl<16> parts[4];
+    narrow_cta(g, narrow_smem{a_smem, b_smem, a_tail, b_tail, c_smem, row_s, parts}, blockIdx.x);
 }
 
 // The grouped narrow GEMM (#1049): up to three narrow GEMMs of one `A`, one launch. Member `i` is
@@ -236,8 +294,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_group_bf16_ker(
     st_bf<TILE, TILE, false>& b_tail = al.allocate<plain_tile>();
     st_bf<TILE, TILE, false>(&c_smem)[CONSUMER_WARPGROUPS] =
         al.allocate<plain_tile, CONSUMER_WARPGROUPS>();
+    chunk_sv(&row_s)[ROW_CHUNKS] = al.allocate<chunk_sv, ROW_CHUNKS>();
+    __shared__ sv_fl<16> parts[4];
     const narrow_globals& m = blockIdx.y == 2 ? g.m2 : blockIdx.y == 1 ? g.m1 : g.m0;
-    narrow_cta(m, narrow_smem{a_smem, b_smem, a_tail, b_tail, c_smem}, blockIdx.x);
+    narrow_cta(m, narrow_smem{a_smem, b_smem, a_tail, b_tail, c_smem, row_s, parts}, blockIdx.x);
 }
 
 // M7 (#857): the one-column projection, `c[r] = a[r, :] · b[0, :]` (a shared expert's gate,
@@ -265,10 +325,34 @@ struct one_globals {
     one_out_gl c;
     int m;
     int chunks;
+    // FP8 S8 W4a: at `m == 1`, the prologue norm when `norm` (the narrow GEMM's, above).
+    gain_gl gain;
+    float eps;
+    float offset;
+    float cols;
+    int norm;
 };
 
 __global__ __launch_bounds__(ONE_THREADS) void gemm_narrow_bf16_n1_ker(
     const __grid_constant__ one_globals g) {
+    __shared__ sv_bf<ONE_CHUNK> row_s[ROW_CHUNKS];
+    __shared__ sv_fl<16> parts[4];
+    // FP8 S8 W4a: the prologue norm, every warp of the one CTA (`m == 1`), before any warp leaves
+    // (W1's FFMA lesson: no early return before a value another warp reads). The row is loaded
+    // into shared memory (`warp::load`, `warp::store`: exact), normalised in place.
+    if (g.norm) {
+        const int wid = kittens::warpid();
+        for (int ch = wid; ch < g.chunks; ch += ONE_WARPS) {
+            one_vec v;
+            warp::load(v, g.a, {0, 0, 0, ch});
+            warp::store(row_s[ch], v);
+        }
+        __syncthreads();
+        const float inv = scratchy::ops::row_norm_inv(row_s, parts, g.chunks, g.cols, g.eps, wid,
+                                                      [] { __syncthreads(); });
+        scratchy::ops::row_norm_apply(row_s, g.gain, g.chunks, inv, g.offset, wid, ONE_WARPS);
+        __syncthreads();
+    }
     const int row = blockIdx.x * ONE_WARPS + kittens::warpid();
     if (row >= g.m) {
         return;
@@ -276,7 +360,11 @@ __global__ __launch_bounds__(ONE_THREADS) void gemm_narrow_bf16_n1_ker(
     one_vec acc, x, w;
     warp::zero(acc);
     for (int ch = 0; ch < g.chunks; ++ch) {
-        warp::load(x, g.a, {0, 0, row, ch});
+        if (g.norm) {
+            warp::load(x, row_s[ch]);
+        } else {
+            warp::load(x, g.a, {0, 0, row, ch});
+        }
         warp::load(w, g.b, {0, 0, 0, ch});
         warp::mul(x, x, w);
         warp::add(acc, acc, x);
@@ -285,6 +373,25 @@ __global__ __launch_bounds__(ONE_THREADS) void gemm_narrow_bf16_n1_ker(
     if (warp::laneid() == 0) {
         g.c[{0, 0, row, 0}] = base_types::convertor<bf16, float>::convert(dot);
     }
+}
+
+}  // namespace
+
+namespace {
+
+// The prologue norm a launcher was given (FP8 S8 W4a): `gain` (null: none), `eps`, `offset`.
+struct norm_end {
+    const void* gain = nullptr;
+    float eps = 0.0f;
+    float offset = 0.0f;
+};
+constexpr norm_end NO_NORM{nullptr, 0.0f, 0.0f};
+
+// The norm's rule: one row (`m == 1`), `k` a multiple of 256 of at most `NORM_CHUNKS` chunks,
+// `eps` finite and positive.
+bool norm_shape(const norm_end& e, uint32_t m, uint32_t k) {
+    return e.gain == nullptr || (m == 1 && k % 256 == 0 && k / 256 <= uint32_t(NORM_CHUNKS) &&
+                                 e.eps > 0.0f && e.eps <= 3.0e38f);
 }
 
 }  // namespace
@@ -327,53 +434,6 @@ extern "C" int scratchy_cuda_gemm_narrow_group_bf16_abt_prepare(void) {
 // input. `n` = 1 runs the warp-vector kernel above, with no shared memory; any other `n` the tile
 // GEMM, for which `scratchy_cuda_gemm_narrow_bf16_abt_prepare` must have succeeded on the current
 // device. The launch is asynchronous on `stream`.
-extern "C" int scratchy_cuda_gemm_narrow_bf16_abt(const void* a, const void* b, void* c,
-                                                  uint32_t m, uint32_t n, uint32_t k,
-                                                  void* stream /* cudaStream_t; null = default */) {
-    if (m == 0 || m > uint32_t(INT_MAX) || n == 0 || (n != 1 && n % VEC != 0) || n > MAX_N ||
-        k == 0 || k % VEC != 0 || k > uint32_t(INT_MAX) || (n == 1 && k % ONE_CHUNK != 0)) {
-        return SCRATCHY_CUDA_ERR_SHAPE;
-    }
-    if (n == 1) {
-        // ThunderKittens' host code can throw; an exception must never unwind into Rust.
-        try {
-            // No view carries a TMA type, so building them encodes nothing.
-            one_in_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m),
-                         size_t(k)};
-            one_in_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, nullptr, size_t(1),
-                         size_t(k)};
-            one_out_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(m), nullptr};
-            one_globals G{ag, bg, cg, int(m), int(k / uint32_t(ONE_CHUNK))};
-            void* args[] = {&G};
-            const dim3 grid((m + uint32_t(ONE_WARPS) - 1) / uint32_t(ONE_WARPS)),
-                block(ONE_THREADS);
-            return static_cast<int>(cudaLaunchKernel(gemm_narrow_bf16_n1_ker, grid, block, args,
-                                                     0, static_cast<cudaStream_t>(stream)));
-        } catch (...) {
-            return SCRATCHY_CUDA_ERR_HOST;
-        }
-    }
-    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
-    try {
-        bf16* ap = static_cast<bf16*>(const_cast<void*>(a));
-        bf16* bp = static_cast<bf16*>(const_cast<void*>(b));
-        bf16* cp = static_cast<bf16*>(c);
-        // Building each `gl` encodes its TMA tensor maps into host memory; nothing is allocated
-        // on the device. Row strides are `2k` and `2n` bytes, multiples of 16.
-        operand_gl ag{ap, nullptr, nullptr, size_t(m), size_t(k)};
-        operand_gl bg{bp, nullptr, nullptr, size_t(n), size_t(k)};
-        output_gl cg{cp, nullptr, nullptr, size_t(m), size_t(n)};
-        narrow_globals G{ag, bg, cg, int(m), int(k / uint32_t(TILE)), k % uint32_t(TILE) != 0};
-        void* args[] = {&G};
-        const dim3 grid((m + uint32_t(CTA_ROWS) - 1) / uint32_t(CTA_ROWS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(gemm_narrow_bf16_ker, grid, block, args,
-                                                 NARROW_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
-    } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
-    }
-}
-
 namespace {
 
 // The tile GEMM's rule, for one narrow member: `n` a non-zero multiple of 8 at most 64 (not the
@@ -386,25 +446,93 @@ bool narrow_tile_shape(uint32_t m, uint32_t n, uint32_t k) {
 // Member `i`'s views and counts, as `scratchy_cuda_gemm_narrow_bf16_abt` builds them. It can
 // throw (TK's host code).
 narrow_globals narrow_member(const void* a, const void* b, void* c, uint32_t m, uint32_t n,
-                             uint32_t k) {
+                             uint32_t k, const norm_end& e) {
     operand_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m), size_t(k)};
     operand_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, nullptr, size_t(n), size_t(k)};
     output_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(m), size_t(n)};
-    return narrow_globals{ag, bg, cg, int(m), int(k / uint32_t(TILE)), k % uint32_t(TILE) != 0};
+    // The row's vector map: A itself (`m` rows), read only when normed.
+    row_gl rg{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m), size_t(k)};
+    gain_gl gg{static_cast<bf16*>(const_cast<void*>(e.gain)), nullptr, nullptr, size_t(1),
+               size_t(k)};
+    return narrow_globals{ag,
+                          bg,
+                          cg,
+                          int(m),
+                          int(k / uint32_t(TILE)),
+                          k % uint32_t(TILE) != 0,
+                          rg,
+                          gg,
+                          e.eps,
+                          e.offset,
+                          float(k),
+                          int((k + 255) / 256),
+                          e.gain != nullptr ? 1 : 0};
+}
+
+
+int narrow(const void* a, const void* b, void* c, uint32_t m, uint32_t n, uint32_t k,
+           const norm_end& e, void* stream) {
+    if (m == 0 || m > uint32_t(INT_MAX) || n == 0 || (n != 1 && n % VEC != 0) || n > MAX_N ||
+        k == 0 || k % VEC != 0 || k > uint32_t(INT_MAX) || (n == 1 && k % ONE_CHUNK != 0) ||
+        !norm_shape(e, m, k)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    if (n == 1) {
+        // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+        try {
+            // No view carries a TMA type, so building them encodes nothing.
+            one_in_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m),
+                         size_t(k)};
+            one_in_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, nullptr, size_t(1),
+                         size_t(k)};
+            one_out_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(m), nullptr};
+            gain_gl gg{static_cast<bf16*>(const_cast<void*>(e.gain)), nullptr, nullptr, size_t(1),
+                       size_t(k)};
+            one_globals G{ag,    bg,       cg,       int(m), int(k / uint32_t(ONE_CHUNK)),
+                          gg,    e.eps,    e.offset, float(k), e.gain != nullptr ? 1 : 0};
+            void* args[] = {&G};
+            const dim3 grid((m + uint32_t(ONE_WARPS) - 1) / uint32_t(ONE_WARPS)),
+                block(ONE_THREADS);
+            return static_cast<int>(cudaLaunchKernel(gemm_narrow_bf16_n1_ker, grid, block, args,
+                                                     0, static_cast<cudaStream_t>(stream)));
+        } catch (...) {
+            return SCRATCHY_CUDA_ERR_HOST;
+        }
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        // Building each `gl` encodes its TMA tensor maps into host memory; nothing is allocated
+        // on the device. Row strides are `2k` and `2n` bytes, multiples of 16.
+        narrow_globals G = narrow_member(a, b, c, m, n, k, e);
+        void* args[] = {&G};
+        const dim3 grid((m + uint32_t(CTA_ROWS) - 1) / uint32_t(CTA_ROWS)), block(NUM_THREADS);
+        return static_cast<int>(cudaLaunchKernel(gemm_narrow_bf16_ker, grid, block, args,
+                                                 NARROW_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }
 
 }  // namespace
+
+extern "C" int scratchy_cuda_gemm_narrow_bf16_abt(const void* a, const void* b, void* c,
+                                                  uint32_t m, uint32_t n, uint32_t k,
+                                                  void* stream /* cudaStream_t; null = default */) {
+    return narrow(a, b, c, m, n, k, NO_NORM, stream);
+}
+
 
 // As `scratchy_cuda_gemm_narrow_bf16_abt` for `count` (2 or 3) members of one `a [m, k]` (#1049):
 // member `i` is `c[i] [m, n[i]] = a · b[i]ᵀ`, each `n[i]` a non-zero multiple of 8 at most 64 (the
 // tile GEMM's; `n = 1` is refused), checked before any pointer is touched. Each member's output
 // is the bits of its own `scratchy_cuda_gemm_narrow_bf16_abt`.
 // `scratchy_cuda_gemm_narrow_group_bf16_abt_prepare` must have succeeded on the current device.
-extern "C" int scratchy_cuda_gemm_narrow_group_bf16_abt(const void* a, const void* const* b,
-                                                        void* const* c, const uint32_t* n,
-                                                        uint32_t m, uint32_t k, uint32_t count,
-                                                        void* stream /* cudaStream_t */) {
-    if (count < 2 || count > 3) {
+namespace {
+
+int narrow_group(const void* a, const void* const* b, void* const* c, const uint32_t* n, uint32_t m,
+                 uint32_t k, uint32_t count, const norm_end& e, void* stream) {
+    if (count < 2 || count > 3 || !norm_shape(e, m, k)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     for (uint32_t i = 0; i < count; i++) {
@@ -415,9 +543,9 @@ extern "C" int scratchy_cuda_gemm_narrow_group_bf16_abt(const void* a, const voi
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
         const uint32_t last = count - 1;
-        narrow_group_globals G{narrow_member(a, b[0], c[0], m, n[0], k),
-                               narrow_member(a, b[1], c[1], m, n[1], k),
-                               narrow_member(a, b[last], c[last], m, n[last], k)};
+        narrow_group_globals G{narrow_member(a, b[0], c[0], m, n[0], k, e),
+                               narrow_member(a, b[1], c[1], m, n[1], k, e),
+                               narrow_member(a, b[last], c[last], m, n[last], k, e)};
         void* args[] = {&G};
         const dim3 grid((m + uint32_t(CTA_ROWS) - 1) / uint32_t(CTA_ROWS), count),
             block(NUM_THREADS);
@@ -427,4 +555,36 @@ extern "C" int scratchy_cuda_gemm_narrow_group_bf16_abt(const void* a, const voi
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
+}
+
+}  // namespace
+
+extern "C" int scratchy_cuda_gemm_narrow_group_bf16_abt(const void* a, const void* const* b,
+                                                        void* const* c, const uint32_t* n,
+                                                        uint32_t m, uint32_t k, uint32_t count,
+                                                        void* stream /* cudaStream_t */) {
+    return narrow_group(a, b, c, n, m, k, count, NO_NORM, stream);
+}
+
+// FP8 S8 W4a: the narrow GEMMs with the one-row prologue norm: `gain` (null: none) the absorbed
+// RMSNorm's `[k]` bf16 weight, `eps` and `gain_offset` its scalars. The row is normalised in
+// shared memory (the bits of `scratchy_cuda_rms_norm_bf16` at one row) and is what each A tile's
+// row 0 holds when its WGMMA (or the `n = 1` warp kernel's dot) reads it, so each output is the
+// launcher above's bits on the norm's output. Only `m == 1`, `k` a multiple of 256 of at most
+// 6,144 (the norm's shared row) and `eps` finite and positive, checked before any pointer is
+// touched; the plain launchers' rules otherwise.
+extern "C" int scratchy_cuda_gemm_narrow_bf16_ends(const void* a, const void* b, void* c,
+                                                   uint32_t m, uint32_t n, uint32_t k,
+                                                   const void* gain, float eps, float gain_offset,
+                                                   void* stream /* cudaStream_t; null = default */) {
+    return narrow(a, b, c, m, n, k, norm_end{gain, eps, gain_offset}, stream);
+}
+
+extern "C" int scratchy_cuda_gemm_narrow_group_bf16_ends(const void* a, const void* const* b,
+                                                         void* const* c, const uint32_t* n,
+                                                         uint32_t m, uint32_t k, uint32_t count,
+                                                         const void* gain, float eps,
+                                                         float gain_offset,
+                                                         void* stream /* cudaStream_t */) {
+    return narrow_group(a, b, c, n, m, k, count, norm_end{gain, eps, gain_offset}, stream);
 }

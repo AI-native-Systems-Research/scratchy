@@ -111,6 +111,32 @@ unsafe extern "C" {
         n_tile: u32,
         stream: *mut c_void,
     ) -> i32;
+    // FP8 S8 W4a: the narrow GEMMs with the one-row prologue norm (`kernels/gemm_narrow_bf16.cu`).
+    fn scratchy_cuda_gemm_narrow_bf16_ends(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        gain: *const c_void,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemm_narrow_group_bf16_ends(
+        a: *const c_void,
+        b: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        m: u32,
+        k: u32,
+        count: u32,
+        gain: *const c_void,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     // FP8 S8 W4a: the bf16 GEMVs with the one-row GEMV's fused ends (`kernels/gemv_bf16.cu`).
     fn scratchy_cuda_gemv_bf16_ends(
         a: *const c_void,
@@ -4530,6 +4556,81 @@ pub unsafe fn expert_gate_up_gemv_bf16_ends(
             expert_rows,
             splits,
             act,
+            ends.gain,
+            ends.eps,
+            ends.gain_offset,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`gemm_narrow_bf16_abt`] with the one-row prologue norm of `ends` (FP8 S8 W4a; its residual
+/// must be null): the bits of [`rms_norm_bf16`] at one row then [`gemm_narrow_bf16_abt`] on its
+/// output. A normed GEMM has `m == 1` and `k` a multiple of 256 of at most 6,144; refused with
+/// [`KernelError::NarrowShape`] before any pointer is touched.
+///
+/// # Safety
+///
+/// As [`gemm_narrow_bf16_abt`]'s and [`gemv_fp8_ends`]' for the gain.
+pub unsafe fn gemm_narrow_bf16_ends(
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    ends: Ends,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let refused = KernelError::NarrowShape { m, n, k };
+    if !ends.residual.is_null() {
+        return Err(refused);
+    }
+    // SAFETY: the caller upholds the contract above; the launcher checks every rule first.
+    let code = unsafe {
+        scratchy_cuda_gemm_narrow_bf16_ends(
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            ends.gain,
+            ends.eps,
+            ends.gain_offset,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`gemm_narrow_group_bf16_abt`] with the shared input's one-row prologue norm (its residual must
+/// be null), as [`gemm_narrow_bf16_ends`].
+///
+/// # Safety
+///
+/// As [`gemm_narrow_group_bf16_abt`]'s and [`gemv_fp8_ends`]' for the gain.
+pub unsafe fn gemm_narrow_group_bf16_ends(
+    a: *const c_void,
+    members: GroupOperands<'_>,
+    (m, k): (u32, u32),
+    ends: Ends,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (b, c, n, refused) = group_parts("gemm_narrow_group_bf16_ends", members, (m, k));
+    if !ends.residual.is_null() {
+        return Err(refused);
+    }
+    let count = members.len() as u32;
+    // SAFETY: as [`gemm_narrow_group_bf16_abt`]'s.
+    let code = unsafe {
+        scratchy_cuda_gemm_narrow_group_bf16_ends(
+            a,
+            b.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            m,
+            k,
+            count,
             ends.gain,
             ends.eps,
             ends.gain_offset,
