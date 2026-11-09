@@ -720,7 +720,12 @@ pub fn synth_footprint_bytes(dims: &[u32], df: Df) -> u64 {
     let inner_stick = inner.div_ceil(stick_elems) * stick_elems;
     // The product of the outer dims (1 for a rank-1 tensor). A zero outer dim is a zero-byte
     // tensor, which the allocator's door refuses — never rounded up to one row.
-    let outer: u64 = dims.iter().rev().skip(1).map(|&d| d as u64).product::<u64>();
+    let outer: u64 = dims
+        .iter()
+        .rev()
+        .skip(1)
+        .map(|&d| d as u64)
+        .product::<u64>();
     outer * inner_stick as u64 * word_length as u64
 }
 
