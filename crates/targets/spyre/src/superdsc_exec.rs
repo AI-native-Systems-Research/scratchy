@@ -32,8 +32,8 @@ use crate::fold_plan::{
     self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
 };
 use crate::runtime::{
-    BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, PeerLink, Stream, SubmittedIds,
+    BatchedCb, ByteOffset, ByteSize, CanvasLabels, CardRuntime, ComputeWireBatch, ControlBlockWire,
+    DevAddr, HwError, LabelledCanvas, PeerLink, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -194,10 +194,10 @@ struct RowReplay {
 struct StepImageData {
     canvas: std::sync::Arc<Vec<ControlBlockWire>>,
     rows: Vec<RowReplay>,
-    /// One label per CB of `canvas` (each row render's own, `cb_plan::Rendered::labels`, concatenated): what a
-    /// replayed step's response blocks are attributed to, since a replay records no launch
-    /// sequence of its own (each CB is filed by its id in the session's [`RbHarvest`]).
-    labels: Vec<String>,
+    /// The labels split from the same [`LabelledCanvas`] as `canvas` — one per CB, each row
+    /// render's own: what a replayed step's response blocks are attributed to, since a replay
+    /// records no launch sequence of its own. Handed back only beside a submit of `canvas`.
+    labels: CanvasLabels<String>,
 }
 
 /// One cached step image — the whole forward (prefix + every body row +
@@ -639,6 +639,7 @@ impl std::fmt::Display for RbKey {
 
 /// What one submitted CB was, for `SCRATCHY_SDSC_RB_TIME`: the op it accumulates under and its
 /// label.
+#[derive(Clone)]
 struct RbLabel {
     key: RbKey,
     label: String,
@@ -647,8 +648,9 @@ struct RbLabel {
 /// ⭐ ONE CARD'S `SCRATCHY_SDSC_RB_TIME` HARVEST — owned by that card's session, as the telemetry
 /// ring it drains is that card's (`rb_telemetry::drain_source` of the card's key).
 ///
-/// ⭐⭐ A CB'S LABEL AND ITS TIMING ARE JOINED BY THE CB'S OWN ID. The submit hands back the ids it
-/// gave the submission's CBs ([`SubmittedIds`]); each is filed here with its label, and each
+/// ⭐⭐ A CB'S LABEL AND ITS TIMING ARE JOINED BY THE CB'S OWN ID. A labelled submit door
+/// ([`Stream::submit_labelled`] and kin) takes each CB with its label and hands back each one's id
+/// with that same label, zipped from the one list it submitted; each pair is filed here, and each
 /// drained record finds its label by `RbTiming::id`. So it does not matter when a record arrives:
 /// a CB still running at this drain is simply not in the ring yet, and its label waits for the
 /// drain that brings it. (The table used to pair a step's completed CBs with its recorded launches
@@ -696,23 +698,10 @@ struct RbHarvest {
 }
 
 impl RbHarvest {
-    /// File one submission's CBs under the ids the submit gave them, CB `i` at `ids.get(i)`.
-    ///
-    /// ⛔ ONE LABEL PER CB, OR A REFUSAL: a submit returns ids only for a submission it queued whole
-    /// (a refused one is the caller's `Err`, labelled by no one), so a count that differs is a
-    /// labelling that does not describe what was submitted — refused, never truncated into CBs
-    /// that would then read as unlabelled with no cause.
-    fn label(&mut self, ids: SubmittedIds, labels: Vec<RbLabel>) -> Result<()> {
-        if labels.len() != ids.len() {
-            bail!(
-                "RB_TIME: a submission of {} CB(s) was labelled with {} — the labels were not \
-                 built from the list that was submitted",
-                ids.len(),
-                labels.len()
-            );
-        }
-        self.labels.extend(ids.iter().zip(labels));
-        Ok(())
+    /// File one submission's CBs, each under the id its submit gave it — the pairs the labelled
+    /// submit doors ([`Stream::submit_labelled`] and kin) zip from the one list they submitted.
+    fn file(&mut self, submitted: impl IntoIterator<Item = (u64, RbLabel)>) {
+        self.labels.extend(submitted);
     }
 }
 /// Accumulators the timing modes write into. Process-wide, like the C++ statics.
@@ -3890,7 +3879,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // This walk's submissions for `SCRATCHY_SDSC_RB_TIME`: each submit's ids with the labels of
         // the CBs it carried, filed into the session's harvest once the walk ends (the walk holds
         // a borrow of the session's stream across every submit, so it records into a local).
-        let mut rb_subs: Vec<(SubmittedIds, Vec<RbLabel>)> = Vec::new();
+        let mut rb_subs: Vec<(u64, Option<RbLabel>)> = Vec::new();
         let rb_time = d.rb_time;
         // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
         // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
@@ -4044,9 +4033,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     rung: ops.len(),
                     op: oi,
                 };
-                let rb_name = |kind: &str| RbLabel {
-                    key: rb_key,
-                    label: format!("{} {kind}", op.label()),
+                // `None` with RB_TIME off: the doorbell path builds no label.
+                let rb_name = |kind: &str| {
+                    rb_time.then(|| RbLabel {
+                        key: rb_key,
+                        label: format!("{} {kind}", op.label()),
+                    })
                 };
 
                 // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
@@ -4061,7 +4053,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     // submits and the item the parity gate renders cannot drift apart in shape.
                     let st0 = Instant::now();
                     pending.extend(cbs.into_iter().map(|item| PendingLaunch {
-                        rb_label: rb_time.then(|| rb_name(item.kind())),
+                        rb_label: rb_name(item.kind()),
                         item,
                         op_index: oi,
                         rep,
@@ -4077,21 +4069,24 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 } else if op.collective.is_some() {
                     // A COLLECTIVE IS ONE SUBMISSION even off the batched path: its send, wait and
                     // consume ride one doorbell, in order, so no diag mode can split them.
-                    let ids = stream.submit_batch(&cbs, barrier).map_err(fault)?;
-                    if rb_time {
-                        rb_subs.push((ids, cbs.iter().map(|c| rb_name(c.kind())).collect()));
-                    }
+                    let labelled: Vec<_> = cbs
+                        .into_iter()
+                        .map(|c| {
+                            let l = rb_name(c.kind());
+                            (c, l)
+                        })
+                        .collect();
+                    rb_subs.extend(stream.submit_labelled(&labelled, barrier).map_err(fault)?);
                 } else if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
                     let st0 = Instant::now();
-                    let ids = stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(fault)?;
+                    rb_subs.extend(
+                        stream
+                            .compute_labelled(&site.batched_compute(), barrier, rb_name("launch"))
+                            .map_err(fault)?,
+                    );
                     let st1 = Instant::now();
-                    if rb_time {
-                        rb_subs.push((ids, vec![rb_name("launch")]));
-                    }
                     let mut t = timers();
                     t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
                     t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
@@ -4105,12 +4100,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     // the mlir path may route flex down a different (seed-only) path for the SFP
                     // transcendental while the matmul tolerates it. The same "" at the diag probes
                     // above and inside the rung flush's `compute_batch` / the CB render door.
-                    let ids = stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(fault)?;
-                    if rb_time {
-                        rb_subs.push((ids, vec![rb_name("launch")]));
-                    }
+                    rb_subs.extend(
+                        stream
+                            .compute_labelled(&site.batched_compute(), barrier, rb_name("launch"))
+                            .map_err(fault)?,
+                    );
                 }
 
                 // DEFAULT-OFF: skipping the per-group drain removes the ~868-ops/layer
@@ -4169,24 +4163,18 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // the doorbell takes, the context is what a refusal dumps.
             let mut sites: Vec<(usize, i64, [u64; NUM_SEGMENTS])> =
                 Vec::with_capacity(pending.len());
-            let mut flush_labels: Vec<RbLabel> = Vec::new();
-            let items: Vec<BatchedCb> = pending
+            let items: Vec<(BatchedCb, Option<RbLabel>)> = pending
                 .drain(..)
                 .map(|p| {
                     sites.push((p.op_index, p.rep, p.off));
-                    flush_labels.extend(p.rb_label);
-                    p.item
+                    (p.item, p.rb_label)
                 })
                 .collect();
             let stream = self.stream_ref()?;
             let st0 = Instant::now();
-            let r = stream.submit_batch(&items, batch_barrier);
+            let r = stream.submit_labelled(&items, batch_barrier);
             let st1 = Instant::now();
-            if let Ok(ids) = &r
-                && rb_time
-            {
-                rb_subs.push((*ids, flush_labels));
-            }
+            let r = r.map(|submitted| rb_subs.extend(submitted));
             if let Err(e) = r {
                 // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
                 // The loop locals the per-op `fault` closure dumps from are gone here, so the
@@ -4205,7 +4193,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     eprint!("{one}");
                     // A launch dumps its aim; a send or wait has no program to dump, and its op's
                     // launch sits two entries on.
-                    if let BatchedCb::Compute(l) | BatchedCb::Consume(l) = &items[*index] {
+                    if let (BatchedCb::Compute(l) | BatchedCb::Consume(l), _) = &items[*index] {
                         let ta: Vec<&DevAddr> = l.tensor_allocs.iter().collect();
                         self.dump_launch_site(
                             "FAULT(batch-flush)",
@@ -4236,9 +4224,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
             }
         }
-        for (ids, labels) in rb_subs {
-            self.rb.label(ids, labels)?;
-        }
+        self.rb
+            .file(rb_subs.into_iter().filter_map(|(id, l)| l.map(|l| (id, l))));
         Ok(())
     }
 
@@ -5749,10 +5736,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let stream = self.stream_ref()?;
         let t1 = Instant::now();
         let cbs = image.data.canvas.len();
-        let r = stream.compute_wires(batch, image.barrier);
+        // The replayed step's CBs come back with their own labels: canvas CB `i` is the
+        // submission's CB `i`, named by the plan it was proven equal to. Keyed by (image length,
+        // CB index), so a replayed step's CBs never average into a walked rung's.
+        let r = stream.submit_shared(batch, &image.data.labels, image.barrier, |i, l| RbLabel {
+            key: RbKey::Replay { image: cbs, cb: i },
+            label: format!("replay {l}"),
+        });
         let t2 = Instant::now();
-        let ids = match r {
-            Ok(ids) => ids,
+        let submitted = match r {
+            Ok(submitted) => submitted,
             Err(e) => {
                 // The image itself was proven at derivation (per-row gates above);
                 // a refused submit here is capacity or shutdown, not addressing —
@@ -5766,27 +5759,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 )));
             }
         };
-        // The replayed step's CBs, filed under the ids the submit gave them: canvas CB `i` is the
-        // submission's CB `i`, named by the plan it was proven equal to. Keyed by (image length,
-        // CB index), so a replayed step's CBs never average into a walked rung's. And its
-        // doorbell: the host instant the submit returned, against the step's first CB.
+        // The step's CBs, filed by their own ids, and its doorbell: the host instant the submit
+        // returned, against the step's first CB.
         if Diag::get().rb_time {
-            if let Some(first) = ids.get(0) {
+            if let Some(&(first, _)) = submitted.first() {
                 self.rb.doorbells.insert(first, t2);
             }
-            self.rb.label(
-                ids,
-                image
-                    .data
-                    .labels
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| RbLabel {
-                        key: RbKey::Replay { image: cbs, cb: i },
-                        label: format!("replay {l}"),
-                    })
-                    .collect(),
-            )?;
+            self.rb.file(submitted);
         }
         let mut t = timers();
         t.replay_steps += 1;
@@ -5890,9 +5869,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 ));
             }
         }
-        let mut canvas: Vec<ControlBlockWire> = Vec::new();
+        let mut canvas: LabelledCanvas<String> = LabelledCanvas::new();
         let mut rows: Vec<RowReplay> = Vec::new();
-        let mut labels: Vec<String> = Vec::new();
         let mut barrier = false;
         let mut sites = 0usize;
         for (ls, where_, follows_step) in specs {
@@ -5901,7 +5879,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 continue;
             }
             let label = format!("{ls:?}/replay-canvas");
-            let (row_canvas, plan, row_labels) = if follows_step {
+            let (row_canvas, plan) = if follows_step {
                 // A body row: the FULL gate — parity at the canvas position,
                 // the patch table, and the off-sample proof that patched
                 // canvas ≡ fresh walk at steps the derivation never visited.
@@ -5916,7 +5894,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     &label,
                     stream,
                 )?;
-                (img.canvas, img.plan, img.labels)
+                (img.canvas, img.plan)
             } else {
                 // A fixed row: the walk launches it at this SAME `where_`
                 // every step, so its replay target is its own canvas,
@@ -5944,7 +5922,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     &where_,
                     stream,
                 )?;
-                (img.canvas, img.plan, img.labels)
+                (img.canvas, img.plan)
             };
             barrier |= plan.barrier;
             sites += plan.sites();
@@ -5954,8 +5932,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 follows_step,
                 plan,
             });
-            canvas.extend(row_canvas);
-            labels.extend(row_labels.into_iter().map(|l| format!("{ls:?} {l}")));
+            canvas.extend_mapped(row_canvas, |l| format!("{ls:?} {l}"));
         }
         if canvas.is_empty() {
             bail!(
@@ -5972,16 +5949,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // submit-side stamp makes the two agree rather than this one being
         // load-bearing (a double-set of the same value is fine; a miss is the
         // defect).
-        canvas[0].set_edep(1);
+        canvas.wires_mut()[0].set_edep(1);
         debug!(
             "[sdsc-replay] derived image sel={sel:?} n_fold_pages={n}: {} CB(s) over {} \
              launch row(s), {sites} patch site(s), barrier={barrier}",
             canvas.len(),
             rows.len()
         );
+        let (canvas, labels) = canvas.share();
         Ok(StepImage {
             data: std::sync::Arc::new(StepImageData {
-                canvas: std::sync::Arc::new(canvas),
+                canvas,
                 rows,
                 labels,
             }),
@@ -7532,7 +7510,7 @@ mod tests {
             data: std::sync::Arc::new(StepImageData {
                 canvas: std::sync::Arc::new(Vec::new()),
                 rows: Vec::new(),
-                labels: Vec::new(),
+                labels: LabelledCanvas::<String>::new().share().1,
             }),
             barrier: false,
         };

@@ -60,7 +60,8 @@ use crate::bundle_code::collective::{
 };
 use crate::fold_plan::{self, OpKv, SessionKv, SlotPos, UniformPages};
 use crate::runtime::{
-    BatchedCb, BatchedCompute, ByteSize, DevAddr, RdmaEnd, RdmaSend, Stream, prog_offset_base,
+    BatchedCb, BatchedCompute, ByteSize, DevAddr, LabelledCanvas, RdmaEnd, RdmaSend, Stream,
+    prog_offset_base,
 };
 use crate::superdsc_exec::{
     LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT, SeqPos,
@@ -546,7 +547,6 @@ impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
             );
         };
         let mut items = Vec::with_capacity(self.entries.len());
-        let mut labels = Vec::with_capacity(self.entries.len());
         let mut barrier = false;
         for e in &self.entries {
             let aim = fold_plan::seg_deltas(
@@ -590,22 +590,19 @@ impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
                     bootstrap_offset: e.bootstrap_offset,
                 },
             )?;
-            labels.extend(cbs.iter().map(|c| format!("{} {}", e.label, c.kind())));
-            items.extend(cbs);
+            items.extend(cbs.into_iter().map(|c| {
+                let label = format!("{} {}", e.label, c.kind());
+                (c, label)
+            }));
         }
-        Ok(Rendered {
-            items,
-            labels,
-            barrier,
-        })
+        Ok(Rendered { items, barrier })
     }
 }
 
-/// What [`CbPlan::render`] stages at one `where_`: the CBs, one label per CB in the same order, and
-/// the walk's host-fence OR.
+/// What [`CbPlan::render`] stages at one `where_`: each CB with its own label, and the walk's
+/// host-fence OR.
 pub(crate) struct Rendered {
-    pub(crate) items: Vec<BatchedCb>,
-    pub(crate) labels: Vec<String>,
+    pub(crate) items: Vec<(BatchedCb, String)>,
     pub(crate) barrier: bool,
 }
 
@@ -719,7 +716,6 @@ pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
     let Rendered {
         items: rendered,
-        labels: rendered_labels,
         barrier: rendered_barrier,
     } = plan.render(fold, where_)?;
     if walked.len() != rendered.len() {
@@ -742,8 +738,8 @@ pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
     // and what remains — tensor XLAT paddrs and lengths, program, bootstrap —
     // is everything the device would be handed.
     let old = stream.render_batch(&walked, 1)?;
-    let new = stream.render_batch(&rendered, 1)?;
-    for (i, (a, b)) in old.iter().zip(new.iter()).enumerate() {
+    let new = stream.render_labelled(rendered, 1)?;
+    for (i, (a, (b, b_label))) in old.iter().zip(new.iter()).enumerate() {
         if a != b {
             let (mut at, mut wb, mut pb) = (0, 0u8, 0u8);
             for (j, (x, y)) in a.bytes().iter().zip(b.bytes().iter()).enumerate() {
@@ -758,7 +754,7 @@ pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
                  data twin of the walk disagrees; refusing to load rather than replay a \
                  wrong image.",
                 old.len(),
-                rendered_labels[i]
+                b_label
             );
         }
     }
@@ -946,7 +942,7 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
     banks: &[Option<DevAddr>],
     where_: &LaunchWhere,
     stream: &Stream,
-) -> Result<(Vec<ControlBlockWire>, Vec<String>, PatchPlan)> {
+) -> Result<(LabelledCanvas<String>, PatchPlan)> {
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
     if pos % fold_plan::SLAB_SLOTS >= fold_plan::SLAB_SLOTS - 1 {
@@ -984,19 +980,21 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
 
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
     let render = |w: &LaunchWhere| -> Result<Vec<ControlBlockWire>> {
-        let items = plan.render(fold, w)?.items;
-        Ok(stream.render_batch(&items, 1)?)
+        let cbs: Vec<BatchedCb> = plan
+            .render(fold, w)?
+            .items
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        Ok(stream.render_batch(&cbs, 1)?)
     };
     // The canvas, rendered once — and the host-fence OR with it: a constant
     // of the plan (entry-keyed, the same for every render of this plan), so
     // the canvas render's value is the image's, what the player submits
     // every step of this image with.
-    let Rendered {
-        items,
-        labels,
-        barrier,
-    } = plan.render(fold, where_)?;
-    let canvas = stream.render_batch(&items, 1)?;
+    let Rendered { items, barrier } = plan.render(fold, where_)?;
+    let labelled = stream.render_labelled(items, 1)?;
+    let canvas = labelled.wires();
     // The two differentials. Each moves exactly one scalar's worth of
     // arithmetic — the other held — so each moving word's measured difference
     // is one equation in that word's coefficients. There is NO page
@@ -1034,7 +1032,7 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
     let mut patches = Vec::new();
     for cb in 0..canvas.len() {
         for dst in (0..CB_NUM_BYTES).step_by(8) {
-            let c = word_at(&canvas, cb, dst);
+            let c = word_at(canvas, cb, dst);
             let d_slot = word_at(&img_slot, cb, dst).wrapping_sub(c) as i64;
             let d_slab = word_at(&img_slab, cb, dst).wrapping_sub(c) as i64;
             if d_slot == 0 && d_slab == 0 {
@@ -1055,8 +1053,7 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
     }
     let reference = step_scalars(fold.paged, per, pos);
     Ok((
-        canvas,
-        labels,
+        labelled,
         PatchPlan {
             reference,
             patches,
@@ -1070,11 +1067,10 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
 /// that turns the copy into any step of the same image key. The plan's
 /// `barrier` is the row's host-fence OR; the player ORs the rows it merges.
 pub(crate) struct RowImage {
-    pub(crate) canvas: Vec<ControlBlockWire>,
+    /// The row's CBs, each with its label — what a replayed step's response blocks are attributed
+    /// to, since a replay records no launch sequence of its own.
+    pub(crate) canvas: LabelledCanvas<String>,
     pub(crate) plan: PatchPlan,
-    /// One label per CB of `canvas` (its render's own, [`Rendered::labels`]) — what a replayed step's response
-    /// blocks are attributed to, since a replay records no launch sequence of its own.
-    pub(crate) labels: Vec<String>,
 }
 
 /// One launch row's canvas with NO patch table — what a step-CONSTANT row
@@ -1096,12 +1092,8 @@ pub(crate) fn render_row<T: ktir_superdsc::collective::Tp>(
     stream: &Stream,
 ) -> Result<RowImage> {
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
-    let Rendered {
-        items,
-        labels,
-        barrier,
-    } = plan.render(fold, where_)?;
-    let canvas = stream.render_batch(&items, 1)?;
+    let Rendered { items, barrier } = plan.render(fold, where_)?;
+    let canvas = stream.render_labelled(items, 1)?;
     let per = fold.page_slots.get().max(1);
     Ok(RowImage {
         canvas,
@@ -1110,7 +1102,6 @@ pub(crate) fn render_row<T: ktir_superdsc::collective::Tp>(
             patches: Vec::new(),
             barrier,
         },
-        labels,
     })
 }
 
@@ -1146,7 +1137,7 @@ pub(crate) fn patch_check<T: ktir_superdsc::collective::Tp>(
     // the walk at this exact `where_` — patching a canvas that already
     // disagreed with the walk would verify nothing.
     parity_check(ops, fold, seg, banks, where_, label, stream)?;
-    let (canvas, labels, patch_plan) = build_patch_plan(ops, fold, seg, banks, where_, stream)
+    let (canvas, patch_plan) = build_patch_plan(ops, fold, seg, banks, where_, stream)
         .map_err(|e| anyhow!("[cbpatch] {label}: patch-table derivation REFUSED — {e:#}"))?;
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
@@ -1198,7 +1189,7 @@ pub(crate) fn patch_check<T: ktir_superdsc::collective::Tp>(
                 canvas.len()
             );
         }
-        let mut got = canvas.clone();
+        let mut got = canvas.wires().to_vec();
         patch_plan.apply(&mut got, &step_scalars(fold.paged, per, spos));
         for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
             if a != b {
@@ -1220,13 +1211,11 @@ pub(crate) fn patch_check<T: ktir_superdsc::collective::Tp>(
             }
         }
     }
-    // The labels are the canvas render's own (`CbPlan::render`): label `i` names canvas CB `i`.
     Ok((
         patch_plan.patches.len(),
         RowImage {
             canvas,
             plan: patch_plan,
-            labels,
         },
     ))
 }
