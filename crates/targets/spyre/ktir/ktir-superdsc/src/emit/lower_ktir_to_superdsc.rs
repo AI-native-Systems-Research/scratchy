@@ -1425,6 +1425,18 @@ fn pointwise_rows(name: &str, out: &Region) -> Result<u32, Error> {
     }
 }
 
+/// The `[rows, cols]` a parameter's buffer is VIEWED as — its `ktdp.construct_memory_view`'s own
+/// shape, read by [`regions`]' rule (the ONE view whose address operand is the parameter), with no
+/// access tile in it. So it is stated by every program, a walk's included: a walk takes its windows
+/// inside its loop, where [`regions`]' first-tile reading refuses to look, but its views are at the
+/// top level. `None` when the parameter states no 2-D view.
+pub fn param_view(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
+    f.operations
+        .iter()
+        .find(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))
+        .and_then(shape_2d)
+}
+
 /// This program's parameters as [`Region`]s, in parameter order.
 ///
 /// ⭐ THE PAIRING IS A ZIP, NOT A SEARCH. A func's `arguments` are `%0..%{n-1}` in first-use order

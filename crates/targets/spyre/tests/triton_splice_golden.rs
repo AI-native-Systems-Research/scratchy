@@ -2734,6 +2734,15 @@ fn the_paged_attention_splices_with_its_contract() {
             walking,
             "{at}: the body is marked for the relaunch exactly when the walk loops"
         );
+        // The query's view states the rows the bake names the rung by (the dump's `mq`): a walk
+        // takes its windows inside its loop, but its views are at the top level.
+        assert_eq!(
+            k.func.arguments.first().and_then(|(q, _)| {
+                ktir_superdsc::emit::lower_ktir_to_superdsc::param_view(&k.func, q)
+            }),
+            Some((s.mq, s.geom.0 * s.geom.2)),
+            "{at}: the query is viewed `[mq, nqh·hd]`"
+        );
         // And a walk's body never fuses away, so the attention has no fold-fused twin: the bake
         // would compile its split program twice, under two names.
         assert!(
