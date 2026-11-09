@@ -952,14 +952,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             // row's extent key off them), and two replaced rows are different
             // wirings (the stamp's resident excuse keys off the stated id).
             SubOp::EmbedRowGather { hidden, replaces } => (hidden, replaces.0).hash(h),
-            // The table range and the entry split are class: two pad-vocabs
+            // The table range and the entry split are class: two row counts
             // or two entry counts are different programs (the staged tables'
             // extents and lane patterns key off them).
-            SubOp::ChainStage {
-                pad_vocab,
-                table_rows,
-                k,
-            } => (pad_vocab, table_rows, k).hash(h),
+            SubOp::ChainStage { table_rows, k } => (table_rows, k).hash(h),
             SubOp::Mamba2 { inner } => inner.hash(h),
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
@@ -1697,18 +1693,13 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `k·s + (i mod k)` the device's own s-gather writes, so the two ends
     /// agree on what the node produced.
     ///
-    /// `pad_vocab` and `table_rows` state the DECOMPOSE'S OWN EXTENT —
-    /// `table_rows = pad_vocab + SAMPLE_SENTINEL_OFFSET + 1`, every
-    /// answerable pick up to the sentinel INCLUSIVE, the sentinel the LAST
-    /// row — the pick's own mint's derivation, never re-derived from
-    /// `pad_vocab` a second time. `k` is the SLAB-GATHER ENTRY COUNT
+    /// `table_rows` states the DECOMPOSE'S OWN EXTENT — [`chain_table_rows`]
+    /// of the pick's pad, every answerable pick up to the sentinel INCLUSIVE,
+    /// the sentinel the LAST row — the mint's one statement, read by the fill
+    /// and the door, never re-derived. `k` is the SLAB-GATHER ENTRY COUNT
     /// ([`chain_slab_entries`]'s answer at this graph's hidden), stated so
     /// the fill, the doors, and both reference arms read one fact.
-    ChainStage {
-        pad_vocab: u32,
-        table_rows: u32,
-        k: u32,
-    },
+    ChainStage { table_rows: u32, k: u32 },
 }
 
 /// The token draw's padded row: the vocab rounded up to a power-of-two whole
@@ -2286,8 +2277,27 @@ pub const SAMPLE_SENTINEL_OFFSET: u32 = SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK + SAM
 /// reference's `None` arm and by the tests that pin the staged tables to it;
 /// the worker's idx-stick readback refuses it.
 pub fn sample_sentinel(vocab: u32) -> u32 {
-    sample_groups(sample_pad_vocab(vocab)) * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
-        + SAMPLE_SENTINEL_OFFSET
+    sample_sentinel_of_pad(sample_pad_vocab(vocab))
+}
+
+/// The all-NaN answer at a padded row of `pad` lanes — `G·4096 + 4160`, `G =
+/// sample_groups(pad)` the WHOLE groups below the pad. A real lane is
+/// `g·4096 + b·64 + l` with `b, l < 64`, so group `g`'s lanes stay below
+/// `(g+1)·4096`, and the sentinel is past every real lane at every pad. When
+/// the last group is whole (`pad = G·4096`) it is `pad + 4160`; when it is
+/// short (`pad − G·4096 < 4096`) it is still past the pad.
+pub fn sample_sentinel_of_pad(pad: u32) -> u32 {
+    sample_groups(pad) * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS) + SAMPLE_SENTINEL_OFFSET
+}
+
+/// ⭐ THE CHAINED HEAD'S DECOMPOSE TABLE ROW COUNT at a padded row of `pad`
+/// lanes — one row per pick the sampler can answer, the sentinel included
+/// and LAST: `sample_sentinel_of_pad(pad) + 1`. Every real lane is below the
+/// sentinel, so the rows cover the whole answerable range at any pad, the
+/// last pick group whole or short. The mint states it once, as the chain
+/// stage's `table_rows`; the fill and the door read that statement.
+pub fn chain_table_rows(pad: u32) -> u32 {
+    sample_sentinel_of_pad(pad) + 1
 }
 
 /// The chained slab's fp16 stick width — the `[hidden, 64]` slab's one-stick
@@ -2994,31 +3004,11 @@ pub fn mint_embed_chain<F: RopeForm>(
     if graph.result.0 >= n_src {
         graph.result.0 += 4;
     }
-    // The tables' row count: every answerable pick `t` up to the sentinel
-    // `pad_vocab + SAMPLE_SENTINEL_OFFSET` INCLUSIVE — the pick contract's
-    // whole range, one row per pick (the sentinel is the LAST row). THE
-    // GROUP LAW LIVES HERE, beside the one statement of the extent: the
-    // sentinel pick is `G·4096 + SAMPLE_SENTINEL_OFFSET` with
-    // `G = sample_groups(pad_vocab)`, which equals
-    // `pad_vocab + SAMPLE_SENTINEL_OFFSET` — the last table row — only
-    // when `pad_vocab` is a whole multiple of the pick group
-    // (`SAMPLE_BLOCK · SAMPLE_GROUP_BLOCKS`). A pad that is not a group
-    // multiple drops the sentinel pick SHORT of the last row — `G` is the
-    // rounded-DOWN group count, so `G·4096 ≤ pad_vocab` and the pick lands
-    // inside the past-pad marks, never past the staged bytes; what breaks
-    // is the ONE-TO-ONE law this extent states (the sentinel is the LAST
-    // row, the answerable range's own upper end) — so the mint refuses it
-    // here, at the single site that computes the extent, rather than
-    // letting a downstream door re-derive the arithmetic.
-    let group = SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS;
-    assert!(
-        pad_vocab != 0 && pad_vocab.is_multiple_of(group),
-        "mint_embed_chain: the padded vocab {pad_vocab} is not a whole multiple of the \
-         pick group {group} — the sentinel pick would land short of the last table row \
-         and the sentinel-is-the-last-row law would be false; the chain mints only \
-         group-multiple pads"
-    );
-    let table_rows = pad_vocab + SAMPLE_SENTINEL_OFFSET + 1;
+    // The tables' row count: every answerable pick up to the sentinel
+    // INCLUSIVE, one row per pick, the sentinel the LAST row — at any pad,
+    // the last pick group whole or short ([`chain_table_rows`]). The one
+    // statement of the extent; the fill and the door read it off the node.
+    let table_rows = chain_table_rows(pad_vocab);
     // ⭐ THE L INDEX'S OWN STICK COUNT — chain_l_sticks' one STATEMENT call:
     // the mint derives it and states the two l shapes from it, so the fill
     // (wiring's staged tables), the door (both gather doors read the
@@ -3160,12 +3150,10 @@ pub fn mint_embed_chain<F: RopeForm>(
 
     // 6) THE STAGE — the pick decomposed into the persistent placements
     //    through the staged tables; the output is a fresh s-value stick
-    //    (every op's output its own), one row per request. `pad_vocab` and
-    //    `table_rows` are stated from the caller's own vocab — the
-    //    decompose's one derivation and the tables' own extent — so producer
-    //    and consumer can never disagree on the range the decompose is exact
-    //    over, and no door re-derives the extent from `pad_vocab` a second
-    //    time. The tables ride the node as ORDINARY OPERANDS (inputs 3 and
+    //    (every op's output its own), one row per request. `table_rows` is
+    //    stated from the caller's own vocab — the tables' own extent — so
+    //    producer and consumer can never disagree on the range the decompose
+    //    is exact over, and no door re-derives it. The tables ride the node as ORDINARY OPERANDS (inputs 3 and
     //    4): the wiring's load-const list derives their `(tid, kind)` entries
     //    from THIS node's inputs, so the worker's staging and the bake's
     //    numeric gate read the same pair the door's gathers name.
@@ -3190,11 +3178,7 @@ pub fn mint_embed_chain<F: RopeForm>(
     });
     graph.nodes.push(SubtileNode {
         id: SubtileId(graph.nodes.len() as u32),
-        op: SubOp::ChainStage {
-            pad_vocab,
-            table_rows,
-            k,
-        },
+        op: SubOp::ChainStage { table_rows, k },
         inputs: vec![
             whole(graph, pick_stick),
             whole(graph, s_stick),
@@ -4492,15 +4476,7 @@ pub fn lower_region(
             SubOp::EmbedRowGather { hidden, replaces } => {
                 SubOp::EmbedRowGather { hidden, replaces }
             }
-            SubOp::ChainStage {
-                pad_vocab,
-                table_rows,
-                k,
-            } => SubOp::ChainStage {
-                pad_vocab,
-                table_rows,
-                k,
-            },
+            SubOp::ChainStage { table_rows, k } => SubOp::ChainStage { table_rows, k },
             SubOp::SumReduce { minted }
             | SubOp::RmsNormReduce { minted, .. }
             | SubOp::RmsNormApply { minted, .. } => match minted {},
@@ -6054,6 +6030,11 @@ mod tests {
     }
 
     fn chained_head_fixture(width: u32, hidden: u32) -> crate::lower::LoweringInput {
+        chained_head_fixture_at(width, hidden, FIXTURE_VOCAB)
+    }
+
+    /// The chained-head toy at its own vocabulary width.
+    fn chained_head_fixture_at(width: u32, hidden: u32, vocab: u32) -> crate::lower::LoweringInput {
         crate::lower::LoweringInput {
             exported: None,
             sources: vec![
@@ -6063,13 +6044,13 @@ mod tests {
                 },
                 SourceShape {
                     rows: hidden,
-                    cols: FIXTURE_VOCAB,
+                    cols: vocab,
                 },
             ],
             ops: vec![
                 OpDesc {
                     op: SubOp::MatmulTile {
-                        n: FIXTURE_VOCAB,
+                        n: vocab,
                         weight: crate::lower::GemmWeight::Dense,
                     },
                     m: width,
@@ -6131,7 +6112,7 @@ mod tests {
                 "the persistent sticks are the NEW sources at the old boundary"
             );
             assert_eq!(g.num_sources, 6, "four sources were inserted");
-            let table_rows = 4096 + SAMPLE_SENTINEL_OFFSET + 1;
+            let table_rows = 8257;
             // hidden 2: k=1, l_sticks=1 — the degenerate's shapes.
             assert_eq!((g.tensors[2].rows, g.tensors[2].cols), (width, 32));
             assert_eq!((g.tensors[3].rows, g.tensors[3].cols), (width, 32));
@@ -6187,7 +6168,6 @@ mod tests {
             assert!(matches!(
                 stage.op,
                 SubOp::ChainStage {
-                    pad_vocab: 4096,
                     table_rows: 8257,
                     k: 1
                 }
@@ -6252,12 +6232,20 @@ mod tests {
     /// device's s-gather writes, `k·s + (i mod k)` — pinned through the
     /// fixture's word-0 trick (column 0 = `e_0`, row 0 = the column index:
     /// the stand-in's word 0 IS the pick).
+    ///
+    /// At two vocabularies: one whose pad is a whole pick group (2048 → 4096)
+    /// and one whose only pick group is SHORT (512 → 1024, a tiny config's).
     #[test]
     fn the_embed_chain_is_the_two_ended_row() {
+        for (vocab, pad) in [(FIXTURE_VOCAB, 4096usize), (512, 1024)] {
+            embed_chain_is_the_two_ended_row_at(vocab, pad);
+        }
+    }
+
+    fn embed_chain_is_the_two_ended_row_at(vocab: u32, pad: usize) {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let hidden = 128u32;
-        let pad = 4096usize;
-        let voc = FIXTURE_VOCAB as usize;
+        let voc = vocab as usize;
         // The tied matrix, RAW layout `[hidden, VOCAB]`: column 0 is `e_0`
         // (row 0 a 1, the rest zeros) so the stand-in's word 0 is the pick;
         // row 0 is the column index; every other entry distinct per (h, j).
@@ -6285,18 +6273,18 @@ mod tests {
         for width in [1u32, 2, 8] {
             // Row r's seeded pick: a distinct in-vocab token per row, past
             // the first slab so the s join is non-trivial.
-            let picks: Vec<usize> = (0..width as usize).map(|r| 130 + 233 * r).collect();
+            let picks: Vec<usize> = (0..width as usize).map(|r| (130 + 233 * r) % voc).collect();
             let plain_rows: Vec<f32> = picks
                 .iter()
                 .flat_map(|&t| col(t).into_iter())
                 .collect::<Vec<_>>();
 
-            let plain = lower_region(&chained_head_fixture(width, hidden), nz(64));
+            let plain = lower_region(&chained_head_fixture_at(width, hidden, vocab), nz(64));
             let bufs_plain = eval_dag(&plain, &[&plain_rows, &w_raw]);
 
-            let mut chained = lower_region(&chained_head_fixture(width, hidden), nz(64));
+            let mut chained = lower_region(&chained_head_fixture_at(width, hidden, vocab), nz(64));
             widen_tied_embed_weight(&mut chained).expect("the toy's tail admits the widening");
-            mint_embed_chain(&mut chained, TensorId(0), TensorId(3), FIXTURE_VOCAB);
+            mint_embed_chain(&mut chained, TensorId(0), TensorId(3), vocab);
             // The host no longer seeds the rows (zeros — nothing reads them);
             // each stick row carries its request's decompose — the SEED laws
             // the device's own ChainStage writes (idempotent with them).
@@ -6363,6 +6351,108 @@ mod tests {
                         [r * CHAIN_IDX_BLOCK as usize..(r + 1) * CHAIN_IDX_BLOCK as usize],
                     &expect[..],
                     "the stage's row is the pick's s-value stick, row {r}"
+                );
+            }
+        }
+    }
+
+    /// ⭐ THE CHAIN'S TABLES END AT THE SENTINEL'S ROW AT ANY PAD — the last
+    /// pick group whole or short. The mint states `table_rows` = the sampler's
+    /// all-NaN answer plus one: a pad that is a whole number of 4096-lane
+    /// groups ends at `pad + 4161` (today's extent), and a pad whose last group
+    /// is short ends at `G·4096 + 4161` — still past every real lane. Each
+    /// expected count is a literal, `(vocab, pad, table_rows)`: the short
+    /// group (512 → 1024, a tiny config's), the smallest one-slab pad (32 →
+    /// 64), the last short pad (2047 → 2048), the first whole one (2048 →
+    /// 4096), a whole one reached from below (4095 → 4096), and two groups
+    /// (4096 → 8192).
+    #[test]
+    fn the_chain_tables_end_at_the_sentinel_row_at_any_pad() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        for (vocab, pad, table_rows) in [
+            (512u32, 1024u32, 4161u32),
+            (32, 64, 4161),
+            (2047, 2048, 4161),
+            (2048, 4096, 8257),
+            (4095, 4096, 8257),
+            (4096, 8192, 12353),
+        ] {
+            let mut g = lower_region(&chained_head_fixture_at(1, 2, vocab), nz(64));
+            let widen =
+                widen_tied_embed_weight(&mut g).expect("the toy's tail admits the widening");
+            assert_eq!(widen.pad_vocab, pad, "vocab {vocab}: the pick's pad");
+            let mint = mint_embed_chain(&mut g, TensorId(0), TensorId(3), vocab);
+            let stage = g.nodes.last().unwrap();
+            assert!(
+                matches!(stage.op, SubOp::ChainStage { table_rows: t, k: 1 } if t == table_rows),
+                "vocab {vocab}: the stage states {table_rows} table rows, got {:?}",
+                stage.op
+            );
+            for tab in [4usize, 5] {
+                assert_eq!(
+                    g.tensors[tab].rows, table_rows,
+                    "vocab {vocab}: table t{tab} is staged at the stated extent"
+                );
+            }
+            assert_eq!(mint.vocab, vocab);
+            assert!(
+                validate(&g).is_ok(),
+                "vocab {vocab}: the chained graph validates"
+            );
+        }
+    }
+
+    /// Two chain stages that differ only in their table rows are two classes: the row count
+    /// is the stage's one carried extent, so it keys the class (and every name built on it).
+    #[test]
+    fn two_chain_stages_of_different_row_counts_hash_apart() {
+        use std::hash::Hasher;
+        let key = |op: SubOp| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            op.reroll_class_key(&mut h);
+            h.finish()
+        };
+        let short = SubOp::ChainStage {
+            table_rows: 4161,
+            k: 1,
+        };
+        let whole = SubOp::ChainStage {
+            table_rows: 8257,
+            k: 1,
+        };
+        assert_ne!(key(short), key(whole), "the row count keys the class");
+        assert_eq!(key(short), key(short), "one stage hashes equal to itself");
+    }
+
+    /// ⭐ THE LAW OVER EVERY VOCAB — at every vocab the sampler admits up to
+    /// 20000, the all-NaN answer is past every real lane and at or past the
+    /// pad, and the chain's tables end exactly at it. The relations between
+    /// the laws, not a value against itself.
+    #[test]
+    fn the_sentinel_is_past_every_lane_and_the_last_table_row_at_every_vocab() {
+        let group = SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS;
+        for vocab in 1u32..=20000 {
+            let pad = sample_pad_vocab(vocab);
+            let sentinel = sample_sentinel(vocab);
+            assert!(
+                sentinel >= pad,
+                "vocab {vocab}: sentinel {sentinel} below pad {pad}"
+            );
+            // The last real lane is pad - 1: group (pad-1)/4096, below the next group's start.
+            assert!(
+                (pad - 1) / group < sentinel / group,
+                "vocab {vocab}: the sentinel {sentinel} is not past the last group"
+            );
+            assert_eq!(
+                chain_table_rows(pad),
+                sentinel + 1,
+                "vocab {vocab}: the tables end at the sentinel's row"
+            );
+            if pad.is_multiple_of(group) {
+                assert_eq!(
+                    sentinel,
+                    pad + SAMPLE_SENTINEL_OFFSET,
+                    "vocab {vocab}: whole groups"
                 );
             }
         }

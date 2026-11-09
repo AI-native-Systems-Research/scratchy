@@ -9325,20 +9325,20 @@ fn load_const_entry_tokens(
             }
         }
         scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
-            pad_vocab,
+            table_rows,
             k,
             hidden,
             block,
             operand,
         } => {
-            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(pad_vocab);
+            let table_rows = proc_macro2::Literal::u32_unsuffixed(table_rows);
             let k = proc_macro2::Literal::u32_unsuffixed(k);
             let hidden = proc_macro2::Literal::u32_unsuffixed(hidden);
             let block = proc_macro2::Literal::u32_unsuffixed(block);
             let operand = proc_macro2::Literal::u8_unsuffixed(operand);
             quote! {
                 ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
-                    pad_vocab: #pad_vocab,
+                    table_rows: #table_rows,
                     k: #k,
                     hidden: #hidden,
                     block: #block,

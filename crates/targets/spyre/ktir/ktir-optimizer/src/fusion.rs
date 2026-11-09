@@ -1565,7 +1565,6 @@ mod tests {
         let mut spec = three_node_spec(a_in, a_out, b_in, b_out, c_in, c_out);
         // The door tests' own toy payload (emit's chain_stage_tests consts).
         spec.nodes[1].program = Program::ChainStage {
-            pad_vocab: 4096,
             table_rows: 8257,
             k: 1,
             hidden: 128,

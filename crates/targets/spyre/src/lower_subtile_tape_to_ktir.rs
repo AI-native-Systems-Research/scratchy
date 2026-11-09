@@ -552,15 +552,15 @@ fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     Ok(ktir_only(k))
 }
 
-/// The pick decompose's program — `Program::ChainStage { pad_vocab, table_rows, k, hidden }`,
+/// The pick decompose's program — `Program::ChainStage { table_rows, k, hidden }`,
 /// `[pick, s_stick, l_stick, s_tab, l_tab]` in and the fresh s-value stick out, hand-minted
 /// over the node's own regions. The two tables are ORDINARY TENSOR OPERANDS — the argmax
 /// nine's own idiom — staged once at load through [`crate::wiring::LoadConst::ChainStageTable`],
-/// never synths. `pad_vocab`, `table_rows`, and `k` arrive as PARAMETERS, paired at
+/// never synths. `table_rows` and `k` arrive as PARAMETERS, paired at
 /// construction in the caller's own `SubOp::ChainStage` arm — the match that
 /// dispatches the node is the match that reads its payload, so no second dispatch exists
 /// here, and the door's extent check reads the stated `table_rows` rather than re-deriving
-/// it from `pad_vocab` in a second crate. `k` is the mint's own stated entry count, read
+/// it in a second crate. `k` is the mint's own stated entry count, read
 /// from the same payload — never a derivation here. `hidden` is read off the PAIRED
 /// gather's own `hidden` payload — the same single statement `load_consts_of_ir` stages
 /// the `ChainStageTable`s from — never a second derivation: the mint splices the pair
@@ -568,7 +568,6 @@ fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 fn chain_stage_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    pad_vocab: u32,
     table_rows: u32,
     k: u32,
 ) -> Result<EmittedOp<T>, String> {
@@ -597,7 +596,6 @@ fn chain_stage_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         node,
         ir,
         ktir_superdsc::ktir_node::Program::ChainStage {
-            pad_vocab,
             table_rows,
             k,
             hidden,
@@ -1013,14 +1011,11 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             Ok(e) => Ops(vec![e]),
             Err(reason) => Unhandled(reason),
         },
-        // The payload's three u32s copy out of the borrowed op (the match is on
+        // The payload's two u32s copy out of the borrowed op (the match is on
         // `&node.op`, so the bindings are references) — the pair-at-construction
-        // call states all three, dereferenced at the call.
-        SubOp::ChainStage {
-            pad_vocab,
-            table_rows,
-            k,
-        } => match chain_stage_emitted(node, ir, *pad_vocab, *table_rows, *k) {
+        // call states both, dereferenced at the call.
+        SubOp::ChainStage { table_rows, k } => match chain_stage_emitted(node, ir, *table_rows, *k)
+        {
             Ok(e) => Ops(vec![e]),
             Err(reason) => Unhandled(reason),
         },
@@ -2002,7 +1997,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
             ));
         }
         (Some(node), None) => {
-            let SubOp::ChainStage { pad_vocab, k, .. } = node.op else {
+            let SubOp::ChainStage { table_rows, k } = node.op else {
                 unreachable!("the filter matched a ChainStage")
             };
             assert_eq!(
@@ -2033,7 +2028,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
                     (
                         tr.tensor.index() as u32,
                         crate::wiring::LoadConst::ChainStageTable {
-                            pad_vocab,
+                            table_rows,
                             k,
                             hidden,
                             block,

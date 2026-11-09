@@ -421,18 +421,15 @@ fn program_kind_tokens(
             quote! { __KProgram::EmbedRowGather { k: #k } }
         }
         Program::ChainStage {
-            pad_vocab,
             table_rows,
             k,
             hidden,
         } => {
-            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(*pad_vocab);
             let table_rows = proc_macro2::Literal::u32_unsuffixed(*table_rows);
             let k = proc_macro2::Literal::u32_unsuffixed(*k);
             let hidden = proc_macro2::Literal::u32_unsuffixed(*hidden);
             quote! {
                 __KProgram::ChainStage {
-                    pad_vocab: #pad_vocab,
                     table_rows: #table_rows,
                     k: #k,
                     hidden: #hidden,

@@ -9303,8 +9303,8 @@ mod embed_row_gather_tests {
 /// the pick stick, the persistent s stick, the persistent l stick, the two decompose
 /// tables, the fresh s-value stick out), lowered, must bake the three one-entry table
 /// gathers in order and refuse every stated-law violation BY NAME — the tables' own
-/// extent included, cross-checked against the program's `pad_vocab` so a mismatched
-/// pair cannot gather past the staged bytes; and with a layout it must mint NO synth of
+/// extent included, cross-checked against the program's `table_rows` so a mismatched
+/// table cannot gather past the staged bytes; and with a layout it must mint NO synth of
 /// its own (the tables are graph sources the placement pass places, never door-minted
 /// reservations).
 #[cfg(test)]
@@ -9322,13 +9322,12 @@ mod chain_stage_tests {
     /// The decompose's smallest honest geometry: the pick stick `[1, 64]` (the argmax idx
     /// stick's own class), all three destinations `[1, 32]` (the u32 stick), both tables
     /// `[table_rows, 32]` — the extent the PAYLOAD states (the mint's one computation; the
-    /// door re-derives nothing) — with `pad_vocab` 4096 and `table_rows` 8257, the pair
-    /// the mint states for a one-group vocab pad.
+    /// door re-derives nothing) — `table_rows` 8257, the extent the mint states for a
+    /// one-group vocab pad.
     const PICK: (i64, i64) = (1, 64);
     const USTICK: (i64, i64) = (1, 32);
-    const PAD_VOCAB: u32 = 4096;
-    /// The mint's stated extent for `PAD_VOCAB` 4096 (4096 + 4160 + 1), pinned here as
-    /// the payload the door reads — the derivation is the mint's, proved at the mint.
+    /// The mint's stated extent for a pad of 4096 (4096 + 4160 + 1), pinned here as the
+    /// payload the door reads — the derivation is the mint's, proved at the mint.
     const TABLE_ROWS: u32 = 8257;
     const TABLES: (i64, i64) = (TABLE_ROWS as i64, 32);
     /// The door tests' toy hidden — `chain_slab_entries(128)` answers 1 (subtile_ir's
@@ -9347,7 +9346,6 @@ mod chain_stage_tests {
         stab: (i64, i64),
         ltab: (i64, i64),
         out: (i64, i64),
-        pad_vocab: u32,
         table_rows: u32,
         hidden: u32,
     }
@@ -9362,7 +9360,6 @@ mod chain_stage_tests {
             stab: TABLES,
             ltab: TABLES,
             out: USTICK,
-            pad_vocab: PAD_VOCAB,
             table_rows: TABLE_ROWS,
             hidden: HIDDEN,
         };
@@ -9380,7 +9377,6 @@ mod chain_stage_tests {
             stab: stab_shape,
             ltab: ltab_shape,
             out: out_shape,
-            pad_vocab,
             table_rows,
             hidden,
         } = *shapes;
@@ -9507,7 +9503,6 @@ mod chain_stage_tests {
             // splat-pattern tables this fixture's refusals exercise); hidden
             // is the payload's own statement, never derived from the stick.
             program: Program::ChainStage {
-                pad_vocab,
                 table_rows,
                 k: 1,
                 hidden,

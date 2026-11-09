@@ -1115,7 +1115,9 @@ pub enum LoadConst {
     /// operand order (1-based over the stage's table inputs, past the pick
     /// and the two sticks — the same convention as the sampler's nine).
     /// Bytes from [`chain_staged_tables`] — the one derivation every stager
-    /// reads, so a table defect cannot hide on one leg only. `k` is the
+    /// reads, so a table defect cannot hide on one leg only. `table_rows` is
+    /// the extent the mint stated into the node (the stage's own payload), so
+    /// the fill stages exactly the rows the door gathers from. `k` is the
     /// slab-gather entry count the mint stated into the node
     /// (scratchy-subtile's `chain_slab_entries` — the lane pattern's
     /// modulus; cited not linked, the leaf-crate law), and `hidden` is the
@@ -1127,7 +1129,7 @@ pub enum LoadConst {
     /// `block` is the mint's own block width ([`ChainWiring::block`]); the rank's origin is bound
     /// when the session stages the table ([`Self::build`]'s `me`).
     ChainStageTable {
-        pad_vocab: u32,
+        table_rows: u32,
         k: u32,
         hidden: u32,
         block: u32,
@@ -1181,14 +1183,14 @@ impl LoadConst {
             // The fill reads the kind's own `hidden` — the ramp's entry
             // count, the mint's own statement — never re-derived here.
             LoadConst::ChainStageTable {
-                pad_vocab,
+                table_rows,
                 k,
                 hidden,
                 block,
                 operand,
             } => {
                 let (bytes, dt, shape) =
-                    chain_staged_tables(pad_vocab, k, hidden, chain_block(block, me))
+                    chain_staged_tables(table_rows, k, hidden, chain_block(block, me))
                         .into_iter()
                         .nth((operand - 1) as usize)
                         .expect("the mint emits operand 1..=2 — the registry's own row");
@@ -1361,14 +1363,14 @@ pub fn stage_col_stick_heads<const N: usize>(
 /// step in the per-step path — idempotent with the device's own writes — and
 /// once per block in the block path) all compute `s = t>>6` / `l = t&63`
 /// from the same pick and encode `s` in the same `k·s + (i mod k)` lane
-/// pattern. Tables are functions of `pad_vocab`, `k`, and `hidden`, constant
+/// pattern. Tables are functions of `table_rows`, `k`, and `hidden`, constant
 /// across decode steps, staged ONCE.
 ///
 /// The SENTINEL (all-NaN row, #666): the device answers `G·4096 + 4160`
-/// (`sample_sentinel` — `PAD_V + 4160` at every pad of whole 4096-lane
-/// groups, and below it otherwise), so the tables run to `pad_vocab +
-/// SAMPLE_SENTINEL_OFFSET + 1` rows to keep that pick's gather IN EXTENT.
-/// Past `pad_vocab` every row stages the sentinel's own values — `stab` =
+/// (`sample_sentinel` — past every real lane at every pad), so the tables run
+/// to the mint's stated `table_rows` (`chain_table_rows`: the sentinel's row
+/// INCLUDED, the last) to keep that pick's gather IN EXTENT. Past the block's
+/// own columns every row stages the sentinel's own values — `stab` =
 /// the s=0 LANE PATTERN (every lane names a quarter of slab 0, the clamp's
 /// bus safety: no special-cased row class), `ltab` = the SENTINEL RAMP
 /// (`chain_l_sentinel_ramp` — lanes naming the transposed placement's
@@ -1392,7 +1394,7 @@ pub fn stage_col_stick_heads<const N: usize>(
 /// one (`raw_ids`' law: LE bytes are the device encoding for raw integer
 /// words), never the IEEE→SEN convert `bind_weight` would run.
 pub fn chain_staged_tables(
-    pad_vocab: u32,
+    table_rows: u32,
     k: u32,
     hidden: u32,
     block: scratchy_subtile::subtile_ir::ChainBlock,
@@ -1410,8 +1412,7 @@ pub fn chain_staged_tables(
          (the mint's stated k; a fill outside the window is a caller defect)",
         scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK
     );
-    let rows =
-        pad_vocab as usize + scratchy_subtile::subtile_ir::SAMPLE_SENTINEL_OFFSET as usize + 1;
+    let rows = table_rows as usize;
     let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
     // The stab row is the LANE PATTERN, not a splat: lane i names entry
     // k·s + (i mod k) of the weight's slab-major staging, `s` the pick's slab
@@ -1431,7 +1432,7 @@ pub fn chain_staged_tables(
     // (`chain_l_stick_ramp`, the ONE spelling the tape seed, the worker's
     // twin push, and this fill all share — SELF-SIZED at the stick count, so
     // one row is the whole multi-stick l index the row gather's per-stick cut
-    // walks). Past pad_vocab the row is the SENTINEL RAMP
+    // walks). Past the block's columns the row is the SENTINEL RAMP
     // (`chain_l_sentinel_ramp`) — words naming the transposed placement's
     // unwritten zero tail, word 0 = `hidden` the mark.
     let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(hidden) as usize;
@@ -2827,15 +2828,21 @@ mod constant_tape_tests {
     /// The staged pad lanes spell the sampler's all-NaN answer (#666): an all-NaN row's one-hot
     /// falls on a pad lane, whose `ginc`, `binc` and `linc` read back idx = `ginc·4096 + binc·64 +
     /// linc` — `sample_sentinel`, the host reference's answer, past the vocab (the readback's
-    /// refusal) and inside the chain tables' extent (the next step's gather stays in bounds).
-    /// At a small vocab, granite's, and gemma-4's power of two, which pads to the next one.
+    /// refusal) and the LAST row of the chain tables' extent (the next step's gather stays in
+    /// bounds). At a small vocab and a tiny config's (each one short pick group), granite's, and
+    /// gemma-4's power of two, which pads to the next one. The expected numbers are literals:
+    /// `(vocab, sentinel, the chain's table rows)`.
     #[test]
     fn the_staged_pad_lanes_spell_the_all_nan_sentinel() {
         use scratchy_subtile::subtile_ir::{
-            SAMPLE_BLOCK, SAMPLE_GROUP_BLOCKS, SAMPLE_SENTINEL_OFFSET, sample_pad_vocab,
-            sample_sentinel,
+            SAMPLE_BLOCK, SAMPLE_GROUP_BLOCKS, chain_table_rows, sample_pad_vocab, sample_sentinel,
         };
-        for vocab in [5u32, 49155, 262144] {
+        for (vocab, sentinel, table_rows) in [
+            (5u32, 4160u32, 4161u32),
+            (512, 4160, 4161),
+            (49155, 69696, 69697),
+            (262144, 528448, 528449),
+        ] {
             let tables = sample_staged_tables(vocab, 1);
             // The last lane of a `[1, pad_v]` f32 table is a pad lane at every vocab.
             let pad = |t: usize| {
@@ -2846,14 +2853,16 @@ mod constant_tape_tests {
             };
             let (binc, linc, ginc) = (pad(2), pad(3), pad(8));
             let idx = ginc * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS) + binc * SAMPLE_BLOCK + linc;
-            assert_eq!(idx, sample_sentinel(vocab), "vocab {vocab}");
-            assert!(
-                idx >= vocab,
-                "vocab {vocab}: the sentinel is past the vocab"
+            assert_eq!(idx, sentinel, "vocab {vocab}: the staged pad lanes");
+            assert_eq!(
+                sample_sentinel(vocab),
+                sentinel,
+                "vocab {vocab}: the host's answer"
             );
-            assert!(
-                idx < sample_pad_vocab(vocab) + SAMPLE_SENTINEL_OFFSET + 1,
-                "vocab {vocab}: the chain's tables reach the sentinel's row"
+            assert_eq!(
+                chain_table_rows(sample_pad_vocab(vocab)),
+                table_rows,
+                "vocab {vocab}: the chain's tables end at the sentinel's row"
             );
         }
     }

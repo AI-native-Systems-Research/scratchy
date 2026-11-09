@@ -345,7 +345,7 @@ pub enum Program {
     /// `[width, 32]` s-value stick out.
     ///
     /// ⭐ THE TABLES ARE THE ARGMAX NINE'S OWN IDIOM, RULED — staged tables, exact by
-    /// construction where fp16 arithmetic is not: the pick reaches `pad_vocab + 4160`,
+    /// construction where fp16 arithmetic is not: the pick reaches the sampler sentinel (`G·4096 + 4160`),
     /// past fp16's RANGE entirely, and integers past 2048 are not fp16-exact anyway.
     /// `s_tab`'s row `t` is the LANE PATTERN — lane `i` stages `k·(t>>6) + (i mod k)`,
     /// clamped to the s=0 pattern `i mod k` past `pad_vocab` (the s-clamp is BUS
@@ -356,7 +356,7 @@ pub enum Program {
     /// unwritten zero tail, word 0 = `hidden` — a real pick's word 0 is a lane `≤ 63`, so
     /// the mark never collides). `s_tab` is `[table_rows, 32]` SENUINT32 and `l_tab` is
     /// `[table_rows, 32·l_sticks]` — the payload's own stated `table_rows`, one patterned
-    /// row per answerable pick, a function of `pad_vocab`, `k`, and `hidden`, staged once
+    /// row per answerable pick, a function of `table_rows`, `k`, and `hidden`, staged once
     /// at prepare.
     /// ⛔ A TWO-LEVEL SPLIT IS DEAD BY ARITHMETIC, NOT PREFERENCE: `t = a·2¹² + b` ⇒
     /// `s = a·64 + (b >> 6)` needs a u32 add no door emits, and `l = t & 63` has no
@@ -377,13 +377,9 @@ pub enum Program {
     /// (`GatherScratch::copies`), which at width 1 is the single whole-buffer op
     /// byte-for-byte.
     ///
-    /// `pad_vocab` — the table range's derivation, stated once at the mint from the pick's
-    /// own argmax (`sample_pad_vocab`) so producer and consumer can never disagree on the
-    /// range the decompose is exact over. The mint asserts the group law on it (a whole
-    /// multiple of the sampler group) beside the extent; nothing derives it twice.
-    ///
-    /// `table_rows` — the tables' OWN row count, stated ONCE at the mint as
-    /// `pad_vocab + SAMPLE_SENTINEL_OFFSET + 1` (the sentinel row included). The door's
+    /// `table_rows` — the tables' OWN row count, stated ONCE at the mint as the sampler's
+    /// all-NaN answer plus one (`chain_table_rows`: every pick the draw can answer, the
+    /// sentinel row included and last, at any pad — the last pick group whole or short). The door's
     /// extent check reads THIS payload, never a re-derivation: this leaf crate carries no
     /// sentinel arithmetic, and the one mint that computed the extent is the one statement
     /// of it.
@@ -402,7 +398,6 @@ pub enum Program {
     /// index stick's width (`CHAIN_IDX_BLOCK`, 32 for EVERY model) is not a statement
     /// of hidden, and `lanes·64` is one model's hidden by coincidence, never a law.
     ChainStage {
-        pad_vocab: u32,
         table_rows: u32,
         k: u32,
         hidden: u32,

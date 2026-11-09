@@ -7635,9 +7635,8 @@ pub fn chain_stage<T: crate::collective::Tp>(
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     // The payload's own stated table extent — the mint's one computation of
-    // it. The door does NOT know `pad_vocab` (the group law that makes the
-    // extent safe is asserted at the mint, where `pad_vocab` lives; this
-    // leaf crate re-derives nothing).
+    // it (every pick the sampler answers has a row, the sentinel last —
+    // stated at the mint; this leaf crate re-derives nothing).
     let table_rows = match k.program {
         crate::ktir_node::Program::ChainStage { table_rows, .. } => table_rows,
         other => {
