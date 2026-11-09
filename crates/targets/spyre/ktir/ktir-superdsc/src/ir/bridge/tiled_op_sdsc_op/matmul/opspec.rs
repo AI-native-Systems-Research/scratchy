@@ -490,11 +490,12 @@ where
         // pinned walk is a size cap the card never strides by (the flat-frame P·V contraction,
         // MEASURED by the microbenchmark: a pinned walk lost the rows past the first stick group,
         // the gap read them).
+        // `Pitch::past` decides it: a frame AT the sweep is no pitch, a shorter one refuses by name.
         let input = match phys_mb {
-            Some(phys) if phys > plan.extent(MbAxis::NAME) => input
+            Some(phys) => input
                 .with_pitch(&plan, MbAxis::NAME, phys)
                 .map_err(|e| e.0)?,
-            _ => input,
+            None => input,
         };
         let output_walk = Walk2::output_rows_by_n();
         let output = TensorArg::<2>::new(
@@ -524,20 +525,11 @@ where
         //
         // `phys_mb` already carried exactly this statement for the batched input ("this op ITERATES a
         // window of a LARGER allocation"); it simply was never offered to the output.
+        // The output's batch rows `phys` apart: the same pitch as the input's, built the same way.
         let output = match phys_mb {
-            Some(phys) => {
-                let swept = plan.extent(MbAxis::NAME);
-                if phys < swept {
-                    return Err(format!(
-                        "matmul_opspec '{o_name}': phys_mb={phys} is SMALLER than the swept mb \
-                         {swept}. device_extent declares a window into a LARGER allocation."
-                    ));
-                }
-                // The output's batch rows `phys` apart: the same pitch as the input's.
-                output
-                    .with_pitch(&plan, MbAxis::NAME, phys)
-                    .map_err(|e| e.0)?
-            }
+            Some(phys) => output
+                .with_pitch(&plan, MbAxis::NAME, phys)
+                .map_err(|e| e.0)?,
             None => output,
         };
         [

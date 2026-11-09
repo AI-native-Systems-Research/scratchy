@@ -2332,8 +2332,70 @@ pub enum DeviceAxis {
     Swept,
     /// A window of an allocation this many elements long along the axis (the pinned walk).
     Window(u32),
-    /// Iterated whole, the next outer step this many elements on (the walk's back gap).
-    Pitch(u32),
+    /// Iterated whole, the next outer step a [`Pitch`] on (the walk's back gap).
+    Pitch(Pitch),
+}
+
+/// ⭐ A PITCH PAST AN AXIS'S SWEPT EXTENT — built ONCE, from the axis's swept extent, the
+/// allocation's declared extent and the operand's stick ([`Pitch::past`]), and only there. Every
+/// reader (the address readers through [`DeviceAxis::declared`], the walk through [`Pitch::gap`])
+/// takes the value; nothing re-derives it, so a pitch the walk cannot carry is unconstructable:
+///
+/// * the declared extent is strictly past the swept one (an equal one is no pitch — the axis is
+///   [`DeviceAxis::Swept`] — and a shorter one would land the next step inside this one);
+/// * on the stick axis the gap is whole sticks — dxp folds a stick axis's gap into its outer
+///   (stick-count) repeat over the stick's own elements (`dsc2.cpp`: `backGap % innerSize == 0`,
+///   "Gap must be a multiple of inner repeats").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pitch {
+    declared: u32,
+    gap: u32,
+}
+
+/// What a declared extent on one axis IS, decided once by [`Pitch::past`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastExtent {
+    /// The declared extent IS the swept one: the axis is swept whole, no gap.
+    AtExtent,
+    /// Strictly past it: the walk's back gap.
+    Pitch(Pitch),
+}
+
+impl Pitch {
+    /// The one constructor: `declared` elements apart, of which the op sweeps `swept`, on an axis
+    /// that is the operand's stick axis (`stick = Some(elements per stick)`) or not (`None`).
+    pub fn past(swept: u32, declared: u32, stick: Option<u32>) -> Result<PastExtent, SuperDscError> {
+        let Some(gap) = declared.checked_sub(swept) else {
+            return Err(SuperDscError(format!(
+                "an axis swept {swept} elements at a pitch of {declared} — a pitch shorter than \
+                 the extent would land the next step inside this one"
+            )));
+        };
+        if let Some(lanes) = stick
+            && !gap.is_multiple_of(lanes)
+        {
+            return Err(SuperDscError(format!(
+                "a gap of {gap} elements on a stick axis — a stick axis's gap is whole \
+                 {lanes}-element sticks, and a gap inside a stick is no view"
+            )));
+        }
+        Ok(if gap == 0 {
+            PastExtent::AtExtent
+        } else {
+            PastExtent::Pitch(Pitch { declared, gap })
+        })
+    }
+
+    /// The allocation's extent along the axis — what an address reads.
+    pub fn declared(self) -> u32 {
+        self.declared
+    }
+
+    /// The elements the walk skips past the swept extent before the next outer step — what the
+    /// back gap carries. Never zero.
+    pub fn gap(self) -> u32 {
+        self.gap
+    }
 }
 
 impl DeviceAxis {
@@ -2341,7 +2403,8 @@ impl DeviceAxis {
     pub fn declared(self) -> Option<u32> {
         match self {
             DeviceAxis::Swept => None,
-            DeviceAxis::Window(p) | DeviceAxis::Pitch(p) => Some(p),
+            DeviceAxis::Window(p) => Some(p),
+            DeviceAxis::Pitch(p) => Some(p.declared()),
         }
     }
 
@@ -2354,7 +2417,7 @@ impl DeviceAxis {
     }
 
     /// The pitch the walk's back gap reads.
-    pub fn pitch(self) -> Option<u32> {
+    pub fn pitch(self) -> Option<Pitch> {
         match self {
             DeviceAxis::Pitch(p) => Some(p),
             DeviceAxis::Swept | DeviceAxis::Window(_) => None,
@@ -2375,8 +2438,8 @@ impl DeviceAxis {
 ///   no LX gap form is proven anywhere; this keeps LX views byte-identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PitchForm {
-    Hbm(u32),
-    Lx(u32),
+    Hbm(Pitch),
+    Lx(Pitch),
 }
 
 #[derive(Clone, Debug)]
@@ -2574,34 +2637,30 @@ impl<const D: usize> TensorArg<D> {
         })?;
         if let DeviceAxis::Pitch(p) = self.device_extent[idx] {
             return Err(SuperDscError(format!(
-                "TensorArg '{}': axis '{dim}' already states a pitch of {p} — a window of a \
+                "TensorArg '{}': axis '{dim}' already states a pitch of {} — a window of a \
                  {phys_extent}-long allocation is the other device mechanism for the axis, and one \
                  axis states one",
-                self.name
+                self.name,
+                p.declared()
             )));
         }
         self.device_extent[idx] = DeviceAxis::Window(phys_extent);
         Ok(self)
     }
 
-    /// ⭐ ITERATE `dim` WHOLE, THE NEXT OUTER STEP `pitch` ELEMENTS ON — the walk's back gap
-    /// ([`DeviceAxis::Pitch`]). A general stride law over this view's own extents: `dim`'s swept
-    /// extent is `plan`'s, and the gap the op never touches is `pitch − swept`.
+    /// ⭐ ITERATE `dim` WHOLE, THE NEXT OUTER STEP `declared` ELEMENTS ON — the walk's back gap
+    /// ([`DeviceAxis::Pitch`]). The pitch is built here, once, by [`Pitch::past`] over `dim`'s swept
+    /// extent (`plan`'s), `declared`, and the operand's stick when `dim` is the stick axis — so a
+    /// short pitch or a sub-stick gap refuses at construction, by name, and every reader takes the
+    /// value. A `declared` AT the swept extent is no pitch: the axis stays [`DeviceAxis::Swept`].
     ///
-    /// `pitch == swept` is no pitch at all (the axis stays [`DeviceAxis::Swept`], and the descriptor
-    /// carries no back gap). Refused by name, at build:
-    /// * a `dim` not in this view's layout;
-    /// * a gap on the STICK axis that is not whole sticks — dxp folds a stick axis's gap into its
-    ///   outer (stick-count) repeat over the stick's own elements (`dsc2.cpp`: `backGap % innerSize
-    ///   == 0`, "Gap must be a multiple of inner repeats"), so a sub-stick gap is no view at all;
-    /// * a pitch SHORTER than the swept extent — the next step would land inside this one;
-    /// * an axis that already states a window ([`TensorArg::with_device_extent`]) — one axis, one
-    ///   mechanism.
+    /// Also refused by name: a `dim` not in this view's layout, and an axis that already states a
+    /// window ([`TensorArg::with_device_extent`]) — one axis, one mechanism.
     pub fn with_pitch(
         mut self,
         plan: &WorkPlan,
         dim: &'static str,
-        pitch: u32,
+        declared: u32,
     ) -> Result<TensorArg<D>, SuperDscError> {
         let idx = self.layout.iter().position(|&d| d == dim).ok_or_else(|| {
             SuperDscError(format!(
@@ -2609,35 +2668,21 @@ impl<const D: usize> TensorArg<D> {
                 self.name, self.layout
             ))
         })?;
-        let swept = plan.extent(dim);
-        if pitch < swept {
-            return Err(SuperDscError(format!(
-                "TensorArg '{}': axis '{dim}' sweeps {swept} at a pitch of {pitch} — a pitch \
-                 smaller than the extent would land the next step inside this one",
-                self.name
-            )));
-        }
-        let stick = self.df.elems_per_stick();
-        if dim == self.stick && !(pitch - swept).is_multiple_of(stick) {
-            return Err(SuperDscError(format!(
-                "TensorArg '{}': a gap of {} elements on the stick axis '{dim}' — a stick axis's \
-                 gap is whole {stick}-element sticks, and a gap inside a stick is no view",
-                self.name,
-                pitch - swept
-            )));
-        }
         if let DeviceAxis::Window(p) = self.device_extent[idx] {
             return Err(SuperDscError(format!(
                 "TensorArg '{}': axis '{dim}' already states a window of a {p}-long allocation — a \
-                 pitch of {pitch} is the other device mechanism for the axis, and one axis states \
-                 one",
+                 pitch of {declared} is the other device mechanism for the axis, and one axis \
+                 states one",
                 self.name
             )));
         }
-        self.device_extent[idx] = if pitch == swept {
-            DeviceAxis::Swept
-        } else {
-            DeviceAxis::Pitch(pitch)
+        let stick = (dim == self.stick).then(|| self.df.elems_per_stick());
+        let past = Pitch::past(plan.extent(dim), declared, stick).map_err(|e| {
+            SuperDscError(format!("TensorArg '{}': axis '{dim}': {}", self.name, e.0))
+        })?;
+        self.device_extent[idx] = match past {
+            PastExtent::AtExtent => DeviceAxis::Swept,
+            PastExtent::Pitch(p) => DeviceAxis::Pitch(p),
         };
         Ok(self)
     }
@@ -2713,7 +2758,7 @@ impl ArgView<'_> {
             .iter()
             .map(|&a| match (a, self.pitch_form(a)) {
                 (DeviceAxis::Window(p), _) => Some(p as usize),
-                (DeviceAxis::Pitch(_), Some(PitchForm::Lx(p))) => Some(p as usize),
+                (DeviceAxis::Pitch(_), Some(PitchForm::Lx(p))) => Some(p.declared() as usize),
                 _ => None,
             })
             .collect()
@@ -2835,9 +2880,10 @@ impl AnyTensorArg {
                 .unwrap_or_else(|| panic!("set_device_extent: '{dim}' not in {:?}", t.layout));
             if let DeviceAxis::Pitch(p) = t.device_extent[idx] {
                 panic!(
-                    "set_device_extent: '{dim}' of '{}' already states a pitch of {p} — one axis \
+                    "set_device_extent: '{dim}' of '{}' already states a pitch of {} — one axis \
                      states one device mechanism",
-                    t.name
+                    t.name,
+                    p.declared()
                 );
             }
             t.device_extent[idx] = DeviceAxis::Window(phys_extent);

@@ -607,13 +607,14 @@ impl Coordinates {
 pub struct BackGap(BTreeMap<&'static str, u32>);
 
 impl BackGap {
-    /// The back gap of a view: `pitch − swept extent` on every axis whose pitch resolves to
-    /// [`PitchForm::Hbm`](crate::superdsc_opspec::PitchForm). `None` when no axis does — the
+    /// The back gap of a view: each [`Pitch::gap`](crate::superdsc_opspec::Pitch::gap) on an axis
+    /// whose pitch resolves to [`PitchForm::Hbm`](crate::superdsc_opspec::PitchForm) — the gap
+    /// `declared − swept` the pitch was built with, read, never re-derived. `None` when no axis does — the
     /// descriptor then carries no `backGapCore_`, byte-identical to every view before the field
     /// existed. An LX view's pitch is [`PitchForm::Lx`](crate::superdsc_opspec::PitchForm), which
     /// the walk carries as its pinned extent and this never sees (`ArgView::window_extents`).
     ///
-    /// ⛔ THE WHOLE SWEPT EXTENT, NOT ONE CORE'S. An HBM unit view's per-dim capacity INCLUDES the
+    /// ⛔ THE GAP IS PAST THE WHOLE SWEPT EXTENT, NOT ONE CORE'S. An HBM unit view's per-dim capacity INCLUDES the
     /// core fold (`dsc2.cpp` `getBufferCapacityForNodePerDim`: `comp == HBM && foldPos ==
     /// coreFoldPos` multiplies the cardinality in), so the repeat the gap is folded into is the
     /// whole tensor's along the axis — the vendor's own `backGap = dev_dim_size − it_dim_size`.
@@ -621,33 +622,18 @@ impl BackGap {
     /// cores split, read the gap fill past block 0 with `pitch − per-core extent`, and every block
     /// with `pitch − extent`; a row band whose `mb` the cores split ([16,384] of [64,384]) is
     /// bit-identical to the whole-parent op with `parent − rows`.
-    pub fn of_hbm_view(
-        op_name: &str,
-        v: &ArgView<'_>,
-        iter: &WorkPlan,
-    ) -> Result<Option<BackGap>, SuperDscError> {
-        let mut gaps = BTreeMap::new();
-        for (&d, &axis) in v.layout.iter().zip(v.device_extent) {
-            let pitch = match v.pitch_form(axis) {
-                Some(crate::superdsc_opspec::PitchForm::Hbm(p)) => p,
+    pub fn of_hbm_view(v: &ArgView<'_>) -> Option<BackGap> {
+        let gaps: BTreeMap<&'static str, u32> = v
+            .layout
+            .iter()
+            .zip(v.device_extent)
+            .filter_map(|(&d, &axis)| match v.pitch_form(axis) {
+                Some(crate::superdsc_opspec::PitchForm::Hbm(p)) => Some((d, p.gap())),
                 // The pinned walk carries it (`window_extents`); no gap, exactly one form.
-                Some(crate::superdsc_opspec::PitchForm::Lx(_)) | None => continue,
-            };
-            let swept = iter.extent(d);
-            // `with_pitch` refuses a pitch below the extent and folds an equal one to `Swept`.
-            let Some(gap) = pitch.checked_sub(swept).filter(|&g| g > 0) else {
-                return Err(SuperDscError(format!(
-                    "op {op_name}: tensor '{}' states a pitch of {pitch} on '{d}', which this op \
-                     sweeps {swept} of — a pitch is past the extent",
-                    v.name
-                )));
-            };
-            gaps.insert(d, gap);
-        }
-        if gaps.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(BackGap(gaps)))
+                Some(crate::superdsc_opspec::PitchForm::Lx(_)) | None => None,
+            })
+            .collect();
+        (!gaps.is_empty()).then_some(BackGap(gaps))
     }
 
     /// The gap on `axis`, in elements of that axis.

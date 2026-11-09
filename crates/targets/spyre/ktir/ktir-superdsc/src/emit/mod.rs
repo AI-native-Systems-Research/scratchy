@@ -4148,7 +4148,7 @@ pub fn emit_sdsc(
             // ⭐ A PITCHED AXIS's walk — the gap past its swept extent, from the view's own pitch
             // (`DeviceAxis::Pitch`, `BackGap::of_hbm_view`). `None` on every view that states no
             // pitch, so every such descriptor is byte-identical.
-            backGapCore_: crate::wire::BackGap::of_hbm_view(op_name, v, iter)?,
+            backGapCore_: crate::wire::BackGap::of_hbm_view(v),
             coordinates_: coordinates,
         })
     })?;

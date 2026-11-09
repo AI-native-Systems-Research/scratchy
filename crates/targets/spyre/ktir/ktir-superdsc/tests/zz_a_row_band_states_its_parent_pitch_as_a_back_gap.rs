@@ -149,7 +149,13 @@ fn a_one_stick_band_states_no_gap() {
 #[test]
 fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     use ktir_superdsc::superdsc_opspec::{
-        Allocation, DeviceAxis, Df, ItDim, MaxCores, Role, Scale, TensorArg, WorkPlan,
+        Allocation, DeviceAxis, Df, ItDim, MaxCores, PastExtent, Pitch, Role, Scale, TensorArg,
+        WorkPlan,
+    };
+    // The pitch a view states is the one value `Pitch::past` builds — read back whole.
+    let pitch = |swept, declared, stick| match Pitch::past(swept, declared, stick).unwrap() {
+        PastExtent::Pitch(p) => p,
+        PastExtent::AtExtent => panic!("{declared} is no pitch past {swept}"),
     };
     let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
         name,
@@ -186,7 +192,7 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     // A pitch past the extent states it; a pitch AT the extent is no pitch.
     assert_eq!(
         axes(view().with_pitch(&plan, "mb", 10).unwrap()),
-        [DeviceAxis::Swept, DeviceAxis::Pitch(10), DeviceAxis::Swept]
+        [DeviceAxis::Swept, DeviceAxis::Pitch(pitch(4, 10, None)), DeviceAxis::Swept]
     );
     assert_eq!(
         axes(view().with_pitch(&plan, "mb", 4).unwrap()),
@@ -194,11 +200,11 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     );
     // The near-miss the law exists for: a pitch SMALLER than the extent.
     let short = view().with_pitch(&plan, "mb", 3).unwrap_err().0;
-    assert!(short.contains("smaller than the extent"), "{short}");
+    assert!(short.contains("shorter than the extent"), "{short}");
     // The stick axis states a pitch of whole sticks, and refuses a gap inside one.
     assert_eq!(
         axes(view().with_pitch(&plan, "out", 256).unwrap()),
-        [DeviceAxis::Swept, DeviceAxis::Swept, DeviceAxis::Pitch(256)]
+        [DeviceAxis::Swept, DeviceAxis::Swept, DeviceAxis::Pitch(pitch(128, 256, Some(64)))]
     );
     let stick = view().with_pitch(&plan, "out", 160).unwrap_err().0;
     assert!(stick.contains("stick axis"), "{stick}");
@@ -229,6 +235,33 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
                 .with_pitch(&plan, "mb", 10)
                 .unwrap()
         ),
-        [DeviceAxis::Window(8), DeviceAxis::Pitch(10), DeviceAxis::Swept]
+        [DeviceAxis::Window(8), DeviceAxis::Pitch(pitch(4, 10, None)), DeviceAxis::Swept]
     );
+}
+
+/// ⭐ THE PITCH IS BUILT ONCE, AND ONLY WHEN THE WALK CAN CARRY IT: [`Pitch::past`] over (swept,
+/// declared, stick) is the one constructor, and its gap is the back gap verbatim.
+#[test]
+fn a_pitch_is_built_once_from_swept_declared_and_stick() {
+    use ktir_superdsc::superdsc_opspec::{PastExtent, Pitch};
+    // The match: the gap is declared − swept, the declared extent is what an address reads.
+    let PastExtent::Pitch(p) = Pitch::past(4, 16, None).unwrap() else {
+        panic!("16 past 4 is a pitch")
+    };
+    assert_eq!((p.declared(), p.gap()), (16, 12));
+    // A whole-stick gap on a stick axis is a pitch.
+    let PastExtent::Pitch(s) = Pitch::past(2048, 512 * 2048, Some(64)).unwrap() else {
+        panic!("a whole-stick gap is a pitch")
+    };
+    assert_eq!(s.gap(), 511 * 2048);
+    // AT the extent: no pitch, the axis is swept whole.
+    assert_eq!(Pitch::past(4, 4, None).unwrap(), PastExtent::AtExtent);
+    assert_eq!(Pitch::past(128, 128, Some(64)).unwrap(), PastExtent::AtExtent);
+    // The near-misses, each refused by name at construction:
+    let short = Pitch::past(16, 4, None).unwrap_err().0;
+    assert!(short.contains("shorter than the extent"), "{short}");
+    let sub_stick = Pitch::past(128, 160, Some(64)).unwrap_err().0;
+    assert!(sub_stick.contains("whole 64-element sticks"), "{sub_stick}");
+    // The stick only binds the stick axis: the same gap is a pitch on a row axis.
+    assert!(matches!(Pitch::past(128, 160, None), Ok(PastExtent::Pitch(_))));
 }
