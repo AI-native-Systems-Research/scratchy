@@ -5422,7 +5422,7 @@ mod walk_on_the_card {
             .collect()
     }
 
-    /// The HBM views the matmul pitch (e55dd14dd8) changed on purpose: each per-batch decode
+    /// The HBM views the matmul pitch changed on purpose: each per-batch decode
     /// contraction whose flat-frame batch rows sit past their own (`mb` 4 of a taller frame, `n` or
     /// `k` past one stick) now carries `backGapCore_[mb] = frame − 4` over a swept walk instead of a
     /// pinned `maxDimSizes_` — the card-proven flat-frame form (the bmm cells, 2026-11-08: pinned
@@ -5445,7 +5445,7 @@ mod walk_on_the_card {
     ];
 
     /// ⭐ THE BATCHED DECODE'S LX VIEWS ARE THE BYTES THEY SHIPPED AS — a matmul `phys_mb` became a
-    /// pitch (e55dd14dd8), and an LX-resident view's pitch is the pinned walk it always was
+    /// pitch, and an LX-resident view's pitch is the pinned walk it always was
     /// (`PitchForm::Lx`). Against the tree before the matmul pitch, over every descriptor of all 40
     /// head-share geometries:
     ///
@@ -5458,8 +5458,8 @@ mod walk_on_the_card {
     /// `fixtures/batched_decode_descriptors_pre_pitch.digest` is `<geometry>\t<op>\t<fnv64 of the
     /// descriptor's JSON>\t<fnv64 of its LX views>` a line; `fixtures/batched_decode_kv8_s1_b1_hd64_
     /// pre_pitch.json` the slice. REGENERATING THE FULL JSON: check out this tree, replace
-    /// `ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/matmul/{opspec,assemble}.rs` with 5d64673767's
-    /// (`git show 5d64673767:<path>`), and serialize `decode_batch_descriptors()` (one `{at, op_name,
+    /// `ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/matmul/{opspec,assemble}.rs` with main's
+    /// (6f6c580ee6, `git show 6f6c580ee6:<path>`), and serialize `decode_batch_descriptors()` (one `{at, op_name,
     /// op}` object per descriptor) from a scratch test in this module; `cargo test --release -p
     /// scratchy-triton-splice --lib <that test>`. Generated so on nickm5 (full JSON md5 03e13d16).
     #[test]

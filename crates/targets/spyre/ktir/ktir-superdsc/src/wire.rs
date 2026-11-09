@@ -617,9 +617,10 @@ impl BackGap {
     /// core fold (`dsc2.cpp` `getBufferCapacityForNodePerDim`: `comp == HBM && foldPos ==
     /// coreFoldPos` multiplies the cardinality in), so the repeat the gap is folded into is the
     /// whole tensor's along the axis — the vendor's own `backGap = dev_dim_size − it_dim_size`.
-    /// MEASURED on the card (2026-11-08): a `sumnonstick` whose stick axis the cores split read the
-    /// gap fill past block 0 with `pitch − per-core extent` (max abs 79 at J = 2, 548 at J = 8), and
-    /// every block correctly with `pitch − extent` on an unsplit axis.
+    /// MEASURED on the card (2026-11-08): a reduction over blocks a pitch apart, whose stick axis the
+    /// cores split, read the gap fill past block 0 with `pitch − per-core extent`, and every block
+    /// with `pitch − extent`; a row band whose `mb` the cores split ([16,384] of [64,384]) is
+    /// bit-identical to the whole-parent op with `parent − rows`.
     pub fn of_hbm_view(
         op_name: &str,
         v: &ArgView<'_>,

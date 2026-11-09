@@ -4018,8 +4018,9 @@ pub fn emit_sdsc(
             // ⛔ A WINDOW'S EXTENT ONLY, NEVER A PITCH'S (`ArgView::window_extents`). `maxDimSizes_`
             // is a size cap (`dsc2.cpp` `buildUnitView`): a pitched axis stated here would make the
             // view TOUCH the gap, and the card would still step the next iteration by the swept
-            // extent — MEASURED, the leading-axis sum's blocks 512 rows apart read as consecutive
-            // rows. A pitch is the walk's back gap (`backGapCore_` below).
+            // extent — MEASURED on the card, a flat-frame batched contraction read every batch past
+            // the first stick group wrong through a pinned walk. A pitch is the walk's back gap
+            // (`backGapCore_` below).
             maxDimSizes_: {
                 let swept: Vec<usize> = v.layout.iter().map(|&d| iter.extent(d) as usize).collect();
                 let stick_pos = v
