@@ -487,6 +487,12 @@ impl Default for LxAlloc {
 /// program is refused at the pair; and it is the borrow that makes a pair nested inside another
 /// pair's construction unwritable. No other constructor than [`LxScope::program`]: a fresh scope per
 /// program, never one carried across two.
+///
+/// ⚖️ WHY THE SECOND-PIN REFUSAL IS A MAP AND NOT A MOVED VALUE. A class is a pin's 128-aligned
+/// footprint in bytes, derived from the pin's dims, so the class SET is known only when the bake
+/// lowers the program (31-33 classes on the shipped granites) — it cannot be one `ClassSlot` field
+/// per class for the compiler to move. The refusal is therefore a NAMED BUILD ERROR at the pair
+/// (`#[forward]` expansion), never a card fault. Nesting, which needs no class, IS a type error.
 #[derive(Debug, Default)]
 pub struct LxScope {
     classes: std::collections::BTreeMap<u64, String>,
@@ -1044,6 +1050,9 @@ impl BundleLayout {
     ///
     /// A layout-less lowering (unit fixtures) has no pins: the pin is the plain synth spelling and
     /// `build` runs with it, as every other intermediate's does there.
+    ///
+    /// ⏳ `layout` is `Option<&BundleLayout>` only because every lowering still threads one; it becomes
+    /// `&BundleLayout` when residency-v2 makes the layout non-optional at the door and the walk.
     ///
     /// A pair NESTED inside another pair's construction does not compile — the program's scope is
     /// already borrowed by the outer pair:
