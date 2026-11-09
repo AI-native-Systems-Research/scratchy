@@ -42,7 +42,7 @@ use scratchy_target_cuda::tape::{
     RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles,
 };
 
-use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_fused, lower_step};
+use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_driver, lower_step};
 
 /// The model facts CUDA's opcode lowering reads, beside the canonical: expansion-time constants,
 /// the counterpart of the `MetalModelConsts` fields metal's rope and gate lowerings read.
@@ -1407,8 +1407,11 @@ pub fn plan_canonical(
     // folds the routed experts' gate and up too (`cuda_fusions`).
     let model = ModelFoldFacts {
         fold_projections: CUDA_FOLD_PROJECTIONS,
-        matvec_ends: false,
-        matvec_norms: false,
+        // FP8 S8 W4a: the one-row bucket's matvecs take their ends, the norm in their prologue and
+        // the residual add in their epilogue (`CUDA_FUSIONS_ONE_ROW`'s first two sweeps), as
+        // Metal's one-row buckets do. Every other bucket is unchanged.
+        matvec_ends: m == 1,
+        matvec_norms: m == 1,
         row_programs: false,
         hidden_out: false,
     };
@@ -1462,6 +1465,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         graph: &plan.graph,
         bindings: &plan.lowered.bindings,
         colouring: &plan.colouring,
+        folds: &plan.folds,
         facts: plan.facts,
         tokens: embedded_hidden(&plan).ok().map(|h| h.rows),
         offsets: match &arena {
@@ -1485,7 +1489,9 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let mut steps = (computes.iter())
         .filter_map(|s| match plan.folds.role(s.writes) {
             StepRole::Kept => lower_step(&cx, s, &computes).transpose(),
-            StepRole::Drives(f) => Some(lower_fused(&cx, s, f, &computes)),
+            StepRole::Drives(_) => {
+                lower_driver(&cx, s, plan.folds.driven(s.writes), &computes).transpose()
+            }
             StepRole::Absorbed { .. } | StepRole::Epilogue { .. } => None,
         })
         .collect::<Result<Vec<_>, _>>()?;

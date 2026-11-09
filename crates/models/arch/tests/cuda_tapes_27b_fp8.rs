@@ -23,8 +23,7 @@ const STEM: &str = "qwen3.8-27b";
 const FEATURE: &str = "CARGO_FEATURE_QWEN3.8_27B_TEXT_ONLY";
 const ARCH: &str = "qwen3-5";
 
-const DECODE_STEPS: [(&str, usize); 13] = [
-    ("AddRmsNorm", 128),
+const DECODE_STEPS: [(&str, usize); 12] = [
     ("AttnDecode", 16),
     ("Embed", 1),
     ("GateApply", 16),
@@ -34,7 +33,7 @@ const DECODE_STEPS: [(&str, usize); 13] = [
     ("Gemv", 1),
     ("GemvFp8", 128),
     ("GemvGroupFp8", 112),
-    ("RmsNorm", 33),
+    ("RmsNorm", 32),
     ("Rope", 16),
     ("RopeAppend", 16),
 ];

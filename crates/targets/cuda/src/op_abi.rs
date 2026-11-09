@@ -17,11 +17,12 @@
 use std::num::NonZeroU32;
 
 use scratchy_subtile::handoff::SourceBinding;
+use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::ops::SubOpKind;
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsFacts};
 use scratchy_subtile::subtile_ir::{EwKind, ExpertBundle, ExpertProj, OpStage, RopeForm, SubOp};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
-use scratchy_subtile::tape_folding::{ColsBand, FoldPattern, FusionTable, GatedKernel};
+use scratchy_subtile::tape_folding::{ColsBand, FoldPattern, FusionTable, GatedKernel, NormReader};
 use scratchy_subtile::tape_steps::OperandIx;
 
 // ── The colour rule ─────────────────────────────────────────────────
@@ -185,6 +186,16 @@ pub enum CudaFusion {
     /// A routed expert's gate and up GEMVs and its activation in one launch, at the one-row bucket
     /// (#1049, `step::CudaStep::ExpertGateUpAct`).
     ExpertGateUpAct,
+    /// An RMSNorm in the prologue of every one-row matvec reading it (FP8 S8 W4a; the shared
+    /// `NormedMatvecs`): the GEMV normalises its row as it loads it, the norm's own launch gone.
+    NormedGemv,
+    /// Gemma's `RouterNorm` in the prologue of the router reading it (FP8 S8 W4a).
+    NormedRouter,
+    /// The one-row fp8 GEMV with the residual add it alone feeds as its epilogue (FP8 S8 W4a; the
+    /// shared `MatvecEpilogue`): the o, GDN-out and down projections write `residual + out`.
+    GemvFp8Residual,
+    /// [`Self::GemvFp8Residual`] on the bf16 GEMV (the 35B's GDN `out_proj`, kept bf16).
+    GemvResidual,
 }
 
 /// Whether CUDA folds a gated MLP's gate and up projections into its activation
@@ -241,12 +252,22 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
     rows: None,
 };
 
-/// [`CUDA_FUSIONS`] and, after its sweep, a routed expert's gate and up GEMVs folded into its
-/// activation (metal's `ExpertActivation` row, #1049): the one-row bucket's table
-/// ([`cuda_fusions`]).
+/// The one-row bucket's table ([`cuda_fusions`]), four sweeps (FP8 S8 W4a). The shared pass visits
+/// the steps in tape order, a norm before its readers, and a fold takes only steps no earlier
+/// fold took, so the order is forced:
+/// 1. [`CUDA_SWEEP_ONE_ROW_GROUPS`]: the sibling matmuls group (`SiblingMatmuls` refuses a matmul
+///    that already carries a fusion, so they group before the norms fold), and a projection
+///    before a residual add takes the add as its epilogue (before `ResidualNorm` could take it);
+/// 2. [`CUDA_SWEEP_ONE_ROW_NORMS`]: an RMSNorm folds into the prologue of the matvecs reading it;
+/// 3. [`CUDA_SWEEP`], every bucket's: its siblings row finds the groups taken, its `Gated`,
+///    `NormAdd`, `ResidualNorm` and `Route` rows as at every bucket;
+/// 4. a routed expert's gate and up GEMVs folded into its activation (metal's `ExpertActivation`
+///    row, #1049).
 pub const CUDA_FUSIONS_ONE_ROW: FusionTable<CudaFusion> = FusionTable {
     counted: &[],
     sweeps: &[
+        CUDA_SWEEP_ONE_ROW_GROUPS,
+        CUDA_SWEEP_ONE_ROW_NORMS,
         CUDA_SWEEP,
         &[FoldPattern::ExpertActivation {
             act: SubOpKind::ExpertGatedAct,
@@ -257,15 +278,84 @@ pub const CUDA_FUSIONS_ONE_ROW: FusionTable<CudaFusion> = FusionTable {
     rows: None,
 };
 
+/// Up to three dense matmuls of one band off one input in one grouped launch (#1049): every
+/// bucket's first row, and the one-row bucket's first.
+const F_SIBLINGS: FoldPattern<CudaFusion> = FoldPattern::SiblingMatmuls {
+    matmul: SubOpKind::MatmulTile,
+    max: 3,
+    bands: CUDA_SIBLING_BANDS,
+    gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+    kernel: CudaFusion::SiblingMatmuls,
+};
+
+/// The one-row bucket's first sweep (FP8 S8 W4a): the siblings group, and the projection a residual
+/// add alone reads (its operand 0, the residual its operand 1) takes the add as its epilogue, on
+/// the fp8 GEMV and the bf16 GEMV (the 35B's GDN `out_proj`). Metal's `F_COMBINE_EPILOGUE` is not
+/// a row: the 35B's tape computes its routed combine before the shared expert, so the combine's
+/// gate scale is not ready there and the row would never fold; its add stays a launch.
+const CUDA_SWEEP_ONE_ROW_GROUPS: &[FoldPattern<CudaFusion>] = &[
+    F_SIBLINGS,
+    FoldPattern::MatvecEpilogue {
+        anchor: SubOpKind::MatmulTile,
+        weights: Some(GemmWeightKind::Fp8Dynamic),
+        bias: None,
+        scale: None,
+        gate_scale: None,
+        add: SubOpKind::Add,
+        gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+        kernel: CudaFusion::GemvFp8Residual,
+    },
+    FoldPattern::MatvecEpilogue {
+        anchor: SubOpKind::MatmulTile,
+        weights: Some(GemmWeightKind::Dense),
+        bias: None,
+        scale: None,
+        gate_scale: None,
+        add: SubOpKind::Add,
+        gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+        kernel: CudaFusion::GemvResidual,
+    },
+];
+
+/// The one-row bucket's second sweep (FP8 S8 W4a): an RMSNorm whose every reader is a one-row
+/// matvec (an fp8 or bf16 GEMV, a router, or a gathered expert step) folds into their prologues;
+/// Gemma's `RouterNorm` into its router's. Metal's `NormedMatvecs` rows, with CUDA's weight kinds.
+const CUDA_SWEEP_ONE_ROW_NORMS: &[FoldPattern<CudaFusion>] = &[
+    FoldPattern::NormedMatvecs {
+        norm: SubOpKind::RmsNorm,
+        readers: &[
+            NormReader::Matvec {
+                kind: SubOpKind::MatmulTile,
+                weights: Some(GemmWeightKind::Fp8Dynamic),
+            },
+            NormReader::Matvec {
+                kind: SubOpKind::MatmulTile,
+                weights: Some(GemmWeightKind::Dense),
+            },
+            NormReader::Matvec {
+                kind: SubOpKind::RouterLogits,
+                weights: None,
+            },
+            NormReader::Gathered {
+                sort: SubOpKind::ExpertSort,
+                gathered_below: CUDA_SORTED_PAIRS,
+            },
+        ],
+        kernel: CudaFusion::NormedGemv,
+    },
+    FoldPattern::NormedMatvecs {
+        norm: SubOpKind::RouterNorm,
+        readers: &[NormReader::Matvec {
+            kind: SubOpKind::RouterLogits,
+            weights: None,
+        }],
+        kernel: CudaFusion::NormedRouter,
+    },
+];
+
 /// The sweep every CUDA bucket folds by ([`CUDA_FUSIONS`]).
 const CUDA_SWEEP: &[FoldPattern<CudaFusion>] = &[
-    FoldPattern::SiblingMatmuls {
-        matmul: SubOpKind::MatmulTile,
-        max: 3,
-        bands: CUDA_SIBLING_BANDS,
-        gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
-        kernel: CudaFusion::SiblingMatmuls,
-    },
+    F_SIBLINGS,
     FoldPattern::Gated {
         mul: SubOpKind::Mul,
         activations: &[
@@ -442,24 +532,50 @@ mod tests {
             assert!(table.rows.is_none());
         }
         assert!(CUDA_SAMPLE_ROWS.weights.is_empty());
-        // The one-row table has the experts' sweep; every other bucket's has the one sweep.
-        assert_eq!(cuda_fusions(1).sweeps.len(), 2);
+        // The one-row table has the matvec ends' two sweeps and the experts' sweep (FP8 S8 W4a);
+        // every other bucket's has the one sweep.
+        assert_eq!(cuda_fusions(1).sweeps.len(), 4);
         for m in [2, 512, 4096] {
             assert_eq!(cuda_fusions(m).sweeps.len(), 1, "m={m}");
         }
         let [sweep] = CUDA_FUSIONS.sweeps else {
             panic!("expected one sweep, got {}", CUDA_FUSIONS.sweeps.len());
         };
-        let [first, experts] = CUDA_FUSIONS_ONE_ROW.sweeps else {
+        let [groups, norms, first, experts] = CUDA_FUSIONS_ONE_ROW.sweeps else {
             panic!(
-                "expected two one-row sweeps, got {}",
+                "expected four one-row sweeps, got {}",
                 CUDA_FUSIONS_ONE_ROW.sweeps.len()
             );
         };
-        assert_eq!(
-            first.len(),
-            sweep.len(),
-            "the one-row table's first sweep is the sweep"
+        assert!(
+            std::ptr::eq(*groups, CUDA_SWEEP_ONE_ROW_GROUPS)
+                && std::ptr::eq(*norms, CUDA_SWEEP_ONE_ROW_NORMS),
+            "the one-row table's first two sweeps are its matvec ends'"
+        );
+        assert!(
+            std::ptr::eq(*first, *sweep) && std::ptr::eq(*sweep, CUDA_SWEEP),
+            "the one-row table's third sweep is the sweep"
+        );
+        assert!(
+            matches!(
+                (CUDA_SWEEP[0], F_SIBLINGS),
+                (
+                    FoldPattern::SiblingMatmuls {
+                        max: 3,
+                        kernel: CudaFusion::SiblingMatmuls,
+                        ..
+                    },
+                    FoldPattern::SiblingMatmuls {
+                        max: 3,
+                        kernel: CudaFusion::SiblingMatmuls,
+                        ..
+                    },
+                )
+            ) && matches!(
+                CUDA_SWEEP_ONE_ROW_GROUPS[0],
+                FoldPattern::SiblingMatmuls { .. }
+            ),
+            "both tables group the siblings by the one row"
         );
         let [
             FoldPattern::ExpertActivation {

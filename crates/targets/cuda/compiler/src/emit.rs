@@ -739,19 +739,22 @@ pub fn weight_table(
             .iter()
             .flat_map(|s| s.parts().into_iter().flatten())
         {
-            let Some((WeightIx(ix), role)) = role(&step) else {
-                continue;
-            };
-            let ix = ix as usize;
-            match roles[ix] {
-                Some(first) if first != role => {
-                    return Err(ModelRefusal::WeightRole {
-                        ix,
-                        first: format!("{first:?}"),
-                        other: format!("{role:?}"),
-                    });
+            // A one-row GEMV's fused norm reads its gain as the norm's own step does (FP8 S8 W4a).
+            let gain = (step.gemv_ends().and_then(|e| e.norm))
+                .zip(step.extents())
+                .and_then(|(n, e)| Some((n.gain, Role::Bf16([e.gain?.bytes / 2, 0], 1))));
+            for (WeightIx(ix), role) in role(&step).into_iter().chain(gain) {
+                let ix = ix as usize;
+                match roles[ix] {
+                    Some(first) if first != role => {
+                        return Err(ModelRefusal::WeightRole {
+                            ix,
+                            first: format!("{first:?}"),
+                            other: format!("{role:?}"),
+                        });
+                    }
+                    _ => roles[ix] = Some(role),
                 }
-                _ => roles[ix] = Some(role),
             }
         }
     }

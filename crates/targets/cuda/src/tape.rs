@@ -1311,7 +1311,7 @@ impl CudaTape {
                     });
                 }
             }
-            if let Some(w) = e.weight {
+            for w in [e.weight, e.gain].into_iter().flatten() {
                 let weights = self.weight_bytes.len();
                 let ix = w.ix.0;
                 let &declared = (self.weight_bytes.get(ix as usize))
@@ -4673,6 +4673,7 @@ mod pool_and_overlap_tests {
             writes,
             second_write: None,
             weight: None,
+            gain: None,
             kv: None,
             gdn: None,
             in_place,
