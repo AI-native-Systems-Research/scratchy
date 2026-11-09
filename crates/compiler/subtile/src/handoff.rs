@@ -315,11 +315,58 @@ impl ArenaExtents {
     }
 }
 
+/// ⭐ THE SOURCE A TAPE GATHERS ITS EMBEDDED ROW INTO — the one `SourceBinding::EmbeddedHidden`
+/// of its bindings, found once by [`LoweredDecode::new`]. A decoder's tape has exactly one; a
+/// tower's (pixels in) has none; two is refused at construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbedRow(usize);
+
+impl EmbedRow {
+    /// The source index.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// What a tape knows of its embed row: `Option<EmbedRow>` for any lowered tape, `EmbedRow` for a
+/// DECODER's tape ([`LoweredDecode::into_decode`]) — the type the decode bake takes, so its read of
+/// the row cannot miss.
+pub trait EmbedState: Clone + std::fmt::Debug {}
+impl EmbedState for Option<EmbedRow> {}
+impl EmbedState for EmbedRow {}
+
+/// A tape whose bindings name two embed rows — the bridge mints one per `Embed` op and the host
+/// gathers one row, so a second is never written. Refused at [`LoweredDecode::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TwoEmbedRows {
+    pub first: usize,
+    pub second: usize,
+}
+
+impl std::fmt::Display for TwoEmbedRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sources t{} and t{} are both EmbeddedHidden — the host gathers one row, so the \
+             second is never written",
+            self.first, self.second
+        )
+    }
+}
+
+/// A tape that gathers no embed row, asked to be a decoder's ([`LoweredDecode::into_decode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoEmbedRow;
+
 #[derive(Debug, Clone)]
-pub struct LoweredDecode {
+pub struct LoweredDecode<E: EmbedState = Option<EmbedRow>> {
     pub input: LoweringInput,
-    /// Parallel to `input.sources`: what each source is bound to.
-    pub bindings: Vec<SourceBinding>,
+    /// Parallel to `input.sources`: what each source is bound to. Private, with the roles it
+    /// states ([`Self::embed`]) computed from it once at [`Self::new`]: nothing can change one
+    /// without the other.
+    bindings: Vec<SourceBinding>,
+    /// The embed row the bindings name — [`EmbedState`].
+    embed: E,
     /// Parallel to `input.ops`: the FUF `(tile, output slot)` each op's
     /// output realizes, when it realizes one (fusion intermediates
     /// don't). Provenance lets per-target emitters reuse the SAME
@@ -339,6 +386,102 @@ pub struct LoweredDecode {
     /// names — a KV encode packs the cache half its writer filled, a coded attention reads the
     /// K/V its stage steps staged. Every other read is an operand.
     pub unnamed_reads: Vec<(usize, usize)>,
+}
+
+impl LoweredDecode {
+    /// A lowered tape: its roles (the embed row) read off `bindings` here, once. Two embed rows
+    /// are refused ([`TwoEmbedRows`]).
+    pub fn new(
+        input: LoweringInput,
+        bindings: Vec<SourceBinding>,
+        op_tiles: Vec<Option<(u32, u8)>>,
+        norm_gain_add_tiles: std::collections::HashMap<usize, u32>,
+        op_expansion: Vec<Option<Expansion>>,
+        unnamed_reads: Vec<(usize, usize)>,
+    ) -> Result<Self, TwoEmbedRows> {
+        let mut rows = (bindings.iter().enumerate())
+            .filter(|(_, b)| matches!(b, SourceBinding::EmbeddedHidden))
+            .map(|(i, _)| i);
+        let embed = match (rows.next(), rows.next()) {
+            (first, None) => first.map(EmbedRow),
+            (Some(first), Some(second)) => return Err(TwoEmbedRows { first, second }),
+            (None, Some(_)) => unreachable!("an iterator yields its first item first"),
+        };
+        Ok(Self {
+            input,
+            bindings,
+            embed,
+            op_tiles,
+            norm_gain_add_tiles,
+            op_expansion,
+            unnamed_reads,
+        })
+    }
+
+    /// The embed row, when the tape gathers one (a tower's does not).
+    pub fn embed_row(&self) -> Option<EmbedRow> {
+        self.embed
+    }
+
+    /// This tape as a DECODER's — its embed row held as a fact ([`EmbedRow`], no `Option`), the
+    /// type the decode bake takes. [`NoEmbedRow`] when the tape gathers none.
+    pub fn into_decode(self) -> Result<LoweredDecode<EmbedRow>, NoEmbedRow> {
+        match self.embed {
+            Some(row) => Ok(LoweredDecode {
+                input: self.input,
+                bindings: self.bindings,
+                embed: row,
+                op_tiles: self.op_tiles,
+                norm_gain_add_tiles: self.norm_gain_add_tiles,
+                op_expansion: self.op_expansion,
+                unnamed_reads: self.unnamed_reads,
+            }),
+            None => Err(NoEmbedRow),
+        }
+    }
+}
+
+impl LoweredDecode<EmbedRow> {
+    /// The embed row — a decoder's tape always gathers one.
+    pub fn embed_row(&self) -> EmbedRow {
+        self.embed
+    }
+}
+
+impl<E: EmbedState> LoweredDecode<E> {
+    /// What each source is bound to (parallel to `input.sources`).
+    pub fn bindings(&self) -> &[SourceBinding] {
+        &self.bindings
+    }
+
+    /// This tape's bindings and embed row over a rewritten forward — the form every op-rewriting
+    /// pass (a codec expansion, a shard, a reorder) returns. Such a pass keeps every source at its
+    /// index (a shard changes only its per-rank shape), so the roles, which are per index, carry
+    /// over as they are, never re-derived.
+    pub fn with_ops(
+        &self,
+        input: LoweringInput,
+        op_tiles: Vec<Option<(u32, u8)>>,
+        norm_gain_add_tiles: std::collections::HashMap<usize, u32>,
+        op_expansion: Vec<Option<Expansion>>,
+        unnamed_reads: Vec<(usize, usize)>,
+    ) -> Self {
+        assert_eq!(
+            input.sources.len(),
+            self.input.sources.len(),
+            "an op rewrite keeps its tape's sources at their indices — a pass that adds or drops \
+             one mints a new tape (`LoweredDecode::new`)"
+        );
+        Self {
+            input,
+            bindings: self.bindings.clone(),
+            embed: self.embed.clone(),
+            op_tiles,
+            norm_gain_add_tiles,
+            op_expansion,
+            unnamed_reads,
+        }
+    }
 }
 
 /// One construct's expansion into ops (see [`LoweredDecode::op_expansion`]).

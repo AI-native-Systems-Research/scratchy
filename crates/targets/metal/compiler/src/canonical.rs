@@ -535,7 +535,7 @@ pub fn lower_canonical(
     let colouring = colour_tape(
         &tp.graph,
         &tp.tape,
-        &l.bindings,
+        l.bindings(),
         &folds.fold_facts(),
         &METAL_COLOUR_FACTS,
     )

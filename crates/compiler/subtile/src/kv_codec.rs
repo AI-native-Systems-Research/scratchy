@@ -240,26 +240,24 @@ pub fn expand_kv_codec(
         }
     }
     let at = &x.at;
-    Ok(LoweredDecode {
-        input: LoweringInput {
+    Ok(l.with_ops(
+        LoweringInput {
             sources: l.input.sources.clone(),
             ops: x.ops,
             result: x.read_as[l.input.result],
             exported: l.input.exported.map(|e| x.read_as[e]),
         },
-        bindings: l.bindings.clone(),
-        op_tiles: x.tiles,
-        norm_gain_add_tiles: l
-            .norm_gain_add_tiles
+        x.tiles,
+        l.norm_gain_add_tiles
             .iter()
             .map(|(op, tile)| (at[*op], *tile))
             .collect(),
-        op_expansion: x.expansion,
-        unnamed_reads: (l.unnamed_reads.iter())
+        x.expansion,
+        (l.unnamed_reads.iter())
             .map(|(w, r)| (at[*w], at[*r]))
             .chain(x.unnamed_reads)
             .collect(),
-    })
+    ))
 }
 
 /// Where a KV writer's operands sit: each operand's value and the cache half it fills, and a
