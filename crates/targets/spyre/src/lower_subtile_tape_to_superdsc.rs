@@ -3557,15 +3557,17 @@ fn teacher_forced_walk<F: RopeForm>(
                     shape,
                 );
                 // ⭐ A FOLDED tail tid states the FOLD'S OWN LAW here too: the
-                // program's product is ONE row (row 0 of the readback — the
-                // stick above it is sized by the IR and never written), so the
-                // row compares the emulator's row 0 against this walk's LAST
+                // program's product is S rows (rows 0..S of the readback —
+                // the stick above them is sized by the IR and never written;
+                // every golden today is one request, so S = 1 and the product
+                // is row 0 alone), so the row compares the emulator's row 0
+                // against this walk's LAST
                 // row (the `selector_lastrow_col` extraction the lowering
                 // pins). The teacher still pins — the fold's own pin: the
-                // program wrote ONE row, row 0, the row the fold's consumers
-                // read (the Sample's `SampleRows::Folded` region is rows
-                // 0..1), so the emulator's row 0 is pinned there and rows 1..
-                // stay as the walk computed them (the program never wrote
+                // program wrote S rows starting at row 0, the rows the fold's
+                // consumers read (the Sample's `SampleRows::Folded` region is
+                // rows 0..S), so the emulator's row 0 is pinned there and rows
+                // 1.. stay as the walk computed them (the program never wrote
                 // them, and the fold law of every downstream folded tid reads
                 // the walk's LAST row). Without this pin the walk's Sample
                 // re-drew from the WALK's row 0 — the FIRST prompt
@@ -4066,7 +4068,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// (ActiveCap::NONE, the first-chunk programs): the gate stages the run-time
 /// forward's OWN first-chunk law — the `[mq, mq]` clamped causal triangle and
 /// the per-position rotary rows — and compares against the golden with the
-/// rope tables read row-aligned and the lm-head tail's m=1 fold stated as the
+/// rope tables read row-aligned and the lm-head tail's m=S fold stated as the
 /// last-row law. A PREFIX-CAPABLE prefill bundle (ActiveCap::FULL — the
 /// continuation chunks) is still refused by the CALLER with a loud skip line:
 /// its resident-prefix mask law is the next rung. Graphs containing ops
@@ -4728,11 +4730,13 @@ fn judge_gate_run<F: RopeForm>(
             }
         };
         // The fold is a documented transform, not a defect: the splice lowers
-        // the result-width tail to m=1 (the last-row extraction feeding the
-        // re-lowered ops), so those tids' program product is ONE row — row 0
-        // of a readback whose STICK the IR still sizes at [mq, cols] (the
-        // program never writes past row 0; measured: t302's stick read back
-        // 19 rows with rows 1-18 all zero). The compare states the fold's own
+        // the result-width tail to m=S over the requests' answer rows (the
+        // last-row extraction feeding the re-lowered ops; this golden's rung
+        // is one request, so S = 1), so those tids' program product is S
+        // rows — rows 0..S of a readback whose STICK the IR still sizes at
+        // [mq, cols] (the program never writes past row S; measured: t302's
+        // stick read back 19 rows with rows 1-18 all zero). The compare
+        // states the fold's own
         // law — the golden's LAST row against the emu's row 0 (the
         // `selector_lastrow_col` extraction the lowering pins) — so a fold
         // that grabs the WRONG row still diverges. A tid that comes back
@@ -9663,14 +9667,15 @@ mod tests {
 
     #[test]
     fn prefill_m_gt_1_lm_head_folds_to_m1_decode_unchanged() {
-        // The mq>1 (prefill) bundle CANNOT run the vocab-wide lm_head at m>1 (it time-tiles, and
-        // per-row time-tiling is design-risk-4). It runs it at m=1 over the LAST prompt row instead,
-        // which is what lets prefill produce the first generated token's logits itself.
+        // The mq>1 (prefill) bundle CANNOT run the vocab-wide lm_head at m=mq (it time-tiles, and
+        // per-row time-tiling is design-risk-4). It runs it at m=S over the requests' answer rows
+        // instead, which is what lets prefill produce every request's first generated token's
+        // logits itself.
         //
         // ⭐ THE PRODUCER HALF IS THE SPLICE'S, AND IT HAS LANDED: `lower_all` routes an m>1
-        // vocab-wide MatmulTile through the Triton `lmlast.py` extraction + the re-lowered m=1
+        // vocab-wide MatmulTile through the Triton `lmlast.py` extraction + the re-lowered m=S
         // matmul. This test pins three things: (1) the m>1 tail LOWERS to the fold's two programs
-        // (an extraction named `lmlast_s{id}` and the m=1 matmul after it — never a silent m>1
+        // (an extraction named `lmlast_s{id}` and the m=S matmul after it — never a silent m=mq
         // lowering of a vocab-wide matmul); (2) the m=1 DECODE bundle stays a single bare matmul —
         // the fold never fires at m=1; (3) the CONSUMER half of the fold
         // (`lower_ktir_to_superdsc::lmlast`, main's copy loop verbatim) still refuses a nameless
@@ -9717,7 +9722,8 @@ mod tests {
             };
             (node, ir)
         };
-        let lower = |m: u32| {
+        let lower_at = |extent: scratchy_subtile::sdsc_abstract::QueryExtent| {
+            let m = extent.graph_rows().get();
             let (_, ir) = build(m);
             // t1 is the lm_head weight; t0 is the activation source.
             let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
@@ -9726,21 +9732,31 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_request_of(m),
+                extent,
             )
             .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
+        let lower = |m: u32| lower_at(one_request_of(m));
+        let packed_rung_of = |w: u32, s: u32| {
+            scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+                scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(w)
+                    .expect("the fixture's width is nonzero"),
+                scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(s)
+                    .expect("the fixture's request count fits a u32"),
+            )
+            .expect("the pair's product fits a u32")
+        };
         // m>1 (prefill): the tail FOLDS — the splice's `lmlast.py` extraction (its own program,
-        // over the reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul, never a
-        // silent m>1 lowering of a vocab-wide matmul (the wrong-token defect the fold exists to
+        // over the reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=S matmul, never a
+        // silent m=mq lowering of a vocab-wide matmul (the wrong-token defect the fold exists to
         // prevent). Through the door the extraction is `hidden/64` per-stick copies named after
-        // the tail's own output tid (`lmlast{j}_o2`), then the m=1 matmul `matmul_o2`.
+        // the tail's own output tid (`lmlast{j}_o2`), then the m=S matmul `matmul_o2`.
         let mq = 8u32;
-        let names = lower(mq).expect("the m>1 lm-head tail folds to m=1");
+        let names = lower(mq).expect("the m>1 lm-head tail folds to m=S");
         assert_eq!(
             names.len() as u32,
             h / 64 + 1,
-            "the fold is the per-stick copies plus the m=1 matmul: {names:?}"
+            "the fold is the per-stick copies plus the m=S matmul: {names:?}"
         );
         for (j, name) in names.iter().take(h as usize / 64).enumerate() {
             assert_eq!(
@@ -9752,8 +9768,37 @@ mod tests {
         assert_eq!(
             names.last().map(String::as_str),
             Some("matmul_o2"),
-            "the fold's last program is the m=1 matmul"
+            "the fold's last program is the m=S matmul"
         );
+        // ⭐ AND THE PACKED RUNG'S FOLD IS THE SAME LAW PER REQUEST — k = 2 and 3 (3 is
+        // not a power of two), each at w = 4: `S · hidden/64` copies named after the
+        // stick-plane row they write (`j·S + r` of the `[S, hidden]` staging), then the
+        // m=S matmul. No count is special-cased: the S=1 block above is this same
+        // assertion at `S = 1`, where `j·S + r` is `j` alone.
+        for s in [2u32, 3] {
+            let names = lower_at(packed_rung_of(4, s))
+                .unwrap_or_else(|e| panic!("the packed lm-head tail folds at S = {s}: {e}"));
+            let sticks = h as usize / 64;
+            assert_eq!(
+                names.len(),
+                s as usize * sticks + 1,
+                "the fold is S · hidden/64 per-stick copies plus the m=S matmul at S = {s}: {names:?}"
+            );
+            for (r, name) in names.iter().take(s as usize * sticks).enumerate() {
+                let req = r / sticks;
+                let j = r % sticks;
+                assert_eq!(
+                    name,
+                    &format!("lmlast{}_o2", j * s as usize + req),
+                    "request {req}'s copy {j} is named after the stick-plane row it writes"
+                );
+            }
+            assert_eq!(
+                names.last().map(String::as_str),
+                Some("matmul_o2"),
+                "the packed fold's last program is still the m=S matmul at S = {s}"
+            );
+        }
         // m==1 (decode): the SAME node lowers to exactly one bare matmul — the fold never fires, so
         // the decode bundle is byte-identical to the pre-fold emitter.
         assert_eq!(
@@ -9779,7 +9824,7 @@ mod tests {
         let mut programs = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(&node, &ir, false)
+        >(&node, &ir, false, one_request_of(mq))
         .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
@@ -9800,6 +9845,37 @@ mod tests {
         };
         assert!(
             why.contains("node_out_tid"),
+            "the refusal must name the missing fact, got {why:?}"
+        );
+
+        // ⛔ NEGATIVE CONTROL FOR THE ROWS' OWN FACT, the same shape: the door takes each
+        // request's answer row from `KtirNode::answer_rows` — the ONE statement — and a
+        // MISSING one must REFUSE rather than re-derive `r·w + (w−1)` from the view
+        // extents by dividing `mq` back apart.
+        let mut programs = scratchy_triton_splice::lower_all::<
+            ktir_superdsc::collective::TpWorld<1>,
+            _,
+        >(&node, &ir, false, one_request_of(mq))
+        .expect("the splice's fold mints the tail");
+        let extract = programs
+            .iter_mut()
+            .find(|e| e.op_name.starts_with("lmlast"))
+            .expect("the tail emits an extraction program");
+        extract.ktir.as_mut().expect("its KTIR").answer_rows = None;
+        let mut sym = 0i64;
+        let stripped = crate::ktir_superdsc_door::lower::<ktir_superdsc::collective::TpWorld<1>>(
+            extract.ktir.as_ref().unwrap(),
+            &mut sym,
+            Some(&layout),
+            None,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        );
+        let why = match stripped {
+            Err(e) => e.message,
+            Ok(_) => panic!("a rowless extraction must refuse"),
+        };
+        assert!(
+            why.contains("answer_rows"),
             "the refusal must name the missing fact, got {why:?}"
         );
     }
@@ -10770,6 +10846,7 @@ mod tests {
             bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
             mask: None,
             node_out_tid: None,
+            answer_rows: None,
             minted: Default::default(),
             lx_plan: Default::default(),
         }

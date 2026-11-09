@@ -1532,7 +1532,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
         let spliced_ops = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(node, &ir, false)
+        >(node, &ir, false, pair_of_one_request(mq))
         .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
         assert_eq!(
             spliced_ops.len(),
@@ -2945,7 +2945,10 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
     );
     let mut programs =
         scratchy_triton_splice::lower_all::<ktir_superdsc::collective::TpWorld<1>, _>(
-            rope, &ir, false,
+            rope,
+            &ir,
+            false,
+            pair_of_one_request(s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(
@@ -3227,7 +3230,10 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
     );
     let mut programs =
         scratchy_triton_splice::lower_all::<ktir_superdsc::collective::TpWorld<1>, _>(
-            rope, &ir, true,
+            rope,
+            &ir,
+            true,
+            batch_pair_of_one_row_each(s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.push(

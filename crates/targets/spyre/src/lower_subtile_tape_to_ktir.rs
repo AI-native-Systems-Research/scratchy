@@ -515,6 +515,7 @@ fn chain_skeleton<F: RopeForm>(
         bindings,
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     })
@@ -1034,13 +1035,13 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
         SubOp::MatmulTile { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1080,11 +1081,10 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // The tables are tape sources the expansion stages at load (functions of
         // the vocab alone); the splice binds them positionally, exactly as it
         // binds silumul's gate and up. `lower_all`, not `lower`: a prefill rung's
-        // draw reads the FOLDED tail's one row (the same `node_at_one_row` law
-        // the tail's ScalarMul and TanhSoftCap get), which is `lower_all`'s
-        // interception.
+        // draw reads the FOLDED tail's answer rows (the `[S, vocab]` window the
+        // mint states on the node), which is `lower_all`'s machinery.
         SubOp::Sample { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1103,7 +1103,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // the split's own lowering emitted (`lower_all`'s interception), so the
         // one-op path is only for the norms that are NOT a sandwich seat.
         SubOp::RmsNorm { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1117,7 +1117,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // ⭐ A KV WRITER LOWERS TO ITS ROTATION AND ITS PAGED WRITE — `lower_all` emits both, the
         // scatter into the pools right after the rotation it stores.
         SubOp::RopeAppend { .. } => {
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
@@ -1139,7 +1139,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             {
                 return HostRouted("ScalarMulWeightFold");
             }
-            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }

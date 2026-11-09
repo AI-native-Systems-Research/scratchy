@@ -12150,15 +12150,24 @@ fn dump_wavefront_mega(
                 // takes. The mint's own tail walk IS the admission: a graph whose
                 // result tail is not the lm-head chain it knows PANICS at expansion —
                 // a build error naming the op, never a silent fall back to the host
-                // readback. A prefill rung's result is the FOLDED lm-head row (the
-                // emitter folds the tail to the last baked row): its prompt-final
-                // chunk's pick is the idx stick, read back exactly like decode's;
-                // a middle chunk's suffix never runs, so its draw is never taken.
+                // readback. A prefill rung's result is the FOLDED lm-head rows (the
+                // emitter folds the tail to the requests' last baked rows): its
+                // prompt-final chunk's picks are the idx stick, read back exactly
+                // like decode's; a middle chunk's suffix never runs, so its draw
+                // is never taken.
                 {
                     let mint = scratchy_subtile::subtile_ir::mint_sample(
                         &mut krg,
                         if is_prefill {
-                            scratchy_subtile::subtile_ir::SampleRows::Folded
+                            // The Folded draw serves the rung's OWN request
+                            // capacity — the same extent pair's `RungCap` the
+                            // attention and the lm-head fold read (one mint,
+                            // never a division of the graph's rows): the fold
+                            // writes S logits rows and the draw serves exactly
+                            // them.
+                            scratchy_subtile::subtile_ir::SampleRows::Folded {
+                                requests: query_rows.requests(),
+                            }
                         } else {
                             scratchy_subtile::subtile_ir::SampleRows::All
                         },

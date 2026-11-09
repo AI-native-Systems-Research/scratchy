@@ -6097,6 +6097,7 @@ mod transpose_tests {
             bindings: vec![BufferId::new(101), BufferId::new(102)],
             mask: None,
             node_out_tid: None,
+            answer_rows: None,
             minted: Default::default(),
             lx_plan: Default::default(),
         }
@@ -8748,6 +8749,7 @@ mod embed_row_gather_tests {
             ],
             mask: None,
             node_out_tid: None,
+            answer_rows: None,
             minted: Default::default(),
             lx_plan: Default::default(),
         }
@@ -9543,6 +9545,7 @@ mod chain_stage_tests {
             ],
             mask: None,
             node_out_tid: None,
+            answer_rows: None,
             minted: Default::default(),
             lx_plan: Default::default(),
         }
