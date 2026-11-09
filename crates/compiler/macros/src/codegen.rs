@@ -2164,10 +2164,7 @@ fn emit_fingerprint_check(
     affine_rows: &[(String, u32, u32)],
     expert_input: Option<&ExpertInputProbe>,
 ) -> TokenStream {
-    let num_hidden_layers = *model
-        .bounds
-        .get("num_hidden_layers")
-        .unwrap_or_else(|| panic!("model `{}` missing `num_hidden_layers`", model.source_stem));
+    let num_hidden_layers = model.text.layers.get() as u64;
     let hidden_size = *model
         .bounds
         .get("hidden_size")
@@ -2467,42 +2464,30 @@ fn emit_fingerprint_check(
     // the type nor the hash check above can tell them apart; before this gate the
     // winner was whichever `inventory` registered first.
     //
-    // Emitted ONLY when this variant's config declares a theta. 19 in-tree configs
-    // don't (gemma3/gemma4/qwen3.5 carry per-attention-class thetas nested under
-    // `rope_parameters`; modernbert and llama-2-70b omit it and take HF's implicit
-    // 10⁴ default) — for those there is no declared value to compare against, and
-    // synthesizing the default here would invent a constraint the config never
-    // stated and false-reject a checkpoint that spells `10000.0` out.
-    //
-    // Resolution order mirrors `rotary_load`'s exactly, MINUS its
-    // `.unwrap_or(10000.0)` fallback, so the gate can never claim a value the
-    // config didn't state.
+    // The gate compares against the θ this variant COMPUTES WITH — the config's typed
+    // `RopeTheta`, resolved once at load (stated, hoisted from `rope_parameters`, aliased, or the
+    // arch's own default for a config that omits it: llama-2-70b's 10⁴ is `LlamaConfig`'s). A
+    // checkpoint that spells a different θ is not this variant; one whose config states none
+    // passes `None` and stays permissive (`HfFingerprint::rope_theta`).
     //
     // The tolerance is relative and computed HERE, at expansion, so the emitted
     // code is a single compare against two literals — and so a config spelling
     // `1000000` where the checkpoint spells `1000000.0` cannot trip it. It is far
     // tighter than any real theta gap (the closest in-tree pair differs by 2×).
-    let rope_theta_check: TokenStream = match model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-    {
-        Some(theta) => {
-            let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
-            let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
-            quote! {
-                // Permissive on `None` (see `HfFingerprint::rope_theta`): a caller
-                // that cannot trust its source's value — the cuda worker for GGUF —
-                // leaves the variant's baked value authoritative.
-                if let Some(theta) = hf.rope_theta
-                    && (theta - #theta_lit).abs() > #tol_lit
-                {
-                    return false;
-                }
+    let rope_theta_check: TokenStream = {
+        let theta = model.text.rope_theta.get();
+        let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
+        let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
+        quote! {
+            // Permissive on `None` (see `HfFingerprint::rope_theta`): a caller
+            // that cannot trust its source's value — the cuda worker for GGUF —
+            // leaves the variant's baked value authoritative.
+            if let Some(theta) = hf.rope_theta
+                && (theta - #theta_lit).abs() > #tol_lit
+            {
+                return false;
             }
         }
-        None => quote! {},
     };
 
     // Content-hash discriminator: reject checkpoints whose
@@ -3487,12 +3472,15 @@ fn emit_weights_struct(
         } else {
             "model.layers".to_string()
         };
-        let num_hidden_layers = *model.bounds.get(layer_count_key).unwrap_or_else(|| {
-            panic!(
-                "model `{}` has `__packed_splits__` but no `{}` bound",
-                model.source_stem, layer_count_key,
-            )
-        }) as usize;
+        let num_hidden_layers = match is_vision {
+            false => model.text.layers.get(),
+            true => *model.bounds.get(layer_count_key).unwrap_or_else(|| {
+                panic!(
+                    "model `{}` has `__packed_splits__` but no `{}` bound",
+                    model.source_stem, layer_count_key,
+                )
+            }) as usize,
+        };
         let mut calls: Vec<TokenStream> = Vec::new();
         for (packed_prefix, targets) in &manifest.packed_splits {
             let mut sized: Vec<(String, u64)> = Vec::with_capacity(targets.len());
@@ -3659,18 +3647,13 @@ fn emit_weights_struct(
     };
 
     let rotary_local_load_metal: TokenStream = if uses_rotary_local {
-        let head_dim = *model
-            .bounds
-            .get("head_dim")
-            .expect("model must have head_dim for RotaryLocal") as usize;
+        let head_dim = model.text.head_dim.get() as usize;
         let local_theta = model
             .scalars
             .get("rope_local_base_freq")
             .copied()
             .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            .or_else(|| model.scalars.get("rope_theta").copied())
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .expect("model must have rope_local_base_freq for RotaryLocal");
+            .unwrap_or(model.text.rope_theta.get());
         quote! {
             let rotary_local = crate::__gpu::rotary::RotaryCache::new_from_gpuweights(
                 gw,
@@ -3750,16 +3733,8 @@ fn emit_weights_struct(
         quote! {}
     };
     let rotary_load_metal: TokenStream = if uses_rotary {
-        let head_dim = *model
-            .bounds
-            .get("head_dim")
-            .expect("model must have head_dim for Rotary") as usize;
-        let rope_theta = model
-            .scalars
-            .get("rope_theta")
-            .copied()
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .unwrap_or(10000.0);
+        let head_dim = model.text.head_dim.get() as usize;
+        let rope_theta = model.text.rope_theta.get();
         let partial = model
             .scalars
             .get("partial_rotary_factor")
@@ -8060,8 +8035,7 @@ fn kv_codec_for(
         use scratchy_ir::{DenseReason, KvGeometry, codec_for};
         let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
         let pool_layers = (model.bounds.get("target_num_hidden_layers"))
-            .or(model.bounds.get("num_hidden_layers"))
-            .map_or(0, |&n| n as usize);
+            .map_or(model.text.layers.get(), |&n| n as usize);
         let geometry = KvGeometry {
             num_layers: pool_layers,
             num_kv_heads: bound("num_key_value_heads"),
@@ -8713,7 +8687,7 @@ pub(crate) fn fill_canonical_params(
     };
     let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, tq_bits);
 
-    let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or(&0) as usize;
+    let num_hidden_layers = model.text.layers.get();
 
     let facts = {
         use scratchy_ir::model_facts as mf;
@@ -8917,10 +8891,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
-    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
-        Some(&n) => n as usize,
-        None => return None,
-    };
+    let num_hidden_layers = model.text.layers.get();
     let mut linear = vec![false; num_hidden_layers];
     let mut is_hybrid = false;
     for node in &fuf.nodes {
@@ -8989,10 +8960,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
-    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
-        Some(&n) => n as usize,
-        None => return None,
-    };
+    let num_hidden_layers = model.text.layers.get();
     let mut sliding = vec![false; num_hidden_layers];
     let mut has_sliding = false;
     for node in &fuf.nodes {
@@ -9016,7 +8984,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
     if !has_sliding {
         return None;
     }
-    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as usize;
+    let head_dim = model.text.head_dim.get() as usize;
     let num_kv = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as usize;
     let g_hd = model
         .bounds
@@ -9162,54 +9130,16 @@ fn chained_row_gathers(
 // `rope_cos_sin_kind` rows by the SAME value (`PrefillGate`). One law, two
 // consumers — the baked table and the gate's staged rows cannot drift apart.
 
-/// The model's attention head dim by the bounds the tape was lowered at —
-/// `head_dim` where the arch declares it, the `hidden/heads` quotient where it
-/// does not (the same fallback the emitter itself uses).
+/// The model's attention head dim — the config's, typed at load ([`crate::config::HeadDim`]: stated,
+/// or the loader's one `hidden/heads` derivation).
 #[cfg(feature = "spyre")]
 fn superdsc_model_head_dim(model: &ModelParams) -> u64 {
-    let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
-    let heads = b("num_attention_heads").max(1);
-    match b("head_dim") {
-        0 => b("hidden_size") / heads,
-        v => v,
-    }
-}
-
-/// The model's decoder layer count — the ONE read every spyre wiring and budget site takes. No
-/// default: a wiring baked for zero layers wires no layer's prefix KV.
-#[cfg(feature = "spyre")]
-fn superdsc_model_layers(model: &ModelParams) -> usize {
-    *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
-        panic!(
-            "[superdsc-wiring] {}: no `num_hidden_layers` bound — a wiring cannot say which \
-             layers' prefix KV it binds",
-            model.source_stem
-        )
-    }) as usize
-}
-
-/// `rope_theta`, scalars first, NO default — the same refusal the wiring bakes
-/// (a silent 1e4 would disagree with llama-3.2's 500000: fluent, subtly
-/// wrong output).
-#[cfg(feature = "spyre")]
-fn superdsc_model_rope_theta(model: &ModelParams) -> f64 {
-    model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-        .unwrap_or_else(|| {
-            panic!(
-                "[superdsc-wiring] {}: no rope_theta in scalars or bounds — refusing to bake a \
-                 default; the baked table would silently disagree with the checkpoint",
-                model.source_stem
-            )
-        })
+    u64::from(model.text.head_dim.get())
 }
 
 /// The rotary class a `local`-flagged source serves, as a VALUE: sliding
 /// sources take the local class's base frequency (falling back to the model's
-/// main θ, `theta` — `superdsc_model_rope_theta`'s one read — the precedence
+/// main θ, `theta` — the config's typed [`crate::config::RopeTheta`] — the precedence
 /// `rotary_local_load` uses); global sources take
 /// proportional partial rotary when the config declares it on a WIDER global
 /// head dim (gemma-4), else the base class.
@@ -9452,7 +9382,7 @@ fn emit_superdsc_wiring(
     let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
     let hidden = u32l(b("hidden_size") as u32);
     let vocab = u32l(b("vocab_size") as u32);
-    let n_layers_expected = superdsc_model_layers(model);
+    let n_layers_expected = model.text.layers.get();
     let n_layers = u32l(n_layers_expected as u32);
     // head_dim is declared by most arches and derived by the rest — the same
     // `hidden/heads` fallback the emitter itself uses, resolved HERE so the
@@ -9472,9 +9402,9 @@ fn emit_superdsc_wiring(
     // mask. MEASURED on gemma-4 tiny-allglobal: heads 2-3 ran unmasked, every layer.
     let nqh = u32l(heads as u32);
     let kv_dim = u32l((b("num_key_value_heads").max(1) * hd) as u32);
-    // θ is `superdsc_model_rope_theta`'s one read (scalars first, no default), the same value
-    // the numeric gate's prefill probe stages its rows by.
-    let theta = superdsc_model_rope_theta(model) as f32;
+    // θ is the config's, typed at load (stated, or its arch's own default), the same value the
+    // numeric gate's prefill probe stages its rows by.
+    let theta = model.text.rope_theta.get() as f32;
     let theta_bits = u32l(theta.to_bits());
 
     // cos/sin carry their FULL column width: GQA gives more than one (Q vs K),
@@ -10296,7 +10226,7 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     //    drained groups are one-per-op KTIR programs, a different unit this budget never sees.
     #[cfg(feature = "spyre-hw")]
     {
-        let layers = superdsc_model_layers(model);
+        let layers = model.text.layers.get();
         let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
         let ceiling = layers * per_layer;
         if n_groups > ceiling {
@@ -12905,7 +12835,7 @@ fn dump_wavefront_mega(
                                             let prefill_classes: Option<PrefillRotaryClasses> =
                                                 prefill_mq.map(|mq| {
                                                 let hd = superdsc_model_head_dim(model);
-                                                let theta = superdsc_model_rope_theta(model);
+                                                let theta = model.text.rope_theta.get();
                                                 let mut rotary_cos = Vec::new();
                                                 let mut rotary_sin = Vec::new();
                                                 for (i, b) in lwd.bindings.iter().enumerate() {
@@ -13701,18 +13631,16 @@ fn dump_wavefront_mega(
         }
 
         // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
-        // ERROR that names the model and its head_dim. A model with no attention (no head_dim
-        // bound) keeps the sub-blocked ceiling — there is no head to type.
-        let prefill_head_width = model.bounds.get("head_dim").map(|&hd| {
-            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(hd, &model.name)
-        });
+        // ERROR that names the model and its head_dim (the config's, typed at load).
+        let prefill_head_width = scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
+            u64::from(model.text.head_dim.get()),
+            &model.name,
+        );
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {
             r <= SUB_BLOCKED_PREFILL_CEILING
-                || prefill_head_width.is_some_and(|hd| {
-                    scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, hd, false)
-                        == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
-                })
+                || scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, prefill_head_width, false)
+                    == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
         };
         let admitted_ceiling = PREFILL_RUNGS
             .into_iter()
@@ -16083,7 +16011,7 @@ pub fn emit_model(
         // `rot_dim = partial_rotary_factor * head_dim` (Qwen3.5: 0.25*256
         // = 64), mirroring the rope-cache builder / `ROT_DIM` fn-const.
         let mrope_cos_sin_bytes = if model.mrope_section.is_some() {
-            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
+            let head_dim = u64::from(model.text.head_dim.get());
             let rot_dim = model
                 .scalars
                 .get("partial_rotary_factor")
@@ -16173,7 +16101,7 @@ pub fn emit_model(
     // 1D-rope arches, whose rope reads the positions.
     let metal_rope_rows_fn: proc_macro2::TokenStream = match model.mrope_section {
         Some([t, h, w]) => {
-            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
+            let head_dim = u64::from(model.text.head_dim.get());
             let rot_dim_val = model
                 .scalars
                 .get("partial_rotary_factor")
@@ -16181,12 +16109,7 @@ pub fn emit_model(
                 .filter(|&f| (f - 1.0).abs() > 1e-9)
                 .map(|f| (f * head_dim as f64).round() as u32)
                 .unwrap_or(head_dim as u32);
-            let rope_theta_val: f64 = model
-                .scalars
-                .get("rope_theta")
-                .copied()
-                .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-                .unwrap_or(10000.0);
+            let rope_theta_val: f64 = model.text.rope_theta.get();
             let rope_theta_lit = proc_macro2::Literal::f64_unsuffixed(rope_theta_val);
             let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
             let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
@@ -17653,12 +17576,16 @@ mod tests {
         bounds.insert("num_key_value_heads".into(), num_key_value_heads);
         bounds.insert("head_dim".into(), head_dim);
         bounds.insert("intermediate_size".into(), intermediate_size);
+        bounds.insert("num_hidden_layers".into(), 1);
+        let scalars = BTreeMap::from([("rope_theta".to_string(), 10_000.0)]);
+        let text = crate::config::TextGeometry::of(&bounds, &scalars, &PathBuf::new())
+            .expect("the shard test model states its geometry");
         crate::config::ModelParams {
             name: "shard_test".into(),
             source_stem: "shard-test".into(),
             source_path: PathBuf::new(),
             bounds,
-            scalars: BTreeMap::new(),
+            scalars,
             layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
@@ -17674,12 +17601,13 @@ mod tests {
             arch: Default::default(),
             expert_activation: crate::config::ExpertActivation::Silu,
             derived: BTreeMap::new(),
+            text,
         }
     }
 
     /// A uniform decoder's KV layers: all of them.
     fn every_layer(m: &ModelParams) -> KvCacheLayers {
-        let layers = m.bounds.get("num_hidden_layers").copied().unwrap_or(1) as u32;
+        let layers = m.text.layers.get() as u32;
         KvCacheLayers((0..layers).collect())
     }
 
@@ -18710,24 +18638,22 @@ mod fingerprint_tests {
         );
     }
 
-    /// A config that declares no `rope_theta` must emit NO gate. 19 in-tree
-    /// configs are in this bucket (gemma3/gemma4/qwen3.5 carry per-attention-
-    /// class thetas nested under `rope_parameters`; modernbert and llama-2-70b
-    /// omit it and take HF's implicit 10⁴ default). Synthesizing that default
-    /// here would invent a constraint the config never stated and false-reject
-    /// a checkpoint that spells `10000.0` out.
+    /// A config that omits `rope_theta` computes with its ARCH's default (llama: `LlamaConfig`'s
+    /// 10⁴, `configs/llama/arch.json`), and the gate compares against that value — the one the
+    /// model runs at — never against nothing.
     #[test]
-    fn a_config_without_rope_theta_emits_no_theta_gate() {
+    fn a_config_omitting_rope_theta_gates_on_its_arch_default() {
+        let path = arch_configs("llama").join("llama-2-70b.json");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert!(
+            raw.get("rope_theta").is_none(),
+            "premise broken: llama-2-70b now states a rope_theta, so it no longer exercises the \
+             arch default — repoint this test at another config that omits it",
+        );
         let model = config_of("llama", "llama-2-70b");
-        assert!(
-            model.scalars.get("rope_theta").is_none() && model.bounds.get("rope_theta").is_none(),
-            "premise broken: llama-2-70b now declares a rope_theta, so it no longer exercises \
-             the no-gate case — repoint this test at another config that declares none",
-        );
-        assert!(
-            emitted_rope_theta(&model, "llama").is_none(),
-            "a config with no declared rope_theta must not gate on one",
-        );
+        assert_eq!(model.text.rope_theta.get(), 10_000.0);
+        assert_eq!(emitted_rope_theta(&model, "llama"), Some(10_000.0));
     }
 
     /// `affine_role_bits` resolved against a variant's own config — the single
