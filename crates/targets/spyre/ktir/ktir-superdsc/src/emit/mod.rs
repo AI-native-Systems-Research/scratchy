@@ -1194,12 +1194,14 @@ pub fn assemble_sfp_rank1<T: crate::collective::Tp>(
     out_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
-    let op = sfp_rank1_opspec(op_func_from_str(op_func), stick_elems, in_name, out_name)
-        .unwrap_or_else(|e| panic!("assemble_sfp_rank1 {op_name}: {e}"));
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    let op = sfp_rank1_opspec(op_func_from_str(op_func), stick_elems, in_name, out_name).map_err(
+        |e| crate::superdsc_error::SuperDscError(format!("assemble_sfp_rank1 {op_name}: {e}")),
+    )?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_sfp_rank1 {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_sfp_rank1 {op_name}: {e}"))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1214,7 +1216,7 @@ pub fn assemble_pointwise_broadcast<T: crate::collective::Tp>(
     o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // RowBlocked output ⇒ residual token stream (not head-major). head_major is derived from the type.
     assemble_pointwise_broadcast_off(
         op_name,
@@ -1246,7 +1248,7 @@ pub fn assemble_pointwise_broadcast_hm<T: crate::collective::Tp>(
     o: &Stk<FlatTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // Flat output ⇒ head-major (per-head attention) op; the builder derives head_major from the type.
     assemble_pointwise_broadcast_off(
         op_name,
@@ -2080,7 +2082,7 @@ pub fn assemble_pointwise_broadcast_off<T: crate::collective::Tp, O: KindTag>(
     out_offset: impl Into<crate::addr::OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     assemble_pointwise_broadcast_divided(
         PointwiseDivided {
             op_name,
@@ -2126,7 +2128,7 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
     p: PointwiseDivided<'_, O>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let PointwiseDivided {
         op_name,
         op_func,
@@ -2143,8 +2145,9 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
     // against the output handle's declared shape and placement before any op is built (the
     // write-side twin of the input mint in `pointwise_broadcast_opspec_from_tile`, which runs
     // inside the funnel call below).
-    mint_ew_output(op_name, o, out_offset.elems(), rows, cols, Df::Fp16, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
+    mint_ew_output(op_name, o, out_offset.elems(), rows, cols, Df::Fp16, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })?;
     // The OUTPUT type drives the layout: a `Stk<FlatTag>` output IS a head-major (per-head attention)
     // op — rank-3 flat; a `Stk<RowBlockedTag>` output is the residual token stream (rank-2 stick-major).
     // So `head_major` is DERIVED from the output kind (no redundant bool that could disagree with it).
@@ -2167,7 +2170,7 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
         && cols > Fp16::ELEMS_PER_STICK
         && inputs.iter().any(|i| i.out_broadcast)
     {
-        panic!(
+        return Err(crate::superdsc_error::SuperDscError(format!(
             "[superdsc sfp-transcendental-guard] {op_name}: SFP `{op_func}` emitted at \
              multi-stick width (cols={cols} > {}) with an OUT-BROADCAST (reduction) input — \
              the full-width-transcendental geometry that CRASHES the dxp compile (map::at in \
@@ -2175,7 +2178,7 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
              (cols={}); broadcast in the following multiply. (guard-every-crash-at-build-time)",
             Fp16::ELEMS_PER_STICK,
             Fp16::ELEMS_PER_STICK,
-        );
+        )));
     }
     let mut op = pointwise_broadcast_opspec_df(
         op_func_from_str(op_func),
@@ -2189,11 +2192,14 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
         layout,
         division,
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })?;
     apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })
 }
 
 /// fp32 elementwise (the torch-spyre RMSNorm island): every operand IEEE_FP32 (`df`), whole-tensor,
@@ -2209,7 +2215,7 @@ pub fn assemble_pointwise_broadcast_df<T: crate::collective::Tp>(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // head_major=TRUE ⇒ rank-3 flat (NOT rank-2 stick-major). The fp32 rmsnorm island runs FLAT so it
     // agrees with the fp16↔fp32 converts (which MUST be rank-3 — the narrowing convert crashes dxp in
     // rank-2). Consistent flat inside the island; only the x-read / out-write boundaries touch RowBlocked.
@@ -2225,10 +2231,17 @@ pub fn assemble_pointwise_broadcast_df<T: crate::collective::Tp>(
         layout,
         crate::work::EwDivision::Law,
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast_df {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!(
+            "assemble_pointwise_broadcast_df {op_name}: {e}"
+        ))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast_df {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!(
+            "assemble_pointwise_broadcast_df {op_name}: {e}"
+        ))
+    })
 }
 
 /// The broadcast gate probe (`mul(x[full], v[out-broadcast])`) via the general
@@ -2242,7 +2255,7 @@ pub fn assemble_broadcast_mul_gate<T: crate::collective::Tp>(
     x_name: &str,
     v_name: &str,
     o_name: &str,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let mut sym = 0i64;
     // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: x and the output are the probe's own
     // `[rows, cols]` tensors, and v is the `[rows, one-stick]` column the out-broadcast read sweeps
@@ -2282,13 +2295,15 @@ pub fn assemble_slice_add_gate<T: crate::collective::Tp>(
     half: u32,
     x_name: &str,
     o_name: &str,
-) -> EmittedOp<T> {
-    let op = slice_add_gate_opspec(rows, half, x_name, o_name)
-        .unwrap_or_else(|e| panic!("assemble_slice_add_gate {op_name}: {e}"));
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    let op = slice_add_gate_opspec(rows, half, x_name, o_name).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_slice_add_gate {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut sym = 0i64;
-    emit_sdsc_tiled(op_name, &op, &folds, &mut sym, None)
-        .unwrap_or_else(|e| panic!("assemble_slice_add_gate {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, &mut sym, None).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_slice_add_gate {op_name}: {e}"))
+    })
 }
 
 fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpec, String> {
@@ -4904,7 +4919,7 @@ pub fn pw1<T: crate::collective::Tp, A: KindTag, O: KindTag>(
     o: &Stk<O>,
     sym: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     assemble_pointwise_broadcast_off(
         op_name,
         op_func,
@@ -4931,7 +4946,7 @@ pub fn pw2<T: crate::collective::Tp, A: KindTag, B: KindTag, O: KindTag>(
     o: &Stk<O>,
     sym: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     assemble_pointwise_broadcast_off(
         op_name,
         op_func,
@@ -5137,7 +5152,7 @@ pub fn assemble_convert<T: crate::collective::Tp>(
     o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // TYPED: a dtype-convert's input and output are both the RowBlocked token stream (only the df
     // changes — fp16→fp32 / fp16→fp8); the handle carries only `.name()`, so the emit is byte-identical.
     //
@@ -5153,7 +5168,9 @@ pub fn assemble_convert<T: crate::collective::Tp>(
         cols,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert {op_name}: {e}"))
+    })?;
     mint_full_window(
         &format!("{op_name}: output '{}'", o.name()),
         o,
@@ -5162,7 +5179,9 @@ pub fn assemble_convert<T: crate::collective::Tp>(
         cols,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert {op_name}: {e}"))
+    })?;
     let op = convert_opspec(
         op_func_from_str(op_func),
         rows,
@@ -5171,10 +5190,13 @@ pub fn assemble_convert<T: crate::collective::Tp>(
         o.name(),
         false,
     )
-    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert {op_name}: {e}"))
+    })
 }
 
 /// Assemble a dtype-convert op over a COLUMN WINDOW of its operands (see [`convert_opspec`]):
@@ -5198,7 +5220,7 @@ pub fn assemble_convert_col<T: crate::collective::Tp>(
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // TYPED, same as `assemble_convert`: both operands are the RowBlocked token stream and the
     // handles carry only `.name()` — the offsets ride the args, not the handles.
     //
@@ -5215,7 +5237,9 @@ pub fn assemble_convert_col<T: crate::collective::Tp>(
         cols,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert_col {op_name}: {e}"))
+    })?;
     mint_full_window(
         &format!("{op_name}: output '{}'", o.name()),
         o,
@@ -5224,7 +5248,9 @@ pub fn assemble_convert_col<T: crate::collective::Tp>(
         cols,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert_col {op_name}: {e}"))
+    })?;
     let mut op = convert_opspec(
         op_func_from_str(op_func),
         rows,
@@ -5233,13 +5259,16 @@ pub fn assemble_convert_col<T: crate::collective::Tp>(
         o.name(),
         false,
     )
-    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert_col {op_name}: {e}"))
+    })?;
     for (arg, off) in op.args_mut().iter_mut().zip([in_off, o_off]) {
         arg.set_offset_elems(off.into_raw_elems());
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert_col {op_name}: {e}"))
+    })
 }
 
 /// ⭐ ONE SIDE OF A BANDED CONVERT — the side's full-buffer handle at its own storage, and the
@@ -5279,7 +5308,7 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
     band: ConvertBand<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let ConvertBand { rows, cols, in_, o } = band;
     let ConvertBandSide { h: in_, w: in_w } = in_;
     let ConvertBandSide { h: o, w: o_w } = o;
@@ -5312,7 +5341,9 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
             cols,
             layout,
         )
-        .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
+        .map_err(|e| {
+            crate::superdsc_error::SuperDscError(format!("assemble_convert_band {op_name}: {e}"))
+        })?;
     }
     // The band's bytes stride at the PARENT's row count when the window crosses a column plane
     // (more than one stick wide); a one-stick band never crosses one and needs no declaration —
@@ -5330,7 +5361,9 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
         o.name(),
         band_multistick,
     )
-    .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert_band {op_name}: {e}"))
+    })?;
     for (arg, w) in op.args_mut().iter_mut().zip([in_w, o_w]) {
         if let Some(w) = w {
             arg.set_offset_elems(w.dev().into_raw_elems());
@@ -5340,8 +5373,9 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
         }
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_convert_band {op_name}: {e}"))
+    })
 }
 
 /// Assemble a complete SuperDSC for ONE shape-preserving ELEMENTWISE op over a
@@ -5355,7 +5389,7 @@ pub fn assemble_pointwise<T: crate::collective::Tp>(
     in_names: &[&str],
     o_name: &str,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let mut sym_id_base: i64 = 0;
     assemble_pointwise_seeded(
         op_name,
@@ -5380,7 +5414,7 @@ pub fn assemble_pointwise_seeded<T: crate::collective::Tp>(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // head_major=false: every `assemble_pointwise_seeded` caller is a whole-tensor residual op
     // (MLP / fp8 quant / elementwise), so it is eligible for the stick-major m>1 seam fix.
     let op = pointwise_opspec(
@@ -5392,10 +5426,13 @@ pub fn assemble_pointwise_seeded<T: crate::collective::Tp>(
         false,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise {op_name}: {e}"))
+    })
 }
 
 /// Build the typed [`OpSpec`] for an `interslicetranspose_fp16` — a single-input,
@@ -5634,9 +5671,10 @@ pub fn assemble_transpose<T: crate::collective::Tp>(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
-    try_assemble_transpose(op_name, mb, out, in_name, o_name, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_transpose {op_name}: {e}"))
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    try_assemble_transpose(op_name, mb, out, in_name, o_name, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_transpose {op_name}: {e}"))
+    })
 }
 
 /// [`assemble_transpose`] AS A `Result` — the form a producer-facing entry point needs.
@@ -5727,7 +5765,8 @@ mod transpose_tests {
     #[test]
     fn the_transpose_layout_matches_the_golden_interslicetranspose_fixture() {
         let mut sid = 0i64;
-        let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None);
+        let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None)
+            .expect("the transpose builds");
         let d = dsc(&op, "tr");
         let inp = &d.primaryDsInfo_["INPUT"];
         let out = &d.primaryDsInfo_["OUTPUT"];
@@ -5748,7 +5787,8 @@ mod transpose_tests {
     #[test]
     fn the_emitted_op_is_interslicetranspose_fp16_on_the_pt_unit() {
         let mut sid = 0i64;
-        let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None);
+        let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None)
+            .expect("the transpose builds");
         let d = dsc(&op, "tr");
         let c = &d.computeOp_[0];
         assert_eq!(c.opFuncName, "interslicetranspose_fp16");
@@ -5779,7 +5819,8 @@ mod transpose_tests {
     #[test]
     fn a_transpose_declares_exactly_one_input_and_one_output_role() {
         let mut sid = 0i64;
-        let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None);
+        let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None)
+            .expect("the transpose builds");
         let d = dsc(&op, "tr");
         assert_eq!(
             d.primaryDsInfo_.keys().copied().collect::<Vec<_>>(),
@@ -6181,7 +6222,8 @@ mod transpose_tests {
     fn a_non_transpose_op_still_sticks_one_64_element_stick_on_its_only_role() {
         let mut sid = 0i64;
         let op =
-            assemble_pointwise_seeded("pw", "add", 64, 128, &["t1", "t2"], "t3", &mut sid, None);
+            assemble_pointwise_seeded("pw", "add", 64, 128, &["t1", "t2"], "t3", &mut sid, None)
+                .expect("the add builds");
         let d = dsc(&op, "pw");
         assert_eq!(
             d.primaryDsInfo_.keys().copied().collect::<Vec<_>>(),
@@ -6548,9 +6590,9 @@ pub fn assemble_topk<T: crate::collective::Tp>(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     try_assemble_topk(op_name, member, geom, in_name, o_name, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_topk {op_name}: {e}"))
+        .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_topk {op_name}: {e}")))
 }
 
 /// [`assemble_topk`] AS A `Result` — the form a door arm needs, so a refusal names the producer's
@@ -6692,7 +6734,7 @@ pub fn assemble_restickify_kt_2d<T: crate::collective::Tp>(
     out_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let in_off = in_off.into_raw_elems();
     let out_off = out_off.into_raw_elems();
     // THE TILE'S FLAT RUN — the element range each side touches. Not `[slots, feats]` as a strided
@@ -6709,7 +6751,9 @@ pub fn assemble_restickify_kt_2d<T: crate::collective::Tp>(
         run,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_restickify_kt_2d {op_name}: {e}"))
+    })?;
     mint_full_window(
         &format!("{op_name}: output '{}'", o.name()),
         o,
@@ -6718,7 +6762,9 @@ pub fn assemble_restickify_kt_2d<T: crate::collective::Tp>(
         run,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_restickify_kt_2d {op_name}: {e}"))
+    })?;
 
     let op = restickify_kt_opspec_2d(
         slots.extent(),
@@ -6728,10 +6774,13 @@ pub fn assemble_restickify_kt_2d<T: crate::collective::Tp>(
         in_off,
         out_off,
     )
-    .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_restickify_kt_2d {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"))
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_restickify_kt_2d {op_name}: {e}"))
+    })
 }
 
 /// A STANDALONE `[rows, cols] → [cols, rows]` fp16 TRANSPOSE ON THE RESTICKIFY DOOR — the form
@@ -8085,6 +8134,7 @@ mod time_tiled_broadcast_operand_is_address_stable {
             &mut 0i64,
             None,
         )
+        .expect("the tscdiv op builds")
     }
 
     /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
@@ -8231,6 +8281,7 @@ mod time_tiled_mb_operand_advances_per_trip {
             &mut 0i64,
             None,
         )
+        .expect("the mbdiv op builds")
     }
 
     /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.

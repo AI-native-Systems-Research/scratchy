@@ -24,7 +24,7 @@ pub fn assemble_matmul<T: crate::collective::Tp>(
     w: &Stk<crate::sdsc_abstract::KernelTag>,
     o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let mut sym_id_base: i64 = 0;
     assemble_matmul_seeded(op_name, m, n, k, batch, a, w, o, &mut sym_id_base, layout)
 }
@@ -43,9 +43,10 @@ pub fn assemble_matmul_seeded<T: crate::collective::Tp>(
     o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
-    try_assemble_matmul_seeded(op_name, m, n, k, batch, a, w, o, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    try_assemble_matmul_seeded(op_name, m, n, k, batch, a, w, o, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
+    })
 }
 
 /// [`assemble_matmul_seeded`] AS A `Result` — the form a producer-facing entry point needs, exactly as
@@ -214,12 +215,14 @@ pub fn assemble_matmul_batched_seeded<T: crate::collective::Tp>(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
-    let op = matmul_opspec_batched(m, n, k, batch, a_name, w_name, o_name)
-        .unwrap_or_else(|e| panic!("assemble_matmul_batched {op_name}: {e}"));
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    let op = matmul_opspec_batched(m, n, k, batch, a_name, w_name, o_name).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_matmul_batched {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul_batched {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_matmul_batched {op_name}: {e}"))
+    })
 }
 
 /// [`assemble_matmul_seeded`] with per-operand ELEMENT start-offsets — the per-GQA-group
@@ -243,7 +246,7 @@ pub fn assemble_matmul_off<T: crate::collective::Tp, O: crate::sdsc_abstract::Ki
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let a_off = a_off.into_raw_elems();
     let w_off = w_off.into_raw_elems();
     let o_off = o_off.into_raw_elems();
@@ -257,7 +260,7 @@ pub fn assemble_matmul_off<T: crate::collective::Tp, O: crate::sdsc_abstract::Ki
     let op = matmul_opspec_off::<Fp16>(
         m, n, k, batch, form, a_name, w_name, o_name, a_off, w_off, o_off,
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 
@@ -301,7 +304,7 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
     let mut op = matmul_opspec_off::<Fp16>(
         m,
@@ -316,17 +319,17 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
         w_off.into_raw_elems(),
         o_off.into_raw_elems(),
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     // ⛔ THE KERNEL'S OWN `in` EXTENT, and a phys SMALLER than the swept k is a mis-declaration
     // (the same rule `matmul_opspec_batched_off` states): a window never covers more than its
     // allocation. Refused here rather than emitting a descriptor whose declared span exceeds the
     // footprint the placement reserved.
     if w_in_phys < k.get() {
-        panic!(
+        return Err(crate::superdsc_error::SuperDscError(format!(
             "assemble_matmul {op_name}: kernel `in` physical extent {w_in_phys} is SMALLER than \
              the swept k {} — a window cannot cover more than its allocation",
             k.get()
-        );
+        )));
     }
     if let Some(kernel) = op
         .args_mut()
@@ -338,7 +341,9 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+        .map_err(|e| {
+            crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
+        })?;
     // ⭐⭐⭐⭐⭐ `N_.in_` CARRIES THE **KERNEL WEIGHT'S PHYSICAL `in` EXTENT**, NOT THE SWEPT `k`
     // — THE ONE NUMBER THE WINDOW CHANGES ABOUT THE WIRE, AND THE CARD DECIDED IT.
     //
@@ -379,7 +384,7 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
             }
         }
     }
-    emitted
+    Ok(emitted)
 }
 
 /// [`assemble_matmul_off`] for an op that sweeps only PART of the activation's rows: `m` is what it
@@ -409,7 +414,7 @@ pub fn assemble_matmul_off_phys_m<T: crate::collective::Tp, O: crate::sdsc_abstr
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_off, w_off, o_off) = (
         a_place.off().into_raw_elems(),
         w_off.into_raw_elems(),
@@ -431,7 +436,7 @@ pub fn assemble_matmul_off_phys_m<T: crate::collective::Tp, O: crate::sdsc_abstr
         <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
         Some(a_place.head_pitch()),
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 
@@ -459,7 +464,7 @@ pub fn assemble_matmul_placed<T: crate::collective::Tp, O: crate::sdsc_abstract:
     o_place: OperandPlacement,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     assemble_matmul_off_phys_m(
         op_name,
         m,
@@ -536,7 +541,7 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     if shape.a_rows != shape.rows {
         op.args_mut()[0].set_device_extent("mb", shape.a_rows);
     }
-    Ok(assemble_from_opspec(op_name, op, sym_id_base, layout))
+    assemble_from_opspec(op_name, op, sym_id_base, layout).map_err(|e| e.0)
 }
 
 /// Shared tail: work-division folds + emit. Identical for both entry points, so a change to how an
@@ -546,15 +551,16 @@ fn assemble_from_opspec<T: crate::collective::Tp>(
     mut op: crate::superdsc_opspec::OpSpec,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // ⭐ A KERNEL MAY LIVE IN LX — the split-KV chunk's gathered Kᵗ and V (`ChunkScratch::lx_form`), read by
     // the core that gathered it. The residency is the tensor's (decided where its name is pinned), so the
     // matmul door consults it by name exactly as the pointwise door does; `emit`'s core-local read law
     // then proves this op hands each core the slice its producer wrote. No-op for every unpinned operand.
     crate::emit::apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
+    })
 }
 
 /// [`assemble_from_opspec`] with a FUSED POINTWISE EPILOGUE chained onto this matmul's own output —
@@ -564,7 +570,7 @@ fn assemble_from_opspec<T: crate::collective::Tp>(
 /// only its device NAME is read; `attach_fused_epilogue` clones THIS op's own output shape/layout
 /// onto it, matching `bmm.ddl`'s bias/resadd convention exactly) at device offset `epi_off`.
 ///
-/// PANICS if `op.time() != 1` (a tiled matmul) — the epilogue operand is not threaded through
+/// REFUSES (an `Err`) a tiled matmul (`op.time() != 1`) — the epilogue operand is not threaded through
 /// `rewrite_op_for_time_tile`'s per-trip affine-stride machinery, so fusing onto a tiled matmul would
 /// silently address only the first trip. A future tiled target needs that machinery extended first,
 /// not this guard removed.
@@ -582,13 +588,13 @@ fn assemble_from_opspec_with_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
-    assert_eq!(
-        op.time(),
-        1,
-        "assemble_matmul {op_name}: a fused epilogue needs an untiled (time=1) matmul — got time={}",
-        op.time()
-    );
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    if op.time() != 1 {
+        return Err(crate::superdsc_error::SuperDscError(format!(
+            "assemble_matmul {op_name}: a fused epilogue needs an untiled (time=1) matmul — got time={}",
+            op.time()
+        )));
+    }
     op.attach_fused_epilogue(crate::superdsc_opspec::EpilogueSpecs {
         one: crate::superdsc_opspec::EpilogueSpec {
             operand_name: epi.name().to_string(),
@@ -623,7 +629,7 @@ fn assemble_from_opspec_maybe_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     match epi {
         Some((e, off)) => assemble_from_opspec_with_epilogue(
             op_name,
@@ -666,7 +672,7 @@ pub fn assemble_matmul_off_maybe_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_off.into_raw_elems(),
         w_off.into_raw_elems(),
@@ -676,7 +682,7 @@ pub fn assemble_matmul_off_maybe_epilogue<
     let op = matmul_opspec_off::<Fp16>(
         m, n, k, batch, form, a_name, w_name, o_name, a_off_raw, w_off_raw, o_off_raw,
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     assemble_from_opspec_maybe_epilogue(
         op_name,
         op,
@@ -715,7 +721,7 @@ pub fn assemble_matmul_off_phys_m_maybe_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_place.off().into_raw_elems(),
         w_off.into_raw_elems(),
@@ -737,7 +743,7 @@ pub fn assemble_matmul_off_phys_m_maybe_epilogue<
         <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
         Some(a_place.head_pitch()),
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     assemble_from_opspec_maybe_epilogue(
         op_name,
         op,
@@ -776,7 +782,7 @@ pub fn assemble_matmul_off_with_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_off.into_raw_elems(),
         w_off.into_raw_elems(),
@@ -786,7 +792,7 @@ pub fn assemble_matmul_off_with_epilogue<
     let op = matmul_opspec_off::<Fp16>(
         m, n, k, batch, form, a_name, w_name, o_name, a_off_raw, w_off_raw, o_off_raw,
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     assemble_from_opspec_with_epilogue(
         op_name,
         op,
@@ -827,7 +833,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue<
     broadcast_batch: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_off_raw, w_off_raw, o_off_raw) = (
         a_place.off().into_raw_elems(),
         w_off.into_raw_elems(),
@@ -849,7 +855,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue<
         <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
         Some(a_place.head_pitch()),
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     assemble_from_opspec_with_epilogue(
         op_name,
         op,
@@ -914,7 +920,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
     gather: Option<crate::superdsc_opspec::GatherIndex>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> crate::emit::EmittedOp<T> {
+) -> Result<crate::emit::EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // Same three offsets, from the same places, as the ungathered sibling — the activation's comes from
     // its PLACEMENT, so this entry point cannot pair a law's pitch with a hand-added offset.
     let (a_off_raw, w_off_raw, o_off_raw) = (
@@ -941,7 +947,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
         Some(a_place.head_pitch()),
         gather,
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
     assemble_from_opspec_with_epilogue(
         op_name,
         op,
@@ -977,7 +983,7 @@ pub fn assemble_matmul_batched_off<T: crate::collective::Tp, O: crate::sdsc_abst
     o_off: u32,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
     let op = super::opspec::matmul_opspec_batched_off(
         m,
@@ -992,10 +998,13 @@ pub fn assemble_matmul_batched_off<T: crate::collective::Tp, O: crate::sdsc_abst
         o_off,
         kernel_device_extent,
     )
-    .unwrap_or_else(|e| panic!("assemble_matmul_batched_off {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_matmul_batched_off {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul_batched_off {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_matmul_batched_off {op_name}: {e}"))
+    })
 }
 
 /// THE CONTROL SET FOR [`out_width_the_weight_holds`], and the reason it is not vacuous.

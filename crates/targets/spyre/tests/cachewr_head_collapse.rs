@@ -83,6 +83,7 @@ fn cachewr_op(
         &mut sym,
         None,
     )
+    .expect("assemble_matmul_placed builds")
 }
 
 fn layout_dim_order(

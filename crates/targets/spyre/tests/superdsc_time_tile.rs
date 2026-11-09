@@ -205,7 +205,8 @@ fn reduce_and_multiop_invariants() {
         &emit::rb("r_x", 64, 576),
         &emit::rb("r_acc", 64, 1),
         None,
-    );
+    )
+    .expect("assemble_reduce builds");
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&emitted.op).unwrap()).unwrap();
     // (1) coreIdToDsc_ spans exactly numCoresUsed_ cores (consistent with the schedule).
@@ -892,7 +893,8 @@ fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
 fn slice_operand_offsets_startaddr() {
     let e = emit::assemble_slice_add_gate::<ktir_superdsc::collective::TpWorld<1>>(
         "slice_g", 64, 64, "sx", "so",
-    );
+    )
+    .expect("assemble_slice_add_gate builds");
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&e.op).unwrap()).unwrap();
     let nodes = &j["dscs_"][0]["slice_g"]["scheduleTree_"];
@@ -964,7 +966,8 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "w"),
         &emit::rb("o", 384, 384),
         None,
-    );
+    )
+    .expect("assemble_matmul builds");
     assert_eq!(e.time, 1, "bmm fits LX in one trip");
     let seg = 0x4_0000_0000u64;
     let a = per_core_addrs(&e, "mm", 0); // INPUT  [mb,in,x,y] split on mb
@@ -1103,6 +1106,7 @@ fn batched_lx_overflowing_matmul() -> emit::EmittedOp<ktir_superdsc::collective:
         &emit::rb("o", m, n),
         None,
     )
+    .expect("assemble_matmul builds")
 }
 
 /// The `y`-batched shape the trip tests drove before the one-stick refusal, 64×16384×2048 at two kernel
@@ -1382,7 +1386,8 @@ fn time1_bundle_mlir_is_byte_identical_to_flat() {
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "wt"),
         &emit::rb("out", 384, 384),
         None,
-    );
+    )
+    .expect("assemble_matmul builds");
     assert_eq!(emitted.time, 1, "bmm must NOT time-tile");
     let via_emitted = superdsc::emit_bundle_mlir(&[emitted]);
     let flat = superdsc::bundle_mlir(&["sdsc_0.json".to_string()]);
@@ -1414,7 +1419,8 @@ fn dump_gate_bundles() {
         &Stk::<KernelTag>::kernel(64_usize, 64_usize, "g1_w"),
         &emit::rb("g1_o", 64, 64),
         None,
-    );
+    )
+    .expect("assemble_matmul builds");
     assert_eq!(fit.time, 1, "64^3 must fit LX in one trip");
     superdsc::write_dxp_input(&root.join("fit64"), &[fit], superdsc::FoldGrouping::Split).unwrap();
     // (B) OVERFLOWING but TILEABLE-ON-`out` — must overflow the full per-core tile
@@ -1449,7 +1455,8 @@ fn dump_gate_bundles() {
                 &Stk::<KernelTag>::kernel(k as usize, n as usize, "gb_w"),
                 &emit::rb("gb_o", m, n),
                 None,
-            );
+            )
+            .expect("assemble_matmul builds");
             assert!(ov.time > 1, "{label} must time-tile");
             eprintln!("→ BAKING {label} as GATE-1b: time = {}", ov.time);
             superdsc::write_dxp_input(&root.join("ov_tiled"), &[ov], superdsc::FoldGrouping::Split)
@@ -1472,7 +1479,8 @@ fn dump_gate_bundles() {
         "bc_x",
         "bc_v",
         "bc_o",
-    );
+    )
+    .expect("assemble_broadcast_mul_gate builds");
     eprintln!("→ BAKING broadcast-mul gate: time={}", bc.time);
     superdsc::write_dxp_input(&root.join("bcast"), &[bc], superdsc::FoldGrouping::Split).unwrap();
     // (D) RMSNORM gate: the full 5-op decomposition (the vendor's spyre_rms_norm formula with the
@@ -1501,7 +1509,8 @@ fn dump_gate_bundles() {
         64,
         "sl_x",
         "sl_o",
-    );
+    )
+    .expect("assemble_slice_add_gate builds");
     eprintln!("→ BAKING slice-add gate: time={}", sl.time);
     superdsc::write_dxp_input(&root.join("slice"), &[sl], superdsc::FoldGrouping::Split).unwrap();
     eprintln!("wrote fit64, ov_tiled, bcast, rmsnorm, slice");

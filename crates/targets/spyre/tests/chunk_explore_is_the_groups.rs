@@ -40,6 +40,7 @@ fn dense_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
         &emit::rb("o", 256, 2048),
         None,
     )
+    .expect("assemble_matmul builds")
 }
 
 /// The token-plane gathered expert gemm, built the way the MoE door builds it: fp16 geometry, every

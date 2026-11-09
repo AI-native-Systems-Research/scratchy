@@ -472,7 +472,7 @@ pub fn assemble_reduce_df<T: crate::collective::Tp>(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // head_major=TRUE ⇒ rank-3 flat, matching the flat fp32 island (see assemble_pointwise_broadcast_df).
     let op = reduce_opspec_df(
         op_func_from_str(op_func),
@@ -483,10 +483,13 @@ pub fn assemble_reduce_df<T: crate::collective::Tp>(
         true,
         df,
     )
-    .unwrap_or_else(|e| panic!("assemble_reduce_df {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_df {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce_df {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_df {op_name}: {e}"))
+    })
 }
 
 /// Assemble a complete SuperDSC for ONE REDUCTION over `[rows, cols]` reducing
@@ -500,7 +503,7 @@ pub fn assemble_reduce<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     data: &Stk<D>,
     accum: &Stk<A>,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let mut sym_id_base: i64 = 0;
     assemble_reduce_seeded(
         op_name,
@@ -525,7 +528,7 @@ pub fn assemble_reduce_seeded<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     accum: &Stk<A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // DATA's kind now DRIVES head_major (was hardcoded `false`, forcing every caller's data operand
     // through the RowBlocked/stickmajor-eligible path regardless of what actually consumes it next).
     // The stick-major optimization exists ONLY so a whole-tensor pointwise producer's output agrees
@@ -553,10 +556,11 @@ pub fn assemble_reduce_seeded<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         Df::Fp16,
         division,
     )
-    .unwrap_or_else(|e| panic!("assemble_reduce {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_reduce {op_name}: {e}")))?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce {op_name}: {e}"))
+    })
 }
 
 /// [`reduce_opspec`] with per-operand ELEMENT offsets — for per-head/offset reduce slices.
@@ -920,7 +924,7 @@ pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let op = reduce_opspec_off(
         op_func_from_str(op_func),
         rows.get(),
@@ -929,10 +933,13 @@ pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         accum,
         df,
     )
-    .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off {op_name}: {e}"))
+    })
 }
 
 /// The parameter list of [`assemble_reduce_off_divided`], carried as a struct (the `PointwiseDivided`
@@ -955,7 +962,7 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
     r: ReduceDivided<'_, D, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let ReduceDivided {
         op_name,
         op_func,
@@ -976,10 +983,13 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
         division,
         scaling: ScalingExtent::whole(cols.get()),
     })
-    .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off_divided {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off_divided {op_name}: {e}"))
+    })
 }
 
 /// ⭐⭐⭐⭐⭐ THE LONG-REDUCE SPLIT — the ONE law for a seeded row reduce too long for one
@@ -1375,20 +1385,23 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     for (i, p) in partials.iter().enumerate() {
         let op_name = format!("{}_c{}_op", s.op_name, i + 1);
         if matches!(s.df, Df::Fp16) {
-            ops.push(crate::emit::assemble_pointwise_broadcast_off(
-                &op_name,
-                combine,
-                rows_t,
-                combine_cols,
-                &[
-                    crate::emit::In::sliced(s.accum, s.accum_off).ew(),
-                    crate::emit::In::full(p).ew(),
-                ],
-                s.accum,
-                s.accum_off,
-                sym_id_base,
-                layout,
-            ));
+            ops.push(
+                crate::emit::assemble_pointwise_broadcast_off(
+                    &op_name,
+                    combine,
+                    rows_t,
+                    combine_cols,
+                    &[
+                        crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                        crate::emit::In::full(p).ew(),
+                    ],
+                    s.accum,
+                    s.accum_off,
+                    sym_id_base,
+                    layout,
+                )
+                .map_err(|e| e.0)?,
+            );
         } else {
             let mut op = crate::emit::pointwise_broadcast_opspec_df(
                 op_func_from_str(combine),

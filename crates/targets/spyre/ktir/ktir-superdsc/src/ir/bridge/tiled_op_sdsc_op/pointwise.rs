@@ -378,7 +378,7 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
     index: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // ⛔ ALL THREE EXTENTS FROM THE SCRATCH, AS ONE VALUE, NOT THREE REACHES. `mb` is the copy's own
     // extent, the index's live entry count and the scratch's row count; `out` is the pool's stick; the
     // `page` the walk pins is the `page` the index declares. They were three separate calls here
@@ -415,7 +415,9 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
                 d.out(),
                 layout,
             )
-            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+            .map_err(|e| {
+                crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+            })?;
         }
         // ⭐ THE SCATTER DESTINATION'S PLACEMENT HALF — the same stride-aware mint the raw door
         // ran, now with the layout at hand so the ChainRow's reservation answers for the bytes
@@ -433,18 +435,20 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
                 d.mb(),
                 layout,
             )
-            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+            .map_err(|e| {
+                crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+            })?;
         }
         crate::sdsc_abstract::GatherDest::CoreLocalLx => {
             if let Some(l) = layout
                 && !l.lx_core_local(dst)
             {
-                panic!(
+                return Err(crate::superdsc_error::SuperDscError(format!(
                     "assemble_gather_copy {op_name}: the copy states a CORE-LOCAL destination but \
                      the layout does not hold '{dst}' as core-local LX — the minted law and the \
                      layout disagree about where this run lands, so it addresses bytes neither \
                      authority stands behind"
-                );
+                )));
             }
         }
     }
@@ -477,14 +481,17 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
             dest: copy.dest(),
         },
     )
-    .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+    })?;
     // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
     // PV contracts it (`ChunkScratch::lx_form`). The copy keeps its own one-entry-per-core division; the
     // read law holds the PV to it. No-op for an HBM scratch.
     crate::emit::apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+    })
 }
 
 /// ⭐⭐⭐ THE SCATTER'S COPY — the mirror of [`gather_copy_opspec`]: an `identity` from a contiguous
@@ -1810,7 +1817,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
     out_offset: impl Into<OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let out_offset = out_offset.into();
     let o_name = o.name();
     let head_major = O::kind() == StickKind::Flat;
@@ -1826,7 +1833,9 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
         tile_op.df,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })?;
     // ⛔ ONE SHARED LIST, NOT A SECOND COPY. This was a verbatim duplicate of the `const` in
     // `emit::assemble_pointwise_broadcast_off`, so a fix had to land in both — and `"mish"` had been
     // added to neither. See [`crate::emit::SFP_SPLIT_TRANSCENDENTALS`] for the geometry, the dxp
@@ -1835,7 +1844,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
         && cols > Fp16::ELEMS_PER_STICK
         && inputs.iter().any(|i| i.out_broadcast())
     {
-        panic!(
+        return Err(crate::superdsc_error::SuperDscError(format!(
             "[superdsc sfp-transcendental-guard] {op_name}: SFP `{op_func}` emitted at \
              multi-stick width (cols={cols} > {}) with an OUT-BROADCAST (reduction) input — \
              the full-width-transcendental geometry that CRASHES the dxp compile (map::at in \
@@ -1843,7 +1852,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
              (cols={}); broadcast in the following multiply. (guard-every-crash-at-build-time)",
             Fp16::ELEMS_PER_STICK,
             Fp16::ELEMS_PER_STICK,
-        );
+        )));
     }
     let op = pointwise_broadcast_opspec_from_tile(
         tile_op,
@@ -1857,10 +1866,13 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
         layout,
         CoreDivision::Ew(EwDivision::Law),
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })
 }
 
 /// `assemble_pointwise_seeded` TAKING AN ALREADY-LOWERED `TileOp` instead of raw `rows`/`cols` — the
@@ -1874,7 +1886,7 @@ pub fn assemble_pointwise_seeded_from_tile<T: crate::collective::Tp>(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let op = pointwise_opspec_from_tile(
         tile_op,
         op_func_from_str(op_func),
@@ -1883,10 +1895,13 @@ pub fn assemble_pointwise_seeded_from_tile<T: crate::collective::Tp>(
         false,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise {op_name}: {e}"))
+    })
 }
 
 #[cfg(test)]

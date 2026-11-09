@@ -10286,7 +10286,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
         let op = emitted.dsc();
         // numWkSlices product = 32 cores.
@@ -10330,7 +10331,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let via_emitted = emit_bundle_mlir(&[emitted]);
         assert_eq!(
             via_emitted,
@@ -10359,7 +10361,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         assert_eq!(whole.time, 1, "an unbatched fp16 matmul is staged by dxp");
         // The shape this test drove before the refusal, 64×16384×2048 at two kernel batches: a
         // 32-stick contraction under a `y` batch, the form measured incoherent on granite-3.1-8b.
@@ -10396,7 +10399,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let n = emitted.time;
         assert!(n > 1, "this matmul must time-tile, got time={n}");
         // (ii) the divided per-time `out` shows up in N_ / ss_ (per-core out_per_time).
@@ -11044,6 +11048,7 @@ mod fingerprint_tests {
                 &rb("out", m, 384),
                 None,
             )
+            .expect("assemble_matmul builds")
         };
         let (a, b) = (at(384), at(192));
         assert_eq!((&a.op_name, a.time), (&b.op_name, b.time));

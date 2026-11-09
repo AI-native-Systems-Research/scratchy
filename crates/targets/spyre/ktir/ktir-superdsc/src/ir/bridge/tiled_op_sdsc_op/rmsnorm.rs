@@ -164,43 +164,52 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     if let Some(split) = split {
         ops.extend(split);
     } else {
-        ops.push(assemble_reduce_seeded(
-            &rmmean_op,
-            "exx2",
-            rows,
-            cols,
-            &x,
-            &mean,
-            sym_id_base,
-            layout,
-        ));
+        ops.push(
+            assemble_reduce_seeded(
+                &rmmean_op,
+                "exx2",
+                rows,
+                cols,
+                &x,
+                &mean,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| e.0)?,
+        );
     }
     // 2. E[x²] + eps  (the `+ eps` inside torch.rsqrt). `mean` holds both half-stick values, so
     //    elements [0..8) compute E[x]+eps and the pad elements compute over stale bytes — both
     //    unread (the tail reads element 8 only), the same computed-but-unread padding class the
     //    elementary chain always had.
-    ops.push(pw2(
-        &format!("rmeps_{prefix}"),
-        "add",
-        t_rows,
-        s_cols,
-        In::full(&mean),
-        In::scalar(&eps),
-        &meps,
-        sym_id_base,
-        layout,
-    )); // E[x²] + eps
+    ops.push(
+        pw2(
+            &format!("rmeps_{prefix}"),
+            "add",
+            t_rows,
+            s_cols,
+            In::full(&mean),
+            In::scalar(&eps),
+            &meps,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| e.0)?,
+    ); // E[x²] + eps
     // 3. rinv = rsqrt(E[x²]+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
-    ops.push(pw1(
-        &format!("rmrsqrt_{prefix}"),
-        "rsqrt",
-        t_rows,
-        s_cols,
-        In::full(&meps),
-        &rinv,
-        sym_id_base,
-        layout,
-    )); // 1/√(E[x²]+eps)
+    ops.push(
+        pw1(
+            &format!("rmrsqrt_{prefix}"),
+            "rsqrt",
+            t_rows,
+            s_cols,
+            In::full(&meps),
+            &rinv,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| e.0)?,
+    ); // 1/√(E[x²]+eps)
     // 4. apply: xn = x·r (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
     //    `rinv`'s element 8 IS E[x²]'s rsqrt — the FIRST element of the exx2 output's second
     //    half-stick ([8..16); the vendor's own consumers read it at exactly this offset,
@@ -213,17 +222,20 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     //    allocate through the ordinary slice-offset machinery — and because `rinv` is LX-pinned,
     //    that byte lands BYTE-exact in the reader's lxlu address (see the `synth_lx_op_local` note above
     //    for why the same offset on HBM is silently floored to element 0).
-    ops.push(pw2(
-        &format!("rmxn_{prefix}"),
-        "multiply",
-        t_rows,
-        f_cols,
-        In::full(&x),
-        In::col_at(&rinv, crate::addr::DevOff::from_view_step(8)),
-        &xn,
-        sym_id_base,
-        layout,
-    ));
+    ops.push(
+        pw2(
+            &format!("rmxn_{prefix}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::full(&x),
+            In::col_at(&rinv, crate::addr::DevOff::from_view_step(8)),
+            &xn,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| e.0)?,
+    );
     // 6. OnePlusScale: gw = gamma + 1 — ONE `add` over the stored row with the
     //    `[1,1]`-broadcast offset (the eps operand mode), filling the `[1,cols]`
     //    `Gw` row the gain multiply reads. The stored gamma is never rewritten.
@@ -232,32 +244,38 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let gw_ones_h = ones_const.map(|c| (rb(&gw, 1, cols), rb(c, 1, stk)));
     let gamma_operand = match &gw_ones_h {
         Some((gw_handle, ones)) => {
-            ops.push(pw2(
-                &format!("rmga_{prefix}"),
-                "add",
-                RowCount::of_token_rows(1),
-                BlockCols::of_feature_cols(cols),
-                In::mb(&gamma),
-                In::scalar(ones),
-                gw_handle,
-                sym_id_base,
-                layout,
-            )); // gw = γ + 1
+            ops.push(
+                pw2(
+                    &format!("rmga_{prefix}"),
+                    "add",
+                    RowCount::of_token_rows(1),
+                    BlockCols::of_feature_cols(cols),
+                    In::mb(&gamma),
+                    In::scalar(ones),
+                    gw_handle,
+                    sym_id_base,
+                    layout,
+                )
+                .map_err(|e| e.0)?,
+            ); // gw = γ + 1
             In::mb(gw_handle)
         }
         None => In::mb(&gamma),
     };
-    ops.push(pw2(
-        &format!("rmg_{prefix}"),
-        "multiply",
-        t_rows,
-        f_cols,
-        In::full(&xn),
-        gamma_operand,
-        &out,
-        sym_id_base,
-        layout,
-    ));
+    ops.push(
+        pw2(
+            &format!("rmg_{prefix}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::full(&xn),
+            gamma_operand,
+            &out,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| e.0)?,
+    );
     Ok(ops)
 }
 
@@ -319,17 +337,20 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     let s_cols = BlockCols::of_one_stick(Lanes::FP16);
     // Steps 1–4 are `assemble_rmsnorm` verbatim — the same formula up to the
     // normalising multiply, because a unit-gain norm is the same norm.
-    ops.push(pw2(
-        &format!("rmsq_{prefix}"),
-        "mul",
-        t_rows,
-        f_cols,
-        In::full(&x),
-        In::full(&x),
-        &sq16,
-        sym_id_base,
-        layout,
-    )); // sq16 = x²
+    ops.push(
+        pw2(
+            &format!("rmsq_{prefix}"),
+            "mul",
+            t_rows,
+            f_cols,
+            In::full(&x),
+            In::full(&x),
+            &sq16,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| e.0)?,
+    ); // sq16 = x²
     // THE ONE PROBE-AND-SPLIT BODY owns the long form here too — the same body, the same
     // question, never a second spelling of the split law.
     let rmmean_op = format!("rmmean_{prefix}");
@@ -353,52 +374,64 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     if let Some(split) = split {
         ops.extend(split);
     } else {
-        ops.push(assemble_reduce_seeded(
-            &rmmean_op,
-            "mean",
-            rows,
-            cols,
-            &sq16,
-            &mean,
+        ops.push(
+            assemble_reduce_seeded(
+                &rmmean_op,
+                "mean",
+                rows,
+                cols,
+                &sq16,
+                &mean,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| e.0)?,
+        );
+    }
+    ops.push(
+        pw2(
+            &format!("rmeps_{prefix}"),
+            "add",
+            t_rows,
+            s_cols,
+            In::full(&mean),
+            In::scalar(&eps),
+            &meps,
             sym_id_base,
             layout,
-        ));
-    }
-    ops.push(pw2(
-        &format!("rmeps_{prefix}"),
-        "add",
-        t_rows,
-        s_cols,
-        In::full(&mean),
-        In::scalar(&eps),
-        &meps,
-        sym_id_base,
-        layout,
-    )); // mean + eps
-    ops.push(pw1(
-        &format!("rmrsqrt_{prefix}"),
-        "rsqrt",
-        t_rows,
-        s_cols,
-        In::full(&meps),
-        &rinv,
-        sym_id_base,
-        layout,
-    )); // 1/√(mean+eps)
+        )
+        .map_err(|e| e.0)?,
+    ); // mean + eps
+    ops.push(
+        pw1(
+            &format!("rmrsqrt_{prefix}"),
+            "rsqrt",
+            t_rows,
+            s_cols,
+            In::full(&meps),
+            &rinv,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| e.0)?,
+    ); // 1/√(mean+eps)
     // Step 5 is the TERMINAL multiply here, not `Xn`: `out = x·rinv` with the
     // per-row reciprocal out-broadcast over cols — the same operand mode
     // (`In::col`) the gained form's `rmxn` uses for the same value.
-    ops.push(pw2(
-        &format!("rmxn_{prefix}"),
-        "multiply",
-        t_rows,
-        f_cols,
-        In::full(&x),
-        In::col(&rinv),
-        &out,
-        sym_id_base,
-        layout,
-    ));
+    ops.push(
+        pw2(
+            &format!("rmxn_{prefix}"),
+            "multiply",
+            t_rows,
+            f_cols,
+            In::full(&x),
+            In::col(&rinv),
+            &out,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|e| e.0)?,
+    );
     Ok(ops)
 }
 
@@ -426,7 +459,7 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     cap_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp<T>> {
+) -> Result<Vec<EmittedOp<T>>, crate::superdsc_error::SuperDscError> {
     use crate::place::SynthRole as R;
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
     let out_s = out_id.to_string();
@@ -453,7 +486,7 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
         &tanhc,
         sym_id_base,
         layout,
-    ));
+    )?);
     // 2. tanh — in place on the scaled buffer's name, into the same synth.
     ops.push(pw1(
         &format!("tscth_{prefix}"),
@@ -464,7 +497,7 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
         &tanhc,
         sym_id_base,
         layout,
-    ));
+    )?);
     // 3. out = cap · tanh(x/cap).
     ops.push(pw2(
         &format!("tscmul_{prefix}"),
@@ -476,6 +509,6 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
         &out,
         sym_id_base,
         layout,
-    ));
-    ops
+    )?);
+    Ok(ops)
 }

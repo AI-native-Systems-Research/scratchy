@@ -240,7 +240,8 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
             &rb("afp8", 1, cols),
             &mut sym,
             None,
-        );
+        )
+        .expect("assemble_convert builds");
         let split = e
             .dsc()
             .numWkSlicesPerDim_

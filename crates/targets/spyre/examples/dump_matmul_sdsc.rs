@@ -98,7 +98,8 @@ fn main() {
             &kh("Tensor1", 2048, 512),
             &rbh("Tensor2", 8, 512),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         full(
             "MINE matmul mb=8 v_proj",
             &serde_json::to_value(&e.op).unwrap(),
@@ -117,7 +118,8 @@ fn main() {
             &kh("Tensor1", 2048, 512),
             &rbh("Tensor2", 8, 512),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let j = serde_json::to_value(&e.op).unwrap();
         let key = j["dscs_"][0]
             .as_object()
@@ -147,7 +149,8 @@ fn main() {
             &rbh("Tensor2", 8, 2048),
             &mut sib,
             None,
-        );
+        )
+        .expect("assemble_pointwise_broadcast builds");
         let j = serde_json::to_value(&e.op).expect("json");
         dump("POINTWISE multiply [8,2048]", &j);
     }
@@ -163,7 +166,8 @@ fn main() {
             &kh("Tensor1", 2048, 512),
             &rbh("Tensor2", m, 512),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         dump(
             &format!("MATMUL v_proj mb={m} [m,512] k=2048"),
             &serde_json::to_value(&e.op).unwrap(),
@@ -180,7 +184,8 @@ fn main() {
         &kh("Tensor1", 2048, 2048),
         &rbh("Tensor2", 8, 2048),
         None,
-    );
+    )
+    .expect("assemble_matmul builds");
     dump(
         "MATMUL q_proj mb=8 [8,2048] k=2048 (mb UNSPLIT)",
         &serde_json::to_value(&e.op).unwrap(),

@@ -12364,12 +12364,15 @@ fn dump_wavefront_mega(
                         );
                         // A hand-authored matmul, so there is no attention node for the four
                         // attention facts to be facts of — main's own `false`/absent at such a site.
-                        match superdsc::emit_bundle::<$W>(
-                            &[g1],
-                            None,
-                            superdsc::FoldGrouping::Split,
-                            None,
-                        ) {
+                        match g1.map_err(|e| e.to_string()).and_then(|g1| {
+                            superdsc::emit_bundle::<$W>(
+                                &[g1],
+                                None,
+                                superdsc::FoldGrouping::Split,
+                                None,
+                            )
+                            .map_err(|e| e.to_string())
+                        }) {
                             Ok(fp) => eprintln!(
                                 "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
                                  dxp compiles it inline"

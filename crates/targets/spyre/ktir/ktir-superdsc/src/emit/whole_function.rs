@@ -6122,7 +6122,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                                 &dst.name(),
                                 sym_id_base,
                                 Some(layout),
-                            ),
+                            )?,
                         );
                         Region {
                             is_out: false,
