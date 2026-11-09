@@ -1791,11 +1791,14 @@ mod tests {
     }
 
     /// A body's step walks the whole pages its sweep covers, and a sweep that is no walk of the pool
-    /// names no step. ⭐ AND THE BODY'S EXTENT IS THE WIRING'S OWN — a body at the wiring's rows
-    /// carries the pair unchanged (capacity and all: a packed rung's `(w, S)` survives), a decode
-    /// batch under the one-request decode's wiring re-mints `(1, width)` (every row a request's
-    /// one token), and a sequence body at rows the wiring does not state names no rung — never a
-    /// re-minted one-request pair that would drop a packed rung's capacity on the floor.
+    /// names no step. ⭐ AND THE BODY'S EXTENT — a body's step states the LAUNCH's own extent
+    /// pair, by the launch's kind: a `Sequence`
+    /// launch is one request of `rows` rows — `(rows, 1)` — whatever width the wiring's own
+    /// pair names (the ladders bake one tape at several widths under one wiring, and `rows` is
+    /// the rung actually launching — the worker's chunk ladder stages a narrow chunk under the
+    /// shared wiring every prompt), and a `Batch` launch is one row per request — `(1, rows)`.
+    /// Both are the same law the bake's codegen minted each rung's own pair by, so a launch on
+    /// the wiring's own width re-derives the wiring's pair exactly.
     #[test]
     fn a_body_steps_at_its_own_walk() {
         let s = step();
@@ -1804,18 +1807,21 @@ mod tests {
         assert_eq!(
             (body.extent.per_request().get(), body.extent.requests().get()),
             (3, 1),
-            "the wiring's own pair carries"
+            "a sequence launch is one request of its own rows"
         );
-        let packed = PagedStep {
+        // ⭐ THE WORKER'S REAL SHAPE: a chunk narrower than the wiring's representative width —
+        // the prefill ladder stages a 4-row chunk under a 3-per-request wiring (one tape, one
+        // wiring, several baked widths). The launch's own pair, never a refusal.
+        let wide = PagedStep {
             rows: 6,
             extent: pair(3, 2),
             ..step()
         };
-        let body = packed.on_body(6, PagedRows::Sequence, 8).unwrap();
+        let body = wide.on_body(4, PagedRows::Sequence, 8).unwrap();
         assert_eq!(
             (body.extent.per_request().get(), body.extent.requests().get()),
-            (3, 2),
-            "a packed rung's capacity survives its own body"
+            (4, 1),
+            "a chunk narrower than the wiring's width still states its own rows"
         );
         let decode = PagedStep {
             rows: 1,
@@ -1826,11 +1832,13 @@ mod tests {
         assert_eq!(
             (body.extent.per_request().get(), body.extent.requests().get()),
             (1, 4),
-            "a batch under the one-request decode's wiring re-mints one row each"
+            "a batch launch is one row per request"
         );
-        assert!(
-            decode.on_body(4, PagedRows::Sequence, 8).is_none(),
-            "a sequence body at rows the wiring does not state"
+        let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
+        assert_eq!(
+            (body.extent.per_request().get(), body.extent.requests().get()),
+            (3, 1),
+            "a launch on the wiring's own width re-derives its pair"
         );
         assert!(
             s.on_body(3, PagedRows::Sequence, 6).is_none(),
