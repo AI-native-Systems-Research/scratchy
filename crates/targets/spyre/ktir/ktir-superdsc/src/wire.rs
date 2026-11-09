@@ -627,10 +627,16 @@ impl BackGap {
             .layout
             .iter()
             .zip(v.device_extent)
-            .filter_map(|(&d, &axis)| match v.pitch_form(axis) {
-                Some(crate::superdsc_opspec::PitchForm::Hbm(p)) => Some((d, p.gap())),
-                // The pinned walk carries it (`window_extents`); no gap, exactly one form.
-                Some(crate::superdsc_opspec::PitchForm::Lx(_)) | None => None,
+            .filter_map(|(&d, &axis)| {
+                use crate::superdsc_opspec::{DeviceAxis, PitchForm};
+                match axis {
+                    DeviceAxis::Swept | DeviceAxis::Window(_) => None,
+                    DeviceAxis::Pitch(p) => match v.pitch_form(p) {
+                        PitchForm::Hbm(p) => Some((d, p.gap())),
+                        // The pinned walk carries it (`window_extents`); no gap, exactly one form.
+                        PitchForm::Lx(_) => None,
+                    },
+                }
             })
             .collect();
         (!gaps.is_empty()).then_some(BackGap(gaps))
