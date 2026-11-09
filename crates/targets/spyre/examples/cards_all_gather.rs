@@ -23,7 +23,7 @@
 //! ```text
 //! cargo run --release -p scratchy-target-spyre --features spyre-hw --example cards_all_gather -- <N>
 //! ```
-//! N cards: senlib's cards 0..N, opened by PCI address.
+//! N cards: the first N of this host's card table (`CardTable`), opened by PCI address.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,7 +40,9 @@ use flex_rs::scheduler::{
 };
 use flex_rs::senlib_ffi::pci_addr_for_region;
 use flex_rs::stream::{RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority};
+use scratchy_target_spyre::bundle_code::collective::TpWorld;
 use scratchy_target_spyre::runtime::CardRuntime as AnyCard;
+use scratchy_target_spyre::runtime::{CardTable, WorldCards};
 
 /// A raw flex-level probe: the cards are driven below the world-typed p2p link, so they are opened
 /// as one card's runtime each.
@@ -158,16 +160,30 @@ fn main() -> Result<()> {
         .context("usage: cards_all_gather <N>")?
         .parse()
         .context("N is a card count")?;
-    let have = flex_rs::senlib_ffi::sen_pci_card_count();
+    // ── The cards: the first N of this host's card table, each a world of one (this probe drives
+    //    its own link and sends, not a tensor-parallel world). ──
+    let table =
+        scratchy_target_spyre::runtime::CardTable::enumerate().map_err(|e| anyhow!("{e}"))?;
+    let have = table.cards().len();
     ensure!(
-        n >= 2 && n as i64 <= have,
+        n >= 2 && n <= have,
         "N={n}: needs 2..={have} cards (senlib enumerates {have})"
     );
+    let own: Vec<CardTable> = table.cards()[..n]
+        .iter()
+        .map(|c| CardTable::of([(c.index(), c.pci().to_string())]))
+        .collect();
 
     // ── Open every card, in parallel: each bring-up is ~5.7 s. ──
     let t = Instant::now();
-    let cards: Vec<CardRuntime> = (0..n as u32)
-        .map(|i| std::thread::spawn(move || CardRuntime::open(i)))
+    let cards: Vec<CardRuntime> = own
+        .into_iter()
+        .map(|one| {
+            std::thread::spawn(move || {
+                let world = WorldCards::<TpWorld<1>>::claim(&one).map_err(|e| anyhow!("{e}"))?;
+                CardRuntime::open(world.per_rank().first()).map_err(|e| anyhow!("{e}"))
+            })
+        })
         .collect::<Vec<_>>()
         .into_iter()
         .enumerate()

@@ -54,6 +54,8 @@
 
 pub mod address;
 pub mod allocator;
+/// The cards senlib enumerates on this host, read once — see [`card_table`].
+pub mod card_table;
 pub mod compute;
 pub mod control_block_wire;
 pub mod control_blocks;
