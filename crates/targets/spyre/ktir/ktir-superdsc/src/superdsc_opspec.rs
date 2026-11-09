@@ -2316,9 +2316,11 @@ pub struct DeviceOrderView<'a> {
 ///   the view touch more, it never moves the next step), so the pitch is the walk's BACK GAP:
 ///   `backGapCore_ {axis: pitch − swept}`, which dxp folds into the axis's outermost repeat
 ///   (`sizesThisCore.at(lastIdx).size_ += backGap / innerSize`) — the vendor inductor's own
-///   `backGap = dev_dim_size − it_dim_size`. MEASURED on the card (nickm5, 2026-11-08): a
-///   `sumnonstick` over 8 blocks 512 rows apart read garbage through the pinned walk (it stepped the
-///   reduced axis by ONE row) and every block correctly through the back gap.
+///   `backGap = dev_dim_size − it_dim_size`. MEASURED on the card (2026-11-08): a flat-frame
+///   batched contraction (b8 m68 k64 and b8 m124 k128, n = 128) read 0 rows correct through the
+///   pinned walk and every row through the back gap; multi-stick row bands of a taller parent
+///   ([1,4096]/[4,4096], [1,8192]/[4,8192], [16,384]/[64,384] with `mb` split across cores) were
+///   bit-identical to the whole-parent op through the back gap.
 ///
 /// Both state the same PHYSICAL extent to every address reader — the arrangement, the per-core
 /// start, the footprint and the time-tile strides all read [`DeviceAxis::declared`] — so the two
@@ -2365,7 +2367,7 @@ impl DeviceAxis {
 /// is known (emit time: an operand's LX pin is applied after its builder states the pitch).
 ///
 /// * [`PitchForm::Hbm`] — the walk's BACK GAP (`backGapCore_ {axis: {"-1": pitch − swept}}`) over the
-///   swept walk. Card-proven on HBM (sumnonstick, row bands, the flat-frame bmm, 2026-11-08).
+///   swept walk. Card-proven on HBM (row bands, the flat-frame bmm, 2026-11-08).
 /// * [`PitchForm::Lx`] — the PINNED walk (`maxDimSizes_` at the pitch), no back gap: the form every
 ///   LX-resident batched-decode operand shipped with and ran on the card. An LX back gap is per core
 ///   and uniform (`dsc2.cpp`), and the vendor allocator never pins a buffer that would need one
