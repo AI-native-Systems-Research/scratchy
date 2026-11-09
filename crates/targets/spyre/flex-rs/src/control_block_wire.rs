@@ -1337,25 +1337,23 @@ impl ControlBlockWire {
     }
 }
 
-/// A decoded response block: the real bytes senlib hands back via
+/// A response block: the real 64 bytes senlib hands back via
 /// `senlib_ffi::rbi_receive_responses_sbf`. Port of the
 /// `ReturnSectionSBF` decode used by `ResponseWorker`/`DmaControlBlockHandler`
 /// to determine per-CB completion status.
+///
+/// The bytes are held RAW (a `#[repr(C)]` `[u8; RB_NUM_BYTES]`, the same
+/// layout as `SenlibResponseBlockSbf`, pinned by const asserts in
+/// `senlib_ffi::response_blocks_as_sbf_mut`) rather than decoded into
+/// separate fields: the drain's buffer goes to senlib and comes back as
+/// these with no staging copy and no decode pass. Every field of the
+/// RET/TIMESTAMP/POWER/APP sections is read on demand through the accessors
+/// below, each naming its own bit range — the same one-fact-one-source
+/// discipline `ControlBlockWire` follows on the submit side.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseBlockWire {
-    ret_word: u64,
-    /// The TIMESTAMP section, `TS_SECTION..PW_SECTION` (bytes 8..28) as five little-endian 32-bit
-    /// words — event snapshots of one wrapping cycle counter, never durations. See the
-    /// [`Self::dmai_cycles`] family for the card-measured semantics.
-    ts_words: [u32; 5],
-    /// The POWER-MEASUREMENT word at `PW_SECTION..APP_SECTION` (bytes 28..32) — the vendor's
-    /// `ResponseBlockWrapper::power()`.
-    power_word: u32,
-    /// The APPLICATION-SPECIFIC section, `APP_SECTION..RB_NUM_BYTES` (bytes 32..64) as four
-    /// little-endian 64-bit BEATS — kept verbatim rather than decoded here because the section is a
-    /// UNION whose meaning depends on `locator()`. [`Self::app_qgi`] reads it as the QGI/HMI variant,
-    /// which is the one that carries a faulting device address. See [`AppQgiSection`].
-    app_beats: [u64; 4],
+    bytes: [u8; RB_NUM_BYTES],
 }
 
 /// Port of `SentientSoc::V1::RBStatusTypeEnum`.
@@ -1380,46 +1378,63 @@ impl ResponseBlockWire {
     /// `cancel = 0`: absence contributes NOTHING to a completion verdict, and
     /// in particular cannot erase the `state == TIMED_OUT` arm.
     pub const ZERO: Self = Self {
-        ret_word: 0,
-        ts_words: [0; 5],
-        power_word: 0,
-        app_beats: [0; 4],
+        bytes: [0; RB_NUM_BYTES],
     };
 
-    /// Decode from the raw 64-byte RB: the `ReturnSectionSBF` (bytes 0..8, `RET_SECTION`) that decides
-    /// completion; the timestamp section (bytes 8..28) as five u32 cycle counts; the power word
-    /// (bytes 28..32); and the APP section (bytes 32..64) held as raw beats for [`Self::app_qgi`].
+    /// Wrap the raw 64 RB bytes. The wire layout: the `ReturnSectionSBF`
+    /// (bytes 0..8, `RET_SECTION`) decides completion; `TS_SECTION = 8` and
+    /// five 4-byte `TimeStampSBF`s in wire order (`time_stamp_sbf.hpp`:
+    /// `TimeStampSectionSBF = std::array<TimeStampSBF, 5>`, each a single
+    /// 31:0 bitfield over a u32 — no sub-field packing to undo);
+    /// `PW_SECTION = 28`, one 31:0 bitfield over a u32
+    /// (`power_measurement_section_sbf.hpp`); `APP_SECTION = 32` to
+    /// `RB_NUM_BYTES = 64` (`response_block_sbf.hpp:36-39`), and the QGI
+    /// variant is a `BEGIN_SAFE_BITFIELD_UNION(QGIBeatUnion, 4,
+    /// std::uint64_t)` — four u64 beats, beat `i` at bits `64i..64i+63`,
+    /// which the header's own comments confirm ("Beat 2: QGI" for 191:158,
+    /// "Beat 1: HMI" for 119:112..69:64, "Beat 0" for 63:56..15:0).
     pub fn from_bytes(bytes: &[u8; RB_NUM_BYTES]) -> Self {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&bytes[0..8]);
-        // `TS_SECTION = 8` and five 4-byte `TimeStampSBF`s in wire order (`time_stamp_sbf.hpp`:
-        // `TimeStampSectionSBF = std::array<TimeStampSBF, 5>`, each a single 31:0 bitfield over a
-        // u32 — no sub-field packing to undo).
-        let mut ts_words = [0u32; 5];
-        for (i, ts) in ts_words.iter_mut().enumerate() {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&bytes[TS_SECTION + i * 4..TS_SECTION + i * 4 + 4]);
-            *ts = u32::from_le_bytes(b);
-        }
-        // `PW_SECTION = 28`, one 31:0 bitfield over a u32 (`power_measurement_section_sbf.hpp`).
-        let mut pw = [0u8; 4];
-        pw.copy_from_slice(&bytes[PW_SECTION..PW_SECTION + 4]);
-        // `APP_SECTION = 32`, `RB_NUM_BYTES = 64` (`response_block_sbf.hpp:36-39`), and the QGI
-        // variant is a `BEGIN_SAFE_BITFIELD_UNION(QGIBeatUnion, 4, std::uint64_t)` — four u64 beats,
-        // beat `i` at bits `64i..64i+63`, which the header's own comments confirm ("Beat 2: QGI" for
-        // 191:158, "Beat 1: HMI" for 119:112..69:64, "Beat 0" for 63:56..15:0).
-        let mut app_beats = [0u64; 4];
-        for (i, beat) in app_beats.iter_mut().enumerate() {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&bytes[APP_SECTION + i * 8..APP_SECTION + i * 8 + 8]);
-            *beat = u64::from_le_bytes(b);
-        }
-        Self {
-            ret_word: u64::from_le_bytes(word),
-            ts_words,
-            power_word: u32::from_le_bytes(pw),
-            app_beats,
-        }
+        Self { bytes: *bytes }
+    }
+
+    /// The RET section word (bytes 0..8, little-endian).
+    const fn ret_word(self) -> u64 {
+        u64::from_le_bytes([
+            self.bytes[0],
+            self.bytes[1],
+            self.bytes[2],
+            self.bytes[3],
+            self.bytes[4],
+            self.bytes[5],
+            self.bytes[6],
+            self.bytes[7],
+        ])
+    }
+
+    /// Timestamp word `i` (`TS_SECTION + 4i`, little-endian u32).
+    const fn ts_word(self, i: usize) -> u32 {
+        let off = TS_SECTION + i * 4;
+        u32::from_le_bytes([
+            self.bytes[off],
+            self.bytes[off + 1],
+            self.bytes[off + 2],
+            self.bytes[off + 3],
+        ])
+    }
+
+    /// APP-section beat `i` (`APP_SECTION + 8i`, little-endian u64).
+    const fn app_beat(self, i: usize) -> u64 {
+        let off = APP_SECTION + i * 8;
+        u64::from_le_bytes([
+            self.bytes[off],
+            self.bytes[off + 1],
+            self.bytes[off + 2],
+            self.bytes[off + 3],
+            self.bytes[off + 4],
+            self.bytes[off + 5],
+            self.bytes[off + 6],
+            self.bytes[off + 7],
+        ])
     }
 
     /// The TIMESTAMP section verbatim: five raw 32-bit device cycle counts, `TS1..TS5` in wire
@@ -1428,7 +1443,13 @@ impl ResponseBlockWire {
     /// durations — see the [`Self::dmai_cycles`] family for the card-measured semantics, and
     /// never sum these raw.
     pub const fn timestamps(self) -> [u32; 5] {
-        self.ts_words
+        [
+            self.ts_word(0),
+            self.ts_word(1),
+            self.ts_word(2),
+            self.ts_word(3),
+            self.ts_word(4),
+        ]
     }
 
     /// ⭐ THE TS SLOTS' CARD-MEASURED SEMANTICS (dd2, granite-3.1-2b fp8, PR #523's on-card run):
@@ -1447,7 +1468,7 @@ impl ResponseBlockWire {
     /// and are meaningless; on a compute CB, `dmao_cycles` is the ~9-cycle writeback tail. Use
     /// the pair that matches the CB's pipeline.
     pub const fn dmai_cycles(self) -> u32 {
-        self.ts_words[1].wrapping_sub(self.ts_words[0])
+        self.ts_word(1).wrapping_sub(self.ts_word(0))
     }
 
     /// The CMPT queue+prep wait: `word[2] - word[1]`, from DMA-in end to the compute engine
@@ -1455,31 +1476,36 @@ impl ResponseBlockWire {
     /// execution — consecutive compute CBs overlap exactly this way (the next CB's prep runs
     /// during the previous CB's exec). See [`Self::dmai_cycles`] for the full measured layout.
     pub const fn prep_cmpt_cycles(self) -> u32 {
-        self.ts_words[2].wrapping_sub(self.ts_words[1])
+        self.ts_word(2).wrapping_sub(self.ts_word(1))
     }
 
     /// The compute engine's execution: `word[3] - word[2]`. The number that sums to the device
     /// span of a forward (cross-checked on card: Σ exec over a forward's CBs ≈ its
     /// `[sdsc-phase] compute` wall time). See [`Self::dmai_cycles`].
     pub const fn exec_cmpt_cycles(self) -> u32 {
-        self.ts_words[3].wrapping_sub(self.ts_words[2])
+        self.ts_word(3).wrapping_sub(self.ts_word(2))
     }
 
     /// The CB's last phase: `word[4] - word[3]` — the D2H duration on a D2H CB, the ~9-cycle
     /// writeback tail on a compute CB. See [`Self::dmai_cycles`].
     pub const fn dmao_cycles(self) -> u32 {
-        self.ts_words[4].wrapping_sub(self.ts_words[3])
+        self.ts_word(4).wrapping_sub(self.ts_word(3))
     }
 
     /// The CB's whole CMPT residency: `word[4] - word[1]` = prep + exec + tail (== the full CB
     /// span on compute CBs, where `word[1] == word[0]`). See [`Self::dmai_cycles`].
     pub const fn total_cmpt_cycles(self) -> u32 {
-        self.ts_words[4].wrapping_sub(self.ts_words[1])
+        self.ts_word(4).wrapping_sub(self.ts_word(1))
     }
 
     /// The POWER-MEASUREMENT word (`ResponseBlockWrapper::power()`).
     pub const fn power(self) -> u32 {
-        self.power_word
+        u32::from_le_bytes([
+            self.bytes[PW_SECTION],
+            self.bytes[PW_SECTION + 1],
+            self.bytes[PW_SECTION + 2],
+            self.bytes[PW_SECTION + 3],
+        ])
     }
 
     /// ⭐ THE APP SECTION READ AS THE QGI/HMI VARIANT — the faulting device address of a compute-side
@@ -1497,7 +1523,12 @@ impl ResponseBlockWire {
         match (self.status(), self.locator_bytes()) {
             (ResponseStatus::Error, LOCATOR_QGI_DIAG | LOCATOR_QGI_NO_DIAG) => {
                 Some(AppQgiSection {
-                    beats: self.app_beats,
+                    beats: [
+                        self.app_beat(0),
+                        self.app_beat(1),
+                        self.app_beat(2),
+                        self.app_beat(3),
+                    ],
                 })
             }
             _ => None,
@@ -1506,12 +1537,12 @@ impl ResponseBlockWire {
 
     /// `ReturnSectionSBF::GetTag` (bits 31:8).
     pub const fn tag(self) -> ResponseTag {
-        ResponseTag(BitField::<31, 8>::unpack(self.ret_word) as u32)
+        ResponseTag(BitField::<31, 8>::unpack(self.ret_word()) as u32)
     }
 
     /// `ReturnSectionSBF::GetStatus` (bits 6:5).
     pub const fn status(self) -> ResponseStatus {
-        match BitField::<6, 5>::unpack(self.ret_word) {
+        match BitField::<6, 5>::unpack(self.ret_word()) {
             0x0 => ResponseStatus::Good,
             0x1 => ResponseStatus::Retry,
             0x2 => ResponseStatus::Abend,
@@ -1524,27 +1555,27 @@ impl ResponseBlockWire {
     /// response came from (`APPLICATION`/`CB_QUEUE`/`QGI_NO_DIAG`/
     /// `QGI_DIAG`/`DMO`/`DMI`/`RESERVED`), raw byte value.
     pub const fn locator_bytes(self) -> u8 {
-        BitField::<39, 32>::unpack(self.ret_word) as u8
+        BitField::<39, 32>::unpack(self.ret_word()) as u8
     }
 
     /// `ReturnSectionSBF::GetMark` (bit 7).
     pub const fn mark(self) -> bool {
-        BitField::<7, 7>::unpack(self.ret_word) != 0
+        BitField::<7, 7>::unpack(self.ret_word()) != 0
     }
 
     /// `ReturnSectionSBF::GetEdep` (bit 4).
     pub const fn edep(self) -> bool {
-        BitField::<4, 4>::unpack(self.ret_word) != 0
+        BitField::<4, 4>::unpack(self.ret_word()) != 0
     }
 
     /// `ReturnSectionSBF::GetFlr` (bit 3).
     pub const fn flr(self) -> bool {
-        BitField::<3, 3>::unpack(self.ret_word) != 0
+        BitField::<3, 3>::unpack(self.ret_word()) != 0
     }
 
     /// `ReturnSectionSBF::GetCancel` (bit 2).
     pub const fn cancelled(self) -> bool {
-        BitField::<2, 2>::unpack(self.ret_word) != 0
+        BitField::<2, 2>::unpack(self.ret_word()) != 0
     }
 }
 

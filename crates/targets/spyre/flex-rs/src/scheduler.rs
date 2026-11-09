@@ -1757,12 +1757,6 @@ impl DeviceAddressResolver for FlexAllocatorAddressResolver {
 /// `LaunchCbs` for ALL pipelines, not one per pipeline), and being the
 /// single consumer of `Rbi()` is `ResponseCompletionThread`'s job.
 pub struct SenlibHardwareSubmit {
-    /// Scratch for `ReceiveResponsesSBF`'s out-parameter — the senlib-format
-    /// twin of `ResponseWorker::rbs_`. Grown to the caller's requested batch
-    /// size on first use and reused, since only the one
-    /// `ResponseCompletionThread` ever drains (the mutex exists because the
-    /// trait method takes `&self`, not because there is real contention).
-    rbs_scratch: Mutex<Vec<crate::senlib_ffi::SenlibResponseBlockSbf>>,
     /// The card whose queues this submits to and drains.
     card: Arc<crate::senlib_ffi::Card>,
     /// The card's NUMA node's CPUs, read when the card opened.
@@ -1771,11 +1765,7 @@ pub struct SenlibHardwareSubmit {
 
 impl SenlibHardwareSubmit {
     pub fn new(card: Arc<crate::senlib_ffi::Card>, cpus: crate::numa::CardCpus) -> Self {
-        Self {
-            rbs_scratch: Mutex::new(Vec::new()),
-            card,
-            cpus,
-        }
+        Self { card, cpus }
     }
 }
 
@@ -1824,16 +1814,9 @@ impl HardwareSubmit for SenlibHardwareSubmit {
         let Some(rbi) = rbi.into_live() else {
             return (0, ResponseCredit::none());
         };
-        let mut scratch = self.rbs_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if scratch.len() < out.len() {
-            scratch.resize(
-                out.len(),
-                crate::senlib_ffi::SenlibResponseBlockSbf { bytes: [0; 64] },
-            );
-        }
         let n = match crate::senlib_ffi::rbi_receive_responses_sbf(
             rbi,
-            &mut scratch[..out.len()],
+            crate::senlib_ffi::response_blocks_as_sbf_mut(out),
             min_count,
         ) {
             Ok(n) => n,
@@ -1844,9 +1827,6 @@ impl HardwareSubmit for SenlibHardwareSubmit {
                 return (0, ResponseCredit::none());
             }
         };
-        for (dst, src) in out.iter_mut().zip(scratch.iter()).take(n as usize) {
-            *dst = src.decode();
-        }
         (n, ResponseCredit::received(n))
     }
 
@@ -2105,12 +2085,7 @@ impl DrainScratch {
     fn new(max_pending_requests: u64) -> Self {
         let n = max_pending_requests as usize;
         Self {
-            rbs: vec![
-                crate::control_block_wire::ResponseBlockWire::from_bytes(
-                    &[0u8; crate::control_block_wire::RB_NUM_BYTES]
-                );
-                n
-            ],
+            rbs: vec![crate::control_block_wire::ResponseBlockWire::ZERO; n],
             tags_to_be_returned: vec![ResponseTag(0); n],
         }
     }

@@ -565,13 +565,36 @@ pub fn control_blocks_as_sbf(
     unsafe { core::slice::from_raw_parts(cbs.as_ptr().cast(), cbs.len()) }
 }
 
-impl SenlibResponseBlockSbf {
-    /// Decode the RB's `ReturnSectionSBF` (completion status/tag/cancel).
-    /// See `crate::control_block_wire::ResponseBlockWire` for the verified
-    /// bit layout this delegates to.
-    pub fn decode(&self) -> crate::control_block_wire::ResponseBlockWire {
-        crate::control_block_wire::ResponseBlockWire::from_bytes(&self.bytes)
-    }
+/// `ResponseBlockWire` and `SenlibResponseBlockSbf` are one layout: both
+/// `#[repr(C)]` wrappers around the same `[u8; RB_NUM_BYTES]` (64, pinned by
+/// the SDK's own `static_assert(sizeof(ResponseBlockSBF) == RB_NUM_BYTES)`).
+/// Same discipline as the control-block pair above: a drift on either side
+/// is a compile error, not silent corruption.
+const _: () = {
+    assert!(
+        size_of::<crate::control_block_wire::ResponseBlockWire>()
+            == size_of::<SenlibResponseBlockSbf>()
+    );
+    assert!(
+        align_of::<crate::control_block_wire::ResponseBlockWire>()
+            == align_of::<SenlibResponseBlockSbf>()
+    );
+};
+
+/// Reinterpret the drain's response-block buffer as the senlib wire type —
+/// zero-copy, because they are the same 64 bytes (see the `const _` asserts
+/// above). This is what lets `ReceiveResponsesSBF` write straight into the
+/// caller's buffer instead of a staging `Vec` that then decodes element by
+/// element.
+pub fn response_blocks_as_sbf_mut(
+    rbs: &mut [crate::control_block_wire::ResponseBlockWire],
+) -> &mut [SenlibResponseBlockSbf] {
+    // SAFETY: same element size and alignment (asserted above), both
+    // `#[repr(C)]` over one `[u8; RB_NUM_BYTES]` field, so every
+    // `ResponseBlockWire` is bit-for-bit a valid `SenlibResponseBlockSbf`.
+    // `rbs.len()` elements remain `rbs.len()` elements; the caller's
+    // mutable borrow is passed through unchanged.
+    unsafe { core::slice::from_raw_parts_mut(rbs.as_mut_ptr().cast(), rbs.len()) }
 }
 
 /// The calling thread's most recent shim error message, for attaching to a
