@@ -28,7 +28,10 @@ const CASES: [(u32, u32, u32, u32); 6] = [
     (512, 2048, 2048, 0),
 ];
 
-fn copy(i: usize, (rows, c_src, c_dst, off): (u32, u32, u32, u32)) -> ktir_superdsc::emit::EmittedOp<W> {
+fn copy(
+    i: usize,
+    (rows, c_src, c_dst, off): (u32, u32, u32, u32),
+) -> ktir_superdsc::emit::EmittedOp<W> {
     let tr = |t: usize, c0: u32, w: u32| TensorRegion {
         tensor: TensorId::from_index(t),
         region: Region {
@@ -65,8 +68,9 @@ fn the_row_blocked_copy_emits_the_per_stick_copys_descriptors() {
         let k = e.ktir.as_ref().expect("a program");
         let mut sym = 0i64;
         let mut q = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
-        let ops = scratchy_target_spyre::ktir_superdsc_door::lower::<W>(k, &mut sym, None, None, &mut q)
-            .unwrap_or_else(|e| panic!("case {i}: {}", e.message));
+        let ops =
+            scratchy_target_spyre::ktir_superdsc_door::lower::<W>(k, &mut sym, None, None, &mut q)
+                .unwrap_or_else(|e| panic!("case {i}: {}", e.message));
         assert_eq!(ops.len(), 1, "case {i}: one identity");
         for op in ops {
             all.push(serde_json::json!({
