@@ -676,9 +676,9 @@ all = [
 # two names, which is exactly why quant scope needed its own crate).
 # `scratchy-forwards.rs` (this crate's build script) calls
 # `scratchy_quantizations::enabled_presets()` — via the [build-dependencies]
-# edge below — to compute SCRATCHY_QUANTS, intersected per-arch against that
-# arch's own quantizations.json (an arch that doesn't declare a preset just
-# ignores it).
+# edge below — to compute the quant scope (the union of enabled presets),
+# intersected per-arch against that arch's own quantizations.json (an arch
+# that doesn't declare a preset just ignores it).
 
 # Speculative-decoding drafters. `mtp-heads`: every selected model whose
 # checkpoint carries a multi-token-prediction head compiles that head too

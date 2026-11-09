@@ -38,9 +38,7 @@ mod config;
 /// The baked program, as const tokens — see its own header.
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
-pub use config::{
-    arch_compiled, selected_config_paths, total_models_emitted, unmatched_build_filter_tags,
-};
+pub use config::{Scope, selected_config_paths, total_models_emitted};
 mod emit;
 mod fuf;
 mod interpreter_codegen;
@@ -533,6 +531,7 @@ pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
     dump_dir: Option<&std::path::Path>,
+    scope: &Scope,
 ) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
@@ -579,8 +578,8 @@ pub fn compile_carrier(
         // bound set from the nested `vision_config` block via the
         // declared `Params` schema instead of the decoder's flat
         // top-level harvest.
-        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec),
-        _ => config::load_dir(models_dir, &spec),
+        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec, scope),
+        _ => config::load_dir(models_dir, &spec, scope),
     }
     .map_err(|e| {
         // A refusal that belongs to ONE config rides the per-stem arm —

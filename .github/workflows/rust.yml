@@ -369,20 +369,18 @@ jobs:
         run: cargo test -p scratchy-layers --lib
 
       # The compile-time half: the per-(stem, preset) width resolution and the
-      # row collection/compression feeding it, plus the quant-config parser
-      # under it. Filtered to those two suites rather than the whole lib —
-      # 15 tests in `classify`/`config`/`shape`/`parse_python`/`codegen::tests`
-      # and the `fp8_block_disambiguation` trio are PRE-EXISTING failures
-      # (`load_dir` filters every stem through `CARGO_FEATURE_<STEM>`, which a
-      # proc-macro crate cannot set, so those tests select zero configs — the
-      # `config_of` doc comment in codegen.rs spells this out). Same class of
-      # rot as the KTIR suites above; fixing them is its own change. Widen this
-      # filter as they are fixed. `head_ladder_tests`: the check the models'
-      # build runs that an MTP head reaches its target's top rung (#600).
-      - name: Variant-selection gate tests (forward-compiler macro)
+      # row collection/compression feeding it, the quant-config parser under
+      # it, the config loader, the codegen and frontend suites, and
+      # `head_ladder_tests` (the check the models' build runs that an MTP head
+      # reaches its target's top rung, #600) — the WHOLE lib. Its loader tests
+      # name the build scope they load under (`config::Scope`), so none
+      # selects zero configs and passes having checked nothing. The spyre leg of
+      # the same lib runs in the spyre job. Then its test targets at
+      # -D warnings, which no other step lints.
+      - name: Forward-compiler macro tests (metal)
         run: cargo test -p scratchy-forward-compiler-macro --features metal --lib
-          -- quantization::tests codegen::fingerprint_tests head_ladder_tests
-          --skip fp8_block_disambiguation
+      - name: Clippy (forward-compiler macro, metal, tests)
+        run: cargo clippy -p scratchy-forward-compiler-macro --features metal --tests -- -D warnings
 
       # Type-check scratchy-models' INTEGRATION tests (`tests/*.rs`). Nothing
       # else does: every clippy step is `--lib`-shaped and the `cargo test`
@@ -571,6 +569,19 @@ jobs:
         run: cargo test -p scratchy-subtile --features spyre
       - name: Test (scratchy-subtile, featureless)
         run: cargo test -p scratchy-subtile
+      # The test targets of spyre-bundle and subtile at -D warnings: `cargo test` compiles
+      # them but never lints them, so lint debt piles up in them unseen.
+      - name: Clippy (spyre-bundle, scratchy-subtile, tests)
+        run: |
+          cargo clippy -p scratchy-spyre-bundle --tests -- -D warnings
+          cargo clippy -p scratchy-subtile --features spyre --tests -- -D warnings
+          cargo clippy -p scratchy-subtile --tests -- -D warnings
+      # The forward-compiler macro's lib under `spyre`: the leg its FP8-block fingerprint test runs
+      # in (metal claims no FP8-block preset). The metal leg runs in the macOS job.
+      - name: Forward-compiler macro tests (spyre)
+        run: |
+          cargo test -p scratchy-forward-compiler-macro --features spyre --lib
+          cargo clippy -p scratchy-forward-compiler-macro --features spyre --tests -- -D warnings
       - name: Clippy (triton re-host crates, all targets)
         run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)
