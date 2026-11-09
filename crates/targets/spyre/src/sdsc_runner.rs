@@ -61,38 +61,6 @@ fn f16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// ⛔ GUARD (env precondition): the deeptools host functions the executor calls open their hardware
-/// arch config at `${DEEPTOOLS_PATH}/perfdsc/HardwareArchMapping/…`. When `DEEPTOOLS_PATH` is unset
-/// the SDK composes a broken relative `..` path and aborts deep inside with
-/// `DtException: Unable to open arch config` (observed on dd2 when the var was not exported).
-/// Convert that cryptic abort into an early, actionable error.
-///
-/// This is an *environment* precondition, so it cannot be a build-time guard — the runtime env is
-/// unknown at `cargo build`. Validate only (no env mutation): the SDK env block is supplied
-/// externally, exactly like `LD_LIBRARY_PATH` / `FLEX_COMPUTE`.
-fn ensure_deeptools_arch_config() -> Result<()> {
-    let root = std::env::var_os("DEEPTOOLS_PATH").filter(|v| !v.is_empty());
-    let Some(root) = root else {
-        bail!(
-            "DEEPTOOLS_PATH is not set — the deeptools host functions need it to locate the arch \
-             config (${{DEEPTOOLS_PATH}}/perfdsc/HardwareArchMapping/…). Set it to the SDK 'share' \
-             dir, e.g. DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share."
-        );
-    };
-    let arch_dir = std::path::Path::new(&root)
-        .join("perfdsc")
-        .join("HardwareArchMapping");
-    if !arch_dir.is_dir() {
-        bail!(
-            "DEEPTOOLS_PATH={} but the arch config dir {} does not exist — point DEEPTOOLS_PATH at \
-             the SDK 'share' dir (e.g. /opt/ibm/spyre/deeptools/share).",
-            std::path::Path::new(&root).display(),
-            arch_dir.display()
-        );
-    }
-    Ok(())
-}
-
 /// The prefix mask's per-fold-pass BYTE stride, minted only from the mask's own declared shape —
 /// never a loose integer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -350,7 +318,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
             load_consts,
             pool_statics,
         } = staged;
-        ensure_deeptools_arch_config()?;
         // The owner binds rank r's weight set on card r; a borrower binds none on any.
         let mut weights: PerRank<T, CardWeights> = match weights {
             Some(w) => w,
