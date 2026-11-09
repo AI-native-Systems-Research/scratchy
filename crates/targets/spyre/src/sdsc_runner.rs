@@ -14,7 +14,7 @@
 use crate::superdsc_exec::{
     DeferredRead, Executor, KvDim, Logits, LogitsRead, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use scratchy_tensors::DType as SDType;
 use tracing::debug;
 
