@@ -463,17 +463,43 @@ impl RbCycles {
     }
 }
 
+/// The device-idle cycles in front of one op's CBs: from the end of the compute pipeline's previous
+/// CB to this CB's start (`ResponseBlockWire` words 4 and 2).
+///
+/// ⭐ EACH CB IS COUNTED IN EXACTLY ONE OF TWO PLACES, AS IT IS SEEN: `known` when the CB in front of
+/// it on the pipeline was drained too (its idle is summed into `cycles`), `unknown` when it was not
+/// (another session's, or drained before the harvest began). So an op's CBs are `known + unknown`
+/// by construction, and the mean is over `known` alone — absent, never a figure, when none is.
+#[derive(Default, Clone, Copy)]
+struct RbIdle {
+    cycles: u64,
+    known: u64,
+    unknown: u64,
+}
+
+impl RbIdle {
+    fn add(&mut self, idle: Option<u32>) {
+        match idle {
+            Some(c) => {
+                self.cycles += u64::from(c);
+                self.known += 1;
+            }
+            None => self.unknown += 1,
+        }
+    }
+
+    /// The mean idle in front of a CB whose idle is known.
+    fn mean(self) -> Option<u64> {
+        self.cycles.checked_div(self.known)
+    }
+}
+
 /// One op's harvested cycles plus the label the launch loop knew it by.
 #[derive(Default)]
 struct RbOpCycles {
     cycles: RbCycles,
-    /// Device-idle cycles in front of this op's CBs: from the end of the compute pipeline's
-    /// previous CB to this CB's start (`ResponseBlockWire` words 4 and 2), over the CBs whose
-    /// predecessor this card's ring has seen.
-    idle: u64,
-    /// This op's CBs whose idle-before is not known — the CB in front of it on the pipeline was
-    /// not seen (another session's, or drained before the harvest began) — counted, never as 0.
-    idle_unknown: u64,
+    /// The device-idle cycles in front of this op's CBs ([`RbIdle`]).
+    idle: RbIdle,
     label: String,
 }
 
@@ -4881,10 +4907,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     }
                     let acc = h.cycles.entry(key).or_default();
                     acc.cycles.add_compute(e.rb);
-                    match idle {
-                        Some(c) => acc.idle += u64::from(c),
-                        None => acc.idle_unknown += 1,
-                    }
+                    acc.idle.add(idle);
                     if acc.label.is_empty() {
                         acc.label = label;
                     }
@@ -7141,18 +7164,24 @@ fn report_rb_time(h: &RbHarvest, rank: Option<u32>) {
     }
     // ⭐ WHERE THE CARD SITS IDLE: the ops whose CBs the compute pipeline waited longest in front
     // of — a collective's wait for its peers, a doorbell the host has not rung yet.
-    let idle_total: u64 = h.cycles.values().map(|a| a.idle).sum();
-    let mut idle: Vec<_> = h.cycles.iter().map(|(k, a)| (a.idle, *k, a)).collect();
+    let idle_total: u64 = h.cycles.values().map(|a| a.idle.cycles).sum();
+    let mut idle: Vec<_> = h
+        .cycles
+        .iter()
+        .map(|(k, a)| (a.idle.cycles, *k, a))
+        .collect();
     idle.sort_by_key(|a| std::cmp::Reverse(a.0));
     eprintln!("[sdsc-rbtime]   {who} idle before CBs: {idle_total} cyc in all; the largest:");
     for (cyc, key, a) in idle.iter().take(12) {
         eprintln!(
-            "[sdsc-rbtime]   {who} idle {key} {:>12} cyc  {:>9} cyc/cb  {:6} cbs  \
-             ({} unknown)  {}",
+            "[sdsc-rbtime]   {who} idle {key} {:>12} cyc  {:>9} cyc/cb  {:6} known  \
+             {:4} unknown  {}",
             cyc,
-            cyc / a.cycles.cbs.saturating_sub(a.idle_unknown).max(1),
-            a.cycles.cbs,
-            a.idle_unknown,
+            a.idle
+                .mean()
+                .map_or_else(|| "—".to_string(), |m| m.to_string()),
+            a.idle.known,
+            a.idle.unknown,
             a.label
         );
     }
