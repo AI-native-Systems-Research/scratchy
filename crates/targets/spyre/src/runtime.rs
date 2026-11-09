@@ -1015,6 +1015,15 @@ impl Stream {
         items: &[BatchedCb],
         first_tag: u32,
     ) -> Result<Vec<ControlBlockWire>, HwError> {
+        self.render_refs(&items.iter().collect::<Vec<_>>(), first_tag)
+    }
+
+    /// [`Self::render_batch`] over borrowed CBs.
+    fn render_refs(
+        &self,
+        items: &[&BatchedCb],
+        first_tag: u32,
+    ) -> Result<Vec<ControlBlockWire>, HwError> {
         let resolver = FlexAllocatorAddressResolver::new(
             self.rt
                 .get_allocator()
@@ -1055,21 +1064,96 @@ impl Stream {
     /// ride the same FIFO as the compute that produces and consumes their bytes.
     /// Returns the ids the batch's CBs were given, CB `i` of `items` at index `i`
     /// ([`SubmittedIds`]).
+    /// [`Self::render_batch`] over a labelled list: the wires and their labels, built together.
+    pub fn render_labelled<L>(
+        &self,
+        items: Vec<(BatchedCb, L)>,
+        first_tag: u32,
+    ) -> Result<LabelledCanvas<L>, HwError> {
+        let wires =
+            self.render_refs(&items.iter().map(|(c, _)| c).collect::<Vec<_>>(), first_tag)?;
+        Ok(LabelledCanvas {
+            wires,
+            labels: items.into_iter().map(|(_, l)| l).collect(),
+        })
+    }
+
+    /// ⭐ SUBMIT A LABELLED LIST: the CBs as one submission ([`Self::submit_batch`]), and back each
+    /// submitted CB's id with its own label — zipped from the one list submitted, so no count of
+    /// labels exists to differ from the count of CBs.
+    pub fn submit_labelled<L: Clone>(
+        &self,
+        items: &[(BatchedCb, L)],
+        pipeline_barrier: bool,
+    ) -> Result<Vec<(u64, L)>, HwError> {
+        let ids = self.submit_items(items.iter().map(|(c, _)| c), pipeline_barrier)?;
+        Ok(ids
+            .iter()
+            .zip(items.iter().map(|(_, l)| l.clone()))
+            .collect())
+    }
+
+    /// One compute launch ([`Self::compute`] with the walk's own `kernel_name=""` and no byte
+    /// offsets, as [`BatchedCompute`] states it) and its label: back comes that CB's id with it.
+    pub fn compute_labelled<L>(
+        &self,
+        launch: &BatchedCompute,
+        pipeline_barrier: bool,
+        label: L,
+    ) -> Result<Vec<(u64, L)>, HwError> {
+        let ta: Vec<&DevAddr> = launch.tensor_allocs.iter().collect();
+        let ids = self.compute(
+            &launch.prog,
+            &ta,
+            "",
+            launch.bootstrap_offset,
+            &[],
+            pipeline_barrier,
+        )?;
+        Ok(ids.iter().zip(std::iter::once(label)).collect())
+    }
+
+    /// Submit shared canvas wires ([`Self::compute_wires`]) with the labels split from the same
+    /// canvas: back comes each CB's id with its own label.
+    pub fn submit_shared<L, M>(
+        &self,
+        batch: ComputeWireBatch,
+        labels: &CanvasLabels<L>,
+        pipeline_barrier: bool,
+        mut name: impl FnMut(usize, &L) -> M,
+    ) -> Result<Vec<(u64, M)>, HwError> {
+        let ids = self.compute_wires(batch, pipeline_barrier)?;
+        Ok(ids
+            .iter()
+            .zip(labels.0.iter().enumerate().map(|(i, l)| name(i, l)))
+            .collect())
+    }
+
     pub fn submit_batch(
         &self,
         items: &[BatchedCb],
         pipeline_barrier: bool,
     ) -> Result<SubmittedIds, HwError> {
-        if items.iter().all(|i| matches!(i, BatchedCb::Compute(_))) {
+        self.submit_items(items.iter(), pipeline_barrier)
+    }
+
+    /// The one submit of a staged list, over borrowed CBs.
+    fn submit_items<'i>(
+        &self,
+        items: impl Iterator<Item = &'i BatchedCb> + Clone,
+        pipeline_barrier: bool,
+    ) -> Result<SubmittedIds, HwError> {
+        if items.clone().all(|i| matches!(i, BatchedCb::Compute(_))) {
             return self.compute_batch(
-                items.iter().filter_map(|i| match i {
+                items.filter_map(|i| match i {
                     BatchedCb::Compute(l) => Some(l),
                     _ => None,
                 }),
                 pipeline_barrier,
             );
         }
-        let canvas = Arc::new(self.render_batch(items, 0)?);
+        let items: Vec<&BatchedCb> = items.collect();
+        let canvas = Arc::new(self.render_refs(&items, 0)?);
         self.compute_wires(
             ComputeWireBatch {
                 canvas,
@@ -1131,6 +1215,81 @@ pub use flex_rs::numa::WorldCpus;
 /// The ids one submission's control blocks were given — what a submit hands back, and what each CB's
 /// response record carries (`flex_rs::rb_telemetry::RbTiming::id`).
 pub use flex_rs::stream::SubmittedIds;
+
+/// ⭐ A CANVAS WHOSE EVERY CB CARRIES ITS LABEL — wires and labels built in one pass from one list
+/// of `(BatchedCb, label)`, so there is no count for the two to disagree on. The wires stay one
+/// contiguous `Vec` (the doorbell copies it whole); the labels are only reachable through
+/// [`Stream::submit_labelled`], which hands back each submitted CB's id paired with its own label.
+pub struct LabelledCanvas<L> {
+    wires: Vec<ControlBlockWire>,
+    labels: Vec<L>,
+}
+
+impl<L> LabelledCanvas<L> {
+    /// Each CB's wire with its label, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (&ControlBlockWire, &L)> {
+        self.wires.iter().zip(&self.labels)
+    }
+
+    /// The wires, for rendering compares and patch derivation.
+    pub fn wires(&self) -> &[ControlBlockWire] {
+        &self.wires
+    }
+
+    /// How many CBs.
+    pub fn len(&self) -> usize {
+        self.wires.len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.wires.is_empty()
+    }
+
+    /// Append another canvas, each label mapped as it moves (a row's labels prefixed by its row).
+    pub fn extend_mapped<M>(&mut self, other: LabelledCanvas<M>, f: impl FnMut(M) -> L) {
+        self.wires.extend(other.wires);
+        self.labels.extend(other.labels.into_iter().map(f));
+    }
+
+    /// The wires, mutably — for the in-place EDEP stamp; labels are untouched.
+    pub fn wires_mut(&mut self) -> &mut [ControlBlockWire] {
+        &mut self.wires
+    }
+
+    /// An empty canvas.
+    pub fn new() -> Self {
+        Self {
+            wires: Vec::new(),
+            labels: Vec::new(),
+        }
+    }
+
+    /// Relabel every CB (the canvas's CB index is the label's own position).
+    pub fn map<M>(self, f: impl FnMut((usize, L)) -> M) -> LabelledCanvas<M> {
+        LabelledCanvas {
+            wires: self.wires,
+            labels: self.labels.into_iter().enumerate().map(f).collect(),
+        }
+    }
+
+    /// Split into the shared wires the replay patches and the labels — the labels typed as this
+    /// canvas's own (`CanvasLabels`), so they are handed back to a submit of exactly these wires.
+    pub fn share(self) -> (Arc<Vec<ControlBlockWire>>, CanvasLabels<L>) {
+        (Arc::new(self.wires), CanvasLabels(self.labels))
+    }
+}
+
+impl<L> Default for LabelledCanvas<L> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The labels of a [`LabelledCanvas`] whose wires were shared out ([`LabelledCanvas::share`]) — one
+/// per CB, in order. Only [`Stream::submit_shared`] consumes them, beside the submission of those
+/// wires.
+pub struct CanvasLabels<L>(Vec<L>);
 
 /// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that
