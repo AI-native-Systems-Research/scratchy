@@ -5,10 +5,11 @@
 //! law (`rows_per_block`), not one copy per stick. Pinned here:
 //!
 //! * THE WIRE IS UNCHANGED. `fixtures/sdsc_blockcopy_splice_per_stick.json` is the door's output for
-//!   six copies through the splice as the per-stick kernel stated them (generated on nickm5 through
+//!   seven copies through the splice as the per-stick kernel stated them (generated on nickm5 through
 //!   `lower_block_copy` and the door at the per-stick kernel, main's `blockcopy.py`: column blocks
-//!   of a wider destination and whole-width copies up to a `[512, 2048]` prefill rung) — the
-//!   descriptor, its bindings, the symbol counter. The row-blocked kernel emits exactly those bytes.
+//!   of a wider destination, whole-width copies up to a `[512, 2048]` prefill rung, and a `[515,
+//!   2048]` column block whose rows leave a 3-row tail, the tail entry's one case) — the descriptor,
+//!   its bindings, the symbol counter. Both row-blocked entries emit exactly those bytes.
 //! * THE PROGRAM IS SMALL. A `[512, 2048]` copy is a few dozen KTIR ops, not ~200K (313 MB of
 //!   build-script memory per such program, measured).
 
@@ -18,14 +19,16 @@ use scratchy_subtile::subtile_ir::{
 
 type W = ktir_superdsc::collective::TpWorld<8>;
 
-/// `(rows, c_src, c_dst, off)` — the golden's six copies, in its order.
-const CASES: [(u32, u32, u32, u32); 6] = [
+/// `(rows, c_src, c_dst, off)` — the golden's seven copies, in its order. The last one's rows are a
+/// whole 512-row block and a 3-row tail at the 2048-wide law, so it takes `blockcopy_tail_fwd`.
+const CASES: [(u32, u32, u32, u32); 7] = [
     (1, 1024, 8192, 2048),
     (4, 128, 512, 256),
     (2, 64, 192, 0),
     (1, 2048, 2048, 0),
     (7, 2048, 2048, 0),
     (512, 2048, 2048, 0),
+    (515, 2048, 4096, 1024),
 ];
 
 fn copy(
@@ -96,4 +99,48 @@ fn a_prefill_rung_copy_is_a_few_dozen_ops() {
         n < 200,
         "a [512, 2048] copy is {n} KTIR ops — the per-stick walk was 196,616"
     );
+}
+
+/// ⛔ THE WHOLE-STICK LAW IS THE SPLICE'S TYPES. A sub-stick source width, destination width or
+/// destination column is refused by its own constructor (`StickExtent`, `ColWindow`), naming which,
+/// before any kernel is compiled — the kernel and the door restate no check of their own.
+#[test]
+fn a_sub_stick_width_or_column_is_refused_naming_which() {
+    let refuse = |rows: u32, c_src: u32, c_dst: u32, off: u32| {
+        let tr = |t: usize, c0: u32, w: u32| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: Region {
+                rows: Range::new(0, rows),
+                cols: Range::new(c0, w),
+            },
+        };
+        let node: SubtileNode = SubtileNode {
+            id: SubtileId::from_index(12),
+            op: SubOp::AllReduce,
+            inputs: vec![tr(11, 0, c_src)],
+            output: tr(12, off, c_src),
+        };
+        match scratchy_triton_splice::lower_block_copy::<W, _>(
+            &node,
+            tr(11, 0, c_src),
+            tr(12, off, c_src),
+            c_dst,
+            "bc",
+        ) {
+            Ok(_) => panic!("[{rows}, {c_src}] at {off} of {c_dst} is not whole sticks"),
+            Err(e) => e,
+        }
+    };
+    for (case, what) in [
+        ((4, 96, 512, 0), "source width"),
+        ((4, 128, 520, 0), "destination width"),
+        ((4, 128, 512, 32), "destination column"),
+    ] {
+        let (r, s, d, o) = case;
+        let e = refuse(r, s, d, o);
+        assert!(
+            e.contains(&format!("the block copy's {what}")),
+            "{case:?} names its {what}: {e}"
+        );
+    }
 }

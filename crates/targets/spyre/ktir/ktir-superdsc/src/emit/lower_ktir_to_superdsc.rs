@@ -5879,9 +5879,7 @@ pub fn block_copy<T: crate::collective::Tp>(
             ins.len()
         ));
     };
-    let stk = Fp16::ELEMS_PER_STICK;
-    let (rows, c_src) = (src.v_rows, src.v_cols);
-    let (c_dst, off) = (out.v_cols, out.c_start);
+    let rows = src.v_rows;
     // The source is read WHOLE from its corner, the destination at row 0 and a stick-aligned column:
     // anything else is not a run of whole stick columns at either end, and no single row range of a
     // tall-narrow view names it.
@@ -5898,19 +5896,34 @@ pub fn block_copy<T: crate::collective::Tp>(
             out.v_rows
         ));
     }
-    if !c_src.is_multiple_of(stk) || !c_dst.is_multiple_of(stk) || !off.is_multiple_of(stk) {
-        return err(format!(
-            "{name}: source width {c_src}, destination width {c_dst} and column {off} must all be \
-             whole {stk}-fp16 sticks — a partial stick column is not a contiguous run"
-        ));
-    }
+    // ⭐ THE WHOLE-STICK LAW IS THE TYPES' — the same `StickExtent` and `ColWindow` constructors the
+    // splice states the kernel's constexprs through. The door reads the extents off the PROGRAM, not
+    // off the splice, so it states them through those constructors rather than restating the law: a
+    // partial stick column is not a contiguous run, and has no spelling here.
+    let whole = |what: &str, r: Result<u32, String>| {
+        r.map_err(|e| Error {
+            message: format!("{name}: the block copy's {what}: {e}"),
+        })
+    };
+    let c_src = whole(
+        "source width",
+        StickExtent::<Fp16>::new(src.v_cols).map(|s| s.elems()),
+    )?;
+    let c_dst = whole(
+        "destination width",
+        StickExtent::<Fp16>::new(out.v_cols).map(|s| s.elems()),
+    )?;
+    let off = whole(
+        "destination column",
+        crate::addr::col_window_of(rows, c_dst, out.c_start, Df::Fp16).map(|w| w.column()),
+    )?;
     if off + c_src > c_dst {
         return err(format!(
             "{name}: the block [{off}, {}) runs past the destination's {c_dst} columns",
             off + c_src
         ));
     }
-    let sticks = c_src / stk;
+    let sticks = c_src / Fp16::ELEMS_PER_STICK;
     let src_name = rb(&src.name(), rows, c_src);
     let dst = rb(&out.name(), rows, c_dst);
     Ok(vec![assemble_pointwise_broadcast_off(
@@ -11760,4 +11773,53 @@ pub fn reduce_df<T: crate::collective::Tp>(
             layout,
         )?,
     ])
+}
+
+#[cfg(test)]
+mod block_copy_tests {
+    use super::elementwise_tests::reg;
+    use super::*;
+
+    /// ⛔ THE DOOR STATES THE PROGRAM'S EXTENTS THROUGH THE SPLICE'S OWN CONSTRUCTORS. A program
+    /// whose source width, destination width or destination column is not whole sticks is refused by
+    /// `StickExtent` / `ColWindow`, naming which, and a whole-stick block still lowers to one op.
+    #[test]
+    fn a_sub_stick_extent_is_refused_by_its_constructor_naming_which() {
+        let lower = |src: Region, out: Region| {
+            let mut sym = 0i64;
+            block_copy::<crate::collective::TpWorld<1>>("bc", &[src, out], &mut sym, None)
+        };
+        // The destination's window at column `c`: its corner moves, its extent is the source's.
+        let at = |r: Region, c: u32| Region {
+            c_start: c,
+            c_len: 128,
+            c_cover: (c, c + 128),
+            ..r
+        };
+        let ok = lower(reg(1, 4, 128, false), at(reg(2, 4, 512, true), 256))
+            .expect("a whole-stick column block lowers");
+        assert_eq!(ok.len(), 1, "one identity");
+        for (src, out, what) in [
+            (reg(1, 4, 96, false), reg(2, 4, 512, true), "source width"),
+            (
+                reg(1, 4, 128, false),
+                reg(2, 4, 520, true),
+                "destination width",
+            ),
+            (
+                reg(1, 4, 128, false),
+                at(reg(2, 4, 512, true), 32),
+                "destination column",
+            ),
+        ] {
+            let Err(e) = lower(src, out) else {
+                panic!("{what}: a sub-stick block copy lowered");
+            };
+            assert!(
+                e.message.contains(&format!("the block copy's {what}")),
+                "names its {what}: {}",
+                e.message
+            );
+        }
+    }
 }

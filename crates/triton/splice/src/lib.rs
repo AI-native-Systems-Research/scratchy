@@ -291,6 +291,8 @@ pub fn lmlast_row() -> TritonKernelRow {
 /// [`lower_block_copy`], which the spyre emitter's collective arm calls; no `SubOp` reaches it
 /// through [`row`].
 pub fn blockcopy_row() -> TritonKernelRow {
+    // The row's `entry` is the whole-block copy; a copy whose rows leave a tail is
+    // `BLOCKCOPY_TAIL_ENTRY`, the same file's other entry (`blockcopy.py` says why there are two).
     TritonKernelRow::Spliced {
         src: include_str!("../../../targets/spyre/kernels/blockcopy.py"),
         file: "blockcopy.py",
@@ -298,6 +300,9 @@ pub fn blockcopy_row() -> TritonKernelRow {
         program: Program::BlockCopy,
     }
 }
+
+/// `blockcopy.py`'s second entry: the whole-block copy followed by its one shorter tail.
+const BLOCKCOPY_TAIL_ENTRY: &str = "blockcopy_tail_fwd";
 
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice has a family below (attention rides its own `lower_attn` entry); the ops the
@@ -1555,17 +1560,31 @@ pub fn lower_block_copy<
     dst_cols: u32,
     name: &str,
 ) -> Result<EmittedOp<T>, String> {
-    let (rows, c_src) = (src.region.rows.len, src.region.cols.len);
-    let off = dst.region.cols.start;
-    let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's block copy checks
-    if !c_src.is_multiple_of(stk) || !dst_cols.is_multiple_of(stk) || !off.is_multiple_of(stk) {
-        return Err(format!(
-            "triton splice: {name}: a block of {c_src} columns at column {off} of a {dst_cols}-wide \
-             destination is not a run of whole {stk}-fp16 sticks"
-        ));
-    }
-    let src_py = match blockcopy_row() {
-        TritonKernelRow::Spliced { src, .. } => src,
+    use ktir_superdsc::superdsc_opspec::{Fp16, StickExtent};
+    let rows = src.region.rows.len;
+    // ⭐ THE WHOLE-STICK LAW, STATED ONCE: both widths are `StickExtent`s and the column is a
+    // `ColWindow`, each refusing a sub-stick value at its own constructor, so the kernel and the
+    // door are handed whole sticks and restate no check of their own.
+    let whole = |what: &str, r: Result<u32, String>| {
+        r.map_err(|e| format!("triton splice: {name}: the block copy's {what}: {e}"))
+    };
+    let c_src = whole(
+        "source width",
+        StickExtent::<Fp16>::new(src.region.cols.len).map(|s| s.elems()),
+    )?;
+    let c_dst = whole(
+        "destination width",
+        StickExtent::<Fp16>::new(dst_cols).map(|s| s.elems()),
+    )?;
+    let off = whole(
+        "destination column",
+        ktir_superdsc::addr::col_window_of(rows, c_dst, dst.region.cols.start, Df::Fp16)
+            .map(|w| w.column()),
+    )?;
+    let (src_py, file, whole_entry) = match blockcopy_row() {
+        TritonKernelRow::Spliced {
+            src, file, entry, ..
+        } => (src, file, entry),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
@@ -1578,27 +1597,35 @@ pub fn lower_block_copy<
     }
     // The row blocks: the elementwise LX law over the copy's one live tile, so the program is
     // `O(rows / BLOCK_M)` straight-line copies at any width (`blockcopy.py`'s own doc says why).
+    // The row count is not a constexpr: the kernel states it as `N_BLOCKS · BLOCK_M (+ TAIL_H)`.
+    // A copy with no tail takes the whole-block entry, which has no `TAIL_H` to state.
     let (block_m, n_blocks, tail_h) = blocks_of(
         rows,
         c_src,
         ktir_superdsc::superdsc_opspec::BLOCK_COPY_LIVE_TILES,
     );
-    for (k, v) in [
-        ("R", rows),
+    let tail = std::num::NonZeroU32::new(tail_h);
+    let mut stated = vec![
         ("C_SRC", c_src),
-        ("C_DST", dst_cols),
+        ("C_DST", c_dst),
         ("COL_OFF", off),
-        ("STK", stk),
         ("BLOCK_M", block_m),
         ("N_BLOCKS", n_blocks),
-        ("TAIL_H", tail_h),
-    ] {
+    ];
+    let entry = match tail {
+        None => whole_entry,
+        Some(t) => {
+            stated.push(("TAIL_H", t.get()));
+            BLOCKCOPY_TAIL_ENTRY
+        }
+    };
+    for (k, v) in stated {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
     }
     let spec = KernelSpec {
-        file: "blockcopy.py".to_string(),
-        kernel: "blockcopy_fwd".to_string(),
+        file: file.to_string(),
+        kernel: entry.to_string(),
         signature,
         constexprs,
     };
