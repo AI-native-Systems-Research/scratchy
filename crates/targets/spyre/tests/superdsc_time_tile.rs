@@ -92,10 +92,6 @@ fn opfunc_names_are_dxp_recognized() {
         "equal",
         "notequal",
         "where3",
-        // The device's fused normalise-and-affine (`layernormnorm.ddl:15`'s own bind spelling;
-        // the vendor fixture `ddc/ddl_templates/test/sdsc_layernormnorm.json` carries it) — the
-        // row-then-column scale fold's target.
-        "layernormnorm",
     ];
     // ⚠️ THIS LIST IS HAND-PICKED, WHICH IS WHY OPS COULD GO MISSING. `OpFunc` has 31
     // variants; this loop names 25. A new variant is NOT an E0004 here, so it joins the emitter
@@ -133,7 +129,6 @@ fn opfunc_names_are_dxp_recognized() {
         OpFunc::Equal,
         OpFunc::NotEqual,
         OpFunc::Where3,
-        OpFunc::LayerNormNorm,
     ] {
         assert!(
             RECOGNIZED.contains(&f.name()),
@@ -245,7 +240,7 @@ fn reduce_and_multiop_invariants() {
         "scaling_factor must be a 16-bit fp16 word, got {val:#x}"
     );
 
-    // multi-op (RMSNorm 4-op): EVERY op's coreIdToDsc_ matches its numCoresUsed_. The chain's HEAD
+    // multi-op (RMSNorm 5-op): EVERY op's coreIdToDsc_ matches its numCoresUsed_. The chain's HEAD
     // is now the device's own fused `exx2` reduce (the vendor layernorm head borrowed for RMS —
     // rmsnorm.rs's module doc): the former `rmsq`+`rmmean` pair is ONE op, 6 → 5.
     let mut sym = 0i64;
@@ -262,17 +257,7 @@ fn reduce_and_multiop_invariants() {
         None,
     )
     .expect("the rmsnorm chain lowers — its long-reduce split, when it fires, is the same law");
-    assert_eq!(
-        ops.len(),
-        4,
-        "the exx2 head fuses rmsq+rmmean (6 → 5), and the row-then-column scale fold fuses the \
-         rmxn+rmg tail (5 → 4)"
-    );
-    assert!(
-        ops.iter()
-            .all(|o| o.op_name != "rmxn_g" && o.op_name != "rmg_g"),
-        "the two tail multiplies are GONE — `x·rinv·γ` is one layernormnorm"
-    );
+    assert_eq!(ops.len(), 5, "the exx2 head fuses rmsq+rmmean: 6 ops → 5");
     assert!(
         ops.iter().all(|o| o.op_name != "rmsq_g"),
         "the x² pointwise is GONE — the square happens inside the reduce"
@@ -337,49 +322,26 @@ fn reduce_and_multiop_invariants() {
     // (E[x²]) — the vendor's own write AND cross-chunk read-back of the second value both carry
     // `stick_replicated_dim_offset_elements=8` (summeanmaxexx2.ddl:625/:192), and their
     // layernormscale reads it at the same offset (layernormscale_32.ddl:75). So the tail must
-    // read rinv at ELEMENT 8: the tail's rinv operand startAddr = rinv's own base + 8·2B. The first
+    // read rinv at ELEMENT 8: rmxn's rinv operand startAddr = rinv's own base + 8·2B. The first
     // card run of this chain read element 1 instead — the E[x] half, ≈0 for a signed activation
     // row, so the norm multiplied by rsqrt(E[x]+eps) and the model emitted degenerate text. This
     // delta is the build-time pin on that failure class.
-    // An operand's own core-0 start, found BY THE BUFFER IT BINDS (each schedule node names its
-    // labeled-ds, whose binding carries the buffer) — never by its position in the tree, which a
-    // five-input op orders differently from a one-input one.
-    let operand_addr = |op_idx: usize, buffer: &str, want_input: bool| -> u64 {
-        let op = &ops[op_idx];
-        let d = op.dsc();
-        for dsc in d.dscs_[0].values() {
-            for node in dsc.scheduleTree_.iter() {
-                let b = &op.arg_bindings[node.ldsIdx_ as usize];
-                if b.is_input == want_input && b.buffer == buffer {
-                    return node
-                        .startAddressCoreCorelet_
-                        .data_
-                        .get("[0, 0, 0]")
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or_else(|| panic!("{}'s {buffer} startAddr", op.op_name));
-                }
-            }
-        }
-        panic!("{}: no schedule node binds {buffer}", op.op_name)
+    let tensor1_addr = |op_idx: usize| -> u64 {
+        let jo: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ops[op_idx].op).unwrap()).unwrap();
+        let name = &ops[op_idx].op_name;
+        jo["dscs_"][0][name.as_str()]["scheduleTree_"][1]["startAddressCoreCorelet_"]["data_"]
+            ["[0, 0, 0]"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{name}'s Tensor1 startAddr (decimal string)"))
     };
-    // rmrsqrt WRITES rinv at its own base; the fused tail READS the SAME synth (its `scale`
-    // operand) at the lane offset. ops: [rmmean, rmeps, rmrsqrt, rmxg].
-    assert_eq!(ops[3].op_name, "rmxg_g");
-    let rinv = ops[2]
-        .arg_bindings
-        .iter()
-        .find(|b| !b.is_input)
-        .expect("rmrsqrt's output is rinv")
-        .buffer
-        .clone();
-    // Layout-less, every operand slot sits in its OWN 16 GiB segment (`wire::segment_base`, by
-    // argument position), and the writer and the reader bind rinv at different positions — so the
-    // lane offset is the difference of the two in-segment offsets (`wire::hbm_seg_off`).
-    let in_seg = |a: u64| ktir_superdsc::wire::hbm_seg_off(a).1;
+    // rmrsqrt's Tensor1 is rinv at its own base; rmxn's Tensor1 is the SAME synth read at the
+    // lane offset. ops: [rmmean, rmeps, rmrsqrt, rmxn, rmg].
     assert_eq!(
-        in_seg(operand_addr(3, &rinv, true)) - in_seg(operand_addr(2, &rinv, false)),
+        tensor1_addr(3) - tensor1_addr(2),
         8 * FP16_BYTES,
-        "the fused tail must read rinv at element 8 — the exx2 output's E[x²] half-stick"
+        "rmxn must read rinv at element 8 — the exx2 output's E[x²] half-stick"
     );
 }
 
@@ -420,18 +382,6 @@ fn rmsnorm_rinv_is_pinned_lx() {
         place(&mut l, 2, cols as u64 * FP16_BYTES); // gamma [1, cols]
         place(&mut l, 3, 64 * FP16_BYTES); // eps [1, stick]
         place(&mut l, 7, xy); // out
-        // The fused tail's zero mean `[rows, stick]` and zero β `[1, cols]` — the producer's own
-        // placement law (`compute_bundle_layout`'s scale-fold zeros).
-        place(
-            &mut l,
-            ktir_superdsc::reserved_tids::ZERO_ROW_TID,
-            rows as u64 * 64 * FP16_BYTES,
-        );
-        place(
-            &mut l,
-            ktir_superdsc::reserved_tids::ZERO_COL_TID,
-            cols as u64 * FP16_BYTES,
-        );
         l
     }
     let run = |rows: u32| -> Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
@@ -466,7 +416,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
 
     // ── m>1 (rows=64): the producer REPLICATES and the reader's slice corner folds ──
     let ops = run(64);
-    assert_eq!(ops.len(), 4, "same 4-op chain under a layout");
+    assert_eq!(ops.len(), 5, "same 5-op chain under a layout");
     let (w_name, wj) = json_of(&ops[2]); // rmrsqrt — rinv's producer
     assert_eq!(w_name, "rmrsqrt_g");
     assert_eq!(
@@ -512,20 +462,19 @@ fn rmsnorm_rinv_is_pinned_lx() {
         "rinv memOrg_ must NOT carry hbm — an HBM residency would stage it through the \
          stick-granular L3 path that floors the lane read away"
     );
-    // The reader (rmxg, mb-split 32-way at rows=64): rinv at pin + 16, and its per-core
+    // The reader (rmxn, mb-split 32-way at rows=64): rinv at pin + 16, and its per-core
     // slice corner advances by one row-group — the same fold HBM addressing uses, on the
     // per-core private copy the replicated producer wrote.
     let (r_name, rj) = json_of(&ops[3]);
-    assert_eq!(r_name, "rmxg_g");
-    // layernormnorm's `scale` operand is its Tensor2 (`x`, the zero `mean`, then `scale`).
-    let rnode = alloc(&rj, "rmxg_g", 2);
+    assert_eq!(r_name, "rmxn_g");
+    let rnode = alloc(&rj, "rmxn_g", 1);
     assert_eq!(rnode["component_"], "lx");
     let pin_str = |s: u64| s.to_string();
     let pin = LX_PIN_END - rinv_fp; // the class slot's start (top-down, below LX_PIN_END)
     assert_eq!(
         rnode["startAddressCoreCorelet_"]["data_"]["[0, 0, 0]"].as_str(),
         Some(pin_str(pin + 8 * FP16_BYTES).as_str()),
-        "the fused tail reads rinv at pin + element-8 byte offset (the E[x²] lane)"
+        "rmxn reads rinv at pin + element-8 byte offset (the E[x²] lane)"
     );
     assert_eq!(
         rnode["startAddressCoreCorelet_"]["data_"]["[1, 0, 0]"].as_str(),
@@ -537,7 +486,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
     //    every reader core reads pin+16 out of its OWN private copy ──
     let ops1 = run(1);
     let (_, rj1) = json_of(&ops1[3]);
-    let rnode1 = alloc(&rj1, "rmxg_g", 2);
+    let rnode1 = alloc(&rj1, "rmxn_g", 1);
     // The m=1 run lowers under its OWN layout: the [1,64] class slots at its own top-down
     // address, one stick below the boundary.
     let pin1 = LX_PIN_END - 64 * FP16_BYTES;
@@ -602,17 +551,6 @@ fn two_norm_layout() -> ktir_superdsc::placement::BundleLayout {
     place(&mut l, 3, 64 * FP16_BYTES); // eps [1, stick]
     place(&mut l, 7, xy); // norm A's out
     place(&mut l, 17, xy); // norm B's out
-    // The fused tail's zero mean and zero β (see `rmsnorm_rinv_is_pinned_lx`'s layout).
-    place(
-        &mut l,
-        ktir_superdsc::reserved_tids::ZERO_ROW_TID,
-        64 * 64 * FP16_BYTES,
-    );
-    place(
-        &mut l,
-        ktir_superdsc::reserved_tids::ZERO_COL_TID,
-        576 * FP16_BYTES,
-    );
     l
 }
 
@@ -649,7 +587,7 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
     let mut sym = 0i64;
     let a = norm(&l, "a", 7, &mut sym);
     let b = norm(&l, "b", 17, &mut sym);
-    assert_eq!((a.len(), b.len()), (4, 4), "two four-op chains");
+    assert_eq!((a.len(), b.len()), (5, 5), "two five-op chains");
     // The fixture's own promise: two pin names, ONE footprint class, ONE slot address.
     let pins = l.lx_op_local_pins();
     assert_eq!(pins.len(), 2);
@@ -669,7 +607,7 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
     // The walk: two programs in order, one name per class each — the accepting shape.
     let mut ops = a.clone();
     ops.extend(b.iter().cloned());
-    let per_prog = vec![("rms_a".to_string(), 4), ("rms_b".to_string(), 4)];
+    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
     let ledger = superdsc::walk_lx_slot_alternation(
         &ops,
         &per_prog,
@@ -686,7 +624,7 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
         assert_eq!(
             row.touched_by,
             vec![(prog.to_string(), false), (prog.to_string(), true)],
-            "{pin}: its own program writes it (rmrsqrt) then reads it (rmxg) — no other \
+            "{pin}: its own program writes it (rmrsqrt) then reads it (rmxn) — no other \
              program touches it"
         );
     }
@@ -720,7 +658,7 @@ fn the_walk_refuses_one_program_touching_two_same_class_pins() {
     // One program's descriptors are one SDSC phase (the citations schedule per node, one
     // phase each), so both pins live in the SAME phase with no phase boundary between
     // their touches for a shared slot to alternate across: refused outright, both named.
-    let per_prog = vec![("rms_pair".to_string(), 8)];
+    let per_prog = vec![("rms_pair".to_string(), 10)];
     let err = superdsc::walk_lx_slot_alternation(
         &ops,
         &per_prog,
@@ -744,9 +682,9 @@ fn the_walk_refuses_a_name_returning_after_its_sibling_took_the_slot() {
     ops.extend(norm(&l, "b", 17, &mut sym));
     ops.extend(norm(&l, "a2", 7, &mut sym)); // A′: A's pin again, a THIRD program
     let per_prog = vec![
-        ("rms_a".to_string(), 4),
-        ("rms_b".to_string(), 4),
-        ("rms_a2".to_string(), 4),
+        ("rms_a".to_string(), 5),
+        ("rms_b".to_string(), 5),
+        ("rms_a2".to_string(), 5),
     ];
     let err = superdsc::walk_lx_slot_alternation(
         &ops,
@@ -773,7 +711,7 @@ fn the_walk_carries_run_state_across_launch_groups() {
     let a2 = norm(&l, "a2", 7, &mut sym);
     // A trip of ANOTHER kind between the runs — a distinct-slot KV cachewr
     // (`slot_stride_bytes` = 128, the decode write's head_dim·2) — cuts the partition:
-    // [A's 4 Pure] [the Slot singleton] [B's and A′'s 8 Pure] are THREE launch groups.
+    // [A's 5 Pure] [the Slot singleton] [B's and A′'s 10 Pure] are THREE launch groups.
     // The clone binds no op-local pin (A's reduce reads x and writes its mean synth), so it
     // contributes no touch — only its trip KIND matters.
     let mut slot = a[0].clone();
@@ -783,9 +721,9 @@ fn the_walk_carries_run_state_across_launch_groups() {
     ops.push(slot);
     ops.extend(b.iter().cloned());
     let per_prog = vec![
-        ("rms_a".to_string(), 4),
+        ("rms_a".to_string(), 5),
         ("cachewr".to_string(), 1),
-        ("rms_b".to_string(), 4),
+        ("rms_b".to_string(), 5),
     ];
     // Without the returning name, the group boundary alone is NOT a refusal: A's run simply
     // stays open across the Slot's group and B closes it in the third.
@@ -803,10 +741,10 @@ fn the_walk_carries_run_state_across_launch_groups() {
     // close B's run, with no refusal.
     ops.extend(a2);
     let per_prog = vec![
-        ("rms_a".to_string(), 4),
+        ("rms_a".to_string(), 5),
         ("cachewr".to_string(), 1),
-        ("rms_b".to_string(), 4),
-        ("rms_a2".to_string(), 4),
+        ("rms_b".to_string(), 5),
+        ("rms_a2".to_string(), 5),
     ];
     let err = superdsc::walk_lx_slot_alternation(
         &ops,
@@ -830,13 +768,13 @@ fn the_walk_refuses_a_pin_no_program_writes() {
     let l = two_norm_layout();
     let mut sym = 0i64;
     // A's chain with its WRITER dropped — `rmrsqrt`, the op whose OUTPUT binding is the pin's
-    // one write. The pin is still declared (the chain's own mint), and `rmxg` still READS it
+    // one write. The pin is still declared (the chain's own mint), and `rmxn` still READS it
     // by name, so the walk sees a read-only touch.
     let a: Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = norm(&l, "a", 7, &mut sym)
         .into_iter()
         .filter(|e| e.op_name != "rmrsqrt_a")
         .collect();
-    assert_eq!(a.len(), 3, "the writer dropped, the reader kept");
+    assert_eq!(a.len(), 4, "the writer dropped, the reader kept");
     let b = norm(&l, "b", 17, &mut sym);
     let mut ops = a.clone();
     ops.extend(b.iter().cloned());
@@ -863,14 +801,14 @@ fn the_walk_refuses_a_pin_no_program_writes() {
 fn the_walk_refuses_a_pin_no_program_reads() {
     let l = two_norm_layout();
     let mut sym = 0i64;
-    // A's chain with its READER dropped — `rmxg`, the op whose INPUT binding (the `col_at`
+    // A's chain with its READER dropped — `rmxn`, the op whose INPUT binding (the `col_at`
     // view of the pin) is the pin's one read. The writer still declares it, so the walk sees
     // a write-only touch: dead scratch against the LX window.
     let a: Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = norm(&l, "a", 7, &mut sym)
         .into_iter()
-        .filter(|e| e.op_name != "rmxg_a")
+        .filter(|e| e.op_name != "rmxn_a")
         .collect();
-    assert_eq!(a.len(), 3, "the reader dropped, the writer kept");
+    assert_eq!(a.len(), 4, "the reader dropped, the writer kept");
     let b = norm(&l, "b", 17, &mut sym);
     let mut ops = a.clone();
     ops.extend(b.iter().cloned());
@@ -910,7 +848,7 @@ fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
     let mut sym = 0i64;
     let mut ops = norm(&l, "a", 7, &mut sym);
     ops.extend(norm(&l, "b", 17, &mut sym));
-    let per_prog = vec![("rms_a".to_string(), 4), ("rms_b".to_string(), 4)];
+    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
     let ledger = superdsc::walk_lx_slot_alternation(
         &ops,
         &per_prog,
@@ -1537,7 +1475,7 @@ fn dump_gate_bundles() {
     );
     eprintln!("→ BAKING broadcast-mul gate: time={}", bc.time);
     superdsc::write_dxp_input(&root.join("bcast"), &[bc], superdsc::FoldGrouping::Split).unwrap();
-    // (D) RMSNORM gate: the full 4-op decomposition (the vendor's spyre_rms_norm formula with the
+    // (D) RMSNORM gate: the full 5-op decomposition (the vendor's spyre_rms_norm formula with the
     //     device's own fused `exx2` head) over [m=64, hidden=576] (SmolLM2 hidden). Tests the
     //     multi-op + broadcast chain (exx2-reduce→add(eps)→rsqrt→broadcast-mul) on-card.
     let mut sym = 0i64;

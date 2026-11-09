@@ -5091,64 +5091,30 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         // `rot`/`xc`/`rs` without ever declaring them, so they fell to `resolve_seg_base`'s bump —
         // which handed all three the SAME address. Rope is `rot = x·P`, `xc = x·cos`,
         // `rs = rot·sin`, `out = xc + rs`: three of its four intermediates were one buffer.
-        // ⭐ THE ROTATE-THEN-SCALE FOLD (`rs = (x @ P) · sin`, one `batchnormfwd` epilogue on the rotate
-        // matmul). Claimed where `sin` is ONE ROW broadcast down the rows — one position, `mq == 1` —
-        // which is the operand form `bmm.ddl`'s `%bnA` takes (loaded once per output-channel stick).
-        // The chain IS the op: `x @ P` is exactly `±x` (every column of P has one ±1), so the epilogue's
-        // `FMA16(acc, sin, 0)` is the `MACC(rot, sin, 0)` the standalone multiply runs, on the same
-        // value, whatever precision the epilogue reads its accumulator at. `rot`'s only reader was that
-        // multiply, so it is never materialised. Above one row the angles vary per row, the operand is
-        // not one row, and the chain stays the matmul plus the multiply.
-        let fold_rs = mq == 1;
-        // `rot` keeps its reservation even where the fold leaves it unwritten: `BundleLayout::synth`
-        // is a bump allocator, so dropping an entry would shift every later intermediate (the same
-        // reason the fp8 chain keeps `fq_chi`'s).
         if let Some(l) = layout {
             for r in [R::Rot, R::Xc, R::Rs] {
                 l.synth(out_id.synth(r), &[rows, hd]);
             }
         }
-        let form = crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-            bmm_site::TapeLoweringSite::witness(),
-        );
-        if fold_rs {
-            let zero = crate::place::act_name(crate::reserved_tids::ZERO_COL_TID);
-            ops.push(
-                crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_off_batchnorm(
-                    &format!("rope_rotsin_o{t}"),
-                    crate::sdsc_abstract::MatM::of_head_major_rows(rows),
-                    crate::sdsc_abstract::MatN::of_head_dim(hdw),
-                    crate::sdsc_abstract::MatK::of_head_dim(hdw),
-                    form,
-                    &rb(&x, rows, hd),
-                    &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                    &rb(&rs, rows, hd),
-                    (&rb(&sin, 1, hd), crate::addr::DevOff::ZERO),
-                    (&rb(&zero, 1, hd), crate::addr::DevOff::ZERO),
-                    sym_id_base,
-                    layout,
-                ),
-            );
-        }
         // rot = x[rows,hd] @ P[hd,hd] — the same P kernel for every row (m=rows GEMM, k=n=hd).
-        if !fold_rs {
-            ops.push(assemble_matmul_off(
-                &format!("rope_rot_o{t}"),
-                crate::sdsc_abstract::MatM::of_head_major_rows(rows),
-                crate::sdsc_abstract::MatN::of_head_dim(hdw),
-                crate::sdsc_abstract::MatK::of_head_dim(hdw),
-                crate::sdsc_abstract::MatY::unbatched(),
-                form,
-                &rb(&x, rows, hd),
-                crate::addr::DevOff::ZERO,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                crate::addr::DevOff::ZERO,
-                &rb(&rot, rows, hd),
-                crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
-            ));
-        }
+        ops.push(assemble_matmul_off(
+            &format!("rope_rot_o{t}"),
+            crate::sdsc_abstract::MatM::of_head_major_rows(rows),
+            crate::sdsc_abstract::MatN::of_head_dim(hdw),
+            crate::sdsc_abstract::MatK::of_head_dim(hdw),
+            crate::sdsc_abstract::MatY::unbatched(),
+            crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
+                bmm_site::TapeLoweringSite::witness(),
+            ),
+            &rb(&x, rows, hd),
+            crate::addr::DevOff::ZERO,
+            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+            crate::addr::DevOff::ZERO,
+            &rb(&rot, rows, hd),
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
         let hh = |name: &str| fl(name, rows, hd);
         // One row of angles shared by every head at mq==1; per-row above that.
         let (cos_h, sin_h) = (hh(&cos), hh(&sin));
@@ -5177,19 +5143,17 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             sym_id_base,
             layout,
         ));
-        if !fold_rs {
-            ops.push(pw2(
-                &format!("rope_rs_o{t}"),
-                "multiply",
-                hm_rows,
-                hd_cols,
-                In::full(&hh(&rot)),
-                sin_in,
-                &hh(&rs),
-                sym_id_base,
-                layout,
-            ));
-        }
+        ops.push(pw2(
+            &format!("rope_rs_o{t}"),
+            "multiply",
+            hm_rows,
+            hd_cols,
+            In::full(&hh(&rot)),
+            sin_in,
+            &hh(&rs),
+            sym_id_base,
+            layout,
+        ));
         ops.push(pw2(
             &format!("rope_add_o{t}"),
             "add",
@@ -11742,132 +11706,4 @@ pub fn reduce_df<T: crate::collective::Tp>(
             layout,
         ),
     ])
-}
-
-#[cfg(test)]
-mod rope_rotsin_fold_tests {
-    use super::*;
-    use ktir_core::codec::round_dlf16;
-
-    fn rope(mq: u32, heads: u32) -> Vec<EmittedOp<crate::collective::TpWorld<1>>> {
-        let mut sym = 0i64;
-        let total = heads * 64;
-        rope_at::<crate::collective::TpWorld<1>, 64>(RopeAt {
-            name: "rope",
-            x: crate::place::act_name(1),
-            cos: crate::place::act_name(2),
-            sin: crate::place::act_name(3),
-            out: crate::place::act_name(4),
-            t: 4,
-            mq,
-            total,
-            p_tid: crate::reserved_tids::ROPE_P_TID,
-            sym_id_base: &mut sym,
-            layout: None,
-            rows_are_requests: true,
-        })
-        .unwrap_or_else(|e| panic!("rope mq={mq} heads={heads}: {}", e.message))
-    }
-
-    fn names(ops: &[EmittedOp<crate::collective::TpWorld<1>>]) -> Vec<String> {
-        ops.iter().map(|o| o.op_name.clone()).collect()
-    }
-
-    /// ⭐ ONE POSITION: the rotate matmul carries `rs = (x @ P) · sin` as its `batchnormfwd`
-    /// epilogue, so the rope is THREE descriptors — rotsin, xc, add — and the standalone `rs`
-    /// multiply and the `rot` matmul are gone.
-    #[test]
-    fn one_position_folds_the_sine_into_the_rotate() {
-        let ops = rope(1, 32);
-        assert_eq!(
-            names(&ops),
-            ["rope_rotsin_o4", "rope_xc_o4", "rope_add_o4"],
-            "the folded single-position rope"
-        );
-        let d = ops[0].dsc();
-        let c = &d.dscs_[0].values().next().expect("one dsc").computeOp_;
-        assert_eq!(c.len(), 2, "the matmul and its epilogue: {c:?}");
-        assert_eq!(c[0].opFuncName, "batchmatmul");
-        assert_eq!(c[1].opFuncName, "batchnormfwd");
-        assert_eq!(c[1].inputLabeledDs.len(), 3, "[out, bnA, bnB]");
-        assert_eq!(
-            c[1].inputLabeledDs[0], c[1].outputLabeledDs[0],
-            "in place on the matmul's own output"
-        );
-        let reads: Vec<&str> = ops[0]
-            .arg_bindings
-            .iter()
-            .filter(|b| b.is_input)
-            .map(|b| b.buffer.as_str())
-            .collect();
-        assert!(
-            reads.contains(&crate::place::act_name(3).as_str())
-                && reads
-                    .contains(&crate::place::act_name(crate::reserved_tids::ZERO_COL_TID).as_str()),
-            "bnA is sin, bnB the staged zero row: {reads:?}"
-        );
-    }
-
-    /// ⛔ NEAR-MISS: above one position the angles vary per row, so `sin` is not one row and the
-    /// chain is left unclaimed — the rotate matmul and the multiply stand, four descriptors.
-    #[test]
-    fn several_positions_leave_the_chain_unclaimed() {
-        let ops = rope(2, 8);
-        assert_eq!(
-            names(&ops),
-            ["rope_rot_o4", "rope_xc_o4", "rope_rs_o4", "rope_add_o4"],
-            "the unfolded multi-position rope"
-        );
-        let d = ops[0].dsc();
-        let c = &d.dscs_[0].values().next().expect("one dsc").computeOp_;
-        assert_eq!(c.len(), 1, "no epilogue on the bare rotate");
-    }
-
-    /// ⭐ THE CHAIN IS THE OP: `x @ P` is exactly `±x` (one ±1 per column), so the epilogue's
-    /// `FMA16(±x, sin, 0)` lands on the multiply's own `MACC(rot, sin, 0)` bit for bit, over every
-    /// sign and a decade sweep of magnitudes, at every column of a head.
-    #[test]
-    fn the_epilogue_is_the_multiply_bit_for_bit() {
-        let hd = 64usize;
-        let mut vals: Vec<f32> = vec![0.0, -0.0, 1.0, -1.0];
-        let mut v = 1.0e-8f32;
-        while v < 1.0e8 {
-            vals.push(round_dlf16(v));
-            vals.push(round_dlf16(-v * 1.13));
-            v *= 2.7;
-        }
-        for o in 0..hd {
-            let (inn, sign) = (0..hd)
-                .find_map(|i| match crate::sdsc_abstract::rope_p_entry(hd, i, o) {
-                    0 => None,
-                    s => Some((i, s as f32)),
-                })
-                .expect("every column of P has one nonzero");
-            let _ = inn;
-            for &x in &vals {
-                for &s in &vals {
-                    // the matmul's product, exact: ±x is representable wherever x is
-                    let rot = round_dlf16(sign * x);
-                    let mul = round_dlf16(rot * s + 0.0);
-                    let epi = round_dlf16(rot.mul_add(s, 0.0));
-                    assert_eq!(mul.to_bits(), epi.to_bits(), "col {o} x={x} sin={s}");
-                }
-            }
-        }
-    }
-
-    /// ⛔ NEIGHBOUR: the fold must not steal the `xc = x · cos` multiply — it reads `x`, not the
-    /// rotate's product, and a `batchnormfwd` on the rotate cannot compute it.
-    #[test]
-    fn the_cosine_multiply_stays_its_own_op() {
-        let ops = rope(1, 32);
-        let xc = ops
-            .iter()
-            .find(|o| o.op_name == "rope_xc_o4")
-            .expect("the cosine multiply is emitted");
-        let d = xc.dsc();
-        let c = &d.dscs_[0].values().next().expect("one dsc").computeOp_;
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].opFuncName, "mul");
-    }
 }
