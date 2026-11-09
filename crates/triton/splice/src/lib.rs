@@ -1576,12 +1576,22 @@ pub fn lower_block_copy<
             ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
         );
     }
+    // The row blocks: the elementwise LX law over the copy's one live tile, so the program is
+    // `O(rows / BLOCK_M)` straight-line copies at any width (`blockcopy.py`'s own doc says why).
+    let (block_m, n_blocks, tail_h) = blocks_of(
+        rows,
+        c_src,
+        ktir_superdsc::superdsc_opspec::BLOCK_COPY_LIVE_TILES,
+    );
     for (k, v) in [
         ("R", rows),
         ("C_SRC", c_src),
         ("C_DST", dst_cols),
         ("COL_OFF", off),
-        ("N_STICKS", rows * (c_src / stk)),
+        ("STK", stk),
+        ("BLOCK_M", block_m),
+        ("N_BLOCKS", n_blocks),
+        ("TAIL_H", tail_h),
     ] {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
