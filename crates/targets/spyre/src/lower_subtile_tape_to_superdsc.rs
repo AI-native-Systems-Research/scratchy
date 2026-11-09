@@ -6588,7 +6588,7 @@ pub struct LxSlotRow {
 /// dump's `bundle_id.json` carries beside the descriptors, read by the #645 same-class pair hunts.
 ///
 /// A REPORT, NOT A GUARD. The three facts the alternation walk used to check after lowering are the
-/// shape of the code now: [`BundleLayout::lx_op_local_pair`] is the only door to an op-local pin, and
+/// shape of the code now: [`ktir_superdsc::emit::lx_op_local_pair`] is the only door to an op-local pin, and
 /// it takes the pin's writer and reader as ONE construction (a pin with no reader cannot be built),
 /// keeps the pin's handle inside that construction (no touch after its scope), and takes the
 /// program's `&mut LxScope` (a nested pair is a borrow error; a second same-class pin in one program
@@ -8322,7 +8322,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
 
     // ⭐ THE OP-LOCAL PIN LEDGER — written into the dump beside the descriptors for the #645
     //    same-class pair hunts. A report: the sharing it records is sound by construction
-    //    (`BundleLayout::lx_op_local_pair`), see `lx_slot_ledger`.
+    //    (`emit::lx_op_local_pair`), see `lx_slot_ledger`.
     let lx_ledger = lx_slot_ledger(&sdsc_ops, &per_prog, layout);
 
     // ── THE BAKE BUDGET, PER BUNDLE (`BakeBudget::bundle_verdict`) ─────────────────────────

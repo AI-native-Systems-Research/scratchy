@@ -208,39 +208,34 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     //    allocate through the ordinary slice-offset machinery — and because `rinv` is LX-pinned,
     //    that byte lands BYTE-exact in the reader's lxlu address (see the LX-pin note above
     //    for why the same offset on HBM is silently floored to element 0).
-    let (rsqrt_op, xn_op) = BundleLayout::lx_op_local_pair(
+    // The pin's one statement of its extents: `rows` one-stick rows. A norm over zero rows has no
+    // row to normalise, so the row count is refused HERE, at the one mint — the reduce above
+    // refuses it too, over the same count.
+    let pin_rows = std::num::NonZeroU32::new(rows)
+        .ok_or_else(|| format!("rmsnorm {prefix}: a norm needs at least one row"))?;
+    let (rsqrt_op, xn_op) = crate::emit::lx_op_local_pair(
         layout,
         lx_scope,
         out_id.synth(R::Rinv),
-        &[rows, stk],
-        |pin| -> Result<_, String> {
-            let rinv = rb(pin.name(), rows, stk);
-            let writer = pw1(
-                &format!("rmrsqrt_{prefix}"),
-                "rsqrt",
-                t_rows,
-                s_cols,
-                In::full(&meps),
-                &rinv,
-                sym_id_base,
-                layout,
-            )
-            .map_err(|e| e.0)?; // 1/√(E[x²]+eps)
-            let reader = pw2(
-                &format!("rmxn_{prefix}"),
-                "multiply",
-                t_rows,
-                f_cols,
-                In::full(&x),
-                In::col_at(&rinv, crate::addr::DevOff::from_view_step(8)),
-                &xn,
-                sym_id_base,
-                layout,
-            )
-            .map_err(|e| e.0)?;
-            Ok((writer, reader))
+        crate::placement::OpLocalShape::rows_of_one_stick(pin_rows),
+        // 1/√(E[x²]+eps)
+        crate::emit::PinWriter {
+            op_name: format!("rmrsqrt_{prefix}"),
+            op_func: "rsqrt",
+            inputs: vec![In::full(&meps).ew()],
         },
-    )?;
+        crate::emit::PinReader {
+            op_name: format!("rmxn_{prefix}"),
+            op_func: "multiply",
+            cols: f_cols,
+            before: vec![In::full(&x).ew()],
+            pin: crate::emit::PinRead::ColAt(crate::addr::DevOff::from_view_step(8)),
+            after: vec![],
+            out: &xn,
+        },
+        sym_id_base,
+    )
+    .map_err(|e| e.0)?;
     ops.push(rsqrt_op);
     ops.push(xn_op);
     // 6. OnePlusScale: gw = gamma + 1 — ONE `add` over the stored row with the

@@ -4926,6 +4926,116 @@ pub fn pw2<T: crate::collective::Tp, A: KindTag, B: KindTag, O: KindTag>(
     )
 }
 
+/// The op that WRITES an op-local pin ([`lx_op_local_pair`]): a pointwise `op_func` over `inputs`
+/// whose output is the pin. The pin is not named here — the pair supplies it.
+pub struct PinWriter<'a> {
+    pub op_name: String,
+    pub op_func: &'static str,
+    pub inputs: Vec<EwOperand<'a>>,
+}
+
+/// How the reader reads the pin: one element lane of each one-stick row, at `DevOff` into it,
+/// broadcast across the reader's columns (the rmsnorm `rinv`'s E[x²] lane, element 8).
+#[derive(Clone, Copy)]
+pub enum PinRead {
+    ColAt(crate::addr::DevOff),
+}
+
+/// The op that READS an op-local pin ([`lx_op_local_pair`]): a pointwise `op_func` over
+/// `before`, then the pin, then `after`, writing `out`. Exactly one operand is the pin — its
+/// position is `before.len()` — by the shape of the type, never by a count.
+pub struct PinReader<'a, O: KindTag> {
+    pub op_name: String,
+    pub op_func: &'static str,
+    pub cols: crate::sdsc_abstract::BlockCols,
+    pub before: Vec<EwOperand<'a>>,
+    pub pin: PinRead,
+    pub after: Vec<EwOperand<'a>>,
+    pub out: &'a Stk<O>,
+}
+
+/// ⭐⭐⭐ THE ONE DOOR TO AN OP-LOCAL LX PIN — the pin, its writer and its reader as ONE construction,
+/// built here, so the pin's operand spelling never leaves this function.
+///
+/// An op-local pin's bytes live only between its writer and its reader, and every pin of one
+/// footprint class shares ONE slot ([`BundleLayout::synth_lx_op_local`]). Sharing is sound exactly
+/// when a pin is written and read inside one program and no other same-class pin is live there.
+/// This door makes all three facts the shape of the code:
+///
+/// * **written AND read** — the pair builds both ops itself: the writer's output IS the pin, and
+///   the reader's one pin operand IS the pin ([`PinReader`]'s shape), so the two returned ops'
+///   bindings name it by construction;
+/// * **touched only inside the pair** — the pin's spelling is minted, used for those two ops, and
+///   dropped: no caller ever holds it;
+/// * **one pin per class per PROGRAM** — `scope` is the program's [`LxScope`], minted once per
+///   program by its lowering door; a second same-class pin in one program is refused here, BY
+///   NAME: the class set is keyed by footprint bytes, a bake-time value (31-33 classes on the
+///   shipped granites), so the refusal is a build error at the pair, never a card fault.
+///
+/// There is no closure and no pin handle to hold: a pair cannot be nested inside another pair's
+/// construction, and the spelling cannot escape it. The writer is handed nothing it could name the
+/// pin with — its output is not a field:
+/// ```compile_fail,E0560
+/// let _ = ktir_superdsc::emit::PinWriter {
+///     op_name: String::new(),
+///     op_func: "rsqrt",
+///     inputs: Vec::new(),
+///     out: (), // E0560: struct has no field named `out`
+/// };
+/// ```
+///
+/// `shape` is the pin's one statement of its extents — `rows` non-zero one-stick rows. The writer
+/// sweeps exactly it, and the reader sweeps the same `rows` over its own `cols`.
+///
+/// ⏳ `layout` is `Option<&BundleLayout>` only because every lowering still threads one; it becomes
+/// `&BundleLayout` when residency-v2 makes the layout non-optional at the door and the walk.
+#[allow(clippy::too_many_arguments)]
+pub fn lx_op_local_pair<T: crate::collective::Tp, O: KindTag>(
+    layout: Option<&BundleLayout>,
+    scope: &mut crate::placement::LxScope,
+    id: crate::place::PlaceId,
+    shape: crate::placement::OpLocalShape,
+    writer: PinWriter<'_>,
+    reader: PinReader<'_, O>,
+    sym: &mut i64,
+) -> Result<(EmittedOp<T>, EmittedOp<T>), SuperDscError> {
+    let name = BundleLayout::claim_op_local(layout, scope, id, shape).map_err(SuperDscError)?;
+    let pin = rb(&name, shape.rows(), shape.cols());
+    let rows = crate::sdsc_abstract::RowCount::of_token_rows(shape.rows());
+    let written = assemble_pointwise_broadcast_off(
+        &writer.op_name,
+        writer.op_func,
+        rows,
+        crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        &writer.inputs,
+        &pin,
+        crate::addr::DevOff::ZERO,
+        sym,
+        layout,
+    )?;
+    let pin_in = match reader.pin {
+        PinRead::ColAt(off) => In::col_at(&pin, off).ew(),
+    };
+    let inputs: Vec<EwOperand<'_>> = reader
+        .before
+        .into_iter()
+        .chain(std::iter::once(pin_in))
+        .chain(reader.after)
+        .collect();
+    let read = assemble_pointwise_broadcast_off(
+        &reader.op_name,
+        reader.op_func,
+        rows,
+        reader.cols,
+        &inputs,
+        reader.out,
+        crate::addr::DevOff::ZERO,
+        sym,
+        layout,
+    )?;
+    Ok((written, read))
+}
+
 /// UNARY dtype-convert (`dl16tofp32` / `fp32todl16`) opspec. Unlike [`pointwise_opspec`] — which marks EVERY
 /// operand `Role::Output` ⇒ ONE shared `primaryDsInfo["OUTPUT"]` (one stick) — a convert's input and output
 /// have DIFFERENT sticks (f16 64-elem vs fp32 32-elem). So the input is `Role::Input` and the output

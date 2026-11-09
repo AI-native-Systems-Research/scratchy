@@ -258,22 +258,20 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
         of: 7,
         role: SynthRole::KRep,
     };
-    // Declared through the one op-local door, its own program's pair (the windows below are the
-    // test's own reads of the pinned name).
-    let _ = ktir_superdsc::placement::BundleLayout::lx_op_local_pair(
-        Some(&layout),
-        &mut ktir_superdsc::placement::LxScope::for_test(),
-        op_id,
-        &[1, 128],
-        |_| Ok::<_, String>(((), ())),
-    );
-    let op_stk =
-        Stk::<RowBlockedTag>::new(op_id.to_string(), StickLayout::row_blocked(1, 128)).unwrap();
-    layout
-        .win(&op_stk, DevOff::ZERO, 1, 128, "test: op-local fits")
+    // Claimed the way the pair claims it, in its own program's scope (the windows below are the
+    // test's own reads of the pinned name; a pin is one stick wide by its shape's type).
+    let name = layout
+        .claim_op_local_for_test(
+            &mut ktir_superdsc::placement::LxScope::for_test(),
+            op_id,
+            ktir_superdsc::placement::OpLocalShape::rows_of_one_stick(std::num::NonZeroU32::MIN),
+        )
         .unwrap();
-    let big =
-        Stk::<RowBlockedTag>::new(op_id.to_string(), StickLayout::row_blocked(1, 1024)).unwrap();
+    let op_stk = Stk::<RowBlockedTag>::new(name.clone(), StickLayout::row_blocked(1, 64)).unwrap();
+    layout
+        .win(&op_stk, DevOff::ZERO, 1, 64, "test: op-local fits")
+        .unwrap();
+    let big = Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(1, 1024)).unwrap();
     let err = layout
         .win(&big, DevOff::ZERO, 1, 1024, "test: op-local past pin")
         .unwrap_err();

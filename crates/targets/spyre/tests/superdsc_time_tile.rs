@@ -675,30 +675,36 @@ fn a_second_same_class_pin_in_one_program_refuses_at_the_pair() {
 }
 
 /// The rule is the PROGRAM's, not the layout's: with no layout to place them in, two same-class
-/// pins in one program still refuse at the pair, at the same class.
+/// norms in one program still refuse at their pins, at the same class.
 #[test]
 fn a_second_same_class_pin_refuses_without_a_layout_too() {
-    use ktir_superdsc::place::SynthRole;
-    use ktir_superdsc::placement::{BundleLayout, LxScope};
-    use scratchy_target_spyre::bundle_code::PlaceId;
-    let mut scope = LxScope::for_test();
-    let pair = |scope: &mut LxScope, t: u32| {
-        BundleLayout::lx_op_local_pair(
+    let mut scope = ktir_superdsc::placement::LxScope::for_test();
+    let norm_no_layout = |out: u32, scope: &mut ktir_superdsc::placement::LxScope| {
+        let mut sym = 0i64;
+        assemble_rmsnorm::<ktir_superdsc::collective::TpWorld<1>>(
+            &format!("n{out}"),
+            64,
+            576,
+            "t1",
+            "t2",
+            scratchy_target_spyre::bundle_code::PlaceId::Act(out),
+            "t3",
+            None,
+            &mut sym,
             None,
             scope,
-            PlaceId::Act(t).synth(SynthRole::Rinv),
-            &[64, 64],
-            |_| Ok::<_, String>(((), ())),
         )
     };
-    pair(&mut scope, 7).expect("the program's first pin of the class");
-    let err =
-        pair(&mut scope, 17).expect_err("a second same-class pin in one program, layout or not");
+    norm_no_layout(7, &mut scope).expect("the program's first norm of the class");
+    let Err(err) = norm_no_layout(17, &mut scope) else {
+        panic!("a second same-class pin in one program, layout or not, must refuse");
+    };
     assert!(
         err.contains("both of the 8192-byte class in ONE program"),
         "{err}"
     );
-    pair(&mut LxScope::for_test(), 17).expect("the same pin in its own program");
+    norm_no_layout(17, &mut ktir_superdsc::placement::LxScope::for_test())
+        .expect("the same norm in its own program");
 }
 
 /// The neighbour: the same two norms as two PROGRAMS (two scopes) — the shared slot alternates.
@@ -732,14 +738,14 @@ fn the_ledger_records_a_pin_this_bundle_never_touches_as_empty() {
     use scratchy_target_spyre::bundle_code::PlaceId;
 
     let l = two_norm_layout();
-    // A third pin of the SAME class, declared into the shared layout the way the declare pass
-    // mints another bundle's norm — declared there (its own program's pair), never touched here.
-    let _ = ktir_superdsc::placement::BundleLayout::lx_op_local_pair(
-        Some(&l),
+    // A third norm of the SAME class, declared into the shared layout the way the declare pass
+    // mints another bundle's norm — its own program's pair — and never touched here.
+    let _ = norm_in(
+        &l,
+        "c",
+        27,
+        &mut 0i64,
         &mut ktir_superdsc::placement::LxScope::for_test(),
-        PlaceId::Act(27).synth(SynthRole::Rinv),
-        &[64, 64],
-        |_| Ok::<_, String>(((), ())),
     );
     let mut sym = 0i64;
     let mut ops = norm(&l, "a", 7, &mut sym);

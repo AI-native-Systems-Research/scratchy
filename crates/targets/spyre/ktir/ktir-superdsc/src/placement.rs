@@ -445,7 +445,7 @@ pub struct LxAlloc {
     pub op_local_slots: std::collections::BTreeMap<u64, u64>,
     /// The names declared OP-LOCAL ([`BundleLayout::synth_lx_op_local`]): short-lived scratch
     /// whose def and use both live inside one assembly call, so same-class names share a slot
-    /// under `lx_op_local_pair`'s construction.
+    /// under [`crate::emit::lx_op_local_pair`]'s construction.
     pub op_local: std::collections::BTreeSet<String>,
     /// Pinned byte address per synth name.
     pub map: std::collections::BTreeMap<String, u64>,
@@ -482,10 +482,9 @@ impl Default for LxAlloc {
 }
 
 /// ⭐ ONE PROGRAM's op-local LX scope — created ONCE per program by the lowering door that lowers it,
-/// and handed `&mut` to every op-local pin ([`BundleLayout::lx_op_local_pair`]) the program states. It
+/// and handed `&mut` to every op-local pin ([`crate::emit::lx_op_local_pair`]) the program states. It
 /// records the footprint classes the program has already pinned, so a second same-class pin in one
-/// program is refused at the pair; and it is the borrow that makes a pair nested inside another
-/// pair's construction unwritable. Its one constructor is crate-private, called by the door that
+/// program is refused at the pair. Its one constructor is crate-private, called by the door that
 /// lowers one program (`whole_function::lower_function_folded`, the per-op rmsnorm door), so a scope
 /// is never carried across two programs and no caller outside the crate can mint one:
 /// ```compile_fail,E0624
@@ -496,7 +495,7 @@ impl Default for LxAlloc {
 /// footprint in bytes, derived from the pin's dims, so the class SET is known only when the bake
 /// lowers the program (31-33 classes on the shipped granites) — it cannot be one `ClassSlot` field
 /// per class for the compiler to move. The refusal is therefore a NAMED BUILD ERROR at the pair
-/// (`#[forward]` expansion), never a card fault. Nesting, which needs no class, IS a type error.
+/// (`#[forward]` expansion), never a card fault.
 #[derive(Debug)]
 pub struct LxScope {
     classes: std::collections::BTreeMap<OpLocalClass, String>,
@@ -509,11 +508,38 @@ pub struct LxScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OpLocalClass(u64);
 
+/// An op-local pin's SHAPE: `rows` one-stick fp16 rows — the per-row scalar an op chain writes and
+/// reads back (the rmsnorm `rinv`). `rows` is non-zero by type, so the footprint is at least one
+/// stick and its class is positive by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpLocalShape {
+    rows: std::num::NonZeroU32,
+}
+
+impl OpLocalShape {
+    /// `rows` one-stick rows.
+    pub const fn rows_of_one_stick(rows: std::num::NonZeroU32) -> OpLocalShape {
+        OpLocalShape { rows }
+    }
+
+    /// The pin's row count.
+    pub const fn rows(self) -> u32 {
+        self.rows.get()
+    }
+
+    /// The pin's width, one fp16 stick.
+    pub const fn cols(self) -> u32 {
+        crate::sdsc_abstract::POOL_STICK
+    }
+}
+
 impl OpLocalClass {
-    /// The class of a pin of shape `dims` (outermost→innermost). An operand has at least one
-    /// element, so its footprint is at least one 128-byte stick.
-    fn of(dims: &[u32]) -> OpLocalClass {
-        OpLocalClass(align128(synth_footprint_bytes(dims, Df::Fp16).max(1)))
+    /// The class of a pin of shape `shape`: its fp16 footprint, 128-aligned.
+    fn of(shape: OpLocalShape) -> OpLocalClass {
+        OpLocalClass(align128(synth_footprint_bytes(
+            &[shape.rows(), shape.cols()],
+            Df::Fp16,
+        )))
     }
 
     /// The class's footprint in bytes — the slot every pin of it shares.
@@ -534,20 +560,6 @@ impl LxScope {
     #[cfg(feature = "test-support")]
     pub fn for_test() -> LxScope {
         LxScope::program()
-    }
-}
-
-/// An op-local LX pin, as its pair's `build` closure sees it: the operand spelling its writer and
-/// reader name. Reachable only by reference inside [`BundleLayout::lx_op_local_pair`].
-#[derive(Debug)]
-pub struct OpLocalPin {
-    name: String,
-}
-
-impl OpLocalPin {
-    /// The pin's operand spelling.
-    pub fn name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -1013,7 +1025,7 @@ impl BundleLayout {
     /// rung's ~23 stacked `[rows,64]` rinvs refused the window; as ~3 classes they fit with
     /// room for the chunk forms). This is sound because each name's live range is confined to
     /// its own assembly call — which is the shape of the code, not a check: the only door is
-    /// [`Self::lx_op_local_pair`], which takes the pin's writer and reader as one construction
+    /// [`crate::emit::lx_op_local_pair`], which builds the pin's writer and reader as one construction
     /// inside one program's [`LxScope`] (see its doc for the three facts it makes structural).
     ///
     /// Slots bump DOWN from [`LX_PIN_END`] so the two pin families are independent by
@@ -1059,96 +1071,48 @@ impl BundleLayout {
         a.op_local.insert(name);
     }
 
-    /// ⭐⭐⭐ THE ONE DOOR TO AN OP-LOCAL LX PIN — the pin, its writer and its reader as ONE construction.
-    ///
-    /// An op-local pin's bytes live only between its writer and its reader, and every pin of one
-    /// footprint class shares ONE slot ([`Self::synth_lx_op_local`]). Sharing is sound exactly when a
-    /// pin is written and read inside one program and no other same-class pin is live there. This
-    /// constructor makes all three facts the shape of the code, not a walk over the emitted order:
-    ///
-    /// * **written AND read** — `build` receives the pin and must return BOTH ops it states (the
-    ///   writer, then the reader) in one value; a pin with a writer and no reader cannot be built;
-    /// * **touched only inside its scope** — the pin is a borrow of the closure's argument, so no
-    ///   handle to it outlives the call;
-    /// * **one name per class per PROGRAM** — `scope` is the program's [`LxScope`], created once per
-    ///   program by its lowering door and handed down `&mut`. A pair nested inside another pair's
-    ///   closure is a borrow error (the scope is already mutably borrowed). A second pair of the SAME
-    ///   class in one program — after the first closed — is refused here, BY NAME: the class set is
-    ///   keyed by footprint bytes, a bake-time value (31-33 classes on the shipped granites), so it
-    ///   cannot be one field per class; the refusal is a build error at the pair, never a card fault.
-    ///
-    /// ⛔ ANY FUTURE LX OP-LOCAL PRODUCER MUST TAKE THE SAME `&mut LxScope` — the type requires it:
-    /// this is the only constructor of an op-local pin.
-    ///
-    /// A layout-less lowering (unit fixtures) has no pins: the pin is the plain synth spelling and
-    /// `build` runs with it, as every other intermediate's does there.
-    ///
-    /// ⏳ `layout` is `Option<&BundleLayout>` only because every lowering still threads one; it becomes
-    /// `&BundleLayout` when residency-v2 makes the layout non-optional at the door and the walk.
-    ///
-    /// A pair NESTED inside another pair's construction does not compile — the program's scope is
-    /// already borrowed by the outer pair:
-    /// ```compile_fail,E0499
-    /// use ktir_superdsc::place::{PlaceId, SynthRole};
-    /// use ktir_superdsc::placement::{BundleLayout, LxScope};
-    /// let mut scope = LxScope::for_test();
-    /// let id = PlaceId::Act(7).synth(SynthRole::Rinv);
-    /// let _ = BundleLayout::lx_op_local_pair(None, &mut scope, id, &[64, 64], |_| {
-    ///     // E0499: `scope` is already mutably borrowed by the outer pair
-    ///     BundleLayout::lx_op_local_pair(None, &mut scope, id, &[64, 64], |_| {
-    ///         Ok::<_, String>(((), ()))
-    ///     })
-    /// });
-    /// ```
-    /// And the pin cannot outlive its pair — its handle is a borrow of the closure's argument:
-    /// ```compile_fail,E0521
-    /// use ktir_superdsc::place::{PlaceId, SynthRole};
-    /// use ktir_superdsc::placement::{BundleLayout, LxScope};
-    /// let mut kept = None;
-    /// let _ = BundleLayout::lx_op_local_pair(
-    ///     None,
-    ///     &mut LxScope::for_test(),
-    ///     PlaceId::Act(7).synth(SynthRole::Rinv),
-    ///     &[64, 64],
-    ///     |pin| {
-    ///         kept = Some(pin); // borrowed data escapes the closure
-    ///         Ok::<_, String>(((), ()))
-    ///     },
-    /// );
-    /// let _ = kept;
-    /// ```
-    pub fn lx_op_local_pair<W, R, E>(
+    /// Claim one op-local pin for one program: its class is checked against the program's
+    /// [`LxScope`] (one pin per class per program, with or without a layout), and on a layout the
+    /// pin is slotted ([`Self::synth_lx_op_local`]). Returns the pin's operand spelling. Reached
+    /// only from [`crate::emit::lx_op_local_pair`], which builds the pin's writer and reader from it
+    /// and lets the spelling go no further.
+    pub(crate) fn claim_op_local(
         layout: Option<&BundleLayout>,
         scope: &mut LxScope,
         id: PlaceId,
-        dims: &[u32],
-        build: impl FnOnce(&OpLocalPin) -> Result<(W, R), E>,
-    ) -> Result<(W, R), E>
-    where
-        E: From<String>,
-    {
-        let pin = OpLocalPin {
-            name: crate::placement::syn(layout, id),
-        };
+        shape: OpLocalShape,
+    ) -> Result<String, String> {
+        let name = crate::placement::syn(layout, id);
         // The pin's class, stated once: the slot it shares and the program's one-per-class rule
-        // both key on it, with or without a layout to place it in.
-        let class = OpLocalClass::of(dims);
+        // both key on it.
+        let class = OpLocalClass::of(shape);
         if let Some(first) = scope.classes.get(&class) {
-            return Err(E::from(format!(
-                "op-local LX pins '{first}' and '{}' are both of the {}-byte class in ONE \
+            return Err(format!(
+                "op-local LX pins '{first}' and '{name}' are both of the {}-byte class in ONE \
                  program: the class's one shared slot alternates only across programs, and \
                  within one program (one SDSC phase) dxp may order the two chains' descriptors \
                  either way, so the second writer could land on the first pin before its \
                  reader runs. Give one of them its own program, or its own class.",
-                pin.name,
                 class.bytes()
-            )));
+            ));
         }
-        scope.classes.insert(class, pin.name.clone());
+        scope.classes.insert(class, name.clone());
         if let Some(l) = layout {
             l.synth_lx_op_local(id, class);
         }
-        build(&pin)
+        Ok(name)
+    }
+
+    /// [`Self::claim_op_local`] for a fixture that reads an op-local pin's windows without a
+    /// writer or reader of its own (the window mint's bounds). Test builds only.
+    #[cfg(feature = "test-support")]
+    pub fn claim_op_local_for_test(
+        &self,
+        scope: &mut LxScope,
+        id: PlaceId,
+        shape: OpLocalShape,
+    ) -> Result<String, String> {
+        Self::claim_op_local(Some(self), scope, id, shape)
     }
 
     /// Declare a synthetic intermediate LX-resident CORE-LOCALLY: every core holds only ITS OWN work
