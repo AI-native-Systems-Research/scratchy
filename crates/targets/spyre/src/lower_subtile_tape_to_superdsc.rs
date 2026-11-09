@@ -7450,7 +7450,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     let err = |e: SuperDscError| std::io::Error::other(e.0);
     let bake = || bake_layout(layout);
     Ok(if cfg!(feature = "spyre-lower") {
-        let rendered = render_bundle(ops, fold, Some(layout), attn_params, dump).map_err(err)?;
+        let rendered = render_bundle(ops, fold, Some(layout), attn_params).map_err(err)?;
         let layout_baked = bake();
         let fp = {
             let _pc = crate::pc::Pc::start("fp");
@@ -8134,7 +8134,6 @@ pub fn render_bundle<T: ktir_superdsc::collective::Tp>(
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-    dump: DumpRoot<'_>,
 ) -> Result<RenderedBundle<T>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
@@ -8461,7 +8460,7 @@ fn stage_bundle<T: ktir_superdsc::collective::Tp>(
         // The rung is named by the bundle's name and its own programs (`per_program`): the dump
         // restates no geometry the programs already carry.
         let mut progs: Vec<(String, usize)> = Vec::new();
-        for (name, range) in &per_prog {
+        for (name, range) in per_prog {
             progs.push((name.clone(), range.len()));
         }
         // The segment budget's verdict rides the identity for the same reason: on a green
@@ -10958,7 +10957,8 @@ mod name_tests {
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 64, 384),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let rendered = render_dxp_input(&[op.shallow_copy()], FoldGrouping::Split).unwrap();
         let shifts = launch_index(&[op], FoldGrouping::Split);
         let named = |layout: &bundle::BundleLayout<'_>| {
