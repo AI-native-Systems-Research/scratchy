@@ -2611,3 +2611,144 @@ mod index_select_tests {
             "a one-stick landing is the flat frame's own bytes, at any batch count"
         );
     }
+}
+
+#[cfg(test)]
+mod expand_blocks_tests {
+    use super::*;
+
+    /// ⭐ granite's Kᵀ for the prompt trip: 8 kv heads' `[64, 128]` blocks, each laid for its 4 query
+    /// heads. Core `kv·4 + g` reads kv head `kv`'s block and writes query head `kv·4 + g`'s.
+    #[test]
+    fn each_query_head_gets_its_kv_heads_block() {
+        let op = expand_blocks_opspec(
+            "Tensor0",
+            "Tensor1",
+            ExpandedBlocks {
+                batch: 8,
+                group: 4,
+                rows: 64,
+                cols: 128,
+            },
+        )
+        .expect("the expansion builds");
+        assert_eq!(op.iter.cores_used().get(), 32, "one block a core");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let v = serde_json::to_value(
+            crate::emit::emit_sdsc("expand_o1", &op, &folds, None).expect("it emits"),
+        )
+        .expect("json");
+        let tree = v["dscs_"][0]["expand_o1"]["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .clone();
+        let starts = |i: usize| -> Vec<u64> {
+            let data = &tree[i]["startAddressCoreCorelet_"]["data_"];
+            let at = |c: u32| -> u64 {
+                data[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            };
+            (0..32).map(|c| at(c) - at(0)).collect()
+        };
+        let block = 64 * 128 * 2;
+        assert_eq!(
+            starts(0),
+            (0..32u64).map(|c| c / 4 * block).collect::<Vec<_>>(),
+            "kv head c/4's block"
+        );
+        assert_eq!(
+            starts(1),
+            (0..32u64).map(|c| c * block).collect::<Vec<_>>(),
+            "query head c's block"
+        );
+        for n in &tree[..2] {
+            assert_eq!(
+                n["layoutDimOrder_"],
+                serde_json::json!(["y", "out", "x", "mb"]),
+                "stick-major blocks"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod index_stick_tests {
+    use super::*;
+    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+
+    /// Each core's index start, in core order, of a one-stick-sub-row gather of `entries` rows.
+    fn index_starts(entries: u32) -> Vec<u64> {
+        let op = page_gather_copy_opspec(
+            "Tensor0",
+            "Tensor2",
+            GatherIndex::of_scratch_rows(
+                "Tensor1".into(),
+                PageExtent::of_positions(1),
+                EntryBase::ZERO,
+            ),
+            entries,
+            64,
+            GatheredWords::Fp16,
+        )
+        .expect("the gather builds");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let v = serde_json::to_value(
+            crate::emit::emit_sdsc("gather_o2", &op, &folds, None).expect("it emits"),
+        )
+        .expect("json");
+        let dsc = &v["dscs_"][0]["gather_o2"];
+        let index = dsc["scheduleTree_"]
+            .as_array()
+            .expect("a tree")
+            .iter()
+            .find(|n| n["indirectAllocType_"] == "index_tensor")
+            .expect("the index");
+        let data = &index["startAddressCoreCorelet_"]["data_"];
+        (0..op.iter.cores_used().get())
+            .map(|c| {
+                data[format!("[{c}, 0, 0]")]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("a concrete start")
+            })
+            .collect()
+    }
+
+    /// ⭐ torch-spyre's 512-entry query gather: past one index stick, each core's index starts at
+    /// the stick holding its entries — here 16 entries a core over 32 cores, so cores `2s` and
+    /// `2s + 1` share stick `s`, 128 bytes a stick.
+    #[test]
+    fn each_core_reads_the_index_stick_holding_its_entries() {
+        let starts = index_starts(512);
+        assert_eq!(starts.len(), 32, "16 entries a core");
+        for (c, &s) in starts.iter().enumerate() {
+            assert_eq!(s - starts[0], (c as u64 / 2) * 128, "core {c}");
+        }
+    }
+
+    /// One stick of entries keeps ONE start for every core, as every gather before it did: dxp reads
+    /// each core's entries inside that stick.
+    #[test]
+    fn a_one_stick_index_has_one_start() {
+        let starts = index_starts(32);
+        assert_eq!(starts.len(), 32);
+        assert!(starts.iter().all(|&s| s == starts[0]), "{starts:?}");
+    }
+
+    /// The runs one op each serves: up to 32 cores of one stick, cut at a whole stick where no
+    /// division keeps every core within one.
+    #[test]
+    fn the_index_runs_fill_every_core_a_stick() {
+        use crate::emit::lower_ktir_to_superdsc::index_runs;
+        assert_eq!(index_runs(8), vec![(0, 8)]);
+        assert_eq!(index_runs(512), vec![(0, 512)]);
+        assert_eq!(
+            index_runs(4096),
+            vec![(0, 1024), (1024, 1024), (2048, 1024), (3072, 1024)]
+        );
+        assert_eq!(index_runs(33), vec![(0, 32), (32, 1)]);
+        assert_eq!(index_runs(1027), vec![(0, 1024), (1024, 3)]);
+    }
+}
