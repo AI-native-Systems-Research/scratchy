@@ -40,8 +40,6 @@ spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scrat
 # path and refused where it does not lower, and no device image. What CI runs for a card's ladder.
 spyre-lower = ["spyre", "scratchy-target-spyre/spyre-lower"]
 spyre-hw = ["spyre-lower", "scratchy-target-spyre/spyre-hw"]
-# Write each baked bundle's dxp input under the expanding crate's OUT_DIR (the target's `superdsc-dump`).
-superdsc-dump = ["spyre", "scratchy-target-spyre/superdsc-dump"]
 # THE EMULATOR — and with it the bake-time NUMERIC GATE: every decode bundle
 # the macro bakes runs on ktir-emulator under the synthetic probe and is
 # compared against the reference semantics of the same dsl_math; divergence

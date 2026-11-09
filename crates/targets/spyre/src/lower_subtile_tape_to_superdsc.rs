@@ -7126,6 +7126,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
     {
@@ -7153,7 +7154,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     }
     let b = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params)?
+        emit_bundle_inner(ops, layout, fold, attn_params, dump)?
     };
     debug_assert_eq!(
         b.fp, fp,
@@ -7429,6 +7430,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> std::io::Result<EmittedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
@@ -7464,7 +7466,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
     let groups = if cfg!(feature = "spyre-lower") {
         PendingGroups::Staged(
-            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params)
+            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params, dump)
                 .map_err(|e| std::io::Error::other(e.0))?,
         )
     } else {
@@ -8100,19 +8102,25 @@ pub fn ktir_groups<T: ktir_superdsc::collective::Tp>(
     Ok(out)
 }
 
-/// Where a `superdsc-dump` build writes each bundle's dxp input: `<OUT_DIR>/superdsc-dump/<fp>/` —
-/// the expanding crate's own build directory, the one cargo hands the build script and the one the
-/// device images are already written to (`include_bytes!`). Asked for anywhere but inside a build
-/// script's expansion, there is no such directory, and the dump refuses rather than pick one.
-#[cfg(feature = "superdsc-dump")]
-fn superdsc_dump_root() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_else(|| {
-        panic!(
-            "`superdsc-dump` writes under the expanding crate's OUT_DIR, and this bake runs \
-             outside a build script (no OUT_DIR): there is no build directory to write to"
-        )
-    }))
-    .join("superdsc-dump")
+/// Where a bake writes each bundle's dxp input, when the build asks it to — the directory the BUILD
+/// passes in (the build script's own `OUT_DIR`, the one place that knows it: `compile_carrier`'s
+/// caller), never a path this crate reads from the environment. `None`: write nothing (every caller
+/// outside a build script, and every build without the `superdsc-dump` feature).
+#[derive(Clone, Copy, Debug)]
+pub struct DumpRoot<'a>(Option<&'a std::path::Path>);
+
+impl<'a> DumpRoot<'a> {
+    /// No dump.
+    pub const NONE: DumpRoot<'static> = DumpRoot(None);
+
+    /// Dump under `<dir>/superdsc-dump/<fp>/` — `dir` is the build's own output directory.
+    pub fn under(dir: &'a std::path::Path) -> Self {
+        DumpRoot(Some(dir))
+    }
+
+    fn bundle_dir(self, fp: &str) -> Option<std::path::PathBuf> {
+        self.0.map(|d| d.join("superdsc-dump").join(fp))
+    }
 }
 
 /// The card's counterpart to [`ktir_groups`] (`-Fspyre-lower`, and so `-Fspyre-hw`): the SAME per-op
@@ -8143,6 +8151,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
@@ -8355,19 +8364,18 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // which run on this same card. Byte-equality against a known-good dump is what localised a layout
     // defect in this repo before; reasoning about paged addressing is what has not.
     //
-    // ⭐ AN OUTPUT A BUILD ASKS FOR BY NAME — the `superdsc-dump` FEATURE, off by default, and the
-    // directory is the build's own (`<OUT_DIR>/superdsc-dump`, never `/tmp`). It is
-    // not a behaviour toggle: what the bake lowers and refuses is the same with it on or off; it only
-    // decides whether the descriptors the bake already rendered are also written where a person can
-    // diff them. A CI lowering check (`spyre-lower`) writes nothing.
+    // ⭐ AN OUTPUT A BUILD ASKS FOR BY NAME — `dump` ([`DumpRoot`]), passed in by the build: the
+    // `superdsc-dump` feature makes the build script hand its own `OUT_DIR` here (never `/tmp`,
+    // never an environment read). It is not a behaviour toggle: what the bake lowers and refuses is
+    // the same with it on or off; it only decides whether the descriptors the bake already rendered
+    // are also written where a person can diff them. A CI lowering check (`spyre-lower`) writes
+    // nothing.
     // ⛔ `fold`, NOT A HARDCODED `Split`. This read `FoldGrouping::Split` unconditionally, so a FUSED
     // twin's dump directory was its split's partition under the twin's name — the one thing about a
     // twin that differs (where the group boundaries fall) was the one thing the dump could not show,
     // and a diff of the two dirs came back "identical" no matter what the bake actually did.
-    #[cfg(feature = "superdsc-dump")]
-    {
+    if let Some(dump) = dump.bundle_dir(fp) {
         let _pc = crate::pc::Pc::start("dump");
-        let dump = superdsc_dump_root().join(fp);
         if let Err(e) = write_rendered_dxp_input(&dump, &rendered) {
             eprintln!(
                 "  [superdsc-dump] {fp}: could not write {}: {e}",

@@ -525,9 +525,14 @@ impl std::fmt::Display for CarrierError {
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
+///
+/// `dump_dir`: where a spyre bake writes each bundle's dxp input — the build script's own output
+/// directory when its build asked for the dump (`superdsc-dump`), else `None` (no dump). The caller
+/// is the one place that knows the directory, so the bake never reads the environment for it.
 pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
+    dump_dir: Option<&std::path::Path>,
 ) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
@@ -1099,6 +1104,7 @@ pub fn compile_carrier(
             sm.tp_world_size,
             mode.emit_arch_dispatch,
             canonical_affine_rows,
+            dump_dir,
         );
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);

@@ -970,6 +970,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         Some(&layout),
         superdsc::FoldGrouping::Split,
         None,
+        superdsc::DumpRoot::NONE,
     );
     assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");
 }
