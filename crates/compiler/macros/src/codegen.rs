@@ -9877,6 +9877,41 @@ fn emit_superdsc_wiring(
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
             let (q_width, head_size) = (u32l(p.q_width), u32l(p.head_size));
+            // ⭐ THE EXTENT PAIR, re-minted in the wiring's own static by the ONE mint
+            // (`QueryExtent::of_baked_rung`, the same constructor the bake's codegen minted
+            // the pair by) — const, so the static carries it. Every `None` arm names a pair
+            // that does not describe a rung, which the bake's own mint already refused, so it
+            // is a build failure here and never a runtime fact (const panic takes a literal, so
+            // the messages are). The types ride the spyre crate's own wiring re-export (the
+            // models crate does not name `scratchy-subtile` directly).
+            let (ew, es) = (
+                u32l(p.extent.per_request().get()),
+                u32l(p.extent.requests().get()),
+            );
+            let extent = quote! {
+                match ::scratchy_target_spyre::wiring::QueryExtent::of_baked_rung(
+                    match ::scratchy_target_spyre::wiring::RungWidth::of_baked_rows(#ew) {
+                        ::core::option::Option::Some(w) => w,
+                        ::core::option::Option::None => ::core::panic!(
+                            "the wiring's per-request width does not name a baked rung — a bake \
+                             bug this static cannot carry"
+                        ),
+                    },
+                    match ::scratchy_target_spyre::wiring::RungCap::of_baked_seqs(#es) {
+                        ::core::option::Option::Some(s) => s,
+                        ::core::option::Option::None => ::core::panic!(
+                            "the wiring's request count does not name a baked rung — a bake bug \
+                             this static cannot carry"
+                        ),
+                    },
+                ) {
+                    ::core::option::Option::Some(e) => e,
+                    ::core::option::Option::None => ::core::panic!(
+                        "the wiring's query extent does not name a baked rung — a bake bug this \
+                         static cannot carry"
+                    ),
+                }
+            };
             let paged_rows = match p.paged_rows {
                 scratchy_target_spyre::paged_step::PagedRows::Batch => {
                     quote! { ::scratchy_target_spyre::paged_step::PagedRows::Batch }
@@ -9892,6 +9927,7 @@ fn emit_superdsc_wiring(
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, q_width: #q_width,
                     head_size: #head_size, walk: #walk,
                     paged_rows: #paged_rows,
+                    extent: #extent,
                 })
             }
         }

@@ -28,6 +28,12 @@ pub use ktir_superdsc::element_arrangement::{
 use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_tensors::GpuTensor;
 
+// The query's extent pair and its two halves, re-exported for the wiring's own emission: the
+// models crate (where `#[forward]` expands) names every wiring type through this crate's root,
+// and `PagedStep` carries the pair ([`PagedStep::extent`]) — so its literal needs the types in
+// reach through the same prefix every other wiring type uses.
+pub use scratchy_subtile::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
+
 // ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
 // whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
 // to hold "the ONE site that spells an operand" — so this was simply left behind when `PlaceId` and
@@ -677,6 +683,15 @@ pub struct PagedStep {
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
     pub paged_rows: crate::paged_step::PagedRows,
+    /// ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(per-request width, capacity)`, minted once
+    /// at the bake from the rung (never a division of [`Self::rows`]) and threaded here so the
+    /// card stager and the layout state the per-request laws off the ONE pair the splice already
+    /// checks against the graph ([`QueryExtent`]'s own doc). The pair's held product IS
+    /// `rows` — the two are one fact in two spellings, pinned at the one mint
+    /// ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]'s agreement check) and maintained
+    /// by [`Self::on_body`]'s own re-mint, so a `PagedStep` can never carry a pair its rows
+    /// disagree with.
+    pub extent: QueryExtent,
 }
 
 impl PagedStep {
@@ -726,17 +741,42 @@ impl PagedStep {
     /// card holds the trip's page ids at: the relaunch shifts every step source in the activation
     /// segment by that one step (`loop_fold`'s pitched index table). The stack is stick-major
     /// (`paged_step::card_mask`), so one trip's tile is its rows' sticks in every plane of it, 128 B
-    /// a row: `rows` of them for one sequence (`[rows, page_slots]`),
-    /// so page table row `i` sits at `i · rows · 128` B (one int32 stick at decode), and
-    /// `entries` of them for a decode batch (`[J, B, 1, 1, page_slots]`: one row per block slot and
+    /// a row: one request's `per_request` rows for a sequence's step (`[w, page_slots]` — at one
+    /// request the extent's width IS the graph's rows, so the pitch is unchanged there), so page
+    /// table row `i` sits at `i · w · 128` B (one int32 stick at decode), and `entries` of them for
+    /// a decode batch (`[J, B, 1, 1, page_slots]`: one row per block slot and
     /// sequence, every kv head reading it through the kernel's broadcast), so chunk `c`'s ids sit at
     /// `c · entries · 128` B.
     pub const fn card_walk_step(self) -> u64 {
         let rows = match self.batch() {
             Some(c) => c.entries(),
-            None => self.rows,
+            None => self.extent.per_request().get(),
         };
         rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
+    }
+
+    /// ⭐ THE REQUEST BLOCK'S PITCH — the stride the step's three tables (page table, mask stack,
+    /// query rows) repeat each request's block at within their placements: request `r`'s copy of
+    /// every one of them sits `r · P` bytes past its placement's start, so ONE shift of the
+    /// activation segment — `r · P` plus the walk's own `t · card_walk_step` — selects request
+    /// `r`'s block in all three at once (the card's seven bound addresses hold one base per
+    /// segment, so the tables cannot take an address each; the pitch is how one base serves them
+    /// all).
+    ///
+    /// `P` is the largest of the three PER-REQUEST sizes — each table's placement is its own
+    /// region, so the pitch only has to keep one request's block clear of the next's within a
+    /// region — aligned up to a whole 128-byte stick, so every request's block starts where both
+    /// the int32 sticks and the mask's fp16 sticks tile. At one request (`S = 1`, every rung
+    /// today) the pitch is never added and nothing moves.
+    pub fn card_request_pitch(self) -> u64 {
+        let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
+        let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
+        let w = u64::from(self.extent.per_request().get());
+        let slots = u64::from(self.page_slots);
+        let page_table = u64::from(self.pages) * self.card_walk_step();
+        let mask = u64::from(self.pages) * w * slots * 2;
+        let query_rows = sticks(w);
+        page_table.max(mask).max(query_rows).div_ceil(128) * 128
     }
 
     /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at
@@ -789,23 +829,32 @@ impl PagedStep {
                     ),
                 ]);
             }
-            None => v.extend([
-                (
-                    self.page_table,
-                    CardSeat::Step,
-                    u64::from(self.pages) * self.card_walk_step(),
-                ),
-                (
-                    self.mask,
-                    CardSeat::Step,
-                    u64::from(self.pages) * u64::from(self.rows) * slots * 2,
-                ),
-                (
-                    self.query_rows,
-                    CardSeat::Step,
-                    sticks(u64::from(self.rows)),
-                ),
-            ]),
+            None => {
+                // ⭐ THE SEQUENCE TABLES' OWN REGION EACH, SIZED FOR THE RUNG'S WHOLE CAPACITY:
+                // one request's block (the per-request size — the pool's whole walk, as ever) plus
+                // `(S - 1) · card_request_pitch()` for the requests behind it, so request `r`'s
+                // copy sits `r · P` past the region's start ([`Self::card_request_pitch`]) and the
+                // regions stay disjoint by their own packing order (write rows, page table, mask,
+                // query rows — the three tables contiguous and last in the segment). At one
+                // request the spare is zero and every size is the per-request one — the layout
+                // every rung today bakes, byte for byte.
+                let w = u64::from(self.extent.per_request().get());
+                let spare =
+                    (u64::from(self.extent.requests().get()) - 1) * self.card_request_pitch();
+                v.extend([
+                    (
+                        self.page_table,
+                        CardSeat::Step,
+                        u64::from(self.pages) * self.card_walk_step() + spare,
+                    ),
+                    (
+                        self.mask,
+                        CardSeat::Step,
+                        u64::from(self.pages) * w * slots * 2 + spare,
+                    ),
+                    (self.query_rows, CardSeat::Step, sticks(w) + spare),
+                ]);
+            }
         }
         if self.reads_kv_row_pool() {
             v.extend([
@@ -828,6 +877,15 @@ impl PagedStep {
     /// prompt-width rung is the same tape baked at `rows` rows), walking the blocks the body sweeps:
     /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
     /// `None` when `swept` is no walk of this pool.
+    ///
+    /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, by the launch's own kind — never a comparison
+    /// against the wiring's stated pair. The wiring states ONE representative of a tape the
+    /// ladders bake at several widths (the prefill ladder's rungs all bind the same tensor ids,
+    /// so one wiring serves them; `rows` here is the rung actually launching), and the runtime
+    /// truth is what the launch itself is: a `Sequence` launch is ONE request of `rows` rows —
+    /// `(rows, 1)` — and a `Batch` launch is one row per request — `(1, rows)`. Both are the
+    /// same law the bake's codegen minted each rung's own pair by, so a launch on the
+    /// representative's own width re-derives the wiring's pair exactly.
     pub fn on_body(
         self,
         rows: u32,
@@ -835,11 +893,20 @@ impl PagedStep {
         swept: u32,
     ) -> Option<PagedStep> {
         let walk = swept / self.page_slots;
+        let extent = match paged_rows {
+            crate::paged_step::PagedRows::Sequence => {
+                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
+            }
+            crate::paged_step::PagedRows::Batch => {
+                QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
+            }
+        };
         (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
             .then_some(PagedStep {
                 rows,
                 paged_rows,
                 walk,
+                extent,
                 ..self
             })
     }

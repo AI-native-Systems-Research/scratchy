@@ -248,7 +248,15 @@ pub(crate) fn run_card_launch(
         })?;
     let card = match &rows_in {
         LaunchRows::Sequence { blocks, rows } => {
-            scratchy_target_spyre::paged_step::card_step_sources(&step, blocks, rows)
+            // One request's list: a sequence launch is one request today — the packing that
+            // widens this list is the concurrent-prefill rung's own step, not this front's.
+            scratchy_target_spyre::paged_step::card_step_sources(
+                &step,
+                &[scratchy_target_spyre::paged_step::RequestStep {
+                    blocks,
+                    rows: *rows,
+                }],
+            )
         }
         LaunchRows::Batch { seqs } => {
             scratchy_target_spyre::paged_step::card_batch_sources(&step, seqs)

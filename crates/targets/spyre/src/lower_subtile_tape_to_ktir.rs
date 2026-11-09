@@ -1579,10 +1579,15 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 /// `active_cap` is the rung the bundle is baked at: its walk ([`scratchy_triton_splice::walk_pages`],
 /// the splice's own law) is the one fact of the step that depends on it. `paged_rows` says whether
 /// the rows are a decode batch, whose chunking of that walk the batched kernel reads.
+/// `query_rows` is the rung's minted extent pair — the ONE mint (the bake's codegen, off the rung
+/// itself, never a division of the graph's rows), checked here against the graph it describes: the
+/// pair's held product must equal the attention's `mq` rows, and a pair that does not is refused by
+/// name — a bake bug, never a silently-wrong per-request width the layout would size by.
 pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
     let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
@@ -1609,6 +1614,17 @@ pub fn paged_step_of_ir<F: RopeForm>(
             )));
         }
         let (pages, mq) = (rows / slots, n.output.region.rows.len);
+        if query_rows.graph_rows().get() != mq {
+            return Err(SuperDscError(format!(
+                "AttnDecode t{}: the graph runs {mq} query row(s) but the rung's minted extent \
+                 states {} ({} per request, {} request(s)) — the mint and the graph disagree, a \
+                 bake bug named here",
+                n.output.tensor.index(),
+                query_rows.graph_rows().get(),
+                query_rows.per_request().get(),
+                query_rows.requests().get(),
+            )));
+        }
         let walk = scratchy_triton_splice::walk_pages(pages, mq, active_cap);
         let step = crate::wiring::PagedStep {
             mask: tids.mask,
@@ -1628,6 +1644,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             head_size: attention.class(mask.class()).head_dim().get(),
             walk,
             paged_rows,
+            extent: query_rows,
         };
         match out {
             Some(prev) if prev != step => {
@@ -1811,7 +1828,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // union of its matmul consumers' view regions (the widen keeps the tied embed
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
-    let paged = paged_step_of_ir(ir, active_cap, paged_rows)?;
+    let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows)?;
     let attn_mask = match (mask, paged) {
         (Some((mid, cap)), Some(p)) => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own

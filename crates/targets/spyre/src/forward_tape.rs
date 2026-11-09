@@ -582,6 +582,23 @@ mod tests {
         head_size: 64,
         walk: 4,
         paged_rows: crate::paged_step::PagedRows::Sequence,
+        // One request of the graph's 3 rows — the mint's own spelling, const: the pair's held
+        // product IS the `rows` above, and each `None` arm is a fixture bug the const panic
+        // names (const panic takes a literal, so the messages are).
+        extent: match crate::wiring::QueryExtent::of_baked_rung(
+            match crate::wiring::RungWidth::of_baked_rows(3) {
+                ::core::option::Option::Some(w) => w,
+                ::core::option::Option::None => {
+                    ::core::panic!("the fixture's three rows are a baked width")
+                }
+            },
+            crate::wiring::RungCap::ONE,
+        ) {
+            ::core::option::Option::Some(e) => e,
+            ::core::option::Option::None => {
+                ::core::panic!("the fixture's three rows by one request name a rung")
+            }
+        },
     };
 
     fn shape() -> ForwardShape {
@@ -625,7 +642,14 @@ mod tests {
     #[test]
     fn the_paged_steps_are_the_card_steps_tables() {
         let rows = crate::paged_step::StepRows::new(9, 3).expect("three rows is three rows");
-        let card = crate::paged_step::card_step_sources(&STEP, &[3, 1, 0], &rows).expect("staged");
+        let card = crate::paged_step::card_step_sources(
+            &STEP,
+            &[crate::paged_step::RequestStep {
+                blocks: &[3, 1, 0],
+                rows,
+            }],
+        )
+        .expect("staged");
         let inp = inputs(Some(&card));
         for t in [STEP.page_table, STEP.write_rows, STEP.query_rows] {
             match staged(ForwardKernel::Paged, t, &inp).expect("a table") {
