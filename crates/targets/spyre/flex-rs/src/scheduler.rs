@@ -69,7 +69,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -4341,32 +4341,16 @@ fn submit_to_hardware(
         // `EvalResponseBlockStatus`, which is what the *graph* scheduler and
         // the data-transfer paths use: this one treats TIMED_OUT, cancel, and
         // any status other than `RB_GOOD` as a hardware error.
-        if let Some(e) = eval_cb_complete_status(pr).failure() {
-            tracing::warn!("Response block error: {e}");
-            *gate_for_cb.hw_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-        }
+        let hw_err = eval_cb_complete_status(pr)
+            .failure()
+            .inspect(|e| tracing::warn!("Response block error: {e}"))
+            .map(|e| Box::new(e) as SchedulerError);
 
         // `recordPipelineProfiler`'s `--{compute,dmai,dmao}_in_flight_`.
         state_for_cb.dec_in_flight(pipeline);
 
         // "Call the completion callback only when all CBs are done."
-        if gate_for_cb.remaining.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(cb) = gate_for_cb
-                .user_cb
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take()
-        {
-            let err = gate_for_cb
-                .hw_error
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
-            match err {
-                Some(e) => cb(Err(Box::new(e))),
-                None => cb(Ok(())),
-            }
-        }
+        gate_for_cb.settle(hw_err);
     });
 
     if let Err(e) = worker.queue_cbs(
@@ -4400,7 +4384,7 @@ fn submit_to_hardware(
 /// and does nothing, matching the previous three-cell layout's behavior.
 struct GroupedSubmit {
     remaining: std::sync::atomic::AtomicU64,
-    hw_error: Mutex<Option<CbCompleteError>>,
+    hw_error: Mutex<Option<SchedulerError>>,
     user_cb: Mutex<Option<CompletionCallback>>,
 }
 
@@ -4410,6 +4394,37 @@ impl GroupedSubmit {
             remaining: std::sync::atomic::AtomicU64::new(num_cbs),
             hw_error: Mutex::new(None),
             user_cb: Mutex::new(Some(callback)),
+        }
+    }
+
+    /// Grow the group — a DMA transfer's per-chunk increments on top of the
+    /// submitter's sentinel, taken before the chunk is queued so a chunk that
+    /// completes while the loop is still queuing cannot drop the count to
+    /// zero early.
+    fn add(&self, n: u64) {
+        self.remaining.fetch_add(n, Ordering::AcqRel);
+    }
+
+    /// `if(--(*pending) == 0) (*cb)(ep);`: record the error (the most recent
+    /// one wins, which is the last member to complete whenever there is at
+    /// most one failure), count one member down, and fire the callback exactly
+    /// once when the group drains.
+    fn settle(&self, err: Option<SchedulerError>) {
+        if let Some(e) = err {
+            *self.hw_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(cb) = self.user_cb.lock().unwrap_or_else(|p| p.into_inner()).take()
+        {
+            let err = self
+                .hw_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            match err {
+                Some(e) => cb(Err(e)),
+                None => cb(Ok(())),
+            }
         }
     }
 }
@@ -4685,44 +4700,49 @@ impl DmaBuf {
     }
 }
 
-/// Port of `flex::DmaBufPool` (`scheduler_config.hpp:90-105`): the shared
-/// completion state of one multi-chunk transfer plus the recycled buffer
-/// queue. `pending` starts at 1 — "a sentinel held by the submitter", which
-/// `submitDma` drops after the last chunk has been QUEUED, so a transfer
-/// whose chunks all complete before the loop finishes still fires its
-/// callback exactly once.
+/// `flex::DmaBufPool`'s buffer half (`scheduler_config.hpp:90-105`), hoisted
+/// from per-transfer to backend lifetime: `DataTransferBufferCount` boxed
+/// `DmaBuf`s — shadow buffers and IOMMU mappings included — created once on
+/// first use and recycled across transfers. A transfer's completion
+/// accounting lives in the [`GroupedSubmit`] `submit_dma` starts at 1, not
+/// here; the C++ pool mixed the two, which is why it (and its multi-MB shadow
+/// allocations) died with every transfer.
 struct DmaBufPool {
     avail_bufs: Mutex<VecDeque<Box<DmaBuf>>>,
     avail_cv: Condvar,
-    pending: AtomicI64,
-    cb: Mutex<Option<CompletionCallback>>,
-    /// The `std::exception_ptr` a completing chunk forwards to
-    /// `(*cb)(ep)`. The real code hands the pool's callback whichever `ep`
-    /// belonged to the LAST chunk to complete; this keeps the most recent one
-    /// seen, which is the same thing whenever there is at most one failure.
-    error: Mutex<Option<SchedulerError>>,
+    /// How many buffers this pool has ever created — the cap on allocation,
+    /// not on population (quarantine replacements bypass it, keeping the
+    /// population constant for transfers still blocked in `acquire`).
+    created: AtomicU64,
 }
 
 impl DmaBufPool {
-    fn new(cb: CompletionCallback) -> Arc<Self> {
-        Arc::new(Self {
+    fn new() -> Self {
+        Self {
             avail_bufs: Mutex::new(VecDeque::new()),
             avail_cv: Condvar::new(),
-            pending: AtomicI64::new(1),
-            cb: Mutex::new(Some(cb)),
-            error: Mutex::new(None),
-        })
+            created: AtomicU64::new(0),
+        }
     }
 
-    /// `pool->avail_bufs.wait_dequeue(chunk_buf)` — block until a chunk
-    /// completes and hands its buffer back. This is the real backpressure on
-    /// how many chunks of one transfer are in flight at once:
-    /// `RuntimeConfig::DataTransferBufferCount()`.
-    fn wait_dequeue(&self) -> Box<DmaBuf> {
+    /// `pool->avail_bufs.wait_dequeue(chunk_buf)`: a recycled buffer if one
+    /// has come back, a fresh one while the pool is under
+    /// `RuntimeConfig::DataTransferBufferCount()`, else block until a chunk
+    /// completes and hands its buffer back. That blocking is the real
+    /// backpressure on how many chunks of one transfer are in flight at once.
+    /// The flag says whether the buffer is fresh — what `setup_dma_buf` uses
+    /// to force the shadow-buffer allocation instead of reusing the previous
+    /// occupant's.
+    fn acquire(&self) -> (Box<DmaBuf>, bool) {
         let mut avail = self.avail_bufs.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(buf) = avail.pop_front() {
-                return buf;
+                return (buf, false);
+            }
+            let limit = RuntimeConfig::data_transfer_buffer_count().value();
+            if self.created.load(Ordering::Acquire) < limit {
+                self.created.fetch_add(1, Ordering::AcqRel);
+                return (Box::new(DmaBuf::new()), true);
             }
             let (guard, _timeout) = self
                 .avail_cv
@@ -4747,22 +4767,6 @@ impl DmaBufPool {
             .unwrap_or_else(|e| e.into_inner())
             .push_back(buf);
         self.avail_cv.notify_one();
-    }
-
-    /// `if(--(*pending) == 0) (*cb)(ep);`
-    fn release(&self, err: Option<SchedulerError>) {
-        if let Some(e) = err {
-            *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-        }
-        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(cb) = self.cb.lock().unwrap_or_else(|p| p.into_inner()).take()
-        {
-            let err = self.error.lock().unwrap_or_else(|p| p.into_inner()).take();
-            match err {
-                Some(e) => cb(Err(e)),
-                None => cb(Ok(())),
-            }
-        }
     }
 }
 
@@ -4797,6 +4801,8 @@ pub struct PfBackend {
     /// `DmaBuf`: once parked, un-parking is unconstructable rather than merely
     /// undone-by-convention.
     dma_quarantine: Arc<Mutex<Vec<QuarantinedBuf>>>,
+    /// The backend-lifetime DMA chunk buffer pool — see [`DmaBufPool`].
+    dma_bufs: Arc<DmaBufPool>,
 }
 
 /// One iteration of `submitDma`'s chunking loop: where this piece starts in the
@@ -4827,6 +4833,7 @@ impl PfBackend {
             iommu_mapper,
             response_worker: std::sync::OnceLock::new(),
             dma_quarantine: Arc::new(Mutex::new(Vec::new())),
+            dma_bufs: Arc::new(DmaBufPool::new()),
         }
     }
 
@@ -4849,8 +4856,7 @@ impl PfBackend {
         dma: &DmaParams,
         resolved_chunk: &ResolvedChunk,
         chunk: DmaChunk,
-        bufs_created: &mut u64,
-        pool: &Arc<DmaBufPool>,
+        group: &Arc<GroupedSubmit>,
     ) -> Result<(), SchedulerError> {
         let DmaChunk {
             hmva,
@@ -4860,15 +4866,9 @@ impl PfBackend {
             pipeline,
         } = chunk;
         let to_device = dma.direction() == DmaDirection::HostToDevice;
-        // `bool new_buf = bufs_created < RuntimeConfig::DataTransferBufferCount();`
-        let new_buf = *bufs_created < RuntimeConfig::data_transfer_buffer_count().value();
-        let mut chunk_buf = if new_buf {
-            *bufs_created += 1;
-            Box::new(DmaBuf::new())
-        } else {
-            // "Waiting for DMA chunk buffer to free up."
-            pool.wait_dequeue()
-        };
+        // "Waiting for DMA chunk buffer to free up." — the backend's pool
+        // recycles buffers (and their shadow allocations) across transfers.
+        let (mut chunk_buf, new_buf) = self.dma_bufs.acquire();
 
         chunk_buf.setup_dma_buf(
             DmaBufRequest {
@@ -4887,8 +4887,9 @@ impl PfBackend {
 
         // `++(*pool->pending);` before submitting, so a chunk that completes
         // while the loop is still queuing cannot drop the count to zero.
-        pool.pending.fetch_add(1, Ordering::AcqRel);
-        let pool_for_cb = pool.clone();
+        group.add(1);
+        let pool_for_cb = self.dma_bufs.clone();
+        let group_for_cb = group.clone();
         let quarantine = self.dma_quarantine.clone();
         let worker = self.response_worker().clone();
         submit_to_hardware(
@@ -4927,7 +4928,7 @@ impl PfBackend {
                     // allocate/map path from scratch. It has never been handed
                     // to hardware, hence the other constructor.
                     pool_for_cb.enqueue(Box::new(DmaBuf::new()), CbRetired::never_submitted());
-                    pool_for_cb.release(result.err());
+                    group_for_cb.settle(result.err());
                     return;
                 };
                 // "For D2H with an unaligned shadow buffer, copy result back
@@ -4951,7 +4952,7 @@ impl PfBackend {
                     }
                 }
                 pool_for_cb.enqueue(chunk_buf, retired);
-                pool_for_cb.release(result.err());
+                group_for_cb.settle(result.err());
             }),
             |tags| {
                 let mut cbs = worker.take_cb_buffer();
@@ -5027,8 +5028,11 @@ impl SchedulerBackend for PfBackend {
             !(hmva_base as u64).is_multiple_of(self.iommu_mapper.alignment() as u64);
         let max_buf_size = RuntimeConfig::data_transfer_buffer_size().value().max(1);
 
-        let pool = DmaBufPool::new(callback);
-        let mut bufs_created = 0u64;
+        // The transfer's completion group: `pending` starts at 1 — "a
+        // sentinel held by the submitter", dropped after the last chunk has
+        // been QUEUED, so a transfer whose chunks all complete before the
+        // loop finishes still fires its callback exactly once.
+        let group = Arc::new(GroupedSubmit::new(1, callback));
         let mut remaining = total_size;
         let mut offset = 0u64;
         while remaining != 0 {
@@ -5044,15 +5048,14 @@ impl SchedulerBackend for PfBackend {
                     buf_unaligned,
                     pipeline,
                 },
-                &mut bufs_created,
-                &pool,
+                &group,
             ) {
                 // The real `submitDmaChunk` throws (IOMMU mapping failure,
                 // CB build failure), which unwinds out of `submitDma` and is
                 // caught by `RuntimeScheduler::schedule`. Stop queuing and
-                // report through the pool so the already-queued chunks still
+                // report through the group so the already-queued chunks still
                 // get to complete first.
-                pool.release(Some(e));
+                group.settle(Some(e));
                 return;
             }
             remaining -= cur_size;
@@ -5060,7 +5063,7 @@ impl SchedulerBackend for PfBackend {
         }
         // "Decrement pending count; if all chunks already completed, invoke
         // callback now."
-        pool.release(None);
+        group.settle(None);
     }
 
     /// Port of `PfRuntimeScheduler::submitCompute` (`pf_runtime_scheduler.cpp:231-259`):
