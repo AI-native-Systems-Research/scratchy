@@ -214,26 +214,28 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let pin_rows = std::num::NonZeroU32::new(rows)
         .ok_or_else(|| format!("rmsnorm {prefix}: a norm needs at least one row"))?;
     let (rsqrt_op, xn_op) = crate::emit::lx_op_local_pair(
-        layout,
+        crate::emit::OpLocalPair {
+            id: out_id.synth(R::Rinv),
+            shape: crate::placement::OpLocalShape::rows_of_one_stick(pin_rows),
+            // 1/√(E[x²]+eps)
+            writer: crate::emit::PinWriter {
+                op_name: format!("rmrsqrt_{prefix}"),
+                op_func: "rsqrt",
+                inputs: vec![In::full(&meps).ew()],
+            },
+            reader: crate::emit::PinReader {
+                op_name: format!("rmxn_{prefix}"),
+                op_func: "multiply",
+                cols: f_cols,
+                before: vec![In::full(&x).ew()],
+                pin: crate::emit::PinRead::ColAt(crate::addr::DevOff::from_view_step(8)),
+                after: vec![],
+                out: &xn,
+            },
+        },
         lx_scope,
-        out_id.synth(R::Rinv),
-        crate::placement::OpLocalShape::rows_of_one_stick(pin_rows),
-        // 1/√(E[x²]+eps)
-        crate::emit::PinWriter {
-            op_name: format!("rmrsqrt_{prefix}"),
-            op_func: "rsqrt",
-            inputs: vec![In::full(&meps).ew()],
-        },
-        crate::emit::PinReader {
-            op_name: format!("rmxn_{prefix}"),
-            op_func: "multiply",
-            cols: f_cols,
-            before: vec![In::full(&x).ew()],
-            pin: crate::emit::PinRead::ColAt(crate::addr::DevOff::from_view_step(8)),
-            after: vec![],
-            out: &xn,
-        },
         sym_id_base,
+        layout,
     )
     .map_err(|e| e.0)?;
     ops.push(rsqrt_op);

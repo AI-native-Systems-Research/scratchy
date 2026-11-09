@@ -4954,6 +4954,18 @@ pub struct PinReader<'a, O: KindTag> {
     pub out: &'a Stk<O>,
 }
 
+/// ONE op-local pin as its pair states it: the pin's identity and its one shape, and the op that
+/// writes it and the op that reads it. Built once by the caller and handed to
+/// [`lx_op_local_pair`] whole, beside the lowering's own context (the program's scope, the symbol
+/// counter, the layout).
+pub struct OpLocalPair<'a, O: KindTag> {
+    pub id: crate::place::PlaceId,
+    /// The pin's one statement of its extents: non-zero one-stick rows.
+    pub shape: crate::placement::OpLocalShape,
+    pub writer: PinWriter<'a>,
+    pub reader: PinReader<'a, O>,
+}
+
 /// ⭐⭐⭐ THE ONE DOOR TO AN OP-LOCAL LX PIN — the pin, its writer and its reader as ONE construction,
 /// built here, so the pin's operand spelling never leaves this function.
 ///
@@ -4984,21 +4996,23 @@ pub struct PinReader<'a, O: KindTag> {
 /// };
 /// ```
 ///
-/// `shape` is the pin's one statement of its extents — `rows` non-zero one-stick rows. The writer
-/// sweeps exactly it, and the reader sweeps the same `rows` over its own `cols`.
+/// [`OpLocalPair::shape`] is the pin's one statement of its extents — `rows` non-zero one-stick
+/// rows. The writer sweeps exactly it, and the reader sweeps the same `rows` over its own `cols`.
 ///
 /// ⏳ `layout` is `Option<&BundleLayout>` only because every lowering still threads one; it becomes
 /// `&BundleLayout` when residency-v2 makes the layout non-optional at the door and the walk.
-#[allow(clippy::too_many_arguments)]
 pub fn lx_op_local_pair<T: crate::collective::Tp, O: KindTag>(
-    layout: Option<&BundleLayout>,
+    pair: OpLocalPair<'_, O>,
     scope: &mut crate::placement::LxScope,
-    id: crate::place::PlaceId,
-    shape: crate::placement::OpLocalShape,
-    writer: PinWriter<'_>,
-    reader: PinReader<'_, O>,
     sym: &mut i64,
+    layout: Option<&BundleLayout>,
 ) -> Result<(EmittedOp<T>, EmittedOp<T>), SuperDscError> {
+    let OpLocalPair {
+        id,
+        shape,
+        writer,
+        reader,
+    } = pair;
     let name = BundleLayout::claim_op_local(layout, scope, id, shape).map_err(SuperDscError)?;
     let pin = rb(&name, shape.rows(), shape.cols());
     let rows = crate::sdsc_abstract::RowCount::of_token_rows(shape.rows());

@@ -534,12 +534,11 @@ impl OpLocalShape {
 }
 
 impl OpLocalClass {
-    /// The class of a pin of shape `shape`: its fp16 footprint, 128-aligned.
+    /// The class of a pin of shape `shape`: its fp16 footprint, 128-aligned — `rows` one-stick
+    /// rows of `Df::Fp16`, so at least one 128-byte stick, with no floor: `rows` is non-zero by type.
     fn of(shape: OpLocalShape) -> OpLocalClass {
-        OpLocalClass(align128(synth_footprint_bytes(
-            &[shape.rows(), shape.cols()],
-            Df::Fp16,
-        )))
+        let stick_bytes = u64::from(shape.cols()) * u64::from(Df::Fp16.word_length());
+        OpLocalClass(align128(u64::from(shape.rows.get()) * stick_bytes))
     }
 
     /// The class's footprint in bytes — the slot every pin of it shares.
