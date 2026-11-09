@@ -8264,14 +8264,19 @@ pub fn ktir_groups<T: ktir_superdsc::collective::Tp>(
     Ok(out)
 }
 
-/// Where a `superdsc-dump` build writes each bundle's dxp input: the build's own target directory
-/// (`CARGO_TARGET_DIR`, else the workspace `target/`), under `superdsc-dump/<fp>/`.
+/// Where a `superdsc-dump` build writes each bundle's dxp input: `<OUT_DIR>/superdsc-dump/<fp>/` —
+/// the expanding crate's own build directory, the one cargo hands the build script and the one the
+/// device images are already written to (`include_bytes!`). Asked for anywhere but inside a build
+/// script's expansion, there is no such directory, and the dump refuses rather than pick one.
 #[cfg(feature = "superdsc-dump")]
 fn superdsc_dump_root() -> std::path::PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target"))
-        .join("superdsc-dump")
+    std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap_or_else(|| {
+        panic!(
+            "`superdsc-dump` writes under the expanding crate's OUT_DIR, and this bake runs \
+             outside a build script (no OUT_DIR): there is no build directory to write to"
+        )
+    }))
+    .join("superdsc-dump")
 }
 
 /// The card's counterpart to [`ktir_groups`] (`-Fspyre-lower`, and so `-Fspyre-hw`): the SAME per-op
@@ -8570,7 +8575,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // defect in this repo before; reasoning about paged addressing is what has not.
     //
     // ⭐ AN OUTPUT A BUILD ASKS FOR BY NAME — the `superdsc-dump` FEATURE, off by default, and the
-    // directory is the build's own (`<CARGO_TARGET_DIR or target>/superdsc-dump`, never `/tmp`). It is
+    // directory is the build's own (`<OUT_DIR>/superdsc-dump`, never `/tmp`). It is
     // not a behaviour toggle: what the bake lowers and refuses is the same with it on or off; it only
     // decides whether the descriptors the bake already rendered are also written where a person can
     // diff them. A CI lowering check (`spyre-lower`) writes nothing.
