@@ -6036,14 +6036,14 @@ pub fn concrete_trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec
             let mut op = e.dsc().clone();
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for node in dsc.scheduleTree_.iter_mut() {
-                        let ti = node.ldsIdx_ as usize;
+                    for mut node in dsc.scheduleTree_.edit() {
+                        let ti = node.operand();
                         let Some(stride) = e.affine_strides.get(ti).and_then(|m| m.get("out"))
                         else {
                             continue; // non-tiled tensor — base address unchanged.
                         };
                         let bump = t as i64 * *stride;
-                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                        for v in node.start_addrs().values_mut() {
                             let base: i64 = v.parse().unwrap_or(0);
                             *v = (base + bump).to_string();
                         }
@@ -6565,10 +6565,10 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-//  The op-local LX slot alternation walk — #645 fix (a)'s guard on sharing
+//  The op-local LX pin ledger — #645's report on sharing (the sharing is sound by construction)
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One op-local pin's row in the alternation walk's ledger — what the dump's `bundle_id.json`
+/// One op-local pin's row in the pin ledger — what the dump's `bundle_id.json`
 /// carries beside the descriptors, and what a same-class pair hunt reads to name a bundle's
 /// independent norms.
 #[derive(Clone, Debug)]
@@ -6584,226 +6584,58 @@ pub struct LxSlotRow {
     pub touched_by: Vec<(String, bool)>,
 }
 
-/// ⭐⭐⭐ THE OP-LOCAL SLOT ALTERNATION WALK — the build-time guard that same-class LX pins
-/// SHARE a slot only where execution order makes the sharing sound (#645's fix (a), step 3 of 3).
+/// ⭐ THE OP-LOCAL PIN LEDGER — which programs touch each op-local LX pin, in walk order: the row the
+/// dump's `bundle_id.json` carries beside the descriptors, read by the #645 same-class pair hunts.
 ///
-/// Every op-local pin of one footprint class resolves to ONE slot address
-/// (`BundleLayout::synth_lx_op_local`), so a name's bytes survive exactly until the next
-/// same-class name's program runs. Sharing is therefore sound iff, per class, the touching
-/// names form CONTIGUOUS RUNS over the bundle's execution order — `x…x y…y` alternates the
-/// slot cleanly, `x…y…x` reads `y`'s bytes as `x`'s. This walk proves that, at build, per
-/// launch group over its programs in order:
+/// A REPORT, NOT A GUARD. The three facts the alternation walk used to check after lowering are the
+/// shape of the code now: [`ktir_superdsc::emit::lx_op_local_pair`] is the only door to an op-local pin, and
+/// it takes the pin's writer and reader as ONE construction (a pin with no reader cannot be built),
+/// keeps the pin's handle inside that construction (no touch after its scope), and takes the
+/// program's `&mut LxScope` (a nested pair is a borrow error; a second same-class pin in one program
+/// is refused at the pair, by name). So this walks the emitted order only to WRITE DOWN what those
+/// constructions produced.
 ///
-///   * **one program, one name per class** — a program touching two same-class pins is
-///     refused outright. One program's descriptors are ONE SDSC phase, and the citation
-///     pack schedules per node, one phase each — so two same-class pins in one program
-///     live in the SAME phase, with no phase boundary between their touches for a shared
-///     slot to alternate across. (Impossible in every emission today — each rmsnorm's
-///     `rinv` is touched only by its own program — guarded generically so a future op
-///     that reads two norms' pins in one program refuses here, not on card.)
-///   * **per-name contiguity** — once a name's run has been closed by a same-class sibling,
-///     touching it again is a refusal naming both names and the class. The run state carries
-///     ACROSS the bundle's launch groups: the groups launch in order on one stream, so a
-///     sibling in an earlier group poisons a later group's re-read exactly as an intra-group
-///     one does.
-///   * **both directions, by name** — every pin this bundle TOUCHES is written by ≥1 program
-///     and read by ≥1 program, both through named `arg_bindings`. A read with no named write
-///     is a producer the emission lost, or one that addresses the pin through a RAW OFFSET no
-///     walk over `arg_bindings` can see; a write with no read is dead scratch against the
-///     window. Scoped to touched pins — the layout is rung-shared, so other bundles' pins sit
-///     untouched in this bundle's table and are not this walk's to judge.
-///
-/// The ORDER this walk guards is the EMITTED order — the order of `sdsc_ops` as lowered, cut
-/// into programs by `per_prog` and into launch groups by the SAME partition [`launch_index`]
-/// and [`render_dxp_input`] use (`trip_kinds_for` + `group_ranges`; `group_ranges` is
-/// Kani-proven an exact covering partition, and contiguous, so emission order is group order).
-/// ⛔ IT DOES NOT GUARD DEVICE ORDER, AND CANNOT: whether the device really executes programs
-/// complete-before-start in declaration order rests on the #645 citation pack (dxp compiles a
-/// group's programs one at a time, `SchedulerStages.cpp:29-38`; program order = declaration
-/// order = combined-packet order, `ProgramLayout.cpp:126-127`, `PlacePrograms.cpp:78-79`; the
-/// vendor stream contract is complete-before-start, `runtime_stream_mode.hpp:25-33`) — and the
-/// CARD LEG is the measurement of that premise, not this walk.
-///
-/// Touches are derived PURELY from each op's `arg_bindings` — the same name-keyed consult
-/// `mark_lx_residency` resolves allocations with — so the walk adds no emission state, keeps
-/// every emitted byte identical, and has no log for the declare pass to drain. A bundle with
-/// no op-local pins (the overwhelmingly common case) returns an empty ledger unchanged.
-///
-/// On a refusal the fallback is to SPLIT THE CONFLICTING CLASS — give the returning name its
-/// own slot — never to un-share globally; the walk itself only refuses.
-pub fn walk_lx_slot_alternation<T: ktir_superdsc::collective::Tp>(
-    sdsc_ops: &[EmittedOp<T>],
-    per_prog: &[(String, usize)],
-    fold: FoldGrouping,
+/// ⛔ ONE PREMISE NO TYPE CARRIES: that the device runs a launch group's programs complete-before-start
+/// in declaration order (the #645 citation pack). The card leg measures it.
+pub fn lx_slot_ledger<T: ktir_superdsc::collective::Tp>(
+    // Every lowered program in walk order, WITH its own descriptors — one list, so an op's program
+    // is the pair it sits in, never an index into a parallel table.
+    programs: &[(&str, &[EmittedOp<T>])],
     layout: Option<&BundleLayout>,
-) -> Result<Vec<LxSlotRow>, String> {
-    // The pin table: name → (class bytes, slot address). Empty ⇒ nothing shares ⇒ Ok, no cost.
-    // Bound to a local so the borrowed keys outlive the collect — the accessor hands back owned
-    // rows (`Vec<(String, u64, u64)>`), and the walk reads them by reference from here on.
-    let table = layout.map(|l| l.lx_op_local_pins()).unwrap_or_default();
-    let pins: std::collections::BTreeMap<&str, (u64, u64)> = table
-        .iter()
-        .map(|(name, fp, slot)| (name.as_str(), (*fp, *slot)))
-        .collect();
-    if pins.is_empty() {
-        return Ok(Vec::new());
-    }
-    // The op-local names each op touches, straight off its arg bindings.
-    let touches: Vec<std::collections::BTreeSet<&str>> = sdsc_ops
-        .iter()
-        .map(|e| {
-            e.arg_bindings
-                .iter()
-                .map(|b| b.buffer.as_str())
-                .filter(|n| pins.contains_key(n))
-                .collect()
-        })
-        .collect();
-    // Program index per op, off the SAME per-program table the dump writes (`per_prog` is
-    // (program name, descriptor count) in lowering order, and `sdsc_ops` is exactly its
-    // concatenation — see `ktir_groups_via_superdsc`'s loop).
-    let mut prog_of: Vec<usize> = Vec::with_capacity(sdsc_ops.len());
-    for (pi, (_, n)) in per_prog.iter().enumerate() {
-        prog_of.extend(std::iter::repeat_n(pi, *n));
-    }
-    debug_assert_eq!(
-        prog_of.len(),
-        sdsc_ops.len(),
-        "per_prog's descriptor counts must sum to sdsc_ops"
-    );
-    // THE partition launch_index and render_dxp_input both use — same kinds, same group walk.
-    let (kinds, owner) = trip_kinds_for(sdsc_ops, fold);
-    let groups = group_ranges(&kinds, group_size());
-    // Run state per class: the name currently holding the slot, and the names whose runs have
-    // been closed by a sibling. Carried ACROSS groups: the bundle's launches are ordered.
-    let mut run: std::collections::BTreeMap<u64, &str> = std::collections::BTreeMap::new();
-    let mut closed: std::collections::BTreeMap<u64, std::collections::BTreeSet<&str>> =
-        std::collections::BTreeMap::new();
-    // The ledger, accumulated in walk order.
-    let mut touched_by: std::collections::BTreeMap<&str, Vec<(String, bool)>> =
-        std::collections::BTreeMap::new();
-    for r in &groups {
-        // This group's programs, in order: maximal runs of one program over the group's trips.
-        // A program cut across a group boundary is two programs — one per compile unit — which
-        // is exactly how dxp sees it (a group is one directory, one compile invocation).
-        let mut seq: Vec<(usize, std::collections::BTreeSet<&str>)> = Vec::new();
-        for ti in r.clone() {
-            let o = owner[ti];
-            let p = prog_of[o];
-            if !seq.last().is_some_and(|(q, _)| *q == p) {
-                seq.push((p, Default::default()));
-            }
-            for &n in &touches[o] {
-                let is_input = sdsc_ops[o]
-                    .arg_bindings
-                    .iter()
-                    .any(|b| b.buffer.as_str() == n && b.is_input);
-                // Ledger row, deduplicated: one entry per (program, direction) per pin.
-                let v = touched_by.entry(n).or_default();
-                if !v
-                    .last()
-                    .is_some_and(|(s, i)| s == &per_prog[p].0 && *i == is_input)
-                {
-                    v.push((per_prog[p].0.clone(), is_input));
-                }
-                seq.last_mut().expect("pushed above").1.insert(n);
-            }
-        }
-        for (p, names) in &seq {
-            let prog = &per_prog[*p].0;
-            // ONE PROGRAM, ONE NAME PER CLASS: two same-class pins in one program have no
-            // phase boundary between them that any citation covers.
-            let mut by_class: std::collections::BTreeMap<u64, Vec<&str>> = Default::default();
-            for &n in names {
-                by_class.entry(pins[n].0).or_default().push(n);
-            }
-            for (fp, same) in &by_class {
-                if same.len() > 1 {
-                    return Err(format!(
-                        "program '{prog}' touches {} same-class op-local LX pins — {} — of the \
-                         {fp}-byte class at slot {}: within one program there is no program-order \
-                         boundary for the shared slot, so the later name would read the earlier's \
-                         bytes. Split the conflicting class (own slot per name) or keep each \
-                         class's names in separate programs; never un-share globally.",
-                        same.len(),
-                        same.iter()
-                            .map(|n| format!("'{n}' (slot {})", pins[n].1))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        pins[same[0]].1,
-                    ));
-                }
-            }
-            // PER-NAME CONTIGUITY: a name re-touched after a sibling closed its run reads the
-            // sibling's bytes — refuse, naming both.
-            for &n in names {
-                let (fp, slot) = pins[n];
-                let closed_names = closed.entry(fp).or_default();
-                if closed_names.contains(n) {
-                    let sibling = run.get(&fp).copied().unwrap_or("<closed>");
-                    return Err(format!(
-                        "op-local LX pin '{n}' of the {fp}-byte class (slot {slot}) is touched \
-                         again by program '{prog}' after '{sibling}' of the same class took the \
-                         slot — the touches of one class must form contiguous runs over the \
-                         bundle's launch groups, or the returning name reads the sibling's bytes. \
-                         Split the conflicting class (own slot per name) or fold '{n}'s uses into \
-                         its own run; never un-share globally."
-                    ));
-                }
-                match run.get(&fp) {
-                    // The name's own run continues — nothing to close.
-                    Some(&m) if m == n => {}
-                    // A sibling's run opens: close the old name's, start this one's.
-                    Some(&m) => {
-                        closed_names.insert(m);
-                        run.insert(fp, n);
-                    }
-                    None => {
-                        run.insert(fp, n);
-                    }
-                }
-            }
-        }
-    }
-    // ⭐ THE DIRECTION GUARD — every op-local pin THIS BUNDLE touches is touched in BOTH
-    // directions: at least one program WRITES it and at least one READS it, both through named
-    // arg bindings (the only consult this walk has). A pin read but never written is a producer
-    // the emission lost — or one that addresses the pin through a RAW OFFSET instead of a named
-    // binding, which no walk over `arg_bindings` can see; this refusal turns both into a build
-    // failure instead of a card-time read of stale slot bytes. A pin written but never read is
-    // dead scratch minted against the window budget. Scoped to the pins this bundle TOUCHES,
-    // not every pin in the table: the layout is RUNG-shared (the declare pass pre-declares
-    // prefix, bodies and suffix alike), so other bundles' pins sit untouched in this bundle's
-    // table and are not this walk's to judge.
-    for (&name, touches) in &touched_by {
-        let (fp, slot) = pins[name];
-        if !touches.iter().any(|(_, is_input)| !is_input) {
-            return Err(format!(
-                "op-local LX pin '{name}' of the {fp}-byte class (slot {slot}) is READ by this \
-                 bundle but no program WRITES it: its producer is missing, or it addresses the pin \
-                 through a raw offset instead of a named arg binding this walk can see. Every pin \
-                 this bundle touches must have one producer and one consumer, both by name."
-            ));
-        }
-        if !touches.iter().any(|(_, is_input)| *is_input) {
-            return Err(format!(
-                "op-local LX pin '{name}' of the {fp}-byte class (slot {slot}) is WRITTEN by this \
-                 bundle but no program READS it: its consumer is missing, or it addresses the pin \
-                 through a raw offset instead of a named arg binding this walk can see — dead \
-                 scratch minted against the LX window. Every pin this bundle touches must have one \
-                 producer and one consumer, both by name."
-            ));
-        }
-    }
-    Ok(pins
+) -> Vec<LxSlotRow> {
+    let Some(layout) = layout else {
+        return Vec::new();
+    };
+    // One row per pin in the table, its touches filled in below; a pin this bundle never touches
+    // keeps its empty run list.
+    let mut rows: std::collections::BTreeMap<String, LxSlotRow> = layout
+        .lx_op_local_pins()
         .into_iter()
-        .map(|(name, (fp, slot))| LxSlotRow {
-            name: name.to_string(),
-            class_bytes: fp,
-            slot,
-            touched_by: touched_by.remove(name).unwrap_or_default(),
+        .map(|(name, class_bytes, slot)| {
+            let row = LxSlotRow {
+                name: name.clone(),
+                class_bytes,
+                slot,
+                touched_by: Vec::new(),
+            };
+            (name, row)
         })
-        .collect())
+        .collect();
+    for &(prog, ops) in programs {
+        for e in ops {
+            for b in &e.arg_bindings {
+                let Some(row) = rows.get_mut(b.buffer.as_str()) else {
+                    continue; // not an op-local pin — the ledger records only those
+                };
+                // One entry per (program, direction) run, as the dump has always written it.
+                let v = &mut row.touched_by;
+                if !v.last().is_some_and(|(q, i)| q == prog && *i == b.is_input) {
+                    v.push((prog.to_string(), b.is_input));
+                }
+            }
+        }
+    }
+    rows.into_values().collect()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -8344,7 +8176,9 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
     // (program name, descriptors) — written into the dump's `bundle_id.json`, since the eprintln below
     // is invisible on a successful build.
-    let mut per_prog: Vec<(String, usize)> = Vec::new();
+    // Each program and its descriptors' place in `sdsc_ops` — recorded by the push that places
+    // them, so a reader takes a program's ops as its own range, never by re-cutting the list.
+    let mut per_prog: Vec<(String, std::ops::Range<usize>)> = Vec::new();
     let _pc_mint = crate::pc::Pc::start("mint");
     for e in ops {
         // ⛔ ONE PATH, AND IT IS CHECKED HERE. An op arriving with a descriptor ALREADY BUILT means
@@ -8407,8 +8241,9 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                 lowered.len()
             );
         }
-        per_prog.push((e.op_name.clone(), lowered.len()));
+        let at = sdsc_ops.len();
         sdsc_ops.extend(lowered);
+        per_prog.push((e.op_name.clone(), at..sdsc_ops.len()));
     }
 
     // ⛔⛔⛔ A WALK'S BODY READS THE SHIFTED SEGMENT ONLY THROUGH THE STEP'S SOURCES. The relaunch moves
@@ -8447,9 +8282,10 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         }
     }
 
-    // ⛔⛔⛔ main's FOUR POST-LOWERING GUARDS, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
+    // ⛔⛔⛔ main's POST-LOWERING ALIASING GUARD, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
     //
-    // All four are `lower_graph_to_superdsc`/`emit_bundle_inner`'s own text, and all four went SILENT
+    // It is `lower_graph_to_superdsc`/`emit_bundle_inner`'s own text, and it (with three dxp-shape
+    // guards since made unwritable by the wire types) went SILENT
     // when the lowering moved here: they read `EmittedOp::op` and `EmittedOp::time`, which main's walk
     // had already filled by the time they ran. On this path the ops reaching `emit_bundle_inner` carry
     // a KTIR program and NOTHING ELSE — `EmittedOp::bare` sets `op: None` and `time: 1` — so the
@@ -8467,79 +8303,23 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                 e.op_name, e.time
             )));
         }
-        // GUARD (priority-1, from OBSERVED on-card failure 2026-06-25): dxp_standalone
-        // throws `DtException: allocNode (dsc2.cpp:3999)` when a dsc has an empty
-        // scheduleTree_ — the per-tensor HBM allocate nodes are REQUIRED. Refuse to
-        // bake a scheduleTree_-less op at BUILD time rather than dxp-crash on-card.
-        for e in &sdsc_ops {
-            let name = &e.op_name;
-            let op = e.dsc();
-            for dsc_map in &op.dscs_ {
-                for (dname, dsc) in dsc_map {
-                    if dsc.scheduleTree_.is_empty() {
-                        return Err(SuperDscError(format!(
-                            "op {name} (dsc {dname}): empty scheduleTree_ — dxp_standalone \
-                         DtException's at allocNode (dsc2.cpp:3999) without the per-tensor HBM \
-                         allocate nodes. Emit them via the page_coalesce HBM coloring (task #50) \
-                         before baking."
-                        )));
-                    }
-                    // GUARD (priority-1, OBSERVED on-card 2026-06-25): an AllocNode with
-                    // an empty `coordinates_.coordInfo` makes the scheduler throw
-                    // `DtException: "There must be at least one valid candidate."`
-                    // (L3DlOpsScheduler.cpp:1195) — the per-dim tile-folds are required.
-                    for an in &dsc.scheduleTree_ {
-                        let empty_coord = an
-                            .coordinates_
-                            .get("coordInfo")
-                            .and_then(|c| c.as_object())
-                            .map(|o| o.is_empty())
-                            .unwrap_or(true);
-                        if empty_coord {
-                            return Err(SuperDscError(format!(
-                                "op {name} (dsc {dname}, alloc {}): empty coordinates_.coordInfo — \
-                             dxp's scheduler DtException's ('at least one valid candidate', \
-                             L3DlOpsScheduler.cpp:1195) without the per-dim tile-folds. Emit the \
-                             coordInfo (core_fold/corelet_fold/elem_arr from the work-division) \
-                             before baking.",
-                                an.name_
-                            )));
-                        }
-                        // GUARD (priority-1, from OBSERVED on-card crash 2026-06-25):
-                        // the startAddressCoreCorelet_ fold's [core,corelet] factors
-                        // MUST equal the SDSC's declared coreFoldProp_/coreletFoldProp_
-                        // sizes, else the FoldManager import throws "Different
-                        // cardinality between json and caller" (foldInfrastructure.h:2775).
-                        let attrs = &an.startAddressCoreCorelet_.dim_prop_attr;
-                        let core_ok =
-                            attrs.first().map(|f| f.factor_) == Some(op.coreFoldProp_.factor_);
-                        let corelet_ok =
-                            attrs.get(1).map(|f| f.factor_) == Some(op.coreletFoldProp_.factor_);
-                        if !core_ok || !corelet_ok {
-                            return Err(SuperDscError(format!(
-                                "op {name} (alloc {}): startAddressCoreCorelet_ fold factors \
-                             [{:?}] disagree with coreFoldProp_={} / coreletFoldProp_={} — dxp \
-                             FoldManager throws 'Different cardinality' (foldInfrastructure.h:2775).",
-                                an.name_,
-                                attrs.iter().map(|f| f.factor_).collect::<Vec<_>>(),
-                                op.coreFoldProp_.factor_,
-                                op.coreletFoldProp_.factor_
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+        // The three dxp-shape guards that followed (an empty `scheduleTree_`, an empty `coordInfo`,
+        // and start-fold factors that disagree with `coreFoldProp_`/`coreletFoldProp_`) are now
+        // unwritable: `wire::ScheduleTree` is built one node per operand of an op that always has an
+        // output, `wire::Coordinates` only by `build_coordinates` over an operand, and both the nodes'
+        // start folds and the op's fold props come from the tree's one fold set.
     } // pc:guards
 
-    // ⭐ THE OP-LOCAL SLOT ALTERNATION WALK — #645 fix (a)'s guard on same-class sharing, at the
-    //    grain where programs and their descriptors now exist. Refuses a bundle whose same-class
-    //    op-local pins would interleave over one shared slot (the walk's own doc states the two
-    //    rules and the exact premise split: emitted order here, device order on the citations,
-    //    the card leg as the measurement). Also THE LEDGER's one computation — the dump below
-    //    writes it beside the descriptors, and the same-class pair hunts read it from there.
-    let lx_ledger =
-        walk_lx_slot_alternation(&sdsc_ops, &per_prog, fold, layout).map_err(SuperDscError)?;
+    // ⭐ THE OP-LOCAL PIN LEDGER — written into the dump beside the descriptors for the #645
+    //    same-class pair hunts. A report: the sharing it records is sound by construction
+    //    (`emit::lx_op_local_pair`), see `lx_slot_ledger`.
+    let lx_ledger = {
+        let programs: Vec<(&str, &[EmittedOp<T>])> = per_prog
+            .iter()
+            .map(|(name, range)| (name.as_str(), &sdsc_ops[range.clone()]))
+            .collect();
+        lx_slot_ledger(&programs, layout)
+    };
 
     // ── THE BAKE BUDGET, PER BUNDLE (`BakeBudget::bundle_verdict`) ─────────────────────────
     //    A bundle is the unit the emitter fans out, so its counts bound BOTH the wave's critical
@@ -8624,8 +8404,8 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         // program's q view is built first and is `[mq, nqh·hd]`, so its row count is `mq` — the same fact
         // `recognize_attn` recovers, not a new one threaded in.
         let mut progs: Vec<(String, usize)> = Vec::new();
-        for (name, n) in &per_prog {
-            progs.push((name.clone(), *n));
+        for (name, range) in &per_prog {
+            progs.push((name.clone(), range.len()));
         }
         let mq = ops
             .iter()
@@ -8660,7 +8440,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         // a green build prints nothing, and the #645 same-class pair hunts (which bundle holds two
         // independent same-class norms, and which programs touch them) have nowhere else to read
         // the walk's view from. One row per op-local pin — name, class bytes, slot address, and
-        // the programs touching it with their direction — straight off the alternation walk's
+        // the programs touching it with their direction — straight off the pin ledger's
         // ledger, so the dump cannot disagree with the guard that ran.
         let lx_pins = lx_ledger
             .iter()
@@ -9058,7 +8838,7 @@ mod tests {
         let f32_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp32)
             .expect("fp32 mean reduce opspec");
         assert_eq!(
-            f32_spec.op_info,
+            f32_spec.op_info(),
             OpInfo::ReduceScalingFp32((1.0f32 / 576.0).to_bits()),
             "fp32 reduce const must be raw IEEE f32 bits of 1/N"
         );
@@ -9086,7 +8866,7 @@ mod tests {
         let f16_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp16)
             .expect("fp16 mean reduce opspec");
         assert_eq!(
-            f16_spec.op_info,
+            f16_spec.op_info(),
             OpInfo::ReduceScaling(sen169_bits(1.0f32 / 576.0) as u32),
             "fp16 reduce const must stay SEN169_FP16"
         );
@@ -9521,7 +9301,7 @@ mod tests {
         // The epilogue operand is the one inserted BEFORE the real output (see
         // `attach_fused_epilogue`'s own doc) — for this 3-arg-input matmul (a,w,o) that is index 2.
         let epi_idx = 2;
-        let view = op.args[epi_idx].view();
+        let view = op.args()[epi_idx].view();
         // ⭐ ASSERTED BY DIM NAME, NOT BY POSITION. This test asserted `layout == ["mb","out","y"]` and
         // a scale array indexed against it; the emitter's order is `["mb","y","out"]` (the
         // on-hardware-proven batch-inner walk `batched_decode_walk_order.rs` pins), so the positional
@@ -9591,7 +9371,7 @@ mod tests {
             },
         });
         let epi_idx = 2;
-        let view = op.args[epi_idx].view();
+        let view = op.args()[epi_idx].view();
         assert_eq!(
             view.layout,
             ["mb", "out"],
@@ -10343,7 +10123,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
         let op = emitted.dsc();
         // numWkSlices product = 32 cores.
@@ -10387,7 +10168,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let via_emitted = emit_bundle_mlir(&[emitted]);
         assert_eq!(
             via_emitted,
@@ -10416,7 +10198,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         assert_eq!(whole.time, 1, "an unbatched fp16 matmul is staged by dxp");
         // The shape this test drove before the refusal, 64×16384×2048 at two kernel batches: a
         // 32-stick contraction under a `y` batch, the form measured incoherent on granite-3.1-8b.
@@ -10453,7 +10236,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let n = emitted.time;
         assert!(n > 1, "this matmul must time-tile, got time={n}");
         // (ii) the divided per-time `out` shows up in N_ / ss_ (per-core out_per_time).
@@ -11073,7 +10857,7 @@ mod tests {
             layout.placements.contains_key(&victim),
             "t{victim} must be a real placement for the collision to be the card's shape"
         );
-        layout.synth(ktir_superdsc::place::PlaceId::Act(victim), &[1, 64]);
+        layout.synth(ktir_superdsc::place::SynthId::Act(victim), &[1, 64]);
         let _ = bake_layout(&layout);
     }
 }
@@ -11101,6 +10885,7 @@ mod fingerprint_tests {
                 &rb("out", m, 384),
                 None,
             )
+            .expect("assemble_matmul builds")
         };
         let (a, b) = (at(384), at(192));
         assert_eq!((&a.op_name, a.time), (&b.op_name, b.time));

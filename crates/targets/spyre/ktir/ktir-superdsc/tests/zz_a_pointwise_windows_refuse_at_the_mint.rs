@@ -40,7 +40,10 @@ fn add(
     b: &Stk<RowBlockedTag>,
     o: &Stk<RowBlockedTag>,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
+) -> Result<
+    EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    ktir_superdsc::superdsc_error::SuperDscError,
+> {
     let mut sym = 0i64;
     assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
         "add_test",
@@ -82,18 +85,14 @@ fn layout_placing(entries: &[(u32, u64)]) -> BundleLayout {
 /// The panic text out of a refused build — the assemblers panic with `format!`ed refusal
 /// messages, so the refusal is observable as the payload.
 fn refused(
-    r: Result<EmittedOp<ktir_superdsc::collective::TpWorld<1>>, Box<dyn std::any::Any + Send>>,
+    r: Result<
+        EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+        ktir_superdsc::superdsc_error::SuperDscError,
+    >,
 ) -> String {
-    let payload = match r {
+    match r {
         Ok(_) => panic!("the build was accepted — the refusal under test did not fire"),
-        Err(p) => p,
-    };
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else {
-        panic!("a panic payload that is not a string")
+        Err(e) => e.0,
     }
 }
 
@@ -104,12 +103,13 @@ fn an_operand_window_past_its_handle_refuses() {
     let true_h = rb("t_true", 31, 2048);
     let o = rb("t_o", 31, 2048);
     let built = add(31, 2048, &true_h, &rb("t_true2", 31, 2048), &o, None);
-    assert!(built.op.is_some(), "the true handle builds — the control");
+    assert!(
+        built.as_ref().is_ok_and(|e| e.op.is_some()),
+        "the true handle builds — the control"
+    );
 
     let lie = rb("t_lie", 1, 64);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        add(31, 2048, &lie, &true_h, &o, None)
-    }));
+    let r = { add(31, 2048, &lie, &true_h, &o, None) };
     let msg = refused(r);
     assert!(
         msg.contains("operand 't_lie'")
@@ -126,9 +126,7 @@ fn an_output_window_past_its_handle_refuses() {
     let a = rb("t_a", 31, 2048);
     let b = rb("t_b", 31, 2048);
     let small = rb("t_small", 1, 64);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        add(31, 2048, &a, &b, &small, None)
-    }));
+    let r = { add(31, 2048, &a, &b, &small, None) };
     let msg = refused(r);
     assert!(
         msg.contains("output 't_small'") && msg.contains("runs past the end its handle declares"),
@@ -148,9 +146,7 @@ fn an_operand_window_past_its_placement_refuses() {
     let a = rb("t8", rows, cols);
     let o = rb("t9", rows, cols);
     let small = layout_placing(&[(1131, 279552), (8, 786432), (9, 786432)]);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        add(rows, cols, &mask, &a, &o, Some(&small))
-    }));
+    let r = { add(rows, cols, &mask, &a, &o, Some(&small)) };
     let msg = refused(r);
     assert!(
         msg.contains("operand 't1131'")
@@ -161,7 +157,7 @@ fn an_operand_window_past_its_placement_refuses() {
     let covering = layout_placing(&[(1131, 786432), (8, 786432), (9, 786432)]);
     let built = add(rows, cols, &mask, &a, &o, Some(&covering));
     assert!(
-        built.op.is_some(),
+        built.as_ref().is_ok_and(|e| e.op.is_some()),
         "a covering placement builds — the control"
     );
 }
@@ -193,13 +189,13 @@ fn a_broadcast_last_row_scalar_past_the_end_refuses() {
     // The column at its base: last row's scalar at (rows-1)·64 = 1920 < 1984 — builds.
     let built = build(In::col(&col));
     assert!(
-        built.op.is_some(),
+        built.as_ref().is_ok_and(|e| e.op.is_some()),
         "the column at its base builds — the control"
     );
     // The same column shifted a whole row past its end: the last row's scalar sits at
     // 1984 + 1920 = 3904, past the 1984 elements the handle declares.
     let past = In::col_at(&col, DevOff::from_view_step(rows * 64));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(past)));
+    let r = build(past);
     let msg = refused(r);
     assert!(
         msg.contains("the broadcast read's last row scalar (element 3904) runs past"),
@@ -234,7 +230,7 @@ fn a_sub_stick_lane_select_stays_legal() {
         None,
     );
     assert!(
-        built.op.is_some(),
+        built.as_ref().is_ok_and(|e| e.op.is_some()),
         "the +8 lane select builds — the rinv law"
     );
 }
@@ -248,7 +244,7 @@ fn a_wider_per_row_broadcast_refuses() {
     let a = rb("t_a", rows, 2048);
     let o = rb("t_o", rows, 2048);
     let mut sym = 0i64;
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let r = {
         assemble_pointwise_broadcast_off::<ktir_superdsc::collective::TpWorld<1>, _>(
             "mul_test",
             "multiply",
@@ -260,7 +256,7 @@ fn a_wider_per_row_broadcast_refuses() {
             &mut sym,
             None,
         )
-    }));
+    };
     let msg = refused(r);
     assert!(
         msg.contains("ONE STICK PER ROW"),
@@ -278,9 +274,7 @@ fn an_undeclared_name_refuses_rather_than_bumps() {
     let a = rb("t8", rows, cols);
     let o = rb("t9", rows, cols);
     let layout = layout_placing(&[(8, 126976), (9, 126976)]);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        add(rows, cols, &ghost, &a, &o, Some(&layout))
-    }));
+    let r = { add(rows, cols, &ghost, &a, &o, Some(&layout)) };
     let msg = refused(r);
     assert!(
         msg.contains("'t4104'") && msg.contains("was never declared to the layout"),

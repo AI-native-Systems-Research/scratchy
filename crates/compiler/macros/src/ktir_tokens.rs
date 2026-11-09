@@ -491,6 +491,11 @@ fn place_id_tokens(
             let r = synth_role_tokens(role);
             quote! { __KPlace::Synth { of: #of, role: #r } }
         }
+        PlaceId::OpLocal { of, role } => {
+            let of = proc_macro2::Literal::u32_unsuffixed(of);
+            let r = crate::codegen::op_local_role_tokens(&role);
+            quote! { __KPlace::OpLocal { of: #of, role: #r } }
+        }
     }
 }
 

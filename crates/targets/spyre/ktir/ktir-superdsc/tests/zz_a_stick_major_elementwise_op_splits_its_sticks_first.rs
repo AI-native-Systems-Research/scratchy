@@ -212,7 +212,8 @@ fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u6
         ktir_superdsc::addr::col_of(rows, full_cols, c_start, Df::Fp16),
         &mut sid,
         None,
-    );
+    )
+    .expect("the multiply builds");
     let v = serde_json::to_value(op.op.as_ref().expect("a descriptor")).unwrap();
     let s = &v["numWkSlicesPerDim_"];
     (
@@ -247,7 +248,8 @@ fn emitted_window_split(
         w,
         &mut sid,
         None,
-    );
+    )
+    .expect("the multiply builds");
     let v = serde_json::to_value(op.op.as_ref().expect("a descriptor")).unwrap();
     let s = &v["numWkSlicesPerDim_"];
     let key = v["dscs_"][0]

@@ -62,6 +62,7 @@ fn pw_31x2048(division: EwDivision) -> emit::EmittedOp<ktir_superdsc::collective
         &mut sid,
         None,
     )
+    .expect("assemble_pointwise_broadcast_divided builds")
 }
 
 /// The last schedule node (the OUTPUT's) of the `pw` op.
@@ -600,7 +601,8 @@ fn decode_matmul_mb1_also_minus_one() {
         &mm_a("o", 1, 2048),
         &mut sid,
         None,
-    );
+    )
+    .expect("assemble_matmul_seeded builds");
     let d = dsc(&mm, "dm");
     for node in d["scheduleTree_"].as_array().unwrap() {
         assert!(

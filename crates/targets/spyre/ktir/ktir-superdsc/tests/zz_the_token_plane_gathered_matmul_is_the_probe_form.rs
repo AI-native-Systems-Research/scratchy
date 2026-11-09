@@ -77,7 +77,7 @@ fn probe_matmul(gather: Option<GatherIndex>) -> ktir_superdsc::superdsc_opspec::
     // forces SENUINT32 on the index whatever the value operands are (the DT_CHECK pair
     // GatherIndexConversion.cpp:133 + L3DlOpsScheduler.cpp:5928), so a W8A8 paint that touches it
     // is a stick-extent refusal at best and a wrong-dtype index at worst.
-    for arg in &mut op.args {
+    for arg in op.args_mut() {
         if !matches!(
             arg.view().role,
             ktir_superdsc::superdsc_opspec::Role::Output
@@ -431,7 +431,7 @@ fn the_plan_under_a_token_plane_gather_splits_mb_only_at_a_multi_stick_out() {
     )
     .expect("the DOWN chunk's gathered matmul builds");
     // The W8A8 paint, the door's own loop verbatim (skipping OUTPUT and the INDEX).
-    for arg in &mut op.args {
+    for arg in op.args_mut() {
         if !matches!(
             arg.view().role,
             ktir_superdsc::superdsc_opspec::Role::Output

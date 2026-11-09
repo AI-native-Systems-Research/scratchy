@@ -210,14 +210,14 @@ fn trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec<SdscOp> {
             let mut op = e.dsc().clone();
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for node in dsc.scheduleTree_.iter_mut() {
-                        let ti = node.ldsIdx_ as usize;
+                    for mut node in dsc.scheduleTree_.edit() {
+                        let ti = node.operand();
                         let Some(stride) = e.affine_strides.get(ti).and_then(|m| m.get("out"))
                         else {
                             continue; // non-tiled tensor — base address unchanged.
                         };
                         let bump = t as i64 * *stride;
-                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                        for v in node.start_addrs().values_mut() {
                             // The address is a STRING on the wire (the torch-spyre frontend's form).
                             // A value that does not parse is a descriptor this bump cannot express,
                             // and silently treating it as 0 would move the tensor to segment 0 — so

@@ -102,18 +102,14 @@ fn layout_placing(tid: u32, size: u64) -> BundleLayout {
 /// The panic text out of a refused build — the assemblers panic with `format!`ed refusal messages,
 /// so the refusal is observable as the payload.
 fn refused(
-    r: Result<EmittedOp<ktir_superdsc::collective::TpWorld<1>>, Box<dyn std::any::Any + Send>>,
+    r: Result<
+        EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+        ktir_superdsc::superdsc_error::SuperDscError,
+    >,
 ) -> String {
-    let payload = match r {
+    match r {
         Ok(_) => panic!("the build was accepted — the refusal under test did not fire"),
-        Err(p) => p,
-    };
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else {
-        panic!("a panic payload that is not a string")
+        Err(e) => e.0,
     }
 }
 
@@ -205,11 +201,11 @@ fn a_core_local_destination_has_no_offset_to_take() {
 /// declared to the layout as synthetics at the copy's own extents, so the destination's doors are
 /// the only variables the legs below leave. Returns the two names to build the copy with.
 fn declare_gather_rig(layout: &BundleLayout, cp: GatherCopy) -> (String, String) {
-    let src_id = PlaceId::Synth {
+    let src_id = ktir_superdsc::place::SynthId::Synth {
         of: 5,
         role: SynthRole::Rot,
     };
-    let idx_id = PlaceId::Synth {
+    let idx_id = ktir_superdsc::place::SynthId::Synth {
         of: 6,
         role: SynthRole::Xc,
     };
@@ -246,10 +242,10 @@ fn a_destination_past_its_placement_refuses() {
 
     let small = layout_placing(7, window_bytes / 2);
     let (src, index) = declare_gather_rig(&small, cp);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let r = {
         let mut sym = 0i64;
         assemble_gather_copy("gdst_small", &src, "t7", cp, &index, &mut sym, Some(&small))
-    }));
+    };
     let msg = refused(r);
     assert!(
         msg.contains("assemble_gather_copy gdst_small: the destination")
@@ -270,7 +266,7 @@ fn a_destination_past_its_placement_refuses() {
         Some(&true_layout),
     );
     assert!(
-        built.op.is_some(),
+        built.as_ref().is_ok_and(|e| e.op.is_some()),
         "the placement the copy's own law states builds — the control"
     );
 }
@@ -303,10 +299,10 @@ fn a_core_local_destination_the_layout_does_not_hold_refuses() {
 
     let hbm = layout_placing(7, 1 << 20);
     let (src, index) = declare_gather_rig(&hbm, cp);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let r = {
         let mut sym = 0i64;
         assemble_gather_copy("glx_hbm", &src, "t7", cp, &index, &mut sym, Some(&hbm))
-    }));
+    };
     let msg = refused(r);
     assert!(
         msg.contains("assemble_gather_copy glx_hbm")
@@ -314,7 +310,7 @@ fn a_core_local_destination_the_layout_does_not_hold_refuses() {
         "the refusal names the name the two authorities disagree about: {msg}"
     );
 
-    let core_id = PlaceId::Synth {
+    let core_id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::VRep,
     };
@@ -332,7 +328,7 @@ fn a_core_local_destination_the_layout_does_not_hold_refuses() {
         Some(&lx_layout),
     );
     assert!(
-        built.op.is_some(),
+        built.as_ref().is_ok_and(|e| e.op.is_some()),
         "the core-local destination the chunk's own law pins builds — the control"
     );
 }

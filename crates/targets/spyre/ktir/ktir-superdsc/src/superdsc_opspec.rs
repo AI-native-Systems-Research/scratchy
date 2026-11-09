@@ -16,7 +16,7 @@
 //!   carries no corelet field at all (corelet is the const [`ACTIVE_CORELETS`]).
 //! * (c) a `startAddr` fold whose `[core,corelet]` factors disagree with the
 //!   declared `coreFoldProp_`/`coreletFoldProp_` — [`SdscFoldSet`] is the single
-//!   source of truth for all fold factors and [`AddrFold::new`] copies them from
+//!   source of truth for all fold factors and [`crate::wire::AddrMint`] copies them from
 //!   it; there is no public field setter to diverge them.
 //! * (d) a `scale_`/`device_dims`/layout rank mismatch — [`TensorArg`] is generic
 //!   over the device rank `const D: usize`, so `scale: [Scale; D]`,
@@ -1352,7 +1352,7 @@ pub fn assert_df_stick_multiple(elems: u32, df: Df) -> Result<(), String> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// (c) SdscFoldSet — the single source of truth for fold factors; AddrFold::new.
+// (c) SdscFoldSet — the single source of truth for fold factors; wire::AddrMint.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// The fold factors for one SuperDSC op: `coreFold = num_cores`, `coreletFold =
@@ -1753,6 +1753,29 @@ pub enum OpFunc {
     TopKValue,
 }
 
+/// How an op function's DDL template binds a reduction's accumulator ([`OpFunc::reduction_binding`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReductionBinding {
+    /// Not a reduction.
+    None,
+    /// A seeded reduce: the accumulator is the output AND an input the template binds.
+    Seeded,
+    /// A reduction whose running state the template keeps internally: the output is only the output.
+    Internal,
+}
+
+impl ReductionBinding {
+    /// Whether the op reduces at all.
+    pub const fn is_reduction(self) -> bool {
+        !matches!(self, ReductionBinding::None)
+    }
+
+    /// Whether the accumulator is also one of the op's bound inputs.
+    pub const fn accum_is_input(self) -> bool {
+        matches!(self, ReductionBinding::Seeded)
+    }
+}
+
 impl OpFunc {
     /// `matmul` for a PLAIN 2-D matmul (batch==1); `batchmatmul` for a true batched matmul
     /// (batch>1, the attention bmm). PROVEN 2026-07-07 by diffing torch-spyre's OWN generate_sdsc:
@@ -1947,6 +1970,10 @@ impl OpFunc {
     /// row and the operand list cannot drift apart.
     pub fn ddl_input_arity(self) -> Option<usize> {
         match self {
+            // `summeanmaxexx2.ddl` binds the data AND the seeded accumulator — TWO inputs (the reduce
+            // fixture: accum is `inputLabeledDs[1]`). The accumulator counts because these rows
+            // bind it so ([`OpFunc::reduction_binding`] `Seeded`), so one data operand is the bind.
+            OpFunc::Sum | OpFunc::Max | OpFunc::Mean | OpFunc::Exx2 => Some(2),
             OpFunc::QuantScalePerTokenFp8 => Some(1),
             // `unary_pipeline.ddl:16` binds clip as `([%type_fp16], [%inptensor], [%outtensor])` —
             // ONE input. Both bounds are external constants, so unlike the seeded reduces there is no
@@ -1960,6 +1987,58 @@ impl OpFunc {
             // fused scale above.
             OpFunc::TopKIndex | OpFunc::TopKValue => Some(1),
             _ => None,
+        }
+    }
+
+    /// ⭐ WHETHER THIS OP FUNC REDUCES, AND HOW ITS DDL TEMPLATE BINDS THE ACCUMULATOR — a const
+    /// table, one row per op func, read by [`OpSpec::new`] (the accumulator is a bound input exactly
+    /// when the row says `Seeded`) and by the coordinates' stick-group stride. A fact of the op
+    /// function's template, never of the operand count an op happens to be built with.
+    pub const fn reduction_binding(self) -> ReductionBinding {
+        match self {
+            // `summeanmaxexx2.ddl`: the accumulator is the output AND `inputLabeledDs[1]`.
+            OpFunc::Sum | OpFunc::Max | OpFunc::Mean | OpFunc::Exx2 => ReductionBinding::Seeded,
+            // The contraction's K, the fused per-token scale (`quant_scale_per_token.ddl:41`, an
+            // on-chip `ddl.internal_tensor`) and the top-k ring (`topk.ddl:36-37`): the running
+            // state is the template's own, so the output is only the output.
+            OpFunc::Matmul
+            | OpFunc::BatchMatmul
+            | OpFunc::QuantScalePerTokenFp8
+            | OpFunc::TopKIndex
+            | OpFunc::TopKValue => ReductionBinding::Internal,
+            OpFunc::Transpose
+            | OpFunc::Restickify
+            | OpFunc::Add
+            | OpFunc::Subtract
+            | OpFunc::Multiply
+            | OpFunc::RealDiv
+            | OpFunc::Abs
+            | OpFunc::Silu
+            | OpFunc::Exp
+            | OpFunc::Log
+            | OpFunc::Neg
+            | OpFunc::Reciprocal
+            | OpFunc::Sqrt
+            | OpFunc::Rsqrt
+            | OpFunc::Sigmoid
+            | OpFunc::Gelu
+            | OpFunc::Mish
+            | OpFunc::Tanh
+            | OpFunc::Dl16ToFp32
+            | OpFunc::Fp32ToDl16
+            | OpFunc::Fp32ToInt32
+            | OpFunc::Int32ToFp32
+            | OpFunc::MulI32ToI32
+            | OpFunc::AddI32ToI32
+            | OpFunc::Identity
+            | OpFunc::Maximum
+            | OpFunc::Minimum
+            | OpFunc::Clip
+            | OpFunc::Qfp8ch
+            | OpFunc::LesserThan
+            | OpFunc::Equal
+            | OpFunc::NotEqual
+            | OpFunc::Where3 => ReductionBinding::None,
         }
     }
 
@@ -2126,6 +2205,9 @@ pub struct TensorArg<const D: usize> {
     layout: [&'static str; D],
     /// Innermost stick axis name (one of `layout`). torch-spyre `stickDimOrder_`.
     stick: &'static str,
+    /// Where `stick` sits in `layout` — found once, by [`TensorArg::new`], which refuses a stick
+    /// outside the layout.
+    stick_idx: usize,
     allocation: Allocation,
     /// SLICE offset into the source dataspace, in ELEMENTS along the stick axis
     /// (0 = whole tensor). A non-zero offset reads `x[offset_elems ..]` — the
@@ -2209,6 +2291,7 @@ impl<const D: usize> TensorArg<D> {
             device_dims,
             layout,
             stick,
+            stick_idx,
             allocation,
             offset_elems: 0,
             df: Df::Fp16,
@@ -2316,6 +2399,8 @@ pub struct ArgView<'a> {
     pub device_dims: &'a [IterSym],
     pub layout: &'a [&'static str],
     pub stick: &'static str,
+    /// Where `stick` sits in `layout` (the [`TensorArg`]'s own, found at its construction).
+    pub stick_idx: usize,
     pub allocation: Allocation,
     /// Slice offset in elements along the stick axis (0 = whole tensor).
     pub offset_elems: u32,
@@ -2543,6 +2628,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
@@ -2559,6 +2645,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
@@ -2575,6 +2662,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
@@ -2591,6 +2679,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
@@ -3872,41 +3961,202 @@ pub struct SamvCoordinateMask {
 /// residency) is ABSENT by construction. Faithful to op_spec.py `OpSpec`, but the
 /// `iteration_space` tuple `(range, work_div)` is REPLACED by the typed
 /// [`WorkPlan`] so over-specification is unrepresentable.
+///
+/// ⭐ BUILT ONLY BY [`OpSpec::new`], which takes the output as its own argument and refuses an operand
+/// list its op function's DDL template cannot bind. `op`, `args` and the bound-input count are
+/// private, so what that arity is a function of cannot change after the check: an operand can be
+/// ATTACHED (an epilogue addend, a gather or scatter index) only PAST the bound inputs, and the
+/// descriptor's `inputLabeledDs` is read from [`OpSpec::bound_inputs`] alone — an attach adds a
+/// tensor, never an input the template binds. No operand is pushed or removed.
+///
+/// The op's aux constants, time tile and coordinate mask are set ONE way — the `with_*` builders
+/// chained on [`OpSpec::new`] (and [`OpSpec::attach_fused_epilogue`] for the epilogue) — and read
+/// through their accessors; none is a public field to overwrite:
+/// ```compile_fail,E0616
+/// fn retile(op: &mut ktir_superdsc::superdsc_opspec::OpSpec) {
+///     op.time_tile = None; // E0616: private field
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct OpSpec {
-    pub op: OpFunc,
-    pub is_reduction: bool,
+    op: OpFunc,
     /// The named iteration space + validated work-division (witnesses (a)(b)(f)).
     pub iter: WorkPlan,
-    /// Ordered tensor args; `arg_index == position` is a type invariant.
-    pub args: Vec<AnyTensorArg>,
-    pub op_info: OpInfo,
-    /// Iteration symbols tiled by an enclosing loop. Subset-of-`iter` by type.
-    /// Populated from `time_tile.dim()` when `time_tile` is `Some` (the LX-fit
-    /// coarse-tile pass), empty otherwise.
-    pub tiled_symbols: Vec<IterSym>,
+    /// Ordered tensor args, the output LAST; `arg_index == position` is a type invariant. Never
+    /// empty: [`OpSpec::new`] takes the output separately.
+    args: Vec<AnyTensorArg>,
+    /// How many of `args` are the inputs the op's DDL template BINDS — the list [`OpSpec::new`] built
+    /// and checked against [`OpFunc::ddl_input_arity`]. Fixed there: every later operand (a fused
+    /// epilogue's addend, a gather or scatter index) is ATTACHED after them and before the output, so
+    /// `args[..bound]` is the bound list by construction and no attach can move it.
+    bound: usize,
+    op_info: OpInfo,
     /// The LX-fit TIME-TILE for this op (the **TimeTile** witness). `None` = the
     /// per-core tile fits [`USABLE_LX_BYTES`] in one trip (today's single-shot
     /// path). `Some(TimeTile{count>1, dim})` = the op's `dim` extent is sliced
     /// into `count` per-time trips so each per-time tile fits the scratchpad —
     /// produced ONLY by [`WorkPlan::time_tile_for_lx`], so "doesn't fit LX" is a
     /// `cargo build` `Err`, never an on-card DtException 1535.
-    pub time_tile: Option<TimeTile>,
+    time_tile: Option<TimeTile>,
     /// This op reads one operand THROUGH another's indices — the hardware gather. `None` (every
     /// op today) emits `indirectAllocType_: "no_indirection"` on every node and an empty
     /// `indirectAccessIndexLabeledDs`, i.e. byte-identical to before this field existed.
     ///
     /// One `Option` for the whole op, never a flag per operand: see [`IndirectAccess`] for why a
-    /// half-declared pair must be unrepresentable.
-    pub indirect: Option<IndirectAccess>,
+    /// half-declared pair must be unrepresentable. Private, and set only with the operand it
+    /// declares ([`Self::attach_gather_index`], [`Self::attach_scatter_index`]): the index it names is
+    /// left out of the inputs the DDL template binds, so it is part of the arity [`Self::new`] fixed.
+    indirect: Option<IndirectAccess>,
     /// The SAMV coordinate masking on a seeded reduce's padded stick dim. `None` (every
     /// stick-aligned reduce) emits `coordinateMasking_: {}`, `maskingConstId_: -1` and no
     /// `samv-maskvalue` constant — byte-identical to before this field existed. See
     /// [`SamvCoordinateMask`] for the wire fields and the identity-value law.
-    pub coordinate_mask: Option<SamvCoordinateMask>,
+    coordinate_mask: Option<SamvCoordinateMask>,
 }
 
 impl OpSpec {
+    /// ⭐⭐⭐ THE ONE DOOR, AND WHERE THE DDL ARITY IS CHECKED.
+    ///
+    /// `DdlConversion::matchDdl2Dsc` (`ddl_conversion.cpp:2161-2163`) walks every `ddl.operation_bind`
+    /// in the selected template and SKIPS a computeOp whose `inputLabeledDs.size()` differs from the
+    /// bind's input count — an arity mismatch is indistinguishable from "wrong op", so dxp refuses the
+    /// whole bundle with a message that names only the op. The count dxp sees is fixed HERE: the
+    /// inputs, plus the accumulator when it is also an input. An op function with a row in
+    /// [`OpFunc::ddl_input_arity`] whose operands disagree with it is a construction `Err` — a
+    /// `cargo build` failure naming the template, at the builder that made the list, for every shape
+    /// that builder is ever handed.
+    ///
+    /// ⭐ THE ACCUMULATOR. A reduction accumulator is BOTH an input AND the output (the reduce
+    /// fixture: accum is `inputLabeledDs[1]` and the sole `outputLabeledDs`) for a seeded reduce —
+    /// `sum`/`max`/`mean`/`exx2` → `summeanmaxexx2.ddl`, which binds TWO inputs. The machine's FUSED
+    /// reduces (`quantscalepertokenfp8` → `quant_scale_per_token.ddl:41`, one `%input_tensor`, its
+    /// accumulator an on-chip `ddl.internal_tensor`) bind ONE. Both are the op function's row
+    /// ([`OpFunc::reduction_binding`]), never the operand count, so nothing attached later (an index,
+    /// an epilogue operand) can change what the template is asked to bind.
+    ///
+    /// Takes exactly the facts the arity is a function of. What the template does not count — the
+    /// aux constants, the time tile, the coordinate mask — chains on after ([`Self::with_op_info`],
+    /// [`Self::with_time_tile`], [`Self::with_coordinate_mask`]).
+    pub fn new(
+        op: OpFunc,
+        iter: WorkPlan,
+        inputs: Vec<AnyTensorArg>,
+        output: AnyTensorArg,
+    ) -> Result<OpSpec, SuperDscError> {
+        let arity = op.ddl_input_arity();
+        let accum_is_input = op.reduction_binding().accum_is_input();
+        let bound = inputs.len() + usize::from(accum_is_input);
+        if let Some(want) = arity
+            && bound != want
+        {
+            return Err(SuperDscError(format!(
+                "{}: its DDL template binds exactly {want} input tensor(s), but this op is built \
+                 with {bound} ({} operand(s){}). `DdlConversion::matchDdl2Dsc` \
+                 (ddl_conversion.cpp:2161) SKIPS a computeOp whose input count differs from the \
+                 `ddl.operation_bind`'s, so the template is declared unsuitable and dxp refuses the \
+                 whole bundle with a message that names only the op. Fix the operand list, or the \
+                 `OpFunc::ddl_input_arity` row if the template really binds a different arity.",
+                op.name(),
+                inputs.len(),
+                if accum_is_input {
+                    " + the accumulator"
+                } else {
+                    ""
+                },
+            )));
+        }
+        let bound_inputs = inputs.len();
+        let mut args = inputs;
+        args.push(output);
+        Ok(OpSpec {
+            op,
+            iter,
+            args,
+            bound: bound_inputs,
+            op_info: OpInfo::None,
+            time_tile: None,
+            indirect: None,
+            coordinate_mask: None,
+        })
+    }
+
+    /// The op's aux constants (`constantInfo_`), or its fused epilogue — set by [`Self::with_op_info`]
+    /// or [`Self::attach_fused_epilogue`], read here.
+    pub fn op_info(&self) -> OpInfo {
+        self.op_info
+    }
+
+    /// The LX-fit time tile ([`Self::with_time_tile`]); `None` is one trip.
+    pub fn time_tile(&self) -> Option<TimeTile> {
+        self.time_tile
+    }
+
+    /// The SAMV coordinate masking ([`Self::with_coordinate_mask`]).
+    pub fn coordinate_mask(&self) -> Option<SamvCoordinateMask> {
+        self.coordinate_mask
+    }
+
+    /// The op's aux constants (`constantInfo_`).
+    pub fn with_op_info(mut self, op_info: OpInfo) -> OpSpec {
+        self.op_info = op_info;
+        self
+    }
+
+    /// The LX-fit time tile, as [`WorkPlan::time_tile_for_lx`] produced it (`None`: one trip).
+    pub fn with_time_tile(mut self, time_tile: Option<TimeTile>) -> OpSpec {
+        self.time_tile = time_tile;
+        self
+    }
+
+    /// The SAMV coordinate masking on a seeded reduce's padded stick dim.
+    pub fn with_coordinate_mask(mut self, mask: Option<SamvCoordinateMask>) -> OpSpec {
+        self.coordinate_mask = mask;
+        self
+    }
+
+    /// The op function — fixed at construction, as the arity check needs it to be.
+    pub fn op(&self) -> OpFunc {
+        self.op
+    }
+
+    /// Whether the op reduces — its op function's row ([`OpFunc::reduction_binding`]).
+    pub fn is_reduction(&self) -> bool {
+        self.op.reduction_binding().is_reduction()
+    }
+
+    /// Every operand, in `Tensor{i}` order, the output last. Never empty.
+    pub fn args(&self) -> &[AnyTensorArg] {
+        &self.args
+    }
+
+    /// Every operand, mutably — as a SLICE, so a caller can restate an operand's view (its offset,
+    /// its residency, a device extent) but cannot add, drop or reorder one.
+    pub fn args_mut(&mut self) -> &mut [AnyTensorArg] {
+        &mut self.args
+    }
+
+    /// The inputs the op's DDL template binds — the list [`Self::new`] checked, in `Tensor{i}` order.
+    /// Never moved by an attached operand (an epilogue addend, an index), which sits past it.
+    pub fn bound_inputs(&self) -> std::ops::Range<usize> {
+        0..self.bound
+    }
+
+    /// The output operand — the last arg, which exists because [`Self::new`] took it.
+    pub fn output_mut(&mut self) -> &mut AnyTensorArg {
+        let last = self.args.len() - 1;
+        &mut self.args[last]
+    }
+
+    /// Whether the reduction's accumulator is also listed as an input ([`Self::new`]'s doc).
+    pub fn accum_is_input(&self) -> bool {
+        self.op.reduction_binding().accum_is_input()
+    }
+
+    /// The gathered (or scattered) access this op declares, if any — set only with its index operand.
+    pub fn indirect(&self) -> Option<IndirectAccess> {
+        self.indirect
+    }
+
     pub fn ex_unit(&self) -> ExUnit {
         self.op.ex_unit()
     }
@@ -3943,6 +4193,10 @@ impl OpSpec {
     /// through `rewrite_op_for_time_tile`'s per-trip affine-stride machinery, so a tiled matmul must not
     /// call this (the caller decides; this method does not check, since `OpSpec` alone cannot see whether
     /// `emit_sdsc_tiled` will time-tile it).
+    /// The addend is a TENSOR of the op, not one of the inputs its DDL template binds: it lands past
+    /// [`Self::bound_inputs`], so the matmul's `inputLabeledDs` is the list [`Self::new`] checked,
+    /// and the addend is named only by the epilogue's own computeOp_ entry.
+    ///
     /// ⛔ TAKES THE WHOLE EPILOGUE AT ONCE. Assigning `self.op_info` here is the ONLY write —
     /// there is no "already has a stage" state to clobber, and [`EpilogueSpecs`] makes a second
     /// stage (which nothing has ever shipped) unrepresentable rather than runtime-rejected.

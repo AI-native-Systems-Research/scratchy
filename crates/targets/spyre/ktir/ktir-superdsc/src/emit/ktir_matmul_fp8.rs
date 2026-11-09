@@ -318,7 +318,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                     &ascale_h,
                     sym_id_base,
                     layout,
-                ));
+                )?);
             } else {
                 // PARTIALS: `time` single-shot fused reduces, each over a `[m, k/time]` column slice
                 // of the RowBlocked activation. Slice j starts at column `j·k/time` — a stick
@@ -391,7 +391,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                         Df::Fp16,
                         sym_id_base,
                         layout,
-                    ));
+                    )?);
                 }
                 // COMBINE: ascale = maximum(ascale, partial_j) — running, in place on `ascale` (the
                 // old amax chain's own law). Lands in the SAME `ascale` name every downstream op
@@ -408,7 +408,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                         &ascale_h,
                         sym_id_base,
                         layout,
-                    ));
+                    )?);
                 }
             }
             // The three tensors the two fused ops subsume, plus the `1/448` and ±448 they used to take as
@@ -437,7 +437,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 &invs_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             // scaled = act·invs; clamp to [-448,448] (torch-spyre's `quantize_fp8_with_scale` ALWAYS clamps).
             let sc_h = rb(&sc, m, k);
             ops.push(pw2(
@@ -450,7 +450,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 &sc_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             // ⭐⭐⭐⭐⭐ THE CLAMP IS THE DEVICE'S OWN `clip` OP — ONE input, computing
             // `FMIN(FMAX(x, clipMin), clipMax)` (`unary_pipeline.ddl:370-377` PE stage, `:472-479` SFP
             // stage) — the same min/max pair the two ops it replaces encoded, so the swap is
@@ -477,7 +477,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 &cl_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             // ⭐ THE PAD WINDOW'S ZERO FILL. `cl`'s logical `[m, k]` window is written by the
             // clamp above; the `[k, cl_reach)` window — the LAST pair's convert overhang,
             // `inn_pad − inn` lanes — is written HERE, unconditionally, every step — a `sub`
@@ -512,7 +512,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                     crate::addr::col_of(m, cl_reach, k, Df::Fp16),
                     sym_id_base,
                     layout,
-                ));
+                )?);
             }
             // qfp8ch: f16 clamped act → SEN143_FP8. A dtype CONVERT (input 64-stick, output 128-stick), so it
             // goes through `assemble_convert` (two `primaryDsInfo_`), NOT a same-stick pointwise. The output's
@@ -533,7 +533,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                     &rb_df(&afp8, m, k_pad, Df::Fp8),
                     sym_id_base,
                     layout,
-                ));
+                )?);
             } else {
                 // PER SLOT — the half-stick `inn` case (the 26b DOWN door's 704): slot `s`'s
                 // convert reads `cl` at column `s·inn` (an fp16 stick boundary — `inn` is a
@@ -580,7 +580,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                         crate::addr::col_of(m, k_pad, s * inn_pad, Df::Fp8),
                         sym_id_base,
                         layout,
-                    ));
+                    )?);
                 }
             }
         } // end `if !already_quantized` — the shared activation-quantize chain (per distinct activation).
@@ -665,7 +665,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
             Df::Fp8,
         )
         .map_err(SuperDscError)?;
-        for arg in &mut spec.args {
+        for arg in spec.args_mut() {
             if !matches!(arg.view().role, Role::Output) {
                 arg.set_df(Df::Fp8);
             }
@@ -691,7 +691,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         &dqa_h,
         sym_id_base,
         layout,
-    ));
+    )?);
     let out_h = rb(&out, m, n);
     let ws_h = rb(&ws_name, 1, n);
     let w_scale_in = if m > 1 {
@@ -709,7 +709,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         &out_h,
         sym_id_base,
         layout,
-    ));
+    )?);
     Ok(ops)
 }
 

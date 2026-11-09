@@ -1205,7 +1205,10 @@ pub fn load_scatters<T: crate::collective::Tp>(
                 value,
                 crate::ktir_node::Scratch::RelayoutMid,
             );
-            layout.synth(PlaceId::Act(tid), &[src.v_rows * groups, width]);
+            layout.synth(
+                crate::place::SynthId::Act(tid),
+                &[src.v_rows * groups, width],
+            );
             let scratch = crate::place::act_name(tid);
             // Each head's group of columns, stick-major `[sticks][rows]` in the source, to row-major
             // `[rows][sticks]` at the same base in the scratch.
@@ -2354,7 +2357,7 @@ pub fn elementwise_df<T: crate::collective::Tp>(
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
-        )]);
+        )?]);
     }
     if bcast.iter().any(Option::is_some) {
         // `df` is `Fp16` here (the non-fp16 gate above returned or routed already), so this is
@@ -2450,7 +2453,7 @@ pub fn elementwise_df<T: crate::collective::Tp>(
             &out.name(),
             sym_id_base,
             layout,
-        );
+        )?;
         return Ok(vec![op]);
     }
     // ⛔⛔⛔ THE CORNERS ARE PER-OPERAND, AND THE PAIRING IS THE PROGRAM'S OWN — the rotate-half
@@ -2519,7 +2522,7 @@ pub fn elementwise_df<T: crate::collective::Tp>(
         out_off,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// ⛔⛔⛔ EVERY OPERAND A COLUMN-BLOCKED PIECE NAMES IS ADDRESSED AT THAT PIECE's WINDOW — the class law,
@@ -2714,7 +2717,7 @@ fn elementwise_per_row<T: crate::collective::Tp>(
         &out.name(),
         sym_id_base,
         layout,
-    );
+    )?;
     Ok(vec![op])
 }
 
@@ -2942,7 +2945,7 @@ pub fn int_binary<T: crate::collective::Tp>(
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// ⭐⭐⭐ [`elementwise`] WITH A BROADCAST OPERAND — the arm [`pointwise_extents_agree`] names in its
@@ -3268,7 +3271,7 @@ fn elementwise_broadcast<T: crate::collective::Tp>(
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// [`elementwise_broadcast`]'s row-split spray at an `out` wider than one stick: ONE descriptor per
@@ -3362,7 +3365,7 @@ fn elementwise_y_by_column<T: crate::collective::Tp>(
             at(out, j),
             sym_id_base,
             layout,
-        ));
+        )?);
     }
     Ok(ops)
 }
@@ -3484,7 +3487,7 @@ fn elementwise_by_inner_spray<T: crate::collective::Tp>(
                 at(out, c),
                 sym_id_base,
                 layout,
-            ))
+            )?)
         })
         .collect()
 }
@@ -3624,7 +3627,7 @@ fn elementwise_by_outer_spray<T: crate::collective::Tp>(
                 at(out, c, 0),
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         return Ok(ops);
     }
@@ -3657,7 +3660,7 @@ fn elementwise_by_outer_spray<T: crate::collective::Tp>(
                 at(out, c, j * mb),
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
     }
     Ok(ops)
@@ -3851,7 +3854,7 @@ pub fn convert<T: crate::collective::Tp>(
             },
             sym_id_base,
             layout,
-        )]);
+        )?]);
     }
     if cols != dev_cols {
         let whole_view = |x: &Region| x.c_start == 0 && x.c_len == x.v_cols;
@@ -3880,7 +3883,7 @@ pub fn convert<T: crate::collective::Tp>(
         &out_h,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// main's `lower_silumul_node` (main 8466-8604): `out = silu(gate) · up` DECOMPOSED into two
@@ -3971,7 +3974,7 @@ pub fn silumul<T: crate::collective::Tp>(
             out_w,
             sym_id_base,
             layout,
-        ),
+        )?,
         assemble_pointwise_broadcast_off(
             &mul_name,
             "multiply",
@@ -3985,7 +3988,7 @@ pub fn silumul<T: crate::collective::Tp>(
             out_w,
             sym_id_base,
             layout,
-        ),
+        )?,
     ])
 }
 
@@ -4080,13 +4083,14 @@ pub fn rmsnorm<T: crate::collective::Tp>(
         cols,
         &x,
         &gamma,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
         layout,
+        &mut crate::placement::LxScope::program(),
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// THE POINTWISE DEVICE-WIDTH PAD, CAPPED AT THE WIDTH THE OUTPUT'S PLACEMENT ACTUALLY HOLDS.
@@ -5114,7 +5118,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
-        ));
+        )?);
         let hh = |name: &str| fl(name, rows, hd);
         // One row of angles shared by every head at mq==1; per-row above that.
         let (cos_h, sin_h) = (hh(&cos), hh(&sin));
@@ -5142,7 +5146,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &hh(&xc),
             sym_id_base,
             layout,
-        ));
+        )?);
         ops.push(pw2(
             &format!("rope_rs_o{t}"),
             "multiply",
@@ -5153,7 +5157,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &hh(&rs),
             sym_id_base,
             layout,
-        ));
+        )?);
         ops.push(pw2(
             &format!("rope_add_o{t}"),
             "add",
@@ -5164,7 +5168,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &hh(&out),
             sym_id_base,
             layout,
-        ));
+        )?);
         return Ok(ops);
     }
     // ── PREFILL (mq>1) hd>stick: SLAB rope ──────────────────────────────────────────────────────────
@@ -5337,7 +5341,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
                 o_place,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         // PREFILL KEEPS THE PER-HEAD P MATMUL — the form measured coherent on granite-8b (`7d27d734`),
         // one `[mq,hd]` window per head with the whole head dim contracted. `heads` ops instead of
@@ -5363,7 +5367,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
                 off_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         // The three elementwise legs, each over the WHOLE tensor: same bytes the per-block ops covered,
         // one op instead of `heads * n_slabs`. cos/sin are the worker's head-TILED table at this site's
@@ -5383,7 +5387,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &rb(&xc, mq, total),
             sym_id_base,
             layout,
-        ));
+        )?);
         ops.push(pw2(
             &format!("rope_rs_o{t}"),
             "multiply",
@@ -5394,7 +5398,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &rb(&rs, mq, total),
             sym_id_base,
             layout,
-        ));
+        )?);
         // ADD, unconditionally: P already carries the rotate's sign, so there is no first-half/
         // second-half split left to make this op two ops (which the stick planes' interleaving would
         // have forced — first-half slabs are every OTHER plane, not a contiguous run).
@@ -5408,7 +5412,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &rb(&out, mq, total),
             sym_id_base,
             layout,
-        ));
+        )?);
         return Ok(ops);
     }
     // ── PREFILL (mq>1) hd==stick: PER-HEAD ROW-BATCHED rope (2026-07-28, TTFT) ──────────────────
@@ -5529,7 +5533,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
-        ));
+        )?);
         // ── The three POINTWISE legs collapse to ONE op EACH, across all heads. ──────────────────
         // These were `heads` ops apiece (160 of the 402 trips in a granite prefill layer body — the
         // single largest family, 40%) purely because they inherited the per-head loop. They do not
@@ -5619,7 +5623,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
                 off,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             ew_ph(
                 &mut ops,
                 format!("rope_xc_r{r}_h{h}_o{t}"),
@@ -5798,7 +5802,7 @@ pub fn lmlast<T: crate::collective::Tp>(
     }
     let s = out.v_rows;
     if let Some(l) = layout {
-        l.synth(PlaceId::Act(out.tid), &[s, hidden]);
+        l.synth(crate::place::SynthId::Act(out.tid), &[s, hidden]);
     }
     // ⭐ TRUE EXTENTS, not the `[1, stk]`/`rbo` staging annotations: the source IS the `[mq, hidden]`
     // prompt buffer and the destination IS the `[S, hidden]` staging the synth above reserves, so the
@@ -5842,7 +5846,7 @@ pub fn lmlast<T: crate::collective::Tp>(
                 layout,
             )
         })
-        .collect())
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 /// A BLOCK COPY — `dst[:, off .. off + C_SRC] = src` for a whole `[R, C_SRC]` source and an
@@ -5919,7 +5923,7 @@ pub fn block_copy<T: crate::collective::Tp>(
         crate::addr::rc_of(rows, c_dst, 0, off, Df::Fp16),
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// main's `lower_matmul_node` (main 7752-8362).
@@ -6301,7 +6305,7 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
             &rb(&out.name(), m, n_dev),
             sym_id_base,
             layout,
-        )
+        )?
     } else {
         // ⛔ A PARTIAL WINDOW MAY NOT TAKE THE UTIL-FLOOR PAD. `n_dev > n` invents output columns
         // the program never stated; on a whole-tensor program their write lands in the placement's
@@ -6341,7 +6345,7 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
             o_off,
             sym_id_base,
             layout,
-        )
+        )?
     };
     // Default path: one f16 matmul.
     Ok(vec![op])
@@ -6464,7 +6468,7 @@ pub fn scalar_binary<T: crate::collective::Tp>(
         crate::addr::OutCorner::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// A buffer SEEDED with one value — a walk's carried state at the value the program initialises it
@@ -6501,7 +6505,7 @@ pub fn fill<T: crate::collective::Tp>(
         crate::addr::OutCorner::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// `linalg.batch_matmul` `[b, m, k] × [b, k, n] → [b, m, n]` — ONE 2-D contraction per batch.
@@ -6679,8 +6683,8 @@ pub fn batch_matmul<T: crate::collective::Tp>(
                 sym_id_base,
                 layout,
             )
-            .map_err(|message| Error {
-                message: format!("{name}: {message}"),
+            .map_err(|e| Error {
+                message: format!("{name}: {}", e.0),
             })?,
         );
     }
@@ -7541,7 +7545,7 @@ pub fn embed_row_gather<T: crate::collective::Tp>(
             &rb(&out.name(), width, hidden),
             sym_id_base,
             layout,
-        ))
+        )?)
     };
     // ── THE EMISSION, in chain order: per request the slab gather then the transpose
     // (the transpose reads what the gather wrote), then the row gather's ops (request
@@ -8399,7 +8403,7 @@ mod elementwise_tests {
             "out is the ONE stick the frame law allows"
         );
         assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
-        for a in &op.args {
+        for a in op.args() {
             assert_eq!(
                 a.view().layout,
                 &["y", "mb", "out"] as &[&'static str],
@@ -8408,7 +8412,7 @@ mod elementwise_tests {
             );
         }
         let merged_view = op
-            .args
+            .args()
             .iter()
             .find(|a| a.view().name == "t6")
             .expect("the merged source's arg")
@@ -8499,7 +8503,7 @@ mod elementwise_tests {
         .expect("the inner row-spray op emits");
         assert_eq!(op.iter.extent("mb"), 64, "mb is the source's rows");
         assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
-        for a in &op.args {
+        for a in op.args() {
             assert_eq!(
                 a.view().layout,
                 &["mb", "y", "out"] as &[&'static str],
@@ -8508,7 +8512,7 @@ mod elementwise_tests {
             );
         }
         let mask_view = op
-            .args
+            .args()
             .iter()
             .find(|a| a.view().name == "t6")
             .expect("the sprayed source's arg")
@@ -10331,6 +10335,7 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
+    lx_scope: &mut crate::placement::LxScope,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     // x, gamma and the output — the parameters the rmsnorm program mints. Its constants are
     // immediates, so none of them is a parameter.
@@ -10387,13 +10392,14 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
         cols,
         &x,
         &gamma,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
         layout,
+        lx_scope,
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::RmsNormUnit`] —
@@ -10454,12 +10460,12 @@ pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
         rows,
         cols,
         &x,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         sym_id_base,
         layout,
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::WindowedRmsNorm`] — the
@@ -10577,7 +10583,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
     let x = tensors[0].name();
     let t = out.tid;
-    let out_id = PlaceId::Act(t);
+    let out_id = crate::place::SynthId::Act(t);
     use crate::place::SynthRole as R;
     let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
     // ── THE SYNTHETICS ──
@@ -10643,7 +10649,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             gw,
             sym_id_base,
             layout,
-        )); // gw = γ + 1, shared by every head
+        )?); // gw = γ + 1, shared by every head
     }
     for h in 0..heads {
         // The head window's base offset in the `[m, H·D]` buffers — a whole-block shift of
@@ -10666,7 +10672,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             win,
             sym_id_base,
             layout,
-        ));
+        )?);
         // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
         //    its own head's buffer at ZERO (the fp8 amax-partial shape). THE ONE PROBE-AND-SPLIT
         //    BODY owns the long form: a head window too wide for one LX pass splits into
@@ -10692,7 +10698,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             sym_id_base,
             layout,
         )
-        .map_err(|e| Error { message: e })?;
+        .map_err(Error::from)?;
         if let Some(split) = split {
             ops.extend(split);
         } else {
@@ -10725,7 +10731,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 crate::superdsc_opspec::Df::Fp16,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         // 3. mean + eps.
         ops.push(pw2(
@@ -10738,7 +10744,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             &meps_h,
             sym_id_base,
             layout,
-        ));
+        )?);
         // 4. rinv = rsqrt(mean+eps).
         ops.push(pw1(
             &format!("rmrsqrt_{prefix}"),
@@ -10749,7 +10755,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             &rinv_h,
             sym_id_base,
             layout,
-        ));
+        )?);
         // 5. xn = x·rinv (r per-row of the head's block, out-broadcast over D) — the
         //    unit form's TERMINAL multiply writes `out` directly here instead.
         // 6. out = xn·gamma (the `[1, D]` row, mb-broadcast) — the Gw row (γ+1)
@@ -10765,7 +10771,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 win,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             let gain = gw_h.as_ref().unwrap_or(g);
             ops.push(assemble_pointwise_broadcast_off(
                 &format!("rmg_{prefix}"),
@@ -10777,7 +10783,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 win,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         } else {
             ops.push(assemble_pointwise_broadcast_off(
                 &format!("rmxn_{prefix}"),
@@ -10789,7 +10795,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 win,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
     }
     Ok(ops)
@@ -10839,11 +10845,11 @@ pub fn tanhsoftcap<T: crate::collective::Tp>(
         rows,
         cols,
         &x,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &cap_const,
         sym_id_base,
         layout,
-    ))
+    )?)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
@@ -10892,7 +10898,7 @@ pub fn scalarweightmul<T: crate::collective::Tp>(
         &out_h,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::Reshape`] — a RE-LAYING COPY that
@@ -11034,7 +11040,7 @@ pub fn reshape<T: crate::collective::Tp>(
             ),
             sym_id_base,
             layout,
-        ));
+        )?);
     }
     Ok(ops)
 }
@@ -11405,7 +11411,7 @@ fn scalarmul_scaled<T: crate::collective::Tp>(
         corner,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// A BARE ROW REDUCTION — `[rows, cols]` → `[rows, 1]`, one `sfp` op along the stick axis.
@@ -11547,7 +11553,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     })?,
                     ReduceDataLeg::whole(&data_h),
                     ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-                    PlaceId::Act(out.tid),
+                    crate::place::SynthId::Act(out.tid),
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -11556,7 +11562,7 @@ pub fn reduce<T: crate::collective::Tp>(
                 layout,
             )
             .map_err(|e| Error {
-                message: format!("{name}: {e}"),
+                message: format!("{name}: {}", e.0),
             })?;
             if let Some(ops) = split {
                 return Ok(ops);
@@ -11571,7 +11577,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     &rb(&out.name(), rows, 1),
                     sym_id_base,
                     layout,
-                ),
+                )?,
             ])
         }
         Df::Fp32 => {
@@ -11614,7 +11620,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     })?,
                     ReduceDataLeg::whole(&data_h),
                     ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-                    PlaceId::Act(out.tid),
+                    crate::place::SynthId::Act(out.tid),
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -11623,7 +11629,7 @@ pub fn reduce<T: crate::collective::Tp>(
                 layout,
             )
             .map_err(|e| Error {
-                message: format!("{name}: {e}"),
+                message: format!("{name}: {}", e.0),
             })?;
             if let Some(ops) = split {
                 return Ok(ops);
@@ -11727,7 +11733,7 @@ pub fn reduce_df<T: crate::collective::Tp>(
             })?,
             ReduceDataLeg::whole(&data_h),
             ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-            PlaceId::Act(out.tid),
+            crate::place::SynthId::Act(out.tid),
         )
         .map_err(|e| Error {
             message: format!("{name}: {e}"),
@@ -11736,7 +11742,7 @@ pub fn reduce_df<T: crate::collective::Tp>(
         layout,
     )
     .map_err(|e| Error {
-        message: format!("{name}: {e}"),
+        message: format!("{name}: {}", e.0),
     })?;
     if let Some(ops) = split {
         return Ok(ops);
@@ -11752,6 +11758,6 @@ pub fn reduce_df<T: crate::collective::Tp>(
             df,
             sym_id_base,
             layout,
-        ),
+        )?,
     ])
 }

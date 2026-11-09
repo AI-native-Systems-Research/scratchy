@@ -959,17 +959,10 @@ mod rope_from_the_fixture {
     /// `should_panic` test whose input is silently well-formed is the failure mode being repaired
     /// here, and an assert that fires first panics with the wrong message and fails.
     ///
-    /// ⛔ IT IS A `should_panic` BECAUSE THE VENDOR STILL UNWRAPS THIS GUARD'S `Err` — CHECKED, not
-    /// assumed, because the `Result` form did arrive for the matmul door this session
-    /// (`try_assemble_matmul_seeded`, `aba078748`) and the obvious guess is that this moved with it.
-    /// It did not: rope's pointwise leg goes through `assemble_pointwise_broadcast`, whose two tails
-    /// are still `.unwrap_or_else(|e| panic!(…))` (`vendor/ktir-superdsc/src/emit/mod.rs:752` and
-    /// `:755`), and `vendor/PROVENANCE.md` records under "FOUND AND DELIBERATELY NOT PATCHED" that
-    /// threading a `Result` out of that family reaches ~40 call sites and was left as their call. So
-    /// there is no `Err` for this test to read. If that door ever returns instead, this test is the
-    /// place to notice: drop the attribute and assert the `Err`.
+    /// ⭐ THE REFUSAL IS AN `Err`. This was a `should_panic` while rope's pointwise leg went through an
+    /// `assemble_pointwise_broadcast` that unwrapped this guard's `Err`; the assembler family now
+    /// returns it, so the door hands it back and the test reads it — the change this note asked for.
     #[test]
-    #[should_panic(expected = "exceeds its placement footprint")]
     fn a_half_width_angle_table_is_caught_in_bytes() {
         let node = rope_kv8();
         let mut r = emit::lower_ktir_to_superdsc::regions(&node).expect("regions");
@@ -1001,7 +994,7 @@ mod rope_from_the_fixture {
             x.size,
             cos.size
         );
-        let _ = drive_rope::<ktir_superdsc::collective::TpWorld<1>>(
+        let Err(e) = drive_rope::<ktir_superdsc::collective::TpWorld<1>>(
             &node,
             128,
             256,
@@ -1009,6 +1002,12 @@ mod rope_from_the_fixture {
             RopeRows::TokenMajor,
             false,
             Some(&l),
+        ) else {
+            panic!("the narrow angle table must be refused");
+        };
+        assert!(
+            format!("{e:?}").contains("exceeds its placement footprint"),
+            "names the footprint the read overruns: {e:?}"
         );
     }
 

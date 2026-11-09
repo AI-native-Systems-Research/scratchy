@@ -10738,6 +10738,26 @@ fn place_id_tokens(
                 ::scratchy_target_spyre::bundle_code::PlaceId::Synth { of: #of, role: #role }
             }
         }
+        P::OpLocal { of, role } => {
+            let of = proc_macro2::Literal::u32_unsuffixed(*of);
+            let role = op_local_role_tokens(role);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::PlaceId::OpLocal { of: #of, role: #role }
+            }
+        }
+    }
+}
+
+/// One op-local pin role as tokens — its named constant. Exhaustive over the kinds, so a new
+/// op-local pin breaks THIS match at build, as a new [`SynthRole`] breaks `synth_role_tokens`.
+#[cfg(feature = "spyre")]
+pub(crate) fn op_local_role_tokens(
+    r: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::OpLocalRole,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::OpLocalKind as K;
+    let b = quote! { ::scratchy_target_spyre::bundle_code::OpLocalRole };
+    match r.kind() {
+        K::Rinv => quote! { #b::RINV },
     }
 }
 
@@ -12364,12 +12384,15 @@ fn dump_wavefront_mega(
                         );
                         // A hand-authored matmul, so there is no attention node for the four
                         // attention facts to be facts of — main's own `false`/absent at such a site.
-                        match superdsc::emit_bundle::<$W>(
-                            &[g1],
-                            None,
-                            superdsc::FoldGrouping::Split,
-                            None,
-                        ) {
+                        match g1.map_err(|e| e.to_string()).and_then(|g1| {
+                            superdsc::emit_bundle::<$W>(
+                                &[g1],
+                                None,
+                                superdsc::FoldGrouping::Split,
+                                None,
+                            )
+                            .map_err(|e| e.to_string())
+                        }) {
                             Ok(fp) => eprintln!(
                                 "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
                                  dxp compiles it inline"

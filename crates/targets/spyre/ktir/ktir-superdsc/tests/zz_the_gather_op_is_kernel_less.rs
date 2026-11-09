@@ -192,7 +192,7 @@ fn the_index_keeps_its_dtype_and_its_own_layout_on_the_gather_op() {
         .expect("the vendor's index LDS");
 
     let op = gather_copy(VENDOR_DECL);
-    let ia = op.indirect.expect("a declared gather");
+    let ia = op.indirect().expect("a declared gather");
     let j = emit(&op);
     let d = dsc(&j);
     let ours = d["labeledDs_"]
@@ -229,7 +229,7 @@ fn the_index_keeps_its_dtype_and_its_own_layout_on_the_gather_op() {
 #[test]
 fn the_pair_cross_links_and_the_base_stays_concrete() {
     let op = gather_copy(VENDOR_DECL);
-    let ia = op.indirect.expect("a declared gather");
+    let ia = op.indirect().expect("a declared gather");
     let j = emit(&op);
     let d = dsc(&j);
     let tree = d["scheduleTree_"].as_array().expect("a schedule tree");
@@ -371,7 +371,7 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
     .expect("the fp8 expert-slab copy builds");
     // Both VALUE operands carry the fp8 residency — 1-byte words, the bank's own format.
     let value_args: Vec<_> = op
-        .args
+        .args()
         .iter()
         .filter(|a| a.view().role != ktir_superdsc::superdsc_opspec::Role::Index)
         .collect();
@@ -384,7 +384,7 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
     // and L3DlOpsScheduler.cpp:5928 read, and the property that lets one BlockTable-style index
     // drive an fp16 KV gather and an fp8 expert gather indifferently.
     let idx_arg = op
-        .args
+        .args()
         .iter()
         .find(|a| a.view().role == ktir_superdsc::superdsc_opspec::Role::Index)
         .expect("the declaration appended the index arg");

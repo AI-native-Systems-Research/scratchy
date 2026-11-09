@@ -30,7 +30,8 @@ fn lm_head_trips(m: u32) -> usize {
         scratchy_subtile::addr::DevOff::ZERO,
         &mut sym,
         None,
-    );
+    )
+    .expect("assemble_matmul_off builds");
     concrete_trips(&e).len()
 }
 

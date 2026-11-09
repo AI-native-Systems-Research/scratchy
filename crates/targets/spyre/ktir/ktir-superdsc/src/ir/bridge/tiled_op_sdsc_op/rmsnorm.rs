@@ -53,12 +53,13 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     cols: u32,
     x: &str,
     gamma: &str,
-    out_id: crate::place::PlaceId,
+    out_id: crate::place::SynthId,
     eps_const: &str,
     ones_const: Option<&str>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp<T>>, String> {
+    lx_scope: &mut crate::placement::LxScope,
+) -> Result<Vec<EmittedOp<T>>, crate::superdsc_error::SuperDscError> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
@@ -67,7 +68,6 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let out = out_s.as_str();
     let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
     let mean = syn(R::Mean); // (E[x], E[x²])  [rows, stk]
-    let rinv = syn(R::Rinv); // 1/√E[x²]   [rows, stk]
     let xn = syn(R::Xn); // x·r          [rows, cols]
     let meps = syn(R::Meps); // E[x²]+eps   [rows, stk]
     // γ+1        [1, cols]  — OnePlusScale only
@@ -80,7 +80,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         ] {
             l.synth(out_id.synth(r), &dims);
         }
-        // `rinv` is PINNED-LX, not seg3-HBM (`synth_lx_op_local`): its consumer reads a SUB-STICK lane
+        // `rinv` is PINNED-LX, not seg3-HBM (`lx_op_local_pair`, below): its consumer reads a SUB-STICK lane
         // (element 8 of the exx2 pair — see step 4 below), and a sub-stick read offset survives
         // the compile chain only on the LX path. On HBM the +16B is floored away twice over —
         // the L3 EBR is stick-granular (the reader's allocate carries the offset but the
@@ -95,7 +95,6 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         // The producer side of the pin: LX is per-core private, so `apply_lx_residency`
         // replicates `rmrsqrt` across all cores (each computes the whole [rows, stk] stick into
         // its own scratchpad) and the reader's own slice corner selects its rows there.
-        l.synth_lx_op_local(out_id.synth(R::Rinv), &[rows, stk]);
         if ones_const.is_some() {
             l.synth(out_id.synth(R::Gw), &[1, cols]);
         }
@@ -120,7 +119,6 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let mean = rb(&mean, rows, stk);
     let meps = rb(&meps, rows, stk);
     let eps = rb(eps_const, 1, stk);
-    let rinv = rb(&rinv, rows, stk);
     let xn = rb(&xn, rows, cols);
     // The norm's typed extents: `rows` is the residual stream's token rows, `cols` its feature
     // width, and the per-row mean/rsqrt scalars live in ONE-STICK-wide tensors.
@@ -153,11 +151,13 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
                 cols,
                 Df::Fp16,
                 layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
-            )?,
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?,
             ReduceDataLeg::whole(&x),
             ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
             out_id,
-        )?,
+        )
+        .map_err(crate::superdsc_error::SuperDscError)?,
         sym_id_base,
         layout,
     )?;
@@ -173,7 +173,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
             &mean,
             sym_id_base,
             layout,
-        ));
+        )?);
     }
     // 2. E[x²] + eps  (the `+ eps` inside torch.rsqrt). `mean` holds both half-stick values, so
     //    elements [0..8) compute E[x]+eps and the pad elements compute over stale bytes — both
@@ -189,19 +189,10 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         &meps,
         sym_id_base,
         layout,
-    )); // E[x²] + eps
-    // 3. rinv = rsqrt(E[x²]+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
-    ops.push(pw1(
-        &format!("rmrsqrt_{prefix}"),
-        "rsqrt",
-        t_rows,
-        s_cols,
-        In::full(&meps),
-        &rinv,
-        sym_id_base,
-        layout,
-    )); // 1/√(E[x²]+eps)
-    // 4. apply: xn = x·r (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
+    )?); // E[x²] + eps
+    // 3 + 4. THE PIN, ITS WRITER AND ITS READER, AS ONE CONSTRUCTION (`lx_op_local_pair`):
+    //   3. rinv = rsqrt(E[x²]+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
+    //   4. apply: xn = x·r (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
     //    `rinv`'s element 8 IS E[x²]'s rsqrt — the FIRST element of the exx2 output's second
     //    half-stick ([8..16); the vendor's own consumers read it at exactly this offset,
     //    `stick_replicated_dim_offset_elements=8`) — read via a one-element view step into the
@@ -211,19 +202,43 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     //    saturated, degenerate generation. The half-stick map is the DDL's, not a guess.
     //    The +8 elements (= +16 B, one fp16 word past the pair's first slot) rides the reader's
     //    allocate through the ordinary slice-offset machinery — and because `rinv` is LX-pinned,
-    //    that byte lands BYTE-exact in the reader's lxlu address (see the `synth_lx_op_local` note above
+    //    that byte lands BYTE-exact in the reader's lxlu address (see the LX-pin note above
     //    for why the same offset on HBM is silently floored to element 0).
-    ops.push(pw2(
-        &format!("rmxn_{prefix}"),
-        "multiply",
-        t_rows,
-        f_cols,
-        In::full(&x),
-        In::col_at(&rinv, crate::addr::DevOff::from_view_step(8)),
-        &xn,
+    // The pin's one statement of its extents: `rows` one-stick rows. A norm over zero rows has no
+    // row to normalise, so the row count is refused HERE, at the one mint — the reduce above
+    // refuses it too, over the same count.
+    let pin_rows = std::num::NonZeroU32::new(rows).ok_or_else(|| {
+        crate::superdsc_error::SuperDscError(format!(
+            "rmsnorm {prefix}: a norm needs at least one row"
+        ))
+    })?;
+    let (rsqrt_op, xn_op) = crate::emit::lx_op_local_pair(
+        crate::emit::OpLocalPair {
+            of: out_id,
+            role: crate::place::OpLocalRole::RINV,
+            shape: crate::placement::OpLocalShape::rows_of_one_stick(pin_rows),
+            // 1/√(E[x²]+eps)
+            writer: crate::emit::PinWriter {
+                op_name: format!("rmrsqrt_{prefix}"),
+                op_func: "rsqrt",
+                inputs: vec![In::full(&meps).ew()],
+            },
+            reader: crate::emit::PinReader {
+                op_name: format!("rmxn_{prefix}"),
+                op_func: "multiply",
+                cols: f_cols,
+                before: vec![In::full(&x).ew()],
+                pin: crate::emit::PinRead::ColAt(crate::addr::DevOff::from_view_step(8)),
+                after: vec![],
+                out: &xn,
+            },
+        },
+        lx_scope,
         sym_id_base,
         layout,
-    ));
+    )?;
+    ops.push(rsqrt_op);
+    ops.push(xn_op);
     // 6. OnePlusScale: gw = gamma + 1 — ONE `add` over the stored row with the
     //    `[1,1]`-broadcast offset (the eps operand mode), filling the `[1,cols]`
     //    `Gw` row the gain multiply reads. The stored gamma is never rewritten.
@@ -242,7 +257,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
                 gw_handle,
                 sym_id_base,
                 layout,
-            )); // gw = γ + 1
+            )?); // gw = γ + 1
             In::mb(gw_handle)
         }
         None => In::mb(&gamma),
@@ -257,7 +272,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         &out,
         sym_id_base,
         layout,
-    ));
+    )?);
     Ok(ops)
 }
 
@@ -280,11 +295,11 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     rows: u32,
     cols: u32,
     x: &str,
-    out_id: crate::place::PlaceId,
+    out_id: crate::place::SynthId,
     eps_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp<T>>, String> {
+) -> Result<Vec<EmittedOp<T>>, crate::superdsc_error::SuperDscError> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
@@ -329,7 +344,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         &sq16,
         sym_id_base,
         layout,
-    )); // sq16 = x²
+    )?); // sq16 = x²
     // THE ONE PROBE-AND-SPLIT BODY owns the long form here too — the same body, the same
     // question, never a second spelling of the split law.
     let rmmean_op = format!("rmmean_{prefix}");
@@ -342,11 +357,13 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
                 cols,
                 Df::Fp16,
                 layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
-            )?,
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?,
             ReduceDataLeg::whole(&sq16),
             ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
             out_id,
-        )?,
+        )
+        .map_err(crate::superdsc_error::SuperDscError)?,
         sym_id_base,
         layout,
     )?;
@@ -362,7 +379,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
             &mean,
             sym_id_base,
             layout,
-        ));
+        )?);
     }
     ops.push(pw2(
         &format!("rmeps_{prefix}"),
@@ -374,7 +391,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         &meps,
         sym_id_base,
         layout,
-    )); // mean + eps
+    )?); // mean + eps
     ops.push(pw1(
         &format!("rmrsqrt_{prefix}"),
         "rsqrt",
@@ -384,7 +401,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         &rinv,
         sym_id_base,
         layout,
-    )); // 1/√(mean+eps)
+    )?); // 1/√(mean+eps)
     // Step 5 is the TERMINAL multiply here, not `Xn`: `out = x·rinv` with the
     // per-row reciprocal out-broadcast over cols — the same operand mode
     // (`In::col`) the gained form's `rmxn` uses for the same value.
@@ -398,7 +415,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         &out,
         sym_id_base,
         layout,
-    ));
+    )?);
     Ok(ops)
 }
 
@@ -422,11 +439,11 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     rows: u32,
     cols: u32,
     x: &str,
-    out_id: crate::place::PlaceId,
+    out_id: crate::place::SynthId,
     cap_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Vec<EmittedOp<T>> {
+) -> Result<Vec<EmittedOp<T>>, crate::superdsc_error::SuperDscError> {
     use crate::place::SynthRole as R;
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
     let out_s = out_id.to_string();
@@ -453,7 +470,7 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
         &tanhc,
         sym_id_base,
         layout,
-    ));
+    )?);
     // 2. tanh — in place on the scaled buffer's name, into the same synth.
     ops.push(pw1(
         &format!("tscth_{prefix}"),
@@ -464,7 +481,7 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
         &tanhc,
         sym_id_base,
         layout,
-    ));
+    )?);
     // 3. out = cap · tanh(x/cap).
     ops.push(pw2(
         &format!("tscmul_{prefix}"),
@@ -476,6 +493,6 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
         &out,
         sym_id_base,
         layout,
-    ));
-    ops
+    )?);
+    Ok(ops)
 }

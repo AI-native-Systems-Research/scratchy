@@ -23,7 +23,7 @@
 
 use crate::sdsc_abstract::{DeviceWalk, StickLayout};
 use crate::superdsc_error::SuperDscError;
-use crate::superdsc_opspec::{ArgView, Role, SdscFoldSet, WorkPlan};
+use crate::superdsc_opspec::{ArgView, OpSpec, Role, SdscFoldSet, WorkPlan};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -344,6 +344,11 @@ pub struct LayoutInfo {
 /// ONLY for symbolic HBM addresses; `relatedIndirectAccessAlloc_`/
 /// `indexTensorType_` ONLY for indirect access (`skip_serializing_if` on the
 /// `Option`s keeps byte-faithfulness for both presence and absence).
+///
+/// ⭐ EVERY FIELD dxp's SCHEDULER REQUIRES IS ONE ONLY ITS OWN AUTHORITY CAN MINT: the start
+/// address fold comes from the [`AddrMint`] of the [`ScheduleTree`] the node is built into (so its
+/// core/corelet factors are that tree's fold set's), and the coordinates come from
+/// [`build_coordinates`] over a real operand (so `coordInfo` holds one entry per dim of it).
 #[derive(Serialize, Clone, Debug)]
 pub struct AllocNode {
     pub nodeType_: &'static str, // "allocate"
@@ -366,26 +371,243 @@ pub struct AllocNode {
     pub startAddressCoreCorelet_: AddrFold,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backGapCore_: Option<serde_json::Value>,
-    pub coordinates_: serde_json::Value, // {coordInfo:{…}, coreIdToWkSlice_:{}}
+    pub coordinates_: Coordinates, // {coordInfo:{…}, coreIdToWkSlice_:{}}
 }
+
+/// ⭐ A DESCRIPTOR's `scheduleTree_` — ONE allocate node per operand of the op it was built from,
+/// every node's start-address fold minted from this tree's own fold set.
+///
+/// Built only by [`ScheduleTree::of_operands`], over an [`OpSpec`], which always has an output
+/// ([`OpSpec::new`] takes it): so a tree is never empty, which dxp_standalone otherwise refuses at
+/// `allocNode` (`dsc2.cpp:3999`, OBSERVED on card 2026-06-25). And the op's own
+/// `coreFoldProp_`/`coreletFoldProp_` are read off the SAME set ([`Self::core_fold`],
+/// [`Self::corelet_fold`]), so a node's factors and the op's cannot differ — the FoldManager's
+/// `Different cardinality between json and caller` (`foldInfrastructure.h:2775`).
+///
+/// Reads go through the node slice (`Deref`); edits through [`ScheduleTree::edit`]'s [`NodeEdit`]s,
+/// which reach a node's addresses and stick coordinate but never the node itself — so a node
+/// cannot be added, removed or replaced.
+///
+/// An empty tree cannot be written — its fields are private, and the only door takes an op:
+/// ```compile_fail,E0451
+/// use ktir_superdsc::wire::ScheduleTree;
+/// let empty = ScheduleTree { folds: todo!(), nodes: Vec::new() }; // E0451: private fields
+/// ```
+/// Nor can a node be pushed after the tree is built (the slice it derefs to has no `push`):
+/// ```compile_fail,E0599
+/// fn grow(t: &mut ktir_superdsc::wire::ScheduleTree, n: ktir_superdsc::wire::AllocNode) {
+///     t.push(n); // E0599: no method `push` on `[AllocNode]`
+/// }
+/// ```
+/// Nor can a node be replaced by one from another tree (the tree derefs to `&[AllocNode]` only):
+/// ```compile_fail,E0594
+/// fn swap(t: &mut ktir_superdsc::wire::ScheduleTree, n: &ktir_superdsc::wire::AllocNode) {
+///     t[0] = n.clone(); // E0594: cannot assign through a `&` reference
+/// }
+/// ```
+/// An op's fold props are a [`TreeFold`], which only a tree mints:
+/// ```compile_fail,E0423
+/// use ktir_superdsc::wire::{FoldProp, TreeFold};
+/// let f = TreeFold(FoldProp { factor_: 7, label_: "core" }); // E0423: private constructor
+/// ```
+/// And a start fold's factors are private — the addresses are open, the factors are not:
+/// ```compile_fail,E0616
+/// fn retarget(a: &mut ktir_superdsc::wire::AddrFold) {
+///     a.dim_prop_attr.clear(); // E0616: private field
+/// }
+/// ```
+/// `coordinates_` is a [`Coordinates`], which only [`build_coordinates`] makes:
+/// ```compile_fail,E0451
+/// let c = ktir_superdsc::wire::Coordinates { coord_info: Default::default() }; // E0451: private
+/// ```
+#[derive(Serialize, Clone, Debug)]
+#[serde(transparent)]
+pub struct ScheduleTree {
+    #[serde(skip)]
+    folds: SdscFoldSet,
+    nodes: Vec<AllocNode>,
+}
+
+impl ScheduleTree {
+    /// Build the tree over `op`'s operands: `node(i, mint)` makes operand `i`'s allocate node, its
+    /// start-address fold from `mint` — the only source of one, carrying this tree's `folds`.
+    pub fn of_operands<E>(
+        op: &OpSpec,
+        folds: &SdscFoldSet,
+        mut node: impl FnMut(usize, &AddrMint<'_>) -> Result<AllocNode, E>,
+    ) -> Result<ScheduleTree, E> {
+        let mint = AddrMint { folds };
+        let nodes = (0..op.args().len())
+            .map(|i| node(i, &mint))
+            .collect::<Result<Vec<_>, E>>()?;
+        Ok(ScheduleTree {
+            folds: *folds,
+            nodes,
+        })
+    }
+
+    /// The op's `coreFoldProp_`, from the fold set every node's start fold was minted from.
+    pub fn core_fold(&self) -> TreeFold {
+        TreeFold(FoldProp {
+            factor_: self.folds.core_fold() as i64,
+            label_: "core",
+        })
+    }
+
+    /// The op's `coreletFoldProp_`, from the same set.
+    pub fn corelet_fold(&self) -> TreeFold {
+        TreeFold(FoldProp {
+            factor_: self.folds.corelet_fold() as i64,
+            label_: "corelet",
+        })
+    }
+}
+
+impl std::ops::Deref for ScheduleTree {
+    type Target = [AllocNode];
+    fn deref(&self) -> &[AllocNode] {
+        &self.nodes
+    }
+}
+
+impl<'a> IntoIterator for &'a ScheduleTree {
+    type Item = &'a AllocNode;
+    type IntoIter = std::slice::Iter<'a, AllocNode>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.nodes.iter()
+    }
+}
+
+/// One node of a [`ScheduleTree`], open for the edits a built descriptor takes — its start
+/// ADDRESSES (a relaunch shift, a trip advance) and its stick coordinate's per-time extent (a
+/// time tile). It hands out no `&mut AllocNode`, so a node cannot be replaced, and none of its
+/// fold factors can be reached.
+pub struct NodeEdit<'a>(&'a mut AllocNode);
+
+impl NodeEdit<'_> {
+    /// The node's operand index (`ldsIdx_`).
+    pub fn operand(&self) -> usize {
+        self.0.ldsIdx_ as usize
+    }
+
+    /// The node's memory component (`"hbm"` | `"lx"`).
+    pub fn component(&self) -> &'static str {
+        self.0.component_
+    }
+
+    /// The per-core start addresses, `"[c, 0, 0]"` → byte address.
+    pub fn start_addrs(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.0.startAddressCoreCorelet_.data_
+    }
+
+    /// Rewrite the stick coordinate at its per-time extent ([`Coordinates::divide_stick`]).
+    pub fn divide_stick(&mut self, out_per_time: i64, eps: i64) {
+        self.0.coordinates_.divide_stick(out_per_time, eps);
+    }
+}
+
+impl ScheduleTree {
+    /// Every node, open for its per-node edits ([`NodeEdit`]).
+    pub fn edit(&mut self) -> impl Iterator<Item = NodeEdit<'_>> {
+        self.nodes.iter_mut().map(NodeEdit)
+    }
+}
+
+/// A core or corelet fold prop of an op — minted only by its [`ScheduleTree`], so it is the factor
+/// every allocate node of that tree carries. Reads as the [`FoldProp`] it serializes as.
+#[derive(Serialize, Clone, Debug)]
+#[serde(transparent)]
+pub struct TreeFold(FoldProp);
+
+impl std::ops::Deref for TreeFold {
+    type Target = FoldProp;
+    fn deref(&self) -> &FoldProp {
+        &self.0
+    }
+}
+
+/// The ONE source of a [`AddrFold`]: handed to a node's builder by [`ScheduleTree::of_operands`],
+/// carrying the tree's fold set.
+pub struct AddrMint<'a> {
+    folds: &'a SdscFoldSet,
+}
+
+/// A node's `coordinates_` — built only by [`build_coordinates`], over an operand, so `coordInfo`
+/// holds one entry per dim of it. An operand has at least one dim (ranks 1–4), so the scheduler's
+/// `There must be at least one valid candidate` (`L3DlOpsScheduler.cpp:1195`, OBSERVED on card
+/// 2026-06-25) is unreachable. Serializes as `{coordInfo, coreIdToWkSlice_: {}}`.
+///
+/// It also carries its operand's STICK dim and the core split that dim's entry was written with,
+/// recorded by [`build_coordinates`] from the same per-dim rule: an operand's stick is one of its
+/// layout dims ([`crate::superdsc_opspec::TensorArg::new`] finds its index), so the stick always
+/// has an entry, and a time-tiled rewrite reads the split it was built with, never a re-parse of
+/// the JSON.
+#[derive(Serialize, Clone, Debug)]
+pub struct Coordinates {
+    #[serde(rename = "coordInfo")]
+    coord_info: serde_json::Map<String, serde_json::Value>,
+    /// Always empty on the wire (`{}`): dxp derives the core→slice map itself.
+    #[serde(rename = "coreIdToWkSlice_")]
+    core_id_to_wk_slice: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip)]
+    stick: StickFold,
+}
+
+/// The stick dim of a [`Coordinates`] and the core split its `coordInfo` entry was built with.
+#[derive(Clone, Copy, Debug)]
+struct StickFold {
+    dim: &'static str,
+    nsplits: i64,
+}
+
+impl Coordinates {
+    /// The `coordInfo` object, one entry per dim of the operand.
+    pub fn coord_info(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.coord_info
+    }
+
+    /// Rewrite the STICK dim's `coordInfo` entry of a time-tiled node at its PER-TIME extent: the
+    /// [`gen_coord_info_value`] `size` (Affine alpha_ + elem_arr_0/elem_arr_1) must reflect
+    /// `out_per_time`, not the full per-core extent. Mirrors compute_ops.py reading
+    /// `iteration_space[dim] // work_slices[dim]` AFTER coarse_tile divided the iteration space. The
+    /// split is the one this entry was built with; the natural-stride form is the time-tiled
+    /// rewrite's (never a RowBlocked reduce: a tiled operand ranges its stick dim).
+    pub fn divide_stick(&mut self, out_per_time: i64, eps: i64) {
+        let StickFold { dim, nsplits } = self.stick;
+        self.coord_info.insert(
+            dim.to_string(),
+            gen_coord_info_value(
+                out_per_time,
+                nsplits,
+                eps,
+                /*is_stick_dim=*/ true,
+                /*is_stick_reduction=*/ false,
+                /*group_stride=*/ eps,
+            ),
+        );
+    }
+}
+
 /// The `startAddressCoreCorelet_` fold: `dim_prop_func` = `[Map, Const, Const]`
 /// over `[core, corelet, time]`, with the per-core HBM byte address in `data_`
 /// keyed `"[c, 0, 0]"` (SPACES, per torch-spyre `_start_addr_data`). The
-/// `[core, corelet]` factors are COPIED from the op's [`SdscFoldSet`] via
-/// [`AddrFold::new`] (witness (c)): there is no public field setter, so a factor
-/// that diverges from `coreFoldProp_`/`coreletFoldProp_` is unrepresentable.
+/// `[core, corelet]` factors are COPIED from the tree's [`SdscFoldSet`] by its [`AddrMint`]
+/// (witness (c)); they are private and have no setter, so a factor that diverges from the op's
+/// `coreFoldProp_`/`coreletFoldProp_` is unrepresentable. `data_` — the addresses — stays open: a
+/// relaunch shift and a trip advance restate addresses, never factors.
 #[derive(Serialize, Clone, Debug)]
 pub struct AddrFold {
-    pub dim_prop_func: Vec<FoldFunc>,
-    pub dim_prop_attr: Vec<FoldProp>,
+    dim_prop_func: Vec<FoldFunc>,
+    dim_prop_attr: Vec<FoldProp>,
     /// "[c, 0, 0]" → HBM byte address (a string, per the torch-spyre frontend).
     pub data_: BTreeMap<String, String>,
 }
-impl AddrFold {
+impl AddrMint<'_> {
     /// Build the address fold, copying the core/corelet/time factors STRAIGHT from
-    /// `folds` (witness (c)). `per_core_addr[c]` is the byte address for core `c`.
+    /// the tree's folds (witness (c)). `per_core_addr[c]` is the byte address for core `c`.
     /// CONCRETE-address path (`isStartAddrSymbolic_` absent) — the time=1 case.
-    pub fn new(per_core_addr: &[u64], folds: &SdscFoldSet) -> AddrFold {
+    pub fn concrete(&self, per_core_addr: &[u64]) -> AddrFold {
+        let folds = self.folds;
         AddrFold {
             // torch-spyre emits [Map, Const, Const] over [core, corelet, time].
             dim_prop_func: vec![FoldFunc::Map {}, FoldFunc::Const {}, FoldFunc::Const {}],
@@ -419,7 +641,8 @@ impl AddrFold {
     /// copied from `folds` (witness (c)); only the `data_` values differ. Pairs
     /// with `isStartAddrSymbolic_: Some(1)` on the AllocNode (the **SymbolicWhenTiled**
     /// witness). `per_core_sym_ids[c]` is the negative id for core `c`.
-    pub fn symbolic(per_core_sym_ids: &[i64], folds: &SdscFoldSet) -> AddrFold {
+    pub fn symbolic(&self, per_core_sym_ids: &[i64]) -> AddrFold {
+        let folds = self.folds;
         AddrFold {
             dim_prop_func: vec![FoldFunc::Map {}, FoldFunc::Const {}, FoldFunc::Const {}],
             dim_prop_attr: vec![
@@ -480,7 +703,8 @@ pub struct Dsc {
     pub maskingConstId_: i64,
     pub dataStageParam_: BTreeMap<String, StageParam>,
     pub primaryDsInfo_: BTreeMap<&'static str, LayoutInfo>,
-    pub scheduleTree_: Vec<AllocNode>,
+    /// Never empty, every node's start fold from the op's own fold set ([`ScheduleTree`]).
+    pub scheduleTree_: ScheduleTree,
     pub labeledDs_: Vec<LabeledDs>,
     // EMPTY → the JSON *string* "{}"; POPULATED → a dict. VERIFIED on torch-spyre's
     // REAL frontend (compiled `torch.rsqrt`/`F.rms_norm`): rsqrt/add/mul emit
@@ -507,8 +731,10 @@ pub struct Dsc {
 pub struct SdscOp {
     pub sdscFoldProps_: Vec<FoldProp>,
     pub sdscFolds_: SdscFolds,
-    pub coreFoldProp_: FoldProp,
-    pub coreletFoldProp_: FoldProp,
+    /// Read off the tree its nodes were minted from ([`ScheduleTree::core_fold`]) — the factor
+    /// every allocate node's start fold carries.
+    pub coreFoldProp_: TreeFold,
+    pub coreletFoldProp_: TreeFold,
     pub numCoresUsed_: u32,
     pub coreIdToDsc_: BTreeMap<String, u32>,
     pub numWkSlicesPerDim_: BTreeMap<&'static str, u32>,
@@ -617,20 +843,26 @@ pub fn build_coordinates(
     plan: &WorkPlan,
     fp8_matmul: bool,
     is_reduction: bool,
-) -> serde_json::Value {
+) -> Coordinates {
     // Stick width from the operand's device format (fp8/int8 = 128, fp16/bf16 = 64, fp32 = 32) so the
     // coordInfo fold matches the emitted `stickSize_`; else dxp folds the fp8 dataspace at 64 (wrong).
     let eps = arg.df.elems_per_stick() as i64;
     let mut ci = serde_json::Map::new();
-    for (i, &d) in arg.layout.iter().enumerate() {
-        let scale = arg.scale[i];
+    // Dim `i`'s per-core size and core split: an ACTIVE dim takes its per-core extent and split, a
+    // reduced one size 1 over 1. The stick's split below is read by the same rule.
+    let fold_of = |i: usize| -> (i64, i64) {
+        let d = arg.layout[i];
         let split = plan.split_of(d) as i64;
         let full = plan.extent(d) as i64;
-        let (size, nsplits) = if scale.is_active() {
+        if arg.scale[i].is_active() {
             ((full / split.max(1)).max(1), split.max(1))
         } else {
             (1, 1)
-        };
+        }
+    };
+    for (i, &d) in arg.layout.iter().enumerate() {
+        let scale = arg.scale[i];
+        let (size, nsplits) = fold_of(i);
         let is_stick = arg.stick == d;
         // The fp8 W8A8 matmul operands use the AIU fp8 PE's NATIVE nested tile geometry (verified against
         // IBM's l0_tethering fixture, extracted via L3DlOpsScheduler_standalone): the WEIGHT's N-stick is
@@ -670,7 +902,14 @@ pub fn build_coordinates(
         };
         ci.insert(d.to_string(), info);
     }
-    serde_json::json!({ "coordInfo": serde_json::Value::Object(ci), "coreIdToWkSlice_": {} })
+    Coordinates {
+        coord_info: ci,
+        core_id_to_wk_slice: serde_json::Map::new(),
+        stick: StickFold {
+            dim: arg.stick,
+            nsplits: fold_of(arg.stick_idx).1,
+        },
+    }
 }
 
 /// fp8 WEIGHT `out` (N) fold: the 64-elem N-stick is sub-tiled 8×8 (elem_arr_1×elem_arr_0), with
@@ -819,4 +1058,66 @@ pub fn segment_base(arg_index: usize) -> Result<u64, SuperDscError> {
             SEGMENT_OFFSETS.len()
         ))
     })
+}
+
+/// ⭐ THE THREE dxp-SHAPE FACTS ARE THE TYPES' — every emitted descriptor carries one allocate node per
+/// operand, a non-empty `coordInfo` on each, and start folds whose factors are the op's own fold props.
+/// (The negative forms are the `compile_fail` blocks on [`ScheduleTree`].)
+#[cfg(test)]
+mod the_schedule_tree_is_whole_by_construction {
+    use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec;
+    use crate::superdsc_opspec::SdscFoldSet;
+
+    /// Over core counts the cost model picks for different shapes — a single-core op and wide ones.
+    #[test]
+    fn every_node_matches_the_op_and_every_operand_has_one() {
+        for (m, n, k) in [(1, 64, 64), (32, 384, 64), (64, 2048, 2048)] {
+            let op = matmul_opspec(m, n, k, 1, "a", "w", "o").expect("a legal matmul");
+            let folds = SdscFoldSet::new(op.iter.cores_used());
+            let sdsc = crate::emit::emit_sdsc("mm_o1", &op, &folds, None).expect("emits");
+            let dsc = &sdsc.dscs_[0]["mm_o1"];
+            assert_eq!(
+                dsc.scheduleTree_.len(),
+                op.args().len(),
+                "one node per operand"
+            );
+            for node in &dsc.scheduleTree_ {
+                let j = serde_json::to_value(node).expect("serializes");
+                let factors: Vec<i64> = j["startAddressCoreCorelet_"]["dim_prop_attr"]
+                    .as_array()
+                    .expect("a fold")
+                    .iter()
+                    .map(|f| f["factor_"].as_i64().expect("a factor"))
+                    .collect();
+                assert_eq!(factors[0], sdsc.coreFoldProp_.factor_, "{m}x{n}x{k}: core");
+                assert_eq!(
+                    factors[1], sdsc.coreletFoldProp_.factor_,
+                    "{m}x{n}x{k}: corelet"
+                );
+                let ci = node.coordinates_.coord_info();
+                assert!(!ci.is_empty(), "{m}x{n}x{k}: {} has its folds", node.name_);
+            }
+        }
+    }
+
+    /// A time-tiled rewrite of a node's stick entry keeps the core split the entry was built with —
+    /// read from what `build_coordinates` recorded, so no entry can be missing and no split made up.
+    #[test]
+    fn the_divided_stick_keeps_the_split_it_was_built_with() {
+        for (m, n, k) in [(1, 64, 64), (32, 384, 64), (64, 2048, 2048)] {
+            let op = matmul_opspec(m, n, k, 1, "a", "w", "o").expect("a legal matmul");
+            let folds = SdscFoldSet::new(op.iter.cores_used());
+            let sdsc = crate::emit::emit_sdsc("mm_o1", &op, &folds, None).expect("emits");
+            for node in &sdsc.dscs_[0]["mm_o1"].scheduleTree_ {
+                let factor = |c: &super::Coordinates| {
+                    c.coord_info()[c.stick.dim]["folds"]["dim_prop_attr"][0]["factor_"].as_i64()
+                };
+                let built = factor(&node.coordinates_);
+                let mut divided = node.coordinates_.clone();
+                divided.divide_stick(64, 64);
+                assert_eq!(factor(&divided), built, "{m}x{n}x{k}: {}", node.name_);
+                assert_eq!(built, Some(node.coordinates_.stick.nsplits));
+            }
+        }
+    }
 }
