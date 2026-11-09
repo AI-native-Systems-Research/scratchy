@@ -2088,8 +2088,15 @@ impl Latency<'_> {
         prompts.sort_unstable();
         prompts.dedup();
         let beside = users == UsersNamed::Beside;
+        // A fixed-size chart's column grows with the panel, the chart centred in it, so a few
+        // charts fill the row rather than its left side; a flexible column is used as given.
+        let column = if column.ends_with("px") {
+            format!("minmax({column}, 1fr)")
+        } else {
+            column.to_string()
+        };
         let columns = format!(
-            "display: grid; grid-template-columns: {}repeat({}, {column}); gap: 0.5rem; align-items: center",
+            "display: grid; grid-template-columns: {}repeat({}, {column}); gap: 0.5rem; align-items: center; justify-items: center",
             if beside { "max-content " } else { "" },
             prompts.len()
         );
@@ -3131,6 +3138,17 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element
                 .collect::<Vec<_>>()
                 .join("/")
         };
+        // Where a column names two sizes, which set each is: "Prompt tokens a column, under 64 GB
+        // / 64 GB and up: 128, 512/1k, 1k/4k, 4k/8k".
+        let two_sizes = (0..most).any(|p| header(p).contains('/'));
+        let legend = two_sizes.then(|| {
+            let gb = lineup.large_from_gb;
+            let columns: Vec<String> = (0..most).map(header).collect();
+            format!(
+                "Prompt tokens a column, under {gb} GB / {gb} GB and up: {}.",
+                columns.join(", ")
+            )
+        });
         // A row's slowest and fastest ratio, over every model and prompt size in it, printed at
         // its right.
         let range = |chip: &str, gm: GridMetric, u: u32| -> Option<(f64, f64)> {
@@ -3282,6 +3300,9 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element
                         {ratio_scale(ScaleFit::Fill, "scale-one-map")}
                     }
                 }
+            }
+            if let Some(legend) = legend {
+                p { style: "font-size: 0.75rem", "{legend}" }
             }
         }
     };
@@ -4293,6 +4314,46 @@ mod tests {
         assert!(html.contains("timed, not scored"));
     }
 
+    /// A grid column that names two prompt sizes, one each set's, says which is which.
+    #[test]
+    fn a_grid_column_of_two_sizes_says_which_set_is_which() {
+        let mut runs = fixtures(&[
+            "apple-m3-pro-2026-10-27T031941Z-f9739363.json",
+            "apple-m4-max-2026-10-28T041936Z-dbe48cd2.json",
+        ]);
+        // The 36 GB Mac's grid at the small set's sizes, as the matrix runs it now.
+        let sc = runs[0].config.scaling.as_mut().expect("a grid run");
+        sc.grid_input = Some(vec![128, 512, 1024, 4096]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section(super::datasets::RANDOM, &machines, &machines));
+        assert!(html.contains(">512/1k<"), "a column of two sizes");
+        assert!(html.contains("Prompt tokens a column, under 64 GB / 64 GB and up: 128, 512/1k, 1k/4k, 4k/8k."));
+    }
+
+    /// A fold's title is the accordion's title slot, not an HTML title attribute, which the
+    /// browser shows as a tooltip over everything inside the fold.
+    #[test]
+    fn a_fold_has_no_title_tooltip() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("Runs on this machine"));
+        assert!(!html.contains("<cds-accordion-item title="), "no title attribute");
+        assert!(html.contains("<span slot=\"title\">Runs on this machine"));
+    }
+
+    /// The latency plots and users charts fill their panel: columns that grow with it, not ones
+    /// leaving its right side empty, and users charts two a row at a readable height.
+    #[test]
+    fn latency_and_users_charts_fill_their_panel() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let rag = render(super::datasets::section("rag", &machines, &machines));
+        assert!(rag.contains("repeat(auto-fit, minmax(16rem, 1fr))"), "ECDFs fill the row");
+        assert!(rag.contains("minmax(min(100%, 20rem), 1fr)"), "users charts two a row");
+        assert!(!rag.contains("max-width: 24rem"));
+    }
+
     #[test]
     fn a_machine_that_did_not_run_a_dataset_has_a_button_saying_so() {
         // The M3 Pro ran rag; the grid-only M5 Max ran no dataset, and still has its buttons.
@@ -4385,7 +4446,7 @@ mod tests {
         // before the runs on this machine.
         let at = |t: &str| html.find(t).unwrap_or_else(|| panic!("no {t}"));
         assert!(html.contains("gpt-oss-20b on Apple M3 Pro · run 2026-11-02"), "the heading");
-        assert!(at("title=\"Setup\"") < at("36 GB unified memory"), "the machine is folded");
+        assert!(at(">Setup<") < at("36 GB unified memory"), "the machine is folded");
         assert!(at("36 GB unified memory") < at("Runs on this machine"));
         // The runs on this machine.
         assert!(html.contains("Runs on this machine"));

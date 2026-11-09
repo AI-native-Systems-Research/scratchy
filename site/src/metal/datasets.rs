@@ -911,7 +911,7 @@ fn pair_latency(dataset: &str, mr: &MachineRuns, stem: &str, chip: &str) -> Elem
                  (across), end to end. Time runs on a log axis, centred on the two medians; further \
                  left is faster, a steeper rise steadier."
             }
-            div { style: "display: grid; gap: var(--cds-spacing-05); grid-template-columns: repeat(auto-fill, {ECDF_COLUMN})",
+            div { style: "display: grid; gap: var(--cds-spacing-05); grid-template-columns: repeat(auto-fit, {ECDF_COLUMN})",
                 for &u in &users {
                     {ecdf_chart(&curves(u), &engines, &["E2EL", &users_at(u)],
                         &format!("end-to-end time of every request, {} at once, {stem} on {chip}", users_at(u)))}
@@ -1021,14 +1021,15 @@ fn users_curves(
     rsx! {
         Stack { gap: 2,
             strong { "Users" }
-            div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem",
+            // Two a row across the panel, so four bars each read at a glance.
+            div { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: 1rem 1.5rem",
                 for (title, unit, pick) in metrics {
                     {
                         let ss = series(pick);
                         rsx! {
                             if !ss.is_empty() {
-                                div { style: "flex: 1 1 16rem; min-width: 16rem; max-width: 24rem",
-                                    {bar_chart(&ss, users, (title, unit), Sweep::Users, "200px",
+                                div { style: "min-width: 0",
+                                    {bar_chart(&ss, users, (title, unit), Sweep::Users, "280px",
                                         &format!("{title}, {stem} on {chip}"))}
                                 }
                             }

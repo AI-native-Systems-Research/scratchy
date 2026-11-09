@@ -482,8 +482,13 @@ pub fn TableCell(#[props(default)] colspan: Option<u8>, children: Element) -> El
 #[component]
 pub fn Fold(#[props(into)] title: String, children: Element) -> Element {
     rsx! {
+        // The title in the item's title slot, not its `title` attribute: a browser shows an
+        // element's title attribute as a tooltip over everything inside it.
         cds-accordion {
-            cds-accordion-item { "title": title, {children} }
+            cds-accordion-item {
+                span { slot: "title", "{title}" }
+                {children}
+            }
         }
     }
 }
