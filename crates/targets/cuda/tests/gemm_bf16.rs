@@ -1304,3 +1304,351 @@ fn the_gate_up_fold_is_its_chain_bit_for_bit() {
     }
     assert!(pass, "a gate/up fold differs from its chain");
 }
+
+// ── FP8 S8 W4a: the one-row bf16 GEMV's fused ends ─────────────────
+
+use scratchy_target_cuda::kernels::{
+    Ends, add_bf16, gate_up_gemv_bf16_ends, gemv_bf16_ends, gemv_group_bf16_abt,
+    gemv_group_bf16_ends, rms_norm_bf16,
+};
+
+/// The norms' eps.
+const W4_EPS: f32 = 1e-6;
+
+fn w4_scratch(device: &CudaDevice, bytes: u64) -> DeviceBuffer {
+    DeviceBuffer::upload_bytes(device, &vec![0u8; (bytes as usize).max(256)]).expect("scratch")
+}
+
+/// `n` rows of `rows · n + TAIL` NaN, `launch` on it, then the rows and whether the tail held.
+fn w4_out(
+    device: &CudaDevice,
+    len: usize,
+    launch: impl FnOnce(*mut std::ffi::c_void) -> Result<(), KernelError>,
+) -> (Vec<u16>, bool) {
+    let c = DeviceBuffer::upload(device, &vec![SENTINEL; len + TAIL]).expect("c");
+    launch(c.ptr()).expect("launch");
+    let out = c.download().expect("download");
+    (
+        out[..len].to_vec(),
+        out[len..].iter().all(|&x| x == SENTINEL),
+    )
+}
+
+/// Random rows, the all-zero row and the ±65,504 row.
+fn w4_rows(k: usize, seed: u64) -> Vec<(&'static str, Vec<u16>)> {
+    let big: Vec<u16> = (0..k)
+        .map(|c| half::bf16::from_f32(if c % 2 == 0 { 65504.0 } else { -65504.0 }).to_bits())
+        .collect();
+    vec![
+        ("rand0", bf16_inputs(k, seed)),
+        ("rand1", bf16_inputs(k, seed ^ 0x11)),
+        ("zeros", vec![0; k]),
+        ("max", big),
+    ]
+}
+
+/// `rms_norm_bf16` of the one row `x` at offset `offset`.
+fn w4_norm(
+    device: &CudaDevice,
+    x: &DeviceBuffer,
+    g: &DeviceBuffer,
+    k: u32,
+    offset: f32,
+) -> DeviceBuffer {
+    let y = DeviceBuffer::upload(device, &vec![SENTINEL; k as usize]).expect("y");
+    // SAFETY: `x`, `g`, `y` hold k bf16, their own allocations.
+    unsafe {
+        rms_norm_bf16(
+            x.ptr().cast_const(),
+            g.ptr().cast_const(),
+            y.ptr(),
+            (1, k),
+            W4_EPS,
+            offset,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("rms_norm_bf16");
+    y
+}
+
+/// The bf16 GEMV at `n × k` from `a`, at its own split, with or without `ends`.
+fn w4_gemv(
+    device: &CudaDevice,
+    a: &DeviceBuffer,
+    b: &DeviceBuffer,
+    (n, k): (u32, u32),
+    ends: Option<Ends>,
+) -> (Vec<u16>, bool) {
+    let splits = gemv_splits(n, k, 1);
+    let p = w4_scratch(device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+    w4_out(device, n as usize, |c| {
+        // SAFETY: `a` k bf16, `b` n·k, `c` n + TAIL, `p` the partials, each its own allocation.
+        unsafe {
+            match ends {
+                Some(e) => gemv_bf16_ends(
+                    (a.ptr().cast_const(), b.ptr().cast_const(), c),
+                    p.ptr(),
+                    (n, k, splits),
+                    e,
+                    std::ptr::null_mut(),
+                ),
+                None => gemv_split_bf16_abt(
+                    (a.ptr().cast_const(), b.ptr().cast_const(), c),
+                    p.ptr(),
+                    (n, k, splits),
+                    std::ptr::null_mut(),
+                ),
+            }
+        }
+    })
+}
+
+/// The normed bf16 GEMV, its group and the gate/up GEMV are the one-row norm then today's kernel,
+/// bit for bit: the 35B's GDN group (2,048 → 8,192 + 4,096), its router (2,048 → 256), lm_head
+/// (2,048 → 248,320 at its split), the Gemma router with the router scale (2,816 → 128, offset 0),
+/// at gain offset 0 and 1, on random, all-zero and ±65,504 rows. `mismatched_bits=0`.
+#[test]
+fn the_normed_bf16_gemv_and_router_are_their_chains_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let dense: [(u32, u32, &str); 4] = [
+        (256, 2048, "35B router"),
+        (248320, 2048, "35B lm_head"),
+        (128, 2816, "Gemma router"),
+        (512, 2048, "35B shared gate/up"),
+    ];
+    for offset in [0.0f32, 1.0] {
+        for (n, k, what) in dense {
+            let ku = k as usize;
+            let g = bf16_inputs(ku, 0x4D00 ^ u64::from(k));
+            let gb = DeviceBuffer::upload(&device, &g).expect("gain");
+            let b = DeviceBuffer::upload(
+                &device,
+                &bf16_inputs(n as usize * ku, 0x4D10 ^ u64::from(n)),
+            )
+            .expect("b");
+            let ends = Ends {
+                gain: gb.ptr().cast_const(),
+                eps: W4_EPS,
+                gain_offset: offset,
+                residual: std::ptr::null(),
+            };
+            for (row, x) in w4_rows(ku, 0x4D20 ^ u64::from(k)) {
+                let xb = DeviceBuffer::upload(&device, &x).expect("x");
+                let y = w4_norm(&device, &xb, &gb, k, offset);
+                let fused = w4_gemv(&device, &xb, &b, (n, k), Some(ends));
+                let chain = w4_gemv(&device, &y, &b, (n, k), None);
+                let bad = mismatched_bits(&fused.0, &chain.0);
+                let ok = bad == 0 && fused.1;
+                eprintln!(
+                    "W4 normed gemv_bf16 {what} n={n} k={k} offset={offset} row={row}: \
+                     mismatched_bits={bad} tail={} {}",
+                    fused.1,
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                pass &= ok;
+                if n == 512 {
+                    // The gate/up GEMV over the same row (the shared expert's), SwiGLU.
+                    let up = DeviceBuffer::upload(&device, &bf16_inputs(n as usize * ku, 0x4D30))
+                        .expect("up");
+                    let splits = gemv_splits(n, k, 1);
+                    let gu = |a: &DeviceBuffer, e: Option<Ends>| {
+                        let p =
+                            w4_scratch(&device, 2 * gemv_scratch_bytes(n, 1, splits).expect("b"));
+                        w4_out(&device, n as usize, |c| {
+                            // SAFETY: as `w4_gemv`'s, for both weights.
+                            unsafe {
+                                match e {
+                                    Some(e) => gate_up_gemv_bf16_ends(
+                                        (
+                                            a.ptr().cast_const(),
+                                            b.ptr().cast_const(),
+                                            up.ptr().cast_const(),
+                                        ),
+                                        (c, p.ptr()),
+                                        (n, k, splits),
+                                        0,
+                                        e,
+                                        std::ptr::null_mut(),
+                                    ),
+                                    None => gate_up_gemv_bf16(
+                                        (
+                                            a.ptr().cast_const(),
+                                            b.ptr().cast_const(),
+                                            up.ptr().cast_const(),
+                                        ),
+                                        (c, p.ptr()),
+                                        (n, k, splits),
+                                        0,
+                                        std::ptr::null_mut(),
+                                    ),
+                                }
+                            }
+                        })
+                    };
+                    let (f, c) = (gu(&xb, Some(ends)), gu(&y, None));
+                    let bad = mismatched_bits(&f.0, &c.0);
+                    eprintln!(
+                        "W4 normed gate_up_gemv_bf16 {what} offset={offset} row={row}: mismatched_bits={bad} {}",
+                        if bad == 0 && f.1 { "PASS" } else { "FAIL" }
+                    );
+                    pass &= bad == 0 && f.1;
+                }
+            }
+        }
+        // The 35B's GDN group: qkv-z 8,192 and z 4,096 off one normed row.
+        let (k, ns) = (2048u32, [8192u32, 4096]);
+        let ku = k as usize;
+        let gb = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x4D40)).expect("gain");
+        let ws: Vec<DeviceBuffer> = (ns.iter().enumerate())
+            .map(|(i, &n)| {
+                DeviceBuffer::upload(&device, &bf16_inputs(n as usize * ku, 0x4D41 ^ i as u64))
+                    .expect("w")
+            })
+            .collect();
+        let splits: Vec<u32> = ns.iter().map(|&n| gemv_splits(n, k, 1)).collect();
+        let ends = Ends {
+            gain: gb.ptr().cast_const(),
+            eps: W4_EPS,
+            gain_offset: offset,
+            residual: std::ptr::null(),
+        };
+        for (row, x) in w4_rows(ku, 0x4D50) {
+            let xb = DeviceBuffer::upload(&device, &x).expect("x");
+            let y = w4_norm(&device, &xb, &gb, k, offset);
+            let run = |a: &DeviceBuffer, e: Option<Ends>| {
+                let outs: Vec<DeviceBuffer> = (ns.iter())
+                    .map(|&n| {
+                        DeviceBuffer::upload(&device, &vec![SENTINEL; n as usize]).expect("c")
+                    })
+                    .collect();
+                let parts: Vec<DeviceBuffer> = (ns.iter().zip(&splits))
+                    .map(|(&n, &s)| w4_scratch(&device, gemv_scratch_bytes(n, 1, s).expect("b")))
+                    .collect();
+                let members: Vec<(*const std::ffi::c_void, *mut std::ffi::c_void, u32)> =
+                    (ws.iter().zip(&outs).zip(&ns))
+                        .map(|((w, c), &n)| (w.ptr().cast_const(), c.ptr(), n))
+                        .collect();
+                let pp: Vec<*mut std::ffi::c_void> = (parts.iter().zip(&splits))
+                    .map(|(p, &s)| if s > 1 { p.ptr() } else { std::ptr::null_mut() })
+                    .collect();
+                // SAFETY: every member's weight, output and partials are their own allocations.
+                unsafe {
+                    match e {
+                        Some(e) => gemv_group_bf16_ends(
+                            a.ptr().cast_const(),
+                            &members,
+                            &pp,
+                            (k, &splits),
+                            e,
+                            std::ptr::null_mut(),
+                        ),
+                        None => gemv_group_bf16_abt(
+                            a.ptr().cast_const(),
+                            &members,
+                            &pp,
+                            (k, &splits),
+                            std::ptr::null_mut(),
+                        ),
+                    }
+                }
+                .expect("group");
+                outs.iter()
+                    .map(|c| c.download().expect("c"))
+                    .collect::<Vec<_>>()
+            };
+            let (f, c) = (run(&xb, Some(ends)), run(&y, None));
+            let bad: usize = f.iter().zip(&c).map(|(a, b)| mismatched_bits(a, b)).sum();
+            eprintln!(
+                "W4 normed gemv_group_bf16 35B GDN n={ns:?} offset={offset} row={row}: mismatched_bits={bad} {}",
+                if bad == 0 { "PASS" } else { "FAIL" }
+            );
+            pass &= bad == 0;
+        }
+    }
+    assert!(
+        pass,
+        "a normed bf16 GEMV differs from the norm then the GEMV"
+    );
+}
+
+/// The bf16 GEMV's residual epilogue is today's bf16 GEMV then `add_bf16`, bit for bit: the 35B's
+/// GDN out_proj (2,048 × 4,096) at one split, its own and the largest, residual rows of random
+/// values, ±0, ±inf and NaN.
+#[test]
+fn the_bf16_gemv_residual_epilogue_is_the_gemv_then_the_add_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let (n, k) = (2048u32, 4096u32);
+    let (nu, ku) = (n as usize, k as usize);
+    let xb = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x4E00)).expect("x");
+    let b = DeviceBuffer::upload(&device, &bf16_inputs(nu * ku, 0x4E01)).expect("b");
+    let specials = [0x0000u16, 0x8000, 0x7F80, 0xFF80, 0x7FC0];
+    let residual: Vec<u16> = (bf16_inputs(nu, 0x4E02).into_iter().enumerate())
+        .map(|(i, r)| {
+            if i % 7 == 0 {
+                specials[(i / 7) % specials.len()]
+            } else {
+                r
+            }
+        })
+        .collect();
+    let rb = DeviceBuffer::upload(&device, &residual).expect("residual");
+    let mut splits_set = vec![1u32, gemv_splits(n, k, 1), 16];
+    splits_set.dedup();
+    for splits in splits_set {
+        let p = w4_scratch(&device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+        let ends = Ends {
+            residual: rb.ptr().cast_const(),
+            ..Ends::NONE
+        };
+        let fused = w4_out(&device, nu, |c| {
+            // SAFETY: as `w4_gemv`'s, and the residual n bf16 apart from `c`.
+            unsafe {
+                gemv_bf16_ends(
+                    (xb.ptr().cast_const(), b.ptr().cast_const(), c),
+                    p.ptr(),
+                    (n, k, splits),
+                    ends,
+                    std::ptr::null_mut(),
+                )
+            }
+        });
+        let v = w4_out(&device, nu, |c| {
+            // SAFETY: as above.
+            unsafe {
+                gemv_split_bf16_abt(
+                    (xb.ptr().cast_const(), b.ptr().cast_const(), c),
+                    p.ptr(),
+                    (n, k, splits),
+                    std::ptr::null_mut(),
+                )
+            }
+        });
+        let vb = DeviceBuffer::upload(&device, &v.0).expect("v");
+        let sum = DeviceBuffer::upload(&device, &vec![SENTINEL; nu]).expect("sum");
+        // SAFETY: `vb`, `rb`, `sum` hold n bf16 each.
+        unsafe {
+            add_bf16(
+                vb.ptr().cast_const(),
+                rb.ptr().cast_const(),
+                sum.ptr(),
+                (1, n),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("add_bf16");
+        let bad = mismatched_bits(&fused.0, &sum.download().expect("sum"));
+        eprintln!(
+            "W4 gemv_bf16 residual 35B GDN out_proj splits={splits}: mismatched_bits={bad} tail={} {}",
+            fused.1,
+            if bad == 0 && fused.1 { "PASS" } else { "FAIL" }
+        );
+        pass &= bad == 0 && fused.1;
+    }
+    assert!(
+        pass,
+        "a bf16 GEMV's residual epilogue differs from the GEMV then the add"
+    );
+}

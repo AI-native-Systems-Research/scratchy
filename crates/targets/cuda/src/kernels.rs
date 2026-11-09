@@ -111,6 +111,89 @@ unsafe extern "C" {
         n_tile: u32,
         stream: *mut c_void,
     ) -> i32;
+    // FP8 S8 W4a: the bf16 GEMVs with the one-row GEMV's fused ends (`kernels/gemv_bf16.cu`).
+    fn scratchy_cuda_gemv_bf16_ends(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        n: u32,
+        k: u32,
+        splits: u32,
+        gain: *const c_void,
+        eps: f32,
+        gain_offset: f32,
+        residual: *const c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemv_group_bf16_ends(
+        a: *const c_void,
+        b: *const *const c_void,
+        c: *const *mut c_void,
+        partials: *const *mut c_void,
+        n: *const u32,
+        k: u32,
+        splits: *const u32,
+        count: u32,
+        gain: *const c_void,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gate_up_gemv_bf16_ends(
+        a: *const c_void,
+        gate: *const c_void,
+        up: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        n: u32,
+        k: u32,
+        splits: u32,
+        act: u32,
+        gain: *const c_void,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_gemv_bf16_ends(
+        a: *const c_void,
+        b: *const c_void,
+        topk_idx: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        m: u32,
+        top_k: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        pair_rows: u32,
+        splits: u32,
+        gain: *const c_void,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_gate_up_gemv_bf16_ends(
+        a: *const c_void,
+        gate: *const c_void,
+        up: *const c_void,
+        topk_idx: *const c_void,
+        c: *mut c_void,
+        partials: *mut c_void,
+        m: u32,
+        top_k: u32,
+        n: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        splits: u32,
+        act: u32,
+        gain: *const c_void,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     // FP8 S8 W4a: the fp8 GEMVs with the one-row GEMV's fused ends (`kernels/gemv_fp8.cu`).
     fn scratchy_cuda_gemv_fp8_ends(
         a: *const c_void,
@@ -4236,6 +4319,217 @@ pub unsafe fn gemv_fp8_quant_probe_ends(
             scale,
             k,
             splits,
+            ends.gain,
+            ends.eps,
+            ends.gain_offset,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`gemv_split_bf16_abt`] with `ends` (FP8 S8 W4a): the prologue norm and the residual epilogue
+/// as [`gemv_fp8_ends`]', a normed `k` a multiple of 256 of at most 6,144. Refused with
+/// [`KernelError::GemvSplit`] before any pointer is touched.
+///
+/// # Safety
+///
+/// As [`gemv_split_bf16_abt`]'s and [`gemv_fp8_ends`]' for the gain and residual.
+pub unsafe fn gemv_bf16_ends(
+    (a, b, c): (*const c_void, *const c_void, *mut c_void),
+    partials: *mut c_void,
+    (n, k, splits): (u32, u32, u32),
+    ends: Ends,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the contract above; the launcher checks every rule first.
+    let code = unsafe {
+        scratchy_cuda_gemv_bf16_ends(
+            a,
+            b,
+            c,
+            partials,
+            n,
+            k,
+            splits,
+            ends.gain,
+            ends.eps,
+            ends.gain_offset,
+            ends.residual,
+            stream,
+        )
+    };
+    check(code, KernelError::GemvSplit { n, k, splits })
+}
+
+/// [`gemv_group_bf16_abt`] with the shared input's prologue norm (`ends.residual` must be null).
+///
+/// # Safety
+///
+/// As [`gemv_group_bf16_abt`]'s and [`gemv_fp8_ends`]' for the gain.
+pub unsafe fn gemv_group_bf16_ends(
+    a: *const c_void,
+    members: GroupOperands<'_>,
+    partials: &[*mut c_void],
+    (k, splits): (u32, &[u32]),
+    ends: Ends,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (b, c, n, refused) = group_parts("gemv_group_bf16_ends", members, (1, k));
+    if splits.len() != members.len() || partials.len() != members.len() || !ends.residual.is_null()
+    {
+        return Err(refused);
+    }
+    let (mut s, mut p) = ([1u32; 3], [std::ptr::null_mut(); 3]);
+    for (i, (&si, &pi)) in splits.iter().zip(partials).take(3).enumerate() {
+        (s[i], p[i]) = (si, pi);
+    }
+    let count = members.len() as u32;
+    // SAFETY: as [`gemv_group_bf16_abt`]'s.
+    let code = unsafe {
+        scratchy_cuda_gemv_group_bf16_ends(
+            a,
+            b.as_ptr(),
+            c.as_ptr(),
+            p.as_ptr(),
+            n.as_ptr(),
+            k,
+            s.as_ptr(),
+            count,
+            ends.gain,
+            ends.eps,
+            ends.gain_offset,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`gate_up_gemv_bf16`] with the shared input's prologue norm (`ends.residual` must be null).
+///
+/// # Safety
+///
+/// As [`gate_up_gemv_bf16`]'s and [`gemv_fp8_ends`]' for the gain.
+pub unsafe fn gate_up_gemv_bf16_ends(
+    (a, gate, up): (*const c_void, *const c_void, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (n, k, splits): (u32, u32, u32),
+    act: u32,
+    ends: Ends,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let refused = KernelError::GateUpShape {
+        kernel: "gate_up_gemv_bf16_ends",
+        dims: [1, n, k, splits],
+    };
+    if !ends.residual.is_null() {
+        return Err(refused);
+    }
+    // SAFETY: as [`gate_up_gemv_bf16`]'s.
+    let code = unsafe {
+        scratchy_cuda_gate_up_gemv_bf16_ends(
+            a,
+            gate,
+            up,
+            c,
+            partials,
+            n,
+            k,
+            splits,
+            act,
+            ends.gain,
+            ends.eps,
+            ends.gain_offset,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`expert_gemv_split_bf16`] with the token rows' prologue norm (`ends.residual` must be null).
+///
+/// # Safety
+///
+/// As [`expert_gemv_split_bf16`]'s and [`gemv_fp8_ends`]' for the gain.
+pub unsafe fn expert_gemv_bf16_ends(
+    (a, b, topk_idx): (*const c_void, *const c_void, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (m, top_k, n, k): (u32, u32, u32, u32),
+    (experts, expert_rows): (u32, u32),
+    (pair_rows, splits): (bool, u32),
+    ends: Ends,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let refused = KernelError::MoeShape {
+        kernel: "expert_gemv_bf16_ends",
+        dims: [m, top_k, n, k],
+    };
+    if !ends.residual.is_null() {
+        return Err(refused);
+    }
+    // SAFETY: as [`expert_gemv_split_bf16`]'s.
+    let code = unsafe {
+        scratchy_cuda_expert_gemv_bf16_ends(
+            a,
+            b,
+            topk_idx,
+            c,
+            partials,
+            m,
+            top_k,
+            n,
+            k,
+            experts,
+            expert_rows,
+            u32::from(pair_rows),
+            splits,
+            ends.gain,
+            ends.eps,
+            ends.gain_offset,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// [`expert_gate_up_gemv_bf16`] with the token rows' prologue norm (`ends.residual` must be null).
+///
+/// # Safety
+///
+/// As [`expert_gate_up_gemv_bf16`]'s and [`gemv_fp8_ends`]' for the gain.
+pub unsafe fn expert_gate_up_gemv_bf16_ends(
+    (a, gate, up, topk_idx): (*const c_void, *const c_void, *const c_void, *const c_void),
+    (c, partials): (*mut c_void, *mut c_void),
+    (m, top_k, n, k): (u32, u32, u32, u32),
+    (experts, expert_rows, splits): (u32, u32, u32),
+    act: u32,
+    ends: Ends,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let refused = KernelError::GateUpShape {
+        kernel: "expert_gate_up_gemv_bf16_ends",
+        dims: [m.saturating_mul(top_k), n, k, splits],
+    };
+    if !ends.residual.is_null() {
+        return Err(refused);
+    }
+    // SAFETY: as [`expert_gate_up_gemv_bf16`]'s.
+    let code = unsafe {
+        scratchy_cuda_expert_gate_up_gemv_bf16_ends(
+            a,
+            gate,
+            up,
+            topk_idx,
+            c,
+            partials,
+            m,
+            top_k,
+            n,
+            k,
+            experts,
+            expert_rows,
+            splits,
+            act,
             ends.gain,
             ends.eps,
             ends.gain_offset,

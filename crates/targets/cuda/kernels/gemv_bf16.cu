@@ -115,6 +115,10 @@ constexpr uint32_t MAX_GRID_Z = 65535;
 
 using chunk_sv = sv_bf<CHUNK>;
 using chunk_rv = rv_fl<CHUNK>;
+// The prologue norm's row (FP8 S8 W4a): a normed `k` is at most `NORM_CHUNKS` chunks, and the
+// norm's tile views of chunk `t` read the 15 after it (`scratchy_ops.cuh`'s `row_norm_inv`).
+constexpr int NORM_CHUNKS = 24;
+constexpr int ROW_CHUNKS = NORM_CHUNKS + 15;
 using reduce_rv = rv_fl<REDUCE_ROWS>;
 // `a [rows, k]` and `B [depth, rows, k]` bf16, each with its vector tensor map.
 using in_gl = gl<bf16, 1, 1, -1, -1, chunk_sv>;
@@ -123,6 +127,8 @@ using weight_gl = gl<bf16, 1, -1, -1, -1, chunk_sv>;
 using out_gl = gl<bf16, 1, 1, -1, -1>;
 using partial_gl = gl<float, 1, 1, -1, -1>;
 using idx_gl = gl<int, 1, 1, -1, -1>;
+// The prologue norm's gain `[1, k]` bf16 (FP8 S8 W4a), read by `warp::load` of a naive vector.
+using gain_gl = gl<bf16, 1, 1, -1, -1>;
 
 struct gemv_globals {
     in_gl a;
@@ -141,6 +147,15 @@ struct gemv_globals {
     // Pair `p` reads `a`'s row `p / row_div` (`top_k` for the token rows, 1 for the pair rows and
     // the dense GEMV).
     int row_div;
+    // FP8 S8 W4a, as `gemv_fp8.cu`'s: the prologue norm (`gain`, `norm`, `eps`, `offset`,
+    // `cols`) and the residual epilogue (`residual` `[P, n]`, `add`).
+    gain_gl gain;
+    out_gl residual;
+    float eps;
+    float offset;
+    float cols;
+    int norm;
+    int add;
 };
 
 struct reduce_globals {
@@ -149,13 +164,18 @@ struct reduce_globals {
     int n;
     int n_pad;
     int splits;
+    // FP8 S8 W4a: the residual epilogue, as `gemv_globals`'.
+    out_gl residual;
+    int add;
 };
 
 constexpr size_t SMEM_VECTORS = size_t(WARPS) * STAGES * (1 + ROWS_PER_WARP) * sizeof(chunk_sv);
 static_assert(sizeof(chunk_sv) == 512, "a chunk is 512 bytes");
 static_assert(SMEM_VECTORS == 81920, "8 warps, 4 stages, a and 4 rows");
+// The prologue norm's row (FP8 S8 W4a), after the rings, so their offsets are unchanged.
+constexpr size_t SMEM_ROW = size_t(ROW_CHUNKS) * sizeof(chunk_sv);
 // The vectors plus the slack the allocator may spend aligning the first to 1024 bytes.
-constexpr int GEMV_SMEM_BYTES = int(SMEM_VECTORS) + 1024;
+constexpr int GEMV_SMEM_BYTES = int(SMEM_VECTORS + SMEM_ROW) + 1024;
 static_assert(2 * GEMV_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "two CTAs per SM");
 
 // One CTA of one GEMV: column block `block`, K split `split`, pair `p`, over `g`'s views, in the
@@ -169,11 +189,40 @@ static_assert(2 * GEMV_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "two CTAs per S
 // the ring index of the call's first load: 0 for the first call, which initialises the
 // semaphores; the second continues the ring where the first ended, so no semaphore is initialised
 // twice and each stage's phase follows its loads.
+// The prologue norm (FP8 S8 W4a), every thread of the CTA, once, when `g.norm`: warp 0 TMA-loads
+// `a`'s row `a_row` into `row` (the `k` tail is TMA's zero fill), and the CTA normalises it in place
+// (`scratchy_ops.cuh`'s `row_norm_inv` and `row_norm_apply`, `rms_norm_one_row_ker`'s bits), so
+// `gemv_dots` reads the absorbed norm's output from `row` instead of TMA-loading `a`.
+__device__ inline void normed_row(const gemv_globals& g, int a_row, chunk_sv (&row)[ROW_CHUNKS],
+                                  kittens::semaphore& row_arrived,
+                                  scratchy::ops::norm_parts (&parts)[4]) {
+    const int w = kittens::warpid();
+    if (w == 0) {
+        if (warp::laneid() == 0) {
+            init_semaphore(row_arrived, 0, 1);
+        }
+        __syncwarp();
+        warp::tma::expect_bytes(row_arrived, uint32_t(g.chunks * sizeof(chunk_sv)));
+        for (int c = 0; c < g.chunks; c++) {
+            warp::tma::load_async(row[c], g.a, {0, 0, a_row, c}, row_arrived);
+        }
+    }
+    // The semaphore is initialised before any thread waits on it.
+    __syncthreads();
+    wait(row_arrived, 0);
+    const float inv = scratchy::ops::row_norm_inv(row, parts, g.chunks, g.cols, g.eps, w,
+                                                  [] { __syncthreads(); });
+    scratchy::ops::row_norm_apply(row, g.gain, g.chunks, inv, g.offset, w, WARPS);
+    // Every chunk is normed before any warp reads it.
+    __syncthreads();
+}
+
 template <bool EXPERT, int ROWS>
 __device__ inline void gemv_dots(const gemv_globals& g, chunk_sv (&a_s)[WARPS][STAGES],
                                  chunk_sv (&b_s)[WARPS][STAGES][ROWS],
                                  kittens::semaphore (&arrived)[WARPS][STAGES], int block,
-                                 int split, int p, int j0, float (&dot)[ROWS]) {
+                                 int split, int p, int j0, float (&dot)[ROWS],
+                                 const chunk_sv (&row)[ROW_CHUNKS]) {
     const int w = kittens::warpid();
     const int row0 = (block * WARPS + w) * ROWS;
     const int rows = max(0, min(ROWS, g.n - row0));
@@ -199,10 +248,14 @@ __device__ inline void gemv_dots(const gemv_globals& g, chunk_sv (&a_s)[WARPS][S
         }
         __syncwarp();
         // Chunk `j` of the split (`c0 + j` of the row) into stage `(j0 + j) % STAGES`.
+        // A normed row is in `row` already (`normed_row`): only the weight's chunks load.
         const auto issue = [&](int j) {
             const int s = (j0 + j) % STAGES;
-            warp::tma::expect_bytes(arrived[w][s], uint32_t((1 + rows) * sizeof(chunk_sv)));
-            warp::tma::load_async(a_s[w][s], g.a, {0, 0, a_row, c0 + j}, arrived[w][s]);
+            const int a_loads = g.norm ? 0 : 1;
+            warp::tma::expect_bytes(arrived[w][s], uint32_t((a_loads + rows) * sizeof(chunk_sv)));
+            if (!g.norm) {
+                warp::tma::load_async(a_s[w][s], g.a, {0, 0, a_row, c0 + j}, arrived[w][s]);
+            }
             for (int r = 0; r < rows; r++) {
                 warp::tma::load_async(b_s[w][s][r], g.b, {0, depth, row0 + r, c0 + j},
                                       arrived[w][s]);
@@ -214,7 +267,11 @@ __device__ inline void gemv_dots(const gemv_globals& g, chunk_sv (&a_s)[WARPS][S
         for (int j = 0; j < count; j++) {
             const int s = (j0 + j) % STAGES;
             wait(arrived[w][s], ((j0 + j) / STAGES) % 2);
-            warp::load(x, a_s[w][s]);
+            if (g.norm) {
+                warp::load(x, row[c0 + j]);
+            } else {
+                warp::load(x, a_s[w][s]);
+            }
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
                 if (r < rows) {
@@ -240,13 +297,23 @@ __device__ inline void gemv_dots(const gemv_globals& g, chunk_sv (&a_s)[WARPS][S
 // One CTA of one GEMV, `gemv_dots` then the store: lane 0 stores each row's partial. The rows
 // past `n` (and a split past the row's chunks) are +0, stored only into the scratch so the reduce
 // reads written values.
+// The CTA's shared row and the norm's semaphore and parts (FP8 S8 W4a), unused without a norm.
+struct row_smem {
+    chunk_sv (&row)[ROW_CHUNKS];
+    kittens::semaphore& arrived;
+    scratchy::ops::norm_parts (&parts)[4];
+};
+
 template <bool EXPERT, int ROWS>
 __device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][STAGES],
                                 chunk_sv (&b_s)[WARPS][STAGES][ROWS],
                                 kittens::semaphore (&arrived)[WARPS][STAGES], int block,
-                                int split, int p) {
+                                int split, int p, const row_smem& rs) {
+    if (g.norm) {
+        normed_row(g, p / g.row_div, rs.row, rs.arrived, rs.parts);
+    }
     float dot[ROWS];
-    gemv_dots<EXPERT, ROWS>(g, a_s, b_s, arrived, block, split, p, 0, dot);
+    gemv_dots<EXPERT, ROWS>(g, a_s, b_s, arrived, block, split, p, 0, dot, rs.row);
     const int row0 = (block * WARPS + kittens::warpid()) * ROWS;
     const int rows = max(0, min(ROWS, g.n - row0));
 #pragma unroll
@@ -255,7 +322,10 @@ __device__ inline void gemv_cta(const gemv_globals& g, chunk_sv (&a_s)[WARPS][ST
         if (warp::laneid() == 0) {
             if (g.splits == 1) {
                 if (r < rows) {
-                    g.c[{0, 0, p, row}] = base_types::convertor<bf16, float>::convert(dot[r]);
+                    // FP8 S8 W4a: the residual epilogue, `add_bf16`'s add on the stored row.
+                    g.c[{0, 0, p, row}] =
+                        g.add ? scratchy::ops::with_residual(dot[r], g.residual[{0, 0, p, row}])
+                              : base_types::convertor<bf16, float>::convert(dot[r]);
                 }
             } else {
                 g.partials[{0, 0, split, p * g.n_pad + row}] = dot[r];
@@ -277,8 +347,12 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_bf16_ker(const __grid_con
     shared_allocator<1024> al((int*)&__shm[0]);
     chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
     chunk_sv(&b_s)[WARPS][STAGES][ROWS] = al.allocate<chunk_sv, WARPS, STAGES, ROWS>();
+    chunk_sv(&row_s)[ROW_CHUNKS] = al.allocate<chunk_sv, ROW_CHUNKS>();
+    __shared__ kittens::semaphore row_arrived;
+    __shared__ sv_fl<16> parts[4];
+    const row_smem rs{row_s, row_arrived, parts};
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
-    gemv_cta<EXPERT, ROWS>(g, a_s, b_s, arrived, blockIdx.x, blockIdx.y, blockIdx.z);
+    gemv_cta<EXPERT, ROWS>(g, a_s, b_s, arrived, blockIdx.x, blockIdx.y, blockIdx.z, rs);
 }
 
 // The grouped GEMV (#1049): up to three dense GEMVs of one `a`, one launch. Member `i` is `m[i]`,
@@ -304,13 +378,17 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_group_bf16_ker(
     chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
     chunk_sv(&b_s)[WARPS][STAGES][ROWS_PER_WARP] =
         al.allocate<chunk_sv, WARPS, STAGES, ROWS_PER_WARP>();
+    chunk_sv(&row_s)[ROW_CHUNKS] = al.allocate<chunk_sv, ROW_CHUNKS>();
+    __shared__ kittens::semaphore row_arrived;
+    __shared__ sv_fl<16> parts[4];
+    const row_smem rs{row_s, row_arrived, parts};
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
     const int x = blockIdx.x;
     const int member = x >= g.start2 ? 2 : x >= g.start1 ? 1 : 0;
     const int local = x - (member == 2 ? g.start2 : member == 1 ? g.start1 : 0);
     const int blocks = member == 2 ? g.blocks2 : member == 1 ? g.blocks1 : g.blocks0;
     const gemv_globals& m = member == 2 ? g.m2 : member == 1 ? g.m1 : g.m0;
-    gemv_cta<false, ROWS_PER_WARP>(m, a_s, b_s, arrived, local % blocks, local / blocks, 0);
+    gemv_cta<false, ROWS_PER_WARP>(m, a_s, b_s, arrived, local % blocks, local / blocks, 0, rs);
 }
 
 // One warp of the reduce: rows `32v .. 32v + 32` of `g`'s `[S, P · n_pad]` partials, one per lane,
@@ -330,7 +408,8 @@ __device__ inline void reduce_warp(const reduce_globals& g, int v) {
     const int p = rr / g.n_pad;
     const int col = rr % g.n_pad;
     if (col < g.n) {
-        g.c[{0, 0, p, col}] = base_types::convertor<bf16, float>::convert(acc[0][0]);
+        g.c[{0, 0, p, col}] = g.add ? scratchy::ops::with_residual(acc[0][0], g.residual[{0, 0, p, col}])
+                                    : base_types::convertor<bf16, float>::convert(acc[0][0]);
     }
 }
 
@@ -383,15 +462,23 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gate_up_gemv_ker(
     chunk_sv(&a_s)[WARPS][STAGES] = al.allocate<chunk_sv, WARPS, STAGES>();
     chunk_sv(&b_s)[WARPS][STAGES][ROWS_PER_WARP] =
         al.allocate<chunk_sv, WARPS, STAGES, ROWS_PER_WARP>();
+    chunk_sv(&row_s)[ROW_CHUNKS] = al.allocate<chunk_sv, ROW_CHUNKS>();
+    __shared__ kittens::semaphore row_arrived;
+    __shared__ sv_fl<16> parts[4];
+    const row_smem rs{row_s, row_arrived, parts};
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
     const int block = blockIdx.x, split = blockIdx.y, p = blockIdx.z;
+    // One prologue norm serves both passes (FP8 S8 W4a).
+    if (g.gate.norm) {
+        normed_row(g.gate, p / g.gate.row_div, rs.row, rs.arrived, rs.parts);
+    }
     float gate[ROWS_PER_WARP], up[ROWS_PER_WARP];
-    gemv_dots<EXPERT, ROWS_PER_WARP>(g.gate, a_s, b_s, arrived, block, split, p, 0, gate);
+    gemv_dots<EXPERT, ROWS_PER_WARP>(g.gate, a_s, b_s, arrived, block, split, p, 0, gate, rs.row);
     // Every lane has read the gate's last stage (its loop's last `__syncwarp`), so the up's loads
     // may take the ring's next stages. A warp with no rows ran no loads, and runs none now.
     const int c0 = split * g.gate.split_chunks;
     const int count = max(0, min(g.gate.split_chunks, g.gate.chunks - c0));
-    gemv_dots<EXPERT, ROWS_PER_WARP>(g.up, a_s, b_s, arrived, block, split, p, count, up);
+    gemv_dots<EXPERT, ROWS_PER_WARP>(g.up, a_s, b_s, arrived, block, split, p, count, up, rs.row);
     const int row0 = (block * WARPS + kittens::warpid()) * ROWS_PER_WARP;
     const int rows = max(0, min(ROWS_PER_WARP, g.gate.n - row0));
 #pragma unroll
@@ -521,7 +608,7 @@ int launch(gemv_globals G, uint32_t n, uint32_t pairs, uint32_t splits, void* st
     if (launched != cudaSuccess || splits == 1) {
         return static_cast<int>(launched);
     }
-    reduce_globals R{G.partials, G.c, int(n), int(padded(n)), int(splits)};
+    reduce_globals R{G.partials, G.c, int(n), int(padded(n)), int(splits), G.residual, G.add};
     void* rargs[] = {&R};
     const uint32_t vectors = pairs * padded(n) / uint32_t(REDUCE_ROWS);
     const dim3 rgrid((vectors + REDUCE_WARPS - 1) / REDUCE_WARPS),
@@ -530,6 +617,47 @@ int launch(gemv_globals G, uint32_t n, uint32_t pairs, uint32_t splits, void* st
 }
 
 // The dense GEMV's shape rule at `splits`: the chunks of one split, or 0 when it is refused.
+// The fused ends a launcher was given (FP8 S8 W4a), as `gemv_fp8.cu`'s: `gain` (null: no norm)
+// with `eps` and `offset`, `residual` (null: no add) `[pairs, n]` bf16 as `c`.
+struct ends {
+    const void* gain = nullptr;
+    float eps = 0.0f;
+    float offset = 0.0f;
+    const void* residual = nullptr;
+};
+constexpr ends NO_ENDS{nullptr, 0.0f, 0.0f, nullptr};
+
+// The ends' rule: a normed `k` a multiple of 256 of at most `NORM_CHUNKS` chunks (the shared
+// row), `eps` finite and positive.
+bool ends_shape(const ends& e, uint32_t k) {
+    return e.gain == nullptr ||
+           (k % uint32_t(CHUNK) == 0 && k / uint32_t(CHUNK) <= uint32_t(NORM_CHUNKS) &&
+            e.eps > 0.0f && e.eps <= 3.0e38f);
+}
+
+// The views of no gain and no residual: never read (`norm` and `add` are 0).
+gain_gl no_gain(uint32_t k) { return gain_gl{nullptr, nullptr, nullptr, size_t(1), size_t(k)}; }
+out_gl no_residual(uint64_t pairs, uint32_t n) {
+    return out_gl{nullptr, nullptr, nullptr, size_t(pairs), size_t(n)};
+}
+
+// `G` with the ends `e`. It can throw (TK's host code).
+gemv_globals with_ends(gemv_globals G, const ends& e, uint64_t pairs, uint32_t n, uint32_t k) {
+    if (e.gain != nullptr) {
+        G.gain = gain_gl{static_cast<bf16*>(const_cast<void*>(e.gain)), nullptr, nullptr, size_t(1),
+                         size_t(k)};
+        G.eps = e.eps;
+        G.offset = e.offset;
+        G.norm = 1;
+    }
+    if (e.residual != nullptr) {
+        G.residual = out_gl{static_cast<bf16*>(const_cast<void*>(e.residual)), nullptr, nullptr,
+                            size_t(pairs), size_t(n)};
+        G.add = 1;
+    }
+    return G;
+}
+
 uint32_t dense_split(void* partials, uint32_t n, uint32_t k, uint32_t splits) {
     if (n == 0 || n > uint32_t(INT_MAX) || k == 0 || k % VEC != 0 || k > uint32_t(INT_MAX)) {
         return 0;
@@ -557,19 +685,21 @@ gemv_globals dense_globals(const void* a, const void* b, void* c, void* partials
                   size_t(padded(n))};
     idx_gl ig{nullptr, nullptr, nullptr, size_t(1), size_t(1)};
     return gemv_globals{ag,          bg,        cg,        pg,          ig, int(n), int(padded(n)),
-                        int(chunks), int(each), int(splits), 1};
+                        int(chunks), int(each), int(splits), 1,
+                        no_gain(k),  no_residual(1, n), 0.0f, 0.0f, float(k), 0, 0};
 }
 
 // The dense GEMV at `splits`: the shape rule, then the views and the launch.
 int dense(const void* a, const void* b, void* c, void* partials, uint32_t n, uint32_t k,
-          uint32_t splits, void* stream) {
+          uint32_t splits, const ends& e, void* stream) {
     const uint32_t each = dense_split(partials, n, k, splits);
-    if (each == 0) {
+    if (each == 0 || !ends_shape(e, k)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        gemv_globals G = dense_globals(a, b, c, partials, n, k, splits, each);
+        gemv_globals G =
+            with_ends(dense_globals(a, b, c, partials, n, k, splits, each), e, 1, n, k);
         return launch<false>(G, n, 1, splits, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
@@ -583,8 +713,8 @@ int dense(const void* a, const void* b, void* c, void* partials, uint32_t n, uin
 // the bits of its own `scratchy_cuda_gemv_split_bf16_abt` at the same split.
 int launch_group(const void* a, const void* const* b, void* const* c, void* const* partials,
                  const uint32_t* n, uint32_t k, const uint32_t* splits, uint32_t count,
-                 void* stream) {
-    if (count < 2 || count > 3) {
+                 const ends& e, void* stream) {
+    if (count < 2 || count > 3 || !ends_shape(e, k) || e.residual != nullptr) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     uint32_t each[3] = {0, 0, 0};
@@ -603,10 +733,13 @@ int launch_group(const void* a, const void* const* b, void* const* c, void* cons
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
         gemv_globals m[3] = {
-            dense_globals(a, b[0], c[0], partials[0], n[0], k, splits[0], each[0]),
-            dense_globals(a, b[1], c[1], partials[1], n[1], k, splits[1], each[1]),
-            dense_globals(a, b[count - 1], c[count - 1], partials[count - 1], n[count - 1], k,
-                          splits[count - 1], each[count - 1]),
+            with_ends(dense_globals(a, b[0], c[0], partials[0], n[0], k, splits[0], each[0]), e, 1,
+                      n[0], k),
+            with_ends(dense_globals(a, b[1], c[1], partials[1], n[1], k, splits[1], each[1]), e, 1,
+                      n[1], k),
+            with_ends(dense_globals(a, b[count - 1], c[count - 1], partials[count - 1],
+                                    n[count - 1], k, splits[count - 1], each[count - 1]),
+                      e, 1, n[count - 1], k),
         };
         int blocks[3], start[4] = {0, 0, 0, 0};
         for (uint32_t i = 0; i < 3; i++) {
@@ -626,9 +759,9 @@ int launch_group(const void* a, const void* const* b, void* const* c, void* cons
         }
         // The split members' reduces, in member order; a one-split member owns no warp.
         reduce_globals r[3] = {
-            {m[0].partials, m[0].c, m[0].n, m[0].n_pad, m[0].splits},
-            {m[1].partials, m[1].c, m[1].n, m[1].n_pad, m[1].splits},
-            {m[2].partials, m[2].c, m[2].n, m[2].n_pad, m[2].splits},
+            {m[0].partials, m[0].c, m[0].n, m[0].n_pad, m[0].splits, m[0].residual, m[0].add},
+            {m[1].partials, m[1].c, m[1].n, m[1].n_pad, m[1].splits, m[1].residual, m[1].add},
+            {m[2].partials, m[2].c, m[2].n, m[2].n_pad, m[2].splits, m[2].residual, m[2].add},
         };
         int rstart[4] = {0, 0, 0, 0};
         for (uint32_t i = 0; i < 3; i++) {
@@ -648,7 +781,11 @@ int launch_group(const void* a, const void* const* b, void* const* c, void* cons
 // The expert GEMV at `splits`: the shape rule, then the views and the launch.
 int expert(const void* a, const void* b, const void* topk_idx, void* c, void* partials,
            uint32_t m, uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts,
-           uint32_t expert_rows, uint32_t pair_rows, uint32_t splits, void* stream) {
+           uint32_t expert_rows, uint32_t pair_rows, uint32_t splits, const ends& e,
+           void* stream) {
+    if (!ends_shape(e, k) || e.residual != nullptr) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
     const uint64_t pairs = uint64_t(m) * uint64_t(top_k);
     const uint64_t a_rows = pair_rows != 0 ? pairs : uint64_t(m);
     if (m == 0 || top_k == 0 || top_k > MAX_TOP_K || pairs > uint64_t(MAX_GRID_Z) || n == 0 ||
@@ -677,8 +814,9 @@ int expert(const void* a, const void* b, const void* topk_idx, void* c, void* pa
                   size_t(pairs)};
         gemv_globals G{ag,          bg,        cg,          pg,
                        ig,          int(n),    int(padded(n)), int(chunks),
-                       int(each),   int(splits), pair_rows != 0 ? 1 : int(top_k)};
-        return launch<true>(G, n, uint32_t(pairs), splits, stream);
+                       int(each),   int(splits), pair_rows != 0 ? 1 : int(top_k),
+                       no_gain(k),  no_residual(pairs, n), 0.0f, 0.0f, float(k), 0, 0};
+        return launch<true>(with_ends(G, e, pairs, n, k), n, uint32_t(pairs), splits, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
@@ -703,8 +841,8 @@ int launch_gate_up(gate_up_globals G, uint32_t n, uint32_t pairs, uint32_t split
         return static_cast<int>(launched);
     }
     gate_up_reduce_globals R{
-        {G.gate.partials, G.gate.c, int(n), int(padded(n)), int(splits)},
-        {G.up.partials, G.up.c, int(n), int(padded(n)), int(splits)},
+        {G.gate.partials, G.gate.c, int(n), int(padded(n)), int(splits), G.gate.residual, 0},
+        {G.up.partials, G.up.c, int(n), int(padded(n)), int(splits), G.up.residual, 0},
     };
     void* rargs[] = {&R};
     const uint32_t vectors = pairs * padded(n) / uint32_t(REDUCE_ROWS);
@@ -725,9 +863,11 @@ int launch_gate_up_act(uint32_t act, const gate_up_globals& G, uint32_t n, uint3
 // with its partials at `partials` (the gate's) and `partials` past the gate's `splits · n_pad`
 // f32 (the up's).
 int dense_gate_up(const void* a, const void* gate, const void* up, void* c, void* partials,
-                  uint32_t n, uint32_t k, uint32_t splits, uint32_t act, void* stream) {
+                  uint32_t n, uint32_t k, uint32_t splits, uint32_t act, const ends& e,
+                  void* stream) {
     const uint32_t each = dense_split(partials, n, k, splits);
-    if (each == 0 || (act != ACT_SILU && act != ACT_GELU)) {
+    if (each == 0 || (act != ACT_SILU && act != ACT_GELU) || !ends_shape(e, k) ||
+        e.residual != nullptr) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -735,8 +875,9 @@ int dense_gate_up(const void* a, const void* gate, const void* up, void* c, void
         float* up_partials =
             partials == nullptr ? nullptr
                                 : static_cast<float*>(partials) + size_t(splits) * padded(n);
-        gate_up_globals G{dense_globals(a, gate, c, partials, n, k, splits, each),
-                          dense_globals(a, up, c, up_partials, n, k, splits, each)};
+        gate_up_globals G{
+            with_ends(dense_globals(a, gate, c, partials, n, k, splits, each), e, 1, n, k),
+            with_ends(dense_globals(a, up, c, up_partials, n, k, splits, each), e, 1, n, k)};
         return launch_gate_up_act<false>(act, G, n, 1, splits, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
@@ -749,7 +890,10 @@ int dense_gate_up(const void* a, const void* gate, const void* up, void* c, void
 int expert_gate_up(const void* a, const void* gate, const void* up, const void* topk_idx, void* c,
                    void* partials, uint32_t m, uint32_t top_k, uint32_t n, uint32_t k,
                    uint32_t experts, uint32_t expert_rows, uint32_t splits, uint32_t act,
-                   void* stream) {
+                   const ends& e, void* stream) {
+    if (!ends_shape(e, k) || e.residual != nullptr) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
     const uint64_t pairs = uint64_t(m) * uint64_t(top_k);
     if (m == 0 || top_k == 0 || top_k > MAX_TOP_K || pairs > uint64_t(MAX_GRID_Z) || n == 0 ||
         n % 64 != 0 || k == 0 || k % 64 != 0 ||
@@ -777,9 +921,10 @@ int expert_gate_up(const void* a, const void* gate, const void* up, const void* 
             partial_gl pg{static_cast<float*>(p), nullptr, nullptr, size_t(splits), run};
             idx_gl ig{static_cast<int*>(const_cast<void*>(topk_idx)), nullptr, nullptr,
                       size_t(1), size_t(pairs)};
-            return gemv_globals{ag,        bg,          cg,         pg,         ig,
-                                int(n),    int(padded(n)), int(chunks), int(each), int(splits),
-                                int(top_k)};
+            return with_ends(gemv_globals{ag, bg, cg, pg, ig, int(n), int(padded(n)), int(chunks),
+                                          int(each), int(splits), int(top_k), no_gain(k),
+                                          no_residual(pairs, n), 0.0f, 0.0f, float(k), 0, 0},
+                             e, pairs, n, k);
         };
         float* up_partials =
             partials == nullptr ? nullptr : static_cast<float*>(partials) + size_t(splits) * run;
@@ -888,7 +1033,7 @@ extern "C" int scratchy_cuda_gate_up_gemv_bf16_prepare(void) {
 extern "C" int scratchy_cuda_gemv_bf16_abt(const void* a, const void* b, void* c, uint32_t n,
                                            uint32_t k,
                                            void* stream /* cudaStream_t; null = default */) {
-    return dense(a, b, c, nullptr, n, k, 1, stream);
+    return dense(a, b, c, nullptr, n, k, 1, NO_ENDS, stream);
 }
 
 // As `scratchy_cuda_gemv_bf16_abt`, its `k` cut into `splits` runs of whole 256-element chunks
@@ -901,7 +1046,7 @@ extern "C" int scratchy_cuda_gemv_split_bf16_abt(const void* a, const void* b, v
                                                  void* partials, uint32_t n, uint32_t k,
                                                  uint32_t splits,
                                                  void* stream /* cudaStream_t; null = default */) {
-    return dense(a, b, c, partials, n, k, splits, stream);
+    return dense(a, b, c, partials, n, k, splits, NO_ENDS, stream);
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -924,7 +1069,7 @@ extern "C" int scratchy_cuda_expert_gemv_bf16(const void* a, const void* b, cons
                                               uint32_t pair_rows,
                                               void* stream /* cudaStream_t; null = default */) {
     return expert(a, b, topk_idx, c, nullptr, m, top_k, n, k, experts, expert_rows, pair_rows, 1,
-                  stream);
+                  NO_ENDS, stream);
 }
 
 // As `scratchy_cuda_expert_gemv_bf16` at `splits` (`step::gemv_splits` of `(n, k)`, the dense
@@ -935,7 +1080,7 @@ extern "C" int scratchy_cuda_expert_gemv_split_bf16(
     uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts, uint32_t expert_rows,
     uint32_t pair_rows, uint32_t splits, void* stream /* cudaStream_t; null = default */) {
     return expert(a, b, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows, pair_rows,
-                  splits, stream);
+                  splits, NO_ENDS, stream);
 }
 
 // As `scratchy_cuda_gemv_split_bf16_abt` for `count` (2 or 3) members of one `a [1, k]` (#1049):
@@ -950,7 +1095,7 @@ extern "C" int scratchy_cuda_gemv_group_bf16_abt(const void* a, const void* cons
                                                  const uint32_t* n, uint32_t k,
                                                  const uint32_t* splits, uint32_t count,
                                                  void* stream /* cudaStream_t; null = default */) {
-    return launch_group(a, b, c, partials, n, k, splits, count, stream);
+    return launch_group(a, b, c, partials, n, k, splits, count, NO_ENDS, stream);
 }
 
 // The gate/up GEMV (#1049): `c [n] = act(bf16(a · gateᵀ), bf16(a · upᵀ))`, rounded once, `act`
@@ -965,7 +1110,7 @@ extern "C" int scratchy_cuda_gate_up_gemv_bf16(const void* a, const void* gate, 
                                                void* c, void* partials, uint32_t n, uint32_t k,
                                                uint32_t splits, uint32_t act,
                                                void* stream /* cudaStream_t; null = default */) {
-    return dense_gate_up(a, gate, up, c, partials, n, k, splits, act, stream);
+    return dense_gate_up(a, gate, up, c, partials, n, k, splits, act, NO_ENDS, stream);
 }
 
 // The expert gate/up GEMV (#1049): per pair `p`, `c[p] = act(bf16(a[p / top_k] · gate_eᵀ),
@@ -979,5 +1124,58 @@ extern "C" int scratchy_cuda_expert_gate_up_gemv_bf16(
     uint32_t m, uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts, uint32_t expert_rows,
     uint32_t splits, uint32_t act, void* stream /* cudaStream_t; null = default */) {
     return expert_gate_up(a, gate, up, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows,
-                          splits, act, stream);
+                          splits, act, NO_ENDS, stream);
+}
+
+// FP8 S8 W4a: the bf16 GEMVs with the one-row GEMV's fused ends, as `gemv_fp8.cu`'s `_ends`
+// launchers: `gain` (null: no norm) the absorbed RMSNorm's `[k]` bf16 weight, `eps` and
+// `gain_offset` its scalars, the row normalised as it loads (the bits of
+// `scratchy_cuda_rms_norm_bf16` at one row then the launcher above on its output); `residual`
+// (null: no add) `[P, n]` bf16 added to the stored rows (`add_bf16`'s add), overlapping no output.
+// A normed `k` is a multiple of 256 of at most 6,144 and `eps` finite and positive; only the dense
+// GEMV takes a residual. Every rule is checked before any pointer is touched.
+extern "C" int scratchy_cuda_gemv_bf16_ends(const void* a, const void* b, void* c, void* partials,
+                                            uint32_t n, uint32_t k, uint32_t splits,
+                                            const void* gain, float eps, float gain_offset,
+                                            const void* residual,
+                                            void* stream /* cudaStream_t; null = default */) {
+    return dense(a, b, c, partials, n, k, splits, ends{gain, eps, gain_offset, residual}, stream);
+}
+
+extern "C" int scratchy_cuda_gemv_group_bf16_ends(const void* a, const void* const* b,
+                                                  void* const* c, void* const* partials,
+                                                  const uint32_t* n, uint32_t k,
+                                                  const uint32_t* splits, uint32_t count,
+                                                  const void* gain, float eps, float gain_offset,
+                                                  void* stream /* cudaStream_t; null = default */) {
+    return launch_group(a, b, c, partials, n, k, splits, count,
+                        ends{gain, eps, gain_offset, nullptr}, stream);
+}
+
+extern "C" int scratchy_cuda_gate_up_gemv_bf16_ends(const void* a, const void* gate,
+                                                    const void* up, void* c, void* partials,
+                                                    uint32_t n, uint32_t k, uint32_t splits,
+                                                    uint32_t act, const void* gain, float eps,
+                                                    float gain_offset,
+                                                    void* stream /* cudaStream_t; null = default */) {
+    return dense_gate_up(a, gate, up, c, partials, n, k, splits, act,
+                         ends{gain, eps, gain_offset, nullptr}, stream);
+}
+
+extern "C" int scratchy_cuda_expert_gemv_bf16_ends(
+    const void* a, const void* b, const void* topk_idx, void* c, void* partials, uint32_t m,
+    uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts, uint32_t expert_rows,
+    uint32_t pair_rows, uint32_t splits, const void* gain, float eps, float gain_offset,
+    void* stream /* cudaStream_t; null = default */) {
+    return expert(a, b, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows, pair_rows,
+                  splits, ends{gain, eps, gain_offset, nullptr}, stream);
+}
+
+extern "C" int scratchy_cuda_expert_gate_up_gemv_bf16_ends(
+    const void* a, const void* gate, const void* up, const void* topk_idx, void* c, void* partials,
+    uint32_t m, uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts, uint32_t expert_rows,
+    uint32_t splits, uint32_t act, const void* gain, float eps, float gain_offset,
+    void* stream /* cudaStream_t; null = default */) {
+    return expert_gate_up(a, gate, up, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows,
+                          splits, act, ends{gain, eps, gain_offset, nullptr}, stream);
 }
