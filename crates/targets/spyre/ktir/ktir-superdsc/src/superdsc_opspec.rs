@@ -1753,6 +1753,29 @@ pub enum OpFunc {
     TopKValue,
 }
 
+/// How an op function's DDL template binds a reduction's accumulator ([`OpFunc::reduction_binding`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReductionBinding {
+    /// Not a reduction.
+    None,
+    /// A seeded reduce: the accumulator is the output AND an input the template binds.
+    Seeded,
+    /// A reduction whose running state the template keeps internally: the output is only the output.
+    Internal,
+}
+
+impl ReductionBinding {
+    /// Whether the op reduces at all.
+    pub const fn is_reduction(self) -> bool {
+        !matches!(self, ReductionBinding::None)
+    }
+
+    /// Whether the accumulator is also one of the op's bound inputs.
+    pub const fn accum_is_input(self) -> bool {
+        matches!(self, ReductionBinding::Seeded)
+    }
+}
+
 impl OpFunc {
     /// `matmul` for a PLAIN 2-D matmul (batch==1); `batchmatmul` for a true batched matmul
     /// (batch>1, the attention bmm). PROVEN 2026-07-07 by diffing torch-spyre's OWN generate_sdsc:
@@ -1947,6 +1970,10 @@ impl OpFunc {
     /// row and the operand list cannot drift apart.
     pub fn ddl_input_arity(self) -> Option<usize> {
         match self {
+            // `summeanmaxexx2.ddl` binds the data AND the seeded accumulator — TWO inputs (the reduce
+            // fixture: accum is `inputLabeledDs[1]`). The accumulator counts because these rows
+            // bind it so ([`OpFunc::reduction_binding`] `Seeded`), so one data operand is the bind.
+            OpFunc::Sum | OpFunc::Max | OpFunc::Mean | OpFunc::Exx2 => Some(2),
             OpFunc::QuantScalePerTokenFp8 => Some(1),
             // `unary_pipeline.ddl:16` binds clip as `([%type_fp16], [%inptensor], [%outtensor])` —
             // ONE input. Both bounds are external constants, so unlike the seeded reduces there is no
@@ -1960,6 +1987,58 @@ impl OpFunc {
             // fused scale above.
             OpFunc::TopKIndex | OpFunc::TopKValue => Some(1),
             _ => None,
+        }
+    }
+
+    /// ⭐ WHETHER THIS OP FUNC REDUCES, AND HOW ITS DDL TEMPLATE BINDS THE ACCUMULATOR — a const
+    /// table, one row per op func, read by [`OpSpec::new`] (the accumulator is a bound input exactly
+    /// when the row says `Seeded`) and by the coordinates' stick-group stride. A fact of the op
+    /// function's template, never of the operand count an op happens to be built with.
+    pub const fn reduction_binding(self) -> ReductionBinding {
+        match self {
+            // `summeanmaxexx2.ddl`: the accumulator is the output AND `inputLabeledDs[1]`.
+            OpFunc::Sum | OpFunc::Max | OpFunc::Mean | OpFunc::Exx2 => ReductionBinding::Seeded,
+            // The contraction's K, the fused per-token scale (`quant_scale_per_token.ddl:41`, an
+            // on-chip `ddl.internal_tensor`) and the top-k ring (`topk.ddl:36-37`): the running
+            // state is the template's own, so the output is only the output.
+            OpFunc::Matmul
+            | OpFunc::BatchMatmul
+            | OpFunc::QuantScalePerTokenFp8
+            | OpFunc::TopKIndex
+            | OpFunc::TopKValue => ReductionBinding::Internal,
+            OpFunc::Transpose
+            | OpFunc::Restickify
+            | OpFunc::Add
+            | OpFunc::Subtract
+            | OpFunc::Multiply
+            | OpFunc::RealDiv
+            | OpFunc::Abs
+            | OpFunc::Silu
+            | OpFunc::Exp
+            | OpFunc::Log
+            | OpFunc::Neg
+            | OpFunc::Reciprocal
+            | OpFunc::Sqrt
+            | OpFunc::Rsqrt
+            | OpFunc::Sigmoid
+            | OpFunc::Gelu
+            | OpFunc::Mish
+            | OpFunc::Tanh
+            | OpFunc::Dl16ToFp32
+            | OpFunc::Fp32ToDl16
+            | OpFunc::Fp32ToInt32
+            | OpFunc::Int32ToFp32
+            | OpFunc::MulI32ToI32
+            | OpFunc::AddI32ToI32
+            | OpFunc::Identity
+            | OpFunc::Maximum
+            | OpFunc::Minimum
+            | OpFunc::Clip
+            | OpFunc::Qfp8ch
+            | OpFunc::LesserThan
+            | OpFunc::Equal
+            | OpFunc::NotEqual
+            | OpFunc::Where3 => ReductionBinding::None,
         }
     }
 
@@ -3884,22 +3963,18 @@ pub struct SamvCoordinateMask {
 /// [`WorkPlan`] so over-specification is unrepresentable.
 ///
 /// ⭐ BUILT ONLY BY [`OpSpec::new`], which takes the output as its own argument and refuses an operand
-/// list its op function's DDL template cannot bind. `op`, `is_reduction` and `args` are private, so the
-/// three facts that arity is a function of cannot change after the check: an operand can be ATTACHED
+/// list its op function's DDL template cannot bind. `op` and `args` are private, so the two facts that
+/// arity is a function of cannot change after the check: an operand can be ATTACHED
 /// (an epilogue operand, a gather index — neither is an input the template binds, so the count the
 /// descriptor lists does not move when one is), never pushed or removed.
 #[derive(Clone, Debug)]
 pub struct OpSpec {
     op: OpFunc,
-    is_reduction: bool,
     /// The named iteration space + validated work-division (witnesses (a)(b)(f)).
     pub iter: WorkPlan,
     /// Ordered tensor args, the output LAST; `arg_index == position` is a type invariant. Never
     /// empty: [`OpSpec::new`] takes the output separately.
     args: Vec<AnyTensorArg>,
-    /// Whether the reduction's accumulator is ALSO one of the op's inputs — stated once, at
-    /// construction, from the operands the op was built with ([`OpSpec::new`]'s doc).
-    accum_is_input: bool,
     pub op_info: OpInfo,
     /// The LX-fit TIME-TILE for this op (the **TimeTile** witness). `None` = the
     /// per-core tile fits [`USABLE_LX_BYTES`] in one trip (today's single-shot
@@ -3937,25 +4012,24 @@ impl OpSpec {
     /// that builder is ever handed.
     ///
     /// ⭐ THE ACCUMULATOR. A reduction accumulator is BOTH an input AND the output (the reduce
-    /// fixture: accum is `inputLabeledDs[1]` and the sole `outputLabeledDs`) for a seeded reduce of
-    /// one data operand — `sum`/`max`/`mean` → `summeanmaxexx2.ddl`, which binds TWO inputs. The
-    /// machine's FUSED reduces (`quantscalepertokenfp8` → `quant_scale_per_token.ddl:41`, one
-    /// `%input_tensor`, its accumulator an on-chip `ddl.internal_tensor`) bind ONE, and their table
-    /// row says so. Decided here, over the operands the op is built with, so nothing attached later
-    /// (an index, an epilogue operand) can change what the template is asked to bind.
+    /// fixture: accum is `inputLabeledDs[1]` and the sole `outputLabeledDs`) for a seeded reduce —
+    /// `sum`/`max`/`mean`/`exx2` → `summeanmaxexx2.ddl`, which binds TWO inputs. The machine's FUSED
+    /// reduces (`quantscalepertokenfp8` → `quant_scale_per_token.ddl:41`, one `%input_tensor`, its
+    /// accumulator an on-chip `ddl.internal_tensor`) bind ONE. Both are the op function's row
+    /// ([`OpFunc::reduction_binding`]), never the operand count, so nothing attached later (an index,
+    /// an epilogue operand) can change what the template is asked to bind.
     ///
     /// Takes exactly the facts the arity is a function of. What the template does not count — the
     /// aux constants, the time tile, the coordinate mask — chains on after ([`Self::with_op_info`],
     /// [`Self::with_time_tile`], [`Self::with_coordinate_mask`]).
     pub fn new(
         op: OpFunc,
-        is_reduction: bool,
         iter: WorkPlan,
         inputs: Vec<AnyTensorArg>,
         output: AnyTensorArg,
     ) -> Result<OpSpec, SuperDscError> {
         let arity = op.ddl_input_arity();
-        let accum_is_input = is_reduction && inputs.len() == 1 && arity.is_none_or(|n| n == 2);
+        let accum_is_input = op.reduction_binding().accum_is_input();
         let bound = inputs.len() + usize::from(accum_is_input);
         if let Some(want) = arity
             && bound != want
@@ -3980,10 +4054,8 @@ impl OpSpec {
         args.push(output);
         Ok(OpSpec {
             op,
-            is_reduction,
             iter,
             args,
-            accum_is_input,
             op_info: OpInfo::None,
             time_tile: None,
             indirect: None,
@@ -4014,8 +4086,9 @@ impl OpSpec {
         self.op
     }
 
+    /// Whether the op reduces — its op function's row ([`OpFunc::reduction_binding`]).
     pub fn is_reduction(&self) -> bool {
-        self.is_reduction
+        self.op.reduction_binding().is_reduction()
     }
 
     /// Every operand, in `Tensor{i}` order, the output last. Never empty.
@@ -4037,7 +4110,7 @@ impl OpSpec {
 
     /// Whether the reduction's accumulator is also listed as an input ([`Self::new`]'s doc).
     pub fn accum_is_input(&self) -> bool {
-        self.accum_is_input
+        self.op.reduction_binding().accum_is_input()
     }
 
     /// The gathered (or scattered) access this op declares, if any — set only with its index operand.

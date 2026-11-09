@@ -452,7 +452,7 @@ pub fn reduce_opspec_df_divided(
         ));
     }
     let op_info = reduce_op_info(op, cols, df, accum_name)?;
-    Ok(OpSpec::new(op, true, plan, vec![data], accum)
+    Ok(OpSpec::new(op, plan, vec![data], accum)
         .map_err(|e| e.0)?
         .with_op_info(op_info)
         .with_time_tile(time_tile)
@@ -900,7 +900,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     // The scaling const divides by the reduce's LOGICAL extent (`ScalingExtent`), never by
     // this emission's slice geometry — see `ReduceOffSpec::scaling`.
     let op_info = reduce_op_info(op, scaling.get(), df, accum_name)?;
-    Ok(OpSpec::new(op, true, plan, vec![data], accum)
+    Ok(OpSpec::new(op, plan, vec![data], accum)
         .map_err(|e| e.0)?
         .with_op_info(op_info)
         .with_time_tile(time_tile)
@@ -1773,7 +1773,7 @@ mod the_arity_is_checked_where_the_op_is_built {
             .map(|i| arg(&p, true, &format!("in{i}"), Scale::Active))
             .collect();
         let out = arg(&p, false, "acc", Scale::RedStick);
-        OpSpec::new(op, true, p, ins, out)
+        OpSpec::new(op, p, ins, out)
     }
 
     fn input_refs(op: &OpSpec) -> usize {
@@ -1820,6 +1820,43 @@ mod the_arity_is_checked_where_the_op_is_built {
         assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
     }
 
+    /// Near-miss: a seeded `sum` with a SECOND data operand — the count rule this replaced decided
+    /// "accumulator is an input" from `inputs.len() == 1`, so two operands silently made it not one.
+    /// The row decides it now, and two data operands plus the accumulator are three, not the
+    /// template's two.
+    #[test]
+    fn a_seeded_reduce_with_two_data_operands_refuses_at_construction() {
+        let e = build(OpFunc::Sum, 2).expect_err("two data operands, a two-input bind");
+        assert!(e.0.contains("binds exactly 2"), "names the bind: {}", e.0);
+        assert!(
+            e.0.contains("+ the accumulator"),
+            "counts the accumulator: {}",
+            e.0
+        );
+    }
+
+    /// The table, row by row: every seeded reduce lists its accumulator, every internal-state
+    /// reduction does not, and a non-reduction is not a reduction.
+    #[test]
+    fn each_op_func_states_how_its_template_binds_the_accumulator() {
+        use crate::superdsc_opspec::ReductionBinding as B;
+        for op in [OpFunc::Sum, OpFunc::Max, OpFunc::Mean, OpFunc::Exx2] {
+            assert_eq!(op.reduction_binding(), B::Seeded, "{op:?}");
+            assert_eq!(op.ddl_input_arity(), Some(2), "{op:?}: data + accumulator");
+        }
+        for op in [
+            OpFunc::Matmul,
+            OpFunc::BatchMatmul,
+            OpFunc::QuantScalePerTokenFp8,
+            OpFunc::TopKIndex,
+            OpFunc::TopKValue,
+        ] {
+            assert_eq!(op.reduction_binding(), B::Internal, "{op:?}");
+            assert!(!op.reduction_binding().accum_is_input(), "{op:?}");
+        }
+        assert!(!OpFunc::Add.reduction_binding().is_reduction());
+    }
+
     /// Near-miss on a non-reduction row: `clip` binds one input; two refuse.
     #[test]
     fn a_two_input_clip_refuses_at_construction() {
@@ -1829,7 +1866,7 @@ mod the_arity_is_checked_where_the_op_is_built {
             arg(&p, true, "b", Scale::Active),
         ];
         let out = arg(&p, false, "o", Scale::Active);
-        let e = OpSpec::new(OpFunc::Clip, false, p, ins, out).expect_err("clip binds one");
+        let e = OpSpec::new(OpFunc::Clip, p, ins, out).expect_err("clip binds one");
         assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
     }
 }

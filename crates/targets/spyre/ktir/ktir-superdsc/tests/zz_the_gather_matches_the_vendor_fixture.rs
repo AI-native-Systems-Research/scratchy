@@ -131,7 +131,6 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
     let args = op.args();
     ktir_superdsc::superdsc_opspec::OpSpec::new(
         op.op(),
-        op.is_reduction(),
         op.iter.clone(),
         vec![args[ia.value].clone()],
         args[args.len() - 1].clone(),

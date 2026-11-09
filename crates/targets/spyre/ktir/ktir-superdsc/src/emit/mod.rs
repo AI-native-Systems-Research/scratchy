@@ -1177,7 +1177,6 @@ fn sfp_rank1_opspec(
     let (input, output) = (mk(true, in_name)?, mk(false, out_name)?);
     OpSpec::new(
         op,
-        false,
         plan,
         vec![AnyTensorArg::R1(input)],
         AnyTensorArg::R1(output),
@@ -2352,7 +2351,6 @@ fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpe
     let out = mk(false, o)?;
     OpSpec::new(
         OpFunc::Add,
-        false,
         plan,
         vec![AnyTensorArg::R3(x_lo), AnyTensorArg::R3(x_hi)],
         AnyTensorArg::R3(out),
@@ -5129,7 +5127,7 @@ fn convert_opspec(
     };
     let input = mk(true, in_name, Role::Input, in_df)?;
     let output = mk(false, o_name, Role::Output, out_df)?;
-    Ok(OpSpec::new(op, false, plan, vec![input], output)
+    Ok(OpSpec::new(op, plan, vec![input], output)
         .map_err(|e| e.0)?
         .with_time_tile(time_tile))
 }
@@ -5646,7 +5644,6 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
     .map_err(|e| e.0)?;
     Ok(OpSpec::new(
         OpFunc::Transpose,
-        false,
         plan,
         vec![AnyTensorArg::R3(input)],
         AnyTensorArg::R3(output),
@@ -6565,7 +6562,6 @@ fn topk_opspec(
     .map_err(|e| e.0)?;
     Ok(OpSpec::new(
         member,
-        true,
         plan,
         vec![AnyTensorArg::R2(input)],
         AnyTensorArg::R2(output),
@@ -6694,7 +6690,6 @@ fn restickify_kt_opspec_2d(
     .with_offset(out_off);
     OpSpec::new(
         OpFunc::Restickify,
-        false,
         plan,
         vec![AnyTensorArg::R2(input)],
         AnyTensorArg::R2(output),
@@ -6927,7 +6922,6 @@ pub(crate) fn restickify_transpose_opspec_batched(
     .map_err(|e| e.0)?;
     OpSpec::new(
         OpFunc::Restickify,
-        false,
         plan,
         vec![AnyTensorArg::R3(input)],
         AnyTensorArg::R3(output),
@@ -8490,7 +8484,6 @@ mod time_tiled_segment_law {
         let out = mk(false, "sl_o", [Scale::Active, Scale::Active, Scale::Active]);
         OpSpec::new(
             OpFunc::Multiply,
-            false,
             plan,
             vec![AnyTensorArg::R3(x), AnyTensorArg::R3(gamma)],
             AnyTensorArg::R3(out),

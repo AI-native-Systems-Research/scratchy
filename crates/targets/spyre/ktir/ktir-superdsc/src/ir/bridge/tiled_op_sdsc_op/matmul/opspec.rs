@@ -666,15 +666,11 @@ where
         }
     }
     let [input, kernel, output]: [AnyTensorArg; 3] = args;
-    Ok(OpSpec::new(
-        OpFunc::matmul(batch),
-        true,
-        plan,
-        vec![input, kernel],
-        output,
+    Ok(
+        OpSpec::new(OpFunc::matmul(batch), plan, vec![input, kernel], output)
+            .map_err(|e| e.0)?
+            .with_time_tile(time_tile),
     )
-    .map_err(|e| e.0)?
-    .with_time_tile(time_tile))
 }
 
 /// BOTH rank-3 args of one regime's shared-kernel batched matmul, from the regime's own typed walk
@@ -942,7 +938,6 @@ pub fn matmul_opspec_batched_off(
     .with_offset(o_off);
     Ok(OpSpec::new(
         OpFunc::matmul(batch),
-        true,
         plan,
         vec![AnyTensorArg::R3(input), AnyTensorArg::R3(kernel)],
         AnyTensorArg::R3(output),
@@ -1045,7 +1040,6 @@ pub fn matmul_opspec_x_batched(
     .map_err(|e| e.0)?;
     OpSpec::new(
         OpFunc::matmul(batch),
-        true,
         plan,
         vec![AnyTensorArg::R3(input), AnyTensorArg::R3(kernel)],
         AnyTensorArg::R3(output),
@@ -1165,7 +1159,6 @@ pub fn matmul_opspec_rows_split(
     let output = rows(false, o_name, Role::Output, o_rows, OutAxis::NAME)?;
     OpSpec::new(
         OpFunc::matmul(batch),
-        true,
         plan,
         vec![AnyTensorArg::R3(input), AnyTensorArg::R3(kernel)],
         AnyTensorArg::R3(output),

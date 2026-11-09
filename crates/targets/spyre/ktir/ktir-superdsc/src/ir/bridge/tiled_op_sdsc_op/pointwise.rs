@@ -911,8 +911,7 @@ pub fn index_select_opspec(
         crate::superdsc_opspec::ViewFrame::Own,
     )?;
     let output = arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?;
-    let mut op =
-        OpSpec::new(OpFunc::Identity, false, plan, vec![input], output).map_err(|e| e.0)?;
+    let mut op = OpSpec::new(OpFunc::Identity, plan, vec![input], output).map_err(|e| e.0)?;
     op.attach_gather_index(gather.gather_index(), 0)
         .ok_or_else(|| {
             format!(
@@ -1029,7 +1028,7 @@ pub fn expand_blocks_opspec(
         ],
     )?;
     let output = arg(false, dst, [Scale::Active; 4])?;
-    OpSpec::new(OpFunc::Identity, false, plan, vec![input], output).map_err(|e| e.0)
+    OpSpec::new(OpFunc::Identity, plan, vec![input], output).map_err(|e| e.0)
 }
 
 /// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
@@ -1120,11 +1119,9 @@ pub fn stick_permute_opspec(
         ))
     };
     let (input, output) = (arg(true, src, from)?, arg(false, dst, to)?);
-    Ok(
-        OpSpec::new(OpFunc::Identity, false, plan, vec![input], output)
-            .map_err(|e| e.0)?
-            .with_time_tile(time_tile),
-    )
+    Ok(OpSpec::new(OpFunc::Identity, plan, vec![input], output)
+        .map_err(|e| e.0)?
+        .with_time_tile(time_tile))
 }
 
 /// One stick permute's extents: `rows` rows of `sticks` sticks of `df`, in `direction`, read from
@@ -1239,11 +1236,9 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
         };
     let input = arg(true, src, src_pitch, src_elems)?;
     let output = arg(false, dst, dst_pitch, dst_elems)?;
-    Ok(
-        OpSpec::new(OpFunc::Identity, false, plan, vec![input], output)
-            .map_err(|e| e.0)?
-            .with_time_tile(time_tile),
-    )
+    Ok(OpSpec::new(OpFunc::Identity, plan, vec![input], output)
+        .map_err(|e| e.0)?
+        .with_time_tile(time_tile))
 }
 
 /// [`stick_runs_copy_opspec`] + `emit_sdsc_tiled`.
@@ -1460,7 +1455,7 @@ fn pointwise_opspec_from_tile_split(
         ),
     };
 
-    Ok(OpSpec::new(op, false, plan, ins, output)
+    Ok(OpSpec::new(op, plan, ins, output)
         .map_err(|e| e.0)?
         .with_op_info(if op.needs_sfp_const_table() {
             OpInfo::SfpConstTable
@@ -1790,7 +1785,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .filter(|w| !w.spans_one_stick())
             .map(|w| w.parent_rows()),
     )?;
-    Ok(OpSpec::new(op, false, plan, ins, output)
+    Ok(OpSpec::new(op, plan, ins, output)
         .map_err(|e| e.0)?
         .with_op_info(if op.needs_sfp_const_table() {
             OpInfo::SfpConstTable
@@ -2667,8 +2662,8 @@ mod index_select_tests {
             crate::superdsc_opspec::ViewFrame::LandedBlocks,
         )
         .expect("the stamped arg builds");
-        let op = OpSpec::new(OpFunc::Identity, false, plan, vec![src_arg], dst_arg)
-            .expect("the op builds");
+        let op =
+            OpSpec::new(OpFunc::Identity, plan, vec![src_arg], dst_arg).expect("the op builds");
         let l = BundleLayout::default();
         l.synth(PlaceId::Act(1), &[64, 64]);
         l.synth(PlaceId::Act(2), &[64, 64]);
