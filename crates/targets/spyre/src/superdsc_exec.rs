@@ -5736,13 +5736,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let stream = self.stream_ref()?;
         let t1 = Instant::now();
         let cbs = image.data.canvas.len();
-        // The replayed step's CBs come back with their own labels: canvas CB `i` is the
-        // submission's CB `i`, named by the plan it was proven equal to. Keyed by (image length,
-        // CB index), so a replayed step's CBs never average into a walked rung's.
-        let r = stream.submit_shared(batch, &image.data.labels, image.barrier, |i, l| RbLabel {
-            key: RbKey::Replay { image: cbs, cb: i },
-            label: format!("replay {l}"),
-        });
+        // The replayed step's ids come back beside the image's labels: canvas CB `i` is the
+        // submission's CB `i`. Nothing is named on the doorbell path; RB_TIME names them below.
+        let r = stream.submit_shared(batch, &image.data.labels, image.barrier);
         let t2 = Instant::now();
         let submitted = match r {
             Ok(submitted) => submitted,
@@ -5759,13 +5755,18 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 )));
             }
         };
-        // The step's CBs, filed by their own ids, and its doorbell: the host instant the submit
-        // returned, against the step's first CB.
+        // Under RB_TIME only: the step's CBs, each filed by its own id with the label of the plan it
+        // was proven equal to — keyed by (image length, CB index), so a replayed step's CBs never
+        // average into a walked rung's — and its doorbell, the host instant the submit returned,
+        // against the step's first CB.
         if Diag::get().rb_time {
-            if let Some(&(first, _)) = submitted.first() {
+            if let Some(first) = submitted.ids().get(0) {
                 self.rb.doorbells.insert(first, t2);
             }
-            self.rb.file(submitted);
+            self.rb.file(submitted.named(|i, l| RbLabel {
+                key: RbKey::Replay { image: cbs, cb: i },
+                label: format!("replay {l}"),
+            }));
         }
         let mut t = timers();
         t.replay_steps += 1;

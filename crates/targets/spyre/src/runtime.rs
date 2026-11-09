@@ -1113,20 +1113,18 @@ impl Stream {
         Ok(ids.iter().zip(std::iter::once(label)).collect())
     }
 
-    /// Submit shared canvas wires ([`Self::compute_wires`]) with the labels split from the same
-    /// canvas: back comes each CB's id with its own label.
-    pub fn submit_shared<L, M>(
+    /// Submit shared canvas wires ([`Self::compute_wires`]) beside the labels split from the same
+    /// canvas: back come the submission's ids, held with those labels ([`SharedSubmitted`]). Nothing
+    /// is named here — the doorbell path builds no label; a caller that wants each CB's id with its
+    /// own label asks [`SharedSubmitted::named`].
+    pub fn submit_shared<'l, L>(
         &self,
         batch: ComputeWireBatch,
-        labels: &CanvasLabels<L>,
+        labels: &'l CanvasLabels<L>,
         pipeline_barrier: bool,
-        mut name: impl FnMut(usize, &L) -> M,
-    ) -> Result<Vec<(u64, M)>, HwError> {
+    ) -> Result<SharedSubmitted<'l, L>, HwError> {
         let ids = self.compute_wires(batch, pipeline_barrier)?;
-        Ok(ids
-            .iter()
-            .zip(labels.0.iter().enumerate().map(|(i, l)| name(i, l)))
-            .collect())
+        Ok(SharedSubmitted { ids, labels })
     }
 
     pub fn submit_batch(
@@ -1290,6 +1288,32 @@ impl<L> Default for LabelledCanvas<L> {
 /// per CB, in order. Only [`Stream::submit_shared`] consumes them, beside the submission of those
 /// wires.
 pub struct CanvasLabels<L>(Vec<L>);
+
+/// One [`Stream::submit_shared`]: the ids its CBs were given, beside the labels of the canvas it
+/// submitted. CB `i` of the canvas has id `ids.get(i)` and label `i`, so the two are paired by the
+/// one canvas, and nothing is built until a caller asks.
+pub struct SharedSubmitted<'l, L> {
+    ids: SubmittedIds,
+    labels: &'l CanvasLabels<L>,
+}
+
+impl<'l, L> SharedSubmitted<'l, L> {
+    /// The submission's ids, CB order.
+    pub fn ids(&self) -> SubmittedIds {
+        self.ids
+    }
+
+    /// Each CB's id with its own label, named by `name(i, label)`.
+    pub fn named<M>(self, mut name: impl FnMut(usize, &L) -> M) -> impl Iterator<Item = (u64, M)> {
+        self.ids.iter().zip(
+            self.labels
+                .0
+                .iter()
+                .enumerate()
+                .map(move |(i, l)| name(i, l)),
+        )
+    }
+}
 
 /// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that
