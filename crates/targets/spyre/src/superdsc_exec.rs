@@ -33,7 +33,7 @@ use crate::fold_plan::{
 };
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, PeerLink, Stream,
+    HwError, PeerLink, Stream, SubmittedIds,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -160,6 +160,8 @@ struct PendingLaunch {
     rep: i64,
     /// The per-segment shifts this entry launched with — what `dump_launch_site` prints.
     off: [u64; NUM_SEGMENTS],
+    /// What `SCRATCHY_SDSC_RB_TIME` files this entry's CB as, when it is on.
+    rb_label: Option<RbLabel>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -194,7 +196,7 @@ struct StepImageData {
     rows: Vec<RowReplay>,
     /// One label per CB of `canvas` (`cb_plan::CbPlan::cb_labels`, per row, concatenated): what a
     /// replayed step's response blocks are attributed to, since a replay records no launch
-    /// sequence of its own (`Executor::rb_seq` is the walk's).
+    /// sequence of its own (each CB is filed by its id in the session's [`RbHarvest`]).
     labels: Vec<String>,
 }
 
@@ -468,6 +470,64 @@ struct RbOpCycles {
     label: String,
 }
 
+/// What one submitted CB was, for `SCRATCHY_SDSC_RB_TIME`: the op it belongs to — (rung length,
+/// op index) for the walk, (image length, CB index) for a replayed step, so neither averages into
+/// the other — and its label.
+struct RbLabel {
+    key: (usize, usize),
+    label: String,
+}
+
+/// ⭐ ONE CARD'S `SCRATCHY_SDSC_RB_TIME` HARVEST — owned by that card's session, as the telemetry
+/// ring it drains is that card's (`rb_telemetry::drain_source` of the card's key).
+///
+/// ⭐⭐ A CB'S LABEL AND ITS TIMING ARE JOINED BY THE CB'S OWN ID. The submit hands back the ids it
+/// gave the submission's CBs ([`SubmittedIds`]); each is filed here with its label, and each
+/// drained record finds its label by `RbTiming::id`. So it does not matter when a record arrives:
+/// a CB still running at this drain is simply not in the ring yet, and its label waits for the
+/// drain that brings it. (The table used to pair a step's completed CBs with its recorded launches
+/// BY POSITION, which a pipelined step — drained at its fence, with only part of it complete and
+/// the next already submitted — never satisfied, so no table printed.)
+///
+/// ⛔ PER CARD, NOT PROCESS-WIDE. These accumulators lived in the process-wide `Timers`, which the
+/// eight sessions of a tp/8 world shared: the first rank to attribute took every rank's launches and
+/// the table summed eight cards as one.
+#[derive(Default)]
+struct RbHarvest {
+    /// Every submitted CB whose record has not been drained yet, by its id.
+    labels: BTreeMap<u64, RbLabel>,
+    /// Per-op harvested cycles, by the label's key.
+    cycles: BTreeMap<(usize, usize), RbOpCycles>,
+    /// The DMA crossings' harvested cycles — the preamble-H2D and logits-D2H, which no op owns.
+    /// Since #544 both ride the COMPUTE pipeline; `rb_attribute` routes them here by the
+    /// direction `RbTiming::dma` carries, so these totals keep their pre-#544 meaning.
+    dmai: RbCycles,
+    dmao: RbCycles,
+    /// Op CBs that completed with no recorded launch — a launch this card submitted outside the
+    /// labelled doors. Named in the report; never a reason to drop the table.
+    unlabelled: RbCycles,
+    /// Drains, op CBs attributed, and `cbs` at the last periodic report — the count jumps a
+    /// whole drain at a time, so a plain `is_multiple_of` would skip its own thresholds.
+    drains: u64,
+    cbs: u64,
+    reported: u64,
+}
+
+impl RbHarvest {
+    /// File one submission's CBs under the ids the submit gave them, CB `i` at `ids.get(i)`.
+    fn label(&mut self, ids: SubmittedIds, labels: impl IntoIterator<Item = RbLabel>) {
+        for (i, l) in labels.into_iter().enumerate() {
+            match ids.get(i) {
+                Some(id) => {
+                    self.labels.insert(id, l);
+                }
+                // A submission that queued fewer CBs than it was labelled with — refused before
+                // its doorbell (the submit's error is the caller's). Nothing will complete for it.
+                None => break,
+            }
+        }
+    }
+}
 /// Accumulators the timing modes write into. Process-wide, like the C++ statics.
 #[derive(Default)]
 struct Timers {
@@ -493,18 +553,6 @@ struct Timers {
     prefix_ms: BTreeMap<(usize, usize), (f64, u64, String)>,
     prefix_call: BTreeMap<usize, u64>,
     repeat_ms: BTreeMap<usize, (f64, f64, u64, String)>,
-    /// Per-op harvested RB cycles — keyed like `prefix_ms` (same rung-numbering hazard).
-    rb_cycles: BTreeMap<(usize, usize), RbOpCycles>,
-    /// The DMA crossings' harvested cycles — the preamble-H2D and logits-D2H, which no op owns.
-    /// Since #544 both ride the COMPUTE pipeline; `rb_attribute` routes them here by the
-    /// direction `RbTiming::dma` carries, so these totals keep their pre-#544 meaning.
-    rb_dmai: RbCycles,
-    rb_dmao: RbCycles,
-    rb_steps: u64,
-    rb_cbs: u64,
-    /// Cumulative `rb_cbs` at the last periodic report — the count jumps a whole forward at a
-    /// time (~162 CBs), so a plain `is_multiple_of` would skip its own thresholds and never fire.
-    rb_reported: u64,
     forwards: i64,
     // ── #603 PR2 2c — the replay player's own decomposition. Recorded
     // UNCONDITIONALLY (a handful of Instants and counters per STEP, not per
@@ -1048,17 +1096,9 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
     /// and its own op counter. `None` unless the env gate is set.
     dump: Option<TensorDump>,
-    /// ⭐ THIS CARD'S `SCRATCHY_SDSC_RB_TIME` LAUNCH SEQUENCE: one entry per compute CB this card
-    /// submitted this forward, in submission order — ((rung length, op index), label). It is the
-    /// card's own, as the telemetry ring it is zipped against is (`rb_telemetry::drain_source` of
-    /// this card's key): the session that pushes a launch is the one that reads it back, so a rank
-    /// can neither take another's launches nor find its own taken. Cleared at the start of every
-    /// forward and taken by [`Self::rb_attribute`] after the step's synchronize.
-    ///
-    /// ⛔ IT WAS ONE PROCESS-WIDE `Vec` FOR EVERY CARD, and at tp/8 that is eight sessions sharing
-    /// it: the first rank to attribute drained all eight ranks' launches (6,896 = 8 × 862 against
-    /// its own 852 CBs) and the other seven found none, so no rank's per-op table printed.
-    rb_seq: Vec<((usize, usize), String)>,
+    /// This card's `SCRATCHY_SDSC_RB_TIME` harvest ([`RbHarvest`]): labels by CB id, and the
+    /// per-op cycles they attribute.
+    rb: RbHarvest,
 
     // ── #603 PR2 2c — the replay player ──
     /// Cached step images, keyed by (body, resident page count, fold shape) —
@@ -1427,7 +1467,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             staged_host: false,
             n_weights_staged: 0,
             dump: None,
-            rb_seq: Vec::new(),
+            rb: RbHarvest::default(),
             step_images: StepImageCache::default(),
             seat,
         };
@@ -3657,9 +3697,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             || d.optrace
             || d.tensordump.is_some());
         let mut pending: Vec<PendingLaunch> = Vec::new();
-        // This walk's launch sequence, appended to the session's own once the walk ends: the walk
-        // holds a borrow of the session's stream across every push, so it records into a local.
-        let mut rb_seq: Vec<((usize, usize), String)> = Vec::new();
+        // This walk's submissions for `SCRATCHY_SDSC_RB_TIME`: each submit's ids with the labels of
+        // the CBs it carried, filed into the session's harvest once the walk ends (the walk holds
+        // a borrow of the session's stream across every submit, so it records into a local).
+        let mut rb_subs: Vec<(SubmittedIds, Vec<RbLabel>)> = Vec::new();
+        let rb_time = d.rb_time;
         // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
         // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
         // fences on the first true barrier and waits on nothing after; the ring stays FIFO).
@@ -3805,14 +3847,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     continue;
                 }
 
-                if d.rb_time {
-                    // The launch sequence the post-synchronize drain zips against: entry i is the
-                    // i-th compute CB of this forward in submission order, keyed by (rung length,
-                    // op index) so prefix/body/suffix op numbers cannot average into each other.
-                    // Recorded before the collect branch so a batched rung's ops land here in the
-                    // same submission order its single doorbell emits them in.
-                    rb_seq.push(((ops.len(), oi), op.label()));
-                }
+                // Each CB of this site, as `SCRATCHY_SDSC_RB_TIME` names it: the op, keyed by (rung
+                // length, op index) so prefix/body/suffix op numbers cannot average into each
+                // other, and which CB of the site it is.
+                let rb_key = (ops.len(), oi);
+                let rb_name = |kind: &str| RbLabel {
+                    key: rb_key,
+                    label: format!("{} {kind}", op.label()),
+                };
 
                 // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
                 // its send and its wait — staged by `cb_plan::site_cbs`, the one function the
@@ -3826,6 +3868,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     // submits and the item the parity gate renders cannot drift apart in shape.
                     let st0 = Instant::now();
                     pending.extend(cbs.into_iter().map(|item| PendingLaunch {
+                        rb_label: rb_time.then(|| rb_name(item.kind())),
                         item,
                         op_index: oi,
                         rep,
@@ -3841,15 +3884,21 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 } else if op.collective.is_some() {
                     // A COLLECTIVE IS ONE SUBMISSION even off the batched path: its send, wait and
                     // consume ride one doorbell, in order, so no diag mode can split them.
-                    stream.submit_batch(&cbs, barrier).map_err(fault)?;
+                    let ids = stream.submit_batch(&cbs, barrier).map_err(fault)?;
+                    if rb_time {
+                        rb_subs.push((ids, cbs.iter().map(|c| rb_name(c.kind())).collect()));
+                    }
                 } else if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
                     let st0 = Instant::now();
-                    stream
+                    let ids = stream
                         .compute(prog, &ta, "", bootstrap, &[], barrier)
                         .map_err(fault)?;
                     let st1 = Instant::now();
+                    if rb_time {
+                        rb_subs.push((ids, vec![rb_name("launch")]));
+                    }
                     let mut t = timers();
                     t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
                     t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
@@ -3863,9 +3912,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     // the mlir path may route flex down a different (seed-only) path for the SFP
                     // transcendental while the matmul tolerates it. The same "" at the diag probes
                     // above and inside the rung flush's `compute_batch` / the CB render door.
-                    stream
+                    let ids = stream
                         .compute(prog, &ta, "", bootstrap, &[], barrier)
                         .map_err(fault)?;
+                    if rb_time {
+                        rb_subs.push((ids, vec![rb_name("launch")]));
+                    }
                 }
 
                 // DEFAULT-OFF: skipping the per-group drain removes the ~868-ops/layer
@@ -3924,10 +3976,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // the doorbell takes, the context is what a refusal dumps.
             let mut sites: Vec<(usize, i64, [u64; NUM_SEGMENTS])> =
                 Vec::with_capacity(pending.len());
+            let mut flush_labels: Vec<RbLabel> = Vec::new();
             let items: Vec<BatchedCb> = pending
                 .drain(..)
                 .map(|p| {
                     sites.push((p.op_index, p.rep, p.off));
+                    flush_labels.extend(p.rb_label);
                     p.item
                 })
                 .collect();
@@ -3935,6 +3989,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             let st0 = Instant::now();
             let r = stream.submit_batch(&items, batch_barrier);
             let st1 = Instant::now();
+            if let Ok(ids) = &r
+                && rb_time
+            {
+                rb_subs.push((*ids, flush_labels));
+            }
             if let Err(e) = r {
                 // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
                 // The loop locals the per-op `fault` closure dumps from are gone here, so the
@@ -3984,7 +4043,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
             }
         }
-        self.rb_seq.append(&mut rb_seq);
+        for (ids, labels) in rb_subs {
+            self.rb.label(ids, labels);
+        }
         Ok(())
     }
 
@@ -4446,20 +4507,20 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     //  Predict
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
-    /// Attribute this forward's harvested RB timings to the ops that launched them, and report on
-    /// the same cadence `group_time` does. The completion thread records every CB's five device
-    /// cycle counts as it completes (`flex_rs::rb_telemetry`), so after the step's `synchronize`
-    /// — the one the step already performs, no extra drain — the ring holds exactly this
-    /// forward's CBs. Op compute entries (DMA crossings excluded by
-    /// [`flex_rs::rb_telemetry::RbTiming::dma`]) sorted by
-    /// submission id zip 1:1 against [`Executor::rb_seq`], which the launch loop filled in the same
-    /// order. This is the attribution `group_time`/`prefix_time` pay ~11% of decode to estimate,
-    /// read for free instead.
+    /// Attribute the RB timings this card's ring has collected to the CBs that produced them, and
+    /// report on the same cadence `group_time` does. The completion thread records every CB's five
+    /// device cycle counts as it completes (`flex_rs::rb_telemetry`); this drains THIS card's
+    /// records (its telemetry key) and joins each op record to its CB's label by the CB's own id
+    /// ([`RbHarvest`]). A CB still running is not in the ring yet and its label waits; an op
+    /// record whose id has no label is counted as such and named in the report.
+    ///
+    /// This is the attribution `group_time`/`prefix_time` pay ~11% of decode to estimate, read for
+    /// free instead.
     fn rb_attribute(&mut self) {
-        let seq = std::mem::take(&mut self.rb_seq);
-        let mut entries = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
-        let mut t = timers();
-        t.rb_steps += 1;
+        let entries = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
+        let rank = self.session().map(|r| r.get());
+        let h = &mut self.rb;
+        h.drains += 1;
         // The DMA crossings belong to no op — the preamble-H2D and logits-D2H — so they
         // accumulate wherever they arrive, attribution-free. Since #544 those two ride the
         // COMPUTE pipeline (they used to take the async ones), so `pipeline` alone no longer
@@ -4471,28 +4532,31 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 | (
                     flex_rs::scheduler::PipelineId::Compute,
                     Some(flex_rs::dma::DmaDirection::HostToDevice),
-                ) => t.rb_dmai.add_dmai(e.rb),
+                ) => h.dmai.add_dmai(e.rb),
                 (flex_rs::scheduler::PipelineId::AsyncDmaO, _)
                 | (
                     flex_rs::scheduler::PipelineId::Compute,
                     Some(flex_rs::dma::DmaDirection::DeviceToHost),
-                ) => t.rb_dmao.add_dmao(e.rb),
+                ) => h.dmao.add_dmao(e.rb),
                 (flex_rs::scheduler::PipelineId::Compute, None) => {}
             }
         }
+        let t_steps = h.drains;
+        // Which card a per-drain line is: the rank, when this session runs one.
+        let who = rank.map_or_else(|| "solo".to_string(), |r| format!("r{r}"));
         // PIN THE MAPPING ON-CARD: raw per-CB records for the first few forwards, verbatim. The
         // aggregates below blend forwards (prefill and decode CBs differ) and cannot decide the
         // slot-to-name mapping; these can — an H2D CB lights the dmai slots, a D2H the dmao
         // slots, a compute CB the rest, and only same-domain slot pairs difference to durations.
         // The compute-pipeline DMA crossings print here too (a Compute line in this print IS one
         // — no op entry reaches it), so their own slot mapping gets pinned the same way.
-        if t.rb_steps <= 3 {
+        if t_steps <= 3 {
             for e in entries.iter().filter(|e| {
                 !matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) || e.dma.is_some()
             }) {
                 eprintln!(
-                    "[sdsc-rbtime] fwd {} {:?} id {} slots {:?} power {}",
-                    t.rb_steps,
+                    "[sdsc-rbtime] {who} fwd {} {:?} id {} slots {:?} power {}",
+                    t_steps,
                     e.pipeline,
                     e.id,
                     e.rb.timestamps(),
@@ -4524,8 +4588,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 None => "-".to_string(),
             };
             eprintln!(
-                "[sdsc-rbgap] fwd {} all{} compute{} h2d{} d2h{} other{}",
-                t.rb_steps,
+                "[sdsc-rbgap] {who} fwd {} all{} compute{} h2d{} d2h{} other{}",
+                t_steps,
                 fmt(&all),
                 fmt(&compute),
                 fmt(&h2d),
@@ -4588,9 +4652,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     .map(|(g, i)| format!("{i}:{g}"))
                     .collect();
                 eprintln!(
-                    "[sdsc-rbkind] fwd {} cbs {} (exec>0 {busy}) span {span} exec {exec} gap {} \
+                    "[sdsc-rbkind] {who} fwd {} cbs {} (exec>0 {busy}) span {span} exec {exec} gap {} \
                      cycles  top-exec {} top-gap {}",
-                    t.rb_steps,
+                    t_steps,
                     ops.len(),
                     span.saturating_sub(exec),
                     top.join(" "),
@@ -4598,61 +4662,35 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 );
             }
         }
-        // The op entries: compute CBs that are not DMA crossings. A crossing kept here would
-        // both break the 1:1 zip below and bill the preamble/readback to whichever op it
-        // happened to sort next to.
-        entries.retain(|e| {
+        // ⭐ THE JOIN, BY ID: each op record finds the label of the CB that produced it.
+        for e in entries.iter().filter(|e| {
             matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) && e.dma.is_none()
-        });
-        entries.sort_unstable_by_key(|e| e.id);
-        if entries.len() != seq.len() {
-            // LOUD, NOT SILENT: a mismatch means per-op attribution would be WRONG, not merely
-            // missing — `repeat_probe` launches computes that are in the ring but not in the
-            // sequence, and a rotated ring loses launches from its front. (The DMA crossings
-            // are NOT a mismatch source anymore: `dma` excludes them above.) Skip the
-            // attribution entirely; the DMA totals above stay honest either way.
-            eprintln!(
-                "[sdsc-rbtime] sequence mismatch: {} completed compute CBs vs {} recorded \
-                 launches — per-op attribution SKIPPED for this forward",
-                entries.len(),
-                seq.len()
-            );
-            return;
-        }
-        let zipped: Vec<_> = entries.iter().zip(seq).collect();
-        if t.rb_steps <= 3 {
-            let n = zipped.len();
-            for (i, (e, ((rung, oi), label))) in zipped
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i < 20 || *i + 8 >= n)
-            {
-                eprintln!(
-                    "[sdsc-rbtime] fwd {} op ({rung},{oi}) rec {i} id {} slots {:?} power {}  {}",
-                    t.rb_steps,
-                    e.id,
-                    e.rb.timestamps(),
-                    e.rb.power(),
-                    label
-                );
+        }) {
+            match h.labels.remove(&e.id) {
+                Some(RbLabel { key, label }) => {
+                    let acc = h.cycles.entry(key).or_default();
+                    acc.cycles.add_compute(e.rb);
+                    if acc.label.is_empty() {
+                        acc.label = label;
+                    }
+                }
+                None => h.unlabelled.add_compute(e.rb),
             }
+            h.cbs += 1;
         }
-        let mut new_cbs = 0u64;
-        for (e, ((rung, oi), label)) in zipped {
-            let acc = t.rb_cycles.entry((rung, oi)).or_default();
-            acc.cycles.add_compute(e.rb);
-            new_cbs += 1;
-            if acc.label.is_empty() {
-                acc.label = label;
-            }
-        }
-        t.rb_cbs += new_cbs;
         // Same cadence as `group_time`'s report: rare enough not to distort, often enough that a
         // long run does not have to end first. Watermarked rather than `is_multiple_of` because
-        // the cumulative count jumps a whole forward at a time.
-        if t.rb_cbs - t.rb_reported >= 20_000 {
-            t.rb_reported = t.rb_cbs;
-            report_rb_time(&t);
+        // the cumulative count jumps a whole drain at a time.
+        if h.cbs - h.reported >= 20_000 {
+            h.reported = h.cbs;
+            report_rb_time(h, rank);
+        }
+    }
+
+    /// This card's RB report so far — what the run-end summary prints for every card.
+    pub fn report_rb_time(&self) {
+        if self.rb.cbs > 0 {
+            report_rb_time(&self.rb, self.session().map(|r| r.get()));
         }
     }
 
@@ -4673,13 +4711,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         self.require_sources_filled()?;
 
-        // RB timing: start the forward's window empty. The previous forward drained its own
-        // entries at its synchronize; what is left in the ring now is pre-forward history
-        // (prepare's weight uploads belong to no op), and the launch sequence starts at zero.
-        if d.rb_time {
-            let _ = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
-        }
-        self.rb_seq.clear();
+        // RB timing needs no per-forward reset: each completed CB finds its label by its own id
+        // (`RbHarvest`), whenever it is drained, so nothing here is thrown away.
 
         // The stream is PERSISTENT: the scheduler retires each op's fence from its per-stream
         // deque the moment that fence resolves (SchedulerState::retire_fence), so nothing
@@ -4965,6 +4998,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             );
             let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
             report_phase_timers(ms(s.half.t1, s.half.t2));
+            // THE HARVEST, DRAIN-FREE: this card's per-op device cycles, which the response
+            // blocks carried all along — riding the phase line (turn `SCRATCHY_SDSC_RB_TIME` on
+            // WITH `phase_time` for the per-forward view; alone, the report fires on the same
+            // 20k-CB cadence as `group_time`).
+            if d.rb_time {
+                self.report_rb_time();
+            }
         }
 
         if let Logits::ReadBack(out) = logits {
@@ -5473,29 +5513,31 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let cbs = image.data.canvas.len();
         let r = stream.compute_wires(batch, image.barrier);
         let t2 = Instant::now();
-        if let Err(e) = r {
-            // The image itself was proven at derivation (per-row gates above);
-            // a refused submit here is capacity or shutdown, not addressing —
-            // so the refusal names the image and the step, not an op site.
-            return Err(anyhow::Error::new(e).context(format!(
-                "replay submit refused: {cbs} CB(s) over {} launch row(s), barrier={}, \
+        let ids = match r {
+            Ok(ids) => ids,
+            Err(e) => {
+                // The image itself was proven at derivation (per-row gates above);
+                // a refused submit here is capacity or shutdown, not addressing —
+                // so the refusal names the image and the step, not an op site.
+                return Err(anyhow::Error::new(e).context(format!(
+                    "replay submit refused: {cbs} CB(s) over {} launch row(s), barrier={}, \
                  sel={sel:?}, n_fold_pages={n}, step at {}",
-                image.data.rows.len(),
-                image.barrier,
-                seq_pos.0
-            )));
-        }
-        // The replayed step's launch sequence, for `rb_attribute`'s zip: every canvas CB is a
-        // compute CB in submission order, named by the plan it was proven equal to. Keyed by
-        // (image length, CB index), so a replayed step's CBs never average into a walked rung's.
+                    image.data.rows.len(),
+                    image.barrier,
+                    seq_pos.0
+                )));
+            }
+        };
+        // The replayed step's CBs, filed under the ids the submit gave them: canvas CB `i` is the
+        // submission's CB `i`, named by the plan it was proven equal to. Keyed by (image length,
+        // CB index), so a replayed step's CBs never average into a walked rung's.
         if Diag::get().rb_time {
-            self.rb_seq.extend(
-                image
-                    .data
-                    .labels
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| ((cbs, i), format!("replay {l}"))),
+            self.rb.label(
+                ids,
+                image.data.labels.iter().enumerate().map(|(i, l)| RbLabel {
+                    key: (cbs, i),
+                    label: format!("replay {l}"),
+                }),
             );
         }
         let mut t = timers();
@@ -6801,24 +6843,27 @@ fn rb_class_window(
 /// `exec` is the compute engine's own time, `prep` the queue+prep wait behind earlier CBs — on a
 /// pipelined stream consecutive CBs overlap (the next CB's prep runs during the previous CB's
 /// exec), so Σ exec, not Σ total, is the stream's device span.
-fn report_rb_time(t: &Timers) {
-    let exec_total: u64 = t.rb_cycles.values().map(|a| a.cycles.exec).sum();
-    let prep_total: u64 = t.rb_cycles.values().map(|a| a.cycles.prep).sum();
-    let dma_total = t.rb_dmai.dmai + t.rb_dmao.tail;
+fn report_rb_time(h: &RbHarvest, rank: Option<u32>) {
+    let who = rank.map_or_else(|| "solo".to_string(), |r| format!("rank {r}"));
+    let exec_total: u64 = h.cycles.values().map(|a| a.cycles.exec).sum();
+    let prep_total: u64 = h.cycles.values().map(|a| a.cycles.prep).sum();
+    let dma_total = h.dmai.dmai + h.dmao.tail;
     eprintln!(
-        "[sdsc-rbtime] device exec cycles by op (of {exec_total} exec + {prep_total} prep + \
-         {dma_total} dma cycles over {} compute CBs, {} forwards)",
-        t.rb_cbs, t.rb_steps
+        "[sdsc-rbtime] {who}: device exec cycles by op (of {exec_total} exec + {prep_total} prep + \
+         {dma_total} dma cycles over {} compute CBs, {} drains; {} awaiting completion)",
+        h.cbs,
+        h.drains,
+        h.labels.len()
     );
-    let mut top: Vec<_> = t
-        .rb_cycles
+    let mut top: Vec<_> = h
+        .cycles
         .iter()
         .map(|(k, a)| (a.cycles.exec, *k, a))
         .collect();
     top.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (cyc, (rung, oi), a) in top.iter().take(20) {
         eprintln!(
-            "[sdsc-rbtime]   op ({rung},{oi:<3}) {:>12} cyc exec  {:>9} cyc/cb  {:6} cbs  \
+            "[sdsc-rbtime]   {who} op ({rung},{oi:<3}) {:>12} cyc exec  {:>9} cyc/cb  {:6} cbs  \
              prep {:>12}  {}",
             cyc,
             cyc / a.cycles.cbs.max(1),
@@ -6827,14 +6872,21 @@ fn report_rb_time(t: &Timers) {
             a.label
         );
     }
+    if h.unlabelled.cbs > 0 {
+        eprintln!(
+            "[sdsc-rbtime]   {who} UNLABELLED: {} compute CB(s) completed with no recorded launch, \
+             {} cyc exec — a launch submitted outside the labelled doors",
+            h.unlabelled.cbs, h.unlabelled.exec
+        );
+    }
     eprintln!(
-        "[sdsc-rbtime]   dmai: {} cb, {} cyc ({} cyc/cb)  |  dmao: {} cb, {} cyc ({} cyc/cb)",
-        t.rb_dmai.cbs,
-        t.rb_dmai.dmai,
-        t.rb_dmai.dmai / t.rb_dmai.cbs.max(1),
-        t.rb_dmao.cbs,
-        t.rb_dmao.tail,
-        t.rb_dmao.tail / t.rb_dmao.cbs.max(1),
+        "[sdsc-rbtime]   {who} dmai: {} cb, {} cyc ({} cyc/cb)  |  dmao: {} cb, {} cyc ({} cyc/cb)",
+        h.dmai.cbs,
+        h.dmai.dmai,
+        h.dmai.dmai / h.dmai.cbs.max(1),
+        h.dmao.cbs,
+        h.dmao.tail,
+        h.dmao.tail / h.dmao.cbs.max(1),
     );
 }
 
@@ -6910,12 +6962,6 @@ fn report_phase_timers(compute_ms: f64) {
         t.prep_ms = 0.0;
         t.submit_calls = 0;
         t.host_fence_launches = 0;
-    }
-    // THE HARVEST, DRAIN-FREE: per-op device cycles the response blocks carried all along. This
-    // section rides the phase line (turn `SCRATCHY_SDSC_RB_TIME` on WITH `phase_time` for the
-    // per-forward view; alone, the report fires on the same 20k-CB cadence as `group_time`).
-    if d.rb_time && t.rb_cbs > 0 {
-        report_rb_time(&t);
     }
     // THE LADDER: T(j) is the mean time from a layer's first launch to the drain after group j, so
     // the RISE from one rung to the next is group j's own device time. A rung with a small rise is a

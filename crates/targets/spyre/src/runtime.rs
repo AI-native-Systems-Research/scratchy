@@ -950,7 +950,7 @@ impl Stream {
         bootstrap_offset: u64,
         tensor_byte_offsets: &[u64],
         pipeline_barrier: bool,
-    ) -> Result<(), HwError> {
+    ) -> Result<SubmittedIds, HwError> {
         let stream = self.live()?;
         let allocs: Vec<Arc<CompositeAddress>> =
             tensor_allocs.iter().map(|a| a.0.clone()).collect();
@@ -986,7 +986,7 @@ impl Stream {
         &self,
         launches: impl Iterator<Item = &'l BatchedCompute>,
         pipeline_barrier: bool,
-    ) -> Result<(), HwError> {
+    ) -> Result<SubmittedIds, HwError> {
         let stream = self.live()?;
         let params: Vec<ComputeParams> = launches.map(BatchedCompute::params).collect();
         stream
@@ -1053,7 +1053,13 @@ impl Stream {
     /// control blocks is rendered through [`Self::render_batch`] and submitted as wires
     /// ([`Self::compute_wires`]) with the leased tags stamped on, so the sends, waits and consumes
     /// ride the same FIFO as the compute that produces and consumes their bytes.
-    pub fn submit_batch(&self, items: &[BatchedCb], pipeline_barrier: bool) -> Result<(), HwError> {
+    /// Returns the ids the batch's CBs were given, CB `i` of `items` at index `i`
+    /// ([`SubmittedIds`]).
+    pub fn submit_batch(
+        &self,
+        items: &[BatchedCb],
+        pipeline_barrier: bool,
+    ) -> Result<SubmittedIds, HwError> {
         if items.iter().all(|i| matches!(i, BatchedCb::Compute(_))) {
             return self.compute_batch(
                 items.iter().filter_map(|i| match i {
@@ -1091,7 +1097,7 @@ impl Stream {
         &self,
         batch: ComputeWireBatch,
         pipeline_barrier: bool,
-    ) -> Result<(), HwError> {
+    ) -> Result<SubmittedIds, HwError> {
         let stream = self.live()?;
         stream
             .launch_compute_wires(batch, pipeline_barrier, None)
@@ -1122,6 +1128,9 @@ pub use flex_rs::control_block_wire::{ControlBlockWire, ResponseTag};
 /// The world's placement the worker builds from its cards' ([`CardRuntime::cpus`]) and pins its
 /// load and decode-loop threads to.
 pub use flex_rs::numa::WorldCpus;
+/// The ids one submission's control blocks were given — what a submit hands back, and what each CB's
+/// response record carries (`flex_rs::rb_telemetry::RbTiming::id`).
+pub use flex_rs::stream::SubmittedIds;
 
 /// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that
@@ -1162,6 +1171,18 @@ pub enum BatchedCb {
     /// Wait for one message from each of several peers to land: one write-done count on each sid
     /// the PEERS signal for that message's landing slot — the wdone barrier's own sid set.
     Wait { sids: Vec<u8> },
+}
+
+impl BatchedCb {
+    /// Which CB of its site this is — the word a per-CB report names it by.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BatchedCb::Compute(_) => "launch",
+            BatchedCb::Consume(_) => "consume",
+            BatchedCb::Send(_) => "send",
+            BatchedCb::Wait { .. } => "wait",
+        }
+    }
 }
 
 /// One end of a send, addressed as the launch it is aimed from addresses it: the allocation backing

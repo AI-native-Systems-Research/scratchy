@@ -289,6 +289,50 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 /// lambda's `if(user_cb) user_cb(user_cb_data);` step).
 pub type CompletionCallback = Box<dyn FnOnce(Result<(), SchedulerError>) + Send>;
 
+/// ⭐ THE IDS ONE SUBMISSION'S CONTROL BLOCKS WERE GIVEN — the same `PendingRequest::id` each CB's
+/// response carries back ([`crate::rb_telemetry::RbTiming::id`]), handed to the submitter so it
+/// never has to re-derive which completion is which CB.
+///
+/// A RANGE, BY CONSTRUCTION: `crate::scheduler::ResponseWorker::prepare_cbs` reserves a submission's ids with ONE
+/// `fetch_add(num_cbs)`, so the ids of one submission are consecutive whoever else submits
+/// concurrently, on the locked path and on the lock-free calibration path alike. CB `i` of the
+/// submission has id `first + i`. Empty for a submission that queues no control block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubmittedIds {
+    first: u64,
+    count: u64,
+}
+
+impl SubmittedIds {
+    /// No control block was queued.
+    pub const NONE: SubmittedIds = SubmittedIds { first: 0, count: 0 };
+
+    /// The `count` ids from `first` — the one reservation `prepare_cbs` made.
+    pub const fn range(first: u64, count: u64) -> SubmittedIds {
+        SubmittedIds { first, count }
+    }
+
+    /// The id of the submission's CB `i`, `None` past its end.
+    pub fn get(self, i: usize) -> Option<u64> {
+        (i as u64).lt(&self.count).then(|| self.first + i as u64)
+    }
+
+    /// How many control blocks the submission queued.
+    pub fn len(self) -> usize {
+        self.count as usize
+    }
+
+    /// Whether the submission queued none.
+    pub fn is_empty(self) -> bool {
+        self.count == 0
+    }
+
+    /// Every id, CB order.
+    pub fn iter(self) -> impl Iterator<Item = u64> {
+        self.first..self.first + self.count
+    }
+}
+
 /// The minimal interface `RuntimeStream` needs from the scheduler backend,
 /// matching exactly what `runtime_stream.cpp` calls: `registerStream` (ctor),
 /// `releaseStream` (dtor), and `schedule` (every `launchOperation*`).
@@ -322,13 +366,16 @@ pub trait SchedulerHandle: Send + Sync {
     /// RuntimeOperation&, CompletionCallback)`. Implementations own ordering
     /// semantics (`mode`) and eventual hardware submission; `completion` must
     /// be invoked exactly once, synchronously or asynchronously.
+    ///
+    /// Returns the ids the operation's control blocks were given ([`SubmittedIds`]) — empty for an
+    /// operation that queued none (a host callback, an event, a failed submission).
     fn schedule(
         &self,
         stream_id: StreamId,
         mode: RuntimeStreamMode,
         op: SubmittedOperation,
         completion: CompletionCallback,
-    ) -> Result<(), SchedulerError>;
+    ) -> Result<SubmittedIds, SchedulerError>;
 }
 
 /// Port of `flex::RuntimeStream`. All fields below mirror the C++ class's
@@ -553,11 +600,13 @@ impl RuntimeStream {
     /// their type-specific parameter validation has already happened in the
     /// concrete-params subsystem. `RuntimeStream`'s own contribution is
     /// exactly this shutdown check + callback lifecycle + scheduler handoff.
+    ///
+    /// Returns the ids the scheduler gave the operation's control blocks ([`SubmittedIds`]).
     pub fn launch_operation(
         self: &Arc<Self>,
         op: SubmittedOperation,
         user_cb: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Result<(), RuntimeStreamError> {
+    ) -> Result<SubmittedIds, RuntimeStreamError> {
         self.check_not_shutdown()?;
         let completion = self.make_completion_callback(user_cb);
         self.scheduler
@@ -641,7 +690,7 @@ impl RuntimeStream {
             skip_hazard: params.skip_hazard(),
             payload: Box::new(params),
         };
-        self.launch_operation(op, user_cb)
+        self.launch_operation(op, user_cb).map(|_| ())
     }
 
     /// Port of `RuntimeStream::launchOperationD2H`: same shape as
@@ -662,7 +711,7 @@ impl RuntimeStream {
             skip_hazard: params.skip_hazard(),
             payload: Box::new(params),
         };
-        self.launch_operation(op, user_cb)
+        self.launch_operation(op, user_cb).map(|_| ())
     }
 
     /// Port of `RuntimeStream::launchOperationCompute`: builds the boxed
@@ -672,7 +721,7 @@ impl RuntimeStream {
         self: &Arc<Self>,
         params: crate::compute::ComputeParams,
         user_cb: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Result<(), RuntimeStreamError> {
+    ) -> Result<SubmittedIds, RuntimeStreamError> {
         // `runtime_stream.cpp:256-267`: chunk count and 128-byte alignment on the
         // program address, then 128-byte alignment on EVERY tensor operand.
         // Deliberately NO `totalSizeGreaterThanZero` — the C++ does not call it
@@ -735,7 +784,7 @@ impl RuntimeStream {
         params: Vec<crate::compute::ComputeParams>,
         pipeline_barrier: bool,
         user_cb: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Result<(), RuntimeStreamError> {
+    ) -> Result<SubmittedIds, RuntimeStreamError> {
         if params.is_empty() {
             return Err(RuntimeStreamError::EmptyBatch("RuntimeOperationCompute"));
         }
@@ -798,7 +847,7 @@ impl RuntimeStream {
         batch: crate::compute::ComputeWireBatch,
         pipeline_barrier: bool,
         user_cb: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Result<(), RuntimeStreamError> {
+    ) -> Result<SubmittedIds, RuntimeStreamError> {
         if batch.canvas.is_empty() {
             return Err(RuntimeStreamError::EmptyBatch(
                 "RuntimeOperationCompute(wires)",
@@ -835,7 +884,7 @@ impl RuntimeStream {
             skip_hazard: false,
             payload: Box::new(params),
         };
-        self.launch_operation(op, None)
+        self.launch_operation(op, None).map(|_| ())
     }
 
     /// Port of `RuntimeStream::launchOperationP2PRdmaSend` (`runtime_stream.cpp:182-200`).
@@ -856,7 +905,7 @@ impl RuntimeStream {
             skip_hazard: false,
             payload: Box::new(params),
         };
-        self.launch_operation(op, user_cb)
+        self.launch_operation(op, user_cb).map(|_| ())
     }
 
     /// Port of `RuntimeStream::launchOperationP2PRdmaWait` (`runtime_stream.cpp:202-214`).
@@ -872,7 +921,7 @@ impl RuntimeStream {
             skip_hazard: false,
             payload: Box::new(params),
         };
-        self.launch_operation(op, user_cb)
+        self.launch_operation(op, user_cb).map(|_| ())
     }
 
     /// Port of `RuntimeStream::launchOperationP2PFirmwareSignal` (`runtime_stream.cpp:216-228`).
@@ -888,7 +937,7 @@ impl RuntimeStream {
             skip_hazard: false,
             payload: Box::new(params),
         };
-        self.launch_operation(op, user_cb)
+        self.launch_operation(op, user_cb).map(|_| ())
     }
 
     /// Port of `RuntimeStream::launchOperationP2PFirmwareWait` (`runtime_stream.cpp:230-243`).
@@ -904,7 +953,7 @@ impl RuntimeStream {
             skip_hazard: false,
             payload: Box::new(params),
         };
-        self.launch_operation(op, user_cb)
+        self.launch_operation(op, user_cb).map(|_| ())
     }
 
     /// Port of `RuntimeStream::launchOperationLegacyP2PDataExchange`
@@ -928,7 +977,7 @@ impl RuntimeStream {
             skip_hazard: false,
             payload: Box::new(operations),
         };
-        self.launch_operation(op, user_cb)
+        self.launch_operation(op, user_cb).map(|_| ())
     }
 
     /// Port of `launchOperationHostCallback`: uniquely among the
@@ -1431,7 +1480,7 @@ mod tests {
             _mode: RuntimeStreamMode,
             _op: SubmittedOperation,
             completion: CompletionCallback,
-        ) -> Result<(), SchedulerError> {
+        ) -> Result<SubmittedIds, SchedulerError> {
             self.schedule_calls.fetch_add(1, Ordering::Relaxed);
             if self.auto_complete {
                 let outcome = self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()));
@@ -1439,7 +1488,7 @@ mod tests {
             } else {
                 self.pending.lock().unwrap().push(completion);
             }
-            Ok(())
+            Ok(SubmittedIds::NONE)
         }
     }
 
@@ -1717,7 +1766,7 @@ mod tests {
         let mut rejected_after_shutdown = false;
         for _ in 0..3 {
             match stream.launch_operation(dummy_op(RuntimeOperationKind::H2D), None) {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(RuntimeStreamError::Shutdown) => rejected_after_shutdown = true,
                 Err(e) => panic!("unexpected error launching operation: {e}"),
             }

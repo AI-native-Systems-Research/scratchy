@@ -81,6 +81,7 @@ use crate::control_block_wire::{
 };
 use crate::dma::{DmaDirection, DmaParams, DmaPipelineShape, FillParams, FillPipeline};
 use crate::flex_config::{DeviceKind, RuntimeConfig};
+pub use crate::stream::SubmittedIds;
 use crate::stream::{
     CompletionCallback, RuntimeOperationKind, RuntimeStreamMode, SchedulerError, SchedulerHandle,
     StreamId, SubmittedOperation,
@@ -594,12 +595,14 @@ pub trait SchedulerBackend: Send + Sync {
         dma: &DmaParams,
         callback: CompletionCallback,
     );
+    /// Returns the ids the submission's CBs were given ([`SubmittedIds`]; empty when it queued
+    /// none). The same holds for the batch and wire forms below.
     fn submit_compute(
         &self,
         state: &Arc<SchedulerState>,
         op: &ComputeParams,
         callback: CompletionCallback,
-    );
+    ) -> SubmittedIds;
     /// The multi-CB form of [`Self::submit_compute`]: N compute ops as ONE
     /// submission group. The vendor's hardware path is batch-shaped end to
     /// end — `ControlBlockStream::QueueControlBlocksSBF(src, num_blocks)`
@@ -624,7 +627,7 @@ pub trait SchedulerBackend: Send + Sync {
         state: &Arc<SchedulerState>,
         ops: &[ComputeParams],
         callback: CompletionCallback,
-    );
+    ) -> SubmittedIds;
     /// The prebuilt-wire form of [`Self::submit_compute_batch`] (#603 PR2's
     /// replay path; contract: the `ComputeWireBatch` doc): the same ONE
     /// `submitToHardware` group — one capacity gate over `canvas.len()` CBs,
@@ -645,7 +648,7 @@ pub trait SchedulerBackend: Send + Sync {
         state: &Arc<SchedulerState>,
         batch: &ComputeWireBatch,
         callback: CompletionCallback,
-    );
+    ) -> SubmittedIds;
     fn submit_fill(
         &self,
         state: &Arc<SchedulerState>,
@@ -870,18 +873,19 @@ impl SchedulerBackend for MockBackend {
         state: &Arc<SchedulerState>,
         _op: &ComputeParams,
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         if *self.throw_on_compute.lock().unwrap() {
             callback(Err(mock_error(
                 "MockRuntimeScheduler: submitCompute configured to throw",
             )));
-            return;
+            return SubmittedIds::NONE;
         }
         // `++compute_in_flight_` ... synchronous submit ... `--compute_in_flight_`
         // (`mock_runtime_scheduler.cpp:302,341`).
         state.inc_in_flight(PipelineId::Compute);
         state.dec_in_flight(PipelineId::Compute);
         callback(Ok(()));
+        SubmittedIds::NONE
     }
 
     fn submit_compute_batch(
@@ -889,12 +893,12 @@ impl SchedulerBackend for MockBackend {
         state: &Arc<SchedulerState>,
         ops: &[ComputeParams],
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         if *self.throw_on_compute.lock().unwrap() {
             callback(Err(mock_error(
                 "MockRuntimeScheduler: submitCompute configured to throw",
             )));
-            return;
+            return SubmittedIds::NONE;
         }
         self.compute_batches.lock().unwrap().push(ops.len());
         // Same synchronous bracket as `submit_compute` above, but the budget
@@ -910,6 +914,7 @@ impl SchedulerBackend for MockBackend {
             state.dec_in_flight(PipelineId::Compute);
         }
         callback(Ok(()));
+        SubmittedIds::NONE
     }
 
     fn submit_compute_wires(
@@ -917,12 +922,12 @@ impl SchedulerBackend for MockBackend {
         state: &Arc<SchedulerState>,
         batch: &ComputeWireBatch,
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         if *self.throw_on_compute.lock().unwrap() {
             callback(Err(mock_error(
                 "MockRuntimeScheduler: submitCompute configured to throw",
             )));
-            return;
+            return SubmittedIds::NONE;
         }
         // The mock runs no wire bytes and no build closure; what it can
         // observe is the submission's SHAPE — one group of `canvas.len()`
@@ -935,6 +940,7 @@ impl SchedulerBackend for MockBackend {
             state.dec_in_flight(PipelineId::Compute);
         }
         callback(Ok(()));
+        SubmittedIds::NONE
     }
 
     fn submit_fill(
@@ -1640,6 +1646,8 @@ struct PreparedBatch {
     /// `None` only after `into_parts` has consumed it.
     cbs: Option<Vec<ControlBlockWire>>,
     pipeline: PipelineId,
+    /// The ids `prepare_cbs` gave these CBs, which `queue_cbs` hands back to its caller.
+    ids: SubmittedIds,
 }
 
 impl PreparedBatch {
@@ -2353,7 +2361,7 @@ impl ResponseWorker {
         qm: QueuingMode,
         dma: Option<DmaDirection>,
         build: impl FnOnce(&[ResponseTag]) -> Result<Vec<ControlBlockWire>, SchedulerError>,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<SubmittedIds, SchedulerError> {
         // "Calibration Fast Path" (`response_worker.cpp:485-510`): the same
         // three steps as the regular path below, minus `submission_mtx_` —
         // see the doc comment above for the single-producer contract that
@@ -2365,6 +2373,7 @@ impl ResponseWorker {
             self.precheck(num_cbs, qm)?;
             let batch = self.prepare_cbs(&cb_fn, num_cbs, pipeline, qm, dma, build)?;
             debug_assert_eq!(batch.len() as u64, num_cbs);
+            let ids = batch.ids;
             self.launch_cbs(batch)?;
             // "Single-threaded mode: poll synchronously until all responses
             // received" — the fast path carries its own copy of the poll,
@@ -2376,7 +2385,7 @@ impl ResponseWorker {
                     self.fetch_and_parse_response_blocks(&mut scratch);
                 }
             }
-            return Ok(());
+            return Ok(ids);
         }
 
         let submission_lock = self
@@ -2386,6 +2395,7 @@ impl ResponseWorker {
         self.precheck(num_cbs, qm)?;
         let batch = self.prepare_cbs(&cb_fn, num_cbs, pipeline, qm, dma, build)?;
         debug_assert_eq!(batch.len() as u64, num_cbs);
+        let ids = batch.ids;
         let launch_result = self.launch_cbs(batch);
         drop(submission_lock);
         // `LaunchCbs`' `cbi->QueueControlBlocksSBF(...)` (`:1268`) is
@@ -2413,7 +2423,7 @@ impl ResponseWorker {
                 self.fetch_and_parse_response_blocks(&mut scratch);
             }
         }
-        Ok(())
+        Ok(ids)
     }
 
     /// Port of `ResponseWorker::Precheck` (`response_worker.cpp:552-571`).
@@ -2468,6 +2478,10 @@ impl ResponseWorker {
         let tags: Vec<ResponseTag> = leases.iter().map(|l| l.tag()).collect();
 
         let batch_id = self.global_pr_batch_id.fetch_add(1, Ordering::AcqRel) + 1;
+        // ⭐ ONE RESERVATION FOR THE WHOLE BATCH: CB `i` is `first_id + i`, so the batch's ids are a
+        // range ([`SubmittedIds`]) on every path, the calibration one included (which takes no
+        // `submission_mtx`, so a per-CB `fetch_add` there would interleave with another producer's).
+        let first_id = self.global_pr_id.fetch_add(num_cbs, Ordering::AcqRel) + 1;
         // "Capture baseline timestamp once for entire batch - all CBs share
         // same timestamp" (`response_worker.cpp:791`).
         let batch_baseline_timestamp = Instant::now();
@@ -2513,7 +2527,7 @@ impl ResponseWorker {
                 let mut data = slot.data.lock().unwrap_or_else(|e| e.into_inner());
                 // "Initialize all fields before setting ready flag."
                 data.control_block = Some(cbs[i]);
-                data.id = self.global_pr_id.fetch_add(1, Ordering::AcqRel) + 1;
+                data.id = first_id + i as u64;
                 data.batch_id = batch_id;
                 data.cb_idx = i as u64;
                 data.pipeline = Some(pipeline);
@@ -2538,6 +2552,7 @@ impl ResponseWorker {
         Ok(PreparedBatch {
             cbs: Some(cbs),
             pipeline,
+            ids: SubmittedIds::range(first_id, num_cbs),
         })
     }
 
@@ -3249,7 +3264,7 @@ mod response_worker_tests {
         // labels — the ring's id-sorted op entries must line up with these, in this order.
         let op_tags = Arc::new(Mutex::new(Vec::<ResponseTag>::new()));
         let op_tags_build = op_tags.clone();
-        worker
+        let op_ids = worker
             .queue_cbs(
                 cb_fn.clone(),
                 3,
@@ -3267,7 +3282,7 @@ mod response_worker_tests {
             .expect("QueueCbs failed");
 
         // The #544 preamble-H2D shape: a DMA submitted on the COMPUTE pipeline.
-        worker
+        let crossing_ids = worker
             .queue_cbs(
                 cb_fn.clone(),
                 1,
@@ -3361,6 +3376,18 @@ mod response_worker_tests {
             compute_crossing.id < async_dma.id,
             "submission order across batches is preserved in the ids"
         );
+        // ⭐ THE SUBMITTER HOLDS EACH CB'S ID: `queue_cbs` hands back the range it reserved, and
+        // CB `i` of the submission is the record whose id is `ids.get(i)` — the join a caller makes
+        // with its labels, whatever order the records complete or drain in.
+        assert_eq!(op_ids.len(), 3, "one id per CB of the op batch");
+        assert_eq!(
+            ops.iter().map(|e| e.id).collect::<Vec<_>>(),
+            op_ids.iter().collect::<Vec<_>>(),
+            "each op record carries the id its submit returned, CB i at ids.get(i)"
+        );
+        assert_eq!(crossing_ids.len(), 1);
+        assert_eq!(crossing_ids.get(0), Some(compute_crossing.id));
+        assert_eq!(op_ids.get(3), None, "no id past the submission's end");
         worker.shutdown();
     }
 
@@ -4193,12 +4220,13 @@ fn submit_to_hardware(
     num_cbs: u64,
     callback: CompletionCallback,
     build: impl FnOnce(&[ResponseTag]) -> Result<Vec<ControlBlockWire>, SchedulerError>,
-) {
+) -> SubmittedIds {
     let pipeline = shape.pipeline;
     if !wait_for_queue_capacity(cap, state, pipeline, num_cbs, USE_DEFAULT_TIMEOUT_MS) {
-        return callback(Err(mock_error(&format!(
+        callback(Err(mock_error(&format!(
             "RuntimeScheduler: CbQueueCapacityExceeded (pipeline={pipeline:?}, num_cbs={num_cbs})"
         ))));
+        return SubmittedIds::NONE;
     }
 
     for _ in 0..num_cbs {
@@ -4246,7 +4274,7 @@ fn submit_to_hardware(
         }
     });
 
-    if let Err(e) = worker.queue_cbs(
+    match worker.queue_cbs(
         cb_fn,
         num_cbs,
         pipeline,
@@ -4254,17 +4282,21 @@ fn submit_to_hardware(
         shape.dma,
         build,
     ) {
-        // `RAS::DEVICE_PF::CbQueueFailed().Throw()`. The C++ throw unwinds out
-        // of `submitToHardware` without undoing step 2's increment (which
-        // then leaks, but the throw is a RAS fatal there); here the operation
-        // simply failed, so the increments are undone — leaving them raised
-        // would wedge `synchronize()`/`query()` forever on a counter that can
-        // never reach zero.
-        for _ in 0..num_cbs {
-            state.dec_in_flight(pipeline);
-        }
-        if let Some(cb) = user_cb.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            cb(Err(e));
+        Ok(ids) => ids,
+        Err(e) => {
+            // `RAS::DEVICE_PF::CbQueueFailed().Throw()`. The C++ throw unwinds out
+            // of `submitToHardware` without undoing step 2's increment (which
+            // then leaks, but the throw is a RAS fatal there); here the operation
+            // simply failed, so the increments are undone — leaving them raised
+            // would wedge `synchronize()`/`query()` forever on a counter that can
+            // never reach zero.
+            for _ in 0..num_cbs {
+                state.dec_in_flight(pipeline);
+            }
+            if let Some(cb) = user_cb.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                cb(Err(e));
+            }
+            SubmittedIds::NONE
         }
     }
 }
@@ -4923,7 +4955,7 @@ impl SchedulerBackend for PfBackend {
         state: &Arc<SchedulerState>,
         op: &ComputeParams,
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         let resolver = self.addr_resolver.as_ref();
         submit_to_hardware(
             state,
@@ -4933,7 +4965,7 @@ impl SchedulerBackend for PfBackend {
             1,
             callback,
             |tags| Ok(vec![build_compute_cb(resolver, op, tags[0])?]),
-        );
+        )
     }
 
     /// The multi-CB form of [`Self::submit_compute`] (contract:
@@ -4947,7 +4979,7 @@ impl SchedulerBackend for PfBackend {
         state: &Arc<SchedulerState>,
         ops: &[ComputeParams],
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         let resolver = self.addr_resolver.as_ref();
         submit_to_hardware(
             state,
@@ -4967,7 +4999,7 @@ impl SchedulerBackend for PfBackend {
                 }
                 Ok(cbs)
             },
-        );
+        )
     }
 
     /// The prebuilt-wire form (contract: [`SchedulerBackend::submit_compute_wires`]
@@ -4981,7 +5013,7 @@ impl SchedulerBackend for PfBackend {
         state: &Arc<SchedulerState>,
         batch: &ComputeWireBatch,
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -4994,7 +5026,7 @@ impl SchedulerBackend for PfBackend {
                 (batch.patch)(tags, &mut cbs);
                 Ok(cbs)
             },
-        );
+        )
     }
 
     /// Port of `PfRuntimeScheduler::submitFill` (`pf_runtime_scheduler.cpp:261-276`):
@@ -5299,7 +5331,7 @@ impl SchedulerBackend for VfBackend {
         state: &Arc<SchedulerState>,
         op: &ComputeParams,
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         let resolver = self.addr_resolver.as_ref();
         submit_to_hardware(
             state,
@@ -5309,7 +5341,7 @@ impl SchedulerBackend for VfBackend {
             1,
             callback,
             |tags| Ok(vec![build_compute_cb(resolver, op, tags[0])?]),
-        );
+        )
     }
     /// The multi-CB form of [`Self::submit_compute`] — same shape as PF's
     /// (the two C++ classes share `submitToHardware`); see
@@ -5319,7 +5351,7 @@ impl SchedulerBackend for VfBackend {
         state: &Arc<SchedulerState>,
         ops: &[ComputeParams],
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         let resolver = self.addr_resolver.as_ref();
         submit_to_hardware(
             state,
@@ -5339,7 +5371,7 @@ impl SchedulerBackend for VfBackend {
                 }
                 Ok(cbs)
             },
-        );
+        )
     }
     /// The prebuilt-wire form — same shape as PF's for the same reason
     /// (`submitToHardware` is shared); see
@@ -5349,7 +5381,7 @@ impl SchedulerBackend for VfBackend {
         state: &Arc<SchedulerState>,
         batch: &ComputeWireBatch,
         callback: CompletionCallback,
-    ) {
+    ) -> SubmittedIds {
         submit_to_hardware(
             state,
             self.response_worker(),
@@ -5362,7 +5394,7 @@ impl SchedulerBackend for VfBackend {
                 (batch.patch)(tags, &mut cbs);
                 Ok(cbs)
             },
-        );
+        )
     }
     /// Port of `VfRuntimeScheduler::submitFill`: same real fill CB as PF.
     fn submit_fill(
@@ -5713,13 +5745,13 @@ impl RuntimeScheduler {
     /// steps that every non-event `schedule()` overload repeats verbatim in
     /// the C++ (`makeFenceCallback` + the surrounding `try`/`catch`).
     // Argument count follows the `schedule()` overloads' shared parameter set in
-    fn schedule_pipelined<T>(
+    fn schedule_pipelined<T, R>(
         &self,
         op: PipelinedOp,
         payload: &T,
         on_complete: CompletionCallback,
-        submit: impl FnOnce(&dyn SchedulerBackend, &Arc<SchedulerState>, &T, CompletionCallback),
-    ) {
+        submit: impl FnOnce(&dyn SchedulerBackend, &Arc<SchedulerState>, &T, CompletionCallback) -> R,
+    ) -> R {
         let PipelinedOp {
             id,
             mode,
@@ -5804,7 +5836,7 @@ impl RuntimeScheduler {
         // response actually arrives — see [`submit_to_hardware`]. Every real
         // `schedule()` overload ends exactly here, at `submit*(params,
         // makeFenceCallback(fence, cb))`.
-        submit(self.backend.as_dyn(), &self.state, payload, wrapped);
+        submit(self.backend.as_dyn(), &self.state, payload, wrapped)
     }
 }
 
@@ -5833,7 +5865,7 @@ impl SchedulerHandle for RuntimeScheduler {
         mode: RuntimeStreamMode,
         op: SubmittedOperation,
         completion: CompletionCallback,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<SubmittedIds, SchedulerError> {
         use RuntimeOperationKind as K;
         // Previously dropped entirely: `schedule_pipelined` hardcoded
         // `requested = false` and no `schedule()` arm below ever read this
@@ -5865,7 +5897,7 @@ impl SchedulerHandle for RuntimeScheduler {
             completion,
         ) {
             HazardDisposition::Proceed(cb) => cb,
-            HazardDisposition::ProducerFailed => return Ok(()),
+            HazardDisposition::ProducerFailed => return Ok(SubmittedIds::NONE),
         };
         match op.kind {
             K::EventSignal | K::EventWait => {
@@ -5889,7 +5921,7 @@ impl SchedulerHandle for RuntimeScheduler {
                      RuntimeStream::launch_event_signal/launch_event_wait, \
                      never by the scheduler",
                 )));
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::HostCallback => {
                 // Host callbacks do not target a hardware pipeline —
@@ -5898,7 +5930,7 @@ impl SchedulerHandle for RuntimeScheduler {
                 // host-callback path just invokes `on_complete` with no
                 // fence/pipeline bookkeeping.
                 completion(Ok(()));
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::H2D | K::D2H => {
                 let dma = match op.payload.downcast::<DmaParams>() {
@@ -5920,7 +5952,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         completion(Err(mock_error(
                             "schedule: H2D/D2H payload was not DmaParams",
                         )));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
                 // Port of `schedule(RuntimeOperationH2D/D2H)`'s three
@@ -5949,7 +5981,7 @@ impl SchedulerHandle for RuntimeScheduler {
                     completion,
                     |backend, state, dma, cb| backend.submit_dma(state, dma, cb),
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::Fill => {
                 let fill = match op.payload.downcast::<FillParams>() {
@@ -5969,7 +6001,7 @@ impl SchedulerHandle for RuntimeScheduler {
                     // `Err` return.
                     Err(_) => {
                         completion(Err(mock_error("schedule: Fill payload was not FillParams")));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
                 // Port of `schedule(RuntimeOperationFill)`'s `use_dmai`: the
@@ -5991,7 +6023,7 @@ impl SchedulerHandle for RuntimeScheduler {
                     completion,
                     |backend, state, fill, cb| backend.submit_fill(state, fill, cb),
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::Compute => {
                 // The batch form first: a whole list of compute ops submitted
@@ -6011,7 +6043,7 @@ impl SchedulerHandle for RuntimeScheduler {
                 // barrier drains it and any later ones would wait on nothing.
                 let payload = match op.payload.downcast::<Vec<ComputeParams>>() {
                     Ok(ops) => {
-                        self.schedule_pipelined(
+                        let ids = self.schedule_pipelined(
                             PipelinedOp {
                                 id: stream_id,
                                 mode,
@@ -6023,7 +6055,7 @@ impl SchedulerHandle for RuntimeScheduler {
                             completion,
                             |backend, state, ops, cb| backend.submit_compute_batch(state, ops, cb),
                         );
-                        return Ok(());
+                        return Ok(ids);
                     }
                     // Hand the box back for the wire-batch downcast below.
                     Err(payload) => payload,
@@ -6038,7 +6070,7 @@ impl SchedulerHandle for RuntimeScheduler {
                 // the ring is FIFO and the step's CBs are consecutive.
                 let payload = match payload.downcast::<ComputeWireBatch>() {
                     Ok(wires) => {
-                        self.schedule_pipelined(
+                        let ids = self.schedule_pipelined(
                             PipelinedOp {
                                 id: stream_id,
                                 mode,
@@ -6052,7 +6084,7 @@ impl SchedulerHandle for RuntimeScheduler {
                                 backend.submit_compute_wires(state, batch, cb)
                             },
                         );
-                        return Ok(());
+                        return Ok(ids);
                     }
                     // Hand the box back for the single-op downcast below.
                     Err(payload) => payload,
@@ -6077,10 +6109,10 @@ impl SchedulerHandle for RuntimeScheduler {
                             "schedule: Compute payload was neither ComputeParams nor a \
                              ComputeParams batch (Vec<ComputeParams>)",
                         )));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
-                self.schedule_pipelined(
+                Ok(self.schedule_pipelined(
                     PipelinedOp {
                         id: stream_id,
                         mode,
@@ -6091,8 +6123,7 @@ impl SchedulerHandle for RuntimeScheduler {
                     &*compute,
                     completion,
                     |backend, state, compute, cb| backend.submit_compute(state, compute, cb),
-                );
-                Ok(())
+                ))
             }
             K::LegacyP2PSendData | K::LegacyP2PRecvData => {
                 let params = match op.payload.downcast::<P2PDataParams>() {
@@ -6114,7 +6145,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         completion(Err(mock_error(
                             "schedule: LegacyP2P{Send,Recv}Data payload was not P2PDataParams",
                         )));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
                 let is_send = op.kind == K::LegacyP2PSendData;
@@ -6136,7 +6167,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         }
                     },
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::LegacyP2PDataExchange => {
                 let params = op.payload.downcast::<Vec<P2PDataParams>>().map_err(|_| {
@@ -6156,7 +6187,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         backend.submit_legacy_p2p_data_exchange(state, params, cb)
                     },
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::P2PRdmaSend => {
                 let params = match op.payload.downcast::<P2PRdmaSendParams>() {
@@ -6178,7 +6209,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         completion(Err(mock_error(
                             "schedule: P2PRdmaSend payload was not P2PRdmaSendParams",
                         )));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
                 self.schedule_pipelined(
@@ -6193,7 +6224,7 @@ impl SchedulerHandle for RuntimeScheduler {
                     completion,
                     |backend, state, params, cb| backend.submit_p2p_rdma_send(state, params, cb),
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::P2PRdmaWait => {
                 let params = match op.payload.downcast::<P2PRdmaWaitParams>() {
@@ -6215,7 +6246,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         completion(Err(mock_error(
                             "schedule: P2PRdmaWait payload was not P2PRdmaWaitParams",
                         )));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
                 self.schedule_pipelined(
@@ -6230,7 +6261,7 @@ impl SchedulerHandle for RuntimeScheduler {
                     completion,
                     |backend, state, params, cb| backend.submit_p2p_rdma_wait(state, params, cb),
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::P2PFirmwareSignal => {
                 let params = match op.payload.downcast::<P2PFirmwareSignalParams>() {
@@ -6252,7 +6283,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         completion(Err(mock_error(
                             "schedule: P2PFirmwareSignal payload was not P2PFirmwareSignalParams",
                         )));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
                 self.schedule_pipelined(
@@ -6269,7 +6300,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         backend.submit_p2p_firmware_signal(state, params, cb)
                     },
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
             K::P2PFirmwareWait => {
                 let params = match op.payload.downcast::<P2PFirmwareWaitParams>() {
@@ -6291,7 +6322,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         completion(Err(mock_error(
                             "schedule: P2PFirmwareWait payload was not P2PFirmwareWaitParams",
                         )));
-                        return Ok(());
+                        return Ok(SubmittedIds::NONE);
                     }
                 };
                 self.schedule_pipelined(
@@ -6308,7 +6339,7 @@ impl SchedulerHandle for RuntimeScheduler {
                         backend.submit_p2p_firmware_wait(state, params, cb)
                     },
                 );
-                Ok(())
+                Ok(SubmittedIds::NONE)
             }
         }
     }

@@ -497,7 +497,7 @@ mod tests {
     use super::*;
     use crate::allocator::FlexAllocatorInit;
     use crate::device_memory_allocator::DeviceMemoryAllocator;
-    use crate::stream::{CompletionCallback, SchedulerError, SubmittedOperation};
+    use crate::stream::{CompletionCallback, SchedulerError, SubmittedIds, SubmittedOperation};
     use crate::topology::DeviceTopology;
 
     /// Trivial `SchedulerHandle` double: good enough for every test below,
@@ -521,9 +521,9 @@ mod tests {
             _mode: RuntimeStreamMode,
             _op: SubmittedOperation,
             completion: CompletionCallback,
-        ) -> Result<(), SchedulerError> {
+        ) -> Result<SubmittedIds, SchedulerError> {
             completion(Ok(()));
-            Ok(())
+            Ok(SubmittedIds::NONE)
         }
     }
 
