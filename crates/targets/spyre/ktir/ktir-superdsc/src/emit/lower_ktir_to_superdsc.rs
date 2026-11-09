@@ -1428,10 +1428,19 @@ fn pointwise_rows(name: &str, out: &Region) -> Result<u32, Error> {
 /// inside its loop, where [`regions`]' first-tile reading refuses to look, but its views are at the
 /// top level. `None` when the parameter states no 2-D view.
 pub fn param_view(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
-    f.operations
-        .iter()
-        .find(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))
-        .and_then(shape_2d)
+    param_view_op(f, ptr).and_then(shape_2d)
+}
+
+/// ⭐ THE VIEW RULE, STATED ONCE: a `ktdp.construct_memory_view` is a view of parameter `ptr` when
+/// `ptr` is its address operand. Every reader of a parameter's views — its declared extent, its
+/// tiles at the top level or inside regions — asks this.
+fn is_view_of(o: &Operation<'_>, ptr: &Ssa) -> bool {
+    o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr)
+}
+
+/// The parameter's view at the function's top level — the one its declared extent is read from.
+fn param_view_op<'f>(f: &'f IRFunction<'static>, ptr: &Ssa) -> Option<&'f Operation<'static>> {
+    f.operations.iter().find(|o| is_view_of(o, ptr))
 }
 
 /// This program's parameters as [`Region`]s, in parameter order.
@@ -1454,20 +1463,13 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
     let stored = store_views(&k.func);
     let mut out = Vec::with_capacity(k.bindings.len());
     for (i, ((ptr, _), tid)) in k.func.arguments.iter().zip(k.bindings.iter()).enumerate() {
-        let view = k
-            .func
-            .operations
-            .iter()
-            .find(|o| {
-                o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr)
-            })
-            .ok_or_else(|| Error {
-                message: format!(
-                    "{}: parameter {i} (t{tid}) states no `ktdp.construct_memory_view`, so nothing \
+        let view = param_view_op(&k.func, ptr).ok_or_else(|| Error {
+            message: format!(
+                "{}: parameter {i} (t{tid}) states no `ktdp.construct_memory_view`, so nothing \
                      says how wide the buffer it addresses is",
-                    k.func.name
-                ),
-            })?;
+                k.func.name
+            ),
+        })?;
         let (rows, cols) = shape_2d(view).ok_or_else(|| Error {
             message: format!(
                 "{}: parameter {i} (t{tid})'s view states no 2-D `shape`",
@@ -1554,9 +1556,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
             .func
             .operations
             .iter()
-            .filter(|o| {
-                o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr)
-            })
+            .filter(|o| is_view_of(o, ptr))
             .filter_map(|o| o.result)
             .collect();
         let r_cover = k
@@ -4479,7 +4479,7 @@ fn param_tiles<'f>(
     let views: Vec<Ssa> = f
         .operations
         .iter()
-        .filter(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))
+        .filter(|o| is_view_of(o, ptr))
         .filter_map(|o| o.result)
         .collect();
     f.operations.iter().filter(move |o| {
@@ -4498,7 +4498,7 @@ fn param_tiles_deep(f: &IRFunction<'static>, ptr: &Ssa) -> usize {
     let views: Vec<Ssa> = f
         .ops_deep()
         .into_iter()
-        .filter(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))
+        .filter(|o| is_view_of(o, ptr))
         .filter_map(|o| o.result)
         .collect();
     f.ops_deep()

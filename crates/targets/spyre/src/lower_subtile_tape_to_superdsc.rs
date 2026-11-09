@@ -7334,7 +7334,7 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
 /// main's own walk held as parameters. It is `None` for a bundle with no attention node.
 pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
-    layout: Option<&BundleLayout>,
+    layout: &BundleLayout,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> std::io::Result<String> {
@@ -7605,7 +7605,7 @@ pub fn drain_emitted_bundles<T: ktir_superdsc::collective::Tp>()
 
 fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
-    layout: Option<&BundleLayout>,
+    layout: &BundleLayout,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> std::io::Result<NamedBundle<T>> {
@@ -7645,18 +7645,16 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     // placements into the plan (`BundleLayout::synth`), so a plan baked before it would ship without
     // them.
     //
-    // ⛔ AND A BUNDLE WITH NO PLAN IS NAMED AS ONE: its name hashes "no plan", never a defaulted
-    // layout standing in for a plan nobody computed. What it SHIPS is still main's empty
-    // `BundleLayout` (the artifact's `layout` is not optional yet); that default and this `Option`
-    // both go with the residency stack, which makes the bake's plan required.
+    // ⛔ AND EVERY BUNDLE HAS A PLAN: `layout` is required, so the layout the name hashes is the
+    // layout the bundle ships — the same value, never a default standing in for one.
     let err = |e: SuperDscError| std::io::Error::other(e.0);
-    let bake = || layout.map(bake_layout);
+    let bake = || bake_layout(layout);
     Ok(if cfg!(feature = "spyre-hw") {
-        let rendered = render_bundle(ops, fold, layout, attn_params).map_err(err)?;
+        let rendered = render_bundle(ops, fold, Some(layout), attn_params).map_err(err)?;
         let layout_baked = bake();
         let fp = {
             let _pc = crate::pc::Pc::start("fp");
-            rendered.name(layout_baked.as_ref())
+            rendered.name(&layout_baked)
         };
         NamedBundle::Rendered {
             fp,
@@ -7664,15 +7662,15 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
             rendered,
         }
     } else {
-        let groups = ktir_groups(ops, fold, layout.map(|l| l.lx_window_bytes())).map_err(err)?;
+        let groups = ktir_groups(ops, fold, Some(layout.lx_window_bytes())).map_err(err)?;
         let layout_baked = bake();
         let fp = {
             let _pc = crate::pc::Pc::start("fp");
-            crate::bundle_name::of_groups(layout_baked.as_ref(), &groups)
+            crate::bundle_name::of_groups(&layout_baked, &groups)
         };
         NamedBundle::Ready(EmittedBundle {
             fp,
-            layout: layout_baked.unwrap_or_default(),
+            layout: layout_baked,
             groups: PendingGroups::Ready(groups),
         })
     })
@@ -7687,7 +7685,7 @@ enum NamedBundle<T: ktir_superdsc::collective::Tp> {
     /// `-Fspyre-hw`: rendered for the device compiler, staged once the name's lock is held.
     Rendered {
         fp: String,
-        layout: Option<bundle::BundleLayout<'static>>,
+        layout: bundle::BundleLayout<'static>,
         rendered: RenderedBundle<T>,
     },
 }
@@ -7701,7 +7699,7 @@ impl<T: ktir_superdsc::collective::Tp> NamedBundle<T> {
     }
 
     /// Hand the device compiler every group it does not already hold, under this name.
-    fn stage(self, plan: Option<&BundleLayout>) -> Result<EmittedBundle<T>, SuperDscError> {
+    fn stage(self, plan: &BundleLayout) -> Result<EmittedBundle<T>, SuperDscError> {
         match self {
             Self::Ready(b) => Ok(b),
             Self::Rendered {
@@ -7709,10 +7707,10 @@ impl<T: ktir_superdsc::collective::Tp> NamedBundle<T> {
                 layout,
                 rendered,
             } => {
-                let staged = stage_bundle(&rendered, &fp, plan)?;
+                let staged = stage_bundle(&rendered, &fp, Some(plan))?;
                 Ok(EmittedBundle {
                     fp,
-                    layout: layout.unwrap_or_default(),
+                    layout,
                     groups: PendingGroups::Staged(staged),
                 })
             }
@@ -8568,10 +8566,8 @@ pub fn render_bundle<T: ktir_superdsc::collective::Tp>(
         let _pc = crate::pc::Pc::start("launch");
         launch_index(&sdsc_ops, fold)
     };
-    let mq = attention_query_rows(ops)?;
     Ok(RenderedBundle {
         programs: ops.len(),
-        mq,
         descriptors: sdsc_ops.len(),
         per_prog,
         lx_ledger,
@@ -8580,40 +8576,11 @@ pub fn render_bundle<T: ktir_superdsc::collective::Tp>(
     })
 }
 
-/// The query rows of the bundle's paged attention, `None` for a bundle that has none — the dump's rung
-/// name. READ FROM THE PROGRAM: the attention's first parameter is its query (`PagedStepTids`' operand
-/// order), viewed `[mq, nqh·hd]`, so its view's row extent is `mq`
-/// (`lower_ktir_to_superdsc::param_view`, the view reading the door's `regions` makes). A paged
-/// attention program whose query states no 2-D view is refused by name.
-fn attention_query_rows<T: ktir_superdsc::collective::Tp>(
-    ops: &[EmittedOp<T>],
-) -> Result<Option<u32>, SuperDscError> {
-    let Some((name, k)) = ops.iter().find_map(|e| {
-        let k = e.ktir.as_ref()?;
-        (k.program == ktir_superdsc::ktir_node::Program::PagedAttn).then_some((&e.op_name, k))
-    }) else {
-        return Ok(None);
-    };
-    k.func
-        .arguments
-        .first()
-        .and_then(|(q, _)| ktir_superdsc::emit::lower_ktir_to_superdsc::param_view(&k.func, q))
-        .map(|(mq, _)| Some(mq))
-        .ok_or_else(|| {
-            SuperDscError(format!(
-                "{name}: a paged attention program's first parameter is its `[mq, nqh·hd]` query, \
-                 and this one states no 2-D view"
-            ))
-        })
-}
-
 /// ⭐ A BUNDLE LOWERED AND RENDERED FOR dxp, BEFORE IT HAS A NAME — [`render_bundle`]'s output, which
 /// is everything the bundle's name covers ([`Self::name`]) and everything staging writes.
 pub struct RenderedBundle<T: ktir_superdsc::collective::Tp> {
     /// How many KTIR programs the bundle carries.
     programs: usize,
-    /// The paged attention's query rows, `None` for a bundle with none (the dump's rung name).
-    mq: Option<u32>,
     /// How many descriptors the bundle's programs lowered to.
     descriptors: usize,
     /// (program name, descriptors) per program, for the dump's `bundle_id.json`.
@@ -8629,7 +8596,7 @@ pub struct RenderedBundle<T: ktir_superdsc::collective::Tp> {
 impl<T: ktir_superdsc::collective::Tp> RenderedBundle<T> {
     /// ⭐ THIS BUNDLE'S NAME — its content ([`crate::bundle_name`]): the layout it ships, then each
     /// group's shifts and dxp input digest, in launch order.
-    pub fn name(&self, layout: Option<&bundle::BundleLayout<'_>>) -> String {
+    pub fn name(&self, layout: &bundle::BundleLayout<'_>) -> String {
         crate::bundle_name::name(
             layout,
             self.shifts.iter().zip(&self.rendered).map(|(kv, g)| {
@@ -8662,14 +8629,13 @@ fn stage_bundle<T: ktir_superdsc::collective::Tp>(
 ) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
     let RenderedBundle {
         programs,
-        mq,
         descriptors,
         per_prog,
         lx_ledger,
         rendered,
         shifts,
     } = r;
-    let (programs, mq, descriptors) = (*programs, *mq, *descriptors);
+    let (programs, descriptors) = (*programs, *descriptors);
     // ⭐ WHICH BUNDLE THE NEXT `GROUPS` LINE BELONGS TO. `launch_index` prints the group/trip totals
     // but takes no bundle identity, so six `GROUPS` lines in a build log are unattributable on their
     // own — and the question that matters is which of them main bakes too. Printed here, immediately
@@ -8707,18 +8673,17 @@ fn stage_bundle<T: ktir_superdsc::collective::Tp>(
         // ⛔ THE IDENTITY GOES IN THE DUMP, BECAUSE THE LOG DOES NOT SURVIVE. cargo swallows a build
         // script's stderr on SUCCESS, so every `BUNDLE`/`GROUPS` line this file prints is visible only when
         // the build FAILS — which means a green build produces 106 dump directories named by fingerprint
-        // and nothing anywhere says which is the `mq=19, start=0` prefill the card refuses. Correlating a
+        // and nothing anywhere says which is the prefill rung the card refuses. Correlating a
         // dump against a log that was never printed is not a comparison; writing the identity beside the
         // descriptors is.
         //
-        // `mq` names the rung, read from the program at the render ([`RenderedBundle::mq`]); a bundle
-        // with no attention states none.
-        let mq = mq.map_or_else(|| "null".to_string(), |m| m.to_string());
+        // The rung is named by the bundle's name and its own programs (`per_program`): the dump
+        // restates no geometry the programs already carry.
         let mut progs: Vec<(String, usize)> = Vec::new();
         for (name, n) in per_prog {
             progs.push((name.clone(), *n));
         }
-        // The segment budget's verdict rides the identity for the same reason `mq` does: on a green
+        // The segment budget's verdict rides the identity for the same reason: on a green
         // build the bake's own SEGMENT BUDGET line is never printed, and a spilled tail is a load-time
         // and device-memory cost that nothing else at build time names.
         let weight_tail = match layout.map(|l| l.weight_tail).unwrap_or_default() {
@@ -8751,7 +8716,7 @@ fn stage_bundle<T: ktir_superdsc::collective::Tp>(
             .collect::<Vec<_>>()
             .join(",");
         let id_json = format!(
-            "{{\"fp\":\"{fp}\",\"mq\":{mq},\"weight_tail\":{weight_tail},\"programs\":{},\
+            "{{\"fp\":\"{fp}\",\"weight_tail\":{weight_tail},\"programs\":{},\
              \"descriptors\":{},\"per_program\":[{}],\"lx_pins\":[{}]}}\n",
             programs,
             descriptors,
@@ -11082,7 +11047,7 @@ mod name_tests {
         let rendered = render_dxp_input(ops, FoldGrouping::Split).expect("the ops render");
         let shifts = launch_index(ops, FoldGrouping::Split);
         crate::bundle_name::name(
-            None,
+            &bundle::BundleLayout::default(),
             shifts.iter().zip(&rendered).map(|(kv, g)| {
                 (
                     kv,
@@ -11137,7 +11102,7 @@ mod name_tests {
         );
         let rendered = render_dxp_input(&[op.shallow_copy()], FoldGrouping::Split).unwrap();
         let shifts = launch_index(&[op], FoldGrouping::Split);
-        let named = |layout: Option<&bundle::BundleLayout<'_>>| {
+        let named = |layout: &bundle::BundleLayout<'_>| {
             crate::bundle_name::name(
                 layout,
                 shifts.iter().zip(&rendered).map(|(kv, g)| {
@@ -11151,8 +11116,6 @@ mod name_tests {
         let narrow = bundle::BundleLayout::default();
         let mut wider = bundle::BundleLayout::default();
         wider.segment_bytes[0] = 1 << 20;
-        assert_ne!(named(Some(&narrow)), named(Some(&wider)));
-        // And a bundle with no plan is not the bundle with an empty one.
-        assert_ne!(named(None), named(Some(&narrow)));
+        assert_ne!(named(&narrow), named(&wider));
     }
 }

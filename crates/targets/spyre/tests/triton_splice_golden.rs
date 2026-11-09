@@ -1979,7 +1979,7 @@ fn a_bundles_name_carries_what_its_lowering_read() {
             Some(BundleAttnParams { rows_are_requests }),
         )
         .unwrap_or_else(|e| panic!("r_ar={rows_are_requests}: {}", e.0))
-        .name(None)
+        .name(&scratchy_target_spyre::bundle_code::BundleLayout::default())
     };
     let bundle = name(&layout, false);
     assert_eq!(
@@ -2724,12 +2724,20 @@ fn the_paged_attention_splices_with_its_contract() {
             walking,
             "{at}: the body is marked for the relaunch exactly when the walk loops"
         );
-        // The query's view states the rows the bake names the rung by (the dump's `mq`): a walk
-        // takes its windows inside its loop, but its views are at the top level.
+        // The query's view states its `[mq, nqh·hd]` rows: a walk takes its windows inside its
+        // loop, but its views are at the top level. The query is the parameter bound to the node's
+        // query tensor, found by that binding, not by its position.
+        let query_tid = node.inputs[0].tensor.index() as u32;
+        let query = k
+            .func
+            .arguments
+            .iter()
+            .zip(&k.bindings)
+            .find(|(_, b)| b.get() == query_tid)
+            .map(|((q, _), _)| *q)
+            .expect("the query tensor is bound");
         assert_eq!(
-            k.func.arguments.first().and_then(|(q, _)| {
-                ktir_superdsc::emit::lower_ktir_to_superdsc::param_view(&k.func, q)
-            }),
+            ktir_superdsc::emit::lower_ktir_to_superdsc::param_view(&k.func, &query),
             Some((s.mq, s.geom.0 * s.geom.2)),
             "{at}: the query is viewed `[mq, nqh·hd]`"
         );
