@@ -4587,14 +4587,15 @@ mod tests {
             assert!(html.contains(&format!(">{label}<")), "no {} column", b.0);
         }
         assert!(html.contains(">Sliding window<"), "the class over its model's buckets");
-        // Squares of the grid's size: 4 rows by 5 buckets for its one model.
+        // Squares of the grid's size: 4 rows by 2 buckets for its one model.
         let squares = html.matches("width: 2.25rem; height: 2.25rem").count();
-        assert_eq!(squares, 4 * 5);
-        // A bucket with requests on both engines has a ratio, named with its rival and bucket.
+        assert_eq!(squares, 4 * 2);
+        // A bucket with enough requests on both engines has a ratio, named with its rival and
+        // bucket.
         assert!(html.contains("vs oMLX</strong>"), "a ratio against its rival");
-        assert!(html.contains("3–3.5k prompt tokens"), "its bucket in its tooltip");
-        // One with none says so.
-        assert!(html.contains("no requests this long"));
+        assert!(html.contains("2.8k+ prompt tokens"), "its bucket in its tooltip");
+        // One of only two requests says so, and is no ratio.
+        assert!(html.contains("2 requests this long, too few"));
     }
 
     /// A run from before cells kept prompt counts has no buckets to draw: its summary says so,

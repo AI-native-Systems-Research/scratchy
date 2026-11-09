@@ -7,15 +7,14 @@ use super::data::{RequestTiming, TaskCell};
 use super::numbers::median;
 
 /// Prompt-length buckets, in tokens: each its label and its upper bound, the last unbounded.
-/// MuSiQue's prompts run about 2k to 4.4k tokens (its 5th to 95th percentile), about 3k at the
-/// middle; these split them about evenly.
-pub const BUCKETS: [(&str, u32); 5] = [
-    ("<2k", 2048),
-    ("2–2.5k", 2560),
-    ("2.5–3k", 3072),
-    ("3–3.5k", 3584),
-    ("3.5k+", u32::MAX),
-];
+/// Two, split at MuSiQue's middle prompt (about 2.8k tokens on the published runs), so a quick
+/// run's cell of 8 requests puts about 4 in each: more buckets leave most of them one or two
+/// requests, or none.
+pub const BUCKETS: [(&str, u32); 2] = [("<2.8k", 2800), ("2.8k+", u32::MAX)];
+
+/// The fewest requests a bucket's median is read from: one or two are no reading of a bucket, a
+/// single slow answer turning its square from blue to red.
+pub const FLOOR: usize = 3;
 
 /// The bucket a prompt of `tokens` falls in: its index in [`BUCKETS`].
 pub fn bucket(tokens: u32) -> usize {
@@ -37,9 +36,11 @@ pub fn in_bucket(c: &TaskCell, timing: RequestTiming, bucket_at: usize) -> Vec<f
         .collect()
 }
 
-/// The median of a cell's requests' `timing` in `bucket_at`; None with none there.
+/// The median of a cell's requests' `timing` in `bucket_at`; None with fewer than [`FLOOR`]
+/// there.
 pub fn median_in(c: &TaskCell, timing: RequestTiming, bucket_at: usize) -> Option<f64> {
-    median(in_bucket(c, timing, bucket_at))
+    let vs = in_bucket(c, timing, bucket_at);
+    (vs.len() >= FLOOR).then(|| median(vs)).flatten()
 }
 
 /// Whether a cell kept its requests' prompt counts, so it can be read by prompt length at all.
@@ -70,14 +71,30 @@ mod tests {
         .unwrap()
     }
 
-    /// A prompt goes in the first bucket it is under; one past the last bound in the last.
+    /// Two buckets, split at MuSiQue's middle prompt: a quick run's 8 requests a cell fall
+    /// about 4 and 4.
     #[test]
     fn a_prompt_falls_in_one_bucket() {
+        assert_eq!(BUCKETS.len(), 2);
         assert_eq!(bucket(1500), 0);
-        assert_eq!(bucket(2048), 1, "a bound starts the next bucket");
-        assert_eq!(bucket(2900), 2);
-        assert_eq!(bucket(3584), 4);
-        assert_eq!(bucket(9000), 4, "the last is unbounded");
+        assert_eq!(bucket(2799), 0);
+        assert_eq!(bucket(2800), 1, "a bound starts the next bucket");
+        assert_eq!(bucket(9000), 1, "the last is unbounded");
+    }
+
+    /// A bucket of fewer than [`FLOOR`] requests has no median: one or two requests are no
+    /// reading of a bucket.
+    #[test]
+    fn a_bucket_under_the_floor_has_no_median() {
+        let c = cell(
+            &[Some(2000), Some(2100), Some(3000), Some(3100), Some(3200)],
+            &[Some(100.0), Some(200.0), Some(300.0), Some(500.0), Some(700.0)],
+            &[None; 5],
+        );
+        assert_eq!(FLOOR, 3);
+        assert_eq!(median_in(&c, RequestTiming::Ttft, 0), None, "two requests");
+        assert_eq!(median_in(&c, RequestTiming::Ttft, 1), Some(500.0), "three");
+        assert_eq!(in_bucket(&c, RequestTiming::Ttft, 0).len(), 2, "still counted");
     }
 
     /// A bucket's median is over its own requests, those with a prompt count and a value: a
@@ -85,27 +102,22 @@ mod tests {
     #[test]
     fn a_buckets_median_is_over_its_own_requests() {
         let c = cell(
-            &[Some(1900), Some(2900), Some(2950), None, Some(3000)],
-            &[Some(100.0), Some(300.0), Some(500.0), Some(900.0), None],
-            &[Some(10.0), Some(20.0), Some(40.0), Some(90.0), Some(50.0)],
+            &[Some(1900), Some(2000), Some(2100), Some(2900), Some(2950), None, Some(3000), Some(3100)],
+            &[Some(100.0), Some(150.0), Some(200.0), Some(300.0), Some(500.0), Some(900.0), None, Some(700.0)],
+            &[Some(10.0), Some(11.0), Some(12.0), Some(20.0), Some(40.0), Some(90.0), Some(50.0), Some(60.0)],
         );
-        assert_eq!(median_in(&c, RequestTiming::Ttft, 0), Some(100.0));
+        assert_eq!(median_in(&c, RequestTiming::Ttft, 0), Some(150.0));
         assert_eq!(
-            median_in(&c, RequestTiming::Ttft, 2),
-            Some(400.0),
-            "300 and 500"
+            median_in(&c, RequestTiming::Ttft, 1),
+            Some(500.0),
+            "300, 500 and 700"
         );
         assert_eq!(
-            median_in(&c, RequestTiming::Tpot, 2),
-            Some(40.0),
-            "20, 40 and 50"
+            median_in(&c, RequestTiming::Tpot, 1),
+            Some(45.0),
+            "20, 40, 50 and 60"
         );
-        assert_eq!(median_in(&c, RequestTiming::E2el, 0), Some(200.0));
-        assert_eq!(
-            median_in(&c, RequestTiming::Ttft, 4),
-            None,
-            "none that long"
-        );
+        assert_eq!(median_in(&c, RequestTiming::E2el, 0), Some(300.0));
         assert!(bucketed(&c));
     }
 
@@ -117,6 +129,6 @@ mod tests {
         }))
         .unwrap();
         assert!(!bucketed(&old));
-        assert!(in_bucket(&old, RequestTiming::Ttft, 2).is_empty());
+        assert!(in_bucket(&old, RequestTiming::Ttft, 1).is_empty());
     }
 }

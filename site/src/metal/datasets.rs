@@ -730,15 +730,25 @@ fn summary_map(
         }
     }
     // A square's ratio, how many times faster scratchy is, or why it has none.
-    let ratio = |chip: &str, column: &str, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
+    let ratio = |chip: &str, column: &str, row: &Row, b: usize| -> Result<(f64, String), String> {
         let p = pair(chip, column).ok_or("not run")?;
         let rival = p.rival.ok_or("scratchy alone so far")?;
         let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
         let (Some(ours), Some(theirs)) = (ours, theirs) else {
-            return Err("not run at this load");
+            return Err("not run at this load".into());
         };
         if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
-            return Err("most requests failed");
+            return Err("most requests failed".into());
+        }
+        let fewest = (buckets::in_bucket(ours, row.timing, b).len())
+            .min(buckets::in_bucket(theirs, row.timing, b).len());
+        match fewest {
+            0 => return Err("no requests this long".into()),
+            n if n < buckets::FLOOR => {
+                let s = if n == 1 { "" } else { "s" };
+                return Err(format!("{n} request{s} this long, too few for a ratio"));
+            }
+            _ => {}
         }
         let a = buckets::median_in(ours, row.timing, b);
         let t = buckets::median_in(theirs, row.timing, b);
@@ -764,7 +774,7 @@ fn summary_map(
         let stem = pair(chip, column).map_or("", |p| p.stem);
         let (fill, verdict) = match ratio(chip, column, row, b) {
             Ok((r, vs)) => (format!("background: {}", RATIO_STEPS[ratio_step(r)]), format!("×{r:.2} vs {vs}")),
-            Err(why) => (STRIPED.to_string(), why.to_string()),
+            Err(why) => (STRIPED.to_string(), why),
         };
         let bucket = buckets::BUCKETS[b].0;
         rsx! {
