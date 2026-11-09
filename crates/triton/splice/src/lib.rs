@@ -4778,7 +4778,11 @@ mod production_ktir_dump {
     #[test]
     fn every_production_kernel_lowers_or_is_refused_by_name() {
         // (kernel, a substring its door refusal carries).
-        const EXPECTED_REFUSALS: &[(&str, &str)] = &[("lmlast_fwd", "states no `node_out_tid`")];
+        const EXPECTED_REFUSALS: &[(&str, &str)] = &[
+            ("lmlast_fwd_s1", "states no `node_out_tid`"),
+            ("lmlast_fwd_s2", "states no `node_out_tid`"),
+            ("lmlast_fwd_s3", "states no `node_out_tid`"),
+        ];
         let mut refused: Vec<(&str, String)> = Vec::new();
         let mut skipped: Vec<&str> = Vec::new();
         for (name, src, spec, grid) in entries() {
