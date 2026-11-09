@@ -4193,9 +4193,9 @@ fn pointwise_width_the_output_holds(
                 .placements
                 .get(&tid)
                 .map(|p| p.size)
-                .or_else(|| l.synth.borrow().sizes.get(name).copied())
+                .or_else(|| l.synth.borrow().size(name))
                 .or_else(|| l.lx_full_size(name)),
-            _ => l.synth.borrow().sizes.get(name).copied(),
+            _ => l.synth.borrow().size(name),
         }?;
         // A footprint is `synth_footprint_bytes`: the INNER (column) axis stick-rounded, the outer
         // multiplied. So one row costs a stick-rounded column count, and the width the buffer holds is
@@ -4352,16 +4352,16 @@ mod pointwise_width_caps {
     }
 
     /// ⭐ CASE (d) — THE NARROWEST OPERAND WINS, AND THE SYNTH ALLOCATOR IS READ. The output `t1` is
-    /// adequately sized; the INPUT is a synthetic intermediate declared only in `SynthAlloc::sizes`
-    /// and holding one stick. `cols` sizes both views, so the pad is only real if BOTH hold it.
+    /// adequately sized; the INPUT is a synthetic intermediate declared only to the synth allocator
+    /// (`BundleLayout::synth`) and holding one stick. `cols` sizes both views, so the pad is only
+    /// real if BOTH hold it.
     #[test]
     fn the_narrowest_operand_wins_including_one_only_the_synth_allocator_knows() {
         let l = placed(u64::from(ROWS) * 512 * 2);
-        let narrow = "t32_synth";
-        l.synth
-            .borrow_mut()
-            .sizes
-            .insert(narrow.to_string(), 64 * 64 * 2);
+        let narrow_id = PlaceId::Act(32).synth(crate::place::SynthRole::Silu);
+        l.synth(narrow_id, &[64, 64]);
+        let narrow = narrow_id.to_string();
+        let narrow = narrow.as_str();
         let out = act_name(1);
         assert_eq!(
             pointwise_width_the_output_holds(Some(&l), &[&out, narrow], ROWS, 64, 512)

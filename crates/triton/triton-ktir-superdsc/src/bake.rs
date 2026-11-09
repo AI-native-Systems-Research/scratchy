@@ -274,7 +274,7 @@ pub fn write_placements(
     let mut seg_bytes = layout.segment_bytes;
     let intermediate = ktir_superdsc::placement::SegRole::Intermediate.segment();
     if intermediate < seg_bytes.len() {
-        seg_bytes[intermediate] = seg_bytes[intermediate].max(synth.next);
+        seg_bytes[intermediate] = seg_bytes[intermediate].max(synth.high_water());
     }
     s.push_str("{\n  \"segment_bytes\": [");
     for (i, b) in seg_bytes.iter().enumerate() {
@@ -299,15 +299,15 @@ pub fn write_placements(
         );
     }
     s.push_str("  ],\n  \"synth\": [\n");
-    for (i, (name, off)) in synth.map.iter().enumerate() {
+    for (i, (name, off, size)) in synth.iter().enumerate() {
         let _ = writeln!(
             s,
             "    {{\"name\": \"{}\", \"segment\": {}, \"offset\": {}, \"size\": {}}}{}",
             name,
             intermediate,
             off,
-            synth.sizes.get(name).copied().unwrap_or(0),
-            if i + 1 == synth.map.len() { "" } else { "," }
+            size,
+            if i + 1 == synth.len() { "" } else { "," }
         );
     }
     // ⛔⛔⛔ THE SCALARMUL SCALES, AND WITHOUT THEM A DECODER SILENTLY COMPUTES ITS OWN RESIDUAL.
