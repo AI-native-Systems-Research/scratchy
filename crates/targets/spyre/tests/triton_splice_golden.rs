@@ -2900,7 +2900,8 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
     )
     .expect_err("the step mint refuses a pair the graph disagrees with");
     assert!(
-        err.0.contains("the graph runs 128 query row(s) but the rung's minted extent states 192"),
+        err.0
+            .contains("the graph runs 128 query row(s) but the rung's minted extent states 192"),
         "the refusal names the graph's rows and the pair's: {}",
         err.0
     );

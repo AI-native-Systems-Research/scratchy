@@ -852,11 +852,7 @@ impl PagedStep {
                         CardSeat::Step,
                         u64::from(self.pages) * w * slots * 2 + spare,
                     ),
-                    (
-                        self.query_rows,
-                        CardSeat::Step,
-                        sticks(w) + spare,
-                    ),
+                    (self.query_rows, CardSeat::Step, sticks(w) + spare),
                 ]);
             }
         }

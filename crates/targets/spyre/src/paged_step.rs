@@ -336,7 +336,9 @@ impl QueryRowIndex {
 
     /// The staged words: `first, first + 1, …, first + rows - 1`.
     pub fn words(self) -> Vec<i32> {
-        (self.first..self.first + self.rows).map(|v| v as i32).collect()
+        (self.first..self.first + self.rows)
+            .map(|v| v as i32)
+            .collect()
     }
 }
 
@@ -645,7 +647,10 @@ pub fn card_step_sources(
         step.page_slots as usize,
         step.nkvh as usize,
     );
-    let (pitch, trip) = (step.card_request_pitch() as usize, step.card_walk_step() as usize);
+    let (pitch, trip) = (
+        step.card_request_pitch() as usize,
+        step.card_walk_step() as usize,
+    );
     // ⭐ THE PAGE INDEX TABLE — request `r`'s `[walk, INT32_ELEMS_PER_STICK]` rows at
     // `r·P + i·trip`: the walk's own trip pitch within the block, the request's block pitch
     // between blocks. An empty slot's rows stay zero — page 0, the null page.
@@ -682,8 +687,7 @@ pub fn card_step_sources(
                     }
                 }
                 None => {
-                    let null =
-                        ((NULL_SLOT / slots) * nkvh + h) * slots + NULL_SLOT % slots;
+                    let null = ((NULL_SLOT / slots) * nkvh + h) * slots + NULL_SLOT % slots;
                     write.extend(std::iter::repeat_n(null as i32, w));
                 }
             }
@@ -1322,7 +1326,14 @@ mod tests {
             real: nz(2),
         };
         let blocks = [2u32, 3];
-        let card = card_step_sources(&s, &[RequestStep { blocks: &blocks, rows }]).unwrap();
+        let card = card_step_sources(
+            &s,
+            &[RequestStep {
+                blocks: &blocks,
+                rows,
+            }],
+        )
+        .unwrap();
         let pitch = s.card_walk_step() as usize;
         assert_eq!(pitch, 3 * 128, "one fp16 stick per score row, three rows");
         let table = ints(card.words(s.page_table).unwrap());
@@ -1363,7 +1374,14 @@ mod tests {
         };
         let blocks = [2u32, 3];
         let logical = mask_stack(&s, &rows);
-        let card = card_step_sources(&s, &[RequestStep { blocks: &blocks, rows }]).unwrap();
+        let card = card_step_sources(
+            &s,
+            &[RequestStep {
+                blocks: &blocks,
+                rows,
+            }],
+        )
+        .unwrap();
         let (n, w) = ((s.walk * s.rows) as usize, s.page_slots as usize);
         assert_eq!(card.mask.1.len(), logical.len());
         for r in 0..n {
@@ -1527,9 +1545,14 @@ mod tests {
                     real: nz(real),
                 };
                 let blocks = [3u32, 2, 1, 0];
-                let card =
-                    card_step_sources(&body, &[RequestStep { blocks: &blocks, rows: st }])
-                        .unwrap();
+                let card = card_step_sources(
+                    &body,
+                    &[RequestStep {
+                        blocks: &blocks,
+                        rows: st,
+                    }],
+                )
+                .unwrap();
                 fits(full, &card, &card_statics(&body).unwrap());
             }
         }
@@ -1621,9 +1644,8 @@ mod tests {
         assert_eq!(write.len(), nkvh * 6);
         // Request A: positions 5, 6 and a pad row repeating 6, over blocks `[2, 3]`.
         // Request B: positions 1, 2, 3, over blocks `[1, 0, 3]`.
-        let slot_of = |page: usize, h: usize, pos: usize| {
-            ((page * nkvh + h) * slots + pos % slots) as i32
-        };
+        let slot_of =
+            |page: usize, h: usize, pos: usize| ((page * nkvh + h) * slots + pos % slots) as i32;
         let want_a = [slot_of(3, 0, 1), slot_of(3, 0, 2), slot_of(3, 0, 2)];
         let want_b = [slot_of(1, 0, 1), slot_of(1, 0, 2), slot_of(1, 0, 3)];
         for h in 0..nkvh {
@@ -1686,7 +1708,14 @@ mod tests {
             start: 5,
             real: nz(2),
         };
-        let card = card_step_sources(&s, &[RequestStep { blocks: &a, rows: ra }]).unwrap();
+        let card = card_step_sources(
+            &s,
+            &[RequestStep {
+                blocks: &a,
+                rows: ra,
+            }],
+        )
+        .unwrap();
         // The empty slot's page table rows are zero — page 0, the null page.
         let table = ints(card.words(s.page_table).unwrap());
         for i in 0..4 {
@@ -1709,7 +1738,14 @@ mod tests {
             extent: pair(3, 1),
             ..step()
         };
-        let solo = card_step_sources(&one, &[RequestStep { blocks: &a, rows: ra }]).unwrap();
+        let solo = card_step_sources(
+            &one,
+            &[RequestStep {
+                blocks: &a,
+                rows: ra,
+            }],
+        )
+        .unwrap();
         assert_eq!(
             &card.words(s.page_table).unwrap()[..4 * trip],
             solo.words(s.page_table).unwrap(),
@@ -1736,17 +1772,19 @@ mod tests {
         assert!(card_step_sources(&s, &three).is_err());
         assert!(card_step_sources(&s, &[]).is_err());
         // A request wider than the per-request window refuses by name.
-        assert!(card_step_sources(
-            &one,
-            &[RequestStep {
-                blocks: &[0, 1, 2, 3],
-                rows: StepRows {
-                    start: 0,
-                    real: nz(4),
-                },
-            }]
-        )
-        .is_err());
+        assert!(
+            card_step_sources(
+                &one,
+                &[RequestStep {
+                    blocks: &[0, 1, 2, 3],
+                    rows: StepRows {
+                        start: 0,
+                        real: nz(4),
+                    },
+                }]
+            )
+            .is_err()
+        );
     }
 
     /// ⭐ AT ONE REQUEST NOTHING MOVES — the capacity's spare is zero, every placement size is the
@@ -1805,7 +1843,10 @@ mod tests {
         let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
         assert_eq!((body.rows, body.walk, body.reach()), (3, 2, 8));
         assert_eq!(
-            (body.extent.per_request().get(), body.extent.requests().get()),
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
             (3, 1),
             "a sequence launch is one request of its own rows"
         );
@@ -1819,7 +1860,10 @@ mod tests {
         };
         let body = wide.on_body(4, PagedRows::Sequence, 8).unwrap();
         assert_eq!(
-            (body.extent.per_request().get(), body.extent.requests().get()),
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
             (4, 1),
             "a chunk narrower than the wiring's width still states its own rows"
         );
@@ -1830,13 +1874,19 @@ mod tests {
         };
         let body = decode.on_body(4, PagedRows::Batch, 8).unwrap();
         assert_eq!(
-            (body.extent.per_request().get(), body.extent.requests().get()),
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
             (1, 4),
             "a batch launch is one row per request"
         );
         let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
         assert_eq!(
-            (body.extent.per_request().get(), body.extent.requests().get()),
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
             (3, 1),
             "a launch on the wiring's own width re-derives its pair"
         );
