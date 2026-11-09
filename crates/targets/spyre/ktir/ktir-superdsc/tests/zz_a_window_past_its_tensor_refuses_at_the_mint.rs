@@ -262,7 +262,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     // test's own reads of the pinned name).
     let _ = ktir_superdsc::placement::BundleLayout::lx_op_local_pair(
         Some(&layout),
-        &mut ktir_superdsc::placement::LxScope::program(),
+        &mut ktir_superdsc::placement::LxScope::for_test(),
         op_id,
         &[1, 128],
         |_| Ok::<_, String>(((), ())),

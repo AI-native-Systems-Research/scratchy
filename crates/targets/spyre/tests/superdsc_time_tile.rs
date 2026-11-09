@@ -256,7 +256,7 @@ fn reduce_and_multiop_invariants() {
         None,
         &mut sym,
         None,
-        &mut ktir_superdsc::placement::LxScope::program(),
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
     .expect("the rmsnorm chain lowers — its long-reduce split, when it fires, is the same law");
     assert_eq!(ops.len(), 5, "the exx2 head fuses rmsq+rmmean: 6 ops → 5");
@@ -403,7 +403,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
             None,
             &mut sym,
             Some(&l),
-            &mut ktir_superdsc::placement::LxScope::program(),
+            &mut ktir_superdsc::placement::LxScope::for_test(),
         )
         .expect("the rmsnorm chain lowers at every rung — a refusal is a broken rung, not a skip")
     };
@@ -573,7 +573,7 @@ fn norm(
         prefix,
         out,
         sym,
-        &mut ktir_superdsc::placement::LxScope::program(),
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
     .expect("the interleave fixture's norm lowers — the LX slot laws it pins need the ops")
 }
@@ -659,7 +659,7 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
 fn a_second_same_class_pin_in_one_program_refuses_at_the_pair() {
     let l = two_norm_layout();
     let mut sym = 0i64;
-    let mut scope = ktir_superdsc::placement::LxScope::program();
+    let mut scope = ktir_superdsc::placement::LxScope::for_test();
     norm_in(&l, "a", 7, &mut sym, &mut scope).expect("the program's first norm of the class");
     let err = norm_in(&l, "b", 17, &mut sym, &mut scope)
         .err()
@@ -681,7 +681,7 @@ fn a_second_same_class_pin_refuses_without_a_layout_too() {
     use ktir_superdsc::place::SynthRole;
     use ktir_superdsc::placement::{BundleLayout, LxScope};
     use scratchy_target_spyre::bundle_code::PlaceId;
-    let mut scope = LxScope::program();
+    let mut scope = LxScope::for_test();
     let pair = |scope: &mut LxScope, t: u32| {
         BundleLayout::lx_op_local_pair(
             None,
@@ -698,7 +698,7 @@ fn a_second_same_class_pin_refuses_without_a_layout_too() {
         err.contains("both of the 8192-byte class in ONE program"),
         "{err}"
     );
-    pair(&mut LxScope::program(), 17).expect("the same pin in its own program");
+    pair(&mut LxScope::for_test(), 17).expect("the same pin in its own program");
 }
 
 /// The neighbour: the same two norms as two PROGRAMS (two scopes) — the shared slot alternates.
@@ -711,7 +711,7 @@ fn same_class_pins_in_two_programs_share_the_slot() {
         "a",
         7,
         &mut sym,
-        &mut ktir_superdsc::placement::LxScope::program(),
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
     .expect("program A");
     norm_in(
@@ -719,7 +719,7 @@ fn same_class_pins_in_two_programs_share_the_slot() {
         "b",
         17,
         &mut sym,
-        &mut ktir_superdsc::placement::LxScope::program(),
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
     .expect("program B");
 }
@@ -736,7 +736,7 @@ fn the_ledger_records_a_pin_this_bundle_never_touches_as_empty() {
     // mints another bundle's norm — declared there (its own program's pair), never touched here.
     let _ = ktir_superdsc::placement::BundleLayout::lx_op_local_pair(
         Some(&l),
-        &mut ktir_superdsc::placement::LxScope::program(),
+        &mut ktir_superdsc::placement::LxScope::for_test(),
         PlaceId::Act(27).synth(SynthRole::Rinv),
         &[64, 64],
         |_| Ok::<_, String>(((), ())),
@@ -1387,7 +1387,7 @@ fn dump_gate_bundles() {
         None,
         &mut sym,
         None,
-        &mut ktir_superdsc::placement::LxScope::program(),
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
     .expect("the card gate's rmsnorm chain lowers — there is nothing to bake otherwise");
     eprintln!("→ BAKING rmsnorm gate: {} ops", rms.len());

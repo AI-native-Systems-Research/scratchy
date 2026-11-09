@@ -485,15 +485,19 @@ impl Default for LxAlloc {
 /// and handed `&mut` to every op-local pin ([`BundleLayout::lx_op_local_pair`]) the program states. It
 /// records the footprint classes the program has already pinned, so a second same-class pin in one
 /// program is refused at the pair; and it is the borrow that makes a pair nested inside another
-/// pair's construction unwritable. No other constructor than [`LxScope::program`]: a fresh scope per
-/// program, never one carried across two.
+/// pair's construction unwritable. Its one constructor is crate-private, called by the door that
+/// lowers one program (`whole_function::lower_function_folded`, the per-op rmsnorm door), so a scope
+/// is never carried across two programs and no caller outside the crate can mint one:
+/// ```compile_fail,E0624
+/// let _ = ktir_superdsc::placement::LxScope::program(); // E0624: private associated function
+/// ```
 ///
 /// ⚖️ WHY THE SECOND-PIN REFUSAL IS A MAP AND NOT A MOVED VALUE. A class is a pin's 128-aligned
 /// footprint in bytes, derived from the pin's dims, so the class SET is known only when the bake
 /// lowers the program (31-33 classes on the shipped granites) — it cannot be one `ClassSlot` field
 /// per class for the compiler to move. The refusal is therefore a NAMED BUILD ERROR at the pair
 /// (`#[forward]` expansion), never a card fault. Nesting, which needs no class, IS a type error.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LxScope {
     classes: std::collections::BTreeMap<OpLocalClass, String>,
 }
@@ -519,9 +523,17 @@ impl OpLocalClass {
 }
 
 impl LxScope {
-    /// The scope of one program's lowering.
-    pub fn program() -> LxScope {
-        LxScope::default()
+    /// The scope of one program's lowering — minted only by the door that lowers that program.
+    pub(crate) fn program() -> LxScope {
+        LxScope {
+            classes: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A program's scope for a fixture that lowers a body without its door. Test builds only.
+    #[cfg(feature = "test-support")]
+    pub fn for_test() -> LxScope {
+        LxScope::program()
     }
 }
 
@@ -1079,7 +1091,7 @@ impl BundleLayout {
     /// ```compile_fail,E0499
     /// use ktir_superdsc::place::{PlaceId, SynthRole};
     /// use ktir_superdsc::placement::{BundleLayout, LxScope};
-    /// let mut scope = LxScope::program();
+    /// let mut scope = LxScope::for_test();
     /// let id = PlaceId::Act(7).synth(SynthRole::Rinv);
     /// let _ = BundleLayout::lx_op_local_pair(None, &mut scope, id, &[64, 64], |_| {
     ///     // E0499: `scope` is already mutably borrowed by the outer pair
@@ -1095,7 +1107,7 @@ impl BundleLayout {
     /// let mut kept = None;
     /// let _ = BundleLayout::lx_op_local_pair(
     ///     None,
-    ///     &mut LxScope::program(),
+    ///     &mut LxScope::for_test(),
     ///     PlaceId::Act(7).synth(SynthRole::Rinv),
     ///     &[64, 64],
     ///     |pin| {
