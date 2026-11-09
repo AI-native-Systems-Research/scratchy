@@ -409,8 +409,8 @@ pub struct AllocNode {
 /// }
 /// ```
 /// `coordinates_` is a [`Coordinates`], which only [`build_coordinates`] makes:
-/// ```compile_fail,E0603
-/// let c = ktir_superdsc::wire::Coordinates(serde_json::json!({})); // E0603: private constructor
+/// ```compile_fail,E0451
+/// let c = ktir_superdsc::wire::Coordinates { coord_info: Default::default() }; // E0451: private
 /// ```
 #[derive(Serialize, Clone, Debug)]
 #[serde(transparent)]
@@ -506,45 +506,55 @@ pub struct AddrMint<'a> {
 /// A node's `coordinates_` — built only by [`build_coordinates`], over an operand, so `coordInfo`
 /// holds one entry per dim of it. An operand has at least one dim (ranks 1–4), so the scheduler's
 /// `There must be at least one valid candidate` (`L3DlOpsScheduler.cpp:1195`, OBSERVED on card
-/// 2026-06-25) is unreachable. Serializes as the JSON object it wraps.
+/// 2026-06-25) is unreachable. Serializes as `{coordInfo, coreIdToWkSlice_: {}}`.
+///
+/// It also carries its operand's STICK dim and the core split that dim's entry was written with,
+/// recorded by [`build_coordinates`] from the same per-dim rule: an operand's stick is one of its
+/// layout dims ([`crate::superdsc_opspec::TensorArg::new`] finds its index), so the stick always
+/// has an entry, and a time-tiled rewrite reads the split it was built with, never a re-parse of
+/// the JSON.
 #[derive(Serialize, Clone, Debug)]
-#[serde(transparent)]
-pub struct Coordinates(serde_json::Value);
+pub struct Coordinates {
+    #[serde(rename = "coordInfo")]
+    coord_info: serde_json::Map<String, serde_json::Value>,
+    /// Always empty on the wire (`{}`): dxp derives the core→slice map itself.
+    #[serde(rename = "coreIdToWkSlice_")]
+    core_id_to_wk_slice: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip)]
+    stick: StickFold,
+}
+
+/// The stick dim of a [`Coordinates`] and the core split its `coordInfo` entry was built with.
+#[derive(Clone, Copy, Debug)]
+struct StickFold {
+    dim: &'static str,
+    nsplits: i64,
+}
 
 impl Coordinates {
-    /// The `coordinates_` object as dxp reads it.
-    pub fn as_value(&self) -> &serde_json::Value {
-        &self.0
+    /// The `coordInfo` object, one entry per dim of the operand.
+    pub fn coord_info(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.coord_info
     }
 
-    /// Divide the `tiled_dim` `coordInfo` of a time-tiled node by `time`: the [`gen_coord_info_value`]
-    /// `size` (Affine alpha_ + elem_arr_0/elem_arr_1) for the tiled stick dim must reflect the PER-TIME
-    /// extent `out_per_time`, not the full per-core extent. Mirrors compute_ops.py reading
-    /// `iteration_space[dim] // work_slices[dim]` AFTER coarse_tile divided the iteration space.
-    pub fn divide_tiled_dim(&mut self, tiled_dim: &str, out_per_time: i64, eps: i64) {
-        let Some(ci) = self.0.get_mut("coordInfo").and_then(|c| c.as_object_mut()) else {
-            return;
-        };
-        let Some(entry) = ci.get_mut(tiled_dim) else {
-            return;
-        };
-        // The stick-dim variant (elemArr==2): rebuild it with the new per-time size.
-        // size==alpha_[0] and the elem_arr_1 factor == size/eps (non-reduction stick).
-        let nsplits = entry
-            .get("folds")
-            .and_then(|f| f.get("dim_prop_attr"))
-            .and_then(|a| a.get(0))
-            .and_then(|c| c.get("factor_"))
-            .and_then(|f| f.as_i64())
-            .unwrap_or(1);
-        *entry = gen_coord_info_value(
-            out_per_time,
-            nsplits,
-            eps,
-            /*is_stick_dim=*/ true,
-            /*is_stick_reduction=*/ false,
-            /*group_stride=*/
-            eps, // time-tiled rewrite is the natural-stride path (not a RowBlocked reduce)
+    /// Rewrite the STICK dim's `coordInfo` entry of a time-tiled node at its PER-TIME extent: the
+    /// [`gen_coord_info_value`] `size` (Affine alpha_ + elem_arr_0/elem_arr_1) must reflect
+    /// `out_per_time`, not the full per-core extent. Mirrors compute_ops.py reading
+    /// `iteration_space[dim] // work_slices[dim]` AFTER coarse_tile divided the iteration space. The
+    /// split is the one this entry was built with; the natural-stride form is the time-tiled
+    /// rewrite's (never a RowBlocked reduce: a tiled operand ranges its stick dim).
+    pub fn divide_stick(&mut self, out_per_time: i64, eps: i64) {
+        let StickFold { dim, nsplits } = self.stick;
+        self.coord_info.insert(
+            dim.to_string(),
+            gen_coord_info_value(
+                out_per_time,
+                nsplits,
+                eps,
+                /*is_stick_dim=*/ true,
+                /*is_stick_reduction=*/ false,
+                /*group_stride=*/ eps,
+            ),
         );
     }
 }
@@ -809,15 +819,21 @@ pub fn build_coordinates(
     // coordInfo fold matches the emitted `stickSize_`; else dxp folds the fp8 dataspace at 64 (wrong).
     let eps = arg.df.elems_per_stick() as i64;
     let mut ci = serde_json::Map::new();
-    for (i, &d) in arg.layout.iter().enumerate() {
-        let scale = arg.scale[i];
+    // Dim `i`'s per-core size and core split: an ACTIVE dim takes its per-core extent and split, a
+    // reduced one size 1 over 1. The stick's split below is read by the same rule.
+    let fold_of = |i: usize| -> (i64, i64) {
+        let d = arg.layout[i];
         let split = plan.split_of(d) as i64;
         let full = plan.extent(d) as i64;
-        let (size, nsplits) = if scale.is_active() {
+        if arg.scale[i].is_active() {
             ((full / split.max(1)).max(1), split.max(1))
         } else {
             (1, 1)
-        };
+        }
+    };
+    for (i, &d) in arg.layout.iter().enumerate() {
+        let scale = arg.scale[i];
+        let (size, nsplits) = fold_of(i);
         let is_stick = arg.stick == d;
         // The fp8 W8A8 matmul operands use the AIU fp8 PE's NATIVE nested tile geometry (verified against
         // IBM's l0_tethering fixture, extracted via L3DlOpsScheduler_standalone): the WEIGHT's N-stick is
@@ -857,9 +873,14 @@ pub fn build_coordinates(
         };
         ci.insert(d.to_string(), info);
     }
-    Coordinates(
-        serde_json::json!({ "coordInfo": serde_json::Value::Object(ci), "coreIdToWkSlice_": {} }),
-    )
+    Coordinates {
+        coord_info: ci,
+        core_id_to_wk_slice: serde_json::Map::new(),
+        stick: StickFold {
+            dim: arg.stick,
+            nsplits: fold_of(arg.stick_idx).1,
+        },
+    }
 }
 
 /// fp8 WEIGHT `out` (N) fold: the 64-elem N-stick is sub-tiled 8×8 (elem_arr_1×elem_arr_0), with
@@ -1044,10 +1065,29 @@ mod the_schedule_tree_is_whole_by_construction {
                     factors[1], sdsc.coreletFoldProp_.factor_,
                     "{m}x{n}x{k}: corelet"
                 );
-                let ci = node.coordinates_.as_value()["coordInfo"]
-                    .as_object()
-                    .expect("coordInfo");
+                let ci = node.coordinates_.coord_info();
                 assert!(!ci.is_empty(), "{m}x{n}x{k}: {} has its folds", node.name_);
+            }
+        }
+    }
+
+    /// A time-tiled rewrite of a node's stick entry keeps the core split the entry was built with —
+    /// read from what `build_coordinates` recorded, so no entry can be missing and no split made up.
+    #[test]
+    fn the_divided_stick_keeps_the_split_it_was_built_with() {
+        for (m, n, k) in [(1, 64, 64), (32, 384, 64), (64, 2048, 2048)] {
+            let op = matmul_opspec(m, n, k, 1, "a", "w", "o").expect("a legal matmul");
+            let folds = SdscFoldSet::new(op.iter.cores_used());
+            let sdsc = crate::emit::emit_sdsc("mm_o1", &op, &folds, None).expect("emits");
+            for node in &sdsc.dscs_[0]["mm_o1"].scheduleTree_ {
+                let factor = |c: &super::Coordinates| {
+                    c.coord_info()[c.stick.dim]["folds"]["dim_prop_attr"][0]["factor_"].as_i64()
+                };
+                let built = factor(&node.coordinates_);
+                let mut divided = node.coordinates_.clone();
+                divided.divide_stick(64, 64);
+                assert_eq!(factor(&divided), built, "{m}x{n}x{k}: {}", node.name_);
+                assert_eq!(built, Some(node.coordinates_.stick.nsplits));
             }
         }
     }

@@ -1996,6 +1996,7 @@ fn core_slices(op: &OpSpec, v: &ArgView<'_>) -> Result<(u64, Vec<u64>), SuperDsc
         device_dims: v.device_dims,
         layout: v.layout,
         stick: v.stick,
+        stick_idx: v.stick_idx,
         allocation: Allocation::Hbm,
         offset_elems: v.offset_elems,
         df: v.df,
@@ -3266,8 +3267,10 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         sm.insert(tiled_dim, stride_bytes);
         affine_strides[ti] = sm;
 
-        // Divide the `out` coordInfo size (the AllocNode stays concrete — the
-        // per-trip address bump happens in `concrete_trips` at write time).
+        // Divide the tiled dim's coordInfo size (the AllocNode stays concrete — the
+        // per-trip address bump happens in `concrete_trips` at write time). The tiled dim
+        // IS this operand's stick (refused above otherwise), so the entry rewritten is
+        // the stick's, at the split it was built with.
         for dsc_map in inner.dscs_.iter_mut() {
             for dsc in dsc_map.values_mut() {
                 if let Some(node) = dsc
@@ -3275,8 +3278,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
                     .iter_mut()
                     .find(|n| n.ldsIdx_ as usize == ti)
                 {
-                    node.coordinates_
-                        .divide_tiled_dim(tiled_dim, out_per_time, eps);
+                    node.coordinates_.divide_stick(out_per_time, eps);
                 }
             }
         }

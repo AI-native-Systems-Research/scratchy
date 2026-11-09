@@ -2126,6 +2126,9 @@ pub struct TensorArg<const D: usize> {
     layout: [&'static str; D],
     /// Innermost stick axis name (one of `layout`). torch-spyre `stickDimOrder_`.
     stick: &'static str,
+    /// Where `stick` sits in `layout` — found once, by [`TensorArg::new`], which refuses a stick
+    /// outside the layout.
+    stick_idx: usize,
     allocation: Allocation,
     /// SLICE offset into the source dataspace, in ELEMENTS along the stick axis
     /// (0 = whole tensor). A non-zero offset reads `x[offset_elems ..]` — the
@@ -2209,6 +2212,7 @@ impl<const D: usize> TensorArg<D> {
             device_dims,
             layout,
             stick,
+            stick_idx,
             allocation,
             offset_elems: 0,
             df: Df::Fp16,
@@ -2316,6 +2320,8 @@ pub struct ArgView<'a> {
     pub device_dims: &'a [IterSym],
     pub layout: &'a [&'static str],
     pub stick: &'static str,
+    /// Where `stick` sits in `layout` (the [`TensorArg`]'s own, found at its construction).
+    pub stick_idx: usize,
     pub allocation: Allocation,
     /// Slice offset in elements along the stick axis (0 = whole tensor).
     pub offset_elems: u32,
@@ -2543,6 +2549,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
@@ -2559,6 +2566,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
@@ -2575,6 +2583,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
@@ -2591,6 +2600,7 @@ impl AnyTensorArg {
                 device_dims: &t.device_dims,
                 layout: &t.layout,
                 stick: t.stick,
+                stick_idx: t.stick_idx,
                 allocation: t.allocation,
                 offset_elems: t.offset_elems,
                 df: t.df,
