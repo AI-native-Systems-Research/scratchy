@@ -4056,7 +4056,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         }
     } else {
         // A section a dataset the shown runs measured, and a link to each: nothing else.
-        let shown = datasets::shown(&machines);
+        let shown = datasets::shown(&machines, &all_machines);
         sections.extend(shown.iter().map(|d| (slug(d), datasets::title(d))));
         rsx! {
             for d in &shown { {datasets::section(d, &machines, &all_machines)} }
@@ -4143,7 +4143,7 @@ mod tests {
         let runs = fixtures(&["apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"]);
         let machines = super::index(&runs);
         assert_eq!(
-            super::datasets::shown(&machines),
+            super::datasets::shown(&machines, &machines),
             ["sharegpt", "rag", "rag-spans", "sharegpt-multi-turn"]
         );
     }
@@ -4152,7 +4152,10 @@ mod tests {
     fn random_tokens_is_a_dataset_where_a_run_has_grid_cells() {
         let runs = fixtures(&["apple-m3-pro-2026-10-27T031941Z-f9739363.json"]);
         let machines = super::index(&runs);
-        assert_eq!(super::datasets::shown(&machines), [super::datasets::RANDOM]);
+        assert_eq!(
+            super::datasets::shown(&machines, &machines),
+            [super::datasets::RANDOM]
+        );
         assert_eq!(
             super::datasets::title(super::datasets::RANDOM),
             "Random tokens"
@@ -4244,6 +4247,31 @@ mod tests {
         let html = render(super::datasets::section("rag", &machines, &machines));
         assert!(html.contains("most requests failed"));
         assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
+    }
+
+    /// A section reads each model's newest run that measured its dataset, the runs a newer one
+    /// replaced too: the grid from an older grid run, MuSiQue from the newer MuSiQue-only one, and
+    /// the grid's section says which run it is from.
+    #[test]
+    fn a_section_reads_the_newest_run_that_measured_its_dataset() {
+        use super::datasets::{RANDOM, section, shown};
+        let grid = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
+        // Both runs on the page: the newer measured MuSiQue alone.
+        let both = fixtures(&[grid, REQUESTS_FIXTURE]);
+        let machines = super::index(&both);
+        assert_eq!(shown(&machines, &machines).last(), Some(&RANDOM));
+        // The grid run replaced, in history/: the page shows the MuSiQue run, and still the grid.
+        let page = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&page);
+        assert!(!shown(&machines, &machines).contains(&RANDOM), "no grid");
+        let all = super::index(&both);
+        assert_eq!(shown(&machines, &all).last(), Some(&RANDOM));
+        let random = render(section(RANDOM, &machines, &all));
+        assert!(random.contains("gpt-oss-20b on Apple M3 Pro"), "drawn");
+        assert!(random.contains("Apple M3 Pro from its 10-27 run"));
+        let rag = render(section("rag", &machines, &all));
+        assert!(rag.contains("gpt-oss-20b on Apple M3 Pro"));
+        assert!(!rag.contains("Older than the machine"), "the newest");
     }
 
     #[test]
@@ -4502,7 +4530,7 @@ mod tests {
             }
         }
         let machines = super::index(&runs);
-        let shown = super::datasets::shown(&machines);
+        let shown = super::datasets::shown(&machines, &machines);
         assert!(
             shown.contains(&"new-one") && shown.contains(&"new-two"),
             "{shown:?}"
@@ -4595,7 +4623,7 @@ mod tests {
         m.tasks.as_mut().unwrap().push(cell(0.48));
         m.tasks_omlx.as_mut().unwrap().push(cell(0.45));
         let machines = super::index(&runs);
-        let shown = super::datasets::shown(&machines);
+        let shown = super::datasets::shown(&machines, &machines);
         assert!(!shown.contains(&"rag-accuracy"), "{shown:?}");
         assert!(shown.contains(&"rag"));
         let html = render(super::datasets::section("rag", &machines, &machines));
@@ -4726,7 +4754,7 @@ mod tests {
         runs[0].models[0].scaling = from.scaling.clone();
         let machines = super::index(&runs);
         assert_eq!(
-            super::datasets::shown(&machines).last(),
+            super::datasets::shown(&machines, &machines).last(),
             Some(&super::datasets::RANDOM)
         );
         let random = render(super::datasets::section(
