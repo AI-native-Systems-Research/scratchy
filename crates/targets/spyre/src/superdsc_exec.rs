@@ -525,12 +525,45 @@ impl RbClock {
     }
 
     /// (ns per cycle, offset ns) — the fit, once the pairs span enough of the run to measure it.
+    ///
+    /// ⭐ THE LOWER ENVELOPE, NOT TWO POINTS. Every pair is the CB's end plus a poll latency ≥ 0, so
+    /// the true host↔device line lies on or under every pair, and touches the fastest-polled ones.
+    /// The fit is the line under all pairs that touches the earliest-third's lowest pair and the
+    /// latest-third's lowest pair (the lowest in each, at the rate the two thirds measure between
+    /// their own medians): the rate a single jittered first or last pair would bend is read where
+    /// the latency is least, at both ends.
     fn fit(&self) -> Option<(f64, f64)> {
-        let (&(h0, d0), &(h1, d1)) = (self.pairs.first()?, self.pairs.last()?);
-        if d1 < d0 + 10_000_000 {
+        let (&(_, d0), &(_, d1)) = (self.pairs.first()?, self.pairs.last()?);
+        if d1 < d0 + 10_000_000 || self.pairs.len() < 6 {
             return None;
         }
-        let r = (h1 - h0) / (d1 - d0) as f64;
+        let third = self.pairs.len() / 3;
+        let (early, late) = (
+            &self.pairs[..third],
+            &self.pairs[self.pairs.len() - third..],
+        );
+        let mid = |xs: &[(f64, u64)]| {
+            let mut v: Vec<f64> = xs.iter().map(|p| p.0).collect();
+            v.sort_by(f64::total_cmp);
+            let mut w: Vec<u64> = xs.iter().map(|p| p.1).collect();
+            w.sort_unstable();
+            (v[v.len() / 2], w[w.len() / 2])
+        };
+        let ((he, de), (hl, dl)) = (mid(early), mid(late));
+        let r0 = (hl - he) / (dl - de) as f64;
+        // The lowest pair of each third, below the line at the coarse rate.
+        let low = |xs: &[(f64, u64)]| {
+            xs.iter()
+                .copied()
+                .min_by(|a, b| (a.0 - a.1 as f64 * r0).total_cmp(&(b.0 - b.1 as f64 * r0)))
+        };
+        let ((ha, da), (hb, db)) = (low(early)?, low(late)?);
+        if db <= da {
+            return None;
+        }
+        let r = (hb - ha) / (db - da) as f64;
+        // The offset is the line through the two touch points, lowered to touch every pair from
+        // below (a pair below it would be a CB seen before it ended).
         let off = self
             .pairs
             .iter()
@@ -7035,6 +7068,21 @@ fn rb_class_window(
 fn report_rb_bells(h: &RbHarvest, rank: Option<u32>) {
     let who = rank.map_or_else(|| "solo".to_string(), |r| format!("rank {r}"));
     if let Some(fit) = h.clock.fit() {
+        // The fit itself, so a reader can judge it: the counter's rate, and how far the latest-
+        // polled pair sits above the line at each end of the run (the poll latency it absorbed).
+        let resid = |xs: &[(f64, u64)]| {
+            xs.iter()
+                .map(|&(hh, d)| hh - d as f64 * fit.0 - fit.1)
+                .fold(f64::INFINITY, f64::min)
+        };
+        let n = h.clock.pairs.len();
+        eprintln!(
+            "[sdsc-rbbell] {who} clock: {:.4} cyc/us over {n} pairs; lowest residual first third \
+             {:.1} us, last third {:.1} us",
+            1e3 / fit.0,
+            resid(&h.clock.pairs[..n / 3]) / 1e3,
+            resid(&h.clock.pairs[n - n / 3..]) / 1e3
+        );
         for &(rang, cb) in &h.rung {
             if let Some(start) = h.clock.host_at(cb, fit) {
                 eprintln!(
