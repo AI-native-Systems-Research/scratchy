@@ -467,6 +467,10 @@ impl RbCycles {
 #[derive(Default)]
 struct RbOpCycles {
     cycles: RbCycles,
+    /// Device-idle cycles in front of this op's CBs: from the end of the compute pipeline's
+    /// previous CB to this CB's start (`ResponseBlockWire` words 4 and 2), over the CBs whose
+    /// predecessor this card's ring has seen.
+    idle: u64,
     label: String,
 }
 
@@ -506,6 +510,10 @@ struct RbHarvest {
     /// Op CBs that completed with no recorded launch — a launch this card submitted outside the
     /// labelled doors. Named in the report; never a reason to drop the table.
     unlabelled: RbCycles,
+    /// The compute pipeline's last drained CB: (id, end cycle). The ring is FIFO and the pipeline
+    /// runs its CBs in id order, so the CB that precedes the next drained one is this one when the
+    /// ids follow on — across drains too.
+    last: Option<(u64, u32)>,
     /// Drains, op CBs attributed, and `cbs` at the last periodic report — the count jumps a
     /// whole drain at a time, so a plain `is_multiple_of` would skip its own thresholds.
     drains: u64,
@@ -4662,14 +4670,35 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 );
             }
         }
-        // ⭐ THE JOIN, BY ID: each op record finds the label of the CB that produced it.
-        for e in entries.iter().filter(|e| {
-            matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute) && e.dma.is_none()
-        }) {
+        // ⭐ THE JOIN, BY ID: each op record finds the label of the CB that produced it. Walked in
+        // id order over the whole compute pipeline (its DMA crossings included, which occupy the
+        // pipeline between ops), so each CB's idle-before is measured against the CB that really
+        // ran in front of it.
+        let mut compute: Vec<&flex_rs::rb_telemetry::RbTiming> = entries
+            .iter()
+            .filter(|e| matches!(e.pipeline, flex_rs::scheduler::PipelineId::Compute))
+            .collect();
+        compute.sort_unstable_by_key(|e| e.id);
+        for e in compute {
+            let ts = e.rb.timestamps();
+            // The idle in front of this CB, when its predecessor is known: the previous id on
+            // this card's compute pipeline. A wrapped (negative) difference is an overlap, not
+            // idle.
+            let idle = match h.last {
+                Some((id, end)) if id + 1 == e.id => {
+                    Some(ts[2].wrapping_sub(end)).filter(|g| *g < 1 << 31)
+                }
+                _ => None,
+            };
+            h.last = Some((e.id, ts[4]));
+            if e.dma.is_some() {
+                continue;
+            }
             match h.labels.remove(&e.id) {
                 Some(RbLabel { key, label }) => {
                     let acc = h.cycles.entry(key).or_default();
                     acc.cycles.add_compute(e.rb);
+                    acc.idle += idle.map_or(0, u64::from);
                     if acc.label.is_empty() {
                         acc.label = label;
                     }
@@ -6869,6 +6898,21 @@ fn report_rb_time(h: &RbHarvest, rank: Option<u32>) {
             cyc / a.cycles.cbs.max(1),
             a.cycles.cbs,
             a.cycles.prep,
+            a.label
+        );
+    }
+    // ⭐ WHERE THE CARD SITS IDLE: the ops whose CBs the compute pipeline waited longest in front
+    // of — a collective's wait for its peers, a doorbell the host has not rung yet.
+    let idle_total: u64 = h.cycles.values().map(|a| a.idle).sum();
+    let mut idle: Vec<_> = h.cycles.iter().map(|(k, a)| (a.idle, *k, a)).collect();
+    idle.sort_by_key(|a| std::cmp::Reverse(a.0));
+    eprintln!("[sdsc-rbtime]   {who} idle before CBs: {idle_total} cyc in all; the largest:");
+    for (cyc, (rung, oi), a) in idle.iter().take(12) {
+        eprintln!(
+            "[sdsc-rbtime]   {who} idle ({rung},{oi:<3}) {:>12} cyc  {:>9} cyc/cb  {:6} cbs  {}",
+            cyc,
+            cyc / a.cycles.cbs.max(1),
+            a.cycles.cbs,
             a.label
         );
     }
