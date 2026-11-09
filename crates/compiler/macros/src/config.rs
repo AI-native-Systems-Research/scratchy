@@ -185,6 +185,13 @@ pub struct TextGeometry {
     pub layers: LayerCount,
     pub head_dim: HeadDim,
     pub rope_theta: RopeTheta,
+    /// The sliding (local) attention class's RoPE base, when the config states one
+    /// (`rope_local_base_freq`, after the hoists and the arch's aliases: gemma-3/4's
+    /// `rope_parameters.sliding_attention.rope_theta`, modernbert's `local_rope_theta`). NOT
+    /// defaulted to [`Self::rope_theta`]: no architecture in tree defines its local base as the
+    /// global one, so a body that reads a local rotary table takes it through
+    /// [`Self::rope_local_for`], which refuses a config that states none.
+    pub rope_local: Option<RopeTheta>,
 }
 
 impl TextGeometry {
@@ -237,10 +244,29 @@ impl TextGeometry {
         if !(theta.is_finite() && theta > 0.0) {
             return Err(missing(format!("`rope_theta` is {theta}")));
         }
+        let rope_local = match scalars.get("rope_local_base_freq").copied() {
+            None => None,
+            Some(t) if t.is_finite() && t > 0.0 => Some(RopeTheta(t)),
+            Some(t) => return Err(missing(format!("`rope_local_base_freq` is {t}"))),
+        };
         Ok(Self {
             layers,
             head_dim,
             rope_theta: RopeTheta(theta),
+            rope_local,
+        })
+    }
+
+    /// The local rotary class's base for a body that READS a local rotary table (`RotaryLocal`):
+    /// the config's stated value, or a build error naming the config — a local table baked at the
+    /// global base would rotate every sliding layer at the wrong frequency, silently.
+    pub fn rope_local_for(&self, stem: &str) -> RopeTheta {
+        self.rope_local.unwrap_or_else(|| {
+            panic!(
+                "model `{stem}`: its body reads a local (sliding) rotary table, but its config \
+                 states no `rope_local_base_freq` (nor an arch alias for one) — the local base is \
+                 the checkpoint's fact, never the global base"
+            )
         })
     }
 }
