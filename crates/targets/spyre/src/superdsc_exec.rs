@@ -192,6 +192,10 @@ struct RowReplay {
 struct StepImageData {
     canvas: std::sync::Arc<Vec<ControlBlockWire>>,
     rows: Vec<RowReplay>,
+    /// One label per CB of `canvas` (`cb_plan::CbPlan::cb_labels`, per row, concatenated): what a
+    /// replayed step's response blocks are attributed to, since a replay records no launch
+    /// sequence of its own (`Timers::rb_seq` is the walk's).
+    labels: Vec<String>,
 }
 
 /// One cached step image — the whole forward (prefix + every body row +
@@ -370,9 +374,9 @@ impl Diag {
         })
     }
 
-    /// Whether EVERY instrument is off — the production configuration. The replay player
-    /// (#603 PR2 2c) requires this: each knob above reads state the walk produces (per-op
-    /// marks, per-op readbacks, per-op rb_seq entries, per-op dump files, mid-rung drains),
+    /// Whether EVERY walk-reading instrument is off — the production configuration. The replay
+    /// player (#603 PR2 2c) requires this: each knob above but `rb_time` reads state the walk
+    /// produces (per-op marks, per-op readbacks, per-op dump files, mid-rung drains),
     /// so rather than reason per knob about which are batch-safe one level up, ANY instrument
     /// falls back to the walk bit for bit — the same discipline the collect path already
     /// applies to its five mid-rung knobs ("a drain between ops of an unflushed rung observes
@@ -385,7 +389,10 @@ impl Diag {
             group_time,
             submit_time,
             prefix_time,
-            rb_time,
+            // Read on either path: the response blocks are recorded for every CB, and a replayed
+            // step states its own launch sequence (the image's labels, `StepImageData::labels`),
+            // so it measures the player rather than forcing the walk.
+            rb_time: _,
             repeat_probe,
             body_trace,
             segaddr,
@@ -401,7 +408,6 @@ impl Diag {
             || *group_time
             || *submit_time
             || *prefix_time
-            || *rb_time
             || *repeat_probe
             || *body_trace
             || *segaddr
@@ -5470,6 +5476,19 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             )));
         }
         let mut t = timers();
+        // The replayed step's launch sequence, for `rb_attribute`'s zip: every canvas CB is a
+        // compute CB in submission order, named by the plan it was proven equal to. Keyed by
+        // (image length, CB index), so a replayed step's CBs never average into a walked rung's.
+        if Diag::get().rb_time {
+            t.rb_seq.extend(
+                image
+                    .data
+                    .labels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| ((cbs, i), format!("replay {l}"))),
+            );
+        }
         t.replay_steps += 1;
         t.replay_cbs += cbs as u64;
         t.replay_sites += image
@@ -5573,6 +5592,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         let mut canvas: Vec<ControlBlockWire> = Vec::new();
         let mut rows: Vec<RowReplay> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
         let mut barrier = false;
         let mut sites = 0usize;
         for (ls, where_, follows_step) in specs {
@@ -5581,7 +5601,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 continue;
             }
             let label = format!("{ls:?}/replay-canvas");
-            let (row_canvas, plan) = if follows_step {
+            let (row_canvas, plan, row_labels) = if follows_step {
                 // A body row: the FULL gate — parity at the canvas position,
                 // the patch table, and the off-sample proof that patched
                 // canvas ≡ fresh walk at steps the derivation never visited.
@@ -5596,7 +5616,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     &label,
                     stream,
                 )?;
-                (img.canvas, img.plan)
+                (img.canvas, img.plan, img.labels)
             } else {
                 // A fixed row: the walk launches it at this SAME `where_`
                 // every step, so its replay target is its own canvas,
@@ -5624,7 +5644,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     &where_,
                     stream,
                 )?;
-                (img.canvas, img.plan)
+                (img.canvas, img.plan, img.labels)
             };
             barrier |= plan.barrier;
             sites += plan.sites();
@@ -5635,6 +5655,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 plan,
             });
             canvas.extend(row_canvas);
+            labels.extend(row_labels.into_iter().map(|l| format!("{ls:?} {l}")));
         }
         if canvas.is_empty() {
             bail!(
@@ -5662,6 +5683,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             data: std::sync::Arc::new(StepImageData {
                 canvas: std::sync::Arc::new(canvas),
                 rows,
+                labels,
             }),
             barrier,
         })
@@ -6932,6 +6954,59 @@ fn report_phase_timers(compute_ms: f64) {
 mod tests {
     use super::*;
 
+    /// Every instrument off, as `Diag::get` builds it when no knob is set.
+    fn quiet_diag() -> Diag {
+        Diag {
+            perop_sync: false,
+            group_time: false,
+            submit_time: false,
+            prefix_time: false,
+            rb_time: false,
+            repeat_probe: false,
+            body_trace: false,
+            segaddr: false,
+            prog_verify: false,
+            phase_time: false,
+            prep_time: false,
+            optrace: false,
+            tensordump: None,
+            launch_mark: false,
+            reset_probe: None,
+        }
+    }
+
+    /// ⭐ `RB_TIME` MEASURES THE PRODUCTION PATH: it reads the response blocks every CB records
+    /// on either path, and a replayed step states its own launch sequence, so turning it on keeps
+    /// the player on. Every other instrument reads walk state and still takes the walk.
+    #[test]
+    fn rb_time_keeps_the_replay_player_on() {
+        assert!(quiet_diag().is_quiet(), "no instrument: the player");
+        assert!(
+            Diag {
+                rb_time: true,
+                ..quiet_diag()
+            }
+            .is_quiet(),
+            "rb_time alone: still the player"
+        );
+        assert!(
+            !Diag {
+                rb_time: true,
+                group_time: true,
+                ..quiet_diag()
+            }
+            .is_quiet(),
+            "a walk-reading instrument beside it still takes the walk"
+        );
+        assert!(
+            !Diag {
+                phase_time: true,
+                ..quiet_diag()
+            }
+            .is_quiet()
+        );
+    }
+
     /// The seat law: a bundle runs in a process only when both agree on the world — no window and
     /// no link, or the link's window exactly — and every disagreement refuses by name.
     #[test]
@@ -7088,6 +7163,7 @@ mod tests {
             data: std::sync::Arc::new(StepImageData {
                 canvas: std::sync::Arc::new(Vec::new()),
                 rows: Vec::new(),
+                labels: Vec::new(),
             }),
             barrier: false,
         };
