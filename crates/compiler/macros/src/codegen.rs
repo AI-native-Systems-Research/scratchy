@@ -9175,6 +9175,19 @@ fn superdsc_model_head_dim(model: &ModelParams) -> u64 {
     }
 }
 
+/// The model's decoder layer count — the ONE read every spyre wiring and budget site takes. No
+/// default: a wiring baked for zero layers wires no layer's prefix KV.
+#[cfg(feature = "spyre")]
+fn superdsc_model_layers(model: &ModelParams) -> usize {
+    *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
+        panic!(
+            "[superdsc-wiring] {}: no `num_hidden_layers` bound — a wiring cannot say which \
+             layers' prefix KV it binds",
+            model.source_stem
+        )
+    }) as usize
+}
+
 /// `rope_theta`, scalars first, NO default — the same refusal the wiring bakes
 /// (a silent 1e4 would disagree with llama-3.2's 500000: fluent, subtly
 /// wrong output).
@@ -9196,7 +9209,8 @@ fn superdsc_model_rope_theta(model: &ModelParams) -> f64 {
 
 /// The rotary class a `local`-flagged source serves, as a VALUE: sliding
 /// sources take the local class's base frequency (falling back to the model's
-/// main θ, the precedence `rotary_local_load` uses); global sources take
+/// main θ, `theta` — `superdsc_model_rope_theta`'s one read — the precedence
+/// `rotary_local_load` uses); global sources take
 /// proportional partial rotary when the config declares it on a WIDER global
 /// head dim (gemma-4), else the base class.
 #[cfg(feature = "spyre")]
@@ -9213,14 +9227,7 @@ fn superdsc_rotary_kind(
             .get("rope_local_base_freq")
             .copied()
             .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            .or_else(|| model.scalars.get("rope_theta").copied())
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .unwrap_or_else(|| {
-                panic!(
-                    "[superdsc-wiring] {}: no rope_local_base_freq for a local rotary source",
-                    model.source_stem
-                )
-            });
+            .unwrap_or(theta);
         scratchy_target_spyre::wiring::RotaryKind::Default {
             head_dim: hd as u32,
             theta_bits: (local_theta as f32).to_bits(),
@@ -9445,17 +9452,15 @@ fn emit_superdsc_wiring(
     let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
     let hidden = u32l(b("hidden_size") as u32);
     let vocab = u32l(b("vocab_size") as u32);
-    let n_layers = u32l(b("num_hidden_layers") as u32);
+    let n_layers_expected = superdsc_model_layers(model);
+    let n_layers = u32l(n_layers_expected as u32);
     // head_dim is declared by most arches and derived by the rest — the same
     // `hidden/heads` fallback the emitter itself uses, resolved HERE so the
     // worker never re-derives it (that re-derivation, against a config whose
     // `num_attention_heads` disagreed with the baked bundle, is a known
     // gemma-4-class failure).
     let heads = b("num_attention_heads").max(1);
-    let hd = match b("head_dim") {
-        0 => b("hidden_size") / heads,
-        v => v,
-    };
+    let hd = superdsc_model_head_dim(model);
     let head_dim = u32l(hd as u32);
     // ⭐⭐⭐⭐⭐ THE HEAD COUNT ITSELF, NOT THE `hidden/hd` QUOTIENT. Baking `heads`
     // here is what retires the host-side `hidden / head_dim` derivation everywhere:
@@ -9467,25 +9472,9 @@ fn emit_superdsc_wiring(
     // mask. MEASURED on gemma-4 tiny-allglobal: heads 2-3 ran unmasked, every layer.
     let nqh = u32l(heads as u32);
     let kv_dim = u32l((b("num_key_value_heads").max(1) * hd) as u32);
-    // ⛔ SCALARS FIRST, AND NO DEFAULT. `rope_theta` is a FLOAT, so it lives in
-    // `model.scalars`; `bounds` is integer-valued and a bounds-only lookup
-    // misses it entirely. With an `unwrap_or(1e4)` behind it that miss is
-    // SILENT and emits θ=10000 for llama-3.2 (whose real θ is 500000) — a
-    // wrong baked constant that produces fluent, subtly-wrong output. The
-    // whole point of baking geometry is to have ONE answer, so a missing θ
-    // fails the build here exactly as metal's `.expect` does.
-    let theta = model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-        .unwrap_or_else(|| {
-            panic!(
-                "[superdsc-wiring] {}: no rope_theta in scalars or bounds — refusing to bake a \
-                 default; the baked table would silently disagree with the checkpoint",
-                model.source_stem
-            )
-        }) as f32;
+    // θ is `superdsc_model_rope_theta`'s one read (scalars first, no default), the same value
+    // the numeric gate's prefill probe stages its rows by.
+    let theta = superdsc_model_rope_theta(model) as f32;
     let theta_bits = u32l(theta.to_bits());
 
     // cos/sin carry their FULL column width: GQA gives more than one (Q vs K),
@@ -9633,25 +9622,14 @@ fn emit_superdsc_wiring(
     //      Forty layers in, thirty-nine wired, no message.
     //    • `embed_src` is `.position(..)` — the FIRST `EmbeddedHidden`. A second one is never
     //      filled by anything.
-    //    • `cos_srcs`/`sin_srcs` are collected by filter, so they cannot miss one — asserted
-    //      anyway, because that is a property of the collection and not of the enum.
+    //    • `cos_srcs`/`sin_srcs` are collected by filter from the same bindings, so they cannot
+    //      miss one, and nothing here re-checks it.
     //
     //  This is the sibling of `superdsc_bake.rs`'s no-device-compiler refusal, and for the same
     //  reason it gives: the binary would link, every session would report ready, and the failure
     //  would surface as a hang or as empty output with no error anywhere.
     {
         use crate::to_wavefront::SourceBinding as SB;
-        let n_layers_expected = model
-            .bounds
-            .get("num_hidden_layers")
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "[superdsc-wiring] {}: no `num_hidden_layers` bound — cannot check that every \
-                     layer's prefix KV is wired, and an unwired layer reads a cache nobody filled",
-                    model.source_stem
-                )
-            }) as usize;
 
         let mut fail: Vec<String> = Vec::new();
 
@@ -9675,8 +9653,6 @@ fn emit_superdsc_wiring(
         }
 
         // ── every caller-filled source is covered by exactly one filler ──
-        let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
-        let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
         // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's
         // five tids (the seed quadruple's four word tables and inv_t) are minted
         // below the `LoweredDecode` binding layer (the mint's own law), so they
@@ -9830,16 +9806,9 @@ fn emit_superdsc_wiring(
                         ));
                     }
                 }
-                SB::Cos { .. } => {
-                    if !cos_ids.contains(&id) {
-                        fail.push(format!("Cos source t{id} is not in the tape's cos_srcs"));
-                    }
-                }
-                SB::Sin { .. } => {
-                    if !sin_ids.contains(&id) {
-                        fail.push(format!("Sin source t{id} is not in the tape's sin_srcs"));
-                    }
-                }
+                // `cos_srcs`/`sin_srcs` ARE every `Cos`/`Sin` binding (`rot_srcs` collects them
+                // from these bindings), so each is in its list by construction.
+                SB::Cos { .. } | SB::Sin { .. } => {}
                 // Device-resident, bound per layer through `LayerWiring` — covered by the layer
                 // count check above.
                 SB::PrefixK { .. } | SB::PrefixV { .. } => {}
@@ -10327,10 +10296,7 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     //    drained groups are one-per-op KTIR programs, a different unit this budget never sees.
     #[cfg(feature = "spyre-hw")]
     {
-        let layers: usize =
-            *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
-                panic!("model `{}` missing `num_hidden_layers`", model.source_stem)
-            }) as usize;
+        let layers = superdsc_model_layers(model);
         let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
         let ceiling = layers * per_layer;
         if n_groups > ceiling {
