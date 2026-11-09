@@ -2788,6 +2788,7 @@ impl ResponseWorker {
         // completed CB's timing is already in the ring.
         if let Some(pipeline) = pipeline {
             crate::rb_telemetry::record(crate::rb_telemetry::RbTiming {
+                seen: now,
                 source: self.hw.telemetry_key(),
                 id,
                 pipeline,
