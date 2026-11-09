@@ -12111,51 +12111,6 @@ fn dump_wavefront_mega(
                 };
                 if sendnn_superdsc && seq_sym.is_none() {
                     use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
-                    // ── GATE-1 de-risk: when `SCRATCHY_SUPERDSC_GATE1=1`, also drop a
-                    //    SINGLE self-contained matmul bundle (no dangling tensor refs)
-                    //    so a pod `sendnn` build's dxp-bake can prove dxp INGESTS
-                    //    scratchy's emitted SuperDSC (encoding + build.rs arm + init.txt
-                    //    end-to-end) BEFORE the full decode bundle is complete. Content-
-                    //    keyed write → idempotent across emit_bundle calls.
-                    if std::env::var("SCRATCHY_SUPERDSC_GATE1").as_deref() == Ok("1") {
-                        // SMALL LX-fitting matmul (64×64×64, batch 1): per-core tile
-                        // (kernel ~8KB) is well under the LX scratchpad, so it compiles
-                        // WITHOUT the frontend coarse-tile (time-tiling) pass — isolating
-                        // "is the typed emitter's format dxp-valid?" from "does it tile
-                        // large tiles?" (the latter = the coarse_tile port, next).
-                        use scratchy_subtile::sdsc_abstract::{
-                            KernelTag, RowBlockedTag, StickLayout, Stk,
-                        };
-                        // Typed matmul operands (compile-time addressing): activation/output RowBlocked, weight Kernel.
-                        let g1_a =
-                            Stk::<RowBlockedTag>::new("g1_a", StickLayout::row_blocked(64, 64))
-                                .unwrap();
-                        let g1_w = Stk::<KernelTag>::kernel(64, 64, "g1_w");
-                        let g1_o =
-                            Stk::<RowBlockedTag>::new("g1_o", StickLayout::row_blocked(64, 64))
-                                .unwrap();
-                        let g1 = superdsc::assemble_matmul(
-                            "gate1_mm", 64, 64, 64, 1, &g1_a, &g1_w, &g1_o, None,
-                        );
-                        // A hand-authored matmul, so there is no attention node for the four
-                        // attention facts to be facts of — main's own `false`/absent at such a site.
-                        match g1.map_err(|e| e.to_string()).and_then(|g1| {
-                            superdsc::emit_bundle::<$W>(
-                                &[g1],
-                                None,
-                                superdsc::FoldGrouping::Split,
-                                None,
-                                dump,
-                            )
-                            .map_err(|e| e.to_string())
-                        }) {
-                            Ok(fp) => eprintln!(
-                                "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
-                                 dxp compiles it inline"
-                            ),
-                            Err(e) => eprintln!("[spyre-superdsc] GATE-1 bundle emit failed: {e}"),
-                        }
-                    }
                     // RE-ROLL the layer loop (the 40-min-compile fix): instead of lowering
                     // the 30×-UNROLLED `krg` to one 2047-op bundle (dxp super-linear → 40 min),
                     // re-roll the tape (mirror the tk_tape path, codegen ~8807) and lower the
