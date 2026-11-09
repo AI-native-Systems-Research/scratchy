@@ -495,7 +495,27 @@ impl Default for LxAlloc {
 /// (`#[forward]` expansion), never a card fault. Nesting, which needs no class, IS a type error.
 #[derive(Debug, Default)]
 pub struct LxScope {
-    classes: std::collections::BTreeMap<u64, String>,
+    classes: std::collections::BTreeMap<OpLocalClass, String>,
+}
+
+/// An op-local pin's FOOTPRINT CLASS: its fp16 footprint, 128-aligned, in bytes. Every pin of one
+/// class shares one slot, and a program holds at most one pin of a class. Computed once per pin, by
+/// [`OpLocalClass::of`], so the slot ([`BundleLayout::synth_lx_op_local`]) and the program's rule
+/// ([`LxScope`]) cannot key on different footprints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpLocalClass(u64);
+
+impl OpLocalClass {
+    /// The class of a pin of shape `dims` (outermost→innermost). An operand has at least one
+    /// element, so its footprint is at least one 128-byte stick.
+    fn of(dims: &[u32]) -> OpLocalClass {
+        OpLocalClass(align128(synth_footprint_bytes(dims, Df::Fp16).max(1)))
+    }
+
+    /// The class's footprint in bytes — the slot every pin of it shares.
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
 }
 
 impl LxScope {
@@ -993,14 +1013,14 @@ impl BundleLayout {
     /// one-function budget the `lx_form` admission witness reads — so this runs at
     /// `#[forward]` expansion AS the cargo-build guard: a bundle whose pins do not fit the
     /// frontend's LX window is unbuildable, not silently overlapping dxp's own LX allocations.
-    fn synth_lx_op_local(&self, id: PlaceId, dims: &[u32]) {
+    fn synth_lx_op_local(&self, id: PlaceId, class: OpLocalClass) {
         let name = id.to_string();
         self.ids.borrow_mut().insert(name.clone(), id);
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
         }
-        let fp = align128(synth_footprint_bytes(dims, Df::Fp16).max(1));
+        let fp = class.bytes();
         let (slot, added) = match a.op_local_slots.get(&fp) {
             Some(&s) => (s, 0),
             None => (a.next_down - fp, fp),
@@ -1098,20 +1118,23 @@ impl BundleLayout {
         let pin = OpLocalPin {
             name: crate::placement::syn(layout, id),
         };
+        // The pin's class, stated once: the slot it shares and the program's one-per-class rule
+        // both key on it, with or without a layout to place it in.
+        let class = OpLocalClass::of(dims);
+        if let Some(first) = scope.classes.get(&class) {
+            return Err(E::from(format!(
+                "op-local LX pins '{first}' and '{}' are both of the {}-byte class in ONE \
+                 program: the class's one shared slot alternates only across programs, and \
+                 within one program (one SDSC phase) dxp may order the two chains' descriptors \
+                 either way, so the second writer could land on the first pin before its \
+                 reader runs. Give one of them its own program, or its own class.",
+                pin.name,
+                class.bytes()
+            )));
+        }
+        scope.classes.insert(class, pin.name.clone());
         if let Some(l) = layout {
-            l.synth_lx_op_local(id, dims);
-            let fp = align128(synth_footprint_bytes(dims, Df::Fp16).max(1));
-            if let Some(first) = scope.classes.get(&fp) {
-                return Err(E::from(format!(
-                    "op-local LX pins '{first}' and '{}' are both of the {fp}-byte class in ONE \
-                     program: the class's one shared slot alternates only across programs, and \
-                     within one program (one SDSC phase) dxp may order the two chains' descriptors \
-                     either way, so the second writer could land on the first pin before its \
-                     reader runs. Give one of them its own program, or its own class.",
-                    pin.name
-                )));
-            }
-            scope.classes.insert(fp, pin.name.clone());
+            l.synth_lx_op_local(id, class);
         }
         build(&pin)
     }

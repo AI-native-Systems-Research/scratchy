@@ -674,6 +674,34 @@ fn a_second_same_class_pin_in_one_program_refuses_at_the_pair() {
     );
 }
 
+/// The rule is the PROGRAM's, not the layout's: with no layout to place them in, two same-class
+/// pins in one program still refuse at the pair, at the same class.
+#[test]
+fn a_second_same_class_pin_refuses_without_a_layout_too() {
+    use ktir_superdsc::place::SynthRole;
+    use ktir_superdsc::placement::{BundleLayout, LxScope};
+    use scratchy_target_spyre::bundle_code::PlaceId;
+    let mut scope = LxScope::program();
+    let pair = |scope: &mut LxScope, t: u32| {
+        BundleLayout::lx_op_local_pair(
+            None,
+            scope,
+            PlaceId::Act(t).synth(SynthRole::Rinv),
+            &[64, 64],
+            |_| Ok::<_, String>(((), ())),
+        )
+    };
+    pair(&mut scope, 7).expect("the program's first pin of the class");
+    let err = pair(&mut scope, 17)
+        .err()
+        .expect("a second same-class pin in one program, layout or not");
+    assert!(
+        err.contains("both of the 8192-byte class in ONE program"),
+        "{err}"
+    );
+    pair(&mut LxScope::program(), 17).expect("the same pin in its own program");
+}
+
 /// The neighbour: the same two norms as two PROGRAMS (two scopes) — the shared slot alternates.
 #[test]
 fn same_class_pins_in_two_programs_share_the_slot() {
