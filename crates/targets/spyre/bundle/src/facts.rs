@@ -187,11 +187,17 @@ impl Facts for BundleLayout<'_> {
         } = self;
         let fields = vec![
             ("segment_bytes", list(s, ListShape::Array, segment_bytes)),
-            ("weight_bank_bytes", list(s, ListShape::Slice, weight_bank_bytes)),
+            (
+                "weight_bank_bytes",
+                list(s, ListShape::Slice, weight_bank_bytes),
+            ),
             ("weight_tail", weight_tail.visit(s)),
             ("places", list(s, ListShape::PlaceTable, places)),
             ("kernel_weights", list(s, ListShape::Slice, kernel_weights)),
-            ("scalarmul_scales", list(s, ListShape::Slice, scalarmul_scales)),
+            (
+                "scalarmul_scales",
+                list(s, ListShape::Slice, scalarmul_scales),
+            ),
             ("weight_scale_folds", {
                 let vs = weight_scale_folds
                     .iter()
@@ -207,7 +213,10 @@ impl Facts for BundleLayout<'_> {
             ("lx_prob_pin_bytes", lx_prob_pin_bytes.visit(s)),
             ("lx_pin_window_bytes", lx_pin_window_bytes.visit(s)),
             ("num_sources", num_sources.visit(s)),
-            ("resident_source_tids", list(s, ListShape::Slice, resident_source_tids)),
+            (
+                "resident_source_tids",
+                list(s, ListShape::Slice, resident_source_tids),
+            ),
         ];
         s.record(&["BundleLayout"], fields)
     }
@@ -226,7 +235,10 @@ impl Facts for FoldRows {
 impl Facts for Walk {
     fn visit<S: FactSink>(&self, s: &mut S) -> S::Out {
         let Walk { trips, step_bytes } = self;
-        let fields = vec![("trips", trips.visit(s)), ("step_bytes", step_bytes.visit(s))];
+        let fields = vec![
+            ("trips", trips.visit(s)),
+            ("step_bytes", step_bytes.visit(s)),
+        ];
         s.record(&["Walk"], fields)
     }
 }

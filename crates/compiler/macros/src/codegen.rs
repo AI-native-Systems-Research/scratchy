@@ -10618,7 +10618,10 @@ impl scratchy_target_spyre::bundle_code::facts::FactSink for TokenSink<'_> {
     // A collective's fragment, rank and window cut, each re-minted through its `const fn` so the
     // static it lands in re-proves the value's law (a whole-flit payload, a rank inside its world —
     // the bundle's own type, inferred from the static — and a cut the window has).
-    fn fragment(&mut self, f: scratchy_target_spyre::bundle_code::collective::Fragment) -> Self::Out {
+    fn fragment(
+        &mut self,
+        f: scratchy_target_spyre::bundle_code::collective::Fragment,
+    ) -> Self::Out {
         let [first, sticks, rows] =
             [f.first_stick(), f.sticks(), f.rows()].map(proc_macro2::Literal::u32_unsuffixed);
         quote! {
