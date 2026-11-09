@@ -2197,6 +2197,11 @@ pub struct ResponseWorker {
     /// path, and the calibration path's single-producer contract replaces
     /// the lock, so at most one submit is ever inside `prepare_cbs`.
     submit_scratch: Mutex<(Vec<TagLease>, Vec<ResponseTag>)>,
+    /// The single-thread mode's inline drain scratch, kept across submits
+    /// (see [`ResponseWorker::drain_inline`]). `None` only while a drain is
+    /// running. Unused in multi-thread mode — the completion thread keeps
+    /// its own local scratch.
+    drain_scratch: Mutex<Option<DrainScratch>>,
 }
 
 /// `prepare_cbs`'s borrowed scratch: the tag-lease list and the tag list,
@@ -2321,6 +2326,7 @@ impl ResponseWorker {
             submission_mtx: Mutex::new(()),
             cb_recycle: Mutex::new(Vec::new()),
             submit_scratch: Mutex::new((Vec::new(), Vec::new())),
+            drain_scratch: Mutex::new(None),
             stop_threads: AtomicBool::new(false),
             force_shutdown: AtomicBool::new(false),
             wakeup_tx,
@@ -2463,10 +2469,7 @@ impl ResponseWorker {
             // identical to the regular path's below (which by then has
             // already dropped the lock).
             if self.single_thread_optimized && !self.skip_launch {
-                let mut scratch = DrainScratch::new(self.max_pending_requests);
-                while self.num_pending_requests.load(Ordering::Acquire) > 0 {
-                    self.fetch_and_parse_response_blocks(&mut scratch);
-                }
+                self.drain_inline();
             }
             return Ok(());
         }
@@ -2500,12 +2503,28 @@ impl ResponseWorker {
         // received" (`response_worker.cpp:540-547`). `ResponseCompletionThread`
         // returns immediately in this mode, so this thread IS the consumer.
         if self.single_thread_optimized && !self.skip_launch {
-            let mut scratch = DrainScratch::new(self.max_pending_requests);
-            while self.num_pending_requests.load(Ordering::Acquire) > 0 {
-                self.fetch_and_parse_response_blocks(&mut scratch);
-            }
+            self.drain_inline();
         }
         Ok(())
+    }
+
+    /// "Single-threaded mode: poll synchronously until all responses
+    /// received" (`response_worker.cpp:540-547`) — the submit thread IS the
+    /// consumer. The drain scratch (a 64 B x max_pending_requests response
+    /// block array plus its tag list — megabytes at real config) is kept on
+    /// the worker and reused across submits instead of being re-allocated
+    /// per `QueueCbs`: the background completion thread owns its own local
+    /// one, and in this mode there is no background thread, so this pool
+    /// serves exactly the one draining thread.
+    fn drain_inline(&self) {
+        let mut slot = self.drain_scratch.lock().unwrap_or_else(|p| p.into_inner());
+        let mut scratch = slot
+            .take()
+            .unwrap_or_else(|| DrainScratch::new(self.max_pending_requests));
+        while self.num_pending_requests.load(Ordering::Acquire) > 0 {
+            self.fetch_and_parse_response_blocks(&mut scratch);
+        }
+        *slot = Some(scratch);
     }
 
     /// Port of `ResponseWorker::Precheck` (`response_worker.cpp:552-571`).
