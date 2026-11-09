@@ -65,7 +65,7 @@ fn gathered_expert_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorl
         )),
     )
     .expect("the gathered expert matmul builds");
-    for arg in &mut spec.args {
+    for arg in spec.args_mut() {
         if !matches!(arg.view().role, Role::Output | Role::Index) {
             arg.set_df(<Fp8 as DataFormat>::DF);
         }

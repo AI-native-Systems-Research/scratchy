@@ -665,7 +665,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
             Df::Fp8,
         )
         .map_err(SuperDscError)?;
-        for arg in &mut spec.args {
+        for arg in spec.args_mut() {
             if !matches!(arg.view().role, Role::Output) {
                 arg.set_df(Df::Fp8);
             }

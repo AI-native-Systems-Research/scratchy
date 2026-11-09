@@ -9521,7 +9521,7 @@ mod tests {
         // The epilogue operand is the one inserted BEFORE the real output (see
         // `attach_fused_epilogue`'s own doc) — for this 3-arg-input matmul (a,w,o) that is index 2.
         let epi_idx = 2;
-        let view = op.args[epi_idx].view();
+        let view = op.args()[epi_idx].view();
         // ⭐ ASSERTED BY DIM NAME, NOT BY POSITION. This test asserted `layout == ["mb","out","y"]` and
         // a scale array indexed against it; the emitter's order is `["mb","y","out"]` (the
         // on-hardware-proven batch-inner walk `batched_decode_walk_order.rs` pins), so the positional
@@ -9591,7 +9591,7 @@ mod tests {
             },
         });
         let epi_idx = 2;
-        let view = op.args[epi_idx].view();
+        let view = op.args()[epi_idx].view();
         assert_eq!(
             view.layout,
             ["mb", "out"],

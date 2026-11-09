@@ -9,8 +9,8 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
-    Role, Scale, StickExtent, TensorArg, WorkPlan,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpSpec, Role,
+    Scale, StickExtent, TensorArg, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -229,7 +229,7 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
             .map_err(|e| e.0)?
             .with_offset(w_off)
             .with_df(operand_df);
-            *op.args.get_mut(KERNEL_OPERAND).ok_or_else(|| {
+            *op.args_mut().get_mut(KERNEL_OPERAND).ok_or_else(|| {
                 format!("no operand at {KERNEL_OPERAND} to re-declare as the kernel")
             })? = AnyTensorArg::R3(kernel);
         }
@@ -298,7 +298,7 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
             .map_err(|e| e.0)?
             .with_offset(w_off)
             .with_df(operand_df);
-            *op.args.get_mut(KERNEL_OPERAND).ok_or_else(|| {
+            *op.args_mut().get_mut(KERNEL_OPERAND).ok_or_else(|| {
                 format!("no operand at {KERNEL_OPERAND} to re-declare as the kernel")
             })? = AnyTensorArg::R3(kernel);
         }
@@ -306,7 +306,7 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
             format!(
                 "the matmul has {} operand(s), so position {KERNEL_OPERAND} is not a kernel a \
                      gather can read through",
-                op.args.len()
+                op.args().len()
             )
         })?;
     }
@@ -464,7 +464,6 @@ where
     .map_err(|e| e.0)?
     .with_offset(w_off);
 
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     // INPUT/OUTPUT rank tracks the op: a PLAIN 2-D matmul (batch==1) is [mb,in]/[mb,out] (opFuncName
     // "matmul", matching torch-spyre's generate_sdsc — the `y` phantom + batchmatmul was THE mq>1
     // prefill collapse). A true batched matmul (batch>1, attention bmm) keeps the `y`(=batch) dim.
@@ -535,7 +534,7 @@ where
             }
             None => output,
         };
-        vec![
+        [
             AnyTensorArg::R2(input),
             AnyTensorArg::R2(kernel),
             AnyTensorArg::R2(output),
@@ -648,7 +647,7 @@ where
                 regime, &plan, a_name, o_name, a_off, o_off, phys_mb, pitches,
             )?,
         };
-        vec![
+        [
             AnyTensorArg::R3(input),
             AnyTensorArg::R2(kernel),
             AnyTensorArg::R3(output),
@@ -666,17 +665,16 @@ where
             arg.set_df(DF::DF);
         }
     }
-    Ok(OpSpec {
-        op: OpFunc::matmul(batch),
-        is_reduction: true,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    let [input, kernel, output]: [AnyTensorArg; 3] = args;
+    Ok(OpSpec::new(
+        OpFunc::matmul(batch),
+        true,
+        plan,
+        vec![input, kernel],
+        output,
+    )
+    .map_err(|e| e.0)?
+    .with_time_tile(time_tile))
 }
 
 /// BOTH rank-3 args of one regime's shared-kernel batched matmul, from the regime's own typed walk
@@ -942,23 +940,15 @@ pub fn matmul_opspec_batched_off(
     )
     .map_err(|e| e.0)?
     .with_offset(o_off);
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    let args = vec![
-        AnyTensorArg::R3(input),
-        AnyTensorArg::R3(kernel),
+    Ok(OpSpec::new(
+        OpFunc::matmul(batch),
+        true,
+        plan,
+        vec![AnyTensorArg::R3(input), AnyTensorArg::R3(kernel)],
         AnyTensorArg::R3(output),
-    ];
-    Ok(OpSpec {
-        op: OpFunc::matmul(batch),
-        is_reduction: true,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    )
+    .map_err(|e| e.0)?
+    .with_time_tile(time_tile))
 }
 
 /// ⭐⭐ torch-spyre's ALL-HEADS CONTRACTION — `[b, m, k] × [b, k, n] → [b, m, n]` as ONE `batchmatmul`
@@ -1053,21 +1043,14 @@ pub fn matmul_opspec_x_batched(
     .with_frame(ViewFrame::FoldedRows)
     .with_device_order([MbAxis::NAME, "x", OutAxis::NAME])
     .map_err(|e| e.0)?;
-    Ok(OpSpec {
-        op: OpFunc::matmul(batch),
-        is_reduction: true,
-        iter: plan,
-        args: vec![
-            AnyTensorArg::R3(input),
-            AnyTensorArg::R3(kernel),
-            AnyTensorArg::R3(output),
-        ],
-        op_info: OpInfo::None,
-        tiled_symbols: Vec::new(),
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    OpSpec::new(
+        OpFunc::matmul(batch),
+        true,
+        plan,
+        vec![AnyTensorArg::R3(input), AnyTensorArg::R3(kernel)],
+        AnyTensorArg::R3(output),
+    )
+    .map_err(|e| e.0)
 }
 
 /// Where a batched operand's batch sits among its rows in the flat frame `[b·m, ·]` it lives in.
@@ -1180,21 +1163,14 @@ pub fn matmul_opspec_rows_split(
     .with_device_order([InAxis::NAME, OutAxis::NAME, "x"])
     .map_err(|e| e.0)?;
     let output = rows(false, o_name, Role::Output, o_rows, OutAxis::NAME)?;
-    Ok(OpSpec {
-        op: OpFunc::matmul(batch),
-        is_reduction: true,
-        iter: plan,
-        args: vec![
-            AnyTensorArg::R3(input),
-            AnyTensorArg::R3(kernel),
-            AnyTensorArg::R3(output),
-        ],
-        op_info: OpInfo::None,
-        tiled_symbols: Vec::new(),
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    OpSpec::new(
+        OpFunc::matmul(batch),
+        true,
+        plan,
+        vec![AnyTensorArg::R3(input), AnyTensorArg::R3(kernel)],
+        AnyTensorArg::R3(output),
+    )
+    .map_err(|e| e.0)
 }
 
 #[cfg(test)]

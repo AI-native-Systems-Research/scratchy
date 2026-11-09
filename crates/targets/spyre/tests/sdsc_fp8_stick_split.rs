@@ -116,7 +116,7 @@ fn fp8_operands_are_fp8_resident() {
     )
     .unwrap();
     let mut non_output = 0;
-    for arg in &f8.args {
+    for arg in f8.args() {
         let v = arg.view();
         if !matches!(v.role, Role::Output) {
             assert_eq!(
@@ -149,7 +149,7 @@ fn fp8_operands_are_fp8_resident() {
         0,
     )
     .unwrap();
-    for arg in &f16.args {
+    for arg in f16.args() {
         assert_eq!(arg.view().df, Df::Fp16, "fp16 matmul operands stay Fp16");
     }
 }

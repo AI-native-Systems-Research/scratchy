@@ -8399,7 +8399,7 @@ mod elementwise_tests {
             "out is the ONE stick the frame law allows"
         );
         assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
-        for a in &op.args {
+        for a in op.args() {
             assert_eq!(
                 a.view().layout,
                 &["y", "mb", "out"] as &[&'static str],
@@ -8408,7 +8408,7 @@ mod elementwise_tests {
             );
         }
         let merged_view = op
-            .args
+            .args()
             .iter()
             .find(|a| a.view().name == "t6")
             .expect("the merged source's arg")
@@ -8499,7 +8499,7 @@ mod elementwise_tests {
         .expect("the inner row-spray op emits");
         assert_eq!(op.iter.extent("mb"), 64, "mb is the source's rows");
         assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
-        for a in &op.args {
+        for a in op.args() {
             assert_eq!(
                 a.view().layout,
                 &["mb", "y", "out"] as &[&'static str],
@@ -8508,7 +8508,7 @@ mod elementwise_tests {
             );
         }
         let mask_view = op
-            .args
+            .args()
             .iter()
             .find(|a| a.view().name == "t6")
             .expect("the sprayed source's arg")

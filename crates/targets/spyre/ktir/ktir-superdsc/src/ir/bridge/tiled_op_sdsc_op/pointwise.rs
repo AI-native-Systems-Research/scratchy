@@ -306,11 +306,11 @@ pub fn gather_copy_opspec(
     // exist yet: `attach_gather_index` below appends it with SENUINT32 FORCED, the one format a
     // gather's index may carry, whatever the value operands are. The gathered SOURCE takes the
     // chunk base AFTER the df is set (`set_offset_elems` scales by the word length itself).
-    for a in op.args.iter_mut() {
+    for a in op.args_mut().iter_mut() {
         a.set_df(df);
     }
     if run.src_elems > 0 {
-        op.args[0].set_offset_elems(run.src_elems);
+        op.args_mut()[0].set_offset_elems(run.src_elems);
     }
     // ⛔ OPERAND 0 IS THE GATHERED ONE, AND IT IS NOT THE OUTPUT. `attach_gather_index` refuses the
     // output slot itself (gathering INTO a destination is a scatter), so this cannot silently become
@@ -576,11 +576,11 @@ pub fn scatter_copy_opspec(
         // The destination is addressed THROUGH the index from the pool's own base.
         OutView::at(0),
     )?;
-    for a in op.args.iter_mut() {
+    for a in op.args_mut().iter_mut() {
         a.set_df(df);
     }
     if src_elems > 0 {
-        op.args[0].set_offset_elems(src_elems);
+        op.args_mut()[0].set_offset_elems(src_elems);
     }
     op.attach_scatter_index(scatter).ok_or_else(|| {
         format!(
@@ -588,10 +588,8 @@ pub fn scatter_copy_opspec(
              its dims are [mb, out, y], so the paged axis must be `mb`"
         )
     })?;
-    if dst_elems > 0
-        && let Some(o) = op.args.last_mut()
-    {
-        o.set_offset_elems(dst_elems);
+    if dst_elems > 0 {
+        op.output_mut().set_offset_elems(dst_elems);
     }
     Ok(op)
 }
@@ -691,7 +689,7 @@ pub fn page_gather_copy_opspec(
         },
         OutView::at(0),
     )?;
-    for a in op.args.iter_mut() {
+    for a in op.args_mut().iter_mut() {
         a.set_df(df);
     }
     op.attach_gather_index(gather, ins.len() - 1).ok_or_else(|| {
@@ -736,12 +734,10 @@ pub fn assemble_page_gather_copy<T: crate::collective::Tp>(
     let mut op =
         page_gather_copy_opspec(src, dst, gather, rows, words.df().elems_per_stick(), words)?;
     if src_elems > 0 {
-        op.args[gathered].set_offset_elems(src_elems);
+        op.args_mut()[gathered].set_offset_elems(src_elems);
     }
-    if dst_elems > 0
-        && let Some(o) = op.args.last_mut()
-    {
-        o.set_offset_elems(dst_elems);
+    if dst_elems > 0 {
+        op.output_mut().set_offset_elems(dst_elems);
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -901,26 +897,15 @@ pub fn index_select_opspec(
             crate::superdsc_opspec::ViewFrame::Own
         }
     };
-    let args = vec![
-        arg(
-            true,
-            src,
-            ["out", "x", "y", "mb"],
-            crate::superdsc_opspec::ViewFrame::Own,
-        )?,
-        arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?,
-    ];
-    let mut op = OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    };
+    let input = arg(
+        true,
+        src,
+        ["out", "x", "y", "mb"],
+        crate::superdsc_opspec::ViewFrame::Own,
+    )?;
+    let output = arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?;
+    let mut op =
+        OpSpec::new(OpFunc::Identity, false, plan, vec![input], output).map_err(|e| e.0)?;
     op.attach_gather_index(gather.gather_index(), 0)
         .ok_or_else(|| {
             format!(
@@ -928,10 +913,8 @@ pub fn index_select_opspec(
              op — its dims are [mb, y, x, out], so the paged axis must be `mb`"
             )
         })?;
-    if page_dst.get() > 0
-        && let Some(o) = op.args.last_mut()
-    {
-        o.set_offset_elems(page_dst.get());
+    if page_dst.get() > 0 {
+        op.output_mut().set_offset_elems(page_dst.get());
     }
     Ok(op)
 }
@@ -1028,30 +1011,18 @@ pub fn expand_blocks_opspec(
             .map_err(|e| e.0)?,
         ))
     };
-    let args = vec![
-        arg(
-            true,
-            src,
-            [
-                Scale::Active,
-                Scale::RedNonStick,
-                Scale::Active,
-                Scale::Active,
-            ],
-        )?,
-        arg(false, dst, [Scale::Active; 4])?,
-    ];
-    Ok(OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    let input = arg(
+        true,
+        src,
+        [
+            Scale::Active,
+            Scale::RedNonStick,
+            Scale::Active,
+            Scale::Active,
+        ],
+    )?;
+    let output = arg(false, dst, [Scale::Active; 4])?;
+    OpSpec::new(OpFunc::Identity, false, plan, vec![input], output).map_err(|e| e.0)
 }
 
 /// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
@@ -1141,19 +1112,12 @@ pub fn stick_permute_opspec(
             .map_err(|e| e.0)?,
         ))
     };
-    let args = vec![arg(true, src, from)?, arg(false, dst, to)?];
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    let (input, output) = (arg(true, src, from)?, arg(false, dst, to)?);
+    Ok(
+        OpSpec::new(OpFunc::Identity, false, plan, vec![input], output)
+            .map_err(|e| e.0)?
+            .with_time_tile(time_tile),
+    )
 }
 
 /// One stick permute's extents: `rows` rows of `sticks` sticks of `df`, in `direction`, read from
@@ -1186,10 +1150,10 @@ pub fn assemble_stick_permute<T: crate::collective::Tp>(
 ) -> Result<EmittedOp<T>, String> {
     let mut op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
     if src_elems > 0 {
-        op.args[0].set_offset_elems(src_elems);
+        op.args_mut()[0].set_offset_elems(src_elems);
     }
     if dst_elems > 0 {
-        op.args[1].set_offset_elems(dst_elems);
+        op.args_mut()[1].set_offset_elems(dst_elems);
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1266,22 +1230,13 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             };
             Ok(AnyTensorArg::R3(t))
         };
-    let args = vec![
-        arg(true, src, src_pitch, src_elems)?,
-        arg(false, dst, dst_pitch, dst_elems)?,
-    ];
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    let input = arg(true, src, src_pitch, src_elems)?;
+    let output = arg(false, dst, dst_pitch, dst_elems)?;
+    Ok(
+        OpSpec::new(OpFunc::Identity, false, plan, vec![input], output)
+            .map_err(|e| e.0)?
+            .with_time_tile(time_tile),
+    )
 }
 
 /// [`stick_runs_copy_opspec`] + `emit_sdsc_tiled`.
@@ -1470,15 +1425,15 @@ fn pointwise_opspec_from_tile_split(
             ))
         }
     };
-    let mut args = Vec::with_capacity(in_names.len() + 1);
+    let mut ins = Vec::with_capacity(in_names.len());
     for name in in_names {
-        args.push(mk(true, name, 0)?);
+        ins.push(mk(true, name, 0)?);
     }
     // The scatter-row output (see `OutView`): `["mb", "y", "out"]`, stick innermost, the
     // physical `y` extent carrying the scatter's width W. The scales stay all-Active so the
     // `y` dim is scale-active — the one `DeviceExtents::of_view` keys on when it lifts the
     // view's physical extent over the plan's iterated one.
-    args.push(match out_view.scatter_interleave {
+    let output = match out_view.scatter_interleave {
         None => mk(false, o_name, out_view.offset)?,
         Some(interleave) => AnyTensorArg::R3(
             TensorArg::<3>::new(
@@ -1496,24 +1451,16 @@ fn pointwise_opspec_from_tile_split(
             .with_device_extent("y", interleave)
             .map_err(|e| e.0)?,
         ),
-    });
+    };
 
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: if op.needs_sfp_const_table() {
+    Ok(OpSpec::new(op, false, plan, ins, output)
+        .map_err(|e| e.0)?
+        .with_op_info(if op.needs_sfp_const_table() {
             OpInfo::SfpConstTable
         } else {
             OpInfo::None
-        },
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+        })
+        .with_time_tile(time_tile))
 }
 
 /// TileIR → SdscOp for the [`EwOperand`]-broadcast pointwise family: takes an ALREADY-LOWERED
@@ -1807,9 +1754,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
             }))
         }
     };
-    let mut args = Vec::with_capacity(inputs.len() + 1);
+    let mut ins = Vec::with_capacity(inputs.len());
     for inp in inputs {
-        args.push(mk(
+        ins.push(mk(
             true,
             inp.name(),
             match spray {
@@ -1827,7 +1774,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // distinct half of the roped output. `per_core_addr` adds this on top of the
     // global placement (task #55). 0 = whole-tensor output (every existing caller;
     // and the `stickmajor` predicate requires out_offset==0, so rank-2 is whole-tensor).
-    args.push(mk(
+    let output = mk(
         false,
         o_name,
         [Scale::Active, Scale::Active, Scale::Active],
@@ -1835,23 +1782,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
         out_row_window
             .filter(|w| !w.spans_one_stick())
             .map(|w| w.parent_rows()),
-    )?);
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: if op.needs_sfp_const_table() {
+    )?;
+    Ok(OpSpec::new(op, false, plan, ins, output)
+        .map_err(|e| e.0)?
+        .with_op_info(if op.needs_sfp_const_table() {
             OpInfo::SfpConstTable
         } else {
             OpInfo::None
-        },
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+        })
+        .with_time_tile(time_tile))
 }
 
 /// `assemble_pointwise_broadcast_off` TAKING AN ALREADY-LOWERED `TileOp` — the TileIR→SdscOp entry
@@ -1976,8 +1915,8 @@ mod scatter_tests {
             },
         )
         .expect("an 8-row, two-stick-per-row scatter builds");
-        let ia = op.indirect.expect("the scatter declares its pair");
-        assert_eq!(op.args.len(), 3, "input, index, output");
+        let ia = op.indirect().expect("the scatter declares its pair");
+        assert_eq!(op.args().len(), 3, "input, index, output");
         assert_eq!(ia.value, 2, "the output is the paged value");
         assert_eq!(ia.index, 1, "the index sits between input and output");
     }
@@ -2144,7 +2083,7 @@ mod stick_runs_tests {
     #[test]
     fn each_side_states_its_own_pitch() {
         let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
-        let v: Vec<_> = op.args.iter().map(|a| a.view()).collect();
+        let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
         assert_eq!(
             v[0].device_extent,
             [None, Some(128), None],
@@ -2713,17 +2652,8 @@ mod index_select_tests {
             crate::superdsc_opspec::ViewFrame::LandedBlocks,
         )
         .expect("the stamped arg builds");
-        let op = OpSpec {
-            op: OpFunc::Identity,
-            is_reduction: false,
-            iter: plan,
-            args: vec![src_arg, dst_arg],
-            op_info: OpInfo::None,
-            tiled_symbols: vec![],
-            time_tile: None,
-            indirect: None,
-            coordinate_mask: None,
-        };
+        let op = OpSpec::new(OpFunc::Identity, false, plan, vec![src_arg], dst_arg)
+            .expect("the op builds");
         let l = BundleLayout::default();
         l.synth(PlaceId::Act(1), &[64, 64]);
         l.synth(PlaceId::Act(2), &[64, 64]);

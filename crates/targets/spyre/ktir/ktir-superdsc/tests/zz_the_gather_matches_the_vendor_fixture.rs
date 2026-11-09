@@ -107,7 +107,7 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
     // of leaving it contiguous, and the score kernel that reads it then gets another request's slots from a
     // clean bake. The vendor's own value tensor is one stick wide too, so this brings the harness closer to
     // the fixture rather than further from it.
-    let mut op = gather_copy_opspec(
+    let op = gather_copy_opspec(
         "Tensor0",
         "Tensor2",
         vendor_index("Tensor1"),
@@ -125,11 +125,18 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
         },
     )
     .expect("the gather-copy op builds");
-    // Drop the index operand and the declaration, leaving the bare two-operand identity.
-    let idx = op.indirect.expect("just attached").index;
-    op.args.remove(idx);
-    op.indirect = None;
-    op
+    // The bare two-operand identity over the SAME value and destination operands and the same plan —
+    // built through the one door, since an op's operand list cannot be edited after it is checked.
+    let ia = op.indirect().expect("just attached");
+    let args = op.args();
+    ktir_superdsc::superdsc_opspec::OpSpec::new(
+        op.op(),
+        op.is_reduction(),
+        op.iter.clone(),
+        vec![args[ia.value].clone()],
+        args[args.len() - 1].clone(),
+    )
+    .expect("an identity binds no fixed arity")
 }
 
 /// The vendor fixture, as ground truth for the field NAMES and SHAPES.
@@ -161,14 +168,14 @@ fn an_indirect_access_cannot_name_one_operand_twice() {
 #[test]
 fn no_declaration_emits_no_indirection_anywhere() {
     let op = plain_matmul();
-    assert!(op.indirect.is_none(), "the default is no gather");
+    assert!(op.indirect().is_none(), "the default is no gather");
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
 
     // Over the op's ACTUAL operands — the KERNEL-less copy op has two, a matmul had three, and a
     // hardcoded `0..3` read a `Null` node as a missing field rather than as an absent operand.
-    for arg in 0..op.args.len() {
+    for arg in 0..op.args().len() {
         let n = node(&j, "MatMul_0", arg);
         assert_eq!(
             n["indirectAllocType_"], "no_indirection",
@@ -289,7 +296,7 @@ fn a_declared_gather_matches_the_vendor_field_set() {
     // whose declared axis happens to be first, and this operand's is not: its layout is
     // `["mb","in"]` and the declaration names "in", so the pin belongs at index 1. That off-by-a-dim
     // is precisely the bug a positional `KernelAxis::position()` introduced.
-    let layout = op.args[0].view().layout.to_vec();
+    let layout = op.args()[0].view().layout.to_vec();
     let want = layout
         .iter()
         .position(|&d| d == VENDOR_DECL.0.dim())
@@ -302,7 +309,7 @@ fn a_declared_gather_matches_the_vendor_field_set() {
     );
     assert_eq!(
         walk.len(),
-        op.args[0].view().layout.len(),
+        op.args()[0].view().layout.len(),
         "the walk's rank must equal the tensor's rank"
     );
 
@@ -323,13 +330,13 @@ fn a_declared_gather_matches_the_vendor_field_set() {
 #[test]
 fn attach_gather_index_wires_the_operand_and_the_declaration_as_one() {
     let mut op = plain_matmul();
-    let before = op.args.len();
+    let before = op.args().len();
     let value_idx = 0usize;
 
     let declared = op
         .attach_gather_index(vendor_index("BlockTable"), value_idx)
         .expect("a valid pair");
-    assert_eq!(op.args.len(), before + 1, "exactly one operand is added");
+    assert_eq!(op.args().len(), before + 1, "exactly one operand is added");
     assert_eq!(declared.value, value_idx);
     // ⛔⛔⛔ THE INDEX GOES BEFORE THE OUTPUT, AND THIS ASSERTION USED TO SAY THE OPPOSITE.
     //
@@ -340,18 +347,18 @@ fn attach_gather_index_wires_the_operand_and_the_declaration_as_one() {
     // the second time that shape of error has been caught in this file's subject matter.
     assert_eq!(
         declared.index,
-        op.args.len() - 2,
+        op.args().len() - 2,
         "the index must sit immediately BEFORE the output, as the vendor's [input, index, output] does"
     );
     assert!(
         matches!(
-            op.args[op.args.len() - 1].view().role,
+            op.args()[op.args().len() - 1].view().role,
             ktir_superdsc::superdsc_opspec::Role::Output
         ),
         "the LAST arg must still be the real output — that is what every reader's `out_idx` resolves to"
     );
     assert_eq!(
-        op.indirect,
+        op.indirect(),
         Some(declared),
         "the declaration is stored, not just returned"
     );
@@ -379,7 +386,7 @@ fn attach_gather_index_wires_the_operand_and_the_declaration_as_one() {
 #[test]
 fn attach_gather_index_refuses_the_output_and_a_missing_operand() {
     let mut op = plain_matmul();
-    let out_idx = op.args.len() - 1;
+    let out_idx = op.args().len() - 1;
     assert!(
         op.attach_gather_index(vendor_index("T"), out_idx).is_none(),
         "a write through an index is a SCATTER, not this"
@@ -389,7 +396,7 @@ fn attach_gather_index_refuses_the_output_and_a_missing_operand() {
         "a declaration cannot name an operand that is not there"
     );
     // Both refusals leave the op untouched — no half-wired state.
-    assert!(op.indirect.is_none(), "a refused attach declares nothing");
+    assert!(op.indirect().is_none(), "a refused attach declares nothing");
 }
 
 /// ⭐ THE VENDOR FIXTURE IS THE ORACLE, so read it and assert our shapes against ITS values — not

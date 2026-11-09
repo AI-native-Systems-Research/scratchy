@@ -1174,20 +1174,15 @@ fn sfp_rank1_opspec(
         )
         .map_err(|e| e.0)
     };
-    Ok(OpSpec {
+    let (input, output) = (mk(true, in_name)?, mk(false, out_name)?);
+    OpSpec::new(
         op,
-        is_reduction: false,
-        iter: plan,
-        args: vec![
-            AnyTensorArg::R1(mk(true, in_name)?),
-            AnyTensorArg::R1(mk(false, out_name)?),
-        ],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+        false,
+        plan,
+        vec![AnyTensorArg::R1(input)],
+        AnyTensorArg::R1(output),
+    )
+    .map_err(|e| e.0)
 }
 
 /// [`sfp_rank1_opspec`] → [`EmittedOp`].
@@ -1706,14 +1701,7 @@ fn one_gathered_leg<T: crate::collective::Tp>(
                  element offset"
             ))
         })?;
-        op.args
-            .last_mut()
-            .ok_or_else(|| {
-                SuperDscError(format!(
-                    "{op_name}: leg `{leg_name}` has no operands, so it has no destination to move"
-                ))
-            })?
-            .set_offset_elems(off);
+        op.output_mut().set_offset_elems(off);
     }
     // `inputs` are args `0..inputs.len()` and the output is pushed last, so an input's index IS its arg
     // position — the same identity `emit_sdsc` relies on for `Tensor{i}-idx{i}`.
@@ -1845,7 +1833,7 @@ pub(crate) fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>)
     let Some(l) = layout else { return };
     mark_lx_residency(op, l);
     if op
-        .args
+        .args()
         .last()
         .is_some_and(|o| l.lx_pin(o.arg_name()).is_some() && !l.lx_core_local(o.arg_name()))
     {
@@ -1859,7 +1847,7 @@ pub(crate) fn apply_lx_residency(op: &mut OpSpec, layout: Option<&BundleLayout>)
 /// and then held to the read law. Allocations only: a replicated producer's PLAN is set by the pointwise
 /// door ([`apply_lx_residency`]), before its folds are taken from it.
 fn mark_lx_residency(op: &mut OpSpec, l: &BundleLayout) {
-    for a in op.args.iter_mut() {
+    for a in op.args_mut().iter_mut() {
         if l.lx_pin(a.arg_name()).is_some() {
             a.set_allocation(if l.lx_core_local(a.arg_name()) {
                 Allocation::LxCoreLocal
@@ -2042,7 +2030,7 @@ fn note_lx_touches(
         return Ok(());
     }
     let indirect: Vec<usize> = op
-        .indirect
+        .indirect()
         .iter()
         .flat_map(|i| [i.index, i.value])
         .collect();
@@ -2346,21 +2334,14 @@ fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpe
     let x_lo = mk(true, x)?; // offset 0
     let x_hi = mk(true, x)?.with_offset(half); // reads x[:, half:]
     let out = mk(false, o)?;
-    Ok(OpSpec {
-        op: OpFunc::Add,
-        is_reduction: false,
-        iter: plan,
-        args: vec![
-            AnyTensorArg::R3(x_lo),
-            AnyTensorArg::R3(x_hi),
-            AnyTensorArg::R3(out),
-        ],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    OpSpec::new(
+        OpFunc::Add,
+        false,
+        plan,
+        vec![AnyTensorArg::R3(x_lo), AnyTensorArg::R3(x_hi)],
+        AnyTensorArg::R3(out),
+    )
+    .map_err(|e| e.0)
 }
 
 /// The emitted SuperDSC op + the per-trip stride the CONCRETE-UNROLL needs. For a
@@ -2957,7 +2938,7 @@ pub fn emit_sdsc_tiled<T: crate::collective::Tp>(
     // no-op for an op that names no LX-pinned tensor.
     let marked;
     let op = match layout {
-        Some(l) if op.args.iter().any(|a| l.lx_pin(a.arg_name()).is_some()) => {
+        Some(l) if op.args().iter().any(|a| l.lx_pin(a.arg_name()).is_some()) => {
             let mut o = op.clone();
             mark_lx_residency(&mut o, l);
             marked = o;
@@ -2969,11 +2950,11 @@ pub fn emit_sdsc_tiled<T: crate::collective::Tp>(
     let inner = emit_sdsc(op_name, op, folds, layout)?;
     if time == 1 {
         // Concrete-address single-shot path: all-empty strides, no unroll.
-        let affine_strides = vec![BTreeMap::new(); op.args.len()];
+        let affine_strides = vec![BTreeMap::new(); op.args().len()];
         return Ok(EmittedOp::new(
             op_name.to_string(),
             inner,
-            &op.args,
+            op.args(),
             &op.iter,
             1,
             affine_strides,
@@ -3038,7 +3019,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         .expect("rewrite_op_for_time_tile called on a non-tiled op")
         .dim()
         .name();
-    let views: Vec<ArgView<'_>> = op.args.iter().map(|a| a.view()).collect();
+    let views: Vec<ArgView<'_>> = op.args().iter().map(|a| a.view()).collect();
     let cores = inner.numCoresUsed_.max(1);
     let eps = Fp16::ELEMS_PER_STICK as i64;
     let per_core_out = op.iter.per_core_extent(tiled_dim) as i64;
@@ -3328,7 +3309,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
     Ok(EmittedOp::new(
         op_name.to_string(),
         inner,
-        &op.args,
+        op.args(),
         &op.iter,
         time,
         affine_strides,
@@ -3574,7 +3555,7 @@ pub fn emit_sdsc(
     layout: Option<&BundleLayout>,
 ) -> Result<SdscOp, SuperDscError> {
     let cores = folds.core_fold();
-    let views: Vec<ArgView<'_>> = op.args.iter().map(|a| a.view()).collect();
+    let views: Vec<ArgView<'_>> = op.args().iter().map(|a| a.view()).collect();
     let out_idx = views.len().saturating_sub(1);
     // ⭐ AN LX-RESIDENT OUTPUT DEMANDS A REPLICATED PRODUCER — the BACKSTOP for
     // `apply_lx_residency` (the consult lives in the pointwise door; this guard lives in
@@ -3613,7 +3594,7 @@ pub fn emit_sdsc(
     // along K), and the compute `dataFormat_` is SEN143_FP8. The activation (INPUT) is a flat fp8 128-K
     // stick and the OUTPUT stays fp16 (64-N stick) — those fall out of each arg's own `df`. Only the
     // KERNEL's 2-D pack + the compute format are special-cased here.
-    let fp8_matmul = matches!(op.op, OpFunc::Matmul | OpFunc::BatchMatmul)
+    let fp8_matmul = matches!(op.op(), OpFunc::Matmul | OpFunc::BatchMatmul)
         && views
             .iter()
             .any(|v| !matches!(v.role, Role::Output) && matches!(v.df, Df::Fp8));
@@ -3665,7 +3646,7 @@ pub fn emit_sdsc(
         // (slots=8, one slot per core — the only form the fixtures demonstrate), and
         // the DDC maximizes the datastage upward itself once the min-check passes,
         // so the work split, the landing bytes and every consumer are unchanged.
-        let staged = if op.op.is_topk_pair() && d.name == "out" {
+        let staged = if op.op().is_topk_pair() && d.name == "out" {
             1
         } else {
             per_core
@@ -3742,7 +3723,7 @@ pub fn emit_sdsc(
         // interslicetranspose_fp16: the OUTPUT role carries the TRANSPOSE — its
         // stick is the 8×8 inter-slice block `["out","mb"]`/[8,8] (vs the INPUT's
         // plain `["out"]`/[64]). Every other op keeps the single-stick layout.
-        let is_transpose_out = op.op == OpFunc::Transpose && matches!(v.role, Role::Output);
+        let is_transpose_out = op.op() == OpFunc::Transpose && matches!(v.role, Role::Output);
         // The fp8 WEIGHT (KERNEL of an fp8 matmul) is a 2-D PACKED stick: `[in:2, out:64]` — 64 N-columns
         // × 2 K-rows per 128-byte stick (2 fp8 packed per fp16-width slot along K). This is what the DDL
         // `batchmatmulfp8` dataflow constraint requires (KERNEL in-stick 2, out-stick 64); a flat
@@ -3787,7 +3768,7 @@ pub fn emit_sdsc(
         // FROM the value operand (so its rank and stick law are legal), which is exactly what makes a
         // spurious input plausible enough to lower.
         if matches!(
-            op.indirect.and_then(|ia| ia.role_of(i)),
+            op.indirect().and_then(|ia| ia.role_of(i)),
             Some(IndirectRole::Index { .. })
         ) {
             continue;
@@ -3799,40 +3780,12 @@ pub fn emit_sdsc(
             input_refs.push(r);
         }
     }
-    // A reduction accumulator is BOTH an input AND the output (matches the
-    // reduce fixture: accum is inputLabeledDs[1] and the sole outputLabeledDs).
-    //
-    // ⛔⛔⛔ EXCEPT WHEN THE OP FUNC'S OWN DDL BINDS A DIFFERENT INPUT ARITY, WHICH IS A HARD MATCH
-    // CRITERION AND NOT A HINT. `ddl_conversion.cpp:2161-2163` (`DdlConversion::matchDdl2Dsc`) walks
-    // every `ddl.operation_bind` in the selected template and skips any computeOp whose
-    // `inputLabeledDs.size() != opBindInputs.size()` — an arity mismatch is indistinguishable from
-    // "wrong op", so the template is silently declared unsuitable and the whole descriptor is refused
-    // with a message that names only the op. A SEEDED reduce (`sum`/`max`/`mean` →
-    // `summeanmaxexx2.ddl`) binds TWO inputs and is unchanged here; the machine's own FUSED reduces
-    // (`quantscalepertokenfp8` → `quant_scale_per_token.ddl:41`, one `%input_tensor`, one
-    // `%output_tensor`, its accumulator an on-chip `ddl.internal_tensor`) bind ONE.
-    //
-    // ⭐ DRIVEN BY [`OpFunc::ddl_input_arity`], a const table — a target-ABI fact this shared pass
-    // takes as INPUT, never a match arm here.
-    if op.is_reduction && views.len() == 2 && op.op.ddl_input_arity().is_none_or(|n| n == 2) {
+    // A reduction accumulator is BOTH an input AND the output (matches the reduce fixture: accum is
+    // inputLabeledDs[1] and the sole outputLabeledDs) — when the op's DDL template binds it so, which
+    // `OpSpec::new` decided over the operands the op was built with, and checked against the
+    // template's arity there.
+    if op.accum_is_input() {
         input_refs.push(format!("Tensor{out_idx}-idx{out_idx}"));
-    }
-    // ⭐⭐⭐ THE ARITY REFUSAL, MOVED FROM THE BAKE TO THE BUILD. `emit_sdsc` runs inside `#[forward]`,
-    // so this `Err` is a `cargo build` error naming the contract — not a `DtException: Scheduler failed
-    // to find a suitable op mapping` hours later on a card, which is how the mismatch above was found.
-    if let Some(want) = op.op.ddl_input_arity()
-        && input_refs.len() != want
-    {
-        return Err(SuperDscError(format!(
-            "op '{op_name}' ({}): its DDL template binds exactly {want} input tensor(s), but this \
-             descriptor lists {} ({input_refs:?}). `DdlConversion::matchDdl2Dsc` \
-             (ddl_conversion.cpp:2161) SKIPS a computeOp whose input count differs from the \
-             `ddl.operation_bind`'s, so the template is declared unsuitable and dxp refuses the \
-             whole bundle with a message that names only the op. Fix the operand list, or the \
-             `OpFunc::ddl_input_arity` row if the template really binds a different arity.",
-            op.op.name(),
-            input_refs.len()
-        )));
     }
 
     // ⛔⛔⛔⛔⛔ A GATHER ON A `KERNEL`-BEARING OP IS REFUSED AT BUILD — EXCEPT THE ONE FORM THE CARD
@@ -3872,7 +3825,7 @@ pub fn emit_sdsc(
     // unprobed descriptor that reaches dxp re-runs the card loop this refusal exists to close.
     // The predicate is decidable from what this function has already built, so it is decided here,
     // once, with both the admitted shape and the KERNEL-LESS alternative named in the message.
-    let token_plane = match op.indirect.as_ref() {
+    let token_plane = match op.indirect().as_ref() {
         Some(ia) => {
             ia.entry_dim == crate::superdsc_opspec::KernelAxis::Batch
                 && ia.per_position.is_none()
@@ -3881,7 +3834,7 @@ pub fn emit_sdsc(
         None => false,
     };
     let kernel_bearing = primary.len() > 1 && primary.contains_key("KERNEL");
-    if op.indirect.is_some() && kernel_bearing && !token_plane {
+    if op.indirect().is_some() && kernel_bearing && !token_plane {
         return Err(SuperDscError(format!(
             "op '{op_name}': a GATHER is declared on an op whose primaryDsInfo_ carries a KERNEL \
              ({:?}) in a shape that was never probe-validated. The card refused the paged-KV form \
@@ -3917,7 +3870,7 @@ pub fn emit_sdsc(
         // This operand's side of a gathered access, if the op declares one. Derived from the op's
         // single `Option`, never from a per-operand flag, so the index and value sides cannot
         // disagree about which pair they belong to.
-        let indirect_role = op.indirect.as_ref().and_then(|ia| ia.role_of(i));
+        let indirect_role = op.indirect().as_ref().and_then(|ia| ia.role_of(i));
         // ── THE PAGED DIMS ──
         // ⛔ PINNING A DIM IS WHAT MAKES IT PAGED: `getPageSize` (`dsc2.cpp:4493-4526`) erases every
         // negative entry of `maxDimSizes_`, so the pinned dims ARE the paged dims and each must
@@ -4018,7 +3971,7 @@ pub fn emit_sdsc(
         // (build_coordinates) and the per-core START (per_core_addr). Neither derives its own, so the walk
         // and start cannot address the tensor differently — a divergence is not representable (task #11).
         let sl = view_stick_layout(v, iter);
-        let coordinates = build_coordinates(v, &sl, iter, fp8_matmul, op.is_reduction);
+        let coordinates = build_coordinates(v, &sl, iter, fp8_matmul, op.is_reduction());
         // SLICE read offset (intra-tensor): a sliced operand (RoPE's x[half:]) reads
         // from `seg_base + offset_elems·wordLength`. `per_core_addr` adds the per-core
         // work-slice offset on top of this intra-segment base.
@@ -4198,8 +4151,8 @@ pub fn emit_sdsc(
         // shared output the ring writes. Admitted only for that exact shape AND only for an op whose
         // template provably carries the combine (`OpFunc::template_combines_a_core_split_reduction`, a
         // const table), never because "it is a reduce".
-        let collapsed_reduction_split = op.is_reduction
-            && op.op.template_combines_a_core_split_reduction()
+        let collapsed_reduction_split = op.is_reduction()
+            && op.op().template_combines_a_core_split_reduction()
             && op.iter.dims().iter().any(|d| {
                 d.is_reduction
                     && op.iter.split_of(d.name) > 1
@@ -4449,13 +4402,13 @@ pub fn emit_sdsc(
     //
     // ⛔ THE TABLE IS THE WHOLE CONDITION: `op_consts()` is empty for every other op func, so every
     // shipped descriptor is byte-identical.
-    let constant_info = if !op.op.op_consts().is_empty() {
+    let constant_info = if !op.op().op_consts().is_empty() {
         // ⭐ THE SAME POST-2026-09 CONTRACT THE REDUCE ARMS BELOW WRITE: `data_` is a FoldManager
         // OBJECT (`fold_manager_const`), one entry per named constant, NO `allocations_` (the
         // validator's additionalProperties-style rejection killed that field). Each value is ONE
         // SEN169 word — the DDL reads it per-element out of `dataFormat_`.
         serde_json::Value::Object(
-            op.op
+            op.op()
                 .op_consts()
                 .iter()
                 .map(|&(cname, v)| {
@@ -4526,7 +4479,7 @@ pub fn emit_sdsc(
     // string can only install a table the template never consumes. See
     // [`OpFunc::is_topk_pair`] for the fixture citations.
     let constant_info =
-        if !op.op.is_topk_pair() && constant_info.as_object().is_some_and(|o| o.is_empty()) {
+        if !op.op().is_topk_pair() && constant_info.as_object().is_some_and(|o| o.is_empty()) {
             serde_json::Value::String("{}".to_string())
         } else {
             constant_info
@@ -4586,8 +4539,8 @@ pub fn emit_sdsc(
                 // fp16, so read an operand, not the output). Same-dtype kernels only (the DDL pairs operands
                 // same-dtype). fp16 matmul + every non-matmul op keep the bare `OpFunc::name`.
                 opFuncName: {
-                    let base = op.op.name();
-                    if matches!(op.op, OpFunc::Matmul | OpFunc::BatchMatmul) {
+                    let base = op.op().name();
+                    if matches!(op.op(), OpFunc::Matmul | OpFunc::BatchMatmul) {
                         match views
                             .iter()
                             .find(|v| !matches!(v.role, Role::Output))
@@ -4614,7 +4567,7 @@ pub fn emit_sdsc(
                     } else if views.get(out_idx).is_some_and(|o| matches!(o.df, Df::Bf16)) {
                         "BF16E"
                     } else if matches!(
-                        op.op,
+                        op.op(),
                         OpFunc::Fp32ToInt32
                             | OpFunc::Int32ToFp32
                             | OpFunc::MulI32ToI32
@@ -4679,7 +4632,7 @@ pub fn emit_sdsc(
                 //
                 // Empty for every op that declares no gather, which is all of them today — so this
                 // is byte-identical for every shipped bundle.
-                indirectAccessIndexLabeledDs: op.indirect.map_or_else(Vec::new, |ia| {
+                indirectAccessIndexLabeledDs: op.indirect().map_or_else(Vec::new, |ia| {
                     vec![format!("Tensor{}-idx{}", ia.index, ia.index)]
                 }),
             }];
@@ -5209,18 +5162,9 @@ fn convert_opspec(
     };
     let input = mk(true, in_name, Role::Input, in_df)?;
     let output = mk(false, o_name, Role::Output, out_df)?;
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op,
-        is_reduction: false,
-        iter: plan,
-        args: vec![input, output],
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    Ok(OpSpec::new(op, false, plan, vec![input], output)
+        .map_err(|e| e.0)?
+        .with_time_tile(time_tile))
 }
 
 /// Assemble a dtype-convert op (see [`convert_opspec`]). Emit-time panic on a malformed spec = a `cargo build`
@@ -5332,7 +5276,7 @@ pub fn assemble_convert_col<T: crate::collective::Tp>(
         false,
     )
     .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
-    for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
+    for (arg, off) in op.args_mut().iter_mut().zip([in_off, o_off]) {
         arg.set_offset_elems(off.into_raw_elems());
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -5429,7 +5373,7 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
         band_multistick,
     )
     .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
-    for (arg, w) in op.args.iter_mut().zip([in_w, o_w]) {
+    for (arg, w) in op.args_mut().iter_mut().zip([in_w, o_w]) {
         if let Some(w) = w {
             arg.set_offset_elems(w.dev().into_raw_elems());
             if !w.spans_one_stick() {
@@ -5711,18 +5655,15 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
         Allocation::Hbm,
     )
     .map_err(|e| e.0)?;
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op: OpFunc::Transpose,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    Ok(OpSpec::new(
+        OpFunc::Transpose,
+        false,
+        plan,
+        vec![AnyTensorArg::R3(input)],
+        AnyTensorArg::R3(output),
+    )
+    .map_err(|e| e.0)?
+    .with_time_tile(time_tile))
 }
 
 /// Assemble a complete SuperDSC `interslicetranspose_fp16` transposing `in_name`
@@ -6628,21 +6569,15 @@ fn topk_opspec(
         Allocation::Hbm,
     )
     .map_err(|e| e.0)?;
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op: member,
-        // A top-k IS a reduction (the `in` scan); `emit_sdsc_tiled`'s seeded-reduce arm cannot
-        // fire on it because the pair's `ddl_input_arity` is `Some(1)` — the unseeded, internal-
-        // state contract the registry row pins.
-        is_reduction: true,
-        iter: plan,
-        args: vec![AnyTensorArg::R2(input), AnyTensorArg::R2(output)],
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    Ok(OpSpec::new(
+        member,
+        true,
+        plan,
+        vec![AnyTensorArg::R2(input)],
+        AnyTensorArg::R2(output),
+    )
+    .map_err(|e| e.0)?
+    .with_time_tile(time_tile))
 }
 
 /// [`topk_opspec`] assembled — the `#[forward]` form, for callers inside an expansion where a
@@ -6763,17 +6698,14 @@ fn restickify_kt_opspec_2d(
     )
     .map_err(|e| e.0)?
     .with_offset(out_off);
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R2(input), AnyTensorArg::R2(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    OpSpec::new(
+        OpFunc::Restickify,
+        false,
+        plan,
+        vec![AnyTensorArg::R2(input)],
+        AnyTensorArg::R2(output),
+    )
+    .map_err(|e| e.0)
 }
 
 /// Assemble ONE per-head Kᵀ restickify (natural `[slots,feats]` → slot-sticked `[feats,slots]`).
@@ -6992,17 +6924,14 @@ pub(crate) fn restickify_transpose_opspec_batched(
     .map_err(|e| e.0)?
     .with_device_order(["out", "y", "mb"])
     .map_err(|e| e.0)?;
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    OpSpec::new(
+        OpFunc::Restickify,
+        false,
+        plan,
+        vec![AnyTensorArg::R3(input)],
+        AnyTensorArg::R3(output),
+    )
+    .map_err(|e| e.0)
 }
 
 /// [`restickify_transpose_opspec_batched`] assembled over whole buffers, each side minted at its
@@ -8048,7 +7977,7 @@ mod fp32toint32_convert_law {
 
     /// The output arg (arg 1, the non-input) — the INDEX dataspace-to-be.
     fn out_arg(op: &OpSpec) -> &AnyTensorArg {
-        op.args
+        op.args()
             .iter()
             .find(|a| !a.view().is_input)
             .expect("an output arg")
@@ -8065,7 +7994,7 @@ mod fp32toint32_convert_law {
         assert_eq!(out.view().df, Df::SenUint32, "the gather's index format");
         assert_eq!(out.view().df.word_length(), 4, "DT_CHECK wordLength == 4");
         let inp = o
-            .args
+            .args()
             .iter()
             .find(|a| a.view().is_input)
             .expect("an input arg");
@@ -8082,7 +8011,7 @@ mod fp32toint32_convert_law {
     fn both_operands_sticks_yield_the_same_slice() {
         let o = op(2);
         let inp = o
-            .args
+            .args()
             .iter()
             .find(|a| a.view().is_input)
             .expect("an input arg");
@@ -8556,21 +8485,15 @@ mod time_tiled_segment_law {
         }
         let x = mk(true, "sl_x", [Scale::Active, Scale::Active, Scale::Active]);
         let out = mk(false, "sl_o", [Scale::Active, Scale::Active, Scale::Active]);
-        OpSpec {
-            op: OpFunc::Multiply,
-            is_reduction: false,
-            iter: plan,
-            args: vec![
-                AnyTensorArg::R3(x),
-                AnyTensorArg::R3(gamma),
-                AnyTensorArg::R3(out),
-            ],
-            op_info: OpInfo::None,
-            tiled_symbols: vec![time_tile.dim()],
-            time_tile: Some(time_tile),
-            indirect: None,
-            coordinate_mask: None,
-        }
+        OpSpec::new(
+            OpFunc::Multiply,
+            false,
+            plan,
+            vec![AnyTensorArg::R3(x), AnyTensorArg::R3(gamma)],
+            AnyTensorArg::R3(out),
+        )
+        .expect("a multiply binds no fixed arity")
+        .with_time_tile(Some(time_tile))
     }
 
     fn emit(op: &OpSpec) -> Result<EmittedOp<crate::collective::TpWorld<1>>, SuperDscError> {

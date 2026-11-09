@@ -434,7 +434,7 @@ pub fn reduce_opspec_df_divided(
         )
     };
 
-    let args = vec![data, accum];
+    let args = [&data, &accum];
     // BUILD-TIME GUARD (guard-every-crash-at-build-time): DATA and ACCUM are both `Role::Output`, so they
     // SHARE one `primaryDsInfo` LayoutInfo of rank N. dxp interprets EACH operand's AllocNode dims against
     // that single rank-N layout — a mismatched-rank operand makes dxp search for a dim that isn't there,
@@ -451,19 +451,12 @@ pub fn reduce_opspec_df_divided(
             ranks[0]
         ));
     }
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     let op_info = reduce_op_info(op, cols, df, accum_name)?;
-    Ok(OpSpec {
-        op,
-        is_reduction: true,
-        iter: plan,
-        args,
-        op_info,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask,
-    })
+    Ok(OpSpec::new(op, true, plan, vec![data], accum)
+        .map_err(|e| e.0)?
+        .with_op_info(op_info)
+        .with_time_tile(time_tile)
+        .with_coordinate_mask(coordinate_mask))
 }
 
 /// fp32 REDUCE (the torch-spyre RMSNorm `mean(x²)`): native fp32 SFP reduce over `cols`, keeping all
@@ -888,7 +881,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             .with_offset(accum_off),
         )
     };
-    let args = vec![data, accum];
+    let args = [&data, &accum];
     // Mirror reduce_opspec_df's build-time guard: a mixed-rank data/accum pair is unconditionally
     // wrong (dxp abort), so catch it here too rather than let a future edit reintroduce it silently.
     let ranks: Vec<usize> = args.iter().map(|a| a.view().layout.len()).collect();
@@ -900,21 +893,14 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             ranks[0]
         ));
     }
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     // The scaling const divides by the reduce's LOGICAL extent (`ScalingExtent`), never by
     // this emission's slice geometry — see `ReduceOffSpec::scaling`.
     let op_info = reduce_op_info(op, scaling.get(), df, accum_name)?;
-    Ok(OpSpec {
-        op,
-        is_reduction: true,
-        iter: plan,
-        args,
-        op_info,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask,
-    })
+    Ok(OpSpec::new(op, true, plan, vec![data], accum)
+        .map_err(|e| e.0)?
+        .with_op_info(op_info)
+        .with_time_tile(time_tile)
+        .with_coordinate_mask(coordinate_mask))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1716,5 +1702,121 @@ mod long_reduce_split {
             c["computeOp_"][0]["opFuncName"], "add",
             "the mean's combine"
         );
+    }
+}
+
+/// ⭐ THE DDL ARITY IS A CONSTRUCTION FACT: `OpSpec::new` refuses an operand list its op function's
+/// template cannot bind, and every descriptor that reaches `emit_sdsc` lists the count the template
+/// binds — so there is no emit-time arity arm left to reach.
+#[cfg(test)]
+mod the_arity_is_checked_where_the_op_is_built {
+    use crate::superdsc_opspec::{
+        Allocation, AnyTensorArg, ItDim, MAX_CORES, MaxCores, OpFunc, OpSpec, Role, Scale,
+        SdscFoldSet, TensorArg, WorkPlan,
+    };
+
+    fn plan() -> WorkPlan {
+        let dims = [
+            ItDim {
+                name: "mb",
+                size: 4,
+                is_reduction: false,
+                is_stick: false,
+                df: crate::superdsc_opspec::Df::Fp16,
+            },
+            ItDim {
+                name: "out",
+                size: 64,
+                is_reduction: true,
+                is_stick: true,
+                df: crate::superdsc_opspec::Df::Fp16,
+            },
+        ];
+        WorkPlan::divide(&dims, MaxCores::<{ MAX_CORES }>, |_, _| {
+            std::collections::BTreeMap::new()
+        })
+        .expect("a two-dim plan divides")
+    }
+
+    fn arg(p: &WorkPlan, is_input: bool, name: &str, out: Scale) -> AnyTensorArg {
+        AnyTensorArg::R2(
+            TensorArg::<2>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active, out],
+                p.iter_syms(["mb", "out"]),
+                ["mb", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .expect("a [mb, out] arg"),
+        )
+    }
+
+    fn build(op: OpFunc, inputs: usize) -> Result<OpSpec, crate::superdsc_error::SuperDscError> {
+        let p = plan();
+        let ins = (0..inputs)
+            .map(|i| arg(&p, true, &format!("in{i}"), Scale::Active))
+            .collect();
+        let out = arg(&p, false, "acc", Scale::RedStick);
+        OpSpec::new(op, true, p, ins, out)
+    }
+
+    fn input_refs(op: &OpSpec) -> usize {
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let e = crate::emit::emit_sdsc("arity_o1", op, &folds, None).expect("emits");
+        let j = serde_json::to_value(&e).expect("serializes");
+        j["dscs_"][0]["arity_o1"]["computeOp_"][0]["inputLabeledDs"]
+            .as_array()
+            .expect("an input list")
+            .len()
+    }
+
+    /// The match, on both rows of the table that bind a fixed arity through a reduce: the fused
+    /// per-token scale binds ONE (its accumulator is template-internal), and the descriptor lists one.
+    #[test]
+    fn a_one_input_fused_reduce_builds_and_lists_one_input() {
+        let op = build(OpFunc::QuantScalePerTokenFp8, 1).expect("one operand is the bind");
+        assert!(!op.accum_is_input(), "the accumulator is template-internal");
+        assert_eq!(input_refs(&op), 1);
+    }
+
+    /// The neighbour with NO fixed row: a seeded `sum` lists its accumulator as its second input,
+    /// the `summeanmaxexx2.ddl` bind — unchanged by the move.
+    #[test]
+    fn a_seeded_reduce_lists_its_accumulator_as_an_input() {
+        let op = build(OpFunc::Sum, 1).expect("a seeded sum builds");
+        assert!(op.accum_is_input());
+        assert_eq!(input_refs(&op), 2);
+    }
+
+    /// Near-miss: one operand too many for the one-input bind is refused AT CONSTRUCTION, naming the
+    /// template's count — before any descriptor exists.
+    #[test]
+    fn one_operand_too_many_refuses_at_construction() {
+        let e =
+            build(OpFunc::QuantScalePerTokenFp8, 2).expect_err("two operands, a one-input bind");
+        assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
+    }
+
+    /// Near-miss: the same table row refuses an operand list with no input at all.
+    #[test]
+    fn no_operand_refuses_at_construction() {
+        let e = build(OpFunc::QuantScalePerTokenFp8, 0).expect_err("no input, a one-input bind");
+        assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
+    }
+
+    /// Near-miss on a non-reduction row: `clip` binds one input; two refuse.
+    #[test]
+    fn a_two_input_clip_refuses_at_construction() {
+        let p = plan();
+        let ins = vec![
+            arg(&p, true, "a", Scale::Active),
+            arg(&p, true, "b", Scale::Active),
+        ];
+        let out = arg(&p, false, "o", Scale::Active);
+        let e = OpSpec::new(OpFunc::Clip, false, p, ins, out).expect_err("clip binds one");
+        assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
     }
 }

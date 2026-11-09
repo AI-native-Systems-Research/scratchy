@@ -328,7 +328,11 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
             k.get()
         );
     }
-    if let Some(kernel) = op.args.iter_mut().find(|arg| arg.view().name == w_name) {
+    if let Some(kernel) = op
+        .args_mut()
+        .iter_mut()
+        .find(|arg| arg.view().name == w_name)
+    {
         use super::walk::WalkAxis as _;
         kernel.set_device_extent(super::walk::InAxis::NAME, w_in_phys);
     }
@@ -530,7 +534,7 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     // The activation's own stick-group pitch, when it is not the output's: a batch block read on
     // its own (`a_rows == m`) is a standalone stick-major `[m, k]`.
     if shape.a_rows != shape.rows {
-        op.args[0].set_device_extent("mb", shape.a_rows);
+        op.args_mut()[0].set_device_extent("mb", shape.a_rows);
     }
     Ok(assemble_from_opspec(op_name, op, sym_id_base, layout))
 }
