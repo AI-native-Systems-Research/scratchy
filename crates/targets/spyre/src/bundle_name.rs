@@ -47,13 +47,22 @@ pub enum GroupContent<'a> {
 }
 
 /// A bundle's name: its layout, then each group's shifts and content, in launch order.
+///
+/// `layout` is `None` for a bundle emitted with no memory plan, which is named as having none —
+/// never as a defaulted plan. The `Option` goes with the residency stack, which makes the plan
+/// required.
 pub fn name<'a, T: Tp>(
-    layout: &BundleLayout<'_>,
+    layout: Option<&BundleLayout<'_>>,
     groups: impl IntoIterator<Item = (&'a KvShifts<T>, GroupContent<'a>)>,
 ) -> String {
     let mut d = DigestSink(Sha256::new());
-    d.tag(b"layout");
-    layout.visit(&mut d);
+    match layout {
+        Some(l) => {
+            d.tag(b"layout");
+            l.visit(&mut d);
+        }
+        None => d.tag(b"no layout"),
+    }
     for (i, (kv, content)) in groups.into_iter().enumerate() {
         d.tag(b"group");
         d.word(i as u64);
@@ -77,7 +86,10 @@ pub fn name<'a, T: Tp>(
 }
 
 /// The name of an emulator bundle, whose groups are complete launches.
-pub fn of_groups<T: Tp>(layout: &BundleLayout<'_>, groups: &[LaunchGroup<'_, T>]) -> String {
+pub fn of_groups<T: Tp>(
+    layout: Option<&BundleLayout<'_>>,
+    groups: &[LaunchGroup<'_, T>],
+) -> String {
     name(
         layout,
         groups
