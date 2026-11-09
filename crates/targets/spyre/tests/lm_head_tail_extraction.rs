@@ -1,12 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// ⛔ RUN THIS FILE WITH `SCRATCHY_PLAN_ONLY_BAKE=1` — the door side of these gates
-// runs the KTIR→SuperDSC lowering, whose fixtures must not demand a device compiler.
-//
-//     SCRATCHY_PLAN_ONLY_BAKE=1 cargo test -p scratchy-target-spyre \
-//         --features spyre-emu --test lm_head_tail_extraction
-//
-// (See `superdsc_time_tile.rs`' header for why the variable is not set from
-// inside the test.)
 #![cfg(feature = "spyre-emu")]
 //! THE PREFILL LM-HEAD TAIL, END TO END — the extraction must feed the matmul the
 //! LAST REAL prompt row, at every `n <= m_cap`.

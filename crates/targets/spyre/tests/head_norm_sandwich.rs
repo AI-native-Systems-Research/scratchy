@@ -1,12 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// ⛔ RUN THIS FILE WITH `SCRATCHY_PLAN_ONLY_BAKE=1` — the door side of these gates
-// runs the KTIR→SuperDSC lowering, whose fixtures must not demand a device compiler.
-//
-//     SCRATCHY_PLAN_ONLY_BAKE=1 cargo test -p scratchy-target-spyre \
-//         --features spyre-emu --test head_norm_sandwich
-//
-// (See `superdsc_time_tile.rs`'s header for why the variable is not set from inside
-// the test.)
 // The numerics gate drives the emulator session (`runner::SpyreSession`), which the
 // `spyre`-only build does not link — the file is empty there, not compiled-out per
 // test, because gates (ii) and (iii) would also be meaningless without the program

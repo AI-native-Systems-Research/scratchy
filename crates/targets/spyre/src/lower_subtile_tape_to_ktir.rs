@@ -2954,7 +2954,8 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
             // ([`crate::lower_subtile_tape_to_superdsc::kv_pool_tids`], placed on a card bake
             // only) — so a program binding it has no card plan to declare into there. A card
             // bake declares every program.
-            if !cfg!(feature = "spyre-hw") && k.bindings.iter().any(|b| pools.contains(&b.get())) {
+            if !cfg!(feature = "spyre-lower") && k.bindings.iter().any(|b| pools.contains(&b.get()))
+            {
                 continue;
             }
             crate::ktir_superdsc_door::lower::<T>(

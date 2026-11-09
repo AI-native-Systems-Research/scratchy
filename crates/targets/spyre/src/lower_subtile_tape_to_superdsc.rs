@@ -976,7 +976,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and a model whose
     //    pools outgrow one device region (`max_position_embeddings` pages of every layer) is refused
     //    by the address audit on the card it cannot fit, not on an emulator that never places them.
-    let pools = if cfg!(feature = "spyre-hw") {
+    let pools = if cfg!(feature = "spyre-lower") {
         kv_pool_tids(ir)
     } else {
         Vec::new()
@@ -7222,7 +7222,7 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
         // emulator has no such ceiling: it runs the tile grid the func declares, which is how a
         // prefill of more than 32 tokens gets one core per token, so this is checked where the
         // limit exists and nowhere else.
-        #[cfg(feature = "spyre-hw")]
+        #[cfg(feature = "spyre-lower")]
         if cores > MAX_CORES {
             fail.push(format!(
                 "{name}: its grid names {cores} cores but the card has {MAX_CORES}"
@@ -7621,11 +7621,12 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     };
 
     // ⭐ ONE SHARED KTIR, TWO CONSUMERS. `-Fspyre-emu` runs the group's own programs directly, so
-    // the group IS the result — nothing is staged and nothing is submitted. `-Fspyre-hw` lowers
-    // that SAME KTIR to a real SuperDSC directory and stages + submits it to the device compiler:
+    // the group IS the result — nothing is staged and nothing is submitted. `-Fspyre-lower` (and so
+    // `-Fspyre-hw`) lowers that SAME KTIR to a real SuperDSC directory, and a card build stages +
+    // submits it to the device compiler:
     // this is the write-files/reserve-disk/pair-with-an-id step `emit_bundle_inner` used to do
     // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
-    let groups = if cfg!(feature = "spyre-hw") {
+    let groups = if cfg!(feature = "spyre-lower") {
         PendingGroups::Staged(
             ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params)
                 .map_err(|e| std::io::Error::other(e.0))?,
@@ -7660,11 +7661,10 @@ impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
                 let bake = crate::superdsc_bake::global();
                 let mut out = Vec::with_capacity(staged.len());
                 for (kv, id) in &staged {
-                    // `bake` is `None` on a cardless build with `SCRATCHY_PLAN_ONLY_BAKE=1` (the
-                    // one case `global()` doesn't panic for having no device compiler) —
-                    // `ktir_groups_via_superdsc` staged/submitted nothing FOR that same reason,
-                    // so there is nothing to have lost here either. Empty `init_binary` matches
-                    // `ktir_groups`'s own plan-only default.
+                    // `bake` is `None` on a `spyre-lower` build without `spyre-hw` (no device image
+                    // is compiled) — `ktir_groups_via_superdsc` staged/submitted nothing FOR that
+                    // same reason, so there is nothing to have lost here either. Empty
+                    // `init_binary` matches `ktir_groups`'s own plan-only default.
                     let (init_binary, job_bin_ptr, correction) = match bake {
                         None => (Vec::new(), 0, Vec::new()),
                         Some(b) => {
@@ -8264,8 +8264,20 @@ pub fn ktir_groups<T: ktir_superdsc::collective::Tp>(
     Ok(out)
 }
 
-/// `-Fspyre-hw`'s counterpart to [`ktir_groups`]: the SAME per-op KTIR, lowered to real SuperDSC
-/// descriptors and handed to the bake queue.
+/// Where a `superdsc-dump` build writes each bundle's dxp input: the build's own target directory
+/// (`CARGO_TARGET_DIR`, else the workspace `target/`), under `superdsc-dump/<fp>/`.
+#[cfg(feature = "superdsc-dump")]
+fn superdsc_dump_root() -> std::path::PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target"))
+        .join("superdsc-dump")
+}
+
+/// The card's counterpart to [`ktir_groups`] (`-Fspyre-lower`, and so `-Fspyre-hw`): the SAME per-op
+/// KTIR, lowered to real SuperDSC descriptors and handed to the bake queue — which a `spyre-lower`
+/// build without `spyre-hw` does not have, so every group is lowered, guarded and rendered and none
+/// is compiled.
 ///
 /// ⛔⛔⛔ THIS RENDERS NOTHING AND WRITES NOTHING OF ITS OWN. `lower_ktir_to_superdsc::lower` returns
 /// [`EmittedOp`]s carrying in-memory [`SdscOp`]s — built by `pw1`/`pw2`/`assemble_matmul`, the SAME
@@ -8497,6 +8509,9 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     //    writes it beside the descriptors, and the same-class pair hunts read it from there.
     let lx_ledger =
         walk_lx_slot_alternation(&sdsc_ops, &per_prog, fold, layout).map_err(SuperDscError)?;
+    // The ledger's reader is the dump; without it the walk still runs as the guard.
+    #[cfg(not(feature = "superdsc-dump"))]
+    drop(lx_ledger);
 
     // ── THE BAKE BUDGET, PER BUNDLE (`BakeBudget::bundle_verdict`) ─────────────────────────
     //    A bundle is the unit the emitter fans out, so its counts bound BOTH the wave's critical
@@ -8554,16 +8569,19 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // which run on this same card. Byte-equality against a known-good dump is what localised a layout
     // defect in this repo before; reasoning about paged addressing is what has not.
     //
-    // ⚠️ DIAGNOSTIC, AND UNCONDITIONAL BY CHOICE — there is no env gate to hide it behind (this repo
-    // forbids behaviour toggles), so it either belongs here or it does not. Remove it deliberately once
-    // the prefill fence is closed, or keep it and say so.
+    // ⭐ AN OUTPUT A BUILD ASKS FOR BY NAME — the `superdsc-dump` FEATURE, off by default, and the
+    // directory is the build's own (`<CARGO_TARGET_DIR or target>/superdsc-dump`, never `/tmp`). It is
+    // not a behaviour toggle: what the bake lowers and refuses is the same with it on or off; it only
+    // decides whether the descriptors the bake already rendered are also written where a person can
+    // diff them. A CI lowering check (`spyre-lower`) writes nothing.
     // ⛔ `fold`, NOT A HARDCODED `Split`. This read `FoldGrouping::Split` unconditionally, so a FUSED
     // twin's dump directory was its split's partition under the twin's name — the one thing about a
     // twin that differs (where the group boundaries fall) was the one thing the dump could not show,
     // and a diff of the two dirs came back "identical" no matter what the bake actually did.
+    #[cfg(feature = "superdsc-dump")]
     {
         let _pc = crate::pc::Pc::start("dump");
-        let dump = std::path::Path::new("/tmp/superdsc-dump").join(fp);
+        let dump = superdsc_dump_root().join(fp);
         if let Err(e) = write_rendered_dxp_input(&dump, &rendered) {
             eprintln!(
                 "  [superdsc-dump] {fp}: could not write {}: {e}",
@@ -8651,12 +8669,12 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         if let Err(e) = std::fs::write(dump.join("bundle_id.json"), &id_json) {
             eprintln!("  [superdsc-dump] {fp}: could not write bundle_id.json: {e}");
         }
-        eprintln!(
-            "[ktir->sdsc] BUNDLE {fp}: {} KTIR program(s) -> {} descriptor(s)",
-            ops.len(),
-            sdsc_ops.len(),
-        );
     } // pc:dump
+    eprintln!(
+        "[ktir->sdsc] BUNDLE {fp}: {} KTIR program(s) -> {} descriptor(s)",
+        ops.len(),
+        sdsc_ops.len(),
+    );
 
     // ── from here down this is main's block, verbatim ──
     let shifts = {
