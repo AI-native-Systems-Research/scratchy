@@ -1972,6 +1972,33 @@ pub struct PendingRequest {
 /// and then moved out of exactly one of them at a time by `IssueCallback`.
 pub type CallbackFn = Arc<dyn Fn(&PendingRequest) + Send + Sync>;
 
+/// What a `pending_requests_` slot invokes when its CB completes. The live
+/// submit path always passes a [`GroupedSubmit`] — the group IS the
+/// callback, stored by `Arc` with no per-submit closure allocation (manual
+/// `impl Fn` is unstable, so the slot names the group explicitly instead).
+/// `Fn` covers everything else: bespoke completions and the test rigs.
+pub(crate) enum SlotCallback {
+    Group(Arc<GroupedSubmit>),
+    Fn(CallbackFn),
+}
+
+impl Clone for SlotCallback {
+    fn clone(&self) -> Self {
+        // Both arms are `Arc` clones — refcount bumps, never allocations;
+        // `ProcessTags` copies the callback into every slot of a batch.
+        match self {
+            SlotCallback::Group(g) => SlotCallback::Group(g.clone()),
+            SlotCallback::Fn(cb) => SlotCallback::Fn(cb.clone()),
+        }
+    }
+}
+
+impl From<CallbackFn> for SlotCallback {
+    fn from(cb: CallbackFn) -> Self {
+        SlotCallback::Fn(cb)
+    }
+}
+
 /// The mutable half of one `pending_requests_` slot.
 struct PendingRequestData {
     id: u64,
@@ -1990,7 +2017,7 @@ struct PendingRequestData {
     completion_time_point: Option<Instant>,
     control_block: Option<ControlBlockWire>,
     response_block: Option<crate::control_block_wire::ResponseBlockWire>,
-    callback_fn: Option<CallbackFn>,
+    callback_fn: Option<SlotCallback>,
     node_name: String,
     /// The tag lease naming this slot for as long as it is ISSUED. Dropping
     /// it IS `ReturnTags`' `available_tags_.enqueue_bulk(...)` — see
@@ -2425,9 +2452,9 @@ impl ResponseWorker {
         }
     }
 
-    pub fn queue_cbs(
+    pub(crate) fn queue_cbs(
         &self,
-        cb_fn: CallbackFn,
+        cb_fn: impl Into<SlotCallback>,
         num_cbs: u64,
         pipeline: PipelineId,
         qm: QueuingMode,
@@ -2441,6 +2468,7 @@ impl ResponseWorker {
         // is on the regular path (see the `launch_result?` note below): the
         // error propagates and the already-published `pending_requests_`
         // slots are left for `CheckPendingJobTimeouts`.
+        let cb_fn = cb_fn.into();
         if qm == QueuingMode::Calibration {
             self.precheck(num_cbs, qm)?;
             let batch = self.prepare_cbs(&cb_fn, num_cbs, pipeline, qm, dma, build)?;
@@ -2543,7 +2571,7 @@ impl ResponseWorker {
     /// consumer is the profiler's baseline timestamp) are not ported.
     fn prepare_cbs(
         &self,
-        cb_fn: &CallbackFn,
+        cb_fn: &SlotCallback,
         num_cbs: u64,
         pipeline: PipelineId,
         qm: QueuingMode,
@@ -2912,7 +2940,8 @@ impl ResponseWorker {
             (cb_fn, snapshot)
         };
         match cb_fn {
-            Some(cb_fn) => cb_fn(&snapshot),
+            Some(SlotCallback::Group(group)) => group.member_completed(&snapshot),
+            Some(SlotCallback::Fn(cb_fn)) => cb_fn(&snapshot),
             None => tracing::warn!(
                 id = snapshot.id,
                 "IssueCallback: no callback for PendingRequest"
@@ -3766,7 +3795,7 @@ mod response_worker_tests {
 
         let err = worker
             .queue_cbs(
-                Arc::new(|_pr: &PendingRequest| {}),
+                Arc::new(|_pr: &PendingRequest| {}) as CallbackFn,
                 1,
                 PipelineId::Compute,
                 QueuingMode::Calibration,
@@ -4308,33 +4337,21 @@ fn submit_to_hardware(
     }
 
     // ONE shared cell per submit, not three: the countdown, the hardware
-    // error, and the user callback all live behind this single `Arc`, so a
-    // submit costs one gate allocation (plus the `CallbackFn`'s own `Arc`)
-    // instead of the previous three separate `Arc<Mutex<..>>`/atomic cells.
+    // error, and the user callback all live behind this single `Arc` — and
+    // the group is its own `CallbackFn` (see its `Fn` impl), so the whole
+    // submit costs ONE allocation where the original port spent three
+    // separate `Arc<Mutex<..>>`/atomic cells plus a closure.
     // The countdown also subsumes the `num_cbs == 1` case for free: a single
     // CB's one invocation is trivially the last.
-    let gate = Arc::new(GroupedSubmit::new(num_cbs, callback));
-    let state_for_cb = state.clone();
-    let gate_for_cb = gate.clone();
-    let cb_fn: CallbackFn = Arc::new(move |pr: &PendingRequest| {
-        // onCbComplete's own status check (`:437-447`) — deliberately NOT
-        // `EvalResponseBlockStatus`, which is what the *graph* scheduler and
-        // the data-transfer paths use: this one treats TIMED_OUT, cancel, and
-        // any status other than `RB_GOOD` as a hardware error.
-        let hw_err = eval_cb_complete_status(pr)
-            .failure()
-            .inspect(|e| tracing::warn!("Response block error: {e}"))
-            .map(|e| Box::new(e) as SchedulerError);
-
-        // `recordPipelineProfiler`'s `--{compute,dmai,dmao}_in_flight_`.
-        state_for_cb.dec_in_flight(pipeline);
-
-        // "Call the completion callback only when all CBs are done."
-        gate_for_cb.settle(hw_err);
-    });
+    let gate = Arc::new(GroupedSubmit::new(
+        num_cbs,
+        callback,
+        state.clone(),
+        pipeline,
+    ));
 
     if let Err(e) = worker.queue_cbs(
-        cb_fn,
+        SlotCallback::Group(gate.clone()),
         num_cbs,
         pipeline,
         QueuingMode::Regular,
@@ -4367,18 +4384,34 @@ fn submit_to_hardware(
 /// path and the queue-failure path can take it — the queue-failure taker wins
 /// a race against a late timeout-reaped callback, which then finds `None`
 /// and does nothing, matching the previous three-cell layout's behavior.
-struct GroupedSubmit {
+///
+/// The group also IS its own [`CallbackFn`]: it carries the submit's
+/// in-flight accounting and pipeline, so `submit_to_hardware` hands the ONE
+/// `Arc` out twice (group + per-CB callback) instead of allocating a second
+/// `Arc` for a closure that captured clones of the same three things.
+pub(crate) struct GroupedSubmit {
     remaining: std::sync::atomic::AtomicU64,
     hw_error: Mutex<Option<SchedulerError>>,
     user_cb: Mutex<Option<CompletionCallback>>,
+    /// The submit's in-flight counter, drained one per member by `call`.
+    state: Arc<SchedulerState>,
+    /// The pipeline the submit's CBs ride — which counter `call` drains.
+    pipeline: PipelineId,
 }
 
 impl GroupedSubmit {
-    fn new(num_cbs: u64, callback: CompletionCallback) -> Self {
+    fn new(
+        num_cbs: u64,
+        callback: CompletionCallback,
+        state: Arc<SchedulerState>,
+        pipeline: PipelineId,
+    ) -> Self {
         Self {
             remaining: std::sync::atomic::AtomicU64::new(num_cbs),
             hw_error: Mutex::new(None),
             user_cb: Mutex::new(Some(callback)),
+            state,
+            pipeline,
         }
     }
 
@@ -4415,6 +4448,28 @@ impl GroupedSubmit {
                 None => cb(Ok(())),
             }
         }
+    }
+
+    /// One member CB of this submit completed: evaluate its response block,
+    /// drain its in-flight accounting, count it down. This is `onCbComplete`
+    /// (`response_worker.cpp:437-447`) as a method on the group it reports
+    /// to — `submit_to_hardware`'s per-CB closure is now a one-line forward
+    /// to this, capturing nothing but the group's own `Arc`.
+    fn member_completed(&self, pr: &PendingRequest) {
+        // onCbComplete's own status check (`:437-447`) — deliberately NOT
+        // `EvalResponseBlockStatus`, which is what the *graph* scheduler and
+        // the data-transfer paths use: this one treats TIMED_OUT, cancel, and
+        // any status other than `RB_GOOD` as a hardware error.
+        let hw_err = eval_cb_complete_status(pr)
+            .failure()
+            .inspect(|e| tracing::warn!("Response block error: {e}"))
+            .map(|e| Box::new(e) as SchedulerError);
+
+        // `recordPipelineProfiler`'s `--{compute,dmai,dmao}_in_flight_`.
+        self.state.dec_in_flight(self.pipeline);
+
+        // "Call the completion callback only when all CBs are done."
+        self.settle(hw_err);
     }
 }
 
@@ -5021,7 +5076,7 @@ impl SchedulerBackend for PfBackend {
         // sentinel held by the submitter", dropped after the last chunk has
         // been QUEUED, so a transfer whose chunks all complete before the
         // loop finishes still fires its callback exactly once.
-        let group = Arc::new(GroupedSubmit::new(1, callback));
+        let group = Arc::new(GroupedSubmit::new(1, callback, state.clone(), pipeline));
         let mut remaining = total_size;
         let mut offset = 0u64;
         while remaining != 0 {
