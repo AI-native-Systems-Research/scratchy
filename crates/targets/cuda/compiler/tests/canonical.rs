@@ -473,6 +473,7 @@ fn a_decode_gemm_lowers_to_the_gemv() {
             m: 1,
             n: 1024,
             k: 1024,
+            ends: scratchy_target_cuda::step::GemvEnds::NONE,
         })]
     );
     assert_eq!(

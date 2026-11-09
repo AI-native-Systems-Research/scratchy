@@ -32,11 +32,12 @@ use scratchy_target_cuda::step::{
     GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE,
     GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
     GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GroupKind,
-    GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight,
-    NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GemvEnds,
+    GroupKind, GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16,
+    MoeWeight, NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
+    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
+    SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -540,6 +541,7 @@ fn sibling_matmuls(
         first: member(&lowered[0]),
         second: member(second),
         third: third.first().map(member),
+        ends: GemvEnds::NONE,
     }))
 }
 
@@ -602,6 +604,7 @@ fn gemm(
         m,
         n,
         k,
+        ends: GemvEnds::NONE,
     };
     Ok(kernel(gemm))
 }
@@ -1708,6 +1711,7 @@ fn router_logits(
         hidden,
         inter: moe.inter,
         kernel,
+        ends: GemvEnds::NONE,
     })
 }
 
@@ -1991,6 +1995,7 @@ fn expert_matmul(
             experts: moe.experts,
             hidden: moe.hidden,
             inter: moe.inter,
+            ends: GemvEnds::NONE,
         }));
     };
     let (_, tn, tk) = GEMM_BF16_TILE;

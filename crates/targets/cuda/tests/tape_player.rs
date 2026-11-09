@@ -4806,6 +4806,7 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
                 m: 1,
                 n: 8,
                 k: 4,
+                ends: scratchy_target_cuda::step::GemvEnds::NONE,
             },
         )]));
         t.weight_bytes = Box::leak(Box::new([64]));

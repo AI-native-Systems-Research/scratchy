@@ -233,6 +233,7 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         m,
         n,
         k,
+        ends: scratchy_target_cuda::step::GemvEnds::NONE,
     })
 }
 

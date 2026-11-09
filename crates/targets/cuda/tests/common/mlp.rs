@@ -105,6 +105,7 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         m,
         n,
         k,
+        ends: scratchy_target_cuda::step::GemvEnds::NONE,
     })
 }
 
@@ -131,6 +132,7 @@ const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaSte
             m: rows,
             n: I,
             k: H,
+            ends: scratchy_target_cuda::step::GemvEnds::NONE,
         },
         up: GemmBf16 {
             a: ArenaOffset(n),
@@ -139,6 +141,7 @@ const fn gate_up(n: u64, (gate, up): (u64, u64), out: u64, rows: u32) -> CudaSte
             m: rows,
             n: I,
             k: H,
+            ends: scratchy_target_cuda::step::GemvEnds::NONE,
         },
         out: ArenaOffset(out),
         kernel: GateUpKernel::Gemm,

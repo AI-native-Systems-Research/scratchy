@@ -493,6 +493,8 @@ pub struct GemmGroupBf16 {
     pub first: GroupMember,
     pub second: GroupMember,
     pub third: Option<GroupMember>,
+    /// The shared input's fused norm (FP8 S8 W4a): a grouped GEMV's prologue, for every member.
+    pub ends: GemvEnds,
 }
 
 impl GemmGroupBf16 {
@@ -510,6 +512,7 @@ impl GemmGroupBf16 {
             m: self.m,
             n: g.n,
             k: self.k,
+            ends: self.ends,
         }
     }
 
@@ -660,6 +663,46 @@ pub struct GemmBf16 {
     pub m: u32,
     pub n: u32,
     pub k: u32,
+    /// The one-row GEMV's fused ends (FP8 S8 W4a); [`GemvEnds::NONE`] on every other kernel.
+    pub ends: GemvEnds,
+}
+
+/// A row norm a one-row GEMV applies to its input row as it loads it (FP8 S8 W4a): the
+/// [`RmsNormBf16`] the fold absorbed, without its arena operands. The GEMV reads the norm's input
+/// as its `a`; `y = bf16(x · inv · (offset + gain))`, `inv` in `rms_norm_one_row_ker`'s order, so
+/// the row it multiplies is the absorbed norm's output, bit for bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RowNorm {
+    pub gain: WeightIx,
+    /// As [`RmsNormBf16::eps_bits`].
+    pub eps_bits: u32,
+    #[serde(serialize_with = "serialize_gain_convention")]
+    pub convention: GainConvention,
+}
+
+impl RowNorm {
+    /// The norm's `eps`.
+    pub const fn eps(&self) -> f32 {
+        f32::from_bits(self.eps_bits)
+    }
+}
+
+/// What a one-row GEMV computes around its dot (FP8 S8 W4a, the one-row bucket's
+/// `NormedMatvec` and `MatvecEpilogue` folds): the norm of its input row, and the residual its
+/// output is added to, `c = bf16(bf16(dot) + residual)`, `add_bf16.cu`'s add. `residual` is a
+/// `[1, n]` arena slot the GEMV reads; `c` is the add's own colour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GemvEnds {
+    pub norm: Option<RowNorm>,
+    pub residual: Option<ArenaOffset>,
+}
+
+impl GemvEnds {
+    /// No fused end: every step of a bucket of two or more rows, and an unfolded GEMV.
+    pub const NONE: Self = Self {
+        norm: None,
+        residual: None,
+    };
 }
 
 /// The narrow GEMM's largest `n`: all of `B`'s rows are one 64-row ThunderKittens tile, and every
@@ -1335,6 +1378,8 @@ pub struct RouterLogitsBf16 {
     /// The bundle's expert width, so every step naming the bundle states its geometry.
     pub inter: u32,
     pub kernel: MatmulKernel,
+    /// As [`GemmBf16::ends`]: the one-row router's fused norm (FP8 S8 W4a).
+    pub ends: GemvEnds,
 }
 
 /// The one expert count the routing kernel's Qwen program takes: one warp per token row, 8 logits
@@ -1498,6 +1543,8 @@ pub struct ExpertGemvBf16 {
     pub experts: u32,
     pub hidden: u32,
     pub inter: u32,
+    /// As [`GemmBf16::ends`]: the token rows' fused norm (FP8 S8 W4a).
+    pub ends: GemvEnds,
 }
 
 impl ExpertGemvBf16 {
@@ -1980,10 +2027,18 @@ impl CudaStep {
                 })
             }
             // The quantized rows (the GEMV's: the bf16 row) and the fp8 weight with its scales.
-            Self::GemmFp8(GemmBf16 { a, b, c, m, n, k })
-            | Self::GemmCol64Fp8(GemmBf16 { a, b, c, m, n, k })
-            | Self::GemmNarrowFp8(GemmBf16 { a, b, c, m, n, k })
-            | Self::GemvFp8(GemmBf16 { a, b, c, m, n, k }) => {
+            Self::GemmFp8(GemmBf16 {
+                a, b, c, m, n, k, ..
+            })
+            | Self::GemmCol64Fp8(GemmBf16 {
+                a, b, c, m, n, k, ..
+            })
+            | Self::GemmNarrowFp8(GemmBf16 {
+                a, b, c, m, n, k, ..
+            })
+            | Self::GemvFp8(GemmBf16 {
+                a, b, c, m, n, k, ..
+            }) => {
                 let ab = match self {
                     Self::GemvFp8(_) => bf16_bytes(m, k),
                     _ => QuantRowsFp8 {
@@ -2035,10 +2090,18 @@ impl CudaStep {
                     in_place: false,
                 })
             }
-            Self::Gemm(GemmBf16 { a, b, c, m, n, k })
-            | Self::GemmCol64(GemmBf16 { a, b, c, m, n, k })
-            | Self::GemmNarrow(GemmBf16 { a, b, c, m, n, k })
-            | Self::Gemv(GemmBf16 { a, b, c, m, n, k }) => {
+            Self::Gemm(GemmBf16 {
+                a, b, c, m, n, k, ..
+            })
+            | Self::GemmCol64(GemmBf16 {
+                a, b, c, m, n, k, ..
+            })
+            | Self::GemmNarrow(GemmBf16 {
+                a, b, c, m, n, k, ..
+            })
+            | Self::Gemv(GemmBf16 {
+                a, b, c, m, n, k, ..
+            }) => {
                 let (Some(ab), Some(bb), Some(cb)) =
                     (bf16_bytes(m, k), bf16_bytes(n, k), bf16_bytes(m, n))
                 else {

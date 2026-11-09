@@ -143,6 +143,7 @@ const fn gemm(a: u64, b: u32, c: u64, (m, n, k): (u32, u32, u32)) -> GemmBf16 {
         m,
         n,
         k,
+        ends: scratchy_target_cuda::step::GemvEnds::NONE,
     }
 }
 
@@ -164,6 +165,7 @@ const fn group(a: u64, m: u32, members: [(u32, u64, u32); 2]) -> GemmGroupBf16 {
         first: member(members[0]),
         second: member(members[1]),
         third: None,
+        ends: scratchy_target_cuda::step::GemvEnds::NONE,
     }
 }
 

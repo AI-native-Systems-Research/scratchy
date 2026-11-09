@@ -1436,8 +1436,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         )
                     }
                 }
-                CudaStep::GemmFp8(GemmBf16 { a, b, c, m, n, k })
-                | CudaStep::GemmCol64Fp8(GemmBf16 { a, b, c, m, n, k }) => {
+                CudaStep::GemmFp8(GemmBf16 {
+                    a, b, c, m, n, k, ..
+                })
+                | CudaStep::GemmCol64Fp8(GemmBf16 {
+                    a, b, c, m, n, k, ..
+                }) => {
                     let col64 = matches!(s, CudaStep::GemmCol64Fp8(_));
                     let (a, b) = (
                         Self::fp8_rows(slot, a, m, k),
@@ -1447,7 +1451,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // (`n*k` bytes then `n` f32, `step::fp8_weight`) and `c` (`m*n`).
                     unsafe { kernels::gemm_fp8_abt(a, b, slot(c), (m, n, k), col64, stream.0) }
                 }
-                CudaStep::GemmNarrowFp8(GemmBf16 { a, b, c, m, n, k }) => {
+                CudaStep::GemmNarrowFp8(GemmBf16 {
+                    a, b, c, m, n, k, ..
+                }) => {
                     let (a, b) = (
                         Self::fp8_rows(slot, a, m, k),
                         Self::fp8_weight(weights, b, n, k),
@@ -1472,7 +1478,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     }
                 }
-                CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
+                CudaStep::GemmCol64(GemmBf16 {
+                    a, b, c, m, n, k, ..
+                }) => {
                     let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                     unsafe {
@@ -1587,12 +1595,16 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         )
                     }
                 }
-                CudaStep::Gemm(GemmBf16 { a, b, c, m, n, k }) => {
+                CudaStep::Gemm(GemmBf16 {
+                    a, b, c, m, n, k, ..
+                }) => {
                     let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                     unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
                 }
-                CudaStep::GemmNarrow(GemmBf16 { a, b, c, m, n, k }) => {
+                CudaStep::GemmNarrow(GemmBf16 {
+                    a, b, c, m, n, k, ..
+                }) => {
                     let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                     unsafe {

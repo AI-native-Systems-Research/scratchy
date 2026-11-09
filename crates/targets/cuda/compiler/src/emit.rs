@@ -121,6 +121,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "SoftCapBf16",
                 "GemmGroupBf16",
                 "GroupMember",
+                "RowNorm",
+                "GemvEnds",
                 "AddRmsNormBf16",
                 "NormAddBf16",
                 "GateUpActBf16",

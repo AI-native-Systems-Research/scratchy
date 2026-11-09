@@ -2258,6 +2258,7 @@ mod tests {
             m: 256,
             n: 1024,
             k: 512,
+            ends: crate::step::GemvEnds::NONE,
         }),
         CudaStep::RmsNorm(RmsNormBf16 {
             x: ArenaOffset(262144),
@@ -2305,6 +2306,7 @@ mod tests {
             m,
             n,
             k,
+            ends: crate::step::GemvEnds::NONE,
         })
     }
 
@@ -3879,6 +3881,7 @@ mod tests {
             m: 1,
             n: 1024,
             k: 512,
+            ends: crate::step::GemvEnds::NONE,
         })],
         rotary: None,
         kv: None,
@@ -3911,6 +3914,7 @@ mod tests {
                 m: 1,
                 n: 8,
                 k: 4,
+                ends: crate::step::GemvEnds::NONE,
             })],
             rotary: None,
             kv: None,
@@ -3935,6 +3939,7 @@ mod tests {
                 m: 2,
                 n: 512,
                 k: 256,
+                ends: crate::step::GemvEnds::NONE,
             })])),
             ..ONE_ROW
         };
