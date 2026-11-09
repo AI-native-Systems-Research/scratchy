@@ -10135,7 +10135,7 @@ fn emit_superdsc_wiring(
 /// nothing parses it, at build time or after. `OUT_DIR` is cargo's own per-build directory for the crate
 /// being expanded, and every arch crate has a `build.rs`, so it is set here.
 #[cfg(feature = "spyre")]
-#[cfg_attr(not(feature = "spyre-hw"), allow(unused_variables))]
+#[cfg_attr(not(feature = "spyre-lower"), allow(unused_variables))]
 fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     // ⭐⭐⭐ WHAT IS INVENTORIED DEPENDS ON THE DEVICE, AND ONLY ON THE DEVICE.
     //
@@ -10228,7 +10228,7 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     //    measured 25 groups/layer (granite-2b, 40 layers) to 73 (gemma-4-12b, 48): a flat
     //    ceiling tight enough to hold the 2b refuses the 12b. Card-only: on the emulator the
     //    drained groups are one-per-op KTIR programs, a different unit this budget never sees.
-    #[cfg(feature = "spyre-hw")]
+    #[cfg(feature = "spyre-lower")]
     {
         let layers = model.text.layers.get();
         let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
@@ -12219,7 +12219,7 @@ fn dump_wavefront_mega(
                                     // applied upstream of both consumers, moved to the consumer that
                                     // wants it.
                                     let unrolled = superdsc::unroll_layers::<$W>(&rolled);
-                                    let card = cfg!(feature = "spyre-hw");
+                                    let card = cfg!(feature = "spyre-lower");
                                     let unrolled_params = rolled.attn_params;
                                     let pre = if card {
                                         superdsc::emit_bundle::<$W>(
@@ -13528,7 +13528,7 @@ fn dump_wavefront_mega(
         // through `superdsc_decode_rungs` / `BatchSlot`, which it consults under `spyre-hw` alone —
         // an emulator build sets `batched_prefill: None` (`spyre_load.rs:1713`) and never runs one.
         // Five more whole-model bakes for nothing.
-        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             // RUNGS PAST 8. A decode step's cost is dominated by a FIXED penalty for leaving the
             // mq==1 fast path — the body goes 271 ops/layer at one request to 612 at two, then only
             // +16 per further request — plus one launch per request. Measured 36 ms fixed + ~2 ms per
@@ -13797,7 +13797,7 @@ fn dump_wavefront_mega(
                 // mq-INDEPENDENT ([nblk,64,nkv,hd]), so this mq-2 placeholder prefill graph's KV
                 // shapes still match the mq=1 decode exactly (the KV-shape-agreement guard passes).
                 DECODE_MQ.max(2)
-            } else if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+            } else if sendnn_superdsc && cfg!(feature = "spyre-lower") {
                 // SuperDSC bakes the whole WIDTH LADDER and lets the WIDEST rung that actually
                 // lowers become the ceiling (see the rung loop below), so this is just where the
                 // ladder STARTS looking — not a value that has to be right. That is what demotes
@@ -13836,7 +13836,7 @@ fn dump_wavefront_mega(
         // reached through `prefill_rungs`, which `spyre_forward.rs` reads under `spyre-hw` alone.
         // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (25 now, to 256) — the generated
         // model source and rustc's single-threaded pass over it both paid for all of them.
-        let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             let mut v: Vec<u32> = PREFILL_RUNGS
                 .into_iter()
                 .filter(|&r| r > 1 && r <= prefill_m && rung_admitted(r))
@@ -14001,7 +14001,7 @@ fn dump_wavefront_mega(
         // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on
         // the rungs codegen actually baked, never the const ladder. A short ladder runs, correctly and
         // slowly, with nothing anywhere saying so; see `PagedKvPool::prefill_ladder_reaches_the_window`.
-        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
@@ -14035,7 +14035,7 @@ fn dump_wavefront_mega(
         // narrowest.
         // ⛔ ONE WIDTH WAS THE MEASURED COST. This baked the widest rung alone, and a 52-row tail ran a
         // full 512-row chunk — granite-3.1-2b at ~2k tokens: 460 ms against 384 ms on the 256-row build.
-        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
@@ -14158,7 +14158,7 @@ fn dump_wavefront_mega(
         // worker stages one wiring's scales for every bundle of a phase. (A card launch binds its own
         // session's placed registry, `SuperDscSession::bake_facts`, so its rungs may differ: a decode
         // batch rung's carries the batched kernel's clamp.)
-        if !cfg!(feature = "spyre-hw") {
+        if !cfg!(feature = "spyre-lower") {
             let (decode_bound, prefill_bound) = &*registry_bound.borrow();
             let wrong: Vec<String> = registry_ledger
                 .borrow()

@@ -4762,6 +4762,62 @@ mod production_ktir_dump {
         Ok(ops.iter().map(sdsc_line).collect())
     }
 
+    /// ⭐ THE STRUCTURAL TWIN, RUN IN EVERY TEST PASS — the same driver over the same `entries()`,
+    /// writing nothing and asserting the SHAPE of the result rather than its bytes. Every production
+    /// kernel compiles to a non-empty KTIR module; every one the door lowers emits at least one op;
+    /// and the kernels the door does NOT lower are exactly the two named tables — the skips
+    /// (`sdsc_skip_of`, kernels with no door row) and the refusals below (kernels whose door
+    /// refuses them by name, each with the substring its refusal must carry). A kernel that starts
+    /// refusing, stops refusing, or refuses for another reason fails here, by name, with no golden
+    /// to regenerate: the byte-level proof stays the ignored driver's diff.
+    #[test]
+    fn every_production_kernel_lowers_or_is_refused_by_name() {
+        // (kernel, a substring its door refusal carries).
+        const EXPECTED_REFUSALS: &[(&str, &str)] = &[
+            ("lmlast_fwd_s1", "states no `node_out_tid`"),
+            ("lmlast_fwd_s2", "states no `node_out_tid`"),
+            ("lmlast_fwd_s3", "states no `node_out_tid`"),
+        ];
+        let mut refused: Vec<(&str, String)> = Vec::new();
+        let mut skipped: Vec<&str> = Vec::new();
+        for (name, src, spec, grid) in entries() {
+            let module = compile_kernel(src, &spec, &grid)
+                .unwrap_or_else(|e| panic!("`{name}` did not compile: {e}"));
+            assert!(
+                !triton_ktir::text::print::print(&module).trim().is_empty(),
+                "`{name}` printed an empty module"
+            );
+            if sdsc_skip_of(name).is_some() {
+                skipped.push(name);
+                continue;
+            }
+            let node = triton_ktir_superdsc::node_for(&module, program_of(name))
+                .unwrap_or_else(|e| panic!("`{name}` did not mint a node: {e}"));
+            match emit_sdsc(name, &node) {
+                Ok(lines) => assert!(!lines.is_empty(), "`{name}` emitted no ops"),
+                Err(reason) => refused.push((name, reason)),
+            }
+        }
+        let names: Vec<&str> = refused.iter().map(|(n, _)| *n).collect();
+        let expected: Vec<&str> = EXPECTED_REFUSALS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names, expected,
+            "the kernels the door refuses moved — refusals: {refused:#?}"
+        );
+        for ((name, reason), (_, why)) in refused.iter().zip(EXPECTED_REFUSALS) {
+            assert!(
+                reason.contains(why),
+                "`{name}` is refused, but not for the named reason ({why:?}): {reason}"
+            );
+        }
+        skipped.sort_unstable();
+        assert_eq!(
+            skipped,
+            ["moe_fwd", "moe_prefill_fwd", "rope_fwd"],
+            "the named skips moved"
+        );
+    }
+
     #[test]
     #[ignore = "the LegalizeTypes byte-identity proof driver: dumps every production \
                 kernel's post-to_ktir module text and asserts nothing about the numbers — \

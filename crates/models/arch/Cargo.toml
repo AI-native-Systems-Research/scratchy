@@ -707,7 +707,13 @@ metal = [
     "scratchy-vision?/metal",
 ]
 # A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
-spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
+# THE CARD'S LOWERING, no device compile (see the macro crate's `spyre-lower`): the step CI runs to
+# see a card-only lowering defect without a card.
+spyre-lower = ["spyre", "scratchy-forward-compiler-macro/spyre-lower"]
+spyre-hw = ["spyre-lower", "scratchy-forward-compiler-macro/spyre-hw"]
+# Write each baked bundle's dxp input under the build's target dir (the macro's `superdsc-dump`): the
+# bake runs inside the proc-macro, so the output is named on the macro's copy of the target crate.
+superdsc-dump = ["spyre", "scratchy-forward-compiler-macro/superdsc-dump"]
 # THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
 # an emu build refuses to compile a bundle whose emulator run diverges from the
 # reference semantics at the probe.

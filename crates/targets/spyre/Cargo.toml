@@ -32,7 +32,15 @@ tp-8 = ["ktir-superdsc/tp-8"]
 #                  own f16 encoding, its own launch. Neither sibling implies the other, and neither
 #                  is a fallback for the other.
 spyre = []
-spyre-hw = ["spyre", "dep:flex-rs"]
+#   spyre-lower  — the card's LOWERING with no device compile: every rung the card bakes, through
+#                  `render_dxp_input` and `launch_index` and every refusal on the way, and no device
+#                  image (`superdsc_bake::global()` is `None`). What a card bake lowers is decided here;
+#                  `spyre-hw` adds only the compiler that turns it into images, and the SDK.
+spyre-lower = ["spyre"]
+# WRITE EACH BAKED BUNDLE'S dxp INPUT under `<target>/superdsc-dump/<fp>/`, for diffing against a
+# known-good dump. An output a build names, off by default; it changes nothing the bake lowers.
+superdsc-dump = ["spyre"]
+spyre-hw = ["spyre-lower", "dep:flex-rs"]
 spyre-emu = ["spyre", "dep:ktir-emulator"]
 # ⭐ THE TRITON SPLICE IS THE ONLY PRODUCER — UNCONDITIONAL. `lower_one_node` routes
 # every spliced op kind (`MatmulTile`, `Elementwise`, `SiluMul`, `RmsNorm`,
