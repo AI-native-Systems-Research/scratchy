@@ -1953,7 +1953,8 @@ def energy(reps):
         return None
     total = {k: round(sum(p[k] for p in parts), 2) for k in ("cpu_j", "gpu_j", "ane_j", "soc_j")}
     total |= {"window_s": round(sum(p["window_s"] for p in parts), 3),
-              "samples": sum(p["samples"] for p in parts)}
+              "samples": sum(p["samples"] for p in parts),
+              "uncovered_s": round(sum(p.get("uncovered_s", 0.0) for p in parts), 3)}
     whole = {k: sum(j.get(k) or 0 for j in reps) for k in ("completed", "failed", "total_output_tokens")}
     if reps[0].get("accuracy") is not None:
         whole |= {"accuracy": reps[0]["accuracy"], "num_tasks": reps[0].get("num_tasks")}
