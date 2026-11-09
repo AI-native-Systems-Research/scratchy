@@ -945,7 +945,7 @@ fn an_on_card_launch_carries_no_token_and_keeps_the_row_laws() {
         "and live 0's new-block column"
     );
     assert_eq!(pad.hist(), live0.hist(), "and live 0's prefix history");
-    for i in 1..3 {
+    for (i, hist) in hists.iter().enumerate().skip(1) {
         let r = rows.row(i).expect("a live slot");
         assert_eq!(
             r.rope_pos(),
@@ -953,7 +953,7 @@ fn an_on_card_launch_carries_no_token_and_keeps_the_row_laws() {
             "live row {i} keeps its own rotation"
         );
         assert_eq!(r.new_block_col().index(), i, "and its own column");
-        assert_eq!(r.hist(), &hists[i], "and its own history");
+        assert_eq!(r.hist(), hist, "and its own history");
     }
 }
 
