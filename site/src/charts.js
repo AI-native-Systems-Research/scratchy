@@ -18,6 +18,11 @@
 // A chart in a hidden switcher panel is clipped to nothing (styles.css), so it
 // is drawn when its panel is shown, at its real size.
 //
+// A page may keep its charts' data apart from its HTML, in a JSON file of one
+// spec an id that a <meta name="chart-data"> names (charts.rs keep_apart): its
+// mounts carry data-chart-id, and the file is fetched once, with the fonts,
+// before any is drawn. A mount carrying data-chart holds its spec itself.
+//
 // The page follows the reader's system theme, Carbon's white or g100 class on
 // <html> (chrome.rs), and so does every chart: the build gives each colour
 // for both, and when the class changes the charts redraw in the new one.
@@ -52,7 +57,7 @@
         drawn.push(draw(e.target, current));
       });
     }, { rootMargin: '100% 0px' });
-    document.querySelectorAll('[data-chart]').forEach(function (el) { near.observe(el); });
+    document.querySelectorAll('[data-chart], [data-chart-id]').forEach(function (el) { near.observe(el); });
     new MutationObserver(function () {
       var t = theme();
       if (t.key === current.key) return;
@@ -63,7 +68,9 @@
   // Draws one chart in the theme `t`.
   function draw(el, t) {
     var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart };
-    var spec = JSON.parse(el.getAttribute('data-chart'));
+    var id = el.getAttribute('data-chart-id');
+    // The side file's specs arrive parsed; an inline one is its attribute's text.
+    var spec = id === null ? JSON.parse(el.getAttribute('data-chart')) : specs[Number(id)];
     if (spec.ratio) {
       var total = spec.options.locale.translations.total;
       spec.options.tooltip = {
@@ -235,8 +242,25 @@
     });
     chart.services.events.addEventListener('heatmap-mouseout', clear);
   }
+  // The side file's specs, by id: empty for a page that carries them inline.
+  var specs = [];
+  function sideFile() {
+    var meta = document.querySelector('meta[name="chart-data"]');
+    if (!meta) return Promise.resolve();
+    return fetch(meta.getAttribute('content'))
+      .then(function (r) {
+        if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+        return r.json();
+      })
+      .then(function (list) { specs = list; });
+  }
   function whenLaidOut() {
-    document.fonts.ready.then(drawNear);
+    Promise.all([document.fonts.ready, sideFile()]).then(drawNear, function (e) {
+      // No data, no charts: say so where each would be, not leave it blank.
+      document.querySelectorAll('[data-chart-id]').forEach(function (el) {
+        el.textContent = 'Chart data did not load (' + e.message + '); reload the page.';
+      });
+    });
   }
   if (document.readyState === 'complete') whenLaidOut();
   else window.addEventListener('load', whenLaidOut, { once: true });

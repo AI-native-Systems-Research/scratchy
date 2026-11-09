@@ -1948,6 +1948,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             og: None,
             root: Root(0),
             libraries: &[Library::CarbonCharts],
+            chart_data: None,
         },
         page,
     )?;

@@ -4061,6 +4061,9 @@ fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
 
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     crate::charts::new_page();
+    // The page's chart specs go to a side file, not its HTML: they are most of its bytes, and a
+    // chart is drawn only once it nears the screen ([`crate::charts::keep_apart`]).
+    crate::charts::keep_apart();
     let runs = load(site)?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
@@ -4113,7 +4116,14 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let description = format!(
         "{against} on Apple silicon: startup, single-user speed, and scaling, per machine."
     );
-    let html = chrome::document(
+    // The body first, so every chart has given its spec before the side file is written.
+    let body = dioxus_ssr::render_element(page);
+    let specs = crate::charts::kept();
+    let side = format!("[{}]", specs.join(","));
+    let side_name = crate::hashed_name("metal.charts.json", side.as_bytes());
+    let side_path = site.out.join(&side_name);
+    fs::write(&side_path, &side).map_err(|e| format!("{}: {e}", side_path.display()))?;
+    let html = chrome::document_html(
         Head {
             assets,
             title: "Metal performance — scratchy",
@@ -4121,8 +4131,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             og: None,
             root: Root(0),
             libraries: &[Library::CarbonCharts],
+            chart_data: Some(&side_name),
         },
-        page,
+        body,
     )?;
     let out = site.out.join("metal.html");
     fs::write(&out, html).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -4352,6 +4363,25 @@ mod tests {
         assert!(rag.contains("repeat(auto-fit, minmax(16rem, 1fr))"), "ECDFs fill the row");
         assert!(rag.contains("minmax(min(100%, 20rem), 1fr)"), "users charts two a row");
         assert!(!rag.contains("max-width: 24rem"));
+    }
+
+    /// A page that keeps its charts' data apart carries only each chart's id in its HTML; the
+    /// data is the side file's, one spec an id, in the order the ids were given.
+    #[test]
+    fn a_pages_chart_data_is_kept_apart() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        crate::charts::keep_apart();
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        let specs = crate::charts::kept();
+        assert!(!specs.is_empty(), "charts drawn");
+        assert!(!html.contains("data-chart=\"{"), "no spec inline");
+        assert_eq!(html.matches("data-chart-id=\"").count(), specs.len());
+        let first: serde_json::Value = serde_json::from_str(&specs[0]).unwrap();
+        assert!(first.get("options").is_some(), "a spec");
+        // A page that does not keep them apart still carries them inline, as before.
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("data-chart=\"{"));
     }
 
     #[test]
