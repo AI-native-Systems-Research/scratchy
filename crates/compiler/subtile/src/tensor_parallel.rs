@@ -1083,11 +1083,11 @@ pub fn shard<T: World>(
 ///
 /// Sources keep their indices (only their per-rank shapes change), so the source bindings carry over
 /// unchanged; how each one is sliced is [`ShardedForward::sources`].
-pub fn shard_lowered<T: World>(
-    lowered: &crate::handoff::LoweredDecode,
+pub fn shard_lowered<T: World, E: crate::handoff::EmbedState>(
+    lowered: &crate::handoff::LoweredDecode<E>,
     granule: SplitGranule,
     gathers: &[RowGather],
-) -> Result<(crate::handoff::LoweredDecode, ShardedForward<T>), ShardRefusal> {
+) -> Result<(crate::handoff::LoweredDecode<E>, ShardedForward<T>), ShardRefusal> {
     let sharded = shard::<T>(&lowered.input, granule, gathers)?;
     let n_local = sharded.local.ops.len();
     let at = |i: usize| sharded.op_map[i];
@@ -1102,22 +1102,21 @@ pub fn shard_lowered<T: World>(
         op_tiles[at(i)] = *tile;
         op_expansion[at(i)] = *exp;
     }
-    let out = crate::handoff::LoweredDecode {
-        input: sharded.local.clone(),
-        bindings: lowered.bindings.clone(),
+    let out = lowered.with_ops(
+        sharded.local.clone(),
         op_tiles,
-        norm_gain_add_tiles: lowered
+        lowered
             .norm_gain_add_tiles
             .iter()
             .map(|(&i, &tile)| (at(i), tile))
             .collect(),
         op_expansion,
-        unnamed_reads: lowered
+        lowered
             .unnamed_reads
             .iter()
             .map(|&(w, r)| (at(w), at(r)))
             .collect(),
-    };
+    );
     Ok((out, sharded))
 }
 
@@ -1520,11 +1519,11 @@ mod tests {
         use crate::fixtures::front_end_lowered;
         let lowered = front_end_lowered(one_layer_input());
         let (one, _) =
-            shard_lowered::<TpWorld<1>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
+            shard_lowered::<TpWorld<1>, _>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
         assert_eq!(format!("{one:?}"), format!("{lowered:?}"));
 
         let (two, sf) =
-            shard_lowered::<TpWorld<2>>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
+            shard_lowered::<TpWorld<2>, _>(&lowered, SplitGranule::of::<64>(), &[]).unwrap();
         assert_eq!(two.op_tiles.len(), two.input.ops.len());
         assert_eq!(two.op_expansion.len(), two.input.ops.len());
         for (i, &k) in sf.op_map.iter().enumerate() {

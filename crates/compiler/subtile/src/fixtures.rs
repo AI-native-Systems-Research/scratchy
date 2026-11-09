@@ -784,16 +784,18 @@ pub const TURBOQUANT_SHAPED_CODEC: KvCodecFacts = KvCodecFacts {
 /// `input` as the front end hands it over: op `i` realizes tile `i`, nothing expanded.
 pub fn front_end_lowered(input: LoweringInput) -> LoweredDecode {
     let n = input.ops.len();
-    LoweredDecode {
-        bindings: (0..input.sources.len() as u32)
-            .map(|id| SourceBinding::Weight { id, index: None })
-            .collect(),
-        op_tiles: (0..n as u32).map(|t| Some((t, 0))).collect(),
-        norm_gain_add_tiles: HashMap::from([(0, 100)]),
-        op_expansion: vec![None; n],
-        unnamed_reads: Vec::new(),
+    let bindings = (0..input.sources.len() as u32)
+        .map(|id| SourceBinding::Weight { id, index: None })
+        .collect();
+    LoweredDecode::new(
         input,
-    }
+        bindings,
+        (0..n as u32).map(|t| Some((t, 0))).collect(),
+        HashMap::from([(0, 100)]),
+        vec![None; n],
+        Vec::new(),
+    )
+    .expect("a fixture of weight sources names no embed row")
 }
 
 /// Per-buffer byte sizes (bf16 = 2 bytes / element) for a
