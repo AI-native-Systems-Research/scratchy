@@ -2111,7 +2111,11 @@ pub enum ViewFrame {
     /// starts are its blocks), so it derives no layout of its own and stays classified as `Own`
     /// outside the authority's declaration.
     /// A one-stick landing is the flat frame's own bytes and never carries this frame.
-    LandedBlocks,
+    ///
+    /// ⭐ IT CARRIES THE ARRANGEMENT IT DECLARES — the stick-major `[rows, cols]` of the one block,
+    /// minted at the stamp from the landing's own extents. The authority reads it; nothing re-derives
+    /// it from the view at emit, so the stamp and the declaration are one fact.
+    LandedBlocks(crate::sdsc_abstract::StickLayout),
 }
 
 /// ⭐ A TENSOR'S STATED DEVICE ORDER — the order dxp reads its dims in, innermost first, as the dims
