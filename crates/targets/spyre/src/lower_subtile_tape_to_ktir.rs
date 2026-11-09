@@ -1327,7 +1327,7 @@ pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // end of `lower_graph_to_ktir` nothing has been declared yet and this grew seg3 by zero. That is
     // the same ordering fact the re-rolled walk pays for with its explicit declare pass.
     let seg3 = SegRole::Intermediate.segment();
-    let synth_high = bundle_layout.synth.borrow().next;
+    let synth_high = bundle_layout.synth.borrow().high_water();
     if synth_high > bundle_layout.segment_bytes[seg3] {
         bundle_layout.segment_bytes[seg3] = synth_high;
     }
@@ -2954,7 +2954,8 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
             // ([`crate::lower_subtile_tape_to_superdsc::kv_pool_tids`], placed on a card bake
             // only) — so a program binding it has no card plan to declare into there. A card
             // bake declares every program.
-            if !cfg!(feature = "spyre-hw") && k.bindings.iter().any(|b| pools.contains(&b.get())) {
+            if !cfg!(feature = "spyre-lower") && k.bindings.iter().any(|b| pools.contains(&b.get()))
+            {
                 continue;
             }
             crate::ktir_superdsc_door::lower::<T>(
@@ -3164,7 +3165,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         }
     }
     let seg3 = SegRole::Intermediate.segment();
-    let synth_high = bundle_layout.synth.borrow().next;
+    let synth_high = bundle_layout.synth.borrow().high_water();
     if synth_high > bundle_layout.segment_bytes[seg3] {
         bundle_layout.segment_bytes[seg3] = synth_high;
     }
@@ -3463,13 +3464,13 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
             );
         }
         let syn = bundle_layout.synth.borrow();
-        let mut szs: Vec<(&String, &u64)> = syn.sizes.iter().collect();
-        szs.sort_by_key(|(_, s)| std::cmp::Reverse(**s));
+        let mut szs: Vec<(&str, u64)> = syn.iter().map(|(name, _, size)| (name, size)).collect();
+        szs.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
         for (name, s) in szs.into_iter().take(10) {
             eprintln!(
                 "[SEGDUMP]   synth {name} size={:.4}GB ({} B)",
-                *s as f64 / 1e9,
-                *s
+                s as f64 / 1e9,
+                s
             );
         }
     }

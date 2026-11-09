@@ -238,8 +238,8 @@ use ktir_superdsc::emit::EmittedOp;
 ///    length field describes. IBM's own validator for this is commented out in `qg.h`.
 ///  * **Inside its segment.** A placement running past `segment_bytes[seg]` addresses memory the
 ///    segment does not own — I1's inner half, which the device checks only on one path.
-///  * **No overlap.** Two placements sharing bytes means one tensor's producer overwrites the
-///    other's, which is silent: wrong output, or a fault when the second is a kernel.
+///  * **No overlap** is not checked here: synthetics are disjoint by construction
+///    (`SynthAlloc::take`), and colored activations share slots by design.
 ///  * **Non-empty.** A zero-length field is read by the device as `1 << 27` flits = 16 GiB, in both
 ///    `handleHostDMA` and `handleXLATentry`. Zero does not mean nothing.
 ///  * **Allocatable.** A segment is ONE `FlexAllocator` allocation, served from ONE region, so it
@@ -344,42 +344,11 @@ fn audit_layout_addresses(
         }
     }
 
-    // ── overlap, per segment — SYNTHETICS ONLY ──
+    // ── overlap: not checked here ──
     //
-    // ⛔ COLORED ACTIVATIONS OVERLAP ON PURPOSE. The slot-coloring pass gives two tensors whose
-    // LIFETIMES are disjoint the same address; that is the optimisation, not a defect, and
-    // granite's `t447`/`t464`/`t1127` legitimately share one 4096 B slot. Liveness is not a fact
-    // this function has, so it does not get to judge them.
-    //
-    // Synthetics are different: they come from a BUMP allocator, so disjointness IS their
-    // invariant and an overlap means the allocator handed the same address out twice — which is
-    // exactly what it did, by never advancing `next` for an undeclared name.
-    for seg in 0..segment_bytes.len() {
-        let mut in_seg: Vec<&bundle::Placement> = places
-            .iter()
-            .filter(|p| {
-                p.segment as usize == seg
-                    && p.size > 0
-                    && matches!(p.id, bundle::PlaceId::Synth { .. })
-            })
-            .collect();
-        in_seg.sort_by_key(|p| p.offset);
-        for w in in_seg.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if a.offset + a.size > b.offset {
-                fail.push(format!(
-                    "{} spans [{}, {}) and {} starts at {} in seg{seg} — they SHARE {} B, so one \
-                     tensor's producer writes over the other's",
-                    a.id,
-                    a.offset,
-                    a.offset + a.size,
-                    b.id,
-                    b.offset,
-                    a.offset + a.size - b.offset
-                ));
-            }
-        }
-    }
+    // Colored activations overlap ON PURPOSE (two tensors whose lifetimes are disjoint share a slot:
+    // the slot-coloring pass's optimisation, a fact this function does not have). Synthetics cannot:
+    // `SynthAlloc::take` is their one writer and hands out disjoint ranges by construction.
 
     if !fail.is_empty() {
         let shown = fail.len().min(12);
@@ -1007,7 +976,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and a model whose
     //    pools outgrow one device region (`max_position_embeddings` pages of every layer) is refused
     //    by the address audit on the card it cannot fit, not on an emulator that never places them.
-    let pools = if cfg!(feature = "spyre-hw") {
+    let pools = if cfg!(feature = "spyre-lower") {
         kv_pool_tids(ir)
     } else {
         Vec::new()
@@ -1608,11 +1577,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
     // colored intermediates in seg3, so they never overlap a real intermediate.
-    let synth = std::cell::RefCell::new(SynthAlloc {
-        next: seg_bytes[SegRole::Intermediate.segment()],
-        map: std::collections::BTreeMap::new(),
-        sizes: std::collections::BTreeMap::new(),
-    });
+    let synth =
+        std::cell::RefCell::new(SynthAlloc::new(seg_bytes[SegRole::Intermediate.segment()]));
     // Every placed tensor's spelling, registered at the one site that knows the whole set.
     let ids = std::cell::RefCell::new(
         placements
@@ -6859,7 +6825,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     // SYNTHETIC intermediates are not SubtileIR tensors, so they have no `t{id}` — they are named
     // directly and always live in the Intermediate segment.
     let synth = synth.borrow();
-    places.extend(synth.map.iter().map(|(name, off)| {
+    places.extend(synth.iter().map(|(name, off, size)| {
         bundle::Placement {
             // ⛔ REFUSES rather than defaulting. Every synthetic is minted through `PlaceId::synth`,
             // which records the id; a name in `map` with no id means something allocated an
@@ -6872,15 +6838,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
             segment: SegRole::Intermediate as u32,
             // Synthetics are intermediates; only the WEIGHT segment is ever banked.
             bank: 0,
-            offset: *off,
-            // ⛔ NO `unwrap_or(0)`. A zero-length field is read by the device as `1 << 27` flits —
-            // 16 GiB — in both `handleHostDMA` and `handleXLATentry`. Every synthetic now has a size,
-            // declared or reserved at first reference, so a missing one is a bug in the allocator and
-            // says so.
-            size: *synth
-                .sizes
-                .get(name)
-                .unwrap_or_else(|| panic!("synthetic '{name}' has an offset but no reserved size")),
+            offset: off,
+            // The allocator reserves a name's size with its offset (`SynthAlloc::take`), and never
+            // zero: a zero-length field is read by the device as `1 << 27` flits — 16 GiB.
+            size,
             is_logits: false,
         }
     }));
@@ -6926,8 +6887,8 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     // caller can forget. A no-op for the SubtileIR path, which already grew it.
     let mut segment_bytes = *segment_bytes;
     let seg_i = SegRole::Intermediate.segment();
-    if synth.next > segment_bytes[seg_i] {
-        segment_bytes[seg_i] = synth.next;
+    if synth.high_water() > segment_bytes[seg_i] {
+        segment_bytes[seg_i] = synth.high_water();
     }
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
@@ -7097,7 +7058,7 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
         // emulator has no such ceiling: it runs the tile grid the func declares, which is how a
         // prefill of more than 32 tokens gets one core per token, so this is checked where the
         // limit exists and nowhere else.
-        #[cfg(feature = "spyre-hw")]
+        #[cfg(feature = "spyre-lower")]
         if cores > MAX_CORES {
             fail.push(format!(
                 "{name}: its grid names {cores} cores but the card has {MAX_CORES}"
@@ -7165,6 +7126,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
     {
@@ -7192,7 +7154,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     }
     let b = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params)?
+        emit_bundle_inner(ops, layout, fold, attn_params, dump)?
     };
     debug_assert_eq!(
         b.fp, fp,
@@ -7468,6 +7430,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> std::io::Result<EmittedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
@@ -7496,13 +7459,14 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     };
 
     // ⭐ ONE SHARED KTIR, TWO CONSUMERS. `-Fspyre-emu` runs the group's own programs directly, so
-    // the group IS the result — nothing is staged and nothing is submitted. `-Fspyre-hw` lowers
-    // that SAME KTIR to a real SuperDSC directory and stages + submits it to the device compiler:
+    // the group IS the result — nothing is staged and nothing is submitted. `-Fspyre-lower` (and so
+    // `-Fspyre-hw`) lowers that SAME KTIR to a real SuperDSC directory, and a card build stages +
+    // submits it to the device compiler:
     // this is the write-files/reserve-disk/pair-with-an-id step `emit_bundle_inner` used to do
     // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
-    let groups = if cfg!(feature = "spyre-hw") {
+    let groups = if cfg!(feature = "spyre-lower") {
         PendingGroups::Staged(
-            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params)
+            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params, dump)
                 .map_err(|e| std::io::Error::other(e.0))?,
         )
     } else {
@@ -7535,11 +7499,10 @@ impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
                 let bake = crate::superdsc_bake::global();
                 let mut out = Vec::with_capacity(staged.len());
                 for (kv, id) in &staged {
-                    // `bake` is `None` on a cardless build with `SCRATCHY_PLAN_ONLY_BAKE=1` (the
-                    // one case `global()` doesn't panic for having no device compiler) —
-                    // `ktir_groups_via_superdsc` staged/submitted nothing FOR that same reason,
-                    // so there is nothing to have lost here either. Empty `init_binary` matches
-                    // `ktir_groups`'s own plan-only default.
+                    // `bake` is `None` on a `spyre-lower` build without `spyre-hw` (no device image
+                    // is compiled) — `ktir_groups_via_superdsc` staged/submitted nothing FOR that
+                    // same reason, so there is nothing to have lost here either. Empty
+                    // `init_binary` matches `ktir_groups`'s own plan-only default.
                     let (init_binary, job_bin_ptr, correction) = match bake {
                         None => (Vec::new(), 0, Vec::new()),
                         Some(b) => {
@@ -8139,8 +8102,31 @@ pub fn ktir_groups<T: ktir_superdsc::collective::Tp>(
     Ok(out)
 }
 
-/// `-Fspyre-hw`'s counterpart to [`ktir_groups`]: the SAME per-op KTIR, lowered to real SuperDSC
-/// descriptors and handed to the bake queue.
+/// Where a bake writes each bundle's dxp input, when the build asks it to — the directory the BUILD
+/// passes in (the build script's own `OUT_DIR`, the one place that knows it: `compile_carrier`'s
+/// caller), never a path this crate reads from the environment. `None`: write nothing (every caller
+/// outside a build script, and every build without the `superdsc-dump` feature).
+#[derive(Clone, Copy, Debug)]
+pub struct DumpRoot<'a>(Option<&'a std::path::Path>);
+
+impl<'a> DumpRoot<'a> {
+    /// No dump.
+    pub const NONE: DumpRoot<'static> = DumpRoot(None);
+
+    /// Dump under `<dir>/superdsc-dump/<fp>/` — `dir` is the build's own output directory.
+    pub fn under(dir: &'a std::path::Path) -> Self {
+        DumpRoot(Some(dir))
+    }
+
+    fn bundle_dir(self, fp: &str) -> Option<std::path::PathBuf> {
+        self.0.map(|d| d.join("superdsc-dump").join(fp))
+    }
+}
+
+/// The card's counterpart to [`ktir_groups`] (`-Fspyre-lower`, and so `-Fspyre-hw`): the SAME per-op
+/// KTIR, lowered to real SuperDSC descriptors and handed to the bake queue — which a `spyre-lower`
+/// build without `spyre-hw` does not have, so every group is lowered, guarded and rendered and none
+/// is compiled.
 ///
 /// ⛔⛔⛔ THIS RENDERS NOTHING AND WRITES NOTHING OF ITS OWN. `lower_ktir_to_superdsc::lower` returns
 /// [`EmittedOp`]s carrying in-memory [`SdscOp`]s — built by `pw1`/`pw2`/`assemble_matmul`, the SAME
@@ -8165,6 +8151,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
@@ -8377,16 +8364,18 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // which run on this same card. Byte-equality against a known-good dump is what localised a layout
     // defect in this repo before; reasoning about paged addressing is what has not.
     //
-    // ⚠️ DIAGNOSTIC, AND UNCONDITIONAL BY CHOICE — there is no env gate to hide it behind (this repo
-    // forbids behaviour toggles), so it either belongs here or it does not. Remove it deliberately once
-    // the prefill fence is closed, or keep it and say so.
+    // ⭐ AN OUTPUT A BUILD ASKS FOR BY NAME — `dump` ([`DumpRoot`]), passed in by the build: the
+    // `superdsc-dump` feature makes the build script hand its own `OUT_DIR` here (never `/tmp`,
+    // never an environment read). It is not a behaviour toggle: what the bake lowers and refuses is
+    // the same with it on or off; it only decides whether the descriptors the bake already rendered
+    // are also written where a person can diff them. A CI lowering check (`spyre-lower`) writes
+    // nothing.
     // ⛔ `fold`, NOT A HARDCODED `Split`. This read `FoldGrouping::Split` unconditionally, so a FUSED
     // twin's dump directory was its split's partition under the twin's name — the one thing about a
     // twin that differs (where the group boundaries fall) was the one thing the dump could not show,
     // and a diff of the two dirs came back "identical" no matter what the bake actually did.
-    {
+    if let Some(dump) = dump.bundle_dir(fp) {
         let _pc = crate::pc::Pc::start("dump");
-        let dump = std::path::Path::new("/tmp/superdsc-dump").join(fp);
         if let Err(e) = write_rendered_dxp_input(&dump, &rendered) {
             eprintln!(
                 "  [superdsc-dump] {fp}: could not write {}: {e}",
@@ -8474,12 +8463,12 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         if let Err(e) = std::fs::write(dump.join("bundle_id.json"), &id_json) {
             eprintln!("  [superdsc-dump] {fp}: could not write bundle_id.json: {e}");
         }
-        eprintln!(
-            "[ktir->sdsc] BUNDLE {fp}: {} KTIR program(s) -> {} descriptor(s)",
-            ops.len(),
-            sdsc_ops.len(),
-        );
     } // pc:dump
+    eprintln!(
+        "[ktir->sdsc] BUNDLE {fp}: {} KTIR program(s) -> {} descriptor(s)",
+        ops.len(),
+        sdsc_ops.len(),
+    );
 
     // ── from here down this is main's block, verbatim ──
     let shifts = {
@@ -10722,7 +10711,7 @@ mod tests {
         // THE DECLARE PASS, then the real one — the same two lowerings every rung runs over
         // the ONE shared plan.
         pass(&layout);
-        let synth_before = layout.synth.borrow().map.len();
+        let synth_before = layout.synth.borrow().len();
         assert!(
             synth_before >= 2,
             "each node minted at least one intermediate — the fixture no longer exercises \
@@ -10736,7 +10725,7 @@ mod tests {
         // pass's buffers instead of on them.
         pass(&layout);
         assert_eq!(
-            layout.synth.borrow().map.len(),
+            layout.synth.borrow().len(),
             synth_before,
             "the second lowering minted fresh synthetics — the declare/real name agreement broke"
         );

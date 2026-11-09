@@ -2190,7 +2190,43 @@ pub enum ViewFrame {
     /// starts are its blocks), so it derives no layout of its own and stays classified as `Own`
     /// outside the authority's declaration.
     /// A one-stick landing is the flat frame's own bytes and never carries this frame.
-    LandedBlocks,
+    ///
+    /// ⭐ IT CARRIES THE ARRANGEMENT IT DECLARES — the stick-major `[rows, cols]` of the one block,
+    /// minted at the stamp from the landing's own extents. The authority reads it; nothing re-derives
+    /// it from the view at emit, so the stamp and the declaration are one fact.
+    LandedBlocks(crate::sdsc_abstract::StickLayout),
+}
+
+/// ⭐ A TENSOR'S STATED DEVICE ORDER — the order dxp reads its dims in, innermost first, as the dims
+/// themselves and as their positions in the tensor's `layout`. A PERMUTATION OF THE LAYOUT BY
+/// CONSTRUCTION: its one constructor is [`TensorArg::with_device_order`], which proves it, so every
+/// reader holds a proven fact and none re-checks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceOrder<const D: usize> {
+    /// The dims, innermost first.
+    dims: [&'static str; D],
+    /// `positions[i]` is the `layout` position of `dims[i]`.
+    positions: [usize; D],
+}
+
+impl<const D: usize> DeviceOrder<D> {
+    /// The dims, innermost first — `layoutDimOrder_`.
+    pub fn dims(&self) -> &[&'static str] {
+        &self.dims
+    }
+
+    /// Where each dim sits in the layout: entry `i` is the `layout` position of the `i`-th dim dxp
+    /// reads. A permutation of `0..D`.
+    pub fn positions(&self) -> &[usize] {
+        &self.positions
+    }
+}
+
+/// A rank-erased [`DeviceOrder`], as an [`ArgView`] carries it — the same proven permutation.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceOrderView<'a> {
+    pub dims: &'a [&'static str],
+    pub positions: &'a [usize],
 }
 
 #[derive(Clone, Debug)]
@@ -2248,7 +2284,7 @@ pub struct TensorArg<const D: usize> {
     /// walked innermost. `None` = dxp reads `layout` as written. Set via
     /// [`TensorArg::with_device_order`]; it reaches only the JSON (`layoutDimOrder_`, `maxDimSizes_`),
     /// never this emitter's start addresses.
-    device_order: Option<[&'static str; D]>,
+    device_order: Option<DeviceOrder<D>>,
 }
 
 impl<const D: usize> TensorArg<D> {
@@ -2309,17 +2345,30 @@ impl<const D: usize> TensorArg<D> {
         mut self,
         order: [&'static str; D],
     ) -> Result<TensorArg<D>, SuperDscError> {
-        let mut sorted = order;
-        let mut want = self.layout;
-        sorted.sort_unstable();
-        want.sort_unstable();
-        if sorted != want {
-            return Err(SuperDscError(format!(
+        let not_a_permutation = || {
+            SuperDscError(format!(
                 "TensorArg '{}': device order {order:?} is not a permutation of layout {:?}",
                 self.name, self.layout
-            )));
+            ))
+        };
+        // Each dim's position in the layout, every layout position taken once: the permutation, proven.
+        let mut positions = [0usize; D];
+        let mut taken = [false; D];
+        for (i, d) in order.iter().enumerate() {
+            let p = self
+                .layout
+                .iter()
+                .position(|l| l == d)
+                .ok_or_else(not_a_permutation)?;
+            if std::mem::replace(&mut taken[p], true) {
+                return Err(not_a_permutation());
+            }
+            positions[i] = p;
         }
-        self.device_order = Some(order);
+        self.device_order = Some(DeviceOrder {
+            dims: order,
+            positions,
+        });
         Ok(self)
     }
 
@@ -2415,24 +2464,14 @@ pub struct ArgView<'a> {
     /// How the view presents the tensor's own frame ([`ViewFrame`]).
     pub frame: ViewFrame,
     /// The order dxp reads the dims in, innermost first, when it is not `layout`'s (see
-    /// [`TensorArg`]'s `device_order`).
-    pub device_order: Option<&'a [&'static str]>,
+    /// [`TensorArg`]'s `device_order`) — a proven permutation of `layout` ([`DeviceOrder`]).
+    pub device_order: Option<DeviceOrderView<'a>>,
 }
 
 impl ArgView<'_> {
-    /// Where each dim of the stated device order sits in `layout` — entry `i` is the `layout` position
-    /// of the `i`-th dim dxp reads — or `None` when the view states no order of its own. The per-dim
-    /// arrays the JSON carries for this tensor (`layoutDimOrder_`, `maxDimSizes_`, `scale_`) are laid
-    /// in this order, so all three read it from here. (dxp indexes `scale_` by the op's primary
-    /// OUTPUT order; every op that states an order gives its operands the output's, or all-`Active`
-    /// scales, so the tensor's own order is that one.)
-    pub fn device_positions(&self) -> Option<Vec<usize>> {
-        self.device_order.map(|order| {
-            order
-                .iter()
-                .filter_map(|d| self.layout.iter().position(|l| l == d))
-                .collect()
-        })
+    /// The order dxp reads this view's dims in, innermost first: the stated order, else `layout`.
+    pub fn device_dims_order(&self) -> &[&'static str] {
+        self.device_order.map_or(self.layout, |o| o.dims)
     }
 }
 
@@ -2635,7 +2674,10 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
-                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
+                device_order: t.device_order.as_ref().map(|o| DeviceOrderView {
+                    dims: o.dims(),
+                    positions: o.positions(),
+                }),
             },
             AnyTensorArg::R2(t) => ArgView {
                 is_input: t.is_input,
@@ -2652,7 +2694,10 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
-                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
+                device_order: t.device_order.as_ref().map(|o| DeviceOrderView {
+                    dims: o.dims(),
+                    positions: o.positions(),
+                }),
             },
             AnyTensorArg::R3(t) => ArgView {
                 is_input: t.is_input,
@@ -2669,7 +2714,10 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
-                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
+                device_order: t.device_order.as_ref().map(|o| DeviceOrderView {
+                    dims: o.dims(),
+                    positions: o.positions(),
+                }),
             },
             AnyTensorArg::R4(t) => ArgView {
                 is_input: t.is_input,
@@ -2686,7 +2734,10 @@ impl AnyTensorArg {
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
                 frame: t.frame,
-                device_order: t.device_order.as_ref().map(|o| o.as_slice()),
+                device_order: t.device_order.as_ref().map(|o| DeviceOrderView {
+                    dims: o.dims(),
+                    positions: o.positions(),
+                }),
             },
         }
     }

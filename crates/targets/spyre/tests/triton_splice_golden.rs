@@ -635,6 +635,7 @@ fn spliced_dense_matmul_executes_the_real_program() {
 
 /// One spliced dense matmul through the production session entry, checked against a
 /// host reference over the SAME on-disk `[n, k]` weight bytes the worker binds.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
     let group = spliced_matmul_group(m, k, n);
 
@@ -804,6 +805,7 @@ fn a_narrow_prefill_matmul_writes_the_width_its_readers_read() {
 }
 
 /// `A[m, k] · W[n, k]ᵀ` on the host, over the on-disk `[n, k]` weight.
+#[cfg(feature = "spyre-emu")]
 fn host_matmul(a: &[f32], w: &[f32], m: u32, k: u32, n: u32) -> Vec<f32> {
     let mut want = vec![0.0f32; (m * n) as usize];
     for mi in 0..m {
@@ -818,6 +820,7 @@ fn host_matmul(a: &[f32], w: &[f32], m: u32, k: u32, n: u32) -> Vec<f32> {
     want
 }
 
+#[cfg(feature = "spyre-emu")]
 fn max_abs_err(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len());
     got.iter()
@@ -827,6 +830,7 @@ fn max_abs_err(got: &[f32], want: &[f32]) -> f32 {
 }
 
 /// The one spliced dense matmul's launch group — the tape's own numbering (A t0, W t1, O t2).
+#[cfg(feature = "spyre-emu")]
 fn spliced_matmul_group(
     m: u32,
     k: u32,
@@ -837,6 +841,7 @@ fn spliced_matmul_group(
 }
 
 /// Node `at` of `ir`, spliced, as a one-program launch group bound by the tape's own numbering.
+#[cfg(feature = "spyre-emu")]
 fn spliced_node_group(
     ir: &SubtileIR,
     at: usize,
@@ -907,6 +912,7 @@ fn spliced_elementwise_executes_the_real_program() {
 
 /// One spliced elementwise program through the production session entry, checked
 /// against a host reference.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
     use std::borrow::Cow;
 
@@ -1020,6 +1026,7 @@ fn spliced_gelu_executes_the_real_program() {
 
 /// One spliced gelu program through the production session entry, checked against the
 /// tanh-form host reference.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_gelu(m: u32, c: u32) {
     use std::borrow::Cow;
 
@@ -1326,6 +1333,7 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
 
 /// One spliced rope program through the production session entry, checked against a
 /// host NeoX reference over the worker-staged bytes.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     use std::borrow::Cow;
 
@@ -1664,6 +1672,7 @@ fn spliced_fp8_matmul_executes_the_real_program() {
 /// a host reference over the SAME packed e4m3 bytes and per-channel scale the
 /// worker binds (`spyre_load.rs`'s fp8 arm stages the weight verbatim 1-byte;
 /// `weight_arg`'s `Fp8E4m3` arm mirrors it here).
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     let ir = matmul_fp8_ir(m, k, n);
     let node = &ir.nodes[0];
@@ -1719,6 +1728,7 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
 
 /// Run ONE fp8 matmul KtirNode through the production session entry with the
 /// given host bytes, returning the `[m, n]` output.
+#[cfg(feature = "spyre-emu")]
 fn execute_fp8_program(
     m: u32,
     k: u32,
@@ -2890,8 +2900,8 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
     );
 }
 
-/// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows.
-#[cfg(feature = "spyre-emu")]
+/// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows. Pure arithmetic,
+/// read by the door tests every build runs, so it is not behind the emulator.
 fn pair_of_one_request(mq: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
     scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
         scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(mq)
@@ -2904,7 +2914,6 @@ fn pair_of_one_request(mq: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent 
 /// The extent pair a BATCH walk states: `rows` rows that are `rows` requests, one row
 /// each — the pair's held product is the graph's row count, which the batched kernel
 /// arm reads.
-#[cfg(feature = "spyre-emu")]
 fn batch_pair_of_one_row_each(rows: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
     scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
         scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
@@ -3606,6 +3615,7 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
 /// (`rmsnormunit.py`, the head-norm sandwich's unit): one input, no gamma. t0 = x
 /// source, t1 = result. Eps is gemma-4's `1e-6` — the subnormal regime the DLF16
 /// landing exists for.
+#[cfg(feature = "spyre-emu")]
 fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
     let tensors = vec![
         TensorShape { rows: m, cols: c },

@@ -132,6 +132,143 @@ pub struct ModelParams {
     /// evaluates to the bound's value, which makes its derivation's law (an exact quotient) a bound
     /// rustc checks.
     pub derived: BTreeMap<String, crate::dim::Dim>,
+    /// ⭐ THE TEXT BACKBONE'S GEOMETRY, typed at load ([`TextGeometry`]): the layer count, the
+    /// attention head dim and the RoPE base, each resolved ONCE where the config is read. A config
+    /// that cannot state one is a load error every scope reaches; no reader re-reads the keys, and
+    /// none defaults them.
+    pub text: TextGeometry,
+}
+
+/// The decoder layer count a config states (`num_hidden_layers`, or the length of its block
+/// schedule). Never zero: a decoder of no layers is not a config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerCount(std::num::NonZeroU32);
+
+impl LayerCount {
+    pub fn get(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+/// The attention head dim a config states, or the one the loader derives where it states none
+/// (`hidden_size / num_attention_heads`, MLA's `qk_nope + qk_rope`: [`derive_implicit_bounds`],
+/// the one derivation). Never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadDim(std::num::NonZeroU32);
+
+impl HeadDim {
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// The RoPE base frequency θ the model computes with: the config's stated `rope_theta` (after
+/// [`normalize_hf_config`]'s hoists and the arch's `config_aliases`), else the ARCH's own default
+/// (`scalar_defaults.rope_theta` in its `arch.json` — the architecture's config class default, the
+/// value its checkpoints were trained against when they omit it, never a value this compiler
+/// picks). A config that states none of an arch that declares none is a load error. Finite and
+/// positive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeTheta(f64);
+
+impl RopeTheta {
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// The text backbone's geometry, typed at load — see [`ModelParams::text`]. A `#[vision_forward]`
+/// config is a VL wrapper whose `text_config` states the decoder it feeds; its tower's own
+/// geometry is the `vision_*` bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextGeometry {
+    pub layers: LayerCount,
+    pub head_dim: HeadDim,
+    pub rope_theta: RopeTheta,
+    /// The sliding (local) attention class's RoPE base, when the config states one
+    /// (`rope_local_base_freq`, after the hoists and the arch's aliases: gemma-3/4's
+    /// `rope_parameters.sliding_attention.rope_theta`, modernbert's `local_rope_theta`). NOT
+    /// defaulted to [`Self::rope_theta`]: no architecture in tree defines its local base as the
+    /// global one, so a body that reads a local rotary table takes it through
+    /// [`Self::rope_local_for`], which refuses a config that states none.
+    pub rope_local: Option<RopeTheta>,
+}
+
+impl TextGeometry {
+    /// Resolve the geometry from a config's normalized json and its harvested bounds/scalars (after
+    /// every derivation and arch default has run), or name the fact the config does not state.
+    pub(crate) fn of(
+        bounds: &BTreeMap<String, u64>,
+        scalars: &BTreeMap<String, f64>,
+        source_path: &Path,
+    ) -> Result<Self, ConfigError> {
+        let missing = |reason: String| ConfigError::Geometry {
+            path: source_path.to_path_buf(),
+            reason,
+        };
+        let layers = bounds
+            .get("num_hidden_layers")
+            .and_then(|&n| u32::try_from(n).ok())
+            .and_then(std::num::NonZeroU32::new)
+            .map(LayerCount)
+            .ok_or_else(|| {
+                missing(
+                    "no `num_hidden_layers` (nor a block schedule to count): a decoder states \
+                     how many layers it has"
+                        .to_string(),
+                )
+            })?;
+        let head_dim = bounds
+            .get("head_dim")
+            .and_then(|&hd| u32::try_from(hd).ok())
+            .and_then(std::num::NonZeroU32::new)
+            .map(HeadDim)
+            .ok_or_else(|| {
+                missing(format!(
+                    "no nonzero `head_dim`, stated or derived (`hidden_size / \
+                     num_attention_heads` where it divides): `head_dim` {:?}, `hidden_size` {:?}, \
+                     `num_attention_heads` {:?}",
+                    bounds.get("head_dim"),
+                    bounds.get("hidden_size"),
+                    bounds.get("num_attention_heads"),
+                ))
+            })?;
+        let theta = scalars.get("rope_theta").copied().ok_or_else(|| {
+            missing(
+                "no `rope_theta`, and its arch declares no default \
+                 (`scalar_defaults.rope_theta` in the arch's arch.json, cited to the \
+                 architecture's own config class)"
+                    .to_string(),
+            )
+        })?;
+        if !(theta.is_finite() && theta > 0.0) {
+            return Err(missing(format!("`rope_theta` is {theta}")));
+        }
+        let rope_local = match scalars.get("rope_local_base_freq").copied() {
+            None => None,
+            Some(t) if t.is_finite() && t > 0.0 => Some(RopeTheta(t)),
+            Some(t) => return Err(missing(format!("`rope_local_base_freq` is {t}"))),
+        };
+        Ok(Self {
+            layers,
+            head_dim,
+            rope_theta: RopeTheta(theta),
+            rope_local,
+        })
+    }
+
+    /// The local rotary class's base for a body that READS a local rotary table (`RotaryLocal`):
+    /// the config's stated value, or a build error naming the config — a local table baked at the
+    /// global base would rotate every sliding layer at the wrong frequency, silently.
+    pub fn rope_local_for(&self, stem: &str) -> RopeTheta {
+        self.rope_local.unwrap_or_else(|| {
+            panic!(
+                "model `{stem}`: its body reads a local (sliding) rotary table, but its config \
+                 states no `rope_local_base_freq` (nor an arch alias for one) — the local base is \
+                 the checkpoint's fact, never the global base"
+            )
+        })
+    }
 }
 
 pub use crate::bundles::ExpertActivation;
@@ -302,6 +439,12 @@ pub enum ConfigError {
         stem: String,
         tensors: Vec<String>,
     },
+    /// A config whose text geometry ([`TextGeometry`]) cannot be stated: no layer count, a zero
+    /// head dim, no RoPE base where neither it nor its arch states one.
+    Geometry {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -341,6 +484,9 @@ impl std::fmt::Display for ConfigError {
                  tensors: {}",
                 tensors.join(", ")
             ),
+            Self::Geometry { path, reason } => {
+                write!(f, "text geometry of {}: {reason}", path.display())
+            }
         }
     }
 }
@@ -1028,13 +1174,12 @@ pub(crate) fn carries_head(
 pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     let (_, json) = read_json_file(path)?;
     let stem = stem_of(path)?;
-    model_params_from_json(
-        &json,
-        &stem,
-        path,
-        Vec::new(),
-        &crate::arch_spec::DeclaredArchSpec::default(),
-    )
+    // The arch's declarations are part of what a config means (its RoPE base where the config
+    // omits it, its key aliases): read them as the walk does, never a default spec.
+    let dir = path
+        .parent()
+        .ok_or_else(|| ConfigError::NotADirectory(path.to_path_buf()))?;
+    model_params_from_json(&json, &stem, path, Vec::new(), &load_arch_json(dir)?)
 }
 
 /// Deep-merge `<stem>.overrides.json` onto `json` when the file exists, pushing
@@ -1779,6 +1924,7 @@ fn model_params_from_json(
     let expert_activation = ExpertActivation::of(json);
 
     derived.extend(apply_generic_bound_defaults(&mut bounds));
+    let text = TextGeometry::of(&bounds, &scalars, source_path)?;
 
     Ok(ModelParams {
         name,
@@ -1801,6 +1947,7 @@ fn model_params_from_json(
         arch,
         expert_activation,
         derived,
+        text,
     })
 }
 
@@ -1912,6 +2059,25 @@ fn vision_params_from_json(
 
     let expert_activation = ExpertActivation::of(json);
     derived.extend(apply_generic_bound_defaults(&mut bounds));
+    // The decoder this tower feeds, as the wrapper's `text_config` states it — read through the
+    // decoder path's own harvest (normalize, bounds, derivations, the arch's defaults), so the two
+    // loaders state one geometry for one config.
+    let text = {
+        let text_json = normalize_hf_config(json, &spec.config_aliases);
+        let mut text_bounds = extract_bounds(&text_json);
+        derive_layer_sets(&text_json, &mut text_bounds).map_err(|reason| {
+            ConfigError::LayerPattern {
+                path: source_path.to_path_buf(),
+                reason,
+            }
+        })?;
+        derive_implicit_bounds(&mut text_bounds);
+        let mut text_scalars = extract_scalars(&text_json);
+        for (k, v) in &spec.scalar_defaults {
+            text_scalars.entry(k.clone()).or_insert(*v);
+        }
+        TextGeometry::of(&text_bounds, &text_scalars, source_path)?
+    };
 
     Ok(ModelParams {
         name,
@@ -1934,6 +2100,7 @@ fn vision_params_from_json(
         arch,
         expert_activation,
         derived,
+        text,
     })
 }
 
@@ -3922,6 +4089,8 @@ mod tests {
             r#"{
                 "num_hidden_layers": 16,
                 "hidden_size": 2048,
+                "num_attention_heads": 16,
+                "rope_theta": 10000.0,
                 "rms_norm_eps": 0.000001,
                 "query_pre_attn_scalar": 256.0,
                 "attn_logit_softcapping": 50.0

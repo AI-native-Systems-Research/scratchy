@@ -1,0 +1,4 @@
+{
+  "_comment": "The RoPE base a Llama config omits is the architecture's own: transformers' `LlamaConfig` defaults `rope_theta=10000.0` (`models/llama/configuration_llama.py`), the value Llama-2 checkpoints were trained against and the one llama-2-70b's verbatim config leaves unstated. An explicit config value always wins.",
+  "scalar_defaults": { "rope_theta": 10000.0 }
+}

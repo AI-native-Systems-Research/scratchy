@@ -112,8 +112,8 @@ mod parse_python {
         let py_text =
             std::fs::read_to_string(root.join("crates/models/arch/dsl/qwen3.py")).unwrap();
         let py_carrier = crate::parse_python::parse_python_file(&py_text).expect("python parse");
-        let py_tokens =
-            crate::compile_carrier(py_carrier, &configs_dir).expect("python-costume pipeline");
+        let py_tokens = crate::compile_carrier(py_carrier, &configs_dir, None)
+            .expect("python-costume pipeline");
 
         let mut py_rendered = String::with_capacity(1 << 20);
         crate::render_tokens(py_tokens, &mut py_rendered);

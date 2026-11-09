@@ -47,12 +47,11 @@ use scratchy_subtile::subtile_ir::{
 };
 
 use crate::classified::{ExternKind, OpKind, UnrollIndex};
-use crate::codegen::weight_kind_accessor_method;
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::Inferred;
-use crate::weight_vocab::{WeightKind, WeightSlot, eval_shape_with, gemm_nk_from_fuf};
+use crate::weight_vocab::{eval_shape_with, gemm_nk_from_fuf};
 
 /// Why a FUF couldn't be lowered to a wavefront `LoweringInput`. Always
 /// surfaced (logged by the drive), never papered over.
@@ -85,6 +84,8 @@ pub enum BridgeError {
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
+    /// The walk minted two embed rows ([`scratchy_subtile::handoff::TwoEmbedRows`]).
+    TwoEmbedRows(scratchy_subtile::handoff::TwoEmbedRows),
     /// An RmsNorm's folded `w + offset` gain is neither the `w` nor the `(1 + w)` convention, and no
     /// kernel implements a third — rounding it to the nearest would scale every normalized
     /// activation by the wrong constant.
@@ -144,6 +145,7 @@ impl std::fmt::Display for BridgeError {
                 "the graph has attention ops but the model states no attention facts"
             ),
             Self::NoResult => write!(f, "FUF produced no result op"),
+            Self::TwoEmbedRows(e) => write!(f, "{e}"),
             Self::UnknownGainConvention { tile, offset } => write!(
                 f,
                 "tile {} rmsnorm gain offset {offset} is neither the w nor the (1+w) convention, \
@@ -2040,76 +2042,20 @@ pub fn lower_decode_to_wavefront(
             }
         }
     }
-    Ok(LoweredDecode {
-        input: LoweringInput {
+    LoweredDecode::new(
+        LoweringInput {
             sources: bx.sources,
             ops: bx.ops,
             result,
             exported,
         },
-        bindings: bx.bindings,
+        bx.bindings,
         op_tiles,
-        norm_gain_add_tiles: bx.norm_gain_add_tiles,
-        op_expansion: bx.op_expansion,
-        unnamed_reads: Vec::new(),
-    })
-}
-
-/// A per-arch weight locator recovered from a lowered decode bucket's
-/// `weight_slots`: the `(bucket, op_idx, slot)` triple the runtime
-/// `WeightAccessors::<kind>_at` match table keys on, plus the [`WeightKind`]
-/// selecting the accessor bundle. The unrolled `layer` is supplied
-/// per-source (it is the FUF's former loop-var), so this is layer-agnostic.
-#[derive(Clone, Debug)]
-pub struct WeightLocInfo {
-    pub bucket: u32,
-    pub op_idx: u32,
-    pub slot: u32,
-    pub kind: WeightKind,
-}
-
-/// Build `accessor-base-name → WeightLocInfo` from a decode bucket's
-/// backbone + lm_head `weight_slots`, reproducing
-/// [`crate::codegen::emit_weight_accessors_impl`]'s per-(op_idx, kind)
-/// slot-ordinal walk EXACTLY — both route the kind→method key through
-/// [`weight_kind_accessor_method`] — so a wavefront weight source resolves
-/// to the SAME `(bucket, op_idx, slot)` match arm the non-mega decode path
-/// uses. `bb_bucket_id` is the backbone tape-index (`2*ci`); lm_head is
-/// `bb_bucket_id + 1`.
-///
-/// First writer wins per base: within one (loop-compressed) decode body
-/// each accessor base occurs once per `(op_idx, kind)`, and every arm for a
-/// given base calls the same layer-parametric `self.<base>(layer)` getter,
-/// so any one arm is interchangeable given the right `layer`.
-pub fn build_base_to_loc(
-    backbone: &[Vec<WeightSlot>],
-    lm_head: &[Vec<WeightSlot>],
-    bb_bucket_id: u32,
-) -> HashMap<String, WeightLocInfo> {
-    let mut map: HashMap<String, WeightLocInfo> = HashMap::new();
-    let mut walk = |slots_arr: &[Vec<WeightSlot>], bucket: u32| {
-        for (op_idx, slots) in slots_arr.iter().enumerate() {
-            // Per-(op_idx, method) ordinal — identical to the runtime match
-            // table's `slot` axis.
-            let mut counts: HashMap<&'static str, u32> = HashMap::new();
-            for slot in slots {
-                let key = weight_kind_accessor_method(&slot.kind);
-                let n = counts.entry(key).or_insert(0);
-                let ordinal = *n;
-                *n += 1;
-                map.entry(slot.base.to_string())
-                    .or_insert_with(|| WeightLocInfo {
-                        bucket,
-                        op_idx: op_idx as u32,
-                        slot: ordinal,
-                        kind: slot.kind.clone(),
-                    });
-            }
-        }
-    };
-    walk(backbone, bb_bucket_id);
-    walk(lm_head, bb_bucket_id + 1);
-    map
+        bx.norm_gain_add_tiles,
+        bx.op_expansion,
+        Vec::new(),
+    )
+    .map_err(BridgeError::TwoEmbedRows)
 }
 
 /// Recover `(group_size, bits)` for a weight from its FUF `storage`
@@ -2153,7 +2099,10 @@ pub struct ResolutionReport {
 }
 
 /// Compute dump stats for a lowered forward (the drive logs these).
-pub fn stats(fuf: &Fuf, lowered: &LoweredDecode) -> BridgeStats {
+pub fn stats<E: scratchy_subtile::handoff::EmbedState>(
+    fuf: &Fuf,
+    lowered: &LoweredDecode<E>,
+) -> BridgeStats {
     let input = &lowered.input;
     let mut hist: HashMap<&'static str, usize> = HashMap::new();
     for od in &input.ops {
@@ -2165,12 +2114,12 @@ pub fn stats(fuf: &Fuf, lowered: &LoweredDecode) -> BridgeStats {
     let mut op_histogram: Vec<(&'static str, usize)> = hist.into_iter().collect();
     op_histogram.sort_by_key(|(n, _)| *n);
     let weight_sources = lowered
-        .bindings
+        .bindings()
         .iter()
         .filter(|b| matches!(b, SourceBinding::Weight { .. }))
         .count();
     let prefix_sources = lowered
-        .bindings
+        .bindings()
         .iter()
         .filter(|b| {
             matches!(

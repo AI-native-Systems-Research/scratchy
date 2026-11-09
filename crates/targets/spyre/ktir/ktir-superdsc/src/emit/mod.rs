@@ -3457,9 +3457,9 @@ fn resolve_seg_base(
         //    producer and consumer of the same name resolve to the SAME address and
         //    it never collides with weights/activations.
         let seg = SegRole::Intermediate.segment();
-        let mut s = l.synth.borrow_mut();
-        let off = if let Some(&o) = s.map.get(name) {
-            o
+        let s = l.synth.borrow();
+        let (off, fp) = if let (Some(o), Some(fp)) = (s.offset(name), s.size(name)) {
+            (o, fp)
         } else {
             // ⛔⛔⛔ THERE IS NO LAZY ALLOCATION. THIS IS A BUILD ERROR.
             //
@@ -3489,28 +3489,16 @@ fn resolve_seg_base(
                  tensor ONE shared address and a zero-byte placement."
             );
         };
-        if let Some(&fp) = s.sizes.get(name) {
-            // DECLARED synth (owns its full shape via BundleLayout::synth): its true footprint
-            // is already reserved up front. GUARD: no access may exceed it — an out-of-footprint
-            // write is a SHAPE MISMATCH that would alias the next tensor → `cargo build` Err
-            // (the typed-shape contract). This is the principled cure for the under-reservation
-            // that aliased sp/spprod/mxp on-card → mxp=0 → softmax overflow → garbage.
-            if window_end > fp {
-                return Err(SuperDscError(format!(
-                    "synth '{name}': access window end {window_end}B (offset {slice}B, operand \
-                     {arg_bytes}B) exceeds its declared footprint {fp}B — shape mismatch (would \
-                     alias the next intermediate). Fix the declared shape (BundleLayout::synth) \
-                     or the op's view/offset."
-                )));
-            }
-        } else {
-            // UNDECLARED synth (rmsnorm/silu decomposition, not yet shape-typed): grow-on-access
-            // high-water so a piecewise multi-write still reserves its true footprint (correct,
-            // but UNCHECKED — these should be migrated to declared shapes).
-            let end = align128(off + window_end);
-            if end > s.next {
-                s.next = end;
-            }
+        // A DECLARED synth owns its full shape (`BundleLayout::synth`): no access may exceed it —
+        // an out-of-footprint write is a SHAPE MISMATCH that would alias the next tensor, a
+        // `cargo build` Err (the typed-shape contract that cured the sp/spprod/mxp aliasing).
+        if window_end > fp {
+            return Err(SuperDscError(format!(
+                "synth '{name}': access window end {window_end}B (offset {slice}B, operand \
+                 {arg_bytes}B) exceeds its declared footprint {fp}B — shape mismatch (would \
+                 alias the next intermediate). Fix the declared shape (BundleLayout::synth) \
+                 or the op's view/offset."
+            )));
         }
         return Ok((segment_base(seg)?, off + slice));
     }
@@ -3638,12 +3626,10 @@ pub fn emit_sdsc(
             ldsIdx_: i as u32,
             dsName_: format!("Tensor{i}"),
             dsType_: v.role.ds_type(),
-            // In the order this tensor's dims go to dxp (`ArgView::device_positions`).
-            scale_: match v.device_positions() {
-                Some(from) if from.len() == v.scale.len() => {
-                    from.iter().map(|&j| v.scale[j].to_i64()).collect()
-                }
-                _ => v.scale.iter().map(|s| s.to_i64()).collect(),
+            // In the order this tensor's dims go to dxp (its proven `DeviceOrder`).
+            scale_: match v.device_order {
+                Some(o) => o.positions.iter().map(|&j| v.scale[j].to_i64()).collect(),
+                None => v.scale.iter().map(|s| s.to_i64()).collect(),
             },
             wordLength: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
@@ -3695,19 +3681,19 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+                    layoutDimOrder_: v.device_dims_order().to_vec(),
                     stickDimOrder_: vec!["out", "mb"],
                     stickSize_: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+                    layoutDimOrder_: v.device_dims_order().to_vec(),
                     stickDimOrder_: vec!["in", "out"],
                     stickSize_: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+                    layoutDimOrder_: v.device_dims_order().to_vec(),
                     stickDimOrder_: vec![v.stick],
                     stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
@@ -4014,7 +4000,7 @@ pub fn emit_sdsc(
                 Some(crate::place::PlaceId::Act(tid)) => l.placements.get(&tid).map(|p| p.size),
                 _ => None,
             }
-            .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
+            .or_else(|| l.synth.borrow().size(v.name));
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
                 let own = view_stick_layout(v, iter);
@@ -4032,31 +4018,8 @@ pub fn emit_sdsc(
                     // the arrangement authority refuses. ADDRESSING is unchanged (the landing's
                     // per-core starts are its blocks); a one-stick landing never carries this
                     // frame, and a view whose extents do not divide keeps `own`.
-                    crate::superdsc_opspec::ViewFrame::LandedBlocks => {
-                        let stick_ext = iter.extent(v.stick) as usize;
-                        let lanes = v.df.elems_per_stick() as usize;
-                        let elems = own.rows * own.cols;
-                        if stick_ext > lanes && elems.is_multiple_of(stick_ext) {
-                            crate::sdsc_abstract::StickLayout::row_blocked_df(
-                                elems / stick_ext,
-                                stick_ext,
-                                v.df,
-                            )
-                        } else {
-                            // A stamp/view disagreement, and it is LOUD: the opspec stamped this
-                            // view LandedBlocks from its own cols, and the view's emit-time
-                            // extents say otherwise — one of the two is wrong, and a silent flat
-                            // declaration would hide which.
-                            return Err(SuperDscError(format!(
-                                "op '{op_name}': tensor '{}' is stamped LandedBlocks — a one-block \
-                                 landing several sticks wide, its blocks' frame derived from its \
-                                 own cols — but the view's emit-time extents disagree: a \
-                                 {stick_ext}-element stick axis over {elems} elements is not a \
-                                 whole-stick, several-stick landing",
-                                v.name
-                            )));
-                        }
-                    }
+                    // The arrangement the stamp minted from the landing's own extents.
+                    crate::superdsc_opspec::ViewFrame::LandedBlocks(landed) => landed,
                     crate::superdsc_opspec::ViewFrame::StickColumns => {
                         own.of_stick_columns().ok_or_else(|| {
                             SuperDscError(format!(
@@ -4124,18 +4087,8 @@ pub fn emit_sdsc(
         }
         let addr = mint.concrete(&per_core);
         // The order dxp reads this view's dims in, innermost first, as positions in `v.layout` — set
-        // only where it is not `v.layout`'s (`TensorArg::with_device_order`).
-        let device_from = v.device_positions();
-        if device_from
-            .as_ref()
-            .is_some_and(|from| from.len() != v.layout.len())
-        {
-            return Err(SuperDscError(format!(
-                "op {op_name}: tensor {i} ('{}') states device order {:?} over layout {:?} — not a \
-                 permutation of it",
-                v.name, v.device_order, v.layout
-            )));
-        }
+        // only where it is not `v.layout`'s, and a proven permutation of it (`DeviceOrder`).
+        let device_from = v.device_order;
         Ok(AllocNode {
             nodeType_: "allocate",
             name_: name,
@@ -4177,7 +4130,7 @@ pub fn emit_sdsc(
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
             // A view that states its own device order (two row dims, read innermost-first by dxp) is
             // the one exception, and states it on the view.
-            layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+            layoutDimOrder_: v.device_dims_order().to_vec(),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -4253,13 +4206,13 @@ pub fn emit_sdsc(
                 } else {
                     walk.clone().paged_at(&paged_dims).unwrap_or(walk)
                 };
-                // In the order `layoutDimOrder_` states the dims.
-                match &device_from {
+                // In the order `layoutDimOrder_` states the dims. The walk is built from this view's
+                // own extents, one per `layout` dim, so its rank is the order's.
+                match device_from {
                     None => walk,
                     Some(from) => walk.reordered(from).ok_or_else(|| {
                         SuperDscError(format!(
-                            "op {op_name}: tensor {i} ('{}'): its walk does not reorder to its \
-                             device order",
+                            "op {op_name}: tensor {i} ('{}'): its walk's rank is not its layout's",
                             v.name
                         ))
                     })?,
@@ -9329,12 +9282,14 @@ mod embed_row_gather_tests {
         );
         let sizes = l.synth.borrow();
         assert_eq!(
-            sizes.sizes["t304_cslab"],
+            sizes.size("t304_cslab").expect("the slab is reserved"),
             crate::placement::align128((HIDDEN as u64) * 64 * 2),
             "the slab is [hidden, 64] fp16"
         );
         assert_eq!(
-            sizes.sizes["t304_cslabt"],
+            sizes
+                .size("t304_cslabt")
+                .expect("the transposed slab is reserved"),
             crate::placement::align128((64 + 1) * (HIDDEN as u64) * 2),
             "the transposed slab is [65, hidden] fp16 — 64 rows of transpose PLUS the \
              sentinel's zero tail"
@@ -9740,7 +9695,7 @@ mod chain_stage_tests {
         )
         .expect("the legal geometry places");
         assert!(
-            l.synth.borrow().sizes.is_empty(),
+            l.synth.borrow().is_empty(),
             "the tables are graph sources the placement pass places — the door must mint \
              no synth of its own for them"
         );
