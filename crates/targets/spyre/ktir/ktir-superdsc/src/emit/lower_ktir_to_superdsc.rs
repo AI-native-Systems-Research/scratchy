@@ -6261,7 +6261,7 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
     // A FULL-TENSOR program — every region the whole window of its view, corners 0, `k` the
     // tensor's whole extent — emits exactly the offsets-zero, no-device-extent form, which is
     // byte-identical to `assemble_matmul_seeded` (`matmul_opspec_off` at zero offsets IS
-    // `matmul_opspec`; `set_device_extent` at `w_in_phys == k` states what the stride derivation
+    // `matmul_opspec`; `set_axis` at `w_in_phys == k` states what the stride derivation
     // already concluded).
     //
     // The corners, per orientation (the kernel's coords are `[in=k, out=n]`, so which of W's two
@@ -8361,7 +8361,7 @@ mod elementwise_tests {
                     if multi {
                         assert_eq!(
                             n["backGapCore_"],
-                            serde_json::json!({"mb": {"-1": (7 * m).to_string()}}),
+                            serde_json::json!({"mb": {crate::wire::HBM_GAP_CORE: (7 * m).to_string()}}),
                             "{what}: the frame's pitch past the batch's {m} rows"
                         );
                     }
@@ -9409,7 +9409,7 @@ mod elementwise_tests {
         let (gap, rpc) = gap_of(op, lds);
         assert_eq!(
             gap,
-            serde_json::json!({"mb": {"-1": (parent - rpc).to_string()}}),
+            serde_json::json!({"mb": {crate::wire::HBM_GAP_CORE: (parent - rpc).to_string()}}),
             "{what}: the parent's pitch is the back gap past the band's {rpc} row(s)"
         );
     }

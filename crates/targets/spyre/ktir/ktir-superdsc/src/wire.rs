@@ -606,6 +606,11 @@ impl Coordinates {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackGap(BTreeMap<&'static str, u32>);
 
+/// The core key an HBM view's back gap is stated under: dxp keys the gap per core and reads HBM's at
+/// core `-1` (`dsc2.cpp`: `DT_CHECK(dimGap.count(-1))` for an HBM component), the key the vendor
+/// inductor writes too (`compute_ops.py`, `{"-1": str(gap)}`). A wire constant, named once.
+pub const HBM_GAP_CORE: &str = "-1";
+
 impl BackGap {
     /// The back gap of a view: each [`Pitch::gap`](crate::superdsc_opspec::Pitch::gap) on an axis
     /// whose pitch resolves to [`PitchForm::Hbm`](crate::superdsc_opspec::PitchForm) — the gap
@@ -653,7 +658,7 @@ impl Serialize for BackGap {
         use serde::ser::SerializeMap;
         let mut m = s.serialize_map(Some(self.0.len()))?;
         for (axis, gap) in &self.0 {
-            m.serialize_entry(axis, &BTreeMap::from([("-1", gap.to_string())]))?;
+            m.serialize_entry(axis, &BTreeMap::from([(HBM_GAP_CORE, gap.to_string())]))?;
         }
         m.end()
     }

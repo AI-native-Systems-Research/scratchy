@@ -215,9 +215,14 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
             .device_extent
             .to_vec()
     };
+    // Each axis's device statement goes through the ONE setter, over the axis's own typed index.
+    let pitched = |t: TensorArg<3>, dim: &'static str, declared: u32| {
+        let at = t.axis(dim).unwrap();
+        at.pitch(&plan, declared).map(|p| t.with_axis(at, p))
+    };
     // A pitch past the extent states it; a pitch AT the extent is no pitch.
     assert_eq!(
-        axes(view().with_pitch(&plan, "mb", 10).unwrap()),
+        axes(pitched(view(), "mb", 10).unwrap()),
         [
             DeviceAxis::Swept,
             DeviceAxis::Pitch(pitch(4, 10, None)),
@@ -225,49 +230,48 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
         ]
     );
     assert_eq!(
-        axes(view().with_pitch(&plan, "mb", 4).unwrap()),
+        axes(pitched(view(), "mb", 4).unwrap()),
         [DeviceAxis::Swept; 3]
     );
     // The near-miss the law exists for: a pitch SMALLER than the extent.
-    let short = view().with_pitch(&plan, "mb", 3).unwrap_err().0;
+    let short = pitched(view(), "mb", 3).unwrap_err().0;
     assert!(short.contains("shorter than the extent"), "{short}");
     // The stick axis states a pitch of whole sticks, and refuses a gap inside one.
     assert_eq!(
-        axes(view().with_pitch(&plan, "out", 256).unwrap()),
+        axes(pitched(view(), "out", 256).unwrap()),
         [
             DeviceAxis::Swept,
             DeviceAxis::Swept,
             DeviceAxis::Pitch(pitch(128, 256, Some(64)))
         ]
     );
-    let stick = view().with_pitch(&plan, "out", 160).unwrap_err().0;
+    let stick = pitched(view(), "out", 160).unwrap_err().0;
     assert!(stick.contains("stick axis"), "{stick}");
-    // A dim the view does not have.
-    let absent = view().with_pitch(&plan, "in", 8).unwrap_err().0;
+    // A dim the view does not have has no index.
+    let absent = view().axis("in").unwrap_err().0;
     assert!(absent.contains("not in layout"), "{absent}");
-    // One axis, one mechanism — in either order.
-    let both = view()
-        .with_device_extent("mb", 16)
-        .unwrap()
-        .with_pitch(&plan, "mb", 10)
-        .unwrap_err()
-        .0;
-    assert!(both.contains("one axis states one"), "{both}");
-    let both = view()
-        .with_pitch(&plan, "mb", 10)
-        .unwrap()
-        .with_device_extent("mb", 16)
-        .unwrap_err()
-        .0;
-    assert!(both.contains("one axis states one"), "{both}");
-    // Different axes may each state their own.
+    // ONE AXIS, ONE STATEMENT: the axis's slot holds one `DeviceAxis`, so a later statement on the
+    // same axis replaces the earlier one — there is no second mechanism left beside it to disagree.
+    let v = view();
+    let mb = v.axis("mb").unwrap();
     assert_eq!(
         axes(
-            view()
-                .with_device_extent("y", 8)
-                .unwrap()
-                .with_pitch(&plan, "mb", 10)
-                .unwrap()
+            v.with_axis(mb, DeviceAxis::Window(16))
+                .with_axis(mb, mb.pitch(&plan, 10).unwrap())
+        ),
+        [
+            DeviceAxis::Swept,
+            DeviceAxis::Pitch(pitch(4, 10, None)),
+            DeviceAxis::Swept
+        ]
+    );
+    // Different axes each state their own.
+    let v = view();
+    let (y, mb) = (v.axis("y").unwrap(), v.axis("mb").unwrap());
+    assert_eq!(
+        axes(
+            v.with_axis(y, DeviceAxis::Window(8))
+                .with_axis(mb, mb.pitch(&plan, 10).unwrap())
         ),
         [
             DeviceAxis::Window(8),

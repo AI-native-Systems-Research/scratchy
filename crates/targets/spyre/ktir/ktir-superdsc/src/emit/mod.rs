@@ -235,7 +235,7 @@ fn per_core_addr(
     //
     // THE ONE EXTENT CONSTRUCTOR ([`DeviceExtents::of_view`], `Span::Materialized` — a non-ranged dim
     // occupies one row). This was a hand-rolled `plan.extent` fold, and because it was hand-rolled it
-    // silently dropped the view's DECLARED physical extent (`TensorArg::with_device_extent`) that
+    // silently dropped the view's DECLARED physical extent (`TensorArg::with_axis`) that
     // `view_stick_layout` — deciding the arrangement of the SAME view of the SAME op — already read. So
     // declaring one moved the classification and left every emitted address untouched: measurably inert,
     // in the exact direction a batched decode needs (iterate a 64-slot window of a resident cache,
@@ -4008,7 +4008,7 @@ pub fn emit_sdsc(
             // row-major buffer (the producer-Flat / card-RowBlocked scramble). Decode (M=1) tiles trivially.
             // ⛔⛔⛔ THE OPERAND'S OWN DEVICE EXTENTS, NOT THE OP'S ITERATION EXTENTS.
             //
-            // `TensorArg::with_device_extent` means "this op ITERATES a window of a LARGER
+            // `TensorArg::with_axis` means "this op ITERATES a window of a LARGER
             // allocation, so derive strides from the allocation". The arrangement
             // (`view_stick_layout`) honours it and the per-core START (`per_core_addr`) honours it —
             // both through `DeviceExtents::of_view` — but this line built its own extent vector from
@@ -5295,7 +5295,7 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
         if let Some(w) = w {
             arg.set_offset_elems(w.dev().into_raw_elems());
             if !w.spans_one_stick() {
-                arg.set_pitch(&plan, "mb", w.parent_rows())
+                arg.set_axis("mb", |mb| mb.pitch(&plan, w.parent_rows()))
                     .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
             }
         }

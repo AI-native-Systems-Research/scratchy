@@ -5387,13 +5387,9 @@ mod walk_on_the_card {
         all
     }
 
-    /// FNV-1a 64 over serialized JSON — a stable, dependency-free identity, so the golden carries
-    /// one line per descriptor instead of its 32 MB of JSON.
-    fn fnv64(bytes: &[u8]) -> u64 {
-        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-    }
+    // FNV-1a 64 over serialized JSON — a stable identity, so the golden carries one line per
+    // descriptor instead of its 32 MB of JSON. The tree's one FNV-1a (`scratchy_core_common::fnv1a64`).
+    use scratchy_core_common::fnv1a64 as fnv64;
 
     /// A descriptor's LX-resident allocate nodes, serialized in order — the views a matmul pitch on
     /// LX must leave untouched (`PitchForm::Lx`).

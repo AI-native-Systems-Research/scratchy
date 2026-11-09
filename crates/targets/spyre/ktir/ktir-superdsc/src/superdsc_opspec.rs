@@ -1083,7 +1083,7 @@ impl WorkPlan {
     /// (`build_coordinates` → `plan.extent / plan.split_of`) and the per-core START
     /// (`per_core_addr` → `WorkPlan::corner_elems`, which is `slice_idx · per_core_extent`). Only the
     /// first two go through [`crate::sdsc_abstract::DeviceExtents::of_view`], so a declared extent
-    /// (`TensorArg::with_device_extent`) reaches two of them and is DROPPED by the other two — which is
+    /// (`TensorArg::with_axis`) reaches two of them and is DROPPED by the other two — which is
     /// exactly how the index came to declare 2048 entries and a 256-byte per-core step. Handing the
     /// index view a plan of its own makes all four read ONE number; there is no per-reader division to
     /// forget.
@@ -2307,11 +2307,11 @@ pub struct DeviceOrderView<'a> {
 /// around it is laid out, and dxp has two mechanisms for two different strides:
 ///
 /// * [`DeviceAxis::Window`] — the axis is a WINDOW of a larger allocation, the allocation's own
-///   extent along it the physical one ([`TensorArg::with_device_extent`]). The on-card walk is
+///   extent along it the physical one ([`TensorArg::with_axis`]). The on-card walk is
 ///   PINNED to the allocation's extents (`maxDimSizes_`), which is how a stick-blocked band strides
 ///   its stick groups by the parent's rows (#1134) — a stride OUTSIDE the axis.
 /// * [`DeviceAxis::Pitch`] — the axis is iterated whole, and the NEXT ITERATION OF THE AXIS
-///   OUTSIDE IT lands a pitch on, past a gap the op never touches ([`TensorArg::with_pitch`]).
+///   OUTSIDE IT lands a pitch on, past a gap the op never touches ([`LayoutAxis::pitch`](crate::superdsc_opspec::LayoutAxis::pitch)).
 ///   `maxDimSizes_` is a size cap, not a stride (`dsc2.cpp` `buildUnitView`: a larger cap makes
 ///   the view touch more, it never moves the next step), so the pitch is the walk's BACK GAP:
 ///   `backGapCore_ {axis: pitch − swept}`, which dxp folds into the axis's outermost repeat
@@ -2325,10 +2325,9 @@ pub struct DeviceOrderView<'a> {
 /// Both state the same PHYSICAL extent to every address reader — the arrangement, the per-core
 /// start, the footprint and the time-tile strides all read [`DeviceAxis::declared`] — so the two
 /// differ in the walk fields alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceAxis {
     /// The allocation's extent along the axis IS the swept extent.
-    #[default]
     Swept,
     /// A window of an allocation this many elements long along the axis (the pinned walk).
     Window(u32),
@@ -2399,6 +2398,57 @@ impl Pitch {
     /// back gap carries. Never zero.
     pub fn gap(self) -> u32 {
         self.gap
+    }
+}
+
+/// ⭐ ONE AXIS OF ONE VIEW'S LAYOUT — a typed index, minted only by [`TensorArg::axis`], which looks
+/// the dim up once. [`TensorArg::with_axis`] takes it, so the one per-axis setter never looks a name
+/// up by position, and an index is in range for its view's rank by its `D`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutAxis<const D: usize> {
+    idx: usize,
+    facts: AxisFacts,
+}
+
+/// What a [`DeviceAxis`] on one axis is built FROM: the axis's name and, when it is the view's stick
+/// axis, the view's elements per stick. Minted with its [`LayoutAxis`], so a pitch is built from the
+/// view's own facts ([`Self::pitch`]), never from a caller's restatement of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AxisFacts {
+    dim: &'static str,
+    stick: Option<u32>,
+}
+
+impl AxisFacts {
+    /// The axis this index names.
+    pub fn dim(self) -> &'static str {
+        self.dim
+    }
+
+    /// The axis iterated whole at `declared`, the next outer step `declared` elements on: the walk's
+    /// back gap ([`DeviceAxis::Pitch`]), built by [`Pitch::past`] over the axis's swept extent
+    /// (`plan`'s) and the view's stick when this is the stick axis. A `declared` AT the swept
+    /// extent is no pitch ([`DeviceAxis::Swept`]); a shorter one, or a sub-stick gap on the stick
+    /// axis, refuses by name.
+    pub fn pitch(self, plan: &WorkPlan, declared: u32) -> Result<DeviceAxis, SuperDscError> {
+        let past = Pitch::past(plan.extent(self.dim), declared, self.stick)
+            .map_err(|e| SuperDscError(format!("axis '{}': {}", self.dim, e.0)))?;
+        Ok(match past {
+            PastExtent::AtExtent => DeviceAxis::Swept,
+            PastExtent::Pitch(p) => DeviceAxis::Pitch(p),
+        })
+    }
+}
+
+impl<const D: usize> LayoutAxis<D> {
+    /// The facts the axis's [`DeviceAxis`] is built from.
+    pub fn facts(self) -> AxisFacts {
+        self.facts
+    }
+
+    /// [`AxisFacts::pitch`] on this axis.
+    pub fn pitch(self, plan: &WorkPlan, declared: u32) -> Result<DeviceAxis, SuperDscError> {
+        self.facts.pitch(plan, declared)
     }
 }
 
@@ -2475,8 +2525,8 @@ pub struct TensorArg<const D: usize> {
     /// dev_dim_size * it_dim_size` rescale exactly.
     ///
     /// ONE SLOT PER AXIS ([`DeviceAxis`]): an axis is swept whole, a WINDOW of a larger allocation
-    /// ([`TensorArg::with_device_extent`] — the pinned walk), or iterated at a PITCH
-    /// ([`TensorArg::with_pitch`] — the walk's back gap). The two are two device mechanisms for two
+    /// ([`TensorArg::with_axis`] — the pinned walk), or iterated at a PITCH
+    /// ([`LayoutAxis::pitch`](crate::superdsc_opspec::LayoutAxis::pitch) — the walk's back gap). The two are two device mechanisms for two
     /// different strides, and one axis states at most one of them.
     device_extent: [DeviceAxis; D],
     /// How this view presents the tensor's own frame, for the arrangement authority ([`ViewFrame`]).
@@ -2608,71 +2658,33 @@ impl<const D: usize> TensorArg<D> {
         self
     }
 
-    /// Declare this tensor's TRUE physical device extent for one `layout` dim, distinct from this
-    /// op's own iteration-space view of it — torch-spyre's `arg.device_size` (`superdsc.py:447-469`).
-    /// `dim` must name one of `layout`'s entries (a `cargo build` `Err` otherwise, same discipline as
-    /// [`TensorArg::new`]'s stick-dim witness). Chains off [`TensorArg::new`].
-    pub fn with_device_extent(
-        mut self,
-        dim: &'static str,
-        phys_extent: u32,
-    ) -> Result<TensorArg<D>, SuperDscError> {
+    /// ⭐ THE INDEX OF `dim` IN THIS VIEW'S LAYOUT — the one lookup a per-axis statement makes. A
+    /// `dim` the layout does not have refuses by name (a `cargo build` `Err`, the same discipline as
+    /// [`TensorArg::new`]'s stick-dim witness).
+    pub fn axis(&self, dim: &'static str) -> Result<LayoutAxis<D>, SuperDscError> {
         let idx = self.layout.iter().position(|&d| d == dim).ok_or_else(|| {
             SuperDscError(format!(
-                "TensorArg '{}': device_extent dim '{dim}' is not in layout {:?}",
+                "TensorArg '{}': dim '{dim}' is not in layout {:?}",
                 self.name, self.layout
             ))
         })?;
-        if let DeviceAxis::Pitch(p) = self.device_extent[idx] {
-            return Err(SuperDscError(format!(
-                "TensorArg '{}': axis '{dim}' already states a pitch of {} — a window of a \
-                 {phys_extent}-long allocation is the other device mechanism for the axis, and one \
-                 axis states one",
-                self.name,
-                p.declared()
-            )));
-        }
-        self.device_extent[idx] = DeviceAxis::Window(phys_extent);
-        Ok(self)
+        Ok(LayoutAxis {
+            idx,
+            facts: AxisFacts {
+                dim,
+                stick: (dim == self.stick).then(|| self.df.elems_per_stick()),
+            },
+        })
     }
 
-    /// ⭐ ITERATE `dim` WHOLE, THE NEXT OUTER STEP `declared` ELEMENTS ON — the walk's back gap
-    /// ([`DeviceAxis::Pitch`]). The pitch is built here, once, by [`Pitch::past`] over `dim`'s swept
-    /// extent (`plan`'s), `declared`, and the operand's stick when `dim` is the stick axis — so a
-    /// short pitch or a sub-stick gap refuses at construction, by name, and every reader takes the
-    /// value. A `declared` AT the swept extent is no pitch: the axis stays [`DeviceAxis::Swept`].
-    ///
-    /// Also refused by name: a `dim` not in this view's layout, and an axis that already states a
-    /// window ([`TensorArg::with_device_extent`]) — one axis, one mechanism.
-    pub fn with_pitch(
-        mut self,
-        plan: &WorkPlan,
-        dim: &'static str,
-        declared: u32,
-    ) -> Result<TensorArg<D>, SuperDscError> {
-        let idx = self.layout.iter().position(|&d| d == dim).ok_or_else(|| {
-            SuperDscError(format!(
-                "TensorArg '{}': pitch dim '{dim}' is not in layout {:?}",
-                self.name, self.layout
-            ))
-        })?;
-        if let DeviceAxis::Window(p) = self.device_extent[idx] {
-            return Err(SuperDscError(format!(
-                "TensorArg '{}': axis '{dim}' already states a window of a {p}-long allocation — a \
-                 pitch of {declared} is the other device mechanism for the axis, and one axis \
-                 states one",
-                self.name
-            )));
-        }
-        let stick = (dim == self.stick).then(|| self.df.elems_per_stick());
-        let past = Pitch::past(plan.extent(dim), declared, stick).map_err(|e| {
-            SuperDscError(format!("TensorArg '{}': axis '{dim}': {}", self.name, e.0))
-        })?;
-        self.device_extent[idx] = match past {
-            PastExtent::AtExtent => DeviceAxis::Swept,
-            PastExtent::Pitch(p) => DeviceAxis::Pitch(p),
-        };
-        Ok(self)
+    /// ⭐ THE ONE PER-AXIS SETTER — state how the device walks axis `at`: swept whole, a WINDOW of a
+    /// larger allocation ([`DeviceAxis::Window`], torch-spyre's `arg.device_size`,
+    /// `superdsc.py:447-469`), or iterated at a PITCH ([`DeviceAxis::Pitch`], from
+    /// [`LayoutAxis::pitch`]). The axis's slot holds ONE [`DeviceAxis`], so one axis states one
+    /// mechanism by type: there is no second setter whose statement could disagree with this one.
+    pub fn with_axis(mut self, at: LayoutAxis<D>, axis: DeviceAxis) -> TensorArg<D> {
+        self.device_extent[at.idx] = axis;
+        self
     }
 }
 
@@ -2853,52 +2865,33 @@ impl AnyTensorArg {
         }
     }
 
-    /// Rank-erased [`TensorArg::with_device_extent`] setter — declares one `layout` dim's TRUE
-    /// physical extent on an arg a builder already assembled. For the windowed dense matmul
-    /// (`assemble_matmul_windowed`), whose kernel is a K/N-tiled slice of the caller's own weight
-    /// buffer: the swept `in` extent is the tile's k while the allocation's is the tensor's, and the
-    /// stick-group stride must come from the allocation. PANICS if `dim` is not in the arg's layout,
-    /// same discipline as [`Self::set_scale_for_dim`].
-    pub fn set_device_extent(&mut self, dim: &'static str, phys_extent: u32) {
-        fn set<const D: usize>(t: &mut TensorArg<D>, dim: &'static str, phys_extent: u32) {
-            let idx = t
-                .layout
-                .iter()
-                .position(|&d| d == dim)
-                .unwrap_or_else(|| panic!("set_device_extent: '{dim}' not in {:?}", t.layout));
-            if let DeviceAxis::Pitch(p) = t.device_extent[idx] {
-                panic!(
-                    "set_device_extent: '{dim}' of '{}' already states a pitch of {} — one axis \
-                     states one device mechanism",
-                    t.name,
-                    p.declared()
-                );
-            }
-            t.device_extent[idx] = DeviceAxis::Window(phys_extent);
-        }
-        match self {
-            AnyTensorArg::R1(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R2(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R3(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R4(t) => set(t, dim, phys_extent),
-        }
-    }
-
-    /// Rank-erased [`TensorArg::with_pitch`] — a band door that assembled its args through a
-    /// rank-generic builder states a row band's parent pitch here. The same refusals, by name.
-    pub fn set_pitch(
+    /// Rank-erased [`TensorArg::with_axis`] — THE SAME ONE SETTER, for a door that assembled its args
+    /// through a rank-generic builder. `dim` is resolved by [`TensorArg::axis`] (the one lookup, a
+    /// named `Err` for a dim the layout lacks) and `axis` builds the [`DeviceAxis`] from that axis's
+    /// own [`AxisFacts`] — a window, or [`AxisFacts::pitch`] — so the statement is one value in one
+    /// slot, whatever the view's rank.
+    pub fn set_axis(
         &mut self,
-        plan: &WorkPlan,
         dim: &'static str,
-        pitch: u32,
+        axis: impl FnOnce(AxisFacts) -> Result<DeviceAxis, SuperDscError>,
     ) -> Result<(), SuperDscError> {
-        match self {
-            AnyTensorArg::R1(t) => *t = t.clone().with_pitch(plan, dim, pitch)?,
-            AnyTensorArg::R2(t) => *t = t.clone().with_pitch(plan, dim, pitch)?,
-            AnyTensorArg::R3(t) => *t = t.clone().with_pitch(plan, dim, pitch)?,
-            AnyTensorArg::R4(t) => *t = t.clone().with_pitch(plan, dim, pitch)?,
+        fn set<const D: usize>(
+            t: &mut TensorArg<D>,
+            dim: &'static str,
+            axis: impl FnOnce(AxisFacts) -> Result<DeviceAxis, SuperDscError>,
+        ) -> Result<(), SuperDscError> {
+            let at = t.axis(dim)?;
+            let a = axis(at.facts())
+                .map_err(|e| SuperDscError(format!("TensorArg '{}': {}", t.name, e.0)))?;
+            t.device_extent[at.idx] = a;
+            Ok(())
         }
-        Ok(())
+        match self {
+            AnyTensorArg::R1(t) => set(t, dim, axis),
+            AnyTensorArg::R2(t) => set(t, dim, axis),
+            AnyTensorArg::R3(t) => set(t, dim, axis),
+            AnyTensorArg::R4(t) => set(t, dim, axis),
+        }
     }
 
     /// Rank-erased ROLE setter. The epilogue's extra operand is tagged [`Role::Output`] to match

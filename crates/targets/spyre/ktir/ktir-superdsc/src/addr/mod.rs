@@ -443,13 +443,13 @@ pub fn col_window_of(rows: u32, full: u32, c: u32, df: Df) -> Result<ColWindow, 
 /// A row band is not a column window: the parent strides its column planes `parent_rows·lanes`
 /// apart while a window of fewer rows would stride its own `rows·lanes`, so the window's bytes
 /// are a stick-major tensor of the PARENT's, reached by declaring the parent's row count as the
-/// operand's `mb` device extent ([`TensorArg::with_device_extent`]) — the same law the batched
+/// operand's `mb` device extent ([`TensorArg::with_axis`]) — the same law the batched
 /// decode's per-request pass uses to iterate one row while the operand's heads stay `mq` rows
 /// apart. A window at most ONE STICK wide never crosses a plane, so its own stick-major layout
 /// coincides with the parent's inside that plane and it needs no declaration — the card-proven
 /// rotate-half form, byte for byte.
 ///
-/// [`TensorArg::with_device_extent`]: crate::superdsc_opspec::TensorArg::with_device_extent
+/// [`TensorArg::with_axis`]: crate::superdsc_opspec::TensorArg::with_axis
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RowWindow {
     corner: DevOff,

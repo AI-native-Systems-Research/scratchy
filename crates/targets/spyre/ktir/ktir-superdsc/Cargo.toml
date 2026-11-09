@@ -36,8 +36,9 @@ test-support = []
 # NOTHING HERE DESERIALIZES — zero `Deserialize` in the crate. This writes descriptors; it does not
 # read them back.
 serde = { workspace = true, features = ["derive"] }
-# ⭐ FOR THE PLACES DXP'S OWN SCHEMA IS UNTYPED. Three wire fields (`constantInfo_`, `coordinates_`,
-# `backGapCore_`) are `serde_json::Value` because dxp accepts EITHER a dict or the string "{}" there
+# ⭐ FOR THE PLACES DXP'S OWN SCHEMA IS UNTYPED. Two wire fields (`constantInfo_`, `coordinates_`)
+# are `serde_json::Value` because dxp accepts EITHER a dict or the string "{}" there (`backGapCore_`
+# is the typed `wire::BackGap`, serialized by hand)
 # — see `Dsc::constantInfo_`, where getting that wrong collapsed every transcendental to its seed.
 # The three fp8 nested-fold generators build their folds with `json!`.
 #
