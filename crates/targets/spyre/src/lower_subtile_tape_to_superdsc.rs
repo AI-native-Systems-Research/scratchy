@@ -7143,7 +7143,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     }
     let named = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params, dump)?
+        emit_bundle_inner(ops, layout, fold, attn_params)?
     };
     let fp = named.name().to_string();
     // ⛔ STAGING AND REGISTRATION ARE ONE STEP PER NAME. Ladder rungs bake in parallel, and two rungs
@@ -7406,7 +7406,6 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     layout: &BundleLayout,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-    dump: DumpRoot<'_>,
 ) -> std::io::Result<NamedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
