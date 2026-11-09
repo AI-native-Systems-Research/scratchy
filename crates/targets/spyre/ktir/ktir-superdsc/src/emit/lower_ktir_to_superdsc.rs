@@ -4085,6 +4085,7 @@ pub fn rmsnorm<T: crate::collective::Tp>(
         ones_const.as_deref(),
         sym_id_base,
         layout,
+        &mut crate::placement::LxScope::program(),
     )
     .map_err(|e| Error { message: e })
 }
@@ -10331,6 +10332,7 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
+    lx_scope: &mut crate::placement::LxScope,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     // x, gamma and the output — the parameters the rmsnorm program mints. Its constants are
     // immediates, so none of them is a parameter.
@@ -10392,6 +10394,7 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
         ones_const.as_deref(),
         sym_id_base,
         layout,
+        lx_scope,
     )
     .map_err(|e| Error { message: e })
 }

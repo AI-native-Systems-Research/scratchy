@@ -258,7 +258,15 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
         of: 7,
         role: SynthRole::KRep,
     };
-    layout.synth_lx_op_local(op_id, &[1, 128]);
+    // Declared through the one op-local door, its own program's pair (the windows below are the
+    // test's own reads of the pinned name).
+    let _ = ktir_superdsc::placement::BundleLayout::lx_op_local_pair(
+        Some(&layout),
+        &mut ktir_superdsc::placement::LxScope::program(),
+        op_id,
+        &[1, 128],
+        |_| Ok::<_, String>(((), ())),
+    );
     let op_stk =
         Stk::<RowBlockedTag>::new(op_id.to_string(), StickLayout::row_blocked(1, 128)).unwrap();
     layout

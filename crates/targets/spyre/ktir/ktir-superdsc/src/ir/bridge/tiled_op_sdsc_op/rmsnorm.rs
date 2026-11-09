@@ -58,6 +58,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     ones_const: Option<&str>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
+    lx_scope: &mut crate::placement::LxScope,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
@@ -67,7 +68,6 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let out = out_s.as_str();
     let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
     let mean = syn(R::Mean); // (E[x], E[x²])  [rows, stk]
-    let rinv = syn(R::Rinv); // 1/√E[x²]   [rows, stk]
     let xn = syn(R::Xn); // x·r          [rows, cols]
     let meps = syn(R::Meps); // E[x²]+eps   [rows, stk]
     // γ+1        [1, cols]  — OnePlusScale only
@@ -80,7 +80,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         ] {
             l.synth(out_id.synth(r), &dims);
         }
-        // `rinv` is PINNED-LX, not seg3-HBM (`synth_lx_op_local`): its consumer reads a SUB-STICK lane
+        // `rinv` is PINNED-LX, not seg3-HBM (`lx_op_local_pair`, below): its consumer reads a SUB-STICK lane
         // (element 8 of the exx2 pair — see step 4 below), and a sub-stick read offset survives
         // the compile chain only on the LX path. On HBM the +16B is floored away twice over —
         // the L3 EBR is stick-granular (the reader's allocate carries the offset but the
@@ -95,7 +95,6 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         // The producer side of the pin: LX is per-core private, so `apply_lx_residency`
         // replicates `rmrsqrt` across all cores (each computes the whole [rows, stk] stick into
         // its own scratchpad) and the reader's own slice corner selects its rows there.
-        l.synth_lx_op_local(out_id.synth(R::Rinv), &[rows, stk]);
         if ones_const.is_some() {
             l.synth(out_id.synth(R::Gw), &[1, cols]);
         }
@@ -120,7 +119,6 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let mean = rb(&mean, rows, stk);
     let meps = rb(&meps, rows, stk);
     let eps = rb(eps_const, 1, stk);
-    let rinv = rb(&rinv, rows, stk);
     let xn = rb(&xn, rows, cols);
     // The norm's typed extents: `rows` is the residual stream's token rows, `cols` its feature
     // width, and the per-row mean/rsqrt scalars live in ONE-STICK-wide tensors.
@@ -196,21 +194,9 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         )
         .map_err(|e| e.0)?,
     ); // E[x²] + eps
-    // 3. rinv = rsqrt(E[x²]+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
-    ops.push(
-        pw1(
-            &format!("rmrsqrt_{prefix}"),
-            "rsqrt",
-            t_rows,
-            s_cols,
-            In::full(&meps),
-            &rinv,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    ); // 1/√(E[x²]+eps)
-    // 4. apply: xn = x·r (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
+    // 3 + 4. THE PIN, ITS WRITER AND ITS READER, AS ONE CONSTRUCTION (`lx_op_local_pair`):
+    //   3. rinv = rsqrt(E[x²]+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
+    //   4. apply: xn = x·r (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
     //    `rinv`'s element 8 IS E[x²]'s rsqrt — the FIRST element of the exx2 output's second
     //    half-stick ([8..16); the vendor's own consumers read it at exactly this offset,
     //    `stick_replicated_dim_offset_elements=8`) — read via a one-element view step into the
@@ -220,22 +206,43 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     //    saturated, degenerate generation. The half-stick map is the DDL's, not a guess.
     //    The +8 elements (= +16 B, one fp16 word past the pair's first slot) rides the reader's
     //    allocate through the ordinary slice-offset machinery — and because `rinv` is LX-pinned,
-    //    that byte lands BYTE-exact in the reader's lxlu address (see the `synth_lx_op_local` note above
+    //    that byte lands BYTE-exact in the reader's lxlu address (see the LX-pin note above
     //    for why the same offset on HBM is silently floored to element 0).
-    ops.push(
-        pw2(
-            &format!("rmxn_{prefix}"),
-            "multiply",
-            t_rows,
-            f_cols,
-            In::full(&x),
-            In::col_at(&rinv, crate::addr::DevOff::from_view_step(8)),
-            &xn,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    );
+    let (rsqrt_op, xn_op) = BundleLayout::lx_op_local_pair(
+        layout,
+        lx_scope,
+        out_id.synth(R::Rinv),
+        &[rows, stk],
+        |pin| -> Result<_, String> {
+            let rinv = rb(pin.name(), rows, stk);
+            let writer = pw1(
+                &format!("rmrsqrt_{prefix}"),
+                "rsqrt",
+                t_rows,
+                s_cols,
+                In::full(&meps),
+                &rinv,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| e.0)?; // 1/√(E[x²]+eps)
+            let reader = pw2(
+                &format!("rmxn_{prefix}"),
+                "multiply",
+                t_rows,
+                f_cols,
+                In::full(&x),
+                In::col_at(&rinv, crate::addr::DevOff::from_view_step(8)),
+                &xn,
+                sym_id_base,
+                layout,
+            )
+            .map_err(|e| e.0)?;
+            Ok((writer, reader))
+        },
+    )?;
+    ops.push(rsqrt_op);
+    ops.push(xn_op);
     // 6. OnePlusScale: gw = gamma + 1 — ONE `add` over the stored row with the
     //    `[1,1]`-broadcast offset (the eps operand mode), filling the `[1,cols]`
     //    `Gw` row the gain multiply reads. The stored gamma is never rewritten.

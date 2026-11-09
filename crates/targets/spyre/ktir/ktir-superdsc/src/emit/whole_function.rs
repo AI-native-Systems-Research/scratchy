@@ -4580,6 +4580,9 @@ fn lower_function_folded<T: crate::collective::Tp>(
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let f = &k.func;
+    // ⭐ THIS PROGRAM's op-local LX scope — made here because this function lowers exactly ONE
+    // program; every op-local pin the program states takes it `&mut` (`lx_op_local_pair`).
+    let mut lx_scope = crate::placement::LxScope::program();
     // Every value's world, minted once by the ONE frame assignment, and read here and nowhere
     // re-derived: the carried-state mint, the shape-op reframe and the splatted constants below
     // all ask this table. ⭐ THE FOLD IS THE WALK'S CARRY STATEMENT: `loop_fold::flatten` drops
@@ -7694,6 +7697,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                 BundleFacts {
                     headmajor,
                     quantized: &mut *quantized,
+                    lx_scope: &mut lx_scope,
                 },
             )?;
             out.append(&mut emitted);
@@ -7803,6 +7807,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             BundleFacts {
                 headmajor,
                 quantized: &mut *quantized,
+                lx_scope: &mut lx_scope,
             },
         )?;
         out.append(&mut emitted);
@@ -9474,6 +9479,9 @@ struct WalkProof<'a> {
 struct BundleFacts<'q> {
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     quantized: &'q mut super::ktir_matmul_fp8::QuantizedActivations,
+    /// THIS program's op-local LX scope ([`crate::placement::LxScope`]) — one per program, made by
+    /// [`lower_function_folded`], the one function that lowers one program.
+    lx_scope: &'q mut crate::placement::LxScope,
 }
 
 /// Hand ONE op's regions to the body its `Program` names.
@@ -9499,6 +9507,7 @@ fn emit_one<T: crate::collective::Tp>(
     let BundleFacts {
         headmajor,
         quantized,
+        lx_scope,
     } = bundle;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
@@ -9567,6 +9576,7 @@ fn emit_one<T: crate::collective::Tp>(
                 per_op,
                 sym_id_base,
                 layout,
+                lx_scope,
             );
         }
         // THE FUSED GAINLESS RMSNORM — the chain whose gain leg closed as the identity. `per_op`
