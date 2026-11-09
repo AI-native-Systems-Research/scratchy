@@ -5357,7 +5357,9 @@ mod walk_on_the_card {
         for kv_heads in [8u32, 4, 2, 1] {
             for hd in [64, 128] {
                 for (seqs, walk) in [(1, 1), (1, 64), (1, 2048), (4, 64), (32, 1)] {
-                    let at = format!("{kv_heads} kv heads, {seqs} sequences over {walk} blocks at hd {hd}");
+                    let at = format!(
+                        "{kv_heads} kv heads, {seqs} sequences over {walk} blocks at hd {hd}"
+                    );
                     let (node, _) = batched_walk_heads(seqs, walk, hd, kv_heads, 4);
                     let layout = triton_ktir_superdsc::layout::for_node(&node)
                         .unwrap_or_else(|e| panic!("{at}: {e:?}"));
@@ -5415,7 +5417,11 @@ mod walk_on_the_card {
                 (
                     d["at"].as_str().unwrap_or("").to_string(),
                     d["op_name"].as_str().unwrap_or("").to_string(),
-                    fnv64(serde_json::to_string(&d["op"]).expect("serializes").as_bytes()),
+                    fnv64(
+                        serde_json::to_string(&d["op"])
+                            .expect("serializes")
+                            .as_bytes(),
+                    ),
                     fnv64(lx_views(&d["op"]).as_bytes()),
                 )
             })
@@ -5477,7 +5483,11 @@ mod walk_on_the_card {
         assert_eq!(got.len(), golden.len(), "the same descriptor count");
         let mut changed = Vec::new();
         for (i, (g, w)) in got.iter().zip(&golden).enumerate() {
-            assert_eq!((&g.0, &g.1), (&w.0, &w.1), "descriptor {i}: the same geometry and op");
+            assert_eq!(
+                (&g.0, &g.1),
+                (&w.0, &w.1),
+                "descriptor {i}: the same geometry and op"
+            );
             assert_eq!(g.3, w.3, "descriptor {i} ({} {}): its LX views", w.0, w.1);
             if g.2 != w.2 {
                 assert!(

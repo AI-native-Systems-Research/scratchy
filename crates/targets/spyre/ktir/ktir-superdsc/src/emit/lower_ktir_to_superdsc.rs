@@ -8333,8 +8333,15 @@ mod elementwise_tests {
                 reg(7, 8 * m, 128, true),
             );
             let mut sym = 0i64;
-            let ops = batch_matmul::<crate::collective::TpWorld<1>>("bmm_s9", 8, BatchFrame::Flat, &r, &mut sym, None)
-                .expect("the flat-frame contraction lowers");
+            let ops = batch_matmul::<crate::collective::TpWorld<1>>(
+                "bmm_s9",
+                8,
+                BatchFrame::Flat,
+                &r,
+                &mut sym,
+                None,
+            )
+            .expect("the flat-frame contraction lowers");
             assert_eq!(ops.len(), 8, "one contraction per batch");
             for op in &ops {
                 let dsc = op.op.as_ref().expect("a descriptor").dscs_[0]
@@ -9378,7 +9385,9 @@ mod elementwise_tests {
         // The band's whole row sweep — what the HBM unit view's capacity spans.
         let swept = v["N_"]["mb_"].as_u64().expect("a swept mb") as u32;
         (
-            node.get("backGapCore_").cloned().unwrap_or(serde_json::Value::Null),
+            node.get("backGapCore_")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             swept,
         )
     }
@@ -9393,7 +9402,8 @@ mod elementwise_tests {
     ) {
         let walk = walk_of(op, lds);
         assert!(
-            walk.as_array().is_some_and(|w| w.first().and_then(|e| e.as_i64()) != Some(i64::from(parent))),
+            walk.as_array()
+                .is_some_and(|w| w.first().and_then(|e| e.as_i64()) != Some(i64::from(parent))),
             "{what}: the walk is not pinned to the parent's rows (a size cap the card never strides by): {walk}"
         );
         let (gap, rpc) = gap_of(op, lds);
