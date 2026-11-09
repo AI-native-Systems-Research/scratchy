@@ -1979,7 +1979,7 @@ fn a_bundles_name_carries_what_its_lowering_read() {
             Some(BundleAttnParams { rows_are_requests }),
         )
         .unwrap_or_else(|e| panic!("r_ar={rows_are_requests}: {}", e.0))
-        .name(&scratchy_target_spyre::bundle_code::BundleLayout::default())
+        .name(None)
     };
     let bundle = name(&layout, false);
     assert_eq!(

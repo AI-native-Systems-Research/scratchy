@@ -7644,14 +7644,19 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     // ⛔ THE LAYOUT IS BAKED AFTER THE LOWERING, in both arms: the lowering mints its synthetic
     // placements into the plan (`BundleLayout::synth`), so a plan baked before it would ship without
     // them.
+    //
+    // ⛔ AND A BUNDLE WITH NO PLAN IS NAMED AS ONE: its name hashes "no plan", never a defaulted
+    // layout standing in for a plan nobody computed. What it SHIPS is still main's empty
+    // `BundleLayout` (the artifact's `layout` is not optional yet); that default and this `Option`
+    // both go with the residency stack, which makes the bake's plan required.
     let err = |e: SuperDscError| std::io::Error::other(e.0);
-    let bake = || layout.map(bake_layout).unwrap_or_default();
+    let bake = || layout.map(bake_layout);
     Ok(if cfg!(feature = "spyre-hw") {
         let rendered = render_bundle(ops, fold, layout, attn_params).map_err(err)?;
         let layout_baked = bake();
         let fp = {
             let _pc = crate::pc::Pc::start("fp");
-            rendered.name(&layout_baked)
+            rendered.name(layout_baked.as_ref())
         };
         NamedBundle::Rendered {
             fp,
@@ -7663,11 +7668,11 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
         let layout_baked = bake();
         let fp = {
             let _pc = crate::pc::Pc::start("fp");
-            crate::bundle_name::of_groups(&layout_baked, &groups)
+            crate::bundle_name::of_groups(layout_baked.as_ref(), &groups)
         };
         NamedBundle::Ready(EmittedBundle {
             fp,
-            layout: layout_baked,
+            layout: layout_baked.unwrap_or_default(),
             groups: PendingGroups::Ready(groups),
         })
     })
@@ -7682,7 +7687,7 @@ enum NamedBundle<T: ktir_superdsc::collective::Tp> {
     /// `-Fspyre-hw`: rendered for the device compiler, staged once the name's lock is held.
     Rendered {
         fp: String,
-        layout: bundle::BundleLayout<'static>,
+        layout: Option<bundle::BundleLayout<'static>>,
         rendered: RenderedBundle<T>,
     },
 }
@@ -7707,7 +7712,7 @@ impl<T: ktir_superdsc::collective::Tp> NamedBundle<T> {
                 let staged = stage_bundle(&rendered, &fp, plan)?;
                 Ok(EmittedBundle {
                     fp,
-                    layout,
+                    layout: layout.unwrap_or_default(),
                     groups: PendingGroups::Staged(staged),
                 })
             }
@@ -8563,29 +8568,7 @@ pub fn render_bundle<T: ktir_superdsc::collective::Tp>(
         let _pc = crate::pc::Pc::start("launch");
         launch_index(&sdsc_ops, fold)
     };
-    // `mq` is the discriminator that names the rung in the dump, and it is READ FROM THE PROGRAM: the
-    // attention program's q view is built first and is `[mq, nqh·hd]`, so its row count is `mq` — the
-    // same fact `recognize_attn` recovers, not a new one threaded in.
-    let mq = ops
-        .iter()
-        .filter(|e| e.op_name.starts_with("attn"))
-        .find_map(|e| {
-            let k = e.ktir.as_ref()?;
-            k.func
-                .operations
-                .iter()
-                .find(|o| o.op_type == OpKind::KtdpConstructMemoryView)
-                .and_then(|o| {
-                    o.attributes
-                        .iter()
-                        .find(|(key, _)| *key == AttrKey::Shape)
-                        .and_then(|(_, v)| match v {
-                            Attr::IntList(l) if l.len() == 2 => l.first().copied(),
-                            _ => None,
-                        })
-                })
-        })
-        .unwrap_or(-1);
+    let mq = attention_query_rows(ops)?;
     Ok(RenderedBundle {
         programs: ops.len(),
         mq,
@@ -8597,13 +8580,36 @@ pub fn render_bundle<T: ktir_superdsc::collective::Tp>(
     })
 }
 
+/// The query rows of the bundle's paged attention, `None` for a bundle that has none — the dump's rung
+/// name. READ FROM THE PROGRAM through the one reader of a program's parameter extents
+/// (`lower_ktir_to_superdsc::regions`, the door's own): the attention's first parameter is its
+/// `[mq, nqh·hd]` query (`PagedStepTids`' operand order), so its view's row extent is `mq`. A paged
+/// attention program whose parameters do not state their extents is refused by name, as the door
+/// refuses it.
+fn attention_query_rows<T: ktir_superdsc::collective::Tp>(
+    ops: &[EmittedOp<T>],
+) -> Result<Option<u32>, SuperDscError> {
+    let Some((name, k)) = ops.iter().find_map(|e| {
+        let k = e.ktir.as_ref()?;
+        (k.program == ktir_superdsc::ktir_node::Program::PagedAttn).then_some((&e.op_name, k))
+    }) else {
+        return Ok(None);
+    };
+    let regions = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+        .map_err(|e| SuperDscError(format!("{name}: {}", e.message)))?;
+    regions
+        .first()
+        .map(|q| Some(q.v_rows))
+        .ok_or_else(|| SuperDscError(format!("{name}: a paged attention program with no query")))
+}
+
 /// ⭐ A BUNDLE LOWERED AND RENDERED FOR dxp, BEFORE IT HAS A NAME — [`render_bundle`]'s output, which
 /// is everything the bundle's name covers ([`Self::name`]) and everything staging writes.
 pub struct RenderedBundle<T: ktir_superdsc::collective::Tp> {
     /// How many KTIR programs the bundle carries.
     programs: usize,
-    /// The attention program's query rows, `-1` for a bundle with none (the dump's rung name).
-    mq: i64,
+    /// The paged attention's query rows, `None` for a bundle with none (the dump's rung name).
+    mq: Option<u32>,
     /// How many descriptors the bundle's programs lowered to.
     descriptors: usize,
     /// (program name, descriptors) per program, for the dump's `bundle_id.json`.
@@ -8619,7 +8625,7 @@ pub struct RenderedBundle<T: ktir_superdsc::collective::Tp> {
 impl<T: ktir_superdsc::collective::Tp> RenderedBundle<T> {
     /// ⭐ THIS BUNDLE'S NAME — its content ([`crate::bundle_name`]): the layout it ships, then each
     /// group's shifts and dxp input digest, in launch order.
-    pub fn name(&self, layout: &bundle::BundleLayout<'_>) -> String {
+    pub fn name(&self, layout: Option<&bundle::BundleLayout<'_>>) -> String {
         crate::bundle_name::name(
             layout,
             self.shifts.iter().zip(&self.rendered).map(|(kv, g)| {
@@ -8701,7 +8707,9 @@ fn stage_bundle<T: ktir_superdsc::collective::Tp>(
         // dump against a log that was never printed is not a comparison; writing the identity beside the
         // descriptors is.
         //
-        // `mq` names the rung, read from the program at the render ([`RenderedBundle::mq`]).
+        // `mq` names the rung, read from the program at the render ([`RenderedBundle::mq`]); a bundle
+        // with no attention states none.
+        let mq = mq.map_or_else(|| "null".to_string(), |m| m.to_string());
         let mut progs: Vec<(String, usize)> = Vec::new();
         for (name, n) in per_prog {
             progs.push((name.clone(), *n));
@@ -11070,7 +11078,7 @@ mod name_tests {
         let rendered = render_dxp_input(ops, FoldGrouping::Split).expect("the ops render");
         let shifts = launch_index(ops, FoldGrouping::Split);
         crate::bundle_name::name(
-            &bundle::BundleLayout::default(),
+            None,
             shifts.iter().zip(&rendered).map(|(kv, g)| {
                 (
                     kv,
@@ -11125,7 +11133,7 @@ mod name_tests {
         );
         let rendered = render_dxp_input(&[op.shallow_copy()], FoldGrouping::Split).unwrap();
         let shifts = launch_index(&[op], FoldGrouping::Split);
-        let named = |layout: &bundle::BundleLayout<'_>| {
+        let named = |layout: Option<&bundle::BundleLayout<'_>>| {
             crate::bundle_name::name(
                 layout,
                 shifts.iter().zip(&rendered).map(|(kv, g)| {
@@ -11136,8 +11144,11 @@ mod name_tests {
                 }),
             )
         };
+        let narrow = bundle::BundleLayout::default();
         let mut wider = bundle::BundleLayout::default();
         wider.segment_bytes[0] = 1 << 20;
-        assert_ne!(named(&bundle::BundleLayout::default()), named(&wider));
+        assert_ne!(named(Some(&narrow)), named(Some(&wider)));
+        // And a bundle with no plan is not the bundle with an empty one.
+        assert_ne!(named(None), named(Some(&narrow)));
     }
 }
