@@ -4827,3 +4827,145 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
         "{got:?}"
     );
 }
+
+// ── FP8 S8 W4a: the one-row folds, whole tapes ─────────────────────
+
+/// `l` at one row lowered twice: with the bucket's folds (the matvec ends on) and with them off
+/// (`matvec_ends` and `matvec_norms` false: the tape before FP8 S8 W4a).
+fn w4_tapes(
+    l: &scratchy_subtile::handoff::LoweredDecode,
+    facts: scratchy_target_cuda_compiler::canonical::CudaModelFacts,
+) -> [CudaTape; 2] {
+    use scratchy_target_cuda_compiler::canonical::{
+        cuda_fold_facts, lower_plan, plan_canonical_folding,
+    };
+    let at = CanonicalAt { stem: "w4", m: 1 };
+    let on = lower_canonical(l, facts, at).expect("the one-row tape lowers with its folds");
+    let off_facts = scratchy_subtile::tape_folding::ModelFoldFacts {
+        matvec_ends: false,
+        matvec_norms: false,
+        ..cuda_fold_facts(1)
+    };
+    let off = (plan_canonical_folding(l, facts, at, off_facts).and_then(lower_plan))
+        .expect("the one-row tape lowers without them");
+    [static_tape(&on), static_tape(&off)]
+}
+
+/// Play bucket 0 and bucket 1 of a worker over `[on, off]` on `x` (KV and GDN as `kv`, `gdn`, the
+/// positions `positions`); `mismatched_bits` of the two results, and how many steps each has.
+fn w4_play(
+    device: &CudaDevice,
+    tapes: &'static [CudaTape; 2],
+    table: &[DeviceBuffer],
+    (pool, gdn_pool): (Option<KvPoolConfig>, Option<GdnPoolConfig>),
+    x: &[u16],
+    (positions, kv, gdn): (&[u32], Option<&KvSequence<'_>>, Option<&GdnSequence>),
+) -> (usize, [usize; 2]) {
+    let result = |t: &CudaTape| t.result.bytes as usize / 2;
+    let mut worker = CudaWorker::new(device, tapes, table, pool, gdn_pool).expect("worker");
+    let mut ys = [vec![0u16; result(&tapes[0])], vec![0u16; result(&tapes[1])]];
+    for (b, y) in ys.iter_mut().enumerate() {
+        (worker.forward(b, Input::Hidden(x), positions, kv, gdn, y)).expect("forward");
+    }
+    (
+        mismatched_bits(&ys[0], &ys[1]),
+        [tapes[0].steps.len(), tapes[1].steps.len()],
+    )
+}
+
+/// Each fixture's one-row tape played with the one-row folds (the norms in their GEMVs' prologue,
+/// the residual adds in their epilogue) against the same canonical lowered with them off, through
+/// the real worker and kernels: `mismatched_bits=0` on the result. The MLP, the attention layer
+/// (a fresh KV slot, position 0), the GDN layer (a fresh state) and the Qwen MoE block.
+#[test]
+fn the_one_row_folds_play_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let mut check = |what: &str, (bad, steps): (usize, [usize; 2])| {
+        let ok = bad == 0 && steps[0] < steps[1];
+        eprintln!(
+            "W4 one-row folds {what}: steps folded={} unfolded={} mismatched_bits={bad} {}",
+            steps[0],
+            steps[1],
+            verdict(ok)
+        );
+        pass &= ok;
+    };
+    // The MLP.
+    let tapes: &'static [CudaTape; 2] = Box::leak(Box::new(w4_tapes(&mlp(1), QWEN3_5_FACTS)));
+    let w = mlp_weights();
+    let table = mlp_table(&device, &w);
+    check(
+        "mlp",
+        w4_play(
+            &device,
+            tapes,
+            &table,
+            (None, None),
+            &mlp_input(1),
+            (&[], None, None),
+        ),
+    );
+    // The attention layer, one token at position 0 of a fresh sequence.
+    let tapes: &'static [CudaTape; 2] =
+        Box::leak(Box::new(w4_tapes(&attn_layer(1), QWEN3_5_FACTS)));
+    let w = layer_weights();
+    let table = layer_table(&device, &w);
+    let block_table = [3u32];
+    let seq = KvSequence {
+        block_table: &block_table,
+        prefix_len: 0,
+        q_len: 1,
+    };
+    check(
+        "attn_layer",
+        w4_play(
+            &device,
+            tapes,
+            &table,
+            (POOL, None),
+            &layer_input(1, 0x4A70),
+            (&[0], Some(&seq), None),
+        ),
+    );
+    // The GDN layer, a fresh state.
+    let tapes: &'static [CudaTape; 2] =
+        Box::leak(Box::new(w4_tapes(&gdn_layer(1), QWEN3_5_GDN_FACTS)));
+    let w = gdn_weights();
+    let table = gdn_table(&device, &w);
+    let gseq = GdnSequence {
+        slot: 1,
+        q_len: 1,
+        fresh: true,
+    };
+    check(
+        "gdn_layer",
+        w4_play(
+            &device,
+            tapes,
+            &table,
+            (None, GDN_POOL),
+            &gdn_input(1, 0x4A71),
+            (&[], None, Some(&gseq)),
+        ),
+    );
+    // The Qwen MoE block.
+    let tapes: &'static [CudaTape; 2] = Box::leak(Box::new(w4_tapes(&moe_block(1), MOE_FACTS)));
+    let w = moe_weights();
+    let table = moe_table(&device, &w);
+    check(
+        "moe_block",
+        w4_play(
+            &device,
+            tapes,
+            &table,
+            (None, None),
+            &moe_x(Routing::Random, 1, 0x4A72),
+            (&[], None, None),
+        ),
+    );
+    assert!(
+        pass,
+        "a one-row tape with its folds differs from the same tape without them"
+    );
+}

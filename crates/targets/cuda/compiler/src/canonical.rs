@@ -1391,6 +1391,33 @@ pub fn plan_canonical(
     facts: CudaModelFacts,
     at: CanonicalAt<'_>,
 ) -> Result<CudaPlan, CanonicalRefusal> {
+    plan_canonical_folding(l, facts, at, cuda_fold_facts(at.m))
+}
+
+/// CUDA's fold facts for a bucket of `m` rows (#1049, FP8 S8 W4a): the gate/up kernels take every
+/// bucket (`CUDA_FOLD_PROJECTIONS`); the one-row bucket's matvecs take their ends, the norm in
+/// their prologue and the residual add in their epilogue (`CUDA_FUSIONS_ONE_ROW`'s first two
+/// sweeps), as Metal's one-row buckets do. Every other bucket is unchanged.
+pub const fn cuda_fold_facts(m: u64) -> ModelFoldFacts {
+    ModelFoldFacts {
+        fold_projections: CUDA_FOLD_PROJECTIONS,
+        matvec_ends: m == 1,
+        matvec_norms: m == 1,
+        row_programs: false,
+        hidden_out: false,
+    }
+}
+
+/// [`plan_canonical`] under the fold facts `model`, not the bucket's: public only so a test can
+/// plan a one-row canonical with its matvec ends off (`tape_player`'s
+/// `the_one_row_folds_play_bit_for_bit`, the tape before FP8 S8 W4a). Not part of the crate's API.
+#[doc(hidden)]
+pub fn plan_canonical_folding(
+    l: &LoweredDecode,
+    facts: CudaModelFacts,
+    at: CanonicalAt<'_>,
+    model: ModelFoldFacts,
+) -> Result<CudaPlan, CanonicalRefusal> {
     let CanonicalAt { stem, m } = at;
     // CUDA's lm_head slice: none is declared, so this inserts nothing — but it runs, so a row
     // added to the table takes effect without touching this function.
@@ -1401,19 +1428,6 @@ pub fn plan_canonical(
         let valid = ValidatedGraph::new(&graph)
             .map_err(|e| CanonicalRefusal::Graph(format!("{stem} m={m}: {e}")))?;
         lower_dag_to_tape(&valid)
-    };
-    // The facts only gate patterns. CUDA's `Gated` reads `fold_projections` alone, which is
-    // CUDA's const fact (#1049): the gate/up kernels take every bucket. The one-row bucket's table
-    // folds the routed experts' gate and up too (`cuda_fusions`).
-    let model = ModelFoldFacts {
-        fold_projections: CUDA_FOLD_PROJECTIONS,
-        // FP8 S8 W4a: the one-row bucket's matvecs take their ends, the norm in their prologue and
-        // the residual add in their epilogue (`CUDA_FUSIONS_ONE_ROW`'s first two sweeps), as
-        // Metal's one-row buckets do. Every other bucket is unchanged.
-        matvec_ends: m == 1,
-        matvec_norms: m == 1,
-        row_programs: false,
-        hidden_out: false,
     };
     let folds = fold_tape(&graph, &tape, &lowered, cuda_fusions(m), model)
         .map_err(CanonicalRefusal::Fold)?;
