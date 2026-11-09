@@ -8581,11 +8581,10 @@ pub fn render_bundle<T: ktir_superdsc::collective::Tp>(
 }
 
 /// The query rows of the bundle's paged attention, `None` for a bundle that has none — the dump's rung
-/// name. READ FROM THE PROGRAM through the one reader of a program's parameter extents
-/// (`lower_ktir_to_superdsc::regions`, the door's own): the attention's first parameter is its
-/// `[mq, nqh·hd]` query (`PagedStepTids`' operand order), so its view's row extent is `mq`. A paged
-/// attention program whose parameters do not state their extents is refused by name, as the door
-/// refuses it.
+/// name. READ FROM THE PROGRAM: the attention's first parameter is its query (`PagedStepTids`' operand
+/// order), viewed `[mq, nqh·hd]`, so its view's row extent is `mq`
+/// (`lower_ktir_to_superdsc::param_view`, the view reading the door's `regions` makes). A paged
+/// attention program whose query states no 2-D view is refused by name.
 fn attention_query_rows<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
 ) -> Result<Option<u32>, SuperDscError> {
@@ -8595,12 +8594,17 @@ fn attention_query_rows<T: ktir_superdsc::collective::Tp>(
     }) else {
         return Ok(None);
     };
-    let regions = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
-        .map_err(|e| SuperDscError(format!("{name}: {}", e.message)))?;
-    regions
+    k.func
+        .arguments
         .first()
-        .map(|q| Some(q.v_rows))
-        .ok_or_else(|| SuperDscError(format!("{name}: a paged attention program with no query")))
+        .and_then(|(q, _)| ktir_superdsc::emit::lower_ktir_to_superdsc::param_view(&k.func, q))
+        .map(|(mq, _)| Some(mq))
+        .ok_or_else(|| {
+            SuperDscError(format!(
+                "{name}: a paged attention program's first parameter is its `[mq, nqh·hd]` query, \
+                 and this one states no 2-D view"
+            ))
+        })
 }
 
 /// ⭐ A BUNDLE LOWERED AND RENDERED FOR dxp, BEFORE IT HAS A NAME — [`render_bundle`]'s output, which
