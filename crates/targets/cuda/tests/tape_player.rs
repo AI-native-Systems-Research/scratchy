@@ -4873,18 +4873,21 @@ fn w4_play(
     )
 }
 
-/// Each fixture's one-row tape played with the one-row folds (the norms in their GEMVs' prologue,
-/// the residual adds in their epilogue) against the same canonical lowered with them off, through
-/// the real worker and kernels: `mismatched_bits=0` on the result. The MLP, the attention layer
-/// (a fresh KV slot, position 0), the GDN layer (a fresh state) and the Qwen MoE block.
+/// Each fixture's one-row tape played with the one-row folds (the residual adds in their GEMVs'
+/// epilogue) against the same canonical lowered with them off, through the real worker and
+/// kernels: `mismatched_bits=0` on the result, and each tape the exact number of launches it folds
+/// to, `[folded, unfolded]`: the MLP [3, 4] (its down takes the add), the attention layer [10, 11]
+/// (its o), the GDN layer [5, 6] (its out_proj) and the Qwen MoE block [11, 11] (its residual add
+/// follows the combine, which takes no epilogue, so nothing folds).
 #[test]
 fn the_one_row_folds_play_bit_for_bit() {
     let device = h100();
     let mut pass = true;
-    let mut check = |what: &str, (bad, steps): (usize, [usize; 2])| {
-        let ok = bad == 0 && steps[0] < steps[1];
+    let mut check = |what: &str, (bad, steps): (usize, [usize; 2]), want: [usize; 2]| {
+        let ok = bad == 0 && steps == want;
         eprintln!(
-            "W4 one-row folds {what}: steps folded={} unfolded={} mismatched_bits={bad} {}",
+            "W4 one-row folds {what}: steps folded={} unfolded={} (want {want:?}) \
+             mismatched_bits={bad} {}",
             steps[0],
             steps[1],
             verdict(ok)
@@ -4905,6 +4908,7 @@ fn the_one_row_folds_play_bit_for_bit() {
             &mlp_input(1),
             (&[], None, None),
         ),
+        [3, 4],
     );
     // The attention layer, one token at position 0 of a fresh sequence.
     let tapes: &'static [CudaTape; 2] =
@@ -4927,6 +4931,7 @@ fn the_one_row_folds_play_bit_for_bit() {
             &layer_input(1, 0x4A70),
             (&[0], Some(&seq), None),
         ),
+        [10, 11],
     );
     // The GDN layer, a fresh state.
     let tapes: &'static [CudaTape; 2] =
@@ -4948,6 +4953,7 @@ fn the_one_row_folds_play_bit_for_bit() {
             &gdn_input(1, 0x4A71),
             (&[], None, Some(&gseq)),
         ),
+        [5, 6],
     );
     // The Qwen MoE block.
     let tapes: &'static [CudaTape; 2] = Box::leak(Box::new(w4_tapes(&moe_block(1), MOE_FACTS)));
@@ -4963,6 +4969,7 @@ fn the_one_row_folds_play_bit_for_bit() {
             &moe_x(Routing::Random, 1, 0x4A72),
             (&[], None, None),
         ),
+        [11, 11],
     );
     assert!(
         pass,
