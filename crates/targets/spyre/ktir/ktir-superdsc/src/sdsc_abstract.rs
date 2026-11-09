@@ -3491,6 +3491,11 @@ impl RungWidth {
     pub const fn count(self) -> usize {
         self.0.get() as usize
     }
+
+    /// ONE row — a decode batch's per-request width: every row of a batch's graph is a
+    /// request's one token ([`QueryExtent`]'s decode law), the width a body's pair takes
+    /// wherever the rows are a batch's. The `S = 1` counterpart of [`RungCap::ONE`].
+    pub const ONE: RungWidth = RungWidth(NonZeroU32::MIN);
 }
 
 /// SEQUENCES A PREFILL RUNG HOLDS — the S axis of the prefill ladder.

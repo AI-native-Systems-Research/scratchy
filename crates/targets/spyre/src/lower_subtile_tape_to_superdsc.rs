@@ -1581,9 +1581,12 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    in the intermediate segment, which neither a layer's launch nor a walk's relaunch shifts
     //    (the KV segment moves with every layer). `PagedStep::card_placements` is
     //    the one statement of what they are and how big — the card stagers stage within it.
-    if let Some(step) =
-        crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL, paged_rows)?
-    {
+    if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+        ir,
+        ActiveCap::FULL,
+        paged_rows,
+        query_rows,
+    )? {
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {
                 crate::wiring::CardSeat::Step => SegRole::Activation,
@@ -3889,6 +3892,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         ir,
         rung.active_cap,
         scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
+        rung.query_rows,
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {

@@ -2888,6 +2888,22 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         err.contains("the graph's 128 row(s) are not the extent pair's 192"),
         "the refusal names both extents: {err}"
     );
+    // ⛔ THE PAGED STEP'S OWN AGREEMENT — `paged_step_of_ir` mints the wiring's step (the
+    // layout sizes the tables by the pair), so the SAME mismatched pair is refused at the step
+    // mint too, naming the graph's rows and the pair's — never a silently-wrong per-request
+    // width the card would stage by.
+    let err = scratchy_target_spyre::lower_subtile_tape_to_ktir::paged_step_of_ir(
+        &ir,
+        s.active_cap(),
+        PagedRows::Sequence,
+        mismatch,
+    )
+    .expect_err("the step mint refuses a pair the graph disagrees with");
+    assert!(
+        err.0.contains("the graph runs 128 query row(s) but the rung's minted extent states 192"),
+        "the refusal names the graph's rows and the pair's: {}",
+        err.0
+    );
 }
 
 /// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows.
@@ -3021,6 +3037,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         &ir,
         s.active_cap(),
         PagedRows::Sequence,
+        pair_of_one_request(s.mq),
     )
     .expect("the paged step derives")
     .expect("the graph has attention");
@@ -3314,6 +3331,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         &ir,
         s.active_cap(),
         PagedRows::Batch,
+        batch_pair_of_one_row_each(s.mq),
     )
     .expect("the paged step derives")
     .expect("the graph has attention");
