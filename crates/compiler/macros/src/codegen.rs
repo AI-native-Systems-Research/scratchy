@@ -10264,7 +10264,7 @@ fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
 ) {
     for b in bundles {
         let fp = proc_macro2::Literal::string(&b.fp);
-        let layout = layout_tokens(&b.layout, places_interner);
+        let layout = fact_tokens(&b.layout, places_interner);
         let groups = b
             .groups
             .iter()
@@ -10272,7 +10272,7 @@ fn bundle_items<T: scratchy_target_spyre::bundle_code::collective::Tp>(
             .map(|(i, g)| {
                 *n_groups += 1;
                 *n_bytes += g.init_binary.len();
-                launch_tokens(g, i, &b.fp, images, interner)
+                launch_tokens(g, i, &b.fp, images, interner, places_interner)
             })
             .collect::<Vec<_>>();
         let reroll = match &b.reroll {
@@ -10304,19 +10304,6 @@ fn cow_str(s: &str) -> proc_macro2::TokenStream {
     quote! { ::std::borrow::Cow::Borrowed(#lit) }
 }
 
-/// A `Cow::Borrowed` slice of unsuffixed integer literals.
-#[cfg(feature = "spyre")]
-fn cow_u64s(v: &[u64]) -> proc_macro2::TokenStream {
-    let lits = v.iter().map(|x| proc_macro2::Literal::u64_unsuffixed(*x));
-    quote! { ::std::borrow::Cow::Borrowed(&[#(#lits),*]) }
-}
-
-/// One [`bundle::Placement`].
-///
-/// ⛔ THE DESTRUCTURES IN THIS FAMILY OF FUNCTIONS ARE THE GUARD, in both directions: a field ADDED to
-/// the artifact type leaves the `quote!` below incomplete (a missing-field error in the expanded code),
-/// and a field REMOVED leaves the destructure naming something that no longer exists. So the baked value
-/// cannot drift from the type it is a value of.
 /// One [`bundle::SynthRole`] as tokens.
 ///
 /// ⛔ AN EXHAUSTIVE MATCH, NOT A STRING. A synthetic's role used to be a name SUFFIX
@@ -10485,59 +10472,6 @@ pub(crate) fn op_local_role_tokens(
     }
 }
 
-#[cfg(feature = "spyre")]
-fn placement_tokens(
-    p: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Placement,
-) -> proc_macro2::TokenStream {
-    let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Placement {
-        id,
-        segment,
-        bank,
-        offset,
-        size,
-        is_logits,
-    } = p;
-    let id = place_id_tokens(id);
-    let (segment, bank, offset, size) = (
-        proc_macro2::Literal::u32_unsuffixed(*segment),
-        proc_macro2::Literal::u32_unsuffixed(*bank),
-        proc_macro2::Literal::u64_unsuffixed(*offset),
-        proc_macro2::Literal::u64_unsuffixed(*size),
-    );
-    quote! {
-        ::scratchy_target_spyre::bundle_code::Placement {
-            id: #id, segment: #segment, bank: #bank, offset: #offset, size: #size,
-            is_logits: #is_logits,
-        }
-    }
-}
-
-/// One [`bundle::KernelWeight`].
-#[cfg(feature = "spyre")]
-fn kernel_weight_tokens(
-    k: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KernelWeight<'_>,
-) -> proc_macro2::TokenStream {
-    let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KernelWeight {
-        id,
-        device_size,
-        stride_map,
-        stick_size,
-        word_length,
-    } = k;
-    let id = place_id_tokens(id);
-    let (device_size, stride_map) = (cow_u64s(device_size), cow_u64s(stride_map));
-    let (stick_size, word_length) = (
-        proc_macro2::Literal::u32_unsuffixed(*stick_size),
-        proc_macro2::Literal::u32_unsuffixed(*word_length),
-    );
-    quote! {
-        ::scratchy_target_spyre::bundle_code::KernelWeight {
-            id: #id, device_size: #device_size, stride_map: #stride_map,
-            stick_size: #stick_size, word_length: #word_length,
-        }
-    }
-}
-
 /// ⭐ ONE `static` PER DISTINCT PLACEMENT TABLE — the rungs of a ladder share one resident layout, so
 /// most bundles' tables are the same table. MEASURED on granite-2b: the 223 bundles carried 223 tables
 /// (~1,550 placements each, 76 MB of the 100 MB generated source) and only 102 were distinct.
@@ -10553,12 +10487,8 @@ struct PlacesInterner {
 
 #[cfg(feature = "spyre")]
 impl PlacesInterner {
-    /// The `static` naming `places`, defined on first sight.
-    fn ident(
-        &mut self,
-        places: &[scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Placement],
-    ) -> proc_macro2::Ident {
-        let rows: Vec<proc_macro2::TokenStream> = places.iter().map(placement_tokens).collect();
+    /// The `static` naming the table of `n` rows `rows`, defined on first sight.
+    fn ident(&mut self, rows: &[proc_macro2::TokenStream]) -> proc_macro2::Ident {
         let body = quote! { [#(#rows),*] };
         let key = body.to_string();
         if let Some(id) = self.seen.get(&key) {
@@ -10568,7 +10498,7 @@ impl PlacesInterner {
             &format!("__SDSC_PLACES_{}", self.items.len()),
             proc_macro2::Span::call_site(),
         );
-        let n = proc_macro2::Literal::usize_unsuffixed(places.len());
+        let n = proc_macro2::Literal::usize_unsuffixed(rows.len());
         self.items.push(quote! {
             static #id: [::scratchy_target_spyre::bundle_code::Placement; #n] = #body;
         });
@@ -10582,6 +10512,143 @@ impl PlacesInterner {
     }
 }
 
+/// ⭐ THE TOKEN SINK OF THE BUNDLE'S ONE WALK (`bundle_code::facts`) — the layout and each launch's
+/// shifts as the `const` expressions that ship them. The bundle crate walks every field (its
+/// destructures are the exhaustiveness guard, so a new field is a build error THERE until it is
+/// walked); this renders what the walk hands it and knows no field by name.
+#[cfg(feature = "spyre")]
+struct TokenSink<'i> {
+    places: &'i mut PlacesInterner,
+}
+
+#[cfg(feature = "spyre")]
+impl TokenSink<'_> {
+    /// `::scratchy_target_spyre::bundle_code::<path>`.
+    fn path(path: scratchy_target_spyre::bundle_code::facts::Path) -> proc_macro2::TokenStream {
+        let segs = path
+            .iter()
+            .map(|s| proc_macro2::Ident::new(s, proc_macro2::Span::call_site()));
+        quote! { ::scratchy_target_spyre::bundle_code #(:: #segs)* }
+    }
+
+    /// `path { name: value, … }`, every field followed by its comma.
+    fn braced(
+        path: proc_macro2::TokenStream,
+        fields: Vec<(&'static str, proc_macro2::TokenStream)>,
+    ) -> proc_macro2::TokenStream {
+        let fields = fields.into_iter().map(|(n, v)| {
+            let n = proc_macro2::Ident::new(n, proc_macro2::Span::call_site());
+            quote! { #n: #v, }
+        });
+        quote! { #path { #(#fields)* } }
+    }
+}
+
+#[cfg(feature = "spyre")]
+impl scratchy_target_spyre::bundle_code::facts::FactSink for TokenSink<'_> {
+    type Out = proc_macro2::TokenStream;
+    fn record(
+        &mut self,
+        path: scratchy_target_spyre::bundle_code::facts::Path,
+        fields: Vec<(&'static str, Self::Out)>,
+    ) -> Self::Out {
+        Self::braced(Self::path(path), fields)
+    }
+    fn variant(
+        &mut self,
+        path: scratchy_target_spyre::bundle_code::facts::Path,
+        variant: &'static str,
+        fields: Vec<(&'static str, Self::Out)>,
+    ) -> Self::Out {
+        let (p, v) = (
+            Self::path(path),
+            proc_macro2::Ident::new(variant, proc_macro2::Span::call_site()),
+        );
+        if fields.is_empty() {
+            quote! { #p::#v }
+        } else {
+            Self::braced(quote! { #p::#v }, fields)
+        }
+    }
+    fn option(&mut self, v: Option<Self::Out>) -> Self::Out {
+        match v {
+            None => quote! { ::core::option::Option::None },
+            Some(v) => quote! { ::core::option::Option::Some(#v) },
+        }
+    }
+    fn list(
+        &mut self,
+        shape: scratchy_target_spyre::bundle_code::facts::ListShape,
+        vs: Vec<Self::Out>,
+    ) -> Self::Out {
+        use scratchy_target_spyre::bundle_code::facts::ListShape as L;
+        match shape {
+            L::Array => quote! { [#(#vs),*] },
+            L::Slice => quote! { ::std::borrow::Cow::Borrowed(&[#(#vs),*]) },
+            L::PlaceTable => {
+                let id = self.places.ident(&vs);
+                quote! { ::std::borrow::Cow::Borrowed(&#id) }
+            }
+        }
+    }
+    fn pair(&mut self, a: Self::Out, b: Self::Out) -> Self::Out {
+        quote! { (#a, #b) }
+    }
+    fn u32(&mut self, v: u32) -> Self::Out {
+        let v = proc_macro2::Literal::u32_unsuffixed(v);
+        quote! { #v }
+    }
+    fn u64(&mut self, v: u64) -> Self::Out {
+        let v = proc_macro2::Literal::u64_unsuffixed(v);
+        quote! { #v }
+    }
+    fn bool(&mut self, v: bool) -> Self::Out {
+        quote! { #v }
+    }
+    fn f32(&mut self, v: f32) -> Self::Out {
+        f32_bits(v)
+    }
+    fn fold_scale(&mut self, v: f32) -> Self::Out {
+        let v = proc_macro2::Literal::f32_suffixed(v);
+        quote! { #v }
+    }
+    fn place(&mut self, id: scratchy_target_spyre::bundle_code::PlaceId) -> Self::Out {
+        place_id_tokens(&id)
+    }
+    // A collective's fragment, rank and window cut, each re-minted through its `const fn` so the
+    // static it lands in re-proves the value's law (a whole-flit payload, a rank inside its world —
+    // the bundle's own type, inferred from the static — and a cut the window has).
+    fn fragment(&mut self, f: scratchy_target_spyre::bundle_code::collective::Fragment) -> Self::Out {
+        let [first, sticks, rows] =
+            [f.first_stick(), f.sticks(), f.rows()].map(proc_macro2::Literal::u32_unsuffixed);
+        quote! {
+            ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
+                #first, #sticks, #rows,
+            )
+        }
+    }
+    fn rank<T: scratchy_target_spyre::bundle_code::collective::Tp>(
+        &mut self,
+        r: scratchy_target_spyre::bundle_code::collective::Rank<T>,
+    ) -> Self::Out {
+        let r = proc_macro2::Literal::u32_unsuffixed(r.get());
+        quote! { ::scratchy_target_spyre::bundle_code::collective::Rank::baked(#r) }
+    }
+    fn cut(&mut self, c: scratchy_target_spyre::bundle_code::collective::WindowCut) -> Self::Out {
+        let c = proc_macro2::Literal::u32_unsuffixed(c.index() as u32);
+        quote! { ::scratchy_target_spyre::bundle_code::collective::WindowCut::baked(#c) }
+    }
+}
+
+/// Render `x` as the expression that ships it.
+#[cfg(feature = "spyre")]
+fn fact_tokens(
+    x: &impl scratchy_target_spyre::bundle_code::facts::Facts,
+    places: &mut PlacesInterner,
+) -> proc_macro2::TokenStream {
+    x.visit(&mut TokenSink { places })
+}
+
 /// The whole memory plan.
 /// ⭐ THE TENSOR-PARALLEL WORLD THIS BUILD BAKES — `scratchy_tp_world::Build`, the one `tp/N` the
 /// build names (one rank when it names none). Its rank count, for the messages and the bundle names
@@ -10589,104 +10656,6 @@ impl PlacesInterner {
 #[cfg(feature = "spyre")]
 const TP_WORLD: u32 =
     <scratchy_target_spyre::bundle_code::collective::Build as scratchy_target_spyre::bundle_code::collective::World>::RANKS;
-
-#[cfg(feature = "spyre")]
-fn layout_tokens(
-    l: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout<'_>,
-    places_interner: &mut PlacesInterner,
-) -> proc_macro2::TokenStream {
-    let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BundleLayout {
-        segment_bytes,
-        weight_bank_bytes,
-        weight_tail,
-        places,
-        kernel_weights,
-        scalarmul_scales,
-        weight_scale_folds,
-        kv_request_stride_bytes,
-        lx_op_local_bytes,
-        lx_prob_pin_bytes,
-        lx_pin_window_bytes,
-        num_sources,
-        resident_source_tids,
-    } = l;
-    let segs = segment_bytes
-        .iter()
-        .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
-    let wbanks = weight_bank_bytes
-        .iter()
-        .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
-    let places = places_interner.ident(places);
-    let kws = kernel_weights.iter().map(kernel_weight_tokens);
-    // The exact value, as its BITS — these are the granite ScalarMul multipliers (a rounded one is a
-    // quietly wrong model) and the page walk's `-inf` seed (which no float literal spells).
-    let scales = scalarmul_scales.iter().map(|s| f32_bits(*s));
-    // The fold list, same exact-value rule: a rounded multiplier is a quietly wrong weight scale.
-    let folds = weight_scale_folds.iter().map(|(tid, scale)| {
-        let tid = proc_macro2::Literal::u32_unsuffixed(*tid);
-        let scale = proc_macro2::Literal::f32_suffixed(*scale);
-        quote! { (#tid, #scale) }
-    });
-    let krs = proc_macro2::Literal::u64_unsuffixed(*kv_request_stride_bytes);
-    // The rung's op-local LX pin slots — the host's term of the one `lx_window_fits` budget. The
-    // pin PLACEMENTS stay emit-only (compiled sdsc allocates); the SUM is baked here so the host
-    // budgets against the same pins the bake did. Same number for every bundle of the rung.
-    let lxol = proc_macro2::Literal::u64_unsuffixed(*lx_op_local_bytes);
-    // The chunk form's probability-part pins — the host's SECOND core-local term of the same
-    // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
-    // chunk form mints none.
-    let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
-    // ⭐ THE WHOLE PIN WINDOW — core-local pins + op-local slot classes, the budget the bake's
-    // `lx_window_fits` guard proved. Carried as an Option: `None` is "no window was ever proven",
-    // which the resident fused path refuses at load rather than charging a silent zero.
-    let lxpw = match lx_pin_window_bytes {
-        Some(b) => {
-            let lit = proc_macro2::Literal::u64_unsuffixed(*b);
-            quote! { ::core::option::Option::Some(#lit) }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
-    // The graph's own wiring facts — the source count and the resident ids, so every session
-    // reads them off the bundle it runs rather than off another graph's wiring (the mint's
-    // renumbering makes the two differ; see the layout field's own doc).
-    let nsrc = proc_macro2::Literal::u32_unsuffixed(*num_sources);
-    let res = resident_source_tids
-        .iter()
-        .map(|t| proc_macro2::Literal::u32_unsuffixed(*t));
-    // The segment budget's verdict, as a variant: every reader matches on it.
-    let tail = match weight_tail {
-        scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
-            quote! { ::scratchy_target_spyre::bundle_code::WeightTail::InPlace }
-        }
-        scratchy_target_spyre::bundle_code::WeightTail::Spilled { segment, bytes } => {
-            let segment = proc_macro2::Literal::u32_unsuffixed(*segment);
-            let bytes = proc_macro2::Literal::u64_unsuffixed(*bytes);
-            quote! {
-                ::scratchy_target_spyre::bundle_code::WeightTail::Spilled {
-                    segment: #segment,
-                    bytes: #bytes,
-                }
-            }
-        }
-    };
-    quote! {
-        ::scratchy_target_spyre::bundle_code::BundleLayout {
-            segment_bytes: [#(#segs),*],
-            weight_bank_bytes: ::std::borrow::Cow::Borrowed(&[#(#wbanks),*]),
-            weight_tail: #tail,
-            places: ::std::borrow::Cow::Borrowed(&#places),
-            kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
-            scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
-            weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
-            kv_request_stride_bytes: #krs,
-            lx_op_local_bytes: #lxol,
-            lx_prob_pin_bytes: #lxpp,
-            lx_pin_window_bytes: #lxpw,
-            num_sources: #nsrc,
-            resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
-        }
-    }
-}
 
 /// ONE LAUNCH: its address shifts and its compiled program, as a single value. The device image is
 /// written to `OUT_DIR` and referenced by `include_bytes!`; everything else is a literal.
@@ -10699,6 +10668,7 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     fp: &str,
     images: &std::path::Path,
     interner: &mut crate::ktir_tokens::ProgramInterner,
+    places_interner: &mut PlacesInterner,
 ) -> proc_macro2::TokenStream {
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LaunchGroup {
         kv,
@@ -10707,96 +10677,8 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
         job_bin_ptr,
         correction,
     } = g;
-    let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KvShifts {
-        slot_stride_bytes,
-        slab_stride_bytes,
-        page_slots,
-        request,
-        slot_offset,
-        page_fold,
-        batched_requests,
-        gathered,
-        fold_rows,
-        walk,
-        tp,
-    } = kv;
-    // A collective's consume: its kind, the operand it sends, and the fragment — re-minted through
-    // `Fragment::baked`, a `const fn`, so the static this lands in re-proves the fragment's law.
-    let tp = match tp {
-        None => quote! { ::core::option::Option::None },
-        Some(c) => {
-            use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::collective::CollectiveKind as K;
-            let kind = match c.kind {
-                K::AllReduce => {
-                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllReduce }
-                }
-                K::AllGather => {
-                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllGather }
-                }
-            };
-            let operand = place_id_tokens(&c.operand);
-            let [first, sticks, rows] = [
-                c.fragment.first_stick(),
-                c.fragment.sticks(),
-                c.fragment.rows(),
-            ]
-            .map(proc_macro2::Literal::u32_unsuffixed);
-            // The consume's rank, re-minted through `Rank::baked`, the const fn that refuses a rank
-            // past its world — the world being the bundle's type, inferred from the static.
-            let r = proc_macro2::Literal::u32_unsuffixed(c.plays_at.get());
-            let plays_at = quote! {
-                ::scratchy_target_spyre::bundle_code::collective::Rank::baked(#r)
-            };
-            // The window cut, re-minted through the const fn that refuses a cut the window
-            // does not have.
-            let cut = proc_macro2::Literal::u32_unsuffixed(c.cut.index() as u32);
-            quote! {
-                ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpConsume {
-                    kind: #kind,
-                    operand: #operand,
-                    fragment: ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
-                        #first, #sticks, #rows,
-                    ),
-                    plays_at: #plays_at,
-                    cut: ::scratchy_target_spyre::bundle_code::collective::WindowCut::baked(#cut),
-                })
-            }
-        }
-    };
-    let walk = match walk {
-        Some(scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::Walk {
-            trips,
-            step_bytes,
-        }) => {
-            let (t, s) = (
-                proc_macro2::Literal::u32_unsuffixed(*trips),
-                proc_macro2::Literal::u32_unsuffixed(*step_bytes),
-            );
-            quote! {
-                ::std::option::Option::Some(::scratchy_target_spyre::bundle_code::Walk {
-                    trips: #t,
-                    step_bytes: #s,
-                })
-            }
-        }
-        None => quote! { ::std::option::Option::None },
-    };
-    let [slot, slab, slots, req, slot_off] = [
-        *slot_stride_bytes,
-        *slab_stride_bytes,
-        *page_slots,
-        *request,
-        *slot_offset,
-    ]
-    .map(proc_macro2::Literal::u32_unsuffixed);
-    let fold_rows = match fold_rows {
-        scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::WholeBatch => {
-            quote! { ::scratchy_target_spyre::bundle_code::FoldRows::WholeBatch }
-        }
-        scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::PerRequest => {
-            quote! { ::scratchy_target_spyre::bundle_code::FoldRows::PerRequest }
-        }
-    };
+    // The shifts as the one walk renders them (`bundle_code::facts`).
+    let kv = fact_tokens(kv, places_interner);
     let jbp = proc_macro2::Literal::u64_unsuffixed(*job_bin_ptr);
     // Launch order is the slice position, so the image path is keyed by it.
     let image = out_dir_bytes(images, &format!("{fp}/group_{index}.bin"), init_binary);
@@ -10814,19 +10696,7 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
         .collect();
     quote! {
         ::scratchy_target_spyre::bundle_code::LaunchGroup {
-            kv: ::scratchy_target_spyre::bundle_code::KvShifts {
-                slot_stride_bytes: #slot,
-                slab_stride_bytes: #slab,
-                page_slots: #slots,
-                request: #req,
-                slot_offset: #slot_off,
-                page_fold: #page_fold,
-                batched_requests: #batched_requests,
-                gathered: #gathered,
-                fold_rows: #fold_rows,
-                walk: #walk,
-                tp: #tp,
-            },
+            kv: #kv,
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,
             job_bin_ptr: #jbp,
