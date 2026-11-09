@@ -1437,3 +1437,74 @@ fn the_normed_expert_and_gate_up_gemvs_are_their_chains_bit_for_bit() {
         "a normed expert fp8 GEMV differs from the norm then the GEMV"
     );
 }
+
+/// FP8 S8 W4a's timing (the brief's §6.5): at the 27B's shapes, the fp8 GEMV with its fused end
+/// beside the same GEMV without, by CUDA events, cold and hot, and the µs the end adds per launch.
+/// The norm on the gate+up and the qkv/z group's dense twin (5,120 → 10,240), the residual on the
+/// o/out and the down. The brief's stop rule is more than 2 µs added; recorded, not asserted (the
+/// clock ramp moves a run by about 35%), each line with its `ADDED` µs for the pod to judge.
+#[test]
+fn the_w4_fused_end_times_are_recorded() {
+    let device = h100();
+    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
+    // (n, k, norm, what): the norm or the residual.
+    for (n, k, norm, what) in [
+        (34816u32, 5120u32, true, "27B gate+up (norm)"),
+        (10240, 5120, true, "27B in_proj_qkv (norm)"),
+        (5120, 6144, false, "27B o / out (residual)"),
+        (5120, 17408, false, "27B down (residual)"),
+    ] {
+        let (nu, ku) = (n as usize, k as usize);
+        let x = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x4F80)).expect("x");
+        let (bq, b_s) = weight(nu, ku, 0x4F81);
+        let w = Fp8Buf::new(&device, &bq, &b_s);
+        let gb = DeviceBuffer::upload(&device, &centred_gains(ku, 0x4F82)).expect("gain");
+        let rb = DeviceBuffer::upload(&device, &bf16_inputs(nu, 0x4F83)).expect("residual");
+        let c = DeviceBuffer::upload(&device, &vec![0u16; nu]).expect("c");
+        let splits = gemv_splits(n, k, 1);
+        let p = scratch(&device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+        let ends = if norm {
+            Ends {
+                gain: gb.ptr().cast_const(),
+                eps: W4_EPS,
+                gain_offset: 1.0,
+                residual: std::ptr::null(),
+            }
+        } else {
+            Ends {
+                residual: rb.ptr().cast_const(),
+                ..Ends::NONE
+            }
+        };
+        for (temp, sc) in [("cold", Some(&scrub)), ("hot", None)] {
+            let time = |e: Ends| {
+                event_times(sc, || {
+                    // SAFETY: as `run_gemv`'s, and the gain k / residual n bf16.
+                    unsafe {
+                        gemv_fp8_ends(
+                            (x.ptr().cast_const(), w.op(), c.ptr()),
+                            p.ptr(),
+                            (n, k, splits),
+                            e,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("launch");
+                })
+            };
+            let (plain, fused) = (time(Ends::NONE), time(ends));
+            eprintln!(
+                "W4 fused end time {temp} n={n} k={k} splits={splits}: plain median={:.1}us \
+                 fused median={:.1}us (min {:.1} / {:.1}, max {:.1} / {:.1}) ADDED={:.2}us \
+                 (recorded, not asserted; stop above 2) ({what})",
+                plain.0,
+                fused.0,
+                plain.1,
+                fused.1,
+                plain.2,
+                fused.2,
+                fused.0 - plain.0
+            );
+        }
+    }
+}
