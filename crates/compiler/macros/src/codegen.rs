@@ -10984,15 +10984,8 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
         correction,
     } = g;
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KvShifts {
-        slot_stride_bytes,
-        slab_stride_bytes,
-        page_slots,
-        request,
-        slot_offset,
         page_fold,
-        batched_requests,
         gathered,
-        fold_rows,
         walk,
         tp,
     } = kv;
@@ -11057,22 +11050,6 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
         }
         None => quote! { ::std::option::Option::None },
     };
-    let [slot, slab, slots, req, slot_off] = [
-        *slot_stride_bytes,
-        *slab_stride_bytes,
-        *page_slots,
-        *request,
-        *slot_offset,
-    ]
-    .map(proc_macro2::Literal::u32_unsuffixed);
-    let fold_rows = match fold_rows {
-        scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::WholeBatch => {
-            quote! { ::scratchy_target_spyre::bundle_code::FoldRows::WholeBatch }
-        }
-        scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::PerRequest => {
-            quote! { ::scratchy_target_spyre::bundle_code::FoldRows::PerRequest }
-        }
-    };
     let jbp = proc_macro2::Literal::u64_unsuffixed(*job_bin_ptr);
     // Launch order is the slice position, so the image path is keyed by it.
     let image = out_dir_bytes(images, &format!("{fp}/group_{index}.bin"), init_binary);
@@ -11091,15 +11068,8 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     quote! {
         ::scratchy_target_spyre::bundle_code::LaunchGroup {
             kv: ::scratchy_target_spyre::bundle_code::KvShifts {
-                slot_stride_bytes: #slot,
-                slab_stride_bytes: #slab,
-                page_slots: #slots,
-                request: #req,
-                slot_offset: #slot_off,
                 page_fold: #page_fold,
-                batched_requests: #batched_requests,
                 gathered: #gathered,
-                fold_rows: #fold_rows,
                 walk: #walk,
                 tp: #tp,
             },

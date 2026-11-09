@@ -37,8 +37,7 @@
 //! leaf crate must not own it, and it cannot be received as data either.
 //!
 //! ⚠️ NOT YET LEAF-CLEAN: [`emit::EmittedOp`], this crate's own output type, still carries a
-//! consumer's bake plan (`kv_page_fold`, `kv_batched_requests`, `kv_fold_rows`, `kv_page_slots`,
-//! `kv_request`, `host_kv_write`, `kv_n_skip`, `slot_no_fuse`) alongside the descriptors it emits.
+//! consumer's bake plan (`kv_page_fold`, `kv_gathered`, `walk`) alongside the descriptors it emits.
 //! Separating what the lowering EMITS from what the caller SCHEDULES is outstanding work.
 //!
 //! Citations to `ibm/main` line numbers throughout are the port's provenance — the body each

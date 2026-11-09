@@ -1,39 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-//! ⭐⭐⭐⭐⭐ THE GATHER REPRODUCES `page_base_bytes` EXACTLY — so batching needs no pool relayout.
+//! ⭐⭐⭐⭐⭐ THE GATHER'S INDEX LAWS — pinned against the pool's own geometry.
 //!
-//! ## The constraint, in the codebase's own words
-//! `SessionKv::fold_requests`: *"ONE LAUNCHED OP HAS ONE PAGE BASE, so B requests cannot share a
-//! pass: the fold runs `pages x requests` times, and each pass names both."*
+//! dxp's index-to-address conversion (`ConvertData_gather_idx`) computes
+//! `addr = idx * skip_addr + base_addr` — an affine map, so the free-list nature of the pool is
+//! IRRELEVANT to the gather: pages are uniformly spaced by construction, and the index is what
+//! selects among them. Nothing needs to be made contiguous, because nothing was ever non-uniform.
 //!
-//! That is the whole batch-scaling cost. The base is a per-launch SCALAR, so B requests need B
-//! launches of work that is already fully core-parallel, with the mask discarding all but one row's
-//! worth. Flash attention's premise — each row reads its own KV — is exactly what a per-launch scalar
-//! cannot express.
-//!
-//! ## Why the hardware gather is a drop-in for it
-//! The host resolves a page like this (`fold_plan::page_base_bytes`):
-//! ```text
-//! phys = block_tables[row][logical_page]
-//! addr = phys * page_stride_bytes
-//! ```
-//! and dxp's index-to-address conversion (`ConvertData_gather_idx`) computes:
-//! ```text
-//! addr = idx * skip_addr + base_addr
-//! ```
-//! ⭐ THE SAME AFFINE MAP. `page_base_bytes` is already `idx * stride` with `idx` the physical page
-//! number the host looked up. So the free-list nature of the pool is IRRELEVANT to the gather: pages
-//! are uniformly spaced by construction (`phys * page_stride_bytes`), and the index is what selects
-//! among them. Nothing needs to be made contiguous, because nothing was ever non-uniform.
-//!
-//! ## The one wrinkle, and why it is free
-//! `page_stride_bytes = iters * kv_stride` — one page spans EVERY layer (`superdsc_exec.rs:712`).
-//! A single score op's value tensor is ONE layer, so its natural entry is `kv_stride`, not the whole
-//! page. That is not a mismatch to engineer around: the index tensor is data WE build on the host, so
-//! layer `L` of logical page `p` is simply index `phys(p) * iters + L` at unit stride `kv_stride`.
-//! The layer term is absorbed into the index, and the host already has `phys` in `block_tables`.
-//!
-//! These tests pin that identity against the REAL `page_base_bytes`, so if either side's arithmetic
-//! is ever changed the correspondence fails here rather than on the card.
+//! What these tests pin is the arithmetic and the LAYOUT of the index table the host stages for a
+//! gathered body: the entry factor (how many index entries one physical page is), the flat
+//! row order of the fold-pass table, and the row law's independence from the window count. The
+//! identity against `fold_plan`'s host page lookup went with that lookup — the runtime never
+//! staged it (0 of 35 card sessions paged, measured 2026-11-09 on main 6f6c580ee6) — and the
+//! still-uncalled `sdsc_abstract` staging surface (`gather_index_table`, `GatherScratch::of_fold_pass`)
+//! is recorded as its own follow-up deletion.
 
 /// The test pool: head count and width as the raw fixture numbers, minted through the pool's
 /// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
@@ -47,108 +26,7 @@ fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool 
     )
 }
 
-use scratchy_target_spyre::fold_plan::{
-    Bytes, PageSlots, RowCursors, RowIdx, RowPage, SessionKv, page_base_bytes,
-};
-
 const ITERS: i64 = 40; // layers in the rolled loop
-const KV_STRIDE: u64 = 4096; // bytes of ONE layer's page
-
-/// A paged session whose block table is deliberately NON-MONOTONIC and sparse — a free list that has
-/// been churned. If the gather's correspondence held only for tidy tables it would be worthless.
-fn churned_session() -> SessionKv {
-    SessionKv {
-        paged: true,
-        fold_pages: 0,
-        page_slots: PageSlots::per_page(256),
-        page_stride_bytes: Bytes(ITERS as u64 * KV_STRIDE),
-        // row 0 -> physical 17, 3, 200 ; row 1 -> 4, 199, 18. Interleaved and out of order, which is
-        // what a real free list under churn looks like.
-        block_tables: vec![vec![17, 3, 200], vec![4, 199, 18]],
-        request_positions: RowCursors::bound(vec![0, 300]),
-        fold_requests: 2,
-        mask_rep_stride_bytes: 0,
-        mask_blocks: 0,
-        int_rep_stride_bytes: 0,
-    }
-}
-
-/// The index value the host would put in the gather's index tensor for (row, logical page, layer).
-/// This is the WHOLE host-side computation the gather needs, and it is one multiply and one add over
-/// data the session already holds.
-fn gather_index(s: &SessionKv, row: usize, logical_page: usize, layer: i64) -> i64 {
-    s.block_tables[row][logical_page] * ITERS + layer
-}
-
-/// dxp's address computation, verbatim from `ConvertData_gather_idx`.
-fn gather_addr(idx: i64, skip_addr: u64, base: u64) -> u64 {
-    (idx as u64) * skip_addr + base
-}
-
-/// ⭐⭐⭐ THE IDENTITY: for every row, every logical page, and every layer, the gather's affine map
-/// lands on exactly the byte the host's page lookup would have chosen.
-#[test]
-fn the_gather_index_lands_exactly_where_the_host_would_have_pointed() {
-    let s = churned_session();
-    let pool_base = 0x4000_0000u64; // the symbolic base the bundle passes in
-
-    for row in 0..s.block_tables.len() {
-        for lp in 0..s.block_tables[row].len() {
-            // What the host computes today, per launch: one base for this (row, page).
-            let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), lp as i64)
-                .expect("the row holds this page");
-            let host_page_base = page_base_bytes(&s, rp).0;
-
-            for layer in 0..ITERS {
-                // Today: page base + the layer's offset within the page.
-                let host = pool_base + host_page_base + layer as u64 * KV_STRIDE;
-                // With a gather: one index, unit stride of one layer's page.
-                let via_gather =
-                    gather_addr(gather_index(&s, row, lp, layer), KV_STRIDE, pool_base);
-                assert_eq!(
-                    via_gather, host,
-                    "row {row} logical page {lp} layer {layer}: the gather must address the SAME \
-                     byte the host's page table chose (phys {})",
-                    s.block_tables[row][lp]
-                );
-            }
-        }
-    }
-}
-
-/// ⛔ AND THE CORRESPONDENCE IS WHAT MAKES BATCHING POSSIBLE, so state that directly: two DIFFERENT
-/// rows' pages are reachable from ONE base with only the index differing.
-///
-/// This is the property a per-launch scalar base cannot have and is the entire reason the fold costs
-/// `pages x requests`. Asserted rather than argued, because "the gather removes the per-launch base"
-/// is the claim the whole change rests on.
-#[test]
-fn two_rows_are_reachable_from_one_base_by_index_alone() {
-    let s = churned_session();
-    let base = 0x8000_0000u64;
-    let layer = 7;
-
-    let addr_of =
-        |row: usize, lp: usize| gather_addr(gather_index(&s, row, lp, layer), KV_STRIDE, base);
-
-    // Row 0's page 0 and row 1's page 0 are different physical pages (17 vs 4)...
-    assert_ne!(s.block_tables[0][0], s.block_tables[1][0]);
-    // ...and both are addressed from the SAME base, differing only in the index.
-    let a = addr_of(0, 0);
-    let b = addr_of(1, 0);
-    assert_ne!(a, b, "distinct rows must land on distinct bytes");
-
-    // Each still matches its own host-computed address, so reaching both from one base costs no
-    // correctness.
-    for (row, addr) in [(0usize, a), (1usize, b)] {
-        let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), 0).expect("page 0");
-        assert_eq!(
-            addr,
-            base + page_base_bytes(&s, rp).0 + layer as u64 * KV_STRIDE,
-            "row {row} read from the shared base must equal its own host address"
-        );
-    }
-}
 
 /// ⭐⭐⭐ WHAT `skip_addr` MUST EQUAL, AND THEREFORE WHAT THE VALUE OPERAND MUST SPAN.
 ///
@@ -210,50 +88,6 @@ fn skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one() {
     );
 }
 
-/// ⭐ THE POOL'S FREE LIST IS NOT AN OBSTACLE, stated as its own law: page addresses are affine in the
-/// PHYSICAL page number regardless of what order the allocator handed them out.
-///
-/// Recorded because the opposite was believed for most of a session — that a free-list pool would have
-/// to be relaid out so gathered entries were contiguous. `page_base_bytes` is `phys * stride`, so the
-/// spacing is uniform no matter how scrambled the table is; only the INDEX is scrambled, and a
-/// scrambled index is precisely what an index tensor is for.
-#[test]
-fn page_addresses_are_uniformly_spaced_however_scrambled_the_table_is() {
-    let s = churned_session();
-    let stride = s.page_stride_bytes.0;
-
-    // Every entry in the (deliberately churned) table obeys `addr == phys * stride`.
-    for row in 0..s.block_tables.len() {
-        for lp in 0..s.block_tables[row].len() {
-            let phys = s.block_tables[row][lp];
-            let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), lp as i64).unwrap();
-            assert_eq!(
-                page_base_bytes(&s, rp).0,
-                phys as u64 * stride,
-                "page addressing must stay affine in the physical page number"
-            );
-        }
-    }
-
-    // And consecutive PHYSICAL pages are exactly one stride apart, which is the only spacing property
-    // the gather's fixed `skip_addr` depends on.
-    let ident = SessionKv {
-        block_tables: vec![vec![0, 1, 2, 3]],
-        ..churned_session()
-    };
-    for p in 1..4i64 {
-        let hi = page_base_bytes(
-            &ident,
-            RowPage::of(&ident, RowIdx::from_launch_row(0), p).unwrap(),
-        );
-        let lo = page_base_bytes(
-            &ident,
-            RowPage::of(&ident, RowIdx::from_launch_row(0), p - 1).unwrap(),
-        );
-        assert_eq!(hi.0 - lo.0, stride, "physical pages are one stride apart");
-    }
-}
-
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 //  ⛔ THE ENTRY UNIT ABOVE IS SUPERSEDED — the tests below use the pool's OWN geometry
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -261,8 +95,8 @@ fn page_addresses_are_uniformly_spaced_however_scrambled_the_table_is() {
 // `KV_STRIDE = 4096` above is a SYNTHETIC number: at nkvh=8/hd=64 a real layer-page is
 // `3 * nkvh * hd * PLANE_SLOTS * 2 = 786,432` bytes (THREE planes — Kᵗ, V and natural K), which
 // `skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one` above also gets wrong by omitting
-// the ×3. Those tests are still true of the AFFINE STRUCTURE, which is all they were written to pin,
-// and they stay; what they must no longer be read as is a statement of the entry unit.
+// the ×3. That test is still true of the AFFINE STRUCTURE, which is all it was written to pin,
+// and it stays; what it must no longer be read as is a statement of the entry unit.
 //
 // The entry unit the emitter actually declares is ONE STICK BLOCK — `PageExtent::of_one_stick()` on the
 // slot axis, `hd * 64` elements, MEASURED at 4096 elements / 8192 bytes at hd=64 by
@@ -270,77 +104,6 @@ fn page_addresses_are_uniformly_spaced_however_scrambled_the_table_is() {
 // the emitter's own doc records why: "`skip_addr` only has to DIVIDE the address stride we need to
 // express". So `skip_addr == one layer-page` was never a requirement, and the operand does NOT have to
 // be widened to span a layer.
-
-/// ⭐⭐⭐⭐⭐ THE ENTRY FACTOR, AGAINST THE REAL POOL AND THE REAL `page_base_bytes`.
-///
-/// This is the number a wrong value of which is the single most dangerous outcome available in this
-/// work: `addr = idx * skip_addr + base` with a short `idx` bakes clean, faults nothing, moves no
-/// counter, and assembles fluent text out of another request's keys. So it is asserted as an IDENTITY
-/// between the two sides — the host's `phys * page_stride_bytes` and the card's `idx * stick_block` —
-/// over a deliberately churned table, at both baked head widths.
-#[test]
-fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
-    use scratchy_subtile::sdsc_abstract::gather_entries_per_page;
-
-    // BOTH baked head widths: the factor carries `hd` (a stick block is `hd * 64`), so a test at one
-    // width would pass on a hardcoded 4096 — which is exactly what every doc comment in the tree says.
-    for (nkvh, hd) in [(8usize, 64usize), (8, 128)] {
-        let pool = pool(nkvh, hd);
-        let layer_page_bytes = pool.layer_stride() * 2;
-        let page_stride = ITERS as u64 * layer_page_bytes;
-
-        let s = SessionKv {
-            page_stride_bytes: Bytes(page_stride),
-            ..churned_session()
-        };
-        let per_page = gather_entries_per_page(page_stride, pool)
-            .unwrap_or_else(|| panic!("nkvh={nkvh} hd={hd}: a page must be whole stick blocks"));
-
-        // ⭐ THE FACTOR IS NOT A CONSTANT. Stated so a future hardcoded 4096 fails here.
-        assert_eq!(
-            per_page.get() as u64 * pool.stick_block_bytes(),
-            page_stride,
-            "nkvh={nkvh} hd={hd}: entries-per-page times the entry size must be exactly one page"
-        );
-
-        // ⛔ AND THE IDENTITY ITSELF, over the churned table: for every row and every logical page the
-        // gather's address equals the host's, from the same base.
-        let base = 0x4000_0000u64;
-        for row in 0..s.block_tables.len() {
-            for lp in 0..s.block_tables[row].len() {
-                let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), lp as i64)
-                    .expect("the row holds this page");
-                let host = base + page_base_bytes(&s, rp).0;
-                let idx = s.block_tables[row][lp] * per_page.get();
-                let via_gather = gather_addr(idx, pool.stick_block_bytes(), base);
-                assert_eq!(
-                    via_gather, host,
-                    "nkvh={nkvh} hd={hd} row {row} page {lp} (phys {}): the gather must land on the \
-                     byte the host's page table chose",
-                    s.block_tables[row][lp]
-                );
-            }
-        }
-
-        // ⛔ AND A PAGE NUMBER STAGED RAW IS WRONG BY THIS WHOLE FACTOR — the failure this test's
-        // existence is aimed at. Named so the magnitude is on record: hundreds, not a rounding.
-        assert!(
-            per_page.get() > 1,
-            "nkvh={nkvh} hd={hd}: if a page were ONE entry, staging phys directly would be correct \
-             and this whole factor would be untestable"
-        );
-        let raw_page_number_addr = gather_addr(s.block_tables[0][2], pool.stick_block_bytes(), 0);
-        let correct = gather_addr(
-            s.block_tables[0][2] * per_page.get(),
-            pool.stick_block_bytes(),
-            0,
-        );
-        assert_ne!(
-            raw_page_number_addr, correct,
-            "nkvh={nkvh} hd={hd}: staging a raw page number must NOT coincide with the right address"
-        );
-    }
-}
 
 /// ⛔ A PAGE THAT IS NOT A WHOLE NUMBER OF ENTRIES HAS NO INDEX, so the factor REFUSES.
 ///

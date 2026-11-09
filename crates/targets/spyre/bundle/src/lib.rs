@@ -348,56 +348,18 @@ impl<'a> BundleLayout<'a> {
 //  The per-op launch index
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Which rows one fold pass of a bundle's page-fold group covers.
-///
-/// ⛔ A CLOSED ENUM AND NOT A `bool`, so "whole batch" is a value and not the absence of one. The
-/// worker derives its intermediate-segment rebase stride from this, and a wrong stride is a request
-/// answering from another request's history: fluent, wrong, and undetectable downstream.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FoldRows {
-    /// One pass covers the WHOLE batch — the intermediate segment is not rebased per row.
-    #[default]
-    WholeBatch,
-    /// One pass covers ONE request — each row rebases the intermediate segment by its own stride.
-    PerRequest,
-}
-
-/// The address shifts a launch applies to its program's segment bases.
-///
-/// A group that carries any of these is a SINGLETON at every group size, because the shift is applied
-/// once to the whole group — `group_ranges` breaks a run at such a trip for exactly that reason.
+/// How a launch group relaunches and what its segment bases read: a walk's body, a gathered read, or a
+/// collective's consume.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvShifts<T: ktir_superdsc::collective::Tp> {
-    /// seg2 shift per write slot, for a group that writes one token into the KV cache. `0` for a group
-    /// that needs no slot shift.
-    pub slot_stride_bytes: u32,
-    /// seg2 shift per 64-slot slab, for a group that restickifies Kᵀ. `0` when not a slab group.
-    pub slab_stride_bytes: u32,
-    /// The write-slot modulus AND the declaration that this bundle is PAGED — a runtime that does not
-    /// know the key must refuse rather than apply an absolute-position shift and land past the page.
-    /// `0` for an unpaged bundle.
-    pub page_slots: u32,
-    /// Which request's KV this group addresses (batched decode). `0` when unbatched.
-    pub request: u32,
-    /// Slots past the launch's write cursor where this group's KV starts — a whole number of pages,
-    /// non-zero only for a later PAGE PART of a prefill window wider than one page. The runtime resolves
-    /// the group's page at `cursor + slot_offset` through the request's block table, and SKIPS the group
-    /// when the request holds no such page. `0` for every other group.
-    pub slot_offset: u32,
-    /// This is the group the runtime re-launches once per page of resident KV.
+    /// This is a walk's body group: the runtime relaunches it [`Walk::trips`] times.
     pub page_fold: bool,
-    /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
-    /// (request, page).
-    pub batched_requests: bool,
     /// ⭐ This group reads the pool through the GATHER — each page came from the index the host stages
     /// rather than from a segment shift. Two consequences the runtime must know: the group's KV shift
     /// must be ZERO (an absolute entry plus a page base composes two bases and lands inside neither),
-    /// and the host must stage the index table for any body carrying such a group. On a fold group it
-    /// also lets the passes collapse with no single pool stride (with [`Self::batched_requests`]); on a
-    /// non-fold group it is the split-KV chunk's gather copies, launched once.
+    /// and the host must stage the index table for any body carrying such a group. On a non-fold group
+    /// it is the split-KV chunk's gather copies, launched once.
     pub gathered: bool,
-    /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
-    pub fold_rows: FoldRows,
     /// ⭐ `Some` iff this group is a COLLECTIVE'S CONSUME. Its launch is preceded by this rank's send
     /// of the operand fragment — an F-send control block, device p2p RDMA — and the wait for the
     /// peer's ([`collective::cb_pipeline`]), and it reads the receive window — a weight-segment
@@ -421,17 +383,6 @@ pub struct Walk {
 }
 
 impl<T: ktir_superdsc::collective::Tp> KvShifts<T> {
-    /// Does this group write one token into the KV cache? DERIVED from the stride, so a stride and its
-    /// flag cannot disagree.
-    pub const fn slot_write(self) -> bool {
-        self.slot_stride_bytes > 0
-    }
-
-    /// Does this group restickify a Kᵀ slab? Derived, for the same reason.
-    pub const fn slab_write(self) -> bool {
-        self.slab_stride_bytes > 0
-    }
-
     /// ⭐ WHERE THIS LAUNCH'S WEIGHT SLOT RESOLVES — `(byte shift, bank)` from the layer's own
     /// `(layer_shift, layer_bank)`.
     ///
@@ -790,35 +741,6 @@ pub struct BundleCode<'a, T: ktir_superdsc::collective::Tp> {
     pub reroll: Option<RerollMeta<'a>>,
 }
 
-impl<'a, T: ktir_superdsc::collective::Tp> BundleCode<'a, T> {
-    /// ⭐ THE FOLD-ROW REGIME THIS BUNDLE DECLARES — what the launch derives its intermediate-segment
-    /// rebase stride from.
-    ///
-    /// No fold groups at all ⇒ [`FoldRows::WholeBatch`]: nothing re-launches, so there is no pass to
-    /// rebase. Fold groups that DISAGREE are refused — a session carries ONE intermediate stride, so a
-    /// mixed bundle has no stride that is right for all of its passes.
-    ///
-    /// [`FoldRows`] is a closed enum every entry carries, so "whole batch" is a declaration rather
-    /// than a silence.
-    pub fn fold_rows(&self) -> Result<FoldRows, String> {
-        let mut seen: Option<FoldRows> = None;
-        for g in self.groups.iter().filter(|g| g.kv.page_fold) {
-            match seen {
-                None => seen = Some(g.kv.fold_rows),
-                Some(s) if s == g.kv.fold_rows => {}
-                Some(s) => {
-                    return Err(format!(
-                        "bundle {}: fold groups disagree about their row regime ({s:?} vs {:?}) — a \
-                         session carries one intermediate stride, so a mixed bundle cannot be launched",
-                        self.fp, g.kv.fold_rows
-                    ));
-                }
-            }
-        }
-        Ok(seen.unwrap_or_default())
-    }
-}
-
 /// ⭐ ONE REGISTERED BUNDLE, OF ITS OWN WORLD. A bundle's world is its type, so the registry holds
 /// each one type-erased and a lookup names its world: [`bundle::<T>`] finds only the bundles that
 /// are `BundleCode<'static, T>`, so a bundle baked for one world is never found by a session of
@@ -964,10 +886,7 @@ mod tests {
             layout: BundleLayout::default(),
             groups: Cow::Borrowed(&[
                 LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
-                    kv: KvShifts {
-                        slot_stride_bytes: 128,
-                        ..KvShifts::default()
-                    },
+                    kv: KvShifts::default(),
                     programs: Cow::Borrowed(PROGS_A),
                     init_binary: Cow::Borrowed(&[1, 2, 3]),
                     job_bin_ptr: 64,
@@ -992,10 +911,6 @@ mod tests {
         assert_eq!(code.groups[1].programs[0].func.grid, (2, 1, 1));
         assert_eq!(code.groups[0].job_bin_ptr, 64);
         assert_eq!(code.groups[1].init_binary.as_ref(), &[4]);
-        // The write predicates are DERIVED from the strides, so a stride and its flag cannot disagree.
-        assert!(code.groups[0].kv.slot_write());
-        assert!(!code.groups[0].kv.slab_write());
-        assert!(!code.groups[1].kv.slot_write());
     }
 
     /// ⭐ A LADDER OF ONE RUNG IS A LADDER — every position up to its sweep runs that rung — and a

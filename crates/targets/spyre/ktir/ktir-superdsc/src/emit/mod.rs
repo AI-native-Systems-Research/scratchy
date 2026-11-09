@@ -2577,20 +2577,6 @@ pub struct EmittedOp<T: crate::collective::Tp> {
     /// `per_iter_out_elems * device_stride_out * 2` (the per-trip HBM advance the
     /// concrete unroll adds onto the base address).
     pub affine_strides: Vec<BTreeMap<&'static str, i64>>,
-    /// Non-zero ONLY for KV cache-write ops (`op_name` "cachewr_*"): the per-step
-    /// slot stride in BYTES (= head_dim·2). The runtime adds `seq_pos·slot_stride_bytes`
-    /// to the op's KV-segment offset so step `p` writes the cache at slot `p`. 0 = the
-    /// op uses the plain per-layer offset (every non-cache-write op).
-    pub slot_stride_bytes: u32,
-    /// SLAB WRITE (kill-restickify Stage 2, hd==64 only): TRUE for the slab-granular INCREMENTAL Kᵀ
-    /// restickify — it transposes ONLY the current 64-slot slab (not the whole active K each step), and
-    /// the shim shifts BOTH its resident input (natural K cache) AND output (resident kct) seg2 bases by
-    /// `(seq_pos/64)·slab_stride_bytes` so step `p` re-transposes slab `p/64` in place; prior slabs
-    /// persist. Classified `GroupKind::Slab` — a DISTINCT kind from `Slot` (its `slab_stride_bytes`
-    /// = STICK_BYTES·stick = 8192 ≠ the cachewr's `slot_stride_bytes` 128, so fusing would trip the Slot
-    /// uniform-stride assert). 0/`false` = the plain full-active_cap restickify. Default false/0.
-    pub slab_write: bool,
-    pub slab_stride_bytes: u32,
     /// PAGE FOLD: folds ONE page of resident prefix into the running online-softmax state. Such ops
     /// are grouped APART from the body and re-launched once per page the context spans, each launch
     /// rebased to that page. The fold is an accumulation, so repeating it IS the loop — there is no
@@ -2602,14 +2588,6 @@ pub struct EmittedOp<T: crate::collective::Tp> {
     /// times, shifting the step's sources by [`loop_fold::WalkTrips::step_bytes`] per relaunch.
     /// `None` for every op outside a walk.
     pub walk: Option<loop_fold::WalkTrips>,
-    /// THIS OP'S KERNEL STEPS ONE REQUEST PER UNIT OF ITS BATCH AXIS, so ONE launch computes every row
-    /// of the batch and the fold needs a pass per PAGE rather than per (request, page).
-    ///
-    /// Travels to the runtime through the manifest because the runtime cannot see it: what axes an op
-    /// was baked with is not visible from a session. Claiming it without the axis collapses the passes
-    /// while the kernel still reads one request's K — every row but one attending the wrong history,
-    /// fluently. See `fold_plan::reps`, which needs this AND a pool that admits a single stride.
-    pub kv_batched_requests: bool,
     /// ⭐⭐⭐ THIS OP'S BATCH AXIS WALKS A **GATHERED** SCRATCH, not the paged pool.
     ///
     /// Travels beside [`Self::kv_batched_requests`] because it answers the OTHER half of `collapsed`:
@@ -2618,77 +2596,12 @@ pub struct EmittedOp<T: crate::collective::Tp> {
     /// false for any free-list allocation — stops being a precondition. Without it a request axis still
     /// needs that proof, so the runtime must be able to tell the two situations apart.
     pub kv_gathered: bool,
-    /// THE ROW REGIME this op's fold passes were baked under (meaningful with [`Self::kv_page_fold`]):
-    /// whole-batch passes sweep every `nqh*mq` shared-buffer row and need NO per-pass rebase in the
-    /// intermediate segment; per-request passes carry one request's `nqh` rows and do. Declared on the
-    /// bundle ([`KV_FOLD_ROWS_PER_REQUEST_KEY`]) because the row count a pass was baked at is not
-    /// visible from a session — the worker derives `set_int_stride` from what it loads
-    /// ([`manifest_fold_row_regime`]) instead of restating the emitter's choice as its own constant.
-    pub kv_fold_rows: crate::sdsc_abstract::FoldRowRegime,
-    /// PAGED cache-write modulus: the write slot is the position MODULO this, because the page a
-    /// position lives in is chosen by the request's block table, not by the position. Applying an
-    /// absolute-position shift to a paged bundle writes past the page — into another request's KV
-    /// once the pool is shared. Non-zero marks the bundle paged; a runtime that does not know the
-    /// key must REFUSE it rather than fall back.
-    pub kv_page_slots: u32,
-    /// WHICH REQUEST of a batched decode this op's KV belongs to.
-    ///
-    /// A prefill chunk's rows are consecutive positions of one sequence, so its cache writes share a
-    /// page and differ only in slot — which `slot_no_fuse` already covers. A decode batch's rows are
-    /// separate requests, so they differ in PAGE as well, and the page comes from a block table the
-    /// runtime holds one of per request. That index is the one thing the runtime cannot derive from
-    /// the op itself.
-    ///
-    /// 0 for every op of an unbatched bundle and for the first request of a batched one, so the
-    /// single-request path is untouched.
-    pub kv_request: u32,
-    /// ⭐ SLOTS PAST THE LAUNCH'S WRITE CURSOR WHERE THIS OP'S KV STARTS — a whole number of pages,
-    /// non-zero only for the later PAGE PARTS of a prefill chunk whose window spans more than one page.
-    ///
-    /// One launch resolves ONE page per op from the request's block table, at the page holding the op's
-    /// cursor. A window of `PREFILL_WINDOW_PAGES` pages therefore cannot be one write: the emitter cuts
-    /// each `(kv head, slab)` copy into parts of `POOL_PAGE_SLOTS` rows, and part `p` carries `p·POOL_PAGE_SLOTS`
-    /// here, so the runtime resolves ITS page at `cursor + offset` (`fold_plan::op_slot_pos`). A part
-    /// whose page the request does not hold (a short last chunk's padding) is SKIPPED, never aimed at
-    /// part 0's page. Ops with different offsets never share a group: one group is one page shift.
-    pub kv_slot_offset: u32,
-    /// TRUE for a cache-write copy that writes a DISTINCT per-entry slot (the mq>1 PREFILL
-    /// per-slot cachewr copies, baked at `qh·cap·hd + s·hd` for distinct `s`). Such copies
-    /// MUST NOT be fused into a `GroupKind::Slot` group: the shim applies ONE `slot_pos`
-    /// base-shift to a fused Slot group (decode semantics — every copy writes the SAME slot,
-    /// baked at slot 0). Fusing distinct-slot copies collapses them (on-card: the prefill KV
-    /// cache landed only a partial subset of slots). So a distinct-slot copy is classified
-    /// `GroupKind::SlotSolo` → its OWN singleton group, launched with its baked slot doff
-    /// (no shift, since prefill `slot_pos == 0`). Decode cachewr (same slot) leaves this
-    /// `false` and keeps the fused-`Slot` launch reduction. Default `false`.
-    pub slot_no_fuse: bool,
     /// ⭐ `Some` iff this op is part of a COLLECTIVE'S CONSUME — classified `GroupKind::TpConsume`:
     /// the consume's ops are ONE launch group of their own, which the bundle's CB pipeline precedes
     /// with this rank's send (the F-send the consume names) and the wait for the peer's. Never fused
     /// with anything but the same consume: the send and the wait belong to exactly this launch.
     /// Default `None`.
     pub tp_consume: Option<crate::collective::TpConsume<T>>,
-    /// HOST KV-CACHE WRITE (Route B). Set on ONE op per `AttnDecode` (the first cachewr).
-    /// The shim does NOT run this op's program (nor the next [`kv_n_skip`] on-card cachewr
-    /// copies): instead it host-scatters this token's roped K into the resident K cache in the
-    /// **Kᵀ device layout the score matmul reads** (the on-card cachewr wrote it NATURAL
-    /// slot-major, which the cap-sticked `[hd,cap]` kernel reads scrambled — the multi-day
-    /// attention bug), and the V natural, then marks seg2 for re-H2D. Mirrors the `host_rmsnorm`
-    /// pattern (op carries metadata; on-card op skipped). Default `false`.
-    pub host_kv_write: bool,
-    /// `2·nqh − 1`: the remaining on-card cachewr copies the shim skips after the tagged op.
-    pub kv_n_skip: u32,
-    /// Source roped new K/V (per-step activations) and the resident K/V cache tensor ids; the
-    /// shim resolves them via `places["t{id}"]`. `kv_nqh/kv_nkvh/kv_hd/kv_cap` give the layout
-    /// (the shim derives `gqa = nqh/nkvh` and writes K at the Kᵀ offset, V at the natural offset).
-    pub kv_new_k_tid: u32,
-    pub kv_new_v_tid: u32,
-    pub kv_kc_tid: u32,
-    pub kv_vc_tid: u32,
-    pub kv_nqh: u32,
-    pub kv_nkvh: u32,
-    pub kv_hd: u32,
-    pub kv_cap: u32,
 }
 
 impl<T: crate::collective::Tp> EmittedOp<T> {
@@ -2783,29 +2696,10 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
             arg_bindings: Vec::new(),
             time: 1,
             affine_strides: Vec::new(),
-            slot_stride_bytes: 0,
-            slab_write: false,
-            slab_stride_bytes: 0,
-            slot_no_fuse: false,
             tp_consume: None,
             kv_page_fold: false,
             walk: None,
-            kv_batched_requests: false,
             kv_gathered: false,
-            kv_fold_rows: Default::default(),
-            kv_page_slots: 0,
-            kv_request: 0,
-            kv_slot_offset: 0,
-            host_kv_write: false,
-            kv_n_skip: 0,
-            kv_new_k_tid: 0,
-            kv_new_v_tid: 0,
-            kv_kc_tid: 0,
-            kv_vc_tid: 0,
-            kv_nqh: 0,
-            kv_nkvh: 0,
-            kv_hd: 0,
-            kv_cap: 0,
         }
     }
 
@@ -2819,29 +2713,10 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
             arg_bindings: self.arg_bindings.clone(),
             time: self.time,
             affine_strides: self.affine_strides.clone(),
-            slot_stride_bytes: self.slot_stride_bytes,
             kv_page_fold: self.kv_page_fold,
             walk: self.walk,
-            kv_batched_requests: self.kv_batched_requests,
             kv_gathered: self.kv_gathered,
-            kv_fold_rows: self.kv_fold_rows,
-            kv_page_slots: self.kv_page_slots,
-            kv_request: self.kv_request,
-            kv_slot_offset: self.kv_slot_offset,
-            slab_write: self.slab_write,
-            slab_stride_bytes: self.slab_stride_bytes,
-            slot_no_fuse: self.slot_no_fuse,
             tp_consume: self.tp_consume,
-            host_kv_write: self.host_kv_write,
-            kv_n_skip: self.kv_n_skip,
-            kv_new_k_tid: self.kv_new_k_tid,
-            kv_new_v_tid: self.kv_new_v_tid,
-            kv_kc_tid: self.kv_kc_tid,
-            kv_vc_tid: self.kv_vc_tid,
-            kv_nqh: self.kv_nqh,
-            kv_nkvh: self.kv_nkvh,
-            kv_hd: self.kv_hd,
-            kv_cap: self.kv_cap,
         }
     }
 
@@ -2899,29 +2774,10 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
             arg_bindings,
             time,
             affine_strides,
-            slot_stride_bytes: 0,
             kv_page_fold: false,
             walk: None,
-            kv_batched_requests: false,
             kv_gathered: false,
-            kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
-            kv_page_slots: 0,
-            kv_request: 0,
-            kv_slot_offset: 0,
-            slab_write: false,
-            slab_stride_bytes: 0,
-            slot_no_fuse: false,
             tp_consume: None,
-            host_kv_write: false,
-            kv_n_skip: 0,
-            kv_new_k_tid: 0,
-            kv_new_v_tid: 0,
-            kv_kc_tid: 0,
-            kv_vc_tid: 0,
-            kv_nqh: 0,
-            kv_nkvh: 0,
-            kv_hd: 0,
-            kv_cap: 0,
         }
     }
 }
