@@ -1116,7 +1116,7 @@ impl DeviceExtents {
     ///
     /// * `swept[i]` — this op's iteration extent for dim `i`.
     /// * `declared[i]` — the dim's TRUE PHYSICAL extent when the view is a WINDOW into a larger
-    ///   allocation (`TensorArg::with_device_extent`). **A declared extent WINS over everything
+    ///   allocation (`TensorArg::with_axis`). **A declared extent WINS over everything
     ///   else**, including the `Materialized` collapse: the whole point is that the address steps by
     ///   the allocation, not by the window. `None` (every call site that does not opt in) falls back
     ///   to the span rule, so this is byte-identical wherever nothing is declared.

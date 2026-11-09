@@ -30,3 +30,5 @@ triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }
 # so the dump serializes each emitted op rather than `Debug`-printing it (floats
 # and maps must render identically across runs for the diff to mean anything).
 serde_json = { workspace = true }
+# The decode-batch golden's digest: the tree's one FNV-1a (`fnv1a64`), not a restatement of it.
+scratchy-core-common = { path = "../../core/common" }

@@ -278,7 +278,7 @@ pub fn assemble_matmul_off<T: crate::collective::Tp, O: crate::sdsc_abstract::Ki
 ///    the tile's stride lands every stick group after the first `k_blk/k_stick`-invented rows
 ///    away — MEASURED as corr 0.983 on the unblocked SwiGLU small twin (the offsets alone reached
 ///    0.983 and the stride was the residual). `kernel_in_phys` declares the tensor's own `in`
-///    extent through [`TensorArg::with_device_extent`], the torch-spyre `arg.device_size` law the
+///    extent through [`TensorArg::with_axis`], the torch-spyre `arg.device_size` law the
 ///    batched attention already relies on for the same reason (a swept window of a larger
 ///    allocation must still be ADDRESSED by the allocation's stride).
 /// 3. **`n` vs `n_dev`.** The util-floor padding and the `DeviceWidth` rule are applied by the
@@ -337,7 +337,11 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
         .find(|arg| arg.view().name == w_name)
     {
         use super::walk::WalkAxis as _;
-        kernel.set_device_extent(super::walk::InAxis::NAME, w_in_phys);
+        kernel
+            .set_axis(super::walk::InAxis::NAME, |_| {
+                Ok(crate::superdsc_opspec::DeviceAxis::Window(w_in_phys))
+            })
+            .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -537,16 +541,14 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
         super::dims::matmul_split_map_for(form),
     )
     .map_err(crate::superdsc_error::SuperDscError)?;
-    // The activation's own stick-group pitch, when it is not the output's: a batch block read on
-    // its own (`a_rows == m`) is a standalone stick-major `[m, k]` (a pitch at the sweep is no
-    // pitch), a taller one a pitch of its own — re-stated over the one `mb` slot, never a second
-    // mechanism beside it.
-    if shape.a_rows != shape.rows {
-        let plan = op.iter.clone();
-        op.args_mut()[0]
-            .set_pitch(&plan, "mb", shape.a_rows)
-            .map_err(|e| format!("assemble_matmul_rows {op_name}: {e}"))?;
-    }
+    // The activation states its OWN stick-group pitch, `a_rows`, over the one `mb` slot: a batch
+    // block read on its own (`a_rows == m`) is a standalone stick-major `[m, k]` (`Pitch::past` at
+    // the sweep is no pitch), a taller one a pitch of its own, and at `a_rows == rows` the statement
+    // is the one the builder already made. `Pitch::past` decides every case; nothing here re-asks it.
+    let plan = op.iter.clone();
+    op.args_mut()[0]
+        .set_axis("mb", |mb| mb.pitch(&plan, shape.a_rows))
+        .map_err(|e| format!("assemble_matmul_rows {op_name}: {e}"))?;
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 

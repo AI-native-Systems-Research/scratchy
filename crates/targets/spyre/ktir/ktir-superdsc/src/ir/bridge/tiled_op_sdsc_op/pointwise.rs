@@ -9,8 +9,8 @@ use crate::ir::island::tile_op::TileOp;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
-    Role, Scale, SdscFoldSet, TensorArg,
+    Allocation, AnyTensorArg, DataFormat, DeviceAxis, Df, Fp16, MAX_CORES, MaxCores, OpFunc,
+    OpInfo, OpSpec, Role, Scale, SdscFoldSet, TensorArg,
 };
 use crate::work::{CoreDivision, EwDivision};
 
@@ -1187,7 +1187,7 @@ pub struct StickRuns {
 
 /// [`StickRuns`] as an `identity` over `[mb = runs, y = run_sticks, out = stick]`: both sides lay a
 /// run's sticks contiguous (`["mb", "y", "out"]`) and each states its own pitch as the physical
-/// extent of `y` ([`TensorArg::with_device_extent`]) — the scatter-row output's form
+/// extent of `y` ([`TensorArg::with_axis`]) — the scatter-row output's form
 /// ([`pointwise_opspec_from_tile_split`]) on both sides.
 pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<OpSpec, String> {
     let StickRuns {
@@ -1237,7 +1237,8 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             let t = if pitch == run_sticks {
                 t
             } else {
-                t.with_device_extent("y", pitch).map_err(|e| e.0)?
+                let y = t.axis("y").map_err(|e| e.0)?;
+                t.with_axis(y, DeviceAxis::Window(pitch))
             };
             Ok(AnyTensorArg::R3(t))
         };
@@ -1444,8 +1445,8 @@ fn pointwise_opspec_from_tile_split(
     // view's physical extent over the plan's iterated one.
     let output = match out_view.scatter_interleave {
         None => mk(false, o_name, out_view.offset)?,
-        Some(interleave) => AnyTensorArg::R3(
-            TensorArg::<3>::new(
+        Some(interleave) => AnyTensorArg::R3({
+            let t = TensorArg::<3>::new(
                 false,
                 o_name.to_string(),
                 Role::Output,
@@ -1456,11 +1457,11 @@ fn pointwise_opspec_from_tile_split(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
-            .with_offset(out_view.offset)
-            .with_device_extent("y", interleave)
-            .map_err(|e| e.0)?,
-        ),
-    };
+            .with_offset(out_view.offset);
+            let y = t.axis("y").map_err(|e| e.0)?;
+            t.with_axis(y, DeviceAxis::Window(interleave))
+        }),
+    });
 
     Ok(OpSpec::new(op, plan, ins, output)
         .map_err(|e| e.0)?
@@ -1700,7 +1701,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
     //
     // `dev_rows` declares a ROW-WINDOW operand's PARENT row count as the `mb` PITCH
-    // ([`TensorArg::with_pitch`]; the caller passes it only when the window spans more than one
+    // ([`LayoutAxis::pitch`](crate::superdsc_opspec::LayoutAxis::pitch); the caller passes it only when the window spans more than one
     // stick — a one-stick window never crosses a column plane and needs no declaration): the
     // band's bytes are a stick-major tensor of the parent's, so the walk must stride the parent's
     // column planes at the parent's `parent_rows·lanes` pitch, never at the band's own fewer
@@ -1730,7 +1731,11 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32));
             let t = match dev_rows {
-                Some(p) => t.with_pitch(&plan, "mb", p).map_err(|e| e.0)?,
+                Some(p) => {
+                    let mb = t.axis("mb").map_err(|e| e.0)?;
+                    let pitch = mb.pitch(&plan, p).map_err(|e| e.0)?;
+                    t.with_axis(mb, pitch)
+                }
                 None => t,
             };
             Ok(AnyTensorArg::R2(t))
@@ -1754,7 +1759,11 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 .with_df(df)
                 .with_row_blocked(matches!(df, Df::Fp32));
                 let t = match dev_rows {
-                    Some(p) => t.with_pitch(&plan, "mb", p).map_err(|e| e.0)?,
+                    Some(p) => {
+                        let mb = t.axis("mb").map_err(|e| e.0)?;
+                        let pitch = mb.pitch(&plan, p).map_err(|e| e.0)?;
+                        t.with_axis(mb, pitch)
+                    }
                     None => t,
                 };
                 // A spray's two row dims go to dxp innermost first.

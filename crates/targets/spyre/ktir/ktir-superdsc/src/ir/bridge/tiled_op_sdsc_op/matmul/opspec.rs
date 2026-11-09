@@ -9,8 +9,8 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpSpec, Role,
-    Scale, StickExtent, TensorArg, WorkPlan,
+    Allocation, AnyTensorArg, DataFormat, DeviceAxis, Df, Fp16, MAX_CORES, MaxCores, OpFunc,
+    OpInfo, OpSpec, Role, Scale, StickExtent, TensorArg, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -486,15 +486,17 @@ where
         // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
         // the flat frame) is addressed with the TENSOR's rows, not the op's.
         // ⛔ A PITCH, NOT A WINDOW: the rows a batch sweeps sit `phys` rows apart in the frame,
-        // which is the walk's back gap (`TensorArg::with_pitch`, `phys − swept` on `mb`); the
+        // which is the walk's back gap (`LayoutAxis::pitch`, `phys − swept` on `mb`); the
         // pinned walk is a size cap the card never strides by (the flat-frame P·V contraction,
         // MEASURED by the microbenchmark: a pinned walk lost the rows past the first stick group,
         // the gap read them).
         // `Pitch::past` decides it: a frame AT the sweep is no pitch, a shorter one refuses by name.
         let input = match phys_mb {
-            Some(phys) => input
-                .with_pitch(&plan, MbAxis::NAME, phys)
-                .map_err(|e| e.0)?,
+            Some(phys) => {
+                let mb = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
+                let pitch = mb.pitch(&plan, phys).map_err(|e| e.0)?;
+                input.with_axis(mb, pitch)
+            }
             None => input,
         };
         let output_walk = Walk2::output_rows_by_n();
@@ -527,9 +529,11 @@ where
         // window of a LARGER allocation"); it simply was never offered to the output.
         // The output's batch rows `phys` apart: the same pitch as the input's, built the same way.
         let output = match phys_mb {
-            Some(phys) => output
-                .with_pitch(&plan, MbAxis::NAME, phys)
-                .map_err(|e| e.0)?,
+            Some(phys) => {
+                let mb = output.axis(MbAxis::NAME).map_err(|e| e.0)?;
+                let pitch = mb.pitch(&plan, phys).map_err(|e| e.0)?;
+                output.with_axis(mb, pitch)
+            }
             None => output,
         };
         [
@@ -703,17 +707,17 @@ fn batched_walk_args<R: RungRegime>(
                     "matmul_opspec '{a_name}': phys_mb={phys} is SMALLER than the swept mb                          {swept}. device_extent declares a window into a LARGER allocation."
                 ));
             }
-            input
-                .with_device_extent(MbAxis::NAME, phys)
-                .map_err(|e| e.0)?
+            let mb = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
+            input.with_axis(mb, DeviceAxis::Window(phys))
         }
         None => input,
     };
     // The ACTIVATION's own pitch, when its placement declares one larger than the swept rows.
     let input = match pitches.map(|(a, _)| a) {
-        Some(a_pitch) if a_pitch > plan.extent(MbAxis::NAME) => input
-            .with_device_extent(MbAxis::NAME, a_pitch)
-            .map_err(|e| e.0)?,
+        Some(a_pitch) if a_pitch > plan.extent(MbAxis::NAME) => {
+            let mb = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
+            input.with_axis(mb, DeviceAxis::Window(a_pitch))
+        }
         _ => input,
     };
     let output = batched_output_arg(o_name, regime.output_walk(), plan)?.with_offset(o_off);
@@ -721,9 +725,10 @@ fn batched_walk_args<R: RungRegime>(
     // against a pitch it never declared makes the two agree on paper while the emitted walk still
     // strides by the shared value.
     let output = match pitches.map(|(_, o)| o) {
-        Some(o_pitch) if o_pitch > plan.extent(MbAxis::NAME) => output
-            .with_device_extent(MbAxis::NAME, o_pitch)
-            .map_err(|e| e.0)?,
+        Some(o_pitch) if o_pitch > plan.extent(MbAxis::NAME) => {
+            let mb = output.axis(MbAxis::NAME).map_err(|e| e.0)?;
+            output.with_axis(mb, DeviceAxis::Window(o_pitch))
+        }
         _ => output,
     };
     Ok((input, output))
@@ -827,7 +832,7 @@ pub fn matmul_opspec_batched(
 ///    `active_cap ≤ cap` of a `[nkvh, hd, cap]` Kᵀ cache, and the V cache is `nqh`-sized while
 ///    only every `gqa`-th head slot is live — in both cases the real `y` stride is LARGER than
 ///    `in · out`. `kernel_device_extent = Some((dim, phys))` declares that dim's TRUE physical
-///    extent via [`TensorArg::with_device_extent`] (torch-spyre's `arg.device_size`), so stride
+///    extent via [`TensorArg::with_axis`] (torch-spyre's `arg.device_size`), so stride
 ///    derivation uses `phys` and the sub-rung ladder addresses correctly. Without it a batched
 ///    score is right only at the top rung — the "no ladder-safe drop-in exists" obstacle.
 ///
@@ -904,7 +909,7 @@ pub fn matmul_opspec_batched_off(
     // exceeds this op's swept extent, so stride derivation uses storage, not iteration.
     let kernel = match kernel_device_extent {
         Some((dim, phys)) => {
-            // `with_device_extent` means "this op sweeps a WINDOW of a larger allocation". A phys
+            // a `DeviceAxis::Window` means "this op sweeps a WINDOW of a larger allocation". A phys
             // SMALLER than the swept extent is not a window, it is a mis-declaration: the walk would
             // describe less memory than the op reads. Refuse at `cargo build` rather than emit a
             // descriptor whose declared size and address span disagree (an on-card Compute CB error).
@@ -917,7 +922,8 @@ pub fn matmul_opspec_batched_off(
                      expressed this way."
                 ));
             }
-            kernel.with_device_extent(dim, phys).map_err(|e| e.0)?
+            let at = kernel.axis(dim).map_err(|e| e.0)?;
+            kernel.with_axis(at, DeviceAxis::Window(phys))
         }
         None => kernel,
     };

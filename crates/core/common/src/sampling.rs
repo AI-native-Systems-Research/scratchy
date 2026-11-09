@@ -320,11 +320,7 @@ pub struct GpuSampleParams {
 ///
 /// NOT `DefaultHasher` (which uses a random per-process seed for DoS protection).
 pub fn fnv_seed(req_id: &str, position: u32) -> u32 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for b in req_id.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-    }
+    let h = fnv1a64(req_id.as_bytes());
     let counter = u64::from(position) + 1;
     let mut v = h.wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     v = (v ^ (v >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -340,12 +336,18 @@ pub fn fnv_seed(req_id: &str, position: u32) -> u32 {
 /// same "not `DefaultHasher`" law; the only difference is that nothing is cut
 /// off.
 pub fn fnv_seed64(req_id: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for b in req_id.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
-    }
-    h
+    fnv1a64(req_id.as_bytes())
+}
+
+/// FNV-1a 64 over `bytes` — its offset basis and prime, stated once. [`fnv_seed`] and
+/// [`fnv_seed64`] hash a request id with it; a stable, dependency-free digest (a test's golden
+/// of serialized descriptors) uses the same function rather than restating the constants.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes
+        .iter()
+        .fold(OFFSET_BASIS, |h, &b| (h ^ u64::from(b)).wrapping_mul(PRIME))
 }
 
 /// Convert a `u32` seed to a uniform in `[0, 1)` by stuffing its top 23 bits into
