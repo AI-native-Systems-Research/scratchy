@@ -967,7 +967,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     assert_eq!(superdsc::concrete_trips(e).len(), 1);
     let r = superdsc::emit_bundle(
         &programs,
-        Some(&layout),
+        &layout,
         superdsc::FoldGrouping::Split,
         None,
         superdsc::DumpRoot::NONE,
