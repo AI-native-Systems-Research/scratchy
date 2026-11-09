@@ -3648,12 +3648,7 @@ fn emit_weights_struct(
 
     let rotary_local_load_metal: TokenStream = if uses_rotary_local {
         let head_dim = model.text.head_dim.get() as usize;
-        let local_theta = model
-            .scalars
-            .get("rope_local_base_freq")
-            .copied()
-            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            .unwrap_or(model.text.rope_theta.get());
+        let local_theta = model.text.rope_local_for(&model.source_stem).get();
         quote! {
             let rotary_local = crate::__gpu::rotary::RotaryCache::new_from_gpuweights(
                 gw,
@@ -9153,9 +9148,9 @@ fn superdsc_model_head_dim(model: &ModelParams) -> u64 {
 }
 
 /// The rotary class a `local`-flagged source serves, as a VALUE: sliding
-/// sources take the local class's base frequency (falling back to the model's
-/// main θ, `theta` — the config's typed [`crate::config::RopeTheta`] — the precedence
-/// `rotary_local_load` uses); global sources take
+/// sources take the local class's base frequency (the config's stated
+/// `rope_local_base_freq`, typed at load — a body with a local source and no
+/// stated base is a build error, [`crate::config::TextGeometry::rope_local_for`]); global sources take
 /// proportional partial rotary when the config declares it on a WIDER global
 /// head dim (gemma-4), else the base class.
 #[cfg(feature = "spyre")]
@@ -9167,12 +9162,7 @@ fn superdsc_rotary_kind(
 ) -> scratchy_target_spyre::wiring::RotaryKind {
     let theta_bits = (theta as f32).to_bits();
     if local {
-        let local_theta = model
-            .scalars
-            .get("rope_local_base_freq")
-            .copied()
-            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            .unwrap_or(theta);
+        let local_theta = model.text.rope_local_for(&model.source_stem).get();
         scratchy_target_spyre::wiring::RotaryKind::Default {
             head_dim: hd as u32,
             theta_bits: (local_theta as f32).to_bits(),
@@ -18605,6 +18595,40 @@ mod fingerprint_tests {
              equal literals mean both variants accept the other's checkpoint and the \
              collision is back",
         );
+    }
+
+    /// Every checked-in config of an arch whose body reads a LOCAL rotary table states the local
+    /// class's base itself — the fact `TextGeometry::rope_local_for` takes, never defaulted to the
+    /// global θ. A config that stopped stating it would be a build error; this names it first.
+    #[test]
+    fn every_local_rotary_config_states_its_local_base() {
+        for arch in ["gemma3", "gemma4", "gemma4-moe", "gemma4-assistant", "modernbert"] {
+            let dir = arch_configs(arch);
+            let mut n = 0;
+            for e in std::fs::read_dir(&dir).expect("arch configs") {
+                let path = e.expect("entry").path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                if !name.ends_with(".json")
+                    || ["arch.json", "quantizations.json", "weights.json"].contains(&name)
+                    || name.ends_with(".overrides.json")
+                {
+                    continue;
+                }
+                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                let Some(model) = crate::config::assert_load_or_refuse_by_name(
+                    &stem,
+                    crate::config::load_file_declared(&path),
+                ) else {
+                    continue;
+                };
+                assert!(
+                    model.text.rope_local.is_some(),
+                    "{arch}/{stem}: no local rotary base stated"
+                );
+                n += 1;
+            }
+            assert!(n > 0, "{arch}: no config checked");
+        }
     }
 
     /// A config that omits `rope_theta` computes with its ARCH's default (llama: `LlamaConfig`'s
