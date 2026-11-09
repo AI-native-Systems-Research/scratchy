@@ -1311,7 +1311,7 @@ impl CudaTape {
                     });
                 }
             }
-            for w in [e.weight, e.gain].into_iter().flatten() {
+            if let Some(w) = e.weight {
                 let weights = self.weight_bytes.len();
                 let ix = w.ix.0;
                 let &declared = (self.weight_bytes.get(ix as usize))
@@ -2258,7 +2258,7 @@ mod tests {
             m: 256,
             n: 1024,
             k: 512,
-            ends: crate::step::GemvEnds::NONE,
+            residual: None,
         }),
         CudaStep::RmsNorm(RmsNormBf16 {
             x: ArenaOffset(262144),
@@ -2306,7 +2306,7 @@ mod tests {
             m,
             n,
             k,
-            ends: crate::step::GemvEnds::NONE,
+            residual: None,
         })
     }
 
@@ -3881,7 +3881,7 @@ mod tests {
             m: 1,
             n: 1024,
             k: 512,
-            ends: crate::step::GemvEnds::NONE,
+            residual: None,
         })],
         rotary: None,
         kv: None,
@@ -3914,7 +3914,7 @@ mod tests {
                 m: 1,
                 n: 8,
                 k: 4,
-                ends: crate::step::GemvEnds::NONE,
+                residual: None,
             })],
             rotary: None,
             kv: None,
@@ -3939,7 +3939,7 @@ mod tests {
                 m: 2,
                 n: 512,
                 k: 256,
-                ends: crate::step::GemvEnds::NONE,
+                residual: None,
             })])),
             ..ONE_ROW
         };
@@ -4673,7 +4673,6 @@ mod pool_and_overlap_tests {
             writes,
             second_write: None,
             weight: None,
-            gain: None,
             kv: None,
             gdn: None,
             in_place,

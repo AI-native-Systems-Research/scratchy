@@ -1459,10 +1459,10 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     assert_eq!(a.block_table, kv.block_table.offset);
     assert_eq!(a.sequence, kv.sequence.offset);
     // The steps `tape_player`'s decode test reads: the query's rope, the append, the attention;
-    // the projections GEMVs (q, k and v one grouped GEMV, #1049), the input norm in its prologue
-    // and the residual add in the o projection's epilogue (FP8 S8 W4a), so no step before them.
+    // the projections GEMVs (q, k and v one grouped GEMV, #1049), the residual add in the o
+    // projection's epilogue (FP8 S8 W4a).
     assert!(matches!(
-        c.steps[4..7],
+        c.steps[5..8],
         [
             CudaStep::Rope(_),
             CudaStep::RopeAppend(_),
@@ -1470,26 +1470,26 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
         ]
     ));
     assert!(
-        matches!(c.steps[0], CudaStep::GemvGroup(GemmGroupBf16 { m: 1, .. })),
-        "step 0: {:?}",
-        c.steps[0]
+        matches!(c.steps[1], CudaStep::GemvGroup(GemmGroupBf16 { m: 1, .. })),
+        "step 1: {:?}",
+        c.steps[1]
     );
     assert!(
-        matches!(c.steps[8], CudaStep::Gemv(GemmBf16 { m: 1, ends, .. }) if ends.residual.is_some()),
-        "step 8: {:?}",
-        c.steps[8]
+        matches!(c.steps[9], CudaStep::Gemv(GemmBf16 { m: 1, residual, .. }) if residual.is_some()),
+        "step 9: {:?}",
+        c.steps[9]
     );
     // That test reads `qn` (the rope's input), `kr` and `v` (the append's) and `attn` back from
     // the arena after the forward: no step after the one writing each overwrites it.
-    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append)) = (c.steps[4], c.steps[5]) else {
+    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append)) = (c.steps[5], c.steps[6]) else {
         unreachable!("matched above");
     };
     let row = |at: ArenaOffset, cols: u32| span(at.0, 2 * u64::from(cols));
     for (what, read, from) in [
-        ("qn", row(rope.x, rope.cols), 4),
-        ("kr", row(append.k_out, append.cols), 5),
-        ("v", row(append.v, append.cols), 5),
-        ("attn", row(a.out, a.q_heads * a.head_dim), 6),
+        ("qn", row(rope.x, rope.cols), 5),
+        ("kr", row(append.k_out, append.cols), 6),
+        ("v", row(append.v, append.cols), 6),
+        ("attn", row(a.out, a.q_heads * a.head_dim), 7),
     ] {
         for (i, s) in c.steps.iter().enumerate().skip(from + 1) {
             let e = s.extents().expect("extents fit");
@@ -2344,10 +2344,7 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                     assert_eq!(n.gain, WeightIx(1), "the router scale");
                 }
                 CudaStep::RouterLogits(r) => {
-                    // At one row the router norm is the router GEMV's prologue (FP8 S8 W4a): it
-                    // reads the hidden.
-                    let want = if m == 1 { ArenaOffset(0) } else { rows.offset };
-                    assert_eq!(r.x, want, "m={m}: the router reads the norm's rows");
+                    assert_eq!(r.x, rows.offset, "m={m}: the router reads the norm's rows");
                     assert_eq!((r.weight, r.bundle), (MoeWeight::Own, WeightIx(2)));
                 }
                 CudaStep::MoeRoute(r) => {
@@ -2388,12 +2385,7 @@ fn a_gemma_moe_block_lowers_in_both_modes() {
                 _ => {}
             }
         }
-        let want_norms = usize::from(m > 1);
-        assert_eq!(
-            (norms, routes, gelus, experts),
-            (want_norms, 1, 1, 3),
-            "m={m}"
-        );
+        assert_eq!((norms, routes, gelus, experts), (1, 1, 1, 3), "m={m}");
         let sorts = (c.steps.iter()).filter(|s| matches!(s, CudaStep::ExpertSort(_)));
         assert_eq!(
             sorts.count(),

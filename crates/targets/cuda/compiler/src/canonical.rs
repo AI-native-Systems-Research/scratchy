@@ -1395,14 +1395,15 @@ pub fn plan_canonical(
 }
 
 /// CUDA's fold facts for a bucket of `m` rows (#1049, FP8 S8 W4a): the gate/up kernels take every
-/// bucket (`CUDA_FOLD_PROJECTIONS`); the one-row bucket's matvecs take their ends, the norm in
-/// their prologue and the residual add in their epilogue (`CUDA_FUSIONS_ONE_ROW`'s first two
-/// sweeps), as Metal's one-row buckets do. Every other bucket is unchanged.
+/// bucket (`CUDA_FOLD_PROJECTIONS`); the one-row bucket's matvecs take the residual add they alone
+/// feed as their epilogue (`CUDA_FUSIONS_ONE_ROW`'s first sweep), as Metal's one-row buckets do. No
+/// norm folds into a matvec (`matvec_norms`, and no `NormedMatvecs` row): a GEMV re-normalises
+/// its row in every CTA (/tmp/d-w4.md §1, the user's decision of 2026-11-09).
 pub const fn cuda_fold_facts(m: u64) -> ModelFoldFacts {
     ModelFoldFacts {
         fold_projections: CUDA_FOLD_PROJECTIONS,
         matvec_ends: m == 1,
-        matvec_norms: m == 1,
+        matvec_norms: false,
         row_programs: false,
         hidden_out: false,
     }

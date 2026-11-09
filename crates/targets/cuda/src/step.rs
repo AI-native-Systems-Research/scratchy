@@ -493,8 +493,6 @@ pub struct GemmGroupBf16 {
     pub first: GroupMember,
     pub second: GroupMember,
     pub third: Option<GroupMember>,
-    /// The shared input's fused norm (FP8 S8 W4a): a grouped GEMV's prologue, for every member.
-    pub ends: GemvEnds,
 }
 
 impl GemmGroupBf16 {
@@ -512,7 +510,7 @@ impl GemmGroupBf16 {
             m: self.m,
             n: g.n,
             k: self.k,
-            ends: self.ends,
+            residual: None,
         }
     }
 
@@ -663,46 +661,10 @@ pub struct GemmBf16 {
     pub m: u32,
     pub n: u32,
     pub k: u32,
-    /// The one-row GEMV's fused ends (FP8 S8 W4a); [`GemvEnds::NONE`] on every other kernel.
-    pub ends: GemvEnds,
-}
-
-/// A row norm a one-row GEMV applies to its input row as it loads it (FP8 S8 W4a): the
-/// [`RmsNormBf16`] the fold absorbed, without its arena operands. The GEMV reads the norm's input
-/// as its `a`; `y = bf16(x · inv · (offset + gain))`, `inv` in `rms_norm_one_row_ker`'s order, so
-/// the row it multiplies is the absorbed norm's output, bit for bit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct RowNorm {
-    pub gain: WeightIx,
-    /// As [`RmsNormBf16::eps_bits`].
-    pub eps_bits: u32,
-    #[serde(serialize_with = "serialize_gain_convention")]
-    pub convention: GainConvention,
-}
-
-impl RowNorm {
-    /// The norm's `eps`.
-    pub const fn eps(&self) -> f32 {
-        f32::from_bits(self.eps_bits)
-    }
-}
-
-/// What a one-row GEMV computes around its dot (FP8 S8 W4a, the one-row bucket's
-/// `NormedMatvec` and `MatvecEpilogue` folds): the norm of its input row, and the residual its
-/// output is added to, `c = bf16(bf16(dot) + residual)`, `add_bf16.cu`'s add. `residual` is a
-/// `[1, n]` arena slot the GEMV reads; `c` is the add's own colour.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-pub struct GemvEnds {
-    pub norm: Option<RowNorm>,
+    /// The residual a one-row GEMV adds its output to (FP8 S8 W4a, the one-row bucket's
+    /// `MatvecEpilogue`): `c = bf16(bf16(a · Bᵀ) + residual)`, `add_bf16.cu`'s add, `residual` a
+    /// `[1, n]` arena slot the GEMV reads and `c` the add's own colour. `None` on every other step.
     pub residual: Option<ArenaOffset>,
-}
-
-impl GemvEnds {
-    /// No fused end: every step of a bucket of two or more rows, and an unfolded GEMV.
-    pub const NONE: Self = Self {
-        norm: None,
-        residual: None,
-    };
 }
 
 /// The narrow GEMM's largest `n`: all of `B`'s rows are one 64-row ThunderKittens tile, and every
@@ -850,15 +812,6 @@ impl RmsNormBf16 {
     /// The norm's `eps`.
     pub const fn eps(&self) -> f32 {
         f32::from_bits(self.eps_bits)
-    }
-
-    /// The norm as a one-row GEMV's prologue computes it ([`GemvEnds::norm`]).
-    pub const fn row_norm(&self) -> RowNorm {
-        RowNorm {
-            gain: self.gain,
-            eps_bits: self.eps_bits,
-            convention: self.convention,
-        }
     }
 }
 
@@ -1387,8 +1340,6 @@ pub struct RouterLogitsBf16 {
     /// The bundle's expert width, so every step naming the bundle states its geometry.
     pub inter: u32,
     pub kernel: MatmulKernel,
-    /// As [`GemmBf16::ends`]: the one-row router's fused norm (FP8 S8 W4a).
-    pub ends: GemvEnds,
 }
 
 /// The one expert count the routing kernel's Qwen program takes: one warp per token row, 8 logits
@@ -1552,8 +1503,6 @@ pub struct ExpertGemvBf16 {
     pub experts: u32,
     pub hidden: u32,
     pub inter: u32,
-    /// As [`GemmBf16::ends`]: the token rows' fused norm (FP8 S8 W4a).
-    pub ends: GemvEnds,
 }
 
 impl ExpertGemvBf16 {
@@ -1750,8 +1699,6 @@ pub struct StepExtents {
     pub writes: ArenaSpan,
     pub second_write: Option<ArenaSpan>,
     pub weight: Option<WeightRead>,
-    /// The fused norm's gain a one-row GEMV reads (FP8 S8 W4a, [`GemvEnds::norm`]).
-    pub gain: Option<WeightRead>,
     pub kv: Option<(u32, KvUse)>,
     pub gdn: Option<u32>,
     /// The write may equal read 0 exactly, the kernel's `out == x` contract.
@@ -1962,58 +1909,6 @@ impl CudaStep {
         Some((g.a, g.m, g.k))
     }
 
-    /// The fused ends of a step that can carry them (FP8 S8 W4a): a GEMM or GEMV's, a group's,
-    /// a router's, an expert GEMV's, a gate/up pair's gate (its up's are equal); `None` for every
-    /// other step.
-    pub const fn gemv_ends(&self) -> Option<GemvEnds> {
-        match *self {
-            Self::Gemm(g)
-            | Self::GemmNarrow(g)
-            | Self::Gemv(g)
-            | Self::GemmCol64(g)
-            | Self::GemmFp8(g)
-            | Self::GemmCol64Fp8(g)
-            | Self::GemmNarrowFp8(g)
-            | Self::GemvFp8(g) => Some(g.ends),
-            Self::GemmGroup(g)
-            | Self::GemmNarrowGroup(g)
-            | Self::GemvGroup(g)
-            | Self::GemmGroupFp8(g)
-            | Self::GemmNarrowGroupFp8(g)
-            | Self::GemvGroupFp8(g) => Some(g.ends),
-            Self::RouterLogits(r) => Some(r.ends),
-            Self::ExpertGemv(g) => Some(g.ends),
-            Self::ExpertGateUpAct(g) => Some(g.gate.ends),
-            Self::GateUpAct(g) => Some(g.gate.ends),
-            Self::QuantRowsFp8(_)
-            | Self::Embed(_)
-            | Self::RmsNorm(_)
-            | Self::Add(_)
-            | Self::SiluMul(_)
-            | Self::Rope(_)
-            | Self::GateSplit(_)
-            | Self::GateApply(_)
-            | Self::RopeAppend(_)
-            | Self::AttnPrefill(_)
-            | Self::AttnDecode(_)
-            | Self::GatedDeltaNet(_)
-            | Self::MoeRoute(_)
-            | Self::ExpertSort(_)
-            | Self::ExpertGemm(_)
-            | Self::ExpertCombine(_)
-            | Self::GateScale(_)
-            | Self::Scale(_)
-            | Self::RmsNormUnit(_)
-            | Self::GeluMul(_)
-            | Self::LayerScale(_)
-            | Self::SoftCap(_)
-            | Self::RouterNorm(_)
-            | Self::AddRmsNorm(_)
-            | Self::NormAdd(_)
-            | Self::GdnDecode(_) => None,
-        }
-    }
-
     /// The kernel steps the step's launch computes: a grouped GEMM's members, each as the GEMM
     /// whose bits it writes, in order; every other step itself. `CudaTape::validate` checks each
     /// part as a step of its own, and a grouped step's members against each other.
@@ -2064,34 +1959,6 @@ impl CudaStep {
     /// `CudaTape::validate` checks a tape against it. A grouped GEMM's are its first member's:
     /// `validate` checks every member's through [`Self::parts`].
     pub const fn extents(&self) -> Option<StepExtents> {
-        let Some(mut e) = self.unfused_extents() else {
-            return None;
-        };
-        // A one-row GEMV's fused ends (FP8 S8 W4a): the residual, `[1, n]` as its output, in the
-        // first free read, and the norm's gain, `[k]` as its one row.
-        if let Some(ends) = self.gemv_ends() {
-            if let Some(residual) = ends.residual {
-                let mut i = 0;
-                while i < e.reads.len() && e.reads[i].is_some() {
-                    i += 1;
-                }
-                if i == e.reads.len() {
-                    return None;
-                }
-                e.reads[i] = Some(span(residual, e.writes.bytes));
-            }
-            if let (Some(norm), Some(a)) = (ends.norm, e.reads[0]) {
-                e.gain = Some(WeightRead {
-                    ix: norm.gain,
-                    bytes: a.bytes,
-                });
-            }
-        }
-        Some(e)
-    }
-
-    /// [`Self::extents`] without the fused ends.
-    const fn unfused_extents(&self) -> Option<StepExtents> {
         match *self {
             Self::GemmGroup(g) | Self::GemmNarrowGroup(g) | Self::GemvGroup(g) => {
                 Self::Gemm(g.member(g.first)).extents()
@@ -2112,7 +1979,6 @@ impl CudaStep {
                     writes: span(q.q, qb),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2120,16 +1986,40 @@ impl CudaStep {
             }
             // The quantized rows (the GEMV's: the bf16 row) and the fp8 weight with its scales.
             Self::GemmFp8(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             })
             | Self::GemmCol64Fp8(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             })
             | Self::GemmNarrowFp8(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             })
             | Self::GemvFp8(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             }) => {
                 let ab = match self {
                     Self::GemvFp8(_) => bf16_bytes(m, k),
@@ -2144,15 +2034,19 @@ impl CudaStep {
                 let (Some(ab), Some(cb), Some(w)) = (ab, bf16_bytes(m, n), fp8_weight(n, k)) else {
                     return None;
                 };
+                // FP8 S8 W4a: the residual a one-row GEMV adds, `[1, n]` as its output.
+                let r = match residual {
+                    Some(r) => Some(span(r, cb)),
+                    None => None,
+                };
                 Some(StepExtents {
-                    reads: [Some(span(a, ab)), None, None, None],
+                    reads: [Some(span(a, ab)), r, None, None],
                     writes: span(c, cb),
                     second_write: None,
                     weight: Some(WeightRead {
                         ix: b,
                         bytes: w.bytes,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2178,35 +2072,62 @@ impl CudaStep {
                         ix: table,
                         bytes: tb,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
                 })
             }
             Self::Gemm(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             })
             | Self::GemmCol64(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             })
             | Self::GemmNarrow(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             })
             | Self::Gemv(GemmBf16 {
-                a, b, c, m, n, k, ..
+                a,
+                b,
+                c,
+                m,
+                n,
+                k,
+                residual,
             }) => {
                 let (Some(ab), Some(bb), Some(cb)) =
                     (bf16_bytes(m, k), bf16_bytes(n, k), bf16_bytes(m, n))
                 else {
                     return None;
                 };
+                // FP8 S8 W4a: the residual a one-row GEMV adds, `[1, n]` as its output.
+                let r = match residual {
+                    Some(r) => Some(span(r, cb)),
+                    None => None,
+                };
                 Some(StepExtents {
-                    reads: [Some(span(a, ab)), None, None, None],
+                    reads: [Some(span(a, ab)), r, None, None],
                     writes: span(c, cb),
                     second_write: None,
                     weight: Some(WeightRead { ix: b, bytes: bb }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2239,7 +2160,6 @@ impl CudaStep {
                         ix: gain,
                         bytes: gb,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2277,7 +2197,6 @@ impl CudaStep {
                         ix: g.gate.b,
                         bytes: bb,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2313,7 +2232,6 @@ impl CudaStep {
                         ix: gain,
                         bytes: gb,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2340,7 +2258,6 @@ impl CudaStep {
                         ix: gain,
                         bytes: gb,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2382,7 +2299,6 @@ impl CudaStep {
                     writes: span(out, bytes),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2406,7 +2322,6 @@ impl CudaStep {
                     writes: span(out, xb),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2431,7 +2346,6 @@ impl CudaStep {
                     writes: span(q, hb),
                     second_write: Some(span(gate, hb)),
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2463,7 +2377,6 @@ impl CudaStep {
                     writes: span(k_out, kb),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: Some((layer, KvUse::Write)),
                     gdn: None,
                     in_place: false,
@@ -2507,7 +2420,6 @@ impl CudaStep {
                     writes: span(out, qb),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: Some((layer, KvUse::Read)),
                     gdn: None,
                     in_place: false,
@@ -2564,7 +2476,6 @@ impl CudaStep {
                         ix: bundle,
                         bytes: bu.bytes,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: Some(layer),
                     in_place: false,
@@ -2596,7 +2507,6 @@ impl CudaStep {
                         ix: bundle,
                         bytes: bu,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2627,7 +2537,6 @@ impl CudaStep {
                     writes: span(topk_idx, u32_bytes(pairs)),
                     second_write: Some(span(scores, u32_bytes(pairs))),
                     weight,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2652,7 +2561,6 @@ impl CudaStep {
                     // `MoeTape::validate` checks each region's own offset.
                     second_write: Some(span(s.chunk_hist, l.index_bytes)),
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2692,7 +2600,6 @@ impl CudaStep {
                         ix: g.bundle,
                         bytes: bu.bytes,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2727,7 +2634,6 @@ impl CudaStep {
                         ix: g.bundle,
                         bytes: bu.bytes,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2763,7 +2669,6 @@ impl CudaStep {
                     writes: span(out, ob),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2790,7 +2695,6 @@ impl CudaStep {
                     writes: span(out, bytes),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2814,7 +2718,6 @@ impl CudaStep {
                     writes: span(out, bytes),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -2833,7 +2736,6 @@ impl CudaStep {
                     writes: span(out, bytes),
                     second_write: None,
                     weight: None,
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: true,
@@ -2857,7 +2759,6 @@ impl CudaStep {
                         ix: scale,
                         bytes: CUDA_ACT_BYTES,
                     }),
-                    gain: None,
                     kv: None,
                     gdn: None,
                     in_place: false,
@@ -3024,44 +2925,15 @@ impl CudaStep {
                     first,
                     second,
                     third,
-                    ends,
                     ..
                 } = g;
                 let mut all = vec![&mut first.b, &mut second.b];
                 all.extend(third.as_mut().map(|t| &mut t.b));
-                all.extend(ends.norm.as_mut().map(|n| &mut n.gain));
                 all
             }
-            Self::GateUpAct(GateUpActBf16 { gate, up, .. }) => {
-                let mut all = vec![&mut gate.b, &mut up.b];
-                // The pair shares one norm: its gain is the gate's and the up's.
-                all.extend(gate.ends.norm.as_mut().map(|n| &mut n.gain));
-                all.extend(up.ends.norm.as_mut().map(|n| &mut n.gain));
-                all
-            }
+            Self::GateUpAct(GateUpActBf16 { gate, up, .. }) => vec![&mut gate.b, &mut up.b],
             Self::ExpertGateUpAct(ExpertGateUpActBf16 { gate, up, .. }) => {
-                let mut all = vec![&mut gate.bundle, &mut up.bundle];
-                all.extend(gate.ends.norm.as_mut().map(|n| &mut n.gain));
-                all.extend(up.ends.norm.as_mut().map(|n| &mut n.gain));
-                all
-            }
-            Self::Gemm(GemmBf16 { b, ends, .. })
-            | Self::GemmNarrow(GemmBf16 { b, ends, .. })
-            | Self::Gemv(GemmBf16 { b, ends, .. })
-            | Self::GemmCol64(GemmBf16 { b, ends, .. })
-            | Self::GemmFp8(GemmBf16 { b, ends, .. })
-            | Self::GemmCol64Fp8(GemmBf16 { b, ends, .. })
-            | Self::GemmNarrowFp8(GemmBf16 { b, ends, .. })
-            | Self::GemvFp8(GemmBf16 { b, ends, .. })
-            | Self::RouterLogits(RouterLogitsBf16 {
-                bundle: b, ends, ..
-            })
-            | Self::ExpertGemv(ExpertGemvBf16 {
-                bundle: b, ends, ..
-            }) => {
-                let mut all = vec![b];
-                all.extend(ends.norm.as_mut().map(|n| &mut n.gain));
-                all
+                vec![&mut gate.bundle, &mut up.bundle]
             }
             other => other.weight_mut().into_iter().collect(),
         }

@@ -81,45 +81,25 @@ fn plan(name: &str, input: LoweringInput) -> CudaPlan {
 }
 
 /// None of the shared fixtures has a `Silu` read by a `Mul` (the layers use the pre-fused
-/// `SiluMul`), so CUDA's gated fold absorbs nothing in any of them. The residual and matvec norms
-/// fold at one token (FP8 S8 W4a): each layer's input norm (op 0) folds into its q/k/v GEMVs (the
-/// last, op 3, holds it), its o projection (op 10) takes the mid-layer add (op 11) as its epilogue,
-/// and the post-attention norm takes that add's residual sum, as before, into the norm that reads
-/// it (#1049's `AddRmsNorm`, op 9 into 11). Nothing else is absorbed.
+/// `SiluMul`), so CUDA's gated fold absorbs nothing in any of them. The layers' residual adds fold
+/// into the norm that reads them (#1049's `AddRmsNorm`): one layer's mid-layer add (op 8, into
+/// norm 9), and each of three layers' adds but the last. Nothing else is absorbed.
 #[test]
 fn plan_canonical_folds_only_the_residual_norms_in_the_shared_fixtures() {
-    type Folds = &'static [(usize, usize)];
-    let want: [(&str, Folds, Folds); 2] = [
-        ("one_layer", &[(0, 3), (9, 11)], &[(2, 1), (3, 1), (11, 10)]),
+    let want: [(&str, &[(usize, usize)]); 2] = [
+        ("one_layer", &[(8, 9)]),
         (
             "n_layer(3)",
-            &[(0, 3), (9, 11), (15, 18), (24, 26), (30, 33), (39, 41)],
-            &[
-                (2, 1),
-                (3, 1),
-                (11, 10),
-                (17, 16),
-                (18, 16),
-                (26, 25),
-                (32, 31),
-                (33, 31),
-                (41, 40),
-            ],
+            &[(8, 9), (14, 15), (23, 24), (29, 30), (38, 39)],
         ),
     ];
     for (name, input) in fixtures() {
         let p = plan(name, input);
-        let (absorbed, epilogue) = (want.iter().find(|(n, ..)| *n == name))
-            .map_or((&[][..], &[][..]), |(_, a, e)| (*a, *e));
+        let absorbed = (want.iter().find(|(n, _)| *n == name)).map_or(&[][..], |(_, a)| *a);
         assert_eq!(
             p.folds.absorbed_ops(),
             absorbed,
-            "{name}: the residual and matvec norms fold at one token"
-        );
-        assert_eq!(
-            p.folds.epilogue_ops(),
-            epilogue,
-            "{name}: the siblings and the residual adds are epilogues"
+            "{name}: only the residual norms fold"
         );
         assert!(
             p.colouring.count().get() >= 1,
@@ -498,7 +478,7 @@ fn a_decode_gemm_lowers_to_the_gemv() {
             m: 1,
             n: 1024,
             k: 1024,
-            ends: scratchy_target_cuda::step::GemvEnds::NONE,
+            residual: None,
         })]
     );
     assert_eq!(
@@ -590,12 +570,7 @@ fn rope_only(tokens: u32, cols: u32, head_dim: u32) -> LoweredDecode {
 }
 
 fn refusal(l: &LoweredDecode, facts: CudaModelFacts) -> CanonicalRefusal {
-    refusal_at(l, facts, AT)
-}
-
-/// [`refusal`] at the bucket `at`.
-fn refusal_at(l: &LoweredDecode, facts: CudaModelFacts, at: CanonicalAt<'_>) -> CanonicalRefusal {
-    match lower_canonical(l, facts, at) {
+    match lower_canonical(l, facts, AT) {
         Err(e) => {
             eprintln!("refused: {e}");
             e
@@ -666,7 +641,7 @@ fn a_gate_split_off_the_vector_is_refused() {
         head_dim: 12,
         ..FACTS
     };
-    let e = refusal_at(&attn_gate(256), facts, AT_256);
+    let e = refusal(&attn_gate(256), facts);
     assert!(e.to_string().contains("multiple of 8"), "{e}");
     assert!(matches!(
         e,
@@ -718,7 +693,7 @@ fn a_gate_split_off_the_instantiated_head_dim_is_refused() {
         head_dim: 128,
         ..FACTS
     };
-    let e = refusal_at(&attn_gate(256), facts, AT_256);
+    let e = refusal(&attn_gate(256), facts);
     assert!(e.to_string().contains("head_dim must be 256"), "{e}");
     assert!(matches!(
         e,
@@ -764,7 +739,7 @@ fn a_decode_attention_above_the_largest_group_is_refused() {
 #[test]
 fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
     let l = mlp_block();
-    let p = plan_canonical(&l, FACTS, AT_256).expect("plan_canonical on the MLP block");
+    let p = plan_canonical(&l, FACTS, AT).expect("plan_canonical on the MLP block");
     let cx = StepCx {
         graph: &p.graph,
         bindings: &p.lowered.bindings,

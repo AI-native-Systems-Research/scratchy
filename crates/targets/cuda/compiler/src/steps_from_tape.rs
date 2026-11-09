@@ -32,12 +32,11 @@ use scratchy_target_cuda::step::{
     GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE,
     GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
     GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GemvEnds,
-    GroupKind, GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16,
-    MoeWeight, NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
-    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
-    SiluMulBf16, SoftCapBf16,
+    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GroupKind,
+    GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight,
+    NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
+    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -55,8 +54,8 @@ pub struct StepCx<'a> {
     /// Parallel to the graph's sources.
     pub bindings: &'a [SourceBinding],
     pub colouring: &'a TapeColouring,
-    /// The folds, which a one-row matvec's lowering reads for the norm and the residual add it
-    /// computes ([`folded_norm`], [`folded_residual`]).
+    /// The folds, which a one-row matvec's lowering reads for the residual add it computes
+    /// ([`folded_residual`]).
     pub folds: &'a TapeFolds<CudaFusion>,
     pub facts: CudaModelFacts,
     /// The bucket's token count (the embedded hidden's rows), when one source is bound to it.
@@ -294,19 +293,17 @@ pub fn lower_fused(
         CudaFusion::GateUpSiluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Silu),
         CudaFusion::GateUpGeluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Gelu),
         CudaFusion::ExpertGateUpAct => expert_gate_up_act(cx, s, fusion.shape, computes),
-        // A one-row matvec's ends are no command of their own: [`lower_driver`] lowers their
-        // matvec, whose lowering reads them ([`folded_norm`], [`folded_residual`]).
-        CudaFusion::NormedGemv
-        | CudaFusion::NormedRouter
-        | CudaFusion::GemvFp8Residual
-        | CudaFusion::GemvResidual => Err(CanonicalRefusal::FusionShape { step: s.step }),
+        // A one-row matvec's residual add is no command of its own: [`lower_driver`] lowers the
+        // matvec, whose lowering reads it ([`folded_residual`]).
+        CudaFusion::GemvFp8Residual | CudaFusion::GemvResidual => {
+            Err(CanonicalRefusal::FusionShape { step: s.step })
+        }
     }
 }
 
 /// Lower a `Compute` that drives the folds `driven` (in the order they were applied): the last
 /// that is a command of its own through [`lower_fused`], or, when every one is a one-row matvec's
-/// end (FP8 S8 W4a: a norm in its prologue, a residual add in its epilogue), the step itself
-/// through [`lower_step`], which reads them.
+/// residual epilogue (FP8 S8 W4a), the step itself through [`lower_step`], which reads it.
 pub fn lower_driver(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
@@ -316,46 +313,12 @@ pub fn lower_driver(
     let end = |f: &&Fusion<CudaFusion>| {
         matches!(
             f.kernel,
-            CudaFusion::NormedGemv
-                | CudaFusion::NormedRouter
-                | CudaFusion::GemvFp8Residual
-                | CudaFusion::GemvResidual
+            CudaFusion::GemvFp8Residual | CudaFusion::GemvResidual
         )
     };
     match driven.iter().rfind(|f| !end(f)) {
         Some(f) => lower_fused(cx, s, f, computes).map(Some),
         None => lower_step(cx, s, computes),
-    }
-}
-
-/// The norm the one-row matvec `s` computes in its prologue (FP8 S8 W4a, the shared
-/// `NormedMatvec`): its `RmsNorm` (Gemma's router: its `RouterNorm`), lowered as the step it is on
-/// its own, at one row. `None` when `s` folded no norm. A matvec reads one input, so two norms are
-/// refused.
-fn folded_norm(
-    cx: &StepCx<'_>,
-    s: &TapeStep<'_>,
-    computes: &[TapeStep<'_>],
-) -> Result<Option<RmsNormBf16>, CanonicalRefusal> {
-    let refused = || CanonicalRefusal::FusionShape { step: s.step };
-    let mut norms = (cx.folds.driven(s.writes).iter()).filter_map(|f| match f.shape {
-        FusedShape::NormedMatvec { norm } => Some(norm),
-        _ => None,
-    });
-    let (Some(norm), None) = (norms.next(), norms.next()) else {
-        return match cx
-            .folds
-            .driven(s.writes)
-            .iter()
-            .any(|f| matches!(f.shape, FusedShape::NormedMatvec { .. }))
-        {
-            true => Err(refused()),
-            false => Ok(None),
-        };
-    };
-    match lower_step(cx, absorbed_step(s, norm, computes)?, computes)? {
-        Some(CudaStep::RmsNorm(n) | CudaStep::RouterNorm(n)) if n.rows == 1 => Ok(Some(n)),
-        Some(_) | None => Err(refused()),
     }
 }
 
@@ -435,9 +398,7 @@ fn gate_up_act(
     };
     let (gk, gate) = kernel(absorbed_step(s, gate, computes)?)?;
     let (uk, up) = kernel(absorbed_step(s, up, computes)?)?;
-    let same = gk == uk
-        && (gate.a, gate.m, gate.n, gate.k, gate.ends) == (up.a, up.m, up.n, up.k, up.ends)
-        && gate.ends.residual.is_none();
+    let same = gk == uk && (gate.a, gate.m, gate.n, gate.k) == (up.a, up.m, up.n, up.k);
     if !same || (mul.gate, mul.up) != (gate.c, up.c) {
         return Err(refused());
     }
@@ -498,7 +459,6 @@ fn expert_gate_up_act(
             weight,
             topk_idx,
             (m, top_k, experts, hidden, inter),
-            g.ends,
         )
     };
     let projections = (gate.proj, up.proj) == (ExpertProjection::Gate, ExpertProjection::Up);
@@ -626,9 +586,8 @@ fn sibling_matmuls(
     };
     // One kind for every member: an fp8 member's kind is never a bf16 one's, so a group is all
     // fp8 or all bf16 (the shared fold's rule), and a mixed one is refused here.
-    let same = (rest.iter()).all(|(k, g)| {
-        k == kind && (g.a, g.m, g.k, g.ends) == (first.a, first.m, first.k, first.ends)
-    });
+    let same =
+        (rest.iter()).all(|(k, g)| k == kind && (g.a, g.m, g.k) == (first.a, first.m, first.k));
     let member = |(_, g): &(GroupKind, GemmBf16)| GroupMember {
         b: g.b,
         c: g.c,
@@ -637,9 +596,7 @@ fn sibling_matmuls(
     let ([second, third @ ..], true) = (rest, same) else {
         return Err(refused());
     };
-    // A group shares its input's norm (every member read the norm, so each folded it); a member
-    // never adds a residual, which is one output's.
-    if third.len() > 1 || first.ends.residual.is_some() {
+    if third.len() > 1 {
         return Err(refused());
     }
     Ok(kind.grouped(GemmGroupBf16 {
@@ -649,7 +606,6 @@ fn sibling_matmuls(
         first: member(&lowered[0]),
         second: member(second),
         third: third.first().map(member),
-        ends: first.ends,
     }))
 }
 
@@ -713,24 +669,17 @@ fn gemm(
         m,
         n,
         k,
-        ends: GemvEnds::NONE,
+        residual: None,
     };
-    // FP8 S8 W4a: the norm it folded reads the norm's input, the residual add it folded writes the
-    // add's output (`a` the matvec's, `b` the residual), each of the matvec's one row.
-    let refused = || CanonicalRefusal::FusionShape { step };
-    if let Some(norm) = folded_norm(cx, s, computes)? {
-        if m != 1 || (norm.y, norm.cols) != (gemm.a, k) {
-            return Err(refused());
-        }
-        gemm.a = norm.x;
-        gemm.ends.norm = Some(norm.row_norm());
-    }
+    // FP8 S8 W4a: the residual add it folded writes the add's output (`a` the matvec's, `b` the
+    // residual), of the matvec's one row, on the one-row GEMVs only.
     if let Some(add) = folded_residual(cx, s, computes)? {
-        if m != 1 || (add.a, add.rows, add.cols) != (gemm.c, 1, n) {
-            return Err(refused());
+        let gemv = matches!(kernel(gemm), CudaStep::Gemv(_) | CudaStep::GemvFp8(_));
+        if !gemv || (add.a, add.rows, add.cols) != (gemm.c, 1, n) {
+            return Err(CanonicalRefusal::FusionShape { step });
         }
         gemm.c = add.out;
-        gemm.ends.residual = Some(add.b);
+        gemm.residual = Some(add.b);
     }
     Ok(kernel(gemm))
 }
@@ -1827,17 +1776,6 @@ fn router_logits(
         _ => at(activation(cx, s, 0, inputs.next())?),
     };
     let bundle = weight_operand(cx, s, 1, inputs.next())?;
-    // FP8 S8 W4a: a folded norm (Qwen's RmsNorm of the hidden, Gemma's RouterNorm into the
-    // scratch's rows) is read from its input, normalised in the GEMV's prologue.
-    let mut ends = GemvEnds::NONE;
-    let mut x = x;
-    if let Some(norm) = folded_norm(cx, s, computes)? {
-        if m != 1 || (norm.y, norm.cols) != (x, hidden) {
-            return Err(CanonicalRefusal::FusionShape { step });
-        }
-        x = norm.x;
-        ends.norm = Some(norm.row_norm());
-    }
     Ok(RouterLogitsBf16 {
         x,
         bundle,
@@ -1848,7 +1786,6 @@ fn router_logits(
         hidden,
         inter: moe.inter,
         kernel,
-        ends,
     })
 }
 
@@ -2112,21 +2049,10 @@ fn expert_matmul(
         }
         // Gathered: the gate and up read each pair's token row, the sort's `x`; the down its own
         // row of the activation.
-        // FP8 S8 W4a: the gathered sort's folded norm (the shared `NormedMatvecs`' `Gathered`
-        // reader) is the gate's and up's prologue, on the norm's input.
-        let mut ends = GemvEnds::NONE;
         let a = match reads {
             PairRows::Token => {
                 let at = arena(cx)?;
-                let x = at(activation(cx, rows, 0, rows.inputs.iter().next())?);
-                match folded_norm(cx, rows, computes)? {
-                    Some(norm) if (norm.y, norm.rows, norm.cols) == (x, 1, k) => {
-                        ends.norm = Some(norm.row_norm());
-                        norm.x
-                    }
-                    Some(_) => return Err(CanonicalRefusal::FusionShape { step: s.step }),
-                    None => x,
-                }
+                at(activation(cx, rows, 0, rows.inputs.iter().next())?)
             }
             PairRows::Pair => moe.act.offset,
         };
@@ -2143,7 +2069,6 @@ fn expert_matmul(
             experts: moe.experts,
             hidden: moe.hidden,
             inter: moe.inter,
-            ends,
         }));
     };
     let (_, tn, tk) = GEMM_BF16_TILE;

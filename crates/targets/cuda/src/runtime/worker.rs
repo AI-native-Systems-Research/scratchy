@@ -41,10 +41,10 @@ use crate::step::{
     ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
     AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpKernel, GatedDeltaNetBf16, GemmBf16, GemvEnds, GroupMember, LayerScaleBf16,
-    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight, gemv_splits,
+    GateUpKernel, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS,
+    MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8, RmsNormBf16,
+    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16,
+    SiluMulBf16, SoftCapBf16, fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KV_ELEM_BYTES,
@@ -632,26 +632,6 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
         && experts != MOE_ROUTE_EXPERTS
     {
         return Some("MoeRoute");
-    }
-    // shortcut: a fused norm or residual add (FP8 S8 W4a) on a kernel that does not compute it yet
-    // is refused, so no launch ever drops one; upgrade by giving that kernel its ends. The fp8 and
-    // bf16 GEMVs (dense, group, gate/up, expert, the one-row router) compute both, the narrow
-    // GEMMs their norm (a narrow residual is refused by its launcher).
-    let computes_ends = match *s {
-        CudaStep::GemvFp8(_)
-        | CudaStep::GemvGroupFp8(_)
-        | CudaStep::Gemv(_)
-        | CudaStep::GemvGroup(_)
-        | CudaStep::GemmNarrow(_)
-        | CudaStep::GemmNarrowGroup(_)
-        | CudaStep::ExpertGemv(_)
-        | CudaStep::ExpertGateUpAct(_) => true,
-        CudaStep::GateUpAct(g) => matches!(g.kernel, GateUpKernel::GemvFp8 | GateUpKernel::Gemv),
-        CudaStep::RouterLogits(r) => r.kernel == MatmulKernel::Gemv,
-        _ => false,
-    };
-    if !computes_ends && s.gemv_ends().is_some_and(|e| e != GemvEnds::NONE) {
-        return Some("GemvEnds");
     }
     None
 }
@@ -1404,20 +1384,21 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     c,
                     n,
                     k,
-                    ends,
+                    residual,
                     ..
                 }) => {
                     let b = Self::fp8_weight(weights, b, n, k);
-                    let ends = Self::ends(weights, slot, ends);
                     // SAFETY: as the `Gemv` arm's, for `a` (`k` bf16, which the kernel quantizes
                     // in its prologue), the fp8 weight (`n*k` bytes then `n` f32,
                     // `step::fp8_weight`) and `c` (`n`).
                     unsafe {
-                        kernels::gemv_fp8_ends(
+                        // FP8 S8 W4a: the residual epilogue (the one-row bucket's o / out / down);
+                        // with none, the same kernel and bits.
+                        kernels::gemv_fp8_residual(
                             (slot(a).cast_const(), b, slot(c)),
                             partials,
                             (n, k, gemv_splits(n, k, 1)),
-                            ends,
+                            residual.map_or(std::ptr::null(), |r| slot(r).cast_const()),
                             stream.0,
                         )
                     }
@@ -1444,12 +1425,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         .collect();
                     // SAFETY: as the `GemvGroup` arm's, each member's weight an fp8 buffer.
                     unsafe {
-                        kernels::gemv_group_fp8_ends(
+                        kernels::gemv_group_fp8_abt(
                             slot(g.a),
                             &members,
                             &parts,
                             (g.k, &splits),
-                            Self::ends(weights, slot, g.ends),
                             stream.0,
                         )
                     }
@@ -1634,26 +1614,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
                 }
                 CudaStep::GemmNarrow(GemmBf16 {
-                    a,
-                    b,
-                    c,
-                    m,
-                    n,
-                    k,
-                    ends,
+                    a, b, c, m, n, k, ..
                 }) => {
                     let b = weights[b.0 as usize].ptr();
-                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`), and the
-                    // norm's gain (`k`, `validate`).
+                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
                     unsafe {
-                        kernels::gemm_narrow_bf16_ends(
-                            slot(a),
-                            b,
-                            slot(c),
-                            (m, n, k),
-                            Self::ends(weights, slot, ends),
-                            stream.0,
-                        )
+                        kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
                     }
                 }
                 CudaStep::Gemv(GemmBf16 {
@@ -1662,7 +1628,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     c,
                     n,
                     k,
-                    ends,
+                    residual,
                     ..
                 }) => {
                     let b = weights[b.0 as usize].ptr();
@@ -1673,12 +1639,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     unsafe {
                         // One split is the unsplit launcher, the same kernel and bits, so its
                         // refusal stays `GemvShape` (#1048's `tape_player` pin).
-                        if ends != GemvEnds::NONE {
-                            kernels::gemv_bf16_ends(
+                        // FP8 S8 W4a: the residual epilogue (the 35B's GDN out_proj).
+                        if let Some(r) = residual {
+                            kernels::gemv_bf16_residual(
                                 (slot(a), b, slot(c)),
                                 partials,
                                 (n, k, splits),
-                                Self::ends(weights, slot, ends),
+                                slot(r).cast_const(),
                                 stream.0,
                             )
                         } else if splits == 1 {
@@ -1709,13 +1676,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         .flatten()
                         .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
                         .collect();
-                    // SAFETY: as the `GemmGroup` arm's, and the norm's gain (`k`, `validate`).
+                    // SAFETY: as the `GemmGroup` arm's.
                     unsafe {
-                        kernels::gemm_narrow_group_bf16_ends(
+                        kernels::gemm_narrow_group_bf16_abt(
                             slot(g.a),
                             &members,
                             (g.m, g.k),
-                            Self::ends(weights, slot, g.ends),
                             stream.0,
                         )
                     }
@@ -1746,12 +1712,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // another (`CudaStep::gemv_scratch`, which `validate` checked), so no two
                     // members' overlap.
                     unsafe {
-                        kernels::gemv_group_bf16_ends(
+                        kernels::gemv_group_bf16_abt(
                             slot(g.a),
                             &members,
                             &parts,
                             (g.k, &splits),
-                            Self::ends(weights, slot, g.ends),
                             stream.0,
                         )
                     }
@@ -1764,7 +1729,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     experts,
                     hidden,
                     kernel,
-                    ends,
                     ..
                 }) => {
                     // The router is the bundle's first tensor, at byte 0 (`moe_bundle`), or Gemma's
@@ -1783,11 +1747,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 hidden,
                                 stream.0,
                             ),
-                            MatmulKernel::Gemv => kernels::gemv_bf16_ends(
+                            MatmulKernel::Gemv => kernels::gemv_split_bf16_abt(
                                 (slot(x), b, slot(logits)),
                                 partials,
                                 (experts, hidden, gemv_splits(experts, hidden, 1)),
-                                Self::ends(weights, slot, ends),
                                 stream.0,
                             ),
                             // Gemma's 128-expert router at m ≥ 2, its own projection.
@@ -1853,15 +1816,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // (`GateUpActBf16::gemv_scratch`, which `validate` checked).
                     unsafe {
                         match g.kernel {
-                            GateUpKernel::Gemv => kernels::gate_up_gemv_bf16_ends(
+                            GateUpKernel::Gemv => kernels::gate_up_gemv_bf16(
                                 (slot(a), gate, up),
                                 (slot(g.out), partials),
                                 (n, k, gemv_splits(n, k, 1)),
                                 act,
-                                Self::ends(weights, slot, g.gate.ends),
                                 stream.0,
                             ),
-                            GateUpKernel::GemvFp8 => kernels::gate_up_gemv_fp8_ends(
+                            GateUpKernel::GemvFp8 => kernels::gate_up_gemv_fp8(
                                 (
                                     slot(a).cast_const(),
                                     Self::fp8_weight(weights, g.gate.b, n, k),
@@ -1870,7 +1832,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (slot(g.out), partials),
                                 (n, k, gemv_splits(n, k, 1)),
                                 act,
-                                Self::ends(weights, slot, g.gate.ends),
                                 stream.0,
                             ),
                             GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8 => {
@@ -2725,13 +2686,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             // SAFETY: as the bf16 launch's below, with the bank `fp8_moe_layout`'s bytes, expert
             // 0's e4m3 block and scale row inside it; `a` is bf16, quantized in the prologue.
             return unsafe {
-                kernels::expert_gemv_fp8_ends(
+                kernels::expert_gemv_fp8(
                     (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
                     (slot(g.c), partials),
                     (g.m, g.top_k, n, k),
                     (g.experts, expert_rows),
                     (g.rows == PairRows::Pair, splits),
-                    Self::ends(weights, &slot, g.ends),
                     stream.0,
                 )
             };
@@ -2752,13 +2712,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // holds; every expert's `[n, k]` lies inside its part) and the scratch (the tape's GEMV
         // scratch, at least this step's partials' bytes, which `validate` checked).
         unsafe {
-            kernels::expert_gemv_bf16_ends(
+            kernels::expert_gemv_split_bf16(
                 (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
                 (slot(g.c), partials),
                 (g.m, g.top_k, n, k),
                 (g.experts, expert_rows),
                 (g.rows == PairRows::Pair, splits),
-                Self::ends(weights, &slot, g.ends),
                 stream.0,
             )
         }
@@ -2798,7 +2757,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             // SAFETY: as the bf16 launch's below, for both fp8 slabs and their scale rows, each
             // inside the bank's gate/up part (`fp8_moe_layout`).
             return unsafe {
-                kernels::expert_gate_up_gemv_fp8_ends(
+                kernels::expert_gate_up_gemv_fp8(
                     (
                         slot(g.gate.a).cast_const(),
                         gate,
@@ -2809,7 +2768,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     (g.gate.m, g.gate.top_k, n, k),
                     (g.gate.experts, rows, splits),
                     g.act.code(),
-                    Self::ends(weights, &slot, g.gate.ends),
                     stream.0,
                 )
             };
@@ -2832,7 +2790,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // the scratch (both projections' partials, `ExpertGateUpActBf16::gemv_scratch`, which
         // `validate` checked).
         unsafe {
-            kernels::expert_gate_up_gemv_bf16_ends(
+            kernels::expert_gate_up_gemv_bf16(
                 (
                     slot(g.gate.a).cast_const(),
                     gate,
@@ -2843,7 +2801,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (g.gate.m, g.gate.top_k, n, k),
                 (g.gate.experts, rows, splits),
                 g.act.code(),
-                Self::ends(weights, &slot, g.gate.ends),
                 stream.0,
             )
         }
@@ -2876,32 +2833,6 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             slot(q).cast_const(),
             slot(ArenaOffset(q.0 + at)).cast_const(),
         )
-    }
-
-    /// A step's fused ends as its launcher takes them (FP8 S8 W4a): the norm's gain buffer, `eps`
-    /// and offset, and the residual's slot; null where it has none.
-    fn ends(
-        weights: &[DeviceBuffer],
-        slot: impl Fn(ArenaOffset) -> *mut c_void,
-        ends: GemvEnds,
-    ) -> kernels::Ends {
-        let (gain, eps, gain_offset) = match ends.norm {
-            Some(n) => (
-                weights[n.gain.0 as usize].ptr().cast_const(),
-                n.eps(),
-                n.convention.offset(),
-            ),
-            None => (std::ptr::null(), 0.0, 0.0),
-        };
-        let residual = ends
-            .residual
-            .map_or(std::ptr::null(), |r| slot(r).cast_const());
-        kernels::Ends {
-            gain,
-            eps,
-            gain_offset,
-            residual,
-        }
     }
 
     /// Weight `b`'s fp8 buffer as an operand: its `[n, k]` e4m3 bytes, then its `[n]` f32 scales

@@ -22,7 +22,7 @@ use scratchy_subtile::ops::SubOpKind;
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsFacts};
 use scratchy_subtile::subtile_ir::{EwKind, ExpertBundle, ExpertProj, OpStage, RopeForm, SubOp};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
-use scratchy_subtile::tape_folding::{ColsBand, FoldPattern, FusionTable, GatedKernel, NormReader};
+use scratchy_subtile::tape_folding::{ColsBand, FoldPattern, FusionTable, GatedKernel};
 use scratchy_subtile::tape_steps::OperandIx;
 
 // ── The colour rule ─────────────────────────────────────────────────
@@ -186,11 +186,6 @@ pub enum CudaFusion {
     /// A routed expert's gate and up GEMVs and its activation in one launch, at the one-row bucket
     /// (#1049, `step::CudaStep::ExpertGateUpAct`).
     ExpertGateUpAct,
-    /// An RMSNorm in the prologue of every one-row matvec reading it (FP8 S8 W4a; the shared
-    /// `NormedMatvecs`): the GEMV normalises its row as it loads it, the norm's own launch gone.
-    NormedGemv,
-    /// Gemma's `RouterNorm` in the prologue of the router reading it (FP8 S8 W4a).
-    NormedRouter,
     /// The one-row fp8 GEMV with the residual add it alone feeds as its epilogue (FP8 S8 W4a; the
     /// shared `MatvecEpilogue`): the o, GDN-out and down projections write `residual + out`.
     GemvFp8Residual,
@@ -252,22 +247,23 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
     rows: None,
 };
 
-/// The one-row bucket's table ([`cuda_fusions`]), four sweeps (FP8 S8 W4a). The shared pass visits
-/// the steps in tape order, a norm before its readers, and a fold takes only steps no earlier
-/// fold took, so the order is forced:
-/// 1. [`CUDA_SWEEP_ONE_ROW_GROUPS`]: the sibling matmuls group (`SiblingMatmuls` refuses a matmul
-///    that already carries a fusion, so they group before the norms fold), and a projection
-///    before a residual add takes the add as its epilogue (before `ResidualNorm` could take it);
-/// 2. [`CUDA_SWEEP_ONE_ROW_NORMS`]: an RMSNorm folds into the prologue of the matvecs reading it;
-/// 3. [`CUDA_SWEEP`], every bucket's: its siblings row finds the groups taken, its `Gated`,
+/// The one-row bucket's table ([`cuda_fusions`]), three sweeps (FP8 S8 W4a). The shared pass visits
+/// the steps in tape order, and a fold takes only steps no earlier fold took, so the order is
+/// forced:
+/// 1. [`CUDA_SWEEP_ONE_ROW_GROUPS`]: the sibling matmuls group, and a projection before a residual
+///    add takes the add as its epilogue (before `ResidualNorm` could take it into a norm);
+/// 2. [`CUDA_SWEEP`], every bucket's: its siblings row finds the groups taken, its `Gated`,
 ///    `NormAdd`, `ResidualNorm` and `Route` rows as at every bucket;
-/// 4. a routed expert's gate and up GEMVs folded into its activation (metal's `ExpertActivation`
+/// 3. a routed expert's gate and up GEMVs folded into its activation (metal's `ExpertActivation`
 ///    row, #1049).
+///
+/// No norm folds into its matvecs (the shared `NormedMatvecs`): measured on the H100 at 38384fc6, a
+/// GEMV that normalises its own row does it in every CTA, 23-63 µs a launch at the 27B shapes, more
+/// than the norm's launch it saves (/tmp/d-w4.md §1; the user's decision of 2026-11-09).
 pub const CUDA_FUSIONS_ONE_ROW: FusionTable<CudaFusion> = FusionTable {
     counted: &[],
     sweeps: &[
         CUDA_SWEEP_ONE_ROW_GROUPS,
-        CUDA_SWEEP_ONE_ROW_NORMS,
         CUDA_SWEEP,
         &[FoldPattern::ExpertActivation {
             act: SubOpKind::ExpertGatedAct,
@@ -314,42 +310,6 @@ const CUDA_SWEEP_ONE_ROW_GROUPS: &[FoldPattern<CudaFusion>] = &[
         add: SubOpKind::Add,
         gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
         kernel: CudaFusion::GemvResidual,
-    },
-];
-
-/// The one-row bucket's second sweep (FP8 S8 W4a): an RMSNorm whose every reader is a one-row
-/// matvec (an fp8 or bf16 GEMV, a router, or a gathered expert step) folds into their prologues;
-/// Gemma's `RouterNorm` into its router's. Metal's `NormedMatvecs` rows, with CUDA's weight kinds.
-const CUDA_SWEEP_ONE_ROW_NORMS: &[FoldPattern<CudaFusion>] = &[
-    FoldPattern::NormedMatvecs {
-        norm: SubOpKind::RmsNorm,
-        readers: &[
-            NormReader::Matvec {
-                kind: SubOpKind::MatmulTile,
-                weights: Some(GemmWeightKind::Fp8Dynamic),
-            },
-            NormReader::Matvec {
-                kind: SubOpKind::MatmulTile,
-                weights: Some(GemmWeightKind::Dense),
-            },
-            NormReader::Matvec {
-                kind: SubOpKind::RouterLogits,
-                weights: None,
-            },
-            NormReader::Gathered {
-                sort: SubOpKind::ExpertSort,
-                gathered_below: CUDA_SORTED_PAIRS,
-            },
-        ],
-        kernel: CudaFusion::NormedGemv,
-    },
-    FoldPattern::NormedMatvecs {
-        norm: SubOpKind::RouterNorm,
-        readers: &[NormReader::Matvec {
-            kind: SubOpKind::RouterLogits,
-            weights: None,
-        }],
-        kernel: CudaFusion::NormedRouter,
     },
 ];
 
@@ -532,29 +492,28 @@ mod tests {
             assert!(table.rows.is_none());
         }
         assert!(CUDA_SAMPLE_ROWS.weights.is_empty());
-        // The one-row table has the matvec ends' two sweeps and the experts' sweep (FP8 S8 W4a);
+        // The one-row table has the residual epilogues' sweep and the experts' sweep (FP8 S8 W4a);
         // every other bucket's has the one sweep.
-        assert_eq!(cuda_fusions(1).sweeps.len(), 4);
+        assert_eq!(cuda_fusions(1).sweeps.len(), 3);
         for m in [2, 512, 4096] {
             assert_eq!(cuda_fusions(m).sweeps.len(), 1, "m={m}");
         }
         let [sweep] = CUDA_FUSIONS.sweeps else {
             panic!("expected one sweep, got {}", CUDA_FUSIONS.sweeps.len());
         };
-        let [groups, norms, first, experts] = CUDA_FUSIONS_ONE_ROW.sweeps else {
+        let [groups, first, experts] = CUDA_FUSIONS_ONE_ROW.sweeps else {
             panic!(
-                "expected four one-row sweeps, got {}",
+                "expected three one-row sweeps, got {}",
                 CUDA_FUSIONS_ONE_ROW.sweeps.len()
             );
         };
         assert!(
-            std::ptr::eq(*groups, CUDA_SWEEP_ONE_ROW_GROUPS)
-                && std::ptr::eq(*norms, CUDA_SWEEP_ONE_ROW_NORMS),
-            "the one-row table's first two sweeps are its matvec ends'"
+            std::ptr::eq(*groups, CUDA_SWEEP_ONE_ROW_GROUPS),
+            "the one-row table's first sweep is its residual epilogues'"
         );
         assert!(
             std::ptr::eq(*first, *sweep) && std::ptr::eq(*sweep, CUDA_SWEEP),
-            "the one-row table's third sweep is the sweep"
+            "the one-row table's second sweep is the sweep"
         );
         assert!(
             matches!(

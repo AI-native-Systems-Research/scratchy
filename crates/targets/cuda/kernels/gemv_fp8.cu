@@ -96,11 +96,6 @@ constexpr int MAX_SPLITS = 16;
 constexpr int STAGES = 4;
 // The chunks of the longest row the shared row holds: 17,408 / 256.
 constexpr int ROW_CHUNKS = 68;
-// The prologue norm's longest row (FP8 S8 W4a): its `st_bf<16, 256>` views of chunk `t` read the 15
-// chunks after it (`scratchy_ops.cuh`'s `row_norm_inv`), so a normed row is at most
-// `ROW_CHUNKS − 15` chunks, 53 · 256 = 13,568 (the three models' hidden widths 5,120, 2,048 and
-// 2,816 are 20, 8 and 11 chunks).
-constexpr int NORM_CHUNKS = ROW_CHUNKS - 15;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 constexpr int ROW_CHOICES[] = {4, 3, 2};
 static_assert(ROW_CHOICES[0] == ROWS_PER_WARP, "the 4-row instance is the split one");
@@ -131,8 +126,6 @@ using scale_gl = gl<float, 1, 1, -1, -1>;
 using out_gl = gl<bf16, 1, 1, -1, -1>;
 using partial_gl = gl<float, 1, 1, -1, -1>;
 using idx_gl = gl<int, 1, 1, -1, -1>;
-// The prologue norm's gain `[1, k]` bf16 (FP8 S8 W4a): read by `warp::load` of a naive vector, no map.
-using gain_gl = gl<bf16, 1, 1, -1, -1>;
 
 struct gemv_globals {
     in_gl a;
@@ -152,15 +145,9 @@ struct gemv_globals {
     // Pair `p` reads `a`'s row `p / row_div` (`top_k` for the token rows, 1 for the pair rows and
     // the dense GEMV).
     int row_div;
-    // FP8 S8 W4a. The prologue norm: `gain` its weight, `norm` whether it runs, `eps`, `offset`
-    // (the gain convention's) and `cols` (`k`) its scalars. The residual epilogue: `residual`
-    // `[P, n]` bf16, added to each stored row when `add` (the reduce adds it at `S > 1`).
-    gain_gl gain;
+    // FP8 S8 W4a, the residual epilogue: `residual` `[P, n]` bf16, added to each stored row when
+    // `add` (the reduce adds it at `S > 1`).
     out_gl residual;
-    float eps;
-    float offset;
-    float cols;
-    int norm;
     int add;
 };
 
@@ -192,18 +179,14 @@ struct gemv_smem {
     kittens::semaphore& row_arrived;
     kittens::semaphore (&arrived)[WARPS][STAGES];
     amax_sv& amax;
-    // The prologue norm's four warp parts (FP8 S8 W4a).
-    scratchy::ops::norm_parts (&parts)[4];
 };
 
 // The prologue: `a`'s row `a_row` (`chunks` chunks) into `sm.row`, its amax and scale, then its
 // chunks `c0 .. c0 + count` quantized in place; returns the scale, in every thread. Every thread
 // of the CTA calls it once.
 template <int ROWS>
-__device__ inline float quantize_row(const gemv_globals& g, int a_row, int c0, int count,
+__device__ inline float quantize_row(const in_gl& a, int a_row, int chunks, int c0, int count,
                                      const gemv_smem<ROWS>& sm) {
-    const in_gl& a = g.a;
-    const int chunks = g.chunks;
     const int w = kittens::warpid();
     if (w == 0) {
         if (warp::laneid() == 0) {
@@ -218,15 +201,6 @@ __device__ inline float quantize_row(const gemv_globals& g, int a_row, int c0, i
     // The semaphore is initialised before any thread waits on it.
     __syncthreads();
     wait(sm.row_arrived, 0);
-    // FP8 S8 W4a: the prologue norm, `rms_norm_one_row_ker`'s bits on the row, in place: its `inv`
-    // (warps 0..3, every warp then reads the parts), then every chunk of the whole row normed and
-    // rounded to bf16, the norm's output, before any warp reads it for the amax. A uniform branch.
-    if (g.norm) {
-        const float inv = scratchy::ops::row_norm_inv(sm.row, sm.parts, chunks, g.cols, g.eps, w,
-                                                      [] { __syncthreads(); });
-        scratchy::ops::row_norm_apply(sm.row, g.gain, chunks, inv, g.offset, w, WARPS);
-        __syncthreads();
-    }
     chunk_rv x, m;
     warp::zero(m);
     for (int c = w; c < chunks; c += WARPS) {
@@ -352,7 +326,7 @@ __device__ inline void gemv_cta(const gemv_globals& g, const gemv_smem<ROWS>& sm
     float dot[ROWS];
     gemv_dots<EXPERT, ROWS>(
         g, sm, block, split, p, 0,
-        [&] { a_scale = quantize_row(g, p / g.row_div, c0, count, sm); }, dot);
+        [&] { a_scale = quantize_row(g.a, p / g.row_div, g.chunks, c0, count, sm); }, dot);
     const int row0 = (block * WARPS + kittens::warpid()) * ROWS;
     const int rows = max(0, min(ROWS, g.n - row0));
     int depth = 0;
@@ -388,8 +362,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_fp8_ker(const __grid_cons
     __shared__ kittens::semaphore row_arrived;
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
     __shared__ sv_fl<16> amax;
-    __shared__ sv_fl<16> parts[4];
-    const gemv_smem<ROWS> sm{row_s, b, row_arrived, arrived, amax, parts};
+    const gemv_smem<ROWS> sm{row_s, b, row_arrived, arrived, amax};
     gemv_cta<EXPERT, ROWS>(g, sm, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
@@ -417,8 +390,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gemv_group_fp8_ker(
     __shared__ kittens::semaphore row_arrived;
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
     __shared__ sv_fl<16> amax;
-    __shared__ sv_fl<16> parts[4];
-    const gemv_smem<ROWS_PER_WARP> sm{row_s, b, row_arrived, arrived, amax, parts};
+    const gemv_smem<ROWS_PER_WARP> sm{row_s, b, row_arrived, arrived, amax};
     const int x = blockIdx.x;
     const int member = x >= g.start2 ? 2 : x >= g.start1 ? 1 : 0;
     const int local = x - (member == 2 ? g.start2 : member == 1 ? g.start1 : 0);
@@ -493,8 +465,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gate_up_gemv_fp8_ker(
     __shared__ kittens::semaphore row_arrived;
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
     __shared__ sv_fl<16> amax;
-    __shared__ sv_fl<16> parts[4];
-    const gemv_smem<ROWS_PER_WARP> sm{row_s, b, row_arrived, arrived, amax, parts};
+    const gemv_smem<ROWS_PER_WARP> sm{row_s, b, row_arrived, arrived, amax};
     const int block = blockIdx.x, split = blockIdx.y, p = blockIdx.z;
     const int c0 = split * g.gate.split_chunks;
     const int count = max(0, min(g.gate.split_chunks, g.gate.chunks - c0));
@@ -503,7 +474,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gate_up_gemv_fp8_ker(
     gemv_dots<EXPERT, ROWS_PER_WARP>(
         g.gate, sm, block, split, p, 0,
         [&] {
-            a_scale = quantize_row(g.gate, p / g.gate.row_div, c0, count, sm);
+            a_scale = quantize_row(g.gate.a, p / g.gate.row_div, g.gate.chunks, c0, count, sm);
         },
         gate);
     // Every lane has read the gate's last stage (its loop's last `__syncwarp`), so the up's loads
@@ -570,11 +541,11 @@ __global__ __launch_bounds__(REDUCE_THREADS) void gate_up_reduce_fp8_ker(
 // each storing its quantized chunks' f32 values into `out` and its scale into `scale[split]`. No
 // `CudaStep` launches it.
 struct probe_globals {
-    // `g.a` the row, `g.chunks` and `g.split_chunks` its counts, and the prologue norm (FP8 S8 W4a)
-    // as a GEMV's; nothing else of `g` is read.
-    gemv_globals g;
+    in_gl a;
     partial_gl out;
     partial_gl scale;
+    int chunks;
+    int split_chunks;
 };
 
 __global__ __launch_bounds__(NUM_THREADS) void gemv_fp8_quant_probe_ker(
@@ -586,12 +557,11 @@ __global__ __launch_bounds__(NUM_THREADS) void gemv_fp8_quant_probe_ker(
     __shared__ kittens::semaphore row_arrived;
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
     __shared__ sv_fl<16> amax;
-    __shared__ sv_fl<16> parts[4];
-    const gemv_smem<ROWS_PER_WARP> sm{row_s, b, row_arrived, arrived, amax, parts};
+    const gemv_smem<ROWS_PER_WARP> sm{row_s, b, row_arrived, arrived, amax};
     const int split = blockIdx.x;
-    const int c0 = split * g.g.split_chunks;
-    const int count = max(0, min(g.g.split_chunks, g.g.chunks - c0));
-    const float a_scale = quantize_row(g.g, 0, c0, count, sm);
+    const int c0 = split * g.split_chunks;
+    const int count = max(0, min(g.split_chunks, g.chunks - c0));
+    const float a_scale = quantize_row(g.a, 0, g.chunks, c0, count, sm);
     for (int c = c0 + kittens::warpid(); c < c0 + count; c += WARPS) {
         chunk_rv x;
         warp::load(x, sm.row[c]);
@@ -714,7 +684,6 @@ gemv_globals views(const void* a, uint32_t a_rows, const void* b, const void* b_
                   size_t(uint64_t(pairs) * padded(n))};
     idx_gl ig{static_cast<int*>(const_cast<void*>(topk_idx)), nullptr, nullptr, size_t(1),
               size_t(pairs)};
-    gain_gl gg{nullptr, nullptr, nullptr, size_t(1), size_t(k)};
     out_gl rg{nullptr, nullptr, nullptr, size_t(pairs), size_t(n)};
     return gemv_globals{ag,     bg,
                         sg,     cg,
@@ -722,46 +691,7 @@ gemv_globals views(const void* a, uint32_t a_rows, const void* b, const void* b_
                         int(n), int(padded(n)),
                         int(row_chunks(k)), int(each),
                         int(splits), row_div,
-                        gg,     rg,
-                        0.0f,   0.0f,
-                        float(k), 0,
-                        0};
-}
-
-// The fused ends a launcher was given (FP8 S8 W4a): `gain` (null: no norm) with `eps` and `offset`,
-// and `residual` (null: no add), `[pairs, n]` bf16 as `c`.
-struct ends {
-    const void* gain = nullptr;
-    float eps = 0.0f;
-    float offset = 0.0f;
-    const void* residual = nullptr;
-};
-constexpr ends NO_ENDS{nullptr, 0.0f, 0.0f, nullptr};
-
-// The ends' rule: a norm reads whole 256-element chunks of its gain and its views read 15 chunks
-// past the row (`NORM_CHUNKS`), so a normed `k` is a multiple of 256 of at most `NORM_CHUNKS`
-// chunks, and `eps` is finite and positive.
-bool ends_shape(const ends& e, uint32_t k) {
-    return e.gain == nullptr ||
-           (k % uint32_t(CHUNK) == 0 && k / uint32_t(CHUNK) <= uint32_t(NORM_CHUNKS) &&
-            e.eps > 0.0f && e.eps <= 3.0e38f);
-}
-
-// `G` with the ends `e` (its `n`, `pairs` and `k` the views'). It can throw (TK's host code).
-gemv_globals with_ends(gemv_globals G, const ends& e, uint32_t pairs, uint32_t n, uint32_t k) {
-    if (e.gain != nullptr) {
-        G.gain = gain_gl{static_cast<bf16*>(const_cast<void*>(e.gain)), nullptr, nullptr, size_t(1),
-                         size_t(k)};
-        G.eps = e.eps;
-        G.offset = e.offset;
-        G.norm = 1;
-    }
-    if (e.residual != nullptr) {
-        G.residual = out_gl{static_cast<bf16*>(const_cast<void*>(e.residual)), nullptr, nullptr,
-                            size_t(pairs), size_t(n)};
-        G.add = 1;
-    }
-    return G;
+                        rg,     0};
 }
 
 // The dense GEMV's views (`views` over one row and one weight).
@@ -773,15 +703,20 @@ gemv_globals dense_globals(const void* a, const void* b, const void* b_scale, vo
 
 // The dense GEMV at `splits`: the shape rule, then the views and the launch.
 int dense(const void* a, const void* b, const void* b_scale, void* c, void* partials, uint32_t n,
-          uint32_t k, uint32_t splits, const ends& e, void* stream) {
+          uint32_t k, uint32_t splits, const void* residual, void* stream) {
     const uint32_t each = dense_split(partials, n, k, splits);
-    if (each == 0 || !ends_shape(e, k)) {
+    if (each == 0) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        gemv_globals G =
-            with_ends(dense_globals(a, b, b_scale, c, partials, n, k, splits, each), e, 1, n, k);
+        gemv_globals G = dense_globals(a, b, b_scale, c, partials, n, k, splits, each);
+        // FP8 S8 W4a: the residual epilogue (null: none), `[1, n]` as `c`.
+        if (residual != nullptr) {
+            G.residual = out_gl{static_cast<bf16*>(const_cast<void*>(residual)), nullptr, nullptr,
+                                size_t(1), size_t(n)};
+            G.add = 1;
+        }
         return launch<false>(G, n, 1, splits, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
@@ -794,8 +729,8 @@ int dense(const void* a, const void* b, const void* b_scale, void* c, void* part
 // then one reduce over the split members, if any: `gemv_bf16.cu`'s `launch_group`.
 int launch_group(const void* a, const void* const* b, const void* const* b_scale, void* const* c,
                  void* const* partials, const uint32_t* n, uint32_t k, const uint32_t* splits,
-                 uint32_t count, const ends& e, void* stream) {
-    if (count < 2 || count > 3 || !ends_shape(e, k) || e.residual != nullptr) {
+                 uint32_t count, void* stream) {
+    if (count < 2 || count > 3) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     uint32_t each[3] = {0, 0, 0};
@@ -815,15 +750,10 @@ int launch_group(const void* a, const void* const* b, const void* const* b_scale
     try {
         const uint32_t last = count - 1;
         gemv_globals m[3] = {
-            with_ends(dense_globals(a, b[0], b_scale[0], c[0], partials[0], n[0], k, splits[0],
-                                    each[0]),
-                      e, 1, n[0], k),
-            with_ends(dense_globals(a, b[1], b_scale[1], c[1], partials[1], n[1], k, splits[1],
-                                    each[1]),
-                      e, 1, n[1], k),
-            with_ends(dense_globals(a, b[last], b_scale[last], c[last], partials[last], n[last], k,
-                                    splits[last], each[last]),
-                      e, 1, n[last], k),
+            dense_globals(a, b[0], b_scale[0], c[0], partials[0], n[0], k, splits[0], each[0]),
+            dense_globals(a, b[1], b_scale[1], c[1], partials[1], n[1], k, splits[1], each[1]),
+            dense_globals(a, b[last], b_scale[last], c[last], partials[last], n[last], k,
+                          splits[last], each[last]),
         };
         int blocks[3], start[4] = {0, 0, 0, 0};
         for (uint32_t i = 0; i < 3; i++) {
@@ -885,21 +815,19 @@ uint32_t expert_split(void* partials, uint32_t m, uint32_t top_k, uint32_t n, ui
 // The expert GEMV at `splits`: the shape rule, then the views and the launch.
 int expert(const void* a, const void* b, const void* b_scale, const void* topk_idx, void* c,
            void* partials, uint32_t m, uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts,
-           uint32_t expert_rows, uint32_t pair_rows, uint32_t splits, const ends& e,
-           void* stream) {
+           uint32_t expert_rows, uint32_t pair_rows, uint32_t splits, void* stream) {
     const uint32_t pairs = m * top_k;
     const uint64_t a_rows = pair_rows != 0 ? uint64_t(m) * uint64_t(top_k) : uint64_t(m);
     const uint32_t each =
         expert_split(partials, m, top_k, n, k, experts, expert_rows, a_rows, splits);
-    if (each == 0 || !ends_shape(e, k) || e.residual != nullptr) {
+    if (each == 0) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        gemv_globals G = with_ends(views(a, uint32_t(a_rows), b, b_scale, experts, expert_rows,
-                                         topk_idx, c, partials, pairs, n, k, splits, each,
-                                         pair_rows != 0 ? 1 : int(top_k)),
-                                   e, pairs, n, k);
+        gemv_globals G = views(a, uint32_t(a_rows), b, b_scale, experts, expert_rows, topk_idx, c,
+                               partials, pairs, n, k, splits, each,
+                               pair_rows != 0 ? 1 : int(top_k));
         return launch<true>(G, n, pairs, splits, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
@@ -948,10 +876,9 @@ int launch_gate_up_act(uint32_t act, const gate_up_globals& G, uint32_t n, uint3
 // with its partials at `partials` (the gate's) and past the gate's `splits · n_pad` f32 (the up's).
 int dense_gate_up(const void* a, const void* gate, const void* gate_scale, const void* up,
                   const void* up_scale, void* c, void* partials, uint32_t n, uint32_t k,
-                  uint32_t splits, uint32_t act, const ends& e, void* stream) {
+                  uint32_t splits, uint32_t act, void* stream) {
     const uint32_t each = dense_split(partials, n, k, splits);
-    if (each == 0 || (act != ACT_SILU && act != ACT_GELU) || !ends_shape(e, k) ||
-        e.residual != nullptr) {
+    if (each == 0 || (act != ACT_SILU && act != ACT_GELU)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -959,11 +886,8 @@ int dense_gate_up(const void* a, const void* gate, const void* gate_scale, const
         float* up_partials =
             partials == nullptr ? nullptr
                                 : static_cast<float*>(partials) + size_t(splits) * padded(n);
-        gate_up_globals G{
-            with_ends(dense_globals(a, gate, gate_scale, c, partials, n, k, splits, each), e, 1, n,
-                      k),
-            with_ends(dense_globals(a, up, up_scale, c, up_partials, n, k, splits, each), e, 1, n,
-                      k)};
+        gate_up_globals G{dense_globals(a, gate, gate_scale, c, partials, n, k, splits, each),
+                          dense_globals(a, up, up_scale, c, up_partials, n, k, splits, each)};
         return launch_gate_up_act<false>(act, G, n, 1, splits, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
@@ -976,11 +900,10 @@ int dense_gate_up(const void* a, const void* gate, const void* gate_scale, const
 int expert_gate_up(const void* a, const void* gate, const void* gate_scale, const void* up,
                    const void* up_scale, const void* topk_idx, void* c, void* partials, uint32_t m,
                    uint32_t top_k, uint32_t n, uint32_t k, uint32_t experts, uint32_t expert_rows,
-                   uint32_t splits, uint32_t act, const ends& e, void* stream) {
+                   uint32_t splits, uint32_t act, void* stream) {
     const uint32_t each =
         expert_split(partials, m, top_k, n, k, experts, expert_rows, uint64_t(m), splits);
-    if (each == 0 || (act != ACT_SILU && act != ACT_GELU) || !ends_shape(e, k) ||
-        e.residual != nullptr) {
+    if (each == 0 || (act != ACT_SILU && act != ACT_GELU)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -990,12 +913,10 @@ int expert_gate_up(const void* a, const void* gate, const void* gate_scale, cons
             partials == nullptr
                 ? nullptr
                 : static_cast<float*>(partials) + size_t(splits) * size_t(pairs) * padded(n);
-        gate_up_globals G{with_ends(views(a, m, gate, gate_scale, experts, expert_rows, topk_idx,
-                                          c, partials, pairs, n, k, splits, each, int(top_k)),
-                                    e, pairs, n, k),
-                          with_ends(views(a, m, up, up_scale, experts, expert_rows, topk_idx, c,
-                                          up_partials, pairs, n, k, splits, each, int(top_k)),
-                                    e, pairs, n, k)};
+        gate_up_globals G{views(a, m, gate, gate_scale, experts, expert_rows, topk_idx, c,
+                                partials, pairs, n, k, splits, each, int(top_k)),
+                          views(a, m, up, up_scale, experts, expert_rows, topk_idx, c,
+                                up_partials, pairs, n, k, splits, each, int(top_k))};
         return launch_gate_up_act<true>(act, G, n, pairs, splits, stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
@@ -1068,7 +989,17 @@ extern "C" int scratchy_cuda_gemv_fp8_abt(const void* a, const void* b, const vo
                                           void* c, void* partials, uint32_t n, uint32_t k,
                                           uint32_t splits,
                                           void* stream /* cudaStream_t; null = default */) {
-    return dense(a, b, b_scale, c, partials, n, k, splits, NO_ENDS, stream);
+    return dense(a, b, b_scale, c, partials, n, k, splits, nullptr, stream);
+}
+
+// FP8 S8 W4a: `scratchy_cuda_gemv_fp8_abt` with the residual epilogue: `residual` (null: none) is
+// a `[n]` bf16 the stored row is added to, `add_bf16`'s add on that launcher's output, written into
+// `c`; it may not overlap `c`. Rule and return codes as that launcher's.
+extern "C" int scratchy_cuda_gemv_fp8_residual(const void* a, const void* b, const void* b_scale,
+                                               void* c, void* partials, uint32_t n, uint32_t k,
+                                               uint32_t splits, const void* residual,
+                                               void* stream /* cudaStream_t; null = default */) {
+    return dense(a, b, b_scale, c, partials, n, k, splits, residual, stream);
 }
 
 // As `scratchy_cuda_gemv_fp8_abt` for `count` (2 or 3) members of one `a [1, k]`: member `i`
@@ -1081,7 +1012,7 @@ extern "C" int scratchy_cuda_gemv_group_fp8_abt(const void* a, const void* const
                                                 void* const* partials, const uint32_t* n,
                                                 uint32_t k, const uint32_t* splits, uint32_t count,
                                                 void* stream /* cudaStream_t; null = default */) {
-    return launch_group(a, b, b_scale, c, partials, n, k, splits, count, NO_ENDS, stream);
+    return launch_group(a, b, b_scale, c, partials, n, k, splits, count, stream);
 }
 
 // The gate/up GEMV: `c [n] = act(g, u)`, rounded once, `g` and `u` the gate's and the up's
@@ -1097,7 +1028,7 @@ extern "C" int scratchy_cuda_gate_up_gemv_fp8(const void* a, const void* gate,
                                               uint32_t act,
                                               void* stream /* cudaStream_t; null = default */) {
     return dense_gate_up(a, gate, gate_scale, up, up_scale, c, partials, n, k, splits, act,
-                         NO_ENDS, stream);
+                         stream);
 }
 
 // The gathered expert GEMV over an fp8 bank: per pair `p`, `c[p] = bf16((q_r · B_eᵀ) ·
@@ -1115,7 +1046,7 @@ extern "C" int scratchy_cuda_expert_gemv_fp8(const void* a, const void* b, const
                                              uint32_t pair_rows, uint32_t splits,
                                              void* stream /* cudaStream_t; null = default */) {
     return expert(a, b, b_scale, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows,
-                  pair_rows, splits, NO_ENDS, stream);
+                  pair_rows, splits, stream);
 }
 
 // The expert gate/up GEMV over an fp8 bank: per pair, `scratchy_cuda_gate_up_gemv_fp8`'s fold of
@@ -1129,7 +1060,7 @@ extern "C" int scratchy_cuda_expert_gate_up_gemv_fp8(
     uint32_t k, uint32_t experts, uint32_t expert_rows, uint32_t splits, uint32_t act,
     void* stream /* cudaStream_t; null = default */) {
     return expert_gate_up(a, gate, gate_scale, up, up_scale, topk_idx, c, partials, m, top_k, n,
-                          k, experts, expert_rows, splits, act, NO_ENDS, stream);
+                          k, experts, expert_rows, splits, act, stream);
 }
 
 // Test support for `tests/gemv_fp8.rs` only: the GEMV's prologue on `a [1, k]` bf16 at `splits`,
@@ -1137,26 +1068,21 @@ extern "C" int scratchy_cuda_expert_gate_up_gemv_fp8(
 // (`⌈k / 256⌉ · 256` f32; the elements past `k` are 0) and its scale into `scale[s]`. Refused, with
 // SCRATCHY_CUDA_ERR_SHAPE before any pointer is touched, unless `k` and `splits` meet
 // `scratchy_cuda_gemv_fp8_abt`'s rule. `out` 16-byte aligned, `scale` 4-byte aligned.
-namespace {
-
-int quant_probe(const void* a, void* out, void* scale, uint32_t k, uint32_t splits, const ends& e,
-                void* stream) {
+extern "C" int scratchy_cuda_gemv_fp8_quant_probe(const void* a, void* out, void* scale,
+                                                  uint32_t k, uint32_t splits,
+                                                  void* stream /* cudaStream_t; null = default */) {
     const uint32_t chunks = row_chunks(k);
     const uint32_t each = chunks == 0 ? 0 : split_chunks(chunks, splits);
-    if (each == 0 || !ends_shape(e, k) || e.residual != nullptr) {
+    if (each == 0) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
+        in_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(1), size_t(k)};
         partial_gl og{static_cast<float*>(out), nullptr, nullptr, size_t(1),
                       size_t(chunks) * size_t(CHUNK)};
         partial_gl sg{static_cast<float*>(scale), nullptr, nullptr, size_t(1), size_t(splits)};
-        // A dense GEMV's views of the row with one output row; the probe reads only `a`, the
-        // counts and the norm. The weight view is the row's bytes as e4m3 (encoded, never read),
-        // so no null pointer is encoded into a tensor map.
-        const gemv_globals g = with_ends(
-            dense_globals(a, a, out, out, out, 1, k, splits, each), e, 1, 1, k);
-        probe_globals G{g, og, sg};
+        probe_globals G{ag, og, sg, int(chunks), int(each)};
         void* args[] = {&G};
         return static_cast<int>(cudaLaunchKernel(gemv_fp8_quant_probe_ker, dim3(splits),
                                                  dim3(NUM_THREADS), args, GEMV_SMEM_BYTES,
@@ -1164,80 +1090,4 @@ int quant_probe(const void* a, void* out, void* scale, uint32_t k, uint32_t spli
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
-}
-
-}  // namespace
-
-extern "C" int scratchy_cuda_gemv_fp8_quant_probe(const void* a, void* out, void* scale,
-                                                  uint32_t k, uint32_t splits,
-                                                  void* stream /* cudaStream_t; null = default */) {
-    return quant_probe(a, out, scale, k, splits, NO_ENDS, stream);
-}
-
-// FP8 S8 W4a: each launcher above with the one-row GEMV's fused ends (`step::GemvEnds`). `gain`
-// (null: no norm) is the absorbed RMSNorm's `[k]` bf16 weight, `eps` and `gain_offset` its
-// scalars (`GainConvention::offset`): the GEMV normalises its row as it loads it, the bits of
-// `scratchy_cuda_rms_norm_bf16` at one row then this launcher on its output. `residual` (null: no
-// add) is a `[P, n]` bf16 the stored rows are added to, `add_bf16`'s add on this launcher's output,
-// written into `c`; it may not overlap `c`. A normed `k` is a multiple of 256 of at most 13,568
-// and `eps` finite and positive; only the dense GEMV takes a residual. Return codes as above, every
-// rule checked before any pointer is touched.
-extern "C" int scratchy_cuda_gemv_fp8_ends(const void* a, const void* b, const void* b_scale,
-                                           void* c, void* partials, uint32_t n, uint32_t k,
-                                           uint32_t splits, const void* gain, float eps,
-                                           float gain_offset, const void* residual,
-                                           void* stream /* cudaStream_t; null = default */) {
-    return dense(a, b, b_scale, c, partials, n, k, splits, ends{gain, eps, gain_offset, residual},
-                 stream);
-}
-
-extern "C" int scratchy_cuda_gemv_group_fp8_ends(const void* a, const void* const* b,
-                                                 const void* const* b_scale, void* const* c,
-                                                 void* const* partials, const uint32_t* n,
-                                                 uint32_t k, const uint32_t* splits, uint32_t count,
-                                                 const void* gain, float eps, float gain_offset,
-                                                 void* stream /* cudaStream_t; null = default */) {
-    return launch_group(a, b, b_scale, c, partials, n, k, splits, count,
-                        ends{gain, eps, gain_offset, nullptr}, stream);
-}
-
-extern "C" int scratchy_cuda_gate_up_gemv_fp8_ends(const void* a, const void* gate,
-                                                   const void* gate_scale, const void* up,
-                                                   const void* up_scale, void* c, void* partials,
-                                                   uint32_t n, uint32_t k, uint32_t splits,
-                                                   uint32_t act, const void* gain, float eps,
-                                                   float gain_offset,
-                                                   void* stream /* cudaStream_t; null = default */) {
-    return dense_gate_up(a, gate, gate_scale, up, up_scale, c, partials, n, k, splits, act,
-                         ends{gain, eps, gain_offset, nullptr}, stream);
-}
-
-extern "C" int scratchy_cuda_expert_gemv_fp8_ends(const void* a, const void* b, const void* b_scale,
-                                                  const void* topk_idx, void* c, void* partials,
-                                                  uint32_t m, uint32_t top_k, uint32_t n, uint32_t k,
-                                                  uint32_t experts, uint32_t expert_rows,
-                                                  uint32_t pair_rows, uint32_t splits,
-                                                  const void* gain, float eps, float gain_offset,
-                                                  void* stream /* cudaStream_t; null = default */) {
-    return expert(a, b, b_scale, topk_idx, c, partials, m, top_k, n, k, experts, expert_rows,
-                  pair_rows, splits, ends{gain, eps, gain_offset, nullptr}, stream);
-}
-
-extern "C" int scratchy_cuda_expert_gate_up_gemv_fp8_ends(
-    const void* a, const void* gate, const void* gate_scale, const void* up, const void* up_scale,
-    const void* topk_idx, void* c, void* partials, uint32_t m, uint32_t top_k, uint32_t n,
-    uint32_t k, uint32_t experts, uint32_t expert_rows, uint32_t splits, uint32_t act,
-    const void* gain, float eps, float gain_offset,
-    void* stream /* cudaStream_t; null = default */) {
-    return expert_gate_up(a, gate, gate_scale, up, up_scale, topk_idx, c, partials, m, top_k, n,
-                          k, experts, expert_rows, splits, act,
-                          ends{gain, eps, gain_offset, nullptr}, stream);
-}
-
-// The probe with the prologue norm (`tests/gemv_fp8.rs`): its quantized row and scale are those of
-// `scratchy_cuda_rms_norm_bf16`'s one-row output, quantized as the probe quantizes a row.
-extern "C" int scratchy_cuda_gemv_fp8_quant_probe_ends(
-    const void* a, void* out, void* scale, uint32_t k, uint32_t splits, const void* gain, float eps,
-    float gain_offset, void* stream /* cudaStream_t; null = default */) {
-    return quant_probe(a, out, scale, k, splits, ends{gain, eps, gain_offset, nullptr}, stream);
 }

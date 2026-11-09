@@ -23,7 +23,7 @@ const STEM: &str = "gemma-4-26b-a4b-it";
 const FEATURE: &str = "CARGO_FEATURE_GEMMA_4_26B_A4B_IT";
 const ARCH: &str = "gemma4-moe";
 
-const DECODE_STEPS: [(&str, usize); 19] = [
+const DECODE_STEPS: [(&str, usize); 20] = [
     ("AttnDecode", 30),
     ("Embed", 1),
     ("ExpertCombine", 30),
@@ -36,11 +36,12 @@ const DECODE_STEPS: [(&str, usize); 19] = [
     ("LayerScale", 30),
     ("MoeRoute", 30),
     ("NormAdd", 90),
-    ("RmsNorm", 90),
+    ("RmsNorm", 181),
     ("RmsNormUnit", 30),
     ("Rope", 30),
     ("RopeAppend", 30),
     ("RouterLogits", 30),
+    ("RouterNorm", 30),
     ("Scale", 1),
     ("SoftCap", 1),
 ];

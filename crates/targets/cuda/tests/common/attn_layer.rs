@@ -213,7 +213,7 @@ const fn gemm(a: u64, b: u32, c: u64, m: u32, n: u32, k: u32) -> CudaStep {
         m,
         n,
         k,
-        ends: scratchy_target_cuda::step::GemvEnds::NONE,
+        residual: None,
     })
 }
 
@@ -236,7 +236,6 @@ const fn qkv(n: u64, (qg, k, v): (u64, u64, u64), m: u32) -> CudaStep {
         first: member((2, qg, 2 * Q)),
         second: member((4, k, KV)),
         third: Some(member((6, v, KV))),
-        ends: scratchy_target_cuda::step::GemvEnds::NONE,
     })
 }
 

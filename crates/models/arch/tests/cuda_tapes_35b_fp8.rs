@@ -24,7 +24,7 @@ const FEATURE: &str = "CARGO_FEATURE_QWEN3.6_35B_A3B";
 const ARCH: &str = "qwen3-5-moe";
 
 const DECODE_STEPS: [(&str, usize); 22] = [
-    ("Add", 40),
+    ("AddRmsNorm", 40),
     ("AttnDecode", 10),
     ("Embed", 1),
     ("ExpertCombine", 40),
@@ -42,7 +42,7 @@ const DECODE_STEPS: [(&str, usize); 22] = [
     ("GemvGroup", 30),
     ("GemvGroupFp8", 10),
     ("MoeRoute", 40),
-    ("RmsNorm", 20),
+    ("RmsNorm", 61),
     ("Rope", 10),
     ("RopeAppend", 10),
     ("RouterLogits", 40),

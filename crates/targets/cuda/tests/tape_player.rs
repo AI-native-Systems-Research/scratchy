@@ -2625,9 +2625,9 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
     let mut worker = CudaWorker::new(&device, buckets, &table, POOL, None).expect("worker");
     let one = &buckets[0];
     let (CudaStep::Rope(rope), CudaStep::RopeAppend(append), CudaStep::AttnDecode(decode)) =
-        (one.steps[4], one.steps[5], one.steps[6])
+        (one.steps[5], one.steps[6], one.steps[7])
     else {
-        panic!("steps 4, 5 and 6 of the one-row tape are the rope, the append and the attention");
+        panic!("steps 5, 6 and 7 of the one-row tape are the rope, the append and the attention");
     };
     // One row of `cols` bf16 at `at`.
     let span_of = |at: ArenaOffset, cols: usize| ArenaSpan {
@@ -4806,7 +4806,7 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
                 m: 1,
                 n: 8,
                 k: 4,
-                ends: scratchy_target_cuda::step::GemvEnds::NONE,
+                residual: None,
             },
         )]));
         t.weight_bytes = Box::leak(Box::new([64]));

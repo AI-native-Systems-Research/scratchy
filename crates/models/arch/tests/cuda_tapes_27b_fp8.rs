@@ -33,7 +33,7 @@ const DECODE_STEPS: [(&str, usize); 12] = [
     ("Gemv", 1),
     ("GemvFp8", 128),
     ("GemvGroupFp8", 112),
-    ("RmsNorm", 32),
+    ("RmsNorm", 161),
     ("Rope", 16),
     ("RopeAppend", 16),
 ];
