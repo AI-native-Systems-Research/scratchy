@@ -2411,22 +2411,6 @@ impl DeviceAxis {
             DeviceAxis::Pitch(p) => Some(p.declared()),
         }
     }
-
-    /// The extent the pinned walk (`maxDimSizes_`) reads: a window's, never a pitch's.
-    pub fn window(self) -> Option<u32> {
-        match self {
-            DeviceAxis::Window(p) => Some(p),
-            DeviceAxis::Swept | DeviceAxis::Pitch(_) => None,
-        }
-    }
-
-    /// The pitch the walk's back gap reads.
-    pub fn pitch(self) -> Option<Pitch> {
-        match self {
-            DeviceAxis::Pitch(p) => Some(p),
-            DeviceAxis::Swept | DeviceAxis::Window(_) => None,
-        }
-    }
 }
 
 /// ⭐ A PITCH, RESOLVED BY RESIDENCY — the two forms a [`DeviceAxis::Pitch`] takes on the wire, each
