@@ -54,6 +54,11 @@ pub struct RbTiming {
     /// tensor-parallel world), and a card's session drains ITS card's records alone
     /// ([`drain_source`]); `0` for a submitter with no card (tests).
     pub source: usize,
+    /// ⭐ WHEN THE HOST SAW THIS CB'S RESPONSE — the response worker's own `Instant` for the poll that
+    /// read it. Paired with the RB's device cycle words it is a host↔card clock pair for the card
+    /// in [`Self::source`]: each card's cycle counter is its own clock, and without such a pair no
+    /// host event (a doorbell, say) can be placed on it.
+    pub seen: std::time::Instant,
     /// The decoded response block itself — the vendor's `PendingRequest` carried the RB too, and
     /// this way the card-measured phase accessors
     /// ([`ResponseBlockWire::exec_cmpt_cycles`] and siblings) have exactly one definition. This
@@ -145,6 +150,7 @@ mod tests {
     fn record_then_drain_returns_entries_and_empties() {
         let mut ring = RbRing::with_cap(8);
         ring.record(RbTiming {
+            seen: std::time::Instant::now(),
             source: 0,
             id: 1,
             pipeline: PipelineId::Compute,
@@ -152,6 +158,7 @@ mod tests {
             rb: rb_with([1, 2, 3, 4, 5], 6),
         });
         ring.record(RbTiming {
+            seen: std::time::Instant::now(),
             source: 0,
             id: 2,
             pipeline: PipelineId::AsyncDmaI,
@@ -163,6 +170,7 @@ mod tests {
             drained,
             vec![
                 RbTiming {
+                    seen: std::time::Instant::now(),
                     source: 0,
                     id: 1,
                     pipeline: PipelineId::Compute,
@@ -170,6 +178,7 @@ mod tests {
                     rb: rb_with([1, 2, 3, 4, 5], 6),
                 },
                 RbTiming {
+                    seen: std::time::Instant::now(),
                     source: 0,
                     id: 2,
                     pipeline: PipelineId::AsyncDmaI,
@@ -186,6 +195,7 @@ mod tests {
         let mut ring = RbRing::with_cap(16);
         for i in 0..24u64 {
             ring.record(RbTiming {
+                seen: std::time::Instant::now(),
                 source: 0,
                 id: i,
                 pipeline: PipelineId::Compute,

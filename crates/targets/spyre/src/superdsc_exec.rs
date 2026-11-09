@@ -474,6 +474,95 @@ struct RbOpCycles {
     label: String,
 }
 
+/// ⭐ ONE CARD'S HOST↔DEVICE CLOCK. A card's RB cycle words are its own free-running counter, which
+/// no other card shares and the host does not see, so a host event cannot be placed on it without
+/// a pair. Every completion is one: the host `Instant` its response was seen and the CB's end cycle.
+/// Seen is after the end by the response-poll latency, so the pair with the SMALLEST host-minus-
+/// device difference (at the measured rate) is the tightest bound, and the offset is taken there.
+///
+/// The rate is the counter's, measured over this card's own completions: the host-time span over
+/// the device-cycle span between the earliest and latest pairs.
+#[derive(Default)]
+struct RbClock {
+    /// The run's host origin, set on the first pair.
+    origin: Option<std::time::Instant>,
+    /// (host ns since origin, unwrapped device cycle) of the first pair, for the rate.
+    first: Option<(f64, u64)>,
+    /// The latest pair, for the rate and to unwrap the u32 counter.
+    latest: Option<(f64, u64)>,
+    /// The smallest (host ns − device cycle × ns/cycle) seen at the current rate — the offset.
+    best: Option<f64>,
+}
+
+impl RbClock {
+    /// One completion: host `seen`, device end cycle `end` (u32, wrapping).
+    fn pair(&mut self, seen: std::time::Instant, end: u32) {
+        let origin = *self.origin.get_or_insert(seen);
+        let h = seen.saturating_duration_since(origin).as_nanos() as f64;
+        // Unwrap the u32 counter against the latest pair: a CB's end is within a wrap of it.
+        let d = match self.latest {
+            Some((_, prev)) => {
+                let lo = prev as u32;
+                prev + u64::from(end.wrapping_sub(lo))
+                    - if end.wrapping_sub(lo) >= 1 << 31 {
+                        1 << 32
+                    } else {
+                        0
+                    }
+            }
+            None => u64::from(end),
+        };
+        self.first.get_or_insert((h, d));
+        self.latest = Some((h, d));
+        if let Some(r) = self.ns_per_cycle() {
+            let off = h - d as f64 * r;
+            self.best = Some(self.best.map_or(off, |b| b.min(off)));
+        }
+    }
+
+    /// Host ns per device cycle, once the pairs span enough of the run to measure it.
+    fn ns_per_cycle(&self) -> Option<f64> {
+        let ((h0, d0), (h1, d1)) = (self.first?, self.latest?);
+        (d1 > d0 + 10_000_000).then(|| (h1 - h0) / (d1 - d0) as f64)
+    }
+
+    /// The device cycle a host `Instant` corresponds to on this card, as an unwrapped count.
+    fn device_at(&self, t: std::time::Instant) -> Option<f64> {
+        let h = t.saturating_duration_since(self.origin?).as_nanos() as f64;
+        Some((h - self.best?) / self.ns_per_cycle()?)
+    }
+
+    /// The host instant a device cycle (unwrapped) corresponds to on this card.
+    fn host_at(&self, cycle: u64) -> Option<std::time::Instant> {
+        let ns = cycle as f64 * self.ns_per_cycle()? + self.best?;
+        Some(self.origin? + std::time::Duration::from_nanos(ns.max(0.0) as u64))
+    }
+
+    /// Unwrap a CB's u32 cycle word against this card's latest pair.
+    fn unwrap(&self, c: u32) -> Option<u64> {
+        let (_, prev) = self.latest?;
+        let lo = prev as u32;
+        let back = lo.wrapping_sub(c);
+        Some(if back < 1 << 31 {
+            prev - u64::from(back)
+        } else {
+            prev + u64::from(c.wrapping_sub(lo))
+        })
+    }
+}
+
+/// The one host origin every card's `[sdsc-rbbell]` times are microseconds from, so the eight
+/// ranks' lines share one axis.
+fn rb_host_us(t: std::time::Instant) -> f64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let o = *ORIGIN.get_or_init(std::time::Instant::now);
+    if t >= o {
+        t.duration_since(o).as_secs_f64() * 1e6
+    } else {
+        -(o.duration_since(t).as_secs_f64() * 1e6)
+    }
+}
+
 /// What one submitted CB was, for `SCRATCHY_SDSC_RB_TIME`: the op it belongs to — (rung length,
 /// op index) for the walk, (image length, CB index) for a replayed step, so neither averages into
 /// the other — and its label.
@@ -514,6 +603,13 @@ struct RbHarvest {
     /// runs its CBs in id order, so the CB that precedes the next drained one is this one when the
     /// ids follow on — across drains too.
     last: Option<(u64, u32)>,
+    /// ⭐ THIS CARD'S DOORBELLS, waiting for their first CB's record: (the submission's first CB
+    /// id, the host `Instant` its submit returned). The record of that CB carries its device start
+    /// cycle and the host `Instant` its response was seen (`RbTiming::seen`), so the card's own
+    /// clock places the doorbell — see [`RbClock`].
+    doorbells: BTreeMap<u64, std::time::Instant>,
+    /// The card's host↔device clock, fitted from its completions as they are drained.
+    clock: RbClock,
     /// Drains, op CBs attributed, and `cbs` at the last periodic report — the count jumps a
     /// whole drain at a time, so a plain `is_multiple_of` would skip its own thresholds.
     drains: u64,
@@ -4670,6 +4766,30 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 );
             }
         }
+        // ⭐ THE CARD'S CLOCK, and every doorbell whose first CB this drain brought: where its host
+        // instant falls on this card's counter, against the CB's own start — the gap the card sat
+        // idle after the host rang (negative would be a clock error, never an early start).
+        for e in &entries {
+            let end = e.rb.timestamps()[4];
+            if end != 0 {
+                h.clock.pair(e.seen, end);
+            }
+        }
+        for e in &entries {
+            let Some(rang) = h.doorbells.remove(&e.id) else {
+                continue;
+            };
+            let start = e.rb.timestamps()[0];
+            if let (Some(bell), Some(cb)) = (h.clock.device_at(rang), h.clock.unwrap(start)) {
+                let gap = cb as f64 - bell;
+                let cb_host = h.clock.host_at(cb).map_or(f64::NAN, rb_host_us);
+                eprintln!(
+                    "[sdsc-rbbell] {who} doorbell {:.1} us  first-CB {cb_host:.1} us  \
+                     doorbell->first-CB {gap:.0} cyc",
+                    rb_host_us(rang)
+                );
+            }
+        }
         // ⭐ THE JOIN, BY ID: each op record finds the label of the CB that produced it. Walked in
         // id order over the whole compute pipeline (its DMA crossings included, which occupy the
         // pipeline between ops), so each CB's idle-before is measured against the CB that really
@@ -4696,6 +4816,20 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             match h.labels.remove(&e.id) {
                 Some(RbLabel { key, label }) => {
+                    // The step-head collective's wait, on the shared host axis: when it started
+                    // waiting and when its last peer's message let it go.
+                    if label.contains("Prefix") && label.ends_with(" wait") {
+                        let (a, b) = (h.clock.unwrap(ts[2]), h.clock.unwrap(ts[4]));
+                        if let (Some(a), Some(b)) = (a, b)
+                            && let (Some(ha), Some(hb)) = (h.clock.host_at(a), h.clock.host_at(b))
+                        {
+                            eprintln!(
+                                "[sdsc-rbbell] {who} prefix-wait {:.1} .. {:.1} us",
+                                rb_host_us(ha),
+                                rb_host_us(hb)
+                            );
+                        }
+                    }
                     let acc = h.cycles.entry(key).or_default();
                     acc.cycles.add_compute(e.rb);
                     acc.idle += idle.map_or(0, u64::from);
@@ -5559,8 +5693,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         };
         // The replayed step's CBs, filed under the ids the submit gave them: canvas CB `i` is the
         // submission's CB `i`, named by the plan it was proven equal to. Keyed by (image length,
-        // CB index), so a replayed step's CBs never average into a walked rung's.
+        // CB index), so a replayed step's CBs never average into a walked rung's. And its
+        // doorbell: the host instant the submit returned, against the step's first CB.
         if Diag::get().rb_time {
+            if let Some(first) = ids.get(0) {
+                self.rb.doorbells.insert(first, t2);
+            }
             self.rb.label(
                 ids,
                 image.data.labels.iter().enumerate().map(|(i, l)| RbLabel {
@@ -7301,6 +7439,7 @@ mod tests {
         };
         let entry =
             |id: u64, pipeline: PipelineId, dma: Option<DmaDirection>, ts: [u32; 5]| RbTiming {
+                seen: std::time::Instant::now(),
                 source: 0,
                 id,
                 pipeline,
