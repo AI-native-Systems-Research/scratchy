@@ -51,7 +51,7 @@ fn main() {
     let text = std::fs::read_to_string(&dsl_path).expect("read DSL");
     let carrier =
         parse_python_file(&text).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let tokens = compile_carrier(carrier, &configs_dir)
+    let tokens = compile_carrier(carrier, &configs_dir, None)
         .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
 
     let mut rendered = String::with_capacity(1 << 20);

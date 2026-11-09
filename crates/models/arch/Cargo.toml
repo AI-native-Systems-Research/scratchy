@@ -711,9 +711,10 @@ metal = [
 # see a card-only lowering defect without a card.
 spyre-lower = ["spyre", "scratchy-forward-compiler-macro/spyre-lower"]
 spyre-hw = ["spyre-lower", "scratchy-forward-compiler-macro/spyre-hw"]
-# Write each baked bundle's dxp input under this crate's OUT_DIR (the macro's `superdsc-dump`): the
-# bake runs inside the proc-macro, so the output is named on the macro's copy of the target crate.
-superdsc-dump = ["spyre", "scratchy-forward-compiler-macro/superdsc-dump"]
+# WRITE EACH BAKED BUNDLE'S dxp INPUT under this crate's OUT_DIR (`superdsc-dump/<fp>/`), for diffing
+# against a known-good dump. Read by the build script, which passes its own OUT_DIR into the bake
+# (`compile_carrier`'s `dump_dir`); off by default, and it changes nothing the bake lowers.
+superdsc-dump = ["spyre"]
 # THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
 # an emu build refuses to compile a bundle whose emulator run diverges from the
 # reference semantics at the probe.
