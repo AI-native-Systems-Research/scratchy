@@ -14,7 +14,7 @@
 # `reroot_crate`, which only the build script applies — see --rerooted).
 #
 # Usage:
-#   scripts/emit-arch.sh <arch> <stem> [--rerooted]
+#   scripts/emit-arch.sh <arch> <stem> [presets] [--rerooted]
 #
 #   scripts/emit-arch.sh llama llama-3.2-1b > /tmp/llama.rs
 #   scripts/emit-arch.sh qwen3 qwen3-0.6b  > /tmp/qwen3.rs
@@ -31,29 +31,25 @@ if [ $# -lt 2 ]; then
 fi
 arch="$1"
 stem="$2"
-reroot="${3:-}"
+presets="${3:-}"
+reroot="${4:-}"
 
-# Mirror Cargo's feature-name → env-var transform exactly: uppercase, `-` → `_`,
-# every other byte verbatim (INCLUDING `.` — `llama-3.2-1b` becomes
-# CARGO_FEATURE_LLAMA_3.2_1B, which needs `env` since bash can't export a name
-# containing a dot). This is the same gate config.rs's `model_feature_enabled`
-# reads, so only the named stem is expanded.
-var="CARGO_FEATURE_$(printf '%s' "$stem" | tr '[:lower:]-' '[:upper:]_')"
-
-# SCRATCHY_QUANTS unset means "every preset"; the real build script always sets
-# it (to the union of enabled presets, empty when none). Set it empty so a
-# default run matches a plain `-Fmodel/<stem>` build rather than silently
-# including every quant preset.
+# The scope passes as the example's ARGUMENTS (values, not env vars — the
+# example states its scope purely from argv): this script passes its own
+# [presets] positional, empty by default — dense-only, matching a plain
+# `-Fmodel/<stem>` build with no quant features, rather than silently
+# including every quant preset — and the one [stem] it means. Name presets to
+# scope them:
+#   scripts/emit-arch.sh qwen3 qwen3-0.6b fp8-dynamic-per-channel
 # The macro crate `compile_error!`s without a backend feature, so one is always
 # passed. `spyre` is the default because it's the only backend that doesn't need
 # macOS — the emit up to codegen is target-neutral, so it is also the cheapest
 # way to exercise any arch. Override for a target-specific check:
 #   SCRATCHY_EMIT_FEATURES=metal scripts/emit-arch.sh qwen3 qwen3-0.6b
 emit() {
-  env "$var=1" SCRATCHY_QUANTS="${SCRATCHY_QUANTS-}" \
-    cargo run -q -p scratchy-forward-compiler-macro --example emit_arch \
+  cargo run -q -p scratchy-forward-compiler-macro --example emit_arch \
     --features "${SCRATCHY_EMIT_FEATURES:-spyre}" \
-    -- "$arch"
+    -- "$arch" "$presets" "$stem"
 }
 
 if [ "$reroot" = "--rerooted" ]; then
