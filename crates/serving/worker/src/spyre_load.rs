@@ -455,7 +455,6 @@ fn sharded_bundle(
         .first()
         .ok_or_else(|| werr("the one-rank bundle has no layer group"))?;
     let named = |fp: &str| SengraphBundleData {
-        manifest_json: "",
         graph_json: Box::leak(format!("{SUPERDSC_SENTINEL}{fp}").into_boxed_str()),
         g2_fingerprint: "",
     };
@@ -917,7 +916,7 @@ impl SpyreWorker {
         // KTIR bakes one decode program PER CAP BUCKET (all share weight ids — same graph,
         // different prefix cap), so parse every one. sendnn bakes a single group-0 program.
         // ⭐ NO PARSING. The wiring is a GENERATED static on the loaded model —
-        // the same facts the `manifest_json` string carried, as typed values.
+        // the launch facts as typed values, from the bake's one walk of the bindings.
         // ⛔ NOT `sendnn`-GATED. The wiring is GENERATED data, emitted for every spyre build, and
         // `stage_bound_weights` reads its `tensor_shapes` on both paths — that is where the staged
         // `[rows, cols]` comes from now that the manifest no longer supplies it. Gating it left the
