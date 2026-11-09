@@ -41,6 +41,10 @@ pub mod correction;
 /// window, the sids and the send → wait → consume ring — see [`collective`].
 pub mod collective;
 
+/// Every baked fact of a bundle's layout and launch shifts, walked once for every reader that renders
+/// them (the macro's tokens, the bundle's content name) — see [`facts`].
+pub mod facts;
+
 /// Re-exported so the `inventory::submit!` the macro emits into each arch crate resolves through the
 /// same path as the types it submits — the arch crate need not depend on `inventory` itself.
 pub use inventory;
