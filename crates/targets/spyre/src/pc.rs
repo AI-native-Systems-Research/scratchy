@@ -33,7 +33,7 @@ const fn row(name: &'static str) -> Row {
 static ROWS: [Row; 20] = [
     row("producer"), // lower_subtile_tape_to_ktir, whole producer walk
     row("foldscan"), // the weight-fold recognizers (full-graph scans)
-    row("fp"),       // bundle_fp — fingerprint hashing
+    row("fp"),       // bundle_name — the content name
     row("audit"),    // audit_op_work
     row("inner"),    // emit_bundle_inner
     row("mint"),     // door::lower over the bundle's programs

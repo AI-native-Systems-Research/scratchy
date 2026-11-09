@@ -442,6 +442,11 @@ fn hex32(b: &[u8; 32]) -> String {
 }
 
 impl GroupDigest {
+    /// The digest's bytes — what a bundle's name hashes for the group ([`crate::bundle_name`]).
+    pub fn bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
     /// The full digest as hex — an entry's file name.
     pub fn hex(&self) -> String {
         hex32(&self.0)

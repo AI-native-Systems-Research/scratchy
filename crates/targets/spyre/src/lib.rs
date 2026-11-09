@@ -25,6 +25,9 @@ pub use scratchy_spyre_bundle as bundle_code;
 /// Run a bundle this binary did not bake — see the module docs.
 #[cfg(feature = "spyre-hw")]
 pub mod bundle_run;
+/// A bundle's name, which is its content: the layout it ships and each group's shifts and compiled
+/// input, in launch order.
+pub mod bundle_name;
 /// dxp's compiled groups, kept across builds under a key that names the compiler as well as the input.
 pub mod dxp_cache;
 /// Where a launched op reads and writes KV: the shim launch loop's per-op, per-page offset

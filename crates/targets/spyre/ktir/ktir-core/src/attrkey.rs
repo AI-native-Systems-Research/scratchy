@@ -95,10 +95,10 @@ pub enum AttrKey {
     // ⛔⛔⛔ A NEW KEY GOES HERE, AT THE END, AND NOT AT ITS ALPHABETICAL HOME. The list above is
     // alphabetical by SPELLING and this one is not, deliberately: this enum is fieldless, so
     // `#[derive(Hash)]` hashes the DISCRIMINANT, and `Operation`'s own derived `Hash` carries
-    // `attributes: &[(AttrKey, Attr)]` straight into `bundle_fingerprint_grouped` — which is the
-    // `superdsc-code/<fp>` directory name every baked bundle is stored and found under. Inserting a
-    // variant in the middle therefore shifts every later discriminant and RENAMES EVERY BUNDLE IN
-    // THE TREE, with no change to a single descriptor byte.
+    // `attributes: &[(AttrKey, Attr)]` straight into an emulator bundle's name (`bundle_name`, which
+    // hashes each group's KTIR programs structurally) — the name every baked bundle is registered and
+    // found under. Inserting a variant in the middle therefore shifts every later discriminant and
+    // RENAMES EVERY EMULATOR BUNDLE, with no change to a single program.
     //
     // MEASURED at `SCRATCHY_SUPERDSC_GROUP_SIZE=512`: `DimSubs` at its alphabetical position (between
     // `DimMap0` and `Dimensions`) moved a 134-bundle set from `ac71651adc80` to `a8d5f0a7e848` with
@@ -153,11 +153,12 @@ pub enum AttrKey {
 ///
 /// The chain, every link of it derived rather than written: [`AttrKey`] is FIELDLESS, so
 /// `#[derive(Hash)]` hashes its DISCRIMINANT; `Operation` derives `Hash` over
-/// `attributes: &[(AttrKey, Attr)]`; `scratchy-target-spyre`'s `bundle_fingerprint_grouped` hashes
-/// `k.func` for every emitted op; and that fingerprint IS the `$OUT_DIR/superdsc-code/<fp>` directory
-/// the bake writes each bundle's device code into and the runtime finds it under. So a variant inserted
-/// in the middle shifts every later discriminant and RENAMES EVERY BUNDLE — while not moving one byte
-/// of one descriptor, which is why reading the diff cannot find it and only the set can.
+/// `attributes: &[(AttrKey, Attr)]`; `scratchy-target-spyre`'s `bundle_name` streams each emulator
+/// group's `func` through that `Hash`; and that name IS the one the bake registers each bundle under
+/// and the runtime finds it by. So a variant inserted in the middle shifts every later discriminant and
+/// RENAMES EVERY EMULATOR BUNDLE — while not moving one byte of one program, which is why reading the
+/// diff cannot find it and only the set can. (A card bundle's name hashes dxp's input instead, which
+/// the order does not reach.)
 ///
 /// The four pins below are the recorded positions. `Dimensions == 11` is the load-bearing one: it is
 /// the first variant an alphabetical `dim_*` insertion displaces, so it is the pin that FAILS on the

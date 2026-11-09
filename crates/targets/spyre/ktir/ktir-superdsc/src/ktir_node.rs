@@ -66,7 +66,7 @@ use crate::superdsc_opspec::{DataFormat, Fp16};
 /// ⭐ THE POINTWISE SET IS THE `OpFunc` SET, NOT A HAND-PICKED FOUR. Every variant below resolves
 /// through `op_func_from_str` to an `OpFunc` that already existed; a target that has the primitive
 /// should not refuse the op merely because this enum never named it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Elementwise {
     Silu,
     Gelu,
@@ -185,7 +185,7 @@ impl Elementwise {
 /// `program_score_scale`, the last of which `attn_at` uses to PROVE a caller's value matches the
 /// program's). Applying it here — deriving the kind and refusing a disagreement — is the outstanding work,
 /// and until then a producer that could state the fact from its own ops is being asked to classify by hand.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Program {
     /// A pointwise function over whole rows.
     Elementwise(Elementwise),
