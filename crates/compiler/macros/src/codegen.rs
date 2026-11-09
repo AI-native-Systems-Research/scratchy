@@ -7105,12 +7105,6 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor], dims: &ModelDims)
     }
 }
 
-/// The `WeightAccessors` trait method a [`WeightKind`] resolves through.
-/// Shared by [`emit_weight_accessors_impl`] (which keys its per-(op_idx,
-/// kind) slot-ordinal walk on this) and the PD-wavefront bridge's
-/// `to_wavefront::build_base_to_loc` (which must reproduce the IDENTICAL
-/// slot ordinals so the wavefront `WeightLoc`s key the SAME runtime match
-/// arms). Keep the two in lockstep by routing both through this fn.
 /// The accessor RETURN TYPE for a weight kind — the second half of
 /// the one accessor-ABI fact, beside
 /// [`weight_kind_accessor_method`]. Both the `WeightAccessors` trait
@@ -7126,6 +7120,8 @@ pub(crate) fn weight_kind_rust_type(kind: &crate::weight_vocab::WeightKind) -> T
         .expect("weight kind rust type is a valid type path")
 }
 
+/// The `WeightAccessors` trait method a [`WeightKind`] resolves through — the key of
+/// [`emit_weight_accessors_impl`]'s per-(op_idx, kind) slot-ordinal walk.
 pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind) -> &'static str {
     use crate::weight_vocab::WeightKind;
     match kind {
@@ -9160,141 +9156,6 @@ fn chained_row_gathers(
     }
 }
 
-#[cfg(feature = "spyre")]
-fn refuse_if_wiring_disagrees_with_manifest(
-    stem: &str,
-    manifest_json: &str,
-    emitted_layers: &[(u64, u32, u32)],
-    emitted_embed: u32,
-    emitted_cos: &[(u32, u32, proc_macro2::TokenStream)],
-    emitted_sin: &[(u32, u32, proc_macro2::TokenStream)],
-    // Which source indices the GENERATED loader will emit a `BoundWeight` for.
-    emitted_weight_ids: &std::collections::BTreeSet<u32>,
-) {
-    use scratchy_target_spyre::manifest::Manifest;
-    let m = match Manifest::from_json(manifest_json) {
-        Ok(m) => m,
-        // The manifest is a bake artifact of this same function; if it will not parse, the
-        // KTIR-emulator path is already broken and that is its own failure, not this check's.
-        Err(e) => panic!("[superdsc-wiring] {stem}: the bake's own manifest does not parse: {e}"),
-    };
-
-    // ── the OLD extraction, exactly as `parse_bundle` performed it ──
-    type LayerIds = Vec<(u64, usize)>;
-    let (mut pk, mut pv): (LayerIds, LayerIds) = (Vec::new(), Vec::new());
-    let (mut embed, mut cos, mut sin) = (None, Vec::new(), Vec::new());
-    for s in &m.sources {
-        match s.role.as_str() {
-            "prefix_k" => pk.push((s.layer.unwrap_or(0), s.id)),
-            "prefix_v" => pv.push((s.layer.unwrap_or(0), s.id)),
-            "embed" => embed = Some(s.id as u32),
-            "cos" => cos.push(s.id as u32),
-            "sin" => sin.push(s.id as u32),
-            _ => {}
-        }
-    }
-    pk.sort_by_key(|x| x.0);
-    pv.sort_by_key(|x| x.0);
-
-    let mut fail: Vec<String> = Vec::new();
-    if embed != Some(emitted_embed) {
-        fail.push(format!(
-            "embed source: manifest says {embed:?}, wiring says {emitted_embed}"
-        ));
-    }
-    let emit_cos: Vec<u32> = emitted_cos.iter().map(|&(i, ..)| i).collect();
-    let emit_sin: Vec<u32> = emitted_sin.iter().map(|&(i, ..)| i).collect();
-    if cos != emit_cos {
-        fail.push(format!(
-            "cos sources: manifest {cos:?}, wiring {emit_cos:?}"
-        ));
-    }
-    if sin != emit_sin {
-        fail.push(format!(
-            "sin sources: manifest {sin:?}, wiring {emit_sin:?}"
-        ));
-    }
-    // ── the WEIGHT set: what the loader stages must be what the bundle declares ──
-    //
-    // ⛔ `load_weights` walked `manifest.sources` filtering `role == "weight" || "weight_scale"`
-    // and used `s.id` as the tid. `stage_bound_weights` walks the GENERATED `BoundWeight` list and
-    // uses the binding index. Those are the same number only if the two lists agree, and nothing
-    // checked that they do — a weight in one and not the other is either a tensor the device reads
-    // that nobody staged, or bytes written into a placement that belongs to something else.
-    let manifest_weights: std::collections::BTreeSet<u32> = m
-        .sources
-        .iter()
-        .filter(|s| s.role == "weight" || s.role == "weight_scale")
-        .map(|s| s.id as u32)
-        .collect();
-    if &manifest_weights != emitted_weight_ids {
-        let only_manifest: Vec<u32> = manifest_weights
-            .difference(emitted_weight_ids)
-            .copied()
-            .collect();
-        let only_emitted: Vec<u32> = emitted_weight_ids
-            .difference(&manifest_weights)
-            .copied()
-            .collect();
-        if !only_manifest.is_empty() {
-            fail.push(format!(
-                "{} weight source(s) the bundle declares that the generated loader does NOT stage: \
-                 {:?} — the device reads a tensor nobody wrote",
-                only_manifest.len(),
-                only_manifest
-            ));
-        }
-        if !only_emitted.is_empty() {
-            fail.push(format!(
-                "{} weight source(s) the generated loader stages that the bundle does NOT declare: \
-                 {:?} — bytes land in a placement belonging to something else",
-                only_emitted.len(),
-                only_emitted
-            ));
-        }
-    }
-
-    if pk.len() != emitted_layers.len() {
-        fail.push(format!(
-            "layer count: manifest has {} prefix_k sources, wiring emits {} layers",
-            pk.len(),
-            emitted_layers.len()
-        ));
-    }
-    // ⛔ POSITION BY POSITION. The worker indexes `layers[i]` for layer `i`, so "same set, other
-    // order" is exactly as wrong as a missing entry.
-    for (i, (&(mlayer, mk), &(wlayer, wk, wv))) in pk.iter().zip(emitted_layers).enumerate() {
-        if mlayer != wlayer || mk != wk as usize {
-            fail.push(format!(
-                "layers[{i}]: manifest says layer {mlayer} prefix_k t{mk}, wiring says layer \
-                 {wlayer} prefix_k t{wk}"
-            ));
-        }
-        let _ = wv;
-    }
-    for (i, (&(mlayer, mv), &(_, _, wv))) in pv.iter().zip(emitted_layers).enumerate() {
-        if mv != wv as usize {
-            fail.push(format!(
-                "layers[{i}] (layer {mlayer}): manifest says prefix_v t{mv}, wiring says t{wv}"
-            ));
-        }
-    }
-
-    if !fail.is_empty() {
-        panic!(
-            "\n⛔ [superdsc-wiring] {stem}: THE EMITTED WIRING DISAGREES WITH THE MANIFEST IT \
-             REPLACED. Refusing to bake.\n\n{}\n\nBoth are derived from one `GraphKtir`, so one \
-             of the two scans is wrong. The worker indexes `layers[i]` for layer `i`: a dropped or \
-             reordered entry binds one layer's K/V cache to another layer's tids, which on the \
-             device is a wrong address — a hang or silent corruption, reported by nothing.\n",
-            fail.iter()
-                .map(|f| format!("  • {f}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-    }
-}
-
 // ── The rotary-class VALUE law, shared by the wiring's tokens and the gate ──
 // The wiring bakes `RotaryKind` TOKENS (`rot_kind` in `emit_superdsc_wiring`
 // re-spells this value); the bake-time numeric gate's prefill probe stages
@@ -9553,9 +9414,6 @@ fn emit_superdsc_wiring(
     lwd: &crate::to_wavefront::LoweredDecode,
     model: &ModelParams,
     decode_position: u32,
-    // The manifest this wiring REPLACES. Both come from `gk`; they must agree, and
-    // `refuse_if_wiring_disagrees_with_manifest` is what checks that they do.
-    manifest_json: &str,
 ) -> proc_macro2::TokenStream {
     use crate::to_wavefront::SourceBinding;
     let u32l = proc_macro2::Literal::u32_unsuffixed;
@@ -10068,30 +9926,6 @@ fn emit_superdsc_wiring(
             );
         }
     }
-
-    // Exactly the sources `weight_bindings` emits a `BoundWeight` for — the same
-    // `SourceBinding::{Weight, WeightScale}` filter, over the same list, at the same indices.
-    let emitted_weight_ids: std::collections::BTreeSet<u32> = lwd
-        .bindings
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| {
-            matches!(
-                b,
-                SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. }
-            )
-        })
-        .map(|(i, _)| i as u32)
-        .collect();
-    refuse_if_wiring_disagrees_with_manifest(
-        &model.source_stem,
-        manifest_json,
-        &layers,
-        embed_src,
-        &cos_v,
-        &sin_v,
-        &emitted_weight_ids,
-    );
 
     let layer_toks = layers.iter().map(|(_, ks, vs)| {
         let (ks, vs) = (u32l(*ks), u32l(*vs));
@@ -11605,7 +11439,7 @@ fn fuf_row_local_tail_op(op: OpKind) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-// `program`, `ktir_bundle_out`, and the `base_to_loc` locals are only
+// `program` and `ktir_bundle_out` are only
 // read inside the spyre cfg block below; without that feature the
 // function still lowers + reports stats but consumes none of them.
 #[cfg_attr(not(feature = "spyre"), allow(unused_variables))]
@@ -11618,9 +11452,6 @@ fn dump_wavefront_mega(
     fuf: &Fuf,
     inferred: &crate::shape::Inferred,
     decode_bounds: &BTreeMap<String, u64>,
-    backbone_slots: &[Vec<WeightSlot>],
-    lm_head_slots: &[Vec<WeightSlot>],
-    bb_bucket_id: u32,
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
     // (spliced into the per-model module); empty under metal.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
@@ -11789,7 +11620,6 @@ fn dump_wavefront_mega(
         st.fuf_tiles, st.sources, st.weight_sources, st.prefix_sources, st.ops, st.op_histogram,
     );
 
-    let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
 
     // Spyre/KTIR (-Fspyre): emit the REAL model's per-op KTIR from the solver-produced
     // graph — every dim, rope form, GQA ratio, and eps is scratchy's, not a hand-built
@@ -11826,9 +11656,9 @@ fn dump_wavefront_mega(
         // `dir`. Factored so we drop BOTH a cheap m=1 decode bundle (fast
         // per-token generation) AND an m=M batched-prefill bundle — the worker
         // uses the right one per phase, so decode never pays the prefill tax.
-        // Returns (ktir_manifest_json, ktir_nodes, whole_graph_sengraph_json,
-        // group_graphs) where group_graphs[i] = (group_idx, input_tensor_id,
-        // result_tensor_id, group_graph_json) — the per-layer-group split graphs.
+        // Returns (whole_graph_sengraph_json, group_graphs) where group_graphs[i] =
+        // (group_idx, input_tensor_id, result_tensor_id, group_graph_json) — the
+        // per-layer-group split graphs.
         type GroupGraphs = Vec<(u32, u32, u32, String)>;
         // SuperDSC bundle fingerprint (set by the m=1 decode walk under
         // `SCRATCHY_SENDNN_MODE=superdsc`). When present, the SengraphBundle's
@@ -12004,7 +11834,6 @@ fn dump_wavefront_mega(
                 // borrow (`&gk` derefs through it where the wiring is built).
                 gk: Box<scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring>,
                 decode_position: u32,
-                man: String,
             },
             // ⭐ ONE WEIGHT-SEGMENT PARITY LEDGER ENTRY — this bundle's packed weight
             // segment (bank 0 bytes + extra banks), exactly as the runtime's alias guard
@@ -12022,15 +11851,13 @@ fn dump_wavefront_mega(
                 scales: Vec<f32>,
             },
         }
-        /// What one bake returns: its manifest, nodes, sengraph json and launch groups.
-        type BakeOut = (String, Vec<(String, String)>, String, GroupGraphs);
+        /// What one bake returns: its sengraph json and launch groups.
+        type BakeOut = (String, GroupGraphs);
         /// Which half of `wiring_tokens` a bake's wiring lands in, if either.
         enum WiringSlot {
             Decode,
             Prefill,
         }
-        // The bake names weights through this view, never through `program` — see `WeightNaming`.
-        let weight_naming = program.weight_naming();
         // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the concrete query-row count the
         // tape was lowered at — the ladder rung this bake belongs to. `None` = decode.
         // ⭐ ONE BAKE BODY, STAMPED PER WORLD. A bake's ops, launch groups and bundle are its
@@ -12282,7 +12109,7 @@ fn dump_wavefront_mega(
                 }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
-                    return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
+                    return ((String::new(), Vec::new()), fx);
                 }
                 // `--target sendnn`: lower the SAME real-model `krg` to a sendnn
                 // op-graph JSON (the DeepTools toolchain compiles + runs it on the
@@ -13461,189 +13288,15 @@ fn dump_wavefront_mega(
                         folds,
                     });
                 }
-                // The programs ride the bundle (`bundle_code::bundle(fp)`), not a per-node text.
-                let nodes: Vec<(String, String)> = Vec::new();
-                let attn_mask_json = match gk.attn_mask {
-                    Some(id) => id.to_string(),
-                    None => "null".to_string(),
-                };
-                let mut man = format!(
-                    "{{\"result\":{},\"num_sources\":{},\"decode_position\":{},\"attn_mask\":{},\"tensors\":[",
-                    gk.result_tensor,
-                    gk.num_sources,
-                    cap.saturating_sub(1),
-                    attn_mask_json,
-                );
-                for (id, (r, c)) in gk.tensor_shapes.iter().enumerate() {
-                    if id > 0 {
-                        man.push(',');
-                    }
-                    let is_src = (id as u32) < gk.num_sources;
-                    man.push_str(&format!(
-                        "{{\"id\":{id},\"rows\":{r},\"cols\":{c},\"is_source\":{is_src}}}"
-                    ));
-                }
-                man.push_str("],\"sources\":[");
-                {
-                    use crate::to_wavefront::SourceBinding;
-                    use scratchy_subtile::lower::InputRef;
-                    use scratchy_subtile::subtile_ir::SubOp;
-                    let mut gemm_weight: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    for od in &fused.ops {
-                        if matches!(od.op, SubOp::MatmulTile { .. })
-                            && let Some(InputRef::Ext(e)) = od.inputs.get(1)
-                        {
-                            gemm_weight.insert(*e);
-                        }
-                    }
-                    for (i, b) in lwd.bindings.iter().enumerate() {
-                        if i > 0 {
-                            man.push(',');
-                        }
-                        let entry = match b {
-                            SourceBinding::EmbeddedHidden => {
-                                format!("{{\"id\":{i},\"role\":\"embed\"}}")
-                            }
-                            SourceBinding::Cos { .. } => format!("{{\"id\":{i},\"role\":\"cos\"}}"),
-                            SourceBinding::Sin { .. } => format!("{{\"id\":{i},\"role\":\"sin\"}}"),
-                            SourceBinding::PrefixK { layer } => {
-                                format!("{{\"id\":{i},\"role\":\"prefix_k\",\"layer\":{layer}}}")
-                            }
-                            SourceBinding::PrefixV { layer } => {
-                                format!("{{\"id\":{i},\"role\":\"prefix_v\",\"layer\":{layer}}}")
-                            }
-                            SourceBinding::Weight { id, index } => {
-                                let name = crate::emit::weight_field_stem(
-                                    weight_naming.weights,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let (wbase, _) = base_layer(&name, *index);
-                                let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let is_gemm = gemm_weight.contains(&i);
-                                let disk = safetensors_prefix(
-                                    weight_naming,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                // lm_head weight binding — resolve the tie decision HERE, at
-                                // bake (compile) time, from the SAME `tie_word_embeddings` flag
-                                // the metal `FieldLoad::LinearTiedToEmbedding` path uses. TIED
-                                // models (llama/smollm2) omit `lm_head.weight` and share the
-                                // embed table; UNTIED models (Granite) ship a distinct head.
-                                // Baking the on-disk name into the manifest means the spyre
-                                // worker binds `{disk}.weight` VERBATIM and can NOT re-derive it:
-                                // the old worker-side `disk == "lm_head" ⇒ embed` assumption
-                                // silently mis-bound an untied head to the embedding matrix
-                                // (garbage-but-consistent logits). Deciding it once, here, makes
-                                // that mishandle unconstructible downstream.
-                                let disk = if disk == "lm_head" && tie_word_embeddings(model) {
-                                    "model.embed_tokens".to_string()
-                                } else {
-                                    disk
-                                };
-                                let loc_json = match base_to_loc.get(&wbase) {
-                                    Some(li) => format!(
-                                        "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
-                                        li.bucket, li.op_idx, li.slot
-                                    ),
-                                    None => "null".to_string(),
-                                };
-                                format!(
-                                    "{{\"id\":{i},\"role\":\"weight\",\"name\":\"{name}\",\
-                                 \"base\":\"{wbase}\",\"disk\":\"{disk}\",\"layer\":{layer},\
-                                 \"is_gemm\":{is_gemm},\"loc\":{loc_json}}}"
-                                )
-                            }
-                            SourceBinding::WeightScale { id, index } => {
-                                // fp8 per-channel weight_scale: SAME disk prefix as the weight (worker loads
-                                // `{disk}.weight_scale`), role "weight_scale", resident like a weight. Its own
-                                // resident placement is registered under `{wbase}.weight_scale` by the layout.
-                                let name = crate::emit::weight_field_stem(
-                                    weight_naming.weights,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let (wbase, _) = base_layer(&name, *index);
-                                let scale_base = format!("{wbase}.weight_scale");
-                                let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let disk = safetensors_prefix(
-                                    weight_naming,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let loc_json = match base_to_loc.get(&scale_base) {
-                                    Some(li) => format!(
-                                        "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
-                                        li.bucket, li.op_idx, li.slot
-                                    ),
-                                    None => "null".to_string(),
-                                };
-                                format!(
-                                    "{{\"id\":{i},\"role\":\"weight_scale\",\"name\":\"{name}\",\
-                                 \"base\":\"{scale_base}\",\"disk\":\"{disk}\",\"layer\":{layer},\
-                                 \"is_gemm\":false,\"loc\":{loc_json}}}"
-                                )
-                            }
-                            SourceBinding::BundleTensor { id, index, tensor } => {
-                                // One tensor of a MULTI-TENSOR MoE bundle: same field, disk
-                                // prefix and layer as the bundle's own `Weight` binding; the
-                                // `tensor` discriminant says which staged tensor fills the
-                                // source. `is_gemm` follows the tensor: codes are gemm
-                                // operands, scales and gains are not.
-                                let name = crate::emit::weight_field_stem(
-                                    weight_naming.weights,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let (wbase, _) = base_layer(&name, *index);
-                                let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let disk = safetensors_prefix(
-                                    weight_naming,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let which = tensor.name();
-                                let is_gemm = tensor.is_gemm_operand();
-                                let loc_json = match base_to_loc.get(&wbase) {
-                                    Some(li) => format!(
-                                        "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
-                                        li.bucket, li.op_idx, li.slot
-                                    ),
-                                    None => "null".to_string(),
-                                };
-                                format!(
-                                    "{{\"id\":{i},\"role\":\"bundle_tensor\",\"name\":\"{name}\",\
-                                 \"base\":\"{wbase}\",\"disk\":\"{disk}\",\"layer\":{layer},\
-                                 \"tensor\":\"{which}\",\"is_gemm\":{is_gemm},\"loc\":{loc_json}}}"
-                                )
-                            }
-                        };
-                        man.push_str(&entry);
-                    }
-                }
-                // ⛔ NO PER-NODE ARRAY. It described a `node{i}.mlir` file per program and a
-                // `{name, tensor, is_output}` per argument; the programs are const data in the
-                // bundle, and what a launch binds is the typed `(Ssa, PlaceId)` pairs it carries.
-                man.push_str("],\"nodes\":[");
-                man.push_str("]}");
-                // ── THE SAME FACTS, TYPED ──────────────────────────────────
+                // ── THE LAUNCH FACTS, TYPED, FROM ONE WALK ─────────────────
                 //
-                // Everything `man` just stringified is a compile-time constant
-                // held HERE as a typed value: `gk.result_tensor`,
-                // `gk.tensor_shapes`, `gk.attn_mask` and — the one that matters
-                // — `lwd.bindings`, which is already the `SourceBinding` ENUM.
-                // Flattening it to `"role":"prefix_k"` for the worker to
-                // `match role.as_str()` back is a round-trip through strings
-                // that loses exhaustiveness on the way out and cannot express a
-                // weight whose on-disk key is not `{prefix}.weight`.
-                //
-                // So emit values of spyre's OWN types instead, exactly as
-                // metal is handed statics of the metal runtime's types.
+                // `gk.result_tensor`, `gk.tensor_shapes`, `gk.attn_mask` and — the
+                // one that matters — `lwd.bindings`, already the `SourceBinding`
+                // ENUM, become values of spyre's OWN types (`wiring::Wiring`),
+                // exactly as metal is handed statics of the metal runtime's types.
+                // ONE walk states them: a second, stringified copy of the same
+                // bindings (the old `manifest.json`) and the check that the two
+                // agreed are gone with it — a fact stated once cannot disagree.
                 {
                     // Tensor ids are PER PROGRAM: the prefill graph numbers its
                     // own. Keeping only one would bind decode ids into prefill
@@ -13698,10 +13351,9 @@ fn dump_wavefront_mega(
                         slot,
                         gk: Box::new(gk),
                         decode_position: cap.saturating_sub(1),
-                        man: man.clone(),
                     });
                 }
-                ((man, nodes, sengraph_json, group_graphs), fx)
+                ((sengraph_json, group_graphs), fx)
             }
             };
         }
@@ -13777,9 +13429,8 @@ fn dump_wavefront_mega(
                         slot,
                         gk,
                         decode_position,
-                        man,
                     } => {
-                        let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
+                        let w = emit_superdsc_wiring(&gk, lwd, model, decode_position);
                         let mut s = world.wiring.borrow_mut();
                         let mut bound = registry_bound.borrow_mut();
                         match slot {
@@ -13839,7 +13490,7 @@ fn dump_wavefront_mega(
         // (the offline_decoder CB-decode / SDPA-prefill bundle path was removed); a
         // PLAIN `cargo build -Fsendnn` (no env) produces it. This is also the TOP
         // decode cap bucket (cap == prefix_len); the narrower buckets are baked below.
-        let (decode_manifest, decode_nodes, _decode_graph_unused, mut default_decode_groups) =
+        let (_decode_graph_unused, mut default_decode_groups) =
             emit_bundle(
                 &lowered,
                 format!("ktir_decode_{stem_id}"),
@@ -13968,56 +13619,6 @@ fn dump_wavefront_mega(
         // its cuts against them (`refuse_if_staged_cut_apart`), and the prefill ladder's own
         // per-width lowering is also called `lowered`.
         let decode_bindings = &lowered.bindings;
-        // ── DECODE CAP BUCKETS (KTIR emulator path) ───────────────────────────────────────────────
-        // The emulator masks over the WHOLE prefix cache each step (decode is O(capacity)), so a
-        // single big-cap program makes every short-context token pay the max-context cost. Bake the
-        // decode program at a few static caps [256,512,1024,2048] below `prefix_len`; the worker runs
-        // the smallest cap covering the current position, so a short chat pays cap-256 cost even when
-        // the max context is large. Static shapes only — the emulator stays a dumb executor.
-        //
-        // NOT under superdsc: that path has its own, finer ActiveCap ladder baked inside `emit_bundle`
-        // (`ActiveCap::decode_ladder`), and re-entering the bake here would restamp `superdsc_fp` with
-        // a narrow-cap body — the last bucket would silently become the model's decode bundle.
-        const DECODE_CAP_BUCKETS: [u32; 4] = [256, 512, 1024, 2048];
-        let mut decode_bundles: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        if !sendnn_superdsc {
-            let mut caps: Vec<u32> = DECODE_CAP_BUCKETS
-                .iter()
-                .copied()
-                .filter(|&c| c < prefix_len.get())
-                .collect();
-            caps.sort_unstable();
-            caps.dedup();
-            for cap in caps {
-                let lwd = match crate::to_wavefront::lower_decode_to_wavefront(
-                    fuf,
-                    inferred,
-                    decode_bounds,
-                    &bridge,
-                    crate::to_wavefront::PrefixCapacity::new(
-                        std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
-                    ),
-                    primary_m,
-                ) {
-                    Ok(l) => l,
-                    Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
-                };
-                let (m, n, _g, _gs) = emit_bundle(
-                    &lwd,
-                    format!("ktir_decode_{stem_id}_cap{cap}"),
-                    cap,
-                    None,
-                    None,
-                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                    primary_m,
-                );
-                decode_bundles.push((m, n));
-            }
-        }
-        // The full-cap bundle is the last (widest) bucket, so the worker's "smallest cap covering the
-        // position" scan over an ascending slice always terminates on it.
-        decode_bundles.push((decode_manifest.clone(), decode_nodes.clone()));
-
         // ── DECODE BATCH LADDER (superdsc) ────────────────────────────────────────────────────────
         // A decode step runs one token of each RUNNING request, and how many that is changes step to
         // step — the scheduler decides it. A SuperDSC bundle is a static-shape graph, so the emitter
@@ -14127,7 +13728,7 @@ fn dump_wavefront_mega(
         // vocab-slice `t65` non-whole-region) so `default_decode_groups` is EMPTY. The SengraphBundle still
         // needs ONE [prefill,decode] group to carry the `SUPERDSC_BUNDLE:{fp}` sentinel (both slots are
         // overridden to it below), so synthesize a placeholder. `in_t`/`res_t` are UNUSED by the superdsc
-        // worker path (it reads the decode manifest_json for wiring); the graph_json is the sentinel. This
+        // worker path (it reads the generated `Wiring`); the graph_json is the sentinel. This
         // is the group STRUCTURE only — the actual compute is the proven dxp bundle, not a sengraph.
         if default_decode_groups.is_empty() && superdsc_fp.borrow().is_some() {
             default_decode_groups.push((0u32, 0u32, 0u32, String::new()));
@@ -14737,7 +14338,7 @@ fn dump_wavefront_mega(
                 decode_mq,
             ) {
                 Ok(lwd_cb) => {
-                    let (_m, _n, sg, groups) = emit_bundle(
+                    let (sg, groups) = emit_bundle(
                         &lwd_cb,
                         format!("ktir_decode_cb_{stem_id}"),
                         prefix_len.get(),
@@ -14790,7 +14391,7 @@ fn dump_wavefront_mega(
         let prefill_sg_present = if sendnn_paged {
             prefill
                 .as_ref()
-                .is_some_and(|(_, _, _, pgs)| !pgs.is_empty())
+                .is_some_and(|(_, pgs)| !pgs.is_empty())
         } else {
             !default_decode_groups.is_empty()
         };
@@ -14865,16 +14466,12 @@ fn dump_wavefront_mega(
                     prefill: #prefill_tokens,
                 };
         };
-        let dml = proc_macro2::Literal::string(&decode_manifest);
 
         // ── `--target sendnn`: bake the LAYER-GROUP sub-bundles. Each group is a
         //    `[prefill, decode]` offline_decoder pair (the worker compiles each
         //    independently + threads the hidden state group→group on the host).
         //    Pair the prefill-group and decode-group by group index; carry the
-        //    group IO wiring (input/result tensor ids = the residual edge). The
-        //    per-group `manifest_json` is the SHARED full manifest (prefill `pml`
-        //    for prefill, decode `dml` for decode) — the worker filters sources by
-        //    the group graph's PrimaryInputs + uses the group's result tensor. ──
+        //    group IO wiring (input/result tensor ids = the residual edge). ──
         // DEFAULT mode: the "prefill" slot holds the SAME single static-SDPA graph as
         // the "decode" slot (one graph drives both phases; host-grown KV). PAGED mode:
         // pair the REAL paged prefill groups (SDPA+Store, distinct from the paged decode)
@@ -14883,14 +14480,10 @@ fn dump_wavefront_mega(
         let prefill_groups: &GroupGraphs = if sendnn_paged {
             prefill
                 .as_ref()
-                .map(|(_, _, _, pgs)| pgs)
+                .map(|(_, pgs)| pgs)
                 .unwrap_or(&default_decode_groups)
         } else {
             &default_decode_groups
-        };
-        let prefill_manifest_lit = match &prefill {
-            Some((pm, _, _, _)) => proc_macro2::Literal::string(pm),
-            None => proc_macro2::Literal::string(&decode_manifest),
         };
         // Pair groups by index (prefill ⟷ decode). They MUST agree in count (same
         // model, same group_size) — guard it.
@@ -15043,12 +14636,10 @@ fn dump_wavefront_mega(
                     input_tensor: #in_lit,
                     result_tensor: #res_lit,
                     prefill: ::scratchy_target_spyre::manifest::SengraphBundleData {
-                        manifest_json: #prefill_manifest_lit,
                         graph_json: #pre_json_lit,
                         g2_fingerprint: #pre_fp_lit,
                     },
                     decode: ::scratchy_target_spyre::manifest::SengraphBundleData {
-                        manifest_json: #dml,
                         graph_json: #dec_json_lit,
                         g2_fingerprint: #dec_fp_lit,
                     },
@@ -15907,10 +15498,6 @@ pub fn emit_model(
         let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
         match decode_wp {
             Some(decode_wp) => {
-                let idx = bucket_points.iter().position(|w| *w == decode_wp).unwrap();
-                let canonical = bucket_canonical[idx];
-                let bb_bucket_id = canonical_to_bucket_id[&canonical];
-                let (cl, ..) = &canonical_lowered[&canonical];
                 let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
                 dump_wavefront_mega(
                     program,
@@ -15919,9 +15506,6 @@ pub fn emit_model(
                     fuf,
                     inferred,
                     &decode_bounds,
-                    &cl.backbone.weight_slots,
-                    &cl.lm_head.weight_slots,
-                    bb_bucket_id,
                     &mut ktir_bundle_const,
                 );
             }
