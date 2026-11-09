@@ -419,6 +419,77 @@ __device__ static inline typename SV::dtype exclusive_scan_sv(SV& v) {
 }
 // TK-GAP(exclusive_scan_sv) end
 
+// THE ONE-ROW GEMV PROLOGUE NORM (FP8 S8 W4a): a one-row GEMV normalises its input row in its own
+// shared memory, the bits of `rms_norm_bf16.cu`'s one-row norm on that row, so the row it reads is
+// the absorbed `RmsNorm`'s output exactly. Two passes over `row`, the row's `chunks` 256-element
+// bf16 chunks:
+//   1. `row_norm_inv`: the norm kernel's pass 1. Warp `w < 4` takes the chunks `w, w + 4, …` in
+//      ascending order; each is row 0 of a plain `st_bf<16, 256, false>` view of the shared row at
+//      that chunk (its rows 1..15 are the chunks after it, read and never used: `row_sum` reduces
+//      each row on its own, so row 0's sum is the norm kernel's row-0 sum of its tile), loaded into
+//      the norm kernel's `rt_fl<16, 256>`, squared (`warp::mul`) and summed into the warp's part by
+//      the same 3-operand `warp::row_sum`. The four parts, row 0 of each, are added in warp order and
+//      `rms_inv_fused` takes `rcp(cols)` and `eps`: the norm kernel's `inv`, in every lane.
+//   2. `row_norm_apply`: `y = bf16((x · inv) · (offset + gain))`, the norm kernel's `mul_row` then
+//      `mul_col` (two products and an add, which nothing contracts into an FMA), each chunk as one
+//      naive `rv_fl<256>` (`warp::load` exact, `warp::store` the one RNE rounding, the convertor the
+//      tile store rounds with), in place.
+// `row` must hold `chunks + 15` chunks of shared memory (the last view's unused rows), and `chunks`
+// whole chunks of the row (its `k` a multiple of 256: the gain is read with no bound).
+using norm_rt = kittens::rt_fl<16, 256>;
+using norm_st = kittens::st_bf<16, 256, false>;
+using norm_cv = norm_rt::col_vec;
+using norm_parts = kittens::sv_fl<16>;
+static_assert(sizeof(norm_st) == 16 * sizeof(kittens::sv_bf<256>), "a view is 16 chunks");
+
+// Pass 1 by the warps `w < 4` of the `sync()` group; returns `inv` in every lane of the group.
+template <int N, typename SYNC>
+__device__ inline float row_norm_inv(const kittens::sv_bf<256> (&row)[N], norm_parts (&parts)[4],
+                                     int chunks, float cols, float eps, int w, SYNC&& sync) {
+    if (w < 4) {
+        norm_cv part;
+        kittens::warp::zero(part);
+        for (int t = w; t < chunks; t += 4) {
+            norm_rt x;
+            kittens::warp::load(x, reinterpret_cast<const norm_st&>(row[t]));
+            kittens::warp::mul(x, x, x);
+            kittens::warp::row_sum(part, x, part);
+        }
+        kittens::warp::store(parts[w], part);
+    }
+    sync();
+    float total = parts[0][0];
+    for (int v = 1; v < 4; v++) {
+        total = kittens::base_ops::sum::op<float>(total, parts[v][0]);
+    }
+    const float rcp = kittens::base_ops::div::op<float>(1.0f, cols);
+    return rms_inv_fused::op<float>(total, rcp, eps);
+}
+
+// Pass 2, chunk `c` by warp `c % warps` of the group, in place; the caller syncs after it.
+template <int N, typename GAIN>
+__device__ inline void row_norm_apply(kittens::sv_bf<256> (&row)[N], const GAIN& gain, int chunks,
+                                      float inv, float offset, int w, int warps) {
+    for (int c = w; c < chunks; c += warps) {
+        kittens::rv_fl<256> x, g;
+        kittens::warp::load(x, row[c]);
+        kittens::warp::mul(x, x, inv);
+        kittens::warp::load(g, gain, {0, 0, 0, c});
+        kittens::warp::add(g, g, offset);
+        kittens::warp::mul(x, x, g);
+        kittens::warp::store(row[c], x);
+    }
+}
+
+// The residual epilogue (FP8 S8 W4a): `bf16(bf16(v) + r)`, `v` rounded as the GEMV stores it, then
+// `add_bf16.cu`'s one f32 add of the two bf16 values and its one rounding.
+__device__ inline kittens::bf16 with_residual(float v, kittens::bf16 r) {
+    using kittens::base_types::convertor;
+    const float stored = convertor<float, kittens::bf16>::convert(convertor<kittens::bf16, float>::convert(v));
+    const float sum = kittens::base_ops::sum::op<float>(stored, convertor<float, kittens::bf16>::convert(r));
+    return convertor<kittens::bf16, float>::convert(sum);
+}
+
 // TK-GAP(rv_fma) begin
 // A register-vector map over three vectors, `dst[i][j] = op(a[i][j], b[i][j], c[i][j])`: TK's own
 // vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or two

@@ -20,11 +20,13 @@ pub mod common {
 use std::ffi::c_void;
 
 use common::fp8::{e4m3_value, quantize_rows};
-use common::numerics::{bf16_inputs, mismatched_bits};
+use common::numerics::{bf16_inputs, centred_gains, mismatched_bits};
 use half::bf16;
 use scratchy_target_cuda::kernels::{
-    Fp8Operand, KernelError, expert_gate_up_gemv_fp8, expert_gemv_fp8, gate_up_gemv_fp8,
-    gemv_fp8_abt, gemv_fp8_quant_probe, gemv_group_fp8_abt, quant_rows_fp8,
+    Ends, Fp8Operand, KernelError, add_bf16, expert_gate_up_gemv_fp8, expert_gate_up_gemv_fp8_ends,
+    expert_gemv_fp8, expert_gemv_fp8_ends, gate_up_gemv_fp8, gate_up_gemv_fp8_ends, gemv_fp8_abt,
+    gemv_fp8_ends, gemv_fp8_quant_probe, gemv_fp8_quant_probe_ends, gemv_group_fp8_abt,
+    gemv_group_fp8_ends, quant_rows_fp8, rms_norm_bf16,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 use scratchy_target_cuda::step::{gemv_scratch_bytes, gemv_splits};
@@ -932,4 +934,506 @@ fn the_fp8_gemv_bandwidth_is_recorded() {
             );
         }
     }
+}
+
+// ── FP8 S8 W4a: the one-row GEMV's fused ends ──────────────────────
+
+/// The norms' eps (qwen3.5's and Gemma's).
+const W4_EPS: f32 = 1e-6;
+
+/// The rows the normed tests run: three random ones, W1's all-zero row and its row of ±65,504
+/// (whose squares overflow to inf).
+fn w4_rows(k: usize, seed: u64) -> Vec<(&'static str, Vec<u16>)> {
+    let big: Vec<u16> = (0..k)
+        .map(|c| bf16::from_f32(if c % 2 == 0 { 65504.0 } else { -65504.0 }).to_bits())
+        .collect();
+    vec![
+        ("rand0", bf16_inputs(k, seed)),
+        ("rand1", bf16_inputs(k, seed ^ 0x11)),
+        ("rand2", bf16_inputs(k, seed ^ 0x22)),
+        ("zeros", vec![0; k]),
+        ("max", big),
+    ]
+}
+
+/// The gain for `offset`: a stored gain (Llama's, offset 0) or a zero-centred one (qwen3.5's,
+/// offset 1), as W1's norm tests take them.
+fn w4_gain(k: usize, offset: f32, seed: u64) -> Vec<u16> {
+    if offset == 0.0 {
+        bf16_inputs(k, seed)
+    } else {
+        centred_gains(k, seed)
+    }
+}
+
+/// Today's chain at one row: `rms_norm_bf16` of `x` (the one-row kernel) into its own buffer.
+fn w4_norm(
+    device: &CudaDevice,
+    x: &DeviceBuffer,
+    g: &DeviceBuffer,
+    k: u32,
+    offset: f32,
+) -> DeviceBuffer {
+    let y = DeviceBuffer::upload(device, &vec![SENTINEL; k as usize]).expect("y");
+    // SAFETY: `x`, `g` and `y` hold k bf16 each, their own allocations; the download waits.
+    unsafe {
+        rms_norm_bf16(
+            x.ptr().cast_const(),
+            g.ptr().cast_const(),
+            y.ptr(),
+            (1, k),
+            W4_EPS,
+            offset,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("rms_norm_bf16 at one row");
+    y
+}
+
+/// The ends of a norm of gain `g` and offset `offset`, and no residual.
+fn w4_norm_ends(g: &DeviceBuffer, offset: f32) -> Ends {
+    Ends {
+        gain: g.ptr().cast_const(),
+        eps: W4_EPS,
+        gain_offset: offset,
+        residual: std::ptr::null(),
+    }
+}
+
+/// The normed fp8 GEMV is the one-row norm then today's fp8 GEMV, bit for bit: the dense GEMV,
+/// the grouped one and the gate/up one at the three models' normed shapes, each at its own split,
+/// gain offset 0 and 1, on random rows, the all-zero row and the ±65,504 row; and the prologue's
+/// quantized bytes and scale (`gemv_fp8_quant_probe`) are the probe's on the norm's output at
+/// every split the shape takes. `mismatched_bits=0` on every output.
+#[test]
+fn the_normed_fp8_gemv_is_the_norm_then_the_gemv_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    // (k, dense n, group members, gate/up n, what)
+    let shapes: [(u32, u32, &[u32], u32, &str); 3] = [
+        (5120, 5120, &[10240, 6144], 17408, "27B"),
+        (2048, 4096, &[4096, 512, 512], 512, "35B"),
+        (2816, 8192, &[4096, 512, 512], 2112, "Gemma"),
+    ];
+    for (k, n, group, gu_n, what) in shapes {
+        let ku = k as usize;
+        for offset in [0.0f32, 1.0] {
+            let gain = w4_gain(ku, offset, 0x4A00 ^ u64::from(k));
+            let gb = DeviceBuffer::upload(&device, &gain).expect("gain");
+            let ends = w4_norm_ends(&gb, offset);
+            for (row, x) in w4_rows(ku, 0x4A10 ^ u64::from(k)) {
+                let xb = DeviceBuffer::upload(&device, &x).expect("x");
+                let y = w4_norm(&device, &xb, &gb, k, offset);
+                let tag = format!("{what} k={k} offset={offset} row={row}");
+                // The prologue's quantized row and scale, at every split a shape takes.
+                for splits in [1u32, gemv_splits(n, k, 1), gemv_splits(1024, k, 1)] {
+                    let chunks = ku.div_ceil(256);
+                    let probe = |ends: Option<Ends>, a: &DeviceBuffer| {
+                        let out = DeviceBuffer::upload_bytes(&device, &vec![0u8; chunks * 256 * 4])
+                            .expect("out");
+                        let sc =
+                            DeviceBuffer::upload_bytes(&device, &vec![0u8; 256]).expect("scale");
+                        // SAFETY: `a` holds k bf16, `out` chunks·256 f32, `sc` 64 f32.
+                        unsafe {
+                            match ends {
+                                Some(e) => gemv_fp8_quant_probe_ends(
+                                    a.ptr().cast_const(),
+                                    (out.ptr(), sc.ptr()),
+                                    (k, splits),
+                                    e,
+                                    std::ptr::null_mut(),
+                                ),
+                                None => gemv_fp8_quant_probe(
+                                    a.ptr().cast_const(),
+                                    (out.ptr(), sc.ptr()),
+                                    (k, splits),
+                                    std::ptr::null_mut(),
+                                ),
+                            }
+                        }
+                        .expect("probe");
+                        (down_f32(&out), down_f32(&sc)[..splits as usize].to_vec())
+                    };
+                    let (fq, fs) = probe(Some(ends), &xb);
+                    let (cq, cs) = probe(None, &y);
+                    let as_bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                    let bad = (as_bits(&fq).iter().zip(as_bits(&cq)))
+                        .filter(|(a, b)| **a != *b)
+                        .count()
+                        + (as_bits(&fs).iter().zip(as_bits(&cs)))
+                            .filter(|(a, b)| **a != *b)
+                            .count();
+                    eprintln!(
+                        "W4 normed probe {tag} splits={splits}: mismatched_bits={bad} {}",
+                        verdict(bad == 0)
+                    );
+                    pass &= bad == 0;
+                }
+                // The dense GEMV.
+                let (q, sc) = weight(n as usize, ku, 0x4A20 ^ u64::from(n));
+                let w = Fp8Buf::new(&device, &q, &sc);
+                let splits = gemv_splits(n, k, 1);
+                let p = scratch(&device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+                let pp = if splits > 1 {
+                    p.ptr()
+                } else {
+                    std::ptr::null_mut()
+                };
+                let fused = run_out(&device, n as usize, |c| {
+                    // SAFETY: as `run_gemv`'s, and the gain k bf16.
+                    unsafe {
+                        gemv_fp8_ends(
+                            (xb.ptr().cast_const(), w.op(), c),
+                            pp,
+                            (n, k, splits),
+                            ends,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                })
+                .expect("fused dense");
+                let chain = run_gemv(&device, &y, &w, (n, k, splits)).expect("chain dense");
+                let bad = mismatched_bits(&fused.0, &chain.0);
+                eprintln!(
+                    "W4 normed gemv_fp8 {tag} n={n} splits={splits}: mismatched_bits={bad} tail={} {}",
+                    fused.1,
+                    verdict(bad == 0 && fused.1)
+                );
+                pass &= bad == 0 && fused.1;
+                // The grouped GEMV.
+                let ws: Vec<Fp8Buf> = (group.iter().enumerate())
+                    .map(|(i, &gn)| {
+                        let (q, s) = weight(gn as usize, ku, 0x4A30 ^ i as u64);
+                        Fp8Buf::new(&device, &q, &s)
+                    })
+                    .collect();
+                let gsplits: Vec<u32> = group.iter().map(|&gn| gemv_splits(gn, k, 1)).collect();
+                let run_group = |a: &DeviceBuffer, e: Option<Ends>| {
+                    let outs: Vec<DeviceBuffer> = (group.iter())
+                        .map(|&gn| {
+                            DeviceBuffer::upload(&device, &vec![SENTINEL; gn as usize]).expect("c")
+                        })
+                        .collect();
+                    let parts: Vec<DeviceBuffer> = (group.iter().zip(&gsplits))
+                        .map(|(&gn, &s)| scratch(&device, gemv_scratch_bytes(gn, 1, s).expect("b")))
+                        .collect();
+                    let members: Vec<(Fp8Operand, *mut c_void, u32)> =
+                        (ws.iter().zip(&outs).zip(group))
+                            .map(|((w, c), &gn)| (w.op(), c.ptr(), gn))
+                            .collect();
+                    let pp: Vec<*mut c_void> = (parts.iter().zip(&gsplits))
+                        .map(|(p, &s)| if s > 1 { p.ptr() } else { std::ptr::null_mut() })
+                        .collect();
+                    // SAFETY: as the group test's, and the gain k bf16.
+                    unsafe {
+                        match e {
+                            Some(e) => gemv_group_fp8_ends(
+                                a.ptr().cast_const(),
+                                &members,
+                                &pp,
+                                (k, &gsplits),
+                                e,
+                                std::ptr::null_mut(),
+                            ),
+                            None => gemv_group_fp8_abt(
+                                a.ptr().cast_const(),
+                                &members,
+                                &pp,
+                                (k, &gsplits),
+                                std::ptr::null_mut(),
+                            ),
+                        }
+                    }
+                    .expect("group");
+                    outs.iter()
+                        .map(|c| c.download().expect("c"))
+                        .collect::<Vec<_>>()
+                };
+                let (fg, cg) = (run_group(&xb, Some(ends)), run_group(&y, None));
+                let bad: usize = fg.iter().zip(&cg).map(|(a, b)| mismatched_bits(a, b)).sum();
+                eprintln!(
+                    "W4 normed gemv_group_fp8 {tag} n={group:?}: mismatched_bits={bad} {}",
+                    verdict(bad == 0)
+                );
+                pass &= bad == 0;
+                // The gate/up GEMV.
+                let (gq, gs) = weight(gu_n as usize, ku, 0x4A40);
+                let (uq, us) = weight(gu_n as usize, ku, 0x4A41);
+                let (gw, uw) = (
+                    Fp8Buf::new(&device, &gq, &gs),
+                    Fp8Buf::new(&device, &uq, &us),
+                );
+                let gsp = gemv_splits(gu_n, k, 1);
+                let run_gu = |a: &DeviceBuffer, e: Option<Ends>| {
+                    let p = scratch(&device, 2 * gemv_scratch_bytes(gu_n, 1, gsp).expect("b"));
+                    let pp = if gsp > 1 {
+                        p.ptr()
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    run_out(&device, gu_n as usize, |c| {
+                        // SAFETY: as the gate/up test's, and the gain k bf16.
+                        unsafe {
+                            match e {
+                                Some(e) => gate_up_gemv_fp8_ends(
+                                    (a.ptr().cast_const(), gw.op(), uw.op()),
+                                    (c, pp),
+                                    (gu_n, k, gsp),
+                                    0,
+                                    e,
+                                    std::ptr::null_mut(),
+                                ),
+                                None => gate_up_gemv_fp8(
+                                    (a.ptr().cast_const(), gw.op(), uw.op()),
+                                    (c, pp),
+                                    (gu_n, k, gsp),
+                                    0,
+                                    std::ptr::null_mut(),
+                                ),
+                            }
+                        }
+                    })
+                    .expect("gate/up")
+                };
+                let (fu, cu) = (run_gu(&xb, Some(ends)), run_gu(&y, None));
+                let bad = mismatched_bits(&fu.0, &cu.0);
+                eprintln!(
+                    "W4 normed gate_up_gemv_fp8 {tag} n={gu_n} splits={gsp}: mismatched_bits={bad} {}",
+                    verdict(bad == 0 && fu.1)
+                );
+                pass &= bad == 0 && fu.1;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "a normed fp8 GEMV differs from the norm then the GEMV"
+    );
+}
+
+/// The fp8 GEMV's residual epilogue is today's fp8 GEMV then `add_bf16`, bit for bit, at the split
+/// `gemv_splits` picks for the o / out / down shapes of the three models, and at one split and the
+/// largest the shape takes, with residual rows of random values, ±0, ±inf and NaN.
+#[test]
+fn the_fp8_gemv_residual_epilogue_is_the_gemv_then_the_add_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    let shapes: [(u32, u32, &str); 7] = [
+        (5120, 6144, "27B o / out"),
+        (5120, 17408, "27B down"),
+        (2048, 4096, "35B o"),
+        (2048, 512, "35B shared down"),
+        (2816, 4096, "Gemma o"),
+        (2816, 8192, "Gemma o (global)"),
+        (2816, 2112, "Gemma down"),
+    ];
+    for (n, k, what) in shapes {
+        let (nu, ku) = (n as usize, k as usize);
+        let x = bf16_inputs(ku, 0x4B00 ^ u64::from(k));
+        let xb = DeviceBuffer::upload(&device, &x).expect("x");
+        let (q, sc) = weight(nu, ku, 0x4B10 ^ u64::from(n));
+        let w = Fp8Buf::new(&device, &q, &sc);
+        let specials = [0x0000u16, 0x8000, 0x7F80, 0xFF80, 0x7FC0];
+        let residual: Vec<u16> = (bf16_inputs(nu, 0x4B20 ^ u64::from(n))
+            .into_iter()
+            .enumerate())
+        .map(|(i, r)| {
+            if i % 7 == 0 {
+                specials[(i / 7) % specials.len()]
+            } else {
+                r
+            }
+        })
+        .collect();
+        let rb = DeviceBuffer::upload(&device, &residual).expect("residual");
+        let max_splits = (ku.div_ceil(256) as u32).min(16);
+        let mut splits_set = vec![1u32, gemv_splits(n, k, 1), max_splits];
+        splits_set.dedup();
+        for splits in splits_set {
+            let p = scratch(&device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+            let pp = if splits > 1 {
+                p.ptr()
+            } else {
+                std::ptr::null_mut()
+            };
+            let ends = Ends {
+                residual: rb.ptr().cast_const(),
+                ..Ends::NONE
+            };
+            let fused = run_out(&device, nu, |c| {
+                // SAFETY: as `run_gemv`'s, and the residual n bf16 apart from `c`.
+                unsafe {
+                    gemv_fp8_ends(
+                        (xb.ptr().cast_const(), w.op(), c),
+                        pp,
+                        (n, k, splits),
+                        ends,
+                        std::ptr::null_mut(),
+                    )
+                }
+            })
+            .expect("fused");
+            let (v, _) = run_gemv(&device, &xb, &w, (n, k, splits)).expect("gemv");
+            let vb = DeviceBuffer::upload(&device, &v).expect("v");
+            let sum = DeviceBuffer::upload(&device, &vec![SENTINEL; nu]).expect("sum");
+            // SAFETY: `vb`, `rb` and `sum` hold n bf16 each, their own allocations.
+            unsafe {
+                add_bf16(
+                    vb.ptr().cast_const(),
+                    rb.ptr().cast_const(),
+                    sum.ptr(),
+                    (1, n),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("add_bf16");
+            let bad = mismatched_bits(&fused.0, &sum.download().expect("sum"));
+            eprintln!(
+                "W4 gemv_fp8 residual {what} n={n} k={k} splits={splits}: mismatched_bits={bad} tail={} {}",
+                fused.1,
+                verdict(bad == 0 && fused.1)
+            );
+            pass &= bad == 0 && fused.1;
+        }
+    }
+    assert!(
+        pass,
+        "an fp8 GEMV's residual epilogue differs from the GEMV then the add"
+    );
+}
+
+/// The normed gathered expert GEMV and expert gate/up GEMV are the one-row norm then today's
+/// kernels, bit for bit: the 35B's (256 experts, 8 pairs, 2,048 → 512) and Gemma's (128 experts, 8
+/// pairs, 2,816 → 704), gain offset 0 and 1, on random rows, the all-zero row and the ±65,504 row.
+#[test]
+fn the_normed_expert_and_gate_up_gemvs_are_their_chains_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for (experts, top_k, k, n, what) in [
+        (256u32, 8u32, 2048u32, 512u32, "35B"),
+        (128, 8, 2816, 704, "Gemma"),
+    ] {
+        let (ku, nu) = (k as usize, n as usize);
+        let pairs = top_k as usize;
+        let topk: Vec<u32> = (0..top_k).map(|j| (j * 37 + 5) % experts).collect();
+        let tb = up_u32(&device, &topk);
+        // Only the picked experts' blocks hold random bytes, as the expert test's bank.
+        let bank = |seed: u64| {
+            let mut q = vec![0u8; experts as usize * nu * ku];
+            for &e in &topk {
+                let e = e as usize;
+                q[e * nu * ku..][..nu * ku]
+                    .copy_from_slice(&e4m3_weights(nu * ku, seed ^ e as u64));
+            }
+            Fp8Buf::new(
+                &device,
+                &q,
+                &weight_scales(experts as usize * nu, seed ^ 0x5CA1E),
+            )
+        };
+        let (gw, uw) = (bank(0x4C00), bank(0x4C01));
+        let splits = gemv_splits(n, k, top_k);
+        for offset in [0.0f32, 1.0] {
+            let gain = w4_gain(ku, offset, 0x4C10 ^ u64::from(k));
+            let gb = DeviceBuffer::upload(&device, &gain).expect("gain");
+            let ends = w4_norm_ends(&gb, offset);
+            for (row, x) in w4_rows(ku, 0x4C20 ^ u64::from(k)) {
+                let xb = DeviceBuffer::upload(&device, &x).expect("x");
+                let y = w4_norm(&device, &xb, &gb, k, offset);
+                let tag = format!("{what} k={k} offset={offset} row={row}");
+                let p = scratch(
+                    &device,
+                    2 * gemv_scratch_bytes(n, top_k, splits).expect("b"),
+                );
+                let pp = if splits > 1 {
+                    p.ptr()
+                } else {
+                    std::ptr::null_mut()
+                };
+                let gemv = |a: &DeviceBuffer, e: Option<Ends>| {
+                    run_out(&device, pairs * nu, |c| {
+                        // SAFETY: as the expert test's, and the gain k bf16.
+                        unsafe {
+                            match e {
+                                Some(e) => expert_gemv_fp8_ends(
+                                    (a.ptr().cast_const(), gw.op(), tb.ptr().cast_const()),
+                                    (c, pp),
+                                    (1, top_k, n, k),
+                                    (experts, n),
+                                    (false, splits),
+                                    e,
+                                    std::ptr::null_mut(),
+                                ),
+                                None => expert_gemv_fp8(
+                                    (a.ptr().cast_const(), gw.op(), tb.ptr().cast_const()),
+                                    (c, pp),
+                                    (1, top_k, n, k),
+                                    (experts, n),
+                                    (false, splits),
+                                    std::ptr::null_mut(),
+                                ),
+                            }
+                        }
+                    })
+                    .expect("expert gemv")
+                };
+                let (f, c) = (gemv(&xb, Some(ends)), gemv(&y, None));
+                let bad = mismatched_bits(&f.0, &c.0);
+                eprintln!(
+                    "W4 normed expert_gemv_fp8 {tag} splits={splits}: mismatched_bits={bad} {}",
+                    verdict(bad == 0 && f.1)
+                );
+                pass &= bad == 0 && f.1;
+                let gate_up = |a: &DeviceBuffer, e: Option<Ends>| {
+                    run_out(&device, pairs * nu, |c| {
+                        // SAFETY: as the expert gate/up test's, and the gain k bf16.
+                        unsafe {
+                            match e {
+                                Some(e) => expert_gate_up_gemv_fp8_ends(
+                                    (
+                                        a.ptr().cast_const(),
+                                        gw.op(),
+                                        uw.op(),
+                                        tb.ptr().cast_const(),
+                                    ),
+                                    (c, pp),
+                                    (1, top_k, n, k),
+                                    (experts, n, splits),
+                                    1,
+                                    e,
+                                    std::ptr::null_mut(),
+                                ),
+                                None => expert_gate_up_gemv_fp8(
+                                    (
+                                        a.ptr().cast_const(),
+                                        gw.op(),
+                                        uw.op(),
+                                        tb.ptr().cast_const(),
+                                    ),
+                                    (c, pp),
+                                    (1, top_k, n, k),
+                                    (experts, n, splits),
+                                    1,
+                                    std::ptr::null_mut(),
+                                ),
+                            }
+                        }
+                    })
+                    .expect("expert gate/up")
+                };
+                let (f, c) = (gate_up(&xb, Some(ends)), gate_up(&y, None));
+                let bad = mismatched_bits(&f.0, &c.0);
+                eprintln!(
+                    "W4 normed expert_gate_up_gemv_fp8 {tag} splits={splits}: mismatched_bits={bad} {}",
+                    verdict(bad == 0 && f.1)
+                );
+                pass &= bad == 0 && f.1;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "a normed expert fp8 GEMV differs from the norm then the GEMV"
+    );
 }
