@@ -1276,15 +1276,17 @@ impl DeviceWalk {
     }
 
     /// The same walk with its dims in another order: entry `i` of the result is entry `from[i]` of
-    /// this one (a paged pin follows its dim). `None` unless `from` is a permutation of `0..rank`.
-    pub(crate) fn reordered(&self, from: &[usize]) -> Option<Self> {
-        let rank = self.rank();
-        let mut seen = vec![false; rank];
-        if from.len() != rank
-            || from
-                .iter()
-                .any(|&j| j >= rank || std::mem::replace(&mut seen[j], true))
-        {
+    /// this one (a paged pin follows its dim). `from` is a [`DeviceOrder`]'s positions — a permutation
+    /// of `0..n`, proven where the order was stated — so the one thing left to hold is that it orders
+    /// THIS walk's dims: `None` when the walk's rank is not `n`.
+    ///
+    /// [`DeviceOrder`]: crate::superdsc_opspec::DeviceOrder
+    pub(crate) fn reordered(
+        &self,
+        from: crate::superdsc_opspec::DeviceOrderView<'_>,
+    ) -> Option<Self> {
+        let from = from.positions;
+        if from.len() != self.rank() {
             return None;
         }
         Some(DeviceWalk(match &self.0 {

@@ -3638,12 +3638,10 @@ pub fn emit_sdsc(
             ldsIdx_: i as u32,
             dsName_: format!("Tensor{i}"),
             dsType_: v.role.ds_type(),
-            // In the order this tensor's dims go to dxp (`ArgView::device_positions`).
-            scale_: match v.device_positions() {
-                Some(from) if from.len() == v.scale.len() => {
-                    from.iter().map(|&j| v.scale[j].to_i64()).collect()
-                }
-                _ => v.scale.iter().map(|s| s.to_i64()).collect(),
+            // In the order this tensor's dims go to dxp (its proven `DeviceOrder`).
+            scale_: match v.device_order {
+                Some(o) => o.positions.iter().map(|&j| v.scale[j].to_i64()).collect(),
+                None => v.scale.iter().map(|s| s.to_i64()).collect(),
             },
             wordLength: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
@@ -3695,19 +3693,19 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+                    layoutDimOrder_: v.device_dims_order().to_vec(),
                     stickDimOrder_: vec!["out", "mb"],
                     stickSize_: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+                    layoutDimOrder_: v.device_dims_order().to_vec(),
                     stickDimOrder_: vec!["in", "out"],
                     stickSize_: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+                    layoutDimOrder_: v.device_dims_order().to_vec(),
                     stickDimOrder_: vec![v.stick],
                     stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
@@ -4124,18 +4122,8 @@ pub fn emit_sdsc(
         }
         let addr = mint.concrete(&per_core);
         // The order dxp reads this view's dims in, innermost first, as positions in `v.layout` — set
-        // only where it is not `v.layout`'s (`TensorArg::with_device_order`).
-        let device_from = v.device_positions();
-        if device_from
-            .as_ref()
-            .is_some_and(|from| from.len() != v.layout.len())
-        {
-            return Err(SuperDscError(format!(
-                "op {op_name}: tensor {i} ('{}') states device order {:?} over layout {:?} — not a \
-                 permutation of it",
-                v.name, v.device_order, v.layout
-            )));
-        }
+        // only where it is not `v.layout`'s, and a proven permutation of it (`DeviceOrder`).
+        let device_from = v.device_order;
         Ok(AllocNode {
             nodeType_: "allocate",
             name_: name,
@@ -4177,7 +4165,7 @@ pub fn emit_sdsc(
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
             // A view that states its own device order (two row dims, read innermost-first by dxp) is
             // the one exception, and states it on the view.
-            layoutDimOrder_: v.device_order.unwrap_or(v.layout).to_vec(),
+            layoutDimOrder_: v.device_dims_order().to_vec(),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -4253,13 +4241,13 @@ pub fn emit_sdsc(
                 } else {
                     walk.clone().paged_at(&paged_dims).unwrap_or(walk)
                 };
-                // In the order `layoutDimOrder_` states the dims.
-                match &device_from {
+                // In the order `layoutDimOrder_` states the dims. The walk is built from this view's
+                // own extents, one per `layout` dim, so its rank is the order's.
+                match device_from {
                     None => walk,
                     Some(from) => walk.reordered(from).ok_or_else(|| {
                         SuperDscError(format!(
-                            "op {op_name}: tensor {i} ('{}'): its walk does not reorder to its \
-                             device order",
+                            "op {op_name}: tensor {i} ('{}'): its walk's rank is not its layout's",
                             v.name
                         ))
                     })?,
