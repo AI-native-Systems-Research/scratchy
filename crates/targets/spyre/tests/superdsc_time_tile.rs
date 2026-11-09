@@ -512,16 +512,14 @@ fn rmsnorm_rinv_is_pinned_lx() {
     );
 }
 
-// ── #645 fix (a), STEP 3: THE OP-LOCAL SLOT ALTERNATION WALK ───────────────────
+// ── #645 fix (a): OP-LOCAL PINS SHARE A SLOT PER CLASS ─────────────────────────
 //    Two norms of ONE footprint class share ONE top-down slot (pinned above: every
 //    same-class rinv resolves to the same address below LX_PIN_END), so a name's bytes
-//    survive exactly until the next same-class name's program runs. The walk proves the
-//    touching names form CONTIGUOUS RUNS over the bundle's emitted order — per launch
-//    group over its programs, with the run state carried ACROSS groups (a bundle's
-//    launches are ordered on one stream). Every test here drives it the way
-//    `ktir_groups_via_superdsc` does: real `assemble_rmsnorm` chains against one
-//    layout, `per_prog` one (program, descriptor-count) entry per chain, the SAME
-//    partition (`trip_kinds_for` + `group_ranges`) the launch index uses.
+//    survive exactly until the next same-class name's program runs. That is sound by
+//    construction: each pin's writer and reader are built by its pair, inside one
+//    program's scope, which refuses a second same-class pin. The tests here drive real
+//    `assemble_rmsnorm` chains against one layout, and read the pin ledger over the
+//    programs with their own descriptors, the way `ktir_groups_via_superdsc` does.
 
 /// The walk tests' fixture: one layout holding both norms' operands — x/gamma/eps shared
 /// (placed tensors; the pins are keyed on the OUT), outs `t7` and `t17` — so two real
@@ -630,10 +628,8 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
     );
     assert_eq!(pin_of("t7_rinv").2, LX_PIN_END - 8192);
     // The ledger: two programs in order, one name per class each — the pairs' own record.
-    let mut ops = a.clone();
-    ops.extend(b.iter().cloned());
-    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
-    let ledger = superdsc::lx_slot_ledger(&ops, &per_prog, Some(&l));
+    let programs = [("rms_a", a.as_slice()), ("rms_b", b.as_slice())];
+    let ledger = superdsc::lx_slot_ledger(&programs, Some(&l));
     assert_eq!(ledger.len(), 2, "one ledger row per pin");
     let row_of = |n: &str| ledger.iter().find(|r| r.name == n).unwrap();
     for (pin, prog) in [("t7_rinv", "rms_a"), ("t17_rinv", "rms_b")] {
@@ -649,8 +645,8 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
     }
     // The ledger keys strictly off the layout's pin table: no layout, or a layout that declared
     // none, records nothing.
-    assert!(superdsc::lx_slot_ledger(&ops, &per_prog, None).is_empty());
-    assert!(superdsc::lx_slot_ledger(&ops, &per_prog, Some(&two_norm_layout())).is_empty());
+    assert!(superdsc::lx_slot_ledger(&programs, None).is_empty());
+    assert!(superdsc::lx_slot_ledger(&programs, Some(&two_norm_layout())).is_empty());
 }
 
 /// ⭐ ONE NAME PER CLASS PER PROGRAM — two same-class norms in ONE program's scope: the second pair
@@ -754,10 +750,9 @@ fn the_ledger_records_a_pin_this_bundle_never_touches_as_empty() {
         &mut ktir_superdsc::placement::LxScope::for_test(),
     );
     let mut sym = 0i64;
-    let mut ops = norm(&l, "a", 7, &mut sym);
-    ops.extend(norm(&l, "b", 17, &mut sym));
-    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
-    let ledger = superdsc::lx_slot_ledger(&ops, &per_prog, Some(&l));
+    let (a, b) = (norm(&l, "a", 7, &mut sym), norm(&l, "b", 17, &mut sym));
+    let programs = [("rms_a", a.as_slice()), ("rms_b", b.as_slice())];
+    let ledger = superdsc::lx_slot_ledger(&programs, Some(&l));
     assert_eq!(
         ledger.len(),
         3,

@@ -6598,57 +6598,44 @@ pub struct LxSlotRow {
 /// ⛔ ONE PREMISE NO TYPE CARRIES: that the device runs a launch group's programs complete-before-start
 /// in declaration order (the #645 citation pack). The card leg measures it.
 pub fn lx_slot_ledger<T: ktir_superdsc::collective::Tp>(
-    sdsc_ops: &[EmittedOp<T>],
-    per_prog: &[(String, usize)],
+    // Every lowered program in walk order, WITH its own descriptors — one list, so an op's program
+    // is the pair it sits in, never an index into a parallel table.
+    programs: &[(&str, &[EmittedOp<T>])],
     layout: Option<&BundleLayout>,
 ) -> Vec<LxSlotRow> {
-    let table = layout.map(|l| l.lx_op_local_pins()).unwrap_or_default();
-    let pins: std::collections::BTreeMap<&str, (u64, u64)> = table
-        .iter()
-        .map(|(name, fp, slot)| (name.as_str(), (*fp, *slot)))
-        .collect();
-    if pins.is_empty() {
+    let Some(layout) = layout else {
         return Vec::new();
-    }
-    // Program index per op, off the per-program table the dump writes (`sdsc_ops` is exactly its
-    // concatenation, in lowering order).
-    let prog_of: Vec<usize> = per_prog
-        .iter()
-        .enumerate()
-        .flat_map(|(pi, (_, n))| std::iter::repeat_n(pi, *n))
+    };
+    // One row per pin in the table, its touches filled in below; a pin this bundle never touches
+    // keeps its empty run list.
+    let mut rows: std::collections::BTreeMap<String, LxSlotRow> = layout
+        .lx_op_local_pins()
+        .into_iter()
+        .map(|(name, class_bytes, slot)| {
+            let row = LxSlotRow {
+                name: name.clone(),
+                class_bytes,
+                slot,
+                touched_by: Vec::new(),
+            };
+            (name, row)
+        })
         .collect();
-    let mut touched_by: std::collections::BTreeMap<&str, Vec<(String, bool)>> =
-        std::collections::BTreeMap::new();
-    for (o, e) in sdsc_ops.iter().enumerate() {
-        let Some(prog) = prog_of.get(o).map(|&p| &per_prog[p].0) else {
-            continue;
-        };
-        let names: std::collections::BTreeSet<&str> = e
-            .arg_bindings
-            .iter()
-            .map(|b| b.buffer.as_str())
-            .filter(|n| pins.contains_key(n))
-            .collect();
-        for n in names {
-            let is_input = e
-                .arg_bindings
-                .iter()
-                .any(|b| b.buffer.as_str() == n && b.is_input);
-            let v = touched_by.entry(n).or_default();
-            // One entry per (program, direction) run, as the dump has always written it.
-            if !v.last().is_some_and(|(q, i)| q == prog && *i == is_input) {
-                v.push((prog.clone(), is_input));
+    for &(prog, ops) in programs {
+        for e in ops {
+            for b in &e.arg_bindings {
+                let Some(row) = rows.get_mut(b.buffer.as_str()) else {
+                    continue; // not an op-local pin — the ledger records only those
+                };
+                // One entry per (program, direction) run, as the dump has always written it.
+                let v = &mut row.touched_by;
+                if !v.last().is_some_and(|(q, i)| q == prog && *i == b.is_input) {
+                    v.push((prog.to_string(), b.is_input));
+                }
             }
         }
     }
-    pins.into_iter()
-        .map(|(name, (fp, slot))| LxSlotRow {
-            name: name.to_string(),
-            class_bytes: fp,
-            slot,
-            touched_by: touched_by.remove(name).unwrap_or_default(),
-        })
-        .collect()
+    rows.into_values().collect()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -8189,7 +8176,9 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
     // (program name, descriptors) — written into the dump's `bundle_id.json`, since the eprintln below
     // is invisible on a successful build.
-    let mut per_prog: Vec<(String, usize)> = Vec::new();
+    // Each program and its descriptors' place in `sdsc_ops` — recorded by the push that places
+    // them, so a reader takes a program's ops as its own range, never by re-cutting the list.
+    let mut per_prog: Vec<(String, std::ops::Range<usize>)> = Vec::new();
     let _pc_mint = crate::pc::Pc::start("mint");
     for e in ops {
         // ⛔ ONE PATH, AND IT IS CHECKED HERE. An op arriving with a descriptor ALREADY BUILT means
@@ -8252,8 +8241,9 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                 lowered.len()
             );
         }
-        per_prog.push((e.op_name.clone(), lowered.len()));
+        let at = sdsc_ops.len();
         sdsc_ops.extend(lowered);
+        per_prog.push((e.op_name.clone(), at..sdsc_ops.len()));
     }
 
     // ⛔⛔⛔ A WALK'S BODY READS THE SHIFTED SEGMENT ONLY THROUGH THE STEP'S SOURCES. The relaunch moves
@@ -8323,7 +8313,13 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // ⭐ THE OP-LOCAL PIN LEDGER — written into the dump beside the descriptors for the #645
     //    same-class pair hunts. A report: the sharing it records is sound by construction
     //    (`emit::lx_op_local_pair`), see `lx_slot_ledger`.
-    let lx_ledger = lx_slot_ledger(&sdsc_ops, &per_prog, layout);
+    let lx_ledger = {
+        let programs: Vec<(&str, &[EmittedOp<T>])> = per_prog
+            .iter()
+            .map(|(name, range)| (name.as_str(), &sdsc_ops[range.clone()]))
+            .collect();
+        lx_slot_ledger(&programs, layout)
+    };
 
     // ── THE BAKE BUDGET, PER BUNDLE (`BakeBudget::bundle_verdict`) ─────────────────────────
     //    A bundle is the unit the emitter fans out, so its counts bound BOTH the wave's critical
@@ -8408,8 +8404,8 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         // program's q view is built first and is `[mq, nqh·hd]`, so its row count is `mq` — the same fact
         // `recognize_attn` recovers, not a new one threaded in.
         let mut progs: Vec<(String, usize)> = Vec::new();
-        for (name, n) in &per_prog {
-            progs.push((name.clone(), *n));
+        for (name, range) in &per_prog {
+            progs.push((name.clone(), range.len()));
         }
         let mq = ops
             .iter()
