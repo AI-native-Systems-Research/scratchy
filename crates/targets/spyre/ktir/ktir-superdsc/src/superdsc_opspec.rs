@@ -2295,7 +2295,11 @@ pub enum PastExtent {
 impl Pitch {
     /// The one constructor: `declared` elements apart, of which the op sweeps `swept`, on an axis
     /// that is the operand's stick axis (`stick = Some(elements per stick)`) or not (`None`).
-    pub fn past(swept: u32, declared: u32, stick: Option<u32>) -> Result<PastExtent, SuperDscError> {
+    pub fn past(
+        swept: u32,
+        declared: u32,
+        stick: Option<u32>,
+    ) -> Result<PastExtent, SuperDscError> {
         let Some(gap) = declared.checked_sub(swept) else {
             return Err(SuperDscError(format!(
                 "an axis swept {swept} elements at a pitch of {declared} — a pitch shorter than \

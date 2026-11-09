@@ -76,11 +76,24 @@ fn band_add(p: u32, r: u32, c: u32) -> (Vec<serde_json::Value>, u64, u64) {
         band: None,
     };
     let mut sym = 0i64;
-    let ops = elementwise::<W>("band", Elementwise::Add, &[band(0), band(1), o], &[], &mut sym, Some(&l))
-        .unwrap_or_else(|e| panic!("[{r}, {c}] of [{p}, {c}]: {}", e.message));
+    let ops = elementwise::<W>(
+        "band",
+        Elementwise::Add,
+        &[band(0), band(1), o],
+        &[],
+        &mut sym,
+        Some(&l),
+    )
+    .unwrap_or_else(|e| panic!("[{r}, {c}] of [{p}, {c}]: {}", e.message));
     assert_eq!(ops.len(), 1, "one descriptor");
     let v = serde_json::to_value(&ops[0].op).unwrap();
-    let d = v["dscs_"][0].as_object().unwrap().values().next().unwrap().clone();
+    let d = v["dscs_"][0]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
     let cores = d["numCoresUsed_"].as_u64().unwrap();
     // The band's whole row sweep — what the HBM unit view's capacity spans (core fold included).
     let swept = d["N_"]["mb_"].as_u64().expect("a swept mb");
@@ -109,7 +122,9 @@ fn a_multi_stick_band_states_the_parent_pitch_as_its_back_gap() {
     ] {
         let (nodes, cores, rpc) = band_add(p, r, c);
         seen.insert(cores);
-        cases.push(format!("[{r},{c}]/[{p},{c}] -> {cores} core(s), {rpc} row(s) swept"));
+        cases.push(format!(
+            "[{r},{c}]/[{p},{c}] -> {cores} core(s), {rpc} row(s) swept"
+        ));
         let gap = (u64::from(p) - rpc).to_string();
         for (i, n) in nodes.iter().enumerate() {
             let what = format!("[{r}, {c}] of [{p}, {c}] on {cores} core(s), operand {i}");
@@ -120,17 +135,24 @@ fn a_multi_stick_band_states_the_parent_pitch_as_its_back_gap() {
                     "{what}: the parent's pitch past the band's rows"
                 );
             } else {
-                assert!(n.get("backGapCore_").is_none(), "{what}: a whole output has no gap");
+                assert!(
+                    n.get("backGapCore_").is_none(),
+                    "{what}: a whole output has no gap"
+                );
             }
             let walk = n["maxDimSizes_"].as_array().unwrap();
             assert!(
-                walk.iter().all(|e| e.as_i64() != Some(i64::from(p)) || p == r),
+                walk.iter()
+                    .all(|e| e.as_i64() != Some(i64::from(p)) || p == r),
                 "{what}: no walk is pinned to the parent's rows: {walk:?}"
             );
         }
     }
     for want in [1u64, 8, 32] {
-        assert!(seen.contains(&want), "the cases reach {want} core(s): {cases:#?}");
+        assert!(
+            seen.contains(&want),
+            "the cases reach {want} core(s): {cases:#?}"
+        );
     }
 }
 
@@ -165,7 +187,11 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
         df: Df::Fp16,
     };
     let plan = WorkPlan::divide(
-        &[dim("y", 3, false), dim("mb", 4, false), dim("out", 128, true)],
+        &[
+            dim("y", 3, false),
+            dim("mb", 4, false),
+            dim("out", 128, true),
+        ],
         MaxCores::<32>,
         |_, _| Default::default(),
     )
@@ -192,7 +218,11 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     // A pitch past the extent states it; a pitch AT the extent is no pitch.
     assert_eq!(
         axes(view().with_pitch(&plan, "mb", 10).unwrap()),
-        [DeviceAxis::Swept, DeviceAxis::Pitch(pitch(4, 10, None)), DeviceAxis::Swept]
+        [
+            DeviceAxis::Swept,
+            DeviceAxis::Pitch(pitch(4, 10, None)),
+            DeviceAxis::Swept
+        ]
     );
     assert_eq!(
         axes(view().with_pitch(&plan, "mb", 4).unwrap()),
@@ -204,7 +234,11 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     // The stick axis states a pitch of whole sticks, and refuses a gap inside one.
     assert_eq!(
         axes(view().with_pitch(&plan, "out", 256).unwrap()),
-        [DeviceAxis::Swept, DeviceAxis::Swept, DeviceAxis::Pitch(pitch(128, 256, Some(64)))]
+        [
+            DeviceAxis::Swept,
+            DeviceAxis::Swept,
+            DeviceAxis::Pitch(pitch(128, 256, Some(64)))
+        ]
     );
     let stick = view().with_pitch(&plan, "out", 160).unwrap_err().0;
     assert!(stick.contains("stick axis"), "{stick}");
@@ -235,7 +269,11 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
                 .with_pitch(&plan, "mb", 10)
                 .unwrap()
         ),
-        [DeviceAxis::Window(8), DeviceAxis::Pitch(pitch(4, 10, None)), DeviceAxis::Swept]
+        [
+            DeviceAxis::Window(8),
+            DeviceAxis::Pitch(pitch(4, 10, None)),
+            DeviceAxis::Swept
+        ]
     );
 }
 
@@ -256,12 +294,18 @@ fn a_pitch_is_built_once_from_swept_declared_and_stick() {
     assert_eq!(s.gap(), 511 * 2048);
     // AT the extent: no pitch, the axis is swept whole.
     assert_eq!(Pitch::past(4, 4, None).unwrap(), PastExtent::AtExtent);
-    assert_eq!(Pitch::past(128, 128, Some(64)).unwrap(), PastExtent::AtExtent);
+    assert_eq!(
+        Pitch::past(128, 128, Some(64)).unwrap(),
+        PastExtent::AtExtent
+    );
     // The near-misses, each refused by name at construction:
     let short = Pitch::past(16, 4, None).unwrap_err().0;
     assert!(short.contains("shorter than the extent"), "{short}");
     let sub_stick = Pitch::past(128, 160, Some(64)).unwrap_err().0;
     assert!(sub_stick.contains("whole 64-element sticks"), "{sub_stick}");
     // The stick only binds the stick axis: the same gap is a pitch on a row axis.
-    assert!(matches!(Pitch::past(128, 160, None), Ok(PastExtent::Pitch(_))));
+    assert!(matches!(
+        Pitch::past(128, 160, None),
+        Ok(PastExtent::Pitch(_))
+    ));
 }
