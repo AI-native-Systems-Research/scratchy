@@ -1251,7 +1251,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     s: ReduceSplit<'_, D, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Option<Vec<EmittedOp<T>>>, String> {
+) -> Result<Option<Vec<EmittedOp<T>>>, crate::superdsc_error::SuperDscError> {
     let rows = s.rows.get();
     let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(rows);
     // The parent's full column extent, read off the handle — the nest every slice corner is
@@ -1264,7 +1264,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         crate::sdsc_abstract::BlockCols::of_feature_cols(s.cols),
         s.df,
         &format!("{}: the long-reduce probe's data window", s.op_name),
-    )?;
+    )
+    .map_err(crate::superdsc_error::SuperDscError)?;
     let probe_accum = win_reduce_accum(
         layout,
         s.accum,
@@ -1272,7 +1273,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         rows_t,
         s.df,
         &format!("{}: the long-reduce probe's accum window", s.op_name),
-    )?;
+    )
+    .map_err(crate::superdsc_error::SuperDscError)?;
     let probe = reduce_opspec_off_divided(ReduceOffSpec {
         op: s.op,
         rows,
@@ -1283,7 +1285,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         division: s.division,
         scaling: ScalingExtent::whole(s.cols),
     })
-    .map_err(|e| format!("{}: {e}", s.op_name))?;
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("{}: {e}", s.op_name)))?;
     if probe.iter.split_of("out") > 1 {
         return Ok(None);
     }
@@ -1313,7 +1315,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     let partials: Vec<Stk<A>> = partial_names
         .iter()
         .map(|n| partial_accum_handle(n, rows, stick, s.df))
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>()
+        .map_err(crate::superdsc_error::SuperDscError)?;
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
     for j in 0..time {
         let slice_cols = slices.cols_of(j);
@@ -1332,7 +1335,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
             crate::sdsc_abstract::BlockCols::of_feature_cols(slice_cols),
             s.df,
             &format!("{op_name}: the slice's data window"),
-        )?;
+        )
+        .map_err(crate::superdsc_error::SuperDscError)?;
         let accum_win = if j == 0 {
             win_reduce_accum(
                 layout,
@@ -1341,7 +1345,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 rows_t,
                 s.df,
                 &format!("{op_name}: the slice's accum window (the caller's own)"),
-            )?
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?
         } else {
             let p = &partials[(j - 1) as usize];
             win_reduce_accum(
@@ -1351,7 +1356,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 rows_t,
                 s.df,
                 &format!("{op_name}: the slice's accum window (its own partial)"),
-            )?
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?
         };
         // The slice's own geometry (`cols` = the slice's width, its pad lanes masked) with the
         // WHOLE reduce's scaling extent — the partials must add to the single-shot result.
@@ -1364,12 +1370,16 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
             df: s.df,
             division: ReduceDivision::Rows,
             scaling: slices.scaling_of(j),
-        })?;
+        })
+        .map_err(crate::superdsc_error::SuperDscError)?;
         let folds = SdscFoldSet::new(spec.iter.cores_used());
-        ops.push(
-            crate::emit::emit_sdsc_tiled(&op_name, &spec, &folds, sym_id_base, layout)
-                .map_err(|e| e.0)?,
-        );
+        ops.push(crate::emit::emit_sdsc_tiled(
+            &op_name,
+            &spec,
+            &folds,
+            sym_id_base,
+            layout,
+        )?);
     }
     // THE COMBINE, one per reduce kind: accum = accum ∘ partial_j, running, in place on the
     // caller's accum, through the same pointwise door every other combine takes. The width is
@@ -1385,23 +1395,20 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     for (i, p) in partials.iter().enumerate() {
         let op_name = format!("{}_c{}_op", s.op_name, i + 1);
         if matches!(s.df, Df::Fp16) {
-            ops.push(
-                crate::emit::assemble_pointwise_broadcast_off(
-                    &op_name,
-                    combine,
-                    rows_t,
-                    combine_cols,
-                    &[
-                        crate::emit::In::sliced(s.accum, s.accum_off).ew(),
-                        crate::emit::In::full(p).ew(),
-                    ],
-                    s.accum,
-                    s.accum_off,
-                    sym_id_base,
-                    layout,
-                )
-                .map_err(|e| e.0)?,
-            );
+            ops.push(crate::emit::assemble_pointwise_broadcast_off(
+                &op_name,
+                combine,
+                rows_t,
+                combine_cols,
+                &[
+                    crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                    crate::emit::In::full(p).ew(),
+                ],
+                s.accum,
+                s.accum_off,
+                sym_id_base,
+                layout,
+            )?);
         } else {
             let mut op = crate::emit::pointwise_broadcast_opspec_df(
                 op_func_from_str(combine),
@@ -1418,13 +1425,16 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 layout,
                 crate::work::EwDivision::Law,
             )
-            .map_err(|e| format!("{op_name}: {e}"))?;
+            .map_err(|e| crate::superdsc_error::SuperDscError(format!("{op_name}: {e}")))?;
             crate::emit::apply_lx_residency(&mut op, layout);
             let folds = SdscFoldSet::new(op.iter.cores_used());
-            ops.push(
-                crate::emit::emit_sdsc_tiled(&op_name, &op, &folds, sym_id_base, layout)
-                    .map_err(|e| e.0)?,
-            );
+            ops.push(crate::emit::emit_sdsc_tiled(
+                &op_name,
+                &op,
+                &folds,
+                sym_id_base,
+                layout,
+            )?);
         }
     }
     Ok(Some(ops))

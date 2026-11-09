@@ -517,7 +517,7 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     o: RowsOperand<'_, crate::sdsc_abstract::RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp<T>, String> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let form = SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness());
     let mut op = matmul_opspec_split::<Fp16, _>(
         shape.m.get(),
@@ -535,13 +535,14 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
         form,
         None,
         super::dims::matmul_split_map_for(form),
-    )?;
+    )
+    .map_err(crate::superdsc_error::SuperDscError)?;
     // The activation's own stick-group pitch, when it is not the output's: a batch block read on
     // its own (`a_rows == m`) is a standalone stick-major `[m, k]`.
     if shape.a_rows != shape.rows {
         op.args_mut()[0].set_device_extent("mb", shape.a_rows);
     }
-    assemble_from_opspec(op_name, op, sym_id_base, layout).map_err(|e| e.0)
+    assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 
 /// Shared tail: work-division folds + emit. Identical for both entry points, so a change to how an

@@ -585,7 +585,10 @@ fn norm_in(
     out: u32,
     sym: &mut i64,
     scope: &mut ktir_superdsc::placement::LxScope,
-) -> Result<Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String> {
+) -> Result<
+    Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>,
+    ktir_superdsc::superdsc_error::SuperDscError,
+> {
     assemble_rmsnorm(
         prefix,
         64,
@@ -661,9 +664,11 @@ fn a_second_same_class_pin_in_one_program_refuses_at_the_pair() {
     let mut sym = 0i64;
     let mut scope = ktir_superdsc::placement::LxScope::for_test();
     norm_in(&l, "a", 7, &mut sym, &mut scope).expect("the program's first norm of the class");
-    let err = norm_in(&l, "b", 17, &mut sym, &mut scope)
-        .err()
-        .expect("a second same-class pin in one program");
+    let Err(ktir_superdsc::superdsc_error::SuperDscError(err)) =
+        norm_in(&l, "b", 17, &mut sym, &mut scope)
+    else {
+        panic!("a second same-class pin in one program must refuse");
+    };
     assert!(
         err.contains("both of the 8192-byte class in ONE program"),
         "{err}"
@@ -696,7 +701,8 @@ fn a_second_same_class_pin_refuses_without_a_layout_too() {
         )
     };
     norm_no_layout(7, &mut scope).expect("the program's first norm of the class");
-    let Err(err) = norm_no_layout(17, &mut scope) else {
+    let Err(ktir_superdsc::superdsc_error::SuperDscError(err)) = norm_no_layout(17, &mut scope)
+    else {
         panic!("a second same-class pin in one program, layout or not, must refuse");
     };
     assert!(

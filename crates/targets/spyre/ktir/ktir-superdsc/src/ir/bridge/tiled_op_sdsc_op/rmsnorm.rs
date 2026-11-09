@@ -59,7 +59,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     lx_scope: &mut crate::placement::LxScope,
-) -> Result<Vec<EmittedOp<T>>, String> {
+) -> Result<Vec<EmittedOp<T>>, crate::superdsc_error::SuperDscError> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
@@ -151,49 +151,45 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
                 cols,
                 Df::Fp16,
                 layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
-            )?,
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?,
             ReduceDataLeg::whole(&x),
             ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
             out_id,
-        )?,
+        )
+        .map_err(crate::superdsc_error::SuperDscError)?,
         sym_id_base,
         layout,
     )?;
     if let Some(split) = split {
         ops.extend(split);
     } else {
-        ops.push(
-            assemble_reduce_seeded(
-                &rmmean_op,
-                "exx2",
-                rows,
-                cols,
-                &x,
-                &mean,
-                sym_id_base,
-                layout,
-            )
-            .map_err(|e| e.0)?,
-        );
+        ops.push(assemble_reduce_seeded(
+            &rmmean_op,
+            "exx2",
+            rows,
+            cols,
+            &x,
+            &mean,
+            sym_id_base,
+            layout,
+        )?);
     }
     // 2. E[x²] + eps  (the `+ eps` inside torch.rsqrt). `mean` holds both half-stick values, so
     //    elements [0..8) compute E[x]+eps and the pad elements compute over stale bytes — both
     //    unread (the tail reads element 8 only), the same computed-but-unread padding class the
     //    elementary chain always had.
-    ops.push(
-        pw2(
-            &format!("rmeps_{prefix}"),
-            "add",
-            t_rows,
-            s_cols,
-            In::full(&mean),
-            In::scalar(&eps),
-            &meps,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    ); // E[x²] + eps
+    ops.push(pw2(
+        &format!("rmeps_{prefix}"),
+        "add",
+        t_rows,
+        s_cols,
+        In::full(&mean),
+        In::scalar(&eps),
+        &meps,
+        sym_id_base,
+        layout,
+    )?); // E[x²] + eps
     // 3 + 4. THE PIN, ITS WRITER AND ITS READER, AS ONE CONSTRUCTION (`lx_op_local_pair`):
     //   3. rinv = rsqrt(E[x²]+eps) — ONE native `rsqrt` (torch.rsqrt), not sqrt+reciprocal.
     //   4. apply: xn = x·r (r per-row, out-broadcast over cols); out = xn·gamma ([1,cols], mb-broadcast).
@@ -211,8 +207,11 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     // The pin's one statement of its extents: `rows` one-stick rows. A norm over zero rows has no
     // row to normalise, so the row count is refused HERE, at the one mint — the reduce above
     // refuses it too, over the same count.
-    let pin_rows = std::num::NonZeroU32::new(rows)
-        .ok_or_else(|| format!("rmsnorm {prefix}: a norm needs at least one row"))?;
+    let pin_rows = std::num::NonZeroU32::new(rows).ok_or_else(|| {
+        crate::superdsc_error::SuperDscError(format!(
+            "rmsnorm {prefix}: a norm needs at least one row"
+        ))
+    })?;
     let (rsqrt_op, xn_op) = crate::emit::lx_op_local_pair(
         crate::emit::OpLocalPair {
             of: out_id,
@@ -237,8 +236,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         lx_scope,
         sym_id_base,
         layout,
-    )
-    .map_err(|e| e.0)?;
+    )?;
     ops.push(rsqrt_op);
     ops.push(xn_op);
     // 6. OnePlusScale: gw = gamma + 1 — ONE `add` over the stored row with the
@@ -249,38 +247,32 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let gw_ones_h = ones_const.map(|c| (rb(&gw, 1, cols), rb(c, 1, stk)));
     let gamma_operand = match &gw_ones_h {
         Some((gw_handle, ones)) => {
-            ops.push(
-                pw2(
-                    &format!("rmga_{prefix}"),
-                    "add",
-                    RowCount::of_token_rows(1),
-                    BlockCols::of_feature_cols(cols),
-                    In::mb(&gamma),
-                    In::scalar(ones),
-                    gw_handle,
-                    sym_id_base,
-                    layout,
-                )
-                .map_err(|e| e.0)?,
-            ); // gw = γ + 1
+            ops.push(pw2(
+                &format!("rmga_{prefix}"),
+                "add",
+                RowCount::of_token_rows(1),
+                BlockCols::of_feature_cols(cols),
+                In::mb(&gamma),
+                In::scalar(ones),
+                gw_handle,
+                sym_id_base,
+                layout,
+            )?); // gw = γ + 1
             In::mb(gw_handle)
         }
         None => In::mb(&gamma),
     };
-    ops.push(
-        pw2(
-            &format!("rmg_{prefix}"),
-            "multiply",
-            t_rows,
-            f_cols,
-            In::full(&xn),
-            gamma_operand,
-            &out,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    );
+    ops.push(pw2(
+        &format!("rmg_{prefix}"),
+        "multiply",
+        t_rows,
+        f_cols,
+        In::full(&xn),
+        gamma_operand,
+        &out,
+        sym_id_base,
+        layout,
+    )?);
     Ok(ops)
 }
 
@@ -307,7 +299,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     eps_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp<T>>, String> {
+) -> Result<Vec<EmittedOp<T>>, crate::superdsc_error::SuperDscError> {
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
@@ -342,20 +334,17 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     let s_cols = BlockCols::of_one_stick(Lanes::FP16);
     // Steps 1–4 are `assemble_rmsnorm` verbatim — the same formula up to the
     // normalising multiply, because a unit-gain norm is the same norm.
-    ops.push(
-        pw2(
-            &format!("rmsq_{prefix}"),
-            "mul",
-            t_rows,
-            f_cols,
-            In::full(&x),
-            In::full(&x),
-            &sq16,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    ); // sq16 = x²
+    ops.push(pw2(
+        &format!("rmsq_{prefix}"),
+        "mul",
+        t_rows,
+        f_cols,
+        In::full(&x),
+        In::full(&x),
+        &sq16,
+        sym_id_base,
+        layout,
+    )?); // sq16 = x²
     // THE ONE PROBE-AND-SPLIT BODY owns the long form here too — the same body, the same
     // question, never a second spelling of the split law.
     let rmmean_op = format!("rmmean_{prefix}");
@@ -368,75 +357,65 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
                 cols,
                 Df::Fp16,
                 layout.map_or(ReduceDivision::Rows, BundleLayout::reduce_rows),
-            )?,
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?,
             ReduceDataLeg::whole(&sq16),
             ReduceAccumLeg::new(&mean, crate::addr::DevOff::ZERO),
             out_id,
-        )?,
+        )
+        .map_err(crate::superdsc_error::SuperDscError)?,
         sym_id_base,
         layout,
     )?;
     if let Some(split) = split {
         ops.extend(split);
     } else {
-        ops.push(
-            assemble_reduce_seeded(
-                &rmmean_op,
-                "mean",
-                rows,
-                cols,
-                &sq16,
-                &mean,
-                sym_id_base,
-                layout,
-            )
-            .map_err(|e| e.0)?,
-        );
+        ops.push(assemble_reduce_seeded(
+            &rmmean_op,
+            "mean",
+            rows,
+            cols,
+            &sq16,
+            &mean,
+            sym_id_base,
+            layout,
+        )?);
     }
-    ops.push(
-        pw2(
-            &format!("rmeps_{prefix}"),
-            "add",
-            t_rows,
-            s_cols,
-            In::full(&mean),
-            In::scalar(&eps),
-            &meps,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    ); // mean + eps
-    ops.push(
-        pw1(
-            &format!("rmrsqrt_{prefix}"),
-            "rsqrt",
-            t_rows,
-            s_cols,
-            In::full(&meps),
-            &rinv,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    ); // 1/√(mean+eps)
+    ops.push(pw2(
+        &format!("rmeps_{prefix}"),
+        "add",
+        t_rows,
+        s_cols,
+        In::full(&mean),
+        In::scalar(&eps),
+        &meps,
+        sym_id_base,
+        layout,
+    )?); // mean + eps
+    ops.push(pw1(
+        &format!("rmrsqrt_{prefix}"),
+        "rsqrt",
+        t_rows,
+        s_cols,
+        In::full(&meps),
+        &rinv,
+        sym_id_base,
+        layout,
+    )?); // 1/√(mean+eps)
     // Step 5 is the TERMINAL multiply here, not `Xn`: `out = x·rinv` with the
     // per-row reciprocal out-broadcast over cols — the same operand mode
     // (`In::col`) the gained form's `rmxn` uses for the same value.
-    ops.push(
-        pw2(
-            &format!("rmxn_{prefix}"),
-            "multiply",
-            t_rows,
-            f_cols,
-            In::full(&x),
-            In::col(&rinv),
-            &out,
-            sym_id_base,
-            layout,
-        )
-        .map_err(|e| e.0)?,
-    );
+    ops.push(pw2(
+        &format!("rmxn_{prefix}"),
+        "multiply",
+        t_rows,
+        f_cols,
+        In::full(&x),
+        In::col(&rinv),
+        &out,
+        sym_id_base,
+        layout,
+    )?);
     Ok(ops)
 }
 

@@ -4090,7 +4090,7 @@ pub fn rmsnorm<T: crate::collective::Tp>(
         layout,
         &mut crate::placement::LxScope::program(),
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// THE POINTWISE DEVICE-WIDTH PAD, CAPPED AT THE WIDTH THE OUTPUT'S PLACEMENT ACTUALLY HOLDS.
@@ -6683,8 +6683,8 @@ pub fn batch_matmul<T: crate::collective::Tp>(
                 sym_id_base,
                 layout,
             )
-            .map_err(|message| Error {
-                message: format!("{name}: {message}"),
+            .map_err(|e| Error {
+                message: format!("{name}: {}", e.0),
             })?,
         );
     }
@@ -10399,7 +10399,7 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
         layout,
         lx_scope,
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::RmsNormUnit`] —
@@ -10465,7 +10465,7 @@ pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
         sym_id_base,
         layout,
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::WindowedRmsNorm`] — the
@@ -10698,7 +10698,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             sym_id_base,
             layout,
         )
-        .map_err(|e| Error { message: e })?;
+        .map_err(Error::from)?;
         if let Some(split) = split {
             ops.extend(split);
         } else {
@@ -11562,7 +11562,7 @@ pub fn reduce<T: crate::collective::Tp>(
                 layout,
             )
             .map_err(|e| Error {
-                message: format!("{name}: {e}"),
+                message: format!("{name}: {}", e.0),
             })?;
             if let Some(ops) = split {
                 return Ok(ops);
@@ -11629,7 +11629,7 @@ pub fn reduce<T: crate::collective::Tp>(
                 layout,
             )
             .map_err(|e| Error {
-                message: format!("{name}: {e}"),
+                message: format!("{name}: {}", e.0),
             })?;
             if let Some(ops) = split {
                 return Ok(ops);
@@ -11742,7 +11742,7 @@ pub fn reduce_df<T: crate::collective::Tp>(
         layout,
     )
     .map_err(|e| Error {
-        message: format!("{name}: {e}"),
+        message: format!("{name}: {}", e.0),
     })?;
     if let Some(ops) = split {
         return Ok(ops);
