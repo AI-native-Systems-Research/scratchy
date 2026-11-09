@@ -156,7 +156,11 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
         parse_python_file(&dsl).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
     // The stem arrives as a FIELD of the typed error (compile_carrier is called once per
     // arch, so the per-config stem can only enter there) — printed, never parsed.
-    let tokens = compile_carrier(carrier, configs_dir).unwrap_or_else(|e| match e {
+    // A `superdsc-dump` build hands the bake THIS build script's output directory — the one place
+    // that knows it — so each baked bundle's dxp input lands beside the device images; any other
+    // build writes no dump.
+    let dump_dir = cfg!(feature = "superdsc-dump").then_some(out_dir);
+    let tokens = compile_carrier(carrier, configs_dir, dump_dir).unwrap_or_else(|e| match e {
         CarrierError::Config { stem, source } => {
             panic!("forward pipeline ({mod_name}/{stem}): {source}")
         }

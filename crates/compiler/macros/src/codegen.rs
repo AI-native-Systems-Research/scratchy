@@ -11325,9 +11325,17 @@ fn dump_wavefront_mega(
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
     // (spliced into the per-model module); empty under metal.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
+    // Where the bake writes each bundle's dxp input, when the build asked (`superdsc-dump`): the
+    // build script's own output directory, passed down from `compile_carrier`'s caller.
+    dump_dir: Option<&std::path::Path>,
 ) {
     use crate::to_wavefront;
     let stem = model.source_stem.as_str();
+    #[cfg(feature = "spyre")]
+    let dump = match dump_dir {
+        Some(d) => scratchy_target_spyre::lower_subtile_tape_to_superdsc::DumpRoot::under(d),
+        None => scratchy_target_spyre::lower_subtile_tape_to_superdsc::DumpRoot::NONE,
+    };
     // ⭐ THE MODEL'S ATTENTION FACTS ride the ops themselves now, minted once at the
     // bridge: every consumer below (the rolls, the wiring, the SuperDSC lowering) reads
     // the op's own value. A canonical stating no attention facts (a vision tower) holds
@@ -12070,6 +12078,7 @@ fn dump_wavefront_mega(
                             None,
                             superdsc::FoldGrouping::Split,
                             None,
+                            dump,
                         ) {
                             Ok(fp) => eprintln!(
                                 "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
@@ -12185,6 +12194,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            dump,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12220,6 +12230,7 @@ fn dump_wavefront_mega(
                                             } else {
                                                 unrolled_params
                                             },
+                                            dump,
                                         );
                                         match r {
                                             Ok(fp) => body_fps.push(fp),
@@ -12272,6 +12283,7 @@ fn dump_wavefront_mega(
                                                         Some(&rolled.layout),
                                                         superdsc::FoldGrouping::Fused,
                                                         rolled.attn_params,
+                                                        dump,
                                                     )
                                                     .map(superdsc::bundle::SiblingFp::from)
                                                     .unwrap_or_else(|e| {
@@ -12298,6 +12310,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            dump,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12493,6 +12506,7 @@ fn dump_wavefront_mega(
                                                                     } else {
                                                                         rung_params
                                                                     },
+                                                                    dump,
                                                                 ) {
                                                                     Ok(rfp) => {
                                                                         rfps.push(rfp);
@@ -12522,6 +12536,7 @@ fn dump_wavefront_mega(
                                                                             Some(&rr.layout),
                                                                             superdsc::FoldGrouping::Fused,
                                                                             rr.attn_params,
+                                                                            dump,
                                                                         )
                                                                         .map(
                                                                             superdsc::bundle::SiblingFp::from,
@@ -14679,6 +14694,9 @@ pub fn emit_model(
     // delegated load reads the canonical's widths, so its fingerprint
     // gate must too. `None` for canonicals themselves.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
+    // The build's own output directory for a `superdsc-dump` build (`compile_carrier`'s caller passes
+    // it); `None` writes no dump.
+    dump_dir: Option<&std::path::Path>,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
     // A head reading its target's KV (`reads_target_kv`) binds its target's TurboQuant runtime.
     let reads_target_kv = model.arch.reads_target_kv;
@@ -15360,6 +15378,7 @@ pub fn emit_model(
                     inferred,
                     &decode_bounds,
                     &mut ktir_bundle_const,
+                    dump_dir,
                 );
             }
             None => eprintln!(
@@ -18602,12 +18621,21 @@ mod fingerprint_tests {
     /// global θ. A config that stopped stating it would be a build error; this names it first.
     #[test]
     fn every_local_rotary_config_states_its_local_base() {
-        for arch in ["gemma3", "gemma4", "gemma4-moe", "gemma4-assistant", "modernbert"] {
+        for arch in [
+            "gemma3",
+            "gemma4",
+            "gemma4-moe",
+            "gemma4-assistant",
+            "modernbert",
+        ] {
             let dir = arch_configs(arch);
             let mut n = 0;
             for e in std::fs::read_dir(&dir).expect("arch configs") {
                 let path = e.expect("entry").path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
                 if !name.ends_with(".json")
                     || ["arch.json", "quantizations.json", "weights.json"].contains(&name)
                     || name.ends_with(".overrides.json")

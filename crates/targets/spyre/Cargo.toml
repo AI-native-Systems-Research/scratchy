@@ -37,9 +37,6 @@ spyre = []
 #                  image (`superdsc_bake::global()` is `None`). What a card bake lowers is decided here;
 #                  `spyre-hw` adds only the compiler that turns it into images, and the SDK.
 spyre-lower = ["spyre"]
-# WRITE EACH BAKED BUNDLE'S dxp INPUT under `<OUT_DIR>/superdsc-dump/<fp>/`, for diffing against a
-# known-good dump. An output a build names, off by default; it changes nothing the bake lowers.
-superdsc-dump = ["spyre"]
 spyre-hw = ["spyre-lower", "dep:flex-rs"]
 spyre-emu = ["spyre", "dep:ktir-emulator"]
 # ⭐ THE TRITON SPLICE IS THE ONLY PRODUCER — UNCONDITIONAL. `lower_one_node` routes
