@@ -194,7 +194,7 @@ struct RowReplay {
 struct StepImageData {
     canvas: std::sync::Arc<Vec<ControlBlockWire>>,
     rows: Vec<RowReplay>,
-    /// One label per CB of `canvas` (`cb_plan::CbPlan::cb_labels`, per row, concatenated): what a
+    /// One label per CB of `canvas` (each row render's own, `cb_plan::Rendered::labels`, concatenated): what a
     /// replayed step's response blocks are attributed to, since a replay records no launch
     /// sequence of its own (each CB is filed by its id in the session's [`RbHarvest`]).
     labels: Vec<String>,
@@ -471,83 +471,78 @@ struct RbOpCycles {
     /// previous CB to this CB's start (`ResponseBlockWire` words 4 and 2), over the CBs whose
     /// predecessor this card's ring has seen.
     idle: u64,
+    /// This op's CBs whose idle-before is not known — the CB in front of it on the pipeline was
+    /// not seen (another session's, or drained before the harvest began) — counted, never as 0.
+    idle_unknown: u64,
     label: String,
 }
 
 /// ⭐ ONE CARD'S HOST↔DEVICE CLOCK. A card's RB cycle words are its own free-running counter, which
 /// no other card shares and the host does not see, so a host event cannot be placed on it without
-/// a pair. Every completion is one: the host `Instant` its response was seen and the CB's end cycle.
-/// Seen is after the end by the response-poll latency, so the pair with the SMALLEST host-minus-
-/// device difference (at the measured rate) is the tightest bound, and the offset is taken there.
+/// a pair. Every completion is one: the host `Instant` its response was seen and the CB's end
+/// cycle. Seen trails the end by the response-poll latency, so at the counter's rate the pair with
+/// the SMALLEST host-minus-device difference is the tightest bound, and the offset is taken there.
 ///
-/// The rate is the counter's, measured over this card's own completions: the host-time span over
-/// the device-cycle span between the earliest and latest pairs.
+/// Fitted when it is read, over every pair so far, cycles counted from the first pair: the rate is
+/// the host span over the device span between the first and latest pairs, and the offset is the
+/// minimum at THAT rate. (An offset kept as a running minimum would mix rates measured over short
+/// early spans, each error multiplied by billions of cycles.)
 #[derive(Default)]
 struct RbClock {
     /// The run's host origin, set on the first pair.
     origin: Option<std::time::Instant>,
-    /// (host ns since origin, unwrapped device cycle) of the first pair, for the rate.
-    first: Option<(f64, u64)>,
-    /// The latest pair, for the rate and to unwrap the u32 counter.
-    latest: Option<(f64, u64)>,
-    /// The smallest (host ns − device cycle × ns/cycle) seen at the current rate — the offset.
-    best: Option<f64>,
+    /// Every pair: (host ns since origin, device cycles since the first pair, unwrapped).
+    pairs: Vec<(f64, u64)>,
+    /// The first pair's raw u32 cycle, and the latest pair's unwrapped count, to unwrap the next.
+    base: u32,
 }
 
 impl RbClock {
     /// One completion: host `seen`, device end cycle `end` (u32, wrapping).
     fn pair(&mut self, seen: std::time::Instant, end: u32) {
         let origin = *self.origin.get_or_insert(seen);
-        let h = seen.saturating_duration_since(origin).as_nanos() as f64;
-        // Unwrap the u32 counter against the latest pair: a CB's end is within a wrap of it.
-        let d = match self.latest {
-            Some((_, prev)) => {
-                let lo = prev as u32;
-                prev + u64::from(end.wrapping_sub(lo))
-                    - if end.wrapping_sub(lo) >= 1 << 31 {
-                        1 << 32
-                    } else {
-                        0
-                    }
-            }
-            None => u64::from(end),
-        };
-        self.first.get_or_insert((h, d));
-        self.latest = Some((h, d));
-        if let Some(r) = self.ns_per_cycle() {
-            let off = h - d as f64 * r;
-            self.best = Some(self.best.map_or(off, |b| b.min(off)));
+        if self.pairs.is_empty() {
+            self.base = end;
         }
+        let Some(d) = self.unwrap(end) else { return };
+        let h = seen.saturating_duration_since(origin).as_nanos() as f64;
+        self.pairs.push((h, d));
     }
 
-    /// Host ns per device cycle, once the pairs span enough of the run to measure it.
-    fn ns_per_cycle(&self) -> Option<f64> {
-        let ((h0, d0), (h1, d1)) = (self.first?, self.latest?);
-        (d1 > d0 + 10_000_000).then(|| (h1 - h0) / (d1 - d0) as f64)
-    }
-
-    /// The device cycle a host `Instant` corresponds to on this card, as an unwrapped count.
-    fn device_at(&self, t: std::time::Instant) -> Option<f64> {
-        let h = t.saturating_duration_since(self.origin?).as_nanos() as f64;
-        Some((h - self.best?) / self.ns_per_cycle()?)
-    }
-
-    /// The host instant a device cycle (unwrapped) corresponds to on this card.
-    fn host_at(&self, cycle: u64) -> Option<std::time::Instant> {
-        let ns = cycle as f64 * self.ns_per_cycle()? + self.best?;
-        Some(self.origin? + std::time::Duration::from_nanos(ns.max(0.0) as u64))
-    }
-
-    /// Unwrap a CB's u32 cycle word against this card's latest pair.
+    /// Unwrap a u32 cycle word to cycles since the first pair, against the latest pair (a word
+    /// is within half a wrap of it).
     fn unwrap(&self, c: u32) -> Option<u64> {
-        let (_, prev) = self.latest?;
-        let lo = prev as u32;
-        let back = lo.wrapping_sub(c);
-        Some(if back < 1 << 31 {
-            prev - u64::from(back)
+        let Some(&(_, prev)) = self.pairs.last() else {
+            return self.origin.map(|_| u64::from(c.wrapping_sub(self.base)));
+        };
+        let lo = (prev as u32).wrapping_add(self.base);
+        let fwd = c.wrapping_sub(lo);
+        Some(if fwd < 1 << 31 {
+            prev + u64::from(fwd)
         } else {
-            prev + u64::from(c.wrapping_sub(lo))
+            prev.saturating_sub(u64::from(lo.wrapping_sub(c)))
         })
+    }
+
+    /// (ns per cycle, offset ns) — the fit, once the pairs span enough of the run to measure it.
+    fn fit(&self) -> Option<(f64, f64)> {
+        let (&(h0, d0), &(h1, d1)) = (self.pairs.first()?, self.pairs.last()?);
+        if d1 < d0 + 10_000_000 {
+            return None;
+        }
+        let r = (h1 - h0) / (d1 - d0) as f64;
+        let off = self
+            .pairs
+            .iter()
+            .map(|&(h, d)| h - d as f64 * r)
+            .fold(f64::INFINITY, f64::min);
+        Some((r, off))
+    }
+
+    /// The host instant an unwrapped device cycle corresponds to on this card.
+    fn host_at(&self, cycle: u64, (r, off): (f64, f64)) -> Option<std::time::Instant> {
+        let ns = cycle as f64 * r + off;
+        Some(self.origin? + std::time::Duration::from_nanos(ns.max(0.0) as u64))
     }
 }
 
@@ -563,11 +558,30 @@ fn rb_host_us(t: std::time::Instant) -> f64 {
     }
 }
 
-/// What one submitted CB was, for `SCRATCHY_SDSC_RB_TIME`: the op it belongs to — (rung length,
-/// op index) for the walk, (image length, CB index) for a replayed step, so neither averages into
-/// the other — and its label.
+/// Which op a CB's cycles accumulate under — a walked op, or a CB of a replayed step's image. Two
+/// kinds, so a rung whose op count equals an image's CB count cannot share a row with it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RbKey {
+    /// A walked op: its rung's length (prefix, body and suffix lists each number from 0) and its
+    /// index.
+    Walk { rung: usize, op: usize },
+    /// A replayed step's CB: its image's length and the CB's index in it.
+    Replay { image: usize, cb: usize },
+}
+
+impl std::fmt::Display for RbKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Walk { rung, op } => write!(f, "walk ({rung},{op:<3})"),
+            Self::Replay { image, cb } => write!(f, "replay ({image},{cb:<3})"),
+        }
+    }
+}
+
+/// What one submitted CB was, for `SCRATCHY_SDSC_RB_TIME`: the op it accumulates under and its
+/// label.
 struct RbLabel {
-    key: (usize, usize),
+    key: RbKey,
     label: String,
 }
 
@@ -590,7 +604,7 @@ struct RbHarvest {
     /// Every submitted CB whose record has not been drained yet, by its id.
     labels: BTreeMap<u64, RbLabel>,
     /// Per-op harvested cycles, by the label's key.
-    cycles: BTreeMap<(usize, usize), RbOpCycles>,
+    cycles: BTreeMap<RbKey, RbOpCycles>,
     /// The DMA crossings' harvested cycles — the preamble-H2D and logits-D2H, which no op owns.
     /// Since #544 both ride the COMPUTE pipeline; `rb_attribute` routes them here by the
     /// direction `RbTiming::dma` carries, so these totals keep their pre-#544 meaning.
@@ -605,9 +619,14 @@ struct RbHarvest {
     last: Option<(u64, u32)>,
     /// ⭐ THIS CARD'S DOORBELLS, waiting for their first CB's record: (the submission's first CB
     /// id, the host `Instant` its submit returned). The record of that CB carries its device start
-    /// cycle and the host `Instant` its response was seen (`RbTiming::seen`), so the card's own
-    /// clock places the doorbell — see [`RbClock`].
+    /// cycle, and the card's own clock ([`RbClock`]) places both on the host's axis.
     doorbells: BTreeMap<u64, std::time::Instant>,
+    /// Doorbells whose first CB has been drained, for the report: (host instant rung, the CB's
+    /// unwrapped start cycle).
+    rung: Vec<(std::time::Instant, u64)>,
+    /// The step-head collective's waits, for the report: each one's release (the wait CB's start,
+    /// unwrapped) and how long the pipeline sat idle in front of it, in cycles.
+    waits: Vec<(u64, Option<u32>)>,
     /// The card's host↔device clock, fitted from its completions as they are drained.
     clock: RbClock,
     /// Drains, op CBs attributed, and `cbs` at the last periodic report — the count jumps a
@@ -619,17 +638,22 @@ struct RbHarvest {
 
 impl RbHarvest {
     /// File one submission's CBs under the ids the submit gave them, CB `i` at `ids.get(i)`.
-    fn label(&mut self, ids: SubmittedIds, labels: impl IntoIterator<Item = RbLabel>) {
-        for (i, l) in labels.into_iter().enumerate() {
-            match ids.get(i) {
-                Some(id) => {
-                    self.labels.insert(id, l);
-                }
-                // A submission that queued fewer CBs than it was labelled with — refused before
-                // its doorbell (the submit's error is the caller's). Nothing will complete for it.
-                None => break,
-            }
+    ///
+    /// ⛔ ONE LABEL PER CB, OR A REFUSAL: a submit returns ids only for a submission it queued whole
+    /// (a refused one is the caller's `Err`, labelled by no one), so a count that differs is a
+    /// labelling that does not describe what was submitted — refused, never truncated into CBs
+    /// that would then read as unlabelled with no cause.
+    fn label(&mut self, ids: SubmittedIds, labels: Vec<RbLabel>) -> Result<()> {
+        if labels.len() != ids.len() {
+            bail!(
+                "RB_TIME: a submission of {} CB(s) was labelled with {} — the labels were not \
+                 built from the list that was submitted",
+                ids.len(),
+                labels.len()
+            );
         }
+        self.labels.extend(ids.iter().zip(labels));
+        Ok(())
     }
 }
 /// Accumulators the timing modes write into. Process-wide, like the C++ statics.
@@ -749,6 +773,9 @@ impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
 
 impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, T> {
     fn drop(&mut self) {
+        if !self.rb.rung.is_empty() {
+            report_rb_bells(&self.rb, self.session().map(|r| r.get()));
+        }
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
         }
@@ -3954,7 +3981,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 // Each CB of this site, as `SCRATCHY_SDSC_RB_TIME` names it: the op, keyed by (rung
                 // length, op index) so prefix/body/suffix op numbers cannot average into each
                 // other, and which CB of the site it is.
-                let rb_key = (ops.len(), oi);
+                let rb_key = RbKey::Walk {
+                    rung: ops.len(),
+                    op: oi,
+                };
                 let rb_name = |kind: &str| RbLabel {
                     key: rb_key,
                     label: format!("{} {kind}", op.label()),
@@ -4148,7 +4178,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
         }
         for (ids, labels) in rb_subs {
-            self.rb.label(ids, labels);
+            self.rb.label(ids, labels)?;
         }
         Ok(())
     }
@@ -4776,18 +4806,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
         }
         for e in &entries {
-            let Some(rang) = h.doorbells.remove(&e.id) else {
-                continue;
-            };
-            let start = e.rb.timestamps()[0];
-            if let (Some(bell), Some(cb)) = (h.clock.device_at(rang), h.clock.unwrap(start)) {
-                let gap = cb as f64 - bell;
-                let cb_host = h.clock.host_at(cb).map_or(f64::NAN, rb_host_us);
-                eprintln!(
-                    "[sdsc-rbbell] {who} doorbell {:.1} us  first-CB {cb_host:.1} us  \
-                     doorbell->first-CB {gap:.0} cyc",
-                    rb_host_us(rang)
-                );
+            if let Some(rang) = h.doorbells.remove(&e.id)
+                && let Some(cb) = h.clock.unwrap(e.rb.timestamps()[0])
+            {
+                h.rung.push((rang, cb));
             }
         }
         // ⭐ THE JOIN, BY ID: each op record finds the label of the CB that produced it. Walked in
@@ -4816,23 +4838,20 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             match h.labels.remove(&e.id) {
                 Some(RbLabel { key, label }) => {
-                    // The step-head collective's wait, on the shared host axis: when it started
-                    // waiting and when its last peer's message let it go.
-                    if label.contains("Prefix") && label.ends_with(" wait") {
-                        let (a, b) = (h.clock.unwrap(ts[2]), h.clock.unwrap(ts[4]));
-                        if let (Some(a), Some(b)) = (a, b)
-                            && let (Some(ha), Some(hb)) = (h.clock.host_at(a), h.clock.host_at(b))
-                        {
-                            eprintln!(
-                                "[sdsc-rbbell] {who} prefix-wait {:.1} .. {:.1} us",
-                                rb_host_us(ha),
-                                rb_host_us(hb)
-                            );
-                        }
+                    // The step-head collective's wait: its release (the CB starts when its last
+                    // peer's message lands) and the idle in front of it.
+                    if label.contains("Prefix")
+                        && label.ends_with(" wait")
+                        && let Some(at) = h.clock.unwrap(ts[2])
+                    {
+                        h.waits.push((at, idle));
                     }
                     let acc = h.cycles.entry(key).or_default();
                     acc.cycles.add_compute(e.rb);
-                    acc.idle += idle.map_or(0, u64::from);
+                    match idle {
+                        Some(c) => acc.idle += u64::from(c),
+                        None => acc.idle_unknown += 1,
+                    }
                     if acc.label.is_empty() {
                         acc.label = label;
                     }
@@ -5701,11 +5720,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             self.rb.label(
                 ids,
-                image.data.labels.iter().enumerate().map(|(i, l)| RbLabel {
-                    key: (cbs, i),
-                    label: format!("replay {l}"),
-                }),
-            );
+                image
+                    .data
+                    .labels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| RbLabel {
+                        key: RbKey::Replay { image: cbs, cb: i },
+                        label: format!("replay {l}"),
+                    })
+                    .collect(),
+            )?;
         }
         let mut t = timers();
         t.replay_steps += 1;
@@ -7004,6 +7029,33 @@ fn rb_class_window(
     window
 }
 
+/// ⭐ THE STEP HEAD ON THE HOST'S AXIS, printed once, when the card's session ends (the clock is
+/// fitted over the whole run then): this card's doorbells against their first CB's start, and its
+/// step-head collective's releases, placed by the card's own clock.
+fn report_rb_bells(h: &RbHarvest, rank: Option<u32>) {
+    let who = rank.map_or_else(|| "solo".to_string(), |r| format!("rank {r}"));
+    if let Some(fit) = h.clock.fit() {
+        for &(rang, cb) in &h.rung {
+            if let Some(start) = h.clock.host_at(cb, fit) {
+                eprintln!(
+                    "[sdsc-rbbell] {who} doorbell {:.1} us  first-CB {:.1} us",
+                    rb_host_us(rang),
+                    rb_host_us(start)
+                );
+            }
+        }
+        for &(at, idle) in &h.waits {
+            if let Some(t) = h.clock.host_at(at, fit) {
+                let idle = idle.map_or_else(|| "unknown".to_string(), |c| c.to_string());
+                eprintln!(
+                    "[sdsc-rbbell] {who} prefix-wait released {:.1} us  idle before {idle} cyc",
+                    rb_host_us(t)
+                );
+            }
+        }
+    }
+}
+
 /// The RB-timestamp report: per-op device cycles, harvested from the response blocks at
 /// completion (no drain), cumulative across the run. Phases are named per the card-measured slot
 /// semantics ([`flex_rs::control_block_wire::ResponseBlockWire::exec_cmpt_cycles`] and siblings):
@@ -7028,9 +7080,9 @@ fn report_rb_time(h: &RbHarvest, rank: Option<u32>) {
         .map(|(k, a)| (a.cycles.exec, *k, a))
         .collect();
     top.sort_by_key(|a| std::cmp::Reverse(a.0));
-    for (cyc, (rung, oi), a) in top.iter().take(20) {
+    for (cyc, key, a) in top.iter().take(20) {
         eprintln!(
-            "[sdsc-rbtime]   {who} op ({rung},{oi:<3}) {:>12} cyc exec  {:>9} cyc/cb  {:6} cbs  \
+            "[sdsc-rbtime]   {who} {key} {:>12} cyc exec  {:>9} cyc/cb  {:6} cbs  \
              prep {:>12}  {}",
             cyc,
             cyc / a.cycles.cbs.max(1),
@@ -7045,12 +7097,14 @@ fn report_rb_time(h: &RbHarvest, rank: Option<u32>) {
     let mut idle: Vec<_> = h.cycles.iter().map(|(k, a)| (a.idle, *k, a)).collect();
     idle.sort_by_key(|a| std::cmp::Reverse(a.0));
     eprintln!("[sdsc-rbtime]   {who} idle before CBs: {idle_total} cyc in all; the largest:");
-    for (cyc, (rung, oi), a) in idle.iter().take(12) {
+    for (cyc, key, a) in idle.iter().take(12) {
         eprintln!(
-            "[sdsc-rbtime]   {who} idle ({rung},{oi:<3}) {:>12} cyc  {:>9} cyc/cb  {:6} cbs  {}",
+            "[sdsc-rbtime]   {who} idle {key} {:>12} cyc  {:>9} cyc/cb  {:6} cbs  \
+             ({} unknown)  {}",
             cyc,
-            cyc / a.cycles.cbs.max(1),
+            cyc / a.cycles.cbs.saturating_sub(a.idle_unknown).max(1),
             a.cycles.cbs,
+            a.idle_unknown,
             a.label
         );
     }

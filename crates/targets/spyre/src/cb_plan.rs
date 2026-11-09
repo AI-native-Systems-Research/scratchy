@@ -534,11 +534,11 @@ impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
     /// input: the same `seg_deltas` the walk calls, applied to the entry's
     /// recorded (base, static shift) with ONE combined `shifted` per segment,
     /// exactly as the walk computes it.
-    pub(crate) fn render(
-        &self,
-        fold: &SessionKv,
-        where_: &LaunchWhere,
-    ) -> Result<(Vec<BatchedCb>, bool)> {
+    ///
+    /// ⭐ AND EACH CB'S LABEL, from the CB itself: the entry's label and the CB's own
+    /// [`BatchedCb::kind`] — the one statement of what a staged CB is, read off the CB this render
+    /// built, so label `i` names CB `i` by construction.
+    pub(crate) fn render(&self, fold: &SessionKv, where_: &LaunchWhere) -> Result<Rendered> {
         let Some(per) = UniformPages::sweeping(where_.n_fold_pages, fold) else {
             bail!(
                 "cb_plan render: the page maps do not admit a uniform {}-page sweep",
@@ -546,6 +546,7 @@ impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
             );
         };
         let mut items = Vec::with_capacity(self.entries.len());
+        let mut labels = Vec::with_capacity(self.entries.len());
         let mut barrier = false;
         for e in &self.entries {
             let aim = fold_plan::seg_deltas(
@@ -581,82 +582,31 @@ impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
                 );
             }
             barrier |= e.barrier;
-            items.extend(site_cbs(
+            let cbs = site_cbs(
                 e.tp,
                 BatchedCompute {
                     prog: e.prog.clone(),
                     tensor_allocs,
                     bootstrap_offset: e.bootstrap_offset,
                 },
-            )?);
+            )?;
+            labels.extend(cbs.iter().map(|c| format!("{} {}", e.label, c.kind())));
+            items.extend(cbs);
         }
-        Ok((items, barrier))
-    }
-
-    /// The label of every CB [`Self::render`] stages at `where_`, in submission order — the op's
-    /// label with its pass, then which of its CBs (`send`, `wait`, `launch`). The SAME enumeration
-    /// `render` walks, the entries a page part with no page skips included, so entry `i` names
-    /// the `i`-th CB of the render: what a replayed step's response blocks are attributed to.
-    pub(crate) fn cb_labels(&self, fold: &SessionKv, where_: &LaunchWhere) -> Result<Vec<String>> {
-        let Some(per) = UniformPages::sweeping(where_.n_fold_pages, fold) else {
-            bail!(
-                "cb_plan labels: the page maps do not admit a uniform {}-page sweep",
-                where_.n_fold_pages
-            );
-        };
-        let mut out = Vec::with_capacity(self.entries.len());
-        for e in &self.entries {
-            let aim = fold_plan::seg_deltas(
-                &e.kv,
-                fold,
-                e.rep,
-                per,
-                SlotPos::of_launch(where_.slot_pos.0),
-                where_.kv_page_base,
-            );
-            if aim.deltas().is_none() {
-                continue;
-            }
-            out.extend(
-                entry_cbs(&e.tp)
-                    .into_iter()
-                    .map(|k| format!("{} {k}", e.label)),
-            );
-        }
-        Ok(out)
-    }
-
-    /// Which entry, and which of its CBs, the plan's `i`-th CB is — the CBs an entry stages are
-    /// [`entry_cbs`]'s (one per message of each send, one wait per message slot, the launch), so
-    /// a refusal names the send or wait, not just its group.
-    fn cb_label(&self, i: usize) -> String {
-        self.entries
-            .iter()
-            .flat_map(|e| entry_cbs(&e.tp).into_iter().map(move |k| (e, k)))
-            .nth(i)
-            .map_or_else(|| format!("CB {i}"), |(e, k)| format!("{} {k}", e.label))
+        Ok(Rendered {
+            items,
+            labels,
+            barrier,
+        })
     }
 }
 
-/// The kind of every CB [`site_cbs`] stages for `tp`, in order — the same walk, without the
-/// addresses: each send is one CB per message, the waits one CB per message slot over every
-/// peer, then the launch.
-fn entry_cbs<T: ktir_superdsc::collective::Tp>(tp: &SiteTp<T>) -> Vec<&'static str> {
-    let messages = tp.bound.map_or(0, |b| b.send.messages().count());
-    let mut out = Vec::new();
-    let mut waited = false;
-    for step in group_steps(tp.index, tp.consume) {
-        match step {
-            CbStep::Send { .. } => out.extend(std::iter::repeat_n("send", messages)),
-            CbStep::Wait { .. } if !waited => {
-                waited = true;
-                out.extend(std::iter::repeat_n("wait", messages));
-            }
-            CbStep::Wait { .. } => {}
-            CbStep::Launch { .. } => out.push("launch"),
-        }
-    }
-    out
+/// What [`CbPlan::render`] stages at one `where_`: the CBs, one label per CB in the same order, and
+/// the walk's host-fence OR.
+pub(crate) struct Rendered {
+    pub(crate) items: Vec<BatchedCb>,
+    pub(crate) labels: Vec<String>,
+    pub(crate) barrier: bool,
 }
 
 /// Assemble the plan for one launch call: the (op, fold pass) enumeration and
@@ -767,7 +717,11 @@ pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
 ) -> Result<usize> {
     let (walked, walked_barrier) = walk_items(ops, fold, seg, banks, where_)?;
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
-    let (rendered, rendered_barrier) = plan.render(fold, where_)?;
+    let Rendered {
+        items: rendered,
+        labels: rendered_labels,
+        barrier: rendered_barrier,
+    } = plan.render(fold, where_)?;
     if walked.len() != rendered.len() {
         bail!(
             "[cbplan] PARITY REFUSED at {label}: the walk stages {} launch(es) but the plan \
@@ -804,7 +758,7 @@ pub(crate) fn parity_check<T: ktir_superdsc::collective::Tp>(
                  data twin of the walk disagrees; refusing to load rather than replay a \
                  wrong image.",
                 old.len(),
-                plan.cb_label(i)
+                rendered_labels[i]
             );
         }
     }
@@ -992,7 +946,7 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
     banks: &[Option<DevAddr>],
     where_: &LaunchWhere,
     stream: &Stream,
-) -> Result<(Vec<ControlBlockWire>, PatchPlan)> {
+) -> Result<(Vec<ControlBlockWire>, Vec<String>, PatchPlan)> {
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
     if pos % fold_plan::SLAB_SLOTS >= fold_plan::SLAB_SLOTS - 1 {
@@ -1030,14 +984,18 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
 
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
     let render = |w: &LaunchWhere| -> Result<Vec<ControlBlockWire>> {
-        let (items, _) = plan.render(fold, w)?;
+        let items = plan.render(fold, w)?.items;
         Ok(stream.render_batch(&items, 1)?)
     };
     // The canvas, rendered once — and the host-fence OR with it: a constant
     // of the plan (entry-keyed, the same for every render of this plan), so
     // the canvas render's value is the image's, what the player submits
     // every step of this image with.
-    let (items, barrier) = plan.render(fold, where_)?;
+    let Rendered {
+        items,
+        labels,
+        barrier,
+    } = plan.render(fold, where_)?;
     let canvas = stream.render_batch(&items, 1)?;
     // The two differentials. Each moves exactly one scalar's worth of
     // arithmetic — the other held — so each moving word's measured difference
@@ -1098,6 +1056,7 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
     let reference = step_scalars(fold.paged, per, pos);
     Ok((
         canvas,
+        labels,
         PatchPlan {
             reference,
             patches,
@@ -1113,7 +1072,7 @@ pub(crate) fn build_patch_plan<T: ktir_superdsc::collective::Tp>(
 pub(crate) struct RowImage {
     pub(crate) canvas: Vec<ControlBlockWire>,
     pub(crate) plan: PatchPlan,
-    /// One label per CB of `canvas` ([`CbPlan::cb_labels`]) — what a replayed step's response
+    /// One label per CB of `canvas` (its render's own, [`Rendered::labels`]) — what a replayed step's response
     /// blocks are attributed to, since a replay records no launch sequence of its own.
     pub(crate) labels: Vec<String>,
 }
@@ -1137,8 +1096,11 @@ pub(crate) fn render_row<T: ktir_superdsc::collective::Tp>(
     stream: &Stream,
 ) -> Result<RowImage> {
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;
-    let (items, barrier) = plan.render(fold, where_)?;
-    let labels = plan.cb_labels(fold, where_)?;
+    let Rendered {
+        items,
+        labels,
+        barrier,
+    } = plan.render(fold, where_)?;
     let canvas = stream.render_batch(&items, 1)?;
     let per = fold.page_slots.get().max(1);
     Ok(RowImage {
@@ -1184,7 +1146,7 @@ pub(crate) fn patch_check<T: ktir_superdsc::collective::Tp>(
     // the walk at this exact `where_` — patching a canvas that already
     // disagreed with the walk would verify nothing.
     parity_check(ops, fold, seg, banks, where_, label, stream)?;
-    let (canvas, patch_plan) = build_patch_plan(ops, fold, seg, banks, where_, stream)
+    let (canvas, labels, patch_plan) = build_patch_plan(ops, fold, seg, banks, where_, stream)
         .map_err(|e| anyhow!("[cbpatch] {label}: patch-table derivation REFUSED — {e:#}"))?;
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
@@ -1258,9 +1220,7 @@ pub(crate) fn patch_check<T: ktir_superdsc::collective::Tp>(
             }
         }
     }
-    // The labels come from the plan `parity_check` above proved the canvas equal to, CB for CB,
-    // so label `i` names canvas CB `i` by that proof.
-    let labels = build_cb_plan(ops, fold, seg, banks, where_)?.cb_labels(fold, where_)?;
+    // The labels are the canvas render's own (`CbPlan::render`): label `i` names canvas CB `i`.
     Ok((
         patch_plan.patches.len(),
         RowImage {
@@ -1377,19 +1337,12 @@ mod tests {
         check::<TpWorld<8>>();
     }
 
-    /// ⭐ THE LABELS ARE THE CBS: [`entry_cbs`] — what a replayed step's response blocks are named
-    /// by ([`CbPlan::cb_labels`]) — states exactly the CBs [`site_cbs`] stages, kind for kind and in
-    /// order, for a plain launch, a one-message consume and a multi-message one, at every world. A
-    /// drift between the two would attribute a replayed step's cycles to the wrong CB.
+    /// ⭐ A CB'S KIND IS ITS OWN: [`BatchedCb::kind`] names every CB [`site_cbs`] stages — a plain
+    /// launch, and a one- and a multi-message consume's sends, waits and consume launch — at every
+    /// world, so a render's labels (built from the CBs it staged) name each one, the consume as
+    /// `consume` on the walk and in a replay alike.
     #[test]
-    fn the_cb_labels_name_exactly_the_cbs_a_site_stages() {
-        fn kind(cb: &BatchedCb) -> &'static str {
-            match cb {
-                BatchedCb::Send(_) => "send",
-                BatchedCb::Wait { .. } => "wait",
-                BatchedCb::Compute(_) | BatchedCb::Consume(_) => "launch",
-            }
-        }
+    fn every_staged_cb_names_its_own_kind() {
         fn check<T: Tp>() {
             let plain = SiteTp::<T> {
                 index: 2,
@@ -1398,8 +1351,8 @@ mod tests {
             };
             let cbs = site_cbs(plain, launch()).unwrap();
             assert_eq!(
-                entry_cbs(&plain),
-                cbs.iter().map(kind).collect::<Vec<_>>(),
+                cbs.iter().map(BatchedCb::kind).collect::<Vec<_>>(),
+                ["launch"],
                 "a plain site, world {}",
                 <T as World>::RANKS
             );
@@ -1419,10 +1372,21 @@ mod tests {
                         consume: Some(consume(me)),
                         bound: Some(BoundCollective { send, me }),
                     };
-                    let cbs = site_cbs(tp, launch()).unwrap();
+                    let kinds: Vec<_> = site_cbs(tp, launch())
+                        .unwrap()
+                        .iter()
+                        .map(BatchedCb::kind)
+                        .collect();
+                    // Every message to every peer, then one wait per message (each over every
+                    // peer's sid for that slot; none with no peers), then the consume.
+                    let messages = send.messages().count();
+                    let peers = <T as World>::RANKS as usize - 1;
+                    let mut want = vec!["send"; messages * peers];
+                    want.extend(vec!["wait"; if peers > 0 { messages } else { 0 }]);
+                    want.push("consume");
                     assert_eq!(
-                        entry_cbs(&tp),
-                        cbs.iter().map(kind).collect::<Vec<_>>(),
+                        kinds,
+                        want,
                         "a {bytes}-byte consume at rank {} of world {}",
                         me.get(),
                         <T as World>::RANKS

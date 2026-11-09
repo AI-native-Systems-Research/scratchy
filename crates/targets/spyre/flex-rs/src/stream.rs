@@ -307,8 +307,9 @@ impl SubmittedIds {
     /// No control block was queued.
     pub const NONE: SubmittedIds = SubmittedIds { first: 0, count: 0 };
 
-    /// The `count` ids from `first` — the one reservation `prepare_cbs` made.
-    pub const fn range(first: u64, count: u64) -> SubmittedIds {
+    /// The `count` ids from `first` — the one reservation `prepare_cbs` made. Crate-private: ids
+    /// are minted by the response worker, never by a caller.
+    pub(crate) const fn range(first: u64, count: u64) -> SubmittedIds {
         SubmittedIds { first, count }
     }
 
@@ -367,8 +368,11 @@ pub trait SchedulerHandle: Send + Sync {
     /// semantics (`mode`) and eventual hardware submission; `completion` must
     /// be invoked exactly once, synchronously or asynchronously.
     ///
-    /// Returns the ids the operation's control blocks were given ([`SubmittedIds`]) — empty for an
-    /// operation that queued none (a host callback, an event, a failed submission).
+    /// Returns the ids a COMPUTE operation's control blocks were given ([`SubmittedIds`]). Every
+    /// other kind returns [`SubmittedIds::NONE`] — a host callback, an event or a failed submission
+    /// queues no CB, and a DMA, fill or p2p operation's CBs (which do complete into the RB ring,
+    /// with their direction on `RbTiming::dma`) are not handed back, because no caller attributes
+    /// them per CB: their totals are kept by direction.
     fn schedule(
         &self,
         stream_id: StreamId,
