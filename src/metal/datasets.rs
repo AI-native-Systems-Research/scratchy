@@ -654,6 +654,9 @@ fn summary_map(
         let (Some(ours), Some(theirs)) = (ours, theirs) else {
             return Err("not run at this load");
         };
+        if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
+            return Err("most requests failed");
+        }
         let a = buckets::median_in(ours, row.timing, b);
         let t = buckets::median_in(theirs, row.timing, b);
         let r = tasks::times(a, t, true).ok_or("no requests this long")?;

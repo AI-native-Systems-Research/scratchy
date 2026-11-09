@@ -4215,6 +4215,37 @@ mod tests {
         assert!(html.contains("Mamba-2 on Apple M3 Pro: not run yet."));
     }
 
+    /// A summary square against a cell most of whose requests failed has no ratio: it says why.
+    #[test]
+    fn a_summary_square_against_a_mostly_failed_cell_has_no_ratio() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        // Prompt counts on the RAG cells, so the summary has buckets to draw.
+        let m = &mut runs[0].models[0];
+        for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            for c in cells.iter_mut().filter(|c| c.workload == "rag") {
+                let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                c.prompt_tokens = Some(vec![Some(3200); n]);
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("vs oMLX</strong>"), "ratios while all answer");
+        assert!(!html.contains("most requests failed"));
+        let omlx = runs[0].models[0].tasks_omlx.iter_mut().flatten();
+        for c in omlx.filter(|c| c.workload == "rag") {
+            let sent = c.completed.unwrap() + c.failed.unwrap_or(0);
+            c.completed = Some(1);
+            c.failed = Some(sent - 1);
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("most requests failed"));
+        assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
+    }
+
     #[test]
     fn a_machine_that_did_not_run_a_dataset_has_a_button_saying_so() {
         // The M3 Pro ran rag; the grid-only M5 Max ran no dataset, and still has its buttons.
