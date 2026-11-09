@@ -687,8 +687,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         }
     };
 
-    // One kernel on one card: the first card senlib enumerates.
-    let card = crate::runtime::CardRuntime::open(0).map_err(|e| anyhow!("open card 0: {e}"))?;
+    // One kernel on one card: a world of one's card, the first senlib enumerates.
+    let card = crate::runtime::WorldCards::<Alone>::open_all()
+        .map_err(|e| anyhow!("{e}"))?
+        .into_first();
     let mut exec = crate::superdsc_exec::Executor::load(
         &card,
         code,

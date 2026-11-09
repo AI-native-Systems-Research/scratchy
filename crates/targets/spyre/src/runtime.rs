@@ -41,6 +41,7 @@ use flex_rs::allocator::{
     AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,
     FlexAllocatorInit,
 };
+pub use flex_rs::card_table::{CardTable, CardTableError, EnumeratedCard};
 use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
 use flex_rs::dma::{
@@ -99,9 +100,8 @@ impl<T: ktir_superdsc::collective::Tp> fmt::Debug for CardRuntime<T> {
 }
 
 impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
-    /// Open card `index` of the cards senlib enumerates (its PCI address resolved by senlib, then
-    /// opened BY THAT ADDRESS, so the card opened is the card named) and bring its runtime up
-    /// (~5.7 s cold).
+    /// Open one card of a world's card set ([`WorldCards`]) — BY ITS PCIe ADDRESS, so the card
+    /// opened is the card named — and bring its runtime up (~5.7 s cold).
     ///
     /// Single on-card domain (`DomainId(0)`), unconditionally: nothing in this codebase has ever
     /// asked the topology which domain is real, and this module does not invent a multi-domain
@@ -114,15 +114,8 @@ impl<T: ktir_superdsc::collective::Tp> CardRuntime<T> {
     /// before anything is opened, so the host buffers bring-up touches first land on that node.
     /// Open each card on its own thread (as the worker does) and each thread lands on its card's
     /// node.
-    pub fn open(index: u32) -> Result<Self, HwError> {
-        let pci = flex_rs::senlib_ffi::pcie_address_for_card(index);
-        if pci.is_empty() {
-            return Err(HwError::BringUp(Arc::new(BringUpError::NoSuchCard {
-                index,
-                cards: flex_rs::senlib_ffi::sen_pci_card_count(),
-            })));
-        }
-        Self::build(index, &pci).map_err(|e| HwError::BringUp(Arc::new(e)))
+    pub fn open(card: &WorldCard<T>) -> Result<Self, HwError> {
+        Self::build(card.0.index(), card.0.pci()).map_err(|e| HwError::BringUp(Arc::new(e)))
     }
 
     fn build(index: u32, pci: &str) -> Result<Self, BringUpError> {
@@ -380,11 +373,123 @@ impl fmt::Display for HwError {
 }
 impl std::error::Error for HwError {}
 
+/// ⭐ THE WORLD'S CARDS — one distinct card per rank of world `T`, claimed from the host's card table
+/// ([`CardTable`], senlib's enumeration read once). Rank `r` runs on `cards.get(r)`: an index into a
+/// value with exactly `T::RANKS` cards, not an integer re-derived per rank.
+///
+/// ⭐ THE SOURCE, STATED: the world is the FIRST `T::RANKS` cards of senlib's enumeration, in its
+/// order — what every TP build has run on. A different subset is a second, typed source; never an
+/// environment variable.
+///
+/// ⭐ DISTINCT BY CONSTRUCTION: [`Self::claim`] is the only constructor and refuses a repeated
+/// address, so no two ranks hold one card and nothing downstream checks it again.
+#[derive(Debug)]
+pub struct WorldCards<T: ktir_superdsc::collective::Tp>(PerRank<T, WorldCard<T>>);
+
+/// One rank's card of a [`WorldCards`] — only a claim mints one, so a card opened as a rank's is a
+/// card its world claimed.
+#[derive(Debug)]
+pub struct WorldCard<T: ktir_superdsc::collective::Tp>(EnumeratedCard, std::marker::PhantomData<T>);
+
+impl<T: ktir_superdsc::collective::Tp> WorldCard<T> {
+    /// The claimed card's PCIe address.
+    pub fn pci(&self) -> &str {
+        self.0.pci()
+    }
+}
+
+/// Why a world's cards could not be claimed from the host's table — a fact of this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// The world needs more cards than senlib enumerates.
+    TooFewCards { needed: u32, enumerated: usize },
+    /// senlib names one PCIe address for two enumerated cards.
+    RepeatedCard { pci: String },
+}
+
+impl fmt::Display for ClaimRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooFewCards { needed, enumerated } => write!(
+                f,
+                "this build's world needs {needed} Spyre card(s); senlib enumerates {enumerated}"
+            ),
+            Self::RepeatedCard { pci } => write!(
+                f,
+                "senlib names card {pci} twice — a world's ranks need distinct cards"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClaimRefusal {}
+
+impl<T: ktir_superdsc::collective::Tp> WorldCards<T> {
+    /// Claim world `T`'s cards from `table`: rank `r` is the table's `r`-th card.
+    ///
+    /// # Errors
+    /// [`ClaimRefusal`], by name.
+    pub fn claim(table: &CardTable) -> Result<Self, ClaimRefusal> {
+        let cards = table.cards();
+        let needed = <T as crate::bundle_code::collective::World>::RANKS;
+        if cards.len() < needed as usize {
+            return Err(ClaimRefusal::TooFewCards {
+                needed,
+                enumerated: cards.len(),
+            });
+        }
+        let world = &cards[..needed as usize];
+        for (i, c) in world.iter().enumerate() {
+            if world[..i].iter().any(|p| p.pci() == c.pci()) {
+                return Err(ClaimRefusal::RepeatedCard {
+                    pci: c.pci().to_string(),
+                });
+            }
+        }
+        Ok(WorldCards(PerRank::from_fn(|r| {
+            WorldCard(world[r.get() as usize].clone(), std::marker::PhantomData)
+        })))
+    }
+
+    /// Rank by rank, each rank's card.
+    pub fn per_rank(&self) -> &PerRank<T, WorldCard<T>> {
+        &self.0
+    }
+
+    /// Claim the world's cards from this host's table and open every one, each on its own thread
+    /// (their ~5.7 s bring-ups overlap), joined in rank order.
+    ///
+    /// # Errors
+    /// The table, the claim, or the first rank whose card does not open — named.
+    pub fn open_all() -> Result<PerRank<T, CardRuntime<T>>, String> {
+        let table = CardTable::enumerate().map_err(|e| format!("Spyre card table: {e}"))?;
+        let world = std::sync::Arc::new(Self::claim(&table).map_err(|e| e.to_string())?);
+        let open = PerRank::<T, _>::from_fn(|r| {
+            let world = std::sync::Arc::clone(&world);
+            std::thread::spawn(move || CardRuntime::<T>::open(world.per_rank().get(r)))
+        });
+        open.try_map_into(|r, h| {
+            h.join()
+                .map_err(|_| format!("card of rank {}: bring-up thread panicked", r.get()))?
+                .map_err(|e| format!("open the card of rank {}: {e}", r.get()))
+        })
+    }
+
+    /// One line naming every rank's card — the world's card set, for the log.
+    ///
+    /// (A world of one is the same claim: its card is the first senlib enumerates.)
+    pub fn describe(&self) -> String {
+        self.0
+            .iter()
+            .map(|(r, c)| format!("r{}={}", r.get(), c.pci()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Why a card's runtime could not be constructed — the refusing layer's own error.
 #[derive(Debug)]
 pub enum BringUpError {
-    /// senlib enumerates no card at `index`.
-    NoSuchCard { index: u32, cards: i64 },
     /// `Card::open` refused: senlib could not open the card, or opened a different one.
     Open(String),
     /// The open card could not report its memory capacity.
@@ -402,9 +507,6 @@ pub enum BringUpError {
 impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoSuchCard { index, cards } => {
-                write!(f, "no Spyre card {index}: senlib enumerates {cards}")
-            }
             Self::Open(e) => write!(f, "card open: {e}"),
             Self::Memory(e) => write!(f, "card memory capacity: {e}"),
             Self::AllocatorInit(e) => write!(f, "{e}"),
@@ -1352,8 +1454,6 @@ impl DevAddr {
 /// device p2p RDMA is refused, never served over the host.
 #[derive(Debug)]
 pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
-    /// Two ranks were handed the same card.
-    SameCard { card: String },
     /// A card is already linked, as another rank or for another window.
     AlreadyLinked {
         card: String,
@@ -1371,10 +1471,6 @@ pub enum AttachRefusal<T: ktir_superdsc::collective::Tp> {
 impl<T: ktir_superdsc::collective::Tp> fmt::Display for AttachRefusal<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SameCard { card } => write!(
-                f,
-                "two ranks were handed the same card ({card}) — a rank cannot send to itself"
-            ),
             Self::AlreadyLinked {
                 card,
                 linked,
@@ -1443,16 +1539,6 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
     cards: &PerRank<T, CardRuntime<T>>,
     window: RecvWindow<T>,
 ) -> Result<(), AttachRefusal<T>> {
-    for (r, a) in cards.iter() {
-        if cards
-            .iter()
-            .any(|(p, b)| p.get() < r.get() && b.card.pci() == a.card.pci())
-        {
-            return Err(AttachRefusal::SameCard {
-                card: a.card.pci().to_string(),
-            });
-        }
-    }
     let region2: PerRank<T, u64> = PerRank::try_from_fn(|r| {
         flex_rs::senlib_ffi::pci_addr_for_region(cards.get(r).card.pci(), 2)
     })
@@ -1679,5 +1765,57 @@ mod tests {
         }
         assert_eq!(walk(&addr, 8), old);
         assert_eq!(old.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod world_cards_tests {
+    use super::{CardTable, ClaimRefusal, WorldCards};
+    use crate::bundle_code::collective::{Rank, TpWorld};
+
+    fn table(pcis: &[&str]) -> CardTable {
+        CardTable::of(
+            pcis.iter()
+                .enumerate()
+                .map(|(i, p)| (i as u32, p.to_string())),
+        )
+    }
+
+    /// ⭐ THE WORLD IS THE TABLE'S FIRST `RANKS` CARDS, IN ITS ORDER: rank `r` holds the `r`-th.
+    #[test]
+    fn a_world_claims_the_first_cards_in_order() {
+        let t = table(&["0000:1a:00.0", "0000:1b:00.0", "0000:1c:00.0"]);
+        let w = WorldCards::<TpWorld<2>>::claim(&t).unwrap();
+        assert_eq!(w.per_rank().get(Rank::of::<0>()).pci(), "0000:1a:00.0");
+        assert_eq!(w.per_rank().get(Rank::of::<1>()).pci(), "0000:1b:00.0");
+        assert_eq!(w.describe(), "r0=0000:1a:00.0 r1=0000:1b:00.0");
+    }
+
+    /// A world bigger than the host refuses, by name.
+    #[test]
+    fn a_world_bigger_than_the_host_is_refused() {
+        let t = table(&["0000:1a:00.0"]);
+        assert_eq!(
+            WorldCards::<TpWorld<2>>::claim(&t).unwrap_err(),
+            ClaimRefusal::TooFewCards {
+                needed: 2,
+                enumerated: 1
+            }
+        );
+    }
+
+    /// ⭐ DISTINCT BY CONSTRUCTION: a table naming one address twice inside the world refuses; past
+    /// the world's cards, a repeat is not the world's concern.
+    #[test]
+    fn a_repeated_card_inside_the_world_is_refused() {
+        let t = table(&["0000:1a:00.0", "0000:1a:00.0", "0000:1c:00.0"]);
+        assert_eq!(
+            WorldCards::<TpWorld<2>>::claim(&t).unwrap_err(),
+            ClaimRefusal::RepeatedCard {
+                pci: "0000:1a:00.0".to_string()
+            }
+        );
+        let t = table(&["0000:1a:00.0", "0000:1b:00.0", "0000:1b:00.0"]);
+        assert!(WorldCards::<TpWorld<2>>::claim(&t).is_ok());
     }
 }

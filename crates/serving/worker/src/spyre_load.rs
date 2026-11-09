@@ -762,27 +762,26 @@ impl SpyreWorker {
         // without a `tp/N`), from `local_rank` up — each opened on its own background thread NOW,
         // so their ~5.7 s bring-ups overlap each other and the host-side weight load below. Joined
         // where the first session needs them; every session of this worker spans all of them.
+        // ⭐ THE WORLD'S CARDS, CLAIMED ONCE: the first `World::RANKS` cards senlib enumerates,
+        // distinct by construction (`WorldCards::claim`). Rank r opens `cards.get(r)` by its PCIe
+        // address — no index arithmetic, and nothing in the environment chooses the set.
         #[cfg(feature = "spyre-hw")]
-        let card_open =
-            scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::try_from_fn(
-                |r| -> ExecutorResult<_> {
-                    let index = u32::try_from(self.config.local_rank)
-                        .ok()
-                        .and_then(|base| base.checked_add(r.get()))
-                        .ok_or_else(|| {
-                            werr(format!(
-                                "local_rank {} + rank {} is not a Spyre card index",
-                                self.config.local_rank,
-                                r.get()
-                            ))
-                        })?;
-                    // The card's bring-up thread: `open` first runs it on the card's NUMA node,
-                    // so the host buffers bring-up touches land there.
-                    Ok(std::thread::spawn(move || {
-                        scratchy_target_spyre::runtime::CardRuntime::<World>::open(index)
-                    }))
-                },
-            )?;
+        let card_open = {
+            let table = scratchy_target_spyre::runtime::CardTable::enumerate()
+                .map_err(|e| werr(format!("Spyre card table: {e}")))?;
+            let world = scratchy_target_spyre::runtime::WorldCards::<World>::claim(&table)
+                .map_err(|e| werr(e.to_string()))?;
+            info!("[spyre-worker] this world's cards: {}", world.describe());
+            let world = std::sync::Arc::new(world);
+            scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::from_fn(|r| {
+                let world = std::sync::Arc::clone(&world);
+                std::thread::spawn(move || {
+                    scratchy_target_spyre::runtime::CardRuntime::<World>::open(
+                        world.per_rank().get(r),
+                    )
+                })
+            })
+        };
 
         let model_dir = resolve_model_path(
             &self.model_path,
