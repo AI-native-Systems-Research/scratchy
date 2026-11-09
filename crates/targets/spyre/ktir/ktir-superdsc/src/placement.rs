@@ -392,13 +392,15 @@ impl SynthAlloc {
         }
     }
 
-    /// Reserve `bytes` for `name` once: its offset, the first time; the same offset after.
-    fn take(&mut self, name: String, bytes: u64) -> u64 {
+    /// Reserve `bytes` for `name` once: its offset, the first time; the same offset after. A
+    /// synthetic of no bytes is a tensor with a zero extent, which no op can read or write — so the
+    /// door takes a [`std::num::NonZeroU64`] and there is no zero case to round up.
+    fn take(&mut self, name: String, bytes: std::num::NonZeroU64) -> u64 {
         if let Some(&o) = self.map.get(&name) {
             return o;
         }
         let o = align128(self.next);
-        let fp = align128(bytes.max(1));
+        let fp = align128(bytes.get());
         self.next = o + fp;
         self.map.insert(name.clone(), o);
         self.sizes.insert(name, fp);
@@ -635,13 +637,9 @@ pub fn synth_footprint_bytes(dims: &[u32], df: Df) -> u64 {
     let word_length = df.word_length();
     let inner = dims.last().copied().unwrap_or(stick_elems);
     let inner_stick = inner.div_ceil(stick_elems) * stick_elems;
-    let outer: u64 = dims
-        .iter()
-        .rev()
-        .skip(1)
-        .map(|&d| d as u64)
-        .product::<u64>()
-        .max(1);
+    // The product of the outer dims (1 for a rank-1 tensor). A zero outer dim is a zero-byte
+    // tensor, which the allocator's door refuses — never rounded up to one row.
+    let outer: u64 = dims.iter().rev().skip(1).map(|&d| d as u64).product::<u64>();
     outer * inner_stick as u64 * word_length as u64
 }
 
@@ -1266,6 +1264,12 @@ impl BundleLayout {
     /// The byte-exact core of [`Self::synth_df`]: bump-allocate `bytes` for `id`, once.
     fn synth_bytes(&self, id: PlaceId, bytes: u64) {
         let name = id.to_string();
+        let bytes = std::num::NonZeroU64::new(bytes).unwrap_or_else(|| {
+            panic!(
+                "synthetic '{name}' declared at 0 bytes — a tensor with a zero extent is not a \
+                 tensor; the declaring site's dims (or the placement it shadows) are wrong"
+            )
+        });
         // The IDENTITY is recorded even when the OFFSET already exists: declaration order decides
         // the offset, never the identity.
         self.ids.borrow_mut().insert(name.clone(), id);
