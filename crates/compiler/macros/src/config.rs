@@ -4029,7 +4029,7 @@ mod tests {
         assert_eq!(mp.scalars.get("attention_multiplier"), Some(&1.0));
         // Logit softcap is verbatim in-config.
         assert_eq!(mp.scalars.get("final_logit_softcapping"), Some(&30.0));
-        assert_eq!(mp.tie_word_embeddings, true);
+        assert!(mp.tie_word_embeddings);
     }
 
     /// End-to-end: the VERBATIM upstream `gemma-4-12b-it` config (the
