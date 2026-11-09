@@ -4207,37 +4207,38 @@ fn submit_to_hardware(
         state.inc_in_flight(pipeline);
     }
 
-    let call_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let hw_error = Arc::new(Mutex::new(None::<CbCompleteError>));
-    let user_cb = Arc::new(Mutex::new(Some(callback)));
-
+    // ONE shared cell per submit, not three: the countdown, the hardware
+    // error, and the user callback all live behind this single `Arc`, so a
+    // submit costs one gate allocation (plus the `CallbackFn`'s own `Arc`)
+    // instead of the previous three separate `Arc<Mutex<..>>`/atomic cells.
+    // The countdown also subsumes the `num_cbs == 1` case for free: a single
+    // CB's one invocation is trivially the last.
+    let gate = Arc::new(GroupedSubmit::new(num_cbs, callback));
     let state_for_cb = state.clone();
-    let hw_error_for_cb = hw_error.clone();
-    let user_cb_for_cb = user_cb.clone();
+    let gate_for_cb = gate.clone();
     let cb_fn: CallbackFn = Arc::new(move |pr: &PendingRequest| {
-        // "Track how many times this callback has been invoked."
-        let current_count = call_count.fetch_add(1, Ordering::AcqRel) + 1;
-
         // onCbComplete's own status check (`:437-447`) — deliberately NOT
         // `EvalResponseBlockStatus`, which is what the *graph* scheduler and
         // the data-transfer paths use: this one treats TIMED_OUT, cancel, and
         // any status other than `RB_GOOD` as a hardware error.
         if let Some(e) = eval_cb_complete_status(pr).failure() {
             tracing::warn!("Response block error: {e}");
-            *hw_error_for_cb.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+            *gate_for_cb.hw_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
         }
 
         // `recordPipelineProfiler`'s `--{compute,dmai,dmao}_in_flight_`.
         state_for_cb.dec_in_flight(pipeline);
 
         // "Call the completion callback only when all CBs are done."
-        if current_count == num_cbs
-            && let Some(cb) = user_cb_for_cb
+        if gate_for_cb.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(cb) = gate_for_cb
+                .user_cb
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take()
         {
-            let err = hw_error_for_cb
+            let err = gate_for_cb
+                .hw_error
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take();
@@ -4265,8 +4266,30 @@ fn submit_to_hardware(
         for _ in 0..num_cbs {
             state.dec_in_flight(pipeline);
         }
-        if let Some(cb) = user_cb.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        if let Some(cb) = gate.user_cb.lock().unwrap_or_else(|p| p.into_inner()).take() {
             cb(Err(e));
+        }
+    }
+}
+
+/// The per-`submit_to_hardware` completion group: the CB countdown, the first
+/// hardware error seen by any CB in the group, and the user callback, behind
+/// one allocation. `user_cb` is `Option` so exactly one of the completion
+/// path and the queue-failure path can take it — the queue-failure taker wins
+/// a race against a late timeout-reaped callback, which then finds `None`
+/// and does nothing, matching the previous three-cell layout's behavior.
+struct GroupedSubmit {
+    remaining: std::sync::atomic::AtomicU64,
+    hw_error: Mutex<Option<CbCompleteError>>,
+    user_cb: Mutex<Option<CompletionCallback>>,
+}
+
+impl GroupedSubmit {
+    fn new(num_cbs: u64, callback: CompletionCallback) -> Self {
+        Self {
+            remaining: std::sync::atomic::AtomicU64::new(num_cbs),
+            hw_error: Mutex::new(None),
+            user_cb: Mutex::new(Some(callback)),
         }
     }
 }
