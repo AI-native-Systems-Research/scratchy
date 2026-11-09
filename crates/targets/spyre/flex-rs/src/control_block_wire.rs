@@ -799,6 +799,7 @@ pub const PW_SECTION: usize = 28;
 /// queued via `senlib_ffi::cbi_queue_control_blocks_sbf`. This is
 /// the type `HardwareSubmit::submit` now carries (see `scheduler.rs`) —
 /// previously that call site carried no payload at all.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlBlockWire {
     bytes: [u8; CB_NUM_BYTES],

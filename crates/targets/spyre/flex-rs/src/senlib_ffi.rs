@@ -534,15 +534,35 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-impl From<crate::control_block_wire::ControlBlockWire> for SenlibControlBlockSbf {
-    /// `ControlBlockWire::to_bytes()` is byte-for-byte the same 128-byte
-    /// `SentientSoc::V1::ControlBlockSBF` layout this type mirrors — see
-    /// `crate::control_block_wire`'s module doc for the verified layout.
-    fn from(wire: crate::control_block_wire::ControlBlockWire) -> Self {
-        Self {
-            bytes: wire.to_bytes(),
-        }
-    }
+/// `ControlBlockWire` and `SenlibControlBlockSbf` are one layout: both
+/// `#[repr(C)]` wrappers around the same `[u8; 128]` (`CB_NUM_BYTES`, pinned
+/// by the SDK's own `static_assert(sizeof(ControlBlockSBF) == CB_NUM_BYTES)`).
+/// These asserts make that identity a compile-time fact: if either side ever
+/// changes a field or a repr, this crate stops building instead of silently
+/// mis-striding every queued CB.
+const _: () = {
+    assert!(
+        size_of::<crate::control_block_wire::ControlBlockWire>()
+            == size_of::<SenlibControlBlockSbf>()
+    );
+    assert!(
+        align_of::<crate::control_block_wire::ControlBlockWire>()
+            == align_of::<SenlibControlBlockSbf>()
+    );
+};
+
+/// Reinterpret a batch of [`ControlBlockWire`]s as the senlib wire type —
+/// zero-copy, because they are the same 128 bytes (see the `const _` asserts
+/// above). This replaces a per-launch `Vec` collect that memcpy'd the whole
+/// batch on the submission path.
+pub fn control_blocks_as_sbf(
+    cbs: &[crate::control_block_wire::ControlBlockWire],
+) -> &[SenlibControlBlockSbf] {
+    // SAFETY: same element size and alignment (asserted above), both
+    // `#[repr(C)]` over one `[u8; CB_NUM_BYTES]` field, so every
+    // `ControlBlockWire` is bit-for-bit a valid `SenlibControlBlockSbf`.
+    // `cbs.len()` elements remain `cbs.len()` elements.
+    unsafe { core::slice::from_raw_parts(cbs.as_ptr().cast(), cbs.len()) }
 }
 
 impl SenlibResponseBlockSbf {

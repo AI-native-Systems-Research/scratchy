@@ -1796,13 +1796,15 @@ impl HardwareSubmit for SenlibHardwareSubmit {
                 "SenlibHardwareSubmit: no ControlBlockInterface for this pipeline (shim not initialized)",
             ));
         };
-        let wire: Vec<crate::senlib_ffi::SenlibControlBlockSbf> =
-            cbs.iter().copied().map(Into::into).collect();
+        // Zero-copy: `ControlBlockWire` IS `SenlibControlBlockSbf` (same
+        // `#[repr(C)]` [u8; 128], asserted in `control_blocks_as_sbf`) — the
+        // batch goes to senlib as-is, no per-launch `Vec` re-collect.
+        let wire = crate::senlib_ffi::control_blocks_as_sbf(cbs);
         // Propagate rather than panic: the real `:1268` call is unguarded, so a
         // senlib throw unwinds into `schedule`'s `catch(...)` and fails the
         // request. Swallowing it (the original port) left the caller waiting out
         // its full timeout on a CB the hardware never received.
-        crate::senlib_ffi::cbi_queue_control_blocks_sbf(cbi, &wire).map_err(|e| {
+        crate::senlib_ffi::cbi_queue_control_blocks_sbf(cbi, wire).map_err(|e| {
             mock_error(&format!(
                 "SenlibHardwareSubmit: senlib QueueControlBlocksSBF failed (CB not submitted): {e}"
             ))
