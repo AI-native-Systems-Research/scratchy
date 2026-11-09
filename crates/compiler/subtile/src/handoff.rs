@@ -335,22 +335,49 @@ pub trait EmbedState: Clone + std::fmt::Debug {}
 impl EmbedState for Option<EmbedRow> {}
 impl EmbedState for EmbedRow {}
 
-/// A tape whose bindings name two embed rows — the bridge mints one per `Embed` op and the host
-/// gathers one row, so a second is never written. Refused at [`LoweredDecode::new`].
+/// ONE LAYER'S RESIDENT KV POOLS — the `PrefixK { layer }` and `PrefixV { layer }` sources the
+/// bridge mints together (`prefix_for`), read once by [`LoweredDecode::new`]. The launch wiring's
+/// per-layer binding is this list, never a scan of a program's arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TwoEmbedRows {
-    pub first: usize,
-    pub second: usize,
+pub struct KvLayer {
+    pub layer: u64,
+    /// The K pool's source index.
+    pub k: usize,
+    /// The V pool's source index.
+    pub v: usize,
 }
 
-impl std::fmt::Display for TwoEmbedRows {
+/// Bindings whose roles cannot be one tape's — refused at [`LoweredDecode::new`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleRefusal {
+    /// Two `EmbeddedHidden` sources: the bridge mints one per `Embed` op and the host gathers one
+    /// row, so a second is never written.
+    TwoEmbedRows { first: usize, second: usize },
+    /// A layer's K pool without its V pool, or its V without its K: one cache half nothing binds.
+    UnpairedKv { layer: u64 },
+    /// A layer with two K (or two V) pools: one would be bound and the other never.
+    TwoKvPools { layer: u64 },
+}
+
+impl std::fmt::Display for RoleRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "sources t{} and t{} are both EmbeddedHidden — the host gathers one row, so the \
-             second is never written",
-            self.first, self.second
-        )
+        match self {
+            Self::TwoEmbedRows { first, second } => write!(
+                f,
+                "sources t{first} and t{second} are both EmbeddedHidden — the host gathers one \
+                 row, so the second is never written"
+            ),
+            Self::UnpairedKv { layer } => write!(
+                f,
+                "layer {layer} has a prefix-KV pool without its other half — one cache half \
+                 nothing binds"
+            ),
+            Self::TwoKvPools { layer } => write!(
+                f,
+                "layer {layer} has two K (or two V) prefix pools — one would be bound and the \
+                 other never"
+            ),
+        }
     }
 }
 
@@ -367,6 +394,8 @@ pub struct LoweredDecode<E: EmbedState = Option<EmbedRow>> {
     bindings: Vec<SourceBinding>,
     /// The embed row the bindings name — [`EmbedState`].
     embed: E,
+    /// Every layer's KV pools the bindings name, in layer order — [`KvLayer`].
+    kv_layers: Vec<KvLayer>,
     /// Parallel to `input.ops`: the FUF `(tile, output slot)` each op's
     /// output realizes, when it realizes one (fusion intermediates
     /// don't). Provenance lets per-target emitters reuse the SAME
@@ -389,8 +418,8 @@ pub struct LoweredDecode<E: EmbedState = Option<EmbedRow>> {
 }
 
 impl LoweredDecode {
-    /// A lowered tape: its roles (the embed row) read off `bindings` here, once. Two embed rows
-    /// are refused ([`TwoEmbedRows`]).
+    /// A lowered tape: its roles (the embed row, each layer's KV pools) read off `bindings` here,
+    /// once. Bindings that cannot be one tape's roles are refused ([`RoleRefusal`]).
     pub fn new(
         input: LoweringInput,
         bindings: Vec<SourceBinding>,
@@ -398,19 +427,44 @@ impl LoweredDecode {
         norm_gain_add_tiles: std::collections::HashMap<usize, u32>,
         op_expansion: Vec<Option<Expansion>>,
         unnamed_reads: Vec<(usize, usize)>,
-    ) -> Result<Self, TwoEmbedRows> {
+    ) -> Result<Self, RoleRefusal> {
         let mut rows = (bindings.iter().enumerate())
             .filter(|(_, b)| matches!(b, SourceBinding::EmbeddedHidden))
             .map(|(i, _)| i);
         let embed = match (rows.next(), rows.next()) {
             (first, None) => first.map(EmbedRow),
-            (Some(first), Some(second)) => return Err(TwoEmbedRows { first, second }),
+            (Some(first), Some(second)) => return Err(RoleRefusal::TwoEmbedRows { first, second }),
             (None, Some(_)) => unreachable!("an iterator yields its first item first"),
         };
+        // (K pool, V pool) per layer, each at most once.
+        let mut pools: BTreeMap<u64, (Option<usize>, Option<usize>)> = BTreeMap::new();
+        for (i, b) in bindings.iter().enumerate() {
+            let (layer, half) = match *b {
+                SourceBinding::PrefixK { layer } => (layer, 0),
+                SourceBinding::PrefixV { layer } => (layer, 1),
+                _ => continue,
+            };
+            let entry = pools.entry(layer).or_default();
+            let slot = if half == 0 {
+                &mut entry.0
+            } else {
+                &mut entry.1
+            };
+            if slot.replace(i).is_some() {
+                return Err(RoleRefusal::TwoKvPools { layer });
+            }
+        }
+        let kv_layers = (pools.into_iter())
+            .map(|(layer, pair)| match pair {
+                (Some(k), Some(v)) => Ok(KvLayer { layer, k, v }),
+                _ => Err(RoleRefusal::UnpairedKv { layer }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             input,
             bindings,
             embed,
+            kv_layers,
             op_tiles,
             norm_gain_add_tiles,
             op_expansion,
@@ -431,6 +485,7 @@ impl LoweredDecode {
                 input: self.input,
                 bindings: self.bindings,
                 embed: row,
+                kv_layers: self.kv_layers,
                 op_tiles: self.op_tiles,
                 norm_gain_add_tiles: self.norm_gain_add_tiles,
                 op_expansion: self.op_expansion,
@@ -452,6 +507,11 @@ impl<E: EmbedState> LoweredDecode<E> {
     /// What each source is bound to (parallel to `input.sources`).
     pub fn bindings(&self) -> &[SourceBinding] {
         &self.bindings
+    }
+
+    /// Every layer's KV pools, in layer order ([`KvLayer`]).
+    pub fn kv_layers(&self) -> &[KvLayer] {
+        &self.kv_layers
     }
 
     /// This tape's bindings and embed row over a rewritten forward — the form every op-rewriting
@@ -476,6 +536,7 @@ impl<E: EmbedState> LoweredDecode<E> {
             input,
             bindings: self.bindings.clone(),
             embed: self.embed.clone(),
+            kv_layers: self.kv_layers.clone(),
             op_tiles,
             norm_gain_add_tiles,
             op_expansion,
@@ -550,4 +611,82 @@ pub struct WeightSlot {
 /// this rule, so a lowering that binds a site's weight computes the slot by it too.
 pub fn accessor_slot(site: &[WeightKind], i: usize) -> u32 {
     site[..i].iter().filter(|k| **k == site[i]).count() as u32
+}
+
+#[cfg(test)]
+mod roles {
+    use super::*;
+    use crate::subtile_ir::SourceShape;
+
+    fn tape(bindings: Vec<SourceBinding>) -> Result<LoweredDecode, RoleRefusal> {
+        let sources = vec![SourceShape { rows: 1, cols: 64 }; bindings.len()];
+        LoweredDecode::new(
+            LoweringInput {
+                sources,
+                ops: Vec::new(),
+                result: 0,
+                exported: None,
+            },
+            bindings,
+            Vec::new(),
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Each layer's pools are read once, in layer order, wherever the bridge minted them.
+    #[test]
+    fn every_layers_pools_are_its_pair_in_layer_order() {
+        use SourceBinding::{EmbeddedHidden, PrefixK, PrefixV};
+        let l = tape(vec![
+            EmbeddedHidden,
+            PrefixK { layer: 1 },
+            PrefixV { layer: 1 },
+            PrefixK { layer: 0 },
+            PrefixV { layer: 0 },
+        ])
+        .expect("a well-formed tape");
+        assert_eq!(
+            l.kv_layers(),
+            [
+                KvLayer {
+                    layer: 0,
+                    k: 3,
+                    v: 4
+                },
+                KvLayer {
+                    layer: 1,
+                    k: 1,
+                    v: 2
+                },
+            ]
+        );
+    }
+
+    /// A half pool, a second pool for a layer and a second embed row cannot be one tape's roles.
+    #[test]
+    fn bindings_that_are_not_one_tapes_roles_are_refused() {
+        use SourceBinding::{EmbeddedHidden, PrefixK, PrefixV};
+        assert_eq!(
+            tape(vec![PrefixK { layer: 3 }]).err(),
+            Some(RoleRefusal::UnpairedKv { layer: 3 })
+        );
+        assert_eq!(
+            tape(vec![
+                PrefixK { layer: 0 },
+                PrefixV { layer: 0 },
+                PrefixV { layer: 0 }
+            ])
+            .err(),
+            Some(RoleRefusal::TwoKvPools { layer: 0 })
+        );
+        assert_eq!(
+            tape(vec![EmbeddedHidden, EmbeddedHidden]).err(),
+            Some(RoleRefusal::TwoEmbedRows {
+                first: 0,
+                second: 1
+            })
+        );
+    }
 }

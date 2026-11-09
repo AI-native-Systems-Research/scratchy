@@ -9488,46 +9488,14 @@ fn emit_superdsc_wiring(
     });
 
     // ── Per-layer pools ──
-    // Every paged attention program binds `[q, out, k pool, v pool, page table, mask]`: the node
-    // that reads the mask names its layer's K pool (a `PrefixK` source) and V pool (a `PrefixV`
-    // source). Nothing else of the layer leaves the device — the step's K/V are scattered into the
-    // pools by the layer's own write — so the pools are the whole per-layer wiring.
-    let mut layers: Vec<(u64, u32, u32)> = Vec::new();
-    if let Some(mask) = gk.attn_mask {
-        let pk: std::collections::HashMap<u32, u64> = lwd
-            .bindings()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, b)| match b {
-                SourceBinding::PrefixK { layer } => Some((i as u32, *layer)),
-                _ => None,
-            })
-            .collect();
-        let pv: std::collections::HashSet<u32> = lwd
-            .bindings()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, b)| match b {
-                SourceBinding::PrefixV { .. } => Some(i as u32),
-                _ => None,
-            })
-            .collect();
-        for node in &gk.nodes {
-            if !node.args.iter().any(|a| *a as u32 == mask) {
-                continue;
-            }
-            let k_pool = node
-                .args
-                .iter()
-                .map(|a| *a as u32)
-                .find(|a| pk.contains_key(a));
-            let v_pool = node.args.iter().map(|a| *a as u32).find(|a| pv.contains(a));
-            if let (Some(ks), Some(vs)) = (k_pool, v_pool) {
-                layers.push((pk[&ks], ks, vs));
-            }
-        }
-        layers.sort_by_key(|x| x.0);
-    }
+    // Every layer's K and V pools, as the tape's own bindings state them (`LoweredDecode::kv_layers`,
+    // read once where the bindings are minted, each pool once and each layer's pair complete): the
+    // wiring binds EVERY prefix-KV source the tape has, in layer order, by construction. Nothing
+    // else of a layer leaves the device — the step's K/V are scattered into the pools by the
+    // layer's own write — so the pools are the whole per-layer wiring.
+    let layers: Vec<(u32, u32)> = (lwd.kv_layers().iter())
+        .map(|l| (l.k as u32, l.v as u32))
+        .collect();
     // ══════════════════════════════════════════════════════════════════════════════════════════
     //  ⛔⛔⛔ THE COMPLETENESS LOCK — a wiring that does not fill every caller-filled source
     //  MAY NOT COMPILE.
@@ -9539,15 +9507,13 @@ fn emit_superdsc_wiring(
     //  covers is never written — and the device does not report that. It waits, or it reads
     //  whatever the segment held.
     //
-    //  Every check below is a hole that existed and was silent:
-    //
-    //    • `layers` is built by POSITIONAL SCAN over each AttnDecode node's args, and its
-    //      `if let (Some, Some, Some, Some, Some)` DROPPED a layer whose pattern did not match.
-    //      Forty layers in, thirty-nine wired, no message.
-    //    • `embed_src` is `.position(..)` — the FIRST `EmbeddedHidden`. A second one is never
-    //      filled by anything.
-    //    • `cos_srcs`/`sin_srcs` are collected by filter from the same bindings, so they cannot
-    //      miss one, and nothing here re-checks it.
+    //  Every check below is a hole that existed and was silent. Two of them are now facts of the
+    //  tape's construction rather than checks here: the per-layer pools are the tape's own
+    //  `kv_layers` (a positional scan over each attention node's args once DROPPED a layer whose
+    //  pattern did not match — forty layers in, thirty-nine wired, no message — and two nodes could
+    //  claim one layer), and there is one `EmbeddedHidden` (`LoweredDecode::new` refuses a second).
+    //  `cos_srcs`/`sin_srcs` are collected by filter from the same bindings, so they cannot miss
+    //  one either.
     //
     //  This is the sibling of `superdsc_bake.rs`'s no-device-compiler refusal, and for the same
     //  reason it gives: the binary would link, every session would report ready, and the failure
@@ -9556,25 +9522,6 @@ fn emit_superdsc_wiring(
         use crate::to_wavefront::SourceBinding as SB;
 
         let mut fail: Vec<String> = Vec::new();
-
-        // ── every layer's prefix KV is wired ──
-        if layers.len() != n_layers_expected {
-            fail.push(format!(
-                "{} of {n_layers_expected} layers have prefix-KV wiring. The rest were dropped by \
-                 the positional arg scan; their K/V cache would never be bound",
-                layers.len(),
-            ));
-        }
-        let mut seen_layers: Vec<u64> = layers.iter().map(|x| x.0).collect();
-        seen_layers.sort_unstable();
-        seen_layers.dedup();
-        if seen_layers.len() != layers.len() {
-            fail.push(format!(
-                "two AttnDecode nodes claim the same layer index — one layer's cache would be \
-                 bound twice and another's not at all ({:?})",
-                layers.iter().map(|x| x.0).collect::<Vec<_>>()
-            ));
-        }
 
         // ── every caller-filled source is covered by exactly one filler ──
         // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's
@@ -9668,7 +9615,6 @@ fn emit_superdsc_wiring(
             }
             scratchy_target_spyre::wiring::ChainFact::Unchained => None,
         };
-        let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings().get(id as usize) else {
                 // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
@@ -9710,41 +9656,17 @@ fn emit_superdsc_wiring(
             match b {
                 // The generated weight loader binds these once, before prepare.
                 SB::Weight { .. } | SB::WeightScale { .. } | SB::BundleTensor { .. } => {}
-                SB::EmbeddedHidden => {
-                    // ⭐ THE CHAIN'S RESIDENT EXCUSE — the replaced row's host
-                    // filler is gone (the tape's ChainSeed steps replaced the
-                    // embed-row push), but the row is not unbound: the device's
-                    // own EmbedRowGather writes it every step. The chain names
-                    // the replaced id at the mint; this gate reads the same
-                    // statement, never a re-derivation.
-                    if let scratchy_target_spyre::wiring::ChainFact::Chained { chain } = &gk.chain
-                        && id == chain.replaces
-                    {
-                        continue;
-                    }
-                    embeds += 1;
-                    if id != embed_src {
-                        fail.push(format!(
-                            "source t{id} is an EmbeddedHidden the tape does not gather \
-                             (it gathers t{embed_src}) — t{id} is never written"
-                        ));
-                    }
-                }
+                // The tape's one embed row (`BakeTape`: `LoweredDecode::new` refuses a second, and
+                // `embed_src` IS it): the host gathers it, or — chained — the device's own
+                // EmbedRowGather writes it every step.
+                SB::EmbeddedHidden => {}
                 // `cos_srcs`/`sin_srcs` ARE every `Cos`/`Sin` binding (`rot_srcs` collects them
                 // from these bindings), so each is in its list by construction.
                 SB::Cos { .. } | SB::Sin { .. } => {}
-                // Device-resident, bound per layer through `LayerWiring` — covered by the layer
-                // count check above.
+                // Device-resident, bound per layer through `LayerWiring` — every one of them, by
+                // construction (`layers` IS the tape's `kv_layers`).
                 SB::PrefixK { .. } | SB::PrefixV { .. } => {}
             }
-        }
-        // A chained decode carries its EmbeddedHidden row as DEVICE-WRITTEN
-        // (excused above), so the tape-side count is legitimately zero there.
-        let embed_floor = if chain_sticks.is_some() { 0 } else { 1 };
-        if embeds < embed_floor {
-            fail.push(format!(
-                "{embeds} EmbeddedHidden sources; the tape gathers exactly one row"
-            ));
         }
 
         if !fail.is_empty() {
@@ -9820,7 +9742,7 @@ fn emit_superdsc_wiring(
         }
     }
 
-    let layer_toks = layers.iter().map(|(_, ks, vs)| {
+    let layer_toks = layers.iter().map(|(ks, vs)| {
         let (ks, vs) = (u32l(*ks), u32l(*vs));
         quote! {
             ::scratchy_target_spyre::wiring::LayerWiring {

@@ -84,8 +84,9 @@ pub enum BridgeError {
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
-    /// The walk minted two embed rows ([`scratchy_subtile::handoff::TwoEmbedRows`]).
-    TwoEmbedRows(scratchy_subtile::handoff::TwoEmbedRows),
+    /// The walk minted bindings that cannot be one tape's roles
+    /// ([`scratchy_subtile::handoff::RoleRefusal`]).
+    Roles(scratchy_subtile::handoff::RoleRefusal),
     /// An RmsNorm's folded `w + offset` gain is neither the `w` nor the `(1 + w)` convention, and no
     /// kernel implements a third — rounding it to the nearest would scale every normalized
     /// activation by the wrong constant.
@@ -145,7 +146,7 @@ impl std::fmt::Display for BridgeError {
                 "the graph has attention ops but the model states no attention facts"
             ),
             Self::NoResult => write!(f, "FUF produced no result op"),
-            Self::TwoEmbedRows(e) => write!(f, "{e}"),
+            Self::Roles(e) => write!(f, "{e}"),
             Self::UnknownGainConvention { tile, offset } => write!(
                 f,
                 "tile {} rmsnorm gain offset {offset} is neither the w nor the (1+w) convention, \
@@ -2055,7 +2056,7 @@ pub fn lower_decode_to_wavefront(
         bx.op_expansion,
         Vec::new(),
     )
-    .map_err(BridgeError::TwoEmbedRows)
+    .map_err(BridgeError::Roles)
 }
 
 /// Recover `(group_size, bits)` for a weight from its FUF `storage`
