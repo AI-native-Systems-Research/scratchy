@@ -4159,7 +4159,7 @@ fn mint(k: &KtirNode, layout: &BundleLayout, floor: u32, key: crate::ktir_node::
     // plan kept there ([`super::lx_plan`]).
     if let Some(&tid) = minted.get(&key) {
         let name = crate::place::act_name(tid);
-        if layout.synth.borrow().map.contains_key(&name) || layout.lx_core_local(&name) {
+        if layout.synth.borrow().contains(&name) || layout.lx_core_local(&name) {
             return tid;
         }
     }
