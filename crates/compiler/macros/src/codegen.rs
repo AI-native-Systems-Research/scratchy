@@ -12109,7 +12109,7 @@ fn dump_wavefront_mega(
                 }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
-                    return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
+                    return ((String::new(), Vec::new()), fx);
                 }
                 // `--target sendnn`: lower the SAME real-model `krg` to a sendnn
                 // op-graph JSON (the DeepTools toolchain compiles + runs it on the
@@ -14391,7 +14391,7 @@ fn dump_wavefront_mega(
         let prefill_sg_present = if sendnn_paged {
             prefill
                 .as_ref()
-                .is_some_and(|(_, _, _, pgs)| !pgs.is_empty())
+                .is_some_and(|(_, pgs)| !pgs.is_empty())
         } else {
             !default_decode_groups.is_empty()
         };
@@ -14480,7 +14480,7 @@ fn dump_wavefront_mega(
         let prefill_groups: &GroupGraphs = if sendnn_paged {
             prefill
                 .as_ref()
-                .map(|(_, _, _, pgs)| pgs)
+                .map(|(_, pgs)| pgs)
                 .unwrap_or(&default_decode_groups)
         } else {
             &default_decode_groups
