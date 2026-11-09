@@ -84,6 +84,8 @@ pub enum BridgeError {
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
+    /// The walk minted two embed rows ([`scratchy_subtile::handoff::TwoEmbedRows`]).
+    TwoEmbedRows(scratchy_subtile::handoff::TwoEmbedRows),
     /// An RmsNorm's folded `w + offset` gain is neither the `w` nor the `(1 + w)` convention, and no
     /// kernel implements a third — rounding it to the nearest would scale every normalized
     /// activation by the wrong constant.
@@ -143,6 +145,7 @@ impl std::fmt::Display for BridgeError {
                 "the graph has attention ops but the model states no attention facts"
             ),
             Self::NoResult => write!(f, "FUF produced no result op"),
+            Self::TwoEmbedRows(e) => write!(f, "{e}"),
             Self::UnknownGainConvention { tile, offset } => write!(
                 f,
                 "tile {} rmsnorm gain offset {offset} is neither the w nor the (1+w) convention, \
@@ -2039,19 +2042,20 @@ pub fn lower_decode_to_wavefront(
             }
         }
     }
-    Ok(LoweredDecode {
-        input: LoweringInput {
+    LoweredDecode::new(
+        LoweringInput {
             sources: bx.sources,
             ops: bx.ops,
             result,
             exported,
         },
-        bindings: bx.bindings,
+        bx.bindings,
         op_tiles,
-        norm_gain_add_tiles: bx.norm_gain_add_tiles,
-        op_expansion: bx.op_expansion,
-        unnamed_reads: Vec::new(),
-    })
+        bx.norm_gain_add_tiles,
+        bx.op_expansion,
+        Vec::new(),
+    )
+    .map_err(BridgeError::TwoEmbedRows)
 }
 
 /// Recover `(group_size, bits)` for a weight from its FUF `storage`
@@ -2095,7 +2099,10 @@ pub struct ResolutionReport {
 }
 
 /// Compute dump stats for a lowered forward (the drive logs these).
-pub fn stats(fuf: &Fuf, lowered: &LoweredDecode) -> BridgeStats {
+pub fn stats<E: scratchy_subtile::handoff::EmbedState>(
+    fuf: &Fuf,
+    lowered: &LoweredDecode<E>,
+) -> BridgeStats {
     let input = &lowered.input;
     let mut hist: HashMap<&'static str, usize> = HashMap::new();
     for od in &input.ops {
@@ -2107,12 +2114,12 @@ pub fn stats(fuf: &Fuf, lowered: &LoweredDecode) -> BridgeStats {
     let mut op_histogram: Vec<(&'static str, usize)> = hist.into_iter().collect();
     op_histogram.sort_by_key(|(n, _)| *n);
     let weight_sources = lowered
-        .bindings
+        .bindings()
         .iter()
         .filter(|b| matches!(b, SourceBinding::Weight { .. }))
         .count();
     let prefix_sources = lowered
-        .bindings
+        .bindings()
         .iter()
         .filter(|b| {
             matches!(

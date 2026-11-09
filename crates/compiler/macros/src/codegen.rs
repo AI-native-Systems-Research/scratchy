@@ -9103,24 +9103,39 @@ fn refuse_if_staged_cut_apart(
     }
 }
 
+/// A spyre bake's tape: a decoder's, whose embed row is a fact
+/// ([`scratchy_subtile::handoff::EmbedRow`]) — every read of it below takes the row, never looks
+/// for it.
+#[cfg(feature = "spyre")]
+type BakeTape = scratchy_subtile::handoff::LoweredDecode<scratchy_subtile::handoff::EmbedRow>;
+
+/// The bridge's tape as a spyre bake's ([`BakeTape`]): a decoder gathers an embed row, and a tape
+/// that gathers none is no decoder this bake serves — a build error naming the model.
+#[cfg(feature = "spyre")]
+fn bake_tape(stem: &str, l: crate::to_wavefront::LoweredDecode) -> BakeTape {
+    l.into_decode().unwrap_or_else(|scratchy_subtile::handoff::NoEmbedRow| {
+        panic!(
+            "[spyre-superdsc] {stem}: the lowered tape gathers no embed row — a spyre bake lowers \
+             a decoder, whose host gather lands in its one EmbeddedHidden source"
+        )
+    })
+}
+
 #[cfg(feature = "spyre")]
 fn chained_row_gathers(
-    lwd: &crate::to_wavefront::LoweredDecode,
+    lwd: &BakeTape,
     model: &ModelParams,
     decode: bool,
 ) -> Vec<scratchy_subtile::tensor_parallel::RowGather> {
     if !(decode && tie_word_embeddings(model)) {
         return Vec::new();
     }
-    let row = lwd
-        .bindings
-        .iter()
-        .position(|b| matches!(b, scratchy_subtile::handoff::SourceBinding::EmbeddedHidden));
-    match (row, lwd.input.vocab_table()) {
-        (Some(row), Some(table)) => {
-            vec![scratchy_subtile::tensor_parallel::RowGather { row, table }]
-        }
-        _ => Vec::new(),
+    match lwd.input.vocab_table() {
+        Some(table) => vec![scratchy_subtile::tensor_parallel::RowGather {
+            row: lwd.embed_row().index(),
+            table,
+        }],
+        None => Vec::new(),
     }
 }
 
@@ -9348,7 +9363,7 @@ fn load_const_entry_tokens(
 #[cfg(feature = "spyre")]
 fn emit_superdsc_wiring(
     gk: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
-    lwd: &crate::to_wavefront::LoweredDecode,
+    lwd: &BakeTape,
     model: &ModelParams,
     decode_position: u32,
 ) -> proc_macro2::TokenStream {
@@ -9364,20 +9379,9 @@ fn emit_superdsc_wiring(
     // over `SourceBinding` still happens, HERE, where a new variant is a build
     // error; what crosses to the runtime is its ANSWER.
     //
-    // Both lookups REFUSE rather than defaulting: a wiring whose host gather
-    // has nowhere to land, or which carries no rotary, is not a wiring.
-    let embed_src = lwd
-        .bindings
-        .iter()
-        .position(|b| matches!(b, SourceBinding::EmbeddedHidden))
-        .map(|i| i as u32)
-        .unwrap_or_else(|| {
-            panic!(
-                "[superdsc-wiring] {}: no EmbeddedHidden source — refusing to bake a wiring \
-                 whose host gather has nowhere to land",
-                model.source_stem
-            )
-        });
+    // The embed row is the tape's own ([`BakeTape`]: a decoder's always gathers one); the rotary
+    // lookup below REFUSES rather than defaulting: a wiring that carries no rotary is not a wiring.
+    let embed_src = lwd.embed_row().index() as u32;
     // ── Geometry, from the bounds the tape was lowered at ──
     let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
     let hidden = u32l(b("hidden_size") as u32);
@@ -9453,7 +9457,7 @@ fn emit_superdsc_wiring(
         }
     };
     let rot_srcs = |want_cos: bool| -> Vec<(u32, u32, proc_macro2::TokenStream)> {
-        lwd.bindings
+        lwd.bindings()
             .iter()
             .enumerate()
             .filter(|(_, b)| match b {
@@ -9501,7 +9505,7 @@ fn emit_superdsc_wiring(
     let mut layers: Vec<(u64, u32, u32)> = Vec::new();
     if let Some(mask) = gk.attn_mask {
         let pk: std::collections::HashMap<u32, u64> = lwd
-            .bindings
+            .bindings()
             .iter()
             .enumerate()
             .filter_map(|(i, b)| match b {
@@ -9510,7 +9514,7 @@ fn emit_superdsc_wiring(
             })
             .collect();
         let pv: std::collections::HashSet<u32> = lwd
-            .bindings
+            .bindings()
             .iter()
             .enumerate()
             .filter_map(|(i, b)| match b {
@@ -9676,7 +9680,7 @@ fn emit_superdsc_wiring(
         };
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
-            let Some(b) = lwd.bindings.get(id as usize) else {
+            let Some(b) = lwd.bindings().get(id as usize) else {
                 // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
                 // binding layer, so it carries NO `SourceBinding`: the wiring's
                 // `load_consts` list names it (BY MEMBERSHIP in the generic
@@ -9797,7 +9801,7 @@ fn emit_superdsc_wiring(
                 continue;
             };
             // Only a real weight has a staged shape; a fp8 scale is a different tensor.
-            if !matches!(lwd.bindings.get(*e), Some(SB::Weight { .. })) {
+            if !matches!(lwd.bindings().get(*e), Some(SB::Weight { .. })) {
                 continue;
             }
             let Some(&(rows, cols)) = gk.tensor_shapes.get(*e) else {
@@ -11432,7 +11436,7 @@ fn dump_wavefront_mega(
     #[cfg(feature = "spyre")]
     let prefix_len = {
         let kv_slot_bytes: Option<u64> = first.as_ref().ok().map(|l| {
-            l.bindings
+            l.bindings()
                 .iter()
                 .zip(&l.input.sources)
                 .filter(|(b, _)| {
@@ -11494,7 +11498,11 @@ fn dump_wavefront_mega(
             );
             return;
         }
-        Ok(l) => l,
+        Ok(l) => {
+            #[cfg(feature = "spyre")]
+            let l = bake_tape(stem, l);
+            l
+        }
         Err(to_wavefront::BridgeError::UnsupportedWeight { detail, .. }) => {
             eprintln!(
                 "[wavefront] {stem}: no superdsc bundle — weight scheme unsupported here \
@@ -11515,7 +11523,6 @@ fn dump_wavefront_mega(
          {} prefix-kv), {} ops; ops {:?}",
         st.fuf_tiles, st.sources, st.weight_sources, st.prefix_sources, st.ops, st.op_histogram,
     );
-
 
     // Spyre/KTIR (-Fspyre): emit the REAL model's per-op KTIR from the solver-produced
     // graph — every dim, rope form, GQA ratio, and eps is scratchy's, not a hand-built
@@ -11762,7 +11769,7 @@ fn dump_wavefront_mega(
         // and the build's one `tp/N` (`Build`). `$W` is that world inside the body.
         macro_rules! world_bake {
             ($W:ty) => {
-            |lwd: &to_wavefront::LoweredDecode,
+            |lwd: &BakeTape,
              base: String,
              // The capacity THIS bundle is baked for. Decode cap buckets vary it;
              // every other call site passes the full `prefix_len`.
@@ -11973,17 +11980,7 @@ fn dump_wavefront_mega(
                                  admission is not implemented."
                             );
                         }
-                        use crate::to_wavefront::SourceBinding;
-                        let embed_row = lwd
-                            .bindings
-                            .iter()
-                            .position(|b| matches!(b, SourceBinding::EmbeddedHidden))
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "[spyre-superdsc] {base}: no EmbeddedHidden source — the \
-                                     chained head's gather has no row to replace"
-                                )
-                            });
+                        let embed_row = lwd.embed_row().index();
                         let pick = krg.result;
                         let chain = scratchy_subtile::subtile_ir::mint_embed_chain(
                             &mut krg,
@@ -12023,7 +12020,7 @@ fn dump_wavefront_mega(
                 // (group, input_tensor, result_tensor, json).
                 let group_graphs: Vec<(u32, u32, u32, String)> = Vec::new();
                 // WEIGHT IDS for the fold pass: the sengraph source tensor id `t{i}` is a
-                // model WEIGHT iff `lwd.bindings[i]` is `SourceBinding::Weight` (the
+                // model WEIGHT iff `lwd.bindings()[i]` is `SourceBinding::Weight` (the
                 // binding index == the sengraph source id — both from the same
                 // `lwd.input`). Runtime activations (embed/cos/sin/prefix-kv) stay
                 // PrimaryInput. `fold_weights_into_model` reclassifies the weights to
@@ -12031,7 +12028,7 @@ fn dump_wavefront_mega(
                 // the per-job I/O descriptor table (the flit-cap fix).
                 let weight_ids: std::collections::HashSet<u32> = {
                     use crate::to_wavefront::SourceBinding;
-                    lwd.bindings
+                    lwd.bindings()
                         .iter()
                         .enumerate()
                         .filter_map(|(i, b)| match b {
@@ -12838,7 +12835,7 @@ fn dump_wavefront_mega(
                                                 let theta = model.text.rope_theta.get();
                                                 let mut rotary_cos = Vec::new();
                                                 let mut rotary_sin = Vec::new();
-                                                for (i, b) in lwd.bindings.iter().enumerate() {
+                                                for (i, b) in lwd.bindings().iter().enumerate() {
                                                     let (want_cos, local) = match b {
                                                         crate::to_wavefront::SourceBinding::Cos { local } => {
                                                             (true, *local)
@@ -13187,7 +13184,7 @@ fn dump_wavefront_mega(
                 // ── THE LAUNCH FACTS, TYPED, FROM ONE WALK ─────────────────
                 //
                 // `gk.result_tensor`, `gk.tensor_shapes`, `gk.attn_mask` and — the
-                // one that matters — `lwd.bindings`, already the `SourceBinding`
+                // one that matters — `lwd.bindings()`, already the `SourceBinding`
                 // ENUM, become values of spyre's OWN types (`wiring::Wiring`),
                 // exactly as metal is handed statics of the metal runtime's types.
                 // ONE walk states them: a second, stringified copy of the same
@@ -13259,9 +13256,7 @@ fn dump_wavefront_mega(
             world_bake!(scratchy_target_spyre::bundle_code::collective::Build);
         // Apply one bake's effects to `world`'s state, in the order the bake recorded them. Serial,
         // and the only code that touches the expansion's shared state.
-        let commit_bake = |world: &WorldBake<'_>,
-                           lwd: &to_wavefront::LoweredDecode,
-                           fx: Vec<BakeEffect>| {
+        let commit_bake = |world: &WorldBake<'_>, lwd: &BakeTape, fx: Vec<BakeEffect>| {
             for e in fx {
                 match e {
                     // Deduped on mq like the prefix-free ladder: a rebake of a width must not double-enter.
@@ -13358,7 +13353,7 @@ fn dump_wavefront_mega(
             }
         };
         let emit_bundle =
-            |lwd: &to_wavefront::LoweredDecode,
+            |lwd: &BakeTape,
              base: String,
              cap: u32,
              seq_sym: Option<(&'static str, u32)>,
@@ -13386,16 +13381,15 @@ fn dump_wavefront_mega(
         // (the offline_decoder CB-decode / SDPA-prefill bundle path was removed); a
         // PLAIN `cargo build -Fsendnn` (no env) produces it. This is also the TOP
         // decode cap bucket (cap == prefix_len); the narrower buckets are baked below.
-        let (_decode_graph_unused, mut default_decode_groups) =
-            emit_bundle(
-                &lowered,
-                format!("ktir_decode_{stem_id}"),
-                prefix_len.get(),
-                None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
-                None, // decode path (Store + PagedAttnCompute) -- no prefill width
-                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                primary_m,
-            );
+        let (_decode_graph_unused, mut default_decode_groups) = emit_bundle(
+            &lowered,
+            format!("ktir_decode_{stem_id}"),
+            prefix_len.get(),
+            None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
+            None, // decode path (Store + PagedAttnCompute) -- no prefill width
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+            primary_m,
+        );
 
         // ⭐ THE SHARDED WORLD — the same decode forward, sharded `TP_WORLD` ways by the shared
         // analysis and baked through the same pipeline into its own world's state. Every collective
@@ -13412,7 +13406,8 @@ fn dump_wavefront_mega(
         } else {
             let (tp_lwd, sf) = scratchy_subtile::tensor_parallel::shard_lowered::<
                 scratchy_target_spyre::bundle_code::collective::Build,
-            >(
+            _,
+        >(
                 &lowered,
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
                 &chained_row_gathers(&lowered, model, true),
@@ -13438,7 +13433,7 @@ fn dump_wavefront_mega(
                     .inputs
                     .iter()
                     .filter_map(|i| match i {
-                        scratchy_subtile::lower::InputRef::Ext(s) => tp_lwd.bindings.get(*s),
+                        scratchy_subtile::lower::InputRef::Ext(s) => tp_lwd.bindings().get(*s),
                         scratchy_subtile::lower::InputRef::Op(_) => None,
                     })
                     .filter_map(|b| match b {
@@ -13460,7 +13455,7 @@ fn dump_wavefront_mega(
                              ({:?}), a row gathered from a column-split table",
                             c.kind,
                             c.op,
-                            tp_lwd.bindings.get(e),
+                            tp_lwd.bindings().get(e),
                         );
                         continue;
                     }
@@ -13514,7 +13509,7 @@ fn dump_wavefront_mega(
         // The decode's source bindings, named apart: every later rung of the sharded world checks
         // its cuts against them (`refuse_if_staged_cut_apart`), and the prefill ladder's own
         // per-width lowering is also called `lowered`.
-        let decode_bindings = &lowered.bindings;
+        let decode_bindings = lowered.bindings();
         // ── DECODE BATCH LADDER (superdsc) ────────────────────────────────────────────────────────
         // A decode step runs one token of each RUNNING request, and how many that is changes step to
         // step — the scheduler decides it. A SuperDSC bundle is a static-shape graph, so the emitter
@@ -13564,6 +13559,7 @@ fn dump_wavefront_mega(
                     seqs,
                 ) {
                     Ok(lwd_b) => {
+                        let lwd_b = bake_tape(stem, lwd_b);
                         emit_bundle(
                             &lwd_b,
                             format!("ktir_decode_{stem_id}"),
@@ -13581,6 +13577,7 @@ fn dump_wavefront_mega(
                             let (tp_lwd, sf_b) =
                                 scratchy_subtile::tensor_parallel::shard_lowered::<
                                     scratchy_target_spyre::bundle_code::collective::Build,
+                                    _,
                                 >(
                                     &lwd_b,
                                     scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
@@ -13595,8 +13592,8 @@ fn dump_wavefront_mega(
                             refuse_if_staged_cut_apart(
                                 stem,
                                 &format!("ktir_decode_tp{TP_WORLD}_{stem_id} seqs={seqs}"),
-                                (&lowered.bindings, shards),
-                                (&lwd_b.bindings, &sf_b.sources),
+                                (lowered.bindings(), shards),
+                                (lwd_b.bindings(), &sf_b.sources),
                             );
                             let (_, fx) = emit_bundle_deferred_sharded(
                                 &tp_lwd,
@@ -13632,10 +13629,11 @@ fn dump_wavefront_mega(
 
         // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
         // ERROR that names the model and its head_dim (the config's, typed at load).
-        let prefill_head_width = scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
-            u64::from(model.text.head_dim.get()),
-            &model.name,
-        );
+        let prefill_head_width =
+            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
+                u64::from(model.text.head_dim.get()),
+                &model.name,
+            );
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {
             r <= SUB_BLOCKED_PREFILL_CEILING
@@ -13864,10 +13862,10 @@ fn dump_wavefront_mega(
         // A rung's bake in each world: the one-rank lowering, its pick and effects, and — when the
         // sharded world baked its decode — the rung's sharded lowering and effects.
         type RungBake = (
-            to_wavefront::LoweredDecode,
+            BakeTape,
             PrefillPick,
             Vec<BakeEffect>,
-            Option<(to_wavefront::LoweredDecode, Vec<BakeEffect>)>,
+            Option<(BakeTape, Vec<BakeEffect>)>,
         );
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
@@ -13897,10 +13895,11 @@ fn dump_wavefront_mega(
             );
             match lowered {
                 Ok(lwd_p) => {
+                    let lwd_p = bake_tape(stem, lwd_p);
                     // One rung's bake, stamped for each world `lwd` may be lowered for.
                     macro_rules! bake_rung_with {
                         ($bake:ident) => {
-                            |lwd: &to_wavefront::LoweredDecode,
+                            |lwd: &BakeTape,
                                      base: String,
                                      shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>| $bake(
                         lwd,
@@ -13948,7 +13947,8 @@ fn dump_wavefront_mega(
                     let tp2 = tp_sources.as_deref().map(|decode_cuts| {
                         let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
                             scratchy_target_spyre::bundle_code::collective::Build,
-                        >(
+                        _,
+                    >(
                             &lwd_p,
                             scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
                             &[],
@@ -13960,7 +13960,7 @@ fn dump_wavefront_mega(
                             stem,
                             &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} m={pl}"),
                             (decode_bindings, decode_cuts),
-                            (&lwd_p.bindings, &sf_p.sources),
+                            (lwd_p.bindings(), &sf_p.sources),
                         );
                         let (_, fx) = bake_rung_sharded(
                             &tp_lwd,
@@ -14052,6 +14052,7 @@ fn dump_wavefront_mega(
                     m,
                 ) {
                     Ok(lwd_p) => {
+                        let lwd_p = bake_tape(stem, lwd_p);
                         emit_bundle(
                             &lwd_p,
                             format!("ktir_prefill_{stem_id}"),
@@ -14066,7 +14067,8 @@ fn dump_wavefront_mega(
                         if let Some(decode_cuts) = tp_sources.as_deref() {
                             let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
                                 scratchy_target_spyre::bundle_code::collective::Build,
-                            >(
+                            _,
+                        >(
                                 &lwd_p,
                                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
                                 &[],
@@ -14083,7 +14085,7 @@ fn dump_wavefront_mega(
                                 stem,
                                 &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} prefix m={m}"),
                                 (decode_bindings, decode_cuts),
-                                (&lwd_p.bindings, &sf_p.sources),
+                                (lwd_p.bindings(), &sf_p.sources),
                             );
                             let (_, fx) = emit_bundle_deferred_sharded(
                                 &tp_lwd,
@@ -14232,6 +14234,7 @@ fn dump_wavefront_mega(
                 decode_mq,
             ) {
                 Ok(lwd_cb) => {
+                    let lwd_cb = bake_tape(stem, lwd_cb);
                     let (sg, groups) = emit_bundle(
                         &lwd_cb,
                         format!("ktir_decode_cb_{stem_id}"),
@@ -14283,9 +14286,7 @@ fn dump_wavefront_mega(
         // would see prefill_sg_present=false and CLEAR the paged decode groups below →
         // "bundle has no layer groups (split produced 0)" at worker load.
         let prefill_sg_present = if sendnn_paged {
-            prefill
-                .as_ref()
-                .is_some_and(|(_, pgs)| !pgs.is_empty())
+            prefill.as_ref().is_some_and(|(_, pgs)| !pgs.is_empty())
         } else {
             !default_decode_groups.is_empty()
         };

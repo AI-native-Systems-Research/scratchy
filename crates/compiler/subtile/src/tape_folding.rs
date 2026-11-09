@@ -780,7 +780,7 @@ impl<'a> Ops<'a> {
             .iter()
             .position(|a| {
                 matches!(a, Arg::Source(t) if matches!(
-                    self.lowered.bindings.get(t.index()),
+                    self.lowered.bindings().get(t.index()),
                     Some(SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. })
                 ))
             })
@@ -1008,7 +1008,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         // own: a target places that source's buffer itself.
         let weight = |t: &TensorId| {
             matches!(
-                self.ops.lowered.bindings.get(t.index()),
+                self.ops.lowered.bindings().get(t.index()),
                 Some(SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. })
             )
         };
@@ -1975,8 +1975,8 @@ mod tests {
             op_tiles[j] = Some((t, 0));
         }
         let op_expansion = vec![None; ops.len()];
-        let lowered = LoweredDecode {
-            input: LoweringInput {
+        let lowered = LoweredDecode::new(
+            LoweringInput {
                 sources: sources
                     .iter()
                     .map(|&(rows, cols)| SourceShape { rows, cols })
@@ -1987,10 +1987,11 @@ mod tests {
             },
             bindings,
             op_tiles,
-            norm_gain_add_tiles: Default::default(),
+            Default::default(),
             op_expansion,
-            unnamed_reads: Vec::new(),
-        };
+            Vec::new(),
+        )
+        .expect("a fold fixture names at most one embed row");
         fold_lowered(&lowered, table, model)
     }
 

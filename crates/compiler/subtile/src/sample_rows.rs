@@ -247,18 +247,19 @@ mod tests {
             ],
             result: 1,
         };
-        LoweredDecode {
+        LoweredDecode::new(
             input,
-            bindings: vec![
+            vec![
                 SourceBinding::EmbeddedHidden,
                 SourceBinding::Weight { id: 0, index: None },
                 SourceBinding::Weight { id: 1, index: None },
             ],
-            op_tiles: vec![Some((0, 0)), Some((1, 0))],
-            norm_gain_add_tiles: Default::default(),
-            op_expansion: vec![None; 2],
-            unnamed_reads: Vec::new(),
-        }
+            vec![Some((0, 0)), Some((1, 0))],
+            Default::default(),
+            vec![None; 2],
+            Vec::new(),
+        )
+        .expect("one embed row")
     }
 
     fn names(l: &LoweredDecode) -> Vec<&'static str> {
@@ -456,7 +457,7 @@ mod tests {
         let colours = |l: &LoweredDecode| {
             let graph = lower_region(&l.input, std::num::NonZeroU32::MAX);
             let tape = lower_dag_to_tape(&ValidatedGraph::new(&graph).expect("a valid graph"));
-            let c = colour_tape(&graph, &tape, &l.bindings, &FoldFacts::default(), &facts)
+            let c = colour_tape(&graph, &tape, l.bindings(), &FoldFacts::default(), &facts)
                 .expect("colours");
             (c.count(), c.result())
         };
