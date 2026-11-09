@@ -5491,28 +5491,6 @@ fn write_refusal_dump(
 pub enum GroupKind<T: ktir_superdsc::collective::Tp> {
     /// Fusable on-card trip (no per-entry shim handling).
     Pure,
-    /// `host_kv_write`: the shim host-scatters KV then does `oi += skip` to skip
-    /// the on-card cachewr copies it replaced. This entry AND those `skip`
-    /// entries MUST be singletons so `oi += skip` skips exactly them.
-    HostKv { skip: usize },
-    /// `slot_write` DECODE cachewr: every fused copy writes the SAME slot (baked at slot 0,
-    /// shim shifts the group base by `slot_pos·stride` ONCE). Consecutive `Slot` trips FUSE
-    /// ≤ g (the launch reduction). MUST all share one slot — enforce via [`GroupKind::SlotSolo`]
-    /// for the distinct-slot case, so a fused `Slot` group is uniform-slot by construction.
-    ///
-    /// CARRIES ITS REQUEST, and a run BREAKS where the request changes. A group is one launch and a
-    /// launch resolves ONE request's page table and write cursor, so two requests cannot share a
-    /// group — but a request's own kv-head copies still can, and they must: a batched decode step's
-    /// cache writes are `nkvh · requests · 2` per layer, and making each its own singleton (which is
-    /// what treating them as distinct-slot did) cost ~5,300 extra launches per forward and ran a
-    /// batch of 8 twenty times slower than one request. 0 for an unbatched bundle, so its grouping
-    /// is exactly what it was.
-    Slot { req: u32 },
-    /// `slot_write` PREFILL cachewr: writes a DISTINCT per-entry slot (baked at `s·hd`). The
-    /// shim's single per-group slot-shift CANNOT express distinct slots, so each is its OWN
-    /// singleton group (launched with its baked slot doff; prefill `slot_pos==0` ⇒ no shift).
-    /// This makes "distinct-slot copy fused into a uniform-shift group" UNCONSTRUCTABLE.
-    SlotSolo,
     /// PAGE FOLD (`kv_page_fold`): folds one page of resident prefix. Consecutive fold trips FUSE
     /// (they share a page base) but must never fuse with anything else — the shim re-launches this
     /// group per page, and a stray op swept in would re-run per page too, re-seeding the new-token
@@ -5523,13 +5501,6 @@ pub enum GroupKind<T: ktir_superdsc::collective::Tp> {
     /// property of the kind and must stay in ONE place; a gathered fold's passes communicate through a
     /// scratch they rewrite, an ungathered fold's do not, and that is the whole difference.
     PageFold { gathered: bool },
-    /// `slab_write` DECODE incremental Kᵀ restickify (kill-restickify Stage 2, hd==64): re-transposes
-    /// ONLY the current 64-slot slab; the shim shifts the group's seg2 base by
-    /// `(slot_pos/64)·slab_stride_bytes` ONCE (each op baked at slab 0). Consecutive `Slab` trips FUSE
-    /// ≤ g (the nkvh per-kv-head restickifies, all one `slab_stride_bytes`). DISTINCT kind from `Slot`:
-    /// its stride (STICK_BYTES·stick = 8192) ≠ the cachewr's `slot_stride_bytes` (128), so fusing the two
-    /// would trip the per-group uniform-stride assert (mixed-stride group → wrong base shift).
-    Slab,
     /// A GATHERED read outside any fold — the split-KV chunk's copies (`attn.rs`'s
     /// `assemble_attn_chunk`), which pull every resident page through the index ONCE per launch.
     /// Consecutive `Gathered` trips FUSE, but never with anything else: the group's `KvShifts::gathered`
@@ -5546,61 +5517,28 @@ pub enum GroupKind<T: ktir_superdsc::collective::Tp> {
     TpConsume(ktir_superdsc::collective::TpConsume<T>),
 }
 
-/// WHICH REQUEST A TRIP'S ADDRESSING BELONGS TO.
-///
-/// Wraps the op's `kv_request` so the group walk cannot silently compare it against something else
-/// (a slot index, a page, a `rep`) — every one of those is also a small integer, and this file's
-/// history is a list of exactly that mistake. `0` is both "request 0" and "untagged", deliberately:
-/// an unbatched bundle must stay byte-identical, so the two are the same value. That conflation is
-/// SAFE HERE and nowhere else — for a group BOUNDARY, treating an untagged trip as request 0 can
-/// only break a run that would otherwise have fused, and over-breaking costs launches while
-/// under-breaking costs correctness. (Where the conflation is NOT safe is the page base and write
-/// cursor; those live behind `fold_plan::RequestSlot`.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TripRequest(pub u32);
-
-/// A body trip: WHAT it is plus WHOSE it is. The pair travels together so the fusion walk cannot
-/// consult one without the other.
-///
-/// Before this type the walk saw only `GroupKind`, and only the `Slot` variant happened to carry a
-/// request. So every OTHER kind fused across requests — and a group is ONE launch, which resolves
-/// ONE request's page table, so a `Pure` run spanning two requests gave both of them the FIRST
-/// request's KV page. That is the same class of bug as the six before it: correctness depended on
-/// each variant separately remembering to check the request, and a new variant (or an op newly
-/// tagged with a request, like the per-page Kᵀ re-transpose) got it wrong by default.
-/// Now the request is checked ONCE, for all kinds, in [`Trip::fusable_with`].
+/// One body trip: the launch-group KIND its op takes. A group is one launch, so the kind decides
+/// which trips may share one ([`GroupKind::fusable_kind_with`]) and how long a run may grow
+/// ([`GroupKind::run_may_be_chunked`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Trip<T: ktir_superdsc::collective::Tp> {
     pub kind: GroupKind<T>,
-    pub req: TripRequest,
-    /// ⭐ THE OP'S [`EmittedOp::kv_slot_offset`] — which PAGE PART of a multi-page prefill window it
-    /// addresses. Checked beside the request, for every kind, and for the same reason: a launch resolves
-    /// ONE page per group, so a cache-write part (a `Slot`) and a Kᵀ re-transpose part (a `Pure`) of the
-    /// window's second page cannot share a group with anything aimed at its first.
-    pub slot_offset: u32,
 }
 
 impl<T: ktir_superdsc::collective::Tp> GroupKind<T> {
-    /// Whether two trips of these kinds may share one concrete bundle, IGNORING the request.
-    ///
-    /// Note `SlotSolo` and `HostKv` are not fusable even with THEMSELVES — that is how "this trip is
-    /// a singleton by construction" is expressed, and it is what makes the walk's advance-by-one
-    /// fallback unnecessary: a run is `[start, start+1)` unless the kind opts in.
+    /// Whether two trips of these kinds may share one concrete bundle. A run is `[start, start+1)`
+    /// unless the kind opts in.
     fn fusable_kind_with(self, other: GroupKind<T>) -> bool {
         match (self, other) {
             (GroupKind::Pure, GroupKind::Pure) => true,
-            (GroupKind::Slab, GroupKind::Slab) => true,
             (GroupKind::Gathered, GroupKind::Gathered) => true,
             // AND THE SAME GATHER STATE. They move together in today's emitter (one `gather` decision
             // serves a whole attention block), so this arm is `true` in practice — but a group takes
             // its SIZE CAP from its first trip's kind, so a run mixing the two would silently give one
             // half the other's cap. Breaking at that boundary can only cost a launch.
             (GroupKind::PageFold { gathered: a }, GroupKind::PageFold { gathered: b }) => a == b,
-            (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
             // One consume's descriptor ops are one launch; two consumes never share one.
             (GroupKind::TpConsume(a), GroupKind::TpConsume(b)) => a == b,
-            // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
-            // HostKv: the shim's `oi += skip` must land on this exact entry.
             _ => false,
         }
     }
@@ -5679,30 +5617,13 @@ impl<T: ktir_superdsc::collective::Tp> GroupKind<T> {
 }
 
 impl<T: ktir_superdsc::collective::Tp> Trip<T> {
-    /// A trip addressing its request's page at the write cursor — every trip but a page part's.
-    pub fn new(kind: GroupKind<T>, req: TripRequest) -> Trip<T> {
-        Trip::at_slot_offset(kind, req, 0)
+    pub fn new(kind: GroupKind<T>) -> Trip<T> {
+        Trip { kind }
     }
 
-    /// A trip addressing the page `slot_offset` slots past the write cursor (see [`Trip::slot_offset`]).
-    pub fn at_slot_offset(kind: GroupKind<T>, req: TripRequest, slot_offset: u32) -> Trip<T> {
-        Trip {
-            kind,
-            req,
-            slot_offset,
-        }
-    }
-
-    /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: same request, same page part, and kinds that fuse.
-    ///
-    /// A group is one launch; a launch resolves one request's page table and one write cursor and
-    /// shifts the segment base ONCE. Two requests therefore cannot share a group whatever their
-    /// kinds — so the request test lives HERE, above the kind test, and applies to kinds that do not
-    /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page.
+    /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: kinds that fuse.
     fn fusable_with(&self, other: &Trip<T>) -> bool {
-        self.req == other.req
-            && self.slot_offset == other.slot_offset
-            && self.kind.fusable_kind_with(other.kind)
+        self.kind.fusable_kind_with(other.kind)
     }
 }
 
@@ -5710,8 +5631,7 @@ impl<T: ktir_superdsc::collective::Tp> Trip<T> {
 /// fusion. Contiguous ⇒ emission (dataflow) order preserved ⇒ every producer
 /// precedes its consumer, so cross-group edges thread through the shared global
 /// HBM placement (addresses are grouping-invariant — baked at lowering, not here).
-/// A run of `Pure` trips is chunked ≤ `g`; each `HostKv` (with the `skip` entries
-/// it replaces) and each `Slot` is its OWN singleton. `g==1` reproduces the per-op
+/// A run of fusable trips is chunked ≤ its kind's cap. `g==1` reproduces the per-op
 /// partition EXACTLY. PURE (no env/IO) so Kani verifies the covering-partition
 /// invariant (no trip dropped or double-emitted → no dropped/duplicated compute).
 pub fn group_ranges<T: ktir_superdsc::collective::Tp>(
@@ -5723,21 +5643,8 @@ pub fn group_ranges<T: ktir_superdsc::collective::Tp>(
     let mut groups: Vec<core::ops::Range<usize>> = Vec::new();
     let mut i = 0usize;
     while i < n {
-        if let GroupKind::HostKv { skip } = trips[i].kind {
-            // this entry + the `skip` on-card copies it replaced: each its own singleton, so the
-            // shim's per-entry `oi += skip` advances over exactly them.
-            let end = i.saturating_add(1).saturating_add(skip).min(n);
-            let mut k = i;
-            while k < end {
-                groups.push(k..k + 1);
-                k += 1;
-            }
-            i = end;
-            continue;
-        }
-        // EVERY other kind takes the same walk. `end` starts one past `start`, so the walk always
-        // advances (termination is structural, not a special case) and a kind that fuses with
-        // nothing — SlotSolo — comes out a singleton without an arm of its own.
+        // Every kind takes the same walk. `end` starts one past `start`, so the walk always advances
+        // (termination is structural, not a special case).
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
@@ -5764,8 +5671,7 @@ pub fn group_ranges<T: ktir_superdsc::collective::Tp>(
 /// CBMC-tractable SCALAR twin of [`group_ranges`]'s partition walk (a `Vec<Range>`
 /// is CBMC-hostile — dynamic alloc over symbolic control flow blows up). Runs the
 /// IDENTICAL i-advancing control flow but tracks only scalars: the covered-prefix
-/// end and whether every emitted group is contiguous + correctly sized (Pure ≤ g,
-/// any non-Pure group == singleton). Returns `(covered_end, ok)`. Because it shares
+/// end and whether every emitted group is contiguous + within its kind's cap. Returns `(covered_end, ok)`. Because it shares
 /// [`group_ranges`]'s exact walk, proving `(covered_end==n && ok)` proves the Vec
 /// version is an EXACT covering partition (no trip dropped/double-emitted) with the
 /// size/singleton invariant. Keep byte-identical to `group_ranges`'s match arms.
@@ -5779,17 +5685,6 @@ pub fn group_ranges_cover_ok<T: ktir_superdsc::collective::Tp>(
     let mut expect = 0usize; // start of the next group must equal the covered-prefix end
     let mut ok = true;
     while i < n {
-        if let GroupKind::HostKv { skip } = trips[i].kind {
-            let end = i.saturating_add(1).saturating_add(skip).min(n);
-            let mut k = i;
-            while k < end {
-                ok &= k == expect; // contiguous; each is a [k,k+1) singleton (len 1 ≤ g)
-                expect = k + 1;
-                k += 1;
-            }
-            i = end;
-            continue;
-        }
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
@@ -5813,50 +5708,6 @@ pub fn group_ranges_cover_ok<T: ktir_superdsc::collective::Tp>(
         i = end;
     }
     (expect, ok)
-}
-
-/// Whether ANY group of this partition spans two requests — the bug-#7 predicate.
-///
-/// A group is one launch, and a launch shifts the KV base by ONE request's page/cursor. So a group
-/// holding trips of two requests gives the second request the first's KV, silently: fluent output,
-/// wrong tokens. Scalar (Vec-free) so CBMC can prove it never happens for ANY trip sequence.
-pub fn group_spans_two_requests<T: ktir_superdsc::collective::Tp>(
-    trips: &[Trip<T>],
-    g: usize,
-) -> bool {
-    let g = if g == 0 { 1 } else { g };
-    let n = trips.len();
-    let mut i = 0usize;
-    while i < n {
-        if let GroupKind::HostKv { skip } = trips[i].kind {
-            i = i.saturating_add(1).saturating_add(skip).min(n);
-            continue;
-        }
-        let start = i;
-        let mut end = start + 1;
-        let mut cnt = 1usize;
-        // THE SAME PER-KIND CAP AS THE WALK. It cannot change this predicate's answer — the run only
-        // extends while `fusable_with` holds, and that requires an equal request — but a third copy of
-        // the walk that drifts from the other two is how the cap came to be missing from one of them.
-        let cap = if trips[start].kind.run_may_be_chunked() {
-            g
-        } else {
-            usize::MAX
-        };
-        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
-            end += 1;
-            cnt += 1;
-        }
-        let mut k = start;
-        while k < end {
-            if trips[k].req != trips[start].req {
-                return true;
-            }
-            k += 1;
-        }
-        i = end;
-    }
-    false
 }
 
 /// ⭐⭐⭐⭐⭐ TRIPS PER CONCRETE dxp BUNDLE, AS A COMPILE-TIME CONSTANT — and the reason it stopped
@@ -6049,11 +5900,8 @@ pub fn emit_bundle_mlir<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>]) 
 /// silently dropped when the `sdsc_*.json` device ops are byte-identical (the cache reuses the old
 /// dir, so the old manifest survives). Pure: no file IO; mirrors `write_bundle`'s trip iteration.
 /// Per-trip [`GroupKind`] + owning-op index for the body's flat trip sequence.
-/// `write_bundle` and `build_manifest_ops` BOTH call this so their grouping is
-/// IDENTICAL (same partition, same subdir names). `host_kv_write`'s first trip
-/// carries `HostKv{skip=kv_n_skip}` (kv_n_skip counts the on-card cachewr TRIPS
-/// it replaces — the same unit the shim's `oi += kv_n_skip` advances over);
-/// `slot_stride_bytes>0` → `Slot`; everything else `Pure` (fusable).
+/// `write_bundle` and `launch_index` BOTH call this so their grouping is IDENTICAL (same partition,
+/// same subdir names).
 fn trip_kinds_and_owner<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
 ) -> (Vec<Trip<T>>, Vec<usize>) {
@@ -6061,13 +5909,9 @@ fn trip_kinds_and_owner<T: ktir_superdsc::collective::Tp>(
     let mut owner = Vec::new();
     for (oi, e) in ops.iter().enumerate() {
         let nt = (e.time.max(1)) as usize; // == concrete_trips(e).len()
-        for ti in 0..nt {
+        for _ in 0..nt {
             let k = if let Some(consume) = e.tp_consume {
                 GroupKind::TpConsume(consume)
-            } else if e.host_kv_write && ti == 0 {
-                GroupKind::HostKv {
-                    skip: e.kv_n_skip as usize,
-                }
             } else if e.kv_page_fold {
                 // ⛔ THE GATHER STATE TRAVELS IN THE KIND, TAKEN FROM THE OP THAT DECLARED IT — the same
                 // field `launch_index` puts on the group's `KvShifts`, so the size cap and the runtime's
@@ -6077,28 +5921,10 @@ fn trip_kinds_and_owner<T: ktir_superdsc::collective::Tp>(
                 }
             } else if e.kv_gathered {
                 GroupKind::Gathered
-            } else if e.slab_write {
-                // Incremental Kᵀ restickify (kill-restickify Stage 2) → Slab (fusable, one
-                // `slab_stride_bytes`). A DISTINCT kind from Slot: its 8192-byte slab stride ≠ the
-                // cachewr's 128, so fusing them would trip the per-group uniform-stride assert.
-                GroupKind::Slab
-            } else if e.slot_stride_bytes > 0 {
-                // Distinct per-slot cachewr (mq>1 prefill) → SlotSolo (singleton); uniform-slot
-                // cachewr (decode) → Slot (fusable). A distinct-slot copy MUST NOT be fused into
-                // a uniform-shift Slot group (would collapse the per-slot writes).
-                if e.slot_no_fuse {
-                    GroupKind::SlotSolo
-                } else {
-                    GroupKind::Slot { req: e.kv_request }
-                }
             } else {
                 GroupKind::Pure
             };
-            kinds.push(Trip::at_slot_offset(
-                k,
-                TripRequest(e.kv_request),
-                e.kv_slot_offset,
-            ));
+            kinds.push(Trip::new(k));
             owner.push(oi);
         }
     }
@@ -6272,12 +6098,8 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
     fold: FoldGrouping,
 ) -> Vec<bundle::KvShifts<T>> {
-    // MEDIUM-GRAIN: one manifest entry per fusion GROUP (a contiguous run of ≤ g Pure
-    // trips = one concrete dxp bundle; every host_kv_write/slot trip a singleton). g==1
-    // reproduces the historical per-trip manifest exactly. The shim reads one entry →
-    // one program; a pure group needs no per-entry handling, a host_kv/slot singleton
-    // carries its metadata (the shim's `oi += kv_n_skip` then skips exactly the singleton
-    // groups that hold the replaced copies).
+    // MEDIUM-GRAIN: one launch group per fusion GROUP (a contiguous run of fusable trips = one
+    // concrete dxp bundle). g==1 reproduces the per-trip partition exactly.
     let (kinds, owner) = trip_kinds_for(ops, fold);
     let groups = group_ranges(&kinds, group_size());
     // LAUNCHES, not ops. A group IS a launch, and fusion means the two numbers are far apart — the
@@ -6385,9 +6207,8 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
         for (gi, r) in groups.iter().enumerate() {
             let e = &ops[owner[r.start]];
             eprintln!(
-                "[sdsc-groups]   op {gi:<3} {:3} trip(s)  req {}  {:?}  {}",
+                "[sdsc-groups]   op {gi:<3} {:3} trip(s)  {:?}  {}",
                 r.end - r.start,
-                kinds[r.start].req.0,
                 kinds[r.start].kind,
                 e.op_name,
             );
@@ -6395,84 +6216,8 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
     }
     let mut shifts: Vec<bundle::KvShifts<T>> = Vec::new();
     for (gi, r) in groups.iter().enumerate() {
-        // The group's first trip's owning op supplies name + any per-entry metadata.
+        // The group's first trip's owning op supplies any per-group metadata.
         let e = &ops[owner[r.start]];
-        // SLOT-group stride: the owner (first trip) carries it; a Slot group's shim slot-shift is
-        // applied ONCE to the whole group, so EVERY op in the group MUST share one stride (else some
-        // head lands at the wrong row). Guard it at build (an un-catchable `cargo build` panic — the
-        // re-roll path swallows Err). Pure groups have stride 0 (their owner is a Pure op). HostKv
-        // singleton stride is 0 (it carries kv_* metadata instead).
-        let slot = if matches!(
-            kinds[r.start].kind,
-            GroupKind::Slot { .. } | GroupKind::SlotSolo
-        ) {
-            let stride = e.slot_stride_bytes;
-            // A SlotSolo group is a singleton (r.len()==1) by construction, so the uniform-stride
-            // check is trivially true; a fused Slot group must share one stride (uniform shift).
-            for t in r.clone() {
-                let o = &ops[owner[t]];
-                assert!(
-                    o.slot_stride_bytes == stride,
-                    "fused Slot group {gi}: op '{}' stride {} != group stride {stride} — a fused \
-                     Slot group's shim slot-shift is uniform, so all cachewr copies must share one \
-                     stride (else a head writes the wrong cache row)",
-                    o.op_name,
-                    o.slot_stride_bytes
-                );
-                // AND one REQUEST. The shim resolves a group's page table and write cursor ONCE,
-                // from the owner's `kv_request`, so two requests in one group would put one
-                // request's token into the other's history — the one cache-write error no later
-                // step can detect. `group_ranges` breaks a Slot run where the request changes, so
-                // this cannot fire; it is here because the consequence is undetectable downstream.
-                assert!(
-                    o.kv_request == e.kv_request,
-                    "fused Slot group {gi}: op '{}' names request {} but the group resolves request \
-                     {} — a group is ONE launch and one page table, so a fused cachewr group must \
-                     be single-request (else a request's token is written into another's history)",
-                    o.op_name,
-                    o.kv_request,
-                    e.kv_request
-                );
-            }
-            stride
-        } else {
-            0
-        };
-        // SLAB-group stride (kill-restickify Stage 2): mirror the Slot guard — the shim shifts the fused
-        // Slab group's seg2 base by `(slot_pos/64)·slab_stride` ONCE, so every op in the group MUST share
-        // one slab_stride (else a kv-head restickifies the wrong slab). Non-Slab groups: 0.
-        let slab = if matches!(kinds[r.start].kind, GroupKind::Slab) {
-            let stride = e.slab_stride_bytes;
-            for t in r.clone() {
-                let o = &ops[owner[t]];
-                assert!(
-                    o.slab_stride_bytes == stride,
-                    "fused Slab group {gi}: op '{}' slab_stride {} != group stride {stride} — a fused \
-                     Slab group's shim shift is uniform, so all restickifies must share one slab_stride \
-                     (else a kv-head re-transposes the wrong slab)",
-                    o.op_name,
-                    o.slab_stride_bytes
-                );
-            }
-            stride
-        } else {
-            0
-        };
-        // ONE PAGE PART per group, of ANY kind — the runtime resolves the group's page once, at the
-        // owner's offset, so an op of another part would land on the wrong page. `group_ranges` breaks a
-        // run where the offset changes (`Trip::fusable_with`), so this cannot fire; it is here because a
-        // part on the wrong page is a cache write nothing downstream can detect.
-        for t in r.clone() {
-            let o = &ops[owner[t]];
-            assert!(
-                o.kv_slot_offset == e.kv_slot_offset,
-                "group {gi}: op '{}' addresses slot offset {} but the group resolves {} — one group is \
-                 one page shift, so a page part must not share a group with another part",
-                o.op_name,
-                o.kv_slot_offset,
-                e.kv_slot_offset
-            );
-        }
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
         // ⭐ A WALK'S BODY GROUP relaunches as its walk says — ONE walk per group, since the group is
@@ -6490,32 +6235,13 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
             );
         }
         shifts.push(bundle::KvShifts {
-            slot_stride_bytes: slot,
-            slab_stride_bytes: slab,
-            // PAGED: `page_slots` is the write-slot modulus AND the declaration that this bundle is
-            // paged — a runtime that does not know the key must refuse rather than apply an
-            // absolute-position shift and land past the page.
-            page_slots: e.kv_page_slots,
-            request: e.kv_request,
-            slot_offset: e.kv_slot_offset,
-            // `page_fold` marks the group the runtime re-launches once per page.
+            // `page_fold` marks the group the runtime re-launches: a walk's body.
             page_fold: fold_group,
-            // ONE PASS PER PAGE INSTEAD OF PER (REQUEST, PAGE) — only when the fold's kernels actually
-            // carry the request axis.
-            batched_requests: fold_group && e.kv_batched_requests,
-            // ⭐ AND WHETHER THAT AXIS IS OVER A GATHERED SCRATCH — the other half of `fold_plan::collapsed`,
-            // and what sends the fold's KV shift to zero. A non-fold group gathers only as a `Gathered`
-            // run (the split-KV chunk's copies), which takes the same zero shift and the same staged index.
+            // ⭐ WHETHER THE GROUP READS THROUGH A GATHERED SCRATCH — what sends its KV shift to zero.
+            // A non-fold group gathers only as a `Gathered` run (the split-KV chunk's copies), which
+            // takes the same zero shift and the same staged index.
             gathered: (fold_group && e.kv_gathered)
                 || matches!(kinds[r.start].kind, GroupKind::Gathered),
-            fold_rows: match e.kv_fold_rows {
-                scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest => {
-                    bundle::FoldRows::PerRequest
-                }
-                scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch => {
-                    bundle::FoldRows::WholeBatch
-                }
-            },
             walk: walk.map(|w| bundle::Walk {
                 trips: w.trips,
                 step_bytes: w.step_bytes,

@@ -28,9 +28,7 @@ use tracing::{debug, info};
 
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::cb_plan;
-use crate::fold_plan::{
-    self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
-};
+use crate::fold_plan::{self, OpKv};
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
     HwError, PeerLink, Stream,
@@ -110,11 +108,6 @@ pub struct KvDim(pub usize);
 /// Physical pages in the resident pool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PoolPages(pub i64);
-/// Positions per page — NONZERO BY MINT: its only producer is the geometry latch, which
-/// latches an op that declares more than zero slots, so a paged geometry's page count divides
-/// without a defense and an unpaged session has no page count at all ([`KvGeometry::Unpaged`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PageSlots(pub std::num::NonZeroI64);
 /// An ABSOLUTE sequence position — how many positions are already resident for this forward.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SeqPos(pub i64);
@@ -131,18 +124,12 @@ pub struct LayerIdx(pub i64);
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The measurement switches, sampled once per process.
-/// WHERE a launch lands: the per-segment byte offsets it shifts by, which KV slot and page it writes,
-/// how many fold passes it makes, and which weight region fills the positional weight slot.
-///
-/// One value rather than five parameters because they are ONE fact — "this launch, at this position" —
-/// and they are always chosen together at the call site that knows the layer index. Passing them
-/// separately also pushed `launch_ops_inner` past the argument limit.
+/// WHERE a launch lands: the per-segment byte offsets it shifts by (the launch row's), and which
+/// weight region fills the positional weight slot. Nothing about the step's position: a walk's body
+/// shifts by its own trip, and every other group launches where the bake placed it.
 #[derive(Clone, Copy)]
 pub(crate) struct LaunchWhere {
     pub(crate) byte_off: [u64; NUM_SEGMENTS],
-    pub(crate) slot_pos: SeqPos,
-    pub(crate) kv_page_base: Bytes,
-    pub(crate) n_fold_pages: i64,
     /// Which weight bank backs the positional weight slot — see `weight_bank_for`.
     pub(crate) weight_bank: usize,
 }
@@ -166,24 +153,6 @@ struct PendingLaunch {
 //  #603 PR2 2c — the replay player's cached step images
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One launch row inside a step image: where the row's canvas sits in the
-/// concatenated step canvas, whether the row's render FOLLOWS the step
-/// scalars, and its patch plan.
-///
-/// `follows_step` is a law of [`Executor::launch_forward`], read here as
-/// data: the body rows launch at the STEP's position/page/count (their
-/// bytes move with the step — patched), while the prefix and suffix launch
-/// at slot 0 / page 0 / one page WHATEVER the step is (their bytes are the
-/// same every step — copied, never patched). A row that is fixed replayed
-/// through its plan would be wrong twice over: the plan was never verified
-/// for the step's slots, and the walk never renders it there.
-struct RowReplay {
-    base: usize,
-    len: usize,
-    follows_step: bool,
-    plan: cb_plan::PatchPlan,
-}
-
 /// The immutable half of a cached image — `Arc`'d because TWO handles must
 /// share it: the cache keeps one, and every step's `ComputeWireBatch` carries
 /// the canvas (one more `Arc`, to the same allocation) plus a stamp closure
@@ -191,12 +160,12 @@ struct RowReplay {
 /// closure is `Send` for free.
 struct StepImageData {
     canvas: std::sync::Arc<Vec<ControlBlockWire>>,
-    rows: Vec<RowReplay>,
+    /// How many launch rows the canvas concatenates — reported by the derivation line.
+    rows: usize,
 }
 
 /// One cached step image — the whole forward (prefix + every body row +
-/// suffix) as ONE canvas, the row table that patches it, and the host-fence
-/// OR the step's single submission carries (the walk's per-row ORs collapse
+/// suffix) as ONE canvas, and the host fence the step's single submission carries (the walk's per-row ORs collapse
 /// into it; see the flush at the end of `launch_ops_inner`).
 #[derive(Clone)]
 struct StepImage {
@@ -204,27 +173,12 @@ struct StepImage {
     barrier: bool,
 }
 
-/// What an image is keyed by — everything the render reads that is not
-/// per-step: WHICH body the ladder picks for this context, how many pages
-/// the resident prefix spans, and the fold shape (below).
+/// What an image is keyed by — WHICH body the ladder picks for this step. Nothing else a launch
+/// addresses varies with the step: a walk's body shifts by its own trip, and every other group
+/// launches where the bake placed it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StepImageKey {
     sel: BodySel,
-    n_fold_pages: i64,
-    /// The fold state the canvas was rendered under: the geometry and
-    /// request count, plus row 0's first `n_fold_pages` page ids. Those ids
-    /// are the ONE fold mutation that can invalidate an image: append-only
-    /// within a request's life (the prefix the fold sweeps is stable), but
-    /// a NEW request reuses the row with different pages.
-    ///
-    /// ⛔ NO ROW CURSORS IN THE KEY, ON PURPOSE. They advance every step —
-    /// keying on them would derive a fresh image per token. A single-request
-    /// launch is `LaunchWidth::Single`, and `RequestSlot::resolve`'s Single
-    /// arm answers the launch's own position without reading any cursor, so
-    /// the render genuinely does not depend on them. `fold_requests != 1`
-    /// never reaches the player (it takes the walk), which is what makes
-    /// that true for every image in this cache.
-    signature: Vec<i64>,
 }
 
 /// The image cache WITH its accounting. The counters live on the two arms
@@ -292,12 +246,7 @@ struct Diag {
     /// CB's five cycle counts (`flex_rs::rb_telemetry`) — so this knob costs nothing but the
     /// printing, and needs NO drain beyond the one `synchronize` a step already performs. It is
     /// the drain-free answer to what `group_time`/`prefix_time` pay ~11% of decode to estimate.
-    /// Combine it with `repeat_probe` and per-op attribution is skipped loudly (the probe's extra
-    /// launches are in the ring but not in the sequence).
     rb_time: bool,
-    /// `SCRATCHY_SDSC_REPEAT_PROBE`: launch the same program twice back to back — separates "a
-    /// launch is expensive" from "switching programs is expensive".
-    repeat_probe: bool,
     /// `SCRATCHY_SDSC_BODY_TRACE`: which body a step actually selected.
     body_trace: bool,
     /// `SCRATCHY_SDSC_SEGADDR_DIAG`: one-shot dump of every segment's resolved runtime base.
@@ -353,7 +302,6 @@ impl Diag {
                 submit_time: on("SCRATCHY_SDSC_SUBMIT_TIME"),
                 prefix_time: on("SCRATCHY_SDSC_PREFIX_TIME"),
                 rb_time: on("SCRATCHY_SDSC_RB_TIME"),
-                repeat_probe: on("SCRATCHY_SDSC_REPEAT_PROBE"),
                 body_trace: on("SCRATCHY_SDSC_BODY_TRACE"),
                 segaddr: on("SCRATCHY_SDSC_SEGADDR_DIAG"),
                 prog_verify: on("SCRATCHY_SDSC_PROG_VERIFY"),
@@ -386,7 +334,6 @@ impl Diag {
             submit_time,
             prefix_time,
             rb_time,
-            repeat_probe,
             body_trace,
             segaddr,
             prog_verify,
@@ -402,7 +349,6 @@ impl Diag {
             || *submit_time
             || *prefix_time
             || *rb_time
-            || *repeat_probe
             || *body_trace
             || *segaddr
             || *prog_verify
@@ -486,7 +432,6 @@ struct Timers {
     /// so a map keyed on the index alone averages a 20-op body's group 2 with a 3-op prefix's.
     prefix_ms: BTreeMap<(usize, usize), (f64, u64, String)>,
     prefix_call: BTreeMap<usize, u64>,
-    repeat_ms: BTreeMap<usize, (f64, f64, u64, String)>,
     /// Per-op harvested RB cycles — keyed like `prefix_ms` (same rung-numbering hazard).
     rb_cycles: BTreeMap<(usize, usize), RbOpCycles>,
     /// The DMA crossings' harvested cycles — the preamble-H2D and logits-D2H, which no op owns.
@@ -516,18 +461,14 @@ struct Timers {
     /// derived (the rest paid a derivation, counted below).
     replay_steps: u64,
     replay_hits: u64,
-    /// Images derived (first use of a (body, page-count, fold-shape) key)
-    /// and what those derivations cost — amortized over every step that
-    /// reuses the image.
+    /// Images derived (first use of a body's key) and what those
+    /// derivations cost — amortized over every step that reuses the image.
     replay_derives: u64,
     replay_derive_ms: f64,
-    /// CBs replayed per step and moving-word patch sites carried by the
-    /// derived images — the player's per-step payload.
+    /// CBs replayed per step — the player's per-step payload.
     replay_cbs: u64,
-    replay_sites: u64,
-    /// The per-step host work: image lookup (key + fold-signature build +
-    /// map hit) and the submit call (canvas memcpy + patches + tag stamps +
-    /// ONE doorbell, all inside it).
+    /// The per-step host work: image lookup (key build + map hit) and the
+    /// submit call (canvas memcpy + tag stamps + ONE doorbell, all inside it).
     replay_lookup_ms: f64,
     replay_submit_ms: f64,
 }
@@ -605,9 +546,6 @@ impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, T> {
 
 impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
     /// Pair one launch-index entry with the program it names.
-    ///
-    /// `slot_write`/`slab_write` stay DERIVED from their strides ("> 0", as the C++ had them) so a
-    /// stride and its flag cannot disagree.
     fn new(
         code: &'static bundle::LaunchGroup<'static, T>,
         fp: &'static str,
@@ -622,17 +560,8 @@ impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
             addr: None,
             collective,
             kv: OpKv {
-                request: kv.request as u64,
-                slot_offset: kv.slot_offset as u64,
                 page_fold: kv.page_fold,
-                slot_write: kv.slot_write(),
-                page_slots: kv.page_slots as u64,
-                slot_stride_bytes: kv.slot_stride_bytes as u64,
-                slab_write: kv.slab_write(),
-                slab_stride_bytes: kv.slab_stride_bytes as u64,
-                batched_requests: kv.batched_requests,
-                // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
-                // zero — a bake fact, carried on the group exactly like the axis itself.
+                // What sends the group's KV shift to zero — a bake fact, carried on the group.
                 gathered: kv.gathered,
                 walk: kv.walk,
             },
@@ -780,9 +709,6 @@ struct Rolled {
     /// launch applies. `(body, w_bank, w_off, kv_off)`: the launch binds bank `w_bank` into
     /// positional slot 1, shifts seg1's base by `w_off` and seg2's by `kv_off`.
     launches: Vec<(usize, u8, u64, u64)>,
-    /// Bytes of ONE pool page — every layer of every class (`Σ_c n_c · stride_c`). Differs from
-    /// any single class's stride exactly when the classes have different KV geometry.
-    kv_page_stride: u64,
     /// The bank the PREFIX program's weight operands were baked in, and the SUFFIX's — the emitter
     /// proved each group's weights live in ONE bank, because a launch has one base per segment.
     prefix_weight_bank: usize,
@@ -792,78 +718,6 @@ struct Rolled {
     // aliasing (hidden_out and suffix_in are aliased onto hidden_in's resident buffer), so the host
     // neither copies nor addresses them. They were carried here only for a tid-archaeology dump of
     // a bug that is fixed.
-}
-
-/// The paged-KV geometry the BUNDLE declares (an op carrying `kv_page_slots` was emitted against
-/// the paged pool), so a paged bundle can never be driven by the unpaged address path — and the
-/// UNPAGED case carries no pool facts at all, which the type states where the zeroed `Default`
-/// and every reader's `.max(1)` defense used to say it at runtime.
-#[derive(Clone, Copy)]
-enum KvGeometry {
-    Unpaged,
-    Paged(PoolGeometry),
-}
-
-/// One pool page's stride across layers — the addressing law the baked value carries, stated as
-/// its two cases. The value's domain is `{0} ∪ positive` BY THE PRODUCER'S OWN CONSTRUCTION
-/// (the reroll pass computes a max of per-layer placement ENDS — `offset + size`, non-negative —
-/// with `unwrap_or(0)`), so the latch's classification is TOTAL AND LOSSLESS: `NonZeroU64::new(v)`
-/// is `Some(s)` exactly when `v = s > 0` and `None` exactly when `v = 0`. The case names what the
-/// value MEANS, it does not re-prove the bake: `Unrolled` IS the stride-0 law — an unrolled
-/// bundle, or a rolled one whose reroll summed no paged KV — and `Strided` is the baked
-/// `Σ n_c · stride_c` every layer of one page spans.
-#[derive(Clone, Copy)]
-enum Stride {
-    Unrolled,
-    Strided(std::num::NonZeroU64),
-}
-
-impl Stride {
-    /// The byte stride — `0` on the stride-0 law, the baked page stride on `Strided`. The
-    /// lossless inverse of the latch's classification: no clamp, no fallback, nothing refused.
-    fn bytes(self) -> u64 {
-        match self {
-            Stride::Unrolled => 0,
-            Stride::Strided(n) => n.get(),
-        }
-    }
-}
-
-/// One pool's geometry — every field a fact the latch stated when it saw an op declare a paged
-/// pool. Page slots are nonzero by mint ([`PageSlots`]); the stride is the baked `Σ n_c·stride_c`
-/// classified by its own domain ([`Stride`]).
-#[derive(Clone, Copy)]
-struct PoolGeometry {
-    page_slots: PageSlots,
-    /// Bytes per page = all layers of one page.
-    page_stride: Stride,
-    pool_pages: PoolPages,
-}
-
-impl KvGeometry {
-    /// The pool geometry when the bundle declared one.
-    fn paged(&self) -> Option<&PoolGeometry> {
-        match self {
-            KvGeometry::Unpaged => None,
-            KvGeometry::Paged(g) => Some(g),
-        }
-    }
-
-    /// ⭐ THE STAND-IN GEOMETRY a SYNTHETIC session addresses — the CB gates' synthetic folds and
-    /// the replay player's canvas math, which must name distinct pages whether or not this
-    /// session has any. The session's own page slots and stride when it has them; a page of one
-    /// slot and one byte when it does not — an unpaged bundle, or one on the stride-0 law
-    /// ([`Stride::Unrolled`]), whose stand-in pages sit one byte apart. ONE statement, shared by
-    /// every site that used to re-derive it as a per-site `.max(1)`.
-    fn synthetic(&self) -> (bool, i64, u64) {
-        match self {
-            KvGeometry::Unpaged => (false, 1, 1),
-            KvGeometry::Paged(g) => match g.page_stride {
-                Stride::Unrolled => (true, g.page_slots.0.get(), 1),
-                Stride::Strided(n) => (true, g.page_slots.0.get(), n.get()),
-            },
-        }
-    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -920,19 +774,9 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     /// (every model but the hybrid-attention ones) has exactly one.
     body_ops: Vec<Ops<T>>,
     suffix_ops: Ops<T>,
-    /// Each class's body with the per-page fold fused back in — one fewer launch per layer. Used
-    /// whenever the context fits ONE page, which is the case that must cost what unpaged cost.
-    /// `None` unless EVERY class has its twin ([`PerClass`]).
-    body_fused: Option<PerClass<Ops<T>>>,
     /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
     /// is the full cap.
     body_rungs: Vec<(SweptCols, Vec<Ops<T>>)>,
-    /// The rungs whose EVERY class has a fold-fused twin, ascending, each with its twins in class
-    /// order ([`fused_rungs`]). A rung with any class sitting out is absent, so it runs split.
-    body_rungs_fused: Vec<(SweptCols, PerClass<Ops<T>>)>,
-    /// PAGED: the SPLIT bodies are only reachable once a context outgrows one page, so their
-    /// Program memory is allocated on first selection.
-    split_bodies_ready: bool,
 
     // ── Device state ──
     // ⛔ The `DevAddr`s below are leaked at shutdown by `impl Drop for Executor` — see the note on
@@ -1032,14 +876,6 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
     /// flag remembered by the bind call alone is a flag the loop can forget.
     const_fp32_ids: BTreeSet<bundle::PlaceId>,
-
-    // ── KV / fold ──
-    kv: KvGeometry,
-    /// The page maps, write cursors and declared strides — [`fold_plan`]'s state, owned here for
-    /// the session's lifetime and read by every launch.
-    fold: SessionKv,
-    /// Has a caller installed a REAL page map (vs the create-time identity default)?
-    block_table_set: bool,
 
     prepared: bool,
     staged_host: bool,
@@ -1314,7 +1150,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 ("SCRATCHY_SDSC_PEROP_SYNC", d.perop_sync),
                 ("SCRATCHY_SDSC_GROUP_TIME", d.group_time),
                 ("SCRATCHY_SDSC_PREFIX_TIME", d.prefix_time),
-                ("SCRATCHY_SDSC_REPEAT_PROBE", d.repeat_probe),
                 ("SCRATCHY_SDSC_OPTRACE", d.optrace),
                 ("SCRATCHY_SDSC_TENSORDUMP", d.tensordump.is_some()),
             ];
@@ -1379,10 +1214,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             prefix_ops: Vec::new(),
             body_ops: Vec::new(),
             suffix_ops: Vec::new(),
-            body_fused: None,
             body_rungs: Vec::new(),
-            body_rungs_fused: Vec::new(),
-            split_bodies_ready: false,
             stream: None,
             seg_addr: [const { None }; NUM_SEGMENTS],
             // ⭐ THE WEIGHT BANKS, STRAIGHT FROM THE BAKED LAYOUT — the bundle decided how many
@@ -1409,9 +1241,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             keyed: BTreeMap::new(),
             staged: BTreeMap::new(),
             const_fp32_ids: BTreeSet::new(),
-            kv: KvGeometry::Unpaged,
-            fold: SessionKv::default(),
-            block_table_set: false,
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
@@ -1428,9 +1257,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         // The BODY's own launch groups (or the whole model's, unrolled).
         ex.load_bodies()?;
-        // AFTER every program is bound: let the BUNDLE declare whether the KV is paged, and size the
-        // pool from the create-time page count.
-        ex.latch_paged_geometry();
 
         debug!(
             "[sdsc-superdsc] load OK — bundle={}, {} placements, seg_bytes={:?}, logits={}, \
@@ -1461,13 +1287,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             )
         })?;
         bind_ops(code, self.session())
-    }
-
-    /// An OPTIONAL sibling's launch groups — a fold-fused twin, which a bundle may not carry.
-    fn optional_sibling_ops(&self, fp: &bundle::SiblingFp<'static>) -> Result<Option<Ops<T>>> {
-        bundle::sibling(fp)
-            .map(|code| bind_ops(code, self.session()))
-            .transpose()
     }
 
     /// The rank this session runs as, when it runs one rank of a sharded world.
@@ -1533,7 +1352,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .iter()
                 .map(|l| (l.body as usize, l.w_bank, l.w_off, l.kv_off))
                 .collect(),
-            kv_page_stride: m.kv_page_stride,
             prefix_weight_bank: m.prefix_weight_bank as usize,
             suffix_weight_bank: m.suffix_weight_bank as usize,
         });
@@ -1587,20 +1405,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .collect::<Result<Vec<_>>>()?;
             self.body_rungs.push((r.active_cap, bodies));
         }
-        // A rung's fold-fused twins are optional: a rung where any class sits out runs its split
-        // bodies — correct, one launch per layer dearer. See [`fused_rungs`] for why it is per rung.
-        let mut twins = Vec::with_capacity(rungs.len());
-        for r in rungs {
-            twins.push((
-                r.active_cap,
-                r.bodies.len(),
-                r.bodies_fused
-                    .iter()
-                    .map(|fp| self.optional_sibling_ops(fp))
-                    .collect::<Result<Vec<_>>>()?,
-            ));
-        }
-        self.body_rungs_fused = fused_rungs(twins);
         // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
         //
         // A bundle carries a memory PLAN and a set of device PROGRAMS. The plan is what every session
@@ -1644,80 +1448,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             self.suffix_ops.len()
         );
         Ok(())
-    }
-
-    /// Let the BUNDLE declare whether the KV is paged — any op carrying `kv_page_slots` was emitted
-    /// against the paged pool. Read from the OPS rather than a flag so a paged bundle can never be
-    /// driven by the unpaged path (which would apply an absolute-position write shift and land past
-    /// the page). seg2 is then sized `pool_pages * page_stride` at RUNTIME rather than from the
-    /// manifest, which is what makes the servable context an allocation instead of a baked constant.
-    fn latch_paged_geometry(&mut self) {
-        let mut page_slots: Option<std::num::NonZeroI64> = None;
-        // A rung holds ONE `Ops` PER ATTENTION CLASS (the roll split by class), so the ladder's
-        // contribution to the sweep is the rungs' class vectors FLATTENED — the same `&Ops` items
-        // `lists()` yields.
-        for ops in self
-            .lists()
-            .into_iter()
-            .chain(self.body_rungs.iter().flat_map(|(_, o)| o))
-        {
-            for o in ops {
-                // The >0 test IS the mint: a nonzero page count is a fact the op states, and
-                // `PageSlots` carries it from here on, so no reader re-proves it.
-                if let Some(ps) = std::num::NonZeroI64::new(o.kv.page_slots as i64) {
-                    page_slots = Some(ps);
-                }
-            }
-        }
-        let Some(page_slots) = page_slots else {
-            return;
-        };
-        // ⭐ THE PAGE STRIDE IS BAKED, NOT DERIVED. It used to be `iters × kv_stride`, which is
-        // only right while every layer has the same KV geometry — a hybrid model's classes do not,
-        // and the emitter's `kv_page_stride` already sums every class's extent (`Σ n_c·stride_c`),
-        // proven against the placements. 0 on an UNROLLED bundle (no reroll meta) is the same value
-        // the old `iters × kv_stride` formula produced there (0 × 0), and the geometry latch below
-        // runs identically — an unrolled paged bundle keeps its pre-split behavior whole. The
-        // CLASSIFICATION into [`Stride`] is total and lossless over the value's own domain (see
-        // the enum): the case states which addressing law the value carries, nothing re-proved.
-        let page_stride =
-            std::num::NonZeroU64::new(self.rolled.as_ref().map_or(0, |r| r.kv_page_stride))
-                .map_or(Stride::Unrolled, Stride::Strided);
-        let geom = PoolGeometry {
-            page_slots: PageSlots(page_slots),
-            page_stride,
-            pool_pages: PoolPages(if self.num_blocks.0 > 0 {
-                self.num_blocks.0
-            } else {
-                1
-            }),
-        };
-        self.fold.paged = true;
-        self.fold.page_slots = fold_plan::PageSlots::per_page(geom.page_slots.0.get());
-        self.fold.page_stride_bytes = Bytes(geom.page_stride.bytes());
-        // CREATE-TIME IDENTITY MAP. A session forwarded before any `set_block_table` addresses
-        // logical page n as physical page n, which is what the unpaged path did.
-        let ident: Vec<i64> = (0..geom.pool_pages.0).collect();
-        self.install_page_map(RowIdx::from_launch_row(0), SeqPos(0), &ident);
-        self.block_table_set = false;
-        debug!(
-            "[sdsc-superdsc] PAGED KV: page={} slots, page_stride={} B, pool={} pages ({:.1} MB) \
-             => {} positions of context available to one request",
-            geom.page_slots.0.get(),
-            geom.page_stride.bytes(),
-            geom.pool_pages.0,
-            (geom.pool_pages.0 as u64 * geom.page_stride.bytes()) as f64 / 1048576.0,
-            geom.pool_pages.0 * geom.page_slots.0.get(),
-        );
-        self.kv = KvGeometry::Paged(geom);
-    }
-
-    fn lists(&self) -> Vec<&Ops<T>> {
-        vec![&self.prefix_ops]
-            .into_iter()
-            .chain(self.body_ops.iter())
-            .chain(std::iter::once(&self.suffix_ops))
-            .collect()
     }
 
     /// The CPUs this session's card's host threads run on (its NUMA node's): a thread that
@@ -2580,26 +2310,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         //    all SHARE the resident tensor segments below. ──
         {
             self.alloc_ops_at(ListSel::Prefix)?;
-            if self.body_rungs.is_empty() {
-                for c in 0..self.body_ops.len() {
-                    self.alloc_ops_at(ListSel::Body(c))?;
-                }
-                self.split_bodies_ready = true;
-            } else {
-                // When every rung has a fold-fused twin, the SPLIT bodies are dead weight until
-                // some context outgrows one page. Allocating both up front is what made the paged
-                // decode session carry 104 program allocations where the unpaged one carried 39,
-                // and the per-token cost of that lands in the DMA ENQUEUE (measured 1.21 ms to
-                // enqueue a 59 KB transfer against 0.58 ms unpaged). Deferring keeps the
-                // steady-state session the same size as the unpaged one.
-                let twins_cover_every_rung = self.body_rungs_fused.len() == self.body_rungs.len();
-                if !twins_cover_every_rung {
-                    for i in 0..self.body_rungs.len() {
-                        for c in 0..self.body_rungs[i].1.len() {
-                            self.alloc_ops_at(ListSel::Rung(i, c))?;
-                        }
-                    }
-                    self.split_bodies_ready = true;
+            for c in 0..self.body_ops.len() {
+                self.alloc_ops_at(ListSel::Body(c))?;
+            }
+            for i in 0..self.body_rungs.len() {
+                for c in 0..self.body_rungs[i].1.len() {
+                    self.alloc_ops_at(ListSel::Rung(i, c))?;
                 }
             }
             self.alloc_ops_at(ListSel::Suffix)?;
@@ -2613,10 +2329,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // ⛔⛔⛔⭐⭐⭐ THE ALLOCATION ORDER IS NATURAL (seg 0..N), AND WEIGHT-FIRST IS **MEASURABLY
         // WORSE** — tried and rejected 2026-08-16, so nobody spends another bake on the inference.
         //
-        // The note below this loop says "an allocation ahead of the weights therefore taxes decode and
-        // leaves prefill alone, which is the exact shape of the gap", and it is applied to the fused
-        // twins by allocating them LAST. It is TEMPTING to read that as "so allocate the weights
-        // first", especially since 8b puts 110 MB of SEG_INTERMEDIATE ahead of an 8.9 GB weight region
+        // An allocation ahead of the weights taxes decode and leaves prefill alone. It is TEMPTING to
+        // read that as "so allocate the weights first", especially since 8b puts 110 MB of SEG_INTERMEDIATE ahead of an 8.9 GB weight region
         // while 2b puts only 16 MB ahead of 5.07 GB, and 8b streams at 103 GB/s against 2b's 185.
         //
         // MEASURED, granite-3.1-8b fp8, 10 runs each:
@@ -2629,7 +2343,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // consistent with the recorded finding that flex exposes no placement input and only the region
         // table is readable.
         for i in 0..NUM_SEGMENTS {
-            let mut bytes = if self.seg_borrowed[i] {
+            let bytes = if self.seg_borrowed[i] {
                 // A BORROWED segment gets the same 128 B placeholder an empty one does: `alias_seg`
                 // replaces this address with the owner's region, so allocating the full extent
                 // would reserve device memory only to drop it immediately.
@@ -2639,15 +2353,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             } else {
                 128
             };
-            // PAGED: the manifest sizes seg2 for ONE page — that is the point, no baked pool — so
-            // the POOL extent is decided here, at run time.
-            if i == SEG_KV.get()
-                && !self.seg_borrowed[i]
-                && let Some(g) = self.kv.paged()
-            {
-                let pool = g.pool_pages.0 as u64 * g.page_stride.bytes();
-                bytes = bytes.max(pool);
-            }
             self.seg_addr[i] = Some(
                 DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
@@ -2706,22 +2411,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             );
         }
 
-        // ── FUSED TWINS ALLOCATE LAST ── They are the only allocation PAGING adds to this session,
-        //    and everything above now happens in the order, and at the sizes, the unpaged path used
-        //    — so the weight region lands exactly where it did before. Decode re-streams those
-        //    weights every token and is bandwidth-bound on them; prefill is compute-bound at the
-        //    roofline. An allocation ahead of the weights therefore taxes decode and leaves prefill
-        //    alone, which is the exact shape of the gap. They are KB each, so being last is free.
-        for i in 0..self.body_rungs_fused.len() {
-            for c in 0..self.body_rungs_fused[i].1.len() {
-                self.alloc_ops_at(ListSel::RungFused(i, c))?;
-            }
-        }
-        for c in 0..self.body_fused.as_ref().map_or(0, PerClass::len) {
-            self.alloc_ops_at(ListSel::BodyFused(c))?;
-        }
-        lap("fused-twin-program-h2d", &mut t0);
-
         // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
         //    critical path. Then grow each seg_host to the device alloc's size (alignment pad,
         //    zero) so the H2D copies a full region. ──
@@ -2731,13 +2420,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // Same rule as the staging shadow: skip only what an alias replaces. Activation
             // segments still grow to the device extent, because this session fills them itself.
             if reserve_only && is_resident_seg(i) {
-                continue;
-            }
-            // NO HOST MIRROR OF THE KV POOL. seg2 is written by the DEVICE (the on-card `cachewr`
-            // ops) and read by the device; nothing on the host needs a copy, and sizing one to the
-            // pool cost 960 MB of RSS (3.84 GB at a 1024-slot page) to mirror bytes the host never
-            // looks at. Two owners of the KV is also the shape that produced the block-table bug.
-            if i == SEG_KV.get() && self.kv.paged().is_some() {
                 continue;
             }
             let need = self.seg_addr[i]
@@ -2776,12 +2458,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             if reserve_only && is_resident_seg(i) {
                 continue;
             }
-            // The KV pool has NO host mirror to send (see the sizing loop), so it is zeroed
-            // separately and in chunks by `zero_seg`. DMA'ing from the empty vector here would be a
-            // null source for a pool-sized transfer.
-            if i == SEG_KV.get() && self.kv.paged().is_some() {
-                continue;
-            }
             let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
             // The shadow was grown to the device extent by the loop above, so this slice is the
             // whole region — and taking it AS A SLICE is what proves the H2D cannot read past the
@@ -2809,21 +2485,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
         }
         lap("tensor-h2d", &mut t0);
-        // ⭐ THE PAGED POOL STARTS ZEROED, filled on the device by the session that allocated it — it
-        // has no host image to upload (above). An unwritten slot is read before its mask applies, and
-        // a decode batch reads page 0 (the null page) under an all-masked row for every block slot
-        // past a sequence's blocks, as spyre-inference does over its zeroed cache. Device memory left
-        // as found holds non-finite words, which no additive mask cancels: MEASURED on the card with
-        // the pool unfilled, 8,253 of them in page 0. A session that borrows the pool takes the
-        // owner's zeroed region by alias.
-        if self.kv.paged().is_some()
-            && !self.seg_borrowed[SEG_KV.get()]
-            && !(reserve_only && is_resident_seg(SEG_KV.get()))
-        {
-            self.zero_seg(SEG_KV)
-                .map_err(|e| anyhow!("prepare: zeroing the paged KV pool: {e}"))?;
-            lap("kv-zero", &mut t0);
-        }
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("prepare: sync: {e}"))?;
@@ -2903,66 +2564,18 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// rendered TWO ways — the submit walk's own enumeration (`cb_plan::walk_items`) and the data
     /// twin (`cb_plan::build_cb_plan` + `CbPlan::render`) — through ONE render door
     /// (`Stream::render_batch`, the same `build_compute_cb` the submit path runs), and a
-    /// differing byte REFUSES THE LOAD. This is the gate that will let 2c's player replay
-    /// pre-rendered images: it proves, at prepare, that the plan's data twin of the walk is
-    /// byte-identical, so no step ever needs to re-derive (or re-check) what it replays.
-    ///
-    /// ⭐ STAGE 2b rides along: per context, `cb_plan::patch_check` proves the IMAGE MODEL itself
-    /// — canvas + affine patches ≡ a fresh walk render, at off-sample steps — under the decode
-    /// player's own single-request shape, and ONLY over the body-class lists: those are the
-    /// lists the player launches at a step-following `where_` (prefix/suffix launch at a
-    /// constant one, so their patch table is empty by construction and their proof is the
-    /// parity leg alone). A geometry too narrow to host the off-sample proof around a mid-page
-    /// canvas (`canvas_room`) skips that leg loudly; every shipped bundle's page
-    /// is 2048 slots.
+    /// differing byte REFUSES THE LOAD. This is the gate that lets the player replay pre-rendered
+    /// images: it proves, at prepare, that the plan's data twin of the walk is byte-identical, so
+    /// no step ever needs to re-derive (or re-check) what it replays.
     ///
     /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
-    /// list that exists by then), at [`Self::alias_seg_from`] (a borrowing session's segments are
-    /// placeholder-poisoned at its prepare, so ITS gate waits for the alias that completes the
-    /// borrowed set — the rungs and the prefix-capable prefill session), and once more at
-    /// [`Self::ensure_split_bodies`] (the deferred rungs, at the one event that makes them exist).
-    ///
-    /// Both step shapes are SYNTHETIC, not the live session's. The parity gate's: 2 requests × 3
-    /// resident pages, a mid-page write slot, request 0's page 2 as the write base — the shape
-    /// that exercises the batched fold (reps > 1), the slot write, the non-fold page resolution
-    /// and the per-request intermediate shift, more than any single real step would, while both
-    /// parity sides read the SAME fold, so the gate's meaning (twin agreement) is independent of
-    /// which shape it runs under. The patch gate's: ONE request × 3 pages — under a single row
-    /// the launch slot IS the position every op's KV term reads (`op_slot_pos` resolves row
-    /// cursors only when the batch is wide), which is the single-request decode regime the
-    /// player serves; the batched shapes are PR4's. The geometry the synthetic folds must not
-    /// contradict (paged-ness, page slots, page stride) is grounded in THIS session's, because a
-    /// bundle that was never baked paged has no fold ops for a paged shape to exercise.
+    /// list that exists by then) and at [`Self::alias_seg_from`] (a borrowing session's segments
+    /// are placeholder-poisoned at its prepare, so ITS gate waits for the alias that completes the
+    /// borrowed set).
     fn check_cb_plan_parity(&self) -> Result<()> {
         let stream = self.stream_ref()?;
-        let (paged, per, stride) = self.kv.synthetic();
-        let fold = SessionKv {
-            paged,
-            page_slots: fold_plan::PageSlots::per_page(per),
-            page_stride_bytes: Bytes(stride),
-            // Two rows of three pages each — the rows AGREE about how many they hold (a uniform
-            // sweep exists) and neither row holds the other's pages (a per-request shift is real,
-            // not zero).
-            block_tables: vec![vec![0, 1, 2], vec![3, 4, 5]],
-            request_positions: RowCursors::bound(vec![2 * per + 5; 2]),
-            fold_requests: 2,
-            mask_rep_stride_bytes: 0,
-            mask_blocks: 64,
-            fold_pages: 3,
-            int_rep_stride_bytes: 65536,
-        };
-        // The write slot lands MID-PAGE (slot 5 of `per`), so the page a non-fold op works in and
-        // the slot a fold writes are different addresses; the write base is request 0's page 2 —
-        // a real block-table walk, not a zero.
-        let slot = SeqPos(2 * per + 5);
-        let kv_page_base = RowPage::of(&fold, RowIdx::from_launch_row(0), 2)
-            .map(|rp| fold_plan::page_base_bytes(&fold, rp))
-            .unwrap_or(Bytes(0));
         let mk = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
             byte_off: off,
-            slot_pos: slot,
-            kv_page_base,
-            n_fold_pages: 3,
             weight_bank: bank,
         };
         // One `LaunchWhere` per distinct weight bank the launch table names (a representative
@@ -2979,9 +2592,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     .is_some_and(|a| a.is_some())
             }
         };
-        // The launch ROWS both gates' sessions share: one (tag, bank, shifts) per distinct
-        // weight bank the session could launch, enumerated once and rendered at each session's
-        // own write slot and page.
+        // The launch ROWS: one (tag, bank, shifts) per distinct weight bank the session could
+        // launch.
         let mut rows: Vec<(String, usize, [u64; NUM_SEGMENTS])> = Vec::new();
         match self.rolled.as_ref() {
             // Unrolled: no layer boundary to bank on — bank 0 and zero shifts are the only shape
@@ -3021,52 +2633,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .map(|(tag, bank, off)| (tag.clone(), mk(*bank, *off)))
             .collect();
 
-        // ⭐ 2b — THE PATCH GATE'S SESSION: the PLAYER's shape, not the batched fold's. ONE
-        // request, three resident pages. The canvas slot is `cb_plan::canvas_slot` — the ONE
-        // recipe, shared with the player, that picks a slot with room on both sides for the
-        // differentials and the off-sample steps: mid-page, off every slab boundary, never
-        // slot 0 of a page.
-        let r_patch = cb_plan::canvas_slot(per, paged);
-        let fold1 = SessionKv {
-            paged,
-            page_slots: fold_plan::PageSlots::per_page(per),
-            page_stride_bytes: Bytes(stride),
-            block_tables: vec![vec![0, 1, 2]],
-            request_positions: RowCursors::bound(vec![2 * per + r_patch.unwrap_or(1)]),
-            fold_requests: 1,
-            mask_rep_stride_bytes: 0,
-            mask_blocks: 64,
-            fold_pages: 3,
-            // A single request has no per-request intermediate shift to exercise — zero is
-            // the decode player's own value, not a skipped dimension.
-            int_rep_stride_bytes: 0,
-        };
-        // The canvas write base is a SYNTHETIC mid-pool page (2·stride): a
-        // stand-in for the table-sourced base the player's own canvas renders
-        // at, far enough from either end of the address range that no render
-        // clips. Nothing probes past it anymore — the patch model has no page
-        // term (the boundary step walks; see `StepScalars`), so this base is
-        // only where the canvas and every off-sample render sit.
-        let page_c = Bytes(2 * stride);
-        let mk1 = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
-            byte_off: off,
-            slot_pos: SeqPos(2 * per + r_patch.unwrap_or(1)),
-            kv_page_base: page_c,
-            n_fold_pages: 3,
-            weight_bank: bank,
-        };
-        // The patch gate needs one image's worth of sampling room around its canvas: the
-        // `slot+65` off-sample (the slab-coefficient proof) must land strictly inside the
-        // image's page span. `canvas_room` is the ONE law, shared with the player — a page
-        // too narrow for it (or one no canvas slot fits at all) skips the leg loudly; every
-        // shipped bundle's page is 2048 slots.
-        let patch_room = r_patch.is_some_and(|r| cb_plan::canvas_room(per, paged, r));
-        if !patch_room {
-            debug!(
-                "[sdsc-cbplan] patch gate SKIPPED: no canvas slot with sampling room fits a \
-                 {per}-slot page. The parity gate above still ran."
-            );
-        }
         // Every list the session could launch — the class dimension is enumerated whole here, so
         // a where need not be matched to the classes its rows name (parity reads the same ops
         // either way). A list whose programs are not allocated yet (the deferred rungs) is
@@ -3075,23 +2641,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         for c in 0..self.body_ops.len() {
             sels.push(ListSel::Body(c));
         }
-        for c in 0..self.body_fused.as_ref().map_or(0, PerClass::len) {
-            sels.push(ListSel::BodyFused(c));
-        }
         for i in 0..self.body_rungs.len() {
             for c in 0..self.body_rungs[i].1.len() {
                 sels.push(ListSel::Rung(i, c));
             }
         }
-        for i in 0..self.body_rungs_fused.len() {
-            for c in 0..self.body_rungs_fused[i].1.len() {
-                sels.push(ListSel::RungFused(i, c));
-            }
-        }
         let mut cbs = 0usize;
         let mut contexts = 0usize;
-        let mut sites = 0usize;
-        let mut patch_contexts = 0usize;
         for sel in sels {
             let ops = self.list(sel);
             if ops.is_empty() || !ops.iter().all(|o| o.addr.is_some()) {
@@ -3101,7 +2657,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 let label = format!("{sel:?}/{tag}");
                 cbs += cb_plan::parity_check(
                     ops,
-                    &fold,
                     &self.seg_addr,
                     &self.weight_bank_addr,
                     where_,
@@ -3110,58 +2665,20 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 )?;
                 contexts += 1;
             }
-            // ⭐ THE PLAYER'S ROW LAW, read here as the gate's scope: only the
-            // four body-class lists are ever launched at a step-following
-            // `where_` — prefix/suffix launch at a constant one (see
-            // `derive_step_image`), so their patch table is empty by
-            // construction and there is nothing for this leg to prove.
-            // Probing them at this leg's mid-pool `where_` measures a
-            // counterfactual no replay executes (measured on the first real
-            // bundle: the page differential's render returns a structurally
-            // different allocation and the affine solve refuses).
-            let step_following = !matches!(sel, ListSel::Prefix | ListSel::Suffix);
-            if patch_room && step_following {
-                for (tag, bank, off) in &rows {
-                    let label = format!("{sel:?}/{tag}");
-                    let (row_sites, _) = cb_plan::patch_check(
-                        ops,
-                        &fold1,
-                        &self.seg_addr,
-                        &self.weight_bank_addr,
-                        &mk1(*bank, *off),
-                        &label,
-                        stream,
-                    )?;
-                    sites += row_sites;
-                    patch_contexts += 1;
-                }
-            }
         }
         if contexts == 0 {
             // The gate may not pass vacuously: prepare allocates the prefix and suffix lists
             // unconditionally and bank 0's region exists by the time this runs, so zero
             // checkable contexts means the enumeration itself is broken — refuse rather than
-            // "prove" nothing. Both legs share this enumeration, so it covers the patch gate
-            // too (they cannot disagree about which (list × row) pairs exist).
+            // "prove" nothing.
             bail!(
                 "[cbplan] parity gate REFUSED: no (list × launch-row) context was checkable — \
                  every bank was skipped or no list is allocated"
             );
         }
-        if patch_room && patch_contexts == 0 {
-            // Not a refusal: the rungs allocate lazily, so a session whose every body-class
-            // list is still deferred legitimately has nothing to patch-prove here — each
-            // rung runs this same gate at its own allocation. Said loudly because a silent
-            // zero is indistinguishable from a broken enumeration.
-            debug!(
-                "[sdsc-cbplan] patch gate verified ZERO images: no body-class list is allocated \
-                 yet (deferred rungs gate at their own allocation)"
-            );
-        }
         debug!(
             "[sdsc-cbplan] parity gate: {cbs} CB(s) proven byte-identical across {contexts} \
-             (list × launch-row) context(s); patch gate: {sites} moving word(s) verified \
-             off-sample across {patch_contexts} image(s)"
+             (list × launch-row) context(s)"
         );
         Ok(())
     }
@@ -3292,13 +2809,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             ListSel::Prefix => &mut self.prefix_ops,
             ListSel::Body(c) => &mut self.body_ops[c],
             ListSel::Suffix => &mut self.suffix_ops,
-            ListSel::BodyFused(c) => self
-                .body_fused
-                .as_mut()
-                .expect("BodyFused is selected only when every class has its twin")
-                .class_mut(c),
             ListSel::Rung(i, c) => &mut self.body_rungs[i].1[c],
-            ListSel::RungFused(i, c) => self.body_rungs_fused[i].1.class_mut(c),
         }
     }
 
@@ -3309,22 +2820,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             ListSel::Prefix => &self.prefix_ops,
             ListSel::Body(c) => &self.body_ops[c],
             ListSel::Suffix => &self.suffix_ops,
-            ListSel::BodyFused(c) => self
-                .body_fused
-                .as_ref()
-                .expect("BodyFused is selected only when every class has its twin")
-                .class(c),
             ListSel::Rung(i, c) => &self.body_rungs[i].1[c],
-            ListSel::RungFused(i, c) => self.body_rungs_fused[i].1.class(c),
         }
     }
 
     /// ⭐⭐⭐⭐⭐ **THE BODY THIS STEP WILL RUN**, and the only way anyone gets one.
     ///
-    /// ⛔⛔⛔ IT TAKES THE WRITE SLOT AND NOTHING ELSE, WHICH IS THE WHOLE POINT. The selector's two
-    /// inputs are `valid_len` and `n_fold_pages`, and BOTH are functions of the slot this step writes —
-    /// so if a caller could pass them it could pass a pair the launch will not use, and then the host's
-    /// index table, the host's mask FORM and the launched descriptor would be about different bodies.
+    /// ⛔⛔⛔ IT TAKES THE WRITE SLOT AND NOTHING ELSE, WHICH IS THE WHOLE POINT. The selector's input
+    /// is `valid_len`, a function of the slot this step writes — so if a caller could pass it, it could
+    /// pass one the launch will not use, and then the host's index table, the host's mask FORM and the
+    /// launched descriptor would be about different bodies.
     /// Derived here, from the one value the host also hands to `run_step` as `start`, there is no second
     /// derivation to drift.
     ///
@@ -3342,16 +2847,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     }
 
     pub fn step_body(&mut self, seq_pos: SeqPos) -> Result<StepBody> {
-        let n_fold_pages = self.n_fold_pages(seq_pos);
         // `valid_len = seq_pos + 1` — positions [0..seq_pos] are filled, including the token written to
-        // KV before attention. Spelled ONCE, here, for both readers of the selection.
-        let sel = self.select_body_paged(seq_pos.0 + 1, n_fold_pages)?;
+        // KV before attention. Spelled ONCE, here, for every reader of the selection.
+        let sel = self.select_body(seq_pos.0 + 1)?;
         // ⭐ EVERY CLASS'S OWN OPS ANSWER IT, folded to the strongest claim: the gather scratch must
         // satisfy every class that reads through one, and the unswept-slot guard must use the
         // NARROWEST sweep any class runs (a rung's extent is shared by every class, so this is the
         // same number for each — but reading it per class keeps the fact with the ops that carry
-        // it). Same discipline as `latch_paged_geometry` reading `page_slots` off the ops: a bake
-        // fact rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body
+        // it). A bake fact rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body
         // that gathers cannot be driven as one that does not, or the reverse.
         let mut gathers_any = false;
         // Same authority, same reason: whether this body re-launches a page fold is the
@@ -3388,13 +2891,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
     /// THIS selection's swept extent — its own ladder rung's `active_cap`, which every class of a
     /// rung shares (a rung IS one swept extent; the classes are the programs baked for it). `None` for
-    /// the ladderless arms (`Body`/`BodyFused`: an UNROLLED bundle, which bakes no rung and so states
+    /// the ladderless arm (`Body`: an UNROLLED bundle, which bakes no rung and so states
     /// no sweep — there is no walk to stage for it, and none is made up).
     fn body_swept(&self, sel: BodySel) -> Option<SweptCols> {
         match sel {
             BodySel::Rung(i) => Some(self.body_rungs[i].0),
-            BodySel::RungFused(i) => Some(self.body_rungs_fused[i].0),
-            BodySel::Body | BodySel::BodyFused => None,
+            BodySel::Body => None,
         }
     }
 
@@ -3403,9 +2905,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     fn list_sel_for(&self, sel: BodySel, class: usize) -> ListSel {
         match sel {
             BodySel::Body => ListSel::Body(class),
-            BodySel::BodyFused => ListSel::BodyFused(class),
             BodySel::Rung(i) => ListSel::Rung(i, class),
-            BodySel::RungFused(i) => ListSel::RungFused(i, class),
         }
     }
 
@@ -3413,49 +2913,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     //  Body selection
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
-    /// Program memory for the split ladder, allocated on first need. Idempotent, and a no-op for a
-    /// session whose bodies were allocated at prepare.
-    ///
-    /// ⛔ ALLOCATING HERE MAKES SELECTION AND ALLOCATION THE SAME EVENT. The gate used to live at
-    /// ONE of the two call sites and re-spell the selector's rule, which is how a split body came to
-    /// be selected and never allocated: the launch took a null device address
-    /// (RAS::RUNTIMEOPERATION::NullArgument) and the whole batch returned no output. Twice, for two
-    /// different reasons. A caller cannot obtain a split body that is not backed.
-    fn ensure_split_bodies(&mut self) -> Result<()> {
-        if self.split_bodies_ready || self.body_rungs.is_empty() {
-            return Ok(());
-        }
-        for i in 0..self.body_rungs.len() {
-            for c in 0..self.body_rungs[i].1.len() {
-                self.alloc_ops_at(ListSel::Rung(i, c))?;
-            }
-        }
-        // Their binaries must land before the first launch.
-        self.stream_ref()?
-            .synchronize()
-            .map_err(|e| anyhow!("split-body sync: {e}"))?;
-        self.split_bodies_ready = true;
-        // ⭐ #603 PR2 2a — the DEFERRED rungs exist now, so the CB parity gate runs at this, the
-        // one event that made them (never per step; the lists prepare already saw were proven
-        // there and are merely re-proven here, once).
-        self.check_cb_plan_parity()?;
-        debug!(
-            "[sdsc-superdsc] allocated {} split decode bodies (a fold that re-launches needs them)",
-            self.body_rungs.len()
-        );
-        Ok(())
-    }
-
-    /// Select the SPLIT decode body for a valid KV length of `valid_len` positions: the smallest
-    /// rung whose `active_cap` ≥ it, which bounds the O(cap) attention sweep. Every return is a
-    /// split body, so this is also where they are guaranteed to EXIST.
+    /// Select the decode body for a valid KV length of `valid_len` positions: the smallest rung whose
+    /// `active_cap` ≥ it, which bounds the O(cap) attention sweep. Every body is allocated at prepare.
     fn select_body(&mut self, valid_len: i64) -> Result<BodySel> {
-        self.ensure_split_bodies()?;
-        let reqs = self.fold_requests_or_1();
         if self.body_rungs.is_empty() {
-            // The ladderless single body — traced for the same reason as the fused one: an untraced
-            // return is indistinguishable from a step that never reached the selector at all.
-            self.trace_body("split-noladder", valid_len, -1, reqs, 0, false);
+            // The ladderless single body — traced: an untraced return is indistinguishable from a
+            // step that never reached the selector at all.
+            self.trace_body("noladder", valid_len, 0);
             return Ok(BodySel::Body);
         }
         // ⭐ THE ONE SELECTION (`Ladder::rung_for`), which the bake ran over every position this bundle
@@ -3473,93 +2937,20 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
             .rung_for(valid_len.max(0) as u64);
         let variant = if rung.active_cap.covers(valid_len.max(0) as u64) {
-            "split"
+            "rung"
         } else {
-            "split-CEILING"
+            "rung-CEILING"
         };
-        self.trace_body(
-            variant,
-            valid_len,
-            -1,
-            reqs,
-            rung.active_cap.get() as i64,
-            false,
-        );
+        self.trace_body(variant, valid_len, rung.active_cap.get() as i64);
         Ok(BodySel::Rung(at))
     }
 
-    /// Pick the body for this step: the sk_bucket rung by live length, and — when the fold would
-    /// run exactly ONE pass — the FOLD-FUSED variant, which carries the baseline's launch count.
-    ///
-    /// ⛔ THE FUSED BODY HAS NO FOLD (`trip_kinds_for` rewrites `PageFold` to `Pure` for the fused
-    /// variant), so `reps` collapses to 1. That is correct for ONE request and WRONG for a batch:
-    /// `reps = n_fold_pages * fold_requests`, and asking only about PAGES picked the fused body for
-    /// a short context with N requests, ran the prefix fold once — the (request 0, page 0) pass —
-    /// and left every other request attending NO resident prefix. Request 0 looked fine, everyone
-    /// else produced garbage from their second token.
-    fn select_body_paged(&mut self, valid_len: i64, n_fold_pages: i64) -> Result<BodySel> {
-        let reqs = self.fold_requests_or_1();
-        let single_page = self.kv.paged().is_none() || (n_fold_pages <= 1 && reqs <= 1);
-        if single_page {
-            if !self.body_rungs_fused.is_empty() {
-                for (i, (swept, _)) in self.body_rungs_fused.iter().enumerate() {
-                    if swept.covers(valid_len.max(0) as u64) {
-                        self.trace_body(
-                            "fused",
-                            valid_len,
-                            n_fold_pages,
-                            reqs,
-                            swept.get() as i64,
-                            true,
-                        );
-                        return Ok(BodySel::RungFused(i));
-                    }
-                }
-                // ⛔ NO FUSED RUNG COVERS THIS CONTEXT — fall through to the SPLIT ladder, do NOT
-                // return the widest fused rung: that hands back a body whose sweep is NARROWER than
-                // the live context and silently DROPS every key past it, answering from a prefix
-                // that stops early, fluently and with no fault. The split ladder is the right
-                // destination because it can FOLD, so a context past the widest single-launch sweep
-                // is served by re-launching rather than by pretending it is shorter.
-                self.trace_body("fused-none-fits", valid_len, n_fold_pages, reqs, 0, false);
-                return self.select_body(valid_len);
-            }
-            // The ladderless fused bodies — present only when every class has its twin.
-            if self.body_fused.is_some() {
-                self.trace_body("fused-noladder", valid_len, n_fold_pages, reqs, 0, true);
-                return Ok(BodySel::BodyFused);
-            }
-        }
-        self.select_body(valid_len)
-    }
-
-    /// How many requests the fold sweeps, per `fold_plan` (which owns the page maps). 1 unbatched.
-    fn fold_requests_or_1(&self) -> i64 {
-        fold_plan::fold_requests(&self.fold).max(1)
-    }
-
     /// WHICH BODY A STEP ACTUALLY RUNS — printed, because it was unobservable and that cost a day.
-    /// `fold_reqs` is printed because it is the value the fused/split decision turns on: a ragged
-    /// bs=4 batch came back with row 0 byte-identical to a solo run and rows 1..3 wrong — the exact
-    /// fused-body signature — and the trace could not say whether the batch STEP had selected fused.
-    fn trace_body(
-        &self,
-        variant: &str,
-        valid_len: i64,
-        pages: i64,
-        reqs: i64,
-        rung: i64,
-        fused: bool,
-    ) {
+    fn trace_body(&self, variant: &str, valid_len: i64, rung: i64) {
         if !Diag::get().body_trace {
             return;
         }
-        eprintln!(
-            "[body-choice] {variant} state={:p} valid_len={valid_len} n_fold_pages={pages} \
-             fold_reqs={reqs} -> rung={rung}{}",
-            &self.fold as *const SessionKv,
-            if fused { " (fold-fused)" } else { " (split)" }
-        );
+        eprintln!("[body-choice] {variant} valid_len={valid_len} -> rung={rung}");
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -3575,9 +2966,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         &mut self,
         sel: ListSel,
         byte_off: [u64; NUM_SEGMENTS],
-        slot_pos: SeqPos,
-        kv_page_base: Bytes,
-        n_fold_pages: i64,
         // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
         // bundle, which is what makes banking invisible to every model whose weights fit one region.
         weight_bank: usize,
@@ -3592,9 +2980,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             &ops,
             LaunchWhere {
                 byte_off,
-                slot_pos,
-                kv_page_base,
-                n_fold_pages,
                 weight_bank,
             },
             d,
@@ -3604,13 +2989,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     }
 
     fn launch_ops_inner(&mut self, ops: &Ops<T>, where_: LaunchWhere, d: &Diag) -> Result<()> {
-        // `slot_pos`/`kv_page_base`/`weight_bank` are read only inside
-        // `cb_plan::launch_site`, through `where_` — nothing else in the walk uses them.
-        let LaunchWhere {
-            byte_off,
-            n_fold_pages,
-            ..
-        } = where_;
+        // `weight_bank` is read only inside `cb_plan::launch_site`, through `where_`.
+        let byte_off = where_.byte_off;
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
         // the stream is in-order, so at any moment the device is a whole layer behind the host.
         // Timing from an un-drained start measures `backlog + ops[0..j]`, and the backlog shrinks by
@@ -3630,20 +3010,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
         // ⛔ NO KNOB OF ITS OWN — THE BATCH IS THE PATH. Every launch this rung would make is
         // collected below and paid as ONE doorbell at the end (the vendor's multi-CB branch;
-        // `Stream::compute_batch`). The five knobs that sync or submit MID-RUNG cannot see a
+        // `Stream::compute_batch`). The knobs that sync MID-RUNG cannot see a
         // pending batch — a drain between ops of an unflushed rung observes nothing — so each of
-        // them falls back to this function's per-op submission, bit for bit: `repeat_probe`
-        // (double-submits per op), `perop_sync`/`group_time` (drain per op), `prefix_time`
+        // them falls back to this function's per-op submission, bit for bit:
+        // `perop_sync`/`group_time` (drain per op), `prefix_time`
         // (drains at a rotating MID-RUNG group), `optrace` and `tensordump` (drain + D2H after
         // each op). `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read
         // program memory or host state this rung's compute ops never write, and `submit_time`
         // measures the flush itself as the enqueue.
-        let collect = !(d.repeat_probe
-            || d.perop_sync
-            || d.group_time
-            || d.prefix_time
-            || d.optrace
-            || d.tensordump.is_some());
+        let collect =
+            !(d.perop_sync || d.group_time || d.prefix_time || d.optrace || d.tensordump.is_some());
         let mut pending: Vec<PendingLaunch> = Vec::new();
         // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
         // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
@@ -3651,48 +3027,29 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let mut batch_barrier = false;
 
         for (oi, op) in ops.iter().enumerate() {
-            // ── PAGE FOLD ── Run this group once per page of resident prefix, rebased each time to
-            //    that page's KV and that page's validity row. The fold ACCUMULATES into the running
-            //    softmax state, so repeating it IS the loop. Zero passes when nothing is resident
-            //    yet — the common case for a first prefill chunk, which attends only itself and
-            //    would otherwise sweep an empty page. This is what makes context a RUNTIME page
-            //    count instead of a baked extent. Whose KV an op touches and how many passes it
-            //    takes are both `fold_plan`'s to answer — and the refusal for a count the pool
-            //    cannot honour is `cb_plan::op_reps`'s, shared with the plan build so the two
-            //    cannot disagree about how many passes an op takes.
-            let reps = cb_plan::op_reps(&op.kv, &self.fold, n_fold_pages, oi)?;
+            // A walk's body relaunches its baked trip count; every other group launches once.
+            let reps = fold_plan::reps(&op.kv);
 
             for rep in 0..reps {
                 let stream = self.stream_ref()?;
-                // ⭐ ONE (op, PASS)'S ARITHMETIC, SINGLE-SOURCED. Everything from the sweep
-                //    witness through the fold deltas, the shifted tensor bases, the weight bank,
-                //    the program, the host-fence flag and the bootstrap is `cb_plan::launch_site`
-                //    — the submit walk below, the diag printers it feeds, and the CB-plan parity
-                //    gate (which proves the plan's data twin of exactly this computation
-                //    byte-identical at prepare) all read the ONE function, so no second
-                //    derivation of the addressing can drift. The law comments that lived on the
-                //    arithmetic moved with it.
-                // ⛔ A PAGE PART WITH NO PAGE DOES NOT LAUNCH — a short last chunk's padding past
-                //    the request's pages (#620). Its rows are never read, and the only base left
-                //    to aim it at is the cursor's own page, which is part 0's keys; the skip
-                //    lives in `launch_site`, shared by the walk and the plan twin.
-                let Some(site) = cb_plan::launch_site(
+                // ⭐ ONE (op, relaunch)'S ARITHMETIC, SINGLE-SOURCED. The walk shift, the shifted
+                //    tensor bases, the weight bank, the program and the bootstrap are
+                //    `cb_plan::launch_site` — the submit walk below, the diag printers it feeds, and
+                //    the CB-plan parity gate (which proves the plan's data twin of exactly this
+                //    computation byte-identical at prepare) all read the ONE function.
+                let site = cb_plan::launch_site(
                     ops,
                     oi,
                     rep,
-                    &self.fold,
                     &self.seg_addr,
                     &self.weight_bank_addr,
                     &where_,
-                )?
-                else {
-                    continue;
-                };
+                )?;
                 // The walk's own locals, re-bound from the site: `ta` as the borrows the submit
                 // and dump paths take, everything else by copy or borrow.
                 let ta: Vec<&DevAddr> = site.ta.iter().collect();
-                let (off, prog, bootstrap, barrier) =
-                    (site.off, &site.prog, site.bootstrap, site.barrier);
+                // Every launch fences: the host fence is one call per launch, never a wire bit.
+                let (off, prog, bootstrap, barrier) = (site.off, &site.prog, site.bootstrap, true);
                 let gt0 = Instant::now();
                 if d.launch_mark {
                     // ⛔ ONE WRITE, and it must reach the fd BEFORE the submit: an abort from senlib's
@@ -3756,38 +3113,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         let one = format!("[progverify] op[{}] {} {r}\n", op.index, op.label());
                         eprint!("{one}");
                     }
-                }
-
-                if d.repeat_probe
-                    && !op.kv.page_fold
-                    && (op.kv.slot_write || op.kv.slab_write || op.kv.request > 0)
-                {
-                    // Both halves pay one drain, so the drain's host round trip cancels in the
-                    // comparison and only the cold-vs-warm program difference is left.
-                    let _ = stream.synchronize();
-                    let r0 = Instant::now();
-                    stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(launch_err)?;
-                    let _ = stream.synchronize();
-                    let r1 = Instant::now();
-                    stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(launch_err)?;
-                    let _ = stream.synchronize();
-                    let r2 = Instant::now();
-                    let mut t = timers();
-                    let e = t
-                        .repeat_ms
-                        .entry(oi)
-                        .or_insert((0.0, 0.0, 0, String::new()));
-                    e.0 += (r1 - r0).as_secs_f64() * 1e3;
-                    e.1 += (r2 - r1).as_secs_f64() * 1e3;
-                    e.2 += 1;
-                    if e.3.is_empty() {
-                        e.3 = op.label();
-                    }
-                    continue;
                 }
 
                 if d.rb_time {
@@ -3873,7 +3198,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         report_group_time(&t);
                     }
                 }
-            } // end per-page fold repeat
+            } // end walk relaunch
 
             if Some(oi) == px_target {
                 // AFTER every rep of this group, so a fold's whole pass count lands in one rung.
@@ -4591,8 +3916,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         entries.sort_unstable_by_key(|e| e.id);
         if entries.len() != seq.len() {
             // LOUD, NOT SILENT: a mismatch means per-op attribution would be WRONG, not merely
-            // missing — `repeat_probe` launches computes that are in the ring but not in the
-            // sequence, and a rotated ring loses launches from its front. (The DMA crossings
+            // missing — a rotated ring loses launches from its front. (The DMA crossings
             // are NOT a mismatch source anymore: `dma` excludes them above.) Skip the
             // attribution entirely; the DMA totals above stay honest either way.
             eprintln!(
@@ -5263,35 +4587,28 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     fn launch_forward(&mut self, seq_pos: SeqPos, suffix: SuffixLaunch) -> Result<()> {
         let zero = [0u64; NUM_SEGMENTS];
         let Some(rolled) = self.rolled.as_ref() else {
-            // Not rolled: one body over the whole model. Pages the RESIDENT PREFIX spans; the
-            // selector also picks the FOLD-FUSED twin when the context fits ONE page, which is the
-            // baseline's group count (3 vs the split body's 5) — selecting the split body
-            // regardless cost two extra launches per layer, ~1 ms/token, for a fold launched once.
+            // Not rolled: one body over the whole model.
             // ⭐ THE SAME DOOR THE HOST ASKS THROUGH — [`Executor::step_body`], from the same write slot.
             // Two call sites here and one on the host, all three taking `seq_pos` and nothing else, so
             // the body the host staged for IS the body launched.
-            let n_fold_pages = self.n_fold_pages(seq_pos);
             let sel = self.step_body(seq_pos)?.sel;
-            let base = self.page_base_for_write(seq_pos)?;
             // UNROLLED: one body over the whole model (class 0 — an unrolled bundle has no class
             // split), and an unrolled bundle has no layer boundary to bank on — its weights are one
             // region by construction (`bank_weight_segment` refuses to bank without layer classes),
             // so bank 0 is the only bank there is.
             let ls = self.list_sel_for(sel, 0);
-            return self.launch_ops(ls, zero, seq_pos, base, n_fold_pages, 0);
+            return self.launch_ops(ls, zero, 0);
         };
         let pre_bank = rolled.prefix_weight_bank;
         let suf_bank = rolled.suffix_weight_bank;
 
-        self.launch_ops(ListSel::Prefix, zero, SeqPos(0), Bytes(0), 1, pre_bank)?;
+        self.launch_ops(ListSel::Prefix, zero, pre_bank)?;
 
         // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
         // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
         // before attention). The same rung serves every layer this step; only the swept extents
         // differ, and the resident KV is shared.
-        let n_fold_pages = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
-        let base = self.page_base_for_write(seq_pos)?;
         // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in true layer
         // order, each naming its body's CLASS and the segment shifts the launch applies — no
         // `v·stride`, no `v / layers_per_bank`, no class base to add. The bake PROVED every row
@@ -5316,9 +4633,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             off[SEG_WEIGHT.get()] = woff;
             off[SEG_KV.get()] = kvoff;
             let ls = self.list_sel_for(sel, body);
-            // The WRITE lands in the page holding seq_pos; the FOLD covers every page the RESIDENT
-            // PREFIX [0, seq_pos) spans — zero of them when there is no prefix.
-            self.launch_ops(ls, off, seq_pos, base, n_fold_pages, wbank as usize)?;
+            self.launch_ops(ls, off, wbank as usize)?;
         }
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
@@ -5331,122 +4646,48 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
         // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
         match suffix {
-            SuffixLaunch::Launched => {
-                self.launch_ops(ListSel::Suffix, zero, SeqPos(0), Bytes(0), 1, suf_bank)
-            }
+            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank),
             SuffixLaunch::Skipped => Ok(()),
         }
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
-    //  #603 PR2 2c — the replay player: one decode step as canvas-copy + patches + ONE doorbell
+    //  #603 PR2 2c — the replay player: one decode step as canvas-copy + ONE doorbell
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
     /// ⭐ THE PLAYER — the decode step's whole forward from a cached image:
-    /// select the image by (body, page count, fold shape), let the submit
-    /// path copy the canvas and stamp it (the step's patches + the
-    /// pool-leased tags), and ring ONE doorbell for the step. The per-step
-    /// host work is a memcpy, K word patches, N tag stamps and one
-    /// submission — no per-op `launch_site`, no `BatchedCompute` build, no
-    /// per-rung flush. Everything the image is keyed by, and everything the
-    /// stamp writes, was proven at the image's derivation:
-    /// `cb_plan::patch_check` per body row (canvas ≡ walk, patched canvas ≡
-    /// fresh walk at steps the derivation never visited) and
-    /// `cb_plan::parity_check` per fixed row.
+    /// select the image by its body, let the submit path copy the canvas and
+    /// stamp the pool-leased tags, and ring ONE doorbell for the step. The
+    /// per-step host work is a memcpy, N tag stamps and one submission — no
+    /// per-op `launch_site`, no `BatchedCompute` build, no per-rung flush. The
+    /// image is proven at its derivation: `cb_plan::parity_check` per launch
+    /// row (canvas ≡ walk). Nothing a launch addresses moves with the step's
+    /// position, so the canvas IS every step's CBs for that body.
     ///
-    /// Returns `Ok(None)` — the caller takes the walk — for every step that
-    /// is not the player's regime, with the reason stated where it fires (a
-    /// per-step debug line would be noise at decode rate; the boundary reason
-    /// fires once per page): a BATCHED step (two or more requests installed —
-    /// PR4's images), any Diag instrument on ([`Diag::is_quiet`] — each one
-    /// reads walk state), a page boundary (slot 0 of a new page — a
-    /// write-base move, not a patchable one), or a page no canvas slot or
-    /// off-sample room fits. There is no third path and no toggle: the
-    /// production configuration (quiet diag, one request) is the player,
-    /// minus one step per page.
+    /// Returns `Ok(None)` — the caller takes the walk — when any Diag
+    /// instrument is on ([`Diag::is_quiet`] — each one reads walk state). There
+    /// is no other path and no toggle: the production configuration is the
+    /// player.
     fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<()>> {
-        if !Diag::get().is_quiet() || fold_plan::fold_requests(&self.fold) != 1 {
+        if !Diag::get().is_quiet() {
             return Ok(None);
         }
-        let (paged, per, _) = self.kv.synthetic();
-        // ⭐ THE PAGE-BOUNDARY STEP WALKS. `pos % per == 0` writes slot 0 of a
-        // page no image of this key ever rendered — a WRITE-BASE move, and a
-        // moved write base is not affine in the patch model's scalars: a
-        // shifted write target's extent is END-PINNED (`DevAddr::shifted`
-        // returns the bytes remaining past the shift), so its XLAT word's
-        // paddr and length fields move together and no per-byte addend
-        // expresses the pair — measured on the first real bundle, where the
-        // page differential's render moved paddr `+stride/2` flits and
-        // length `-stride/2` flits for a one-stride base move and the solve
-        // refused. That includes pos 0 — slot 0 of page 0, whose image key
-        // (n = 0) has no page behind it. One step per page takes the walk;
-        // every step between boundaries writes the image's own page and
-        // replays.
-        if paged && seq_pos.0 % per == 0 {
-            debug!(
-                "[sdsc-replay] page-boundary step {} walks: slot 0 of a new page is a \
-                 write-base move, not a patchable one",
-                seq_pos.0
-            );
-            return Ok(None);
-        }
-        let n = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
-        let Some(r) = cb_plan::canvas_slot(per, paged) else {
-            debug!(
-                "[sdsc-replay] walking every step: no canvas slot fits a {per}-slot page, so no \
-                 image can be derived for this session"
-            );
-            return Ok(None);
-        };
-        if !cb_plan::canvas_room(per, paged, r) {
-            debug!(
-                "[sdsc-replay] walking every step: a {per}-slot page leaves no off-sample room \
-                 around canvas slot {r}, so no slab-crossing proof fits — no image is derived"
-            );
-            return Ok(None);
-        }
-        // The canvas position: inside THIS image's page span (`(n-1)·per` is
-        // the image's first page; `r ≥ 1` keeps off the boundary), or any
-        // position at all for an unpaged session, whose one image covers
-        // them all. The write base is the page holding it — a RESIDENT page,
-        // unlike the boundary step's brand-new one, so the reference always
-        // reads a page the block table already names.
-        let pos_c = if paged { (n - 1) * per + r } else { r };
-        let page_c = self.page_base_for_write(SeqPos(pos_c))?;
-        let key = StepImageKey {
-            sel,
-            n_fold_pages: n,
-            signature: fold_signature(&self.fold, n),
-        };
+        let key = StepImageKey { sel };
         let image = match self.step_images.lookup_cached(&key) {
             Some(hit) => hit,
             None => {
                 let t1 = Instant::now();
-                let image = self.derive_step_image(sel, n, pos_c, page_c)?;
+                let image = self.derive_step_image(sel)?;
                 self.step_images.note_derived(key, image.clone(), t1);
                 image
             }
         };
-        // The step's scalars — the two values every moving word of the body
-        // rows is affine in, measured at the position this step writes. The
-        // write page is not among them and cannot move between two replayed
-        // steps of one image: both write the image's own page (the boundary
-        // step that would move it walked, above).
-        let scalars = cb_plan::step_scalars(paged, per, seq_pos.0);
-        // The stamp closure: patches the body rows onto the backend's canvas
-        // copy, then stamps the leased tags over the render-time ones. The
-        // fixed rows are skipped by `follows_step` — see `RowReplay`.
+        // The stamp closure stamps the leased tags over the render-time ones.
         let data = std::sync::Arc::clone(&image.data);
         let batch = ComputeWireBatch {
             canvas: std::sync::Arc::clone(&data.canvas),
             patch: Box::new(move |tags, cbs| {
-                for row in &data.rows {
-                    if row.follows_step {
-                        row.plan
-                            .apply(&mut cbs[row.base..row.base + row.len], &scalars);
-                    }
-                }
                 for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
                     cb.set_tag(*tag);
                 }
@@ -5458,26 +4699,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let r = stream.compute_wires(batch, image.barrier);
         let t2 = Instant::now();
         if let Err(e) = r {
-            // The image itself was proven at derivation (per-row gates above);
-            // a refused submit here is capacity or shutdown, not addressing —
-            // so the refusal names the image and the step, not an op site.
+            // The image itself was proven at derivation (per-row gates); a refused submit here is
+            // capacity or shutdown, not addressing — so the refusal names the image and the step.
             return Err(anyhow::Error::new(e).context(format!(
                 "replay submit refused: {cbs} CB(s) over {} launch row(s), barrier={}, \
-                 sel={sel:?}, n_fold_pages={n}, step at {}",
-                image.data.rows.len(),
-                image.barrier,
-                seq_pos.0
+                 sel={sel:?}, step at {}",
+                image.data.rows, image.barrier, seq_pos.0
             )));
         }
         let mut t = timers();
         t.replay_steps += 1;
         t.replay_cbs += cbs as u64;
-        t.replay_sites += image
-            .data
-            .rows
-            .iter()
-            .map(|row| row.plan.sites())
-            .sum::<usize>() as u64;
         t.replay_submit_ms += (t2 - t1).as_secs_f64() * 1e3;
         // First step AND the 256 cadence: the canonical gate cell is 64 tokens,
         // so a cadence-only marker would stay silent in exactly the run that
@@ -5492,28 +4724,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
     /// Derive one step image at its first use — the row sequence is
     /// EXACTLY `launch_forward`'s (that is the merge's one law: the step's
-    /// CBs, in the order the walk would submit them), each row rendered
-    /// through the gates that prove it, concatenated into one canvas.
-    ///
-    /// The body rows render at the CANVAS position (`pos_c`/`page_c`, inside
-    /// the image's own page span), not at the calling step's — the patch
-    /// model's reference can be any step of the image, and a fixed reference
-    /// keeps the derivation off the slab and page boundaries the calling
-    /// step might sit on. The fixed rows render at their own constant
-    /// `where_` (slot 0, page 0, one page), which is where the walk launches
-    /// them every step whatever the body is doing.
-    fn derive_step_image(
-        &self,
-        sel: BodySel,
-        n: i64,
-        pos_c: i64,
-        page_c: Bytes,
-    ) -> Result<StepImage> {
+    /// CBs, in the order the walk would submit them), each row proven by the
+    /// parity gate and rendered at its own `where_`, concatenated into one canvas.
+    fn derive_step_image(&self, sel: BodySel) -> Result<StepImage> {
         let stream = self.stream_ref()?;
-        // (list, where, follows-step) per launch row, mirroring
-        // `launch_forward` arm by arm. An empty list launches nothing in the
-        // walk (its flush stages zero CBs), so it contributes no row here.
-        let mut specs: Vec<(ListSel, LaunchWhere, bool)> = Vec::new();
+        // (list, where) per launch row, mirroring `launch_forward` arm by arm. An empty list
+        // launches nothing in the walk (its flush stages zero CBs), so it contributes no row here.
+        let mut specs: Vec<(ListSel, LaunchWhere)> = Vec::new();
         let zero = [0u64; NUM_SEGMENTS];
         match self.rolled.as_ref() {
             Some(r) => {
@@ -5521,12 +4738,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     ListSel::Prefix,
                     LaunchWhere {
                         byte_off: zero,
-                        slot_pos: SeqPos(0),
-                        kv_page_base: Bytes(0),
-                        n_fold_pages: 1,
                         weight_bank: r.prefix_weight_bank,
                     },
-                    false,
                 ));
                 for (class, wbank, woff, kvoff) in r.launches.clone() {
                     let mut off = [0u64; NUM_SEGMENTS];
@@ -5536,24 +4749,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         self.list_sel_for(sel, class),
                         LaunchWhere {
                             byte_off: off,
-                            slot_pos: SeqPos(pos_c),
-                            kv_page_base: page_c,
-                            n_fold_pages: n,
                             weight_bank: wbank as usize,
                         },
-                        true,
                     ));
                 }
                 specs.push((
                     ListSel::Suffix,
                     LaunchWhere {
                         byte_off: zero,
-                        slot_pos: SeqPos(0),
-                        kv_page_base: Bytes(0),
-                        n_fold_pages: 1,
                         weight_bank: r.suffix_weight_bank,
                     },
-                    false,
                 ));
             }
             None => {
@@ -5562,84 +4767,43 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     self.list_sel_for(sel, 0),
                     LaunchWhere {
                         byte_off: zero,
-                        slot_pos: SeqPos(pos_c),
-                        kv_page_base: page_c,
-                        n_fold_pages: n,
                         weight_bank: 0,
                     },
-                    true,
                 ));
             }
         }
         let mut canvas: Vec<ControlBlockWire> = Vec::new();
-        let mut rows: Vec<RowReplay> = Vec::new();
+        let mut rows = 0usize;
         let mut barrier = false;
-        let mut sites = 0usize;
-        for (ls, where_, follows_step) in specs {
+        for (ls, where_) in specs {
             let ops = self.list(ls);
             if ops.is_empty() {
                 continue;
             }
             let label = format!("{ls:?}/replay-canvas");
-            let (row_canvas, plan) = if follows_step {
-                // A body row: the FULL gate — parity at the canvas position,
-                // the patch table, and the off-sample proof that patched
-                // canvas ≡ fresh walk at steps the derivation never visited.
-                // This is the exact check the prepare gate ran under a
-                // synthetic session, now under the live one.
-                let (_, img) = cb_plan::patch_check(
-                    ops,
-                    &self.fold,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
-                    &where_,
-                    &label,
-                    stream,
-                )?;
-                (img.canvas, img.plan)
-            } else {
-                // A fixed row: the walk launches it at this SAME `where_`
-                // every step, so its replay target is its own canvas,
-                // unchanged — parity at that `where_` is the whole
-                // correctness statement. Its patch table is empty BY
-                // CONSTRUCTION (a constant `where_` makes every
-                // step-differential zero), so none is derived: probing one
-                // would measure a counterfactual no replay executes — the
-                // measured failure mode the prepare gate's scope law also
-                // encodes (its patch leg skips the prefix/suffix lists).
-                cb_plan::parity_check(
-                    ops,
-                    &self.fold,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
-                    &where_,
-                    &label,
-                    stream,
-                )?;
-                let img = cb_plan::render_row(
-                    ops,
-                    &self.fold,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
-                    &where_,
-                    stream,
-                )?;
-                (img.canvas, img.plan)
-            };
-            barrier |= plan.barrier;
-            sites += plan.sites();
-            rows.push(RowReplay {
-                base: canvas.len(),
-                len: row_canvas.len(),
-                follows_step,
-                plan,
-            });
+            cb_plan::parity_check(
+                ops,
+                &self.seg_addr,
+                &self.weight_bank_addr,
+                &where_,
+                &label,
+                stream,
+            )?;
+            let (row_canvas, row_barrier) = cb_plan::render_canvas(
+                ops,
+                &self.seg_addr,
+                &self.weight_bank_addr,
+                &where_,
+                stream,
+            )?;
+            barrier |= row_barrier;
+            rows += 1;
             canvas.extend(row_canvas);
         }
         if canvas.is_empty() {
             bail!(
-                "replay image derivation REFUSED: sel={sel:?} n_fold_pages={n} produced zero \
-                 CBs — the walk it mirrors launches nothing, which no body selection can do"
+                "replay image derivation REFUSED: sel={sel:?} produced zero CBs — the walk it \
+                 mirrors launches nothing, which no body selection can do"
             );
         }
         // The image's own first CB carries the same EDEP1 the submit path
@@ -5653,10 +4817,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // defect).
         canvas[0].set_edep(1);
         debug!(
-            "[sdsc-replay] derived image sel={sel:?} n_fold_pages={n}: {} CB(s) over {} \
-             launch row(s), {sites} patch site(s), barrier={barrier}",
-            canvas.len(),
-            rows.len()
+            "[sdsc-replay] derived image sel={sel:?}: {} CB(s) over {rows} launch row(s), \
+             barrier={barrier}",
+            canvas.len()
         );
         Ok(StepImage {
             data: std::sync::Arc::new(StepImageData {
@@ -5665,59 +4828,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }),
             barrier,
         })
-    }
-
-    /// How many pages the RESIDENT PREFIX `[0, seq_pos)` spans.
-    /// THE PAGES OF **RESIDENT PREFIX** THIS STEP FOLDS OVER — `ceil(seq_pos / per)`, EXCLUSIVE of the
-    /// slot being written, because the page that slot lands in is the BODY's job and not a fold pass.
-    ///
-    /// ⛔ DO NOT "FIX" THIS TO `ceil((seq_pos + 1) / per)`. It looks one short — a row writing slot
-    /// 2048 does hold 2049 slots — and it is not: MEASURED 2026-08-12, that change REGRESSED the
-    /// ragged gate from 3/6 to 1/6 (`Rome` and `Cario` became `'The provided text does not contain…'`,
-    /// `Nairobi` became `Nariobi`), in both batch orders. The extra pass folds a page the body already
-    /// accounts for.
-    ///
-    /// The host's [`FoldPages`] staging must therefore match THIS count, which is what
-    /// `FoldPages::resident_before` is for. It used `covering` (= `ceil((slot + 1) / per)`), so at every
-    /// exact page multiple the host staged one block more than the launch walks and the fold refused:
-    ///
-    ///   `fold: 8 pass(es) REFUSED — the launch walks 8 page(s) but the host STAGED the mask for 9`
-    ///
-    /// That fired on the BATCHED path only (a lone request takes the solo path and stages no batched
-    /// mask, which is why single-request sweeps across 768 all passed and the 76..1840 gate probes
-    /// never hit it), and it read as a "2048 wall" only because `max_num_batched_tokens`' 2048 default
-    /// truncated long prompts to exactly 2048 — a page multiple.
-    fn n_fold_pages(&self, seq_pos: SeqPos) -> i64 {
-        match self.kv.paged() {
-            Some(g) => {
-                let per = g.page_slots.0.get();
-                (seq_pos.0 + per - 1) / per
-            }
-            None => 1,
-        }
-    }
-
-    /// The byte base of the page this step's WRITE lands in (request 0's — a batched step installs
-    /// per-request maps and the per-op request tag selects among them inside `fold_plan`).
-    ///
-    /// ⛔ THE PAGE MUST BE HELD. The staging door (`paged_step::check`) proves the request's
-    /// blocks cover every position this step writes, so a write whose page is not held is a
-    /// staging/geometry disagreement, not a condition to paper over: the old `map_or(Bytes(0))`
-    /// silently pointed the write at the NULL page — row 0's keys, exactly the wrong-page read
-    /// [`RowPage::of`]'s `Option` exists to name. It is refused here, naming the page.
-    fn page_base_for_write(&self, seq_pos: SeqPos) -> Result<Bytes> {
-        let Some(g) = self.kv.paged() else {
-            return Ok(Bytes(0));
-        };
-        let lp = seq_pos.0 / g.page_slots.0.get();
-        let rp = RowPage::of(&self.fold, RowIdx::from_launch_row(0), lp).ok_or_else(|| {
-            anyhow!(
-                "the write at position {} lands in page {lp}, which this request does not hold \
-                 — the staging that sized its block table is wrong",
-                seq_pos.0
-            )
-        })?;
-        Ok(fold_plan::page_base_bytes(&self.fold, rp))
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -5736,7 +4846,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
             None => (ListSel::Body(0), 0),
         };
-        self.launch_ops(sel, zero, SeqPos(0), Bytes(0), 1, bank)?;
+        self.launch_ops(sel, zero, bank)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
@@ -6347,18 +5457,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     //  Accessors + the declared session facts
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
-    pub fn is_paged(&self) -> bool {
-        self.kv.paged().is_some()
-    }
-    /// The pool's page count — `None` when the bundle is unpaged (there is no pool to count).
-    pub fn pool_pages(&self) -> Option<PoolPages> {
-        self.kv.paged().map(|g| g.pool_pages)
-    }
-    /// Positions per page — `None` when the bundle is unpaged.
-    pub fn page_slots(&self) -> Option<PageSlots> {
-        self.kv.paged().map(|g| g.page_slots)
-    }
-
     /// ⛔⛔⛔ THE COLUMNS THE BROADCAST PREFIX MASK RESERVES — **READ OFF THE PLACEMENT THE BIND GUARD
     /// CHECKS AGAINST**, so the extent the host stages and the size it is validated against are ONE
     /// FIELD and cannot disagree.
@@ -6374,115 +5472,28 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// decode-BATCH bundle places `[nqh*mq, ...]` instead, and its staging is blocked by the DECLARED fold
     /// grid (`PrefixMaskShape` / `MaskBlocks`), not by this. `None` when the bundle placed no mask, or when
     /// the placement is not a whole number of pages — either way the caller must refuse rather than guess.
-    /// ⭐ BYTES PER PHYSICAL PAGE — `iters * kv_stride`, all layers of one page. THE number
-    /// `fold_plan::page_base_bytes` multiplies a block-table entry by, so it is also the number the
-    /// gather's index unit must divide. `0` for an unpaged bundle.
-    pub fn kv_page_stride_bytes(&self) -> u64 {
-        self.kv.paged().map_or(0, |g| g.page_stride.bytes())
-    }
-
     pub fn pmask_slots(&self) -> Option<usize> {
         let nm = bundle::PlaceId::Act(crate::lower_subtile_tape_to_superdsc::ATTN_MASK_TID);
         let slots = (self.places.get(&nm)?.size / 2) as usize;
         let per_page = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
         (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
     }
-
-    /// Resident capacity in slots. PAGED ONLY: what ONE REQUEST can hold — the pages
-    /// it has been given. The pool is SHARED, so reporting it here would let a request
-    /// run off its own pages into another's. ⚔ `None` IS "NO POOL": an UNPAGED bundle
-    /// has no pool fact to report.
-    pub fn cap(&self) -> Option<i64> {
-        self.kv.paged().map(|g| {
-            let held = self.fold.block_tables.first().map_or(0, |t| t.len() as i64);
-            held * g.page_slots.0.get()
-        })
-    }
-
-    /// Install request `req`'s logical→physical page map, its POOL ROW, and the position its next
-    /// token writes at. EVERY session that runs a forward for a request needs it — prefill rungs are
-    /// separate sessions, and one left on the create-time identity map writes the prompt into page 0
-    /// while decode reads the request's real pages.
-    ///
-    /// A page outside the pool is REFUSED, never clamped: a clamp points this request at another's
-    /// KV. The `row` is likewise the bundle's to bound — row `ROWS` of one kv head is row 0 of the
-    /// next — so a refusal from `fold_plan` is forwarded, never dropped.
-    pub fn set_block_table(&mut self, req: RowIdx, pos: SeqPos, pages: &[i64]) -> Result<()> {
-        let Some(g) = self.kv.paged() else {
-            bail!("set_block_table on a NON-PAGED bundle — refused");
-        };
-        if pages.is_empty() {
-            bail!("set_block_table: empty page list");
-        }
-        for (i, &p) in pages.iter().enumerate() {
-            if p < 0 || p >= g.pool_pages.0 {
-                bail!(
-                    "set_block_table: page {p} (entry {i}) outside the {}-page pool — refused",
-                    g.pool_pages.0
-                );
-            }
-        }
-        self.block_table_set = true;
-        self.install_page_map(req, pos, pages);
-        Ok(())
-    }
-
-    /// The map install itself — shared by the create-time identity default and `set_block_table`.
-    /// The RULE (slot 0 retires the last forward's rows, so the inferred fold width is this
-    /// forward's and not a high-water mark) lives on [`SessionKv`], which owns the state.
-    fn install_page_map(&mut self, req: RowIdx, pos: SeqPos, pages: &[i64]) {
-        self.fold.install_row(req, SlotPos::of_launch(pos.0), pages);
-    }
-
-    /// The prefix mask's per-fold-pass stride in bytes. A batched decode's mask is one
-    /// `[nqh*mq, page]` block per (request, page) pass, so the runtime steps it by a whole block;
-    /// only the worker, which stages it, knows how deep a block is. 0 restores the one-row-per-page
-    /// step a prompt uses.
-    pub fn set_mask_stride(&mut self, stride_bytes: u64) {
-        self.fold.mask_rep_stride_bytes = stride_bytes;
-    }
-
-    /// HOW MANY BLOCKS the staged mask has. Only the worker knows — it allocated the buffer — and
-    /// the fold needs it to refuse a pass past the last block, where it would read unstaged zeros
-    /// that an additive mask treats as VALID.
-    pub fn set_mask_blocks(&mut self, blocks: u64) {
-        self.fold.mask_blocks = blocks;
-    }
-
-    /// HOW MANY PAGES THE FOLD WALKS, decided by the HOST from the batch's shared write slot. This
-    /// executor derives the same number itself (`n_fold_pages`); declaring the host's value lets
-    /// `fold_plan::reps` REFUSE on a disagreement instead of folding a mask blocked by one number
-    /// with passes indexed by another — a mismatch makes every row but row 0 read another row's
-    /// page, and an unstaged additive-mask byte reads as ZERO, i.e. VALID.
-    pub fn set_fold_pages(&mut self, pages: u64) {
-        self.fold.fold_pages = pages;
-    }
-
-    /// The per-request row-block stride in the INTERMEDIATE segment. A row-batched fold's ops are
-    /// baked for ONE request's `nqh` rows, so each pass has to be rebased onto its own request's
-    /// block; only the emitter knows it baked them that way. 0 = the fold spans the whole batch.
-    pub fn set_int_stride(&mut self, stride_bytes: u64) {
-        self.fold.int_rep_stride_bytes = stride_bytes;
-    }
 }
 
-/// ⭐ WHICH BODY — NOT WHICH LIST. The selector picks the BODY (a swept extent, possibly
-/// fold-fused); the launch table then names the CLASS whose list runs it. Splitting the two is
+/// ⭐ WHICH BODY — NOT WHICH LIST. The selector picks the BODY (a swept extent); the launch table then names the CLASS whose list runs it. Splitting the two is
 /// what keeps a hybrid model's selector identical to a single-class one: a rung is one extent
 /// shared by every class, so "which body serves this context" never needs a class argument.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum BodySel {
     Body,
-    BodyFused,
     Rung(usize),
-    RungFused(usize),
 }
 
 /// Which op list a selection names. An index rather than a reference so the selector can hand one
 /// back while `&mut self` is still needed to allocate it.
 ///
 /// ⭐ EVERY BODY ARM CARRIES A CLASS INDEX. A hybrid-attention model has one body per attention
-/// class; a single-class model has exactly one, so `Body(0)`/`BodyFused(0)`/`Rung(i, 0)` is the
+/// class; a single-class model has exactly one, so `Body(0)`/`Rung(i, 0)` is the
 /// case every existing rolled bundle was. The RUNG index names the ladder entry (shared by every
 /// class — a rung is one swept extent); the class index names which class's list inside it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -6490,9 +5501,7 @@ enum ListSel {
     Prefix,
     Body(usize),
     Suffix,
-    BodyFused(usize),
     Rung(usize, usize),
-    RungFused(usize, usize),
 }
 
 /// ⭐ WHAT A FORWARD'S CALLER DOES WITH ITS LOGITS — the one fact that decides both whether the suffix
@@ -6806,29 +5815,6 @@ fn report_rb_time(t: &Timers) {
     );
 }
 
-/// The fold shape an image was derived under, as one comparable value: every
-/// `SessionKv` field the render reads that is not per-step, plus row 0's
-/// first `n_fold_pages` page ids (see [`StepImageKey::signature`] for why
-/// those, and why no row cursors). Cheap to build and compare — a dozen
-/// i64s against a cached key — against a step whose device time is
-/// milliseconds.
-fn fold_signature(fold: &SessionKv, n_fold_pages: i64) -> Vec<i64> {
-    let mut s = vec![
-        fold.paged as i64,
-        fold.page_slots.get(),
-        fold.page_stride_bytes.0 as i64,
-        fold_plan::fold_requests(fold),
-        fold.mask_rep_stride_bytes as i64,
-        fold.mask_blocks as i64,
-        fold.fold_pages as i64,
-        fold.int_rep_stride_bytes as i64,
-    ];
-    if let Some(row0) = fold.block_tables.first() {
-        s.extend(row0.iter().take(n_fold_pages.max(0) as usize).copied());
-    }
-    s
-}
-
 /// The replay player's decomposition — cumulative since process start, on a
 /// 256-step cadence. ⛔ ONE WRITE: the same single-`format!` discipline as
 /// `[progverify]` — an abort from senlib's monitor thread takes the process
@@ -6840,13 +5826,11 @@ fn report_replay(t: &Timers) {
     let steps = t.replay_steps.max(1);
     let derives = t.replay_derives.max(1);
     debug!(
-        "[sdsc-replay] {} step(s) replayed: {:.1}% from cached image(s) | {:.1} CB(s)/step, {} \
-         patch site(s)/image | lookup {:.1} us/step, submit {:.3} ms/step | {} derivation(s) at \
-         {:.1} ms each",
+        "[sdsc-replay] {} step(s) replayed: {:.1}% from cached image(s) | {:.1} CB(s)/step | \
+         lookup {:.1} us/step, submit {:.3} ms/step | {} derivation(s) at {:.1} ms each",
         t.replay_steps,
         100.0 * t.replay_hits as f64 / steps as f64,
         t.replay_cbs as f64 / steps as f64,
-        t.replay_sites / derives,
         1000.0 * t.replay_lookup_ms / steps as f64,
         t.replay_submit_ms / steps as f64,
         t.replay_derives,
@@ -6854,7 +5838,7 @@ fn report_replay(t: &Timers) {
     );
 }
 
-/// The submit / prefix-ladder / repeat-probe reports, emitted with the phase line.
+/// The submit / prefix-ladder reports, emitted with the phase line.
 fn report_phase_timers(compute_ms: f64) {
     let d = Diag::get();
     let mut t = timers();
@@ -6909,22 +5893,6 @@ fn report_phase_timers(compute_ms: f64) {
             prev = v;
         }
         t.prefix_ms.clear();
-    }
-    // THE REPEAT PROBE: `1st` and `again` both contain one drain, so `switch` — their difference —
-    // is what the card pays to bring in a program it was not already holding. If `switch` is most of
-    // `1st`, the per-request groups are paying for being distinct baked programs rather than for
-    // being launches, and one program relaunched per request removes it.
-    if d.repeat_probe && !t.repeat_ms.is_empty() {
-        eprintln!("[sdsc-repeat] same program launched twice back to back");
-        for (oi, (first, again, n, prog)) in &t.repeat_ms {
-            let (a, b) = (first / *n as f64, again / *n as f64);
-            eprintln!(
-                "[sdsc-repeat]   op {oi:<3}  1st={a:7.3} ms  again={b:7.3} ms  switch={:+7.3} ms  \
-                 n={n:<4}  {prog}",
-                a - b
-            );
-        }
-        t.repeat_ms.clear();
     }
 }
 
@@ -7080,14 +6048,12 @@ mod tests {
         };
         let mut cache = StepImageCache::default();
         let key = StepImageKey {
-            sel: BodySel::RungFused(0),
-            n_fold_pages: 1,
-            signature: vec![7],
+            sel: BodySel::Rung(0),
         };
         let dummy = StepImage {
             data: std::sync::Arc::new(StepImageData {
                 canvas: std::sync::Arc::new(Vec::new()),
-                rows: Vec::new(),
+                rows: 0,
             }),
             barrier: false,
         };

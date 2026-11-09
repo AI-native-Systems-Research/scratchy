@@ -4635,15 +4635,8 @@ mod production_ktir_dump {
             "affine_strides".into(),
             serde_json::json!(format!("{:?}", op.affine_strides)),
         );
-        obj.insert(
-            "slot_stride_bytes".into(),
-            serde_json::json!(op.slot_stride_bytes),
-        );
-        obj.insert("slab_write".into(), serde_json::json!(op.slab_write));
-        obj.insert(
-            "slab_stride_bytes".into(),
-            serde_json::json!(op.slab_stride_bytes),
-        );
+        obj.insert("kv_page_fold".into(), serde_json::json!(op.kv_page_fold));
+        obj.insert("kv_gathered".into(), serde_json::json!(op.kv_gathered));
         obj.insert("walk".into(), serde_json::json!(format!("{:?}", op.walk)));
         serde_json::Value::Object(obj).to_string()
     }

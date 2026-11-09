@@ -2084,19 +2084,9 @@ impl SpyreWorker {
                     "[timing] SuperDscSession::new (bind weights + prepare) took {:.2}s",
                     _t_sess.elapsed().as_secs_f64()
                 );
-                let (paged, page_slots) = match ss.paged {
-                    Some((_, slots)) => (true, slots.0.get()),
-                    None => (false, 0),
-                };
                 info!(
                     "[spyre-worker] sendnn: SUPERDSC dxp session ready (fp={fp}, vocab {vocab}, \
-                     kv_dim {kv_dim}, num_blocks {num_blocks}, cap {} slots, paged={} \
-                     page_slots={}, pmask reserves {:?} column(s))",
-                    ss.cap()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "unpaged (no pool)".to_string()),
-                    paged,
-                    page_slots,
+                     kv_dim {kv_dim}, num_blocks {num_blocks}, pmask reserves {:?} column(s))",
                     ss.pmask_slots,
                 );
                 // ── SHARE seg2 (the resident KV) between the PREFILL and DECODE sessions ──

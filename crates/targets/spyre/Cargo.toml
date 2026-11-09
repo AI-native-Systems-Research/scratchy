@@ -110,9 +110,9 @@ scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 # The model facts (`scratchy_ir::model_facts`) the bake threads through the lowering.
 scratchy-ir = { path = "../../compiler/ir" }
 
-# `fold_plan`'s fixtures mint the law-governed `SessionKv` fields (the mask /
-# intermediate rep strides) through the same `sdsc_abstract` laws production
-# uses, so a fixture cannot encode a relationship production can't.
+# The tests mint the pool's law-governed quantities (head widths, slot and
+# page counts, gather scratches) through the same `sdsc_abstract` doors
+# production uses, so a fixture cannot encode a relationship production can't.
 [dev-dependencies]
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 # A fixture states one program's LX scope (`LxScope::for_test`) without a lowering door.

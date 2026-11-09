@@ -12,13 +12,9 @@
 //! runs is the dxp-compiled SuperDSC bundle.
 
 use crate::superdsc_exec::{
-    DeferredRead, Executor, KvDim, Logits, LogitsRead, NewTokens, PageSlots, PoolPages, SegIdx,
-    SeqPos, Vocab,
+    DeferredRead, Executor, KvDim, Logits, LogitsRead, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
 };
-use anyhow::{Result, anyhow, bail};
-use scratchy_subtile::sdsc_abstract::{
-    FoldPages, FoldRowRegime, FoldWalker, MaskBlocks, PrefixMaskShape,
-};
+use anyhow::{Result, anyhow};
 use scratchy_tensors::DType as SDType;
 use tracing::debug;
 
@@ -61,32 +57,6 @@ fn f16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The prefix mask's per-fold-pass BYTE stride, minted only from the mask's own declared shape —
-/// never a loose integer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MaskRepStride(u64);
-
-impl MaskRepStride {
-    /// One block of `shape`, in f16 bytes — the only constructor.
-    pub const fn of<const STICK: u32, const COLS: u32>(
-        shape: PrefixMaskShape<STICK, COLS>,
-    ) -> MaskRepStride {
-        MaskRepStride(shape.rep_stride_bytes())
-    }
-}
-
-/// The per-request row-block stride in the INTERMEDIATE segment, minted only from the bundle's own
-/// declared [`FoldRowRegime`] — a whole-batch bundle's 0 arrives by derivation, not by choice.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct IntRepStride(u64);
-
-impl IntRepStride {
-    /// The regime's stride across one request's `nqh` head rows — the only constructor.
-    pub const fn of(regime: FoldRowRegime, nqh: u32) -> IntRepStride {
-        IntRepStride(regime.int_rep_stride_bytes(nqh))
-    }
-}
-
 /// A resident SUPERDSC session: the dxp-compiled bundle loaded from its AoT cache directory and run
 /// through the flex runtime. Weights pack into resident device segments and the KV grows in a
 /// resident pool; `run_step` appends `n_new` NEW positions at `[seq_pos..seq_pos+n_new)` and returns
@@ -105,14 +75,6 @@ pub struct SuperDscSession<'c, T: ktir_superdsc::collective::Tp> {
     ranks: PerRank<T, Executor<'c, T>>,
     /// Logits column count.
     pub vocab: usize,
-    /// ⭐ THE PAGED POOL'S OWN GEOMETRY — pages in the SHARED pool, and positions per page — held
-    /// exactly when the bundle declared a paged pool. `None` IS the unpaged meaning (no pool, no
-    /// pages to count): the zeroed `usize` pair this replaces, and the `paged` flag that stood
-    /// beside it, were sentinels for this absence, which every reader re-derived as `> 0`.
-    /// Load-time callers pair it with [`Self::pmask_slots`]: unpaged, the attention sweeps the
-    /// whole `cap`, so a `cap` past the mask's placement is unservable and must be refused
-    /// rather than staged either way.
-    pub paged: Option<(PoolPages, PageSlots)>,
     /// One resident K/V row width (= kv_heads·head_dim).
     pub kv_dim: usize,
     /// ⛔ THE BROADCAST PREFIX MASK'S EXTENT, from the bundle's own placement — see
@@ -415,7 +377,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         let exec = ranks.first();
         Ok(Self {
             vocab: exec.vocab.0,
-            paged: exec.pool_pages().zip(exec.page_slots()),
             kv_dim: exec.kv_dim.0,
             pmask_slots: exec.pmask_slots(),
             ranks,
@@ -492,113 +453,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         })
     }
 
-    /// Whether this bundle's resident cache is PAGED — the geometry's presence itself, not a
-    /// flag kept beside it.
-    pub fn is_paged(&self) -> bool {
-        self.paged.is_some()
-    }
-
-    /// Resident capacity in slots (= the longest context THIS request can hold) — the lead
-    /// executor's own [`Executor::cap`], read live off the card. `None` ⇒ the bundle is
-    /// UNPAGED: no pool fact exists to report (see [`Executor::cap`]).
-    pub fn cap(&self) -> Option<usize> {
-        self.ranks.first().cap().map(|c| c as usize)
-    }
-
-    /// Positions a request can hold given the `pages` it was assigned. Unpaged, `0` — the exact
-    /// behavior the zeroed sentinel carried, stated by the case itself rather than by a zero
-    /// read out of a field that means "there is no pool".
-    pub fn context_for_pages(&self, pages: usize) -> usize {
-        match self.paged {
-            Some((_, slots)) => pages * slots.0.get() as usize,
-            None => 0,
-        }
-    }
-
-    /// Declare how many BLOCKS the staged prefix mask has, so the fold can refuse a pass that would
-    /// read past it. Takes [`MaskBlocks`], whose only mint is `MaskBlocks::of(MaskPassGrid)` — the
-    /// count the fold will walk, never a loose integer.
-    ///
-    /// PRIVATE, with [`FoldWalker::declare_fold`] as the public door: this number and the page count
-    /// below are one decision, and a caller able to send half of it can block the mask by a geometry
-    /// the fold does not walk.
-    fn set_mask_blocks(&mut self, blocks: MaskBlocks) -> Result<()> {
-        let b = blocks.get() as u64;
-        for e in self.ranks.values_mut() {
-            e.set_mask_blocks(b);
-        }
-        Ok(())
-    }
-
-    /// Declare the host's [`FoldPages`] — the page count the fold must walk, derived ONCE from the
-    /// batch's `BatchSlot`. The executor derives the same number itself; declaring it makes a
-    /// divergence a refusal rather than a silently wrong fold.
-    ///
-    /// PRIVATE for the same reason as [`Self::set_mask_blocks`]: see [`FoldWalker::declare_fold`].
-    fn set_fold_pages(&mut self, pages: FoldPages) -> Result<()> {
-        let p = pages.get().get() as u64;
-        for e in self.ranks.values_mut() {
-            e.set_fold_pages(p);
-        }
-        Ok(())
-    }
-
-    /// Declare the prefix mask's per-fold-pass stride. A batched decode's mask is one
-    /// `[nqh*mq, page]` block per (request, page) pass; only the worker, which stages it, knows how
-    /// deep a block is.
-    pub fn set_mask_stride(&mut self, stride: MaskRepStride) -> Result<()> {
-        for e in self.ranks.values_mut() {
-            e.set_mask_stride(stride.0);
-        }
-        Ok(())
-    }
-
-    /// Declare the per-request row-block stride in the intermediate segment.
-    pub fn set_int_stride(&mut self, stride: IntRepStride) -> Result<()> {
-        for e in self.ranks.values_mut() {
-            e.set_int_stride(stride.0);
-        }
-        Ok(())
-    }
-
-    /// ⭐⭐⭐⭐⭐ THE GATHER'S ENTRY UNIT — how many index entries one PHYSICAL PAGE spans, i.e. the factor
-    /// that turns a block-table page number into the index value the card reads.
-    ///
-    /// ⛔ NOT A CONSTANT, AND NOT `4096`. An index entry advances one `skip_addr`, which the emitter
-    /// declares as ONE STICK BLOCK of the value operand (`PageExtent::of_one_stick()` on the slot axis)
-    /// — `hd * ELEMS_PER_STICK` elements, so 4096 at head_dim 64 and **8192 at head_dim 128**. A page
-    /// spans every LAYER (`page_stride_bytes = iters * kv_stride`), so the factor carries `iters` too and
-    /// is a property of this BUNDLE, not of the pool alone. Every doc comment in this tree that says
-    /// "global 4096-element block" is implicitly hd=64.
-    ///
-    /// ⛔ DERIVED FROM THE SESSION'S OWN `page_stride_bytes`, WHICH IS THE NUMBER `page_base_bytes`
-    /// MULTIPLIES. That is the whole point: the host's page address is `phys * page_stride_bytes` and the
-    /// card's is `idx * skip_addr + base`, so `idx = phys * (page_stride_bytes / skip_addr_bytes)` is an
-    /// identity between two quantities read off the same session — not two derivations that must be kept
-    /// in agreement. `zz_the_gather_index_reproduces_the_host_page_address` pins it.
-    ///
-    /// `None` when the bundle is unpaged, or when a page is not a whole number of entries — in which case
-    /// no integer index can name a page boundary and the caller must refuse rather than round.
-    ///
-    /// The arithmetic itself is [`gather_entries_per_page`]; this hands it the ONE number only the
-    /// session knows.
-    ///
-    /// [`gather_entries_per_page`]: scratchy_subtile::sdsc_abstract::gather_entries_per_page
-    pub fn gather_entries_per_page(
-        &self,
-        pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-    ) -> Option<scratchy_subtile::sdsc_abstract::EntriesPerPage> {
-        scratchy_subtile::sdsc_abstract::gather_entries_per_page(
-            self.ranks.first().kv_page_stride_bytes(),
-            pool,
-        )
-    }
-
-    // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE
-    // count for the pin that the card refuses (`PagePlaneExtent::entry_elems`); the page-granular gather
-    // pins one stick block like every other gather and reads the accessor above. Two accessors over one
-    // `kv_page_stride_bytes` is the "same number, two derivations" shape the identity exists to remove.
-
     /// ⭐⭐⭐⭐⭐ WHICH BODY THE NEXT LAUNCH AT `start` WILL RUN, and what it declares — see
     /// [`superdsc_exec::StepBody`]. The host asks this BEFORE it stages anything, because both the
     /// gather's index table and the prefix mask's block form are decisions about the selected body.
@@ -621,46 +475,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         // Every rank runs the same bundle at the same position, so every rank selects the same body.
         self.lead()
             .step_body(crate::superdsc_exec::SeqPos(start as i64))
-    }
-
-    /// Install a request's page map under the SLOT it occupies in this forward, with its write cursor.
-    ///
-    /// ⛔ A SLOT, AND NOTHING ELSE. This took a second argument — the KV ROW the request holds for life —
-    /// and threaded it down to `SessionKv::kv_rows`, where NOTHING READ IT: every address builder below
-    /// says "NO REQUEST TERM", so the row never reached an address. It is deleted rather than kept "for
-    /// reporting": a device-layer field named after a forbidden concept is read as evidence the concept
-    /// is still load-bearing, and it cost one investigation already.
-    ///
-    /// What distinguishes two requests down here is their PAGES, installed under the slot they occupy.
-    pub fn set_block_table(
-        &mut self,
-        slot: crate::fold_plan::LaunchSlotIdx,
-        pos: i64,
-        pages: &[i64],
-    ) -> Result<()> {
-        if pages.is_empty() {
-            bail!("set_block_table: empty page map — a request needs at least one page");
-        }
-        let pool_pages = match self.paged {
-            Some((p, _)) => p.0 as usize,
-            None => 0,
-        };
-        self.each(|e| {
-            e.set_block_table(
-                crate::fold_plan::RowIdx::from_launch_row(slot.get() as u64),
-                SeqPos(pos),
-                pages,
-            )
-        })
-        .map(|_| ())
-        .map_err(|e| {
-            anyhow!(
-                "{e} (request slot {} at {pos} with {} page(s); pool has {})",
-                slot.get(),
-                pages.len(),
-                pool_pages
-            )
-        })
     }
 
     /// Run ONE INCREMENTAL forward over `n_new` NEW positions at `[seq_pos..seq_pos+n_new)`.
@@ -1161,18 +975,5 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
             e.alias_seg_from(owner.ranks.get(r), s)?;
         }
         Ok(())
-    }
-}
-
-/// THE SESSION IS THE THING THAT WALKS THE FOLD, so it is the thing a launch declares its pass geometry
-/// to — and the [`DeclaredFold`](scratchy_subtile::sdsc_abstract::DeclaredFold) it hands back is what the
-/// prefix-mask staging is blocked by. One call, both numbers, so the count the shim's `fold_plan::reps`
-/// checks itself against and the count the mask is sized by are the same declaration.
-impl<T: ktir_superdsc::collective::Tp> FoldWalker for SuperDscSession<'_, T> {
-    type Error = anyhow::Error;
-
-    fn declare_fold(&mut self, pages: FoldPages, blocks: MaskBlocks) -> Result<()> {
-        self.set_mask_blocks(blocks)?;
-        self.set_fold_pages(pages)
     }
 }
