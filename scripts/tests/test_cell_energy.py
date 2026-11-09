@@ -43,6 +43,33 @@ class Window(unittest.TestCase):
         self.assertIsNone(cell_energy.window(log, 101.0, 110.0))
 
 
+    def test_a_long_window_keeps_its_energy_over_a_gap_of_seconds(self):
+        # Two hours of one-joule seconds with 5 s missing: past the fixed slack, under a share of
+        # the window. The missed seconds count at the window's own mean power, and are recorded.
+        log = rows(*[(1, 0, 0)] * 7200)
+        del log[3600:3605]
+        e = cell_energy.window(log, 100.0, 7300.0)
+        self.assertIsNotNone(e)
+        self.assertEqual(e["uncovered_s"], 5.0)
+        self.assertAlmostEqual(e["cpu_j"], 7200.0, places=1)
+        self.assertEqual(e["window_s"], 7200.0)
+
+    def test_a_short_window_still_needs_the_fixed_slack(self):
+        # 3 s missing from a 10 s window: the share would allow 0.1 s, the fixed slack 1.5 s.
+        log = rows(*[(1, 0, 0)] * 10)
+        del log[4:7]
+        self.assertIsNone(cell_energy.window(log, 100.0, 110.0))
+
+    def test_a_window_missing_more_than_its_share_is_none(self):
+        log = rows(*[(1, 0, 0)] * 7200)
+        del log[3600:3700]
+        self.assertIsNone(cell_energy.window(log, 100.0, 7300.0))
+
+    def test_a_covered_window_misses_nothing(self):
+        e = cell_energy.window(rows((1, 1, 1), (1, 1, 1)), 100.0, 102.0)
+        self.assertEqual(e["uncovered_s"], 0.0)
+
+
 class Per(unittest.TestCase):
     def test_a_cells_energy_per_request_token_and_right_answer(self):
         cell = {"completed": 10, "failed": 0, "total_output_tokens": 500, "num_tasks": 10,
