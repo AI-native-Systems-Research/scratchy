@@ -5931,7 +5931,7 @@ mod walk_on_the_card {
                     e.op_name
                 );
                 let synth = layout.synth.borrow();
-                let footprint = *synth.sizes.get(dst).unwrap_or_else(|| {
+                let footprint = synth.size(dst).unwrap_or_else(|| {
                     panic!(
                         "mq={mq} hd={hd}: {}: the landing {dst} is no HBM synthetic of the \
                          Intermediate segment",

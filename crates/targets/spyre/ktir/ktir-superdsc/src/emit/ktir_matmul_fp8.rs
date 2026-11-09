@@ -917,8 +917,7 @@ mod tests {
         assert!(
             l.synth
                 .borrow()
-                .map
-                .contains_key(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
+                .contains(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
             "the first partial synth is declared"
         );
     }
@@ -961,8 +960,7 @@ mod tests {
         assert!(
             !l.synth
                 .borrow()
-                .map
-                .contains_key(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
+                .contains(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
             "no partial synth may be declared at a fitting geometry"
         );
     }
@@ -1009,29 +1007,26 @@ mod tests {
         // [m, k_pad] fp8 (1 byte/elem — the ½-fp16 residency).
         let s = l.synth.borrow();
         let cl_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * k_pad as u64 * 2,
             "cl owns [m, k_pad] fp16"
         );
         let afp8_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqAfp8).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqAfp8).to_string())
             .expect("afp8 is placed");
         assert_eq!(
-            *afp8_sz,
+            afp8_sz,
             m as u64 * k_pad as u64,
             "afp8 owns [m, k_pad] fp8 (1 B/elem)"
         );
         // The amax family is untouched by the pad: `absx` stays at the LOGICAL [m, k].
         let absx_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqAbsX).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqAbsX).to_string())
             .expect("absx is placed");
-        assert_eq!(*absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
+        assert_eq!(absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
     }
 
     /// ⭐ THE ALIGNED CASE IS BYTE-IDENTICAL: at a 128-aligned k (every earlier fp8 model), no
@@ -1058,11 +1053,10 @@ mod tests {
         );
         let s = l.synth.borrow();
         let cl_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * k as u64 * 2,
             "cl owns [m, k] fp16 — no widening"
         );
@@ -1222,28 +1216,25 @@ mod tests {
         let s = l.synth.borrow();
         let a7 = PlaceId::Act(7);
         let cl_sz = s
-            .sizes
-            .get(&a7.synth(SynthRole::FqCl).to_string())
+            .size(&a7.synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * cl_reach as u64 * 2,
             "cl owns [m, cl_reach] = [1, {cl_reach}] fp16"
         );
         let afp8_sz = s
-            .sizes
-            .get(&a7.synth(SynthRole::FqAfp8).to_string())
+            .size(&a7.synth(SynthRole::FqAfp8).to_string())
             .expect("afp8 is placed");
         assert_eq!(
-            *afp8_sz,
+            afp8_sz,
             m as u64 * k_pad as u64,
             "afp8 owns [m, k_pad] = [1, {k_pad}] fp8 (1 B/elem)"
         );
         let absx_sz = s
-            .sizes
-            .get(&a7.synth(SynthRole::FqAbsX).to_string())
+            .size(&a7.synth(SynthRole::FqAbsX).to_string())
             .expect("absx is placed");
-        assert_eq!(*absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
+        assert_eq!(absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
     }
 
     /// ⭐ THE ALIGNED-`inn` CONTROL: at the expert door's gate/up geometry (inn=2816, itself a
@@ -1283,11 +1274,10 @@ mod tests {
         );
         let s = l.synth.borrow();
         let cl_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * k as u64 * 2,
             "cl owns [m, k] fp16 — no widening"
         );
@@ -1407,28 +1397,25 @@ mod tests {
         let s2 = l2.synth.borrow();
         let a7 = PlaceId::Act(7);
         let cl_sz = s2
-            .sizes
-            .get(&a7.synth(SynthRole::FqCl).to_string())
+            .size(&a7.synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * cl_reach as u64 * 2,
             "cl owns [m, cl_reach] = [{m}, {cl_reach}] fp16"
         );
         let afp8_sz = s2
-            .sizes
-            .get(&a7.synth(SynthRole::FqAfp8).to_string())
+            .size(&a7.synth(SynthRole::FqAfp8).to_string())
             .expect("afp8 is placed");
         assert_eq!(
-            *afp8_sz,
+            afp8_sz,
             m as u64 * k_pad as u64,
             "afp8 owns [m, k_pad] = [{m}, {k_pad}] fp8 (1 B/elem)"
         );
         let absx_sz = s2
-            .sizes
-            .get(&a7.synth(SynthRole::FqAbsX).to_string())
+            .size(&a7.synth(SynthRole::FqAbsX).to_string())
             .expect("absx is placed");
-        assert_eq!(*absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
+        assert_eq!(absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
         // And the positive control: the same m=2 at an ALIGNED inn (1024, a whole fp8 stick)
         // EMITS — one whole-tensor convert, the m-generic form the prefill door consumes.
         let l3 = fp8_layout(2, 2048, 128);

@@ -238,8 +238,8 @@ use ktir_superdsc::emit::EmittedOp;
 ///    length field describes. IBM's own validator for this is commented out in `qg.h`.
 ///  * **Inside its segment.** A placement running past `segment_bytes[seg]` addresses memory the
 ///    segment does not own — I1's inner half, which the device checks only on one path.
-///  * **No overlap.** Two placements sharing bytes means one tensor's producer overwrites the
-///    other's, which is silent: wrong output, or a fault when the second is a kernel.
+///  * **No overlap** is not checked here: synthetics are disjoint by construction
+///    (`SynthAlloc::take`), and colored activations share slots by design.
 ///  * **Non-empty.** A zero-length field is read by the device as `1 << 27` flits = 16 GiB, in both
 ///    `handleHostDMA` and `handleXLATentry`. Zero does not mean nothing.
 ///  * **Allocatable.** A segment is ONE `FlexAllocator` allocation, served from ONE region, so it
@@ -344,42 +344,11 @@ fn audit_layout_addresses(
         }
     }
 
-    // ── overlap, per segment — SYNTHETICS ONLY ──
+    // ── overlap: not checked here ──
     //
-    // ⛔ COLORED ACTIVATIONS OVERLAP ON PURPOSE. The slot-coloring pass gives two tensors whose
-    // LIFETIMES are disjoint the same address; that is the optimisation, not a defect, and
-    // granite's `t447`/`t464`/`t1127` legitimately share one 4096 B slot. Liveness is not a fact
-    // this function has, so it does not get to judge them.
-    //
-    // Synthetics are different: they come from a BUMP allocator, so disjointness IS their
-    // invariant and an overlap means the allocator handed the same address out twice — which is
-    // exactly what it did, by never advancing `next` for an undeclared name.
-    for seg in 0..segment_bytes.len() {
-        let mut in_seg: Vec<&bundle::Placement> = places
-            .iter()
-            .filter(|p| {
-                p.segment as usize == seg
-                    && p.size > 0
-                    && matches!(p.id, bundle::PlaceId::Synth { .. })
-            })
-            .collect();
-        in_seg.sort_by_key(|p| p.offset);
-        for w in in_seg.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if a.offset + a.size > b.offset {
-                fail.push(format!(
-                    "{} spans [{}, {}) and {} starts at {} in seg{seg} — they SHARE {} B, so one \
-                     tensor's producer writes over the other's",
-                    a.id,
-                    a.offset,
-                    a.offset + a.size,
-                    b.id,
-                    b.offset,
-                    a.offset + a.size - b.offset
-                ));
-            }
-        }
-    }
+    // Colored activations overlap ON PURPOSE (two tensors whose lifetimes are disjoint share a slot:
+    // the slot-coloring pass's optimisation, a fact this function does not have). Synthetics cannot:
+    // `SynthAlloc::take` is their one writer and hands out disjoint ranges by construction.
 
     if !fail.is_empty() {
         let shown = fail.len().min(12);
@@ -1608,11 +1577,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
     // colored intermediates in seg3, so they never overlap a real intermediate.
-    let synth = std::cell::RefCell::new(SynthAlloc {
-        next: seg_bytes[SegRole::Intermediate.segment()],
-        map: std::collections::BTreeMap::new(),
-        sizes: std::collections::BTreeMap::new(),
-    });
+    let synth =
+        std::cell::RefCell::new(SynthAlloc::new(seg_bytes[SegRole::Intermediate.segment()]));
     // Every placed tensor's spelling, registered at the one site that knows the whole set.
     let ids = std::cell::RefCell::new(
         placements
@@ -7023,7 +6989,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     // SYNTHETIC intermediates are not SubtileIR tensors, so they have no `t{id}` — they are named
     // directly and always live in the Intermediate segment.
     let synth = synth.borrow();
-    places.extend(synth.map.iter().map(|(name, off)| {
+    places.extend(synth.iter().map(|(name, off, size)| {
         bundle::Placement {
             // ⛔ REFUSES rather than defaulting. Every synthetic is minted through `PlaceId::synth`,
             // which records the id; a name in `map` with no id means something allocated an
@@ -7036,15 +7002,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
             segment: SegRole::Intermediate as u32,
             // Synthetics are intermediates; only the WEIGHT segment is ever banked.
             bank: 0,
-            offset: *off,
-            // ⛔ NO `unwrap_or(0)`. A zero-length field is read by the device as `1 << 27` flits —
-            // 16 GiB — in both `handleHostDMA` and `handleXLATentry`. Every synthetic now has a size,
-            // declared or reserved at first reference, so a missing one is a bug in the allocator and
-            // says so.
-            size: *synth
-                .sizes
-                .get(name)
-                .unwrap_or_else(|| panic!("synthetic '{name}' has an offset but no reserved size")),
+            offset: off,
+            // The allocator reserves a name's size with its offset (`SynthAlloc::take`), and never
+            // zero: a zero-length field is read by the device as `1 << 27` flits — 16 GiB.
+            size,
             is_logits: false,
         }
     }));
@@ -7090,8 +7051,8 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     // caller can forget. A no-op for the SubtileIR path, which already grew it.
     let mut segment_bytes = *segment_bytes;
     let seg_i = SegRole::Intermediate.segment();
-    if synth.next > segment_bytes[seg_i] {
-        segment_bytes[seg_i] = synth.next;
+    if synth.high_water() > segment_bytes[seg_i] {
+        segment_bytes[seg_i] = synth.high_water();
     }
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
@@ -10861,7 +10822,7 @@ mod tests {
         // THE DECLARE PASS, then the real one — the same two lowerings every rung runs over
         // the ONE shared plan.
         pass(&layout);
-        let synth_before = layout.synth.borrow().map.len();
+        let synth_before = layout.synth.borrow().len();
         assert!(
             synth_before >= 2,
             "each node minted at least one intermediate — the fixture no longer exercises \
@@ -10875,7 +10836,7 @@ mod tests {
         // pass's buffers instead of on them.
         pass(&layout);
         assert_eq!(
-            layout.synth.borrow().map.len(),
+            layout.synth.borrow().len(),
             synth_before,
             "the second lowering minted fresh synthetics — the declare/real name agreement broke"
         );

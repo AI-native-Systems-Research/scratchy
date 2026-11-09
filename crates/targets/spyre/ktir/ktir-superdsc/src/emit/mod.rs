@@ -3506,9 +3506,9 @@ fn resolve_seg_base(
         //    producer and consumer of the same name resolve to the SAME address and
         //    it never collides with weights/activations.
         let seg = SegRole::Intermediate.segment();
-        let mut s = l.synth.borrow_mut();
-        let off = if let Some(&o) = s.map.get(name) {
-            o
+        let s = l.synth.borrow();
+        let (off, fp) = if let (Some(o), Some(fp)) = (s.offset(name), s.size(name)) {
+            (o, fp)
         } else {
             // ⛔⛔⛔ THERE IS NO LAZY ALLOCATION. THIS IS A BUILD ERROR.
             //
@@ -3538,28 +3538,16 @@ fn resolve_seg_base(
                  tensor ONE shared address and a zero-byte placement."
             );
         };
-        if let Some(&fp) = s.sizes.get(name) {
-            // DECLARED synth (owns its full shape via BundleLayout::synth): its true footprint
-            // is already reserved up front. GUARD: no access may exceed it — an out-of-footprint
-            // write is a SHAPE MISMATCH that would alias the next tensor → `cargo build` Err
-            // (the typed-shape contract). This is the principled cure for the under-reservation
-            // that aliased sp/spprod/mxp on-card → mxp=0 → softmax overflow → garbage.
-            if window_end > fp {
-                return Err(SuperDscError(format!(
-                    "synth '{name}': access window end {window_end}B (offset {slice}B, operand \
-                     {arg_bytes}B) exceeds its declared footprint {fp}B — shape mismatch (would \
-                     alias the next intermediate). Fix the declared shape (BundleLayout::synth) \
-                     or the op's view/offset."
-                )));
-            }
-        } else {
-            // UNDECLARED synth (rmsnorm/silu decomposition, not yet shape-typed): grow-on-access
-            // high-water so a piecewise multi-write still reserves its true footprint (correct,
-            // but UNCHECKED — these should be migrated to declared shapes).
-            let end = align128(off + window_end);
-            if end > s.next {
-                s.next = end;
-            }
+        // A DECLARED synth owns its full shape (`BundleLayout::synth`): no access may exceed it —
+        // an out-of-footprint write is a SHAPE MISMATCH that would alias the next tensor, a
+        // `cargo build` Err (the typed-shape contract that cured the sp/spprod/mxp aliasing).
+        if window_end > fp {
+            return Err(SuperDscError(format!(
+                "synth '{name}': access window end {window_end}B (offset {slice}B, operand \
+                 {arg_bytes}B) exceeds its declared footprint {fp}B — shape mismatch (would \
+                 alias the next intermediate). Fix the declared shape (BundleLayout::synth) \
+                 or the op's view/offset."
+            )));
         }
         return Ok((segment_base(seg)?, off + slice));
     }
@@ -4116,7 +4104,7 @@ pub fn emit_sdsc(
                 Some(crate::place::PlaceId::Act(tid)) => l.placements.get(&tid).map(|p| p.size),
                 _ => None,
             }
-            .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
+            .or_else(|| l.synth.borrow().size(v.name));
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
                 let own = view_stick_layout(v, iter);
@@ -9270,12 +9258,14 @@ mod embed_row_gather_tests {
         );
         let sizes = l.synth.borrow();
         assert_eq!(
-            sizes.sizes["t304_cslab"],
+            sizes.size("t304_cslab").expect("the slab is reserved"),
             crate::placement::align128((HIDDEN as u64) * 64 * 2),
             "the slab is [hidden, 64] fp16"
         );
         assert_eq!(
-            sizes.sizes["t304_cslabt"],
+            sizes
+                .size("t304_cslabt")
+                .expect("the transposed slab is reserved"),
             crate::placement::align128((64 + 1) * (HIDDEN as u64) * 2),
             "the transposed slab is [65, hidden] fp16 — 64 rows of transpose PLUS the \
              sentinel's zero tail"
@@ -9680,7 +9670,7 @@ mod chain_stage_tests {
         )
         .expect("the legal geometry places");
         assert!(
-            l.synth.borrow().sizes.is_empty(),
+            l.synth.borrow().is_empty(),
             "the tables are graph sources the placement pass places — the door must mint \
              no synth of its own for them"
         );

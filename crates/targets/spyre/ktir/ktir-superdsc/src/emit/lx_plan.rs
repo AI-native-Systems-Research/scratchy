@@ -113,10 +113,8 @@ pub(crate) fn plan<T: crate::collective::Tp>(
     let footprint = |l: &BundleLayout, name: &str| -> u64 {
         l.synth
             .borrow()
-            .sizes
-            .get(name)
-            .or(l.lx.borrow().full_sizes.get(name))
-            .copied()
+            .size(name)
+            .or(l.lx.borrow().full_sizes.get(name).copied())
             .unwrap_or(0)
     };
     let candidates = batch_groups(node)

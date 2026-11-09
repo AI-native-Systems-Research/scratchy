@@ -368,18 +368,79 @@ pub struct BundleLayout {
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate
-/// segment (task #55). `next` starts at the colored-intermediate high-water; each
-/// distinct synthetic name gets one 128B-aligned offset, reused on later sight.
+/// segment (task #55). The cursor starts at the colored-intermediate high-water; each
+/// distinct synthetic name gets one 128B-aligned range, reused on later sight.
+///
+/// ⭐ DISJOINT BY CONSTRUCTION. The fields are private and [`Self::take`] is the one writer: it
+/// hands out `[align128(cursor), +align128(bytes))` and advances the cursor past it, recording the
+/// offset and the size together. No two names can share a byte, and no name can have an offset
+/// without a size — the facts an after-the-fact overlap audit used to re-check.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SynthAlloc {
-    pub next: u64,
-    pub map: std::collections::BTreeMap<String, u64>,
-    /// Declared FULL footprint (bytes) per synth name — set by [`BundleLayout::synth`].
-    /// Present ⇒ the tensor OWNS its shape: `resolve_seg_base` reserves this whole size up
-    /// front (so a per-head write at offset h·stride can't land on the next tensor) and GUARDS
-    /// that no access exceeds it — an out-of-footprint access is a shape mismatch and a
-    /// `cargo build` Err, not silent on-card aliasing.
-    pub sizes: std::collections::BTreeMap<String, u64>,
+    next: u64,
+    map: std::collections::BTreeMap<String, u64>,
+    /// The FULL footprint (bytes) of each name, reserved with its offset.
+    sizes: std::collections::BTreeMap<String, u64>,
+}
+
+impl SynthAlloc {
+    /// An allocator whose first range starts at `base` (128-aligned at the first take).
+    pub fn new(base: u64) -> Self {
+        Self {
+            next: base,
+            ..Self::default()
+        }
+    }
+
+    /// Reserve `bytes` for `name` once: its offset, the first time; the same offset after.
+    fn take(&mut self, name: String, bytes: u64) -> u64 {
+        if let Some(&o) = self.map.get(&name) {
+            return o;
+        }
+        let o = align128(self.next);
+        let fp = align128(bytes.max(1));
+        self.next = o + fp;
+        self.map.insert(name.clone(), o);
+        self.sizes.insert(name, fp);
+        o
+    }
+
+    /// `name`'s offset in the Intermediate segment, when it was reserved.
+    pub fn offset(&self, name: &str) -> Option<u64> {
+        self.map.get(name).copied()
+    }
+
+    /// `name`'s reserved footprint in bytes, when it was reserved.
+    pub fn size(&self, name: &str) -> Option<u64> {
+        self.sizes.get(name).copied()
+    }
+
+    /// Whether `name` was reserved.
+    pub fn contains(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+
+    /// How many names are reserved.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether nothing is reserved.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The end of the last range: the Intermediate segment's extent must cover it.
+    pub fn high_water(&self) -> u64 {
+        self.next
+    }
+
+    /// Every reservation as `(name, offset, size)`, in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, u64, u64)> + '_ {
+        self.map
+            .iter()
+            .map(|(name, &o)| (name.as_str(), o, self.sizes[name]))
+    }
 }
 
 /// LX scratchpad size per core — the SAME fact `superdsc_opspec`'s
@@ -785,7 +846,7 @@ impl BundleLayout {
         }
         // A SYNTHETIC intermediate — declared or refused; the mint never allocates.
         let s = self.synth.borrow();
-        match s.sizes.get(name).copied() {
+        match s.size(name) {
             None => Err(format!(
                 "{what}: '{name}' is windowed but was never declared to the layout. Every \
                  intermediate is known at bake — declare it with `BundleLayout::synth(id, dims)` \
@@ -1205,22 +1266,10 @@ impl BundleLayout {
     /// The byte-exact core of [`Self::synth_df`]: bump-allocate `bytes` for `id`, once.
     fn synth_bytes(&self, id: PlaceId, bytes: u64) {
         let name = id.to_string();
-        let a = self.synth.borrow_mut();
-        // The IDENTITY is recorded even when the OFFSET already exists. `resolve_seg_base` bump-
-        // allocates an intermediate the first time an op references it, which can happen BEFORE the
-        // declaring `synth()` call; the early return below then skipped the id and the placement had
-        // no identity to be built from. Declaration order decides the offset, never the identity.
-        drop(a);
+        // The IDENTITY is recorded even when the OFFSET already exists: declaration order decides
+        // the offset, never the identity.
         self.ids.borrow_mut().insert(name.clone(), id);
-        let mut a = self.synth.borrow_mut();
-        if a.map.contains_key(&name) {
-            return;
-        }
-        let o = align128(a.next);
-        let fp = align128(bytes.max(1));
-        a.next = o + fp;
-        a.map.insert(name.clone(), o);
-        a.sizes.insert(name, fp);
+        self.synth.borrow_mut().take(name, bytes);
     }
 
     /// THE arrangement authority. Record that tensor `name` is addressed through `want`; a later op that
