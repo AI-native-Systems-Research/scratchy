@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// ⛔ RUN THIS FILE WITH `SCRATCHY_PLAN_ONLY_BAKE=1`.
+// `tiled_matmul_trips_do_not_alias_and_advance` drives a real bake; under `spyre-lower` without
+// `spyre-hw` that bake lowers every group and compiles none (`superdsc_bake::global()` is `None` by
+// feature), so the PLAN it inspects is built with no device compiler on the host:
 //
-// `tiled_matmul_trips_do_not_alias_and_advance` drives a real bake, and the bake
-// REFUSES on a host with no device compiler (`no_dxp_or_die`) — deliberately, so
-// a build cannot ship a memory plan with no device programs, which links and
-// serves and returns empty completions with no error anywhere. A test that only
-// inspects the PLAN is the one legitimate caller of that escape hatch, so it
-// must state it on purpose:
+//     cargo test -p scratchy-target-spyre --features spyre-lower --test superdsc_time_tile
 //
-//     SCRATCHY_PLAN_ONLY_BAKE=1 cargo test -p scratchy-target-spyre
-//
-// It is NOT set from inside the test: `std::env::set_var` is `unsafe` in edition
-// 2024 and races every other thread in this binary that bakes.
 //! LX-fit TIME-TILING (coarse_tile) gate for the typed SuperDSC IR.
 //!
 //! Pins the **TimeTile** / **TiledStickExtent** / **SymbolicWhenTiled** witnesses:

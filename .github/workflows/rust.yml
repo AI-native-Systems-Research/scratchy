@@ -577,6 +577,41 @@ jobs:
         run: cargo test -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice
 
   # ---------------------------------------------------------------------------
+  # ⭐ THE CARD'S LOWERING, WITHOUT A CARD. `spyre-lower` lowers every rung a card build bakes — the
+  # decode ceiling and its batch rungs, every prefill width to 512, the prefix and CB rungs — through
+  # the card's own path (`ktir_groups_via_superdsc`, `render_dxp_input`, `launch_index`) and every
+  # refusal on the way, and compiles no device image. Before it, a lowering defect only the card path
+  # reaches (#1162's fold: an aliasing time-tiled write at 8b fp8's prefill m=384) was invisible to
+  # every CI job and surfaced on the card. That fold FAILS this step; main passes it.
+  #
+  # One model per job: a lowering holds 8.5–9.8 GiB at peak (measured on the four granites), over
+  # half a standard runner's 16 GB. ~2 min each on a warm 144-core host; a cold runner is CPU-bound.
+  # Check-only, so the SDK's C++ shim is skipped as in the linux-workspace job.
+  # ---------------------------------------------------------------------------
+  linux-spyre-lower:
+    name: linux-amd64 (spyre-lower ${{ matrix.model.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - { name: granite-3.1-2b fp16, features: "scratchy-models/granite-3.1-2b-instruct" }
+          - { name: granite-3.1-2b fp8, features: "scratchy-models/granite-3.1-2b-instruct,scratchy-quantizations/fp8-dynamic-per-channel" }
+          - { name: granite-3.1-8b fp16, features: "scratchy-models/granite-3.1-8b-instruct" }
+          - { name: granite-3.1-8b fp8, features: "scratchy-models/granite-3.1-8b-instruct,scratchy-quantizations/fp8-dynamic-per-channel" }
+    env:
+      SCRATCHY_SKIP_SENDNN_CXX: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-spyre-lower
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lower every card rung (no device compile)
+        run: cargo check -p scratchy-models --features scratchy-models/spyre-lower,${{ matrix.model.features }}
+
+  # ---------------------------------------------------------------------------
   # compile_fail doctest ERROR CODES, checked on nightly rustdoc.
   #
   # A ```compile_fail,E0277 doctest is a proof that rustc rejects a bad shape for
