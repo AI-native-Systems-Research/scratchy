@@ -212,7 +212,7 @@ fn fp8_large_matmul_time_tile_never_substick() {
             .unwrap_or_else(|e| panic!("{tag} N={n} K={k} fp8 must emit, got Err: {e}"));
         let split = f.iter.split_of("out").max(1);
         let per_core = f.iter.per_core_extent("out");
-        let time = f.time_tile.as_ref().map(|t| t.count()).unwrap_or(1).max(1);
+        let time = f.time_tile().map(|t| t.count()).unwrap_or(1).max(1);
         let per_core_per_trip = per_core / time;
         assert_eq!(
             per_core_per_trip % 128,

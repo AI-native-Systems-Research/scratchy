@@ -1857,6 +1857,49 @@ mod the_arity_is_checked_where_the_op_is_built {
         assert!(!OpFunc::Add.reduction_binding().is_reduction());
     }
 
+    /// An attached operand is a tensor, never a bound input: a fused epilogue's addend sits past the
+    /// inputs `OpSpec::new` checked, so the descriptor's `inputLabeledDs` is the same list before
+    /// and after, and the addend appears only in the SECOND computeOp_ entry.
+    #[test]
+    fn an_attached_epilogue_moves_no_bound_input() {
+        use crate::superdsc_opspec::{EpilogueOpFunc, EpilogueSpec, EpilogueSpecs};
+        let ins = |op: &OpSpec| -> serde_json::Value {
+            let folds = SdscFoldSet::new(op.iter.cores_used());
+            let e = crate::emit::emit_sdsc("epi_o1", op, &folds, None).expect("emits");
+            serde_json::to_value(&e).expect("serializes")["dscs_"][0]["epi_o1"]["computeOp_"]
+                .clone()
+        };
+        let mut op =
+            crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec(1, 64, 64, 1, "a", "w", "o")
+                .expect("a legal matmul");
+        let before = ins(&op)[0]["inputLabeledDs"].clone();
+        let bound = op.bound_inputs();
+        op.attach_fused_epilogue(EpilogueSpecs {
+            one: EpilogueSpec {
+                operand_name: "bias".to_string(),
+                offset_elems: 0,
+                op_func: EpilogueOpFunc::StridedAdd,
+                broadcast_dims: &[],
+                broadcast_batch: false,
+            },
+        });
+        let after = ins(&op);
+        assert_eq!(
+            op.bound_inputs(),
+            bound,
+            "the bound inputs are fixed at construction"
+        );
+        assert_eq!(
+            after[0]["inputLabeledDs"], before,
+            "the matmul's own inputs do not move"
+        );
+        assert_eq!(
+            after[1]["inputLabeledDs"],
+            serde_json::json!(["Tensor3-idx3", "Tensor2-idx2"]),
+            "the addend is the epilogue's, read with the slid output"
+        );
+    }
+
     /// Near-miss on a non-reduction row: `clip` binds one input; two refuse.
     #[test]
     fn a_two_input_clip_refuses_at_construction() {

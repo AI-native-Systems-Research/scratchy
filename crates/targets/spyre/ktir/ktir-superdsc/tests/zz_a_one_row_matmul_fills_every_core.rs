@@ -129,7 +129,7 @@ fn every_granite_8b_fp8_decode_contraction_runs_on_all_32_cores() {
             got, want,
             "granite-8b fp8 {name} [{k} -> {n}]: (mb, out, in)"
         );
-        let t = spec.time_tile.as_ref().map(|t| t.count()).unwrap_or(1);
+        let t = spec.time_tile().map(|t| t.count()).unwrap_or(1);
         assert_eq!(t, trips, "granite-8b fp8 {name}: LX-fit trips");
     }
 }

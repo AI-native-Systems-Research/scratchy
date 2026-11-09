@@ -1897,7 +1897,7 @@ fn core_local_reads_agree(
                  bytes as an HBM address"
             )));
         }
-        if op.time_tile.is_some() {
+        if op.time_tile().is_some() {
             return Err(SuperDscError(format!(
                 "op '{op_name}' is time-tiled over core-local LX tensor '{name}' — a trip-sliced op \
                  walks a different slice per trip, and the pin holds one"
@@ -2039,7 +2039,7 @@ fn note_lx_touches(
     for (i, v) in views.iter().enumerate() {
         let share = if indirect.contains(&i) {
             crate::placement::LxShare::Indirect
-        } else if op.time_tile.is_some() {
+        } else if op.time_tile().is_some() {
             crate::placement::LxShare::TimeTiled
         } else if v.offset_elems != 0 && stick_plane(op, v).is_none() {
             crate::placement::LxShare::Partial
@@ -2956,21 +2956,22 @@ pub fn emit_sdsc_tiled<T: crate::collective::Tp>(
         }
         _ => op,
     };
-    let time = op.time();
     let inner = emit_sdsc(op_name, op, folds, layout)?;
-    if time == 1 {
+    match op.time_tile() {
         // Concrete-address single-shot path: all-empty strides, no unroll.
-        let affine_strides = vec![BTreeMap::new(); op.args().len()];
-        return Ok(EmittedOp::new(
-            op_name.to_string(),
-            inner,
-            op.args(),
-            &op.iter,
-            1,
-            affine_strides,
-        ));
+        None => {
+            let affine_strides = vec![BTreeMap::new(); op.args().len()];
+            Ok(EmittedOp::new(
+                op_name.to_string(),
+                inner,
+                op.args(),
+                &op.iter,
+                1,
+                affine_strides,
+            ))
+        }
+        Some(tile) => rewrite_op_for_time_tile(op_name, op, tile, folds, inner, sym_id_base),
     }
-    rewrite_op_for_time_tile(op_name, op, folds, inner, time, sym_id_base)
 }
 
 /// Rewrite a freshly-emitted (time=1-shaped) [`SdscOp`] into its TIME-TILED form:
@@ -3018,17 +3019,15 @@ fn own_extent_at(
 fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
     op_name: &str,
     op: &OpSpec,
+    // The op's own time tile — handed by the caller that matched it, so this rewrite cannot be
+    // reached for an untiled op.
+    tile: crate::superdsc_opspec::TimeTile,
     folds: &SdscFoldSet,
     mut inner: SdscOp,
-    time: u32,
     sym_id_base: &mut i64,
 ) -> Result<EmittedOp<T>, SuperDscError> {
-    let tiled_dim = op
-        .time_tile
-        .as_ref()
-        .expect("rewrite_op_for_time_tile called on a non-tiled op")
-        .dim()
-        .name();
+    let time = tile.count();
+    let tiled_dim = tile.dim().name();
     let views: Vec<ArgView<'_>> = op.args().iter().map(|a| a.view()).collect();
     let cores = inner.numCoresUsed_.max(1);
     let eps = Fp16::ELEMS_PER_STICK as i64;
@@ -3544,7 +3543,7 @@ pub fn emit_sdsc(
     {
         let replicated =
             op.iter.cores_used().get() == MAX_CORES && op.iter.splits().values().all(|&s| s == 1);
-        if !replicated || op.time_tile.is_some() {
+        if !replicated || op.time_tile().is_some() {
             return Err(SuperDscError(format!(
                 "op '{op_name}': its LX-resident output '{}' is produced by a non-replicated \
                  op — an LX-resident tensor must be produced by a REPLICATED op (all \
@@ -3627,14 +3626,6 @@ pub fn emit_sdsc(
     let stage = StageParam {
         ss_: ss.clone(),
         el_: ss,
-    };
-
-    // The fused-epilogue's extra operand (if any): its Tensor{i} still gets a labeledDs_/primaryDsInfo_
-    // entry below (it is a real tensor the on-card walk must address), but it is NOT one of THIS op's own
-    // inputLabeledDs/outputLabeledDs — it belongs to the SECOND computeOp_ entry built after the loop.
-    let epilogue_arg_idx: Option<usize> = match op.op_info {
-        OpInfo::FusedEpilogue { arg_idx, .. } => Some(arg_idx),
-        _ => None,
     };
 
     // ── labeledDs_ + primaryDsInfo_ (one entry per distinct Role). ──
@@ -3722,35 +3713,18 @@ pub fn emit_sdsc(
                 }
             }
         });
-        // computeOp_ wiring: `Tensor{i}-idx{i}`; the LAST arg is the output. The epilogue's own
-        // operand is excluded here — the SECOND computeOp_ entry references it explicitly below.
-        if epilogue_arg_idx == Some(i) {
-            continue;
-        }
-        // ⛔⛔ THE INDEX OPERAND IS NOT AN ARITHMETIC INPUT, AND THE VENDOR FIXTURE IS EXPLICIT.
-        // `dxp/test/test_gather_1core/sdsc_1.json` has three tensors and lists them as
-        // `inputLabeledDs ["Tensor0-idx0"]`, `outputLabeledDs ["Tensor2-idx2"]`,
-        // `indirectAccessIndexLabeledDs ["Tensor1-idx1"]` — the index appears in exactly ONE list,
-        // and it is not the input list. It is read by the ADDRESSING, never by the arithmetic.
-        //
-        // Listing it as an input would hand dxp an op with one more operand than its DDL declares:
-        // a 2-input identity, a 3-input matmul. That is an arity the op function has no register for,
-        // and the failure is not a clean rejection — `attach_gather_index` shapes the index operand
-        // FROM the value operand (so its rank and stick law are legal), which is exactly what makes a
-        // spurious input plausible enough to lower.
-        if matches!(
-            op.indirect().and_then(|ia| ia.role_of(i)),
-            Some(IndirectRole::Index { .. })
-        ) {
-            continue;
-        }
-        let r = format!("Tensor{i}-idx{i}");
-        if i == out_idx {
-            output_refs.push(r);
-        } else {
-            input_refs.push(r);
-        }
     }
+    // computeOp_ wiring: `Tensor{i}-idx{i}`. The inputs are EXACTLY the ones the DDL template binds —
+    // `OpSpec::bound_inputs`, the list `OpSpec::new` checked — and the output is the last arg. An
+    // attached operand sits past the bound inputs, so it is in neither list: the fused epilogue's
+    // addend belongs to the SECOND computeOp_ entry (which names it below), and a gather's index is
+    // read by the ADDRESSING, never the arithmetic — `dxp/test/test_gather_1core/sdsc_1.json` lists
+    // `inputLabeledDs ["Tensor0-idx0"]`, `outputLabeledDs ["Tensor2-idx2"]`,
+    // `indirectAccessIndexLabeledDs ["Tensor1-idx1"]`, the index in exactly one list.
+    for i in op.bound_inputs() {
+        input_refs.push(format!("Tensor{i}-idx{i}"));
+    }
+    output_refs.push(format!("Tensor{out_idx}-idx{out_idx}"));
     // A reduction accumulator is BOTH an input AND the output (matches the reduce fixture: accum is
     // inputLabeledDs[1] and the sole outputLabeledDs) — when the op's DDL template binds it so, which
     // `OpSpec::new` decided over the operands the op was built with, and checked against the
@@ -4392,7 +4366,7 @@ pub fn emit_sdsc(
                 .collect(),
         )
     } else {
-        match op.op_info {
+        match op.op_info() {
             OpInfo::SfpConstTable => sfp_constant_table(folds),
             OpInfo::ReduceScaling(packed) => scaling_factor_const(packed, folds),
             OpInfo::ReduceScalingFp32(bits) => scaling_factor_const_fp32(bits, folds),
@@ -4415,7 +4389,7 @@ pub fn emit_sdsc(
     // Both stay empty/-1 for every stick-aligned reduce, byte-identical to before this field
     // existed. The fixture's own `maskingConstId_: 8` counts ITS eight preceding constants;
     // ours is 1 — `scaling_factor` occupies "0".
-    let (constant_info, coordinate_masking, masking_const_id) = match op.coordinate_mask {
+    let (constant_info, coordinate_masking, masking_const_id) = match op.coordinate_mask() {
         None => (constant_info, BTreeMap::new(), -1),
         Some(m) => {
             let mut entries = constant_info.as_object().cloned().unwrap_or_default();
@@ -4458,7 +4432,7 @@ pub fn emit_sdsc(
     // `MatMul_122` golden — it reads THIS op's own output plus the extra operand, and writes back
     // to the SAME output in place (no new HBM tensor, no separate trip). Built before `dsc` so both
     // entries share one `computeOp_` vec.
-    let epilogue_compute_ops: Vec<ComputeOp> = match op.op_info {
+    let epilogue_compute_ops: Vec<ComputeOp> = match op.op_info() {
         OpInfo::FusedEpilogue { arg_idx, op_func } => {
             let out_ref = format!("Tensor{out_idx}-idx{out_idx}");
             let epi_ref = format!("Tensor{arg_idx}-idx{arg_idx}");

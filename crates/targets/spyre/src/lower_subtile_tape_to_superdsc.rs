@@ -8842,7 +8842,7 @@ mod tests {
         let f32_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp32)
             .expect("fp32 mean reduce opspec");
         assert_eq!(
-            f32_spec.op_info,
+            f32_spec.op_info(),
             OpInfo::ReduceScalingFp32((1.0f32 / 576.0).to_bits()),
             "fp32 reduce const must be raw IEEE f32 bits of 1/N"
         );
@@ -8870,7 +8870,7 @@ mod tests {
         let f16_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp16)
             .expect("fp16 mean reduce opspec");
         assert_eq!(
-            f16_spec.op_info,
+            f16_spec.op_info(),
             OpInfo::ReduceScaling(sen169_bits(1.0f32 / 576.0) as u32),
             "fp16 reduce const must stay SEN169_FP16"
         );

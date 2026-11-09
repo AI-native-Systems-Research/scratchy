@@ -3963,10 +3963,20 @@ pub struct SamvCoordinateMask {
 /// [`WorkPlan`] so over-specification is unrepresentable.
 ///
 /// ⭐ BUILT ONLY BY [`OpSpec::new`], which takes the output as its own argument and refuses an operand
-/// list its op function's DDL template cannot bind. `op` and `args` are private, so the two facts that
-/// arity is a function of cannot change after the check: an operand can be ATTACHED
-/// (an epilogue operand, a gather index — neither is an input the template binds, so the count the
-/// descriptor lists does not move when one is), never pushed or removed.
+/// list its op function's DDL template cannot bind. `op`, `args` and the bound-input count are
+/// private, so what that arity is a function of cannot change after the check: an operand can be
+/// ATTACHED (an epilogue addend, a gather or scatter index) only PAST the bound inputs, and the
+/// descriptor's `inputLabeledDs` is read from [`OpSpec::bound_inputs`] alone — an attach adds a
+/// tensor, never an input the template binds. No operand is pushed or removed.
+///
+/// The op's aux constants, time tile and coordinate mask are set ONE way — the `with_*` builders
+/// chained on [`OpSpec::new`] (and [`OpSpec::attach_fused_epilogue`] for the epilogue) — and read
+/// through their accessors; none is a public field to overwrite:
+/// ```compile_fail,E0616
+/// fn retile(op: &mut ktir_superdsc::superdsc_opspec::OpSpec) {
+///     op.time_tile = None; // E0616: private field
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct OpSpec {
     op: OpFunc,
@@ -3975,14 +3985,19 @@ pub struct OpSpec {
     /// Ordered tensor args, the output LAST; `arg_index == position` is a type invariant. Never
     /// empty: [`OpSpec::new`] takes the output separately.
     args: Vec<AnyTensorArg>,
-    pub op_info: OpInfo,
+    /// How many of `args` are the inputs the op's DDL template BINDS — the list [`OpSpec::new`] built
+    /// and checked against [`OpFunc::ddl_input_arity`]. Fixed there: every later operand (a fused
+    /// epilogue's addend, a gather or scatter index) is ATTACHED after them and before the output, so
+    /// `args[..bound]` is the bound list by construction and no attach can move it.
+    bound: usize,
+    op_info: OpInfo,
     /// The LX-fit TIME-TILE for this op (the **TimeTile** witness). `None` = the
     /// per-core tile fits [`USABLE_LX_BYTES`] in one trip (today's single-shot
     /// path). `Some(TimeTile{count>1, dim})` = the op's `dim` extent is sliced
     /// into `count` per-time trips so each per-time tile fits the scratchpad —
     /// produced ONLY by [`WorkPlan::time_tile_for_lx`], so "doesn't fit LX" is a
     /// `cargo build` `Err`, never an on-card DtException 1535.
-    pub time_tile: Option<TimeTile>,
+    time_tile: Option<TimeTile>,
     /// This op reads one operand THROUGH another's indices — the hardware gather. `None` (every
     /// op today) emits `indirectAllocType_: "no_indirection"` on every node and an empty
     /// `indirectAccessIndexLabeledDs`, i.e. byte-identical to before this field existed.
@@ -3996,7 +4011,7 @@ pub struct OpSpec {
     /// stick-aligned reduce) emits `coordinateMasking_: {}`, `maskingConstId_: -1` and no
     /// `samv-maskvalue` constant — byte-identical to before this field existed. See
     /// [`SamvCoordinateMask`] for the wire fields and the identity-value law.
-    pub coordinate_mask: Option<SamvCoordinateMask>,
+    coordinate_mask: Option<SamvCoordinateMask>,
 }
 
 impl OpSpec {
@@ -4050,17 +4065,35 @@ impl OpSpec {
                 },
             )));
         }
+        let bound_inputs = inputs.len();
         let mut args = inputs;
         args.push(output);
         Ok(OpSpec {
             op,
             iter,
             args,
+            bound: bound_inputs,
             op_info: OpInfo::None,
             time_tile: None,
             indirect: None,
             coordinate_mask: None,
         })
+    }
+
+    /// The op's aux constants (`constantInfo_`), or its fused epilogue — set by [`Self::with_op_info`]
+    /// or [`Self::attach_fused_epilogue`], read here.
+    pub fn op_info(&self) -> OpInfo {
+        self.op_info
+    }
+
+    /// The LX-fit time tile ([`Self::with_time_tile`]); `None` is one trip.
+    pub fn time_tile(&self) -> Option<TimeTile> {
+        self.time_tile
+    }
+
+    /// The SAMV coordinate masking ([`Self::with_coordinate_mask`]).
+    pub fn coordinate_mask(&self) -> Option<SamvCoordinateMask> {
+        self.coordinate_mask
     }
 
     /// The op's aux constants (`constantInfo_`).
@@ -4100,6 +4133,12 @@ impl OpSpec {
     /// its residency, a device extent) but cannot add, drop or reorder one.
     pub fn args_mut(&mut self) -> &mut [AnyTensorArg] {
         &mut self.args
+    }
+
+    /// The inputs the op's DDL template binds — the list [`Self::new`] checked, in `Tensor{i}` order.
+    /// Never moved by an attached operand (an epilogue addend, an index), which sits past it.
+    pub fn bound_inputs(&self) -> std::ops::Range<usize> {
+        0..self.bound
     }
 
     /// The output operand — the last arg, which exists because [`Self::new`] took it.
@@ -4154,6 +4193,10 @@ impl OpSpec {
     /// through `rewrite_op_for_time_tile`'s per-trip affine-stride machinery, so a tiled matmul must not
     /// call this (the caller decides; this method does not check, since `OpSpec` alone cannot see whether
     /// `emit_sdsc_tiled` will time-tile it).
+    /// The addend is a TENSOR of the op, not one of the inputs its DDL template binds: it lands past
+    /// [`Self::bound_inputs`], so the matmul's `inputLabeledDs` is the list [`Self::new`] checked,
+    /// and the addend is named only by the epilogue's own computeOp_ entry.
+    ///
     /// ⛔ TAKES THE WHOLE EPILOGUE AT ONCE. Assigning `self.op_info` here is the ONLY write —
     /// there is no "already has a stage" state to clobber, and [`EpilogueSpecs`] makes a second
     /// stage (which nothing has ever shipped) unrepresentable rather than runtime-rejected.
