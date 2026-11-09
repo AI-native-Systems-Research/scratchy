@@ -384,7 +384,9 @@ pub struct AllocNode {
 /// [`Self::corelet_fold`]), so a node's factors and the op's cannot differ — the FoldManager's
 /// `Different cardinality between json and caller` (`foldInfrastructure.h:2775`).
 ///
-/// Reads and per-node edits go through the node slice (`Deref`); a node cannot be added or removed.
+/// Reads go through the node slice (`Deref`); edits through [`ScheduleTree::edit`]'s [`NodeEdit`]s,
+/// which reach a node's addresses and stick coordinate but never the node itself — so a node
+/// cannot be added, removed or replaced.
 ///
 /// An empty tree cannot be written — its fields are private, and the only door takes an op:
 /// ```compile_fail,E0451
@@ -395,6 +397,12 @@ pub struct AllocNode {
 /// ```compile_fail,E0599
 /// fn grow(t: &mut ktir_superdsc::wire::ScheduleTree, n: ktir_superdsc::wire::AllocNode) {
 ///     t.push(n); // E0599: no method `push` on `[AllocNode]`
+/// }
+/// ```
+/// Nor can a node be replaced by one from another tree (the tree derefs to `&[AllocNode]` only):
+/// ```compile_fail,E0594
+/// fn swap(t: &mut ktir_superdsc::wire::ScheduleTree, n: &ktir_superdsc::wire::AllocNode) {
+///     t[0] = n.clone(); // E0594: cannot assign through a `&` reference
 /// }
 /// ```
 /// An op's fold props are a [`TreeFold`], which only a tree mints:
@@ -462,12 +470,6 @@ impl std::ops::Deref for ScheduleTree {
     }
 }
 
-impl std::ops::DerefMut for ScheduleTree {
-    fn deref_mut(&mut self) -> &mut [AllocNode] {
-        &mut self.nodes
-    }
-}
-
 impl<'a> IntoIterator for &'a ScheduleTree {
     type Item = &'a AllocNode;
     type IntoIter = std::slice::Iter<'a, AllocNode>;
@@ -476,11 +478,38 @@ impl<'a> IntoIterator for &'a ScheduleTree {
     }
 }
 
-impl<'a> IntoIterator for &'a mut ScheduleTree {
-    type Item = &'a mut AllocNode;
-    type IntoIter = std::slice::IterMut<'a, AllocNode>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.nodes.iter_mut()
+/// One node of a [`ScheduleTree`], open for the edits a built descriptor takes — its start
+/// ADDRESSES (a relaunch shift, a trip advance) and its stick coordinate's per-time extent (a
+/// time tile). It hands out no `&mut AllocNode`, so a node cannot be replaced, and none of its
+/// fold factors can be reached.
+pub struct NodeEdit<'a>(&'a mut AllocNode);
+
+impl NodeEdit<'_> {
+    /// The node's operand index (`ldsIdx_`).
+    pub fn operand(&self) -> usize {
+        self.0.ldsIdx_ as usize
+    }
+
+    /// The node's memory component (`"hbm"` | `"lx"`).
+    pub fn component(&self) -> &'static str {
+        self.0.component_
+    }
+
+    /// The per-core start addresses, `"[c, 0, 0]"` → byte address.
+    pub fn start_addrs(&mut self) -> &mut BTreeMap<String, String> {
+        &mut self.0.startAddressCoreCorelet_.data_
+    }
+
+    /// Rewrite the stick coordinate at its per-time extent ([`Coordinates::divide_stick`]).
+    pub fn divide_stick(&mut self, out_per_time: i64, eps: i64) {
+        self.0.coordinates_.divide_stick(out_per_time, eps);
+    }
+}
+
+impl ScheduleTree {
+    /// Every node, open for its per-node edits ([`NodeEdit`]).
+    pub fn edit(&mut self) -> impl Iterator<Item = NodeEdit<'_>> {
+        self.nodes.iter_mut().map(NodeEdit)
     }
 }
 

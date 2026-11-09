@@ -2722,15 +2722,15 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
                 let mut op = self.dsc().clone();
                 for dsc_map in op.dscs_.iter_mut() {
                     for dsc in dsc_map.values_mut() {
-                        for node in dsc.scheduleTree_.iter_mut() {
-                            let ti = node.ldsIdx_ as usize;
+                        for mut node in dsc.scheduleTree_.edit() {
+                            let ti = node.operand();
                             let Some(stride) =
                                 self.affine_strides.get(ti).and_then(|m| m.get("out"))
                             else {
                                 continue; // non-tiled tensor — base address unchanged.
                             };
                             let bump = t as i64 * *stride;
-                            for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                            for v in node.start_addrs().values_mut() {
                                 let base: i64 = v.parse().unwrap_or(0);
                                 *v = (base + bump).to_string();
                             }
@@ -2757,12 +2757,8 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
         if let Some(op) = e.op.as_mut() {
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for node in dsc
-                        .scheduleTree_
-                        .iter_mut()
-                        .filter(|n| n.component_ == "hbm")
-                    {
-                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                    for mut node in dsc.scheduleTree_.edit().filter(|n| n.component() == "hbm") {
+                        for v in node.start_addrs().values_mut() {
                             if let Ok(a) = v.parse::<u64>()
                                 && window.contains(&a)
                             {
@@ -3273,12 +3269,8 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         // the stick's, at the split it was built with.
         for dsc_map in inner.dscs_.iter_mut() {
             for dsc in dsc_map.values_mut() {
-                if let Some(node) = dsc
-                    .scheduleTree_
-                    .iter_mut()
-                    .find(|n| n.ldsIdx_ as usize == ti)
-                {
-                    node.coordinates_.divide_stick(out_per_time, eps);
+                if let Some(mut node) = dsc.scheduleTree_.edit().find(|n| n.operand() == ti) {
+                    node.divide_stick(out_per_time, eps);
                 }
             }
         }
