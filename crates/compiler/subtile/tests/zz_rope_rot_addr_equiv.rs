@@ -93,7 +93,7 @@ fn both_forms_compute_the_same_rotate() {
             } else {
                 s - n_slabs / 2
             };
-            let sign = i32::from(if s < n_slabs / 2 { -1 } else { 1 });
+            let sign: i32 = if s < n_slabs / 2 { -1 } else { 1 };
             let slab_form = sign * x(h, p_in * STK + o % STK);
             assert_eq!(
                 per_head, slab_form,
