@@ -692,9 +692,8 @@ fn a_second_same_class_pin_refuses_without_a_layout_too() {
         )
     };
     pair(&mut scope, 7).expect("the program's first pin of the class");
-    let err = pair(&mut scope, 17)
-        .err()
-        .expect("a second same-class pin in one program, layout or not");
+    let err =
+        pair(&mut scope, 17).expect_err("a second same-class pin in one program, layout or not");
     assert!(
         err.contains("both of the 8192-byte class in ONE program"),
         "{err}"
