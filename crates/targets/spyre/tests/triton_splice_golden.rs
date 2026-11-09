@@ -1949,6 +1949,72 @@ fn spliced_rope_lowers_through_the_door() {
     }
 }
 
+/// ⭐⭐ A BUNDLE'S NAME IS WHAT IT RUNS: WHAT ITS LOWERING READ IS IN IT WITHOUT BEING LISTED, AND
+/// WHAT CHANGES NOTHING IT RUNS IS NOT.
+///
+/// One rope program at granite-2b's prompt shape (31 rows, 32 heads, head dim 64), lowered three ways:
+///   * under the walk's own layout as one sequence's rows — the bundle;
+///   * under the SAME layout as 31 requests' rows. The row kind is a lowering input
+///     (`BundleAttnParams::rows_are_requests`, which picks rope's head-major collapse), and at this
+///     shape both forms are one `[heads·mq, hd]` sweep, byte for byte: the same bundle, one name;
+///   * as one sequence, with the output placed elsewhere in its segment. The program is the same
+///     program — the old name hashed only the program, so it was the SAME name, and the emitter
+///     handed this bundle the first one's descriptors, addressing the old placement. Named by what
+///     the lowering produced, the two are two bundles.
+#[test]
+fn a_bundles_name_carries_what_its_lowering_read() {
+    let (mq, heads, hd) = (31, 32, 64);
+    // PRODUCTION'S node shape, the wide `[mq, heads·hd]` plane.
+    let ir = rope_plane_ir(mq, heads, hd);
+    let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
+    let layout = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir,
+        &weight_ids,
+        PagedRows::Sequence,
+        &[],
+        pair_of_one_request(mq),
+    )
+    .expect("the rope's layout");
+    let spliced = scratchy_triton_splice::lower::<ktir_superdsc::collective::TpWorld<1>, _>(
+        &ir.nodes[0],
+        &ir,
+        false,
+    )
+    .expect("the rope splices");
+    let name = |layout: &ktir_superdsc::placement::BundleLayout, rows_are_requests: bool| {
+        scratchy_target_spyre::lower_subtile_tape_to_superdsc::render_bundle(
+            &[spliced.shallow_copy()],
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::FoldGrouping::Split,
+            Some(layout),
+            Some(BundleAttnParams { rows_are_requests }),
+        )
+        .unwrap_or_else(|e| panic!("r_ar={rows_are_requests}: {}", e.0))
+        .name(&scratchy_target_spyre::bundle_code::BundleLayout::default())
+    };
+    let bundle = name(&layout, false);
+    assert_eq!(
+        bundle,
+        name(&layout, true),
+        "at head dim 64 both row kinds lower to one sweep, so they are one bundle"
+    );
+    // The output, moved past its segment's high-water: a placement the program does not state.
+    let out = ir.nodes[0].output.tensor.index() as u32;
+    let moved = {
+        let l = layout.clone();
+        let mut l = l;
+        let p = l.placements.get_mut(&out).expect("the output is placed");
+        let seg = p.segment;
+        p.offset = l.segment_bytes[seg].next_multiple_of(128);
+        l.segment_bytes[seg] = p.offset + p.size;
+        l
+    };
+    assert_ne!(
+        bundle,
+        name(&moved, false),
+        "the same program under another placement addresses other bytes, so it is another bundle"
+    );
+}
+
 /// One rope node as a one-node [`SubtileIR`]: `rotate(x, cos, sin) -> out` over
 /// `[mq, heads*hd]`. The x/cos/sin/out tensors carry the WORKER's staging — x/out as
 /// `[mq*heads, hd]` tall views of the `[mq, heads*hd]` plane (same bytes, the

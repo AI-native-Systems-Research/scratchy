@@ -1278,7 +1278,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// UPSTREAM. main incremented the negative-symbol-id counter and inserted into the fp8
 /// activation-quantize dedup set as it built each DESCRIPTOR, so both are per-bundle facts of the
 /// descriptor pass — the producer's copies are threaded but never written (main's
-/// `lower_matmul_node`'s `_quantized`). `ktir_groups_via_superdsc` mints them at exactly this grain for exactly this reason.
+/// `lower_matmul_node`'s `_quantized`). `render_bundle` mints them at exactly this grain for exactly this reason.
 pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -2915,7 +2915,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // intermediate during the TAPE WALK — main's `lower_rmsnorm_node` calls `assemble_rmsnorm`, which
     // calls `BundleLayout::synth`, for prefix, body AND suffix nodes alike — so its layout is complete
     // before the first `emit_bundle`. On this path the producer emits only a KTIR program, and
-    // `assemble_rmsnorm` runs LATER, in the consumer (`ktir_groups_via_superdsc`), once per bundle.
+    // `assemble_rmsnorm` runs LATER, in the consumer (`render_bundle`), once per bundle.
     // `emit_bundle` then does `layout.map(bake_layout)` right after lowering ITS OWN ops, and codegen
     // emits prefix → body → suffix. So the BODY's snapshot — which is the layout the RUNTIME loads,
     // sizes its segments from and resolves every address through — held the prefix's and the body's
@@ -2931,7 +2931,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     //
     // ⭐ THIS DECLARES, IT DOES NOT EMIT. `BundleLayout::synth_bytes` is first-one-wins, so running
     // the consumer over prefix → body → suffix here fixes every synthetic's offset in the SAME order
-    // the tape walk would have, and the real pass in `ktir_groups_via_superdsc` finds each one already
+    // the tape walk would have, and the real pass in `render_bundle` finds each one already
     // declared and resolves the identical address. The symbol counter and the fp8-quantize set are
     // throwaways because only the layout is wanted; the descriptors are dropped.
     // The SAME four facts the real consumer pass is handed — read once here, off the graph's own

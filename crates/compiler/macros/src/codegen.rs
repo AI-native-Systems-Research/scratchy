@@ -12421,18 +12421,9 @@ fn dump_wavefront_mega(
                                                                         // launch count, and a short
                                                                         // context needs BOTH. ON THE
                                                                         // CARD, for the ceiling twin's
-                                                                        // reason above — and here it
-                                                                        // also keeps the twin's NAME
-                                                                        // lawful. `bundle_fp` says a
-                                                                        // twin is `<split fp>f`, so it
-                                                                        // must hash the ops the split
-                                                                        // hashed; off-card the split
-                                                                        // is `&rung_unrolled` while
-                                                                        // this is `&b.ops`, so the
-                                                                        // "twin" was named after a
-                                                                        // bundle nothing else emitted. And
-                                                                        // only where there is a fold to fuse,
-                                                                        // as for the ceiling's.
+                                                                        // reason above. And only where
+                                                                        // there is a fold to fuse, as
+                                                                        // for the ceiling's.
                                                                         rfused.push(if card
                                                                             && superdsc::has_fused_twin::<$W>(&b.ops)
                                                                         {

@@ -97,7 +97,7 @@ pub use ktir_superdsc::work::{
 
 // ⭐ THE DXP-GROUP DESCRIPTOR CEILING LIVES IN THE LEAF CRATE — in `sdsc_abstract`, beside the
 // emitter's window-chunk split that targets it — so the split decision and the bake-side
-// oversized-group guard (in `ktir_groups_via_superdsc` below) cannot each grow their own
+// oversized-group guard (in `render_bundle` below) cannot each grow their own
 // constant. Re-exported here under the leaf's own name: a second divergent value would have to
 // be a NEW name in a file that already resolves this one. See `DxGroupCeiling`'s own doc for
 // the measured pedigree of 4204.
@@ -6969,7 +6969,7 @@ pub enum PendingGroups<T: ktir_superdsc::collective::Tp> {
     /// finished the moment it is constructed.
     Ready(Vec<bundle::LaunchGroup<'static, T>>),
     /// `-Fspyre-hw`'s shape: each group's SuperDSC directory is staged and submitted
-    /// ([`ktir_groups_via_superdsc`]), and its `(KvShifts, GroupId)` is all `into_code` needs to
+    /// ([`stage_bundle`]), and its `(KvShifts, GroupId)` is all `into_code` needs to
     /// find the compiled artifact once `superdsc_bake::finish_global()` has drained the queue —
     /// exactly the id `emit_bundle_inner` "used to" carry before this branch pivoted to KTIR.
     Staged(Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>),
@@ -7108,16 +7108,24 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
     }
 }
 
-/// ⭐ EMIT ONE BUNDLE: audit its ops, then build its launch index and memory plan.
+/// ⭐ EMIT ONE BUNDLE: audit its ops, lower and render them, name the result by its content, and
+/// register it under that name.
 ///
 /// ⛔ NOTHING PERSISTS AND NOTHING IS SUBMITTED — see [`emit_bundle_inner`]. The bundle is collected
 /// in memory for the macro to bake, because a launch group now carries its own KTIR instead of an
 /// id naming device code a compiler still owes us.
 ///
-/// Returns the bundle's FINGERPRINT, which is its identity everywhere downstream: a sibling names
-/// it, [`attach_reroll`] addresses it, and [`drain_emitted_bundles`] hands it to the macro. It is
-/// content-addressed, so emitting the same ops at the same grouping twice (the ladder's ceiling
-/// rung IS the body) does nothing the second time.
+/// Returns the bundle's NAME, which is its identity everywhere downstream: a sibling names it,
+/// [`attach_reroll`] addresses it, and [`drain_emitted_bundles`] hands it to the macro.
+///
+/// ⭐⭐⭐ THE NAME IS THE CONTENT ([`crate::bundle_name`]): the layout the bundle ships, and each
+/// group's shifts and compiled input, in launch order. It is taken AFTER the lowering, so it covers
+/// everything the lowering read — the layout, the row kind in `attn_params`, the fold grouping —
+/// without listing any of it. Two emits share a name exactly when they produce the same bundle, so
+/// the second registers nothing new, and two different bundles cannot share one: there is no "same
+/// name, other content" to refuse. (The name used to be a hash of the ops BEFORE the lowering, which
+/// left out what the lowering also read: a bundle with equal ops and another layout or row kind took
+/// the first one's name, and was handed the first one's programs.)
 ///
 /// `attn_params` is [`RolledSuperDsc::attn_params`] — the four attention facts no KTIR states, which
 /// main's own walk held as parameters. It is `None` for a bundle with no attention node.
@@ -7133,33 +7141,27 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
         let _pc = crate::pc::Pc::start("audit");
         audit_op_work(ops, "<bundle>");
     }
-    // Content-addressed: the same ops at the same grouping ARE the same bundle, so the second emit has
-    // nothing to do. The ladder's ceiling rung IS the body, so this fires on every rolled model.
-    let fp = {
-        let _pc = crate::pc::Pc::start("fp");
-        bundle_fp(ops, fold, attn_params)
-    };
-    // ⛔ THE CHECK AND THE EMIT ARE ONE STEP PER FINGERPRINT. Ladder rungs bake in parallel, and two
-    // rungs can be one program: a decode batch pads its walk to whole chunks, so at two sequences
-    // the 64-, 128- and 256-slot rungs are all one chunk of four block slots. Both emits passed the
-    // check before either inserted, both staged the same group directory, and the second's cleanup
-    // deleted it under the first's compile (dxp: `no bundle to compile`). The second now waits for
-    // the first and takes its fingerprint.
-    let gate = emitting(&fp);
-    let _one_emit = gate
-        .lock()
-        .map_err(|_| std::io::Error::other("a bundle emit panicked holding its fingerprint"))?;
-    if emitted::<T>().lock().is_ok_and(|c| c.contains_key(&fp)) {
-        return Ok(fp);
-    }
-    let b = {
+    let named = {
         let _pc = crate::pc::Pc::start("inner");
         emit_bundle_inner(ops, layout, fold, attn_params, dump)?
     };
-    debug_assert_eq!(
-        b.fp, fp,
-        "bundle_fp and emit_bundle_inner disagree on the fingerprint"
-    );
+    let fp = named.name().to_string();
+    // ⛔ STAGING AND REGISTRATION ARE ONE STEP PER NAME. Ladder rungs bake in parallel, and two rungs
+    // can be one bundle: a decode batch pads its walk to whole chunks, so at two sequences the 64-,
+    // 128- and 256-slot rungs are all one chunk of four block slots. Both arrive here with one name,
+    // which is one content. Staged together, both wrote the same group directory and the second's
+    // cleanup deleted it under the first's compile (dxp: `no bundle to compile`). The second now waits
+    // for the first and finds its name registered.
+    let gate = emitting(&fp);
+    let _one_emit = gate
+        .lock()
+        .map_err(|_| std::io::Error::other("a bundle emit panicked holding its name"))?;
+    if emitted::<T>().lock().is_ok_and(|c| c.contains_key(&fp)) {
+        return Ok(fp);
+    }
+    let b = named
+        .stage(layout, dump)
+        .map_err(|e| std::io::Error::other(e.0))?;
     if let Ok(mut c) = emitted::<T>().lock() {
         c.entry(fp.clone()).or_insert((b, None));
     }
@@ -7168,32 +7170,6 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
         crate::pc::count("registry", ops.len() as u64);
     }
     Ok(fp)
-}
-
-/// This bundle's fingerprint — the SPLIT hash, with an `f` suffix marking the fused variant.
-///
-/// ⛔ THE FUSED TWIN'S NAME KEYS OFF THE UNFILTERED OPS. The runtime finds a body's fused twin as
-/// `<split fp>f`, so the base hash must be the split body's, computed before `ops_for_grouping` drops
-/// anything. Hashing the trimmed list is what made the twin unfindable.
-///
-/// ⛔⛔⛔ AND IT HASHES THE SPLIT-KV CHUNK, BECAUSE THE OPS CANNOT. `ops` are the pre-expansion programs,
-/// and a chunk rung's programs are BIT-IDENTICAL to every other rung's — the attention program sweeps one
-/// page, and the chunk width is a bake fact (`BundleAttnParams::chunk_pages`) the door expands. Hashed
-/// without it, every rung of the chunk ladder fingerprints alike, the content-addressed early-out in
-/// [`emit_bundle`] returns the FIRST rung's body for all of them, and a 16-page context runs a 1-page
-/// chunk: clean bake, no fault, every key past slot 256 silently unread. Appended only when present, so
-/// every bundle without a chunk keeps its fingerprint byte for byte.
-fn bundle_fp<T: ktir_superdsc::collective::Tp>(
-    ops: &[EmittedOp<T>],
-    fold: FoldGrouping,
-    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-) -> String {
-    let _ = attn_params;
-    let base = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
-    match fold {
-        FoldGrouping::Split => base,
-        FoldGrouping::Fused => format!("{base}f"),
-    }
 }
 
 /// Attach the layer-loop parameters to the re-rolled BODY named by `fp`.
@@ -7398,7 +7374,7 @@ fn emitted<T: ktir_superdsc::collective::Tp>() -> &'static Collector<T> {
 type Collector<T> =
     std::sync::Mutex<BTreeMap<String, (EmittedBundle<T>, Option<bundle::RerollMeta<'static>>)>>;
 
-/// The lock [`emit_bundle`] holds for one fingerprint while it checks [`emitted`] and emits.
+/// The lock [`emit_bundle`] holds for one name while it checks [`emitted`], stages and registers.
 fn emitting(fp: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
     static L: std::sync::OnceLock<
         std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
@@ -7431,7 +7407,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
     dump: DumpRoot<'_>,
-) -> std::io::Result<EmittedBundle<T>> {
+) -> std::io::Result<NamedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
     //    per-core HBM segment addressing each tiled tensor's trips advance from a real per-core base,
@@ -7447,7 +7423,6 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
         )));
     }
 
-    let fp = bundle_fp(ops, fold, attn_params);
     let kept: Vec<&EmittedOp<T>> = ops_for_grouping(ops, fold);
     let filtered: Vec<EmittedOp<T>>;
     let ops: &[EmittedOp<T>] = if kept.len() == ops.len() {
@@ -7463,24 +7438,86 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     // `-Fspyre-hw`) lowers that SAME KTIR to a real SuperDSC directory, and a card build stages +
     // submits it to the device compiler:
     // this is the write-files/reserve-disk/pair-with-an-id step `emit_bundle_inner` used to do
-    // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
-    let groups = if cfg!(feature = "spyre-lower") {
-        PendingGroups::Staged(
-            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params, dump)
-                .map_err(|e| std::io::Error::other(e.0))?,
-        )
+    // directly from SubtileIR, revived here over KTIR instead (`render_bundle`, then `stage_bundle`
+    // under the bundle's name).
+    //
+    // ⛔ THE LAYOUT IS BAKED AFTER THE LOWERING, in both arms: the lowering mints its synthetic
+    // placements into the plan (`BundleLayout::synth`), so a plan baked before it would ship without
+    // them.
+    let err = |e: SuperDscError| std::io::Error::other(e.0);
+    let bake = || layout.map(bake_layout).unwrap_or_default();
+    Ok(if cfg!(feature = "spyre-lower") {
+        let rendered = render_bundle(ops, fold, layout, attn_params, dump).map_err(err)?;
+        let layout_baked = bake();
+        let fp = {
+            let _pc = crate::pc::Pc::start("fp");
+            rendered.name(&layout_baked)
+        };
+        NamedBundle::Rendered {
+            fp,
+            layout: layout_baked,
+            rendered,
+        }
     } else {
-        PendingGroups::Ready(
-            ktir_groups(ops, fold, layout.map(|l| l.lx_window_bytes()))
-                .map_err(|e| std::io::Error::other(e.0))?,
-        )
-    };
-
-    Ok(EmittedBundle {
-        fp,
-        layout: layout.map(bake_layout).unwrap_or_default(),
-        groups,
+        let groups = ktir_groups(ops, fold, layout.map(|l| l.lx_window_bytes())).map_err(err)?;
+        let layout_baked = bake();
+        let fp = {
+            let _pc = crate::pc::Pc::start("fp");
+            crate::bundle_name::of_groups(&layout_baked, &groups)
+        };
+        NamedBundle::Ready(EmittedBundle {
+            fp,
+            layout: layout_baked,
+            groups: PendingGroups::Ready(groups),
+        })
     })
+}
+
+/// ⭐ A BUNDLE WITH ITS NAME, NOT YET REGISTERED — what [`emit_bundle`] holds while it takes the
+/// name's lock. Its name is its content ([`crate::bundle_name`]), so it is fixed before anything is
+/// staged: staging writes under the name.
+enum NamedBundle<T: ktir_superdsc::collective::Tp> {
+    /// `-Fspyre-emu`: the launches are complete, and there is nothing to stage.
+    Ready(EmittedBundle<T>),
+    /// `-Fspyre-hw`: rendered for the device compiler, staged once the name's lock is held.
+    Rendered {
+        fp: String,
+        layout: bundle::BundleLayout<'static>,
+        rendered: RenderedBundle<T>,
+    },
+}
+
+impl<T: ktir_superdsc::collective::Tp> NamedBundle<T> {
+    fn name(&self) -> &str {
+        match self {
+            Self::Ready(b) => &b.fp,
+            Self::Rendered { fp, .. } => fp,
+        }
+    }
+
+    /// Hand the device compiler every group it does not already hold, under this name. The dump
+    /// root rides along: staging is what writes the bundle's dxp input where a build asked for it.
+    fn stage(
+        self,
+        plan: Option<&BundleLayout>,
+        dump: DumpRoot<'_>,
+    ) -> Result<EmittedBundle<T>, SuperDscError> {
+        match self {
+            Self::Ready(b) => Ok(b),
+            Self::Rendered {
+                fp,
+                layout,
+                rendered,
+            } => {
+                let staged = stage_bundle(&rendered, &fp, plan, dump)?;
+                Ok(EmittedBundle {
+                    fp,
+                    layout,
+                    groups: PendingGroups::Staged(staged),
+                })
+            }
+        }
+    }
 }
 
 impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
@@ -7500,8 +7537,8 @@ impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
                 let mut out = Vec::with_capacity(staged.len());
                 for (kv, id) in &staged {
                     // `bake` is `None` on a `spyre-lower` build without `spyre-hw` (no device image
-                    // is compiled) — `ktir_groups_via_superdsc` staged/submitted nothing FOR that
-                    // same reason, so there is nothing to have lost here either. Empty
+                    // is compiled) — `render_bundle`/`stage_bundle` staged/submitted nothing FOR
+                    // that same reason, so there is nothing to have lost here either. Empty
                     // `init_binary` matches `ktir_groups`'s own plan-only default.
                     let (init_binary, job_bin_ptr, correction) = match bake {
                         None => (Vec::new(), 0, Vec::new()),
@@ -7552,63 +7589,6 @@ impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
             reroll,
         })
     }
-}
-
-/// Deterministic content fingerprint of a SuperDSC bundle — its identity everywhere downstream, and
-/// the bake queue's cue that a bundle it has already emitted is this one again.
-///
-/// Stable across builds (`DefaultHasher` has a fixed seed). Hashes the launch grouping, and per op its
-/// name, `time`, KTIR program and bindings, and its lowered SuperDSC descriptor: everything dxp is
-/// handed for it.
-pub fn bundle_fingerprint<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>]) -> String {
-    bundle_fingerprint_grouped(ops, FoldGrouping::Split)
-}
-
-/// As [`bundle_fingerprint`], keyed by the fold grouping as well — the two variants share their ops and
-/// differ only in group boundaries.
-pub fn bundle_fingerprint_grouped<T: ktir_superdsc::collective::Tp>(
-    ops: &[EmittedOp<T>],
-    fold: FoldGrouping,
-) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    // MEDIUM-GRAIN: fold the group size in, since flipping G repartitions the body into different
-    // launch groups and therefore different dxp programs.
-    group_size().hash(&mut h);
-    // ⛔ AND THE ACTUAL PARTITION, NOT JUST G. A `GroupKind` change (e.g. distinct-slot cachewr
-    // Slot→SlotSolo) repartitions the body into a DIFFERENT set of groups even when every per-op json
-    // and G are unchanged, so two bundles that launch differently would otherwise share a fingerprint —
-    // and one would silently answer for the other.
-    {
-        let (kinds, _owner) = trip_kinds_for(ops, fold);
-        for r in group_ranges(&kinds, group_size()) {
-            (r.start, r.end).hash(&mut h);
-        }
-    }
-    // ⭐ THE FINGERPRINT IS OVER WHAT GETS BAKED, AND WHAT GETS BAKED IS THE KTIR. Hashing the
-    // per-trip SuperDSC descriptors said nothing about a program whose ops, tiling or grid changed
-    // while its descriptors happened to agree. `Operation` hashes structurally — kind, operands,
-    // attributes, result type, nested regions — so any edit to the emitted program is an edit to
-    // the fingerprint, and a bundle can never silently answer for a different one.
-    //
-    // ⛔ AND THE DESCRIPTOR. The same KTIR lowers to different descriptors under a different layout
-    // or scratchpad plan (`emit::lx_plan`): granite-3.1-2b's decode walk kept its fingerprint when its
-    // trip went to one kv head a core in LX. The fingerprint is the bake's dedup key, so a bundle
-    // whose descriptors changed must not answer to the old one's name.
-    for e in ops {
-        e.op_name.hash(&mut h);
-        e.time.hash(&mut h);
-        if let Some(k) = e.ktir.as_ref() {
-            k.func.hash(&mut h);
-            k.bindings.hash(&mut h);
-        }
-        if let Some(op) = e.op.as_ref() {
-            serde_json::to_vec(op)
-                .expect("a lowered descriptor serializes")
-                .hash(&mut h);
-        }
-    }
-    format!("{:016x}", h.finish())
 }
 
 /// Build-time aliasing check for a TIME-TILED op (#50 verification, GUARD #14):
@@ -8142,17 +8122,17 @@ impl<'a> DumpRoot<'a> {
 /// an axis of extent 1, which dxp refuses from inside its scheduler). The copy is deleted; the law
 /// lives once, where it is proven on the card.
 ///
-/// Returns the identity each group's compiled artifact will be found under — nothing here reads a
-/// compiled result back; that happens once for the whole emit, in [`EmittedBundle::into_code`], after
-/// `superdsc_bake::finish_global()` has drained the queue.
-fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
+/// Returns the bundle lowered and rendered, before it has a name: its name is this content
+/// ([`RenderedBundle::name`]), and [`stage_bundle`] then hands it to the queue under that name.
+/// Nothing reads a compiled result back here; that happens once for the whole emit, in
+/// [`EmittedBundle::into_code`], after `superdsc_bake::finish_global()` has drained the queue.
+pub fn render_bundle<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
-    fp: &str,
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
     dump: DumpRoot<'_>,
-) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
+) -> Result<RenderedBundle<T>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
     let mut sym_id_base: i64 = 0;
@@ -8313,9 +8293,17 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     //    path and every serial path's per-bundle cost. Refused here, after the correctness guards
     //    but before the render: a bundle past the budget costs nothing to refuse, and a bundle
     //    that is also incorrect should name the correctness defect, not the size.
+    // Both budgets refuse before the bundle has a name (its name is its rendered content), so they
+    // name it by its ops.
+    let unnamed = format!(
+        "the bundle of {} op(s) {}..{}",
+        ops.len(),
+        ops.first().map_or("", |e| e.op_name.as_str()),
+        ops.last().map_or("", |e| e.op_name.as_str()),
+    );
     {
         let trips: u64 = sdsc_ops.iter().map(|o| o.time.max(1) as u64).sum();
-        crate::superdsc_bake::BakeBudget::bundle_verdict(fp, sdsc_ops.len(), trips)
+        crate::superdsc_bake::BakeBudget::bundle_verdict(&unnamed, sdsc_ops.len(), trips)
             .map_err(SuperDscError)?;
     }
 
@@ -8342,10 +8330,115 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     //    trip; `bundle.mlir` is the +1 that is not a descriptor.
     for g in &rendered {
         let descriptors = g.files.len() - 1;
-        crate::superdsc_bake::BakeBudget::group_verdict(fp, g.group, descriptors)
+        crate::superdsc_bake::BakeBudget::group_verdict(&unnamed, g.group, descriptors)
             .map_err(SuperDscError)?;
     }
 
+    // The launch index — each group's shifts, which the runtime replays and the name covers.
+    let shifts = {
+        let _pc = crate::pc::Pc::start("launch");
+        launch_index(&sdsc_ops, fold)
+    };
+    // `mq` is the discriminator that names the rung in the dump, and it is READ FROM THE PROGRAM: the
+    // attention program's q view is built first and is `[mq, nqh·hd]`, so its row count is `mq` — the
+    // same fact `recognize_attn` recovers, not a new one threaded in.
+    let mq = ops
+        .iter()
+        .filter(|e| e.op_name.starts_with("attn"))
+        .find_map(|e| {
+            let k = e.ktir.as_ref()?;
+            k.func
+                .operations
+                .iter()
+                .find(|o| o.op_type == OpKind::KtdpConstructMemoryView)
+                .and_then(|o| {
+                    o.attributes
+                        .iter()
+                        .find(|(key, _)| *key == AttrKey::Shape)
+                        .and_then(|(_, v)| match v {
+                            Attr::IntList(l) if l.len() == 2 => l.first().copied(),
+                            _ => None,
+                        })
+                })
+        })
+        .unwrap_or(-1);
+    Ok(RenderedBundle {
+        programs: ops.len(),
+        mq,
+        descriptors: sdsc_ops.len(),
+        per_prog,
+        lx_ledger,
+        rendered,
+        shifts,
+    })
+}
+
+/// ⭐ A BUNDLE LOWERED AND RENDERED FOR dxp, BEFORE IT HAS A NAME — [`render_bundle`]'s output, which
+/// is everything the bundle's name covers ([`Self::name`]) and everything staging writes.
+pub struct RenderedBundle<T: ktir_superdsc::collective::Tp> {
+    /// How many KTIR programs the bundle carries.
+    programs: usize,
+    /// The attention program's query rows, `-1` for a bundle with none (the dump's rung name).
+    mq: i64,
+    /// How many descriptors the bundle's programs lowered to.
+    descriptors: usize,
+    /// Each program and its descriptors' place in `sdsc_ops` — recorded by the push that places
+    /// them, so a reader takes a program's ops as its own range, never by re-cutting the list. The
+    /// dump's `per_program` counts read `range.len()`.
+    per_prog: Vec<(String, std::ops::Range<usize>)>,
+    /// The op-local pin ledger, for the dump.
+    lx_ledger: Vec<LxSlotRow>,
+    /// Every group's dxp input, in launch order.
+    rendered: Vec<GroupInput>,
+    /// Every group's shifts, in launch order.
+    shifts: Vec<bundle::KvShifts<T>>,
+}
+
+impl<T: ktir_superdsc::collective::Tp> RenderedBundle<T> {
+    /// ⭐ THIS BUNDLE'S NAME — its content ([`crate::bundle_name`]): the layout it ships, then each
+    /// group's shifts and dxp input digest, in launch order.
+    pub fn name(&self, layout: &bundle::BundleLayout<'_>) -> String {
+        crate::bundle_name::name(
+            layout,
+            self.shifts.iter().zip(&self.rendered).map(|(kv, g)| {
+                (
+                    kv,
+                    crate::bundle_name::GroupContent::DxpInput(g.key.bytes()),
+                )
+            }),
+        )
+    }
+
+    /// Each group's dxp input, in launch order.
+    pub fn groups(&self) -> &[GroupInput] {
+        &self.rendered
+    }
+
+    /// Each group's shifts, in launch order.
+    pub fn shifts(&self) -> &[bundle::KvShifts<T>] {
+        &self.shifts
+    }
+}
+
+/// ⭐ STAGE A NAMED BUNDLE — dump it under its name, then hand each group the compiler does not
+/// already hold to the bake queue. Returns the identity each group's compiled artifact will be found
+/// under.
+fn stage_bundle<T: ktir_superdsc::collective::Tp>(
+    r: &RenderedBundle<T>,
+    fp: &str,
+    layout: Option<&BundleLayout>,
+    dump: DumpRoot<'_>,
+) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
+    let RenderedBundle {
+        programs,
+        mq,
+        descriptors,
+        per_prog,
+        lx_ledger,
+        rendered,
+        shifts,
+    } = r;
+    let (programs, mq, descriptors) = (*programs, *mq, *descriptors);
     // ⭐ WHICH BUNDLE THE NEXT `GROUPS` LINE BELONGS TO. `launch_index` prints the group/trip totals
     // but takes no bundle identity, so six `GROUPS` lines in a build log are unattributable on their
     // own — and the question that matters is which of them main bakes too. Printed here, immediately
@@ -8376,7 +8469,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // and a diff of the two dirs came back "identical" no matter what the bake actually did.
     if let Some(dump) = dump.bundle_dir(fp) {
         let _pc = crate::pc::Pc::start("dump");
-        if let Err(e) = write_rendered_dxp_input(&dump, &rendered) {
+        if let Err(e) = write_rendered_dxp_input(&dump, rendered) {
             eprintln!(
                 "  [superdsc-dump] {fp}: could not write {}: {e}",
                 dump.display()
@@ -8389,33 +8482,11 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         // dump against a log that was never printed is not a comparison; writing the identity beside the
         // descriptors is.
         //
-        // `mq` is the discriminator that names the rung, and it is READ FROM THE PROGRAM: the attention
-        // program's q view is built first and is `[mq, nqh·hd]`, so its row count is `mq` — the same fact
-        // `recognize_attn` recovers, not a new one threaded in.
+        // `mq` names the rung, read from the program at the render ([`RenderedBundle::mq`]).
         let mut progs: Vec<(String, usize)> = Vec::new();
         for (name, range) in &per_prog {
             progs.push((name.clone(), range.len()));
         }
-        let mq = ops
-            .iter()
-            .filter(|e| e.op_name.starts_with("attn"))
-            .find_map(|e| {
-                let k = e.ktir.as_ref()?;
-                k.func
-                    .operations
-                    .iter()
-                    .find(|o| o.op_type == OpKind::KtdpConstructMemoryView)
-                    .and_then(|o| {
-                        o.attributes
-                            .iter()
-                            .find(|(key, _)| *key == AttrKey::Shape)
-                            .and_then(|(_, v)| match v {
-                                Attr::IntList(l) if l.len() == 2 => l.first().copied(),
-                                _ => None,
-                            })
-                    })
-            })
-            .unwrap_or(-1);
         // The segment budget's verdict rides the identity for the same reason `mq` does: on a green
         // build the bake's own SEGMENT BUDGET line is never printed, and a spilled tail is a load-time
         // and device-memory cost that nothing else at build time names.
@@ -8429,8 +8500,8 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         // a green build prints nothing, and the #645 same-class pair hunts (which bundle holds two
         // independent same-class norms, and which programs touch them) have nowhere else to read
         // the walk's view from. One row per op-local pin — name, class bytes, slot address, and
-        // the programs touching it with their direction — straight off the pin ledger's
-        // ledger, so the dump cannot disagree with the guard that ran.
+        // the programs touching it with their direction — straight off the pin ledger, so the dump
+        // cannot disagree with the ledger the emit computed.
         let lx_pins = lx_ledger
             .iter()
             .map(|r| {
@@ -8451,8 +8522,8 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         let id_json = format!(
             "{{\"fp\":\"{fp}\",\"mq\":{mq},\"weight_tail\":{weight_tail},\"programs\":{},\
              \"descriptors\":{},\"per_program\":[{}],\"lx_pins\":[{}]}}\n",
-            ops.len(),
-            sdsc_ops.len(),
+            programs,
+            descriptors,
             progs
                 .iter()
                 .map(|(n, c)| format!("{{\"op\":\"{n}\",\"descriptors\":{c}}}"))
@@ -8465,22 +8536,15 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         }
     } // pc:dump
     eprintln!(
-        "[ktir->sdsc] BUNDLE {fp}: {} KTIR program(s) -> {} descriptor(s)",
-        ops.len(),
-        sdsc_ops.len(),
+        "[ktir->sdsc] BUNDLE {fp}: {programs} KTIR program(s) -> {descriptors} descriptor(s)",
     );
 
-    // ── from here down this is main's block, verbatim ──
-    let shifts = {
-        let _pc = crate::pc::Pc::start("launch");
-        launch_index(&sdsc_ops, fold)
-    };
     let mut groups: Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)> = Vec::new();
     let mut staged: u64 = 0;
     // No dxp (a Mac / cardless `cargo check`) ⇒ nothing to stage, and nothing to stage it FOR. This
     // is a CAPABILITY probe, not a behaviour flag.
     if let Some(bake) = crate::superdsc_bake::global() {
-        for g in &rendered {
+        for g in rendered {
             let id = crate::superdsc_bake::GroupId {
                 fp: fp.to_string(),
                 group: g.group,
@@ -8522,7 +8586,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
             groups.push((kv, id));
         }
     }
-    crate::pc::bundle_line(fp, ops.len(), sdsc_ops.len(), staged);
+    crate::pc::bundle_line(fp, programs, descriptors, staged);
     Ok(groups)
 }
 
@@ -8532,10 +8596,10 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
 ///   1. [`lower_subtile_tape_to_ktir`] walks the rerolled tape and builds ONE KTIR program per node
 ///      (the producer half, in its own file — nothing there emits a descriptor);
 ///   2. [`crate::ktir_superdsc_door::lower`] turns each of those programs into the real SuperDSC
-///      descriptors, reached from [`ktir_groups_via_superdsc`] below (the consumer half, in its own
+///      descriptors, reached from [`render_bundle`] below (the consumer half, in its own
 ///      file — main's proven bodies with their input door changed);
 ///   3. the bake — [`render_dxp_input`] + `superdsc_bake`'s stage/seal/submit, also in
-///      [`ktir_groups_via_superdsc`] — compiles them and `inventory::submit`s the result.
+///      [`render_bundle`] — compiles them and `inventory::submit`s the result.
 ///
 /// Steps 2 and 3 run per BUNDLE, from [`emit_bundle`], because the tape walk's three segments
 /// (prefix / body / suffix) are baked as three bundles over one layout; this entry is step 1 plus
@@ -10852,18 +10916,35 @@ mod tests {
 }
 
 #[cfg(test)]
-mod fingerprint_tests {
+mod name_tests {
     use super::*;
+    use ktir_superdsc::collective::TpWorld;
     use ktir_superdsc::emit::rb;
     use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
 
-    /// ⭐ A BUNDLE IS ITS DESCRIPTORS. Two ops alike in every field the fingerprint hashed before —
-    /// name, `time`, KTIR program and bindings (here none) — but lowered to different descriptors are
-    /// different bundles, as the same KTIR under a different scratchpad plan is.
+    /// A bundle of already-lowered ops, named the way [`RenderedBundle::name`] names one: its layout,
+    /// then each group's shifts and dxp input digest.
+    fn name_of(ops: &[EmittedOp<TpWorld<1>>]) -> String {
+        let rendered = render_dxp_input(ops, FoldGrouping::Split).expect("the ops render");
+        let shifts = launch_index(ops, FoldGrouping::Split);
+        crate::bundle_name::name(
+            &bundle::BundleLayout::default(),
+            shifts.iter().zip(&rendered).map(|(kv, g)| {
+                (
+                    kv,
+                    crate::bundle_name::GroupContent::DxpInput(g.key.bytes()),
+                )
+            }),
+        )
+    }
+
+    /// ⭐ A BUNDLE IS ITS DESCRIPTORS. Two ops alike in name and `time` but lowered to different
+    /// descriptors are different bundles, as the same KTIR under a different scratchpad plan is: the
+    /// name covers what dxp compiles.
     #[test]
-    fn a_changed_descriptor_changes_the_fingerprint() {
+    fn a_changed_descriptor_changes_the_name() {
         let at = |m: u32| {
-            assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
+            assemble_matmul::<TpWorld<1>>(
                 "MatMul_0",
                 m,
                 384,
@@ -10878,10 +10959,44 @@ mod fingerprint_tests {
         };
         let (a, b) = (at(384), at(192));
         assert_eq!((&a.op_name, a.time), (&b.op_name, b.time));
+        assert_eq!(name_of(&[a.shallow_copy()]), name_of(&[a.shallow_copy()]));
         assert_ne!(
-            bundle_fingerprint(&[a]),
-            bundle_fingerprint(&[b]),
+            name_of(&[a]),
+            name_of(&[b]),
             "the descriptors differ, so the bundles do"
         );
+    }
+
+    /// ⭐ AND IT IS THE LAYOUT THE BUNDLE SHIPS. Equal groups under two layouts are two bundles: a
+    /// session allocates the segments its bundle's layout states.
+    #[test]
+    fn a_changed_layout_changes_the_name() {
+        let op = assemble_matmul::<TpWorld<1>>(
+            "MatMul_0",
+            64,
+            384,
+            64,
+            16,
+            &rb("act", 64, 64),
+            &Stk::<KernelTag>::kernel(64, 384, "wt"),
+            &rb("out", 64, 384),
+            None,
+        );
+        let rendered = render_dxp_input(&[op.shallow_copy()], FoldGrouping::Split).unwrap();
+        let shifts = launch_index(&[op], FoldGrouping::Split);
+        let named = |layout: &bundle::BundleLayout<'_>| {
+            crate::bundle_name::name(
+                layout,
+                shifts.iter().zip(&rendered).map(|(kv, g)| {
+                    (
+                        kv,
+                        crate::bundle_name::GroupContent::DxpInput(g.key.bytes()),
+                    )
+                }),
+            )
+        };
+        let mut wider = bundle::BundleLayout::default();
+        wider.segment_bytes[0] = 1 << 20;
+        assert_ne!(named(&bundle::BundleLayout::default()), named(&wider));
     }
 }

@@ -1966,7 +1966,7 @@ pub struct BakeStats {
 ///
 /// - PER GROUP (descriptors): `DxGroupCeiling::MAX_DESCRIPTORS` — the leaf crate's one const,
 ///   re-exported beside the emission it bounds (in `lower_subtile_tape_to_superdsc`) and enforced
-///   in that crate's `ktir_groups_via_superdsc`, where the rendered groups exist.
+///   in that crate's `render_bundle`, where the rendered groups exist.
 ///   A group is the unit dxp compiles, and its cost is SUPERLINEAR in size (8,300 descriptors ≈
 ///   2.5 h; 4,183 ≈ 57 min ⇒ exponent ≈ 1.4), so one oversized group sets the whole bake's span.
 /// - PER BUNDLE (descriptors, trips): `MAX_BUNDLE_DESCRIPTORS` / `MAX_BUNDLE_TRIPS`, enforced in
@@ -2022,7 +2022,7 @@ impl BakeBudget {
     pub const MAX_GROUPS_PER_LAYER: usize = 256;
 
     /// The per-BUNDLE budget verdict — `Err` carries the refusal verbatim, for
-    /// `ktir_groups_via_superdsc` to return as the bundle's `Err` (fatal at a primary body,
+    /// `render_bundle` to return as the bundle's `Err` (fatal at a primary body,
     /// the documented rung-skip on a ladder rung). `trips` is `Σ EmittedOp::time` over the
     /// bundle's minted ops; `descriptors` is their count.
     ///
@@ -2045,7 +2045,7 @@ impl BakeBudget {
     }
 
     /// The per-GROUP verdict — the bake-side oversized-dxp-group guard the leaf crate's
-    /// `DxGroupCeiling` doc promises for `ktir_groups_via_superdsc`. `descriptors` is the
+    /// `DxGroupCeiling` doc promises for `render_bundle`. `descriptors` is the
     /// group's rendered trip count (one `sdsc_{li}.json` per trip). `Err` carries the refusal
     /// verbatim.
     ///
