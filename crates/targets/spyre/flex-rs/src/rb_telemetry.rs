@@ -149,8 +149,9 @@ mod tests {
     #[test]
     fn record_then_drain_returns_entries_and_empties() {
         let mut ring = RbRing::with_cap(8);
+        let seen = std::time::Instant::now();
         ring.record(RbTiming {
-            seen: std::time::Instant::now(),
+            seen,
             source: 0,
             id: 1,
             pipeline: PipelineId::Compute,
@@ -158,7 +159,7 @@ mod tests {
             rb: rb_with([1, 2, 3, 4, 5], 6),
         });
         ring.record(RbTiming {
-            seen: std::time::Instant::now(),
+            seen,
             source: 0,
             id: 2,
             pipeline: PipelineId::AsyncDmaI,
@@ -170,7 +171,7 @@ mod tests {
             drained,
             vec![
                 RbTiming {
-                    seen: std::time::Instant::now(),
+                    seen,
                     source: 0,
                     id: 1,
                     pipeline: PipelineId::Compute,
@@ -178,7 +179,7 @@ mod tests {
                     rb: rb_with([1, 2, 3, 4, 5], 6),
                 },
                 RbTiming {
-                    seen: std::time::Instant::now(),
+                    seen,
                     source: 0,
                     id: 2,
                     pipeline: PipelineId::AsyncDmaI,
