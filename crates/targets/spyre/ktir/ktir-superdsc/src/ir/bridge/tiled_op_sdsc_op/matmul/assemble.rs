@@ -341,7 +341,7 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
             .set_axis(super::walk::InAxis::NAME, |_| {
                 Ok(crate::superdsc_opspec::DeviceAxis::Window(w_in_phys))
             })
-            .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+            .map_err(|e| at(e.0))?;
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
