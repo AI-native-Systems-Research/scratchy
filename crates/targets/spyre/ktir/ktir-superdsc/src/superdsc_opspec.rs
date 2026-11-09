@@ -2756,25 +2756,25 @@ impl ArgView<'_> {
     pub fn window_extents(&self) -> Vec<Option<usize>> {
         self.device_extent
             .iter()
-            .map(|&a| match (a, self.pitch_form(a)) {
-                (DeviceAxis::Window(p), _) => Some(p as usize),
-                (DeviceAxis::Pitch(_), Some(PitchForm::Lx(p))) => Some(p.declared() as usize),
-                _ => None,
+            .map(|&a| match a {
+                DeviceAxis::Swept => None,
+                DeviceAxis::Window(p) => Some(p as usize),
+                DeviceAxis::Pitch(p) => match self.pitch_form(p) {
+                    PitchForm::Lx(p) => Some(p.declared() as usize),
+                    PitchForm::Hbm(_) => None,
+                },
             })
             .collect()
     }
 
-    /// ⭐ HOW THIS VIEW'S PITCH ON AN AXIS REACHES THE WALK — the one resolution, by the view's
-    /// residency ([`PitchForm`]). `None` for an axis with no pitch.
-    pub fn pitch_form(&self, axis: DeviceAxis) -> Option<PitchForm> {
-        let DeviceAxis::Pitch(p) = axis else {
-            return None;
-        };
-        Some(if self.allocation.is_lx() {
+    /// ⭐ HOW THIS VIEW'S PITCH REACHES THE WALK — the one resolution, by the view's residency
+    /// ([`PitchForm`]).
+    pub fn pitch_form(&self, p: Pitch) -> PitchForm {
+        if self.allocation.is_lx() {
             PitchForm::Lx(p)
         } else {
             PitchForm::Hbm(p)
-        })
+        }
     }
 
     /// Where each dim of the stated device order sits in `layout` — entry `i` is the `layout` position
