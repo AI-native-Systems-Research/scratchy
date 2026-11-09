@@ -4742,7 +4742,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             }
             let frame = frames.frame_of(f, c.init, &dims)?;
             let tid = mint_inter(k, layout, floor, c.arg);
-            layout.synth(crate::place::PlaceId::Act(tid), &frame);
+            layout.synth(crate::place::SynthId::Act(tid), &frame);
             let r = Region {
                 tid,
                 v_rows: frame[0],
@@ -4851,7 +4851,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         };
                         let tid =
                             mint_scratch(k, layout, floor, c.result, Scratch::CarriedHandback);
-                        layout.synth(crate::place::PlaceId::Act(tid), &[r.v_rows, r.v_cols]);
+                        layout.synth(crate::place::SynthId::Act(tid), &[r.v_rows, r.v_cols]);
                         let copy = Region { tid, ..r };
                         out.extend(super::lower_ktir_to_superdsc::elementwise(
                             f.name,
@@ -5085,7 +5085,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     None => {
                         let tid = mint_inter(k, layout, floor, res);
                         layout.synth(
-                            crate::place::PlaceId::Act(tid),
+                            crate::place::SynthId::Act(tid),
                             &[rows, sticks * stick as u32],
                         );
                         Region {
@@ -5282,7 +5282,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         // The stick-major `[entries, cols]` the gathered rows land in.
                         let mint_rows = || {
                             let tid = mint_inter(k, layout, floor, src);
-                            layout.synth(crate::place::PlaceId::Act(tid), &[g.entries, cols]);
+                            layout.synth(crate::place::SynthId::Act(tid), &[g.entries, cols]);
                             Region {
                                 tid,
                                 v_rows: g.entries,
@@ -5675,7 +5675,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                             };
                             let run = mint_scratch(k, layout, floor, src, Scratch::IndexRun);
                             layout.synth_df(
-                                crate::place::PlaceId::Act(run),
+                                crate::place::SynthId::Act(run),
                                 &[1, super::lower_ktir_to_superdsc::INDEX_RUN_WORDS],
                                 crate::superdsc_opspec::Df::SenUint32,
                             );
@@ -5791,7 +5791,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                             let land_tid =
                                 mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
                             layout.synth(
-                                crate::place::PlaceId::Act(land_tid),
+                                crate::place::SynthId::Act(land_tid),
                                 &[t_rows.get(), w.elems()],
                             );
                             let land = Region {
@@ -6244,7 +6244,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // port never bakes (`J = min(32 / seqs, blocks)` over power-of-two buckets is always one).
             let halving = matches!(kind, ReduceKind::Max) && blocks.is_power_of_two();
             let tid = mint_inter(k, layout, floor, res);
-            layout.synth(crate::place::PlaceId::Act(tid), &[rows, src.v_cols]);
+            layout.synth(crate::place::SynthId::Act(tid), &[rows, src.v_cols]);
             // ⛔ THE TREE'S WIDE LEVELS GET THEIR OWN BUFFER, NOT A TALLER RESULT. A level above the
             // last writes several windows, and the result buffer is ONE window — the shape every
             // consumer of this reduction reads. Widening it instead made the result present as its
@@ -6256,7 +6256,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // is this arm's alone.
             let wide = (halving && blocks > 2).then(|| {
                 let t = mint_scratch(k, layout, floor, data, Scratch::FoldTreeWide);
-                layout.synth(crate::place::PlaceId::Act(t), &[src.v_rows / 2, src.v_cols]);
+                layout.synth(crate::place::SynthId::Act(t), &[src.v_rows / 2, src.v_cols]);
                 (t, src.v_rows / 2)
             });
             let acc = Region {
@@ -7520,7 +7520,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
             // threads into the descriptors.
             if carried.is_none() {
-                layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+                layout.synth_df(crate::place::SynthId::Act(tid), &dev_dims, op_df);
             }
             // ⭐⭐⭐ THE BAND PROPAGATES THROUGH THE MINT — a banded op's intermediate is a
             // banded operand of the NEXT op. The minted region states the band its inputs
@@ -8914,7 +8914,7 @@ fn splat_buffer(
     };
     let [rows, cols] = frames.frame_of(f, v, dims)?;
     let tid = mint_inter(k, layout, floor, v);
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, cols]);
     Ok(Some((
         Region {
             tid,
@@ -9026,7 +9026,7 @@ impl HeadRows {
 /// A minted row-major `[rows, stick]` buffer's region.
 fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
     let stick = crate::work::FP16_ELEMS_PER_STICK;
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, stick]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, stick]);
     Region {
         tid,
         v_rows: rows,
@@ -9058,7 +9058,7 @@ fn block_landing_cols(cols: u32, stick: i64) -> Option<u32> {
 /// A minted stick-major `[rows, sticks · stick]` buffer's region.
 fn stick_major_region(tid: u32, rows: u32, sticks: u32, layout: &BundleLayout) -> Region {
     let cols = sticks * crate::work::FP16_ELEMS_PER_STICK;
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, cols]);
     Region {
         tid,
         v_rows: rows,
@@ -9847,7 +9847,7 @@ fn gathered_matmul_materializes<T: crate::collective::Tp>(
         ));
     };
     let tid = mint_inter(k, layout, *floor, gathered_result);
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, head]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, head]);
     let r = Region {
         tid,
         v_rows: rows,

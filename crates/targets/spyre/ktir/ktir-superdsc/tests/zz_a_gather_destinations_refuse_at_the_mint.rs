@@ -201,11 +201,11 @@ fn a_core_local_destination_has_no_offset_to_take() {
 /// declared to the layout as synthetics at the copy's own extents, so the destination's doors are
 /// the only variables the legs below leave. Returns the two names to build the copy with.
 fn declare_gather_rig(layout: &BundleLayout, cp: GatherCopy) -> (String, String) {
-    let src_id = PlaceId::Synth {
+    let src_id = ktir_superdsc::place::SynthId::Synth {
         of: 5,
         role: SynthRole::Rot,
     };
-    let idx_id = PlaceId::Synth {
+    let idx_id = ktir_superdsc::place::SynthId::Synth {
         of: 6,
         role: SynthRole::Xc,
     };
@@ -310,7 +310,7 @@ fn a_core_local_destination_the_layout_does_not_hold_refuses() {
         "the refusal names the name the two authorities disagree about: {msg}"
     );
 
-    let core_id = PlaceId::Synth {
+    let core_id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::VRep,
     };

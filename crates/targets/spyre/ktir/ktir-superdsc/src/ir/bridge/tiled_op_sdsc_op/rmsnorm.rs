@@ -53,7 +53,7 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     cols: u32,
     x: &str,
     gamma: &str,
-    out_id: crate::place::PlaceId,
+    out_id: crate::place::SynthId,
     eps_const: &str,
     ones_const: Option<&str>,
     sym_id_base: &mut i64,
@@ -215,7 +215,8 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         .ok_or_else(|| format!("rmsnorm {prefix}: a norm needs at least one row"))?;
     let (rsqrt_op, xn_op) = crate::emit::lx_op_local_pair(
         crate::emit::OpLocalPair {
-            id: out_id.synth(R::Rinv),
+            of: out_id,
+            role: crate::place::OpLocalRole::RINV,
             shape: crate::placement::OpLocalShape::rows_of_one_stick(pin_rows),
             // 1/√(E[x²]+eps)
             writer: crate::emit::PinWriter {
@@ -302,7 +303,7 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     rows: u32,
     cols: u32,
     x: &str,
-    out_id: crate::place::PlaceId,
+    out_id: crate::place::SynthId,
     eps_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -459,7 +460,7 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     rows: u32,
     cols: u32,
     x: &str,
-    out_id: crate::place::PlaceId,
+    out_id: crate::place::SynthId,
     cap_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,

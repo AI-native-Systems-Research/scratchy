@@ -4959,7 +4959,10 @@ pub struct PinReader<'a, O: KindTag> {
 /// [`lx_op_local_pair`] whole, beside the lowering's own context (the program's scope, the symbol
 /// counter, the layout).
 pub struct OpLocalPair<'a, O: KindTag> {
-    pub id: crate::place::PlaceId,
+    /// The tensor the pin derives from.
+    pub of: crate::place::SynthId,
+    /// Which op-local pin it is — constructible only in this crate ([`crate::place::OpLocalRole`]).
+    pub role: crate::place::OpLocalRole,
     /// The pin's one statement of its extents: non-zero one-stick rows.
     pub shape: crate::placement::OpLocalShape,
     pub writer: PinWriter<'a>,
@@ -5008,12 +5011,14 @@ pub fn lx_op_local_pair<T: crate::collective::Tp, O: KindTag>(
     layout: Option<&BundleLayout>,
 ) -> Result<(EmittedOp<T>, EmittedOp<T>), SuperDscError> {
     let OpLocalPair {
-        id,
+        of,
+        role,
         shape,
         writer,
         reader,
     } = pair;
-    let name = BundleLayout::claim_op_local(layout, scope, id, shape).map_err(SuperDscError)?;
+    let name =
+        BundleLayout::claim_op_local(layout, scope, of, role, shape).map_err(SuperDscError)?;
     let pin = rb(&name, shape.rows(), shape.cols());
     let rows = crate::sdsc_abstract::RowCount::of_token_rows(shape.rows());
     let written = assemble_pointwise_broadcast_off(

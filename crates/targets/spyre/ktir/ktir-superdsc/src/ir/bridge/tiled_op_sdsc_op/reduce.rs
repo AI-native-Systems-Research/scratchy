@@ -1063,7 +1063,7 @@ pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
     accum_off: DevOff,
     /// The place the partial synthetics mint under — the reduce's own place, whatever the
     /// caller holds for it.
-    parent: crate::place::PlaceId,
+    parent: crate::place::SynthId,
     /// The caller's OWN core division — the probe must ask the tiler the question the caller's
     /// single-shot emission asks.
     division: ReduceDivision,
@@ -1146,7 +1146,7 @@ impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
         geometry: ReduceGeometry,
         data: ReduceDataLeg<'a, D>,
         accum: ReduceAccumLeg<'a, A>,
-        parent: crate::place::PlaceId,
+        parent: crate::place::SynthId,
     ) -> Result<Self, String> {
         let parent_cols = u32::try_from(data.stk.layout().cols).map_err(|_| {
             format!(
@@ -1298,7 +1298,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     // The partials: `time - 1` synthetics under the reduce's own place, one stick per row each,
     // so no two slice reduces share an output byte. Slice 0 seeds the CALLER's accum.
     use crate::place::SynthRole as R;
-    let partial_ids: Vec<crate::place::PlaceId> = (1..time)
+    let partial_ids: Vec<crate::place::SynthId> = (1..time)
         .map(|j| s.parent.synth(R::ReducePartial(j)))
         .collect();
     let partial_names: Vec<String> = partial_ids
@@ -1565,7 +1565,7 @@ mod long_reduce_split {
                     .expect("the split's geometry mints"),
                 ReduceDataLeg::whole(&data),
                 ReduceAccumLeg::new(&accum, DevOff::ZERO),
-                crate::place::PlaceId::Act(1),
+                crate::place::SynthId::Act(1),
             )
             .expect("the split request mints"),
             &mut 0i64,
@@ -1590,7 +1590,7 @@ mod long_reduce_split {
                     .expect("the split's geometry mints"),
                 ReduceDataLeg::whole(&data),
                 ReduceAccumLeg::new(&accum, DevOff::ZERO),
-                crate::place::PlaceId::Act(1),
+                crate::place::SynthId::Act(1),
             )
             .expect("the split request mints"),
             &mut 0i64,
@@ -1646,7 +1646,7 @@ mod long_reduce_split {
                     .expect("the split's geometry mints"),
                 ReduceDataLeg::whole(&data),
                 ReduceAccumLeg::new(&accum, DevOff::ZERO),
-                crate::place::PlaceId::Act(1),
+                crate::place::SynthId::Act(1),
             )
             .expect("the split request mints"),
             &mut 0i64,

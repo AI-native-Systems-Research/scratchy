@@ -1960,13 +1960,13 @@ mod scatter_tests {
 #[cfg(test)]
 mod stick_permute_tests {
     use super::*;
-    use crate::place::{PlaceId, act_name};
+    use crate::place::act_name;
     use crate::sdsc_abstract::StickLayout;
 
     fn layout() -> BundleLayout {
         let l = BundleLayout::default();
-        l.synth(PlaceId::Act(1), &[32, 128]);
-        l.synth(PlaceId::Act(2), &[64, 64]);
+        l.synth(crate::place::SynthId::Act(1), &[32, 128]);
+        l.synth(crate::place::SynthId::Act(2), &[64, 64]);
         l
     }
 
@@ -2121,7 +2121,7 @@ mod stick_runs_tests {
 #[cfg(test)]
 mod index_select_tests {
     use super::*;
-    use crate::place::{PlaceId, act_name};
+    use crate::place::act_name;
     use crate::sdsc_abstract::StickLayout;
     use crate::superdsc_opspec::EntryBase;
 
@@ -2386,9 +2386,9 @@ mod index_select_tests {
     fn gathered(entries: u32, rows: u32, cols: u32) -> BundleLayout {
         let l = BundleLayout::default();
         let flat = || [entries * rows, cols];
-        l.synth(PlaceId::Act(1), &flat());
-        l.synth(PlaceId::Act(2), &flat());
-        l.synth(PlaceId::Act(9), &[1, 32]);
+        l.synth(crate::place::SynthId::Act(1), &flat());
+        l.synth(crate::place::SynthId::Act(2), &flat());
+        l.synth(crate::place::SynthId::Act(9), &[1, 32]);
         l
     }
 
@@ -2665,8 +2665,8 @@ mod index_select_tests {
         let op =
             OpSpec::new(OpFunc::Identity, plan, vec![src_arg], dst_arg).expect("the op builds");
         let l = BundleLayout::default();
-        l.synth(PlaceId::Act(1), &[64, 64]);
-        l.synth(PlaceId::Act(2), &[64, 64]);
+        l.synth(crate::place::SynthId::Act(1), &[64, 64]);
+        l.synth(crate::place::SynthId::Act(2), &[64, 64]);
         let folds = SdscFoldSet::new(op.iter.cores_used());
         let err = crate::emit::emit_sdsc("probe_o1", &op, &folds, Some(&l))
             .expect_err("the stamp/view disagreement refuses");

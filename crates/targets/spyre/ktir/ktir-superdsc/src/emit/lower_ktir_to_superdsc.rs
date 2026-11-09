@@ -1205,7 +1205,10 @@ pub fn load_scatters<T: crate::collective::Tp>(
                 value,
                 crate::ktir_node::Scratch::RelayoutMid,
             );
-            layout.synth(PlaceId::Act(tid), &[src.v_rows * groups, width]);
+            layout.synth(
+                crate::place::SynthId::Act(tid),
+                &[src.v_rows * groups, width],
+            );
             let scratch = crate::place::act_name(tid);
             // Each head's group of columns, stick-major `[sticks][rows]` in the source, to row-major
             // `[rows][sticks]` at the same base in the scratch.
@@ -4080,7 +4083,7 @@ pub fn rmsnorm<T: crate::collective::Tp>(
         cols,
         &x,
         &gamma,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
@@ -5799,7 +5802,7 @@ pub fn lmlast<T: crate::collective::Tp>(
     }
     let s = out.v_rows;
     if let Some(l) = layout {
-        l.synth(PlaceId::Act(out.tid), &[s, hidden]);
+        l.synth(crate::place::SynthId::Act(out.tid), &[s, hidden]);
     }
     // ⭐ TRUE EXTENTS, not the `[1, stk]`/`rbo` staging annotations: the source IS the `[mq, hidden]`
     // prompt buffer and the destination IS the `[S, hidden]` staging the synth above reserves, so the
@@ -10389,7 +10392,7 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
         cols,
         &x,
         &gamma,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
@@ -10457,7 +10460,7 @@ pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
         rows,
         cols,
         &x,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         sym_id_base,
         layout,
@@ -10580,7 +10583,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
     let x = tensors[0].name();
     let t = out.tid;
-    let out_id = PlaceId::Act(t);
+    let out_id = crate::place::SynthId::Act(t);
     use crate::place::SynthRole as R;
     let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
     // ── THE SYNTHETICS ──
@@ -10842,7 +10845,7 @@ pub fn tanhsoftcap<T: crate::collective::Tp>(
         rows,
         cols,
         &x,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &cap_const,
         sym_id_base,
         layout,
@@ -11550,7 +11553,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     })?,
                     ReduceDataLeg::whole(&data_h),
                     ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-                    PlaceId::Act(out.tid),
+                    crate::place::SynthId::Act(out.tid),
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -11617,7 +11620,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     })?,
                     ReduceDataLeg::whole(&data_h),
                     ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-                    PlaceId::Act(out.tid),
+                    crate::place::SynthId::Act(out.tid),
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -11730,7 +11733,7 @@ pub fn reduce_df<T: crate::collective::Tp>(
             })?,
             ReduceDataLeg::whole(&data_h),
             ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-            PlaceId::Act(out.tid),
+            crate::place::SynthId::Act(out.tid),
         )
         .map_err(|e| Error {
             message: format!("{name}: {e}"),

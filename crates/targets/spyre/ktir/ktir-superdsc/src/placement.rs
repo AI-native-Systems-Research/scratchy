@@ -20,7 +20,7 @@
 //! as the ONE implementation rather than something each consumer re-derives.
 
 use crate::addr::{DevOff, Win};
-use crate::place::PlaceId;
+use crate::place::{PlaceId, SynthId};
 use crate::sdsc_abstract::{KindTag, StickKind, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::Df;
@@ -678,10 +678,11 @@ pub fn align128(n: u64) -> u64 {
 /// Every `{tensor}_{role}` name goes through here, so `resolve_seg_base` can recover the identity
 /// by LOOKUP. Minting and registering are one call because a name minted without being registered
 /// is exactly the case the parse used to paper over.
-pub fn syn(layout: Option<&BundleLayout>, id: PlaceId) -> String {
+pub fn syn(layout: Option<&BundleLayout>, id: impl Into<SynthId>) -> String {
+    let id: SynthId = id.into();
     let n = id.to_string();
     if let Some(l) = layout {
-        l.ids.borrow_mut().insert(n.clone(), id);
+        l.ids.borrow_mut().insert(n.clone(), id.place());
     }
     n
 }
@@ -945,7 +946,7 @@ impl BundleLayout {
     /// This is the principled replacement for the old bump allocator that sized each synthetic
     /// from its FIRST op's per-op view (ONE head) — which aliased sp/spprod/mxp on-card and
     /// produced the garbage attention. The shape is now part of the tensor, not guessed per-op.
-    pub fn synth(&self, id: PlaceId, dims: &[u32]) {
+    pub fn synth(&self, id: impl Into<SynthId>, dims: &[u32]) {
         self.synth_df(id, dims, Df::Fp16);
     }
 
@@ -956,8 +957,9 @@ impl BundleLayout {
     ///
     /// ⭐ A PLANNED id ([`Self::lx_planned`]) is declared core-local in LX instead, at its planned
     /// pin: the scratchpad plan's one point of effect on the lowering.
-    pub fn synth_df(&self, id: PlaceId, dims: &[u32], df: Df) {
-        let planned = self.lx_planned.borrow().get(&id).copied();
+    pub fn synth_df(&self, id: impl Into<SynthId>, dims: &[u32], df: Df) {
+        let id: SynthId = id.into();
+        let planned = self.lx_planned.borrow().get(&id.place()).copied();
         match planned {
             Some(pin) => {
                 self.synth_lx_planned(id, pin);
@@ -1038,7 +1040,6 @@ impl BundleLayout {
     /// frontend's LX window is unbuildable, not silently overlapping dxp's own LX allocations.
     fn synth_lx_op_local(&self, id: PlaceId, class: OpLocalClass) {
         let name = id.to_string();
-        self.ids.borrow_mut().insert(name.clone(), id);
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
@@ -1078,10 +1079,15 @@ impl BundleLayout {
     pub(crate) fn claim_op_local(
         layout: Option<&BundleLayout>,
         scope: &mut LxScope,
-        id: PlaceId,
+        of: SynthId,
+        role: crate::place::OpLocalRole,
         shape: OpLocalShape,
     ) -> Result<String, String> {
-        let name = crate::placement::syn(layout, id);
+        let id = of.place().op_local(role);
+        let name = id.to_string();
+        if let Some(l) = layout {
+            l.ids.borrow_mut().insert(name.clone(), id);
+        }
         // The pin's class, stated once: the slot it shares and the program's one-per-class rule
         // both key on it.
         let class = OpLocalClass::of(shape);
@@ -1108,10 +1114,16 @@ impl BundleLayout {
     pub fn claim_op_local_for_test(
         &self,
         scope: &mut LxScope,
-        id: PlaceId,
+        of: SynthId,
         shape: OpLocalShape,
     ) -> Result<String, String> {
-        Self::claim_op_local(Some(self), scope, id, shape)
+        Self::claim_op_local(
+            Some(self),
+            scope,
+            of,
+            crate::place::OpLocalRole::RINV,
+            shape,
+        )
     }
 
     /// Declare a synthetic intermediate LX-resident CORE-LOCALLY: every core holds only ITS OWN work
@@ -1125,9 +1137,10 @@ impl BundleLayout {
     /// every op that differs, at build ([`Self::record_lx_division`]).
     ///
     /// ⛔ PANICS past [`LX_PIN_END`], the same `cargo build` guard as [`Self::synth_lx_op_local`].
-    pub fn synth_lx_core_local(&self, id: PlaceId, per_core_bytes: u64) {
+    pub fn synth_lx_core_local(&self, id: impl Into<SynthId>, per_core_bytes: u64) {
+        let id: SynthId = id.into();
         let name = id.to_string();
-        self.ids.borrow_mut().insert(name.clone(), id);
+        self.ids.borrow_mut().insert(name.clone(), id.place());
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
@@ -1173,9 +1186,9 @@ impl BundleLayout {
     /// plan reserved ([`Self::reserve_lx_plan`]) — the same declaration as
     /// [`Self::synth_lx_core_local`], at the plan's address instead of the next free one. Idempotent
     /// per name.
-    pub fn synth_lx_planned(&self, id: PlaceId, pin: LxPin) {
+    pub fn synth_lx_planned(&self, id: SynthId, pin: LxPin) {
         let name = id.to_string();
-        self.ids.borrow_mut().insert(name.clone(), id);
+        self.ids.borrow_mut().insert(name.clone(), id.place());
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
@@ -1318,7 +1331,8 @@ impl BundleLayout {
     ///
     /// Falls back to `dims` when the tensor has no placement (a synth OF a synth, and every unit test
     /// that lowers without a layout) — the old behaviour, correct whenever the op is not chunked.
-    pub fn synth_like(&self, id: PlaceId, shadows: u32, dims: &[u32], df: Df) {
+    pub fn synth_like(&self, id: impl Into<SynthId>, shadows: u32, dims: &[u32], df: Df) {
+        let id: SynthId = id.into();
         match self.placements.get(&shadows) {
             Some(p) => self.synth_bytes(id, p.size),
             None => self.synth_bytes(id, synth_footprint_bytes(dims, df)),
@@ -1326,7 +1340,7 @@ impl BundleLayout {
     }
 
     /// The byte-exact core of [`Self::synth_df`]: bump-allocate `bytes` for `id`, once.
-    fn synth_bytes(&self, id: PlaceId, bytes: u64) {
+    fn synth_bytes(&self, id: SynthId, bytes: u64) {
         let name = id.to_string();
         let a = self.synth.borrow_mut();
         // The IDENTITY is recorded even when the OFFSET already exists. `resolve_seg_base` bump-
@@ -1334,7 +1348,7 @@ impl BundleLayout {
         // declaring `synth()` call; the early return below then skipped the id and the placement had
         // no identity to be built from. Declaration order decides the offset, never the identity.
         drop(a);
-        self.ids.borrow_mut().insert(name.clone(), id);
+        self.ids.borrow_mut().insert(name.clone(), id.place());
         let mut a = self.synth.borrow_mut();
         if a.map.contains_key(&name) {
             return;

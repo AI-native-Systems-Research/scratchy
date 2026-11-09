@@ -175,7 +175,7 @@ fn an_undeclared_name_refuses_rather_than_panics() {
 #[test]
 fn a_declared_synth_window_is_bounded_by_its_declaration() {
     let layout = BundleLayout::default();
-    let id = PlaceId::Synth {
+    let id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::Silu,
     };
@@ -191,7 +191,7 @@ fn a_declared_synth_window_is_bounded_by_its_declaration() {
         .unwrap();
     // A declaration SMALLER than the handle's shape: a whole-tensor sweep exceeds the
     // declaration's footprint —
-    let short = PlaceId::Synth {
+    let short = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::Xc,
     };
@@ -223,7 +223,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     // CORE-LOCAL: every core's slice starts AT the pin. The one view into it is a whole stick plane
     // of its rows, which sits at that plane of every core's slice; any other offset — here one row of
     // two — has no place in a core's slice.
-    let core_id = PlaceId::Synth {
+    let core_id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::Qs,
     };
@@ -254,7 +254,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     assert!(err.contains("test: core-local row offset"), "{err}");
     assert!(err.contains("only a whole stick plane"), "{err}");
     // OP-LOCAL: a pin that does not cover the handle's declared shape is the disagreement.
-    let op_id = PlaceId::Synth {
+    let op_id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::KRep,
     };

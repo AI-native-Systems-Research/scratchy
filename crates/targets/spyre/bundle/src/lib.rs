@@ -155,7 +155,7 @@ pub use ktir_superdsc::ktir_node::{Elementwise, Program};
 /// scratchy dependency of its own, and all three still reach these types through this crate.
 /// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
 /// not name.
-pub use ktir_superdsc::place::{PlaceId, SynthRole};
+pub use ktir_superdsc::place::{OpLocalKind, OpLocalRole, PlaceId, SynthId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
@@ -1116,7 +1116,7 @@ mod tests {
                     is_logits: true,
                 },
                 Placement {
-                    id: PlaceId::Act(728).synth(SynthRole::Sq16),
+                    id: PlaceId::Act(728).synth(SynthRole::Sq16).place(),
                     segment: 0,
                     bank: 0,
                     offset: 4096,
@@ -1129,7 +1129,7 @@ mod tests {
         assert_eq!(l.logits().unwrap().id, PlaceId::Act(788));
         assert_eq!(l.place_of_tid(788).unwrap().size, 98304);
         assert_eq!(
-            l.place(PlaceId::Act(728).synth(SynthRole::Sq16))
+            l.place(PlaceId::Act(728).synth(SynthRole::Sq16).place())
                 .unwrap()
                 .offset,
             4096
@@ -1167,7 +1167,7 @@ mod place_id_tests {
     #[test]
     fn a_synthetic_is_not_bindable_even_though_it_shares_a_tid() {
         let a = PlaceId::Act(7);
-        let s = a.synth(SynthRole::Rot);
+        let s = a.synth(SynthRole::Rot).place();
         assert_eq!(a.tid(), s.tid(), "same tid");
         assert_ne!(a, s, "different identities");
         assert_eq!(a.bindable(), Some(7));

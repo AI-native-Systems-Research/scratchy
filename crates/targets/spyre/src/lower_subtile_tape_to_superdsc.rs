@@ -10861,7 +10861,7 @@ mod tests {
             layout.placements.contains_key(&victim),
             "t{victim} must be a real placement for the collision to be the card's shape"
         );
-        layout.synth(ktir_superdsc::place::PlaceId::Act(victim), &[1, 64]);
+        layout.synth(ktir_superdsc::place::SynthId::Act(victim), &[1, 64]);
         let _ = bake_layout(&layout);
     }
 }
