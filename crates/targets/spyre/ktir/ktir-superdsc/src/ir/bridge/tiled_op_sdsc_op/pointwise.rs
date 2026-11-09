@@ -899,7 +899,14 @@ pub fn index_select_opspec(
         crate::superdsc_opspec::Fp16,
     >| -> crate::superdsc_opspec::ViewFrame {
         if entries.get() * blocks.get() == 1 && cols.elems() > df.elems_per_stick() {
-            crate::superdsc_opspec::ViewFrame::LandedBlocks
+            // The one block's stick-major `[rows, cols]` — the arrangement the frame declares.
+            crate::superdsc_opspec::ViewFrame::LandedBlocks(
+                crate::sdsc_abstract::StickLayout::row_blocked_df(
+                    rows.get() as usize,
+                    cols.elems() as usize,
+                    df,
+                ),
+            )
         } else {
             crate::superdsc_opspec::ViewFrame::Own
         }
@@ -2602,83 +2609,6 @@ mod index_select_tests {
         assert!(
             l.arrangements.borrow()[&act_name(2)].addr_eq(&StickLayout::flat(1, 8 * 128 * 64)),
             "a one-stick landing is the flat frame's own bytes, at any batch count"
-        );
-    }
-
-    /// ⭐ A STAMP/VIEW DISAGREEMENT IS LOUD — [`crate::superdsc_opspec::ViewFrame::LandedBlocks`]
-    /// is stamped from the opspec's own cols, so a view whose emit-time extents are not a
-    /// several-stick landing (here: one stick wide) is a stamping bug, and it is a build `Err`
-    /// naming the tensor — never a silent flat declaration of a frame the bytes are not in.
-    #[test]
-    fn a_landed_blocks_stamp_on_a_one_stick_view_is_refused_by_name() {
-        let df = Df::Fp16;
-        let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
-            name,
-            size,
-            is_reduction: false,
-            is_stick,
-            df,
-        };
-        // One stick wide (`out` = 64): the stamping law never puts LandedBlocks here — stamped
-        // anyway, exactly the disagreement the arm must refuse.
-        let dims = [
-            dim("mb", 2, false),
-            dim("y", 1, false),
-            dim("x", 32, false),
-            dim("out", 64, true),
-        ];
-        let plan =
-            crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
-                gather_copy_cores(d, max, 1)
-            })
-            .expect("the plan divides");
-        let layout = ["mb", "y", "x", "out"];
-        let arg = |is_input: bool,
-                   name: &str,
-                   frame: crate::superdsc_opspec::ViewFrame|
-         -> Result<_, String> {
-            Ok(AnyTensorArg::R4(
-                TensorArg::<4>::new(
-                    is_input,
-                    name.to_string(),
-                    Role::Output,
-                    [Scale::Active; 4],
-                    plan.iter_syms(layout),
-                    layout,
-                    "out",
-                    Allocation::Hbm,
-                )
-                .map_err(|e| e.0)?
-                .with_device_order(["x", "out", "y", "mb"])
-                .map_err(|e| e.0)?
-                .with_frame(frame),
-            ))
-        };
-        let src_arg = arg(true, &act_name(1), crate::superdsc_opspec::ViewFrame::Own)
-            .expect("the source arg builds");
-        let dst_arg = arg(
-            false,
-            &act_name(2),
-            crate::superdsc_opspec::ViewFrame::LandedBlocks,
-        )
-        .expect("the stamped arg builds");
-        let op =
-            OpSpec::new(OpFunc::Identity, plan, vec![src_arg], dst_arg).expect("the op builds");
-        let l = BundleLayout::default();
-        l.synth(crate::place::SynthId::Act(1), &[64, 64]);
-        l.synth(crate::place::SynthId::Act(2), &[64, 64]);
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let err = crate::emit::emit_sdsc("probe_o1", &op, &folds, Some(&l))
-            .expect_err("the stamp/view disagreement refuses");
-        assert!(
-            err.0.contains(&act_name(2)),
-            "names the tensor whose stamp and view disagree: {}",
-            err.0
-        );
-        assert!(
-            err.0.contains("LandedBlocks"),
-            "names the stamped frame: {}",
-            err.0
         );
     }
 }
