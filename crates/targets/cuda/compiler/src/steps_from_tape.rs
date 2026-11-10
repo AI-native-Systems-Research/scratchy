@@ -288,7 +288,8 @@ pub fn lower_fused(
         CudaFusion::SiluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::SiluMul),
         CudaFusion::GeluMul => gated_mul(cx, s, fusion.shape, computes).map(CudaStep::GeluMul),
         CudaFusion::MoeRoute => moe_route(cx, s, fusion.shape, computes).map(CudaStep::MoeRoute),
-        CudaFusion::SiblingMatmuls => sibling_matmuls(cx, s, fusion.shape, computes),
+        CudaFusion::SiblingMatmuls => sibling_matmuls(cx, s, fusion.shape, computes, false),
+        CudaFusion::SiblingMatvecs => sibling_matmuls(cx, s, fusion.shape, computes, true),
         CudaFusion::AddRmsNorm => add_rms_norm(cx, s, fusion.shape, computes),
         CudaFusion::NormAdd => norm_add(cx, s, fusion.shape, computes),
         CudaFusion::GateUpSiluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Silu),
@@ -662,12 +663,16 @@ fn absorbed_step<'c, 'a>(
 /// The `SiblingMatmuls` fold (#1049): the driving `MatmulTile` and the siblings its shape names,
 /// each lowered as the GEMM it is on its own ([`lower_step`]), as one grouped launch of that
 /// kernel. Every member must have lowered to the same kernel over the same `a`, `m` and `k` (the
-/// fold's band picks one kernel; a member that did not is refused, never split apart).
+/// fold's band picks one kernel; a member that did not is refused, never split apart). `matvecs`
+/// ([`CudaFusion::SiblingMatvecs`], the one-row bucket's row, FP8 S8 W4b): a one-row bf16 narrow
+/// group launches as the GEMV group, each member under the GEMV's rule ([`gemv_shape`]); a lone
+/// narrow GEMM keeps its kernel.
 fn sibling_matmuls(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     shape: FusedShape,
     computes: &[TapeStep<'_>],
+    matvecs: bool,
 ) -> Result<CudaStep, CanonicalRefusal> {
     let step = s.step;
     let FusedShape::SiblingMatmuls { slots } = shape else {
@@ -694,10 +699,30 @@ fn sibling_matmuls(
     let [(kind, first), rest @ ..] = lowered.as_slice() else {
         return Err(refused());
     };
+    let promote = matvecs && *kind == GroupKind::GemmNarrow && first.m == 1;
+    let as_group = |k: GroupKind| {
+        if promote && k == GroupKind::GemmNarrow {
+            GroupKind::Gemv
+        } else {
+            k
+        }
+    };
+    if promote {
+        for (_, g) in &lowered {
+            gemv_shape(g.n, g.k).map_err(|rule| CanonicalRefusal::GemmShape {
+                step,
+                m: g.m,
+                n: g.n,
+                k: g.k,
+                rule,
+            })?;
+        }
+    }
+    let kind = &as_group(*kind);
     // One kind for every member: an fp8 member's kind is never a bf16 one's, so a group is all
     // fp8 or all bf16 (the shared fold's rule), and a mixed one is refused here.
-    let same =
-        (rest.iter()).all(|(k, g)| k == kind && (g.a, g.m, g.k) == (first.a, first.m, first.k));
+    let same = (rest.iter())
+        .all(|(k, g)| as_group(*k) == *kind && (g.a, g.m, g.k) == (first.a, first.m, first.k));
     let member = |(_, g): &(GroupKind, GemmBf16)| GroupMember {
         b: g.b,
         c: g.c,

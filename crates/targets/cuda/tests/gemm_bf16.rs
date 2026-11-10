@@ -1404,3 +1404,279 @@ fn the_bf16_gemv_residual_epilogue_is_the_gemv_then_the_add_bit_for_bit() {
         "a bf16 GEMV's residual epilogue differs from the GEMV then the add"
     );
 }
+
+// ── FP8 S8 W4b: the one-row narrow siblings as the GEMV group ──────
+
+use scratchy_target_cuda::kernels::{gemm_narrow_group_bf16_abt, gemv_group_bf16_abt};
+
+/// The 35B's bf16 GDN `in_proj_a` and `in_proj_b` (n = 32 + 32, k = 2,048): two members off one
+/// row, the one-row narrow siblings W4b launches as the GEMV group.
+const W4B_GROUP: (u32, u32, u32) = (32, 32, 2048);
+
+/// The GEMV group over `(a, [b_a, b_b])` at the lowering's splits (`gemv_splits(n, k, 1)`, the
+/// worker's), each member's partials after the one before it; returns both members' rows and
+/// whether their tails held.
+fn w4b_gemv_group(
+    device: &CudaDevice,
+    a: &DeviceBuffer,
+    b: [&DeviceBuffer; 2],
+    (n0, n1, k): (u32, u32, u32),
+) -> [(Vec<u16>, bool); 2] {
+    let splits = [gemv_splits(n0, k, 1), gemv_splits(n1, k, 1)];
+    let before = gemv_scratch_bytes(n0, 1, splits[0]).expect("bytes");
+    let after = gemv_scratch_bytes(n1, 1, splits[1]).expect("bytes");
+    let p = w4_scratch(device, before + after);
+    let (c0, c1) = (
+        DeviceBuffer::upload(device, &vec![SENTINEL; n0 as usize + TAIL]).expect("c0"),
+        DeviceBuffer::upload(device, &vec![SENTINEL; n1 as usize + TAIL]).expect("c1"),
+    );
+    let part = |s: u32, at: u64| match s {
+        1 => std::ptr::null_mut(),
+        _ => p.ptr().cast::<u8>().wrapping_add(at as usize).cast(),
+    };
+    let members = [
+        (b[0].ptr().cast_const(), c0.ptr(), n0),
+        (b[1].ptr().cast_const(), c1.ptr(), n1),
+    ];
+    // SAFETY: `a` holds k bf16, each `b` n·k, each `c` n + TAIL, the scratch both members' partials
+    // one after the other; every buffer is its own allocation.
+    unsafe {
+        gemv_group_bf16_abt(
+            a.ptr().cast_const(),
+            &members,
+            &[part(splits[0], 0), part(splits[1], before)],
+            (k, &splits),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("gemv_group_bf16_abt");
+    [(c0, n0), (c1, n1)].map(|(c, n)| {
+        let out = c.download().expect("download");
+        let tail = out[n as usize..].iter().all(|&x| x == SENTINEL);
+        (out[..n as usize].to_vec(), tail)
+    })
+}
+
+/// FP8 S8 W4b: the one-row narrow siblings (the 35B's GDN a and b, n = 32 + 32, k = 2,048) as the
+/// GEMV group are within the GEMV bound of f64 (`common::numerics::compare`, unchanged), each
+/// member's tail untouched, bit-identical on a repeat, and each member the bits of its own GEMV at
+/// the same split (`gemv_split_bf16_abt`). The bits move against the narrow GEMM's (another K
+/// order, approved by kind 2026-11-07): recorded per member as `vs_narrow mismatched_bits`, not
+/// asserted.
+#[test]
+fn the_one_row_narrow_siblings_are_within_the_gemv_bound() {
+    let device = h100();
+    let (n0, n1, k) = W4B_GROUP;
+    let ku = k as usize;
+    let mut pass = true;
+    for seed in 0..3u64 {
+        let a_bits = bf16_inputs(ku, 0x4B00 ^ seed << 8);
+        let bs = [n0, n1].map(|n| bf16_inputs(n as usize * ku, 0x4B10 ^ seed << 8 ^ u64::from(n)));
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("a");
+        let b = bs
+            .clone()
+            .map(|bits| DeviceBuffer::upload(&device, &bits).expect("b"));
+        let first = w4b_gemv_group(&device, &a, [&b[0], &b[1]], W4B_GROUP);
+        let again = w4b_gemv_group(&device, &a, [&b[0], &b[1]], W4B_GROUP);
+        let narrow: [Vec<u16>; 2] = {
+            let cs = [n0, n1].map(|n| {
+                DeviceBuffer::upload(&device, &vec![SENTINEL; n as usize]).expect("narrow c")
+            });
+            let members = [
+                (b[0].ptr().cast_const(), cs[0].ptr(), n0),
+                (b[1].ptr().cast_const(), cs[1].ptr(), n1),
+            ];
+            // SAFETY: as `w4b_gemv_group`'s, the narrow group's `m` one.
+            unsafe {
+                gemm_narrow_group_bf16_abt(
+                    a.ptr().cast_const(),
+                    &members,
+                    (1, k),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("gemm_narrow_group_bf16_abt");
+            cs.map(|c| c.download().expect("narrow"))
+        };
+        for (i, (n, which)) in [(n0, "in_proj_a"), (n1, "in_proj_b")]
+            .into_iter()
+            .enumerate()
+        {
+            let nu = n as usize;
+            let (got, tail) = &first[i];
+            let cmp = compare(got, &a_bits, &bs[i], 1, nu, ku);
+            let repeat = mismatched_bits(got, &again[i].0);
+            let splits = gemv_splits(n, k, 1);
+            let p = w4_scratch(&device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+            let lone = w4_out(&device, nu, |c| {
+                // SAFETY: `a` k bf16, `b` n·k, `c` n + TAIL, `p` the partials, each its own.
+                unsafe {
+                    gemv_split_bf16_abt(
+                        (a.ptr().cast_const(), b[i].ptr().cast_const(), c),
+                        p.ptr(),
+                        (n, k, splits),
+                        std::ptr::null_mut(),
+                    )
+                }
+            });
+            let own = mismatched_bits(got, &lone.0);
+            let moved = mismatched_bits(got, &narrow[i]);
+            let ok = cmp.pass() && *tail && repeat == 0 && own == 0;
+            eprintln!(
+                "W4b one-row narrow sibling {which} n={n} k={k} seed={seed}: {} tail_intact={tail} \
+                 repeat_mismatched_bits={repeat} vs_own_gemv mismatched_bits={own} \
+                 vs_narrow mismatched_bits={moved} (recorded) {}",
+                cmp.line(),
+                if ok { "PASS" } else { "FAIL" }
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "a one-row narrow sibling as the GEMV group is out of the GEMV bound: see the lines above"
+    );
+}
+
+/// `cudaEvent_t`, declared here for W4b's timing lines only (the runtime declares no event call).
+type CudaEvent = *mut std::ffi::c_void;
+
+unsafe extern "C" {
+    fn cudaEventCreate(event: *mut CudaEvent) -> i32;
+    fn cudaEventRecord(event: CudaEvent, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: CudaEvent) -> i32;
+    fn cudaEventElapsedTime(ms: *mut f32, start: CudaEvent, end: CudaEvent) -> i32;
+    fn cudaEventDestroy(event: CudaEvent) -> i32;
+}
+
+/// The median µs of 20 launches after 3 warm-ups, each between two CUDA events on the default
+/// stream (hot: the inputs stay in L2, as a decode step's activations do).
+fn event_median(mut launch: impl FnMut()) -> f64 {
+    let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event
+    // is destroyed below.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut start), 0, "cudaEventCreate");
+        assert_eq!(cudaEventCreate(&mut end), 0, "cudaEventCreate");
+    }
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let mut ms = 0.0f32;
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(cudaEventRecord(start, std::ptr::null_mut()), 0, "record");
+            launch();
+            assert_eq!(cudaEventRecord(end, std::ptr::null_mut()), 0, "record");
+            assert_eq!(cudaEventSynchronize(end), 0, "synchronize");
+            assert_eq!(cudaEventElapsedTime(&mut ms, start, end), 0, "elapsed");
+        }
+        if i >= 3 {
+            times.push(f64::from(ms) * 1e3);
+        }
+    }
+    // SAFETY: both events were created above and are no longer used.
+    unsafe {
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// FP8 S8 W4b's gate, measured first (the user's rule: stop unless it is faster): the GEMV group
+/// over the 35B's GDN a and b (n = 32 + 32, k = 2,048) against the narrow group it replaces, and
+/// the GEMV at the shared expert's gate (n = 1, k = 2,048) against the narrow GEMM's one-column
+/// kernel, µs per launch by CUDA events, hot. `FASTER` or `SLOWER` per line; recorded, not
+/// asserted (the clock ramp moves a run by about 35%).
+#[test]
+fn the_one_row_narrow_sibling_time_is_recorded() {
+    let device = h100();
+    let (n0, n1, k) = W4B_GROUP;
+    let ku = k as usize;
+    let a = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x4B20)).expect("a");
+    let b: [DeviceBuffer; 2] = [n0, n1].map(|n| {
+        DeviceBuffer::upload(
+            &device,
+            &bf16_inputs(n as usize * ku, 0x4B21 ^ u64::from(n)),
+        )
+        .expect("b")
+    });
+    let cs: [DeviceBuffer; 2] =
+        [n0, n1].map(|n| DeviceBuffer::upload(&device, &vec![SENTINEL; n as usize]).expect("c"));
+    let members = [
+        (b[0].ptr().cast_const(), cs[0].ptr(), n0),
+        (b[1].ptr().cast_const(), cs[1].ptr(), n1),
+    ];
+    let splits = [gemv_splits(n0, k, 1), gemv_splits(n1, k, 1)];
+    let before = gemv_scratch_bytes(n0, 1, splits[0]).expect("bytes");
+    let p = w4_scratch(
+        &device,
+        before + gemv_scratch_bytes(n1, 1, splits[1]).expect("bytes"),
+    );
+    let part = |s: u32, at: u64| match s {
+        1 => std::ptr::null_mut(),
+        _ => p.ptr().cast::<u8>().wrapping_add(at as usize).cast(),
+    };
+    let parts = [part(splits[0], 0), part(splits[1], before)];
+    // SAFETY (both closures): as `the_one_row_narrow_siblings_are_within_the_gemv_bound`'s.
+    let gemv = event_median(|| {
+        unsafe {
+            gemv_group_bf16_abt(
+                a.ptr().cast_const(),
+                &members,
+                &parts,
+                (k, &splits),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("gemv group");
+    });
+    let narrow = event_median(|| {
+        unsafe {
+            gemm_narrow_group_bf16_abt(a.ptr().cast_const(), &members, (1, k), std::ptr::null_mut())
+        }
+        .expect("narrow group");
+    });
+    eprintln!(
+        "W4b sibling time 35B GDN a+b n={n0}+{n1} k={k} splits={splits:?}: gemv group {gemv:.2} us; \
+         narrow group {narrow:.2} us; saved {:.2} us {} (recorded, not asserted)",
+        narrow - gemv,
+        if gemv < narrow { "FASTER" } else { "SLOWER" }
+    );
+    // The shared expert's gate, n = 1: it has no free sibling on the tape (the router is a
+    // `RouterLogits`, the gate/up a gated fold's), so it moves to the GEMV only if this is faster.
+    let g = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x4B30)).expect("gate");
+    let c = DeviceBuffer::upload(&device, &[SENTINEL; 1]).expect("c");
+    let s1 = gemv_splits(1, k, 1);
+    let p1 = w4_scratch(&device, gemv_scratch_bytes(1, 1, s1).expect("bytes"));
+    // SAFETY (both closures): `a` k bf16, `g` k, `c` one, `p1` the partials, each its own.
+    let gemv1 = event_median(|| {
+        unsafe {
+            gemv_split_bf16_abt(
+                (a.ptr().cast_const(), g.ptr().cast_const(), c.ptr()),
+                p1.ptr(),
+                (1, k, s1),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("gemv n=1");
+    });
+    let narrow1 = event_median(|| {
+        unsafe {
+            gemm_narrow_bf16_abt(
+                a.ptr().cast_const(),
+                g.ptr().cast_const(),
+                c.ptr(),
+                (1, 1, k),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("narrow n=1");
+    });
+    eprintln!(
+        "W4b sibling time 35B shared_expert_gate n=1 k={k} splits={s1}: gemv {gemv1:.2} us; narrow \
+         {narrow1:.2} us; saved {:.2} us {} (recorded, not asserted)",
+        narrow1 - gemv1,
+        if gemv1 < narrow1 { "FASTER" } else { "SLOWER" }
+    );
+}

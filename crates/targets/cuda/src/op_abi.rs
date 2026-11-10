@@ -174,6 +174,10 @@ pub enum CudaFusion {
     /// GDN layer's `in_proj_qkv` and `in_proj_z`, or its `in_proj_a` and `in_proj_b`
     /// (`step::CudaStep::GemmGroup`, `GemmNarrowGroup`, `GemvGroup`).
     SiblingMatmuls,
+    /// [`Self::SiblingMatmuls`] at the one-row bucket (FP8 S8 W4b): a narrow-band group (the 35B's
+    /// bf16 `in_proj_a` and `in_proj_b`, n = 32 + 32) launches as the GEMV group
+    /// (`step::CudaStep::GemvGroup`), not the narrow GEMM's; every other group as at every bucket.
+    SiblingMatvecs,
     /// A residual add and the RMSNorm reading it in one launch (#1049, Qwen's `norm(add(..))`;
     /// `step::CudaStep::AddRmsNorm`): the sum and the norm both written.
     AddRmsNorm,
@@ -290,7 +294,7 @@ pub const CUDA_FUSIONS_ONE_ROW: FusionTable<CudaFusion> = FusionTable {
 };
 
 /// Up to three dense matmuls of one band off one input in one grouped launch (#1049): every
-/// bucket's first row, and the one-row bucket's first.
+/// bucket's first row.
 const F_SIBLINGS: FoldPattern<CudaFusion> = FoldPattern::SiblingMatmuls {
     matmul: SubOpKind::MatmulTile,
     max: 3,
@@ -299,13 +303,26 @@ const F_SIBLINGS: FoldPattern<CudaFusion> = FoldPattern::SiblingMatmuls {
     kernel: CudaFusion::SiblingMatmuls,
 };
 
-/// The one-row bucket's first sweep (FP8 S8 W4a): the siblings group, and the projection a residual
+/// [`F_SIBLINGS`]'s groups at the one-row bucket's first row (FP8 S8 W4b): the same bands, cap and
+/// exclusions, so the same groups form (the 35B's GDN norm feeds qkv + z and a + b, two groups of
+/// two), and each lowers as GEMVs ([`CudaFusion::SiblingMatvecs`]). At W0 the bf16 a + b narrow
+/// group took 12.6 µs a launch, 30 a token.
+const F_SIBLINGS_ONE_ROW: FoldPattern<CudaFusion> = FoldPattern::SiblingMatmuls {
+    matmul: SubOpKind::MatmulTile,
+    max: 3,
+    bands: CUDA_SIBLING_BANDS,
+    gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+    kernel: CudaFusion::SiblingMatvecs,
+};
+
+/// The one-row bucket's first sweep (FP8 S8 W4a): the siblings group (as GEMVs, W4b), and the
+/// projection a residual
 /// add alone reads (its operand 0, the residual its operand 1) takes the add as its epilogue, on
 /// the fp8 GEMV and the bf16 GEMV (the 35B's GDN `out_proj`). Metal's `F_COMBINE_EPILOGUE` is not
 /// a row: the 35B's tape computes its routed combine before the shared expert, so the combine's
 /// gate scale is not ready there and the row would never fold; its add stays a launch.
 const CUDA_SWEEP_ONE_ROW_GROUPS: &[FoldPattern<CudaFusion>] = &[
-    F_SIBLINGS,
+    F_SIBLINGS_ONE_ROW,
     FoldPattern::MatvecEpilogue {
         anchor: SubOpKind::MatmulTile,
         weights: Some(GemmWeightKind::Fp8Dynamic),
@@ -583,6 +600,30 @@ mod tests {
                 FoldPattern::SiblingMatmuls { .. }
             ),
             "both tables group the siblings by the one row"
+        );
+        // The one-row row is every bucket's but for its kernel (FP8 S8 W4b): the same groups form.
+        let (
+            FoldPattern::SiblingMatmuls {
+                matmul,
+                max,
+                bands,
+                gated,
+                kernel: CudaFusion::SiblingMatvecs,
+            },
+            FoldPattern::SiblingMatmuls {
+                matmul: every_matmul,
+                max: every_max,
+                bands: every_bands,
+                gated: every_gated,
+                kernel: CudaFusion::SiblingMatmuls,
+            },
+        ) = (CUDA_SWEEP_ONE_ROW_GROUPS[0], F_SIBLINGS)
+        else {
+            panic!("the one-row siblings row is the GEMV groups'");
+        };
+        assert_eq!(
+            (matmul, max, bands, gated),
+            (every_matmul, every_max, every_bands, every_gated)
         );
         let [
             FoldPattern::ExpertActivation {
