@@ -123,12 +123,19 @@ impl<'a> RetileWalk<'a> {
         Some(order)
     }
 
-    /// Which arm stages this walk — ONE statement: the bake reads it to state
-    /// [`crate::bundle_code::KernelWeight::arm`], and `stage_weight_tiled`'s own branch follows it
-    /// for callers that hold a walk but not a bundle.
-    pub fn arm(&self) -> WalkArm {
-        if self.permutation().is_some() {
-            WalkArm::Permutation
+    /// Which arm stages this walk — ONE statement, and it carries its own order: the bake
+    /// reads it to state [`crate::bundle_code::KernelWeight::arm`], and the boot dispatches on
+    /// it. `stage_weight_tiled` follows it too, for callers that hold a walk but not a bundle.
+    pub fn arm(&self) -> WalkArm<'static> {
+        if let Some(order) = self.permutation() {
+            assert!(
+                order.len() <= u8::MAX as usize,
+                "a rank-{} walk exceeds the axis order's u8",
+                order.len()
+            );
+            WalkArm::Permutation {
+                order: std::borrow::Cow::Owned(order.iter().map(|&i| i as u8).collect()),
+            }
         } else if self.inner_contig() {
             WalkArm::InnerContig
         } else {
@@ -169,51 +176,39 @@ fn axes_of(ds: &[u64], sm: &[u64]) -> Vec<(u64, u64)> {
     ds.iter().zip(sm).map(|(&d, &s)| (d, s)).collect()
 }
 
-/// Stage one weight: read `host` (the on-disk layout, IEEE-fp16 or fp8 bytes) and write `dev`
-/// (the device tile layout, SEN bytes) via the descriptor's pure walk.
+/// Stage one weight through the walk-holder's entry: read `host` (the on-disk layout, IEEE-fp16
+/// or fp8 bytes) and write `dev` (the device tile layout, SEN bytes) via the descriptor's pure
+/// walk, on the arm the walk's own law states. The BOOT does not come through here — it holds
+/// the bake's stated arm and dispatches each arm's walker directly; this entry is for callers
+/// that hold a walk but not a bundle (fixtures, proofs).
 ///
 /// `host` and `dev` are in ELEMENTS of `elem` width: both must hold `walk.total_elems()`
-/// elements (the caller has already validated the host size against prod(device_size), which for
+/// elements (the caller has already validated the host size against prod(extents), which for
 /// a permutation walk bounds every host offset).
 pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, elem: Element) {
-    // ⭐ A MIXED-RADIX PERMUTATION ([`RetileWalk::permutation`]) IS A LINEAR HOST SCAN — the
-    // host offsets are exactly 0..total in ascending-stride order, so the walk never needs a
-    // dot product or a full-rank odometer: read the host linearly, write the device at offsets
-    // the outer odometer carries incrementally. This is the arm the 2b's boot weights live on
-    // (measured: the fp8 packed-tile walk's "row copy" was TWO BYTES — a dot product and a
-    // 4-axis odometer per 2 bytes, 0.33 GB/s per thread).
-    if let Some(order) = walk.permutation() {
-        assert!(
-            order.len() <= u8::MAX as usize,
-            "stage_weight_tiled: a rank-{} walk exceeds the axis order's u8",
-            order.len()
-        );
-        let order: Vec<u8> = order.iter().map(|&i| i as u8).collect();
-        stage_weight_permuted(host, dev, walk.axes, &order, elem);
-        return;
+    match walk.arm() {
+        WalkArm::Permutation { order } => stage_weight_permuted(host, dev, walk.axes, &order, elem),
+        WalkArm::InnerContig => stage_weight_rows(host, dev, walk, elem),
+        WalkArm::PerElement => stage_weight_per_element(host, dev, walk, elem),
     }
-    let rank = walk.axes.len();
+}
+
+/// The inner-contiguous arm ([`RetileWalk::inner_contig`]): the innermost device axis is a run
+/// of consecutive host elements, so the walk computes one host offset per ROW (dot product
+/// excluding the innermost axis) and copies/converts the whole row — an odometer step per row,
+/// not per element.
+pub(crate) fn stage_weight_rows(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, elem: Element) {
     let total = walk.total_elems();
     let inner = walk.inner();
-    let inner_contig = walk.inner_contig();
-    let mut coord = vec![0u64; rank];
-
+    let mut coord = vec![0u64; walk.axes.len()];
     match elem {
         Element::Fp8 => {
-            if inner_contig {
-                let mut lin = 0;
-                while lin < total {
-                    let hoff = walk.host_off(&coord, 1);
-                    dev[lin..lin + inner].copy_from_slice(&host[hoff..hoff + inner]);
-                    walk.advance(&mut coord, 1);
-                    lin += inner;
-                }
-            } else {
-                for d in dev.iter_mut().take(total) {
-                    let hoff = walk.host_off(&coord, 0);
-                    *d = host[hoff];
-                    walk.advance(&mut coord, 0);
-                }
+            let mut lin = 0;
+            while lin < total {
+                let hoff = walk.host_off(&coord, 1);
+                dev[lin..lin + inner].copy_from_slice(&host[hoff..hoff + inner]);
+                walk.advance(&mut coord, 1);
+                lin += inner;
             }
         }
         Element::F16 => {
@@ -226,25 +221,52 @@ pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, ele
                 .map(|c| u16::from_le_bytes(*c))
                 .collect();
             let conv = |x: u16| ieee_to_sen(IeeeF16(x)).0;
-            let mut write = |lin: usize, v: u16| {
-                dev[lin * 2..lin * 2 + 2].copy_from_slice(&v.to_le_bytes());
-            };
-            if inner_contig {
-                let mut lin = 0;
-                while lin < total {
-                    let hoff = walk.host_off(&coord, 1);
-                    for j in 0..inner {
-                        write(lin + j, conv(h[hoff + j]));
-                    }
-                    walk.advance(&mut coord, 1);
-                    lin += inner;
+            let mut lin = 0;
+            while lin < total {
+                let hoff = walk.host_off(&coord, 1);
+                for j in 0..inner {
+                    let v = conv(h[hoff + j]).to_le_bytes();
+                    dev[(lin + j) * 2..(lin + j) * 2 + 2].copy_from_slice(&v);
                 }
-            } else {
-                for lin in 0..total {
-                    let hoff = walk.host_off(&coord, 0);
-                    write(lin, conv(h[hoff]));
-                    walk.advance(&mut coord, 0);
-                }
+                walk.advance(&mut coord, 1);
+                lin += inner;
+            }
+        }
+    }
+}
+
+/// The per-element arm — the reference walk: a dot product and an odometer step per element.
+/// What every walk reduces to when no faster law holds (gather/broadcast structure, gapped or
+/// repeated strides).
+pub(crate) fn stage_weight_per_element(
+    host: &[u8],
+    dev: &mut [u8],
+    walk: RetileWalk<'_>,
+    elem: Element,
+) {
+    let total = walk.total_elems();
+    let mut coord = vec![0u64; walk.axes.len()];
+    match elem {
+        Element::Fp8 => {
+            for d in dev.iter_mut().take(total) {
+                let hoff = walk.host_off(&coord, 0);
+                *d = host[hoff];
+                walk.advance(&mut coord, 0);
+            }
+        }
+        Element::F16 => {
+            let h: Vec<u16> = host
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect();
+            let conv = |x: u16| ieee_to_sen(IeeeF16(x)).0;
+            for lin in 0..total {
+                let hoff = walk.host_off(&coord, 0);
+                let v = conv(h[hoff]).to_le_bytes();
+                dev[lin * 2..lin * 2 + 2].copy_from_slice(&v);
+                walk.advance(&mut coord, 0);
             }
         }
     }
@@ -258,8 +280,8 @@ pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, ele
 /// device positions step by `dev_stride[order[0]]` and the loop writes them element-wise —
 /// still no dot product, still no full-rank odometer.
 ///
-/// `order` is the bake's stated host-scan axis order ([`crate::bundle_code::KernelWeight::order`],
-/// u8 axis indices); `stage_weight_tiled` derives it itself for callers without a bundle.
+/// `order` is the arm's own host-scan axis order ([`crate::bundle_code::WalkArm::Permutation`],
+/// u8 axis indices); `stage_weight_tiled` derives it for callers without a bundle.
 pub(crate) fn stage_weight_permuted(
     host: &[u8],
     dev: &mut [u8],
@@ -490,7 +512,12 @@ mod tests {
         let sm = [64u64, 2, 16, 1];
         let walk_axes = axes_of(&ds, &sm);
         let walk = RetileWalk { axes: &walk_axes };
-        assert_eq!(walk.arm(), WalkArm::Permutation);
+        assert_eq!(
+            walk.arm(),
+            WalkArm::Permutation {
+                order: std::borrow::Cow::Owned(vec![3, 1, 2, 0])
+            }
+        );
         // Distinct bytes: identity is host offset — a wrong law reads a different byte.
         let host: Vec<u8> = (0..ds.iter().product::<u64>() as usize)
             .map(|x| (x % 251) as u8)
@@ -510,7 +537,12 @@ mod tests {
         let sm = [8u64, 1, 4];
         let walk_axes = axes_of(&ds, &sm);
         let walk = RetileWalk { axes: &walk_axes };
-        assert_eq!(walk.arm(), WalkArm::Permutation);
+        assert_eq!(
+            walk.arm(),
+            WalkArm::Permutation {
+                order: std::borrow::Cow::Owned(vec![1, 2, 0])
+            }
+        );
         // device stride of the host-innermost axis (axis 1) is 2 ≠ 1 ⇒ the strided arm.
         let host8: Vec<u8> = (0..24u8).collect();
         let mut dev8 = vec![0u8; 24];
@@ -536,7 +568,12 @@ mod tests {
         let sm = [64u64, 2, 16, 1];
         let walk_axes = axes_of(&ds, &sm);
         let walk = RetileWalk { axes: &walk_axes };
-        assert_eq!(walk.arm(), WalkArm::Permutation);
+        assert_eq!(
+            walk.arm(),
+            WalkArm::Permutation {
+                order: std::borrow::Cow::Owned(vec![3, 1, 2, 0])
+            }
+        );
         // Distinct finite fp16 values: the convert is in the claim, so every element must
         // round-trip through ieee_to_sen exactly as the naive walk converts it.
         let host: Vec<u8> = (0..ds.iter().product::<u64>() as u16)

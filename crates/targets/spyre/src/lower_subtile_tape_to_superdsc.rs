@@ -6666,19 +6666,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                         .collect();
                     let walk = crate::stage_weight::RetileWalk { axes: &axes };
                     let arm = walk.arm();
-                    let order = walk.permutation().unwrap_or_default();
-                    assert!(
-                        order.len() <= u8::MAX as usize,
-                        "a rank-{} walk exceeds the axis order's u8",
-                        order.len()
-                    );
                     bundle::KernelWeight {
                         id: bundle::PlaceId::Act(*tid),
                         axes: std::borrow::Cow::Owned(axes),
                         arm,
-                        order: std::borrow::Cow::Owned(
-                            order.iter().map(|&i| i as u8).collect(),
-                        ),
                         stick_size: k.stick_size,
                         word_length: k.word_length,
                     }

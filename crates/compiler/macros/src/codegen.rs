@@ -10571,17 +10571,20 @@ fn kernel_weight_tokens(
         id,
         axes,
         arm,
-        order,
         stick_size,
         word_length,
     } = k;
     let id = place_id_tokens(id);
     // ⭐ AN EXHAUSTIVE MATCH, NOT A DERIVATION: the bake holds the arm verdict and the macro
     // emits it verbatim — a variant ADDED to `WalkArm` breaks THIS match at build time, and
-    // the boot receives the statement, never a re-analysis of the axes.
+    // the boot receives the statement, never a re-analysis of the axes. The permutation arm
+    // carries its own order, so the macro cannot emit an arm and an order that disagree.
     let arm = match arm {
-        bundle::WalkArm::Permutation => {
-            quote! { ::scratchy_target_spyre::bundle_code::WalkArm::Permutation }
+        bundle::WalkArm::Permutation { order } => {
+            let order = cow_u8s(order);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::WalkArm::Permutation { order: #order }
+            }
         }
         bundle::WalkArm::InnerContig => {
             quote! { ::scratchy_target_spyre::bundle_code::WalkArm::InnerContig }
@@ -10590,14 +10593,14 @@ fn kernel_weight_tokens(
             quote! { ::scratchy_target_spyre::bundle_code::WalkArm::PerElement }
         }
     };
-    let (axes, order) = (cow_axis_pairs(axes), cow_u8s(order));
+    let axes = cow_axis_pairs(axes);
     let (stick_size, word_length) = (
         proc_macro2::Literal::u32_unsuffixed(*stick_size),
         proc_macro2::Literal::u32_unsuffixed(*word_length),
     );
     quote! {
         ::scratchy_target_spyre::bundle_code::KernelWeight {
-            id: #id, axes: #axes, arm: #arm, order: #order,
+            id: #id, axes: #axes, arm: #arm,
             stick_size: #stick_size, word_length: #word_length,
         }
     }

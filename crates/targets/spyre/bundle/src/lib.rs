@@ -208,11 +208,9 @@ pub struct KernelWeight<'a> {
     pub axes: Cow<'a, [(u64, u64)]>,
     /// The bake's verdict on which staging arm walks this weight ([`WalkArm`]) — the walk's own
     /// law, read once at bake and stated here the way [`WeightTail`] is stated, so the boot does
-    /// no analysis.
-    pub arm: WalkArm,
-    /// The host-scan axis order (ascending stride), stated for [`WalkArm::Permutation`]; empty
-    /// for the other arms.
-    pub order: Cow<'a, [u8]>,
+    /// no analysis. The permutation arm carries its own host-scan order: the arm and its order
+    /// are one fact, and separate fields could disagree.
+    pub arm: WalkArm<'a>,
     /// Elements per stick (64 for fp16).
     pub stick_size: u32,
     /// Bytes per element (2 for fp16, 1 for fp8/int8).
@@ -223,12 +221,13 @@ pub struct KernelWeight<'a> {
 /// [`KernelWeight`] the way [`WeightTail`] is, so the boot does no analysis. The law itself
 /// lives in `scratchy-target-spyre`'s `RetileWalk::arm` (the walker's own statement over the
 /// paired axes); the bake reads it once and this carries the result to the runtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WalkArm {
-    /// A mixed-radix permutation: the host offsets are exactly `0..total` in
-    /// [`KernelWeight::order`]'s order — one linear host scan, device offsets carried
-    /// incrementally.
-    Permutation,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WalkArm<'a> {
+    /// A mixed-radix permutation: the host offsets are exactly `0..total` in the carried
+    /// order's order — one linear host scan, device offsets carried incrementally. The order
+    /// (ascending-stride axis indices) is the arm's own: a permutation without its order, or
+    /// another arm with one, is not a state this type can hold.
+    Permutation { order: Cow<'a, [u8]> },
     /// The innermost device axis is host-contiguous: whole-row copies/converts.
     InnerContig,
     /// Everything else: per-element dot-product walk.

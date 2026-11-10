@@ -35,7 +35,8 @@ use crate::runtime::{
 };
 use crate::sen_convert;
 use crate::stage_weight::{
-    Element, RetileWalk, WalkArm, stage_weight_permuted, stage_weight_tiled,
+    Element, RetileWalk, WalkArm, stage_weight_per_element, stage_weight_permuted,
+    stage_weight_rows,
 };
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -2444,9 +2445,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let stage_arm = |mode: StageMode<'_>| match mode {
             // The arm label reads the BAKE'S verdict (`k.arm`), not a re-derivation — the
             // table is the record of what the boot dispatched on.
-            StageMode::Retile(k, elem) => match (k.arm, elem) {
-                (WalkArm::Permutation, Element::Fp8) => ArmKind::PermFp8,
-                (WalkArm::Permutation, Element::F16) => ArmKind::PermF16,
+            StageMode::Retile(k, elem) => match (&k.arm, elem) {
+                (WalkArm::Permutation { .. }, Element::Fp8) => ArmKind::PermFp8,
+                (WalkArm::Permutation { .. }, Element::F16) => ArmKind::PermF16,
                 (WalkArm::InnerContig, Element::Fp8) => ArmKind::RowCopyFp8,
                 (WalkArm::InnerContig, Element::F16) => ArmKind::RowConvertF16,
                 (WalkArm::PerElement, Element::Fp8) => ArmKind::PerElementFp8,
@@ -2463,18 +2464,18 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     for (src, dst, mode, slot, offset) in bucket {
                         let t0 = stage_diag.then(Instant::now);
                         match mode {
-                            // ⭐ THE BAKE'S VERDICT DISPATCHES — no analysis at boot. The
-                            // permutation arm plays the bake's stated order; every other
-                            // arm is the tiled walk over the bake's paired axes.
-                            StageMode::Retile(k, elem) => match k.arm {
-                                WalkArm::Permutation => stage_weight_permuted(
-                                    src,
-                                    dst,
-                                    &k.axes,
-                                    &k.order,
-                                    elem,
-                                ),
-                                _ => stage_weight_tiled(
+                            // ⭐ THE BAKE'S VERDICT DISPATCHES — no analysis at boot, for ANY
+                            // arm: each arm's own walker runs directly (no wildcard to re-slot,
+                            // no `stage_weight_tiled` to re-derive the walk's law), the
+                            // permutation arm playing the order the arm itself carries.
+                            StageMode::Retile(k, elem) => match &k.arm {
+                                WalkArm::Permutation { order } => {
+                                    stage_weight_permuted(src, dst, &k.axes, order, elem)
+                                }
+                                WalkArm::InnerContig => {
+                                    stage_weight_rows(src, dst, RetileWalk { axes: &k.axes }, elem)
+                                }
+                                WalkArm::PerElement => stage_weight_per_element(
                                     src,
                                     dst,
                                     RetileWalk { axes: &k.axes },
