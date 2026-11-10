@@ -2052,14 +2052,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
     }
 
-    /// Slot `s`'s host shadow (read-only). Slots past the segments are weight banks.
-    fn shadow(&self, s: usize) -> &[u8] {
-        match s.checked_sub(NUM_SEGMENTS) {
-            None => &self.seg_host[s],
-            Some(b) => &self.weight_bank_host[b],
-        }
-    }
-
     /// ⭐ WHETHER THIS SESSION BINDS ANYTHING INTO A RESIDENT SEGMENT — what "reserve only"
     /// asks. NOT `bound.is_empty()`: a reserving or borrowing session still binds its own staged
     /// constants (the sampler's tables, placed in the never-aliased activation segment), and
@@ -5467,14 +5459,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// zeroed it is both the correct result and the smaller transfer.
     pub fn write_seg_prefix(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
         let i = seg.get();
-        let addr = self.seg_addr[i]
-            .as_ref()
-            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
         // ⭐ MEASURED AGAINST THE REGION, NOT THE SHADOW: a device-only slot's shadow is a 128 B
         // placeholder (nothing staged into it), but the spilled tail this exists to hand a
         // borrower still fits the REGION the bundle allocated — so the shadow grows to the
         // prefix and only the prefix is H2D'd, exactly the window the doc below promises.
-        let dev = addr.total_size().as_u64() as usize;
+        // (The region is re-borrowed below: the address borrows `self` immutably, and the
+        // quiet point + the copy in between need it mutably.)
+        let dev = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?
+            .total_size()
+            .as_u64() as usize;
         if data.len() > dev {
             bail!(
                 "write_seg_prefix(seg{i}): {} B does not fit this session's {dev} B segment",
@@ -5488,6 +5483,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             self.seg_host[i].resize(data.len(), 0);
         }
         self.seg_host[i][..data.len()].copy_from_slice(data);
+        let addr = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
         let win = addr
             .window(ByteOffset(0), ByteSize(data.len() as u64))
             .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
