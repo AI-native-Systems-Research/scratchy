@@ -22,8 +22,7 @@ use std::num::NonZeroU64;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use flex_rs::dma::IovaAddress;
-use flex_rs::iommu::{IommuMapping, PfIommuMapper};
+use flex_rs::iommu::PfIommuMapper;
 use flex_rs::memory_region::MemoryType;
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
@@ -33,7 +32,7 @@ use crate::cb_plan;
 use crate::fold_plan::{self, OpKv};
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, PeerLink, Stream,
+    H2dPin, HwError, PeerLink, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{
@@ -95,7 +94,7 @@ pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
 /// ⭐ THE HOST SHADOW'S OWN BUFFER — page-aligned, THP-advised anonymous memory.
 ///
 /// Why not a `Vec`: prepare sends these bytes by the PRE-MAPPED door
-/// ([`Stream::h2d_premapped`]), and that door's recipe — the vendor's own, stated where
+/// ([`Stream::pin_h2d`]), and that door's recipe — the vendor's own, stated where
 /// `DmaBuf::setup_dma_buf` skips its shadow copy for a caller-supplied iova — is an
 /// IOMMU-page-ALIGNED, fully-populated host buffer. A `Vec`'s pointer is the allocator's
 /// to place (glibc's huge blocks come back 16 B into their mapping), so alignment cannot be
@@ -945,35 +944,35 @@ fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
 
 /// ⭐ THE PRE-MAPPED SEND OF ONE WHOLE SHADOW — the boot-weight door's consumer side. The
 /// shadow's pages are faulted (value-preserving, by prepare's grow loop); here the buffer
-/// is pinned ONCE for its whole extent
-/// ([`PfIommuMapper::map`] — an IOMMU mapping, RAII-unpinned on drop) and the transfer goes
-/// out window by window through [`Stream::h2d_premapped`], each window's iova the mapping's
-/// base plus that window's own linear offset — the same arithmetic the #606 pool's slot
+/// is pinned ONCE for its whole extent ([`Stream::pin_h2d`], which refuses a mapping that
+/// does not cover the shadow BY NAME — `PremappedH2dRefusal::ShortPin`) and the transfer
+/// goes out window by window through [`H2dPin::send_window`], each window's host slice AND
+/// iova derived from the pin itself — the same linear arithmetic the #606 pool's slot
 /// resolution rides and the law the scheduler states by advancing a caller iova with its
 /// host address. One pin, one submit per window, and none of the plain door's per-call
 /// DmaBuf setup and pin: ~59 GB/s against its 6-7 (card-measured, `h2d_streams_probe`,
 /// 2026-11-10), which is the whole point — a 2b model's ~2.5 GiB of weights.
 ///
-/// The mapping is parked in `alive`: the caller holds it until its `synchronize` has
-/// retired the transfers, then drops it — the unpin must not race a DMA still reading the
-/// iova.
-fn send_premapped(
-    stream: &Stream,
-    src: &[u8],
+/// The pin is parked in `alive` until the caller's `synchronize` has retired the transfers
+/// — but that is the happy path only, and not where the safety lives: the guard's own
+/// [`Drop`] synchronizes the stream BEFORE it unpins, so an early return (a refused
+/// window, a failed sync, an unwind) retires the DMA too. The unpin never races a
+/// transfer, on any exit.
+fn send_premapped<'a>(
+    stream: &'a Stream,
+    src: &'a [u8],
     addr: &DevAddr,
     mapper: &std::sync::Arc<PfIommuMapper>,
-    alive: &mut Vec<IommuMapping>,
+    alive: &mut Vec<H2dPin<'a>>,
     what: &str,
 ) -> Result<()> {
-    let mapping = mapper
-        .map(src.as_ptr() as usize, src.len(), true)
-        .map_err(|e| anyhow!("{what}: pinning the {} B shadow: {e:?}", src.len()))?;
-    let base = mapping.iova();
+    let pin = stream
+        .pin_h2d(mapper, src)
+        .map_err(|e| anyhow!("{what}: pinning the {} B shadow: {e}", src.len()))?;
     let mut off = 0usize;
     for w in addr.windows(H2D_WINDOW) {
         let win = w.total_size().as_u64() as usize;
-        stream
-            .h2d_premapped(&src[off..off + win], &w, IovaAddress(base + off))
+        pin.send_window(&w, off..off + win)
             .map_err(|e| anyhow!("{what}: pre-mapped window at byte {off}: {e}"))?;
         off += win;
     }
@@ -984,7 +983,7 @@ fn send_premapped(
          cover-each-chunk-once law is broken",
         src.len()
     );
-    alive.push(mapping);
+    alive.push(pin);
     Ok(())
 }
 
@@ -3066,9 +3065,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         //    pool alone is ~10 GB of wire time on a 2b model. Activations refill per
         //    predict. ──
         // The mapper is one per prepare (a page size and a table); `pinned` holds every
-        // mapping the sends below take until the synchronize retires them.
+        // guard the sends below take. Each guard owns its mapping and borrows the shadow
+        // it pinned, and its own Drop synchronizes before unpinning — so the guards are
+        // safe to drop on ANY exit from here on, not just the sync below.
         let mapper = PfIommuMapper::new(self.card.card().clone());
-        let mut pinned: Vec<IommuMapping> = Vec::new();
+        let mut pinned: Vec<H2dPin<'_>> = Vec::new();
         for i in 0..NUM_SEGMENTS {
             // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
@@ -3155,9 +3156,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .synchronize()
             .map_err(|e| anyhow!("prepare: sync: {e}"))?;
         lap("sync", &mut t0);
-        // ⭐ THE PINS RETIRE HERE: the sync above waited out every pre-mapped window, so no
-        // DMA reads a shadow's iova any more — dropping the mappings unpins them (RAII)
-        // without racing a transfer. Held one line longer than the sync, never shorter.
+        // ⭐ THE PINS RETIRE HERE — and would on any earlier exit too: the sync above waited
+        // out every pre-mapped window, and each guard's own Drop synchronizes before it
+        // unpins, so no DMA reads a shadow's iova after its pin is gone on this path, a
+        // refused one, or an unwind. Dropping here (rather than at scope end) simply unpins
+        // before the parity gate and the ladder run on.
         drop(pinned);
         // ⭐ #603 PR2 2a — THE CB PARITY GATE, before the session becomes loadable: a plan twin
         // that disagrees with the walk refuses the LOAD here, never a step.

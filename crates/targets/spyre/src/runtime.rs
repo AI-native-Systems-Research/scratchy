@@ -49,6 +49,7 @@ use flex_rs::dma::{
     HostVirtualAddress, IovaAddress,
 };
 use flex_rs::flex_config::DeviceKind;
+use flex_rs::iommu::{IommuMapping, PfIommuMapper};
 use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::numa::{CardCpus, PinError, PlacementError};
 use flex_rs::runtime::{RuntimeContext, RuntimeContextError};
@@ -64,6 +65,7 @@ use flex_rs::stream::{
     SchedulerError, StreamId,
 };
 use flex_rs::topology::populate_domain_topology;
+use flex_rs::util::Status;
 
 /// ⭐ ONE OPEN SPYRE CARD AND THE FLEX RUNTIME DRIVING IT. Nothing card-scoped is process-global:
 /// every stream, allocation and capacity query goes through the `CardRuntime` it acts on, and a
@@ -346,16 +348,21 @@ pub enum HwError {
     /// pool's own validation set — slot range, single-chunk device, the
     /// slot-capacity transfer law — or the submission it built was rejected.
     PooledCopy(SharedHostPoolError),
-    /// A pre-mapped H2D ([`Stream::h2d_premapped`]) was refused before
-    /// submission — the window is not one chunk, or the host slice is not
-    /// exactly the window's extent.
+    /// Pinning a host shadow into the IOMMU for a pre-mapped H2D
+    /// ([`Stream::pin_h2d`]) was refused by the vendor mapper. Never a
+    /// submission: nothing was sent on any stream.
+    IommuPin(Status),
+    /// A pre-mapped H2D ([`H2dPin::send_window`]) was refused before
+    /// submission — the window is not one chunk, the host slice is not
+    /// exactly the window's extent, or the pin does not cover the shadow.
     PremappedH2d(PremappedH2dRefusal),
 }
 
 /// Why a pre-mapped H2D was refused before submission ([`HwError::PremappedH2d`]):
-/// the two facts [`Stream::h2d_premapped`]'s recipe states about the pair it is
-/// handed — the device window resolves one chunk, and the host slice is exactly
-/// that window's extent.
+/// the facts [`H2dPin::send_window`]'s recipe states about the transfer it is
+/// handed — the device window resolves one chunk, the host slice is exactly
+/// that window's extent, the byte range is inside the pinned shadow, and the
+/// pin covers the whole shadow it was asked to map.
 #[derive(Debug)]
 pub enum PremappedH2dRefusal {
     /// The window spans more than one chunk. The pre-mapped recipe resolves one
@@ -363,9 +370,21 @@ pub enum PremappedH2dRefusal {
     /// multi-chunk region must cut it with [`DevAddr::windows`] first.
     NotOneChunk { chunks: usize },
     /// The host slice's length is not the window's extent. The transfer length
-    /// is the window's total size — the caller's iova maps `bytes` exactly, so
+    /// is the window's total size — the pin's iova maps the slice exactly, so
     /// any other length would DMA pages the mapping does not own.
     LengthMismatch { len: u64, window: u64 },
+    /// The IOMMU mapping the mapper handed back covers fewer bytes than the
+    /// shadow it was asked to pin. A mapping carries its FIRST scatter-gather
+    /// entry's length, not the size asked for (the shim reads only
+    /// `dev_shm_sglist.front()`), so a pin the driver split does not own an
+    /// iova for every byte of the shadow — a window past the split would DMA
+    /// from an iova this mapping does not own, and the unpin would leave the
+    /// rest pinned for the process's life. Refused by name, never sent.
+    ShortPin { asked: u64, pinned: u64 },
+    /// The byte range is not inside the pinned shadow: the window walk and the
+    /// shadow disagree about the transfer's extent, so the host side and the
+    /// iova side of the transfer would not be the same bytes.
+    RangeOutsideShadow { start: u64, end: u64, shadow: u64 },
 }
 
 impl fmt::Display for PremappedH2dRefusal {
@@ -382,11 +401,23 @@ impl fmt::Display for PremappedH2dRefusal {
                 "refused before submission: the {len} B host slice is not the {window} B window — \
                  the pre-mapped transfer length is the window's extent, the span its iova maps"
             ),
+            Self::ShortPin { asked, pinned } => write!(
+                f,
+                "refused before submission: the mapper pinned {pinned} B of a {asked} B shadow — \
+                 the mapping owns an iova for only part of it, so windows past the split would \
+                 DMA from an iova the mapping does not own"
+            ),
+            Self::RangeOutsideShadow { start, end, shadow } => write!(
+                f,
+                "refused before submission: byte range {start}..{end} is outside the {shadow} B \
+                 pinned shadow — the window walk and the shadow disagree about the transfer's \
+                 extent"
+            ),
         }
     }
 }
 
-/// The pre-mapped pairing [`Stream::h2d_premapped`] demands of its (slice, window)
+/// The pre-mapped pairing [`H2dPin::send_window`] demands of its (slice, window)
 /// pair, stated apart from the door so it is checkable without a card: the window
 /// resolves one chunk, and the slice is exactly that window's extent. Everything
 /// past this check needs a live stream; the check itself is a fact about the pair.
@@ -426,6 +457,7 @@ impl fmt::Display for HwError {
             Self::Reset(e) => write!(f, "{e}"),
             Self::CbRender(e) => write!(f, "CB image render (no submission): {e}"),
             Self::PooledCopy(e) => write!(f, "pooled copy: {e}"),
+            Self::IommuPin(e) => write!(f, "pinning host memory into the IOMMU: {e}"),
             Self::PremappedH2d(e) => write!(f, "pre-mapped H2D: {e}"),
         }
     }
@@ -973,45 +1005,43 @@ impl Stream {
             .map_err(HwError::Stream)
     }
 
-    /// ⭐ PRE-MAPPED H2D OF `bytes` INTO `addr` — the same transfer as [`Self::h2d`] on the
-    /// same consumer path the #606 pool rides: `DmaShaping::iova` tells the backend the caller
-    /// already pinned and IOMMU-mapped the host pages, so it skips its per-call DmaBuf setup
-    /// and VFIO pin of anonymous memory and DMAs straight from the caller's mapping. Those
-    /// per-call costs are the plain door's rate — 6-7 GB/s host-blocking, against ~59 GB/s
-    /// pre-mapped (card-measured, `h2d_streams_probe`, 2026-11-10) — which is why boot weight
-    /// staging, a one-shot multi-GiB transfer from a THP-backed region, wants this door.
+    /// ⭐ PIN A HOST SHADOW FOR PRE-MAPPED H2D — the constructor of the guard that carries
+    /// the transfer's safety ([`H2dPin`]). The mapper pins and IOMMU-maps the slice's own
+    /// pages ONCE (`PfIommuMapper::map`), and the guard that comes back owns that mapping
+    /// and borrows the slice it was pinned from — so the iova a window is sent from and
+    /// the bytes it reads are derived from ONE value and cannot disagree, and the borrow
+    /// cannot end while a transfer may still be reading the bytes (the guard's [`Drop`]
+    /// synchronizes before it unpins). Those per-call costs are the plain door's rate —
+    /// 6-7 GB/s host-blocking, against ~59 GB/s pre-mapped (card-measured,
+    /// `h2d_streams_probe`, 2026-11-10) — which is why boot weight staging, a one-shot
+    /// multi-GiB transfer from a THP-backed region, wants this door.
     ///
-    /// The pairing the recipe states, refused before submission (cardless, like
-    /// [`HwError::OverrunsRegion`]): `addr` is a SINGLE-CHUNK window — the transfer resolves
-    /// one chunk, so a caller walking a multi-chunk region cuts it with [`DevAddr::windows`]
-    /// first — and `bytes.len()` IS the window's extent, the pool's `copyRaw` law: the iova
-    /// the caller passes maps exactly `bytes`, so any other length would DMA pages the
-    /// mapping does not own. The caller keeps the mapping alive until the transfer has
-    /// synchronized; the slice this door reads is a plain borrow and carries no pin.
-    pub fn h2d_premapped(
-        &self,
-        bytes: &[u8],
-        addr: &DevAddr,
-        iova: IovaAddress,
-    ) -> Result<(), HwError> {
-        premapped_pairing(bytes, addr).map_err(HwError::PremappedH2d)?;
-        let stream = self.live()?;
-        // `bytes.len()` equals the window's extent by the refusal above, so the explicit
-        // size is the window's total size — the padded-extent over-read `h2d_shaped`'s doc
-        // guards against cannot happen here: the equality is the proof the caller's slice
-        // spans the whole window.
-        let params = DmaParams::with_explicit_size(
-            HostVirtualAddress(bytes.as_ptr() as usize),
-            ByteSize(bytes.len() as u64),
-            DmaDirection::HostToDevice,
-            Some(addr.0.clone()),
-            DmaShaping {
-                iova: Some(iova),
-                ..Default::default()
-            },
-        )
-        .expect("device_address is Some, constructed from an owned DevAddr");
-        stream.launch_h2d(params, None).map_err(HwError::Stream)
+    /// A mapping that does not cover the whole slice is refused BY NAME before any window
+    /// is sent ([`PremappedH2dRefusal::ShortPin`]): the shim's mapping carries its first
+    /// scatter-gather entry's length, not the size asked for, so a pin the driver split
+    /// does not own an iova for every byte of the shadow.
+    pub fn pin_h2d<'a>(
+        &'a self,
+        mapper: &Arc<PfIommuMapper>,
+        src: &'a [u8],
+    ) -> Result<H2dPin<'a>, HwError> {
+        let mapping = mapper
+            .map(src.as_ptr() as usize, src.len(), true)
+            .map_err(HwError::IommuPin)?;
+        if (mapping.size_bytes() as u64) < src.len() as u64 {
+            // Nothing was submitted from this mapping, so its drop-side unpin
+            // races no transfer — other pins' transfers are guarded by their
+            // own guards.
+            return Err(HwError::PremappedH2d(PremappedH2dRefusal::ShortPin {
+                asked: src.len() as u64,
+                pinned: mapping.size_bytes() as u64,
+            }));
+        }
+        Ok(H2dPin {
+            src,
+            stream: self,
+            mapping,
+        })
     }
 
     /// Async D2H into `bytes` from the device window `addr`.
@@ -1310,6 +1340,98 @@ impl Drop for Stream {
         // completion now, `retire_fence`) and itself logs-and-swallows any
         // deferred error.
         let _ = self.rt.destroy_stream(self.id);
+    }
+}
+
+/// ⭐ THE GUARD THAT CARRIES A PRE-MAPPED H2D'S SAFETY: it owns the IOMMU
+/// mapping and borrows the host bytes that mapping was pinned from, so the two
+/// facts a pre-mapped transfer states — which host bytes it reads, and which
+/// iova those bytes map to — are DERIVED from one value and cannot disagree.
+/// [`H2dPin::send_window`] takes a byte range and derives both: `src[range]`
+/// for the bytes, `iova + range.start` for the address, the same linear
+/// arithmetic the #606 pool's slot resolution rides and the law the scheduler
+/// states by advancing a caller iova with its host address.
+///
+/// The borrow is the lifetime proof, and the guard's [`Drop`] is what makes it
+/// hold on EVERY exit, not just the caller's happy path: a refused later
+/// window, a failed synchronize, a panic unwind — each one drops the guard,
+/// the guard SYNCHRONIZES THE STREAM BEFORE THE MAPPING UNPINS, and only then
+/// does the pin go away. A transfer can never read an iova that is already
+/// unpinned, or host pages the borrow no longer covers. A caller that holds
+/// pins across its own synchronize and drops them after pays one extra
+/// (already-drained) sync per guard, never a race.
+///
+/// Built by [`Stream::pin_h2d`], which refuses a mapping that does not cover
+/// the whole slice ([`PremappedH2dRefusal::ShortPin`] — the shim's mapping
+/// carries its first scatter-gather entry's length, not the size asked for).
+pub struct H2dPin<'a> {
+    src: &'a [u8],
+    stream: &'a Stream,
+    mapping: IommuMapping,
+}
+
+impl H2dPin<'_> {
+    /// Send byte range `range` of the pinned shadow into `window` — the same
+    /// transfer as [`Stream::h2d`] on the same consumer path the #606 pool
+    /// rides: `DmaShaping::iova` tells the backend the caller already pinned
+    /// and IOMMU-mapped the host pages, so it skips its per-call DmaBuf setup
+    /// and VFIO pin and DMAs straight from the pin's mapping.
+    ///
+    /// The pairing the recipe states, refused before submission (cardless,
+    /// like [`HwError::OverrunsRegion`]): `window` is a SINGLE-CHUNK window —
+    /// the transfer resolves one chunk, so a caller walking a multi-chunk
+    /// region cuts it with [`DevAddr::windows`] first — the range's slice IS
+    /// the window's extent, the pool's `copyRaw` law, and the range is inside
+    /// the shadow the pin borrows. The slice and the iova both come from the
+    /// guard, so they cannot disagree.
+    pub fn send_window(
+        &self,
+        window: &DevAddr,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), HwError> {
+        let bytes = self.src.get(range.clone()).ok_or(HwError::PremappedH2d(
+            PremappedH2dRefusal::RangeOutsideShadow {
+                start: range.start as u64,
+                end: range.end as u64,
+                shadow: self.src.len() as u64,
+            },
+        ))?;
+        premapped_pairing(bytes, window).map_err(HwError::PremappedH2d)?;
+        // The mapping's iova maps `src[0]` (the constructor refused a shorter
+        // pin), so `iova + range.start` maps `bytes` — the mapping's iova
+        // advanced by the host offset. `bytes.len()` equals the window's
+        // extent by the refusal above, so the explicit size is the window's
+        // total size — the padded-extent over-read `h2d_shaped`'s doc guards
+        // against cannot happen here: the equality is the proof the slice
+        // spans the window.
+        let params = DmaParams::with_explicit_size(
+            HostVirtualAddress(bytes.as_ptr() as usize),
+            ByteSize(bytes.len() as u64),
+            DmaDirection::HostToDevice,
+            Some(window.0.clone()),
+            DmaShaping {
+                iova: Some(IovaAddress(self.mapping.iova() + range.start)),
+                ..Default::default()
+            },
+        )
+        .expect("device_address is Some, constructed from an owned DevAddr");
+        self.stream
+            .live()?
+            .launch_h2d(params, None)
+            .map_err(HwError::Stream)
+    }
+}
+
+impl Drop for H2dPin<'_> {
+    fn drop(&mut self) {
+        // ⭐ THE PIN OUTLIVES ITS DMA, ON EVERY EXIT: synchronize BEFORE the
+        // mapping unpins (`IommuMapping`'s own drop), so an in-flight transfer
+        // never reads an iova that is already unpinned. Best-effort by
+        // necessity — a refusal here is logged and the unpin proceeds, which
+        // is no worse than the vendor's own RAII on a dying stream.
+        if let Err(e) = self.stream.synchronize() {
+            tracing::debug!("pre-mapped H2D pin: sync before unpin refused: {e}");
+        }
     }
 }
 
@@ -1868,7 +1990,7 @@ mod tests {
     }
 
     /// ⭐ THE PRE-MAPPED DOOR'S REFUSALS ARE CARDLESS — the two facts of
-    /// [`Stream::h2d_premapped`]'s recipe, stated in [`premapped_pairing`] apart
+    /// [`H2dPin::send_window`]'s pairing, stated in [`premapped_pairing`] apart
     /// from the door so they are checkable without a runtime: a window that
     /// spans chunks, and a slice that is not the window's extent, are both
     /// refused BY NAME before any stream is touched. The paired case — one
@@ -1896,6 +2018,39 @@ mod tests {
 
         let one28 = DevAddr(Arc::new(CompositeAddress::from_chunk(chunk(5, 256, 28, 0))));
         assert!(premapped_pairing(&bytes, &one28).is_ok());
+    }
+
+    /// The two refusals that need a live mapper to fire — a pin that came back
+    /// shorter than the shadow it was asked to map, and a byte range outside
+    /// the pinned shadow — still NAME their facts when they do: the numbers a
+    /// split pin or an overruning walk would have to be diagnosed from are in
+    /// the refusal's own text. The refusals themselves are constructed by the
+    /// card ([`Stream::pin_h2d`], [`H2dPin::send_window`]); their words are a
+    /// fact about the types, checkable cardlessly.
+    #[test]
+    fn premapped_refusals_name_a_short_pin_and_an_outside_range() {
+        let short = PremappedH2dRefusal::ShortPin {
+            asked: 5_130_000_000,
+            pinned: 4_294_967_296,
+        };
+        let text = short.to_string();
+        assert!(
+            text.contains("5130000000"),
+            "names the bytes asked for: {text}"
+        );
+        assert!(
+            text.contains("4294967296"),
+            "names the bytes pinned: {text}"
+        );
+
+        let outside = PremappedH2dRefusal::RangeOutsideShadow {
+            start: 64,
+            end: 128,
+            shadow: 96,
+        };
+        let text = outside.to_string();
+        assert!(text.contains("64..128"), "names the range: {text}");
+        assert!(text.contains("96"), "names the shadow's extent: {text}");
     }
 }
 
