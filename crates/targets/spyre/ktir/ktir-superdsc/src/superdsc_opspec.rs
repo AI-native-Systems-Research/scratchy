@@ -186,6 +186,8 @@ pub const EW_BINARY_LIVE_TILES: u32 = 3;
 /// The silu-mul live set: gate, up, neg, exp, the splat, denom, silu, y — EIGHT tiles,
 /// the widest live set in the model.
 pub const SILU_MUL_LIVE_TILES: u32 = 8;
+/// The block-copy live set: the one tile it loads and stores.
+pub const BLOCK_COPY_LIVE_TILES: u32 = 1;
 
 /// How many ROWS of a `cols`-wide region keep `live` tiles inside [`EW_LX_ELEMS`] —
 /// ONE LAW, shared by the deleted builder's row-block arms (`lower_elementwise_node_rows`,
