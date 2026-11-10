@@ -34,7 +34,7 @@ use crate::runtime::{
     HwError, PeerLink, Stream,
 };
 use crate::sen_convert;
-use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
+use crate::stage_weight::{Element, RetileWalk, WalkArm, stage_weight_tiled};
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  Typed quantities. Every number below names WHICH number it is; the executor never takes a bare
@@ -2420,10 +2420,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         /// Which arm of the staging transforms a weight's bytes took.
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum ArmKind {
-            Fp8RowCopy,
-            Fp8PerElement,
-            F16RowConvert,
-            F16PerElement,
+            PermFp8,
+            PermF16,
+            RowCopyFp8,
+            RowConvertF16,
+            PerElementFp8,
+            PerElementF16,
             Convert,
             Verbatim,
         }
@@ -2439,16 +2441,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let t_stage = stage_diag.then(Instant::now);
         let stage_arm = |mode: StageMode<'_>| match mode {
             StageMode::Retile(k, elem) => {
-                let contig = RetileWalk {
+                let walk = RetileWalk {
                     device_size: &k.device_size,
                     stride_map: &k.stride_map,
-                }
-                .inner_contig();
-                match (elem, contig) {
-                    (Element::Fp8, true) => ArmKind::Fp8RowCopy,
-                    (Element::Fp8, false) => ArmKind::Fp8PerElement,
-                    (Element::F16, true) => ArmKind::F16RowConvert,
-                    (Element::F16, false) => ArmKind::F16PerElement,
+                };
+                match (walk.arm(), elem) {
+                    (WalkArm::Permutation, Element::Fp8) => ArmKind::PermFp8,
+                    (WalkArm::Permutation, Element::F16) => ArmKind::PermF16,
+                    (WalkArm::InnerContig, Element::Fp8) => ArmKind::RowCopyFp8,
+                    (WalkArm::InnerContig, Element::F16) => ArmKind::RowConvertF16,
+                    (WalkArm::PerElement, Element::Fp8) => ArmKind::PerElementFp8,
+                    (WalkArm::PerElement, Element::F16) => ArmKind::PerElementF16,
                 }
             }
             StageMode::Convert => ArmKind::Convert,
@@ -2515,10 +2518,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 },
             );
             for (arm, name) in [
-                (ArmKind::Fp8RowCopy, "retile fp8 row-copy"),
-                (ArmKind::Fp8PerElement, "retile fp8 per-element"),
-                (ArmKind::F16RowConvert, "retile f16 row-convert"),
-                (ArmKind::F16PerElement, "retile f16 per-element"),
+                (ArmKind::PermFp8, "retile fp8 permutation scan"),
+                (ArmKind::PermF16, "retile f16 permutation scan"),
+                (ArmKind::RowCopyFp8, "retile fp8 row-copy"),
+                (ArmKind::RowConvertF16, "retile f16 row-convert"),
+                (ArmKind::PerElementFp8, "retile fp8 per-element"),
+                (ArmKind::PerElementF16, "retile f16 per-element"),
                 (ArmKind::Convert, "ieee-f16 -> sen convert"),
                 (ArmKind::Verbatim, "verbatim"),
             ] {

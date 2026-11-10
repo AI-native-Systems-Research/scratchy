@@ -90,6 +90,80 @@ impl<'a> RetileWalk<'a> {
             coord[r] = 0;
         }
     }
+
+    /// The walk's axes in HOST-SCAN order (ascending stride), when the stride map is a
+    /// mixed-radix PERMUTATION: each axis's stride equals the product of the extents of every
+    /// smaller-stride axis. Positional notation then makes the host offsets EXACTLY `0..total`
+    /// in that order — the whole tensor is one linear host scan, and only the device side
+    /// needs coordinate math (incremental; no per-element dot product, no per-row odometer
+    /// over the full rank). This is the boot walks' own law, not a special case: the measured
+    /// table (`SCRATCHY_SDSC_STAGE_TIME`, 2b fp8) shows every slow walk — the 280 fp8 items
+    /// at 0.33 GB/s/thread whose "row copy" is TWO BYTES (`[128,1024,64,2]` /
+    /// `[131072,2,2048,1]`) and the 200 MiB f16 embedding walked per-element
+    /// (`[800,2048,64]` / `[131072,1,2048]`) — satisfies strides==products exactly. A walk
+    /// with gather/broadcast structure (repeated or gapped strides) is NOT a permutation and
+    /// takes the arms below.
+    pub fn permutation(&self) -> Option<Vec<usize>> {
+        let mut order: Vec<usize> = (0..self.device_size.len()).collect();
+        order.sort_by_key(|&i| self.stride_map[i]);
+        let mut run = 1u64;
+        for &ax in &order {
+            if self.stride_map[ax] != run {
+                return None;
+            }
+            run = run.saturating_mul(self.device_size[ax]);
+        }
+        Some(order)
+    }
+
+    /// Which arm [`stage_weight_tiled`] takes for this walk — one statement, read by the
+    /// walker's own branch and by the stage-time diagnostic.
+    pub(crate) fn arm(&self) -> WalkArm {
+        if self.permutation().is_some() {
+            WalkArm::Permutation
+        } else if self.inner_contig() {
+            WalkArm::InnerContig
+        } else {
+            WalkArm::PerElement
+        }
+    }
+}
+
+/// Which arm [`stage_weight_tiled`] takes for a walk — the walker branches on it and the
+/// stage-time diagnostic reports by it: ONE statement, both readers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WalkArm {
+    /// A mixed-radix permutation ([`RetileWalk::permutation`]): linear host scan,
+    /// incremental device offsets.
+    Permutation,
+    /// Innermost device axis host-contiguous: whole-row copies/converts.
+    InnerContig,
+    /// Everything else: per-element dot-product walk.
+    PerElement,
+}
+
+/// Increment the odometer over the OUTER axes (host-scan order, `order[1..]`), adjusting the
+/// device offset INCREMENTALLY: `dev_stride[ax]` per step, minus the axis's whole span on
+/// carry. Returns false when every axis has wrapped — the walk is complete. `d` is always
+/// the device offset of the current outer coordinate at inner coordinate 0, so the caller's
+/// block/stride loop can key off it directly.
+fn advance_outer(
+    coord: &mut [u64],
+    d: &mut usize,
+    order: &[usize],
+    dev_stride: &[u64],
+    ext: &[u64],
+) -> bool {
+    for &ax in order.iter().skip(1) {
+        coord[ax] += 1;
+        *d += dev_stride[ax] as usize;
+        if coord[ax] < ext[ax] {
+            return true;
+        }
+        coord[ax] = 0;
+        *d -= dev_stride[ax] as usize * ext[ax] as usize;
+    }
+    false
 }
 
 /// Stage one weight: read `host` (the on-disk layout, IEEE-fp16 or fp8 bytes) and write `dev`
@@ -99,6 +173,16 @@ impl<'a> RetileWalk<'a> {
 /// elements (the caller has already validated the host size against prod(device_size), which for
 /// a permutation walk bounds every host offset).
 pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, elem: Element) {
+    // ⭐ A MIXED-RADIX PERMUTATION ([`RetileWalk::permutation`]) IS A LINEAR HOST SCAN — the
+    // host offsets are exactly 0..total in ascending-stride order, so the walk never needs a
+    // dot product or a full-rank odometer: read the host linearly, write the device at offsets
+    // the outer odometer carries incrementally. This is the arm the 2b's boot weights live on
+    // (measured: the fp8 packed-tile walk's "row copy" was TWO BYTES — a dot product and a
+    // 4-axis odometer per 2 bytes, 0.33 GB/s per thread).
+    if let Some(order) = walk.permutation() {
+        stage_weight_permuted(host, dev, &walk, &order, elem);
+        return;
+    }
     let rank = walk.device_size.len();
     let total = walk.total_elems();
     let inner = walk.inner();
@@ -153,6 +237,71 @@ pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, ele
                     walk.advance(&mut coord, 0);
                 }
             }
+        }
+    }
+}
+
+/// The permutation walk ([`RetileWalk::permutation`]): the host is ONE linear scan (offsets
+/// `0..total` in `order`'s mixed-radix order), and the device offset is carried incrementally
+/// by [`advance_outer`] — `dev_stride[ax]` per outer step, the axis's whole span subtracted on
+/// carry. The host-innermost axis (`order[0]`) is the inner run: when its device stride is 1
+/// the run is contiguous on BOTH sides and copies/converts as one block; otherwise the run's
+/// device positions step by `dev_stride[order[0]]` and the loop writes them element-wise —
+/// still no dot product, still no full-rank odometer.
+fn stage_weight_permuted(
+    host: &[u8],
+    dev: &mut [u8],
+    walk: &RetileWalk<'_>,
+    order: &[usize],
+    elem: Element,
+) {
+    let rank = walk.device_size.len();
+    let ext = walk.device_size;
+    // Device row-major stride per axis: the last axis is 1, each earlier axis the product of
+    // the extents after it.
+    let mut dev_stride = vec![1u64; rank];
+    for i in (0..rank.saturating_sub(1)).rev() {
+        dev_stride[i] = dev_stride[i + 1] * ext[i + 1];
+    }
+    let inner = order[0];
+    let run = ext[inner] as usize;
+    let block = dev_stride[inner] == 1;
+    let dstep = dev_stride[inner] as usize;
+    let mut coord = vec![0u64; rank];
+    let mut h = 0usize; // host ELEMENT offset — linear
+    let mut d = 0usize; // device ELEMENT offset — incremental, base of the inner run
+    loop {
+        if block {
+            match elem {
+                Element::Fp8 => dev[d..d + run].copy_from_slice(&host[h..h + run]),
+                Element::F16 => {
+                    for j in 0..run {
+                        let x = u16::from_le_bytes([host[(h + j) * 2], host[(h + j) * 2 + 1]]);
+                        let v = ieee_to_sen(IeeeF16(x)).0;
+                        dev[(d + j) * 2..(d + j) * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        } else {
+            match elem {
+                Element::Fp8 => {
+                    for j in 0..run {
+                        dev[d + j * dstep] = host[h + j];
+                    }
+                }
+                Element::F16 => {
+                    for j in 0..run {
+                        let x = u16::from_le_bytes([host[(h + j) * 2], host[(h + j) * 2 + 1]]);
+                        let v = ieee_to_sen(IeeeF16(x)).0;
+                        let at = (d + j * dstep) * 2;
+                        dev[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        h += run;
+        if !advance_outer(&mut coord, &mut d, order, &dev_stride, ext) {
+            break;
         }
     }
 }
@@ -322,6 +471,95 @@ mod tests {
         let hoff = (2 * out + 7) as usize;
         let want = ieee_to_sen(IeeeF16(0x3C00 + hoff as u16)).0;
         assert_eq!(u16::from_le_bytes([dev[lin * 2], dev[lin * 2 + 1]]), want);
+    }
+
+    /// ⭐ THE PERMUTATION SCAN — the 2b boot walks' own law, pinned at the measured shape's
+    /// structure: the fp8 packed-tile walk `[n/64, k/2, 64, 2]` / `[64k, 2, k, 1]` whose
+    /// "row copy" was TWO BYTES (a dot product and a 4-axis odometer per 2 bytes, 0.33 GB/s
+    /// per thread, 280 items / 2320 MiB on the card). Strides==products exactly ⇒ the host is
+    /// one linear scan; the scan must equal the naive walk. Scaled to keep the test fast —
+    /// the stride law is the claim, not the magnitude.
+    #[test]
+    fn permutation_scan_matches_naive_fp8() {
+        let ds = [4u64, 8, 4, 2];
+        let sm = [64u64, 2, 16, 1];
+        let walk = RetileWalk {
+            device_size: &ds,
+            stride_map: &sm,
+        };
+        assert_eq!(walk.arm(), WalkArm::Permutation);
+        // Distinct bytes: identity is host offset — a wrong law reads a different byte.
+        let host: Vec<u8> = (0..ds.iter().product::<u64>() as usize)
+            .map(|x| (x % 251) as u8)
+            .collect();
+        let mut dev = vec![0u8; host.len()];
+        stage_weight_tiled(&host, &mut dev, walk, Element::Fp8);
+        assert_eq!(dev, naive(&host, walk, Element::Fp8));
+    }
+
+    /// The STRIDED permutation arm — the f16 embedding's shape (`t726`, 200 MiB walked
+    /// per-element on the card): `[800, 2048, 64]` / `[131072, 1, 2048]`, where the
+    /// host-innermost axis (stride 1, extent 2048) has DEVICE stride 64, so the scan writes
+    /// a strided run. Scaled; both element widths.
+    #[test]
+    fn strided_permutation_scan_matches_naive() {
+        let ds = [3u64, 4, 2];
+        let sm = [8u64, 1, 4];
+        let walk = RetileWalk {
+            device_size: &ds,
+            stride_map: &sm,
+        };
+        assert_eq!(walk.arm(), WalkArm::Permutation);
+        // device stride of the host-innermost axis (axis 1) is 2 ≠ 1 ⇒ the strided arm.
+        let host8: Vec<u8> = (0..24u8).collect();
+        let mut dev8 = vec![0u8; 24];
+        stage_weight_tiled(&host8, &mut dev8, walk, Element::Fp8);
+        assert_eq!(dev8, naive(&host8, walk, Element::Fp8));
+
+        let host16: Vec<u8> = (0..24u16)
+            .flat_map(|i| (0x4000 + i).to_le_bytes())
+            .collect();
+        let mut dev16 = vec![0u8; 48];
+        stage_weight_tiled(&host16, &mut dev16, walk, Element::F16);
+        assert_eq!(dev16, naive(&host16, walk, Element::F16));
+    }
+
+    /// A NEAR-MISS is LEFT UNCLAIMED: one stride off the mixed-radix law and the walk is not
+    /// a permutation — it must fall to the older arms (here the inner-contig row-copy, and
+    /// with a non-1 tail stride the per-element walk) and still equal the naive walk. A walk
+    /// with gather/broadcast structure can never take the scan.
+    #[test]
+    fn a_near_miss_permutation_falls_to_the_older_arms() {
+        let ds = [4u64, 8, 4, 2];
+        // Off by one on axis 2: 17 where the mixed-radix law says 16.
+        let miss_sm = [64u64, 2, 17, 1];
+        let miss = RetileWalk {
+            device_size: &ds,
+            stride_map: &miss_sm,
+        };
+        assert_eq!(miss.arm(), WalkArm::InnerContig);
+        // A broadcast stride (two axes at stride 1) is not a permutation either.
+        let bcast = RetileWalk {
+            device_size: &[4u64, 8, 4],
+            stride_map: &[32u64, 1, 1],
+        };
+        assert_eq!(bcast.arm(), WalkArm::InnerContig);
+        // A non-1 innermost stride: per-element.
+        let tail = RetileWalk {
+            device_size: &[4u64, 8, 4, 2],
+            stride_map: &[64u64, 2, 16, 3],
+        };
+        assert_eq!(tail.arm(), WalkArm::PerElement);
+        // And each of them still stages exactly the naive walk. The host stays whole: a
+        // near-miss walk can reach offsets past total (that is exactly what makes it not a
+        // permutation), so neither the walker nor the naive reference may be handed a slice.
+        let host: Vec<u8> = (0..1024usize).map(|x| (x % 251) as u8).collect();
+        for walk in [&miss, &bcast, &tail] {
+            let total = walk.total_elems();
+            let mut dev = vec![0u8; total];
+            stage_weight_tiled(&host, &mut dev, *walk, Element::Fp8);
+            assert_eq!(dev, naive(&host, *walk, Element::Fp8));
+        }
     }
 
     /// fp8 is a VERBATIM byte gather — no conversion.
