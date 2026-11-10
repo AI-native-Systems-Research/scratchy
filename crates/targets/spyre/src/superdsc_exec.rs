@@ -2650,7 +2650,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let wheres: Vec<(String, LaunchWhere)> = rows
             .iter()
             .flat_map(|(tag, bank, off)| {
-                let two = fold_plan::Requests { count: 2, pitch: 4096 };
+                let two = fold_plan::Requests {
+                    count: 2,
+                    pitch: 4096,
+                };
                 [
                     (tag.clone(), mk(*bank, *off, fold_plan::Requests::default())),
                     (format!("{tag}/req2"), mk(*bank, *off, two)),

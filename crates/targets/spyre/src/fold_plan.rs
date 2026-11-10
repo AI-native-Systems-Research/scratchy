@@ -225,8 +225,9 @@ pub fn launches(kvs: &[OpKv], requests: u32) -> Vec<Launch> {
             i += 1;
         }
         for request in 0..requests {
-            for op in start..i {
-                for rep in 0..reps(&kvs[op]) {
+            for (op, kv) in kvs[start..i].iter().enumerate() {
+                let op = op + start;
+                for rep in 0..reps(kv) {
                     out.push(Launch { op, request, rep });
                 }
             }
@@ -431,18 +432,66 @@ mod tests {
         assert_eq!(
             launches(&kvs, 2),
             vec![
-                Launch { op: 0, request: 0, rep: 0 },
-                Launch { op: 1, request: 0, rep: 0 },
-                Launch { op: 2, request: 0, rep: 0 },
-                Launch { op: 2, request: 0, rep: 1 },
-                Launch { op: 2, request: 0, rep: 2 },
-                Launch { op: 3, request: 0, rep: 0 },
-                Launch { op: 1, request: 1, rep: 0 },
-                Launch { op: 2, request: 1, rep: 0 },
-                Launch { op: 2, request: 1, rep: 1 },
-                Launch { op: 2, request: 1, rep: 2 },
-                Launch { op: 3, request: 1, rep: 0 },
-                Launch { op: 4, request: 0, rep: 0 },
+                Launch {
+                    op: 0,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 1,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 0,
+                    rep: 1
+                },
+                Launch {
+                    op: 2,
+                    request: 0,
+                    rep: 2
+                },
+                Launch {
+                    op: 3,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 1,
+                    request: 1,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 1,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 1,
+                    rep: 1
+                },
+                Launch {
+                    op: 2,
+                    request: 1,
+                    rep: 2
+                },
+                Launch {
+                    op: 3,
+                    request: 1,
+                    rep: 0
+                },
+                Launch {
+                    op: 4,
+                    request: 0,
+                    rep: 0
+                },
             ]
         );
     }
