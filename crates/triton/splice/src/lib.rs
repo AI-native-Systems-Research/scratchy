@@ -2264,6 +2264,15 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let module = compile_kernel(src, &spec, &[1])?;
     let positional = triton_ktir_superdsc::node_for(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    // ⭐ THE BINDINGS ARE THE REQUEST SHIFT'S WHOLE REACH. A launch serving several requests
+    // relaunches this program's whole group span once per request (`fold_plan`'s request law),
+    // shifting the activation segment by one table pitch — so the activation-segment operands the
+    // span reads must be EXACTLY the per-request tables the host stages at that pitch
+    // (`query_row_index`, `page_index_table`, `mask_stack`), and nothing else. The list below is
+    // that law stated literally: `query`/`out` are the graph's own rows (gathered and scattered
+    // through `query_row_index` — absolute rows, never shifted), the pools are append-only KV, and
+    // the three reserved-tid buffers are the tables. A new activation-segment operand added here
+    // is a new table the host must stage per request — it does not ride the shift for free.
     let mut bindings = vec![
         t(&node.inputs[0]),
         BufferId::new(tids.query_rows),

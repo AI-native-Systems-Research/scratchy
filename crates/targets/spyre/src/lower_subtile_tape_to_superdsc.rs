@@ -5551,7 +5551,8 @@ impl<T: ktir_superdsc::collective::Tp> GroupKind<T> {
     /// `PageFold { gathered: true }` ALONE, and that is a CORRECTNESS law, not a tuning choice.
     ///
     /// ⛔⛔⛔ A GROUP IS THE UNIT OF THE `reps` RELAUNCH, AND THE LOOP IS GROUP-MAJOR.
-    /// `superdsc_exec::launch_ops_inner` is `for op in ops { for rep in 0..reps(op) { … } }`, so a fold
+    /// `superdsc_exec::launch_ops_inner` enumerates `fold_plan::launches` — at one request exactly
+    /// `for op in ops { for rep in 0..reps(op) { … } }` — so a fold
     /// cut into groups A then B runs **A(pass 0..n), then B(pass 0..n)** — never A(0),B(0),A(1),B(1).
     /// Every op inside one pass therefore has to be inside one group.
     ///
