@@ -1699,11 +1699,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // [`EwOperand::scale_sprayed`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
     //
-    // `dev_rows` declares a ROW-WINDOW operand's PARENT row count as the `mb` device extent
-    // (the caller passes it only when the window spans more than one stick — a one-stick window
-    // never crosses a column plane and needs no declaration): the band's bytes are a
-    // stick-major tensor of the parent's, so the walk must stride the parent's column planes
-    // at the parent's `parent_rows·lanes` pitch, never at the band's own fewer rows'.
+    // `dev_rows` declares a ROW-WINDOW operand's PARENT row count as the `mb` PITCH
+    // ([`TensorArg::with_pitch`]; the caller passes it only when the window spans more than one
+    // stick — a one-stick window never crosses a column plane and needs no declaration): the
+    // band's bytes are a stick-major tensor of the parent's, so the walk must stride the parent's
+    // column planes at the parent's `parent_rows·lanes` pitch, never at the band's own fewer
+    // rows'. ⛔ A PITCH, NOT A WINDOW: the pinned walk (`maxDimSizes_`) is a size cap dxp never
+    // reads as a stride — MEASURED on the card (microbenchmark, 2026-11-08), a multi-stick band
+    // placed stick `j` at `j·rows·64` through it, and `backGapCore_[mb] = parent − rows` (what a
+    // pitch emits) read and wrote it bit-exact.
     let mk = |is_input: bool,
               name: &str,
               scale: [Scale; 3],
@@ -1726,7 +1730,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32));
             let t = match dev_rows {
-                Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                Some(p) => t.with_pitch(&plan, "mb", p).map_err(|e| e.0)?,
                 None => t,
             };
             Ok(AnyTensorArg::R2(t))
@@ -1750,7 +1754,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 .with_df(df)
                 .with_row_blocked(matches!(df, Df::Fp32));
                 let t = match dev_rows {
-                    Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                    Some(p) => t.with_pitch(&plan, "mb", p).map_err(|e| e.0)?,
                     None => t,
                 };
                 // A spray's two row dims go to dxp innermost first.
@@ -2100,15 +2104,16 @@ mod stick_runs_tests {
     #[test]
     fn each_side_states_its_own_pitch() {
         let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
+        use crate::superdsc_opspec::DeviceAxis::{Swept, Window};
         let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
         assert_eq!(
             v[0].device_extent,
-            [None, Some(128), None],
+            [Swept, Window(128), Swept],
             "the source's pitch"
         );
         assert_eq!(
             v[1].device_extent,
-            [None, None, None],
+            [Swept, Swept, Swept],
             "the destination is dense"
         );
         assert_eq!(

@@ -5350,6 +5350,166 @@ mod walk_on_the_card {
         }
     }
 
+    /// Every descriptor the batched decode walk emits at every rank's head share — the
+    /// `a_decode_batch_lowers_at_every_ranks_head_share` geometries — serialized whole, in order.
+    fn decode_batch_descriptors() -> Vec<serde_json::Value> {
+        let mut all = Vec::new();
+        for kv_heads in [8u32, 4, 2, 1] {
+            for hd in [64, 128] {
+                for (seqs, walk) in [(1, 1), (1, 64), (1, 2048), (4, 64), (32, 1)] {
+                    let at = format!("{kv_heads} kv heads, {seqs} sequences over {walk} blocks at hd {hd}");
+                    let (node, _) = batched_walk_heads(seqs, walk, hd, kv_heads, 4);
+                    let layout = triton_ktir_superdsc::layout::for_node(&node)
+                        .unwrap_or_else(|e| panic!("{at}: {e:?}"));
+                    allocate_paged_cache(&node, &layout).expect("the cache allocates");
+                    let mut sym = 0i64;
+                    let ops = ktir_superdsc::emit::whole_function::lower_walk::<
+                        ktir_superdsc::collective::TpWorld<1>,
+                    >(
+                        &node,
+                        Some(&layout),
+                        &mut sym,
+                        &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+                    )
+                    .unwrap_or_else(|e| panic!("{at}: {}", e.message));
+                    for op in ops {
+                        all.push(serde_json::json!({
+                            "at": at,
+                            "op_name": op.op_name,
+                            "op": serde_json::to_value(&op.op).expect("serializes"),
+                        }));
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    /// FNV-1a 64 over serialized JSON — a stable, dependency-free identity, so the golden carries
+    /// one line per descriptor instead of its 32 MB of JSON.
+    fn fnv64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// A descriptor's LX-resident allocate nodes, serialized in order — the views a matmul pitch on
+    /// LX must leave untouched (`PitchForm::Lx`).
+    fn lx_views(op: &serde_json::Value) -> String {
+        op["dscs_"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|m| m.as_object().into_iter().flat_map(|o| o.values()))
+            .flat_map(|d| d["scheduleTree_"].as_array().into_iter().flatten())
+            .filter(|n| n["nodeType_"] == "allocate" && n["component_"] == "lx")
+            .map(|n| serde_json::to_string(n).expect("serializes"))
+            .collect()
+    }
+
+    /// One line per descriptor: `<geometry>\t<op>\t<fnv64 of its JSON>\t<fnv64 of its LX views>`.
+    fn decode_batch_digest() -> Vec<(String, String, u64, u64)> {
+        decode_batch_descriptors()
+            .iter()
+            .map(|d| {
+                (
+                    d["at"].as_str().unwrap_or("").to_string(),
+                    d["op_name"].as_str().unwrap_or("").to_string(),
+                    fnv64(serde_json::to_string(&d["op"]).expect("serializes").as_bytes()),
+                    fnv64(lx_views(&d["op"]).as_bytes()),
+                )
+            })
+            .collect()
+    }
+
+    /// The HBM views the matmul pitch (e55dd14dd8) changed on purpose: each per-batch decode
+    /// contraction whose flat-frame batch rows sit past their own (`mb` 4 of a taller frame, `n` or
+    /// `k` past one stick) now carries `backGapCore_[mb] = frame − 4` over a swept walk instead of a
+    /// pinned `maxDimSizes_` — the card-proven flat-frame form (the bmm cells, 2026-11-08: pinned
+    /// read 0 rows correct, the gap every row). `(geometry, op)`, exactly the descriptors that differ.
+    const PITCHED_HBM_BMMS: [(&str, &str); 14] = [
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o14"),
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o14"),
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm2_o14"),
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm3_o14"),
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o21"),
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o21"),
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm2_o21"),
+        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm3_o21"),
+        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o11"),
+        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o11"),
+        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o18"),
+        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o18"),
+        ("1 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o11"),
+        ("1 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o11"),
+    ];
+
+    /// ⭐ THE BATCHED DECODE'S LX VIEWS ARE THE BYTES THEY SHIPPED AS — a matmul `phys_mb` became a
+    /// pitch (e55dd14dd8), and an LX-resident view's pitch is the pinned walk it always was
+    /// (`PitchForm::Lx`). Against the tree before the matmul pitch, over every descriptor of all 40
+    /// head-share geometries:
+    ///
+    /// * every descriptor's LX views are byte-identical;
+    /// * every descriptor is byte-identical whole, except exactly [`PITCHED_HBM_BMMS`] — the HBM
+    ///   flat-frame contractions the pitch changed on purpose (and each of those does differ);
+    /// * the smallest LX-bearing geometry's 16 descriptors match whole, as JSON, so a failure there
+    ///   reads without regenerating anything.
+    ///
+    /// `fixtures/batched_decode_descriptors_pre_pitch.digest` is `<geometry>\t<op>\t<fnv64 of the
+    /// descriptor's JSON>\t<fnv64 of its LX views>` a line; `fixtures/batched_decode_kv8_s1_b1_hd64_
+    /// pre_pitch.json` the slice. REGENERATING THE FULL JSON: check out this tree, replace
+    /// `ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/matmul/{opspec,assemble}.rs` with 5d64673767's
+    /// (`git show 5d64673767:<path>`), and serialize `decode_batch_descriptors()` (one `{at, op_name,
+    /// op}` object per descriptor) from a scratch test in this module; `cargo test --release -p
+    /// scratchy-triton-splice --lib <that test>`. Generated so on nickm5 (full JSON md5 03e13d16).
+    #[test]
+    fn the_batched_decode_emits_what_it_shipped() {
+        let golden: Vec<(String, String, u64, u64)> =
+            include_str!("../tests/fixtures/batched_decode_descriptors_pre_pitch.digest")
+                .lines()
+                .map(|l| {
+                    let f: Vec<&str> = l.split('\t').collect();
+                    let hex = |s: &str| u64::from_str_radix(s, 16).expect("a hex digest");
+                    (f[0].to_string(), f[1].to_string(), hex(f[2]), hex(f[3]))
+                })
+                .collect();
+        let got = decode_batch_digest();
+        assert_eq!(got.len(), golden.len(), "the same descriptor count");
+        let mut changed = Vec::new();
+        for (i, (g, w)) in got.iter().zip(&golden).enumerate() {
+            assert_eq!((&g.0, &g.1), (&w.0, &w.1), "descriptor {i}: the same geometry and op");
+            assert_eq!(g.3, w.3, "descriptor {i} ({} {}): its LX views", w.0, w.1);
+            if g.2 != w.2 {
+                assert!(
+                    PITCHED_HBM_BMMS.contains(&(w.0.as_str(), w.1.as_str())),
+                    "descriptor {i} ({} {}) changed and is not a pitched HBM contraction",
+                    w.0,
+                    w.1
+                );
+                changed.push((w.0.clone(), w.1.clone()));
+            }
+        }
+        for (at, op) in PITCHED_HBM_BMMS {
+            assert!(
+                changed.iter().any(|(a, o)| a == at && o == op),
+                "{at} {op}: listed as pitched and emitted unchanged"
+            );
+        }
+        let slice: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/batched_decode_kv8_s1_b1_hd64_pre_pitch.json"
+        ))
+        .expect("the slice parses");
+        let at = "8 kv heads, 1 sequences over 1 blocks at hd 64";
+        let mine: Vec<serde_json::Value> = decode_batch_descriptors()
+            .into_iter()
+            .filter(|d| d["at"] == at)
+            .collect();
+        assert_eq!(mine.len(), slice.len(), "{at}: the descriptor count");
+        for (i, (a, b)) in mine.iter().zip(&slice).enumerate() {
+            assert_eq!(a, b, "{at}: descriptor {i} ({})", b["op_name"]);
+        }
+    }
+
     /// ⛔ `BatchChunking::of` IS TOTAL — `seqs` and `nkvh` both divide in it, so a zero would be a
     /// panic inside a `const` evaluation at BAKE rather than a wrong answer a test could catch. No
     /// producer passes zero (`ModelAttnGeometry::mint` refuses a zero kv-head count, a rung's rows

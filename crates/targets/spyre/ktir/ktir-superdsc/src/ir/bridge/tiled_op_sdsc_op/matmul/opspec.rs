@@ -485,9 +485,14 @@ where
         // output takes below: a stick-blocked view's stick-group stride comes from its `mb` DEVICE
         // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
         // the flat frame) is addressed with the TENSOR's rows, not the op's.
+        // ⛔ A PITCH, NOT A WINDOW: the rows a batch sweeps sit `phys` rows apart in the frame,
+        // which is the walk's back gap (`TensorArg::with_pitch`, `phys − swept` on `mb`); the
+        // pinned walk is a size cap the card never strides by (the flat-frame P·V contraction,
+        // MEASURED by the microbenchmark: a pinned walk lost the rows past the first stick group,
+        // the gap read them).
         let input = match phys_mb {
             Some(phys) if phys > plan.extent(MbAxis::NAME) => input
-                .with_device_extent(MbAxis::NAME, phys)
+                .with_pitch(&plan, MbAxis::NAME, phys)
                 .map_err(|e| e.0)?,
             _ => input,
         };
@@ -528,8 +533,9 @@ where
                          {swept}. device_extent declares a window into a LARGER allocation."
                     ));
                 }
+                // The output's batch rows `phys` apart: the same pitch as the input's.
                 output
-                    .with_device_extent(MbAxis::NAME, phys)
+                    .with_pitch(&plan, MbAxis::NAME, phys)
                     .map_err(|e| e.0)?
             }
             None => output,

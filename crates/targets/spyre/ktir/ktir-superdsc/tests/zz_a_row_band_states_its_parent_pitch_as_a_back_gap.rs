@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: Apache-2.0
+//! ⭐ A ROW BAND OF A TALLER PARENT STATES THE PARENT'S PITCH AS THE WALK'S BACK GAP.
+//!
+//! A pointwise op over rows `[j·r, (j+1)·r)` of a stick-major `[p, c]` parent (`c` past one stick)
+//! must stride the parent's stick-column planes at `p·64`, not at the band's own rows. dxp's walk is
+//! a size cap it never reads as a stride, so the pitch is `backGapCore_[mb] = p − r` on every
+//! banded HBM operand (an HBM view's capacity includes the core fold, so the gap is past the
+//! band's whole sweep) — MEASURED on the card (microbenchmark, 2026-11-08): the pinned walk placed
+//! stick `j` at `j·r·64` ([1,4096] of [4,4096], [1,8192] of [4,8192], [16,384] of [64,384]), and
+//! this gap read and wrote them bit-exact. The output (a whole tensor) carries none, and no view states a pinned walk for it.
+
+use ktir_superdsc::collective::TpWorld;
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, elementwise};
+use ktir_superdsc::ktir_node::Elementwise;
+use ktir_superdsc::place::{PlaceId, act_name};
+use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
+
+type W = TpWorld<1>;
+
+const PARENT: u32 = 10;
+const OUT: u32 = 11;
+
+fn layout(p: u32, r: u32, c: u32) -> BundleLayout {
+    let mut l = BundleLayout::default();
+    let mut off = 0u64;
+    for (tid, rows) in [(PARENT, p), (OUT, r)] {
+        let size = u64::from(rows) * u64::from(c) * 2;
+        l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+        l.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Activation,
+                segment: 3,
+                bank: 0,
+                offset: off,
+                size,
+            },
+        );
+        off += size.next_multiple_of(128);
+    }
+    l.segment_bytes[3] = off;
+    l
+}
+
+/// The `add` of bands 0 and 1 of the parent into a whole `[r, c]` output; returns each operand's
+/// allocate node, `numCoresUsed_` and the rows each core sweeps.
+fn band_add(p: u32, r: u32, c: u32) -> (Vec<serde_json::Value>, u64, u64) {
+    let l = layout(p, r, c);
+    let band = |j: u32| Region {
+        tid: PARENT,
+        v_rows: p,
+        v_cols: c,
+        r_start: j * r,
+        r_len: r,
+        r_cover: (j * r, (j + 1) * r),
+        c_start: 0,
+        c_len: c,
+        c_cover: (0, c),
+        is_out: false,
+        is_fp8: false,
+        band: None,
+    };
+    let o = Region {
+        tid: OUT,
+        v_rows: r,
+        v_cols: c,
+        r_start: 0,
+        r_len: r,
+        r_cover: (0, r),
+        c_start: 0,
+        c_len: c,
+        c_cover: (0, c),
+        is_out: true,
+        is_fp8: false,
+        band: None,
+    };
+    let mut sym = 0i64;
+    let ops = elementwise::<W>("band", Elementwise::Add, &[band(0), band(1), o], &[], &mut sym, Some(&l))
+        .unwrap_or_else(|e| panic!("[{r}, {c}] of [{p}, {c}]: {}", e.message));
+    assert_eq!(ops.len(), 1, "one descriptor");
+    let v = serde_json::to_value(&ops[0].op).unwrap();
+    let d = v["dscs_"][0].as_object().unwrap().values().next().unwrap().clone();
+    let cores = d["numCoresUsed_"].as_u64().unwrap();
+    // The band's whole row sweep — what the HBM unit view's capacity spans (core fold included).
+    let swept = d["N_"]["mb_"].as_u64().expect("a swept mb");
+    (d["scheduleTree_"].as_array().unwrap().clone(), cores, swept)
+}
+
+/// ⭐ THE LAW, at every core count the division reaches (1, 8 and 32 among them): both banded
+/// operands carry `backGapCore_ {mb: {"-1": p − r}}`, the output carries none, and no operand pins
+/// its walk to the parent (`maxDimSizes_` is the swept walk or `-1`).
+#[test]
+fn a_multi_stick_band_states_the_parent_pitch_as_its_back_gap() {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cases = Vec::new();
+    for (p, r, c) in [
+        (4u32, 1u32, 4096u32),
+        (4, 1, 8192),
+        (64, 16, 384),
+        (1024, 512, 128),
+        (16, 8, 128),
+        (8, 2, 256),
+        (2, 1, 128),
+        (6, 3, 192),
+        (3, 1, 320),
+        // 37 sticks — prime past 32, so the stick axis divides over ONE core.
+        (2, 1, 37 * 64),
+    ] {
+        let (nodes, cores, rpc) = band_add(p, r, c);
+        seen.insert(cores);
+        cases.push(format!("[{r},{c}]/[{p},{c}] -> {cores} core(s), {rpc} row(s) swept"));
+        let gap = (u64::from(p) - rpc).to_string();
+        for (i, n) in nodes.iter().enumerate() {
+            let what = format!("[{r}, {c}] of [{p}, {c}] on {cores} core(s), operand {i}");
+            if i < 2 {
+                assert_eq!(
+                    n["backGapCore_"],
+                    serde_json::json!({"mb": {"-1": gap}}),
+                    "{what}: the parent's pitch past the band's rows"
+                );
+            } else {
+                assert!(n.get("backGapCore_").is_none(), "{what}: a whole output has no gap");
+            }
+            let walk = n["maxDimSizes_"].as_array().unwrap();
+            assert!(
+                walk.iter().all(|e| e.as_i64() != Some(i64::from(p)) || p == r),
+                "{what}: no walk is pinned to the parent's rows: {walk:?}"
+            );
+        }
+    }
+    for want in [1u64, 8, 32] {
+        assert!(seen.contains(&want), "the cases reach {want} core(s): {cases:#?}");
+    }
+}
+
+/// A ONE-STICK band never crosses a column plane: no declaration, no gap — byte-identical to the
+/// form every shipped one-stick band already emits.
+#[test]
+fn a_one_stick_band_states_no_gap() {
+    let (nodes, _, _) = band_add(8, 2, 64);
+    for n in &nodes {
+        assert!(n.get("backGapCore_").is_none(), "{n}");
+    }
+}
+
+/// ⭐ THE PITCH LAW ON ITS OWN, over any view: stated over the view's extents alone, one mechanism
+/// per axis, and every near-miss refused by name at build.
+#[test]
+fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
+    use ktir_superdsc::superdsc_opspec::{
+        Allocation, DeviceAxis, Df, ItDim, MaxCores, Role, Scale, TensorArg, WorkPlan,
+    };
+    let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df: Df::Fp16,
+    };
+    let plan = WorkPlan::divide(
+        &[dim("y", 3, false), dim("mb", 4, false), dim("out", 128, true)],
+        MaxCores::<32>,
+        |_, _| Default::default(),
+    )
+    .unwrap();
+    let view = || {
+        TensorArg::<3>::new(
+            true,
+            "t".to_string(),
+            Role::Output,
+            [Scale::Active; 3],
+            plan.iter_syms(["y", "mb", "out"]),
+            ["y", "mb", "out"],
+            "out",
+            Allocation::Hbm,
+        )
+        .unwrap()
+    };
+    let axes = |t: TensorArg<3>| -> Vec<DeviceAxis> {
+        ktir_superdsc::superdsc_opspec::AnyTensorArg::R3(t)
+            .view()
+            .device_extent
+            .to_vec()
+    };
+    // A pitch past the extent states it; a pitch AT the extent is no pitch.
+    assert_eq!(
+        axes(view().with_pitch(&plan, "mb", 10).unwrap()),
+        [DeviceAxis::Swept, DeviceAxis::Pitch(10), DeviceAxis::Swept]
+    );
+    assert_eq!(
+        axes(view().with_pitch(&plan, "mb", 4).unwrap()),
+        [DeviceAxis::Swept; 3]
+    );
+    // The near-miss the law exists for: a pitch SMALLER than the extent.
+    let short = view().with_pitch(&plan, "mb", 3).unwrap_err().0;
+    assert!(short.contains("smaller than the extent"), "{short}");
+    // The stick axis states a pitch of whole sticks, and refuses a gap inside one.
+    assert_eq!(
+        axes(view().with_pitch(&plan, "out", 256).unwrap()),
+        [DeviceAxis::Swept, DeviceAxis::Swept, DeviceAxis::Pitch(256)]
+    );
+    let stick = view().with_pitch(&plan, "out", 160).unwrap_err().0;
+    assert!(stick.contains("stick axis"), "{stick}");
+    // A dim the view does not have.
+    let absent = view().with_pitch(&plan, "in", 8).unwrap_err().0;
+    assert!(absent.contains("not in layout"), "{absent}");
+    // One axis, one mechanism — in either order.
+    let both = view()
+        .with_device_extent("mb", 16)
+        .unwrap()
+        .with_pitch(&plan, "mb", 10)
+        .unwrap_err()
+        .0;
+    assert!(both.contains("one axis states one"), "{both}");
+    let both = view()
+        .with_pitch(&plan, "mb", 10)
+        .unwrap()
+        .with_device_extent("mb", 16)
+        .unwrap_err()
+        .0;
+    assert!(both.contains("one axis states one"), "{both}");
+    // Different axes may each state their own.
+    assert_eq!(
+        axes(
+            view()
+                .with_device_extent("y", 8)
+                .unwrap()
+                .with_pitch(&plan, "mb", 10)
+                .unwrap()
+        ),
+        [DeviceAxis::Window(8), DeviceAxis::Pitch(10), DeviceAxis::Swept]
+    );
+}
