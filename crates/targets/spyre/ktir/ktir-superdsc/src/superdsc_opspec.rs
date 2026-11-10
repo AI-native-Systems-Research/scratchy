@@ -2237,14 +2237,26 @@ pub struct DeviceOrderView<'a> {
 /// The op iterates the axis's swept extent in every case; what differs is how the allocation
 /// around it is laid out, and dxp has two mechanisms for two different strides:
 ///
-/// * [`DeviceAxis::Window`] — the axis is a WINDOW of a larger allocation, the allocation's own
-///   extent along it the physical one ([`TensorArg::with_axis`]). The on-card walk is
-///   PINNED to the allocation's extents (`maxDimSizes_`), which is how a stick-blocked band strides
-///   its stick groups by the parent's rows (#1134) — a stride OUTSIDE the axis.
+/// * [`DeviceAxis::Window`] — the axis is a WINDOW of a larger allocation, the view's own
+///   physical extent along it the cap ([`TensorArg::with_axis`]). The pin (`maxDimSizes_`) CAPS a
+///   dim's per-step size, chopping the visible extent into cap-sized steps when it binds
+///   (`dsc2.cpp:2806-2815`: `if (maxDimSize > 0 && size > maxDimSize) { remainingDimSize /=
+///   maxDimSize; size = maxDimSize; }`) — it is not a step-landing mechanism; a landing PAST the
+///   swept extent is moved only by `backGapCore_` (`dsc2.cpp:2900-2924`, folded into the outermost
+///   size, "Gap must be a multiple of inner repeats"). #1134's stick-blocked band and the windowed
+///   matmul sit on the pin's CAP role — a binding cap (pin below the visible extent) sizing the
+///   stride product. MEASURED, crossing walks (microbenchmark 2026-11-08, flat-frame bmm cells):
+///   the pinned form read 0 rows correct, the back gap every row. MEASURED, non-crossing walks
+///   (the b2 bake, three granite configs): all 5,536 restated descriptors — pin at the declared
+///   extent, swept below — replied byte-identical, structurally: the pin at the declared extent
+///   caps nothing (`min(visible, declared) = visible`), so the restatement changes no size the
+///   walk reads. ONE-LINE SEPARATOR: a pinned walk is correct exactly while no loop landing
+///   crosses the swept extent within the allocation; the crossing stride exists only as
+///   `backGapCore_`.
 /// * [`DeviceAxis::Pitch`] — the axis is iterated whole, and the NEXT ITERATION OF THE AXIS
 ///   OUTSIDE IT lands a pitch on, past a gap the op never touches ([`LayoutAxis::pitch`](crate::superdsc_opspec::LayoutAxis::pitch)).
-///   `maxDimSizes_` is a size cap, not a stride (`dsc2.cpp` `buildUnitView`: a larger cap makes
-///   the view touch more, it never moves the next step), so the pitch is the walk's BACK GAP:
+///   The pin (`maxDimSizes_`) caps a dim's per-step size and never moves a landing — a landing
+///   past the swept extent is moved only by the back gap — so the pitch is the walk's BACK GAP:
 ///   `backGapCore_ {axis: pitch − swept}`, which dxp folds into the axis's outermost repeat
 ///   (`sizesThisCore.at(lastIdx).size_ += backGap / innerSize`) — the vendor inductor's own
 ///   `backGap = dev_dim_size − it_dim_size`. MEASURED on the card (2026-11-08): a flat-frame

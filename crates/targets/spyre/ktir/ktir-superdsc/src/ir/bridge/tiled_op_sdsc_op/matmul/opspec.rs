@@ -486,10 +486,15 @@ where
         // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
         // the flat frame) is addressed with the TENSOR's rows, not the op's.
         // ⛔ A PITCH, NOT A WINDOW: the rows a batch sweeps sit `phys` rows apart in the frame,
-        // which is the walk's back gap (`LayoutAxis::pitch`, `phys − swept` on `mb`); the
-        // pinned walk is a size cap the card never strides by (the flat-frame P·V contraction,
-        // MEASURED by the microbenchmark: a pinned walk lost the rows past the first stick group,
-        // the gap read them).
+        // which is the walk's back gap (`LayoutAxis::pitch`, `phys − swept` on `mb`). The pin
+        // (`maxDimSizes_`) CAPS a dim's per-step size (`dsc2.cpp:2806-2815`) and never moves a
+        // landing — a landing past the swept extent is moved only by `backGapCore_`
+        // (`dsc2.cpp:2900-2924`) — MEASURED by the microbenchmark on the flat-frame P·V
+        // contraction (crossing walks: the pinned form read 0 rows correct, the gap every row),
+        // and MEASURED on all three granite configs of the b2 bake (non-crossing walks: every
+        // restated descriptor replied byte-identical, structurally — a pin at the declared extent
+        // caps nothing). A pinned walk is correct exactly while no loop landing crosses the
+        // swept extent within the allocation; the crossing stride exists only as the back gap.
         // `Pitch::past` decides it: a frame AT the sweep is no pitch, a shorter one refuses by name.
         let input = match phys_mb {
             Some(phys) => {

@@ -8322,8 +8322,14 @@ mod elementwise_tests {
     /// `[8, m, k] x [8, k, 128]` with batch `i` at rows `i·m` of the `[8·m, ·]` frames and `n` two
     /// sticks wide: each batch's output (and, at `k` past one stick, its activation) is a row band
     /// of the taller frame, and its pitch is the walk's back gap `8·m − m` on `mb`, never a pinned
-    /// `maxDimSizes_` (a size cap the card never strides by — MEASURED by the microbenchmark on
-    /// these two shapes: pinned lost the rows past the first stick group, the gap read them).
+    /// `maxDimSizes_` — the pin CAPS a dim's per-step size (`dsc2.cpp:2806-2815`) and never moves
+    /// a landing; a landing past the swept extent is moved only by `backGapCore_`
+    /// (`dsc2.cpp:2900-2924`). MEASURED both ways: the microbenchmark on these two shapes (crossing
+    /// walks — pinned lost the rows past the first stick group, the gap read them) and the b2 bake
+    /// on three granite configs (non-crossing walks — every pin restated at the declared extent
+    /// replied byte-identical, structurally: such a pin caps nothing). A pinned walk is correct
+    /// exactly while no loop landing crosses the swept extent within the allocation; the crossing
+    /// stride exists only as the back gap.
     #[test]
     fn a_flat_frame_batch_states_its_frame_as_a_pitch() {
         for (m, k) in [(68u32, 64u32), (124, 128)] {
@@ -9404,7 +9410,7 @@ mod elementwise_tests {
         assert!(
             walk.as_array()
                 .is_some_and(|w| w.first().and_then(|e| e.as_i64()) != Some(i64::from(parent))),
-            "{what}: the walk is not pinned to the parent's rows (a size cap the card never strides by): {walk}"
+            "{what}: the walk is not pinned to the parent's rows (the pin caps a per-step size and never moves a landing): {walk}"
         );
         let (gap, rpc) = gap_of(op, lds);
         assert_eq!(
