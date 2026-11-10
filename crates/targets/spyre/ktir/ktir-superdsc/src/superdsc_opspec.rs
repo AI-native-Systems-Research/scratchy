@@ -43,15 +43,10 @@ use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
 // ───────────────────────────────────────────────────────────────────────────
-// Hardware constants (dd2). Single source of truth shared with the wire module.
+// Hardware constants. The core count is a fact of the card generation
+// ([`crate::device_gen::DeviceGen::CORES`], read through `Baked`), not a constant here.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Spyre dd2: the core count — READ from the baked generation's table
-/// (`<Baked as DeviceGen>::CORES`, senlib's `RCU_CORES` = 32 under its
-/// citation). The literal is spelled once, in Gen1's impl; this name stays
-/// because the work planner feeds it to const contexts
-/// (`MaxCores::<MAX_CORES>`) that read a named const.
-pub const MAX_CORES: u32 = <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORES;
 /// Corelets declared per core in the FRONTEND SDSC = 1 (matches torch-spyre's
 /// `compute_ops.py` `coreletFoldProp_`={factor_:1} / `numCoreletsUsed_`:1). The
 /// L3 scheduler decides the real corelet split — the frontend does NOT
@@ -774,8 +769,8 @@ pub struct ItDim {
     pub df: Df,
 }
 
-/// A `≤ MAX_CORES` core count with no public constructor — minted only by
-/// [`WorkPlan::divide`] (witness (b): the product of the splits is `≤ 32` by
+/// A core count no larger than its budget, with no public constructor — minted only by
+/// [`WorkPlan::divide`] (witness (b): the product of the splits is `≤` the [`CoreBudget`] by
 /// type, not by a runtime re-check) and [`WorkPlan::replicate`] (all cores,
 /// no splits — the LX-producer shape).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -817,10 +812,74 @@ impl serde::Serialize for SliceIndex {
     }
 }
 
-/// `MaxCores<N>` — the core budget, a type-level cap so the splitter cannot be
-/// called with a budget other than the hardware's.
-#[derive(Clone, Copy, Debug)]
-pub struct MaxCores<const N: u32>;
+/// ⭐ THE CORE BUDGET — how many of generation `G`'s cores one op may be divided over. SEALED: the
+/// field is private and there are exactly two constructors, so no caller can hand the splitter a
+/// count it computed itself.
+///
+///   * [`Self::whole`] — every core the generation has. The budget of every division that is a
+///     correctness law of its own (a gather's entries, a walk's row groups, a matmul's cost search,
+///     a replicated LX producer), and of every op whose bytes fill the card anyway.
+///   * [`Self::for_bytes`] — the cores an elementwise op's bytes pay for: one core per
+///     [`DeviceGen::BYTES_PER_CORE`](crate::device_gen::DeviceGen::BYTES_PER_CORE) of the bytes it
+///     moves, at least one, at most every core. A descriptor's fixed cost grows with the cores it is
+///     spread over while its byte cost is flat for a few KiB a core, so a decode-sized op is cheapest
+///     on the few cores its bytes need.
+///
+/// `WorkPlan::divide` holds every split to the budget's [`Self::get`], so a split past it is a
+/// `cargo build` `Err`.
+///
+/// ```compile_fail
+/// // The count is private: a budget is never a number the caller picked.
+/// let _ = ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>(7, std::marker::PhantomData);
+/// ```
+pub struct CoreBudget<G: crate::device_gen::DeviceGen> {
+    cores: u32,
+    _gen: PhantomData<G>,
+}
+
+impl<G: crate::device_gen::DeviceGen> Clone for CoreBudget<G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<G: crate::device_gen::DeviceGen> Copy for CoreBudget<G> {}
+impl<G: crate::device_gen::DeviceGen> std::fmt::Debug for CoreBudget<G> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CoreBudget({}/{})", self.cores, G::CORES)
+    }
+}
+
+impl<G: crate::device_gen::DeviceGen> CoreBudget<G> {
+    /// Every core of the generation.
+    pub const fn whole() -> Self {
+        CoreBudget {
+            cores: G::CORES,
+            _gen: PhantomData,
+        }
+    }
+
+    /// The cores `bytes` of operand traffic pay for: `ceil(bytes / BYTES_PER_CORE)`, clamped to
+    /// `1..=CORES`.
+    pub const fn for_bytes(bytes: u64) -> Self {
+        let want = bytes.div_ceil(G::BYTES_PER_CORE);
+        let cores = if want < 1 {
+            1
+        } else if want > G::CORES as u64 {
+            G::CORES
+        } else {
+            want as u32
+        };
+        CoreBudget {
+            cores,
+            _gen: PhantomData,
+        }
+    }
+
+    /// The budget's core count — what the splitter is handed and the split product is held to.
+    pub const fn get(self) -> u32 {
+        self.cores
+    }
+}
 
 /// An iteration-space symbol. SEALED: the only way to obtain one is
 /// [`WorkPlan::iter_sym`] / [`WorkPlan::iter_syms`], so any `IterSym` referenced
@@ -844,16 +903,16 @@ impl IterSym {
 pub struct WorkPlan {
     /// Ordered iteration dims (extent + stick flag), the iteration vocabulary.
     dims: Vec<ItDim>,
-    /// dim name → split count (1 = unsplit). `product ≤ MAX_CORES` by ctor.
+    /// dim name → split count (1 = unsplit). `product ≤` the budget by ctor.
     splits: BTreeMap<&'static str, u32>,
     cores: CoresUsed,
 }
 
 impl WorkPlan {
-    /// Build a work-division for `dims`, capped at `N` cores. Runs the supplied
+    /// Build a work-division for `dims`, capped at the `budget`'s cores. Runs the supplied
     /// `splitter` (the cost-model / 3-pass distribute_cores ported in the wire
     /// module) and ASSERTS the (b) invariants:
-    ///   * `product(splits) ≤ N`,
+    ///   * `product(splits) ≤ budget.get()`,
     ///   * every STICK dim keeps `≥1 stick / core` (stick_count(size) ≥ split).
     ///
     /// A violation is a `cargo`-surfaced `Err`, never an on-card DtException.
@@ -862,19 +921,20 @@ impl WorkPlan {
     /// omitted). It is supplied by the caller so the wire module keeps its
     /// existing `matmul_cost_split`/`distribute_cores` logic verbatim — this
     /// type only OWNS the proof, not the heuristic.
-    pub fn divide<const N: u32>(
+    pub fn divide<G: crate::device_gen::DeviceGen>(
         dims: &[ItDim],
-        _budget: MaxCores<N>,
+        budget: CoreBudget<G>,
         splitter: impl FnOnce(&[ItDim], u32) -> BTreeMap<&'static str, u32>,
     ) -> Result<WorkPlan, String> {
-        let mut splits = splitter(dims, N);
+        let cap = budget.get();
+        let mut splits = splitter(dims, cap);
         // Normalise: drop 1-splits (they are the default).
         splits.retain(|_, v| *v > 1);
 
         let product: u32 = splits.values().product::<u32>().max(1);
-        if product > N {
+        if product > cap {
             return Err(format!(
-                "work-division product {product} exceeds the {N}-core budget \
+                "work-division product {product} exceeds the {cap}-core budget \
                  (splits={splits:?})"
             ));
         }
@@ -934,7 +994,7 @@ impl WorkPlan {
     }
 
     /// Build a REPLICATED work-division for `dims`: EVERY core runs the whole
-    /// iteration space (`splits` empty, `cores = MAX_CORES`). The producer side of
+    /// iteration space (`splits` empty, every core of the build's generation). The producer side of
     /// [`Allocation::Lx`] residency — LX is per-core private, so a consumer on any
     /// core can only read a byte that core's own producer pass wrote; replicating
     /// the producer puts the full tensor in every core's scratchpad, and the
@@ -942,8 +1002,8 @@ impl WorkPlan {
     /// base exactly as it does for HBM) then selects its rows there.
     ///
     /// The redundant compute is the deliberate trade: it is only ever chosen for
-    /// tiny per-row scalar tensors (the rmsnorm `rinv` stick), where MAX_CORES
-    /// copies of a handful of sticks cost nothing next to the L3 store + multicast
+    /// tiny per-row scalar tensors (the rmsnorm `rinv` stick), where one copy per core
+    /// — of a handful of sticks cost nothing next to the L3 store + multicast
     /// round-trip through HBM it deletes. A split division would leave the tensor
     /// partitioned across DIFFERENT cores' private scratchpads — unreadable by the
     /// cores whose slices reference rows another core wrote.
@@ -955,11 +1015,11 @@ impl WorkPlan {
         WorkPlan {
             dims: dims.to_vec(),
             splits: BTreeMap::new(),
-            cores: CoresUsed(MAX_CORES),
+            cores: CoresUsed(crate::device_gen::BUILD_CORES),
         }
     }
 
-    /// `≤ N` cores used (witness (b) by type).
+    /// `≤ budget` cores used (witness (b) by type).
     pub fn cores_used(&self) -> CoresUsed {
         self.cores
     }
@@ -1218,9 +1278,9 @@ impl WorkPlan {
     /// Exhausting every divisor of the reduction stick count still yields the Stage-2 `Err` — a shape
     /// that genuinely needs K-TIME (not K-core) accumulation is still a `cargo build` failure, never
     /// an on-card DtException 1535.
-    pub fn divide_and_time_tile_for_lx<const N: u32>(
+    pub fn divide_and_time_tile_for_lx<G: crate::device_gen::DeviceGen>(
         dims: &[ItDim],
-        budget: MaxCores<N>,
+        budget: CoreBudget<G>,
         tiled_dim: &'static str,
         splitter: impl Fn(&[ItDim], u32) -> BTreeMap<&'static str, u32>,
         resident_bytes_fn: impl Fn(&WorkPlan, u32) -> u64,
@@ -1239,14 +1299,15 @@ impl WorkPlan {
             return Err(refusal);
         };
         let red_sticks = red.size / stick_basis(red).max(1);
-        for r in 2..=red_sticks.min(N) {
+        let cap = budget.get();
+        for r in 2..=red_sticks.min(cap) {
             if !red_sticks.is_multiple_of(r) {
                 continue;
             }
             // Ask the cost model for its own best split of the cores the reduction does NOT take, then
             // pin the reduction to `r` (or to its own larger choice). Re-running the SAME splitter
             // under a smaller budget keeps the spatial shape the model's decision, not this pass's.
-            let mut splits = splitter(dims, (N / r).max(1));
+            let mut splits = splitter(dims, (cap / r).max(1));
             let own = splits.get(red.name).copied().unwrap_or(1);
             splits.insert(red.name, own.max(r));
             // `divide` re-checks the core budget and the whole-stick-per-core law, so an illegal
@@ -1264,7 +1325,7 @@ impl WorkPlan {
              not more K cores.",
             refusal.0,
             red.name,
-            red_sticks.min(N)
+            red_sticks.min(cap)
         )))
     }
 }
@@ -4754,20 +4815,32 @@ mod tests {
             },
         ];
         // A splitter that over-subscribes is rejected (witness b).
-        let bad = WorkPlan::divide(&dims, MaxCores::<32>, |_, _| {
-            BTreeMap::from([("mb", 16), ("out", 4)]) // 64 > 32
-        });
+        let bad = WorkPlan::divide(
+            &dims,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+            |_, _| {
+                BTreeMap::from([("mb", 16), ("out", 4)]) // 64 > 32
+            },
+        );
         assert!(bad.is_err());
         // A valid split is accepted and ≤32 by type.
-        let ok = WorkPlan::divide(&dims, MaxCores::<32>, |_, _| {
-            BTreeMap::from([("mb", 16), ("out", 2)]) // 32
-        })
+        let ok = WorkPlan::divide(
+            &dims,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+            |_, _| {
+                BTreeMap::from([("mb", 16), ("out", 2)]) // 32
+            },
+        )
         .unwrap();
         assert_eq!(ok.cores_used().get(), 32);
         // A stick dim split beyond its stick count is rejected (≥1 stick/core).
-        let sub = WorkPlan::divide(&dims, MaxCores::<32>, |_, _| {
-            BTreeMap::from([("out", 7)]) // 384 = 6 sticks; 7 > 6
-        });
+        let sub = WorkPlan::divide(
+            &dims,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+            |_, _| {
+                BTreeMap::from([("out", 7)]) // 384 = 6 sticks; 7 > 6
+            },
+        );
         assert!(sub.is_err());
     }
 
@@ -4793,7 +4866,7 @@ mod tests {
     fn matmul_plan(m: u32, n: u32, k: u32, batch: u32, mb_split: u32, out_split: u32) -> WorkPlan {
         WorkPlan::divide(
             &matmul_dims(m, n, k, batch),
-            MaxCores::<MAX_CORES>,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
             |_, _| BTreeMap::from([("mb", mb_split), ("out", out_split)]),
         )
         .unwrap()
@@ -4963,7 +5036,12 @@ mod tests {
 
         // CONTROL — without the repair this shape is a build refusal, so the assertions below are
         // measuring the repair and not a plan that fitted all along.
-        let unrepaired = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, out_only_splitter).unwrap();
+        let unrepaired = WorkPlan::divide(
+            &dims,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+            out_only_splitter,
+        )
+        .unwrap();
         assert_eq!(unrepaired.split_of("out"), 32);
         assert_eq!(
             matmul_resident_per_core_k(&unrepaired, 64),
@@ -4979,7 +5057,7 @@ mod tests {
 
         let (plan, tt) = WorkPlan::divide_and_time_tile_for_lx(
             &dims,
-            MaxCores::<MAX_CORES>,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
             "out",
             out_only_splitter,
             matmul_resident_per_core_k,
@@ -5016,7 +5094,7 @@ mod tests {
         let fixed = |_: &[ItDim], _: u32| BTreeMap::from([("mb", 16u32), ("out", 2u32)]);
         let (plan, tt) = WorkPlan::divide_and_time_tile_for_lx(
             &dims,
-            MaxCores::<MAX_CORES>,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
             "out",
             fixed,
             matmul_resident_per_core_k,
@@ -5040,7 +5118,7 @@ mod tests {
         let fixed = |_: &[ItDim], _: u32| BTreeMap::new();
         let e = WorkPlan::divide_and_time_tile_for_lx(
             &dims,
-            MaxCores::<MAX_CORES>,
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
             "out",
             fixed,
             matmul_resident_per_core_k,

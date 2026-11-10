@@ -60,7 +60,7 @@ use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
     DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
 };
-use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
+use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ddl_binds::DeviceOp;
@@ -724,14 +724,14 @@ pub fn row_scatter_of(k: &KtirNode, tile: &Operation<'_>) -> Result<RowScatter, 
 /// stick, and a run no split divides is cut at its last whole stick.
 pub fn index_runs(entries: u32) -> Vec<(u32, u32)> {
     let stick = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    let most = stick * crate::superdsc_opspec::MAX_CORES;
+    let most = stick * crate::device_gen::BUILD_CORES;
     let mut runs = Vec::new();
     let mut first = 0;
     while first < entries {
         let left = entries - first;
         let n = if left >= most {
             most
-        } else if crate::work::index_core_split(left, crate::superdsc_opspec::MAX_CORES, stick)
+        } else if crate::work::index_core_split(left, crate::device_gen::BUILD_CORES, stick)
             .is_some()
         {
             left
@@ -6209,9 +6209,9 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
     //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for
     //    batch=1). A FLOP-heavy matmul left on <8 cores is the 1.45× sengraph regression this emitter
     //    exists to fix; the padding above is what fills them for a prime-stick output. ──
-    let sp = CoreSplit::plan(m, n_dev);
+    let sp = CoreSplit::plan::<crate::device_gen::Baked>(m, n_dev);
     let cores = sp.ncores();
-    if macs >= (1 << 20) && cores < UTIL_FLOOR_CORES {
+    if macs >= (1 << 20) && cores < crate::device_gen::BUILD_UTIL_FLOOR_CORES {
         return err(format!(
             "MatmulTile t{}: {m}×{n_dev}×{k} ({macs} MACs) CoreSplit-divided onto only {cores} \
              core(s) — below the util floor; the OUTPUT stick count is not splittable to ≥8 even \

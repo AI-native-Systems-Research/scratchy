@@ -9,8 +9,8 @@ use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, KindTag, RowCount, StickKind, Stk};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, Fp32, MAX_CORES, MaxCores, OpFunc, OpInfo,
-    OpSpec, Role, SamvCoordinateMask, Scale, SdscFoldSet, TensorArg,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, Fp32, OpFunc, OpInfo, OpSpec, Role,
+    SamvCoordinateMask, Scale, SdscFoldSet, TensorArg,
 };
 use crate::work::distribute_cores;
 
@@ -333,11 +333,11 @@ pub fn reduce_opspec_df_divided(
     };
     let tiled = match division {
         ReduceDivision::Groups(n) => tile_op.tile(
-            MaxCores::<MAX_CORES>,
+            crate::device_gen::whole(),
             |dims, max_cores| crate::work::row_groups(dims, max_cores, n),
             "out",
         ),
-        ReduceDivision::Rows => tile_op.tile(MaxCores::<MAX_CORES>, distribute_cores, "out"),
+        ReduceDivision::Rows => tile_op.tile(crate::device_gen::whole(), distribute_cores, "out"),
         ReduceDivision::ReducedAxis => {
             return Err(format!(
                 "reduce `{accum_name}`: a split of the reduced axis is `reduce_opspec_off_divided`'s, \
@@ -757,9 +757,9 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         df,
     };
     let tiled = match division {
-        ReduceDivision::Rows => tile_op.tile(MaxCores::<MAX_CORES>, distribute_cores, "out"),
+        ReduceDivision::Rows => tile_op.tile(crate::device_gen::whole(), distribute_cores, "out"),
         ReduceDivision::Groups(n) => tile_op.tile(
-            MaxCores::<MAX_CORES>,
+            crate::device_gen::whole(),
             |dims, max_cores| crate::work::row_groups(dims, max_cores, n),
             "out",
         ),
@@ -773,7 +773,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
                 ));
             }
             tile_op.tile(
-                MaxCores::<MAX_CORES>,
+                crate::device_gen::whole(),
                 crate::work::distribute_cores_reduced_axis,
                 "out",
             )
@@ -1734,8 +1734,8 @@ mod long_reduce_split {
 #[cfg(test)]
 mod the_arity_is_checked_where_the_op_is_built {
     use crate::superdsc_opspec::{
-        Allocation, AnyTensorArg, ItDim, MAX_CORES, MaxCores, OpFunc, OpSpec, Role, Scale,
-        SdscFoldSet, TensorArg, WorkPlan,
+        Allocation, AnyTensorArg, CoreBudget, ItDim, OpFunc, OpSpec, Role, Scale, SdscFoldSet,
+        TensorArg, WorkPlan,
     };
 
     fn plan() -> WorkPlan {
@@ -1755,9 +1755,11 @@ mod the_arity_is_checked_where_the_op_is_built {
                 df: crate::superdsc_opspec::Df::Fp16,
             },
         ];
-        WorkPlan::divide(&dims, MaxCores::<{ MAX_CORES }>, |_, _| {
-            std::collections::BTreeMap::new()
-        })
+        WorkPlan::divide(
+            &dims,
+            CoreBudget::<crate::device_gen::Gen1>::whole(),
+            |_, _| std::collections::BTreeMap::new(),
+        )
         .expect("a two-dim plan divides")
     }
 

@@ -378,6 +378,14 @@ mod tests {
         }
     }
 
+    /// The `numCoresUsed_` of every descriptor one rank's consume group renders to.
+    fn rank_group_cores<T: Tp>(ops: &[ktir_superdsc::emit::EmittedOp<T>], rank: u32) -> Vec<u64> {
+        ops.iter()
+            .filter(|e| e.tp_consume.is_some_and(|c| c.plays_at.get() == rank))
+            .filter_map(|e| e.op.as_ref().map(|d| u64::from(d.numCoresUsed_)))
+            .collect()
+    }
+
     /// Every core-0 start address of the descriptors one rank's consume group renders to.
     fn rank_group_starts<T: Tp>(
         ops: &[ktir_superdsc::emit::EmittedOp<T>],
@@ -412,7 +420,8 @@ mod tests {
 
     /// ⭐ THE STATIC AUDIT (#1007 §5), AT EVERY WORLD: every peer's block a rank's consume reads is
     /// addressed, in the very input dxp compiles, at its TYPED placement (`SEGMENT_OFFSETS[segment]`
-    /// plus the offset, the emitter's own segment law), one stick per core, and the rank's OWN block
+    /// plus the offset, the emitter's own segment law), once per core the reading descriptor runs on,
+    /// and the rank's OWN block
     /// is never read. (Compiled by hand with `dxp_standalone` through the `dump_tp_consume_sdsc`
     /// example.)
     #[test]
@@ -467,7 +476,21 @@ mod tests {
                             me.get(),
                             s.get()
                         );
-                        assert_eq!(reads.len(), 32, "the block's 32 sticks, one per core");
+                        // One start per core of the one consume descriptor that reads this
+                        // block: an elementwise consume spends the cores its bytes pay for
+                        // (`CoreBudget::for_bytes`), so that count is its own `numCoresUsed_`,
+                        // and every core reads its slice from inside the block.
+                        let cores = rank_group_cores(&ops, me.get());
+                        let all_same = cores.windows(2).all(|w| w[0] == w[1]);
+                        assert!(
+                            all_same && cores.first() == Some(&(reads.len() as u64)),
+                            "world {}: rank {} reads rank {}'s block at {} starts — one per core \
+                             of the consume descriptor reading it ({cores:?})",
+                            T::RANKS,
+                            me.get(),
+                            s.get(),
+                            reads.len()
+                        );
                     }
                 }
             }

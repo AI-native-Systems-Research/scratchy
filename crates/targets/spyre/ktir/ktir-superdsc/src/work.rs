@@ -5,13 +5,14 @@
 //! 10,284-line `lower_subtile_tape_to_superdsc.rs` with 85 in-file call sites, which is exactly why
 //! an earlier pass deferred them: cutting eight holes in a file that was itself mid-move creates
 //! merge surface for code about to move again. They are pure arithmetic over types this crate
-//! already owns — [`ItDim`], [`WorkPlan`], [`MAX_CORES`] — so they are one module here and nothing
+//! already owns — [`ItDim`], [`WorkPlan`], the generation's core count — so they are one module here and nothing
 //! else changed.
 //!
 //! ⛔ THE SPYRE MODEL, NOT THE KTIR EMITTER'S. 256 MB/core span and a 64-element fp16 stick; the
 //! `pick_k`/`n_block` formulas in the KTIR emitter are H100's and are the wrong hardware.
 
-use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, MAX_CORES, WorkPlan};
+use crate::device_gen::{Baked, DeviceGen};
+use crate::superdsc_opspec::{CoreBudget, DataFormat, Df, Fp16, ItDim, WorkPlan};
 use std::collections::BTreeMap;
 
 /// Corelets per compute tile — READ from the baked generation's table
@@ -111,11 +112,11 @@ pub fn stick_count(elems: u32) -> u32 {
     elems.div_ceil(FP16_ELEMS_PER_STICK)
 }
 
-/// The 32-core split of one op's `[rows, cols]` output: `row_cores × stick_cores`, each core owning a
+/// The core split of one op's `[rows, cols]` output: `row_cores × stick_cores`, each core owning a
 /// contiguous row-chunk × stick-chunk. CANONICAL here (subtile) so the emitter and the Kani-verifying tower
 /// (`scratchy-sdsc`, which RE-EXPORTS this + proves it disjoint+covering) share ONE definition — no
 /// duplicate brain. Output dims are split largest-first (rows vs stick-count), each by `core_split`; a
-/// reduction dim is never split. `row_cores * stick_cores ≤ MAX_CORES`. (Was ported from `distribute_cores`,
+/// reduction dim is never split. `row_cores * stick_cores ≤` the generation's cores. (Was ported from `distribute_cores`,
 /// which the pointwise/reduce ops already use — so making matmul use THIS makes the whole emit one split.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoreSplit {
@@ -124,16 +125,13 @@ pub struct CoreSplit {
 }
 
 impl CoreSplit {
-    /// Distribute up to `MAX_CORES` over `[rows, cols]`: split the larger output extent first (rows by
-    /// row-count, cols by stick-count), each by `core_split`, with the cores left after the first.
-    pub fn plan(rows: u32, cols: u32) -> CoreSplit {
-        // ⭐ THE CAP IS `MAX_CORES`, AND IT IS THE ONLY CAP. The 1-core / N-core bisection
-        // knobs that used to narrow it were emit-time env reads, so the Kani proofs had to
-        // call `plan_capped(_, _, MAX_CORES)` explicitly to keep `cap` concrete — CBMC models
-        // `var_os` as nondeterministic, which unbounded the `core_split` loop. With the cap a
-        // constant, what the proofs check and what the emitter does are the same expression.
-        let cap = MAX_CORES;
-        Self::plan_capped(rows, cols, cap)
+    /// Distribute up to generation `G`'s cores over `[rows, cols]`: split the larger output extent first
+    /// (rows by row-count, cols by stick-count), each by `core_split`, with the cores left after the
+    /// first. Lowering code calls it at [`Baked`]; the Kani proofs name the generation they prove.
+    pub fn plan<G: DeviceGen>(rows: u32, cols: u32) -> CoreSplit {
+        // ⭐ THE CAP IS THE GENERATION'S CORE COUNT, AND IT IS THE ONLY CAP — a const of `G`, so what
+        // the proofs check and what the emitter does are the same expression.
+        Self::plan_capped(rows, cols, G::CORES)
     }
 
     /// The PURE planning math (no env, no I/O): distribute up to `cap` cores over `[rows, cols]`,
@@ -234,8 +232,8 @@ impl Fp16Sticks {
 pub fn bump_sticks_to_splittable(sticks: Fp16Sticks) -> u32 {
     let sticks = sticks.0;
     let n64 = sticks * FP16_ELEMS_PER_STICK;
-    let cur = core_split(sticks, MAX_CORES);
-    if cur >= MAX_CORES {
+    let cur = core_split(sticks, crate::device_gen::BUILD_CORES);
+    if cur >= crate::device_gen::BUILD_CORES {
         return n64; // already fills the machine
     }
     // ── FULL-OCCUPANCY PAD ───────────────────────────────────────────────────────────────────────
@@ -246,7 +244,7 @@ pub fn bump_sticks_to_splittable(sticks: Fp16Sticks) -> u32 {
     // largest tensor in the model (2048·49664·2 B ≈ 203 MB/token, ~7.7% of all weight bytes) streams
     // through a quarter of the machine.
     //
-    // Rounding to a multiple of MAX_CORES instead makes `core_split` exact: 800 = 32·25 ⇒ 32 cores.
+    // Rounding to a multiple of the core count instead makes `core_split` exact: 800 = 32·25 ⇒ 32 cores.
     // A matmul this shape is BANDWIDTH-bound in its core count, so 4× the cores is worth 3.1% more
     // bytes (+24 sticks). The emitter's own util-floor guard calls under-occupancy "the 1.45×
     // sengraph regression this emitter exists to fix" — this raises that floor to the whole machine.
@@ -267,14 +265,15 @@ pub fn bump_sticks_to_splittable(sticks: Fp16Sticks) -> u32 {
     // 8b decode step put the whole 49 ms the pad cost in the MLP group. 224 sticks on 32 cores is 7
     // sticks a core — a prime — so each of gate and up was time-tiled into 7 one-stick trips, where
     // 200 sticks on 25 cores is 8 a core and runs 4 two-stick trips.
-    let full = sticks.next_multiple_of(MAX_CORES);
-    if cur * 2 < MAX_CORES && (full - sticks) * 8 <= sticks {
+    let full = sticks.next_multiple_of(crate::device_gen::BUILD_CORES);
+    if cur * 2 < crate::device_gen::BUILD_CORES && (full - sticks) * 8 <= sticks {
         return full * FP16_ELEMS_PER_STICK;
     }
-    if cur >= UTIL_FLOOR_CORES {
+    if cur >= crate::device_gen::BUILD_UTIL_FLOOR_CORES {
         n64
     } else {
-        sticks.next_multiple_of(8) * FP16_ELEMS_PER_STICK
+        // The floor: round up to a stick count that divides over the generation's util-floor cores.
+        sticks.next_multiple_of(crate::device_gen::BUILD_UTIL_FLOOR_CORES) * FP16_ELEMS_PER_STICK
     }
 }
 
@@ -347,11 +346,9 @@ pub const FP8_PACKED_KERNEL_IN_GRAN: u32 = 2;
 // through KTIR. The chunk-major bank law they stated lives on where the token-plane
 // descriptor states it (`superdsc_opspec`'s token-plane form doc).
 
-/// ⭐ THE UTIL-FLOOR CORE COUNT — the minimum cores a FLOP-heavy matmul (`macs ≥ 2^20`) may be
-/// split onto. One constant for every reader: `DeviceWidth::for_matmul`'s windowed drop test,
-/// guard #11's refusal in the emitter, and `out_width_the_weight_holds`' floor test in the
-/// bridge. Previously three hard-coded `8`s that had to agree by hand (issue 201 item 5).
-pub const UTIL_FLOOR_CORES: u32 = 8;
+// ⭐ THE UTIL-FLOOR CORE COUNT is the generation's [`DeviceGen::UTIL_FLOOR_CORES`]: the minimum cores a
+// FLOP-heavy matmul (`macs ≥ 2^20`) may be split onto, read by `DeviceWidth::for_matmul`'s windowed drop
+// test, guard #11's refusal in the emitter and `out_width_the_weight_holds`' floor test in the bridge.
 
 /// A matmul OUTPUT/KERNEL **device stick width** — 64-aligned, and (for a FLOP-heavy gemm) core-splittable
 /// to ≥8 cores — BY CONSTRUCTION. TYPE-SAFE LOCK-DOWN of the padding/alignment invariant: the SOLE
@@ -380,7 +377,10 @@ impl DeviceWidth {
     pub fn for_matmul(m: u32, logical_n: u32, k: u32, windowed: bool) -> DeviceWidth {
         if windowed {
             let n64 = logical_n.next_multiple_of(FP16_ELEMS_PER_STICK);
-            if n64 > logical_n && CoreSplit::plan(m, logical_n).ncores() >= UTIL_FLOOR_CORES {
+            if n64 > logical_n
+                && CoreSplit::plan::<Baked>(m, logical_n).ncores()
+                    >= crate::device_gen::BUILD_UTIL_FLOOR_CORES
+            {
                 // The logical width already meets the util floor the bump was buying — and its
                 // stick rounding is kept by returning `n64`, not `logical_n`.
                 return DeviceWidth(n64);
@@ -453,10 +453,10 @@ pub fn distribute_cores(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str
     // 64-stick across ALL rows but the walk still advances each row by `eps` — so row `r` of out-core `c`
     // lands at `(c+r)·eps` (ROW-MIXING: scalarmul wrote only `mb+out/eps−1` of `mb·out/eps` stick-groups,
     // measured `nz=3968=(c+r)·64`). Splitting `mb` first makes each core own WHOLE rows (≤1 row/core for
-    // mq≤MAX_CORES), so the flat start alone places the row and there is no mb-stride to mis-walk — the
+    // mq ≤ cores), so the flat start alone places the row and there is no mb-stride to mis-walk — the
     // SAME reason the matmul (mb-split) is correct while the pointwise (out-split) was not. Byte-identical
     // at mb==1 (decode: `core_split(1,·)=1`, falls through to the out loop) and for single-stick ops (a
-    // 1-stick `out` can't split, so mb was split anyway). NOTE: mq>MAX_CORES leaves >1 row/core → the
+    // 1-stick `out` can't split, so mb was split anyway). NOTE: mq > cores leaves >1 row/core → the
     // mb-walk row-mixing returns; that regime needs the per-tensor flat `stride_map` (see
     // `element_arrangement_design.md`), not just the split.
     if let Some(mb) = dims
@@ -577,6 +577,23 @@ pub fn row_groups(dims: &[ItDim], max_cores: u32, n: u32) -> BTreeMap<&'static s
 }
 
 impl EwDivision {
+    /// ⭐ THE BUDGET THIS DIVISION SPENDS, for an op that moves `bytes` — the one place the byte law is
+    /// applied. The two divisions the elementwise law chooses between ([`Self::RowsFirst`],
+    /// [`Self::SticksFirst`]) are free choices of how to spread the op, so they spend the cores its
+    /// bytes pay for ([`CoreBudget::for_bytes`]): a decode-sized op runs on the few cores whose
+    /// fixed cost it needs, not on all of them. [`Self::Groups`] is a correctness law of its own —
+    /// one row group a core, so each core's LX holds the intermediates its group reads — and keeps
+    /// every core ([`CoreBudget::whole`]). [`Self::Law`] is not a division until it is resolved, and
+    /// spends what its resolution spends.
+    pub fn budget<G: DeviceGen>(self, bytes: u64) -> CoreBudget<G> {
+        match self {
+            EwDivision::Law | EwDivision::RowsFirst | EwDivision::SticksFirst => {
+                CoreBudget::for_bytes(bytes)
+            }
+            EwDivision::Groups(_) => CoreBudget::whole(),
+        }
+    }
+
     /// The concrete division. [`Self::Law`] resolves on the operands: `stick_major` is the builder's own
     /// rank-2 stick-major presentation decision — the SAME value that picks the operands' layout, so the
     /// layout and the division cannot disagree — and `core_local` is whether any operand is a core-local
@@ -1578,7 +1595,7 @@ mod kani_proofs {
 #[cfg(test)]
 mod layout_first_tests {
     use super::{distribute_cores_layout_first, layout_walk_is_whole};
-    use crate::superdsc_opspec::{Df, ItDim, MAX_CORES, MaxCores, WorkPlan};
+    use crate::superdsc_opspec::{Df, ItDim, WorkPlan};
 
     /// A row-split op's `[mb, out, y]` dims at one stick.
     fn dims(mb: u32, y: u32) -> Vec<ItDim> {
@@ -1607,7 +1624,7 @@ mod layout_first_tests {
                 for mb in (1..=64).chain([71, 96, 128, 256, 512]) {
                     let plan = WorkPlan::divide(
                         &dims(mb, y),
-                        MaxCores::<MAX_CORES>,
+                        crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
                         distribute_cores_layout_first(rows),
                     )
                     .unwrap_or_else(|e| panic!("{rows:?} y={y} mb={mb}: refused: {e}"));
@@ -1627,7 +1644,7 @@ mod layout_first_tests {
         let divide = |mb: u32, y: u32| {
             let plan = WorkPlan::divide(
                 &dims(mb, y),
-                MaxCores::<MAX_CORES>,
+                crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
                 distribute_cores_layout_first(["y", "mb"]),
             )
             .unwrap_or_else(|e| panic!("y={y} mb={mb}: {e}"));
@@ -1644,9 +1661,11 @@ mod layout_first_tests {
     /// measured row-mixing, stated as a plan.
     #[test]
     fn the_rows_split_under_every_spray_is_refused() {
-        let plan = WorkPlan::divide(&dims(21, 32), MaxCores::<MAX_CORES>, |_, _| {
-            [("mb", 21)].into_iter().collect()
-        })
+        let plan = WorkPlan::divide(
+            &dims(21, 32),
+            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+            |_, _| [("mb", 21)].into_iter().collect(),
+        )
         .expect("a 21-way row split is a valid plan");
         assert!(layout_walk_is_whole(&plan, ["y", "mb"]).is_err());
     }

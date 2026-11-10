@@ -25,7 +25,7 @@
 
 use super::tiled_op::TiledOp;
 use crate::sdsc_abstract::StickLayout;
-use crate::superdsc_opspec::{Df, FP16_BYTES, ItDim, MaxCores, WorkPlan};
+use crate::superdsc_opspec::{CoreBudget, Df, FP16_BYTES, ItDim, WorkPlan};
 
 /// The three op-kinds whose LX residency this crate hand-rolls today. Every new op kind must be added
 /// here (exhaustive match in [`TileOp::resident_bytes`]) — there is no `_ => `, so a fourth residency
@@ -73,6 +73,42 @@ impl TileOp {
         }
     }
 
+    /// The bytes this op moves: every operand's tile at the op's own extents. A pointwise or reduce
+    /// op's operands each span its whole iteration space (`n_operands` of them); a seeded reduce
+    /// reads its data and writes one accumulator stick per row. A matmul's three operands are its
+    /// activation `[mb, in]`, kernel `[in, out]` and output `[mb, out]`, each over its batch. This is
+    /// what [`crate::superdsc_opspec::CoreBudget::for_bytes`] spends cores on.
+    pub fn operand_bytes(&self) -> u64 {
+        let ext = |name: &str| {
+            self.dims
+                .iter()
+                .find(|d| d.name == name)
+                .map_or(1, |d| d.size as u64)
+        };
+        let word = self.df.word_length() as u64;
+        let batch = ext("x").max(1) * ext("y").max(1);
+        match self.kind {
+            TileOpKind::PointwiseOrReduce { n_operands } => {
+                let elems: u64 = self.dims.iter().map(|d| d.size.max(1) as u64).product();
+                n_operands as u64 * elems * word
+            }
+            TileOpKind::SeededReduce => {
+                let elems: u64 = self.dims.iter().map(|d| d.size.max(1) as u64).product();
+                let rows: u64 = self
+                    .dims
+                    .iter()
+                    .filter(|d| !d.is_stick && !d.is_reduction)
+                    .map(|d| d.size.max(1) as u64)
+                    .product();
+                (elems + rows * self.df.elems_per_stick() as u64) * word
+            }
+            TileOpKind::Matmul => {
+                let (m, k, n) = (ext("mb"), ext("in"), ext("out"));
+                (m * k + k * n + m * n) * batch * word
+            }
+        }
+    }
+
     /// The per-core LX residency for THIS op's kind, at a given `out_per_time` (the same shape
     /// `time_tile_for_lx` passes to `resident_bytes_fn`). Dispatches to the existing, unchanged
     /// `matmul_lx_resident`/`pointwise_lx_resident` math — see their Kani-proven equivalence below;
@@ -93,9 +129,9 @@ impl TileOp {
     /// Run the full tiler (Bridge 2: `crate::ir::bridge::tile_op_tiled_op`) over THIS declaration's
     /// dims/kind. Thin wrapper — kept here, not inlined at call sites, so every existing
     /// `some_tile_op.tile(...)` call in the emitter is unaffected by where the orchestration lives.
-    pub fn tile<const N: u32>(
+    pub fn tile<G: crate::device_gen::DeviceGen>(
         &self,
-        budget: MaxCores<N>,
+        budget: CoreBudget<G>,
         splitter: impl Fn(&[ItDim], u32) -> std::collections::BTreeMap<&'static str, u32>,
         tiled_dim: &'static str,
     ) -> Result<TiledOp, crate::superdsc_error::SuperDscError> {
@@ -208,7 +244,7 @@ mod proofs {
                 df: Df::Fp16,
             },
         ];
-        WorkPlan::divide(&dims, MaxCores::<32>, |_, _| Default::default()).unwrap()
+        WorkPlan::divide(&dims, crate::device_gen::whole(), |_, _| Default::default()).unwrap()
     }
 
     /// `TileOp::resident_bytes` for `PointwiseOrReduce` matches the ORIGINAL hand-rolled formula at

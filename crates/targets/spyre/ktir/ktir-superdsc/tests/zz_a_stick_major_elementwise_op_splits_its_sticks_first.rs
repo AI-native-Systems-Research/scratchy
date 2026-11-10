@@ -16,7 +16,7 @@
 
 use ktir_superdsc::emit::{In, assemble_pointwise_broadcast_off};
 use ktir_superdsc::sdsc_abstract::{BlockCols, RowBlockedTag, RowCount, StickLayout, Stk};
-use ktir_superdsc::superdsc_opspec::{Df, ItDim, MAX_CORES, MaxCores, WorkPlan};
+use ktir_superdsc::superdsc_opspec::{Df, ItDim, WorkPlan};
 use ktir_superdsc::work::{
     EwDivision, core_to_wk_slice, distribute_cores, distribute_cores_sticks_first,
 };
@@ -57,12 +57,24 @@ fn the_sticks_first_plan_tiles_every_shape_on_at_least_as_many_cores() {
     let mut wider = 0usize;
     for (rows, cols) in grid() {
         let d = dims(rows, cols);
-        let plan = WorkPlan::divide(&d, MaxCores::<MAX_CORES>, distribute_cores_sticks_first)
-            .unwrap_or_else(|e| panic!("[{rows}, {cols}]: sticks-first plan refused: {e}"));
-        let rows_first = WorkPlan::divide(&d, MaxCores::<MAX_CORES>, distribute_cores)
-            .unwrap_or_else(|e| panic!("[{rows}, {cols}]: rows-first plan refused: {e}"));
+        let plan = WorkPlan::divide(
+            &d,
+            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            distribute_cores_sticks_first,
+        )
+        .unwrap_or_else(|e| panic!("[{rows}, {cols}]: sticks-first plan refused: {e}"));
+        let rows_first = WorkPlan::divide(
+            &d,
+            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            distribute_cores,
+        )
+        .unwrap_or_else(|e| panic!("[{rows}, {cols}]: rows-first plan refused: {e}"));
         let cores = plan.cores_used().get();
-        assert!(cores <= MAX_CORES, "[{rows}, {cols}]: {cores} cores");
+        assert!(
+            cores
+                <= <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
+            "[{rows}, {cols}]: {cores} cores"
+        );
         assert!(
             cores >= rows_first.cores_used().get(),
             "[{rows}, {cols}]: sticks-first uses {cores} cores, rows-first {}",
@@ -107,10 +119,10 @@ fn the_sticks_first_plan_tiles_every_shape_on_at_least_as_many_cores() {
         // win #549's (e) cells measured. Checked against the whole candidate set, not against the code's
         // own search.
         let sticks = cols / STICK;
-        let best = (1..=sticks.min(MAX_CORES))
+        let best = (1..=sticks.min(<ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES))
             .filter(|c| sticks.is_multiple_of(*c))
             .flat_map(|c| {
-                (1..=(MAX_CORES / c).min(rows))
+                (1..=(<ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES / c).min(rows))
                     .filter(move |m| rows.is_multiple_of(*m))
                     .map(move |m| (c * m, c))
             })
@@ -137,7 +149,7 @@ fn the_measured_shapes_split_their_sticks_first() {
     let split = |rows: u32, cols: u32| {
         let p = WorkPlan::divide(
             &dims(rows, cols),
-            MaxCores::<MAX_CORES>,
+            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
             distribute_cores_sticks_first,
         )
         .unwrap();
@@ -157,8 +169,12 @@ fn the_measured_shapes_split_their_sticks_first() {
     // a 4-request decode rung on the 2b MLP: out:32, where rows-first made mb:4 × out:8.
     assert_eq!(split(4, 8192), (1, 32));
     // Rows-first, for contrast: the division it replaces.
-    let rows_first =
-        WorkPlan::divide(&dims(256, 8192), MaxCores::<MAX_CORES>, distribute_cores).unwrap();
+    let rows_first = WorkPlan::divide(
+        &dims(256, 8192),
+        ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+        distribute_cores,
+    )
+    .unwrap();
     assert_eq!(
         (rows_first.split_of("mb"), rows_first.split_of("out")),
         (32, 1)
@@ -292,10 +308,14 @@ fn the_pointwise_door_splits_a_stick_major_op_by_its_sticks() {
         (32, 1),
         "a non-block column window stated as a bare offset is flat: rows first"
     );
+    // One row: a decode-sized op spends the cores its bytes pay for (`CoreBudget::for_bytes`) — a
+    // `[1, 8192]` multiply moves 3 × 16 KiB = 48 KiB, 16 cores at gen1's 3 KiB a core, where the
+    // whole-machine split took 32. (Measured: a chained `[1, 8192]` add costs 0.86 µs on 16 cores
+    // against 0.87 on 32; at `[1, 2048]` the cap's 4 cores cost 0.51 against 0.80.)
     assert_eq!(
         emitted_split(1, 8192, 8192, 0),
-        (1, 32),
-        "one row: unchanged"
+        (1, 16),
+        "one row: the byte law's 16 cores"
     );
 }
 

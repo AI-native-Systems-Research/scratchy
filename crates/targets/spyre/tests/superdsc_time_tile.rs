@@ -27,8 +27,8 @@ use ktir_superdsc::emit;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
 use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
 use scratchy_subtile::superdsc_opspec::{
-    Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, MAX_CORES, MaxCores, OpFunc, Role, Scale,
-    TensorArg, USABLE_LX_BYTES, WorkPlan,
+    Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, OpFunc, Role, Scale, TensorArg,
+    USABLE_LX_BYTES, WorkPlan,
 };
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 use std::collections::BTreeMap;
@@ -417,12 +417,14 @@ fn rmsnorm_rinv_is_pinned_lx() {
     assert_eq!(w_name, "rmrsqrt_g");
     assert_eq!(
         wj["numCoresUsed_"].as_u64(),
-        Some(MAX_CORES as u64),
+        Some(
+            <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES as u64
+        ),
         "an LX-resident output's producer REPLICATES across all cores"
     );
     assert_eq!(
         wj["coreIdToDsc_"].as_object().unwrap().len(),
-        MAX_CORES as usize
+        <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES as usize
     );
     assert!(
         wj["numWkSlicesPerDim_"]
@@ -499,7 +501,9 @@ fn rmsnorm_rinv_is_pinned_lx() {
     let (_, wj1) = json_of(&ops1[2]);
     assert_eq!(
         wj1["numCoresUsed_"].as_u64(),
-        Some(MAX_CORES as u64),
+        Some(
+            <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES as u64
+        ),
         "the m=1 producer replicates too (a 1-core producer would leave cores 1..31 \
          reading an empty scratchpad)"
     );
@@ -1135,9 +1139,11 @@ fn matmul_plan(m: u32, n: u32, k: u32, batch: u32, mb: u32, out: u32) -> WorkPla
             is_stick: false,
         },
     ];
-    WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
-        BTreeMap::from([("mb", mb), ("out", out)])
-    })
+    WorkPlan::divide(
+        &dims,
+        ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+        |_, _| BTreeMap::from([("mb", mb), ("out", out)]),
+    )
     .unwrap()
 }
 
@@ -1321,7 +1327,13 @@ fn dump_gate_bundles() {
     ];
     let mut wrote_b = false;
     for &(m, n, k, b, label) in candidates {
-        let s = superdsc::matmul_cost_split(b, m, n, k, MAX_CORES);
+        let s = superdsc::matmul_cost_split(
+            b,
+            m,
+            n,
+            k,
+            <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
+        );
         let per_core_mb = (m / s.m).max(1) as u64;
         let per_core_out = (n / s.n) as u64;
         let kk = k as u64;
