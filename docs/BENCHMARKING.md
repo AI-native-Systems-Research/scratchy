@@ -450,12 +450,22 @@ scratchy is 1.24× to 2.6× faster to its first token at 1 user on every model.
   its turns follow one another, each after the last has answered.
 
 **Comparable answers:** a timed cell forces every answer to its task's length
-(`bench serve --timed-answers`: `ignore_eos`), the same on every engine: a RAG task's 64 tokens,
-a conversation turn's recorded reply, a shared-prefix question's 32. Answers ending on their own
-are each engine's own length, so their total time is not like for like. Accuracy is therefore not
-scored on timed cells; `--full`'s `rag-accuracy` cell scores it, its answers running free, closed
-loop. A span query (`rag-spans`, scratchy's own row) cannot be forced: its answers end on their
-own, so its total time is scratchy's alone and is not compared.
+(`bench serve --timed-answers`: `ignore_eos`), the same on every engine: a conversation turn's
+recorded reply, a shared-prefix question's 32. Answers ending on their own are each engine's own
+length, so their total time is not like for like, and accuracy is not scored on timed cells.
+
+**MuSiQue answers end on their own** (#1208), in every MuSiQue cell (`rag`, `rag-spans`,
+`rag-accuracy`), so each is scored for accuracy. A real MuSiQue answer is about 6 to 12 tokens.
+Forced to 64, most of each answer was text past where the model would have stopped. An engine
+that drafts tokens ahead (scratchy's MTP heads, Splash's DFlash draft) guesses that text far
+worse than the answer itself: on qwen3.6-35b-a3b at 1 user, 76% of its drafts were accepted
+inside the answer and 23% past it. So the cell's TPOT measured the padding, and made drafting look
+slower than decoding without it, when on the real answers it is faster (3.5 against 4.6 ms a
+token). The cost: answers differ in length across engines, so the end-to-end rows (2u, 4u)
+compare somewhat different amounts of work. The detail table sets two engines' total times
+against each other only where their answers are about one length. A span query (`rag-spans`,
+scratchy's own row) could never be forced, so its total time is scratchy's alone and is not
+compared.
 
 **Timeouts:** with `--open-loop`, a cell's limit adds its arrival schedule's own span (its requests over the
 rate), so a low rate is not taken for a hung server: 16 tasks at 0.03/s take 534 s before any is
