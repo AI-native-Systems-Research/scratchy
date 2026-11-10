@@ -1755,10 +1755,17 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // stick — a one-stick window never crosses a column plane and needs no declaration): the
     // band's bytes are a stick-major tensor of the parent's, so the walk must stride the parent's
     // column planes at the parent's `parent_rows·lanes` pitch, never at the band's own fewer
-    // rows'. ⛔ A PITCH, NOT A WINDOW: the pinned walk (`maxDimSizes_`) is a size cap dxp never
-    // reads as a stride — MEASURED on the card (microbenchmark, 2026-11-08), a multi-stick band
-    // placed stick `j` at `j·rows·64` through it, and `backGapCore_[mb] = parent − rows` (what a
-    // pitch emits) read and wrote it bit-exact.
+    // rows'. ⛔ A PITCH, NOT A WINDOW: the pin (`maxDimSizes_`) CAPS a dim's per-step size
+    // (`dsc2.cpp:2806-2815`) and never moves a landing — a landing past the swept extent is moved
+    // only by `backGapCore_` (`dsc2.cpp:2900-2924`). MEASURED on the card (microbenchmark,
+    // 2026-11-08): a multi-stick band crossing its column planes through the pinned form placed
+    // stick `j` wrong, and `backGapCore_[mb] = parent − rows` (what a pitch emits) read and wrote
+    // it bit-exact — a crossing walk is correct only through the back gap. MEASURED on the
+    // non-crossing side (the b2 bake, three granite configs): every descriptor whose pin was
+    // restated AT the declared extent replied byte-identical — the pin at the declared extent
+    // caps nothing (`min(visible, declared) = visible`), so the restatement changes no size the
+    // walk reads. A pinned walk is correct exactly while no loop landing crosses the swept extent
+    // within the allocation; the crossing stride exists only as the back gap.
     let mk = |is_input: bool,
               name: &str,
               scale: [Scale; 3],

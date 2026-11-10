@@ -5287,9 +5287,15 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
     .map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_convert_band {op_name}: {e}"))
     })?;
-    // ⛔ THE PARENT IS A PITCH, NOT A WINDOW — the band door's law (`with_pitch`): the pinned walk
-    // is a size cap the card never strides by (MEASURED, microbenchmark 2026-11-08), the back gap
-    // `parent − rows` is the stride.
+    // ⛔ THE PARENT IS A PITCH, NOT A WINDOW — the band door's law (`with_pitch`): the pin
+    // (`maxDimSizes_`) CAPS a dim's per-step size (`dsc2.cpp:2806-2815`) and never moves a
+    // landing — a landing past the swept extent is moved only by `backGapCore_`
+    // (`dsc2.cpp:2900-2924`) — so the back gap `parent − rows` is the stride. MEASURED both
+    // ways: crossing walks (microbenchmark 2026-11-08) read 0 rows correct through the pin and
+    // every row through the gap; non-crossing walks (the b2 bake, three granite configs) replied
+    // byte-identical through pin restatements at the declared extent, structurally — such a pin
+    // caps nothing. A pinned walk is correct exactly while no loop landing crosses the swept
+    // extent within the allocation; the crossing stride exists only as the back gap.
     let plan = op.iter.clone();
     for (arg, w) in op.args_mut().iter_mut().zip([in_w, o_w]) {
         if let Some(w) = w {
