@@ -86,6 +86,8 @@ pub const SEG_KV: SegIdx = SegIdx::known::<2>();
 /// MASK (seg3) — the prefix-validity mask, in its own segment precisely so a fold can shift it
 /// without disturbing the running softmax state or any other activation.
 pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
+/// LOGITS (seg4) — the single graph output; the per-step D2H readback lands in its host shadow.
+pub const SEG_LOGITS: SegIdx = SegIdx::known::<4>();
 
 /// ⭐ THE SEGMENTS A BORROWER ADOPTS INSTEAD OF FILLING — the resident ones. Three sites read this
 /// (host-shadow sizing, device sizing, H2D) and they MUST agree: a segment sized as a placeholder but
@@ -632,13 +634,25 @@ fn h2d_run(offset: u64, len: u64) -> (u64, u64) {
 /// The H2D window alignment [`h2d_run`] rounds to.
 const H2D_ALIGN: u64 = 4096;
 
-/// The fill window step — `zero_seg`'s own walk step, shared by `prepare`'s device-side
-/// zero fills so both submit the same single-chunk window shapes (the window size only
+/// The fill window step — the walk step of EVERY device-side zero fill, so `zero_seg` and
+/// `prepare`'s fills submit the same single-chunk window shapes (the window size only
 /// sets how many fill control blocks the walk submits; no host buffer rides the fill).
 const FILL_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
     Some(w) => w,
     None => unreachable!(),
 };
+
+/// ⭐ THE ONE ZERO-FILL WALK: [`DevAddr::windows`] at [`FILL_WINDOW`], so a multi-chunk
+/// (interleaved) region is filled chunk by chunk — every byte the region owns, none it does
+/// not — and each window is the single-chunk shape the fill control block resolves. Every
+/// device-side fill goes through here (`zero_seg`, `prepare`'s segment and bank fills); a
+/// second copy would drift from this one's window shape.
+fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
+    for w in addr.windows(FILL_WINDOW) {
+        stream.fill_zero(&w).map_err(|e| anyhow!("{what}: {e}"))?;
+    }
+    Ok(())
+}
 
 /// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
 /// whatever page size the host actually uses.
@@ -900,14 +914,17 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     prepared: bool,
     staged_host: bool,
     n_weights_staged: usize,
-    /// ⭐ THE STAGED EXTENT OF EVERY SLOT (segments then extra weight banks, the
-    /// `slot_of` order): one past the last byte `stage_weights` wrote into that
-    /// slot's shadow. A slot whose extent is 0 holds ONLY the zeros its shadow was
-    /// born with — `prepare` zero-fills that slot's region ON THE DEVICE
-    /// ([`Stream::fill_zero`], ~62 GB/s measured) instead of pushing those zeros
-    /// over the host→device wire (~6-7 GB/s), which for the KV pool alone is
-    /// ~10 GB of wire time. Recorded by [`Executor::stage_weights`] so the one
-    /// pass that writes the shadows is the one pass that measures them.
+    /// ⭐ THE STAGED EXTENT OF EVERY SLOT (segments then extra weight banks, the `slot_of`
+    /// order): one past the last byte `stage_weights` writes into that slot's shadow, for
+    /// every slot, unconditionally. Two readers, both of which must be able to trust a `0`:
+    /// shadow sizing (a slot nothing stages into and nothing host-mirrors is DEVICE-ONLY —
+    /// placeholder shadow, no memset, no RSS) and `prepare`'s send routing (a slot nothing
+    /// stages into is zero-filled ON THE DEVICE by [`Stream::fill_zero`], ~62 GB/s measured,
+    /// instead of pushing born-zero shadow bytes over the wire at ~6-7 GB/s — for the KV pool
+    /// alone that is ~10 GB of wire time). The record is written by [`Executor::stage_weights`],
+    /// the one pass that stages, and `prepare` REFUSES on a record that does not cover every
+    /// slot — a missing entry would silently zero-fill weights, so it is an `Err`, never a
+    /// default.
     staged_extent: Vec<u64>,
     /// ⭐ TENSORDUMP STATE (`SCRATCHY_SDSC_TENSORDUMP`): this session's last-seen bytes per placed
     /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
@@ -2061,40 +2078,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             return Ok(());
         }
         // NOTHING BOUND ⇒ this session holds allocations only; it is aliased onto an owner's
-        // populated regions before use, so every host shadow here is dead. Sizing them at the
-        // placeholder skips a 2.6 GB memset for the weight segment — measured as 2.134s on the
-        // batched-prefill session, which binds nothing precisely because its ALLOCATION is the
-        // point and its bytes are not.
+        // populated regions before use, so every host shadow here is dead. The shadows are sized
+        // BELOW, once the staged extents say which slots carry content at all.
         let reserve_only = !self.binds_resident();
-        for i in 0..NUM_SEGMENTS {
-            // A BORROWED segment is never staged or H2D'd by this session, so it gets the
-            // placeholder rather than a zero-fill the width of the whole segment. ...but ONLY for
-            // the segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segments are bound
-            // per-forward by this very session and must keep their real size.
-            let aliased_later = reserve_only && is_resident_seg(i);
-            let bytes = if self.seg_borrowed[i] || aliased_later {
-                128
-            } else if self.segment_bytes[i] > 0 {
-                self.segment_bytes[i] as usize
-            } else {
-                128
-            };
-            self.seg_host[i] = vec![0u8; bytes];
-        }
-        // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK, sized the same way. A bank holds only weights, so
-        // it follows the RESIDENT rule exactly: a session that binds nothing gets a placeholder
-        // because an owner's region will replace it.
-        for b in 0..self.weight_bank_bytes.len() {
-            // A HOST placeholder allowance, NOT the flit: an empty or borrowed bank
-            // gets a minimal host buffer so the vec exists — nothing in the device
-            // law ties this number to the stick (an owner's region replaces it).
-            let bytes = if reserve_only || self.seg_borrowed[SEG_WEIGHT.get()] {
-                128
-            } else {
-                self.weight_bank_bytes[b].max(128) as usize
-            };
-            self.weight_bank_host[b] = vec![0u8; bytes];
-        }
 
         // ── Collect the weight placements, validating each against its own extent. ──
         // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
@@ -2171,14 +2157,22 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     self.weight_bank_bytes.len() + 1
                 );
             };
-            if p.offset as usize + src.len() > self.shadow(slot).len() {
+            // ⭐ MEASURED AGAINST THE SLOT'S DECLARED CAPACITY, not this session's shadow: the
+            // shadows are sized after this loop (a reserving or borrowing session stages nothing,
+            // so its shadows are placeholders), but the placement has to fit the segment the
+            // bundle DECLARES regardless of who stages it.
+            let cap = match slot.checked_sub(NUM_SEGMENTS) {
+                None => self.segment_bytes[slot],
+                Some(b) => self.weight_bank_bytes[b],
+            };
+            if p.offset as usize + src.len() > cap as usize {
                 bail!(
                     "stage: weight '{nm}' off {} + {} B exceeds seg{} bank {} ({} B)",
                     p.offset,
                     src.len(),
                     p.segment,
                     p.bank,
-                    self.shadow(slot).len()
+                    cap
                 );
             }
             let mode = if self.const_fp32_ids.contains(nm) {
@@ -2216,6 +2210,66 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 src,
                 mode,
             });
+        }
+
+        // ⭐ THE STAGED EXTENT PER SLOT, recorded by the one pass that knows it: one past the
+        //    last byte the items write into each slot's shadow. Everything past this in a
+        //    shadow is the zero it was born with, which is exactly what `prepare`'s
+        //    device-side fill replaces the zero-push for.
+        let n_slots = NUM_SEGMENTS + self.weight_bank_bytes.len();
+        let mut extent = vec![0u64; n_slots];
+        for it in &items {
+            let end = (it.offset + it.src.len()) as u64;
+            if end > extent[it.slot] {
+                extent[it.slot] = end;
+            }
+        }
+        self.staged_extent = extent;
+
+        // ── Size the host shadows BY ROLE + THE ONE FACT ABOVE. A slot needs a real shadow iff
+        //    something STAGES into it (weights — the weight segment, its banks, or a spilled
+        //    tail in an intermediate colour slot) or the SESSION KEEPS USING IT after prepare
+        //    (the mask segment, which the host writes every step; the logits segment, which the
+        //    per-step D2H reads back into). Everything else — the KV pool, the intermediates —
+        //    is DEVICE-ONLY: its bytes never touch the host, so it gets the 128 B placeholder
+        //    and `prepare` fills its region on the device. That deletes the ~10 GB KV shadow a
+        //    2b model allocated, memset, and kept in RSS for the session's whole life. ──
+        for i in 0..NUM_SEGMENTS {
+            // A BORROWED segment is never staged or H2D'd by this session, so it gets the
+            // placeholder rather than a zero-fill the width of the whole segment. ...but ONLY for
+            // the segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segments are bound
+            // per-forward by this very session and must keep their real size.
+            let aliased_later = reserve_only && is_resident_seg(i);
+            let mirrored = i == SEG_MASK.get() || i == SEG_LOGITS.get();
+            let bytes = if self.seg_borrowed[i]
+                || aliased_later
+                || !(mirrored || self.staged_extent[i] > 0)
+            {
+                128
+            } else if self.segment_bytes[i] > 0 {
+                self.segment_bytes[i] as usize
+            } else {
+                128
+            };
+            self.seg_host[i] = vec![0u8; bytes];
+        }
+        // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK: a bank holds only weights, so it follows the
+        // staged rule exactly — a bank nothing stages into is device-only (placeholder + device
+        // fill), and a session that binds nothing or borrows the weight segment stages into no
+        // bank at all.
+        for b in 0..self.weight_bank_bytes.len() {
+            // A HOST placeholder allowance, NOT the flit: an empty, unstaged or borrowed bank
+            // gets a minimal host buffer so the vec exists — nothing in the device
+            // law ties this number to the stick (an owner's region replaces it).
+            let bytes = if reserve_only
+                || self.seg_borrowed[SEG_WEIGHT.get()]
+                || self.staged_extent[NUM_SEGMENTS + b] == 0
+            {
+                128
+            } else {
+                self.weight_bank_bytes[b].max(128) as usize
+            };
+            self.weight_bank_host[b] = vec![0u8; bytes];
         }
 
         // ── Hand each item its OWN destination sub-slice. Splitting the segment buffers this way
@@ -2294,19 +2348,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         });
 
         self.n_weights_staged = n_items;
-        // ⭐ THE STAGED EXTENT PER SLOT, recorded by the one pass that knows it: one past the
-        //    last byte the items write into each slot's shadow. Everything past this in a
-        //    shadow is the zero it was born with, which is exactly what `prepare`'s
-        //    device-side fill replaces the zero-push for.
-        let n_slots = NUM_SEGMENTS + self.weight_bank_bytes.len();
-        let mut extent = vec![0u64; n_slots];
-        for it in &items {
-            let end = (it.offset + it.src.len()) as u64;
-            if end > extent[it.slot] {
-                extent[it.slot] = end;
-            }
-        }
-        self.staged_extent = extent;
         self.staged_host = true;
         Ok(())
     }
@@ -2455,14 +2496,27 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
 
         // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
-        //    critical path. Then grow each seg_host to the device alloc's size (alignment pad,
-        //    zero) so the H2D copies a full region. ──
+        //    critical path. Then grow each STAGED seg_host to the device alloc's size (alignment
+        //    pad, zero) so the H2D copies a full region. Unstaged slots never H2D their shadow, so
+        //    they stay at the size `stage_weights` gave them (real for the host-mirrored mask and
+        //    logits segments, placeholder for the device-only ones). ──
         self.stage_weights()?;
+        // ⛔ THE EXTENT RECORD MUST COVER EVERY SLOT. A short record would turn an uncovered slot
+        // into a silent device fill — for the weight segment that swaps weights for zeros — so a
+        // disagreement between the two passes is a refusal, never a default.
+        let n_slots = NUM_SEGMENTS + self.weight_bank_bytes.len();
+        if self.staged_extent.len() != n_slots {
+            bail!(
+                "prepare: the staged extent covers {} slot(s), but this session has {n_slots} — \
+                 stage_weights and prepare disagree about the slot space",
+                self.staged_extent.len()
+            );
+        }
         let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
-            // Same rule as the staging shadow: skip only what an alias replaces. Activation
-            // segments still grow to the device extent, because this session fills them itself.
-            if reserve_only && is_resident_seg(i) {
+            // Same rule as the staging shadow: skip only what an alias replaces, and grow only
+            // what this send loop is about to H2D in full.
+            if (reserve_only && is_resident_seg(i)) || self.staged_extent[i] == 0 {
                 continue;
             }
             let need = self.seg_addr[i]
@@ -2473,9 +2527,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
         }
         // The weight banks follow the weight segment's own rule exactly: grow to the device extent
-        // unless an alias is about to replace the region.
+        // unless an alias is about to replace the region, and only when something stages there.
         if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
             for b in 0..self.weight_bank_bytes.len() {
+                if self.staged_extent[NUM_SEGMENTS + b] == 0 {
+                    continue;
+                }
                 let need = self.weight_bank_addr[b]
                     .as_ref()
                     .map_or(0, |a| a.total_size().as_u64()) as usize;
@@ -2487,11 +2544,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let n_weights = self.n_weights_staged;
         lap("weight-convert", &mut t0);
 
-        // ── SEND every tensor-segment region's content ONCE (weights staged in seg1; the rest
-        //    zero-init). A slot NOTHING was staged into holds only its shadow's born-zeros —
-        //    those go out as a DEVICE-SIDE FILL ([`Stream::fill_zero`], ~62 GB/s measured)
-        //    instead of host-pushed H2D bytes (~6-7 GB/s), which for the KV pool alone is
-        //    ~10 GB of wire time on a 2b model. Activations refill per predict. ──
+        // ── SEND every tensor-segment region's content ONCE, ROUTED BY WHAT THE SLOT CARRIES:
+        //    a slot weights were STAGED into (the weight segment, its banks, a spilled tail in
+        //    an intermediate colour) goes out by host H2D from its shadow; every other slot —
+        //    the KV pool, the intermediates, an unstaged mask/logits segment — holds only zeros
+        //    at boot, and those go out as a DEVICE-SIDE FILL ([`Stream::fill_zero`], ~62 GB/s
+        //    measured) instead of host-pushed H2D bytes (~6-7 GB/s), which for the KV pool alone
+        //    is ~10 GB of wire time on a 2b model. Activations refill per predict. ──
         for i in 0..NUM_SEGMENTS {
             // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
@@ -2505,7 +2564,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 continue;
             }
             let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
-            let staged = self.staged_extent.get(i).copied().unwrap_or(0);
+            let staged = self.staged_extent[i];
             if d.prep_time {
                 eprintln!(
                     "[sdsc-prep-time] seg{i}: region {} B, staged extent {staged} B → {}",
@@ -2518,13 +2577,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 );
             }
             if staged == 0 {
-                // The same walk `zero_seg` submits: 64 MiB single-chunk windows, every
-                // byte the region owns, none it does not. No host buffer rides the fill.
-                for w in addr.windows(FILL_WINDOW) {
-                    stream
-                        .fill_zero(&w)
-                        .map_err(|e| anyhow!("prepare: seg{i} zero fill: {e}"))?;
-                }
+                fill_zero_walk(stream, addr, &format!("prepare: seg{i} zero fill"))?;
                 continue;
             }
             // The shadow was grown to the device extent by the loop above, so this slice is the
@@ -2548,17 +2601,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         .as_ref()
                         .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
                 );
-                let staged = self
-                    .staged_extent
-                    .get(NUM_SEGMENTS + b)
-                    .copied()
-                    .unwrap_or(0);
+                let staged = self.staged_extent[NUM_SEGMENTS + b];
                 if staged == 0 {
-                    for w in addr.windows(FILL_WINDOW) {
-                        stream.fill_zero(&w).map_err(|e| {
-                            anyhow!("prepare: weight bank {} zero fill: {e}", b + 1)
-                        })?;
-                    }
+                    fill_zero_walk(
+                        stream,
+                        addr,
+                        &format!("prepare: weight bank {} zero fill", b + 1),
+                    )?;
                     continue;
                 }
                 let src = whole_shadow(&self.weight_bank_host[b], addr, NUM_SEGMENTS + b)?;
@@ -2613,7 +2662,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             for (i, (host, has_act)) in self.seg_host.iter_mut().zip(seg_has_activation).enumerate()
             {
-                // The KV shadow backs read_seg/write_seg — keep it.
+                // The KV shadow is a device-only placeholder now (read_seg grows one on
+                // demand), so this keep is about the mirrored segments: has_act covers the
+                // mask segment and anything else the host re-binds per step.
                 if i == SEG_KV.get() || has_act {
                     continue;
                 }
@@ -3677,6 +3728,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let mut line = format!("[optrace] op[{oi}]");
         for i in [0usize, 2, 3, 4, 5, 6] {
             let seg = SegIdx::checked(i as i64).expect("literal < NUM_SEGMENTS");
+            // Device-only segments hold a placeholder shadow; this probe wants their real bytes,
+            // so it materializes the mirror first (`read_seg`'s own rule).
+            let _ = self.mirror_seg_shadow(seg);
             let got = self.d2h_seg_clamped(seg);
             let stat = match got {
                 Ok(got) => {
@@ -4277,6 +4331,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if want == LogitsRead::ReadBack {
             let seg = SegIdx::checked(lp.segment as i64)
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
+            // The shadow the readback lands in must cover the window below (and the multi-chunk
+            // fallback reads the WHOLE region): the mirrored shadow is sized to the segment's
+            // placements, so grow it to the region's padded extent first.
+            self.mirror_seg_shadow(seg)?;
             d2h_seg = lp.segment as i64;
             let addr = self.seg_addr[seg.get()].as_ref().unwrap();
             let tot = addr.total_size().as_u64();
@@ -5359,11 +5417,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // The window size only sets how many fill control blocks the walk submits (each is a
         // fixed enqueue cost on both host and device); no host buffer rides the fill.
         let stream = self.stream_ref()?;
-        for win in addr.windows(FILL_WINDOW) {
-            stream
-                .fill_zero(&win)
-                .map_err(|e| anyhow!("zero fill (seg{i}): {e}"))?;
-        }
+        fill_zero_walk(stream, addr, &format!("zero fill (seg{i})"))?;
         stream
             .synchronize()
             .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
@@ -5371,9 +5425,33 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     }
 
     /// D2H the WHOLE tensor segment (raw sen-fp16 bytes, NO conversion).
+    ///
+    /// ⭐ MATERIALIZES THE SHADOW FIRST (see [`Self::mirror_seg_shadow`]): device-only segments
+    /// carry a 128 B placeholder, and a clamped short read here would quietly hide most of the
+    /// segment this door exists to show.
     pub fn read_seg(&mut self, seg: SegIdx) -> Result<Vec<u8>> {
+        let i = seg.get();
+        self.mirror_seg_shadow(seg)?;
         let got = self.d2h_seg_clamped(seg)?;
-        Ok(self.seg_host[seg.get()][..got.min(self.seg_host[seg.get()].len())].to_vec())
+        Ok(self.seg_host[i][..got.min(self.seg_host[i].len())].to_vec())
+    }
+
+    /// Grow `seg`'s host shadow to its device region's full extent. Device-only segments (the
+    /// KV pool, the intermediates) carry a 128 B placeholder after [`Executor::stage_weights`] —
+    /// nothing in a forward ever touches their host side — so the inspection doors that DO want
+    /// their bytes (`read_seg`, `optrace`) materialize a mirror here, on demand. Returns the
+    /// region's size in bytes.
+    fn mirror_seg_shadow(&mut self, seg: SegIdx) -> Result<usize> {
+        let i = seg.get();
+        let dev = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?
+            .total_size()
+            .as_u64() as usize;
+        if self.seg_host[i].len() < dev {
+            self.seg_host[i].resize(dev, 0);
+        }
+        Ok(dev)
     }
 
     /// Overwrite the FIRST `data.len()` bytes of a tensor segment and H2D exactly that window.
@@ -5389,20 +5467,27 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// zeroed it is both the correct result and the smaller transfer.
     pub fn write_seg_prefix(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
         let i = seg.get();
-        if data.len() > self.seg_host[i].len() {
+        let addr = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
+        // ⭐ MEASURED AGAINST THE REGION, NOT THE SHADOW: a device-only slot's shadow is a 128 B
+        // placeholder (nothing staged into it), but the spilled tail this exists to hand a
+        // borrower still fits the REGION the bundle allocated — so the shadow grows to the
+        // prefix and only the prefix is H2D'd, exactly the window the doc below promises.
+        let dev = addr.total_size().as_u64() as usize;
+        if data.len() > dev {
             bail!(
-                "write_seg_prefix(seg{i}): {} B does not fit this session's {} B segment",
-                data.len(),
-                self.seg_host[i].len()
+                "write_seg_prefix(seg{i}): {} B does not fit this session's {dev} B segment",
+                data.len()
             );
         }
         // The shadow's quiet point, at the door — this copy overwrites the whole
         // prefix while an earlier H2D may still be reading the shadow.
         self.quiet_shadow()?;
+        if self.seg_host[i].len() < data.len() {
+            self.seg_host[i].resize(data.len(), 0);
+        }
         self.seg_host[i][..data.len()].copy_from_slice(data);
-        let addr = self.seg_addr[i]
-            .as_ref()
-            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
         let win = addr
             .window(ByteOffset(0), ByteSize(data.len() as u64))
             .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
