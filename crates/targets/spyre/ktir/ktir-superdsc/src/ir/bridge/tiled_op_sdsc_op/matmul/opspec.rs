@@ -9,7 +9,7 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, DeviceAxis, Df, Fp16, MAX_CORES, MaxCores, OpFunc,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc,
     OpSpec, Role, Scale, StickExtent, TensorArg, WorkPlan,
 };
 
