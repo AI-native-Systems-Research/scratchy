@@ -2717,6 +2717,7 @@ impl ArgView<'_> {
     pub fn device_positions(&self) -> Option<Vec<usize>> {
         self.device_order.map(|order| {
             order
+                .dims
                 .iter()
                 .filter_map(|d| self.layout.iter().position(|l| l == d))
                 .collect()

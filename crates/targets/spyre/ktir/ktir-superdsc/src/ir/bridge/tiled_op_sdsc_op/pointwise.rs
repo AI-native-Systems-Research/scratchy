@@ -1459,9 +1459,9 @@ fn pointwise_opspec_from_tile_split(
             .map_err(|e| e.0)?
             .with_offset(out_view.offset);
             let y = t.axis("y").map_err(|e| e.0)?;
-            t.with_axis(y, DeviceAxis::Window(interleave))
+            t.with_axis(y, crate::superdsc_opspec::DeviceAxis::Window(interleave))
         }),
-    });
+    };
 
     Ok(OpSpec::new(op, plan, ins, output)
         .map_err(|e| e.0)?

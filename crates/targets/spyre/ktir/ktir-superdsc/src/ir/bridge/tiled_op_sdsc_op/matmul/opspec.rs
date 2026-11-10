@@ -10,7 +10,7 @@ use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, DeviceAxis, Df, Fp16, MAX_CORES, MaxCores, OpFunc,
-    OpInfo, OpSpec, Role, Scale, StickExtent, TensorArg, WorkPlan,
+    OpSpec, Role, Scale, StickExtent, TensorArg, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
