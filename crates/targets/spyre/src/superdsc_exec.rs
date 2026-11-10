@@ -2107,10 +2107,24 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         })
     }
 
+    /// ⭐ WHETHER THIS SESSION STAGES WEIGHTS AT ALL — the session rule every
+    /// weight-carrying slot follows (the weight segment's banks and the spilled tail).
+    /// A session that binds nothing resident (a reserving anchor) or whose weight
+    /// segment is aliased from an owner (a borrower) stages no weights: its tail
+    /// arrives later through [`Self::write_seg_prefix`], which materializes exactly
+    /// the prefix, and its banks are never staged — so those slots are device-filled
+    /// at boot rather than host-allocated and zero-pushed over the wire.
+    fn stages_weights(&self) -> bool {
+        self.binds_resident() && !self.seg_borrowed[SEG_WEIGHT.get()]
+    }
+
     /// ⭐ WHETHER A SEGMENT'S HOST SIDE EXISTS AT ALL — the bundle's own statement, not a
     /// measurement of what staging wrote. `SegRole` names each segment's job; `WeightTail`
     /// names the one intermediate-colour slot that carries spilled weights (a bare role
     /// table would device-fill the spilled lm_head, so the spill is part of the statement).
+    /// The spill slot carries WEIGHTS, so it also carries the weight-carrying slots' own
+    /// SESSION rule ([`Self::stages_weights`]): a borrower stages no tail, and its slot is
+    /// device-filled at boot exactly like its banks.
     ///
     /// The segments named here are the ones the HOST owns: their boot content is the staged
     /// shadow (weights, the spill tail, the activation segment's staged constants and born
@@ -2126,10 +2140,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         i == SegRole::Weight.segment()
             || i == SegRole::Activation.segment()
             || i == SegRole::Logits.segment()
-            || matches!(
+            || (matches!(
                 self.code.layout.weight_tail,
                 bundle::WeightTail::Spilled { segment, .. } if segment as usize == i
-            )
+            ) && self.stages_weights())
     }
 
     /// ⭐ THE ONE DOOR THAT MATERIALIZES A HOST SHADOW FOR A READ. A device-only slot holds
@@ -2307,10 +2321,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
         }
         // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK: a bank holds only weights, so it follows the
-        // weight segment's own rule exactly — a session that binds nothing or borrows the weight
-        // segment stages into no bank at all, so every bank of such a session is device-only.
+        // weight segment's own session rule exactly ([`Self::stages_weights`]) — a session
+        // that stages no weights stages into no bank at all, so every bank of such a session
+        // is device-only.
         for b in 0..self.weight_bank_bytes.len() {
-            if reserve_only || self.seg_borrowed[SEG_WEIGHT.get()] {
+            if !self.stages_weights() {
                 self.weight_bank_host[b] = HostShadow::DeviceOnly;
             } else {
                 self.weight_bank_host[b] =
@@ -2573,9 +2588,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 v.resize(need, 0);
             }
         }
-        // The weight banks follow the weight segment's own rule exactly: grow to the device extent
-        // unless an alias is about to replace the region.
-        if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
+        // The weight banks follow the weight segment's own session rule exactly
+        // ([`Self::stages_weights`]): grow to the device extent when this session stages.
+        if self.stages_weights() {
             for b in 0..self.weight_bank_bytes.len() {
                 let need = self.weight_bank_addr[b]
                     .as_ref()
@@ -2643,10 +2658,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .h2d(src, addr)
                 .map_err(|e| anyhow!("prepare: seg{i} H2D: {e}"))?;
         }
-        // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own conditions — it is the same
-        // segment, so "borrowed" and "nothing bound" mean the same thing for it. A bank holds only
-        // weights by construction, so it always follows the host-owned route.
-        if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
+        // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own session rule
+        // ([`Self::stages_weights`]) — a bank holds only weights by construction, so it
+        // always follows the host-owned route when this session stages any.
+        if self.stages_weights() {
             for b in 0..self.weight_bank_bytes.len() {
                 let (stream, addr) = (
                     self.stream_ref()?,
