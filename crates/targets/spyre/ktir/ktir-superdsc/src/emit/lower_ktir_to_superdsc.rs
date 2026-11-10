@@ -6354,6 +6354,10 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
             &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
             w_off,
             k_full,
+            // The weight tensor's full `in` extent IS `k_full` — the same number the caller
+            // threads as `w_in_phys`: the windowed weight is staged exactly at
+            // `[in_phys, out]`, so the view IS the allocation along `in`.
+            k_full,
             &rb(&out.name(), m, n_dev),
             o_off,
             sym_id_base,

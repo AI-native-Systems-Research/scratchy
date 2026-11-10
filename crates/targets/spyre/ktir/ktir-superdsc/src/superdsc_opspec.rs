@@ -2341,10 +2341,74 @@ pub struct DeviceOrderView<'a> {
 pub enum DeviceAxis {
     /// The allocation's extent along the axis IS the swept extent.
     Swept,
-    /// A window of an allocation this many elements long along the axis (the pinned walk).
-    Window(u32),
+    /// A window of an allocation, its view capped at [`Window::phys`] elements along the axis —
+    /// the axis whose physical extent is the RESIDENCY the card reconstructs from. Built only by
+    /// [`Window::cap`], which proves the view fits its allocation and covers the sweep.
+    Window(Window),
     /// Iterated whole, the next outer step a [`Pitch`] on (the walk's back gap).
     Pitch(Pitch),
+}
+
+/// ⭐ A WINDOW'S CAP — built ONCE, from the axis's swept extent, the allocation's declared extent
+/// and the view's physical extent ([`Window::cap`]), and only there. A legal window covers the
+/// sweep within the allocation: `swept ≤ phys ≤ declared` — the view may BE the allocation
+/// (`phys == declared`: nothing larger exists; the statement is the residency extent itself).
+/// Every reader (the address readers through [`DeviceAxis::declared`]) takes the value; nothing
+/// re-derives it. Two refusals, by name:
+///
+/// * `phys > declared` — the view exceeds its allocation (out of bounds);
+/// * `phys < swept` — the walk would describe less memory than the op reads.
+///
+/// ⛔ WHY THE CONSTRUCTOR CANNOT DECIDE PITCH-VS-WINDOW, AND THE ROLE LAW THAT DOES: the values
+/// alone are indistinguishable — a windowed weight's `(k, in_phys, in_phys)` and a batched row
+/// pitch's `(rows, plane_depth, plane_depth)` are the same tuple. What decides is the op's ROLE
+/// for the axis, stated once at the site:
+///
+/// * a **Pitch** states an axis whose next landing must clear dead space the card cannot derive
+///   (`backGapCore_` = `declared − swept`) — the iterated-with-dead-space axes (rank-2/3 `mb`,
+///   the spray/interleave `y`) call [`AxisFacts::pitch`] and have NO [`Window`] construction
+///   reachable on their path at all;
+/// * a **Window** states an axis whose physical extent is the residency the card reconstructs
+///   from (`N_`, the stride unit), traversed by the card's own mechanisms — the contraction
+///   `in` axis calls [`Window::cap`].
+///
+/// The constructor checks each form's well-formedness; the role law picks the form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    phys: u32,
+}
+
+impl Window {
+    /// The one constructor: the view's physical extent `phys` on an axis the op sweeps `swept` of,
+    /// in an allocation declaring `declared` along it. Refuses a view that exceeds its allocation
+    /// (`phys > declared`) and one that fails to cover the sweep (`phys < swept`). At `phys ==
+    /// swept` the window IS the sweep — it yields [`DeviceAxis::Swept`], the same statement in its
+    /// second spelling (one fact, one source), proven byte-identical on card (a flat weight and
+    /// `k == in_phys` emit identically).
+    pub fn cap(swept: u32, declared: u32, phys: u32) -> Result<DeviceAxis, SuperDscError> {
+        if phys > declared {
+            return Err(SuperDscError(format!(
+                "a window cap of {phys} on an axis declared {declared} — the view exceeds its \
+                 allocation"
+            )));
+        }
+        if phys < swept {
+            return Err(SuperDscError(format!(
+                "a window cap of {phys} on an axis swept {swept} — the walk would describe \
+                 less memory than the op reads"
+            )));
+        }
+        Ok(if phys == swept {
+            DeviceAxis::Swept
+        } else {
+            DeviceAxis::Window(Window { phys })
+        })
+    }
+
+    /// The view's physical extent along the axis — the residency the card reconstructs from.
+    pub fn phys(self) -> u32 {
+        self.phys
+    }
 }
 
 /// ⭐ A PITCH PAST AN AXIS'S SWEPT EXTENT — built ONCE, from the axis's swept extent, the
@@ -2469,7 +2533,7 @@ impl DeviceAxis {
     pub fn declared(self) -> Option<u32> {
         match self {
             DeviceAxis::Swept => None,
-            DeviceAxis::Window(p) => Some(p),
+            DeviceAxis::Window(w) => Some(w.phys()),
             DeviceAxis::Pitch(p) => Some(p.declared()),
         }
     }
@@ -2770,7 +2834,7 @@ impl ArgView<'_> {
             .iter()
             .map(|&a| match a {
                 DeviceAxis::Swept => None,
-                DeviceAxis::Window(p) => Some(p as usize),
+                DeviceAxis::Window(w) => Some(w.phys() as usize),
                 DeviceAxis::Pitch(p) => match self.pitch_form(p) {
                     PitchForm::Lx(p) => Some(p.declared() as usize),
                     PitchForm::Hbm(_) => None,

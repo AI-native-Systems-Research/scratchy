@@ -1254,12 +1254,13 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             // A run's sticks are its innermost dim, in dxp's innermost-first order.
             .with_device_order(crate::emit::SprayOrder::Inner.device_layout())
             .map_err(|e| e.0)?;
-            let t = if pitch == run_sticks {
-                t
-            } else {
-                let y = t.axis("y").map_err(|e| e.0)?;
-                t.with_axis(y, DeviceAxis::Window(pitch))
-            };
+            // ⛔ A PITCH, NOT A WINDOW: the run's sticks sit `pitch` apart in the frame — a
+            // stride landing past the swept `run_sticks` is the walk's back gap, never a pin.
+            // `Pitch::past` decides it: a frame AT the run is no pitch (the `run_sticks` case
+            // the hand-branch used to spell), a shorter one refuses by name (the guard above).
+            let y = t.axis("y").map_err(|e| e.0)?;
+            let pitched = y.pitch(&plan, pitch).map_err(|e| e.0)?;
+            let t = t.with_axis(y, pitched);
             Ok(AnyTensorArg::R3(t))
         };
     let input = arg(true, src, src_pitch, src_elems)?;
@@ -1490,8 +1491,13 @@ where
             )
             .map_err(|e| e.0)?
             .with_offset(out_view.offset);
+            // ⛔ A PITCH, NOT A WINDOW: the scatter's rows sit `interleave` apart in the
+            // destination allocation — a stride landing past the swept `y` is the walk's back
+            // gap, never a pin. `Pitch::past` decides it: a frame AT the sweep is no pitch, a
+            // shorter one refuses by name.
             let y = t.axis("y").map_err(|e| e.0)?;
-            t.with_axis(y, crate::superdsc_opspec::DeviceAxis::Window(interleave))
+            let pitched = y.pitch(&plan, interleave).map_err(|e| e.0)?;
+            t.with_axis(y, pitched)
         }),
     };
 
@@ -2166,15 +2172,20 @@ mod stick_runs_tests {
         }
     }
 
-    /// Each side states its own pitch as `y`'s physical extent, and only where it is not the run.
+    /// Each side states its own pitch as `y`'s back gap, and only where it is not the run
+    /// (`Pitch::past` yields `Swept` at the run — the hand-branch the law replaced).
     #[test]
     fn each_side_states_its_own_pitch() {
         let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
-        use crate::superdsc_opspec::DeviceAxis::{Swept, Window};
+        use crate::superdsc_opspec::DeviceAxis::{Pitch as AxisPitch, Swept};
+        use crate::superdsc_opspec::{PastExtent, Pitch};
+        let PastExtent::Pitch(src_pitch) = Pitch::past(64, 128, None).unwrap() else {
+            panic!("128 past 64 is a pitch")
+        };
         let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
         assert_eq!(
             v[0].device_extent,
-            [Swept, Window(128), Swept],
+            [Swept, AxisPitch(src_pitch), Swept],
             "the source's pitch"
         );
         assert_eq!(
