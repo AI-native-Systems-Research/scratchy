@@ -2194,7 +2194,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         struct Item<'a> {
             /// The weight's own id — what the stage-time diagnostic names a row by.
-            name: &'a str,
+            name: String,
             /// The SHADOW SLOT this weight stages into — a segment, or a weight bank beyond bank 0.
             /// See [`Executor::slot_of`]: banking gives one segment several regions, so the segment
             /// index alone stopped being an address.
@@ -2302,7 +2302,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
             };
             items.push(Item {
-                name: nm.as_str(),
+                name: format!("{nm}"),
                 slot,
                 offset: p.offset as usize,
                 src,
