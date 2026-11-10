@@ -112,6 +112,19 @@ fn max_dim_sizes(
         .collect()
 }
 
+/// The operand's own `mb` back gap — the pitch past the swept rows, read off the emitted
+/// `backGapCore_` (HBM's core key `-1`, the gap a JSON string, as `dsc2.cpp` parses it).
+/// `None` when the axis carries no gap: a depth AT the swept rows is no pitch (`Swept`).
+fn mb_back_gap(
+    e: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
+    arg: usize,
+) -> Option<i64> {
+    let v = serde_json::to_value(&e.op).unwrap();
+    v["dscs_"][0]["cachewr_pin"]["scheduleTree_"][arg]["backGapCore_"]["mb"]["-1"]
+        .as_str()
+        .map(|g| g.parse().expect("the gap is a JSON string of a number"))
+}
+
 /// The op's own base address for one operand, in elements — the minimum over the per-core start
 /// addresses, so it is the emitter's answer and not a re-derivation of the placement.
 fn base_addr_elems(e: &emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>, arg: usize) -> i64 {
@@ -185,8 +198,13 @@ fn the_write_declares_the_head_outermost_walk() {
     }
 }
 
-/// THE DECLARED EXTENTS ARE EACH OPERAND'S OWN: `nkvh` heads of `mq*nslab`-deep source planes against
-/// `nkvh` heads of `PLANE_SLOTS*nslab`-deep cache planes. One shared `mb` extent cannot state both.
+/// THE DECLARED DEPTHS ARE EACH OPERAND'S OWN, each as its own `mb` BACK GAP: `nkvh` heads of
+/// `mq*nslab`-deep source planes against `nkvh` heads of `PLANE_SLOTS*nslab`-deep cache planes.
+/// One shared `mb` gap cannot state both. The walk itself sweeps the request's rows (`mb` at the
+/// swept extent in `maxDimSizes_`); the depth past them is the gap the next head's landing clears —
+/// the pitch role, not a window: the residency the card reconstructs `y`'s stride from is the
+/// swept-plus-gap repeat, and the pin at the depth measured inert (b2) while the gap is the
+/// card-proven form for a landing past the swept extent.
 #[test]
 fn each_operand_declares_its_own_head_depth() {
     for hd in [64u32, 128, 256, 512] {
@@ -195,17 +213,25 @@ fn each_operand_declares_its_own_head_depth() {
             let e = cachewr_op(mq, hd, true, 0, 0);
             assert_eq!(
                 max_dim_sizes(&e, 0),
-                vec![i64::from(NKVH), i64::from(mq * n), i64::from(STICK)],
-                "hd={hd} mq={mq}: the source's head is mq*nslab rows deep"
+                vec![i64::from(NKVH), 1, i64::from(STICK)],
+                "hd={hd} mq={mq}: the source sweeps the request's row"
+            );
+            assert_eq!(
+                mb_back_gap(&e, 0),
+                (mq * n > 1).then(|| i64::from(mq * n - 1)),
+                "hd={hd} mq={mq}: the source's head is mq*nslab rows deep — the gap past the row, \
+                 or no gap at nslab == 1 and mq == 1"
             );
             assert_eq!(
                 max_dim_sizes(&e, 2),
-                vec![
-                    i64::from(NKVH),
-                    i64::from(PLANE_SLOTS * n),
-                    i64::from(STICK)
-                ],
-                "hd={hd} mq={mq}: the cache's head is PLANE_SLOTS*nslab rows deep"
+                vec![i64::from(NKVH), 1, i64::from(STICK)],
+                "hd={hd} mq={mq}: the cache sweeps the request's row"
+            );
+            assert_eq!(
+                mb_back_gap(&e, 2),
+                Some(i64::from(PLANE_SLOTS * n - 1)),
+                "hd={hd} mq={mq}: the cache's head is PLANE_SLOTS*nslab rows deep — the gap past \
+                 the row"
             );
         }
     }
@@ -238,7 +264,9 @@ fn the_slab_steps_one_plane_on_each_operand() {
 }
 
 /// A PROMPT CHUNK writes all its rows in one op per (slab, tensor) — rows are consecutive positions
-/// of ONE sequence, which `m = mq` plus the runtime's single slot-shift expresses exactly.
+/// of ONE sequence, which `m = mq` plus the runtime's single slot-shift expresses exactly: the
+/// walk sweeps all `mq` rows (`maxDimSizes_`'s `mb`), and the head's remaining depth past them is
+/// the `mb` back gap.
 #[test]
 fn a_prompt_chunk_writes_all_its_rows_in_one_op() {
     for hd in [64u32, 128] {
@@ -247,8 +275,14 @@ fn a_prompt_chunk_writes_all_its_rows_in_one_op() {
             let n = slabs(hd).get();
             assert_eq!(
                 max_dim_sizes(&e, 0),
-                vec![i64::from(NKVH), i64::from(mq * n), i64::from(STICK)],
+                vec![i64::from(NKVH), i64::from(mq), i64::from(STICK)],
                 "hd={hd} mq={mq}: a chunk sweeps all its rows under one head walk"
+            );
+            assert_eq!(
+                mb_back_gap(&e, 0),
+                (n > 1).then(|| i64::from(mq * n - mq)),
+                "hd={hd} mq={mq}: the head's depth past the chunk's rows is the gap, or no gap \
+                 at nslab == 1"
             );
         }
     }

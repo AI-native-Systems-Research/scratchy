@@ -300,6 +300,10 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
     w: &Stk<crate::sdsc_abstract::KernelTag>,
     w_off: crate::addr::DevOff,
     w_in_phys: u32,
+    // The weight TENSOR's full `in` extent — the allocation the window caps into. Threaded
+    // separately from `w_in_phys` so `Window::cap` can prove the cap binds; where the two are
+    // equal the window caps nothing and the constructor refuses by name.
+    w_in_declared: u32,
     o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
     o_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
@@ -320,17 +324,22 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
         o_off.into_raw_elems(),
     )
     .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
-    // ⛔ THE KERNEL'S OWN `in` EXTENT, and a phys SMALLER than the swept k is a mis-declaration
-    // (the same rule `matmul_opspec_batched_off` states): a window never covers more than its
-    // allocation. Refused here rather than emitting a descriptor whose declared span exceeds the
-    // footprint the placement reserved.
-    if w_in_phys < k.get() {
-        return Err(crate::superdsc_error::SuperDscError(format!(
-            "assemble_matmul {op_name}: kernel `in` physical extent {w_in_phys} is SMALLER than \
-             the swept k {} — a window cannot cover more than its allocation",
-            k.get()
-        )));
-    }
+    // ⛔ THE KERNEL'S OWN `in` EXTENT — the ROLE law's window arm: this axis's physical extent is
+    // the RESIDENCY the card reconstructs from (`N_`, the stride unit — see the `N_.in_` law
+    // below), NOT an axis whose next landing clears dead space (that is a Pitch, `backGapCore_`).
+    // Built by the ONE constructor, `Window::cap`, which refuses a view that exceeds its
+    // allocation (`phys > declared`) and one that fails to cover the sweep (`phys < swept`), by
+    // name, and yields `Swept` at `phys == swept` — the flat, byte-identical collapse. The live
+    // caller threading `k_full` as both `phys` and `declared` is not a duplicated fact: it is the
+    // CHECKED assertion that the view IS the whole allocation, and it becomes load-bearing the
+    // day a capped view inside a larger weight appears.
+    let w_axis =
+        crate::superdsc_opspec::Window::cap(k.get(), w_in_declared, w_in_phys).map_err(|e| {
+            crate::superdsc_error::SuperDscError(format!(
+                "assemble_matmul {op_name} kernel `in` axis: {}",
+                e.0
+            ))
+        })?;
     if let Some(kernel) = op
         .args_mut()
         .iter_mut()
@@ -338,9 +347,7 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
     {
         use super::walk::WalkAxis as _;
         kernel
-            .set_axis(super::walk::InAxis::NAME, |_| {
-                Ok(crate::superdsc_opspec::DeviceAxis::Window(w_in_phys))
-            })
+            .set_axis(super::walk::InAxis::NAME, |_| Ok(w_axis))
             .map_err(|e| {
                 crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
             })?;
@@ -975,7 +982,7 @@ pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
 
 /// [`assemble_matmul_off`] for the TRUE PER-BATCH (3-D-kernel) batchmatmul: ONE op covering
 /// `batch` kv-heads instead of `batch · gqa` per-head ops. See [`matmul_opspec_batched_off`] for
-/// the offset / `kernel_device_extent` contract.
+/// the offset contract (its dead `kernel_device_extent` arm is deleted there).
 ///
 /// Same typed-operand discipline as [`assemble_matmul_off`] — activation is `RowBlocked`, the
 /// K/V cache is a `Kernel`, so addressing the cache as a non-Kernel does not type-check.
@@ -990,7 +997,6 @@ pub fn assemble_matmul_batched_off<T: crate::collective::Tp, O: crate::sdsc_abst
     a_off: u32,
     w: &Stk<crate::sdsc_abstract::KernelTag>,
     w_off: u32,
-    kernel_device_extent: Option<(&'static str, u32)>,
     o: &Stk<O>,
     o_off: u32,
     sym_id_base: &mut i64,
@@ -998,17 +1004,7 @@ pub fn assemble_matmul_batched_off<T: crate::collective::Tp, O: crate::sdsc_abst
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
     let op = super::opspec::matmul_opspec_batched_off(
-        m,
-        n,
-        k,
-        batch,
-        a_name,
-        w_name,
-        o_name,
-        a_off,
-        w_off,
-        o_off,
-        kernel_device_extent,
+        m, n, k, batch, a_name, w_name, o_name, a_off, w_off, o_off,
     )
     .map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_matmul_batched_off {op_name}: {e}"))

@@ -172,7 +172,7 @@ fn a_one_stick_band_states_no_gap() {
 fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     use ktir_superdsc::superdsc_opspec::{
         Allocation, DeviceAxis, Df, ItDim, MaxCores, PastExtent, Pitch, Role, Scale, TensorArg,
-        WorkPlan,
+        Window, WorkPlan,
     };
     // The pitch a view states is the one value `Pitch::past` builds — read back whole.
     let pitch = |swept, declared, stick| match Pitch::past(swept, declared, stick).unwrap() {
@@ -256,7 +256,7 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     let mb = v.axis("mb").unwrap();
     assert_eq!(
         axes(
-            v.with_axis(mb, DeviceAxis::Window(16))
+            v.with_axis(mb, Window::cap(4, 32, 16).unwrap())
                 .with_axis(mb, mb.pitch(&plan, 10).unwrap())
         ),
         [
@@ -270,15 +270,42 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     let (y, mb) = (v.axis("y").unwrap(), v.axis("mb").unwrap());
     assert_eq!(
         axes(
-            v.with_axis(y, DeviceAxis::Window(8))
+            v.with_axis(y, Window::cap(3, 16, 8).unwrap())
                 .with_axis(mb, mb.pitch(&plan, 10).unwrap())
         ),
         [
-            DeviceAxis::Window(8),
+            Window::cap(3, 16, 8).unwrap(),
             DeviceAxis::Pitch(pitch(4, 10, None)),
             DeviceAxis::Swept
         ]
     );
+}
+
+/// ⭐ THE WINDOW LAW ON ITS OWN: a cap is built ONCE by [`Window::cap`] from (swept, declared,
+/// phys), fits its allocation, covers the sweep, and collapses to `Swept` at the sweep — every
+/// near-miss refused by name at the mint.
+#[test]
+fn a_window_cap_is_built_once_and_its_near_misses_refuse_by_name() {
+    use ktir_superdsc::superdsc_opspec::{DeviceAxis, Window};
+    // The match: swept ≤ phys ≤ declared, and the reader takes the value back whole.
+    let DeviceAxis::Window(w) = Window::cap(4, 32, 16).unwrap() else {
+        panic!("a view of 16 past a sweep of 4, in an allocation of 32, is a window")
+    };
+    assert_eq!(w.phys(), 16);
+    // The view may BE the allocation — the statement is the residency extent itself.
+    let DeviceAxis::Window(w) = Window::cap(4, 16, 16).unwrap() else {
+        panic!("a view of 16 that IS its allocation is a window, not a pitch")
+    };
+    assert_eq!(w.phys(), 16);
+    // At the sweep the window IS the sweep — `Swept`, the same statement in its second
+    // spelling (one fact, one source), proven byte-identical on card.
+    assert_eq!(Window::cap(4, 32, 4).unwrap(), DeviceAxis::Swept);
+    // A view that exceeds its allocation is out of bounds.
+    let past = Window::cap(4, 16, 24).unwrap_err().0;
+    assert!(past.contains("exceeds its allocation"), "{past}");
+    // A cap that fails to cover the sweep: the walk would describe less memory than the op reads.
+    let short = Window::cap(4, 32, 3).unwrap_err().0;
+    assert!(short.contains("less memory than the op reads"), "{short}");
 }
 
 /// ⭐ THE PITCH IS BUILT ONCE, AND ONLY WHEN THE WALK CAN CARRY IT: [`Pitch::past`] over (swept,

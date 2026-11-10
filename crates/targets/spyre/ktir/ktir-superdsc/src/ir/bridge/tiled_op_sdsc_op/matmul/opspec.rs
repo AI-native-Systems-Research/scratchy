@@ -702,39 +702,40 @@ fn batched_walk_args<R: RungRegime>(
     pitches: Option<(u32, u32)>,
 ) -> Result<(TensorArg<3>, TensorArg<3>), String> {
     let input = batched_input_arg(a_name, regime.input_walk(), plan)?.with_offset(a_off);
-    // A phys SMALLER than the swept extent is a mis-declaration, not a window (same rule the
-    // kernel override enforces): the walk would describe less memory than the op reads.
+    // ⛔ A PITCH, NOT A WINDOW — the rank-3 form of the rank-2 rule at `matmul_opspec` above: the
+    // rows a batch sweeps sit `phys` rows apart in the frame, which is the walk's back gap
+    // (`LayoutAxis::pitch`, `phys − swept` on `mb`). The pin (`maxDimSizes_`) CAPS a dim's
+    // per-step size and never moves a landing; the crossing stride exists only as the back gap.
+    // `Pitch::past` decides it: a frame AT the sweep is no pitch, a shorter one refuses by name.
     let input = match phys_mb {
         Some(phys) => {
-            let swept = plan.extent(MbAxis::NAME);
-            if phys < swept {
-                return Err(format!(
-                    "matmul_opspec '{a_name}': phys_mb={phys} is SMALLER than the swept mb                          {swept}. device_extent declares a window into a LARGER allocation."
-                ));
-            }
             let mb = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
-            input.with_axis(mb, DeviceAxis::Window(phys))
+            let pitch = mb.pitch(plan, phys).map_err(|e| e.0)?;
+            input.with_axis(mb, pitch)
         }
         None => input,
     };
-    // The ACTIVATION's own pitch, when its placement declares one larger than the swept rows.
+    // The ACTIVATION's own pitch, from its own placement law — stated unconditionally:
+    // `Pitch::past` itself yields `Swept` at the sweep and refuses below it.
     let input = match pitches.map(|(a, _)| a) {
-        Some(a_pitch) if a_pitch > plan.extent(MbAxis::NAME) => {
+        Some(a_pitch) => {
             let mb = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
-            input.with_axis(mb, DeviceAxis::Window(a_pitch))
+            let pitch = mb.pitch(plan, a_pitch).map_err(|e| e.0)?;
+            input.with_axis(mb, pitch)
         }
-        _ => input,
+        None => input,
     };
     let output = batched_output_arg(o_name, regime.output_walk(), plan)?.with_offset(o_off);
     // ⛔ AND THE OUTPUT DECLARES ITS OWN — this is the half that was missing. Checking the output
     // against a pitch it never declared makes the two agree on paper while the emitted walk still
-    // strides by the shared value.
+    // strides by the shared value. Its own pitch, stated unconditionally, same rule as the input's.
     let output = match pitches.map(|(_, o)| o) {
-        Some(o_pitch) if o_pitch > plan.extent(MbAxis::NAME) => {
+        Some(o_pitch) => {
             let mb = output.axis(MbAxis::NAME).map_err(|e| e.0)?;
-            output.with_axis(mb, DeviceAxis::Window(o_pitch))
+            let pitch = mb.pitch(plan, o_pitch).map_err(|e| e.0)?;
+            output.with_axis(mb, pitch)
         }
-        _ => output,
+        None => output,
     };
     Ok((input, output))
 }
@@ -820,29 +821,22 @@ pub fn matmul_opspec_batched(
         0,
         0,
         0,
-        None,
     )
 }
 
-/// [`matmul_opspec_batched`] with per-operand ELEMENT start-offsets and an optional KERNEL
-/// physical-extent override — the form the batched DECODE attention needs.
+/// [`matmul_opspec_batched`] with per-operand ELEMENT start-offsets — the form the batched DECODE
+/// attention needs.
 ///
-/// Two things separate a batched attention bmm from the plain batched form:
+/// What separates a batched attention bmm from the plain batched form:
 ///
-/// 1. **Offsets.** Each block of the online-softmax loop reads a 64-slot window of the resident
-///    K/V cache, so the kernel starts at `b · <block stride>`, not 0.
-/// 2. **Swept extent ≠ storage stride.** `matmul_opspec_batched` derives the 3-D kernel's
-///    per-batch (`y`) stride from the ITERATION extents (`in · out`). That is only the true
-///    stride when the op sweeps the tensor's whole physical extent. The decode ladder sweeps
-///    `active_cap ≤ cap` of a `[nkvh, hd, cap]` Kᵀ cache, and the V cache is `nqh`-sized while
-///    only every `gqa`-th head slot is live — in both cases the real `y` stride is LARGER than
-///    `in · out`. `kernel_device_extent = Some((dim, phys))` declares that dim's TRUE physical
-///    extent via [`TensorArg::with_axis`] (torch-spyre's `arg.device_size`), so stride
-///    derivation uses `phys` and the sub-rung ladder addresses correctly. Without it a batched
-///    score is right only at the top rung — the "no ladder-safe drop-in exists" obstacle.
+/// **Offsets.** Each block of the online-softmax loop reads a 64-slot window of the resident K/V
+/// cache, so the kernel starts at `b · <block stride>`, not 0.
 ///
-/// `None` reproduces [`matmul_opspec_batched`] exactly (all offsets 0, strides from iteration
-/// extents), so this is a strict superset and existing behaviour is byte-identical.
+/// ⛔ THE DEAD `kernel_device_extent` ARM IS DELETED (compile-checked dead law — the round-one
+/// `device_positions` ruling): at both this stack's tips its only caller was
+/// [`matmul_opspec_batched`] passing `None`, and the collapsed fold killed every `Some` caller.
+/// The kernel-axis residency statement lives in [`crate::superdsc_opspec::Window::cap`]; this
+/// door re-gains a parameter the day a live caller needs one.
 #[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_batched_off(
     m: MatM,
@@ -855,7 +849,6 @@ pub fn matmul_opspec_batched_off(
     a_off: u32,
     w_off: u32,
     o_off: u32,
-    kernel_device_extent: Option<(&'static str, u32)>,
 ) -> Result<OpSpec, String> {
     // ⛔⛔⛔ THIS FORM IS NOT FOR REQUESTS, AND THAT IS A CARD MEASUREMENT. A `RequestAxis` parameter here
     // once carried the three `y` steps a request-batched fold leg would take, checked against the walk
@@ -910,28 +903,6 @@ pub fn matmul_opspec_batched_off(
     )
     .map_err(|e| e.0)?
     .with_offset(w_off);
-    // The `y`-stride override (see the fn doc): declare the kernel dim whose PHYSICAL extent
-    // exceeds this op's swept extent, so stride derivation uses storage, not iteration.
-    let kernel = match kernel_device_extent {
-        Some((dim, phys)) => {
-            // a `DeviceAxis::Window` means "this op sweeps a WINDOW of a larger allocation". A phys
-            // SMALLER than the swept extent is not a window, it is a mis-declaration: the walk would
-            // describe less memory than the op reads. Refuse at `cargo build` rather than emit a
-            // descriptor whose declared size and address span disagree (an on-card Compute CB error).
-            let swept = plan.extent(dim);
-            if phys < swept {
-                return Err(format!(
-                    "matmul_opspec_batched_off '{w_name}': kernel device_extent {dim}={phys} is \
-                     SMALLER than the swept extent {swept}. device_extent declares a window into a \
-                     LARGER physical allocation (phys >= iteration); a smaller value cannot be \
-                     expressed this way."
-                ));
-            }
-            let at = kernel.axis(dim).map_err(|e| e.0)?;
-            kernel.with_axis(at, DeviceAxis::Window(phys))
-        }
-        None => kernel,
-    };
     let output_walk = Walk3::output_head_outermost();
     let output = TensorArg::<3>::new(
         false,
