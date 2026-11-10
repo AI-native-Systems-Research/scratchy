@@ -86,8 +86,52 @@ pub const SEG_KV: SegIdx = SegIdx::known::<2>();
 /// MASK (seg3) — the prefix-validity mask, in its own segment precisely so a fold can shift it
 /// without disturbing the running softmax state or any other activation.
 pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
-/// LOGITS (seg4) — the single graph output; the per-step D2H readback lands in its host shadow.
-pub const SEG_LOGITS: SegIdx = SegIdx::known::<4>();
+
+/// ⭐ ONE SLOT'S HOST SIDE — a real buffer, or the typed statement that the slot's bytes live
+/// only on the device.
+///
+/// A device-only slot (the KV pool, the intermediates) is not "a short shadow": `prepare`
+/// fills its region on the device and no forward ever touches its host side. Spelling that
+/// as a 128 B `Vec` made a forgotten reader a PANIC (an index past 128) or a silent
+/// truncation — this PR shipped one of each before the type existed. As a variant, a reader
+/// cannot get bytes out of a device-only slot without saying what to do about it: the
+/// read doors materialize through [`Executor::shadow_for_read`], and every other site
+/// refuses.
+#[derive(Debug)]
+enum HostShadow {
+    /// A real host buffer: staged weights, a per-step mirror (the activation and logits
+    /// segments), or one materialized on demand by a read. `Default` is the empty buffer —
+    /// the pre-staging state; [`Executor::stage_weights`] is what sizes it.
+    Host(Vec<u8>),
+    /// No host bytes, by the bundle's own statement (see [`Executor::host_owned_seg`]):
+    /// device-filled at boot, materialized only when a read asks.
+    DeviceOnly,
+}
+
+impl Default for HostShadow {
+    fn default() -> Self {
+        HostShadow::Host(Vec::new())
+    }
+}
+
+impl HostShadow {
+    /// The buffer, or `None` on a device-only slot — the answer every reader must give a
+    /// reason for.
+    fn host(&self) -> Option<&[u8]> {
+        match self {
+            HostShadow::Host(v) => Some(v),
+            HostShadow::DeviceOnly => None,
+        }
+    }
+
+    /// The buffer mutably, same law as [`Self::host`].
+    fn host_vec_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            HostShadow::Host(v) => Some(v),
+            HostShadow::DeviceOnly => None,
+        }
+    }
+}
 
 /// ⭐ THE SEGMENTS A BORROWER ADOPTS INSTEAD OF FILLING — the resident ones. Three sites read this
 /// (host-shadow sizing, device sizing, H2D) and they MUST agree: a segment sized as a placeholder but
@@ -826,14 +870,16 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     /// segment 1); it is a different REGION bound into the same positional slot by the launch that
     /// needs it. See [`bundle::Placement::bank`] and [`Executor::slot_of`].
     weight_bank_addr: Vec<Option<DevAddr>>,
-    weight_bank_host: Vec<Vec<u8>>,
+    weight_bank_host: Vec<HostShadow>,
     weight_bank_bytes: Vec<u64>,
     /// Per extra bank: its region is BORROWED from an owner session, so never H2D this session's
     /// shadow over it. Mirrors [`Self::seg_aliased`], which cannot cover banks because it is indexed
     /// by segment.
     weight_bank_aliased: Vec<bool>,
-    /// Host staging (sen bytes) per segment.
-    seg_host: [Vec<u8>; NUM_SEGMENTS],
+    /// One slot's host side (see [`HostShadow`]): a real staging/mirror buffer, or the typed
+    /// statement that the slot is device-only. Sized by [`Executor::stage_weights`] from the
+    /// bundle's own role statement (see [`Executor::host_owned_seg`]).
+    seg_host: [HostShadow; NUM_SEGMENTS],
     /// ⭐ #32 (C) — THE DEFERRED PICKS' LANDING RING: one slot per outstanding deferred
     /// read, allocated ONCE at first use at the read's own length and reused forever.
     /// The shadow slice a deferred read lands in today is the PLACEMENT's own window in
@@ -914,18 +960,6 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     prepared: bool,
     staged_host: bool,
     n_weights_staged: usize,
-    /// ⭐ THE STAGED EXTENT OF EVERY SLOT (segments then extra weight banks, the `slot_of`
-    /// order): one past the last byte `stage_weights` writes into that slot's shadow, for
-    /// every slot, unconditionally. Two readers, both of which must be able to trust a `0`:
-    /// shadow sizing (a slot nothing stages into and nothing host-mirrors is DEVICE-ONLY —
-    /// placeholder shadow, no memset, no RSS) and `prepare`'s send routing (a slot nothing
-    /// stages into is zero-filled ON THE DEVICE by [`Stream::fill_zero`], ~62 GB/s measured,
-    /// instead of pushing born-zero shadow bytes over the wire at ~6-7 GB/s — for the KV pool
-    /// alone that is ~10 GB of wire time). The record is written by [`Executor::stage_weights`],
-    /// the one pass that stages, and `prepare` REFUSES on a record that does not cover every
-    /// slot — a missing entry would silently zero-fill weights, so it is an `Err`, never a
-    /// default.
-    staged_extent: Vec<u64>,
     /// ⭐ TENSORDUMP STATE (`SCRATCHY_SDSC_TENSORDUMP`): this session's last-seen bytes per placed
     /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
     /// and its own op counter. `None` unless the env gate is set.
@@ -1271,11 +1305,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .layout
                 .weight_bank_bytes
                 .iter()
-                .map(|_| Vec::new())
+                .map(|_| HostShadow::Host(Vec::new()))
                 .collect(),
             weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
             weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
-            seg_host: [const { Vec::new() }; NUM_SEGMENTS],
+            seg_host: [const { HostShadow::Host(Vec::new()) }; NUM_SEGMENTS],
             read_ring: Vec::new(),
             read_ring_free: Vec::new(),
             last_h2d: None,
@@ -1290,7 +1324,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
-            staged_extent: Vec::new(),
             dump: None,
             step_images: StepImageCache::default(),
             seat,
@@ -1694,7 +1727,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // live across a `&mut self` call.
         let (segi, off) = (seg.get(), p.offset);
         self.quiet_shadow()?;
+        // An activation placement names the ACTIVATION segment, whose shadow is real by the
+        // role statement — a device-only slot here means the placement and the bundle's own
+        // role statement disagree, which is a refusal, never a write into nothing.
         let dst = self.seg_host[segi]
+            .host_vec_mut()
+            .ok_or_else(|| {
+                anyhow!("bind: activation '{id}' names seg{segi}, which is DEVICE-ONLY")
+            })?
             .get_mut(off as usize..(off + len) as usize)
             .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", segi))?;
         sen_convert::f32_to_sen_bytes(vals, dst);
@@ -1800,7 +1840,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let shadow = self
             .seg_host
             .get_mut(seg)
-            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?;
+            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?
+            .host_vec_mut()
+            .ok_or_else(|| anyhow!("the activation segment {seg} is DEVICE-ONLY"))?;
         fault_in(shadow);
         Ok(shadow.len() as u64)
     }
@@ -2065,6 +2107,46 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         })
     }
 
+    /// ⭐ WHETHER A SEGMENT'S HOST SIDE EXISTS AT ALL — the bundle's own statement, not a
+    /// measurement of what staging wrote. `SegRole` names each segment's job; `WeightTail`
+    /// names the one intermediate-colour slot that carries spilled weights (a bare role
+    /// table would device-fill the spilled lm_head, so the spill is part of the statement).
+    ///
+    /// The segments named here are the ones the HOST owns: their boot content is the staged
+    /// shadow (weights, the spill tail, the activation segment's staged constants and born
+    /// zeros), sent by H2D, and the session keeps using their shadow after prepare (the
+    /// activation segment it writes every step, the logits segment the per-step D2H reads
+    /// back into). Every other segment — the KV pool, the intermediates — is DEVICE-ONLY:
+    /// `prepare` fills its region on the device ([`Stream::fill_zero`], ~62 GB/s measured,
+    /// vs ~6-7 GB/s for host-pushed zeros — for the KV pool alone that is ~10 GB of wire
+    /// time) and it gets NO host shadow, which deletes the ~10 GB a 2b model allocated,
+    /// memset, and held in RSS for the session's whole life.
+    fn host_owned_seg(&self, i: usize) -> bool {
+        use crate::lower_subtile_tape_to_superdsc::SegRole;
+        i == SegRole::Weight.segment()
+            || i == SegRole::Activation.segment()
+            || i == SegRole::Logits.segment()
+            || matches!(
+                self.code.layout.weight_tail,
+                bundle::WeightTail::Spilled { segment, .. } if segment as usize == i
+            )
+    }
+
+    /// ⭐ THE ONE DOOR THAT MATERIALIZES A HOST SHADOW FOR A READ. A device-only slot holds
+    /// no host bytes by design; a read (`read_seg`, `read_tensor`, the deferred reads, the
+    /// logits readback) is what asks for some, so it lands D2H bytes in a fresh zeroed
+    /// buffer of exactly the window it reads. A mirrored buffer shorter than `want` grows —
+    /// the bytes past its old end are born zeros, and the D2H overwrites the window anyway.
+    fn shadow_for_read(&mut self, seg: SegIdx, want: usize) {
+        let i = seg.get();
+        match self.seg_host[i].host_vec_mut() {
+            Some(v) if v.len() >= want => {}
+            Some(v) => v.resize(want, 0),
+            // `None` carries no live borrow, so the slot can be replaced in this arm.
+            None => self.seg_host[i] = HostShadow::Host(vec![0u8; want]),
+        }
+    }
+
     pub fn stage_weights(&mut self) -> Result<()> {
         if self.staged_host {
             return Ok(());
@@ -2204,64 +2286,36 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             });
         }
 
-        // ⭐ THE STAGED EXTENT PER SLOT, recorded by the one pass that knows it: one past the
-        //    last byte the items write into each slot's shadow. Everything past this in a
-        //    shadow is the zero it was born with, which is exactly what `prepare`'s
-        //    device-side fill replaces the zero-push for.
-        let n_slots = NUM_SEGMENTS + self.weight_bank_bytes.len();
-        let mut extent = vec![0u64; n_slots];
-        for it in &items {
-            let end = (it.offset + it.src.len()) as u64;
-            if end > extent[it.slot] {
-                extent[it.slot] = end;
+        // ── Size the host shadows BY THE BUNDLE'S OWN ROLE STATEMENT
+        //    ([`Self::host_owned_seg`]): a slot the host owns gets a real buffer (staged
+        //    weights, the spill tail, the activation segment's staged constants, the logits
+        //    readback mirror); every other slot — the KV pool, the intermediates — is
+        //    DEVICE-ONLY: no host bytes at all, `prepare` fills its region on the device.
+        //    That deletes the ~10 GB KV shadow a 2b model allocated, memset, and kept in RSS
+        //    for the session's whole life. ──
+        for i in 0..NUM_SEGMENTS {
+            // A BORROWED segment is never staged or H2D'd by this session, so its host side is
+            // dead too (an alias repoints the region at the owner's). ...but ONLY for the
+            // segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segment is bound
+            // per-forward by this very session and must keep its real size.
+            let aliased_later = reserve_only && is_resident_seg(i);
+            if self.seg_borrowed[i] || aliased_later || !self.host_owned_seg(i) {
+                self.seg_host[i] = HostShadow::DeviceOnly;
+            } else {
+                self.seg_host[i] =
+                    HostShadow::Host(vec![0u8; self.segment_bytes[i].max(128) as usize]);
             }
         }
-        self.staged_extent = extent;
-
-        // ── Size the host shadows BY ROLE + THE ONE FACT ABOVE. A slot needs a real shadow iff
-        //    something STAGES into it (weights — the weight segment, its banks, or a spilled
-        //    tail in an intermediate colour slot) or the SESSION KEEPS USING IT after prepare
-        //    (the mask segment, which the host writes every step; the logits segment, which the
-        //    per-step D2H reads back into). Everything else — the KV pool, the intermediates —
-        //    is DEVICE-ONLY: its bytes never touch the host, so it gets the 128 B placeholder
-        //    and `prepare` fills its region on the device. That deletes the ~10 GB KV shadow a
-        //    2b model allocated, memset, and kept in RSS for the session's whole life. ──
-        for i in 0..NUM_SEGMENTS {
-            // A BORROWED segment is never staged or H2D'd by this session, so it gets the
-            // placeholder rather than a zero-fill the width of the whole segment. ...but ONLY for
-            // the segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segments are bound
-            // per-forward by this very session and must keep their real size.
-            let aliased_later = reserve_only && is_resident_seg(i);
-            let mirrored = i == SEG_MASK.get() || i == SEG_LOGITS.get();
-            let bytes = if self.seg_borrowed[i]
-                || aliased_later
-                || !(mirrored || self.staged_extent[i] > 0)
-            {
-                128
-            } else if self.segment_bytes[i] > 0 {
-                self.segment_bytes[i] as usize
-            } else {
-                128
-            };
-            self.seg_host[i] = vec![0u8; bytes];
-        }
         // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK: a bank holds only weights, so it follows the
-        // staged rule exactly — a bank nothing stages into is device-only (placeholder + device
-        // fill), and a session that binds nothing or borrows the weight segment stages into no
-        // bank at all.
+        // weight segment's own rule exactly — a session that binds nothing or borrows the weight
+        // segment stages into no bank at all, so every bank of such a session is device-only.
         for b in 0..self.weight_bank_bytes.len() {
-            // A HOST placeholder allowance, NOT the flit: an empty, unstaged or borrowed bank
-            // gets a minimal host buffer so the vec exists — nothing in the device
-            // law ties this number to the stick (an owner's region replaces it).
-            let bytes = if reserve_only
-                || self.seg_borrowed[SEG_WEIGHT.get()]
-                || self.staged_extent[NUM_SEGMENTS + b] == 0
-            {
-                128
+            if reserve_only || self.seg_borrowed[SEG_WEIGHT.get()] {
+                self.weight_bank_host[b] = HostShadow::DeviceOnly;
             } else {
-                self.weight_bank_bytes[b].max(128) as usize
-            };
-            self.weight_bank_host[b] = vec![0u8; bytes];
+                self.weight_bank_host[b] =
+                    HostShadow::Host(vec![0u8; self.weight_bank_bytes[b].max(128) as usize]);
+            }
         }
 
         // ── Hand each item its OWN destination sub-slice. Splitting the segment buffers this way
@@ -2280,11 +2334,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // advance below (and its disjointness proof) is unchanged by banking. `chain` here rather
             // than a second staging loop: a bank holds ~half a model's weights, and a serial pass
             // over those would cost more than the whole parallel stage it bypassed.
-            let mut rests: Vec<&mut [u8]> = self
+            // A device-only slot holds `None` — no item may land in one (items stage weights, and
+            // weights only land in host-owned slots), so the take below refuses instead of
+            // silently staging into nothing.
+            let mut rests: Vec<Option<&mut [u8]>> = self
                 .seg_host
                 .iter_mut()
                 .chain(self.weight_bank_host.iter_mut())
-                .map(|v| &mut v[..])
+                .map(|s| s.host_vec_mut().map(|v| &mut v[..]))
                 .collect();
             let mut cursor = vec![0usize; rests.len()];
             for it in &items {
@@ -2296,10 +2353,18 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         it.offset
                     );
                 };
-                let rest = std::mem::take(&mut rests[it.slot]);
+                let rest = rests[it.slot].take().ok_or_else(|| {
+                    anyhow!(
+                        "stage: a weight would land in slot {}, which is DEVICE-ONLY — weights \
+                         only stage into host-owned slots (the weight segment, its banks, the \
+                         spill slot), so the placement and the bundle's own role statement \
+                         disagree",
+                        it.slot
+                    )
+                })?;
                 let (_, r) = rest.split_at_mut(skip);
                 let (dst, r2) = r.split_at_mut(it.src.len());
-                rests[it.slot] = r2;
+                rests[it.slot] = Some(r2);
                 cursor[it.slot] = it.offset + it.src.len();
                 tasks.push((it.src, dst, it.mode));
             }
@@ -2488,61 +2553,51 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
 
         // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
-        //    critical path. Then grow each STAGED seg_host to the device alloc's size (alignment
-        //    pad, zero) so the H2D copies a full region. Unstaged slots never H2D their shadow, so
-        //    they stay at the size `stage_weights` gave them (real for the host-mirrored mask and
-        //    logits segments, placeholder for the device-only ones). ──
+        //    critical path. Then grow each HOST-OWNED seg_host to the device alloc's size
+        //    (alignment pad, zero) so the H2D copies a full region. Device-only slots never
+        //    H2D their shadow — they have none. ──
         self.stage_weights()?;
-        // ⛔ THE EXTENT RECORD MUST COVER EVERY SLOT. A short record would turn an uncovered slot
-        // into a silent device fill — for the weight segment that swaps weights for zeros — so a
-        // disagreement between the two passes is a refusal, never a default.
-        let n_slots = NUM_SEGMENTS + self.weight_bank_bytes.len();
-        if self.staged_extent.len() != n_slots {
-            bail!(
-                "prepare: the staged extent covers {} slot(s), but this session has {n_slots} — \
-                 stage_weights and prepare disagree about the slot space",
-                self.staged_extent.len()
-            );
-        }
         let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
             // Same rule as the staging shadow: skip only what an alias replaces, and grow only
             // what this send loop is about to H2D in full.
-            if (reserve_only && is_resident_seg(i)) || self.staged_extent[i] == 0 {
+            if (reserve_only && is_resident_seg(i)) || !self.host_owned_seg(i) {
                 continue;
             }
             let need = self.seg_addr[i]
                 .as_ref()
                 .map_or(0, |a| a.total_size().as_u64()) as usize;
-            if self.seg_host[i].len() < need {
-                self.seg_host[i].resize(need, 0);
+            if let Some(v) = self.seg_host[i].host_vec_mut()
+                && v.len() < need
+            {
+                v.resize(need, 0);
             }
         }
         // The weight banks follow the weight segment's own rule exactly: grow to the device extent
-        // unless an alias is about to replace the region, and only when something stages there.
+        // unless an alias is about to replace the region.
         if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
             for b in 0..self.weight_bank_bytes.len() {
-                if self.staged_extent[NUM_SEGMENTS + b] == 0 {
-                    continue;
-                }
                 let need = self.weight_bank_addr[b]
                     .as_ref()
                     .map_or(0, |a| a.total_size().as_u64()) as usize;
-                if self.weight_bank_host[b].len() < need {
-                    self.weight_bank_host[b].resize(need, 0);
+                if let Some(v) = self.weight_bank_host[b].host_vec_mut()
+                    && v.len() < need
+                {
+                    v.resize(need, 0);
                 }
             }
         }
         let n_weights = self.n_weights_staged;
         lap("weight-convert", &mut t0);
 
-        // ── SEND every tensor-segment region's content ONCE, ROUTED BY WHAT THE SLOT CARRIES:
-        //    a slot weights were STAGED into (the weight segment, its banks, a spilled tail in
-        //    an intermediate colour) goes out by host H2D from its shadow; every other slot —
-        //    the KV pool, the intermediates, an unstaged mask/logits segment — holds only zeros
-        //    at boot, and those go out as a DEVICE-SIDE FILL ([`Stream::fill_zero`], ~62 GB/s
-        //    measured) instead of host-pushed H2D bytes (~6-7 GB/s), which for the KV pool alone
-        //    is ~10 GB of wire time on a 2b model. Activations refill per predict. ──
+        // ── SEND every tensor-segment region's content ONCE, ROUTED BY THE BUNDLE'S OWN ROLE
+        //    STATEMENT ([`Self::host_owned_seg`]): a host-owned slot (the weight segment, the
+        //    spill slot, the activation segment with its staged constants) goes out by host
+        //    H2D from its shadow; every other slot — the KV pool, the intermediates — holds
+        //    only zeros at boot, and those go out as a DEVICE-SIDE FILL
+        //    ([`Stream::fill_zero`], ~62 GB/s measured) instead of host-pushed H2D bytes
+        //    (~6-7 GB/s), which for the KV pool alone is ~10 GB of wire time on a 2b model.
+        //    Activations refill per predict. ──
         for i in 0..NUM_SEGMENTS {
             // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
@@ -2556,35 +2611,41 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 continue;
             }
             let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
-            let staged = self.staged_extent[i];
+            let host_owned = self.host_owned_seg(i);
             if d.prep_time {
                 eprintln!(
-                    "[sdsc-prep-time] seg{i}: region {} B, staged extent {staged} B → {}",
+                    "[sdsc-prep-time] seg{i}: region {} B → {}",
                     addr.total_size().as_u64(),
-                    if staged == 0 {
-                        "device fill"
-                    } else {
+                    if host_owned {
                         "host H2D"
+                    } else {
+                        "device fill"
                     }
                 );
             }
-            if staged == 0 {
+            if !host_owned {
                 fill_zero_walk(stream, addr, &format!("prepare: seg{i} zero fill"))?;
                 continue;
             }
             // The shadow was grown to the device extent by the loop above, so this slice is the
             // whole region — and taking it AS A SLICE is what proves the H2D cannot read past the
             // shadow. `get` rather than `[..]`: a short shadow is a wiring bug to report, not a
-            // panic, and never a DMA over-read.
-            let src = whole_shadow(&self.seg_host[i], addr, i)?;
+            // panic, and never a DMA over-read. A host-owned slot with no shadow is the same
+            // disagreement, refused.
+            let src = whole_shadow(
+                self.seg_host[i].host().ok_or_else(|| {
+                    anyhow!("prepare: seg{i} is host-owned but holds no host shadow")
+                })?,
+                addr,
+                i,
+            )?;
             stream
                 .h2d(src, addr)
                 .map_err(|e| anyhow!("prepare: seg{i} H2D: {e}"))?;
         }
         // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own conditions — it is the same
         // segment, so "borrowed" and "nothing bound" mean the same thing for it. A bank holds only
-        // weights by construction, so its staged extent is never 0 unless it is empty — the same
-        // routing applies regardless.
+        // weights by construction, so it always follows the host-owned route.
         if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
             for b in 0..self.weight_bank_bytes.len() {
                 let (stream, addr) = (
@@ -2593,16 +2654,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         .as_ref()
                         .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
                 );
-                let staged = self.staged_extent[NUM_SEGMENTS + b];
-                if staged == 0 {
-                    fill_zero_walk(
-                        stream,
-                        addr,
-                        &format!("prepare: weight bank {} zero fill", b + 1),
-                    )?;
-                    continue;
-                }
-                let src = whole_shadow(&self.weight_bank_host[b], addr, NUM_SEGMENTS + b)?;
+                let src = whole_shadow(
+                    self.weight_bank_host[b].host().ok_or_else(|| {
+                        anyhow!(
+                            "prepare: weight bank {} is host-owned but holds no host shadow",
+                            b + 1
+                        )
+                    })?,
+                    addr,
+                    NUM_SEGMENTS + b,
+                )?;
                 stream
                     .h2d(src, addr)
                     .map_err(|e| anyhow!("prepare: weight bank {} H2D: {e}", b + 1))?;
@@ -2654,20 +2715,26 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             for (i, (host, has_act)) in self.seg_host.iter_mut().zip(seg_has_activation).enumerate()
             {
-                // The KV shadow is a device-only placeholder now (read_seg grows one on
+                // The KV slot is device-only by the role statement (read doors materialize on
                 // demand), so this keep is about the mirrored segments: has_act covers the
-                // mask segment and anything else the host re-binds per step.
+                // activation segment and anything else the host re-binds per step.
                 if i == SEG_KV.get() || has_act {
                     continue;
                 }
-                *host = Vec::new();
+                // Empty, not gone: a read door may still materialize this slot again, and a
+                // device-only slot stays device-only.
+                if let HostShadow::Host(v) = host {
+                    *v = Vec::new();
+                }
             }
             // ⭐ AND EVERY BANK SHADOW, unconditionally: a bank holds ONLY weights (that is what
             // makes it aliasable), so there is no activation to keep one alive and nothing reads its
             // host bytes after the H2D. Not reclaiming these is the largest host allocation in the
             // process — a bank is up to 16 GiB.
             for host in self.weight_bank_host.iter_mut() {
-                *host = Vec::new();
+                if let HostShadow::Host(v) = host {
+                    *v = Vec::new();
+                }
             }
         }
         debug!(
@@ -3720,13 +3787,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let mut line = format!("[optrace] op[{oi}]");
         for i in [0usize, 2, 3, 4, 5, 6] {
             let seg = SegIdx::checked(i as i64).expect("literal < NUM_SEGMENTS");
-            // Device-only segments hold a placeholder shadow; this probe wants their real bytes,
-            // so it materializes the mirror first (`read_seg`'s own rule).
+            // Device-only segments hold no mirror; this probe wants their real bytes,
+            // so it materializes one first (`read_seg`'s own rule).
             let _ = self.mirror_seg_shadow(seg);
             let got = self.d2h_seg_clamped(seg);
             let stat = match got {
                 Ok(got) => {
-                    let host = &self.seg_host[i][..got.min(self.seg_host[i].len())];
+                    let shadow = self.seg_host[i].host().unwrap_or(&[]);
+                    let host = &shadow[..got.min(shadow.len())];
                     let (mut nz, mut mx) = (0usize, 0.0f32);
                     let mut n_inf = 0usize;
                     // First NON-FINITE element offsets (element index in the segment), so a divergence
@@ -3866,7 +3934,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
                 continue;
             }
-            let cur = &self.seg_host[i][p.offset as usize..][..p.size as usize];
+            // `avail > 0` proves the D2H brought bytes back, so the slot holds a host buffer;
+            // the `else` is the type's price, not an expected arm.
+            let Some(host) = self.seg_host[i].host() else {
+                continue;
+            };
+            let cur = &host[p.offset as usize..][..p.size as usize];
             let moved = match dump.snap.get(id) {
                 Some(prev) => prev.as_slice() != cur,
                 None => cur.iter().any(|b| *b != 0),
@@ -4372,7 +4445,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 None => (addr, 0, tot),
             };
             d2h_bytes = b - a;
-            let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
+            // The mirror grew the shadow to the whole region above (the multi-chunk fallback
+            // reads all of it), and the window is clamped to `tot`, so the slice is in range;
+            // the let-else is the shadow type's price — the logits segment is host-owned by
+            // the role statement, so this arm is a consistency refusal, not an expectation.
+            let host = {
+                let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
+                    bail!("predict: the logits segment {} is DEVICE-ONLY", seg.get());
+                };
+                &mut v[a as usize..b as usize]
+            };
             // ON THE COMPUTE PIPELINE (#544): the logits readback is the LAST op of every
             // step, right after the step's COMPUTE ops. Riding ASYNC_DMAO, its switch
             // barrier drained the COMPUTE deque — the readback submission HOST-BLOCKED until
@@ -4450,7 +4532,19 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             let seg = SegIdx::checked(lp.segment as i64)
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             let elems = self.vocab.0.min(out.len() / 2);
-            let src = &self.seg_host[seg.get()][lp.offset as usize..];
+            // The submit half materialized this shadow for its readback window; the convert
+            // reads inside that same window. A device-only logits segment would mean the two
+            // halves of the read disagree with the role statement — refuse, never convert
+            // nothing.
+            let src = self.seg_host[seg.get()]
+                .host()
+                .and_then(|h| h.get(lp.offset as usize..))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "predict_finish: the logits segment {} holds no host shadow",
+                        seg.get()
+                    )
+                })?;
             sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
         }
 
@@ -4586,8 +4680,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     p.offset
                 );
             }
-            if p.offset as usize + src.len() > self.seg_host[seg.get()].len() {
-                bail!("predict: activation '{nm}' overflows seg{}", p.segment);
+            match self.seg_host[seg.get()].host() {
+                None => bail!(
+                    "predict: activation '{nm}' names seg{}, which is DEVICE-ONLY — the \
+                     placement and the bundle's own role statement disagree",
+                    p.segment
+                ),
+                Some(h) if p.offset as usize + src.len() > h.len() => {
+                    bail!("predict: activation '{nm}' overflows seg{}", p.segment);
+                }
+                _ => {}
             }
             writes.push((seg.get(), p.offset, src.as_slice()));
             seg_dirty[seg.get()] = true;
@@ -4645,7 +4747,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             let Some(seg) = SegIdx::checked(p.segment as i64) else {
                 continue;
             };
-            let dst = &mut self.seg_host[seg.get()][p.offset as usize..][..src.len()];
+            // The convert loop's destinations are the ACTIVATION segment the collect pass just
+            // bounds-checked above — a device-only slot there is a role-statement mismatch, not
+            // a condition to carry on from (the convert would be writing into nothing).
+            let dst = self.seg_host[seg.get()]
+                .host_vec_mut()
+                .ok_or_else(|| anyhow!("predict: seg{} is DEVICE-ONLY", p.segment))?
+                .get_mut(p.offset as usize..p.offset as usize + src.len())
+                .ok_or_else(|| anyhow!("predict: activation '{nm}' overflows seg{}", p.segment))?;
             // ⛔ A RAW BIND IS COPIED, NOT RE-ENCODED. `ieee_to_sen_bytes` treats its source as fp16
             // pairs; for the gather's int32 index table that rewrites every entry into a different
             // valid block number. See [`Self::raw_ids`].
@@ -4726,7 +4835,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             if runs.is_empty() {
                 last_h2d = Some(
                     stream
-                        .h2d_on_compute_signaled(whole_shadow(&self.seg_host[i], addr, i)?, addr)
+                        .h2d_on_compute_signaled(
+                            whole_shadow(
+                                self.seg_host[i].host().ok_or_else(|| {
+                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
+                                })?,
+                                addr,
+                                i,
+                            )?,
+                            addr,
+                        )
                         .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?,
                 );
             } else {
@@ -4737,7 +4855,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     last_h2d = Some(
                         stream
                             .h2d_on_compute_signaled(
-                                &self.seg_host[i][a as usize..b as usize],
+                                &self.seg_host[i].host().ok_or_else(|| {
+                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
+                                })?[a as usize..b as usize],
                                 &win,
                             )
                             .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?,
@@ -5048,11 +5168,15 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
     /// D2H a whole tensor segment into its host shadow, CLAMPED to the shadow's allocated size.
     ///
-    /// The two sizes genuinely differ on the paged path: prepare sizes seg2's DEVICE region for the
-    /// whole pool but leaves its host shadow at ONE page ("NO HOST MIRROR OF THE KV POOL"), so a
-    /// whole-region D2H would write pool-many pages into a one-page buffer. When the shadow is
-    /// smaller, only its leading window transfers, and the clamped-vs-requested sizes are printed —
-    /// a truncated readback is visible, never silent. Returns the bytes transferred.
+    /// The two sizes genuinely differ on the paged path: a device-only slot's region is sized for
+    /// the whole pool while its host side holds nothing until a read materializes one, so a
+    /// whole-region D2H would write pool-many pages into a buffer that does not exist. A
+    /// DEVICE-ONLY slot reads as 0 B here — the doors that want its bytes (`read_seg`,
+    /// `read_tensor`, the deferred reads, `optrace`) materialize a shadow through
+    /// [`Self::shadow_for_read`] FIRST; this is the clamped reader they all land in. When the
+    /// shadow is smaller than the region, only its leading window transfers, and the
+    /// clamped-vs-requested sizes are printed — a truncated readback is visible, never silent.
+    /// Returns the bytes transferred.
     fn d2h_seg_clamped(&mut self, seg: SegIdx) -> Result<usize> {
         let i = seg.get();
         let dev = self.seg_addr[i]
@@ -5060,7 +5184,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .ok_or_else(|| anyhow!("seg{i} has no region"))?
             .total_size()
             .as_u64();
-        let host = self.seg_host[i].len() as u64;
         // The shadow, the region and the stream are three disjoint fields of `self`; splitting the
         // borrow here is what lets the DMA write into a real `&mut [u8]` instead of a pointer
         // conjured from a shared reference.
@@ -5074,9 +5197,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let stream = stream
             .as_ref()
             .ok_or_else(|| anyhow!("no stream — prepare was not called"))?;
+        let Some(shadow) = seg_host[i].host_vec_mut() else {
+            debug!(
+                "[sdsc-superdsc] read seg{i}: DEVICE-ONLY — no host mirror, 0 B D2H'd (a read \
+                 door that wants these bytes materializes one first)"
+            );
+            return Ok(0);
+        };
+        let host = shadow.len() as u64;
         if host >= dev {
             stream
-                .d2h(&mut seg_host[i][..dev as usize], addr)
+                .d2h(&mut shadow[..dev as usize], addr)
                 .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
             stream
                 .synchronize()
@@ -5094,7 +5225,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .window(ByteOffset(0), ByteSize(host))
                 .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
             stream
-                .d2h(&mut seg_host[i][..host as usize], &win)
+                .d2h(&mut shadow[..host as usize], &win)
                 .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
             stream
                 .synchronize()
@@ -5130,6 +5261,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 p.bank
             );
         }
+        // ⭐ THE WHOLE SEGMENT, NOT WHAT A DEVICE-ONLY SLOT HAPPENS TO MIRROR: this is the
+        // probe harness's reader, and an intermediate's slot holds no host bytes until a read
+        // asks. Materialize the full region first (the same door `read_seg` takes), or the
+        // clamped D2H below would hand back 0 B and this door would report a truncated file
+        // as success.
+        let dev = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?
+            .total_size()
+            .as_u64() as usize;
+        self.shadow_for_read(seg, dev);
         let got = self.d2h_seg_clamped(seg)?;
         let mut elems = (p.size / 2) as usize;
         elems = elems.min(cap_elems);
@@ -5149,7 +5291,15 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if elems == 0 {
             return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
         }
-        let src = &self.seg_host[seg.get()][p.offset as usize..][..elems * 2];
+        let src = self.seg_host[seg.get()]
+            .host()
+            .and_then(|h| h.get(p.offset as usize..p.offset as usize + elems * 2))
+            .ok_or_else(|| {
+                anyhow!(
+                    "read_tensor('{name}'): seg{} lost its host mirror",
+                    p.segment
+                )
+            })?;
         let mut out = vec![0u8; elems * 2];
         sen_convert::sen_to_ieee_bytes(src, &mut out);
         Ok(out)
@@ -5254,7 +5404,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // The landing: the shadow window (one-shot law) or a ring slot (in-flight
         // law). Field-direct on purpose — `addr`/`win` hold the shared borrow of
         // `seg_addr` this whole body is written under, and the slot's take/grow is
-        // three field moves, not a method call.
+        // field moves on `seg_host`/`read_ring`, disjoint from that borrow.
         let (host, ring_slot) = if ring {
             let need = (b - a) as usize;
             let slot = match self.read_ring_free.pop() {
@@ -5274,7 +5424,25 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             (&mut s[..need], Some(slot))
         } else {
-            (&mut self.seg_host[seg.get()][a as usize..b as usize], None)
+            // ⭐ A ONE-SHOT READ MAY NAME A DEVICE-ONLY SLOT — an intermediate, when the
+            // answer re-point reads the idx stick — and its landing window does not exist
+            // until this read asks for it; indexing it was a PANIC. Materialized to the
+            // window's END and never the whole region: this door sits on the token path,
+            // and the bytes past the window are nobody's.
+            if matches!(self.seg_host[seg.get()], HostShadow::DeviceOnly) {
+                self.seg_host[seg.get()] = HostShadow::Host(vec![0u8; b as usize]);
+            } else if let Some(v) = self.seg_host[seg.get()].host_vec_mut()
+                && v.len() < b as usize
+            {
+                v.resize(b as usize, 0);
+            }
+            let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
+                bail!(
+                    "read_tensor_raw('{id}'): seg{} lost its host mirror mid-read",
+                    seg.get()
+                );
+            };
+            (&mut v[a as usize..b as usize], None)
         };
         let done = self
             .stream
@@ -5374,13 +5542,30 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 self.read_ring_free.push(slot);
                 Ok(bytes)
             }
-            None => Ok(self.seg_host[read.seg.get()][read.offset as usize..][..n].to_vec()),
+            None => {
+                // The one-shot landing's window — materialized by the enqueue half
+                // (a device-only slot grows its shadow there); refuse rather than
+                // index if something tore it down in between.
+                let host = self.seg_host[read.seg.get()].host().ok_or_else(|| {
+                    anyhow!(
+                        "read_tensor_raw({}): seg{} lost its host mirror mid-read",
+                        read.id,
+                        read.seg.get()
+                    )
+                })?;
+                Ok(host[read.offset as usize..][..n].to_vec())
+            }
         }
     }
 
-    /// The host shadow's byte size for `seg` — what to size a [`Executor::read_seg`] buffer at.
+    /// The byte size a [`Executor::read_seg`] of `seg` returns: the DEVICE region's
+    /// extent — a read materializes the shadow to exactly that, whatever the slot's
+    /// role (`read_seg`'s own rule, via [`Self::mirror_seg_shadow`]).
     pub fn seg_bytes(&self, seg: SegIdx) -> usize {
-        self.seg_host[seg.get()].len()
+        self.seg_addr[seg.get()]
+            .as_ref()
+            .map(|a| a.total_size().as_u64() as usize)
+            .unwrap_or(0)
     }
 
     /// ZERO a whole tensor segment ON THE DEVICE, with the vendor's fill op.
@@ -5418,21 +5603,23 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
     /// D2H the WHOLE tensor segment (raw sen-fp16 bytes, NO conversion).
     ///
-    /// ⭐ MATERIALIZES THE SHADOW FIRST (see [`Self::mirror_seg_shadow`]): device-only segments
-    /// carry a 128 B placeholder, and a clamped short read here would quietly hide most of the
-    /// segment this door exists to show.
+    /// ⭐ MATERIALIZES THE SHADOW FIRST (see [`Self::mirror_seg_shadow`]): device-only
+    /// segments hold no mirror at all, and a clamped short read here would quietly
+    /// hide most of the segment this door exists to show.
     pub fn read_seg(&mut self, seg: SegIdx) -> Result<Vec<u8>> {
-        let i = seg.get();
         self.mirror_seg_shadow(seg)?;
         let got = self.d2h_seg_clamped(seg)?;
-        Ok(self.seg_host[i][..got.min(self.seg_host[i].len())].to_vec())
+        let host = self.seg_host[seg.get()].host().unwrap_or(&[]);
+        Ok(host[..got.min(host.len())].to_vec())
     }
 
-    /// Grow `seg`'s host shadow to its device region's full extent. Device-only segments (the
-    /// KV pool, the intermediates) carry a 128 B placeholder after [`Executor::stage_weights`] —
-    /// nothing in a forward ever touches their host side — so the inspection doors that DO want
-    /// their bytes (`read_seg`, `optrace`) materialize a mirror here, on demand. Returns the
-    /// region's size in bytes.
+    /// Materialize `seg`'s host shadow to its device region's full extent — the
+    /// one materialize rule ([`Self::shadow_for_read`]) applied at region scale.
+    /// Device-only segments (the KV pool, the intermediates) hold NO mirror after
+    /// [`Executor::stage_weights`] — nothing in a forward ever touches their host
+    /// side — so the inspection doors that DO want their bytes (`read_seg`,
+    /// `optrace`, the logits readback's multi-chunk fallback) materialize one
+    /// here, on demand. Returns the region's size in bytes.
     fn mirror_seg_shadow(&mut self, seg: SegIdx) -> Result<usize> {
         let i = seg.get();
         let dev = self.seg_addr[i]
@@ -5440,9 +5627,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .ok_or_else(|| anyhow!("seg{i} has no region"))?
             .total_size()
             .as_u64() as usize;
-        if self.seg_host[i].len() < dev {
-            self.seg_host[i].resize(dev, 0);
-        }
+        self.shadow_for_read(seg, dev);
         Ok(dev)
     }
 
@@ -5459,10 +5644,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// zeroed it is both the correct result and the smaller transfer.
     pub fn write_seg_prefix(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
         let i = seg.get();
-        // ⭐ MEASURED AGAINST THE REGION, NOT THE SHADOW: a device-only slot's shadow is a 128 B
-        // placeholder (nothing staged into it), but the spilled tail this exists to hand a
-        // borrower still fits the REGION the bundle allocated — so the shadow grows to the
-        // prefix and only the prefix is H2D'd, exactly the window the doc below promises.
+        // ⭐ MEASURED AGAINST THE REGION, NOT THE SHADOW: a device-only slot holds no
+        // mirror at all (nothing staged into it), but the spilled tail this exists to
+        // hand a borrower still fits the REGION the bundle allocated — so the shadow
+        // materializes to the prefix and only the prefix is H2D'd, exactly the window
+        // the doc above promises.
         // (The region is re-borrowed below: the address borrows `self` immutably, and the
         // quiet point + the copy in between need it mutably.)
         let dev = self.seg_addr[i]
@@ -5479,10 +5665,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // The shadow's quiet point, at the door — this copy overwrites the whole
         // prefix while an earlier H2D may still be reading the shadow.
         self.quiet_shadow()?;
-        if self.seg_host[i].len() < data.len() {
-            self.seg_host[i].resize(data.len(), 0);
-        }
-        self.seg_host[i][..data.len()].copy_from_slice(data);
+        // The one materialize rule, at prefix scale: a Host slot shorter than the
+        // prefix grows; a DeviceOnly slot becomes one.
+        self.shadow_for_read(seg, data.len());
+        let dst = self.seg_host[i]
+            .host_vec_mut()
+            .ok_or_else(|| anyhow!("write_seg_prefix(seg{i}): lost the host mirror"))?;
+        dst[..data.len()].copy_from_slice(data);
         let addr = self.seg_addr[i]
             .as_ref()
             .ok_or_else(|| anyhow!("seg{i} has no region"))?;
@@ -5491,7 +5680,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
         let stream = self.stream_ref()?;
         stream
-            .h2d(&self.seg_host[i][..data.len()], &win)
+            .h2d(
+                self.seg_host[i]
+                    .host()
+                    .and_then(|h| h.get(..data.len()))
+                    .ok_or_else(|| anyhow!("write_seg_prefix(seg{i}): lost the host mirror"))?,
+                &win,
+            )
             .map_err(|e| anyhow!("write_seg_prefix H2D seg{i}: {e}"))?;
         stream
             .synchronize()
