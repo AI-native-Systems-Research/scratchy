@@ -1347,8 +1347,8 @@ fn the_one_row_gate_times_are_recorded() {
 // ── FP8 S8 W4c: the one-row rope append ────────────────────────────
 
 /// The geometries the fused rope append runs at: q heads, kv heads, head dim, rotated width,
-/// pairing, `rope_theta` (and so the table), and whether its head norms run (Gemma's sliding
-/// layers only, `NormedRope`).
+/// pairing, `rope_theta` (and so the table), and whether its head norms run (`NormedRope`: Gemma's
+/// sliding layers, and its global ones where the fold takes them).
 #[derive(Clone, Copy)]
 struct W4cShape {
     what: &'static str,
@@ -1391,7 +1391,7 @@ const fn w4c_shape(
     }
 }
 
-const W4C_SHAPES: [W4cShape; 4] = [
+const W4C_SHAPES: [W4cShape; 5] = [
     w4c_shape(
         "Gemma sliding, normed",
         (16, 8, 256, 256, false),
@@ -1399,6 +1399,12 @@ const W4C_SHAPES: [W4cShape; 4] = [
         true,
     ),
     w4c_shape("Gemma global", (16, 2, 512, 128, true), THETA_GLOBAL, false),
+    w4c_shape(
+        "Gemma global, normed",
+        (16, 2, 512, 128, true),
+        THETA_GLOBAL,
+        true,
+    ),
     w4c_shape("27B", (24, 4, 256, 64, false), THETA, false),
     w4c_shape("35B", (16, 2, 256, 64, false), THETA, false),
 ];
@@ -1691,7 +1697,8 @@ fn the_fused_rope_append_time_is_recorded() {
 
 /// FP8 S8 W4c: the fused rope append is its chain bit for bit, at Gemma's sliding geometry (16 q
 /// heads × 256, 8 kv heads, the full-width rope, normed: RmsNorm(q), RmsNorm(k), RmsNormUnit(v),
-/// Rope, RopeAppend), its global one (16 × 512, 2 kv heads, `<128, true>`, unnormed) and the 27B's
+/// Rope, RopeAppend), its global one (16 × 512, 2 kv heads, `<128, true>`, unnormed and normed:
+/// two 256-column tiles a head view) and the 27B's
 /// and 35B's (`<64, false>`), at positions 0, 1, 191 and 8,191, 3 seeds: `mismatched_bits=0` on q's
 /// rope and k's rope, and 0 differing bytes over both whole caches (the written slot and every other
 /// byte).

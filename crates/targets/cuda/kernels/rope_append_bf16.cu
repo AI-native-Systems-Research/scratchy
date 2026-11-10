@@ -12,14 +12,16 @@
 //     (`rope_bf16_ker<ROT, HALF_HEAD, true>`). CTA `h < q_heads` is q's head h; CTA `q_heads + j`
 //     is k's head j, and also appends k's and v's head j.
 //   - **The head norm** (normed only) is `rms_norm_bf16_ker`'s code at its one CTA over the head
-//     view (`[heads, head_dim]`, `rows = heads ≤ 16`: one 16-row block, one 256-column tile): the
-//     view's tile TMA-loaded into a plain `st_bf<16, 256, false>` (rows past `heads` zeros), loaded
-//     into `rt_fl<16, 256>`, squared (`warp::mul`), the 3-operand `warp::row_sum`, `warp::div` by
-//     `cols`, `rms_inv` with `eps`, `mul_row` by `inv`, `mul_col` by `0 + gain` (not under the unit
-//     norm), `warp::store` (the one RNE rounding). The 16-row kernel's warp 0 does exactly this for
-//     tile 0 of the block; its warps 1..3 own no tile and add exact zeros in warp order, so one warp
-//     gives the same total. Every CTA of a view computes the whole block (a few hundred FMAs), and
-//     keeps its own head's row: `head % 16`. Only `head_dim` 256 (Gemma's sliding heads) is normed.
+//     view (`[heads, head_dim]`, `rows = heads ≤ 16`: one 16-row block, `head_dim / 256` column
+//     tiles): each tile TMA-loaded into a plain `st_bf<16, 256, false>` (rows past `heads` zeros),
+//     loaded into `rt_fl<16, 256>`, squared (`warp::mul`), the 3-operand `warp::row_sum`, the parts
+//     added in warp order, `warp::div` by `cols`, `rms_inv` with `eps`, `mul_row` by `inv`,
+//     `mul_col` by `0 + gain` (not under the unit norm), `warp::store` (the one RNE rounding). The
+//     16-row kernel's warp `t` does exactly this for tile `t` of the block (tile 0 at Gemma's
+//     sliding 256, tiles 0 and 1 at its global 512); its other warps own no tile and add exact
+//     zeros in warp order, so one warp doing each owning warp's part gives the same total. Every
+//     CTA of a view computes the whole block (a few hundred FMAs a tile), and keeps its own head's
+//     row: `head % 16`.
 //   - **The rope** is `rope_bf16_ker`'s one-row unit code on the head: its boxes of
 //     `st_bf<16, 64, false>` (from the normed tile's row, or TMA-loaded), the table's boxes, the same
 //     maps in the same order, each box stored back (the one rounding), then TMA-stored to its output.
@@ -34,8 +36,10 @@
 //
 // Instances (`step::ROPE_BF16_KERNEL_SHAPES` by head dim, and `NORMS` on the one the fold takes):
 // `<64, false, 256>` (27B, 35B), `<256, false, 256>` and `<256, false, 256, true>` (Gemma sliding),
-// `<128, true, 512>` (Gemma global). Shared memory: the head's boxes (8 KiB at 512), the table's,
-// and the norm's tile and gain (8 KiB, 512 B), under 48 KiB, so the setup only loads them.
+// `<128, true, 512>` and `<128, true, 512, true>` (Gemma global). Shared memory: the head's boxes
+// (16 KiB at 512), the table's, and each view's norm tiles and gains (8 KiB and 512 B a tile),
+// under 48 KiB but on the normed global instance (two tiles a view, 54 KiB), whose setup raises
+// its limit.
 
 #include "kittens.cuh"
 #include "scratchy_ops.cuh"
@@ -117,47 +121,63 @@ struct ra_globals {
     uint32_t num_blocks;
 };
 
-// `rms_norm_bf16_ker<FORM>`'s code at its one CTA over a head view of `heads ≤ 16` rows and one
-// 256-column tile, by one warp (its warp 0; warps 1..3 own no tile): the block's tile into `x_s`,
-// normed, rounded, stored back. `UNIT`: no gain.
-template <bool UNIT>
-__device__ inline void view_norm(norm_tile& x_s, gain_vec& g_s, const norm_gl& x,
+// `rms_norm_bf16_ker<FORM>`'s code at its one CTA over a head view of `heads ≤ 16` rows and
+// `TILES ≤ 4` 256-column tiles, by one warp doing the work of its warps 0..TILES-1 (warp `t` owns
+// tile `t`; the others own none): the block's tiles into `x_s`, normed, rounded, stored back.
+// `UNIT`: no gain.
+template <bool UNIT, int TILES>
+__device__ inline void view_norm(norm_tile (&x_s)[TILES], gain_vec (&g_s)[TILES], const norm_gl& x,
                                  const gain_gl& gain, float eps, float cols, semaphore& arrived) {
-    warp::tma::expect_bytes(arrived, sizeof(norm_tile) + (UNIT ? 0 : sizeof(gain_vec)));
-    warp::tma::load_async(x_s, x, coord<norm_tile>{0, 0, 0, 0}, arrived);
-    if constexpr (!UNIT) {
-        warp::tma::load_async(g_s, gain, coord<gain_vec>{0, 0, 0, 0}, arrived);
+    static_assert(TILES >= 1 && TILES <= 4, "one tile per warp of the 16-row kernel's four");
+    warp::tma::expect_bytes(arrived, TILES * (sizeof(norm_tile) + (UNIT ? 0 : sizeof(gain_vec))));
+    for (int t = 0; t < TILES; t++) {
+        warp::tma::load_async(x_s[t], x, coord<norm_tile>{0, 0, 0, t}, arrived);
+        if constexpr (!UNIT) {
+            warp::tma::load_async(g_s[t], gain, coord<gain_vec>{0, 0, 0, t}, arrived);
+        }
     }
     wait(arrived, 0);
-    // Pass 1: the tile's sum of squares into `part`, then the four warps' parts in warp order
-    // (warps 1..3 hold `+0`), then `inv` as the 16-row kernel's SASS forms it and the one-row
-    // norm writes it out (`rms_norm_one_row_ker`, W1, bit-identical over 8 M outputs): MUFU.RCP
-    // of `cols`, one FFMA `total · rcp + eps`, MUFU.RSQ (`scratchy::ops::rms_inv_fused`).
-    norm_rows part, zero;
-    warp::zero(part);
-    warp::zero(zero);
+    // Pass 1: warp `w`'s sum of squares of its tile into `part[w]` (warps past `TILES` hold `+0`),
+    // then the four parts in warp order, then `inv` as the 16-row kernel's SASS forms it and the
+    // one-row norm writes it out (`rms_norm_one_row_ker`, W1, bit-identical over 8 M outputs):
+    // MUFU.RCP of `cols`, one FFMA `total · rcp + eps`, MUFU.RSQ (`scratchy::ops::rms_inv_fused`).
+    norm_rows part[4];
+    for (int w = 0; w < 4; w++) {
+        warp::zero(part[w]);
+    }
     norm_rt v;
-    warp::load(v, x_s);
-    warp::mul(v, v, v);
-    warp::row_sum(part, v, part);
+    for (int t = 0; t < TILES; t++) {
+        warp::load(v, x_s[t]);
+        warp::mul(v, v, v);
+        warp::row_sum(part[t], v, part[t]);
+    }
     for (int w = 1; w < 4; w++) {
-        warp::add(part, part, zero);
+        warp::add(part[0], part[0], part[w]);
     }
     norm_rows rcp, inv;
     warp::one(rcp);
     warp::div(rcp, rcp, cols);
-    scratchy::ops::rv_ternary_map<scratchy::ops::rms_inv_fused>(inv, part, rcp, eps);
-    // Pass 2: `x · inv · (0 + gain)`, the one rounding.
-    warp::load(v, x_s);
-    warp::mul_row(v, v, inv);
-    if constexpr (!UNIT) {
-        norm_cols g;
-        warp::load(g, g_s);
-        warp::add(g, g, 0.0f);
-        warp::mul_col(v, v, g);
+    scratchy::ops::rv_ternary_map<scratchy::ops::rms_inv_fused>(inv, part[0], rcp, eps);
+    // Pass 2: `x · inv · (0 + gain)` per tile, the one rounding.
+    for (int t = 0; t < TILES; t++) {
+        warp::load(v, x_s[t]);
+        warp::mul_row(v, v, inv);
+        if constexpr (!UNIT) {
+            norm_cols g;
+            warp::load(g, g_s[t]);
+            warp::add(g, g, 0.0f);
+            warp::mul_col(v, v, g);
+        }
+        warp::store(x_s[t], v);
     }
-    warp::store(x_s, v);
     __syncwarp();
+}
+
+// The norm tiles an instance allocates per view: the head's 256-column tiles when normed, else
+// one (never read).
+template <int HEAD_DIM, bool NORMS>
+constexpr int norm_tiles() {
+    return NORMS ? HEAD_DIM / NORM_COLS : 1;
 }
 
 template <int ROT, bool HALF_HEAD, int HEAD_DIM, bool NORMS>
@@ -167,14 +187,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_append_ker(
     constexpr int TABLE_BOXES = rope_shape<ROT, HALF_HEAD>::TABLE_BOXES;
     constexpr int PAIR_OFF = rope_shape<ROT, HALF_HEAD>::PAIR_OFF;
     constexpr int HEAD_BOXES = HEAD_DIM / BOX_COLS;
-    static_assert(!NORMS || HEAD_DIM == NORM_COLS, "only a 256-lane head is normed");
+    constexpr int NORM_TILES = norm_tiles<HEAD_DIM, NORMS>();
+    static_assert(!NORMS || HEAD_DIM % NORM_COLS == 0, "a normed head is whole 256-lane tiles");
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
     box(&x_s)[HEAD_BOXES] = al.allocate<box, HEAD_BOXES>();
     box(&t_s)[TABLE_BOXES] = al.allocate<box, TABLE_BOXES>();
-    norm_tile& n_s = al.allocate<norm_tile>();
-    norm_tile& nv_s = al.allocate<norm_tile>();
-    gain_vec& g_s = al.allocate<gain_vec>();
+    norm_tile(&n_s)[NORM_TILES] = al.allocate<norm_tile, NORM_TILES>();
+    norm_tile(&nv_s)[NORM_TILES] = al.allocate<norm_tile, NORM_TILES>();
+    gain_vec(&g_s)[NORM_TILES] = al.allocate<gain_vec, NORM_TILES>();
     __shared__ sv_bf<HEAD_DIM> k_buf;
     __shared__ sv_bf<HEAD_DIM> v_buf;
     __shared__ sv_fp8e4m3<HEAD_DIM> k_q;
@@ -201,7 +222,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_append_ker(
     if constexpr (NORMS) {
         view_norm<false>(n_s, g_s, is_q ? g.qn : g.kn, is_q ? g.q_gain : g.k_gain, g.eps, g.cols,
                          norm_arrived);
-        // Row `h % 16` of the view's tile is the head: box `b` is its lanes `64b .. 64b + 63`, into
+        // Row `h % 16` of the view's tiles is the head: box `b` is its lanes `64b .. 64b + 63`, into
         // row 0 of the box, through the tiles' accessors (a copy of bf16 bytes). Rows 1..15 are
         // zeros, as the one-row rope's TMA reads them past its one-row array; its store drops
         // them, as this one's does.
@@ -210,7 +231,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_append_ker(
         }
         __syncwarp();
         for (int e = warp::laneid(); e < HEAD_DIM; e += kittens::WARP_THREADS) {
-            x_s[e / BOX_COLS][{0, e % BOX_COLS}] = n_s[{h % ROWS, e}];
+            x_s[e / BOX_COLS][{0, e % BOX_COLS}] = n_s[e / NORM_COLS][{h % ROWS, e % NORM_COLS}];
         }
         __syncwarp();
     } else {
@@ -293,7 +314,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_append_ker(
                 // Its own tile: the k norm's generic-proxy writes to `n_s` precede no TMA load here.
                 view_norm<true>(nv_s, g_s, g.vn, g.k_gain, g.eps, g.cols, v_arrived);
                 for (int e = warp::laneid(); e < HEAD_DIM; e += kittens::WARP_THREADS) {
-                    v_buf[e] = nv_s[{h % ROWS, e}];
+                    v_buf[e] = nv_s[e / NORM_COLS][{h % ROWS, e % NORM_COLS}];
                 }
             } else {
                 // `kv_append_fp8_ker`'s bulk load of the head's row.
@@ -319,17 +340,21 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_append_ker(
     warp::tma::store_async_wait();
 }
 
-// The instance's dynamic shared memory: the head's boxes, the table's, two norm tiles and the
-// gain vector, plus 1,024 bytes of alignment slack.
-template <int ROT, bool HALF_HEAD, int HEAD_DIM>
+// The instance's dynamic shared memory: the head's boxes, the table's, the two views' norm tiles
+// and the gain vectors, plus 1,024 bytes of alignment slack.
+template <int ROT, bool HALF_HEAD, int HEAD_DIM, bool NORMS>
 constexpr int smem_bytes() {
     return int((HEAD_DIM / BOX_COLS + rope_shape<ROT, HALF_HEAD>::TABLE_BOXES) * sizeof(box) +
-               2 * sizeof(norm_tile) + sizeof(gain_vec)) +
+               norm_tiles<HEAD_DIM, NORMS>() * (2 * sizeof(norm_tile) + sizeof(gain_vec))) +
            1024;
 }
-static_assert(smem_bytes<128, true, 512>() + 3 * 512 * 2 <= 48 * 1024 &&
-                  smem_bytes<256, false, 256>() + 3 * 256 * 2 <= 48 * 1024,
+static_assert(smem_bytes<128, true, 512, false>() + 3 * 512 * 2 <= 48 * 1024 &&
+                  smem_bytes<256, false, 256, true>() + 3 * 256 * 2 <= 48 * 1024,
               "under the default dynamic shared memory limit, with the static vectors");
+// The normed global instance's two tiles per view take it past 48 KiB: its setup raises the limit.
+constexpr int HALF_NORMED_SMEM = smem_bytes<128, true, 512, true>();
+static_assert(HALF_NORMED_SMEM > 48 * 1024 && HALF_NORMED_SMEM + 3 * 512 * 2 <= 227 * 1024,
+              "past the default limit, under the H100's opt-in one, with the static vectors");
 
 // The launch's operands, as the launcher was given them.
 struct ra_args {
@@ -372,14 +397,15 @@ int launch(const ra_args& a, uint32_t q_heads, uint32_t kv_heads, uint32_t num_b
     // Unnormed, the gain views are never read: they view q, which holds at least `head_dim` bf16.
     const void* qgain = NORMS ? a.q_gain : a.q;
     const void* kgain = NORMS ? a.k_gain : a.q;
-    gain_gl qgg{bf(qgain), nullptr, nullptr, nullptr, size_t(NORM_COLS)};
-    gain_gl kgg{bf(kgain), nullptr, nullptr, nullptr, size_t(NORM_COLS)};
+    gain_gl qgg{bf(qgain), nullptr, nullptr, nullptr, size_t(HEAD_DIM)};
+    gain_gl kgg{bf(kgain), nullptr, nullptr, nullptr, size_t(HEAD_DIM)};
     ra_globals<HEAD_DIM> G{qg, qog, kg, kog, vg, tg, sg, kcg, vcg, qn, kn, vn, qgg, kgg,
                            eps, float(HEAD_DIM), int(q_heads), int(kv_heads), num_blocks};
     void* args[] = {&G};
     const dim3 grid{q_heads + kv_heads}, block{uint32_t(NUM_THREADS)};
     return static_cast<int>(cudaLaunchKernel(rope_append_ker<ROT, HALF_HEAD, HEAD_DIM, NORMS>, grid,
-                                             block, args, smem_bytes<ROT, HALF_HEAD, HEAD_DIM>(),
+                                             block, args,
+                                             smem_bytes<ROT, HALF_HEAD, HEAD_DIM, NORMS>(),
                                              s));
 }
 
@@ -390,9 +416,10 @@ constexpr uint32_t PAIRING_HALF_ROTATED = 0;
 constexpr uint32_t PAIRING_HALF_HEAD = 1;
 
 // The kernel's one-time setup, run once per device by `kernels::prepare_all`: query each
-// instance's attributes, which loads its module, so a graph capture never loads one mid-capture.
+// instance's attributes, which loads its module, so a graph capture never loads one mid-capture,
+// and allow the normed global instance its `HALF_NORMED_SMEM` of dynamic shared memory.
 //
-// 0 = done; any other value = the cudaError_t of the first query that failed.
+// 0 = done; any other value = the cudaError_t of the first call that failed.
 extern "C" int scratchy_cuda_rope_append_fp8_prepare(void) {
     cudaFuncAttributes attr;
     for (const cudaError_t e : {
@@ -400,6 +427,9 @@ extern "C" int scratchy_cuda_rope_append_fp8_prepare(void) {
              cudaFuncGetAttributes(&attr, rope_append_ker<256, false, 256, false>),
              cudaFuncGetAttributes(&attr, rope_append_ker<256, false, 256, true>),
              cudaFuncGetAttributes(&attr, rope_append_ker<128, true, 512, false>),
+             cudaFuncGetAttributes(&attr, rope_append_ker<128, true, 512, true>),
+             cudaFuncSetAttribute(rope_append_ker<128, true, 512, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, HALF_NORMED_SMEM),
          }) {
         if (e != cudaSuccess) {
             return static_cast<int>(e);
@@ -420,7 +450,8 @@ extern "C" int scratchy_cuda_rope_append_fp8_prepare(void) {
 // the unit norm (`eps`), as `scratchy_cuda_rms_norm_bf16` and `scratchy_cuda_rms_norm_unit_bf16` on
 // the head views `[heads, head_dim]`. Refused before any pointer is touched: `(rot_dim, pairing,
 // head_dim)` not (64, half-rotated, 256), (256, half-rotated, 256) or (128, half-head, 512); the
-// heads zero or above 16 under the norms, which take (256, half-rotated, 256) only, at a finite
+// heads zero or above 16 under the norms, which take (256, half-rotated, 256) and (128, half-head,
+// 512) only, at a finite
 // positive `eps`; `block_size` not 64. `q`, `q_out` hold `q_heads · head_dim` bf16, `k`, `k_out`,
 // `v` `kv_heads · head_dim`, the table `rot_dim`, the gains `head_dim` bf16; the outputs overlap no
 // input; the caches as `scratchy_cuda_kv_append_fp8`'s. `num_blocks` 0 appends nothing. The launch
@@ -437,7 +468,7 @@ extern "C" int scratchy_cuda_rope_append_fp8(
     const bool norms = q_gain != nullptr;
     if (!(narrow || full || half) || q_heads == 0 || kv_heads == 0 || block_size != BLOCK_SIZE ||
         uint64_t(q_heads + kv_heads) > 65535 ||
-        (norms && (!full || k_gain == nullptr || q_heads > uint32_t(ROWS) ||
+        (norms && (!(full || half) || k_gain == nullptr || q_heads > uint32_t(ROWS) ||
                    kv_heads > uint32_t(ROWS) || !(eps > 0.0f && eps <= 3.0e38f)))) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
@@ -446,7 +477,8 @@ extern "C" int scratchy_cuda_rope_append_fp8(
         const ra_args a{q, q_out, k, k_out, v, table, slot_mapping, k_cache, v_cache, q_gain, k_gain};
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
         if (half) {
-            return launch<128, true, 512, false>(a, q_heads, kv_heads, num_blocks, eps, s);
+            return norms ? launch<128, true, 512, true>(a, q_heads, kv_heads, num_blocks, eps, s)
+                         : launch<128, true, 512, false>(a, q_heads, kv_heads, num_blocks, eps, s);
         }
         if (narrow) {
             return launch<64, false, 256, false>(a, q_heads, kv_heads, num_blocks, eps, s);

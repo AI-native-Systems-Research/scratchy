@@ -3965,8 +3965,8 @@ pub unsafe fn gemv_bf16_residual(
 /// norm, the bits of [`rms_norm_bf16`] (stored gain) and [`rms_norm_unit_bf16`] on the head views.
 /// Asynchronous; refused with [`KernelError::KvAppendShape`] before any pointer is touched unless
 /// `(rot_dim, pairing, head_dim)` is (64, half-rotated, 256), (256, half-rotated, 256) or (128,
-/// half-head, 512), `block_size` 64, and, normed, (256, half-rotated, 256) with at most 16 heads of
-/// each and a finite positive `eps`.
+/// half-head, 512), `block_size` 64, and, normed, (256, half-rotated, 256) or (128, half-head, 512)
+/// with at most 16 heads of each and a finite positive `eps`.
 ///
 /// # Safety
 ///
