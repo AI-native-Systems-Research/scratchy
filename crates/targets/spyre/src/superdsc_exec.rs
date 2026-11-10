@@ -22,6 +22,7 @@ use std::num::NonZeroU64;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+use flex_rs::iommu::PfIommuMapper;
 use flex_rs::memory_region::MemoryType;
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
@@ -31,7 +32,7 @@ use crate::cb_plan;
 use crate::fold_plan::{self, OpKv};
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, PeerLink, Stream,
+    H2dPin, HwError, PeerLink, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{
@@ -90,6 +91,231 @@ pub const SEG_KV: SegIdx = SegIdx::known::<2>();
 /// without disturbing the running softmax state or any other activation.
 pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
 
+/// ⭐ THE HOST SHADOW'S OWN BUFFER — page-aligned, THP-advised anonymous memory.
+///
+/// Why not a `Vec`: prepare sends these bytes by the PRE-MAPPED door
+/// ([`Stream::pin_h2d`]), and that door's recipe — the vendor's own, stated where
+/// `DmaBuf::setup_dma_buf` skips its shadow copy for a caller-supplied iova — is an
+/// IOMMU-page-ALIGNED, fully-populated host buffer. A `Vec`'s pointer is the allocator's
+/// to place (glibc's huge blocks come back 16 B into their mapping), so alignment cannot be
+/// asked of one; `mmap` gives it by construction.
+///
+/// The huge-page advice is not decoration: the IOMMU pin that pre-mapped send rides walks
+/// the buffer's backing pages, and VFIO pins at the backing page's granularity — 4 KiB
+/// anonymous pages pin at 1.3-2.4 GB/s where THP-backed ones pin at 288 GB/s
+/// (card-measured, `h2d_streams_probe`, 2026-11-10), so a 2.5 GiB weight shadow pins in
+/// ~10 ms THP-backed or over a second not. The pod's THP defrag mode is `madvise`, so an
+/// un-advised mapping's huge pages are best-effort; [`advise_huge_pages`] is what makes
+/// them reliable. Population is [`fault_in`]'s job, at prepare, value-preserving — staged
+/// bytes are already faulted by the staging walk's writes, and the pad extents fault as
+/// born zeros without disturbing them.
+///
+/// `len` is the LOGICAL length (the byte count every reader sees through `Deref`); the
+/// mapping itself is [`pages_of`]` (len)` — the page-rounded extent, whose tail bytes past
+/// `len` read as zeros (anonymous `mmap` semantics) and are nobody's to write. The
+/// invariant `len == 0` ⟺ "never mapped" (a dangling pointer) is what [`Drop`] and
+/// [`HostBuf::resize`] both rest on.
+#[derive(Debug)]
+pub(crate) struct HostBuf {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+/// A host buffer's page-rounded extent — the size actually mapped for `len` logical bytes.
+fn pages_of(len: usize) -> usize {
+    len.div_ceil(HOST_PAGE) * HOST_PAGE
+}
+
+/// Why a host shadow buffer could not be made: the kernel's errno, by stage.
+#[derive(Debug)]
+pub(crate) enum HostBufError {
+    /// `mmap` refused the allocation.
+    Map { errno: std::io::Error },
+    /// `mremap` refused the growth (Linux; other targets grow by copy, which cannot fail
+    /// this way).
+    Remap { errno: std::io::Error },
+}
+
+impl std::fmt::Display for HostBufError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Map { errno } => write!(f, "mmap refused the host shadow: {errno}"),
+            Self::Remap { errno } => write!(f, "mremap refused the host shadow's growth: {errno}"),
+        }
+    }
+}
+
+impl std::error::Error for HostBufError {}
+
+/// `MADV_HUGEPAGE` over a mapping we own — see [`HostBuf`]'s doc for the pin-rate law that
+/// makes this load-bearing. Best-effort BY NATURE (it is an advice): a kernel without THP
+/// refuses it, and the buffer is still correct — only the pin's rate suffers, which the
+/// refusal line names when it happens.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(ptr: *mut std::ffi::c_void, mapped: usize) {
+    // SAFETY: `ptr`/`mapped` are our own live mapping (every caller passes a buffer this
+    // module mmap'd), and `madvise` reads only the VMA metadata.
+    unsafe {
+        if libc::madvise(ptr, mapped, libc::MADV_HUGEPAGE) != 0 {
+            let errno = std::io::Error::last_os_error();
+            debug!(
+                "MADV_HUGEPAGE refused ({errno}) — the shadow's pages will pin at 4 KiB \
+                    granularity"
+            );
+        }
+    }
+}
+
+/// Only Linux has `MADV_HUGEPAGE`, and only Linux drives a card — a shadow on any other
+/// target exists for cardless tests and is never pinned.
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages(_ptr: *mut std::ffi::c_void, _mapped: usize) {}
+
+// SAFETY (both): the buffer is plain anonymous memory with no thread affinity — the same
+// statement `RaiiBuffer` makes for the vendor's own aligned host buffers
+// (`flex_rs::host_interface`), and the reason a `Vec<u8>` payload was `Send` and `Sync`
+// too.
+unsafe impl Send for HostBuf {}
+unsafe impl Sync for HostBuf {}
+
+impl HostBuf {
+    /// The empty buffer — no mapping at all. [`Executor::stage_weights`] is what sizes a
+    /// shadow; every other construction site of an empty one is a slot awaiting that.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            ptr: std::ptr::NonNull::dangling(),
+            len: 0,
+        }
+    }
+
+    /// A page-aligned, zero-filled buffer of `len` bytes. "Zero-filled" is the mapping's
+    /// own semantics (anonymous `mmap` reads as zeros until written), so nothing is memset:
+    /// the staging walk's writes fault the pages it touches and [`fault_in`] faults the
+    /// rest at prepare — the kernel zeroes each page exactly once, on first touch, either
+    /// way.
+    pub(crate) fn zeroed(len: usize) -> Result<Self, HostBufError> {
+        if len == 0 {
+            return Ok(Self::empty());
+        }
+        let mapped = pages_of(len);
+        // SAFETY: a nonzero page count, no file, no fixed address — `mmap` has no
+        // preconditions left to violate, and the return is checked against `MAP_FAILED`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(HostBufError::Map {
+                errno: std::io::Error::last_os_error(),
+            });
+        }
+        advise_huge_pages(ptr, mapped);
+        Ok(Self {
+            // SAFETY: `mmap` succeeded, so the pointer is non-null.
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr.cast()) },
+            len,
+        })
+    }
+
+    /// `Vec::resize(new_len, 0)`'s contract on this buffer: grow with born-zero tail bytes,
+    /// shrink by dropping them. Growth on Linux is `mremap` — the kernel moves the pages,
+    /// so a weight shadow grown by its region's alignment pad does not copy 2 GiB to add
+    /// 2 MiB (the allocator's own `realloc` plays the same trick for its mmap'd blocks);
+    /// other targets grow by copy, and never run on a card anyway.
+    pub(crate) fn resize(&mut self, new_len: usize) -> Result<(), HostBufError> {
+        if new_len == self.len {
+            return Ok(());
+        }
+        if self.len == 0 || new_len == 0 {
+            // An empty buffer holds no mapping to keep, and a resize to empty drops the
+            // mapping outright — either way the result is a fresh buffer carrying the old
+            // prefix where one exists.
+            let mut next = Self::zeroed(new_len)?;
+            let keep = self.len.min(new_len);
+            if keep > 0 {
+                next[..keep].copy_from_slice(&self[..keep]);
+            }
+            *self = next;
+            return Ok(());
+        }
+        let old_mapped = pages_of(self.len);
+        let new_mapped = pages_of(new_len);
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `ptr`/`old_mapped` are this buffer's own live mapping; `MREMAP_MAYMOVE`
+            // is the only flag, and the return is checked against `MAP_FAILED`.
+            let grown = unsafe {
+                libc::mremap(
+                    self.ptr.as_ptr().cast(),
+                    old_mapped,
+                    new_mapped,
+                    libc::MREMAP_MAYMOVE,
+                )
+            };
+            if grown == libc::MAP_FAILED {
+                return Err(HostBufError::Remap {
+                    errno: std::io::Error::last_os_error(),
+                });
+            }
+            // SAFETY: `mremap` succeeded, so the pointer is non-null.
+            self.ptr = unsafe { std::ptr::NonNull::new_unchecked(grown.cast()) };
+            // The moved mapping carries its VMA flags, but the grown tail is new — advise
+            // the whole range again so it is covered either way.
+            advise_huge_pages(grown, new_mapped);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut next = Self::zeroed(new_len)?;
+            let keep = self.len.min(new_len);
+            next[..keep].copy_from_slice(&self[..keep]);
+            *self = next;
+            let _ = (old_mapped, new_mapped);
+        }
+        self.len = new_len;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for HostBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            // SAFETY: `ptr` names our own mapping of at least `len` bytes, uniquely held.
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+    }
+}
+
+impl std::ops::DerefMut for HostBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            // SAFETY: as `Deref`, and uniquely held through `&mut self`.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+    }
+}
+
+impl Drop for HostBuf {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // SAFETY: `ptr`/`pages_of(len)` are this buffer's own live mapping — the invariant
+        // `len == 0` ⟺ never-mapped is what makes the guard sufficient.
+        unsafe { libc::munmap(self.ptr.as_ptr().cast(), pages_of(self.len)) };
+    }
+}
+
 /// ⭐ ONE SLOT'S HOST SIDE — a real buffer, or the typed statement that the slot's bytes live
 /// only on the device.
 ///
@@ -105,7 +331,7 @@ enum HostShadow {
     /// A real host buffer: staged weights, a per-step mirror (the activation and logits
     /// segments), or one materialized on demand by a read. `Default` is the empty buffer —
     /// the pre-staging state; [`Executor::stage_weights`] is what sizes it.
-    Host(Vec<u8>),
+    Host(HostBuf),
     /// No host bytes, by the bundle's own statement (see [`Executor::host_owned_seg`]):
     /// device-filled at boot, materialized only when a read asks.
     DeviceOnly,
@@ -113,7 +339,7 @@ enum HostShadow {
 
 impl Default for HostShadow {
     fn default() -> Self {
-        HostShadow::Host(Vec::new())
+        HostShadow::Host(HostBuf::empty())
     }
 }
 
@@ -128,7 +354,7 @@ impl HostShadow {
     }
 
     /// The buffer mutably, same law as [`Self::host`].
-    fn host_vec_mut(&mut self) -> Option<&mut Vec<u8>> {
+    fn host_buf_mut(&mut self) -> Option<&mut HostBuf> {
         match self {
             HostShadow::Host(v) => Some(v),
             HostShadow::DeviceOnly => None,
@@ -696,6 +922,14 @@ const FILL_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
     None => unreachable!(),
 };
 
+/// The window step of a pre-mapped whole-region send ([`send_premapped`]) — the same 64 MiB
+/// the #606 pool's own copies cut, so one window is one DMA control block on the wire and a
+/// multi-GiB region costs tens of submissions, not thousands.
+const H2D_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
+    Some(w) => w,
+    None => unreachable!(),
+};
+
 /// ⭐ THE ONE ZERO-FILL WALK: [`DevAddr::windows`] at [`FILL_WINDOW`], so a multi-chunk
 /// (interleaved) region is filled chunk by chunk — every byte the region owns, none it does
 /// not — and each window is the single-chunk shape the fill control block resolves. Every
@@ -705,6 +939,51 @@ fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
     for w in addr.windows(FILL_WINDOW) {
         stream.fill_zero(&w).map_err(|e| anyhow!("{what}: {e}"))?;
     }
+    Ok(())
+}
+
+/// ⭐ THE PRE-MAPPED SEND OF ONE WHOLE SHADOW — the boot-weight door's consumer side. The
+/// shadow's pages are faulted (value-preserving, by prepare's grow loop); here the buffer
+/// is pinned ONCE for its whole extent ([`Stream::pin_h2d`], which refuses a mapping that
+/// does not cover the shadow BY NAME — `PremappedH2dRefusal::ShortPin`) and the transfer
+/// goes out window by window through [`H2dPin::send_window`], each window's host slice AND
+/// iova derived from the pin itself — the same linear arithmetic the #606 pool's slot
+/// resolution rides and the law the scheduler states by advancing a caller iova with its
+/// host address. One pin, one submit per window, and none of the plain door's per-call
+/// DmaBuf setup and pin: ~59 GB/s against its 6-7 (card-measured, `h2d_streams_probe`,
+/// 2026-11-10), which is the whole point — a 2b model's ~2.5 GiB of weights.
+///
+/// The pin is parked in `alive` until the caller's `synchronize` has retired the transfers
+/// — but that is the happy path only, and not where the safety lives: the guard's own
+/// [`Drop`] synchronizes the stream BEFORE it unpins, so an early return (a refused
+/// window, a failed sync, an unwind) retires the DMA too. The unpin never races a
+/// transfer, on any exit.
+fn send_premapped<'a>(
+    stream: &'a Stream,
+    src: &'a [u8],
+    addr: &DevAddr,
+    mapper: &std::sync::Arc<PfIommuMapper>,
+    alive: &mut Vec<H2dPin<'a>>,
+    what: &str,
+) -> Result<()> {
+    let pin = stream
+        .pin_h2d(mapper, src)
+        .map_err(|e| anyhow!("{what}: pinning the {} B shadow: {e}", src.len()))?;
+    let mut off = 0usize;
+    for w in addr.windows(H2D_WINDOW) {
+        let win = w.total_size().as_u64() as usize;
+        pin.send_window(&w, off..off + win)
+            .map_err(|e| anyhow!("{what}: pre-mapped window at byte {off}: {e}"))?;
+        off += win;
+    }
+    assert_eq!(
+        off,
+        src.len(),
+        "{what}: the window walk covered {off} of {} B — DevAddr::windows' \
+         cover-each-chunk-once law is broken",
+        src.len()
+    );
+    alive.push(pin);
     Ok(())
 }
 
@@ -1315,11 +1594,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .layout
                 .weight_bank_bytes
                 .iter()
-                .map(|_| HostShadow::Host(Vec::new()))
+                .map(|_| HostShadow::Host(HostBuf::empty()))
                 .collect(),
             weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
             weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
-            seg_host: [const { HostShadow::Host(Vec::new()) }; NUM_SEGMENTS],
+            seg_host: [const { HostShadow::Host(HostBuf::empty()) }; NUM_SEGMENTS],
             read_ring: Vec::new(),
             read_ring_free: Vec::new(),
             last_h2d: None,
@@ -1741,7 +2020,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // role statement — a device-only slot here means the placement and the bundle's own
         // role statement disagree, which is a refusal, never a write into nothing.
         let dst = self.seg_host[segi]
-            .host_vec_mut()
+            .host_buf_mut()
             .ok_or_else(|| {
                 anyhow!("bind: activation '{id}' names seg{segi}, which is DEVICE-ONLY")
             })?
@@ -1851,7 +2130,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .seg_host
             .get_mut(seg)
             .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?
-            .host_vec_mut()
+            .host_buf_mut()
             .ok_or_else(|| anyhow!("the activation segment {seg} is DEVICE-ONLY"))?;
         fault_in(shadow);
         Ok(shadow.len() as u64)
@@ -2161,14 +2440,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// logits readback) is what asks for some, so it lands D2H bytes in a fresh zeroed
     /// buffer of exactly the window it reads. A mirrored buffer shorter than `want` grows —
     /// the bytes past its old end are born zeros, and the D2H overwrites the window anyway.
-    fn shadow_for_read(&mut self, seg: SegIdx, want: usize) {
+    /// The buffer is MAPPED memory, so a materialization or growth the kernel refuses is a
+    /// refusal the caller reports, never a panic or a shorter buffer.
+    fn shadow_for_read(&mut self, seg: SegIdx, want: usize) -> Result<()> {
         let i = seg.get();
-        match self.seg_host[i].host_vec_mut() {
+        match self.seg_host[i].host_buf_mut() {
             Some(v) if v.len() >= want => {}
-            Some(v) => v.resize(want, 0),
+            Some(v) => v.resize(want)?,
             // `None` carries no live borrow, so the slot can be replaced in this arm.
-            None => self.seg_host[i] = HostShadow::Host(vec![0u8; want]),
+            None => self.seg_host[i] = HostShadow::Host(HostBuf::zeroed(want)?),
         }
+        Ok(())
     }
 
     pub fn stage_weights(&mut self) -> Result<()> {
@@ -2330,7 +2612,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 self.seg_host[i] = HostShadow::DeviceOnly;
             } else {
                 self.seg_host[i] =
-                    HostShadow::Host(vec![0u8; self.segment_bytes[i].max(128) as usize]);
+                    HostShadow::Host(HostBuf::zeroed(self.segment_bytes[i].max(128) as usize)?);
             }
         }
         // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK: a bank holds only weights, so it follows the
@@ -2342,7 +2624,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 self.weight_bank_host[b] = HostShadow::DeviceOnly;
             } else {
                 self.weight_bank_host[b] =
-                    HostShadow::Host(vec![0u8; self.weight_bank_bytes[b].max(128) as usize]);
+                    HostShadow::Host(HostBuf::zeroed(self.weight_bank_bytes[b].max(128) as usize)?);
             }
         }
 
@@ -2370,7 +2652,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .seg_host
                 .iter_mut()
                 .chain(self.weight_bank_host.iter_mut())
-                .map(|s| s.host_vec_mut().map(|v| &mut v[..]))
+                .map(|s| s.host_buf_mut().map(|v| &mut v[..]))
                 .collect();
             let mut cursor = vec![0usize; rests.len()];
             for it in &items {
@@ -2726,8 +3008,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
         // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
         //    critical path. Then grow each HOST-OWNED seg_host to the device alloc's size
-        //    (alignment pad, zero) so the H2D copies a full region. Device-only slots never
-        //    H2D their shadow — they have none. ──
+        //    (alignment pad, zero) so the H2D copies a full region, and FAULT ITS PAGES IN —
+        //    value-preserving ([`fault_in`]), so the staged bytes cross untouched; what it
+        //    adds is residency for the extents the staging walk never wrote (the pad between
+        //    placements, a region's tail), which the pre-mapped pin below then walks as
+        //    THP-backed pages instead of faulting them itself at 4 KiB granularity.
+        //    Device-only slots never H2D their shadow — they have none, so a borrowed
+        //    segment (marked device-only at staging) faults nothing either. ──
         self.stage_weights()?;
         let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
@@ -2739,10 +3026,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             let need = self.seg_addr[i]
                 .as_ref()
                 .map_or(0, |a| a.total_size().as_u64()) as usize;
-            if let Some(v) = self.seg_host[i].host_vec_mut()
-                && v.len() < need
-            {
-                v.resize(need, 0);
+            if let Some(v) = self.seg_host[i].host_buf_mut() {
+                if v.len() < need {
+                    v.resize(need)?;
+                }
+                if let Some(pages) = v.get_mut(..need) {
+                    fault_in(pages);
+                }
             }
         }
         // The weight banks follow the weight segment's own session rule exactly
@@ -2752,10 +3042,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 let need = self.weight_bank_addr[b]
                     .as_ref()
                     .map_or(0, |a| a.total_size().as_u64()) as usize;
-                if let Some(v) = self.weight_bank_host[b].host_vec_mut()
-                    && v.len() < need
-                {
-                    v.resize(need, 0);
+                if let Some(v) = self.weight_bank_host[b].host_buf_mut() {
+                    if v.len() < need {
+                        v.resize(need)?;
+                    }
+                    if let Some(pages) = v.get_mut(..need) {
+                        fault_in(pages);
+                    }
                 }
             }
         }
@@ -2764,12 +3057,19 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
         // ── SEND every tensor-segment region's content ONCE, ROUTED BY THE BUNDLE'S OWN ROLE
         //    STATEMENT ([`Self::host_owned_seg`]): a host-owned slot (the weight segment, the
-        //    spill slot, the activation segment with its staged constants) goes out by host
-        //    H2D from its shadow; every other slot — the KV pool, the intermediates — holds
-        //    only zeros at boot, and those go out as a DEVICE-SIDE FILL
-        //    ([`Stream::fill_zero`], ~62 GB/s measured) instead of host-pushed H2D bytes
-        //    (~6-7 GB/s), which for the KV pool alone is ~10 GB of wire time on a 2b model.
-        //    Activations refill per predict. ──
+        //    spill slot, the activation segment with its staged constants) goes out by the
+        //    PRE-MAPPED door ([`send_premapped`]) from its shadow — pinned once, ~59 GB/s,
+        //    where the plain per-call door pays its DmaBuf setup for 6-7; every other slot —
+        //    the KV pool, the intermediates — holds only zeros at boot, and those go out as
+        //    a DEVICE-SIDE FILL ([`Stream::fill_zero`], ~62 GB/s measured), which for the KV
+        //    pool alone is ~10 GB of wire time on a 2b model. Activations refill per
+        //    predict. ──
+        // The mapper is one per prepare (a page size and a table); `pinned` holds every
+        // guard the sends below take. Each guard owns its mapping and borrows the shadow
+        // it pinned, and its own Drop synchronizes before unpinning — so the guards are
+        // safe to drop on ANY exit from here on, not just the sync below.
+        let mapper = PfIommuMapper::new(self.card.card().clone());
+        let mut pinned: Vec<H2dPin<'_>> = Vec::new();
         for i in 0..NUM_SEGMENTS {
             // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
@@ -2789,7 +3089,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     "[sdsc-prep-time] seg{i}: region {} B → {}",
                     addr.total_size().as_u64(),
                     if host_owned {
-                        "host H2D"
+                        "pre-mapped H2D"
                     } else {
                         "device fill"
                     }
@@ -2799,11 +3099,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 fill_zero_walk(stream, addr, &format!("prepare: seg{i} zero fill"))?;
                 continue;
             }
-            // The shadow was grown to the device extent by the loop above, so this slice is the
-            // whole region — and taking it AS A SLICE is what proves the H2D cannot read past the
-            // shadow. `get` rather than `[..]`: a short shadow is a wiring bug to report, not a
-            // panic, and never a DMA over-read. A host-owned slot with no shadow is the same
-            // disagreement, refused.
+            // The shadow was grown (and its pages faulted in) by the loop above, so this slice
+            // is the whole region — and taking it AS A SLICE is what proves the H2D cannot read
+            // past the shadow. `get` rather than `[..]`: a short shadow is a wiring bug to
+            // report, not a panic, and never a DMA over-read. A host-owned slot with no shadow
+            // is the same disagreement, refused.
             let src = whole_shadow(
                 self.seg_host[i].host().ok_or_else(|| {
                     anyhow!("prepare: seg{i} is host-owned but holds no host shadow")
@@ -2811,9 +3111,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 addr,
                 i,
             )?;
-            stream
-                .h2d(src, addr)
-                .map_err(|e| anyhow!("prepare: seg{i} H2D: {e}"))?;
+            send_premapped(
+                stream,
+                src,
+                addr,
+                &mapper,
+                &mut pinned,
+                &format!("prepare: seg{i}"),
+            )?;
         }
         // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own session rule
         // ([`Self::stages_weights`]) — a bank holds only weights by construction, so it
@@ -2836,9 +3141,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     addr,
                     NUM_SEGMENTS + b,
                 )?;
-                stream
-                    .h2d(src, addr)
-                    .map_err(|e| anyhow!("prepare: weight bank {} H2D: {e}", b + 1))?;
+                send_premapped(
+                    stream,
+                    src,
+                    addr,
+                    &mapper,
+                    &mut pinned,
+                    &format!("prepare: weight bank {}", b + 1),
+                )?;
             }
         }
         lap("tensor-h2d", &mut t0);
@@ -2846,6 +3156,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .synchronize()
             .map_err(|e| anyhow!("prepare: sync: {e}"))?;
         lap("sync", &mut t0);
+        // ⭐ THE PINS RETIRE HERE — and would on any earlier exit too: the sync above waited
+        // out every pre-mapped window, and each guard's own Drop synchronizes before it
+        // unpins, so no DMA reads a shadow's iova after its pin is gone on this path, a
+        // refused one, or an unwind. Dropping here (rather than at scope end) simply unpins
+        // before the parity gate and the ladder run on.
+        drop(pinned);
         // ⭐ #603 PR2 2a — THE CB PARITY GATE, before the session becomes loadable: a plan twin
         // that disagrees with the walk refuses the LOAD here, never a step.
         //
@@ -2896,7 +3212,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 // Empty, not gone: a read door may still materialize this slot again, and a
                 // device-only slot stays device-only.
                 if let HostShadow::Host(v) = host {
-                    *v = Vec::new();
+                    *v = HostBuf::empty();
                 }
             }
             // ⭐ AND EVERY BANK SHADOW, unconditionally: a bank holds ONLY weights (that is what
@@ -2905,7 +3221,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // process — a bank is up to 16 GiB.
             for host in self.weight_bank_host.iter_mut() {
                 if let HostShadow::Host(v) = host {
-                    *v = Vec::new();
+                    *v = HostBuf::empty();
                 }
             }
         }
@@ -4931,7 +5247,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // bounds-checked above — a device-only slot there is a role-statement mismatch, not
             // a condition to carry on from (the convert would be writing into nothing).
             let dst = self.seg_host[seg.get()]
-                .host_vec_mut()
+                .host_buf_mut()
                 .ok_or_else(|| anyhow!("predict: seg{} is DEVICE-ONLY", p.segment))?
                 .get_mut(p.offset as usize..p.offset as usize + src.len())
                 .ok_or_else(|| anyhow!("predict: activation '{nm}' overflows seg{}", p.segment))?;
@@ -5379,7 +5695,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let stream = stream
             .as_ref()
             .ok_or_else(|| anyhow!("no stream — prepare was not called"))?;
-        let Some(shadow) = seg_host[i].host_vec_mut() else {
+        let Some(shadow) = seg_host[i].host_buf_mut() else {
             bail!(
                 "read seg{i}: DEVICE-ONLY — no host mirror to read into. A read door that wants \
                  these bytes materializes one first (shadow_for_read); one that does not know \
@@ -5453,7 +5769,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?
             .total_size()
             .as_u64() as usize;
-        self.shadow_for_read(seg, dev);
+        self.shadow_for_read(seg, dev)?;
         let got = self.d2h_seg_clamped(seg)?;
         let mut elems = (p.size / 2) as usize;
         elems = elems.min(cap_elems);
@@ -5612,11 +5928,19 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // window's END and never the whole region: this door sits on the token path,
             // and the bytes past the window are nobody's.
             if matches!(self.seg_host[seg.get()], HostShadow::DeviceOnly) {
-                self.seg_host[seg.get()] = HostShadow::Host(vec![0u8; b as usize]);
-            } else if let Some(v) = self.seg_host[seg.get()].host_vec_mut()
+                self.seg_host[seg.get()] =
+                    HostShadow::Host(HostBuf::zeroed(b as usize).map_err(|e| {
+                        anyhow!(
+                            "read_tensor_raw('{id}'): materializing seg{}: {e}",
+                            seg.get()
+                        )
+                    })?);
+            } else if let Some(v) = self.seg_host[seg.get()].host_buf_mut()
                 && v.len() < b as usize
             {
-                v.resize(b as usize, 0);
+                v.resize(b as usize).map_err(|e| {
+                    anyhow!("read_tensor_raw('{id}'): growing seg{}: {e}", seg.get())
+                })?;
             }
             let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
                 bail!(
@@ -5809,7 +6133,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .ok_or_else(|| anyhow!("seg{i} has no region"))?
             .total_size()
             .as_u64() as usize;
-        self.shadow_for_read(seg, dev);
+        self.shadow_for_read(seg, dev)?;
         Ok(dev)
     }
 
@@ -5849,9 +6173,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         self.quiet_shadow()?;
         // The one materialize rule, at prefix scale: a Host slot shorter than the
         // prefix grows; a DeviceOnly slot becomes one.
-        self.shadow_for_read(seg, data.len());
+        self.shadow_for_read(seg, data.len())?;
         let dst = self.seg_host[i]
-            .host_vec_mut()
+            .host_buf_mut()
             .ok_or_else(|| anyhow!("write_seg_prefix(seg{i}): lost the host mirror"))?;
         dst[..data.len()].copy_from_slice(data);
         let addr = self.seg_addr[i]
@@ -6484,6 +6808,58 @@ fn report_phase_timers(compute_ms: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ THE SHADOW BUFFER'S OWN LAWS — everything the pre-mapped send rests on that a card
+    /// is not needed for: page alignment (the vendor's pre-mapped contract), born zeros
+    /// (mmap semantics — the pad extents a staging walk never touches still read as zero),
+    /// `Vec::resize`'s grow/shrink contract, and [`fault_in`] preserving written bytes while
+    /// it populates the rest.
+    #[test]
+    fn a_host_buf_is_page_aligned_born_zero_and_resizes_like_a_vec() {
+        let mut b = HostBuf::zeroed(3 * HOST_PAGE + 100).expect("mmap of a few pages");
+        assert_eq!(b.len(), 3 * HOST_PAGE + 100);
+        // Page alignment is the pre-mapped door's contract, so it is the type's contract.
+        assert_eq!(
+            b.as_ptr() as usize % HOST_PAGE,
+            0,
+            "the shadow buffer must be page-aligned for the pre-mapped door"
+        );
+        // Born zeros — every byte, including the mapping's whole page-rounded extent.
+        assert!(b.iter().all(|&x| x == 0));
+        assert_eq!(pages_of(b.len()), 4 * HOST_PAGE);
+
+        // Write, then grow: the prefix is carried, the tail is born zeros (Vec::resize's
+        // contract, which `shadow_for_read`'s mirror-growth and prepare's pad-growth both
+        // rely on).
+        b[..7].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+        b.resize(5 * HOST_PAGE).expect("growth by mremap or copy");
+        assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);
+        assert!(b[7..].iter().all(|&x| x == 0));
+        assert_eq!(b.len(), 5 * HOST_PAGE);
+
+        // Shrink drops the tail; a regrown buffer does not remember it.
+        b.resize(HOST_PAGE).expect("shrink");
+        assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);
+        b.resize(2 * HOST_PAGE).expect("regrow");
+        assert!(b[HOST_PAGE..].iter().all(|&x| x == 0));
+
+        // The fault sweep is value-preserving: staged bytes survive it byte for byte.
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = (i % 251) as u8;
+        }
+        let before = b.to_vec();
+        fault_in(&mut b[..]);
+        assert_eq!(&b[..], &before[..]);
+
+        // The empty buffer is a value like any other: no mapping, reads as empty, and a
+        // resize out of it is a fresh born-zero buffer.
+        let mut e = HostBuf::empty();
+        assert!(e.is_empty());
+        e.resize(64).expect("resize out of empty");
+        assert_eq!(&e[..], &[0u8; 64]);
+        e.resize(0).expect("resize to empty");
+        assert!(e.is_empty());
+    }
 
     /// The seat law: a bundle runs in a process only when both agree on the world — no window and
     /// no link, or the link's window exactly — and every disagreement refuses by name.
