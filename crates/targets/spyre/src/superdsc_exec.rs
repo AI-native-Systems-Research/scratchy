@@ -2506,6 +2506,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
             let staged = self.staged_extent.get(i).copied().unwrap_or(0);
+            if d.prep_time {
+                eprintln!(
+                    "[sdsc-prep-time] seg{i}: region {} B, staged extent {staged} B → {}",
+                    addr.total_size().as_u64(),
+                    if staged == 0 { "device fill" } else { "host H2D" }
+                );
+            }
             if staged == 0 {
                 // The same walk `zero_seg` submits: 64 MiB single-chunk windows, every
                 // byte the region owns, none it does not. No host buffer rides the fill.
