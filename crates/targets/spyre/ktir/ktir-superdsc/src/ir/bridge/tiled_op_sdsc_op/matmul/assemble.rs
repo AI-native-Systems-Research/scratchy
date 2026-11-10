@@ -538,9 +538,14 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     )
     .map_err(crate::superdsc_error::SuperDscError)?;
     // The activation's own stick-group pitch, when it is not the output's: a batch block read on
-    // its own (`a_rows == m`) is a standalone stick-major `[m, k]`.
+    // its own (`a_rows == m`) is a standalone stick-major `[m, k]` (a pitch at the sweep is no
+    // pitch), a taller one a pitch of its own — re-stated over the one `mb` slot, never a second
+    // mechanism beside it.
     if shape.a_rows != shape.rows {
-        op.args_mut()[0].set_device_extent("mb", shape.a_rows);
+        let plan = op.iter.clone();
+        op.args_mut()[0]
+            .set_pitch(&plan, "mb", shape.a_rows)
+            .map_err(|e| format!("assemble_matmul_rows {op_name}: {e}"))?;
     }
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }

@@ -118,11 +118,7 @@ pub(crate) fn view_stick_layout(
             .iter()
             .map(|&d| plan.extent(d) as usize)
             .collect::<Vec<_>>(),
-        &view
-            .device_extent
-            .iter()
-            .map(|o| o.map(|p| p as usize))
-            .collect::<Vec<_>>(),
+        &view.declared_extents(),
         view.layout
             .iter()
             .position(|&d| d == view.stick)
@@ -254,11 +250,7 @@ fn per_core_addr(
             .iter()
             .map(|&d| plan.extent(d) as usize)
             .collect::<Vec<_>>(),
-        &view
-            .device_extent
-            .iter()
-            .map(|o| o.map(|p| p as usize))
-            .collect::<Vec<_>>(),
+        &view.declared_extents(),
         layout
             .iter()
             .position(|&d| d == view.stick)
@@ -2452,10 +2444,7 @@ pub fn declared_axis_block_steps(v: &crate::superdsc_opspec::ArgView, iter: &Wor
             .iter()
             .map(|&d| iter.extent(d) as usize)
             .collect::<Vec<_>>(),
-        &v.device_extent
-            .iter()
-            .map(|o| o.map(|p| p as usize))
-            .collect::<Vec<_>>(),
+        &v.declared_extents(),
         stick_idx,
         &(0..v.layout.len())
             .map(|li| v.scale.get(li).map(|s| s.to_i64()).unwrap_or(1) > 0)
@@ -2876,7 +2865,13 @@ fn own_extent_at(
     phys_extent: &impl Fn(&'static str) -> i64,
 ) -> i64 {
     let collapsed = !v.scale.get(i).is_none_or(Scale::is_active);
-    if collapsed && v.device_extent.get(i).copied().flatten().is_none() {
+    if collapsed
+        && v.device_extent
+            .get(i)
+            .copied()
+            .and_then(crate::superdsc_opspec::DeviceAxis::declared)
+            .is_none()
+    {
         1
     } else {
         phys_extent(v.layout[i])
@@ -3036,7 +3031,12 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         // exactly to this op's shape (the overwhelmingly common, and until now ONLY, case).
         let phys_extent = |d: &'static str| -> i64 {
             let idx = v.layout.iter().position(|&ld| ld == d);
-            let ov = idx.and_then(|i| v.device_extent.get(i).copied().flatten());
+            let ov = idx.and_then(|i| {
+                v.device_extent
+                    .get(i)
+                    .copied()
+                    .and_then(crate::superdsc_opspec::DeviceAxis::declared)
+            });
             ov.map(|p| p as i64)
                 .unwrap_or_else(|| op.iter.extent(d) as i64)
         };
@@ -3164,7 +3164,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
             .device_extent
             .get(si)
             .copied()
-            .flatten()
+            .and_then(crate::superdsc_opspec::DeviceAxis::declared)
             .map(|p| p as i64)
             .unwrap_or_else(|| op.iter.extent(tiled_dim) as i64);
         if phys > out_per_time && affine_strides[ti].get(tiled_dim).copied().unwrap_or(0) == 0 {
@@ -4026,6 +4026,12 @@ pub fn emit_sdsc(
             //
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
+            //
+            // ⛔ A WINDOW'S EXTENT ONLY, NEVER A PITCH'S (`ArgView::window_extents`). `maxDimSizes_`
+            // is a size cap (`dsc2.cpp` `buildUnitView`): a pitched axis stated here would make the
+            // view TOUCH the gap, and the card would still step the next iteration by the swept
+            // extent — MEASURED, the leading-axis sum's blocks 512 rows apart read as consecutive
+            // rows. A pitch is the walk's back gap (`backGapCore_` below).
             maxDimSizes_: {
                 let swept: Vec<usize> = v.layout.iter().map(|&d| iter.extent(d) as usize).collect();
                 let stick_pos = v
@@ -4035,10 +4041,7 @@ pub fn emit_sdsc(
                     .unwrap_or(usize::MAX);
                 let device: Vec<i64> = crate::sdsc_abstract::DeviceExtents::of_view(
                     &swept,
-                    &v.device_extent
-                        .iter()
-                        .map(|o| o.map(|p| p as usize))
-                        .collect::<Vec<_>>(),
+                    &v.window_extents(),
                     stick_pos,
                     &vec![true; v.layout.len()],
                     crate::sdsc_abstract::Span::Swept,
@@ -4141,7 +4144,10 @@ pub fn emit_sdsc(
                 None | Some(IndirectRole::Value { .. }) => None,
             },
             startAddressCoreCorelet_: addr,
-            backGapCore_: None,
+            // ⭐ A PITCHED AXIS's walk — the gap past its swept extent, from the view's own pitch
+            // (`DeviceAxis::Pitch`, `BackGap::of_hbm_view`). `None` on every view that states no
+            // pitch, so every such descriptor is byte-identical.
+            backGapCore_: crate::wire::BackGap::of_hbm_view(op_name, v, iter)?,
             coordinates_: coordinates,
         })
     })?;
@@ -5280,11 +5286,16 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
     .map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_convert_band {op_name}: {e}"))
     })?;
+    // ⛔ THE PARENT IS A PITCH, NOT A WINDOW — the band door's law (`with_pitch`): the pinned walk
+    // is a size cap the card never strides by (MEASURED, microbenchmark 2026-11-08), the back gap
+    // `parent − rows` is the stride.
+    let plan = op.iter.clone();
     for (arg, w) in op.args_mut().iter_mut().zip([in_w, o_w]) {
         if let Some(w) = w {
             arg.set_offset_elems(w.dev().into_raw_elems());
             if !w.spans_one_stick() {
-                arg.set_device_extent("mb", w.parent_rows());
+                arg.set_pitch(&plan, "mb", w.parent_rows())
+                    .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
             }
         }
     }

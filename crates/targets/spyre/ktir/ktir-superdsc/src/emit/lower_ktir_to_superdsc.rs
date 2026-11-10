@@ -8318,6 +8318,51 @@ mod elementwise_tests {
         );
     }
 
+    /// ⭐⭐ A FLAT-FRAME BATCHED CONTRACTION STATES ITS FRAME AS A PITCH — the prefill P·V form,
+    /// `[8, m, k] x [8, k, 128]` with batch `i` at rows `i·m` of the `[8·m, ·]` frames and `n` two
+    /// sticks wide: each batch's output (and, at `k` past one stick, its activation) is a row band
+    /// of the taller frame, and its pitch is the walk's back gap `8·m − m` on `mb`, never a pinned
+    /// `maxDimSizes_` (a size cap the card never strides by — MEASURED by the microbenchmark on
+    /// these two shapes: pinned lost the rows past the first stick group, the gap read them).
+    #[test]
+    fn a_flat_frame_batch_states_its_frame_as_a_pitch() {
+        for (m, k) in [(68u32, 64u32), (124, 128)] {
+            let r = node(
+                reg(5, 8 * m, k, false),
+                reg(6, 8 * k, 128, false),
+                reg(7, 8 * m, 128, true),
+            );
+            let mut sym = 0i64;
+            let ops = batch_matmul::<crate::collective::TpWorld<1>>("bmm_s9", 8, BatchFrame::Flat, &r, &mut sym, None)
+                .expect("the flat-frame contraction lowers");
+            assert_eq!(ops.len(), 8, "one contraction per batch");
+            for op in &ops {
+                let dsc = op.op.as_ref().expect("a descriptor").dscs_[0]
+                    .values()
+                    .next()
+                    .expect("one dsc");
+                let v = serde_json::to_value(dsc).expect("the dsc serializes");
+                for n in v["scheduleTree_"].as_array().unwrap() {
+                    let what = format!("m {m} k {k}: {}", n["name_"]);
+                    let walk = n["maxDimSizes_"].as_array().unwrap();
+                    assert!(
+                        walk.iter().all(|e| e.as_i64() != Some(i64::from(8 * m))),
+                        "{what}: no walk is pinned to the frame's rows: {walk:?}"
+                    );
+                    let multi = n["layoutDimOrder_"] == serde_json::json!(["mb", "out"])
+                        || (k > 64 && n["layoutDimOrder_"] == serde_json::json!(["mb", "in"]));
+                    if multi {
+                        assert_eq!(
+                            n["backGapCore_"],
+                            serde_json::json!({"mb": {"-1": (7 * m).to_string()}}),
+                            "{what}: the frame's pitch past the batch's {m} rows"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// ⭐⭐ AN INNER SPRAY IS ONE ROW-VECTOR BROADCAST — a decode batch's mask over its query-head
     /// group at granite-3.1-2b's 32-request rung: the walk's first `[256, 64]` chunk tile of a
     /// `[1024, 64]` mask stack, each row repeated 4 times down a `[1024, 64]` score tile. One flat
@@ -9313,6 +9358,52 @@ mod elementwise_tests {
         .expect("the walk serializes")
     }
 
+    /// The `backGapCore_` of one operand's allocate node, and the band's swept rows — the wire's
+    /// statement of a band's parent pitch (`DeviceAxis::Pitch`): `parent − rows` on `mb` (an HBM
+    /// view's capacity includes the core fold), which the card reads as the stride the pinned walk
+    /// never was.
+    fn gap_of(op: &EmittedOp<crate::collective::TpWorld<1>>, lds: u32) -> (serde_json::Value, u32) {
+        let dsc = op.op.as_ref().expect("a descriptor").dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc");
+        let v = serde_json::to_value(dsc).expect("the dsc serializes");
+        let node = v["scheduleTree_"]
+            .as_array()
+            .expect("a schedule tree")
+            .iter()
+            .find(|n| n["nodeType_"] == "allocate" && n["ldsIdx_"] == lds)
+            .expect("an allocate node per operand")
+            .clone();
+        // The band's whole row sweep — what the HBM unit view's capacity spans.
+        let swept = v["N_"]["mb_"].as_u64().expect("a swept mb") as u32;
+        (
+            node.get("backGapCore_").cloned().unwrap_or(serde_json::Value::Null),
+            swept,
+        )
+    }
+
+    /// A band of a `parent`-row tensor: its walk is the SWEPT one (no pinned parent extents), and
+    /// its back gap is the parent's pitch past the rows a core sweeps.
+    fn assert_band_pitch(
+        op: &EmittedOp<crate::collective::TpWorld<1>>,
+        lds: u32,
+        parent: u32,
+        what: &str,
+    ) {
+        let walk = walk_of(op, lds);
+        assert!(
+            walk.as_array().is_some_and(|w| w.first().and_then(|e| e.as_i64()) != Some(i64::from(parent))),
+            "{what}: the walk is not pinned to the parent's rows (a size cap the card never strides by): {walk}"
+        );
+        let (gap, rpc) = gap_of(op, lds);
+        assert_eq!(
+            gap,
+            serde_json::json!({"mb": {"-1": (parent - rpc).to_string()}}),
+            "{what}: the parent's pitch is the back gap past the band's {rpc} row(s)"
+        );
+    }
+
     /// ⭐⭐⭐ THE LEAD'S OWN FIXTURE — the Mulf the moved refusal named: one operand the
     /// converted 42-row PIECE (a whole `[42, 2048]` value), the other the whole 64-row VALUE's
     /// load of the same window `[0, 42)`. One window, two frames, TWO VALUES — the door places
@@ -9335,17 +9426,11 @@ mod elementwise_tests {
         let ops = elementwise("mulf_s9", Elementwise::Mul, &head, &[], &mut sym, None)
             .expect("two values each state the sweep in their own frame");
         assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
-        // The load (arg 1) is PINNED to the parent's extents — the walk states them for
-        // reconstruction and sizing. The STRIDE safety is not the walk's to give (dxp reads
-        // `maxDimSizes_` as a size cap only, card-measured 2026-11-08: init_binary is
-        // byte-identical with or without it); it is the windowed-stick law's — one stick a
-        // core, so no core ever walks the parent's inter-plane stride. The piece (arg 0) and
-        // the output (arg 2) reconstruct.
-        assert_eq!(
-            walk_of(&ops[0], 1),
-            serde_json::json!([64, cols]),
-            "the load walks the PARENT's rows"
-        );
+        // The load (arg 1) states the parent's PITCH — without it dxp strides its stick groups
+        // by the sweep's 42 rows, short by 22 for every stick after the first (the pinned walk
+        // never stated that: the card read it as a size cap). The piece (arg 0) and the output
+        // (arg 2) reconstruct.
+        assert_band_pitch(&ops[0], 1, 64, "the head load");
         assert_eq!(
             walk_of(&ops[0], 0),
             serde_json::json!([-1, -1]),
@@ -9365,11 +9450,7 @@ mod elementwise_tests {
         );
         let ops = elementwise("mulf_s10", Elementwise::Mul, &tail, &[], &mut sym, None)
             .expect("the tail pairing lowers the same way");
-        assert_eq!(
-            walk_of(&ops[0], 1),
-            serde_json::json!([64, cols]),
-            "the tail load walks the PARENT's rows too"
-        );
+        assert_band_pitch(&ops[0], 1, 64, "the tail load");
         assert_eq!(
             bound_at(&ops[0], "t5"),
             42 * 64,
@@ -9380,9 +9461,9 @@ mod elementwise_tests {
 
     /// ⭐ THE BAND CONVERT — the chain's per-block `dl16tofp32`: the input a `[rows, cols]`
     /// band of the 64-row parameter, the output the whole minted fp32 piece. The input arg
-    /// DECLARES the parent's row count (its walk pinned to `[64, 4096, 1]` — the rank-3
-    /// row-blocked form the narrowing fp32 convert keeps), the output piece reconstructs, and
-    /// each side sits at its own corner: the head at 0, the tail at 2688.
+    /// states the parent's row count as its `mb` PITCH (the back gap `64 − rows` — the
+    /// rank-3 row-blocked form the narrowing fp32 convert keeps), the output piece reconstructs,
+    /// and each side sits at its own corner: the head at 0, the tail at 2688.
     #[test]
     fn a_band_convert_declares_the_parent_and_places_the_corner() {
         let cols = 4096u32;
@@ -9391,11 +9472,7 @@ mod elementwise_tests {
         let ops = convert("cvt_s1", ConvertKind::Dl16ToFp32, &head, &mut sym, None)
             .expect("the head convert lowers as a band");
         assert_eq!(ops.len(), 1);
-        assert_eq!(
-            walk_of(&ops[0], 0),
-            serde_json::json!([64, cols, 1]),
-            "the band input walks the PARENT's rows, rank-3 as the narrowing convert keeps"
-        );
+        assert_band_pitch(&ops[0], 0, 64, "the head band input");
         assert_eq!(
             walk_of(&ops[0], 1),
             serde_json::json!([-1, -1, -1]),
@@ -9406,11 +9483,7 @@ mod elementwise_tests {
         let tail = vec![split(5, 64, 42, 22, cols), reg(6, 22, cols, true)];
         let ops = convert("cvt_s2", ConvertKind::Dl16ToFp32, &tail, &mut sym, None)
             .expect("the tail convert lowers as a band");
-        assert_eq!(
-            walk_of(&ops[0], 0),
-            serde_json::json!([64, cols, 1]),
-            "the tail band walks the PARENT's rows too"
-        );
+        assert_band_pitch(&ops[0], 0, 64, "the tail band input");
         assert_eq!(
             bound_at(&ops[0], "t5"),
             42 * 64,
@@ -10014,11 +10087,7 @@ mod elementwise_tests {
         .unwrap_or_else(|e| panic!("the head band lowers: {}", e.message));
         assert_eq!(ops.len(), 1, "one descriptor, not a decomposition");
         assert_eq!(ops[0].op_name, "scalarmul_o7");
-        assert_eq!(
-            walk_of(&ops[0], 0),
-            serde_json::json!([64, cols]),
-            "the band input walks the PARENT's rows"
-        );
+        assert_band_pitch(&ops[0], 0, 64, "the head band input");
         assert_eq!(bound_at(&ops[0], "t5"), 0, "the head band's corner is 0");
         assert_eq!(
             bound_at(&ops[0], "t7"),
@@ -10046,11 +10115,7 @@ mod elementwise_tests {
         )
         .unwrap_or_else(|e| panic!("the tail band lowers: {}", e.message));
         assert_eq!(ops.len(), 1, "one descriptor, not a decomposition");
-        assert_eq!(
-            walk_of(&ops[0], 0),
-            serde_json::json!([64, cols]),
-            "the tail band walks the PARENT's rows too"
-        );
+        assert_band_pitch(&ops[0], 0, 64, "the tail band input");
         assert_eq!(
             bound_at(&ops[0], "t5"),
             42 * 64,
