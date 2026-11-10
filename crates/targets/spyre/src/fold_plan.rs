@@ -4,6 +4,20 @@
 //! Every relaunched group on the card is a walk's body: its trip count and per-trip step are bake
 //! facts ([`scratchy_spyre_bundle::Walk`]) carried on the group, so the launch reads them and decides
 //! nothing. Every other group launches once, where the bake placed it.
+//!
+//! # A BUNDLE THAT WALKS SERVES ONE REQUEST PER RELAUNCH OF ITS WHOLE SPAN
+//!
+//! A walking program's group span — its pre-loop seed, its walk body, its post-loop epilogue — is
+//! one request's attention: the pre group seeds THE ONE carried buffer the body's trips accumulate
+//! into and the post group reads, so a second request's trips must not start from the first's final
+//! state. A launch that serves several requests therefore repeats the span once per request,
+//! request-outer ([`launches`]): each request's span re-seeds before its body runs, exactly the
+//! per-sequence launches spyre-inference makes of one compiled kernel. What moves between requests
+//! is the step's tables — the activation-segment buffers the splice binds at the reserved paged tids
+//! and the host stages one pitch apart ([`Requests`]) — and nothing else: the query and output rows
+//! ride `query_row_index` (absolute rows, gathered and scattered through the table), the carried
+//! buffer is re-seeded in place, and the pools are append-only. The span is stamped onto every group
+//! of the bundle at load ([`OpKv::per_request`]), never baked: the bundle's own groups state it.
 
 /// The KV cache's segment index.
 pub const SEG_KV: usize = 2;
@@ -35,6 +49,33 @@ pub struct OpKv {
     /// ⭐ A WALK'S BLOCK BODY (`bundle::KvShifts::walk`): launched the walk's own trip count, the
     /// activation segment shifted one step per trip and nothing else — the bake's facts.
     pub walk: Option<scratchy_spyre_bundle::Walk>,
+    /// ⭐ THIS GROUP'S BUNDLE WALKS, so its whole span serves one request per relaunch (see the
+    /// module's request law). Stamped at load — `bind_ops`, from the bundle's own groups — never
+    /// baked: the span is a fact of which groups sit in one bundle, not of any one record. A walk
+    /// body is always `per_request` (it walks, so its bundle walks); the pre-loop seed and the
+    /// post-loop epilogue carry it because the seed must re-run between requests. Every group of
+    /// every other bundle launches once, whatever the launch serves.
+    pub per_request: bool,
+}
+
+/// ⭐ THE LAUNCH'S REQUEST FACTS — how many requests one launch serves, and the pitch their tables
+/// sit at in the activation segment. [`Default`] is ONE request at no pitch: every launch today
+/// states it (the worker forwards one request at a time, and a decode batch's requests ride ONE
+/// launch of the batched kernel — its bundle's `per_request` span repeats once, by the same
+/// default), and a request's tables sit at `request · pitch` whatever the pitch is, so at one
+/// request the pitch is never read. A launch serving several is a packed prefill's statement to
+/// make, and it names its pitch with it — the step's own `card_request_pitch`, the same number the
+/// host stages the tables by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Requests {
+    pub count: u32,
+    pub pitch: u64,
+}
+
+impl Default for Requests {
+    fn default() -> Self {
+        Requests { count: 1, pitch: 0 }
+    }
 }
 
 /// ⛔⛔⛔ THE RUNG A CONTEXT PAST EVERY SWEEP TAKES — the widest one that FOLDS, and the top only when
@@ -135,13 +176,64 @@ pub fn fallback_rung(rungs: &[RungReach]) -> usize {
     past_every_sweep(&folds)
 }
 
-/// How many times this op's group is launched: a walk's body its baked trip count, every other group
-/// once.
+/// How many times this op's group is launched **within one request of the launch**: a walk's body
+/// its baked trip count, every other group once. The request repetition is the span's, not the
+/// op's — see [`launches`].
 pub fn reps(op: &OpKv) -> i64 {
     // A WALK'S BODY runs its walk's trip count, baked with the rung: the blocks past a sequence's own
     // are fully masked, so the count is the walk's, never the session's pages. Every other group
     // launches once.
     op.walk.map_or(1, |w| i64::from(w.trips))
+}
+
+/// One launch of one op: its place in the list, the request of the launch it serves, and its own
+/// relaunch within that request (a walk body's trip).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub op: usize,
+    pub request: u32,
+    pub rep: i64,
+}
+
+/// ⭐ THE LAUNCH SEQUENCE — every (op, request, relaunch) one launch call submits, in submission
+/// order, stated ONCE: the submit walk, the parity gate's reference walk and its data twin all
+/// enumerate through this function, so the three cannot drift in order any more than in addressing.
+///
+/// A `per_request` run — the contiguous span of one walking bundle's groups — repeats once per
+/// request of the launch, REQUEST-OUTER: request `r`'s seed, then its walk's trips, then its
+/// epilogue, before request `r + 1` re-seeds. Every other op launches once, where it sits in the
+/// list. At one request the sequence is exactly the op-major `for op { for rep }` it has always
+/// been, byte for byte.
+pub fn launches(kvs: &[OpKv], requests: u32) -> Vec<Launch> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < kvs.len() {
+        if !kvs[i].per_request {
+            for rep in 0..reps(&kvs[i]) {
+                out.push(Launch {
+                    op: i,
+                    request: 0,
+                    rep,
+                });
+            }
+            i += 1;
+            continue;
+        }
+        // The span: every group of the bundle, so the seed re-runs ahead of each request's body.
+        let start = i;
+        while i < kvs.len() && kvs[i].per_request {
+            i += 1;
+        }
+        for request in 0..requests {
+            for (op, kv) in kvs[start..i].iter().enumerate() {
+                let op = op + start;
+                for rep in 0..reps(kv) {
+                    out.push(Launch { op, request, rep });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Everything the launch loop adds to the segment bases for one op on one relaunch.
@@ -154,18 +246,30 @@ pub struct SegDeltas {
     pub intermediate: Bytes,
 }
 
-/// THE segment shifts for op `op` on relaunch `rep`. Only a walk's body moves: trip `rep` reads the
-/// step's page-table row and mask tile `rep` steps into the activation segment, and everything else
-/// where the bake placed it — its gathers carry their own pages (the entries are absolute), so no KV
-/// shift, and its state is the one carried buffer. Every other group launches once, unshifted.
-pub fn seg_deltas(op: &OpKv, rep: i64) -> SegDeltas {
+/// THE segment shifts for op `op` serving request `request` of a launch whose tables sit `pitch`
+/// apart, on relaunch `rep`. Only a `per_request` group moves: its request's tables sit
+/// `request · pitch` into the activation segment, and a walk's body adds its own trip's step on top
+/// — trip `rep` reads the step's page-table row and mask tile `rep` steps further in. Everything
+/// else stays where the bake placed it — the gathers carry their own pages (the entries are
+/// absolute), so no KV shift, and the state is the one carried buffer, re-seeded per request by the
+/// span's pre group. A group of a bundle that does not walk launches once, unshifted, whatever it
+/// is handed.
+pub fn seg_deltas(op: &OpKv, request: u32, rep: i64, pitch: u64) -> SegDeltas {
+    if !op.per_request {
+        return SegDeltas::default();
+    }
+    let tables = Bytes(u64::from(request).wrapping_mul(pitch));
     match op.walk {
         Some(w) => SegDeltas {
             kv: Bytes(0),
-            mask: Bytes((rep as u64).wrapping_mul(u64::from(w.step_bytes))),
+            mask: tables + Bytes((rep as u64).wrapping_mul(u64::from(w.step_bytes))),
             intermediate: Bytes(0),
         },
-        None => SegDeltas::default(),
+        None => SegDeltas {
+            kv: Bytes(0),
+            mask: tables,
+            intermediate: Bytes(0),
+        },
     }
 }
 
@@ -236,13 +340,17 @@ mod tests {
 
     /// ⭐ ONLY A WALK'S BODY RELAUNCHES, AND ONLY BY ITS OWN WALK: its trip count from the bake, its
     /// mask tile `rep` steps of the baked step into the activation segment, and no KV shift — its gathers
-    /// carry their own pages. Every other group launches once, unshifted.
+    /// carry their own pages. Every other group launches once, unshifted. The request term is zero
+    /// at one request whatever the pitch, so the walk at request 0 steps exactly as it always has.
     #[test]
     fn only_a_walk_body_relaunches_and_it_steps_by_its_own_walk() {
-        use super::{Bytes, OpKv, SegDeltas, reps, seg_deltas};
+        use super::{Bytes, OpKv, Requests, SegDeltas, reps, seg_deltas};
         let once = OpKv::default();
         assert_eq!(reps(&once), 1);
-        assert_eq!(seg_deltas(&once, 0), SegDeltas::default());
+        assert_eq!(seg_deltas(&once, 0, 0, 0), SegDeltas::default());
+        // A group of a bundle that does not walk is unshifted whatever it is handed — the launch
+        // only ever hands it request 0, and the law holds by its own terms, not by the caller's.
+        assert_eq!(seg_deltas(&once, 3, 2, 8192), SegDeltas::default());
         let walk = OpKv {
             page_fold: true,
             gathered: true,
@@ -250,11 +358,12 @@ mod tests {
                 trips: 7,
                 step_bytes: 4096,
             }),
+            per_request: true,
         };
         assert_eq!(reps(&walk), 7);
         for rep in 0..7 {
             assert_eq!(
-                seg_deltas(&walk, rep),
+                seg_deltas(&walk, 0, rep, u64::MAX),
                 SegDeltas {
                     kv: Bytes(0),
                     mask: Bytes(rep as u64 * 4096),
@@ -262,5 +371,170 @@ mod tests {
                 }
             );
         }
+        // THE COMPOSITION: request `r`'s tables at `r · pitch`, the trip's step on top — the two
+        // variables of the relaunch law, added, never re-derived one from the other.
+        assert_eq!(
+            seg_deltas(&walk, 2, 3, 8192),
+            SegDeltas {
+                kv: Bytes(0),
+                mask: Bytes(2 * 8192 + 3 * 4096),
+                intermediate: Bytes(0),
+            }
+        );
+        // The span's pre and post groups (no walk of their own) take the request's tables and
+        // nothing else.
+        let epilogue = OpKv {
+            per_request: true,
+            ..OpKv::default()
+        };
+        assert_eq!(
+            seg_deltas(&epilogue, 4, 0, 4096),
+            SegDeltas {
+                kv: Bytes(0),
+                mask: Bytes(4 * 4096),
+                intermediate: Bytes(0),
+            }
+        );
+        // Default is one request at no pitch — every launch today.
+        assert_eq!(Requests::default(), Requests { count: 1, pitch: 0 });
+    }
+
+    /// ⭐ THE SPAN REPEATS REQUEST-OUTER, AND ONLY THE SPAN REPEATS. A walking bundle's groups —
+    /// seed, walk body, epilogue — run for request 0, then ALL of them again for request 1: the
+    /// seed re-runs between requests because the carried buffer is ONE buffer, and the first
+    /// request's final state in it is not the second's seed. The ops around the span launch once.
+    #[test]
+    fn a_walking_bundle_s_span_repeats_once_per_request_r_outer() {
+        use super::{Launch, OpKv, launches};
+        let walk = |trips| OpKv {
+            page_fold: true,
+            gathered: true,
+            per_request: true,
+            walk: Some(scratchy_spyre_bundle::Walk {
+                trips,
+                step_bytes: 1024,
+            }),
+        };
+        // One layer's shape: the KV write ahead, the attention bundle's span, the MLP behind.
+        let kvs = [
+            OpKv::default(),
+            OpKv {
+                per_request: true,
+                ..OpKv::default()
+            },
+            walk(3),
+            OpKv {
+                per_request: true,
+                ..OpKv::default()
+            },
+            OpKv::default(),
+        ];
+        assert_eq!(
+            launches(&kvs, 2),
+            vec![
+                Launch {
+                    op: 0,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 1,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 0,
+                    rep: 1
+                },
+                Launch {
+                    op: 2,
+                    request: 0,
+                    rep: 2
+                },
+                Launch {
+                    op: 3,
+                    request: 0,
+                    rep: 0
+                },
+                Launch {
+                    op: 1,
+                    request: 1,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 1,
+                    rep: 0
+                },
+                Launch {
+                    op: 2,
+                    request: 1,
+                    rep: 1
+                },
+                Launch {
+                    op: 2,
+                    request: 1,
+                    rep: 2
+                },
+                Launch {
+                    op: 3,
+                    request: 1,
+                    rep: 0
+                },
+                Launch {
+                    op: 4,
+                    request: 0,
+                    rep: 0
+                },
+            ]
+        );
+    }
+
+    /// ⛔ AT ONE REQUEST THE SEQUENCE IS THE OP-MAJOR ONE IT HAS ALWAYS BEEN — the request law is
+    /// inert until a launch states more than one request, so every launch today submits exactly the
+    /// (op, rep) pairs it did before the span existed.
+    #[test]
+    fn at_one_request_the_sequence_is_the_op_major_one() {
+        use super::{OpKv, launches};
+        let walk = OpKv {
+            page_fold: true,
+            gathered: true,
+            per_request: true,
+            walk: Some(scratchy_spyre_bundle::Walk {
+                trips: 4,
+                step_bytes: 2048,
+            }),
+        };
+        let kvs = [
+            OpKv {
+                per_request: true,
+                ..OpKv::default()
+            },
+            walk,
+            OpKv {
+                per_request: true,
+                ..OpKv::default()
+            },
+        ];
+        // The old enumeration, hand-rolled here as the oracle: `for op { for rep }`.
+        let mut oracle = Vec::new();
+        for (op, kv) in kvs.iter().enumerate() {
+            for rep in 0..super::reps(kv) {
+                oracle.push((op, 0, rep));
+            }
+        }
+        assert_eq!(
+            launches(&kvs, 1)
+                .into_iter()
+                .map(|l| (l.op, l.request, l.rep))
+                .collect::<Vec<_>>(),
+            oracle
+        );
     }
 }

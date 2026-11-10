@@ -1,11 +1,12 @@
 //! #603 PR2 — one launch's compute control blocks, as DATA.
 //!
 //! The submit walk (`superdsc_exec::launch_ops_inner`) stages a launch sequence whose only
-//! per-launch inputs are the launch row's segment shifts and weight bank. This module is that
-//! sequence as data — a [`CbPlan`] (one entry per (op, relaunch), carrying exactly
-//! `build_compute_cb`'s inputs) plus a render. The enumeration and the per-(op, rep) arithmetic
-//! are single-sourced here ([`launch_site`], `fold_plan::reps`) and called by BOTH the submit walk
-//! and the plan build, and the gate below proves the data twin against the walk anyway.
+//! per-launch inputs are the launch row's segment shifts, weight bank and request facts. This
+//! module is that sequence as data — a [`CbPlan`] (one entry per (op, request, relaunch), carrying
+//! exactly `build_compute_cb`'s inputs) plus a render. The ENUMERATION is one function
+//! (`fold_plan::launches`) and the per-launch arithmetic one ([`launch_site`]), both called by the
+//! submit walk, the reference walk and the plan build alike, and the gate below proves the data
+//! twin against the walk anyway.
 //!
 //! ⭐ THE PARITY GATE IS A PREPARE-TIME REFUSAL, NOT A RUNTIME CHECK. A step never pays for it:
 //! `Executor::prepare` renders every allocated launch list two ways — the walk ([`walk_items`]) and
@@ -100,11 +101,13 @@ impl LaunchSite {
     }
 }
 
-/// One (op, relaunch)'s launch: the walk's body shift for relaunch `rep` on the launch row's static
-/// shifts, the resolved bases, the program and its bootstrap.
+/// One (op, request, relaunch)'s launch: the request's tables and the walk's body shift for
+/// relaunch `rep` on the launch row's static shifts, the resolved bases, the program and its
+/// bootstrap.
 pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
     ops: &Ops<T>,
     oi: usize,
+    request: u32,
     rep: i64,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
     banks: &[Option<DevAddr>],
@@ -112,7 +115,7 @@ pub(crate) fn launch_site<T: ktir_superdsc::collective::Tp>(
 ) -> Result<LaunchSite> {
     let op = &ops[oi];
     let mut off = where_.byte_off;
-    let delta = fold_plan::seg_deltas(&op.kv, rep);
+    let delta = fold_plan::seg_deltas(&op.kv, request, rep, where_.requests.pitch);
     off[SEG_KV.get()] += delta.kv.0;
     off[SEG_MASK.get()] += delta.mask.0;
     off[SEG_INTERMEDIATE.get()] += delta.intermediate.0;
@@ -318,12 +321,14 @@ pub(crate) fn base_addr_entry<T: ktir_superdsc::collective::Tp>(to: Rank<T>) -> 
 }
 
 /// The walk's staged batch for one launch call — the OLD way, built from the
-/// same `fold_plan::reps`/`launch_site` the submit walk reads. This is the parity
-/// gate's reference side. The submit walk keeps its own loop (its diag knobs
+/// same `fold_plan::launches`/`launch_site` the submit walk reads. This is the parity
+/// gate's reference side. The submit walk keeps its own loop body (its diag knobs
 /// interleave with the arithmetic), which is exactly why the gate exists: if
-/// the two loops ever disagree in enumeration or addressing, the rendered CBs
-/// differ and prepare refuses. Returns the items and the walk's host fence: set
-/// whenever the call launches anything, since every launch fences.
+/// the walk and its twin ever disagree in addressing, the rendered CBs
+/// differ and prepare refuses. The enumeration itself is ONE function both read, so
+/// order cannot drift — only addressing can, and the gate catches that. Returns the
+/// items and the walk's host fence: set whenever the call launches anything, since
+/// every launch fences.
 pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
     ops: &Ops<T>,
     seg: &[Option<DevAddr>; NUM_SEGMENTS],
@@ -332,12 +337,14 @@ pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
 ) -> Result<(Vec<BatchedCb>, bool)> {
     let mut items = Vec::new();
     let mut barrier = false;
-    for oi in 0..ops.len() {
-        for rep in 0..fold_plan::reps(&ops[oi].kv) {
-            let site = launch_site(ops, oi, rep, seg, banks, where_)?;
-            barrier = true;
-            items.extend(site_cbs(ops[oi].site_tp(), site.batched_compute())?);
-        }
+    // ⭐ THE ONE ENUMERATION — `fold_plan::launches`, the same sequence the submit walk and the
+    // plan build enumerate: a walking bundle's span repeats once per request of the launch,
+    // request-outer, and every other op launches once.
+    let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
+    for l in fold_plan::launches(&kvs, where_.requests.count) {
+        let site = launch_site(ops, l.op, l.request, l.rep, seg, banks, where_)?;
+        barrier = true;
+        items.extend(site_cbs(ops[l.op].site_tp(), site.batched_compute())?);
     }
     Ok((items, barrier))
 }
@@ -347,13 +354,14 @@ pub(crate) fn walk_items<T: ktir_superdsc::collective::Tp>(
 /// built for.
 pub(crate) struct CbPlanEntry<T: ktir_superdsc::collective::Tp> {
     /// Diagnostic identity — the label the walk's own traces print plus the
-    /// relaunch — so a parity refusal names its CB.
+    /// request and relaunch — so a parity refusal names its CB.
     label: String,
     prog: DevAddr,
     bootstrap_offset: u64,
     /// The op's own launch-group facts, carried whole: the render calls the SAME
     /// `fold_plan::seg_deltas` the walk calls, never a re-derivation.
     kv: OpKv,
+    request: u32,
     rep: i64,
     /// POSITIONAL, one per segment: the base the walk would resolve (the
     /// weight BANK's region for the weight segment, the segment's own
@@ -370,6 +378,9 @@ pub(crate) struct CbPlanEntry<T: ktir_superdsc::collective::Tp> {
 /// (list, launch row) at build time.
 pub(crate) struct CbPlan<T: ktir_superdsc::collective::Tp> {
     entries: Vec<CbPlanEntry<T>>,
+    /// The launch's request pitch, recorded at build from the same `where_` the walk reads — the
+    /// render composes each entry's request shift with it, exactly as the walk does live.
+    pitch: u64,
 }
 
 impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
@@ -379,7 +390,7 @@ impl<T: ktir_superdsc::collective::Tp> CbPlan<T> {
     pub(crate) fn render(&self) -> Result<(Vec<BatchedCb>, bool)> {
         let mut items = Vec::with_capacity(self.entries.len());
         for e in &self.entries {
-            let delta = fold_plan::seg_deltas(&e.kv, e.rep);
+            let delta = fold_plan::seg_deltas(&e.kv, e.request, e.rep, self.pitch);
             let mut dyn_off = [0u64; NUM_SEGMENTS];
             dyn_off[SEG_KV.get()] += delta.kv.0;
             dyn_off[SEG_MASK.get()] += delta.mask.0;
@@ -443,8 +454,8 @@ fn entry_cbs<T: ktir_superdsc::collective::Tp>(tp: &SiteTp<T>) -> Vec<&'static s
     out
 }
 
-/// Assemble the plan for one launch call: the (op, relaunch) enumeration and every per-CB input.
-/// Built from the same `fold_plan::reps` the walk calls; the bases come from the same
+/// Assemble the plan for one launch call: the (op, request, relaunch) enumeration and every per-CB
+/// input. Built from the same `fold_plan::launches` the walk calls; the bases come from the same
 /// `segment_base` resolution the walk's `launch_site` performs.
 pub(crate) fn build_cb_plan<T: ktir_superdsc::collective::Tp>(
     ops: &Ops<T>,
@@ -453,7 +464,9 @@ pub(crate) fn build_cb_plan<T: ktir_superdsc::collective::Tp>(
     where_: &LaunchWhere,
 ) -> Result<CbPlan<T>> {
     let mut entries = Vec::new();
-    for (oi, op) in ops.iter().enumerate() {
+    let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
+    for l in fold_plan::launches(&kvs, where_.requests.count) {
+        let (oi, op) = (l.op, &ops[l.op]);
         // WHICH REGION BACKS THE WEIGHT SLOT, AND AT WHAT SHIFT — `weight_slot`, the one law the
         // walk's `launch_site` reads: the launch's bank and layer shift, except for a collective's
         // consume, pinned to bank 0 at shift 0 because its weight-segment operand is the window.
@@ -462,44 +475,46 @@ pub(crate) fn build_cb_plan<T: ktir_superdsc::collective::Tp>(
             .kv
             .weight_slot(where_.byte_off[SEG_WEIGHT.get()], where_.weight_bank);
         let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
-        for rep in 0..fold_plan::reps(&op.kv) {
-            let mut bases = Vec::with_capacity(NUM_SEGMENTS);
-            for i in 0..NUM_SEGMENTS {
-                bases.push(if i == SEG_WEIGHT.get() {
-                    (wbase.clone(), weight_shift)
-                } else {
-                    (
-                        segment_base(seg, banks, weight_bank, i)?.clone(),
-                        where_.byte_off[i],
-                    )
-                });
-            }
-            entries.push(CbPlanEntry {
-                label: format!("{}/rep{rep}", op.label()),
-                prog: op
-                    .addr
-                    .clone()
-                    .ok_or_else(|| anyhow!("op {oi} has no program allocation"))?,
-                bootstrap_offset: op
-                    .code
-                    .prog_image(prog_offset_base())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "op {oi}: job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x} — it \
-                             names no bootstrap offset at all",
-                            op.code.job_bin_ptr,
-                            prog_offset_base()
-                        )
-                    })?
-                    .bootstrap(),
-                kv: op.kv,
-                rep,
-                bases,
-                tp: op.site_tp(),
+        let mut bases = Vec::with_capacity(NUM_SEGMENTS);
+        for i in 0..NUM_SEGMENTS {
+            bases.push(if i == SEG_WEIGHT.get() {
+                (wbase.clone(), weight_shift)
+            } else {
+                (
+                    segment_base(seg, banks, weight_bank, i)?.clone(),
+                    where_.byte_off[i],
+                )
             });
         }
+        entries.push(CbPlanEntry {
+            label: format!("{}/req{}/rep{}", op.label(), l.request, l.rep),
+            prog: op
+                .addr
+                .clone()
+                .ok_or_else(|| anyhow!("op {oi} has no program allocation"))?,
+            bootstrap_offset: op
+                .code
+                .prog_image(prog_offset_base())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "op {oi}: job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x} — it \
+                         names no bootstrap offset at all",
+                        op.code.job_bin_ptr,
+                        prog_offset_base()
+                    )
+                })?
+                .bootstrap(),
+            kv: op.kv,
+            request: l.request,
+            rep: l.rep,
+            bases,
+            tp: op.site_tp(),
+        });
     }
-    Ok(CbPlan { entries })
+    Ok(CbPlan {
+        entries,
+        pitch: where_.requests.pitch,
+    })
 }
 
 /// ⭐ THE 2a GATE. Render one launch both ways — the walk's staged batch and

@@ -124,26 +124,34 @@ pub struct LayerIdx(pub i64);
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The measurement switches, sampled once per process.
-/// WHERE a launch lands: the per-segment byte offsets it shifts by (the launch row's), and which
-/// weight region fills the positional weight slot. Nothing about the step's position: a walk's body
-/// shifts by its own trip, and every other group launches where the bake placed it.
+/// WHERE a launch lands: the per-segment byte offsets it shifts by (the launch row's), which
+/// weight region fills the positional weight slot, and the request facts the relaunch law reads.
+/// Nothing about the step's position: a walk's body shifts by its own trip, and every other group
+/// launches where the bake placed it.
 #[derive(Clone, Copy)]
 pub(crate) struct LaunchWhere {
     pub(crate) byte_off: [u64; NUM_SEGMENTS],
     /// Which weight bank backs the positional weight slot — see `weight_bank_for`.
     pub(crate) weight_bank: usize,
+    /// ⭐ HOW MANY REQUESTS THIS LAUNCH SERVES, and the pitch their tables sit at — the request half
+    /// of `fold_plan`'s relaunch law (a walking bundle's span repeats once per request, its tables
+    /// `request · pitch` into the activation segment). ONE request at no pitch is every launch
+    /// today; a packed prefill launch is the one that states more, and it states the step's own
+    /// `card_request_pitch` with it.
+    pub(crate) requests: fold_plan::Requests,
 }
 
 /// One rung launch staged for the rung's single doorbell. `launch_ops_inner` collects these across
-/// its whole (op, rep) loop and flushes once at the end ([`crate::runtime::Stream::submit_batch`]
-/// — the vendor's multi-CB branch). The site context rides alongside the item because the per-op
-/// `fault` closure dumps from loop locals (`ta`/`off`/the fold rep), which are gone by flush time:
-/// a refused flush rebuilds the offending entry's dump from these, and the flex-rs error names the
-/// entry index it refused.
+/// its whole (op, request, rep) loop and flushes once at the end
+/// ([`crate::runtime::Stream::submit_batch`] — the vendor's multi-CB branch). The site context
+/// rides alongside the item because the per-op `fault` closure dumps from loop locals
+/// (`ta`/`off`/the request and fold rep), which are gone by flush time: a refused flush rebuilds
+/// the offending entry's dump from these, and the flex-rs error names the entry index it refused.
 struct PendingLaunch {
     item: BatchedCb,
-    /// Which op of the rung (`oi`) and which fold rep produced this entry.
+    /// Which op of the rung (`oi`), serving which request, at which fold rep produced this entry.
     op_index: usize,
+    request: u32,
     rep: i64,
     /// The per-segment shifts this entry launched with — what `dump_launch_site` prints.
     off: [u64; NUM_SEGMENTS],
@@ -545,12 +553,15 @@ impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, T> {
 }
 
 impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
-    /// Pair one launch-index entry with the program it names.
+    /// Pair one launch-index entry with the program it names. `per_request` is the bundle's own
+    /// verdict — whether ANY of its groups walks — stamped here at load onto every group of the
+    /// bundle alike (see `fold_plan`'s request law); it is never baked, so no record states it.
     fn new(
         code: &'static bundle::LaunchGroup<'static, T>,
         fp: &'static str,
         index: usize,
         collective: Option<cb_plan::BoundCollective<T>>,
+        per_request: bool,
     ) -> Self {
         let kv = &code.kv;
         OpProg {
@@ -564,6 +575,7 @@ impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
                 // What sends the group's KV shift to zero — a bake fact, carried on the group.
                 gathered: kv.gathered,
                 walk: kv.walk,
+                per_request,
             },
         }
     }
@@ -2574,9 +2586,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// borrowed set).
     fn check_cb_plan_parity(&self) -> Result<()> {
         let stream = self.stream_ref()?;
-        let mk = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
+        let mk = |bank: usize, off: [u64; NUM_SEGMENTS], requests| LaunchWhere {
             byte_off: off,
             weight_bank: bank,
+            requests,
         };
         // One `LaunchWhere` per distinct weight bank the launch table names (a representative
         // row's shifts — parity is about the twin agreeing, not about covering every shift
@@ -2628,9 +2641,24 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
             }
         }
+        // ⭐ EVERY ROW AT ONE REQUEST, AND AGAIN AT TWO — the request half of the relaunch law (a
+        // walking bundle's span repeats once per request, its tables `request · pitch` in) has to
+        // be proven twin-identical too, and no launch states more than one request yet. The
+        // two-request row states a SYNTHETIC pitch: parity is about the walk and its data twin
+        // composing the same request shift, never about this pitch being any model's — the same
+        // standing as the representative bank shifts above.
         let wheres: Vec<(String, LaunchWhere)> = rows
             .iter()
-            .map(|(tag, bank, off)| (tag.clone(), mk(*bank, *off)))
+            .flat_map(|(tag, bank, off)| {
+                let two = fold_plan::Requests {
+                    count: 2,
+                    pitch: 4096,
+                };
+                [
+                    (tag.clone(), mk(*bank, *off, fold_plan::Requests::default())),
+                    (format!("{tag}/req2"), mk(*bank, *off, two)),
+                ]
+            })
             .collect();
 
         // Every list the session could launch — the class dimension is enumerated whole here, so
@@ -2981,6 +3009,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             LaunchWhere {
                 byte_off,
                 weight_bank,
+                // One request — the count a packed prefill launch states is a later law's; every
+                // launch today serves one, and the span law is inert at one.
+                requests: fold_plan::Requests::default(),
             },
             d,
         );
@@ -3026,20 +3057,33 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // fences on the first true barrier and waits on nothing after; the ring stays FIFO).
         let mut batch_barrier = false;
 
-        for (oi, op) in ops.iter().enumerate() {
-            // A walk's body relaunches its baked trip count; every other group launches once.
-            let reps = fold_plan::reps(&op.kv);
+        // ⭐ THE ONE ENUMERATION — `fold_plan::launches`: a walking bundle's span repeats once per
+        // request of the launch, request-outer (the seed re-runs ahead of each request's body), and
+        // every other op launches once. At one request this is exactly the op-major
+        // `for op { for rep }` sequence it has always been. The per-op diag epilogue below fires at
+        // each op's run end — a run is the op's contiguous stretch of the sequence, so at one
+        // request it fires exactly where the old nested loop's did.
+        let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
+        let seq = fold_plan::launches(&kvs, where_.requests.count);
+        let mut at = 0;
+        while at < seq.len() {
+            let oi = seq[at].op;
+            let op = &ops[oi];
 
-            for rep in 0..reps {
+            while at < seq.len() && seq[at].op == oi {
+                let l = seq[at];
+                at += 1;
+                let (request, rep) = (l.request, l.rep);
                 let stream = self.stream_ref()?;
-                // ⭐ ONE (op, relaunch)'S ARITHMETIC, SINGLE-SOURCED. The walk shift, the shifted
-                //    tensor bases, the weight bank, the program and the bootstrap are
+                // ⭐ ONE (op, relaunch)'S ARITHMETIC, SINGLE-SOURCED. The request and walk shifts,
+                //    the shifted tensor bases, the weight bank, the program and the bootstrap are
                 //    `cb_plan::launch_site` — the submit walk below, the diag printers it feeds, and
                 //    the CB-plan parity gate (which proves the plan's data twin of exactly this
                 //    computation byte-identical at prepare) all read the ONE function.
                 let site = cb_plan::launch_site(
                     ops,
                     oi,
+                    request,
                     rep,
                     &self.seg_addr,
                     &self.weight_bank_addr,
@@ -3059,7 +3103,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     // moves ONLY by `delta.mask`, so "did the host shift pass p's index" is answered
                     // by this line and nothing else — `[gather]` prints the TABLE, not the base.
                     let one = format!(
-                        "[mark] op[{}] rep={rep} seg0+{} seg2+{} seg3+{} gathered={} pf={} {}\n",
+                        "[mark] op[{}] req={request} rep={rep} seg0+{} seg2+{} seg3+{} gathered={} \
+                         pf={} {}\n",
                         op.index,
                         off[SEG_INTERMEDIATE.get()],
                         off[SEG_KV.get()],
@@ -3138,6 +3183,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     pending.extend(cbs.into_iter().map(|item| PendingLaunch {
                         item,
                         op_index: oi,
+                        request,
                         rep,
                         off,
                     }));
@@ -3232,12 +3278,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         if !pending.is_empty() {
             // Split the site context from the items once, at the boundary: the items are what
             // the doorbell takes, the context is what a refusal dumps.
-            let mut sites: Vec<(usize, i64, [u64; NUM_SEGMENTS])> =
+            let mut sites: Vec<(usize, u32, i64, [u64; NUM_SEGMENTS])> =
                 Vec::with_capacity(pending.len());
             let items: Vec<BatchedCb> = pending
                 .drain(..)
                 .map(|p| {
-                    sites.push((p.op_index, p.rep, p.off));
+                    sites.push((p.op_index, p.request, p.rep, p.off));
                     p.item
                 })
                 .collect();
@@ -3252,12 +3298,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 // the failing element's index when it has one; a refusal that names no element
                 // (shutdown, capacity) still gets the sweep and the rung's shape.
                 if let HwError::Stream(RuntimeStreamError::BatchElement { index, .. }) = &e
-                    && let Some(&(oi, rep, off)) = sites.get(*index)
+                    && let Some(&(oi, request, rep, off)) = sites.get(*index)
                 {
                     // ⛔ ONE WRITE — same single-`format!` discipline as `[progverify]`.
                     let one = format!(
-                        "[flush] refused at batch entry {index} (op {oi}, rep {rep}) of {} \
-                         staged launch(es)\n",
+                        "[flush] refused at batch entry {index} (op {oi}, req {request}, rep \
+                         {rep}) of {} staged launch(es)\n",
                         items.len()
                     );
                     eprint!("{one}");
@@ -4739,6 +4785,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: r.prefix_weight_bank,
+                        requests: fold_plan::Requests::default(),
                     },
                 ));
                 for (class, wbank, woff, kvoff) in r.launches.clone() {
@@ -4750,6 +4797,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         LaunchWhere {
                             byte_off: off,
                             weight_bank: wbank as usize,
+                            requests: fold_plan::Requests::default(),
                         },
                     ));
                 }
@@ -4758,6 +4806,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: r.suffix_weight_bank,
+                        requests: fold_plan::Requests::default(),
                     },
                 ));
             }
@@ -4768,6 +4817,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     LaunchWhere {
                         byte_off: zero,
                         weight_bank: 0,
+                        requests: fold_plan::Requests::default(),
                     },
                 ));
             }
@@ -5656,6 +5706,11 @@ fn bind_ops<T: ktir_superdsc::collective::Tp>(
             .map(|s| (s.group, s.send))
             .collect();
     let mut ops = Vec::with_capacity(code.groups.len());
+    // ⭐ DOES THIS BUNDLE WALK — stated once, from the bundle's own groups, and stamped onto every
+    // group of it below: a walking program's whole span (seed, walk body, epilogue) serves one
+    // request per relaunch, so the seed re-runs between requests. Derived here because the span is
+    // a fact of WHICH GROUPS SIT IN ONE BUNDLE — no single group's record can state it.
+    let per_request = code.groups.iter().any(|g| g.kv.walk.is_some());
     for (i, g) in code.groups.iter().enumerate() {
         let mut collective = None;
         if let Some(consume) = g.kv.tp {
@@ -5678,7 +5733,7 @@ fn bind_ops<T: ktir_superdsc::collective::Tp>(
             };
             collective = Some(cb_plan::BoundCollective { send, me });
         }
-        ops.push(OpProg::new(g, &code.fp, i, collective));
+        ops.push(OpProg::new(g, &code.fp, i, collective, per_request));
     }
     Ok(ops)
 }
