@@ -10,7 +10,8 @@
 //     over `MoeWeight::Fp8Bundle`/`Fp8Own`), pair `p` reading the first `n` rows of expert
 //     `e = topk_idx[p]`'s `[expert_rows, k]` block and its scale row;
 //   - `gate_up_gemv_fp8_ker`: the gate/up fold of either (`GateUpAct` with
-//     `GateUpKernel::GemvFp8`, `ExpertGateUpAct` over an fp8 bank).
+//     `GateUpKernel::GemvFp8`, `ExpertGateUpAct` over an fp8 bank), at the plain GEMV's
+//     `rows_per_warp` (FP8 S8: Gemma's 2,112 rows run 132 CTAs at 2 rows, not 66 at 4).
 //
 // The CUDA-core form, FP8 S4's measured winner (S0 part ii, 2026-11-06: 2.15 TB/s on the 27B's
 // gate+up against 0.56 for WGMMA with `m` padded to 64): the e4m3 bytes are widened in registers
@@ -455,23 +456,23 @@ struct gate_up_globals {
     gemv_globals up;
 };
 
-template <bool EXPERT, typename OP>
+template <bool EXPERT, typename OP, int ROWS>
 __global__ __launch_bounds__(NUM_THREADS, 2) void gate_up_gemv_fp8_ker(
     const __grid_constant__ gate_up_globals g) {
     extern __shared__ int __shm[];
     shared_allocator<1024> al((int*)&__shm[0]);
     row_sv(&row_s)[ROW_CHUNKS] = al.allocate<row_sv, ROW_CHUNKS>();
-    w_sv(&b)[WARPS][STAGES][ROWS_PER_WARP] = al.allocate<w_sv, WARPS, STAGES, ROWS_PER_WARP>();
+    w_sv(&b)[WARPS][STAGES][ROWS] = al.allocate<w_sv, WARPS, STAGES, ROWS>();
     __shared__ kittens::semaphore row_arrived;
     __shared__ kittens::semaphore arrived[WARPS][STAGES];
     __shared__ sv_fl<16> amax;
-    const gemv_smem<ROWS_PER_WARP> sm{row_s, b, row_arrived, arrived, amax};
+    const gemv_smem<ROWS> sm{row_s, b, row_arrived, arrived, amax};
     const int block = blockIdx.x, split = blockIdx.y, p = blockIdx.z;
     const int c0 = split * g.gate.split_chunks;
     const int count = max(0, min(g.gate.split_chunks, g.gate.chunks - c0));
     float a_scale = 0.0f;
-    float gate[ROWS_PER_WARP], up[ROWS_PER_WARP];
-    gemv_dots<EXPERT, ROWS_PER_WARP>(
+    float gate[ROWS], up[ROWS];
+    gemv_dots<EXPERT, ROWS>(
         g.gate, sm, block, split, p, 0,
         [&] {
             a_scale = quantize_row(g.gate.a, p / g.gate.row_div, g.gate.chunks, c0, count, sm);
@@ -479,15 +480,15 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gate_up_gemv_fp8_ker(
         gate);
     // Every lane has read the gate's last stage (its loop's last `__syncwarp`), so the up's loads
     // may take the ring's next stages. A warp with no rows ran no loads, and runs none now.
-    gemv_dots<EXPERT, ROWS_PER_WARP>(g.up, sm, block, split, p, count, [] {}, up);
-    const int row0 = (block * WARPS + kittens::warpid()) * ROWS_PER_WARP;
-    const int rows = max(0, min(ROWS_PER_WARP, g.gate.n - row0));
+    gemv_dots<EXPERT, ROWS>(g.up, sm, block, split, p, count, [] {}, up);
+    const int row0 = (block * WARPS + kittens::warpid()) * ROWS;
+    const int rows = max(0, min(ROWS, g.gate.n - row0));
     int depth = 0;
     if constexpr (EXPERT) {
         depth = g.gate.topk_idx[{0, 0, 0, p}];
     }
 #pragma unroll
-    for (int r = 0; r < ROWS_PER_WARP; r++) {
+    for (int r = 0; r < ROWS; r++) {
         const int row = row0 + r;
         if (warp::laneid() == 0) {
             const float gv = r < rows ? fp8_scaled(g.gate, depth, row, gate[r], a_scale) : 0.0f;
@@ -846,9 +847,15 @@ int launch_gate_up(gate_up_globals G, uint32_t n, uint32_t pairs, uint32_t split
                    void* stream) {
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
     void* args[] = {&G};
-    const dim3 grid(padded(n) / uint32_t(BLOCK_ROWS), splits, pairs), block(NUM_THREADS);
-    const cudaError_t launched =
-        cudaLaunchKernel(gate_up_gemv_fp8_ker<EXPERT, OP>, grid, block, args, GEMV_SMEM_BYTES, s);
+    // The plain GEMV's `rows_per_warp` (4 at `splits > 1`, so the partials keep their layout): each
+    // row's dot is the same per-row code at any rows, so the same bits.
+    const int rows = rows_per_warp(n, pairs, splits);
+    const uint32_t block_rows = uint32_t(WARPS * rows);
+    const dim3 grid((n + block_rows - 1) / block_rows, splits, pairs), block(NUM_THREADS);
+    const auto ker = rows == 2   ? gate_up_gemv_fp8_ker<EXPERT, OP, 2>
+                     : rows == 3 ? gate_up_gemv_fp8_ker<EXPERT, OP, 3>
+                                 : gate_up_gemv_fp8_ker<EXPERT, OP, ROWS_PER_WARP>;
+    const cudaError_t launched = cudaLaunchKernel(ker, grid, block, args, GEMV_SMEM_BYTES, s);
     if (launched != cudaSuccess || splits == 1) {
         return static_cast<int>(launched);
     }
@@ -944,10 +951,18 @@ extern "C" int scratchy_cuda_gemv_fp8_prepare(void) {
          {allow(gemv_fp8_ker<false, 4>), allow(gemv_fp8_ker<false, 3>),
           allow(gemv_fp8_ker<false, 2>), allow(gemv_fp8_ker<true, 4>),
           allow(gemv_fp8_ker<true, 3>), allow(gemv_fp8_ker<true, 2>), allow(gemv_group_fp8_ker),
-          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::silu_mul>),
-          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::gelu_tanh_mul>),
-          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::silu_mul>),
-          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::gelu_tanh_mul>),
+          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::silu_mul, 4>),
+          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::silu_mul, 3>),
+          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::silu_mul, 2>),
+          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::gelu_tanh_mul, 4>),
+          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::gelu_tanh_mul, 3>),
+          allow(gate_up_gemv_fp8_ker<false, scratchy::ops::gelu_tanh_mul, 2>),
+          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::silu_mul, 4>),
+          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::silu_mul, 3>),
+          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::silu_mul, 2>),
+          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::gelu_tanh_mul, 4>),
+          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::gelu_tanh_mul, 3>),
+          allow(gate_up_gemv_fp8_ker<true, scratchy::ops::gelu_tanh_mul, 2>),
           allow(gemv_fp8_quant_probe_ker)}) {
         if (e == cudaSuccess) {
             e = r;
