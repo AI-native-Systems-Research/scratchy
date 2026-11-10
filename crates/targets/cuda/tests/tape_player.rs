@@ -1210,8 +1210,17 @@ fn gate_up_direct(
 /// `qr`, which the gate apply overwrites in the arena before the forward ends. The kernel is
 /// deterministic, so this is the forward's `qr` bit for bit.
 fn qr_direct(device: &CudaDevice, tape: &CudaTape, qn: &[u16], table: &[u16]) -> Vec<u16> {
-    let CudaStep::Rope(rope) = tape.steps[5] else {
-        panic!("step 5 is the query's rope");
+    // At one row the query's rope is folded into step 5's rope append (FP8 S8 W4c): its `q`.
+    let (rows, cols, head_dim, rot_dim) = match tape.steps[5] {
+        CudaStep::Rope(r) => (r.rows, r.cols, r.head_dim, r.rot_dim),
+        CudaStep::RopeAppend(RopeAppendBf16 {
+            q: Some(q),
+            rows,
+            head_dim,
+            rot_dim,
+            ..
+        }) => (rows, q.cols, head_dim, rot_dim),
+        _ => panic!("step 5 is the query's rope"),
     };
     let (xb, tb) = (
         DeviceBuffer::upload(device, qn).expect("upload qn"),
@@ -1225,8 +1234,8 @@ fn qr_direct(device: &CudaDevice, tape: &CudaTape, qn: &[u16], table: &[u16]) ->
             xb.ptr(),
             tb.ptr(),
             out.ptr(),
-            (rope.rows, rope.cols),
-            (rope.head_dim, rope.rot_dim),
+            (rows, cols),
+            (head_dim, rot_dim),
             std::ptr::null_mut(),
         )
     }
@@ -4881,8 +4890,9 @@ fn w4_play(
 /// Each fixture's one-row tape played with the one-row folds (the residual adds in their GEMVs'
 /// epilogue) against the same canonical lowered with them off, through the real worker and
 /// kernels: `mismatched_bits=0` on the result, and each tape the exact number of launches it folds
-/// to, `[folded, unfolded]`: the MLP [3, 4] (its down takes the add), the attention layer [10, 11]
-/// (its o), the GDN layer [5, 6] (its out_proj) and the Qwen MoE block [11, 11] (its residual add
+/// to, `[folded, unfolded]`: the MLP [3, 4] (its down takes the add), the attention layer [9, 10]
+/// (its o; in both tapes the query's rope folds into the key's rope append, which the end facts do
+/// not gate, so it is one launch fewer than the 10 and 11 it lowered to before W4c), the GDN layer [5, 6] (its out_proj) and the Qwen MoE block [11, 11] (its residual add
 /// follows the combine, which takes no epilogue, so nothing folds).
 #[test]
 fn the_one_row_folds_play_bit_for_bit() {
@@ -4936,7 +4946,7 @@ fn the_one_row_folds_play_bit_for_bit() {
             &layer_input(1, 0x4A70),
             (&[0], Some(&seq), None),
         ),
-        [10, 11],
+        [9, 10],
     );
     // The GDN layer, a fresh state.
     let tapes: &'static [CudaTape; 2] =
