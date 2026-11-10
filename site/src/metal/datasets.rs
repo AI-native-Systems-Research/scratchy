@@ -8,14 +8,14 @@ use crate::carbon::{
     Alignment, ContentPanel, Definition, Heading, Section, Stack, TabItem, Tabs, TabsKind, Tile,
     TipHeading,
 };
-use crate::charts::{RATIO_STEPS, ScaleFit, ratio_scale, ratio_step};
+use crate::charts::{RATIO_STEPS, ScaleFit, ratio_ink, ratio_labels, ratio_scale, ratio_step};
 
 use super::data::{At, Model, RequestTiming, Run, TaskCell};
 use super::numbers::{Engine, served};
 use super::buckets;
 use super::{
-    ECDF_COLUMN, Entry, MachineRuns, Series, Sweep, bar_chart, ecdf_chart, engine_key, grid_glance,
-    grid_maps, history, in_order, lineup, marks_key, over_time_charts, parity, parity_info,
+    ECDF_COLUMN, Entry, HEAT_LABELS, MachineRuns, Series, Sweep, bar_chart, ecdf_chart, engine_key, grid_glance,
+    grid_maps, in_order, lineup, marks_key, over_time_charts, parity, parity_info,
     previous_run, request_plots, runs_table, served_as, slug, sweep_part, tasks, users_at,
 };
 
@@ -119,38 +119,6 @@ fn measured<'a>(
         .collect()
 }
 
-/// Under a section's summary: each machine some of whose numbers there are from a run older than
-/// its newest, and which run, so an old grid is not read as current. Nothing where every one is
-/// from the newest.
-fn older_runs(ran: &[(&str, Vec<&str>)], machines: &BTreeMap<&str, MachineRuns>) -> Element {
-    let older: Vec<String> = (ran.iter())
-        .filter_map(|&(chip, ref stems)| {
-            let mr = &machines[chip];
-            let newest = &mr.runs.last()?.generated_utc;
-            let mut days: Vec<&str> = (stems.iter())
-                .filter_map(|stem| mr.latest(stem))
-                .filter(|e| &e.run.generated_utc < newest)
-                .map(|e| e.run.generated_utc.month_day())
-                .collect();
-            days.sort_unstable();
-            days.dedup();
-            (!days.is_empty()).then(|| {
-                let runs = if days.len() == 1 { "run" } else { "runs" };
-                format!("{chip} from its {} {runs}", days.join(" and "))
-            })
-        })
-        .collect();
-    if older.is_empty() {
-        return rsx! {};
-    }
-    rsx! {
-        p { style: "font-size: 0.875rem",
-            "Older than the machine's newest run, which did not measure this: {older.join(\"; \")}. \
-             Each pair's detail names the run its numbers are from."
-        }
-    }
-}
-
 /// The machines that ran `dataset`, fewest GB first, each with every model it ran that measured
 /// it, in the order it first ran them: every model, not only its lineup class's current one, so a
 /// model an earlier round ran keeps its numbers on the page.
@@ -204,16 +172,14 @@ pub(super) fn section(
         Stack { gap: 4,
             p { style: "contain: inline-size",
                 "Per machine, its rows: prefill (P) and decode (D) with 1 user, then end-to-end time \
-                 with each users count above it (2u, 4u). Per model, a column for each prompt length, \
-                 its requests sorted by the prompt tokens the server counted; the same tasks to every \
-                 engine. Colour is how many times faster scratchy is than the engine it is set \
-                 against, its median over that length's requests against the rival's: blue faster, \
-                 red slower, grey within noise. A striped square has no ratio: no requests of that \
-                 length, or one engine did not run it. Hover or focus a square for its ratio, the \
-                 engine, and a borrowed rival's run."
+                 with each users count above it (2u, 4u). A column per model, under its family; the \
+                 same tasks to every engine. Colour is how many times faster scratchy is than the \
+                 engine it is set against, its median over the cell's requests against the rival's: \
+                 blue faster, red slower, grey within noise. A striped square has no ratio: one engine \
+                 did not run it, or most of its requests failed. Hover or focus a square for its \
+                 ratio, the engine, and a borrowed rival's run."
             }
             {summary_map(dataset, &id, &ran, machines, &summary_columns)}
-            {older_runs(&ran, machines)}
         }
     };
     rsx! {
@@ -244,17 +210,41 @@ impl<'a> SummaryGrid<'a> {
             .find(|&&(c, k, _)| c == chip && k == column)
             .map(|&(_, _, s)| s)
     }
+
+    /// The models a class column shows, once each, a line each where Macs run different ones.
+    /// Empty where the column is a model itself.
+    fn models_of(&self, column: &str) -> Vec<&'a str> {
+        let mut names: Vec<&'a str> = Vec::new();
+        for &(_, k, stem) in &self.cells {
+            if k == column && stem != column && !names.contains(&stem) {
+                names.push(stem);
+            }
+        }
+        names
+    }
 }
 
 fn summary_grid<'a>(
     ran: &[(&'a str, Vec<&'a str>)],
     machines: &'a BTreeMap<&str, MachineRuns<'a>>,
 ) -> SummaryGrid<'a> {
-    let classes = lineup(machines).map(|l| l.classes).unwrap_or_default();
+    let lineup = lineup(machines);
+    let classes = lineup.as_ref().map(|l| l.classes).unwrap_or_default();
     let class_of = |stem: &str| {
         (classes.iter())
             .find(|c| c.small == stem || c.large == stem)
             .map(|c| c.class.as_str())
+    };
+    // The model a Mac shows in a class, as the random-token map has it ([`Lineup::model`]): one,
+    // the small set's where every Mac runs it, though a Mac that ran both sets measured both.
+    let shows = |chip: &str, stem: &str| {
+        let memory = machines[chip].runs[machines[chip].runs.len() - 1]
+            .machine
+            .memory_gb;
+        match (lineup.as_ref(), class_of(stem)) {
+            (Some(l), Some(class)) => l.model(class, memory) == Some(stem),
+            _ => true,
+        }
     };
     let all_classed = ran
         .iter()
@@ -262,7 +252,7 @@ fn summary_grid<'a>(
     let mut columns: Vec<&str> = Vec::new();
     let mut cells = Vec::new();
     for (chip, stems) in ran {
-        for &stem in stems {
+        for &stem in stems.iter().filter(|s| !all_classed || shows(chip, s)) {
             let column = match all_classed {
                 true => class_of(stem).unwrap_or(stem),
                 false => stem,
@@ -519,7 +509,7 @@ fn random(
                     p { "random-token prompts at fixed lengths, the matrix's diagnostic grid (--random)" }
                 }
                 {tabbed(id, &Pairs::of(ran, machines),
-                    rsx! { Stack { gap: 4, {grid_glance(machines)} {older_runs(ran, machines)} } },
+                    grid_glance(machines),
                     over_time_panel(&timelines),
                     |chip, stem| grid_latency(id, &machines[chip], stem, chip),
                     |chip, stem| grid_pair(id, &machines[chip], stem, chip))}
@@ -538,12 +528,6 @@ fn grid_pair(id: &str, mr: &MachineRuns, stem: &str, chip: &str) -> Element {
     let seen: &[Entry] = (mr.models.iter())
         .find(|(s, _)| *s == stem)
         .map_or(&[], |(_, es)| es.as_slice());
-    // The newest earlier run of this model, here, that scratchy served: the curves' faint line.
-    let prev = seen[..seen.len().saturating_sub(1)]
-        .iter()
-        .rev()
-        .find(|e| served(e.m))
-        .copied();
     rsx! {
         Stack { gap: 6,
             {provenance(mr, stem, chip)}
@@ -553,10 +537,9 @@ fn grid_pair(id: &str, mr: &MachineRuns, stem: &str, chip: &str) -> Element {
             {borrowed_note(&(m.borrowed.iter()).filter_map(|(k, when)| Some((Engine::ALL.into_iter().find(|e| e.key() == k)?, when.month_day().to_string()))).collect::<Vec<_>>())}
             if let Some(note) = previous_run(seen) { {note} }
             p { style: "font-size: 0.875rem", "What the marks on its numbers mean " {marks_key()} }
-            {sweep_part(m, run, prev, Sweep::Users)}
+            {sweep_part(m, run, Sweep::Users)}
             {grid_maps(m, &mid, run)}
-            {sweep_part(m, run, prev, Sweep::Prompt)}
-            {history(seen)}
+            {sweep_part(m, run, Sweep::Prompt)}
         }
     }
 }
@@ -609,18 +592,25 @@ fn provenance(mr: &MachineRuns, stem: &str, chip: &str) -> Element {
         .filter(|x| mr.latest(&x.stem).is_none())
         .map(|x| format!("{} ({})", x.stem, x.reason.as_deref().unwrap_or("skipped")))
         .collect();
+    // The machine, the model's files and its build: folded with the runs, out of the way.
+    let about = rsx! {
+        p { "{cores} · {mc.memory_gb} GB unified memory · macOS {mc.macos}" }
+        p {
+            a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
+            " · {m.quant.as_deref().unwrap_or(\"default\")}"
+            if let Some(rev) = m.model_files.as_ref().and_then(|f| f.revision.as_deref()) {
+                " · files "
+                a { href: "https://huggingface.co/{m.model_id}/tree/{rev}", code { "{&rev[..rev.len().min(8)]}" } }
+            }
+            "{build}"
+        }
+    };
     rsx! {
         Stack { gap: 2,
             strong { "{stem} on {chip}" }
-            p { "{cores} · {mc.memory_gb} GB unified memory · macOS {mc.macos}" }
+            // What a reader needs first: which run, and whether its answers matched mlx-lm.
             p {
-                a { href: "https://huggingface.co/{m.model_id}", "{m.model_id}" }
-                " · {m.quant.as_deref().unwrap_or(\"default\")}"
-                if let Some(rev) = m.model_files.as_ref().and_then(|f| f.revision.as_deref()) {
-                    " · files "
-                    a { href: "https://huggingface.co/{m.model_id}/tree/{rev}", code { "{&rev[..rev.len().min(8)]}" } }
-                }
-                "{build} · run {run.generated_utc.date()}, "
+                "Run {run.generated_utc.date()}, "
                 code { "{run.repo.sha8()}" }
                 if let Some(verdict) = parity(m) {
                     " · {verdict} " {parity_info()}
@@ -635,7 +625,7 @@ fn provenance(mr: &MachineRuns, stem: &str, chip: &str) -> Element {
             if !skipped.is_empty() {
                 p { "Not run on this machine: {skipped.join(\"; \")}." }
             }
-            {runs_table(&mr.runs)}
+            {runs_table(&mr.runs, about)}
         }
     }
 }
@@ -719,8 +709,8 @@ fn summary_map(
     };
     let n = buckets::BUCKETS.len();
     let col = |k: usize, b: usize| 3 + k * n + b;
-    // The grid's lines: two header lines, then each machine's rows.
-    let mut lines: Vec<Option<(&str, Row)>> = vec![None, None];
+    // The grid's lines: three header lines (class, models, buckets), then each machine's rows.
+    let mut lines: Vec<Option<(&str, Row)>> = vec![None, None, None];
     let mut spans: Vec<(&str, usize, usize)> = Vec::new();
     for &(chip, _) in ran {
         let start = lines.len();
@@ -742,7 +732,7 @@ fn summary_map(
         }
         let a = buckets::median_in(ours, row.timing, b);
         let t = buckets::median_in(theirs, row.timing, b);
-        let r = tasks::times(a, t, true).ok_or("no requests this long")?;
+        let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
         let from = theirs.borrowed_from.as_ref()
             .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
         Ok((r, format!("{}{from}", rival.label())))
@@ -760,17 +750,40 @@ fn summary_map(
         (k, b) if k + 1 == grid.columns.len() && b + 2 >= n => "top-right",
         _ => "top",
     };
+    // The squares to write their factor in, as the random-token map does: each colour step's
+    // square furthest from ×1, so its shades read apart ([`ratio_labels`]).
+    let mut ratios: BTreeMap<(&str, &str, &str, usize), f64> = BTreeMap::new();
+    for (chip, row) in lines.iter().flatten() {
+        for &column in &grid.columns {
+            for b in 0..n {
+                if let Ok((r, _)) = ratio(chip, column, row, b) {
+                    ratios.insert((chip, column, row.label.as_str(), b), r);
+                }
+            }
+        }
+    }
+    let labelled = ratio_labels(&ratios, HEAT_LABELS);
     let square = |chip: &str, column: &str, row: &Row, b: usize, place: String| -> Element {
         let stem = pair(chip, column).map_or("", |p| p.stem);
-        let (fill, verdict) = match ratio(chip, column, row, b) {
-            Ok((r, vs)) => (format!("background: {}", RATIO_STEPS[ratio_step(r)]), format!("×{r:.2} vs {vs}")),
-            Err(why) => (STRIPED.to_string(), why.to_string()),
+        let (fill, label, verdict) = match ratio(chip, column, row, b) {
+            Ok((r, vs)) => {
+                let step = ratio_step(r);
+                let shown = labelled.contains(&(chip, column, row.label.as_str(), b));
+                (
+                    format!("background: {}; color: {}", RATIO_STEPS[step], ratio_ink(step)),
+                    shown.then(|| format!("×{r:.1}")),
+                    format!("×{r:.2} vs {vs}"),
+                )
+            }
+            Err(why) => (STRIPED.to_string(), None, why.to_string()),
         };
         let bucket = buckets::BUCKETS[b].0;
         rsx! {
             cds-tooltip { "align": align(grid.columns.iter().position(|c| *c == column).unwrap_or(0), b),
                 style: "{place}; display: flex",
-                div { tabindex: "0", style: "width: {SQUARE}; height: {SQUARE}; {fill}" }
+                div { tabindex: "0", style: "width: {SQUARE}; height: {SQUARE}; {fill}; display: flex; align-items: center; justify-content: center; font-size: 0.625rem; font-weight: 600",
+                    if let Some(label) = label { "{label}" }
+                }
                 cds-tooltip-content { style: "text-align: left",
                     TipHeading { heading: verdict }
                     div { "{stem} on {chip}" }
@@ -782,13 +795,20 @@ fn summary_map(
     let template = format!("max-content max-content repeat({}, {SQUARE})", grid.columns.len() * n);
     rsx! {
         div { style: "display: flex; gap: 1.5rem; align-items: flex-start; overflow-x: auto",
-            div { style: "display: grid; grid-template-columns: {template} max-content; column-gap: 2px; row-gap: 2px; align-items: center",
+            div { style: "display: grid; grid-template-columns: {template} max-content max-content; column-gap: 2px; row-gap: 2px; align-items: center",
                 for (k, column) in grid.columns.iter().enumerate() {
-                    div { style: "grid-row: 1; grid-column: {col(k, 0)} / span {n}; text-align: center; font-weight: 600; font-size: 0.75rem; white-space: nowrap",
+                    div { style: "grid-row: 1; grid-column: {col(k, 0)} / span {n}; text-align: center; font-weight: 600; font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0",
                         "{column}"
                     }
+                    // Under its class the model it shows, as the random-token map has it, then its
+                    // prompt-length buckets.
+                    div { style: "grid-row: 2; grid-column: {col(k, 0)} / span {n}; text-align: center; font-size: 0.625rem; min-width: 0",
+                        for name in grid.models_of(column) {
+                            div { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap", title: "{name}", "{name}" }
+                        }
+                    }
                     for (b, (label, _)) in buckets::BUCKETS.iter().enumerate() {
-                        div { style: "grid-row: 2; grid-column: {col(k, b)}; text-align: center; font-size: 0.625rem; white-space: nowrap",
+                        div { style: "grid-row: 3; grid-column: {col(k, b)}; text-align: center; font-size: 0.5625rem; white-space: nowrap",
                             "{label}"
                         }
                     }
@@ -804,7 +824,7 @@ fn summary_map(
                             }
                         }
                         if let Some((lo, hi)) = range(chip, row) {
-                            div { style: "grid-row: {i + 1}; grid-column: {col(grid.columns.len(), 0)}; font-size: 0.75rem; white-space: nowrap; padding-left: 1rem",
+                            div { style: "grid-row: {i + 1}; grid-column: {col(grid.columns.len(), 0) + 1}; font-size: 0.75rem; white-space: nowrap; padding-left: 1.5rem",
                                 "×{lo:.2}–×{hi:.2}"
                             }
                         }
@@ -815,8 +835,15 @@ fn summary_map(
                         "{chip}"
                     }
                 }
+                // The ratio scale right beside the squares, as tall as their rows, the random-token
+                // map's: one cell over all of them, so each row's range, a column further on,
+                // stays on its row.
+                if let (Some(&(_, first, _)), Some(&(_, _, last))) = (spans.first(), spans.last()) {
+                    div { style: "grid-row: {first + 1} / {last + 2}; grid-column: {col(grid.columns.len(), 0)}; align-self: stretch; display: flex; padding-left: 0.5rem",
+                        {ratio_scale(ScaleFit::Fill, &format!("{id}-summary-scale"))}
+                    }
+                }
             }
-            {ratio_scale(ScaleFit::Fixed, &format!("{id}-summary-scale"))}
         }
     }
 }

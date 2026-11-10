@@ -449,9 +449,15 @@ pub fn TipHeading(#[props(into)] heading: String) -> Element {
     rsx! { strong { style: "display: block; margin-bottom: 0.5rem", "{heading}" } }
 }
 
-/// A small `cds-table` with one header row.
+/// A small `cds-table` with one header row. Where `abouts` gives a header a non-empty
+/// definition, the header is a [`Definition`] of it: the column says what it means where it is
+/// read, not in a paragraph under the table.
 #[component]
-pub fn Table(headers: Vec<String>, children: Element) -> Element {
+pub fn Table(
+    headers: Vec<String>,
+    #[props(default)] abouts: Vec<String>,
+    children: Element,
+) -> Element {
     // Scrolls sideways in its own box on a narrow screen, rather than
     // widening the page around it.
     rsx! {
@@ -459,7 +465,14 @@ pub fn Table(headers: Vec<String>, children: Element) -> Element {
         cds-table { "size": "sm",
             cds-table-head {
                 cds-table-header-row {
-                    for h in headers { cds-table-header-cell { "{h}" } }
+                    for (i, h) in headers.iter().enumerate() {
+                        cds-table-header-cell {
+                            match abouts.get(i).filter(|a| !a.is_empty()) {
+                                Some(about) => rsx! { Definition { alignment: Alignment::Bottom, definition: about.clone(), "{h}" } },
+                                None => rsx! { "{h}" },
+                            }
+                        }
+                    }
                 }
             }
             cds-table-body { {children} }

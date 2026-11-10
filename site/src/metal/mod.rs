@@ -32,7 +32,7 @@ use crate::charts::{
     ColorLegend, Colour, ComboLayer, Enabled, Gradient, HeatPoint, HeatmapOptions, Hover,
     LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, RatioSquare, ScaleFit, SparkAxes,
     SparkPoint, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
-    mini_heatmap, ratio_scale, ratio_step, sparkline,
+    mini_heatmap, ratio_ink, ratio_labels, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, RequestTiming, Run, Scenario};
@@ -373,9 +373,12 @@ fn commit(run: &Run) -> Element {
     rsx! { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
 }
 
-pub(super) fn runs_table(runs: &[&Run]) -> Element {
+/// The machine and its runs, folded under the pair's heading: `about` (the machine, the model's
+/// files and build), then a row a run.
+pub(super) fn runs_table(runs: &[&Run], about: Element) -> Element {
     rsx! {
-        Fold { title: "Runs on this machine ({runs.len()})",
+        Fold { title: "This machine and its runs ({runs.len()})",
+            {about}
             Table {
                 headers: headers(["when", "scratchy", "steps", "cold priming launches", "scratchy KV cache", "scratchy serve flags", "engine versions", "pinned", "data"]),
                 for run in runs.iter().rev() {
@@ -470,43 +473,6 @@ fn conditions_changed(run: &Run, m: &Model, prev: Entry) -> String {
         .map(|((k, now), (_, then))| format!("{k} {then} then, {now} now"))
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-pub(super) fn history(entries: &[Entry]) -> Element {
-    if entries.len() < 2 {
-        return rsx! {};
-    }
-    rsx! {
-        Fold { title: "Runs of this model ({entries.len()})",
-            Table {
-                headers: headers(["run", "scratchy", "quant", "tok/s, 1 user", "tok/s, most users", "TPOT ms, most users"]),
-                for Entry { run, m } in entries.iter().rev() {
-                    TableRow {
-                        TableCell { "{run.generated_utc.date()}" }
-                        TableCell { {commit(run)} }
-                        TableCell { "{m.quant.as_deref().unwrap_or_default()}" }
-                        if served(m) {
-                            {
-                                let us = by_users(m, run, Engine::Scratchy);
-                                let one = us.get(&1).copied();
-                                let many = us.keys().max().filter(|&&n| n != 0).and_then(|n| us.get(n).copied());
-                                let vals = [
-                                    // Every cell's number through cfmt, so a dead or failed
-                                    // one carries its mark like the TPOT beside it.
-                                    cfmt(one, Metric::Throughput),
-                                    cfmt(many, Metric::Throughput),
-                                    cfmt(many, Metric::Tpot),
-                                ];
-                                rsx! { for v in vals { TableCell { "{v}" } } }
-                            }
-                        } else {
-                            TableCell { colspan: 3, "no numbers" }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// What differs from a model's previous run here, besides scratchy's own code: its settings and
@@ -757,21 +723,22 @@ fn users_shape(m: &Model, run: &Run) -> (Option<u32>, Option<u32>) {
 /// before the gate.
 pub(super) fn parity(m: &Model) -> Option<String> {
     m.parity_mlx_lm.map(|p| match (p, &m.parity_skipped) {
-        (None, Some(why)) => format!("output not checked against mlx-lm: {why}"),
+        (None, Some(why)) => format!("answers not checked against mlx-lm: {why}"),
         (Some(true), _) => match &m.parity_ties {
             Some(ties) if !ties.is_empty() => {
-                let (n, max) = (ties.values().flatten())
-                    .fold((0, 0.0_f64), |(n, max), &g| (n + 1, max.max(g)));
+                let n = ties.values().flatten().count();
                 format!(
-                    "output matches mlx-lm up to {n} near-tie token{} (at most {max:.2} logits \
-                     behind mlx-lm's top)",
+                    "answers checked against mlx-lm, Apple's reference: they match, but for {n} \
+                     near-tie word{}",
                     if n == 1 { "" } else { "s" }
                 )
             }
-            _ => "output matches mlx-lm".to_string(),
+            _ => "answers checked against mlx-lm, Apple's reference: they match".to_string(),
         },
-        (Some(false), _) => "output does not match mlx-lm".to_string(),
-        (None, None) => "output not checked (no mlx-lm)".to_string(),
+        (Some(false), _) => {
+            "answers checked against mlx-lm, Apple's reference: they differ".to_string()
+        }
+        (None, None) => "answers not checked (no mlx-lm)".to_string(),
     })
 }
 
@@ -779,11 +746,11 @@ pub(super) fn parity_info() -> Element {
     info(
         "",
         rsx! {
-            "Before anything is timed, scratchy and mlx-lm answer the same short prompts with greedy decoding, \
-             and the answers must match. Where they part, mlx-lm is run over scratchy's own answer and judges \
-             each token scratchy picked: one within a logit of mlx-lm's top is a near-tie two correct stacks \
-             break differently, and passes. A token further behind points at a wrong load path (quant preset, \
-             group size, dequant), so that model is not timed at all."
+            "A correctness check, not a speed comparison: before anything is timed, scratchy and mlx-lm, \
+             Apple's own implementation of the model, answer the same short prompts, and the answers must \
+             match. Where they part, mlx-lm scores the word scratchy picked: one within a logit of mlx-lm's \
+             own top choice is a near-tie two correct implementations can break either way, and passes. A \
+             word further behind means scratchy loaded the model wrong, so that model is not timed at all."
         },
     )
 }
@@ -869,28 +836,12 @@ impl Sweep {
     fn metrics(self) -> [(Metric, &'static str, &'static str); 2] {
         match self {
             Sweep::Users => [
-                (
-                    Metric::Throughput,
-                    "Throughput (tok/s, higher is better)",
-                    "tok/s",
-                ),
-                (
-                    Metric::E2el,
-                    "End-to-end time (ms, lower is better)",
-                    "E2EL ms",
-                ),
+                (Metric::Throughput, "Output tokens a second", "tok/s"),
+                (Metric::E2el, "End-to-end p50", "ms"),
             ],
             Sweep::Prompt => [
-                (
-                    Metric::Ttft,
-                    "Time to first token (ms, lower is better)",
-                    "TTFT ms",
-                ),
-                (
-                    Metric::PeakMem,
-                    "Peak memory (MiB, lower is better)",
-                    "peak MiB",
-                ),
+                (Metric::Ttft, "TTFT p50", "ms"),
+                (Metric::PeakMem, "Peak memory", "MiB"),
             ],
         }
     }
@@ -1035,15 +986,10 @@ fn sweep_cells(cells: &[Cell], sweep: Sweep) -> BTreeMap<u32, &Cell> {
 }
 
 /// A sweep as small multiples: per metric, one small chart per engine scratchy
-/// is compared with, each scratchy (blue) against that one engine (orange)
-/// with scratchy's previous run in grey behind, so however many engines a run
-/// has, no chart holds more than three lines.
-pub(super) fn sweep_part<'a>(
-    m: &'a Model,
-    run: &Run,
-    prev: Option<Entry<'a>>,
-    sweep: Sweep,
-) -> Element {
+/// is compared with, each scratchy (blue) against that one engine (orange), so
+/// however many engines a run has, no chart holds more than two. How scratchy
+/// moved between runs is the Over time tab's.
+pub(super) fn sweep_part<'a>(m: &'a Model, run: &Run, sweep: Sweep) -> Element {
     let map_of = |mm: &'a Model, rr: &Run, e: Engine| -> BTreeMap<u32, &'a Cell> {
         match sweep {
             Sweep::Users => by_users(mm, rr, e),
@@ -1076,22 +1022,6 @@ pub(super) fn sweep_part<'a>(
     xs.sort_unstable();
     xs.dedup();
 
-    // The previous run's scratchy line, drawn first so it sits behind.
-    let pcs = prev
-        .filter(|p| sweep == Sweep::Prompt || users_shape(p.m, p.run) == users_shape(m, run))
-        .map(|p| map_of(p.m, p.run, Engine::Scratchy))
-        .unwrap_or_default();
-    let plabel = prev.map_or(String::new(), |p| {
-        let differ = if settings_changed(run, p.run).is_empty() {
-            ")"
-        } else {
-            ", different settings)"
-        };
-        format!(
-            "scratchy, previous ({}{differ}",
-            p.run.generated_utc.month_day()
-        )
-    });
     let line =
         |label: &str, class: &'static str, cs: &BTreeMap<u32, &Cell>, metric: Metric| Series {
             label: label.to_string(),
@@ -1117,12 +1047,10 @@ pub(super) fn sweep_part<'a>(
             rivals
                 .iter()
                 .map(|(e, cs)| {
-                    let mut ss = Vec::new();
-                    if !pcs.is_empty() {
-                        ss.push(line(&plabel, "prev", &pcs, metric));
-                    }
-                    ss.push(line("scratchy", "s1", mine, metric));
-                    ss.push(line(e.label(), "s2", cs, metric));
+                    let ss = vec![
+                        line("scratchy", "s1", mine, metric),
+                        line(e.label(), "s2", cs, metric),
+                    ];
                     (format!("vs {}", e.label()), ss)
                 })
                 .collect()
@@ -1133,7 +1061,7 @@ pub(super) fn sweep_part<'a>(
                 ss.retain(|s| s.pts.iter().any(|p| p.1.is_some()));
                 (t, ss)
             })
-            .filter(|(_, ss)| ss.iter().any(|s| s.class != "prev"))
+            .filter(|(_, ss)| !ss.is_empty())
             .collect();
         // Each engine not plotted, by why: no cells at all, every cell from a server that had
         // stopped answering, or cells whose answers never streamed.
@@ -1148,11 +1076,13 @@ pub(super) fn sweep_part<'a>(
             }
         }
         rsx! {
-            Stack { gap: 2,
+            // One of a row's measures, side by side, as the dataset sections' users charts are.
+            div { style: "flex: 1 1 16rem; min-width: 16rem; max-width: 24rem",
+              Stack { gap: 2,
                 strong { "{title}" }
-                div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem",
+                div { style: "display: flex; flex-direction: column; gap: 1rem",
                     for (t, ss) in &charts {
-                        div { style: "flex: 1 1 16rem; min-width: 16rem; max-width: 24rem",
+                        div {
                             {bar_chart(ss, &xs, (t.as_str(), ylabel), sweep, "200px", &format!("{title}, scratchy {t}"))}
                         }
                     }
@@ -1166,6 +1096,7 @@ pub(super) fn sweep_part<'a>(
                 if !no_cells.is_empty() {
                     p { "{no_cells.join(\", \")}: no numbers for this sweep (its requests failed or it was not measured; see the run's logs), not plotted." }
                 }
+              }
             }
         }
     };
@@ -1193,7 +1124,7 @@ pub(super) fn sweep_part<'a>(
             rsx! {
                 "Throughput and end-to-end time with {xs_text} users at once " {users_info()}
                 "; {opt(ui)}-token prompts, {opt(uo)}-token answers{from_grid}. One small chart per engine, each scratchy \
-                 against that engine, scratchy's previous run in grey. A line that rises in the second row means \
+                 against that engine. A line that rises in the second row means \
                  each request takes longer as more share the engine; once the GPU is busy, scheduling only moves \
                  that wait between the first token and the rest, so the end-to-end time is what is compared."
             },
@@ -1222,7 +1153,7 @@ pub(super) fn sweep_part<'a>(
         heading,
         intro,
         rsx! {
-            Stack { gap: 5,
+            div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: flex-start",
                 {row(m1, t1, y1)}
                 {row(m2, t2, y2)}
             }
@@ -1657,7 +1588,7 @@ const GRID_METRICS: [GridMetric; 3] = [
         load: Load::Alone,
         name: "Prefill",
         about: "Time to first token with 1 user: how long the prompt takes before the answer starts.",
-        title: "time to first token, 1 user",
+        title: "TTFT p50, 1 user",
         letter: "P",
     },
     GridMetric {
@@ -1665,7 +1596,7 @@ const GRID_METRICS: [GridMetric; 3] = [
         load: Load::Alone,
         name: "Decode",
         about: "Time per output token with 1 user: how fast the answer streams once it has started.",
-        title: "time per output token, 1 user",
+        title: "TPOT p50, 1 user",
         letter: "D",
     },
     GridMetric {
@@ -1674,7 +1605,7 @@ const GRID_METRICS: [GridMetric; 3] = [
         name: "End-to-end Latency",
         about: "From sending a request to its last token. Once the GPU is busy, scheduling only moves \
                 each request's wait between its first token and the rest, so their sum is what compares.",
-        title: "end-to-end time, 2 or more users",
+        title: "End-to-end p50, 2 or more users",
         letter: "u",
     },
 ];
@@ -1692,7 +1623,7 @@ const MODEL_GRID_METRICS: [GridMetric; 4] = [
         about: "Joules an output token with 1 user, from the CPU, GPU and ANE counters, not DRAM, \
                 the Mac's idle floor of about 1.6 W in it; read once a second, so a cell of under \
                 about 20 s is coarse.",
-        title: "energy per output token, 1 user",
+        title: "J/token, 1 user",
         letter: "J",
     },
 ];
@@ -1859,7 +1790,9 @@ pub(super) fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
             Stack { gap: 3,
                 strong { "{a}-token answers" }
                 p { "{note}." }
-                div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start",
+                // One row, the scale beside its maps: wrapping would drop the scale onto a line of
+                // its own under them. Scrolls sideways on a narrow screen, as the summary maps do.
+                div { style: "display: flex; gap: 1.5rem; align-items: flex-start; overflow-x: auto",
                     for (gm, s) in &parts { {heat_map(s, gm.metric, gm.title, &format!("scale-{mid}-{a}"))} }
                     if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed, &format!("scale-{mid}-{a}"))} }
                 }
@@ -2730,7 +2663,7 @@ pub(super) fn over_time_charts(
 /// How many of the overview's heat map squares have their factor written in
 /// them: at most one per colour step, spread over the steps the squares use.
 /// A heat map left without one then gets one of its own.
-const HEAT_LABELS: usize = 12;
+pub(super) const HEAT_LABELS: usize = 12;
 
 /// Where an overview heat map square is: machine, model, metric, and its
 /// users count and prompt length.
@@ -2982,23 +2915,8 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element
             })
         })
         .collect();
-    // Each colour step's square furthest from ×1; then HEAT_LABELS of those
-    // steps, evenly spread from the slowest to the fastest, both always in.
-    let mut by_step: BTreeMap<usize, (Square, f64)> = BTreeMap::new();
-    for (&at, &r) in &squares {
-        let kept = by_step.entry(ratio_step(r)).or_insert((at, r));
-        if r.log2().abs() > kept.1.log2().abs() {
-            *kept = (at, r);
-        }
-    }
-    let used: Vec<Square> = by_step.into_values().map(|(at, _)| at).collect();
-    let mut highlights: BTreeSet<Square> = if used.len() <= HEAT_LABELS {
-        used.into_iter().collect()
-    } else {
-        (0..HEAT_LABELS)
-            .map(|k| used[k * (used.len() - 1) / (HEAT_LABELS - 1)])
-            .collect()
-    };
+    // Each colour step's square furthest from ×1, HEAT_LABELS of them ([`ratio_labels`]).
+    let mut highlights: BTreeSet<Square> = ratio_labels(&squares, HEAT_LABELS);
     // Then each heat map still without a label gets one: its square furthest
     // from ×1 in a colour step not yet labelled, or, every step it has taken,
     // its square furthest from ×1.
@@ -3180,12 +3098,7 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element
                         users: u,
                         prompt: i,
                     });
-                    // The steps far from ×1 are dark in light mode and light in dark mode.
-                    let ink = if step.abs_diff(RATIO_STEPS.len() / 2) >= 6 {
-                        "light-dark(#ffffff, #161616)"
-                    } else {
-                        "light-dark(#161616, #ffffff)"
-                    };
+                    let ink = ratio_ink(step);
                     (
                         format!("background: {}; color: {ink}", RATIO_STEPS[step]),
                         shown.then(|| format!("×{r:.1}")),
@@ -4268,10 +4181,46 @@ mod tests {
         assert_eq!(shown(&machines, &all).last(), Some(&RANDOM));
         let random = render(section(RANDOM, &machines, &all));
         assert!(random.contains("gpt-oss-20b on Apple M3 Pro"), "drawn");
-        assert!(random.contains("Apple M3 Pro from its 10-27 run"));
+        // Its detail names the older run its grid is from.
+        assert!(random.contains("Run 2026-10-27"), "the grid run, named");
         let rag = render(section("rag", &machines, &all));
         assert!(rag.contains("gpt-oss-20b on Apple M3 Pro"));
-        assert!(!rag.contains("Older than the machine"), "the newest");
+    }
+
+    /// A Mac that ran both sets shows its class's one model on the summary map, the small set's
+    /// as the random-token map does, and the class names only that model: not the large one
+    /// it also ran, whose numbers are in its own tab.
+    #[test]
+    fn a_summary_shows_one_model_a_class_on_a_mac_that_ran_both_sets() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        // The same model's numbers again, as the class's large model, which the Mac ran too.
+        let mut large = fixtures(&[REQUESTS_FIXTURE]).remove(0).models.remove(0);
+        large.stem = "gpt-oss-120b-3bit".into();
+        runs[0].models.push(large);
+        // Prompt counts on the RAG cells, so the summary has buckets to draw.
+        for m in &mut runs[0].models {
+            for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                for c in cells.iter_mut().filter(|c| c.workload == "rag") {
+                    let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.prompt_tokens = Some(vec![Some(2700); n]);
+                }
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        // The summary map: one model's squares, 4 rows by 4 buckets.
+        let map = &html[..html
+            .find("id=\"rag-summary-scale\"")
+            .expect("the summary map")];
+        assert_eq!(
+            map.matches("width: 2.25rem; height: 2.25rem").count(),
+            4 * 4
+        );
+        assert!(map.contains(">gpt-oss-20b<"), "the small model, named");
+        assert!(!map.contains(">gpt-oss-120b-3bit<"), "not the large one");
     }
 
     #[test]
@@ -4363,7 +4312,7 @@ mod tests {
         assert!(html.contains("scratchy build 17 s"), "its build time");
         assert!(html.contains("53 MiB binary"), "its binary size");
         // The runs on this machine.
-        assert!(html.contains("Runs on this machine"));
+        assert!(html.contains("This machine and its runs"));
         assert!(html.contains("f9dc285a"), "its commit");
         assert!(html.contains("oMLX 9de79bc3"), "the rival's version");
         assert!(
@@ -4485,9 +4434,10 @@ mod tests {
         );
     }
 
-    /// A model run more than once on a machine keeps its before and after: the previous run's line
-    /// behind the curves, a table of its runs, and what differs from the previous run besides the
-    /// code. The M3 Pro's two published grid runs of gpt-oss-20b, 10-29 and 11-03.
+    /// A model run more than once on a machine names its previous run here, and what differs
+    /// from it besides the code. How scratchy moved between runs is the Over time tab's: no table of
+    /// its runs in the detail, and no line for the previous run on its curves. The M3 Pro's two
+    /// published grid runs of gpt-oss-20b, 10-29 and 11-03.
     #[test]
     fn a_model_run_twice_shows_its_before_and_after() {
         let runs = fixtures(&[
@@ -4501,15 +4451,17 @@ mod tests {
             &machines,
         ));
         assert!(
-            html.contains("Runs of this model (2)"),
-            "the model's runs table"
+            !html.contains("Runs of this model"),
+            "no runs table in the detail"
         );
         assert!(
             html.contains("Previous run here"),
             "the previous run is named"
         );
-        // The previous run's faint line behind scratchy's, on the users curves.
-        assert!(html.contains("prev"), "the previous run's line");
+        assert!(
+            !html.contains("scratchy, previous"),
+            "no previous run's line on the curves"
+        );
     }
 
     /// A workload the page does not know yet keeps its own section and nav link, under its own
@@ -4557,14 +4509,14 @@ mod tests {
     }
 
     /// A dataset's summary is the random-token map's look: per machine a row each for prefill
-    /// and decode at 1 user and end-to-end time at each users count above it (P, D, 2u, 4u), per
-    /// model a column each for its prompt-length buckets, each square scratchy's median against
-    /// the rival's over that bucket's requests. Read where the run kept its prompt counts.
+    /// and decode at 1 user and end-to-end time at each users count above it (P, D, 2u, 4u), a
+    /// column per model under its class, each square scratchy's median against the rival's over
+    /// all of the cell's requests. Read where the run kept its prompt counts.
     #[test]
     fn a_datasets_summary_is_the_grid_maps_look_by_prompt_length() {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         // The fixture is from before cells kept prompt counts: give its RAG cells some, two
-        // requests in the 2.5 to 3k bucket and the rest in 3 to 3.5k.
+        // requests in the 2.55k+ bucket and the rest in 2.85k+.
         let m = &mut runs[0].models[0];
         for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()].into_iter().flatten() {
             for c in cells.iter_mut().filter(|c| c.workload == "rag") {
@@ -4580,21 +4532,19 @@ mod tests {
         for row in [">P<", ">D<", ">2u<", ">4u<"] {
             assert!(html.contains(row), "no {row} row");
         }
-        // A column a bucket under its model's class.
-        // The page escapes the less-than sign.
+        // The model's class, and under it the model, as the random-token map has them.
+        assert!(html.contains(">Sliding window<"), "the class over its model");
+        assert!(html.contains(">gpt-oss-20b<"), "the model under its class");
+        // A column a bucket under its model, the random-token map's four.
         for b in super::buckets::BUCKETS {
             let label = b.0.replace('<', "&#60;");
             assert!(html.contains(&format!(">{label}<")), "no {} column", b.0);
         }
-        assert!(html.contains(">Sliding window<"), "the class over its model's buckets");
-        // Squares of the grid's size: 4 rows by 5 buckets for its one model.
+        // Squares of the grid's size: 4 rows by 4 buckets for its one model.
         let squares = html.matches("width: 2.25rem; height: 2.25rem").count();
-        assert_eq!(squares, 4 * 5);
-        // A bucket with requests on both engines has a ratio, named with its rival and bucket.
+        assert_eq!(squares, 4 * 4);
         assert!(html.contains("vs oMLX</strong>"), "a ratio against its rival");
-        assert!(html.contains("3–3.5k prompt tokens"), "its bucket in its tooltip");
-        // One with none says so.
-        assert!(html.contains("no requests this long"));
+        assert!(html.contains("2.85k+ prompt tokens"), "its bucket in its tooltip");
     }
 
     /// A run from before cells kept prompt counts has no buckets to draw: its summary says so,
@@ -4631,7 +4581,7 @@ mod tests {
             !html.contains("Accuracy, 400 tasks at 4 users"),
             "no accuracy line under the map"
         );
-        assert!(html.contains(">MuSiQue accuracy<"), "its row in the table");
+        assert!(html.contains(">MuSiQue, scored<"), "its row in the table");
         assert!(html.contains("48% of 400"));
     }
 
@@ -4650,8 +4600,14 @@ mod tests {
         runs[0].models[0].tasks.as_mut().unwrap().push(cell);
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains(">MuSiQue accuracy<"), "its own row");
+        assert!(html.contains(">MuSiQue, scored<"), "its own row");
         assert!(html.contains("48% of 400 (2-hop 53%, 3-hop 46%, 4-hop 38%)"));
+        // The timed rows say why they have no accuracy, rather than a bare dash.
+        assert!(
+            html.contains(">MuSiQue, timed<"),
+            "a timed row named for what it is"
+        );
+        assert!(html.contains(">not scored<"), "a timed row is not scored");
         // Its columns say what they are: accuracy, and energy a right answer.
         assert!(html.contains(">accuracy<"), "the accuracy column");
         assert!(html.contains(">J/right answer<"), "energy a right answer");

@@ -5,7 +5,7 @@
 //! metal.html and spyre.html render these with their own data; nothing here
 //! knows a page's own numbers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dioxus::prelude::*;
@@ -774,6 +774,36 @@ pub fn ratio_step(r: f64) -> usize {
     let at = (log2_ratio(r) - RATIO_RANGE.min) / (RATIO_RANGE.max - RATIO_RANGE.min);
     // Truncation is the floor here: clamped to 0 first.
     ((at.max(0.0) * n as f64) as usize).min(n - 1)
+}
+
+/// The squares of a ratio map to write their factor in, `most` of them: each colour step's
+/// square furthest from ×1, spread evenly from the slowest to the fastest where there are more
+/// steps than labels, both ends always in. So the shades a map uses can be read apart.
+pub fn ratio_labels<K: Copy + Ord>(squares: &BTreeMap<K, f64>, most: usize) -> BTreeSet<K> {
+    let mut by_step: BTreeMap<usize, (K, f64)> = BTreeMap::new();
+    for (&at, &r) in squares {
+        let kept = by_step.entry(ratio_step(r)).or_insert((at, r));
+        if r.log2().abs() > kept.1.log2().abs() {
+            *kept = (at, r);
+        }
+    }
+    let used: Vec<K> = by_step.into_values().map(|(at, _)| at).collect();
+    if used.len() <= most || most < 2 {
+        return used.into_iter().take(most).collect();
+    }
+    (0..most)
+        .map(|k| used[k * (used.len() - 1) / (most - 1)])
+        .collect()
+}
+
+/// A label's ink on a ratio square of step `step`: light on the dark steps far from ×1, dark on
+/// the rest, in light mode; the reverse in dark mode.
+pub fn ratio_ink(step: usize) -> &'static str {
+    if step.abs_diff(RATIO_STEPS.len() / 2) >= 6 {
+        "light-dark(#ffffff, #161616)"
+    } else {
+        "light-dark(#161616, #ffffff)"
+    }
 }
 
 /// One side of a comparison chart: the name of its line, and of its fill
