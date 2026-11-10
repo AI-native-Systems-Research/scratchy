@@ -3860,8 +3860,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// `sen_to_f32` the optrace's stats use. RAW int32 tensors (the gather index table, in
     /// `raw_ids`) are dumped as i32→f32 with `.n = size/4` so the file stays comparable; the
     /// emulator never dumps those (host-bound sources), so they simply have no reference file.
-    /// Bank ≥ 1 weights and placements past a clamped shadow window are skipped (unreadable), each
-    /// with one `skip.txt` line so the gap is visible rather than silent.
+    /// Bank ≥ 1 weights are skipped (not in their segment's region), and a placement past what
+    /// was read back is a layout shock — each with one `skip.txt` line so the gap is visible
+    /// rather than silent. Every segment is materialized to its full region before the D2H, so
+    /// the intermediates the ops compute into are dumped exactly as they were when every shadow
+    /// was host-mirrored; nothing reads back as a quiet 0 B.
     fn tensordump(&mut self, oi: usize, op: &OpProg<T>) -> Result<()> {
         let Some(dir) = Diag::get().tensordump.clone() else {
             return Ok(());
@@ -3886,18 +3889,21 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             });
         }
         let _ = self.stream_ref()?.synchronize();
-        // D2H every segment a placement can live in. seg2's shadow is one page (clamped read), and
-        // an aliased segment's device region belongs to its owner — reading it back is still SOUND
-        // (a read never writes), it just reflects the owner's bytes, which is exactly what this
-        // session's launches compute against.
+        // D2H every segment a placement can live in — `read_seg`'s own rule: this tool exists to
+        // see the bytes the ops COMPUTE (the intermediates above all), which are device-only slots,
+        // so every segment with a region materializes its shadow first. An aliased segment's
+        // device region belongs to its owner — reading it back is still SOUND (a read never
+        // writes), it just reflects the owner's bytes, which is exactly what this session's
+        // launches compute against. And a failed read is an `Err`, never a quiet 0 B: a segment
+        // that reads as nothing would hide every placement in it from the diff.
         let mut got = [0usize; NUM_SEGMENTS];
         for (i, g) in got.iter_mut().enumerate() {
             if self.seg_addr[i].is_none() {
                 continue;
             }
-            *g = self
-                .d2h_seg_clamped(SegIdx::checked(i as i64).expect("< NUM_SEGMENTS"))
-                .unwrap_or(0);
+            let seg = SegIdx::checked(i as i64).expect("< NUM_SEGMENTS");
+            self.mirror_seg_shadow(seg)?;
+            *g = self.d2h_seg_clamped(seg)?;
         }
         let dump = self.dump.as_mut().expect("just initialized");
         dump.op += 1;
@@ -3922,22 +3928,24 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 continue;
             }
             // Only whole-tensor reads that the clamped D2H actually brought back: a placement past
-            // the shadow's window would read stale host bytes and masquerade as a write.
+            // what was read would read stale host bytes and masquerade as a write. Every segment
+            // was materialized to its full region above, so a miss here is a layout shock in ANY
+            // segment — and the skip is WRITTEN, never silent (the doc's own law).
             let avail = got[i] as u64;
             if avail == 0 || p.offset + p.size > avail {
-                if p.segment as usize == SEG_WEIGHT.get() {
-                    // The weight segment's shadow is full-size; a miss there is a layout shock.
-                    skipped.push_str(&format!(
-                        "op{opno} prog{prog} {id}: seg{} off {} size {} past the {} B read back\n",
-                        p.segment, p.offset, p.size, avail
-                    ));
-                }
+                skipped.push_str(&format!(
+                    "op{opno} prog{prog} {id}: seg{} off {} size {} past the {} B read back\n",
+                    p.segment, p.offset, p.size, avail
+                ));
                 continue;
             }
-            // `avail > 0` proves the D2H brought bytes back, so the slot holds a host buffer;
-            // the `else` is the type's price, not an expected arm.
+            // The loop above materialized every segment with a region, and `avail > 0` proves the
+            // D2H brought its bytes back — a `DeviceOnly` slot here is a wiring bug, refused.
             let Some(host) = self.seg_host[i].host() else {
-                continue;
+                bail!(
+                    "tensordump: placement {id} names seg{i}, which is DEVICE-ONLY despite the \
+                     materialize pass above — the shadow state and the dump loop disagree"
+                );
             };
             let cur = &host[p.offset as usize..][..p.size as usize];
             let moved = match dump.snap.get(id) {
@@ -5168,15 +5176,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
     /// D2H a whole tensor segment into its host shadow, CLAMPED to the shadow's allocated size.
     ///
-    /// The two sizes genuinely differ on the paged path: a device-only slot's region is sized for
-    /// the whole pool while its host side holds nothing until a read materializes one, so a
-    /// whole-region D2H would write pool-many pages into a buffer that does not exist. A
-    /// DEVICE-ONLY slot reads as 0 B here — the doors that want its bytes (`read_seg`,
-    /// `read_tensor`, the deferred reads, `optrace`) materialize a shadow through
-    /// [`Self::shadow_for_read`] FIRST; this is the clamped reader they all land in. When the
-    /// shadow is smaller than the region, only its leading window transfers, and the
-    /// clamped-vs-requested sizes are printed — a truncated readback is visible, never silent.
-    /// Returns the bytes transferred.
+    /// ⛔ A DEVICE-ONLY SLOT IS REFUSED, NOT READ AS 0 B. This is the clamped reader every read
+    /// door lands in; if it answered "0 B, `debug!`" for a slot with no host mirror, that answer
+    /// would stand in for every caller's own decision — and a caller that had nothing to say
+    /// about it (tensordump, once) would hand back a silently empty dump. The doors that want a
+    /// device-only slot's bytes (`read_seg`, `read_tensor`, `optrace`, `tensordump`, the logits
+    /// readback) materialize a shadow through [`Self::shadow_for_read`] FIRST; a caller that
+    /// reaches this reader with a `DeviceOnly` slot is a wiring bug, and this is its `Err`.
+    ///
+    /// The two sizes may still differ — a read may have materialized only a window — and then
+    /// only the shadow's leading window transfers, with the clamped-vs-requested sizes printed:
+    /// a truncated readback is visible, never silent. Returns the bytes transferred.
     fn d2h_seg_clamped(&mut self, seg: SegIdx) -> Result<usize> {
         let i = seg.get();
         let dev = self.seg_addr[i]
@@ -5198,11 +5208,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .as_ref()
             .ok_or_else(|| anyhow!("no stream — prepare was not called"))?;
         let Some(shadow) = seg_host[i].host_vec_mut() else {
-            debug!(
-                "[sdsc-superdsc] read seg{i}: DEVICE-ONLY — no host mirror, 0 B D2H'd (a read \
-                 door that wants these bytes materializes one first)"
+            bail!(
+                "read seg{i}: DEVICE-ONLY — no host mirror to read into. A read door that wants \
+                 these bytes materializes one first (shadow_for_read); one that does not know \
+                 what they mean has no business reading this segment"
             );
-            return Ok(0);
         };
         let host = shadow.len() as u64;
         if host >= dev {
