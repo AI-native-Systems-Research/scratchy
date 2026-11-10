@@ -9,8 +9,8 @@ use crate::ir::island::tile_op::TileOp;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, DeviceAxis, Df, Fp16, OpFunc, OpInfo, OpSpec, Role,
-    Scale, SdscFoldSet, TensorArg,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpInfo, OpSpec, Role, Scale,
+    SdscFoldSet, TensorArg, Window,
 };
 use crate::work::{CoreDivision, EwDivision};
 
@@ -1254,13 +1254,15 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             // A run's sticks are its innermost dim, in dxp's innermost-first order.
             .with_device_order(crate::emit::SprayOrder::Inner.device_layout())
             .map_err(|e| e.0)?;
-            // ⛔ A PITCH, NOT A WINDOW: the run's sticks sit `pitch` apart in the frame — a
-            // stride landing past the swept `run_sticks` is the walk's back gap, never a pin.
-            // `Pitch::past` decides it: a frame AT the run is no pitch (the `run_sticks` case
-            // the hand-branch used to spell), a shorter one refuses by name (the guard above).
+            // ⛔ A WINDOW AT THE SITE'S OWN EXTENT — the spelling the gated emission ships and
+            // the splice golden pins: a landing past the swept `run_sticks` is carried by the
+            // dim's size (this `Window`) or by the back gap folded onto it (arithmetic-identical
+            // spellings of the same stride; see the carrier law in `superdsc_opspec`). The
+            // pitch conversion of this site broke the golden and was reverted.
             let y = t.axis("y").map_err(|e| e.0)?;
-            let pitched = y.pitch(&plan, pitch).map_err(|e| e.0)?;
-            let t = t.with_axis(y, pitched);
+            let w = Window::cap(run_sticks, pitch, pitch)
+                .map_err(|e| format!("stick_runs_copy '{name}': y window: {}", e.0))?;
+            let t = t.with_axis(y, w);
             Ok(AnyTensorArg::R3(t))
         };
     let input = arg(true, src, src_pitch, src_elems)?;
@@ -1491,13 +1493,15 @@ where
             )
             .map_err(|e| e.0)?
             .with_offset(out_view.offset);
-            // ⛔ A PITCH, NOT A WINDOW: the scatter's rows sit `interleave` apart in the
-            // destination allocation — a stride landing past the swept `y` is the walk's back
-            // gap, never a pin. `Pitch::past` decides it: a frame AT the sweep is no pitch, a
-            // shorter one refuses by name.
+            // ⛔ A WINDOW AT THE SITE'S OWN EXTENT — the spelling the gated emission ships: the
+            // scatter's rows sit `interleave` apart in the destination allocation, and the
+            // landing past the swept `y` is carried by the dim's size (this `Window`) or by the
+            // back gap folded onto it — arithmetic-identical spellings of the same stride (see
+            // the carrier law in `superdsc_opspec`). The pitch conversion was reverted.
             let y = t.axis("y").map_err(|e| e.0)?;
-            let pitched = y.pitch(&plan, interleave).map_err(|e| e.0)?;
-            t.with_axis(y, pitched)
+            let w = Window::cap(plan.extent("y"), interleave, interleave)
+                .map_err(|e| format!("pointwise '{o_name}': y window: {}", e.0))?;
+            t.with_axis(y, w)
         }),
     };
 
@@ -2172,20 +2176,18 @@ mod stick_runs_tests {
         }
     }
 
-    /// Each side states its own pitch as `y`'s back gap, and only where it is not the run
-    /// (`Pitch::past` yields `Swept` at the run — the hand-branch the law replaced).
+    /// Each side states its own pitch as `y`'s physical extent (a window at the site's own
+    /// extent), and only where it is not the run — `Window::cap` collapses to `Swept` at the
+    /// run (the hand-branch the constructor replaced).
     #[test]
     fn each_side_states_its_own_pitch() {
         let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
-        use crate::superdsc_opspec::DeviceAxis::{Pitch as AxisPitch, Swept};
-        use crate::superdsc_opspec::{PastExtent, Pitch};
-        let PastExtent::Pitch(src_pitch) = Pitch::past(64, 128, None).unwrap() else {
-            panic!("128 past 64 is a pitch")
-        };
+        use crate::superdsc_opspec::DeviceAxis::Swept;
+        use crate::superdsc_opspec::Window;
         let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
         assert_eq!(
             v[0].device_extent,
-            [Swept, AxisPitch(src_pitch), Swept],
+            [Swept, Window::cap(64, 128, 128).unwrap(), Swept],
             "the source's pitch"
         );
         assert_eq!(

@@ -10,7 +10,7 @@ use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpSpec, Role, Scale, StickExtent,
-    TensorArg, WorkPlan,
+    TensorArg, Window, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -702,38 +702,45 @@ fn batched_walk_args<R: RungRegime>(
     pitches: Option<(u32, u32)>,
 ) -> Result<(TensorArg<3>, TensorArg<3>), String> {
     let input = batched_input_arg(a_name, regime.input_walk(), plan)?.with_offset(a_off);
-    // ⛔ A PITCH, NOT A WINDOW — the rank-3 form of the rank-2 rule at `matmul_opspec` above: the
-    // rows a batch sweeps sit `phys` rows apart in the frame, which is the walk's back gap
-    // (`LayoutAxis::pitch`, `phys − swept` on `mb`). The pin (`maxDimSizes_`) CAPS a dim's
-    // per-step size and never moves a landing; the crossing stride exists only as the back gap.
-    // `Pitch::past` decides it: a frame AT the sweep is no pitch, a shorter one refuses by name.
+    // ⛔ A WINDOW AT THE SITE'S OWN EXTENT — the spelling the gated emission ships and the
+    // splice golden pins: a landing past the swept rows is carried by the dim's size (this
+    // `Window`, the stride product) or by the back gap folded onto it (the pitch —
+    // arithmetic-identical, both lawful spellings of the same stride). The conversion of these
+    // sites to the pitch spelling broke the golden's non-pitched HBM descriptors and was
+    // reverted; see the carrier law in `superdsc_opspec`'s window docs.
     let input = match phys_mb {
         Some(phys) => {
+            let swept = plan.extent(MbAxis::NAME);
             let mb = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
-            let pitch = mb.pitch(plan, phys).map_err(|e| e.0)?;
-            input.with_axis(mb, pitch)
+            let w = Window::cap(swept, phys, phys)
+                .map_err(|e| format!("matmul_opspec '{a_name}': mb window: {}", e.0))?;
+            input.with_axis(mb, w)
         }
         None => input,
     };
-    // The ACTIVATION's own pitch, from its own placement law — stated unconditionally:
-    // `Pitch::past` itself yields `Swept` at the sweep and refuses below it.
+    // The ACTIVATION's own declared extent, from its own placement law — the same window
+    // spelling, through the same checked constructor.
     let input = match pitches.map(|(a, _)| a) {
         Some(a_pitch) => {
+            let swept = plan.extent(MbAxis::NAME);
             let mb = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
-            let pitch = mb.pitch(plan, a_pitch).map_err(|e| e.0)?;
-            input.with_axis(mb, pitch)
+            let w = Window::cap(swept, a_pitch, a_pitch)
+                .map_err(|e| format!("matmul_opspec '{a_name}': mb window: {}", e.0))?;
+            input.with_axis(mb, w)
         }
         None => input,
     };
     let output = batched_output_arg(o_name, regime.output_walk(), plan)?.with_offset(o_off);
     // ⛔ AND THE OUTPUT DECLARES ITS OWN — this is the half that was missing. Checking the output
-    // against a pitch it never declared makes the two agree on paper while the emitted walk still
-    // strides by the shared value. Its own pitch, stated unconditionally, same rule as the input's.
+    // against an extent it never declared makes the two agree on paper while the emitted walk
+    // still strides by the shared value. Its own extent, same window spelling, same constructor.
     let output = match pitches.map(|(_, o)| o) {
         Some(o_pitch) => {
+            let swept = plan.extent(MbAxis::NAME);
             let mb = output.axis(MbAxis::NAME).map_err(|e| e.0)?;
-            let pitch = mb.pitch(plan, o_pitch).map_err(|e| e.0)?;
-            output.with_axis(mb, pitch)
+            let w = Window::cap(swept, o_pitch, o_pitch)
+                .map_err(|e| format!("matmul_opspec '{o_name}': mb window: {}", e.0))?;
+            output.with_axis(mb, w)
         }
         None => output,
     };
