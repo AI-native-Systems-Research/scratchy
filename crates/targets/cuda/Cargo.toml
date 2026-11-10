@@ -144,6 +144,12 @@ required-features = ["nvcc"]
 name = "gemv_fp8"
 required-features = ["nvcc"]
 
+# FP8 S8: the tensor-core decode GEMV against S3's f64 bound and today's GEMV's time, on the GPU.
+# Not built without `nvcc`.
+[[test]]
+name = "gemv_fp8_tc"
+required-features = ["nvcc"]
+
 # FP8 S5: the e4m3 KV append bit for bit, and each attention kernel over the e4m3 cache against its
 # bf16 kernel on the widened cache, bit for bit, on the GPU. A binary of its own so a fault cannot
 # hide `attention`'s verdict. Not built without `nvcc`.

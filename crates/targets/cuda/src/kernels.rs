@@ -162,6 +162,21 @@ unsafe extern "C" {
     ) -> i32;
     // FP8 S4: the decode fp8 GEMV family, one prepare for the file.
     fn scratchy_cuda_gemv_fp8_prepare() -> i32;
+    // FP8 S8: the tensor-core decode GEMV (`kernels/gemv_fp8_tc.cu`), no tape launches it yet.
+    fn scratchy_cuda_gemv_fp8_tc_prepare() -> i32;
+    fn scratchy_cuda_gemv_fp8_tc_partial_bytes(n: *const u32, count: u32, k: u32) -> u64;
+    fn scratchy_cuda_gemv_fp8_tc(
+        q: *const c_void,
+        a_scale: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        count: u32,
+        k: u32,
+        partials: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_fp8_abt(
         a: *const c_void,
         b: *const c_void,
@@ -1212,6 +1227,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
+    ("gemv_fp8_tc", scratchy_cuda_gemv_fp8_tc_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -3761,6 +3777,55 @@ pub unsafe fn gemv_group_fp8_abt(
             k,
             sp.as_ptr(),
             count,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// The `partials` bytes [`gemv_fp8_tc`] needs for members of `n` rows each over `k`, or `None`
+/// when that launcher refuses the shape.
+pub fn gemv_fp8_tc_partial_bytes(n: &[u32], k: u32) -> Option<u64> {
+    let count = u32::try_from(n.len()).ok()?;
+    // SAFETY: `n` is `count` u32s; the function only reads them, after checking `count`.
+    let bytes = unsafe { scratchy_cuda_gemv_fp8_tc_partial_bytes(n.as_ptr(), count, k) };
+    (bytes != 0).then_some(bytes)
+}
+
+/// The tensor-core decode GEMV (`kernels/gemv_fp8_tc.cu`, FP8 S8, not yet in a tape): member `i`
+/// of `members` is `c [n] = bf16(((q · bᵀ) · b_scale) · a_scale)` off one quantized row `q [1, k]`
+/// e4m3 and its scale `a_scale` (one f32, `quant_rows_fp8`'s), 1 to 3 members, each `n` a non-zero
+/// multiple of 64 and `k` of 64. `partials` holds [`gemv_fp8_tc_partial_bytes`] bytes. Two launches,
+/// asynchronous; refused with [`KernelError::GroupShape`] before any pointer is touched.
+///
+/// # Safety
+///
+/// Every pointer is 16-byte-aligned device memory of its size; no output overlaps an input or
+/// another output; `stream` is a live stream or null.
+pub unsafe fn gemv_fp8_tc(
+    (q, a_scale): Fp8Operand,
+    members: Fp8GroupOperands<'_>,
+    partials: *mut c_void,
+    k: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemv_fp8_tc", members, (1, k));
+    if members.is_empty() || members.len() > 3 {
+        return Err(refused);
+    }
+    // SAFETY: as above; the arrays are three long and the launcher checks the count and every
+    // member's shape before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemv_fp8_tc(
+            q,
+            a_scale,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            members.len() as u32,
+            k,
+            partials,
             stream,
         )
     };
