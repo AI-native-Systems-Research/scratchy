@@ -633,13 +633,6 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
     {
         return Some("MoeRoute");
     }
-    // shortcut: a rope append with its folded query rope or head norms (FP8 S8 W4c) is refused
-    // until its kernel lands in the next commit, so no launch drops them; upgrade by launching it.
-    if let CudaStep::RopeAppend(r) = *s
-        && (r.q.is_some() || r.norms.is_some())
-    {
-        return Some("RopeAppend");
-    }
     None
 }
 
@@ -1384,844 +1377,894 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // checked every KV tape has the pool's geometry), and every block a kernel touches is one
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
-            let launched = match *s {
-                CudaStep::GemvFp8(GemmBf16 {
-                    a,
-                    b,
-                    c,
-                    n,
-                    k,
-                    residual,
-                    ..
-                }) => {
-                    let b = Self::fp8_weight(weights, b, n, k);
-                    // SAFETY: as the `Gemv` arm's, for `a` (`k` bf16, which the kernel quantizes
-                    // in its prologue), the fp8 weight (`n*k` bytes then `n` f32,
-                    // `step::fp8_weight`) and `c` (`n`).
-                    unsafe {
-                        // FP8 S8 W4a: the residual epilogue (the one-row bucket's o / out / down);
-                        // with none, the same kernel and bits.
-                        kernels::gemv_fp8_residual(
-                            (slot(a).cast_const(), b, slot(c)),
-                            partials,
-                            (n, k, gemv_splits(n, k, 1)),
-                            residual.map_or(std::ptr::null(), |r| slot(r).cast_const()),
-                            stream.0,
-                        )
+            let launched = 'launch: {
+                match *s {
+                    CudaStep::GemvFp8(GemmBf16 {
+                        a,
+                        b,
+                        c,
+                        n,
+                        k,
+                        residual,
+                        ..
+                    }) => {
+                        let b = Self::fp8_weight(weights, b, n, k);
+                        // SAFETY: as the `Gemv` arm's, for `a` (`k` bf16, which the kernel quantizes
+                        // in its prologue), the fp8 weight (`n*k` bytes then `n` f32,
+                        // `step::fp8_weight`) and `c` (`n`).
+                        unsafe {
+                            // FP8 S8 W4a: the residual epilogue (the one-row bucket's o / out / down);
+                            // with none, the same kernel and bits.
+                            kernels::gemv_fp8_residual(
+                                (slot(a).cast_const(), b, slot(c)),
+                                partials,
+                                (n, k, gemv_splits(n, k, 1)),
+                                residual.map_or(std::ptr::null(), |r| slot(r).cast_const()),
+                                stream.0,
+                            )
+                        }
                     }
-                }
-                CudaStep::GemvGroupFp8(g) => {
-                    let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
-                        .filter_map(|(i, m)| m.map(|m| (i, m)))
-                        .collect();
-                    let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> = (present.iter())
+                    CudaStep::GemvGroupFp8(g) => {
+                        let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
+                            .filter_map(|(i, m)| m.map(|m| (i, m)))
+                            .collect();
+                        let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> = (present
+                            .iter())
                         .map(|(_, m)| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
                         .collect();
-                    let splits: Vec<u32> = (present.iter())
-                        .map(|(_, m)| gemv_splits(m.n, g.k, 1))
-                        .collect();
-                    // Member `i`'s partials follow the members' before it, as the bf16 group's.
-                    let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
-                        .map(|(&(i, _), &sp)| {
-                            (g.gemv_scratch_before(i))
-                                .filter(|_| sp > 1 && !partials.is_null())
-                                .map_or(std::ptr::null_mut(), |before| {
-                                    partials.cast::<u8>().wrapping_add(before as usize).cast()
-                                })
-                        })
-                        .collect();
-                    // SAFETY: as the `GemvGroup` arm's, each member's weight an fp8 buffer.
-                    unsafe {
-                        kernels::gemv_group_fp8_abt(
-                            slot(g.a),
-                            &members,
-                            &parts,
-                            (g.k, &splits),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::QuantRowsFp8(QuantRowsFp8 { x, q, rows, cols }) => {
-                    let (q, scale) = Self::fp8_rows(slot, q, rows, cols);
-                    // SAFETY: as above, for `x` (`rows*cols` bf16) and the quant scratch, which
-                    // holds `rows*cols` bytes then `rows` f32 at `scale_at` (`validate`).
-                    unsafe {
-                        kernels::quant_rows_fp8(
-                            slot(x),
-                            (q.cast_mut(), scale.cast_mut()),
-                            (rows, cols),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::GemmFp8(GemmBf16 {
-                    a, b, c, m, n, k, ..
-                })
-                | CudaStep::GemmCol64Fp8(GemmBf16 {
-                    a, b, c, m, n, k, ..
-                }) => {
-                    let col64 = matches!(s, CudaStep::GemmCol64Fp8(_));
-                    let (a, b) = (
-                        Self::fp8_rows(slot, a, m, k),
-                        Self::fp8_weight(weights, b, n, k),
-                    );
-                    // SAFETY: as above, for the quantized rows and their scales, the fp8 weight
-                    // (`n*k` bytes then `n` f32, `step::fp8_weight`) and `c` (`m*n`).
-                    unsafe { kernels::gemm_fp8_abt(a, b, slot(c), (m, n, k), col64, stream.0) }
-                }
-                CudaStep::GemmNarrowFp8(GemmBf16 {
-                    a, b, c, m, n, k, ..
-                }) => {
-                    let (a, b) = (
-                        Self::fp8_rows(slot, a, m, k),
-                        Self::fp8_weight(weights, b, n, k),
-                    );
-                    // SAFETY: as the `GemmFp8` arm's.
-                    unsafe { kernels::gemm_narrow_fp8_abt(a, b, slot(c), (m, n, k), stream.0) }
-                }
-                CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => {
-                    let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> =
-                        (g.members().iter())
-                            .flatten()
-                            .map(|m| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                        let splits: Vec<u32> = (present.iter())
+                            .map(|(_, m)| gemv_splits(m.n, g.k, 1))
                             .collect();
-                    let a = Self::fp8_rows(slot, g.a, g.m, g.k);
-                    // SAFETY: as the `GemmFp8` arm's, for every member, whose outputs overlap
-                    // neither the input nor each other (`validate`).
-                    unsafe {
-                        if matches!(s, CudaStep::GemmGroupFp8(_)) {
-                            kernels::gemm_group_fp8_abt(a, &members, (g.m, g.k), stream.0)
-                        } else {
-                            kernels::gemm_narrow_group_fp8_abt(a, &members, (g.m, g.k), stream.0)
-                        }
-                    }
-                }
-                CudaStep::GemmCol64(GemmBf16 {
-                    a, b, c, m, n, k, ..
-                }) => {
-                    let b = weights[b.0 as usize].ptr();
-                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
-                    unsafe {
-                        kernels::gemm_col64_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
-                    }
-                }
-                CudaStep::Scale(ScaleBf16 {
-                    x,
-                    out,
-                    rows,
-                    cols,
-                    scale_bits,
-                }) => {
-                    // SAFETY: as above, for `x` and `out` (`rows*cols` each).
-                    unsafe {
-                        kernels::scale_bf16(
-                            slot(x),
-                            slot(out),
-                            (rows, cols),
-                            f32::from_bits(scale_bits),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::LayerScale(LayerScaleBf16 {
-                    x,
-                    scale,
-                    out,
-                    rows,
-                    cols,
-                }) => {
-                    let w = weights[scale.0 as usize].ptr();
-                    // SAFETY: as above, for `x` and `out` (`rows*cols` each) and `scale` (one
-                    // bf16).
-                    unsafe {
-                        kernels::layer_scale_bf16(slot(x), w, slot(out), (rows, cols), stream.0)
-                    }
-                }
-                CudaStep::SoftCap(SoftCapBf16 {
-                    x,
-                    out,
-                    rows,
-                    cols,
-                    cap_bits,
-                }) => {
-                    // SAFETY: as above, for `x` and `out` (`rows*cols` each).
-                    unsafe {
-                        kernels::soft_cap_bf16(
-                            slot(x),
-                            slot(out),
-                            (rows, cols),
-                            f32::from_bits(cap_bits),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::RmsNormUnit(RmsNormUnitBf16 {
-                    x,
-                    y,
-                    rows,
-                    cols,
-                    eps_bits,
-                }) => {
-                    // SAFETY: as above, for `x` and `y` (`rows*cols` each).
-                    unsafe {
-                        kernels::rms_norm_unit_bf16(
-                            slot(x),
-                            slot(y),
-                            (rows, cols),
-                            f32::from_bits(eps_bits),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::GeluMul(SiluMulBf16 {
-                    gate,
-                    up,
-                    out,
-                    rows,
-                    cols,
-                }) => {
-                    // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
-                    unsafe {
-                        kernels::gelu_mul_bf16(
-                            slot(gate),
-                            slot(up),
-                            slot(out),
-                            (rows, cols),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::Embed(EmbedBf16 {
-                    tokens,
-                    table,
-                    out,
-                    rows,
-                    hidden,
-                    vocab,
-                }) => {
-                    let table = weights[table.0 as usize].ptr();
-                    // SAFETY: as above, for `tokens` (`rows` u32, the token ids uploaded above,
-                    // every one below `vocab`), `table` (`vocab*hidden`) and `out`
-                    // (`rows*hidden`).
-                    unsafe {
-                        kernels::embed_bf16(
-                            slot(tokens),
-                            table,
-                            slot(out),
-                            (rows, hidden, vocab),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::Gemm(GemmBf16 {
-                    a, b, c, m, n, k, ..
-                }) => {
-                    let b = weights[b.0 as usize].ptr();
-                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
-                    unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
-                }
-                CudaStep::GemmNarrow(GemmBf16 {
-                    a, b, c, m, n, k, ..
-                }) => {
-                    let b = weights[b.0 as usize].ptr();
-                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
-                    unsafe {
-                        kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
-                    }
-                }
-                CudaStep::Gemv(GemmBf16 {
-                    a,
-                    b,
-                    c,
-                    n,
-                    k,
-                    residual,
-                    ..
-                }) => {
-                    let b = weights[b.0 as usize].ptr();
-                    let splits = gemv_splits(n, k, 1);
-                    // SAFETY: as above, for `a` (`k`, its `m` is 1: `validate`), `b` (`n*k`) and
-                    // `c` (`n`); the scratch is the tape's GEMV scratch, at least this step's
-                    // partials' bytes, which no other step touches (`validate`).
-                    unsafe {
-                        // One split is the unsplit launcher, the same kernel and bits, so its
-                        // refusal stays `GemvShape` (#1048's `tape_player` pin).
-                        // FP8 S8 W4a: the residual epilogue (the 35B's GDN out_proj).
-                        if let Some(r) = residual {
-                            kernels::gemv_bf16_residual(
-                                (slot(a), b, slot(c)),
-                                partials,
-                                (n, k, splits),
-                                slot(r).cast_const(),
-                                stream.0,
-                            )
-                        } else if splits == 1 {
-                            kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0)
-                        } else {
-                            kernels::gemv_split_bf16_abt(
-                                (slot(a), b, slot(c)),
-                                partials,
-                                (n, k, splits),
-                                stream.0,
-                            )
-                        }
-                    }
-                }
-                CudaStep::GemmGroup(g) => {
-                    let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
-                        .flatten()
-                        .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
-                        .collect();
-                    // SAFETY: as above, for `a` (`m*k`) and each member's `b` (`n*k`) and `c`
-                    // (`m*n`), which overlap neither `a` nor each other (`validate`).
-                    unsafe {
-                        kernels::gemm_group_bf16_abt(slot(g.a), &members, (g.m, g.k), stream.0)
-                    }
-                }
-                CudaStep::GemmNarrowGroup(g) => {
-                    let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
-                        .flatten()
-                        .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
-                        .collect();
-                    // SAFETY: as the `GemmGroup` arm's.
-                    unsafe {
-                        kernels::gemm_narrow_group_bf16_abt(
-                            slot(g.a),
-                            &members,
-                            (g.m, g.k),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::GemvGroup(g) => {
-                    let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
-                        .filter_map(|(i, m)| m.map(|m| (i, m)))
-                        .collect();
-                    let members: Vec<(*const c_void, *mut c_void, u32)> = (present.iter())
-                        .map(|(_, m)| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
-                        .collect();
-                    let splits: Vec<u32> = (present.iter())
-                        .map(|(_, m)| gemv_splits(m.n, g.k, 1))
-                        .collect();
-                    // Member `i`'s partials follow the members' before it
-                    // (`GemmGroupBf16::gemv_scratch_before`), null at one split.
-                    let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
-                        .map(|(&(i, _), &sp)| {
-                            (g.gemv_scratch_before(i))
-                                .filter(|_| sp > 1 && !partials.is_null())
-                                .map_or(std::ptr::null_mut(), |before| {
-                                    partials.cast::<u8>().wrapping_add(before as usize).cast()
-                                })
-                        })
-                        .collect();
-                    // SAFETY: as the `Gemv` arm, for `a` (`k`) and each member's `b`, `c` and
-                    // partials: the tape's GEMV scratch holds every member's partials one after
-                    // another (`CudaStep::gemv_scratch`, which `validate` checked), so no two
-                    // members' overlap.
-                    unsafe {
-                        kernels::gemv_group_bf16_abt(
-                            slot(g.a),
-                            &members,
-                            &parts,
-                            (g.k, &splits),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::RouterLogits(RouterLogitsBf16 {
-                    x,
-                    bundle,
-                    logits,
-                    m,
-                    experts,
-                    hidden,
-                    kernel,
-                    ..
-                }) => {
-                    // The router is the bundle's first tensor, at byte 0 (`moe_bundle`), or Gemma's
-                    // own projection, whole (`MoeWeight::router_bytes`).
-                    let b = weights[bundle.0 as usize].ptr();
-                    // SAFETY: as above, for `x` (`m*hidden`), the router (`experts*hidden`, the
-                    // weight's first bytes) and `logits` (`m*experts`).
-                    unsafe {
-                        match kernel {
-                            MatmulKernel::Tiled => kernels::gemm_bf16_abt(
-                                slot(x),
-                                b,
-                                slot(logits),
-                                m,
-                                experts,
-                                hidden,
-                                stream.0,
-                            ),
-                            MatmulKernel::Gemv => kernels::gemv_split_bf16_abt(
-                                (slot(x), b, slot(logits)),
-                                partials,
-                                (experts, hidden, gemv_splits(experts, hidden, 1)),
-                                stream.0,
-                            ),
-                            // Gemma's 128-expert router at m ≥ 2, its own projection.
-                            MatmulKernel::Col64 => kernels::gemm_col64_bf16_abt(
-                                slot(x),
-                                b,
-                                slot(logits),
-                                (m, experts, hidden),
-                                stream.0,
-                            ),
-                        }
-                    }
-                }
-                CudaStep::MoeRoute(MoeRouteBf16 {
-                    logits,
-                    topk_idx,
-                    scores,
-                    m,
-                    experts,
-                    top_k,
-                    renorm,
-                    program,
-                    expert_scale,
-                }) => match (program, expert_scale) {
-                    // SAFETY: as above, for `logits` (`m*experts`), `topk_idx` and `scores`
-                    // (`m*top_k` each).
-                    (RouteProgram::QwenSoftmax, _) => unsafe {
-                        kernels::moe_route_bf16(
-                            slot(logits),
-                            (slot(topk_idx), slot(scores)),
-                            (m, experts, top_k),
-                            renorm,
-                            stream.0,
-                        )
-                    },
-                    (RouteProgram::GemmaScaledSoftmax { scale_bits }, pes) => {
-                        // A Gemma routing with no per-expert scale is the launcher's refusal (a
-                        // null pointer), before it touches any pointer.
-                        let pes = pes.map_or(std::ptr::null(), |w| weights[w.0 as usize].ptr());
-                        // SAFETY: as above, and `expert_scale` (`experts`).
+                        // Member `i`'s partials follow the members' before it, as the bf16 group's.
+                        let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
+                            .map(|(&(i, _), &sp)| {
+                                (g.gemv_scratch_before(i))
+                                    .filter(|_| sp > 1 && !partials.is_null())
+                                    .map_or(std::ptr::null_mut(), |before| {
+                                        partials.cast::<u8>().wrapping_add(before as usize).cast()
+                                    })
+                            })
+                            .collect();
+                        // SAFETY: as the `GemvGroup` arm's, each member's weight an fp8 buffer.
                         unsafe {
-                            kernels::gemma_route_bf16(
-                                (slot(logits), pes),
-                                (slot(topk_idx), slot(scores)),
-                                (m, experts, top_k),
+                            kernels::gemv_group_fp8_abt(
+                                slot(g.a),
+                                &members,
+                                &parts,
+                                (g.k, &splits),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::QuantRowsFp8(QuantRowsFp8 { x, q, rows, cols }) => {
+                        let (q, scale) = Self::fp8_rows(slot, q, rows, cols);
+                        // SAFETY: as above, for `x` (`rows*cols` bf16) and the quant scratch, which
+                        // holds `rows*cols` bytes then `rows` f32 at `scale_at` (`validate`).
+                        unsafe {
+                            kernels::quant_rows_fp8(
+                                slot(x),
+                                (q.cast_mut(), scale.cast_mut()),
+                                (rows, cols),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GemmFp8(GemmBf16 {
+                        a, b, c, m, n, k, ..
+                    })
+                    | CudaStep::GemmCol64Fp8(GemmBf16 {
+                        a, b, c, m, n, k, ..
+                    }) => {
+                        let col64 = matches!(s, CudaStep::GemmCol64Fp8(_));
+                        let (a, b) = (
+                            Self::fp8_rows(slot, a, m, k),
+                            Self::fp8_weight(weights, b, n, k),
+                        );
+                        // SAFETY: as above, for the quantized rows and their scales, the fp8 weight
+                        // (`n*k` bytes then `n` f32, `step::fp8_weight`) and `c` (`m*n`).
+                        unsafe { kernels::gemm_fp8_abt(a, b, slot(c), (m, n, k), col64, stream.0) }
+                    }
+                    CudaStep::GemmNarrowFp8(GemmBf16 {
+                        a, b, c, m, n, k, ..
+                    }) => {
+                        let (a, b) = (
+                            Self::fp8_rows(slot, a, m, k),
+                            Self::fp8_weight(weights, b, n, k),
+                        );
+                        // SAFETY: as the `GemmFp8` arm's.
+                        unsafe { kernels::gemm_narrow_fp8_abt(a, b, slot(c), (m, n, k), stream.0) }
+                    }
+                    CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => {
+                        let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> =
+                            (g.members().iter())
+                                .flatten()
+                                .map(|m| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                                .collect();
+                        let a = Self::fp8_rows(slot, g.a, g.m, g.k);
+                        // SAFETY: as the `GemmFp8` arm's, for every member, whose outputs overlap
+                        // neither the input nor each other (`validate`).
+                        unsafe {
+                            if matches!(s, CudaStep::GemmGroupFp8(_)) {
+                                kernels::gemm_group_fp8_abt(a, &members, (g.m, g.k), stream.0)
+                            } else {
+                                kernels::gemm_narrow_group_fp8_abt(
+                                    a,
+                                    &members,
+                                    (g.m, g.k),
+                                    stream.0,
+                                )
+                            }
+                        }
+                    }
+                    CudaStep::GemmCol64(GemmBf16 {
+                        a, b, c, m, n, k, ..
+                    }) => {
+                        let b = weights[b.0 as usize].ptr();
+                        // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
+                        unsafe {
+                            kernels::gemm_col64_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                        }
+                    }
+                    CudaStep::Scale(ScaleBf16 {
+                        x,
+                        out,
+                        rows,
+                        cols,
+                        scale_bits,
+                    }) => {
+                        // SAFETY: as above, for `x` and `out` (`rows*cols` each).
+                        unsafe {
+                            kernels::scale_bf16(
+                                slot(x),
+                                slot(out),
+                                (rows, cols),
                                 f32::from_bits(scale_bits),
                                 stream.0,
                             )
                         }
                     }
-                },
-                CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
-                CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
-                CudaStep::ExpertGemv(g) => Self::expert_gemv(&g, slot, partials, weights, stream),
-                CudaStep::GateUpAct(g) => {
-                    let (gate, up) = (
-                        weights[g.gate.b.0 as usize].ptr(),
-                        weights[g.up.b.0 as usize].ptr(),
-                    );
-                    let (GemmBf16 { a, m, n, k, .. }, act) = (g.gate, g.act.code());
-                    // SAFETY: as above, for `a` (`m*k`), `gate` and `up` (`n*k` each) and `out`
-                    // (`m*n`); at one row the scratch holds both projections' partials
-                    // (`GateUpActBf16::gemv_scratch`, which `validate` checked).
-                    unsafe {
-                        match g.kernel {
-                            GateUpKernel::Gemv => kernels::gate_up_gemv_bf16(
-                                (slot(a), gate, up),
-                                (slot(g.out), partials),
-                                (n, k, gemv_splits(n, k, 1)),
-                                act,
+                    CudaStep::LayerScale(LayerScaleBf16 {
+                        x,
+                        scale,
+                        out,
+                        rows,
+                        cols,
+                    }) => {
+                        let w = weights[scale.0 as usize].ptr();
+                        // SAFETY: as above, for `x` and `out` (`rows*cols` each) and `scale` (one
+                        // bf16).
+                        unsafe {
+                            kernels::layer_scale_bf16(slot(x), w, slot(out), (rows, cols), stream.0)
+                        }
+                    }
+                    CudaStep::SoftCap(SoftCapBf16 {
+                        x,
+                        out,
+                        rows,
+                        cols,
+                        cap_bits,
+                    }) => {
+                        // SAFETY: as above, for `x` and `out` (`rows*cols` each).
+                        unsafe {
+                            kernels::soft_cap_bf16(
+                                slot(x),
+                                slot(out),
+                                (rows, cols),
+                                f32::from_bits(cap_bits),
                                 stream.0,
-                            ),
-                            GateUpKernel::GemvFp8 => kernels::gate_up_gemv_fp8(
-                                (
-                                    slot(a).cast_const(),
-                                    Self::fp8_weight(weights, g.gate.b, n, k),
-                                    Self::fp8_weight(weights, g.up.b, n, k),
+                            )
+                        }
+                    }
+                    CudaStep::RmsNormUnit(RmsNormUnitBf16 {
+                        x,
+                        y,
+                        rows,
+                        cols,
+                        eps_bits,
+                    }) => {
+                        // SAFETY: as above, for `x` and `y` (`rows*cols` each).
+                        unsafe {
+                            kernels::rms_norm_unit_bf16(
+                                slot(x),
+                                slot(y),
+                                (rows, cols),
+                                f32::from_bits(eps_bits),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GeluMul(SiluMulBf16 {
+                        gate,
+                        up,
+                        out,
+                        rows,
+                        cols,
+                    }) => {
+                        // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
+                        unsafe {
+                            kernels::gelu_mul_bf16(
+                                slot(gate),
+                                slot(up),
+                                slot(out),
+                                (rows, cols),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::Embed(EmbedBf16 {
+                        tokens,
+                        table,
+                        out,
+                        rows,
+                        hidden,
+                        vocab,
+                    }) => {
+                        let table = weights[table.0 as usize].ptr();
+                        // SAFETY: as above, for `tokens` (`rows` u32, the token ids uploaded above,
+                        // every one below `vocab`), `table` (`vocab*hidden`) and `out`
+                        // (`rows*hidden`).
+                        unsafe {
+                            kernels::embed_bf16(
+                                slot(tokens),
+                                table,
+                                slot(out),
+                                (rows, hidden, vocab),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::Gemm(GemmBf16 {
+                        a, b, c, m, n, k, ..
+                    }) => {
+                        let b = weights[b.0 as usize].ptr();
+                        // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
+                        unsafe { kernels::gemm_bf16_abt(slot(a), b, slot(c), m, n, k, stream.0) }
+                    }
+                    CudaStep::GemmNarrow(GemmBf16 {
+                        a, b, c, m, n, k, ..
+                    }) => {
+                        let b = weights[b.0 as usize].ptr();
+                        // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
+                        unsafe {
+                            kernels::gemm_narrow_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                        }
+                    }
+                    CudaStep::Gemv(GemmBf16 {
+                        a,
+                        b,
+                        c,
+                        n,
+                        k,
+                        residual,
+                        ..
+                    }) => {
+                        let b = weights[b.0 as usize].ptr();
+                        let splits = gemv_splits(n, k, 1);
+                        // SAFETY: as above, for `a` (`k`, its `m` is 1: `validate`), `b` (`n*k`) and
+                        // `c` (`n`); the scratch is the tape's GEMV scratch, at least this step's
+                        // partials' bytes, which no other step touches (`validate`).
+                        unsafe {
+                            // One split is the unsplit launcher, the same kernel and bits, so its
+                            // refusal stays `GemvShape` (#1048's `tape_player` pin).
+                            // FP8 S8 W4a: the residual epilogue (the 35B's GDN out_proj).
+                            if let Some(r) = residual {
+                                kernels::gemv_bf16_residual(
+                                    (slot(a), b, slot(c)),
+                                    partials,
+                                    (n, k, splits),
+                                    slot(r).cast_const(),
+                                    stream.0,
+                                )
+                            } else if splits == 1 {
+                                kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0)
+                            } else {
+                                kernels::gemv_split_bf16_abt(
+                                    (slot(a), b, slot(c)),
+                                    partials,
+                                    (n, k, splits),
+                                    stream.0,
+                                )
+                            }
+                        }
+                    }
+                    CudaStep::GemmGroup(g) => {
+                        let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
+                            .flatten()
+                            .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
+                            .collect();
+                        // SAFETY: as above, for `a` (`m*k`) and each member's `b` (`n*k`) and `c`
+                        // (`m*n`), which overlap neither `a` nor each other (`validate`).
+                        unsafe {
+                            kernels::gemm_group_bf16_abt(slot(g.a), &members, (g.m, g.k), stream.0)
+                        }
+                    }
+                    CudaStep::GemmNarrowGroup(g) => {
+                        let members: Vec<(*const c_void, *mut c_void, u32)> = (g.members().iter())
+                            .flatten()
+                            .map(|m| (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n))
+                            .collect();
+                        // SAFETY: as the `GemmGroup` arm's.
+                        unsafe {
+                            kernels::gemm_narrow_group_bf16_abt(
+                                slot(g.a),
+                                &members,
+                                (g.m, g.k),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GemvGroup(g) => {
+                        let present: Vec<(usize, GroupMember)> = (g.members().iter().enumerate())
+                            .filter_map(|(i, m)| m.map(|m| (i, m)))
+                            .collect();
+                        let members: Vec<(*const c_void, *mut c_void, u32)> = (present.iter())
+                            .map(|(_, m)| {
+                                (weights[m.b.0 as usize].ptr().cast_const(), slot(m.c), m.n)
+                            })
+                            .collect();
+                        let splits: Vec<u32> = (present.iter())
+                            .map(|(_, m)| gemv_splits(m.n, g.k, 1))
+                            .collect();
+                        // Member `i`'s partials follow the members' before it
+                        // (`GemmGroupBf16::gemv_scratch_before`), null at one split.
+                        let parts: Vec<*mut c_void> = (present.iter().zip(&splits))
+                            .map(|(&(i, _), &sp)| {
+                                (g.gemv_scratch_before(i))
+                                    .filter(|_| sp > 1 && !partials.is_null())
+                                    .map_or(std::ptr::null_mut(), |before| {
+                                        partials.cast::<u8>().wrapping_add(before as usize).cast()
+                                    })
+                            })
+                            .collect();
+                        // SAFETY: as the `Gemv` arm, for `a` (`k`) and each member's `b`, `c` and
+                        // partials: the tape's GEMV scratch holds every member's partials one after
+                        // another (`CudaStep::gemv_scratch`, which `validate` checked), so no two
+                        // members' overlap.
+                        unsafe {
+                            kernels::gemv_group_bf16_abt(
+                                slot(g.a),
+                                &members,
+                                &parts,
+                                (g.k, &splits),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::RouterLogits(RouterLogitsBf16 {
+                        x,
+                        bundle,
+                        logits,
+                        m,
+                        experts,
+                        hidden,
+                        kernel,
+                        ..
+                    }) => {
+                        // The router is the bundle's first tensor, at byte 0 (`moe_bundle`), or Gemma's
+                        // own projection, whole (`MoeWeight::router_bytes`).
+                        let b = weights[bundle.0 as usize].ptr();
+                        // SAFETY: as above, for `x` (`m*hidden`), the router (`experts*hidden`, the
+                        // weight's first bytes) and `logits` (`m*experts`).
+                        unsafe {
+                            match kernel {
+                                MatmulKernel::Tiled => kernels::gemm_bf16_abt(
+                                    slot(x),
+                                    b,
+                                    slot(logits),
+                                    m,
+                                    experts,
+                                    hidden,
+                                    stream.0,
                                 ),
-                                (slot(g.out), partials),
-                                (n, k, gemv_splits(n, k, 1)),
-                                act,
+                                MatmulKernel::Gemv => kernels::gemv_split_bf16_abt(
+                                    (slot(x), b, slot(logits)),
+                                    partials,
+                                    (experts, hidden, gemv_splits(experts, hidden, 1)),
+                                    stream.0,
+                                ),
+                                // Gemma's 128-expert router at m ≥ 2, its own projection.
+                                MatmulKernel::Col64 => kernels::gemm_col64_bf16_abt(
+                                    slot(x),
+                                    b,
+                                    slot(logits),
+                                    (m, experts, hidden),
+                                    stream.0,
+                                ),
+                            }
+                        }
+                    }
+                    CudaStep::MoeRoute(MoeRouteBf16 {
+                        logits,
+                        topk_idx,
+                        scores,
+                        m,
+                        experts,
+                        top_k,
+                        renorm,
+                        program,
+                        expert_scale,
+                    }) => match (program, expert_scale) {
+                        // SAFETY: as above, for `logits` (`m*experts`), `topk_idx` and `scores`
+                        // (`m*top_k` each).
+                        (RouteProgram::QwenSoftmax, _) => unsafe {
+                            kernels::moe_route_bf16(
+                                slot(logits),
+                                (slot(topk_idx), slot(scores)),
+                                (m, experts, top_k),
+                                renorm,
                                 stream.0,
-                            ),
-                            GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8 => {
-                                kernels::gate_up_gemm_fp8(
+                            )
+                        },
+                        (RouteProgram::GemmaScaledSoftmax { scale_bits }, pes) => {
+                            // A Gemma routing with no per-expert scale is the launcher's refusal (a
+                            // null pointer), before it touches any pointer.
+                            let pes = pes.map_or(std::ptr::null(), |w| weights[w.0 as usize].ptr());
+                            // SAFETY: as above, and `expert_scale` (`experts`).
+                            unsafe {
+                                kernels::gemma_route_bf16(
+                                    (slot(logits), pes),
+                                    (slot(topk_idx), slot(scores)),
+                                    (m, experts, top_k),
+                                    f32::from_bits(scale_bits),
+                                    stream.0,
+                                )
+                            }
+                        }
+                    },
+                    CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
+                    CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
+                    CudaStep::ExpertGemv(g) => {
+                        Self::expert_gemv(&g, slot, partials, weights, stream)
+                    }
+                    CudaStep::GateUpAct(g) => {
+                        let (gate, up) = (
+                            weights[g.gate.b.0 as usize].ptr(),
+                            weights[g.up.b.0 as usize].ptr(),
+                        );
+                        let (GemmBf16 { a, m, n, k, .. }, act) = (g.gate, g.act.code());
+                        // SAFETY: as above, for `a` (`m*k`), `gate` and `up` (`n*k` each) and `out`
+                        // (`m*n`); at one row the scratch holds both projections' partials
+                        // (`GateUpActBf16::gemv_scratch`, which `validate` checked).
+                        unsafe {
+                            match g.kernel {
+                                GateUpKernel::Gemv => kernels::gate_up_gemv_bf16(
+                                    (slot(a), gate, up),
+                                    (slot(g.out), partials),
+                                    (n, k, gemv_splits(n, k, 1)),
+                                    act,
+                                    stream.0,
+                                ),
+                                GateUpKernel::GemvFp8 => kernels::gate_up_gemv_fp8(
                                     (
-                                        Self::fp8_rows(slot, a, m, k),
+                                        slot(a).cast_const(),
                                         Self::fp8_weight(weights, g.gate.b, n, k),
                                         Self::fp8_weight(weights, g.up.b, n, k),
                                     ),
-                                    slot(g.out),
-                                    (m, n, k),
-                                    (act, g.kernel == GateUpKernel::GemmCol64Fp8),
+                                    (slot(g.out), partials),
+                                    (n, k, gemv_splits(n, k, 1)),
+                                    act,
                                     stream.0,
-                                )
-                            }
-                            GateUpKernel::Gemm | GateUpKernel::GemmCol64 => {
-                                kernels::gate_up_gemm_bf16(
-                                    (slot(a), gate, up),
-                                    slot(g.out),
-                                    (m, n, k),
-                                    (act, g.kernel == GateUpKernel::GemmCol64),
-                                    stream.0,
-                                )
+                                ),
+                                GateUpKernel::GemmFp8 | GateUpKernel::GemmCol64Fp8 => {
+                                    kernels::gate_up_gemm_fp8(
+                                        (
+                                            Self::fp8_rows(slot, a, m, k),
+                                            Self::fp8_weight(weights, g.gate.b, n, k),
+                                            Self::fp8_weight(weights, g.up.b, n, k),
+                                        ),
+                                        slot(g.out),
+                                        (m, n, k),
+                                        (act, g.kernel == GateUpKernel::GemmCol64Fp8),
+                                        stream.0,
+                                    )
+                                }
+                                GateUpKernel::Gemm | GateUpKernel::GemmCol64 => {
+                                    kernels::gate_up_gemm_bf16(
+                                        (slot(a), gate, up),
+                                        slot(g.out),
+                                        (m, n, k),
+                                        (act, g.kernel == GateUpKernel::GemmCol64),
+                                        stream.0,
+                                    )
+                                }
                             }
                         }
                     }
-                }
-                CudaStep::ExpertGateUpAct(g) => {
-                    Self::expert_gate_up(&g, slot, partials, weights, stream)
-                }
-                CudaStep::ExpertCombine(ExpertCombineBf16 {
-                    down,
-                    pos,
-                    scores,
-                    out,
-                    m,
-                    top_k,
-                    hidden,
-                    down_rows,
-                }) => {
-                    // SAFETY: as above, for `down` (`down_rows*hidden`), `pos` when sorted and
-                    // `scores` (`m*top_k` each), and `out` (`m*hidden`).
-                    unsafe {
-                        kernels::moe_combine_bf16(
-                            (slot(down), pos.map(|p| slot(p).cast_const()), slot(scores)),
-                            slot(out),
-                            (m, top_k, hidden, down_rows),
-                            stream.0,
-                        )
+                    CudaStep::ExpertGateUpAct(g) => {
+                        Self::expert_gate_up(&g, slot, partials, weights, stream)
                     }
-                }
-                CudaStep::GateScale(GateScaleBf16 {
-                    routed,
-                    shared,
-                    g,
-                    out,
-                    rows,
-                    cols,
-                }) => {
-                    // SAFETY: as above, for `routed`, `shared` and `out` (`rows*cols` each) and
-                    // `g` (`rows`).
-                    unsafe {
-                        kernels::gate_scale_bf16(
-                            (slot(routed), slot(shared), slot(g)),
-                            slot(out),
-                            (rows, cols),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::GatedDeltaNet(g) => {
-                    let pool = gdn.expect("`new` made a pool for a GDN tape");
-                    Self::gated_delta_net(&g, pool, slot, weights, stream)
-                }
-                CudaStep::GdnDecode(g) => {
-                    let pool = gdn.expect("`new` made a pool for a GDN tape");
-                    Self::gdn_decode(&g, pool, slot, weights, stream)
-                }
-                CudaStep::RmsNorm(
-                    norm @ RmsNormBf16 {
-                        x,
-                        gain,
-                        y,
-                        rows,
-                        cols,
-                        convention,
-                        ..
-                    },
-                )
-                | CudaStep::RouterNorm(
-                    norm @ RmsNormBf16 {
-                        x,
-                        gain,
-                        y,
-                        rows,
-                        cols,
-                        convention,
-                        ..
-                    },
-                ) => {
-                    let gain = weights[gain.0 as usize].ptr();
-                    // SAFETY: as above, for `x` and `y` (`rows*cols`) and `gain` (`cols`).
-                    unsafe {
-                        kernels::rms_norm_bf16(
-                            slot(x),
-                            gain,
-                            slot(y),
-                            (rows, cols),
-                            norm.eps(),
-                            convention.offset(),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::AddRmsNorm(f) => {
-                    let n = f.norm;
-                    let gain = weights[n.gain.0 as usize].ptr();
-                    // SAFETY: as above, for `a`, `b`, `sum` and `y` (`rows*cols` each) and `gain`
-                    // (`cols`); `sum` and `y` overlap neither each other nor an input (`validate`).
-                    unsafe {
-                        kernels::add_rms_norm_bf16(
-                            (slot(f.a), slot(f.b)),
-                            gain,
-                            (slot(f.sum), slot(n.y)),
-                            (n.rows, n.cols),
-                            (n.eps(), n.convention.offset()),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::NormAdd(NormAddBf16 { norm: n, residual }) => {
-                    let gain = weights[n.gain.0 as usize].ptr();
-                    // SAFETY: as above, for `x`, `residual` and `y` (`rows*cols` each) and `gain`
-                    // (`cols`).
-                    unsafe {
-                        kernels::norm_add_bf16(
-                            (slot(n.x), slot(residual)),
-                            gain,
-                            slot(n.y),
-                            (n.rows, n.cols),
-                            (n.eps(), n.convention.offset()),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::Add(AddBf16 {
-                    a,
-                    b,
-                    out,
-                    rows,
-                    cols,
-                }) => {
-                    // SAFETY: as above, for `a`, `b` and `out` (`rows*cols` each).
-                    unsafe {
-                        kernels::add_bf16(slot(a), slot(b), slot(out), (rows, cols), stream.0)
-                    }
-                }
-                CudaStep::SiluMul(SiluMulBf16 {
-                    gate,
-                    up,
-                    out,
-                    rows,
-                    cols,
-                }) => {
-                    // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
-                    unsafe {
-                        kernels::silu_mul_bf16(
-                            slot(gate),
-                            slot(up),
-                            slot(out),
-                            (rows, cols),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::Rope(RopeBf16 {
-                    x,
-                    table,
-                    out,
-                    rows,
-                    cols,
-                    head_dim,
-                    rot_dim,
-                    pairing,
-                }) => {
-                    // SAFETY: as above, for `x` and `out` (`rows*cols`) and `table`
-                    // (`rows*rot_dim`), whose rows this forward uploaded above.
-                    unsafe {
-                        kernels::rope_paired_bf16(
-                            slot(x),
-                            slot(table),
-                            slot(out),
-                            (rows, cols),
-                            (head_dim, rot_dim, pairing),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::GateSplit(GateSplitBf16 {
-                    qg,
-                    q,
-                    gate,
-                    rows,
-                    half_cols,
-                    head_dim,
-                }) => {
-                    // SAFETY: as above, for `qg` (`rows*2*half_cols`), and `q` and `gate`
-                    // (`rows*half_cols` each), its two writes, which overlap neither each other
-                    // nor `qg`.
-                    unsafe {
-                        kernels::gate_split_bf16(
-                            slot(qg),
-                            slot(q),
-                            slot(gate),
-                            (rows, half_cols),
-                            head_dim,
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::GateApply(GateApplyBf16 {
-                    attn,
-                    gate,
-                    out,
-                    rows,
-                    cols,
-                }) => {
-                    // SAFETY: as above, for `attn`, `gate` and `out` (`rows*cols` each).
-                    unsafe {
-                        kernels::gate_apply_bf16(
-                            slot(attn),
-                            slot(gate),
-                            slot(out),
-                            (rows, cols),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::RopeAppend(RopeAppendBf16 {
-                    k,
-                    v,
-                    table,
-                    slot_mapping,
-                    k_out,
-                    layer,
-                    rows,
-                    cols,
-                    head_dim,
-                    rot_dim,
-                    pairing,
-                    ..
-                }) => {
-                    let pool = kv.expect("`new` made a pool for a KV tape");
-                    let l = layer as usize;
-                    // Layer `l`'s class layout: its `kv_heads` and `head_dim` (`validate`
-                    // checked the step's are its class's).
-                    let layout = pool.layer_layout(l);
-                    // SAFETY: as above, for `k`, `v` and `k_out` (`rows*cols`), `table`
-                    // (`rows*rot_dim`) and `slot_mapping` (`rows` u32), uploaded above; the cache
-                    // halves are layer `l`'s, `num_blocks · kv_heads · 64 · head_dim` of its
-                    // class each, and every slot uploaded is in a checked block or `u32::MAX`.
-                    unsafe {
-                        kernels::rope_paired_bf16(
-                            slot(k),
-                            slot(table),
-                            slot(k_out),
-                            (rows, cols),
-                            (head_dim, rot_dim, pairing),
-                            stream.0,
-                        )
-                        .and_then(|()| {
-                            kernels::kv_append_fp8(
-                                (slot(k_out), slot(v)),
-                                slot(slot_mapping),
-                                (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
-                                (rows, layout.num_kv_heads, layout.head_dim),
-                                (layout.block_size, layout.num_blocks),
+                    CudaStep::ExpertCombine(ExpertCombineBf16 {
+                        down,
+                        pos,
+                        scores,
+                        out,
+                        m,
+                        top_k,
+                        hidden,
+                        down_rows,
+                    }) => {
+                        // SAFETY: as above, for `down` (`down_rows*hidden`), `pos` when sorted and
+                        // `scores` (`m*top_k` each), and `out` (`m*hidden`).
+                        unsafe {
+                            kernels::moe_combine_bf16(
+                                (slot(down), pos.map(|p| slot(p).cast_const()), slot(scores)),
+                                slot(out),
+                                (m, top_k, hidden, down_rows),
                                 stream.0,
                             )
-                        })
+                        }
                     }
-                }
-                CudaStep::AttnPrefill(
-                    attn @ AttnPrefillBf16 {
-                        q,
-                        block_table,
-                        sequence,
+                    CudaStep::GateScale(GateScaleBf16 {
+                        routed,
+                        shared,
+                        g,
                         out,
+                        rows,
+                        cols,
+                    }) => {
+                        // SAFETY: as above, for `routed`, `shared` and `out` (`rows*cols` each) and
+                        // `g` (`rows`).
+                        unsafe {
+                            kernels::gate_scale_bf16(
+                                (slot(routed), slot(shared), slot(g)),
+                                slot(out),
+                                (rows, cols),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GatedDeltaNet(g) => {
+                        let pool = gdn.expect("`new` made a pool for a GDN tape");
+                        Self::gated_delta_net(&g, pool, slot, weights, stream)
+                    }
+                    CudaStep::GdnDecode(g) => {
+                        let pool = gdn.expect("`new` made a pool for a GDN tape");
+                        Self::gdn_decode(&g, pool, slot, weights, stream)
+                    }
+                    CudaStep::RmsNorm(
+                        norm @ RmsNormBf16 {
+                            x,
+                            gain,
+                            y,
+                            rows,
+                            cols,
+                            convention,
+                            ..
+                        },
+                    )
+                    | CudaStep::RouterNorm(
+                        norm @ RmsNormBf16 {
+                            x,
+                            gain,
+                            y,
+                            rows,
+                            cols,
+                            convention,
+                            ..
+                        },
+                    ) => {
+                        let gain = weights[gain.0 as usize].ptr();
+                        // SAFETY: as above, for `x` and `y` (`rows*cols`) and `gain` (`cols`).
+                        unsafe {
+                            kernels::rms_norm_bf16(
+                                slot(x),
+                                gain,
+                                slot(y),
+                                (rows, cols),
+                                norm.eps(),
+                                convention.offset(),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::AddRmsNorm(f) => {
+                        let n = f.norm;
+                        let gain = weights[n.gain.0 as usize].ptr();
+                        // SAFETY: as above, for `a`, `b`, `sum` and `y` (`rows*cols` each) and `gain`
+                        // (`cols`); `sum` and `y` overlap neither each other nor an input (`validate`).
+                        unsafe {
+                            kernels::add_rms_norm_bf16(
+                                (slot(f.a), slot(f.b)),
+                                gain,
+                                (slot(f.sum), slot(n.y)),
+                                (n.rows, n.cols),
+                                (n.eps(), n.convention.offset()),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::NormAdd(NormAddBf16 { norm: n, residual }) => {
+                        let gain = weights[n.gain.0 as usize].ptr();
+                        // SAFETY: as above, for `x`, `residual` and `y` (`rows*cols` each) and `gain`
+                        // (`cols`).
+                        unsafe {
+                            kernels::norm_add_bf16(
+                                (slot(n.x), slot(residual)),
+                                gain,
+                                slot(n.y),
+                                (n.rows, n.cols),
+                                (n.eps(), n.convention.offset()),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::Add(AddBf16 {
+                        a,
+                        b,
+                        out,
+                        rows,
+                        cols,
+                    }) => {
+                        // SAFETY: as above, for `a`, `b` and `out` (`rows*cols` each).
+                        unsafe {
+                            kernels::add_bf16(slot(a), slot(b), slot(out), (rows, cols), stream.0)
+                        }
+                    }
+                    CudaStep::SiluMul(SiluMulBf16 {
+                        gate,
+                        up,
+                        out,
+                        rows,
+                        cols,
+                    }) => {
+                        // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
+                        unsafe {
+                            kernels::silu_mul_bf16(
+                                slot(gate),
+                                slot(up),
+                                slot(out),
+                                (rows, cols),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::Rope(RopeBf16 {
+                        x,
+                        table,
+                        out,
+                        rows,
+                        cols,
+                        head_dim,
+                        rot_dim,
+                        pairing,
+                    }) => {
+                        // SAFETY: as above, for `x` and `out` (`rows*cols`) and `table`
+                        // (`rows*rot_dim`), whose rows this forward uploaded above.
+                        unsafe {
+                            kernels::rope_paired_bf16(
+                                slot(x),
+                                slot(table),
+                                slot(out),
+                                (rows, cols),
+                                (head_dim, rot_dim, pairing),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GateSplit(GateSplitBf16 {
+                        qg,
+                        q,
+                        gate,
+                        rows,
+                        half_cols,
+                        head_dim,
+                    }) => {
+                        // SAFETY: as above, for `qg` (`rows*2*half_cols`), and `q` and `gate`
+                        // (`rows*half_cols` each), its two writes, which overlap neither each other
+                        // nor `qg`.
+                        unsafe {
+                            kernels::gate_split_bf16(
+                                slot(qg),
+                                slot(q),
+                                slot(gate),
+                                (rows, half_cols),
+                                head_dim,
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GateApply(GateApplyBf16 {
+                        attn,
+                        gate,
+                        out,
+                        rows,
+                        cols,
+                    }) => {
+                        // SAFETY: as above, for `attn`, `gate` and `out` (`rows*cols` each).
+                        unsafe {
+                            kernels::gate_apply_bf16(
+                                slot(attn),
+                                slot(gate),
+                                slot(out),
+                                (rows, cols),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::RopeAppend(RopeAppendBf16 {
+                        k,
+                        v,
+                        table,
+                        slot_mapping,
+                        k_out,
                         layer,
                         rows,
-                        q_heads,
-                        kv_heads,
+                        cols,
                         head_dim,
-                        window,
-                        ..
-                    },
-                ) => {
-                    let pool = kv.expect("`new` made a pool for a KV tape");
-                    let l = layer as usize;
-                    let layout = pool.layer_layout(l);
-                    // The column-split kernel at head dim 512, the head-dim-256 one otherwise
-                    // (whose launcher refuses any other head dim).
-                    let launch: PrefillLaunch = match head_dim {
-                        ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_fp8kv,
-                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_fp8kv,
-                        // No prefill attention kernel at another head dim: refused, nothing
-                        // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
-                        other => {
-                            let error = KernelError::AttnShape {
-                                rows,
-                                q_heads,
-                                kv_heads,
-                                head_dim: other,
-                                block_size: layout.block_size,
-                                num_blocks: layout.num_blocks,
-                            };
-                            return Err((step, error));
-                        }
-                    };
-                    // SAFETY: as above, for `q` and `out` (`rows*q_heads*head_dim`), and the
-                    // block table and sequence uploaded above, which `forward` checked: every
-                    // block the keys `0 .. P + L` need is a table entry inside the pool, and
-                    // `1 ≤ L ≤ rows`. The cache halves are layer `l`'s, of its class's layout.
-                    unsafe {
-                        launch(
-                            (slot(q), slot(out)),
-                            (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
-                            (slot(block_table), slot(sequence)),
-                            (rows, q_heads, kv_heads, head_dim),
-                            (layout.block_size, layout.num_blocks),
-                            (attn.scale(), window.unwrap_or(0)),
-                            stream.0,
-                        )
-                    }
-                }
-                CudaStep::AttnDecode(
-                    attn @ AttnPrefillBf16 {
+                        rot_dim,
+                        pairing,
                         q,
-                        block_table,
-                        sequence,
-                        out,
-                        layer,
-                        q_heads,
-                        kv_heads,
-                        head_dim,
-                        window,
-                        ..
-                    },
-                ) => {
-                    let pool = kv.expect("`new` made a pool for a KV tape");
-                    let l = layer as usize;
-                    let layout = pool.layer_layout(l);
-                    let launch: DecodeLaunch = match head_dim {
-                        ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_fp8kv,
-                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_fp8kv,
-                        // No decode attention kernel at another head dim: refused, nothing
-                        // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
-                        other => {
-                            let error = KernelError::AttnDecodeShape {
-                                q_heads,
-                                kv_heads,
-                                head_dim: other,
-                                block_size: layout.block_size,
-                                num_blocks: layout.num_blocks,
+                        norms,
+                    }) => {
+                        let pool = kv.expect("`new` made a pool for a KV tape");
+                        let l = layer as usize;
+                        // Layer `l`'s class layout: its `kv_heads` and `head_dim` (`validate`
+                        // checked the step's are its class's).
+                        let layout = pool.layer_layout(l);
+                        // FP8 S8 W4c: the folded query rope (and Gemma's head norms) take the one-row
+                        // rope append, one launch for the q rope, the k rope and the append.
+                        if let Some(q) = q {
+                            let norms = norms.map(|n| {
+                                (
+                                    weights[n.q_gain.0 as usize].ptr().cast_const(),
+                                    weights[n.k_gain.0 as usize].ptr().cast_const(),
+                                    n.eps(),
+                                )
+                            });
+                            // SAFETY: as the unfolded launches' below, and `q.x`, `q.out` (`q.cols`
+                            // bf16, `validate`), the gains (`head_dim` bf16, read by the norms the
+                            // fold absorbed, so declared).
+                            break 'launch unsafe {
+                                kernels::rope_append_fp8(
+                                    (
+                                        slot(q.x).cast_const(),
+                                        slot(q.out),
+                                        slot(k).cast_const(),
+                                        slot(k_out),
+                                        slot(v).cast_const(),
+                                    ),
+                                    (slot(table).cast_const(), slot(slot_mapping).cast_const()),
+                                    (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
+                                    (
+                                        q.cols / head_dim,
+                                        layout.num_kv_heads,
+                                        layout.head_dim,
+                                        rot_dim,
+                                        pairing,
+                                    ),
+                                    (layout.block_size, layout.num_blocks),
+                                    norms,
+                                    stream.0,
+                                )
                             };
-                            return Err((step, error));
                         }
-                    };
-                    // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
-                    // its rows are 1: `validate`), and the block table and sequence uploaded
-                    // above, which `forward` checked: every block the keys `0 .. P + L` need is a
-                    // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s,
-                    // of its class's layout.
-                    unsafe {
-                        launch(
-                            (slot(q), slot(out)),
-                            (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
-                            (slot(block_table), slot(sequence)),
-                            (q_heads, kv_heads, head_dim),
-                            (layout.block_size, layout.num_blocks),
-                            (attn.scale(), window.unwrap_or(0)),
-                            stream.0,
-                        )
+                        // SAFETY: as above, for `k`, `v` and `k_out` (`rows*cols`), `table`
+                        // (`rows*rot_dim`) and `slot_mapping` (`rows` u32), uploaded above; the cache
+                        // halves are layer `l`'s, `num_blocks · kv_heads · 64 · head_dim` of its
+                        // class each, and every slot uploaded is in a checked block or `u32::MAX`.
+                        unsafe {
+                            kernels::rope_paired_bf16(
+                                slot(k),
+                                slot(table),
+                                slot(k_out),
+                                (rows, cols),
+                                (head_dim, rot_dim, pairing),
+                                stream.0,
+                            )
+                            .and_then(|()| {
+                                kernels::kv_append_fp8(
+                                    (slot(k_out), slot(v)),
+                                    slot(slot_mapping),
+                                    (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
+                                    (rows, layout.num_kv_heads, layout.head_dim),
+                                    (layout.block_size, layout.num_blocks),
+                                    stream.0,
+                                )
+                            })
+                        }
+                    }
+                    CudaStep::AttnPrefill(
+                        attn @ AttnPrefillBf16 {
+                            q,
+                            block_table,
+                            sequence,
+                            out,
+                            layer,
+                            rows,
+                            q_heads,
+                            kv_heads,
+                            head_dim,
+                            window,
+                            ..
+                        },
+                    ) => {
+                        let pool = kv.expect("`new` made a pool for a KV tape");
+                        let l = layer as usize;
+                        let layout = pool.layer_layout(l);
+                        // The column-split kernel at head dim 512, the head-dim-256 one otherwise
+                        // (whose launcher refuses any other head dim).
+                        let launch: PrefillLaunch = match head_dim {
+                            ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_fp8kv,
+                            ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_fp8kv,
+                            // No prefill attention kernel at another head dim: refused, nothing
+                            // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
+                            other => {
+                                let error = KernelError::AttnShape {
+                                    rows,
+                                    q_heads,
+                                    kv_heads,
+                                    head_dim: other,
+                                    block_size: layout.block_size,
+                                    num_blocks: layout.num_blocks,
+                                };
+                                return Err((step, error));
+                            }
+                        };
+                        // SAFETY: as above, for `q` and `out` (`rows*q_heads*head_dim`), and the
+                        // block table and sequence uploaded above, which `forward` checked: every
+                        // block the keys `0 .. P + L` need is a table entry inside the pool, and
+                        // `1 ≤ L ≤ rows`. The cache halves are layer `l`'s, of its class's layout.
+                        unsafe {
+                            launch(
+                                (slot(q), slot(out)),
+                                (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
+                                (slot(block_table), slot(sequence)),
+                                (rows, q_heads, kv_heads, head_dim),
+                                (layout.block_size, layout.num_blocks),
+                                (attn.scale(), window.unwrap_or(0)),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::AttnDecode(
+                        attn @ AttnPrefillBf16 {
+                            q,
+                            block_table,
+                            sequence,
+                            out,
+                            layer,
+                            q_heads,
+                            kv_heads,
+                            head_dim,
+                            window,
+                            ..
+                        },
+                    ) => {
+                        let pool = kv.expect("`new` made a pool for a KV tape");
+                        let l = layer as usize;
+                        let layout = pool.layer_layout(l);
+                        let launch: DecodeLaunch = match head_dim {
+                            ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_fp8kv,
+                            ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_fp8kv,
+                            // No decode attention kernel at another head dim: refused, nothing
+                            // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
+                            other => {
+                                let error = KernelError::AttnDecodeShape {
+                                    q_heads,
+                                    kv_heads,
+                                    head_dim: other,
+                                    block_size: layout.block_size,
+                                    num_blocks: layout.num_blocks,
+                                };
+                                return Err((step, error));
+                            }
+                        };
+                        // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
+                        // its rows are 1: `validate`), and the block table and sequence uploaded
+                        // above, which `forward` checked: every block the keys `0 .. P + L` need is a
+                        // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s,
+                        // of its class's layout.
+                        unsafe {
+                            launch(
+                                (slot(q), slot(out)),
+                                (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
+                                (slot(block_table), slot(sequence)),
+                                (q_heads, kv_heads, head_dim),
+                                (layout.block_size, layout.num_blocks),
+                                (attn.scale(), window.unwrap_or(0)),
+                                stream.0,
+                            )
+                        }
                     }
                 }
             };

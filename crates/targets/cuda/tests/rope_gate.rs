@@ -1343,3 +1343,392 @@ fn the_one_row_gate_times_are_recorded() {
     }
     eprintln!("{line}");
 }
+
+// ── FP8 S8 W4c: the one-row rope append ────────────────────────────
+
+/// The geometries the fused rope append runs at: q heads, kv heads, head dim, rotated width,
+/// pairing, `rope_theta` (and so the table), and whether its head norms run (Gemma's sliding
+/// layers only, `NormedRope`).
+#[derive(Clone, Copy)]
+struct W4cShape {
+    what: &'static str,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    rot: u32,
+    half: bool,
+    theta: f64,
+    norms: bool,
+}
+
+impl W4cShape {
+    const fn geom(self) -> (u32, u32, u32, u32, bool) {
+        (
+            self.q_heads,
+            self.kv_heads,
+            self.head_dim,
+            self.rot,
+            self.half,
+        )
+    }
+}
+
+const fn w4c_shape(
+    what: &'static str,
+    (q_heads, kv_heads, head_dim, rot, half): (u32, u32, u32, u32, bool),
+    theta: f64,
+    norms: bool,
+) -> W4cShape {
+    W4cShape {
+        what,
+        q_heads,
+        kv_heads,
+        head_dim,
+        rot,
+        half,
+        theta,
+        norms,
+    }
+}
+
+const W4C_SHAPES: [W4cShape; 4] = [
+    w4c_shape(
+        "Gemma sliding, normed",
+        (16, 8, 256, 256, false),
+        THETA_LOCAL,
+        true,
+    ),
+    w4c_shape("Gemma global", (16, 2, 512, 128, true), THETA_GLOBAL, false),
+    w4c_shape("27B", (24, 4, 256, 64, false), THETA, false),
+    w4c_shape("35B", (16, 2, 256, 64, false), THETA, false),
+];
+/// The KV pool the rope append tests write into, and the slot they use.
+const W4C_BLOCKS: u32 = 4;
+const W4C_EPS: f32 = 1e-6;
+
+/// One case's device buffers: the raw projections, the table, the slot, the caches and the gains.
+struct W4c {
+    q: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    table: DeviceBuffer,
+    slot: DeviceBuffer,
+    q_gain: DeviceBuffer,
+    k_gain: DeviceBuffer,
+    qc: usize,
+    kc: usize,
+}
+
+fn w4c_case(device: &CudaDevice, sh: W4cShape, position: u32, seed: u64) -> W4c {
+    let (qh, kvh, hd, rot, half) = sh.geom();
+    let theta = sh.theta;
+    use scratchy_target_cuda::rotary::rotary_rows_with_freq_dim;
+    let (qc, kc) = ((qh * hd) as usize, (kvh * hd) as usize);
+    let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+    let table = match half {
+        true => rotary_rows_with_freq_dim(&[position], rot, hd, theta),
+        false => rotary_rows(&[position], rot, theta),
+    };
+    let slot = [position % (W4C_BLOCKS * 64)];
+    W4c {
+        q: up(&bf16_inputs(qc, seed)),
+        k: up(&bf16_inputs(kc, seed ^ 0x11)),
+        v: up(&bf16_inputs(kc, seed ^ 0x22)),
+        table: up(&table),
+        slot: DeviceBuffer::upload_bytes(device, &slot[0].to_le_bytes()).expect("slot"),
+        q_gain: up(&bf16_inputs(hd as usize, seed ^ 0x33)),
+        k_gain: up(&bf16_inputs(hd as usize, seed ^ 0x44)),
+        qc,
+        kc,
+    }
+}
+
+fn w4c_caches(device: &CudaDevice, kvh: u32, hd: u32) -> (DeviceBuffer, DeviceBuffer) {
+    let bytes = (W4C_BLOCKS * kvh * 64 * hd) as usize;
+    let z = || DeviceBuffer::upload_bytes(device, &vec![0x5Au8; bytes]).expect("cache");
+    (z(), z())
+}
+
+/// The chain the fused launch replaces, as today's launches: (normed) RmsNorm(q heads), RmsNorm(k
+/// heads), RmsNormUnit(v heads), then Rope(q), and RopeAppend = Rope(k) + kv_append_fp8. Returns
+/// q's rope and k's rope (the attention's operands), and leaves the caches written.
+fn w4c_chain(
+    device: &CudaDevice,
+    c: &W4c,
+    (qh, kvh, hd, rot, half): (u32, u32, u32, u32, bool),
+    norms: bool,
+    caches: (&DeviceBuffer, &DeviceBuffer),
+) -> (Vec<u16>, Vec<u16>) {
+    use scratchy_target_cuda::kernels::{
+        kv_append_fp8, rms_norm_bf16, rms_norm_unit_bf16, rope_paired_bf16,
+    };
+    use scratchy_target_cuda::step::RopePairing;
+    let pairing = if half {
+        RopePairing::HalfHead
+    } else {
+        RopePairing::HalfRotated
+    };
+    let null = std::ptr::null_mut();
+    let buf = |n: usize| DeviceBuffer::upload(device, &vec![0u16; n]).expect("buffer");
+    let (qn, kn, vn) = (buf(c.qc), buf(c.kc), buf(c.kc));
+    let (qr, kr) = (buf(c.qc), buf(c.kc));
+    // SAFETY: every buffer holds what the launch reads or writes, each its own allocation; null is
+    // the default stream, which the downloads wait for.
+    unsafe {
+        let (q, k, v) = if norms {
+            rms_norm_bf16(
+                c.q.ptr(),
+                c.q_gain.ptr(),
+                qn.ptr(),
+                (qh, hd),
+                W4C_EPS,
+                0.0,
+                null,
+            )
+            .expect("q norm");
+            rms_norm_bf16(
+                c.k.ptr(),
+                c.k_gain.ptr(),
+                kn.ptr(),
+                (kvh, hd),
+                W4C_EPS,
+                0.0,
+                null,
+            )
+            .expect("k norm");
+            rms_norm_unit_bf16(c.v.ptr(), vn.ptr(), (kvh, hd), W4C_EPS, null).expect("v norm");
+            (qn.ptr(), kn.ptr(), vn.ptr())
+        } else {
+            (c.q.ptr(), c.k.ptr(), c.v.ptr())
+        };
+        rope_paired_bf16(
+            q,
+            c.table.ptr(),
+            qr.ptr(),
+            (1, c.qc as u32),
+            (hd, rot, pairing),
+            null,
+        )
+        .expect("q rope");
+        rope_paired_bf16(
+            k,
+            c.table.ptr(),
+            kr.ptr(),
+            (1, c.kc as u32),
+            (hd, rot, pairing),
+            null,
+        )
+        .expect("k rope");
+        kv_append_fp8(
+            (kr.ptr(), v),
+            c.slot.ptr(),
+            (caches.0.ptr(), caches.1.ptr()),
+            (1, kvh, hd),
+            (64, W4C_BLOCKS),
+            null,
+        )
+        .expect("append");
+    }
+    (qr.download().expect("qr"), kr.download().expect("kr"))
+}
+
+/// The fused launch on the same inputs; q's and k's ropes, the caches written.
+fn w4c_fused(
+    device: &CudaDevice,
+    c: &W4c,
+    (qh, kvh, hd, rot, half): (u32, u32, u32, u32, bool),
+    norms: bool,
+    caches: (&DeviceBuffer, &DeviceBuffer),
+) -> (Vec<u16>, Vec<u16>) {
+    let (qr, kr) = (
+        DeviceBuffer::upload(device, &vec![SENTINEL; c.qc]).expect("qr"),
+        DeviceBuffer::upload(device, &vec![SENTINEL; c.kc]).expect("kr"),
+    );
+    w4c_launch(c, (qh, kvh, hd, rot, half), norms, caches, (&qr, &kr)).expect("fused");
+    (qr.download().expect("qr"), kr.download().expect("kr"))
+}
+
+fn w4c_launch(
+    c: &W4c,
+    (qh, kvh, hd, rot, half): (u32, u32, u32, u32, bool),
+    norms: bool,
+    caches: (&DeviceBuffer, &DeviceBuffer),
+    (qr, kr): (&DeviceBuffer, &DeviceBuffer),
+) -> Result<(), KernelError> {
+    use scratchy_target_cuda::kernels::rope_append_fp8;
+    use scratchy_target_cuda::step::RopePairing;
+    let pairing = if half {
+        RopePairing::HalfHead
+    } else {
+        RopePairing::HalfRotated
+    };
+    let gains = norms.then(|| {
+        (
+            c.q_gain.ptr().cast_const(),
+            c.k_gain.ptr().cast_const(),
+            W4C_EPS,
+        )
+    });
+    // SAFETY: as `w4c_chain`'s; the outputs are their own allocations.
+    unsafe {
+        rope_append_fp8(
+            (c.q.ptr(), qr.ptr(), c.k.ptr(), kr.ptr(), c.v.ptr()),
+            (c.table.ptr(), c.slot.ptr()),
+            (caches.0.ptr(), caches.1.ptr()),
+            (qh, kvh, hd, rot, pairing),
+            (64, W4C_BLOCKS),
+            gains,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// FP8 S8 W4c's gate, measured before anything else (the user's rule: stop unless the fused launch
+/// is faster than the stages it replaces): the fused rope append's µs per launch beside the sum of
+/// the launches it replaces, by CUDA events, hot, at each geometry. `FASTER` or `SLOWER` per line;
+/// recorded, not asserted (the clock ramp moves a run by about 35%).
+#[test]
+fn the_fused_rope_append_time_is_recorded() {
+    use scratchy_target_cuda::kernels::{
+        kv_append_fp8, rms_norm_bf16, rms_norm_unit_bf16, rope_paired_bf16,
+    };
+    use scratchy_target_cuda::step::RopePairing;
+    let device = h100();
+    for sh in W4C_SHAPES {
+        let (what, norms) = (sh.what, sh.norms);
+        let (qh, kvh, hd, rot, half) = sh.geom();
+        let c = w4c_case(&device, sh, 191, 0x4C00);
+        let caches = w4c_caches(&device, kvh, hd);
+        let buf = |n: usize| DeviceBuffer::upload(&device, &vec![0u16; n]).expect("buffer");
+        let (qn, kn, vn, qr, kr) = (buf(c.qc), buf(c.kc), buf(c.kc), buf(c.qc), buf(c.kc));
+        let pairing = if half {
+            RopePairing::HalfHead
+        } else {
+            RopePairing::HalfRotated
+        };
+        let null = std::ptr::null_mut();
+        let shape = (qh, kvh, hd, rot, half);
+        let fused = event_median(|| {
+            w4c_launch(&c, shape, norms, (&caches.0, &caches.1), (&qr, &kr)).expect("fused");
+        });
+        // SAFETY (every stage below): as `w4c_chain`'s.
+        let stage = |f: &mut dyn FnMut()| event_median(f);
+        let mut sum = 0.0;
+        let mut line = format!("rope append time {what}: fused {fused:.2} us; stages");
+        if norms {
+            let a = stage(&mut || unsafe {
+                rms_norm_bf16(
+                    c.q.ptr(),
+                    c.q_gain.ptr(),
+                    qn.ptr(),
+                    (qh, hd),
+                    W4C_EPS,
+                    0.0,
+                    null,
+                )
+                .expect("q norm");
+            });
+            let b = stage(&mut || unsafe {
+                rms_norm_bf16(
+                    c.k.ptr(),
+                    c.k_gain.ptr(),
+                    kn.ptr(),
+                    (kvh, hd),
+                    W4C_EPS,
+                    0.0,
+                    null,
+                )
+                .expect("k norm");
+            });
+            let u = stage(&mut || unsafe {
+                rms_norm_unit_bf16(c.v.ptr(), vn.ptr(), (kvh, hd), W4C_EPS, null).expect("v norm");
+            });
+            sum += a + b + u;
+            line += &format!(" q norm {a:.2} + k norm {b:.2} + v unit norm {u:.2}");
+        }
+        let qrope = stage(&mut || unsafe {
+            rope_paired_bf16(
+                c.q.ptr(),
+                c.table.ptr(),
+                qr.ptr(),
+                (1, c.qc as u32),
+                (hd, rot, pairing),
+                null,
+            )
+            .expect("q rope");
+        });
+        let krope = stage(&mut || unsafe {
+            rope_paired_bf16(
+                c.k.ptr(),
+                c.table.ptr(),
+                kr.ptr(),
+                (1, c.kc as u32),
+                (hd, rot, pairing),
+                null,
+            )
+            .expect("k rope");
+        });
+        let append = stage(&mut || unsafe {
+            kv_append_fp8(
+                (kr.ptr(), c.v.ptr()),
+                c.slot.ptr(),
+                (caches.0.ptr(), caches.1.ptr()),
+                (1, kvh, hd),
+                (64, W4C_BLOCKS),
+                null,
+            )
+            .expect("append");
+        });
+        sum += qrope + krope + append;
+        let verdict = if fused < sum { "FASTER" } else { "SLOWER" };
+        eprintln!(
+            "{line} + q rope {qrope:.2} + k rope {krope:.2} + append {append:.2} = {sum:.2} us; \
+             saved {:.2} us {verdict} (recorded, not asserted)",
+            sum - fused
+        );
+    }
+}
+
+/// FP8 S8 W4c: the fused rope append is its chain bit for bit, at Gemma's sliding geometry (16 q
+/// heads × 256, 8 kv heads, the full-width rope, normed: RmsNorm(q), RmsNorm(k), RmsNormUnit(v),
+/// Rope, RopeAppend), its global one (16 × 512, 2 kv heads, `<128, true>`, unnormed) and the 27B's
+/// and 35B's (`<64, false>`), at positions 0, 1, 191 and 8,191, 3 seeds: `mismatched_bits=0` on q's
+/// rope and k's rope, and 0 differing bytes over both whole caches (the written slot and every other
+/// byte).
+#[test]
+fn the_normed_rope_is_its_chain_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for sh in W4C_SHAPES {
+        let (kvh, hd) = (sh.kv_heads, sh.head_dim);
+        for position in [0u32, 1, 191, 8191] {
+            for seed in 0..3u64 {
+                let c = w4c_case(
+                    &device,
+                    sh,
+                    position,
+                    0x4C10 ^ seed << 8 ^ u64::from(position),
+                );
+                let (a, b) = (w4c_caches(&device, kvh, hd), w4c_caches(&device, kvh, hd));
+                let (cq, ck) = w4c_chain(&device, &c, sh.geom(), sh.norms, (&a.0, &a.1));
+                let (fq, fk) = w4c_fused(&device, &c, sh.geom(), sh.norms, (&b.0, &b.1));
+                let bytes = |x: &DeviceBuffer, y: &DeviceBuffer| {
+                    let (x, y) = (x.download().expect("cache"), y.download().expect("cache"));
+                    x.iter().zip(&y).filter(|(p, q)| p != q).count()
+                };
+                let bad_q = mismatched_bits(&fq, &cq);
+                let bad_k = mismatched_bits(&fk, &ck);
+                let bad_cache = bytes(&a.0, &b.0) + bytes(&a.1, &b.1);
+                let ok = bad_q == 0 && bad_k == 0 && bad_cache == 0;
+                eprintln!(
+                    "W4 rope append {} pos={position} seed={seed}: q mismatched_bits={bad_q} k \
+                     mismatched_bits={bad_k} cache mismatched_bytes={bad_cache} {}",
+                    sh.what,
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "the fused rope append differs from its chain");
+}

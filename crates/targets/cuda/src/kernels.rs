@@ -36,6 +36,7 @@ unsafe extern "C" {
     fn scratchy_cuda_moe_route_bf16_prepare() -> i32;
     fn scratchy_cuda_moe_sort_prepare() -> i32;
     fn scratchy_cuda_rope_bf16_prepare() -> i32;
+    fn scratchy_cuda_rope_append_fp8_prepare() -> i32;
     fn scratchy_cuda_embed_bf16(
         tokens: *const c_void,
         table: *const c_void,
@@ -109,6 +110,29 @@ unsafe extern "C" {
         experts: u32,
         expert_rows: u32,
         n_tile: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    // FP8 S8 W4c: the one-row rope append (`kernels/rope_append_bf16.cu`).
+    fn scratchy_cuda_rope_append_fp8(
+        q: *const c_void,
+        q_out: *mut c_void,
+        k: *const c_void,
+        k_out: *mut c_void,
+        v: *const c_void,
+        table: *const c_void,
+        slot_mapping: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        rot_dim: u32,
+        pairing: u32,
+        block_size: u32,
+        num_blocks: u32,
+        q_gain: *const c_void,
+        k_gain: *const c_void,
+        eps: f32,
         stream: *mut c_void,
     ) -> i32;
     // FP8 S8 W4a: the one-row GEMVs with the residual epilogue (`kernels/gemv_fp8.cu`,
@@ -1206,6 +1230,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("moe_route_bf16", scratchy_cuda_moe_route_bf16_prepare),
     ("moe_sort", scratchy_cuda_moe_sort_prepare),
     ("rope_bf16", scratchy_cuda_rope_bf16_prepare),
+    ("rope_append_fp8", scratchy_cuda_rope_append_fp8_prepare),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
@@ -3931,4 +3956,76 @@ pub unsafe fn gemv_bf16_residual(
         scratchy_cuda_gemv_bf16_residual(a, b, c, partials, n, k, splits, residual, stream)
     };
     check(code, KernelError::GemvSplit { n, k, splits })
+}
+
+/// The one-row rope append (FP8 S8 W4c, `kernels/rope_append_bf16.cu`): at one row, `q_out =
+/// rope(q)`, `k_out = rope(k)`, and k_out's and v's head rows appended to the e4m3 caches at
+/// `slot_mapping[0]`, the bits of [`rope_paired_bf16`] on q, the same on k and [`kv_append_fp8`]; with
+/// `norms` (`(q_gain, k_gain, eps)`), first q's and k's heads by their RMSNorm and v's by the unit
+/// norm, the bits of [`rms_norm_bf16`] (stored gain) and [`rms_norm_unit_bf16`] on the head views.
+/// Asynchronous; refused with [`KernelError::KvAppendShape`] before any pointer is touched unless
+/// `(rot_dim, pairing, head_dim)` is (64, half-rotated, 256), (256, half-rotated, 256) or (128,
+/// half-head, 512), `block_size` 64, and, normed, (256, half-rotated, 256) with at most 16 heads of
+/// each and a finite positive `eps`.
+///
+/// # Safety
+///
+/// `q`, `q_out` must be 16-byte-aligned device pointers to `q_heads · head_dim` bf16; `k`, `k_out`,
+/// `v` to `kv_heads · head_dim`; `table` to `rot_dim`; `slot_mapping` to one u32; the caches as
+/// [`kv_append_fp8`]'s; the gains to `head_dim` bf16; the outputs overlap no input. [`prepare_all`]
+/// must have succeeded on the current device; `stream` as [`rope_paired_bf16`]'s.
+pub unsafe fn rope_append_fp8(
+    (q, q_out, k, k_out, v): (
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+    ),
+    (table, slot_mapping): (*const c_void, *const c_void),
+    (k_cache, v_cache): (*mut c_void, *mut c_void),
+    (q_heads, kv_heads, head_dim, rot_dim, pairing): (u32, u32, u32, u32, RopePairing),
+    (block_size, num_blocks): (u32, u32),
+    norms: Option<(*const c_void, *const c_void, f32)>,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let pairing_code = match pairing {
+        RopePairing::HalfRotated => 0,
+        RopePairing::HalfHead => 1,
+    };
+    let (q_gain, k_gain, eps) = norms.unwrap_or((std::ptr::null(), std::ptr::null(), 0.0));
+    // SAFETY: the caller upholds the contract above; the launcher checks every rule first.
+    let code = unsafe {
+        scratchy_cuda_rope_append_fp8(
+            q,
+            q_out,
+            k,
+            k_out,
+            v,
+            table,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            q_heads,
+            kv_heads,
+            head_dim,
+            rot_dim,
+            pairing_code,
+            block_size,
+            num_blocks,
+            q_gain,
+            k_gain,
+            eps,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::KvAppendShape {
+            rows: 1,
+            kv_heads,
+            head_dim,
+            block_size,
+        },
+    )
 }

@@ -1967,6 +1967,26 @@ impl CudaStep {
                 Some(g.act.step(g.activation())),
             ];
         }
+        // A rope append with its query rope folded in (FP8 S8 W4c): the append, then the query rope
+        // as the step it is on its own, so `validate` checks its spans too.
+        if let Self::RopeAppend(r) = self
+            && let Some(q) = r.q
+        {
+            return [
+                Some(*self),
+                Some(Self::Rope(RopeBf16 {
+                    x: q.x,
+                    table: r.table,
+                    out: q.out,
+                    rows: r.rows,
+                    cols: q.cols,
+                    head_dim: r.head_dim,
+                    rot_dim: r.rot_dim,
+                    pairing: r.pairing,
+                })),
+                None,
+            ];
+        }
         [Some(*self), None, None]
     }
 
@@ -2970,6 +2990,11 @@ impl CudaStep {
             Self::ExpertGateUpAct(ExpertGateUpActBf16 { gate, up, .. }) => {
                 vec![&mut gate.bundle, &mut up.bundle]
             }
+            // The head norms' gains a rope append reads (FP8 S8 W4c).
+            Self::RopeAppend(RopeAppendBf16 {
+                norms: Some(HeadNorms { q_gain, k_gain, .. }),
+                ..
+            }) => vec![q_gain, k_gain],
             other => other.weight_mut().into_iter().collect(),
         }
     }
