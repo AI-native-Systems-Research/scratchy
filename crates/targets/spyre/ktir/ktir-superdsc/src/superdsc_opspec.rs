@@ -2707,22 +2707,6 @@ impl ArgView<'_> {
             PitchForm::Hbm(p)
         }
     }
-
-    /// Where each dim of the stated device order sits in `layout` — entry `i` is the `layout` position
-    /// of the `i`-th dim dxp reads — or `None` when the view states no order of its own. The per-dim
-    /// arrays the JSON carries for this tensor (`layoutDimOrder_`, `maxDimSizes_`, `scale_`) are laid
-    /// in this order, so all three read it from here. (dxp indexes `scale_` by the op's primary
-    /// OUTPUT order; every op that states an order gives its operands the output's, or all-`Active`
-    /// scales, so the tensor's own order is that one.)
-    pub fn device_positions(&self) -> Option<Vec<usize>> {
-        self.device_order.map(|order| {
-            order
-                .dims
-                .iter()
-                .filter_map(|d| self.layout.iter().position(|l| l == d))
-                .collect()
-        })
-    }
 }
 
 impl AnyTensorArg {
