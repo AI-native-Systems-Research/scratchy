@@ -196,6 +196,12 @@ pub(super) fn section(
     // The summary's columns: the lineup's classes, where the runs record one; else every model
     // shown, a column each.
     let summary_columns = summary_grid(&ran, machines);
+    // Each machine's models as the section reads them, for the accuracy table: in page order.
+    let scored_pairs: Vec<(&str, &Model)> = (ran.iter())
+        .flat_map(|(chip, stems)| {
+            (stems.iter()).filter_map(move |stem| Some((*chip, machines[chip].latest(stem)?.m)))
+        })
+        .collect();
     let open_loop = (ran.iter()).any(|(chip, stems)| {
         (stems.iter()).any(|stem| {
             machines[chip].latest(stem).is_some_and(|e| tasks::open_loop(e.m, dataset))
@@ -219,6 +225,7 @@ pub(super) fn section(
             }
             {summary_map(dataset, &id, &ran, machines, &summary_columns)}
             {older_runs(&ran, machines)}
+            {tasks::accuracy_table(dataset, &scored_pairs)}
             {tasks::table_notes(open_loop)}
         }
     };

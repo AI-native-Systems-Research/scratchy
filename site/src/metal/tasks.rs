@@ -3,7 +3,7 @@
 
 use dioxus::prelude::*;
 
-use crate::carbon::{Table, TableCell, TableRow};
+use crate::carbon::{Stack, Table, TableCell, TableRow};
 
 use super::data::{Model, RequestTiming, TaskCell};
 use super::numbers::Engine;
@@ -246,6 +246,23 @@ fn right(c: &TaskCell) -> String {
     }
 }
 
+/// An accuracy's 95% range, in points: the binomial interval over its tasks,
+/// ±1.96·√(p(1−p)/n), to one decimal. None where it shows no accuracy or kept no task count.
+fn range(c: &TaskCell) -> Option<f64> {
+    let (p, n) = (accuracy(c)?, f64::from(c.num_tasks.filter(|&n| n > 0)?));
+    Some((1960.0 * (p * (1.0 - p) / n).sqrt()).round() / 10.0)
+}
+
+/// A cell's accuracy with its range, "25% ±4.2", as the accuracy table shows it; or why it has
+/// none ([`held_back`]), or how many requests answered where most failed.
+fn scored(c: &TaskCell) -> String {
+    match (accuracy(c), range(c)) {
+        (Some(a), Some(r)) => format!("{} ±{r:.1}", pct(Some(a))),
+        (Some(a), None) => format!("~{}", pct(Some(a))),
+        _ => right(c),
+    }
+}
+
 /// Why a cell shows no accuracy, where the page knows: a timed cell's answers are forced to one
 /// length and never scored; a scored cell most of whose answers ran to their cap, or opened as
 /// reasoning, is held back, with how many.
@@ -327,8 +344,8 @@ fn table(m: &Model, only: Option<&str>) -> Element {
     rsx! {
         Table {
             headers: [
-                "workload", "load", "TTFT", "total", "answer tok", "cached tok", "accuracy",
-                "J/request", "J/token", "J/right answer", "vs", "TTFT", "total", "J/request",
+                "workload", "load", "TTFT", "total", "answer tok", "cached tok",
+                "J/request", "J/token", "vs", "TTFT", "total", "J/request",
             ]
             .map(String::from)
             .to_vec(),
@@ -359,12 +376,10 @@ fn table(m: &Model, only: Option<&str>) -> Element {
                                 TableCell { "{ms(c.median_e2el_ms)}" }
                                 TableCell { "{n(c.answer_tokens())}" }
                                 TableCell { "{n(c.mean_cached_tokens)}" }
-                                TableCell { "{right(c)}" }
                                 TableCell { "{joules(per_request(c))}" }
                                 TableCell { "{joules(per_token(c))}" }
-                                TableCell { "{joules(per_right(c))}" }
                             } else {
-                                TableCell { colspan: 8, "no answers" }
+                                TableCell { colspan: 6, "no answers" }
                             }
                             TableCell { "{vs}" }
                             if let Some(why) = why {
@@ -382,6 +397,52 @@ fn table(m: &Model, only: Option<&str>) -> Element {
     }
 }
 
+/// A dataset's scored cells, a row each a machine, model and engine: scratchy's and its rival's
+/// side by side, each accuracy with its range, by hops, and joules a right answer; a held-back
+/// one says why. `pairs` is each machine and its models' cells as the section reads them. Nothing
+/// where none of them was scored.
+pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
+    let rows: Vec<(String, &str, &TaskCell)> = (pairs.iter())
+        .flat_map(|&(chip, m)| {
+            let rival = rival_of(m, dataset);
+            let mut engines = vec![Engine::Scratchy];
+            engines.extend(rival);
+            engines.into_iter().flat_map(move |e| {
+                (e.tasks(m).iter())
+                    .filter(|c| of_dataset(c, dataset) && !c.timed_answers && c.accuracy.is_some())
+                    .map(move |c| (format!("{} on {chip}", m.stem), e.label(), c))
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        Stack { gap: 2,
+            strong { "{workload_label(ACCURACY_WORKLOAD).0}" }
+            Table {
+                headers: ["model", "engine", "load", "tasks", "accuracy", "by hops", "capped", "J/right answer"]
+                    .map(String::from).to_vec(),
+                for (model, engine, c) in rows {
+                    TableRow {
+                        TableCell { "{model}" }
+                        TableCell { "{engine}" }
+                        TableCell { "{load_label(c)}" }
+                        TableCell { {c.num_tasks.map_or("—".to_string(), |n| crate::thousands(n as usize))} }
+                        TableCell { "{scored(c)}" }
+                        TableCell { "{by_hops(c).filter(|_| accuracy(c).is_some()).unwrap_or_default()}" }
+                        TableCell { {c.capped_answers.map_or("—".to_string(), |k| crate::thousands(k as usize))} }
+                        TableCell { "{joules(per_right(c))}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The accuracy cell's workload: MuSiQue over more tasks, for its accuracy alone.
+const ACCURACY_WORKLOAD: &str = "rag-accuracy";
+
 /// What a dataset's table columns mean, said once under the section's summary, not under every
 /// pair's table: accuracy and why it is held back, energy, and, where any cell shown was timed
 /// open loop (`--open-loop`), its load.
@@ -389,8 +450,9 @@ pub fn table_notes(open_loop: bool) -> Element {
     rsx! {
         p { style: "font-size: 0.875rem",
             "Accuracy: the share of tasks answered right, a failed request or an answer that ran to \
-             its cap counted wrong; none on a cell whose answers are forced to one length, so its \
-             times compare across engines, as every cell at a users count is; left out where most answers ran to their cap or opened as reasoning, the cell saying which \
+             its cap counted wrong, ± its 95% range over the tasks; scored only on cells whose \
+             answers end on their own, not the timed cells, whose answers are forced to one length so \
+             their times compare across engines; left out where most answers ran to their cap or opened as reasoning, the cell saying which \
              and how many. A cell most of whose requests failed shows how many answered, and no accuracy, energy or ratio on either side. ~ marks one over fewer \
              than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
              indicative only. The second total ratio is shown only where both engines' answers were \
@@ -633,6 +695,23 @@ mod tests {
             Some("rival: 9 of 2,415 answered")
         );
         assert_eq!(no_ratio(&cell(2415, 0), &cell(2415, 0)), None);
+    }
+
+    /// An accuracy's 95% range: the binomial interval over its tasks, in points.
+    #[test]
+    fn an_accuracy_carries_its_range() {
+        let cell = |acc: f64, n: u32| -> TaskCell {
+            serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+                "completed": n, "num_tasks": n, "accuracy": acc, "thinking_answers": 0,
+                "capped_answers": 0}))
+            .unwrap()
+        };
+        // 1.96 * sqrt(0.25 * 0.75 / 400) = 4.2 points; over 2,415 tasks, 1.7.
+        assert_eq!(range(&cell(0.25, 400)), Some(4.2));
+        assert_eq!(range(&cell(0.25, 2415)), Some(1.7));
+        assert_eq!(scored(&cell(0.25, 400)), "25% ±4.2");
+        // One decimal always: 1.96 * sqrt(0.5 * 0.5 / 2401) = 2.0 points.
+        assert_eq!(scored(&cell(0.5, 2401)), "50% ±2.0");
     }
 
     /// A MuSiQue cell that recorded its accuracy by hop count shows each beside the whole, in hop

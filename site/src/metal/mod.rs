@@ -4307,7 +4307,7 @@ mod tests {
     }
 
     /// A section's table notes are said once, under its summary, however many pairs it has, and
-    /// a timed row's accuracy says it is not scored.
+    /// a timed row, never scored, has no accuracy cell to fill.
     #[test]
     fn a_sections_table_notes_are_said_once() {
         let mut runs = fixtures(&[REQUESTS_FIXTURE, REQUESTS_FIXTURE]);
@@ -4322,7 +4322,7 @@ mod tests {
         assert!(html.contains("on Apple M4 Max") && html.contains("on Apple M3 Pro"), "two pairs");
         assert_eq!(html.matches("Accuracy: the share of tasks answered right").count(), 1);
         assert_eq!(html.matches("J/request and J/token: the energy").count(), 1);
-        assert!(html.contains("timed, not scored"));
+        assert!(!html.contains("timed, not scored"), "no accuracy column on a timed row");
     }
 
     /// A grid column that names two prompt sizes, one each set's, says which is which.
@@ -4382,6 +4382,33 @@ mod tests {
         // A page that does not keep them apart still carries them inline, as before.
         let html = render(super::datasets::section("rag", &machines, &machines));
         assert!(html.contains("data-chart=\"{"));
+    }
+
+    /// MuSiQue's accuracy is its own table under the summary, a row a model and engine, the
+    /// rival's beside scratchy's, held-back ones saying why; the timing tables carry no
+    /// accuracy, so a timed row has no column it can never fill.
+    #[test]
+    fn musique_accuracy_is_a_table_of_its_own() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let m = &mut runs[0].models[0];
+        let cell = |acc: f64, capped: u32| -> super::data::TaskCell {
+            serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+                "completed": 400, "num_tasks": 400, "accuracy": acc, "thinking_answers": 0,
+                "capped_answers": capped, "median_ttft_ms": 4000.0,
+                "accuracy_by_group": {"2": 0.3, "3": 0.2, "4": 0.1}}))
+            .unwrap()
+        };
+        m.tasks.as_mut().unwrap().push(cell(0.25, 10));
+        m.tasks_omlx.as_mut().unwrap().push(cell(0.1, 331));
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        let at = |t: &str| html.find(t).unwrap_or_else(|| panic!("no {t}"));
+        assert!(at("<strong>MuSiQue accuracy</strong>") < at("rag-latency-machine"), "in the summary");
+        assert!(html.contains("25% ±4.2"), "scratchy's, with its range");
+        assert!(html.contains("2-hop 30%, 3-hop 20%, 4-hop 10%"));
+        assert!(html.contains("ran to its cap: 331 of 400"), "oMLX's, held back");
+        assert!(!html.contains("timed, not scored"), "no accuracy column on timed rows");
+        assert!(!html.contains(">J/right answer<") || at(">J/right answer<") < at("rag-latency-machine"));
     }
 
     #[test]
@@ -4748,12 +4775,12 @@ mod tests {
             !html.contains("Accuracy, 400 tasks at 4 users"),
             "no accuracy line under the map"
         );
-        assert!(html.contains(">MuSiQue accuracy<"), "its row in the table");
-        assert!(html.contains("48% of 400"));
+        assert!(html.contains("<strong>MuSiQue accuracy</strong>"), "its own table");
+        assert!(html.contains("48% ±4.9") && html.contains("45% ±4.9"), "both engines' rows");
     }
 
-    /// MuSiQue's detail table has its accuracy cell as a row of its own, beside the cells at each
-    /// users count: its accuracy over its tasks, by hop count, as every other row's.
+    /// MuSiQue's accuracy cell keeps its timings as a row of the detail table, beside the cells
+    /// at each users count, and its accuracy, by hop count, in the accuracy table.
     #[test]
     fn musiques_accuracy_cell_is_a_row_of_its_table() {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
@@ -4767,8 +4794,9 @@ mod tests {
         runs[0].models[0].tasks.as_mut().unwrap().push(cell);
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains(">MuSiQue accuracy<"), "its own row");
-        assert!(html.contains("48% of 400 (2-hop 53%, 3-hop 46%, 4-hop 38%)"));
+        assert!(html.contains(">MuSiQue accuracy<"), "its timings' own row");
+        assert!(html.contains("48% ±4.9"), "its accuracy and range");
+        assert!(html.contains("2-hop 53%, 3-hop 46%, 4-hop 38%"));
         // Its columns say what they are: accuracy, and energy a right answer.
         assert!(html.contains(">accuracy<"), "the accuracy column");
         assert!(html.contains(">J/right answer<"), "energy a right answer");
