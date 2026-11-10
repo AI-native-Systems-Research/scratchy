@@ -635,7 +635,7 @@ const H2D_ALIGN: u64 = 4096;
 /// The fill window step — `zero_seg`'s own walk step, shared by `prepare`'s device-side
 /// zero fills so both submit the same single-chunk window shapes (the window size only
 /// sets how many fill control blocks the walk submits; no host buffer rides the fill).
-const FILL_WINDOW: std::num::NonZeroU64 = match std::num::NonZeroU64::new(64 << 20) {
+const FILL_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
     Some(w) => w,
     None => unreachable!(),
 };
@@ -2510,7 +2510,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 eprintln!(
                     "[sdsc-prep-time] seg{i}: region {} B, staged extent {staged} B → {}",
                     addr.total_size().as_u64(),
-                    if staged == 0 { "device fill" } else { "host H2D" }
+                    if staged == 0 {
+                        "device fill"
+                    } else {
+                        "host H2D"
+                    }
                 );
             }
             if staged == 0 {
@@ -2551,9 +2555,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     .unwrap_or(0);
                 if staged == 0 {
                     for w in addr.windows(FILL_WINDOW) {
-                        stream
-                            .fill_zero(&w)
-                            .map_err(|e| anyhow!("prepare: weight bank {} zero fill: {e}", b + 1))?;
+                        stream.fill_zero(&w).map_err(|e| {
+                            anyhow!("prepare: weight bank {} zero fill: {e}", b + 1)
+                        })?;
                     }
                     continue;
                 }
