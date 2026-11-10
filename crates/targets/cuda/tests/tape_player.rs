@@ -58,7 +58,7 @@ use scratchy_target_cuda::runtime::{
     KvPoolConfig, KvSequence, WorkerError,
 };
 use scratchy_target_cuda::step::MatmulKernel;
-use scratchy_target_cuda::step::{CudaStep, gdn_bundle, gdn_scratch};
+use scratchy_target_cuda::step::{CudaStep, RopeAppendBf16, gdn_bundle, gdn_scratch};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError,
     TapeInput, WeightIx,
@@ -2624,10 +2624,15 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
     let buckets = decode_layer_buckets();
     let mut worker = CudaWorker::new(&device, buckets, &table, POOL, None).expect("worker");
     let one = &buckets[0];
-    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append), CudaStep::AttnDecode(decode)) =
-        (one.steps[5], one.steps[6], one.steps[7])
+    let (
+        CudaStep::RopeAppend(append @ RopeAppendBf16 { q: Some(rope), .. }),
+        CudaStep::AttnDecode(decode),
+    ) = (one.steps[5], one.steps[6])
     else {
-        panic!("steps 5, 6 and 7 of the one-row tape are the rope, the append and the attention");
+        panic!(
+            "steps 5 and 6 of the one-row tape are the append, the query's rope in it, and the \
+             attention"
+        );
     };
     // One row of `cols` bf16 at `at`.
     let span_of = |at: ArenaOffset, cols: usize| ArenaSpan {

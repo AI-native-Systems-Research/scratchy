@@ -81,16 +81,27 @@ fn plan(name: &str, input: LoweringInput) -> CudaPlan {
 }
 
 /// None of the shared fixtures has a `Silu` read by a `Mul` (the layers use the pre-fused
-/// `SiluMul`), so CUDA's gated fold absorbs nothing in any of them. The layers' residual adds fold
-/// into the norm that reads them (#1049's `AddRmsNorm`): one layer's mid-layer add (op 8, into
-/// norm 9), and each of three layers' adds but the last. Nothing else is absorbed.
+/// `SiluMul`), so CUDA's gated fold absorbs nothing in any of them. The residual norms and the q
+/// rope fold at one token: the layers' residual adds into the norm that reads them (#1049's
+/// `AddRmsNorm`: one layer's mid-layer add, op 8 into norm 9, and each of three layers' adds but
+/// the last), and each layer's query rotation into its rope append (FP8 S8 W4c's `Sibling`, op 4
+/// into 5). Nothing else is absorbed.
 #[test]
 fn plan_canonical_folds_only_the_residual_norms_in_the_shared_fixtures() {
     let want: [(&str, &[(usize, usize)]); 2] = [
-        ("one_layer", &[(8, 9)]),
+        ("one_layer", &[(4, 5), (8, 9)]),
         (
             "n_layer(3)",
-            &[(8, 9), (14, 15), (23, 24), (29, 30), (38, 39)],
+            &[
+                (4, 5),
+                (8, 9),
+                (14, 15),
+                (19, 20),
+                (23, 24),
+                (29, 30),
+                (34, 35),
+                (38, 39),
+            ],
         ),
     ];
     for (name, input) in fixtures() {
@@ -99,7 +110,7 @@ fn plan_canonical_folds_only_the_residual_norms_in_the_shared_fixtures() {
         assert_eq!(
             p.folds.absorbed_ops(),
             absorbed,
-            "{name}: only the residual norms fold"
+            "{name}: the residual norms and the q rope fold at one token"
         );
         assert!(
             p.colouring.count().get() >= 1,

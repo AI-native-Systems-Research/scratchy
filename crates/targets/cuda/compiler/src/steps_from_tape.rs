@@ -21,7 +21,7 @@ use scratchy_subtile::subtile_ir::{
 use scratchy_subtile::subtile_ir::{TensorRegion, TensorShape};
 use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, SlotId};
 use scratchy_subtile::tape_colouring::{Colour, TapeColouring};
-use scratchy_subtile::tape_folding::{FusedShape, Fusion, TapeFolds};
+use scratchy_subtile::tape_folding::{FusedShape, Fusion, StepRole, TapeFolds};
 use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_COUNTS};
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
@@ -33,10 +33,11 @@ use scratchy_target_cuda::step::{
     GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
     GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
     GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GroupKind,
-    GroupMember, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight,
-    NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    GroupMember, HeadNorms, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16,
+    MoeWeight, NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
+    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ,
+    RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS,
+    ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -293,12 +294,121 @@ pub fn lower_fused(
         CudaFusion::GateUpSiluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Silu),
         CudaFusion::GateUpGeluMul => gate_up_act(cx, s, fusion.shape, computes, GatedOp::Gelu),
         CudaFusion::ExpertGateUpAct => expert_gate_up_act(cx, s, fusion.shape, computes),
+        CudaFusion::RopeAppendSibling | CudaFusion::RopeAppendNormed => {
+            rope_append_folded(cx, s, computes).map(CudaStep::RopeAppend)
+        }
         // A one-row matvec's residual add is no command of its own: [`lower_driver`] lowers the
         // matvec, whose lowering reads it ([`folded_residual`]).
         CudaFusion::GemvFp8Residual | CudaFusion::GemvResidual => {
             Err(CanonicalRefusal::FusionShape { step: s.step })
         }
     }
+}
+
+/// A `RopeAppend` with the folds its rope sweep applied (FP8 S8 W4c), every one the step drives,
+/// in order: the query rotation it absorbed (`Sibling`: that [`RopeBf16`] on its own becomes
+/// [`RopeAppendBf16::q`], at the append's table, head dim, rotated width and pairing), and Gemma's
+/// per-head norms (`NormedRope`: the q and k RMSNorms and the V unit norm it absorbed; `q.x`, `k`
+/// and `v` become the raw projections, the gains [`RopeAppendBf16::norms`]). Each absorbed step is
+/// lowered as the step it is on its own and must match: head views of the step's head dim, the
+/// stored gain convention and one `eps`.
+fn rope_append_folded(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    computes: &[TapeStep<'_>],
+) -> Result<RopeAppendBf16, CanonicalRefusal> {
+    let refused = || CanonicalRefusal::FusionShape { step: s.step };
+    // The absorbed query rotation first: it is earlier on the tape, so its refusal is the first.
+    let sibling = (cx.folds.driven(s.writes).iter()).find_map(|f| match f.shape {
+        FusedShape::Sibling { sibling } => Some(sibling),
+        _ => None,
+    });
+    let q_rope = match sibling {
+        Some(sibling) => match lower_step(cx, absorbed_step(s, sibling, computes)?, computes)? {
+            Some(CudaStep::Rope(q)) => Some(q),
+            Some(_) | None => return Err(refused()),
+        },
+        None => None,
+    };
+    let Some(CudaStep::RopeAppend(mut r)) = lower_step(cx, s, computes)? else {
+        return Err(refused());
+    };
+    for f in cx.folds.driven(s.writes) {
+        match f.shape {
+            FusedShape::Sibling { .. } => {
+                let Some(q) = q_rope else {
+                    return Err(refused());
+                };
+                let same = (q.table, q.rows, q.head_dim, q.rot_dim, q.pairing)
+                    == (r.table, r.rows, r.head_dim, r.rot_dim, r.pairing);
+                if !same || r.q.is_some() {
+                    return Err(refused());
+                }
+                r.q = Some(RopeQ {
+                    x: q.x,
+                    out: q.out,
+                    cols: q.cols,
+                });
+            }
+            FusedShape::NormedRope {
+                q,
+                k,
+                v,
+                q_gain,
+                k_gain,
+            } => {
+                let (Some(qg), Some(kg)) = (q_gain, k_gain) else {
+                    return Err(refused());
+                };
+                let lowered = |slot: SlotId| -> Result<Option<CudaStep>, CanonicalRefusal> {
+                    lower_step(cx, absorbed_step(s, slot, computes)?, computes)
+                };
+                let (Some(CudaStep::RmsNorm(qn)), Some(CudaStep::RmsNorm(kn))) =
+                    (lowered(qg.step)?, lowered(kg.step)?)
+                else {
+                    return Err(refused());
+                };
+                // The V unit norm the fold absorbed: the one RmsNormUnit absorbed into this step.
+                let mut units = (computes.iter()).filter(|c| {
+                    matches!(c.node.op, SubOp::RmsNormUnit { .. })
+                        && cx.folds.role(c.writes) == StepRole::Absorbed { into: s.writes }
+                });
+                let (Some(unit), None) = (units.next(), units.next()) else {
+                    return Err(refused());
+                };
+                let Some(CudaStep::RmsNormUnit(vn)) = lower_step(cx, unit, computes)? else {
+                    return Err(refused());
+                };
+                let Some(rq) = r.q.as_mut() else {
+                    return Err(refused());
+                };
+                let heads = |n: u32, cols: u32| n.checked_mul(r.head_dim) == Some(cols);
+                let ok = (qn.cols, kn.cols, vn.cols) == (r.head_dim, r.head_dim, r.head_dim)
+                    && heads(qn.rows, rq.cols)
+                    && heads(kn.rows, r.cols)
+                    && heads(vn.rows, r.cols)
+                    && (qn.convention, kn.convention)
+                        == (GainConvention::Scale, GainConvention::Scale)
+                    && qn.eps_bits == kn.eps_bits
+                    && qn.eps_bits == vn.eps_bits
+                    && r.norms.is_none();
+                if !ok {
+                    return Err(refused());
+                }
+                let at = arena(cx)?;
+                rq.x = at(colour_of(cx, q));
+                r.k = at(colour_of(cx, k));
+                r.v = at(colour_of(cx, v));
+                r.norms = Some(HeadNorms {
+                    q_gain: qn.gain,
+                    k_gain: kn.gain,
+                    eps_bits: qn.eps_bits,
+                });
+            }
+            _ => return Err(refused()),
+        }
+    }
+    Ok(r)
 }
 
 /// Lower a `Compute` that drives the folds `driven` (in the order they were applied): the last
@@ -1101,6 +1211,8 @@ fn rope_append(
         head_dim,
         rot_dim,
         pairing: class.pairing,
+        q: None,
+        norms: None,
     })
 }
 

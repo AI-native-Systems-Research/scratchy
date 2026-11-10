@@ -993,6 +993,41 @@ pub struct RopeAppendBf16 {
     /// As [`RopeBf16::pairing`].
     #[serde(serialize_with = "serialize_rope_pairing")]
     pub pairing: RopePairing,
+    /// The query rope the step also computes (FP8 S8 W4c, the one-row bucket's `Sibling` fold):
+    /// `q.out = rope(q.x)` over `[rows, q.cols]` at this step's table, head dim, rotated width and
+    /// pairing. `None`: the query rope is its own [`CudaStep::Rope`].
+    pub q: Option<RopeQ>,
+    /// The per-head norms the step applies before the rope (FP8 S8 W4c, Gemma's `NormedRope`
+    /// fold): `q.x`'s and `k`'s heads by their RMSNorm (`q_gain`, `k_gain`), `v`'s by the unit
+    /// norm, each at `eps`; `k` and `v` (and `q.x`) are then the raw projections. `None` on every
+    /// other step.
+    pub norms: Option<HeadNorms>,
+}
+
+/// A query rope folded into its layer's [`RopeAppendBf16`] (FP8 S8 W4c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RopeQ {
+    pub x: ArenaOffset,
+    pub out: ArenaOffset,
+    pub cols: u32,
+}
+
+/// The per-head norms a [`RopeAppendBf16`] applies (FP8 S8 W4c, Gemma's): q's and k's RMSNorm
+/// gains (`[head_dim]` bf16 weights, the stored-gain convention, offset 0) and V's unit norm, all
+/// at `eps`. The normed V is appended to the cache only: the decode attention reads the cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct HeadNorms {
+    pub q_gain: WeightIx,
+    pub k_gain: WeightIx,
+    /// `eps` as its bits (`f32::to_bits`), so the step is `Eq`.
+    pub eps_bits: u32,
+}
+
+impl HeadNorms {
+    /// The norms' `eps`.
+    pub const fn eps(&self) -> f32 {
+        f32::from_bits(self.eps_bits)
+    }
 }
 
 /// Causal GQA attention of `q [rows, q_heads · head_dim]` over layer `layer`'s paged K/V cache,

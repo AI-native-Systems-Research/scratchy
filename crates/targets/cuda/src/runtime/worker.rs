@@ -633,6 +633,13 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
     {
         return Some("MoeRoute");
     }
+    // shortcut: a rope append with its folded query rope or head norms (FP8 S8 W4c) is refused
+    // until its kernel lands in the next commit, so no launch drops them; upgrade by launching it.
+    if let CudaStep::RopeAppend(r) = *s
+        && (r.q.is_some() || r.norms.is_some())
+    {
+        return Some("RopeAppend");
+    }
     None
 }
 
@@ -2082,6 +2089,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     head_dim,
                     rot_dim,
                     pairing,
+                    ..
                 }) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;

@@ -2900,6 +2900,8 @@ mod tests {
             head_dim: 256,
             rot_dim: 64,
             pairing: RopePairing::HalfRotated,
+            q: None,
+            norms: None,
         })
     }
 

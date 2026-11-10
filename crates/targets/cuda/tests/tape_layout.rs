@@ -41,7 +41,7 @@ use scratchy_subtile::subtile_ir::{
     AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
 use scratchy_subtile::subtile_tape::Instr;
-use scratchy_target_cuda::step::{CudaStep, GemmBf16, GemmGroupBf16};
+use scratchy_target_cuda::step::{CudaStep, GemmBf16, GemmGroupBf16, RopeAppendBf16};
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput, WeightIx,
 };
@@ -1458,14 +1458,13 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
     );
     assert_eq!(a.block_table, kv.block_table.offset);
     assert_eq!(a.sequence, kv.sequence.offset);
-    // The steps `tape_player`'s decode test reads: the query's rope, the append, the attention;
-    // the projections GEMVs (q, k and v one grouped GEMV, #1049), the residual add in the o
-    // projection's epilogue (FP8 S8 W4a).
+    // The steps `tape_player`'s decode test reads: the rope append with the query's rope folded in
+    // (FP8 S8 W4c), the attention; the projections GEMVs (q, k and v one grouped GEMV, #1049), the
+    // residual add in the o projection's epilogue (FP8 S8 W4a).
     assert!(matches!(
-        c.steps[5..8],
+        c.steps[5..7],
         [
-            CudaStep::Rope(_),
-            CudaStep::RopeAppend(_),
+            CudaStep::RopeAppend(RopeAppendBf16 { q: Some(_), .. }),
             CudaStep::AttnDecode(_)
         ]
     ));
@@ -1475,21 +1474,21 @@ fn a_one_row_attention_lowers_to_the_decode_attention() {
         c.steps[1]
     );
     assert!(
-        matches!(c.steps[9], CudaStep::Gemv(GemmBf16 { m: 1, residual, .. }) if residual.is_some()),
-        "step 9: {:?}",
-        c.steps[9]
+        matches!(c.steps[8], CudaStep::Gemv(GemmBf16 { m: 1, residual, .. }) if residual.is_some()),
+        "step 8: {:?}",
+        c.steps[8]
     );
     // That test reads `qn` (the rope's input), `kr` and `v` (the append's) and `attn` back from
     // the arena after the forward: no step after the one writing each overwrites it.
-    let (CudaStep::Rope(rope), CudaStep::RopeAppend(append)) = (c.steps[5], c.steps[6]) else {
+    let CudaStep::RopeAppend(append @ RopeAppendBf16 { q: Some(rope), .. }) = c.steps[5] else {
         unreachable!("matched above");
     };
     let row = |at: ArenaOffset, cols: u32| span(at.0, 2 * u64::from(cols));
     for (what, read, from) in [
         ("qn", row(rope.x, rope.cols), 5),
-        ("kr", row(append.k_out, append.cols), 6),
-        ("v", row(append.v, append.cols), 6),
-        ("attn", row(a.out, a.q_heads * a.head_dim), 7),
+        ("kr", row(append.k_out, append.cols), 5),
+        ("v", row(append.v, append.cols), 5),
+        ("attn", row(a.out, a.q_heads * a.head_dim), 6),
     ] {
         for (i, s) in c.steps.iter().enumerate().skip(from + 1) {
             let e = s.extents().expect("extents fit");

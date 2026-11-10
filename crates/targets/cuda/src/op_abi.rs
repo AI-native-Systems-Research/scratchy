@@ -22,7 +22,9 @@ use scratchy_subtile::ops::SubOpKind;
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsFacts};
 use scratchy_subtile::subtile_ir::{EwKind, ExpertBundle, ExpertProj, OpStage, RopeForm, SubOp};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
-use scratchy_subtile::tape_folding::{ColsBand, FoldPattern, FusionTable, GatedKernel};
+use scratchy_subtile::tape_folding::{
+    ColsBand, CountedOperands, FoldPattern, FusionTable, GatedKernel,
+};
 use scratchy_subtile::tape_steps::OperandIx;
 
 // ── The colour rule ─────────────────────────────────────────────────
@@ -191,6 +193,12 @@ pub enum CudaFusion {
     GemvFp8Residual,
     /// [`Self::GemvFp8Residual`] on the bf16 GEMV (the 35B's GDN `out_proj`, kept bf16).
     GemvResidual,
+    /// The query rotation folded into its layer's rope and append (the shared `Sibling`, FP8 S8
+    /// W4c): one step computes the q rope, the k rope and the K/V append.
+    RopeAppendSibling,
+    /// Gemma's per-head q and k RMSNorms and the V unit norm folded into that step (the shared
+    /// `NormedRope`, FP8 S8 W4c): the step reads the raw projections.
+    RopeAppendNormed,
 }
 
 /// Whether CUDA folds a gated MLP's gate and up projections into its activation
@@ -261,10 +269,17 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
 /// GEMV that normalises its own row does it in every CTA, 23-63 µs a launch at the 27B shapes, more
 /// than the norm's launch it saves (/tmp/d-w4.md §1; the user's decision of 2026-11-09).
 pub const CUDA_FUSIONS_ONE_ROW: FusionTable<CudaFusion> = FusionTable {
-    counted: &[],
+    // A decode attention's operands from 1 on are no consumer edges (Metal's row): its new K and V
+    // (operands 3 and 4) name what its layer's append wrote, the cache its kernel reads. So the V
+    // unit norm has one consumer, the append, and `NormedRope` can take it.
+    counted: &[CountedOperands {
+        kind: SubOpKind::AttnDecode,
+        before: OperandIx(1),
+    }],
     sweeps: &[
         CUDA_SWEEP_ONE_ROW_GROUPS,
         CUDA_SWEEP,
+        CUDA_SWEEP_ONE_ROW_ROPE,
         &[FoldPattern::ExpertActivation {
             act: SubOpKind::ExpertGatedAct,
             matmul: SubOpKind::ExpertMatmul,
@@ -310,6 +325,25 @@ const CUDA_SWEEP_ONE_ROW_GROUPS: &[FoldPattern<CudaFusion>] = &[
         add: SubOpKind::Add,
         gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
         kernel: CudaFusion::GemvResidual,
+    },
+];
+
+/// The one-row bucket's rope sweep (FP8 S8 W4c, the user's decisions of 2026-11-09): the query
+/// rotation folds into its layer's rope and append (`Sibling`, every model), then Gemma's per-head
+/// q and k norms and V unit norm into that step (`NormedRope`, Metal's row: it fires only where V
+/// is a single-consumer unit norm, so on Gemma's sliding layers; its global layers' V reads the
+/// same per-head K projection as the k norm, which the pattern does not take).
+const CUDA_SWEEP_ONE_ROW_ROPE: &[FoldPattern<CudaFusion>] = &[
+    FoldPattern::Sibling {
+        driver: SubOpKind::RopeAppend,
+        sibling: SubOpKind::RopeRotate,
+        kernel: CudaFusion::RopeAppendSibling,
+    },
+    FoldPattern::NormedRope {
+        rope: SubOpKind::RopeAppend,
+        gain_norm: SubOpKind::RmsNorm,
+        unit_norm: SubOpKind::RmsNormUnit,
+        kernel: CudaFusion::RopeAppendNormed,
     },
 ];
 
@@ -488,22 +522,32 @@ mod tests {
     #[test]
     fn cuda_declares_its_folds_per_bucket_and_no_sampled_rows() {
         for table in [&CUDA_FUSIONS, &CUDA_FUSIONS_ONE_ROW] {
-            assert!(table.counted.is_empty());
             assert!(table.rows.is_none());
         }
+        assert!(CUDA_FUSIONS.counted.is_empty());
+        // The one-row table counts a decode attention's operand 0 alone (FP8 S8 W4c, Metal's row).
+        let [
+            CountedOperands {
+                kind: SubOpKind::AttnDecode,
+                before: OperandIx(1),
+            },
+        ] = CUDA_FUSIONS_ONE_ROW.counted
+        else {
+            panic!("the one-row table's counted operands");
+        };
         assert!(CUDA_SAMPLE_ROWS.weights.is_empty());
-        // The one-row table has the residual epilogues' sweep and the experts' sweep (FP8 S8 W4a);
-        // every other bucket's has the one sweep.
-        assert_eq!(cuda_fusions(1).sweeps.len(), 3);
+        // The one-row table has the residual epilogues' sweep, the rope sweep (FP8 S8 W4a, W4c) and
+        // the experts' sweep; every other bucket's has the one sweep.
+        assert_eq!(cuda_fusions(1).sweeps.len(), 4);
         for m in [2, 512, 4096] {
             assert_eq!(cuda_fusions(m).sweeps.len(), 1, "m={m}");
         }
         let [sweep] = CUDA_FUSIONS.sweeps else {
             panic!("expected one sweep, got {}", CUDA_FUSIONS.sweeps.len());
         };
-        let [groups, first, experts] = CUDA_FUSIONS_ONE_ROW.sweeps else {
+        let [groups, first, rope, experts] = CUDA_FUSIONS_ONE_ROW.sweeps else {
             panic!(
-                "expected three one-row sweeps, got {}",
+                "expected four one-row sweeps, got {}",
                 CUDA_FUSIONS_ONE_ROW.sweeps.len()
             );
         };
@@ -514,6 +558,10 @@ mod tests {
         assert!(
             std::ptr::eq(*first, *sweep) && std::ptr::eq(*sweep, CUDA_SWEEP),
             "the one-row table's second sweep is the sweep"
+        );
+        assert!(
+            std::ptr::eq(*rope, CUDA_SWEEP_ONE_ROW_ROPE),
+            "the one-row table's third sweep is the rope's"
         );
         assert!(
             matches!(

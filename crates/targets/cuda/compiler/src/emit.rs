@@ -99,6 +99,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "GateSplitBf16",
                 "GateApplyBf16",
                 "RopeAppendBf16",
+                "RopeQ",
+                "HeadNorms",
                 "AttnPrefillBf16",
                 "GatedDeltaNetBf16",
                 "RouterLogitsBf16",

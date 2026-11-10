@@ -294,6 +294,8 @@ const fn rope_append(
         head_dim: HD,
         rot_dim: R,
         pairing: RopePairing::HalfRotated,
+        q: None,
+        norms: None,
     })
 }
 
