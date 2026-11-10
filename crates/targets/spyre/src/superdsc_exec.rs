@@ -632,6 +632,14 @@ fn h2d_run(offset: u64, len: u64) -> (u64, u64) {
 /// The H2D window alignment [`h2d_run`] rounds to.
 const H2D_ALIGN: u64 = 4096;
 
+/// The fill window step — `zero_seg`'s own walk step, shared by `prepare`'s device-side
+/// zero fills so both submit the same single-chunk window shapes (the window size only
+/// sets how many fill control blocks the walk submits; no host buffer rides the fill).
+const FILL_WINDOW: std::num::NonZeroU64 = match std::num::NonZeroU64::new(64 << 20) {
+    Some(w) => w,
+    None => unreachable!(),
+};
+
 /// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
 /// whatever page size the host actually uses.
 const HOST_PAGE: usize = 4096;
@@ -892,6 +900,15 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     prepared: bool,
     staged_host: bool,
     n_weights_staged: usize,
+    /// ⭐ THE STAGED EXTENT OF EVERY SLOT (segments then extra weight banks, the
+    /// `slot_of` order): one past the last byte `stage_weights` wrote into that
+    /// slot's shadow. A slot whose extent is 0 holds ONLY the zeros its shadow was
+    /// born with — `prepare` zero-fills that slot's region ON THE DEVICE
+    /// ([`Stream::fill_zero`], ~62 GB/s measured) instead of pushing those zeros
+    /// over the host→device wire (~6-7 GB/s), which for the KV pool alone is
+    /// ~10 GB of wire time. Recorded by [`Executor::stage_weights`] so the one
+    /// pass that writes the shadows is the one pass that measures them.
+    staged_extent: Vec<u64>,
     /// ⭐ TENSORDUMP STATE (`SCRATCHY_SDSC_TENSORDUMP`): this session's last-seen bytes per placed
     /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
     /// and its own op counter. `None` unless the env gate is set.
@@ -1256,6 +1273,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
+            staged_extent: Vec::new(),
             dump: None,
             step_images: StepImageCache::default(),
             seat,
@@ -2276,6 +2294,19 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         });
 
         self.n_weights_staged = n_items;
+        // ⭐ THE STAGED EXTENT PER SLOT, recorded by the one pass that knows it: one past the
+        //    last byte the items write into each slot's shadow. Everything past this in a
+        //    shadow is the zero it was born with, which is exactly what `prepare`'s
+        //    device-side fill replaces the zero-push for.
+        let n_slots = NUM_SEGMENTS + self.weight_bank_bytes.len();
+        let mut extent = vec![0u64; n_slots];
+        for it in &items {
+            let end = (it.offset + it.src.len()) as u64;
+            if end > extent[it.slot] {
+                extent[it.slot] = end;
+            }
+        }
+        self.staged_extent = extent;
         self.staged_host = true;
         Ok(())
     }
@@ -2456,10 +2487,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let n_weights = self.n_weights_staged;
         lap("weight-convert", &mut t0);
 
-        // ── H2D every tensor-segment region ONCE (weights staged in seg1; the rest zero-init).
-        //    Activations refill per predict. ──
+        // ── SEND every tensor-segment region's content ONCE (weights staged in seg1; the rest
+        //    zero-init). A slot NOTHING was staged into holds only its shadow's born-zeros —
+        //    those go out as a DEVICE-SIDE FILL ([`Stream::fill_zero`], ~62 GB/s measured)
+        //    instead of host-pushed H2D bytes (~6-7 GB/s), which for the KV pool alone is
+        //    ~10 GB of wire time on a 2b model. Activations refill per predict. ──
         for i in 0..NUM_SEGMENTS {
-            // BORROWED: the owner already H2D'd this region and `alias_seg` is about to point us at
+            // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
             // shadow over the owner's live data would be WRONG.
             if self.seg_borrowed[i] {
@@ -2471,6 +2505,17 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 continue;
             }
             let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
+            let staged = self.staged_extent.get(i).copied().unwrap_or(0);
+            if staged == 0 {
+                // The same walk `zero_seg` submits: 64 MiB single-chunk windows, every
+                // byte the region owns, none it does not. No host buffer rides the fill.
+                for w in addr.windows(FILL_WINDOW) {
+                    stream
+                        .fill_zero(&w)
+                        .map_err(|e| anyhow!("prepare: seg{i} zero fill: {e}"))?;
+                }
+                continue;
+            }
             // The shadow was grown to the device extent by the loop above, so this slice is the
             // whole region — and taking it AS A SLICE is what proves the H2D cannot read past the
             // shadow. `get` rather than `[..]`: a short shadow is a wiring bug to report, not a
@@ -2481,7 +2526,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 .map_err(|e| anyhow!("prepare: seg{i} H2D: {e}"))?;
         }
         // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own conditions — it is the same
-        // segment, so "borrowed" and "nothing bound" mean the same thing for it.
+        // segment, so "borrowed" and "nothing bound" mean the same thing for it. A bank holds only
+        // weights by construction, so its staged extent is never 0 unless it is empty — the same
+        // routing applies regardless.
         if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
             for b in 0..self.weight_bank_bytes.len() {
                 let (stream, addr) = (
@@ -2490,6 +2537,19 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         .as_ref()
                         .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
                 );
+                let staged = self
+                    .staged_extent
+                    .get(NUM_SEGMENTS + b)
+                    .copied()
+                    .unwrap_or(0);
+                if staged == 0 {
+                    for w in addr.windows(FILL_WINDOW) {
+                        stream
+                            .fill_zero(&w)
+                            .map_err(|e| anyhow!("prepare: weight bank {} zero fill: {e}", b + 1))?;
+                    }
+                    continue;
+                }
                 let src = whole_shadow(&self.weight_bank_host[b], addr, NUM_SEGMENTS + b)?;
                 stream
                     .h2d(src, addr)
@@ -5287,9 +5347,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         // The window size only sets how many fill control blocks the walk submits (each is a
         // fixed enqueue cost on both host and device); no host buffer rides the fill.
-        const CHUNK: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
         let stream = self.stream_ref()?;
-        for win in addr.windows(CHUNK) {
+        for win in addr.windows(FILL_WINDOW) {
             stream
                 .fill_zero(&win)
                 .map_err(|e| anyhow!("zero fill (seg{i}): {e}"))?;
