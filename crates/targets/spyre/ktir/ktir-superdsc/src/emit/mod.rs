@@ -28,9 +28,10 @@ use crate::placement::{BundleLayout, SegRole, align128};
 use crate::sdsc_abstract::{FlatTag, KindTag, RowBlockedTag, StickKind, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
-    IndirectRole, ItDim, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet,
-    StickExtent, TensorArg, USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
+    Allocation, AnyTensorArg, ArgView, DataFormat, DeviceAxis, DeviceTileLayout, Df, Fp8, Fp16,
+    Fp32, IndirectRole, ItDim, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec, Role, Scale,
+    SdscFoldSet, StickExtent, TensorArg, USABLE_LX_BYTES, Window, WorkPlan,
+    assert_df_stick_multiple,
 };
 use crate::wire::{
     AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs, LayoutInfo,
@@ -121,7 +122,7 @@ pub(crate) fn view_stick_layout(
         &view
             .device_extent
             .iter()
-            .map(|o| o.map(|p| p as usize))
+            .map(|&a| a.declared().map(|p| p as usize))
             .collect::<Vec<_>>(),
         view.layout
             .iter()
@@ -257,7 +258,7 @@ fn per_core_addr(
         &view
             .device_extent
             .iter()
-            .map(|o| o.map(|p| p as usize))
+            .map(|&a| a.declared().map(|p| p as usize))
             .collect::<Vec<_>>(),
         layout
             .iter()
@@ -2443,7 +2444,7 @@ pub fn declared_axis_block_steps(v: &crate::superdsc_opspec::ArgView, iter: &Wor
             .collect::<Vec<_>>(),
         &v.device_extent
             .iter()
-            .map(|o| o.map(|p| p as usize))
+            .map(|&a| a.declared().map(|p| p as usize))
             .collect::<Vec<_>>(),
         stick_idx,
         &(0..v.layout.len())
@@ -2865,7 +2866,13 @@ fn own_extent_at(
     phys_extent: &impl Fn(&'static str) -> i64,
 ) -> i64 {
     let collapsed = !v.scale.get(i).is_none_or(Scale::is_active);
-    if collapsed && v.device_extent.get(i).copied().flatten().is_none() {
+    if collapsed
+        && v.device_extent
+            .get(i)
+            .copied()
+            .and_then(DeviceAxis::declared)
+            .is_none()
+    {
         1
     } else {
         phys_extent(v.layout[i])
@@ -3025,7 +3032,12 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         // exactly to this op's shape (the overwhelmingly common, and until now ONLY, case).
         let phys_extent = |d: &'static str| -> i64 {
             let idx = v.layout.iter().position(|&ld| ld == d);
-            let ov = idx.and_then(|i| v.device_extent.get(i).copied().flatten());
+            let ov = idx.and_then(|i| {
+                v.device_extent
+                    .get(i)
+                    .copied()
+                    .and_then(DeviceAxis::declared)
+            });
             ov.map(|p| p as i64)
                 .unwrap_or_else(|| op.iter.extent(d) as i64)
         };
@@ -3153,7 +3165,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
             .device_extent
             .get(si)
             .copied()
-            .flatten()
+            .and_then(DeviceAxis::declared)
             .map(|p| p as i64)
             .unwrap_or_else(|| op.iter.extent(tiled_dim) as i64);
         if phys > out_per_time && affine_strides[ti].get(tiled_dim).copied().unwrap_or(0) == 0 {
@@ -4025,7 +4037,7 @@ pub fn emit_sdsc(
                     &swept,
                     &v.device_extent
                         .iter()
-                        .map(|o| o.map(|p| p as usize))
+                        .map(|&a| a.declared().map(|p| p as usize))
                         .collect::<Vec<_>>(),
                     stick_pos,
                     &vec![true; v.layout.len()],
@@ -5272,7 +5284,20 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
         if let Some(w) = w {
             arg.set_offset_elems(w.dev().into_raw_elems());
             if !w.spans_one_stick() {
-                arg.set_device_extent("mb", w.parent_rows());
+                // The band's rows are a WINDOW of the parent's: the swept extent is the band's
+                // `rows`, the allocation (and the view's physical extent along `mb`) the parent's.
+                // `Window::cap` collapses to `Swept` when the parent is no wider than the band —
+                // the same statement in its second spelling, byte for byte.
+                let axis = Window::cap(rows, w.parent_rows(), w.parent_rows()).map_err(|e| {
+                    crate::superdsc_error::SuperDscError(format!(
+                        "assemble_convert_band {op_name}: {e}"
+                    ))
+                })?;
+                arg.set_axis("mb", axis).map_err(|e| {
+                    crate::superdsc_error::SuperDscError(format!(
+                        "assemble_convert_band {op_name}: {e}"
+                    ))
+                })?;
             }
         }
     }

@@ -1015,7 +1015,7 @@ impl WorkPlan {
     /// (`build_coordinates` → `plan.extent / plan.split_of`) and the per-core START
     /// (`per_core_addr` → `WorkPlan::corner_elems`, which is `slice_idx · per_core_extent`). Only the
     /// first two go through [`crate::sdsc_abstract::DeviceExtents::of_view`], so a declared extent
-    /// (`TensorArg::with_device_extent`) reaches two of them and is DROPPED by the other two — which is
+    /// (`TensorArg::with_axis`) reaches two of them and is DROPPED by the other two — which is
     /// exactly how the index came to declare 2048 entries and a 256-byte per-core step. Handing the
     /// index view a plan of its own makes all four read ONE number; there is no per-reader division to
     /// forget.
@@ -2231,6 +2231,94 @@ pub struct DeviceOrderView<'a> {
     pub positions: &'a [usize],
 }
 
+/// ⭐ WHAT ONE AXIS OF A VIEW STATES ABOUT ITS OWN ALLOCATION — swept whole, or a WINDOW of a larger
+/// one. One slot per axis ([`TensorArg::device_extent`]), written only through [`TensorArg::with_axis`].
+///
+/// * [`DeviceAxis::Swept`] — the allocation's extent along the axis IS the swept extent: the
+///   overwhelmingly common case, a tensor allocated exactly to the shape this one op
+///   produces/consumes.
+/// * [`DeviceAxis::Window`] — the axis is a WINDOW of a larger allocation, the view's own physical
+///   extent along it the cap. Every address reader (the arrangement, the per-core start, the
+///   footprint, the time-tile strides) takes the value through [`DeviceAxis::declared`], so
+///   address/stride derivation for that dim uses the cap, not the op's logical extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAxis {
+    /// The allocation's extent along the axis IS the swept extent.
+    Swept,
+    /// A window of an allocation, its view capped at [`Window::phys`] elements along the axis.
+    /// Built only by [`Window::cap`], which proves the view fits its allocation and covers the
+    /// sweep.
+    Window(Window),
+}
+
+impl DeviceAxis {
+    /// The physical extent an ADDRESS reads along the axis — `None` when the allocation's extent
+    /// IS the swept one (no override; every reader falls back to the op's own iteration extent).
+    pub fn declared(self) -> Option<u32> {
+        match self {
+            DeviceAxis::Swept => None,
+            DeviceAxis::Window(w) => Some(w.phys()),
+        }
+    }
+}
+
+/// ⭐ A WINDOW'S CAP — built ONCE, from the axis's swept extent, the allocation's declared extent
+/// and the view's physical extent ([`Window::cap`]), and only there. Every reader takes the value
+/// through [`DeviceAxis::declared`]; nothing re-derives it. The constructor's contract:
+///
+/// * `phys < swept` — REFUSED, at every site: the walk would describe less memory than the op
+///   reads. This is the state the typed slot makes unrepresentable: a view smaller than the sweep
+///   cannot be stated, where the `Option<u32>` it replaces accepted it silently.
+/// * `phys > declared` — REFUSED, where the site states an allocation distinct from the view: the
+///   view exceeds its allocation (out of bounds). At the sites whose allocation IS the view's own
+///   (`declared == phys`) this refusal cannot bind; their live refusals are `phys < swept` and the
+///   Swept collapse.
+/// * `phys == swept` — the window IS the sweep: the constructor yields [`DeviceAxis::Swept`], the
+///   same statement in its second spelling (one fact, one source).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    phys: u32,
+}
+
+impl Window {
+    /// The one constructor: the view's physical extent `phys` on an axis the op sweeps `swept` of,
+    /// in an allocation declaring `declared` along it. Refuses a view that fails to cover the
+    /// sweep (`phys < swept`) and one that exceeds its allocation (`phys > declared`). At
+    /// `phys == swept` yields [`DeviceAxis::Swept`].
+    pub fn cap(swept: u32, declared: u32, phys: u32) -> Result<DeviceAxis, SuperDscError> {
+        if phys > declared {
+            return Err(SuperDscError(format!(
+                "a window cap of {phys} on an axis declared {declared} — the view exceeds its \
+                 allocation"
+            )));
+        }
+        if phys < swept {
+            return Err(SuperDscError(format!(
+                "a window cap of {phys} on an axis swept {swept} — the walk would describe \
+                 less memory than the op reads"
+            )));
+        }
+        Ok(if phys == swept {
+            DeviceAxis::Swept
+        } else {
+            DeviceAxis::Window(Window { phys })
+        })
+    }
+
+    /// The view's physical extent along the axis.
+    pub fn phys(self) -> u32 {
+        self.phys
+    }
+}
+
+/// ⭐ ONE AXIS OF ONE VIEW'S LAYOUT — a typed index, minted only by [`TensorArg::axis`], which looks
+/// the dim up once. [`TensorArg::with_axis`] takes it, so the one per-axis setter never looks a name
+/// up by position, and an index is in range for its view's rank by its `D`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutAxis<const D: usize> {
+    idx: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct TensorArg<const D: usize> {
     is_input: bool,
@@ -2264,17 +2352,15 @@ pub struct TensorArg<const D: usize> {
     /// convert) yet ADDRESS RowBlocked (the residual is RowBlocked, and a flat rank-3 read row-mixes). Default
     /// `false` = rank-based (`for_view_df`). Set via [`TensorArg::with_row_blocked`].
     row_blocked: bool,
-    /// Per-dim PHYSICAL device extent, distinct from this op's own iteration-space view of that dim
-    /// (`device_dims`/`op.iter.extent`) — torch-spyre's `arg.device_size` (`superdsc.py:447-469`), which
-    /// every stride/offset is derived from, NOT from `iteration_space[dim]`. `None` at an index means
-    /// "this tensor's physical extent for that dim IS the op's own iteration extent" (the overwhelmingly
-    /// common case — a tensor allocated exactly to the shape this one op produces/consumes), so every
-    /// existing call site is a no-op (`[None; D]` from `TensorArg::new`). `Some(phys)` declares the tensor
-    /// is actually a slice/reuse of a LARGER physical allocation along that dim (`phys > it_dim_size`) —
-    /// torch-spyre's `dev_dim_size > it_dim_size` case — so address/stride derivation for that dim must use
-    /// `phys`, not the op's logical extent, mirroring torch-spyre's `strides[dim] = strides[dim] //
-    /// dev_dim_size * it_dim_size` rescale exactly. Set via [`TensorArg::with_device_extent`].
-    device_extent: [Option<u32>; D],
+    /// What each axis states about its own allocation ([`DeviceAxis`]) — swept whole by default
+    /// (`[DeviceAxis::Swept; D]`), a window of a larger one only through [`TensorArg::with_axis`]
+    /// with a [`DeviceAxis`] built by [`Window::cap`]. Readers take the value through
+    /// [`DeviceAxis::declared`]: `None` (swept) means "physical extent == this op's own iteration
+    /// extent for that dim"; `Some(phys)` means address/stride derivation for that dim uses `phys`,
+    /// not the op's logical extent — torch-spyre's `arg.device_size` (`superdsc.py:447-469`), its
+    /// `dev_dim_size > it_dim_size` case, its `strides[dim] = strides[dim] // dev_dim_size *
+    /// it_dim_size` rescale.
+    device_extent: [DeviceAxis; D],
     /// How this view presents the tensor's own frame, for the arrangement authority ([`ViewFrame`]).
     frame: ViewFrame,
     /// ⭐ THE ORDER dxp READS THIS TENSOR'S DIMS IN, when it is not `layout`'s. dxp takes
@@ -2334,7 +2420,7 @@ impl<const D: usize> TensorArg<D> {
             offset_elems: 0,
             df: Df::Fp16,
             row_blocked: false,
-            device_extent: [None; D],
+            device_extent: [DeviceAxis::Swept; D],
             frame: ViewFrame::Own,
             device_order: None,
         })
@@ -2404,22 +2490,28 @@ impl<const D: usize> TensorArg<D> {
         self
     }
 
-    /// Declare this tensor's TRUE physical device extent for one `layout` dim, distinct from this
-    /// op's own iteration-space view of it — torch-spyre's `arg.device_size` (`superdsc.py:447-469`).
-    /// `dim` must name one of `layout`'s entries (a `cargo build` `Err` otherwise, same discipline as
-    /// [`TensorArg::new`]'s stick-dim witness). Chains off [`TensorArg::new`].
-    pub fn with_device_extent(
-        mut self,
-        dim: &'static str,
-        phys_extent: u32,
-    ) -> Result<TensorArg<D>, SuperDscError> {
+    /// Look up one `layout` dim by name ONCE, as a typed index for [`Self::with_axis`] — a
+    /// `cargo build` `Err` if the dim is not in `layout`, same discipline as [`TensorArg::new`]'s
+    /// stick-dim witness.
+    pub fn axis(&self, dim: &'static str) -> Result<LayoutAxis<D>, SuperDscError> {
         let idx = self.layout.iter().position(|&d| d == dim).ok_or_else(|| {
             SuperDscError(format!(
-                "TensorArg '{}': device_extent dim '{dim}' is not in layout {:?}",
+                "TensorArg '{}': axis dim '{dim}' is not in layout {:?}",
                 self.name, self.layout
             ))
         })?;
-        self.device_extent[idx] = Some(phys_extent);
+        Ok(LayoutAxis { idx })
+    }
+
+    /// State what one axis of this tensor's allocation is ([`DeviceAxis`]) — `Swept` by default;
+    /// a `Window` only as built by [`Window::cap`]. The one per-axis setter. Chains off
+    /// [`TensorArg::new`].
+    pub fn with_axis(
+        mut self,
+        at: LayoutAxis<D>,
+        axis: DeviceAxis,
+    ) -> Result<TensorArg<D>, SuperDscError> {
+        self.device_extent[at.idx] = axis;
         Ok(self)
     }
 }
@@ -2460,9 +2552,8 @@ pub struct ArgView<'a> {
     pub df: Df,
     /// FORCE RowBlocked device addressing regardless of rank (the fp32 island `ElementArrangement`).
     pub row_blocked: bool,
-    /// Per-`layout`-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
-    /// "physical extent == this op's own iteration extent for that dim" (see [`TensorArg::device_extent`]).
-    pub device_extent: &'a [Option<u32>],
+    /// What each `layout` axis states about its own allocation (see [`TensorArg::device_extent`]).
+    pub device_extent: &'a [DeviceAxis],
     /// How the view presents the tensor's own frame ([`ViewFrame`]).
     pub frame: ViewFrame,
     /// The order dxp reads the dims in, innermost first, when it is not `layout`'s (see
@@ -2549,26 +2640,33 @@ impl AnyTensorArg {
         }
     }
 
-    /// Rank-erased [`TensorArg::with_device_extent`] setter — declares one `layout` dim's TRUE
-    /// physical extent on an arg a builder already assembled. For the windowed dense matmul
-    /// (`assemble_matmul_windowed`), whose kernel is a K/N-tiled slice of the caller's own weight
-    /// buffer: the swept `in` extent is the tile's k while the allocation's is the tensor's, and the
-    /// stick-group stride must come from the allocation. PANICS if `dim` is not in the arg's layout,
-    /// same discipline as [`Self::set_scale_for_dim`].
-    pub fn set_device_extent(&mut self, dim: &'static str, phys_extent: u32) {
-        fn set<const D: usize>(t: &mut TensorArg<D>, dim: &'static str, phys_extent: u32) {
-            let idx = t
-                .layout
-                .iter()
-                .position(|&d| d == dim)
-                .unwrap_or_else(|| panic!("set_device_extent: '{dim}' not in {:?}", t.layout));
-            t.device_extent[idx] = Some(phys_extent);
+    /// Rank-erased [`TensorArg::with_axis`] setter — states what one `layout` dim's allocation is,
+    /// on an arg a builder already assembled, with the [`DeviceAxis`] already built by
+    /// [`Window::cap`] at the site that knows the swept/declared/phys facts. For the windowed dense
+    /// matmul (`assemble_matmul_windowed`), whose kernel is a K/N-tiled slice of the caller's own
+    /// weight buffer: the swept `in` extent is the tile's k while the allocation's is the tensor's,
+    /// and the stick-group stride must come from the allocation. A `cargo build` `Err` if `dim` is
+    /// not in the arg's layout, same discipline as [`Self::set_scale_for_dim`].
+    pub fn set_axis(&mut self, dim: &'static str, axis: DeviceAxis) -> Result<(), SuperDscError> {
+        fn set<const D: usize>(
+            t: &mut TensorArg<D>,
+            dim: &'static str,
+            axis: DeviceAxis,
+        ) -> Result<(), SuperDscError> {
+            let idx = t.layout.iter().position(|&d| d == dim).ok_or_else(|| {
+                SuperDscError(format!(
+                    "set_axis: '{dim}' not in {:?} of '{}'",
+                    t.layout, t.name
+                ))
+            })?;
+            t.device_extent[idx] = axis;
+            Ok(())
         }
         match self {
-            AnyTensorArg::R1(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R2(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R3(t) => set(t, dim, phys_extent),
-            AnyTensorArg::R4(t) => set(t, dim, phys_extent),
+            AnyTensorArg::R1(t) => set(t, dim, axis),
+            AnyTensorArg::R2(t) => set(t, dim, axis),
+            AnyTensorArg::R3(t) => set(t, dim, axis),
+            AnyTensorArg::R4(t) => set(t, dim, axis),
         }
     }
 

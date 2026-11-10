@@ -10,7 +10,7 @@ use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
-    Role, Scale, SdscFoldSet, TensorArg,
+    Role, Scale, SdscFoldSet, TensorArg, Window,
 };
 use crate::work::{CoreDivision, EwDivision};
 
@@ -1234,11 +1234,13 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             // A run's sticks are its innermost dim, in dxp's innermost-first order.
             .with_device_order(crate::emit::SprayOrder::Inner.device_layout())
             .map_err(|e| e.0)?;
-            let t = if pitch == run_sticks {
-                t
-            } else {
-                t.with_device_extent("y", pitch).map_err(|e| e.0)?
-            };
+            // A run's sticks sit inside a row `pitch` sticks wide — the `y` axis is a window of
+            // that row. `Window::cap` collapses to `Swept` when the pitch IS the run, so the
+            // guard is the constructor's, not an `if` at the site.
+            let at = t.axis("y").map_err(|e| e.0)?;
+            let t = t
+                .with_axis(at, Window::cap(run_sticks, pitch, pitch).map_err(|e| e.0)?)
+                .map_err(|e| e.0)?;
             Ok(AnyTensorArg::R3(t))
         };
     let input = arg(true, src, src_pitch, src_elems)?;
@@ -1444,8 +1446,8 @@ fn pointwise_opspec_from_tile_split(
     // view's physical extent over the plan's iterated one.
     let output = match out_view.scatter_interleave {
         None => mk(false, o_name, out_view.offset)?,
-        Some(interleave) => AnyTensorArg::R3(
-            TensorArg::<3>::new(
+        Some(interleave) => AnyTensorArg::R3({
+            let t = TensorArg::<3>::new(
                 false,
                 o_name.to_string(),
                 Role::Output,
@@ -1456,10 +1458,16 @@ fn pointwise_opspec_from_tile_split(
                 Allocation::Hbm,
             )
             .map_err(|e| e.0)?
-            .with_offset(out_view.offset)
-            .with_device_extent("y", interleave)
-            .map_err(|e| e.0)?,
-        ),
+            .with_offset(out_view.offset);
+            // The scatter's width W is the physical `y` extent — a window over the op's own
+            // swept `y`, in an allocation exactly W wide.
+            let at = t.axis("y").map_err(|e| e.0)?;
+            t.with_axis(
+                at,
+                Window::cap(plan.extent("y"), interleave, interleave).map_err(|e| e.0)?,
+            )
+            .map_err(|e| e.0)?
+        }),
     };
 
     Ok(OpSpec::new(op, plan, ins, output)
@@ -1726,7 +1734,13 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32));
             let t = match dev_rows {
-                Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                Some(p) => {
+                    // The band's rows are a WINDOW of the parent's row count `p`, in an
+                    // allocation exactly `p` rows wide.
+                    let at = t.axis("mb").map_err(|e| e.0)?;
+                    t.with_axis(at, Window::cap(plan.extent("mb"), p, p).map_err(|e| e.0)?)
+                        .map_err(|e| e.0)?
+                }
                 None => t,
             };
             Ok(AnyTensorArg::R2(t))
@@ -1750,7 +1764,13 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 .with_df(df)
                 .with_row_blocked(matches!(df, Df::Fp32));
                 let t = match dev_rows {
-                    Some(p) => t.with_device_extent("mb", p).map_err(|e| e.0)?,
+                    Some(p) => {
+                        // The band's rows are a WINDOW of the parent's row count `p`, in an
+                        // allocation exactly `p` rows wide.
+                        let at = t.axis("mb").map_err(|e| e.0)?;
+                        t.with_axis(at, Window::cap(plan.extent("mb"), p, p).map_err(|e| e.0)?)
+                            .map_err(|e| e.0)?
+                    }
                     None => t,
                 };
                 // A spray's two row dims go to dxp innermost first.
@@ -2096,20 +2116,26 @@ mod stick_runs_tests {
         }
     }
 
-    /// Each side states its own pitch as `y`'s physical extent, and only where it is not the run.
+    /// Each side states its own pitch as `y`'s window, and only where it is not the run.
     #[test]
     fn each_side_states_its_own_pitch() {
         let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
         let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
         assert_eq!(
-            v[0].device_extent,
-            [None, Some(128), None],
+            v[0].device_extent
+                .iter()
+                .map(|&a| a.declared())
+                .collect::<Vec<_>>(),
+            vec![None, Some(128), None],
             "the source's pitch"
         );
         assert_eq!(
-            v[1].device_extent,
-            [None, None, None],
-            "the destination is dense"
+            v[1].device_extent
+                .iter()
+                .map(|&a| a.declared())
+                .collect::<Vec<_>>(),
+            vec![None, None, None],
+            "the destination is dense — swept, in the constructor's own spelling"
         );
         assert_eq!(
             (v[0].offset_elems, v[1].offset_elems),

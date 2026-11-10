@@ -6,7 +6,7 @@ use super::walk::SharedKernelBmmForm;
 use crate::emit::EmittedOp;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, OperandPlacement, Stk};
-use crate::superdsc_opspec::{DataFormat, Fp16, SdscFoldSet};
+use crate::superdsc_opspec::{DataFormat, Fp16, SdscFoldSet, Window};
 
 /// Assemble a complete SuperDSC for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch
 /// `b`), via the typed [`matmul_opspec`] builder + `emit_sdsc`. PANICS on a
@@ -320,24 +320,26 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
         o_off.into_raw_elems(),
     )
     .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}")))?;
-    // ⛔ THE KERNEL'S OWN `in` EXTENT, and a phys SMALLER than the swept k is a mis-declaration
-    // (the same rule `matmul_opspec_batched_off` states): a window never covers more than its
-    // allocation. Refused here rather than emitting a descriptor whose declared span exceeds the
-    // footprint the placement reserved.
-    if w_in_phys < k.get() {
-        return Err(crate::superdsc_error::SuperDscError(format!(
-            "assemble_matmul {op_name}: kernel `in` physical extent {w_in_phys} is SMALLER than \
-             the swept k {} — a window cannot cover more than its allocation",
-            k.get()
-        )));
-    }
+    // ⛔ THE KERNEL'S OWN `in` EXTENT — the one site whose allocation is DISTINCT from its view:
+    // the swept extent is the tile's k, the allocation (and the view's physical extent along
+    // `in`) the tensor's own `w_in_phys`. A phys SMALLER than the swept k is a mis-declaration
+    // (`Window::cap`'s own refusal, by name): a window never covers more than its allocation —
+    // refused here rather than emitting a descriptor whose declared span exceeds the footprint
+    // the placement reserved.
     if let Some(kernel) = op
         .args_mut()
         .iter_mut()
         .find(|arg| arg.view().name == w_name)
     {
         use super::walk::WalkAxis as _;
-        kernel.set_device_extent(super::walk::InAxis::NAME, w_in_phys);
+        let axis = Window::cap(k.get(), w_in_phys, w_in_phys).map_err(|e| {
+            crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
+        })?;
+        kernel
+            .set_axis(super::walk::InAxis::NAME, axis)
+            .map_err(|e| {
+                crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
+            })?;
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -538,9 +540,12 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     )
     .map_err(crate::superdsc_error::SuperDscError)?;
     // The activation's own stick-group pitch, when it is not the output's: a batch block read on
-    // its own (`a_rows == m`) is a standalone stick-major `[m, k]`.
+    // its own (`a_rows == m`) is a standalone stick-major `[m, k]` — this op sweeps `m` rows of
+    // an `a_rows`-row tensor, undoing the `phys_mb = rows` statement above (the flat frame's
+    // pitch) so the block strides its own rows.
     if shape.a_rows != shape.rows {
-        op.args_mut()[0].set_device_extent("mb", shape.a_rows);
+        let axis = Window::cap(shape.m.get(), shape.a_rows, shape.a_rows)?;
+        op.args_mut()[0].set_axis("mb", axis)?;
     }
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }

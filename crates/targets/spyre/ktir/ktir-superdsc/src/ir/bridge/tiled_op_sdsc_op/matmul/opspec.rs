@@ -10,7 +10,7 @@ use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpSpec, Role,
-    Scale, StickExtent, TensorArg, WorkPlan,
+    Scale, StickExtent, TensorArg, Window, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -486,10 +486,16 @@ where
         // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
         // the flat frame) is addressed with the TENSOR's rows, not the op's.
         let input = match phys_mb {
-            Some(phys) if phys > plan.extent(MbAxis::NAME) => input
-                .with_device_extent(MbAxis::NAME, phys)
-                .map_err(|e| e.0)?,
-            _ => input,
+            Some(phys) => {
+                let at = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
+                input
+                    .with_axis(
+                        at,
+                        Window::cap(plan.extent(MbAxis::NAME), phys, phys).map_err(|e| e.0)?,
+                    )
+                    .map_err(|e| e.0)?
+            }
+            None => input,
         };
         let output_walk = Walk2::output_rows_by_n();
         let output = TensorArg::<2>::new(
@@ -521,15 +527,12 @@ where
         // window of a LARGER allocation"); it simply was never offered to the output.
         let output = match phys_mb {
             Some(phys) => {
-                let swept = plan.extent(MbAxis::NAME);
-                if phys < swept {
-                    return Err(format!(
-                        "matmul_opspec '{o_name}': phys_mb={phys} is SMALLER than the swept mb \
-                         {swept}. device_extent declares a window into a LARGER allocation."
-                    ));
-                }
+                let at = output.axis(MbAxis::NAME).map_err(|e| e.0)?;
                 output
-                    .with_device_extent(MbAxis::NAME, phys)
+                    .with_axis(
+                        at,
+                        Window::cap(plan.extent(MbAxis::NAME), phys, phys).map_err(|e| e.0)?,
+                    )
                     .map_err(|e| e.0)?
             }
             None => output,
@@ -696,26 +699,31 @@ fn batched_walk_args<R: RungRegime>(
 ) -> Result<(TensorArg<3>, TensorArg<3>), String> {
     let input = batched_input_arg(a_name, regime.input_walk(), plan)?.with_offset(a_off);
     // A phys SMALLER than the swept extent is a mis-declaration, not a window (same rule the
-    // kernel override enforces): the walk would describe less memory than the op reads.
+    // kernel override enforces): the walk would describe less memory than the op reads —
+    // `Window::cap`'s own refusal, by name.
     let input = match phys_mb {
         Some(phys) => {
-            let swept = plan.extent(MbAxis::NAME);
-            if phys < swept {
-                return Err(format!(
-                    "matmul_opspec '{a_name}': phys_mb={phys} is SMALLER than the swept mb                          {swept}. device_extent declares a window into a LARGER allocation."
-                ));
-            }
+            let at = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
             input
-                .with_device_extent(MbAxis::NAME, phys)
+                .with_axis(
+                    at,
+                    Window::cap(plan.extent(MbAxis::NAME), phys, phys).map_err(|e| e.0)?,
+                )
                 .map_err(|e| e.0)?
         }
         None => input,
     };
     // The ACTIVATION's own pitch, when its placement declares one larger than the swept rows.
     let input = match pitches.map(|(a, _)| a) {
-        Some(a_pitch) if a_pitch > plan.extent(MbAxis::NAME) => input
-            .with_device_extent(MbAxis::NAME, a_pitch)
-            .map_err(|e| e.0)?,
+        Some(a_pitch) if a_pitch > plan.extent(MbAxis::NAME) => {
+            let at = input.axis(MbAxis::NAME).map_err(|e| e.0)?;
+            input
+                .with_axis(
+                    at,
+                    Window::cap(plan.extent(MbAxis::NAME), a_pitch, a_pitch).map_err(|e| e.0)?,
+                )
+                .map_err(|e| e.0)?
+        }
         _ => input,
     };
     let output = batched_output_arg(o_name, regime.output_walk(), plan)?.with_offset(o_off);
@@ -723,9 +731,15 @@ fn batched_walk_args<R: RungRegime>(
     // against a pitch it never declared makes the two agree on paper while the emitted walk still
     // strides by the shared value.
     let output = match pitches.map(|(_, o)| o) {
-        Some(o_pitch) if o_pitch > plan.extent(MbAxis::NAME) => output
-            .with_device_extent(MbAxis::NAME, o_pitch)
-            .map_err(|e| e.0)?,
+        Some(o_pitch) if o_pitch > plan.extent(MbAxis::NAME) => {
+            let at = output.axis(MbAxis::NAME).map_err(|e| e.0)?;
+            output
+                .with_axis(
+                    at,
+                    Window::cap(plan.extent(MbAxis::NAME), o_pitch, o_pitch).map_err(|e| e.0)?,
+                )
+                .map_err(|e| e.0)?
+        }
         _ => output,
     };
     Ok((input, output))
@@ -906,20 +920,17 @@ pub fn matmul_opspec_batched_off(
     // exceeds this op's swept extent, so stride derivation uses storage, not iteration.
     let kernel = match kernel_device_extent {
         Some((dim, phys)) => {
-            // `with_device_extent` means "this op sweeps a WINDOW of a larger allocation". A phys
-            // SMALLER than the swept extent is not a window, it is a mis-declaration: the walk would
-            // describe less memory than the op reads. Refuse at `cargo build` rather than emit a
-            // descriptor whose declared size and address span disagree (an on-card Compute CB error).
-            let swept = plan.extent(dim);
-            if phys < swept {
-                return Err(format!(
-                    "matmul_opspec_batched_off '{w_name}': kernel device_extent {dim}={phys} is \
-                     SMALLER than the swept extent {swept}. device_extent declares a window into a \
-                     LARGER physical allocation (phys >= iteration); a smaller value cannot be \
-                     expressed this way."
-                ));
-            }
-            kernel.with_device_extent(dim, phys).map_err(|e| e.0)?
+            // A phys SMALLER than the swept extent is not a window, it is a mis-declaration: the
+            // walk would describe less memory than the op reads — `Window::cap`'s own refusal, by
+            // name, rather than a descriptor whose declared size and address span disagree (an
+            // on-card Compute CB error).
+            let at = kernel.axis(dim).map_err(|e| e.0)?;
+            kernel
+                .with_axis(
+                    at,
+                    Window::cap(plan.extent(dim), phys, phys).map_err(|e| e.0)?,
+                )
+                .map_err(|e| e.0)?
         }
         None => kernel,
     };
