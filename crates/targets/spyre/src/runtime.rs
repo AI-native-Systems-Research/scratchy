@@ -46,7 +46,7 @@ use flex_rs::compute::{BootstrapOffset, ComputeParams, KernelName};
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
 use flex_rs::dma::{
     DmaDirection, DmaParams, DmaPipelineShape, DmaShaping, FillParams, FillPattern, FillPipeline,
-    HostVirtualAddress,
+    HostVirtualAddress, IovaAddress,
 };
 use flex_rs::flex_config::DeviceKind;
 use flex_rs::memory_region::{DomainId, MemoryType};
@@ -346,6 +346,64 @@ pub enum HwError {
     /// pool's own validation set — slot range, single-chunk device, the
     /// slot-capacity transfer law — or the submission it built was rejected.
     PooledCopy(SharedHostPoolError),
+    /// A pre-mapped H2D ([`Stream::h2d_premapped`]) was refused before
+    /// submission — the window is not one chunk, or the host slice is not
+    /// exactly the window's extent.
+    PremappedH2d(PremappedH2dRefusal),
+}
+
+/// Why a pre-mapped H2D was refused before submission ([`HwError::PremappedH2d`]):
+/// the two facts [`Stream::h2d_premapped`]'s recipe states about the pair it is
+/// handed — the device window resolves one chunk, and the host slice is exactly
+/// that window's extent.
+#[derive(Debug)]
+pub enum PremappedH2dRefusal {
+    /// The window spans more than one chunk. The pre-mapped recipe resolves one
+    /// chunk per transfer (the pool's `copyRaw` law); a caller walking a
+    /// multi-chunk region must cut it with [`DevAddr::windows`] first.
+    NotOneChunk { chunks: usize },
+    /// The host slice's length is not the window's extent. The transfer length
+    /// is the window's total size — the caller's iova maps `bytes` exactly, so
+    /// any other length would DMA pages the mapping does not own.
+    LengthMismatch { len: u64, window: u64 },
+}
+
+impl fmt::Display for PremappedH2dRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotOneChunk { chunks } => write!(
+                f,
+                "refused before submission: the device window spans {chunks} chunks and the \
+                 pre-mapped recipe resolves one — cut the region into single-chunk windows with \
+                 DevAddr::windows"
+            ),
+            Self::LengthMismatch { len, window } => write!(
+                f,
+                "refused before submission: the {len} B host slice is not the {window} B window — \
+                 the pre-mapped transfer length is the window's extent, the span its iova maps"
+            ),
+        }
+    }
+}
+
+/// The pre-mapped pairing [`Stream::h2d_premapped`] demands of its (slice, window)
+/// pair, stated apart from the door so it is checkable without a card: the window
+/// resolves one chunk, and the slice is exactly that window's extent. Everything
+/// past this check needs a live stream; the check itself is a fact about the pair.
+fn premapped_pairing(bytes: &[u8], addr: &DevAddr) -> Result<(), PremappedH2dRefusal> {
+    if !addr.is_single_chunk() {
+        return Err(PremappedH2dRefusal::NotOneChunk {
+            chunks: addr.0.chunks().len(),
+        });
+    }
+    let window = addr.total_size();
+    if bytes.len() as u64 != window.as_u64() {
+        return Err(PremappedH2dRefusal::LengthMismatch {
+            len: bytes.len() as u64,
+            window: window.as_u64(),
+        });
+    }
+    Ok(())
 }
 
 impl fmt::Display for HwError {
@@ -368,6 +426,7 @@ impl fmt::Display for HwError {
             Self::Reset(e) => write!(f, "{e}"),
             Self::CbRender(e) => write!(f, "CB image render (no submission): {e}"),
             Self::PooledCopy(e) => write!(f, "pooled copy: {e}"),
+            Self::PremappedH2d(e) => write!(f, "pre-mapped H2D: {e}"),
         }
     }
 }
@@ -912,6 +971,47 @@ impl Stream {
         stream
             .launch_h2d(params, signal.map(ReadSignal::arm))
             .map_err(HwError::Stream)
+    }
+
+    /// ⭐ PRE-MAPPED H2D OF `bytes` INTO `addr` — the same transfer as [`Self::h2d`] on the
+    /// same consumer path the #606 pool rides: `DmaShaping::iova` tells the backend the caller
+    /// already pinned and IOMMU-mapped the host pages, so it skips its per-call DmaBuf setup
+    /// and VFIO pin of anonymous memory and DMAs straight from the caller's mapping. Those
+    /// per-call costs are the plain door's rate — 6-7 GB/s host-blocking, against ~59 GB/s
+    /// pre-mapped (card-measured, `h2d_streams_probe`, 2026-11-10) — which is why boot weight
+    /// staging, a one-shot multi-GiB transfer from a THP-backed region, wants this door.
+    ///
+    /// The pairing the recipe states, refused before submission (cardless, like
+    /// [`HwError::OverrunsRegion`]): `addr` is a SINGLE-CHUNK window — the transfer resolves
+    /// one chunk, so a caller walking a multi-chunk region cuts it with [`DevAddr::windows`]
+    /// first — and `bytes.len()` IS the window's extent, the pool's `copyRaw` law: the iova
+    /// the caller passes maps exactly `bytes`, so any other length would DMA pages the
+    /// mapping does not own. The caller keeps the mapping alive until the transfer has
+    /// synchronized; the slice this door reads is a plain borrow and carries no pin.
+    pub fn h2d_premapped(
+        &self,
+        bytes: &[u8],
+        addr: &DevAddr,
+        iova: IovaAddress,
+    ) -> Result<(), HwError> {
+        premapped_pairing(bytes, addr).map_err(HwError::PremappedH2d)?;
+        let stream = self.live()?;
+        // `bytes.len()` equals the window's extent by the refusal above, so the explicit
+        // size is the window's total size — the padded-extent over-read `h2d_shaped`'s doc
+        // guards against cannot happen here: the equality is the proof the caller's slice
+        // spans the whole window.
+        let params = DmaParams::with_explicit_size(
+            HostVirtualAddress(bytes.as_ptr() as usize),
+            ByteSize(bytes.len() as u64),
+            DmaDirection::HostToDevice,
+            Some(addr.0.clone()),
+            DmaShaping {
+                iova: Some(iova),
+                ..Default::default()
+            },
+        )
+        .expect("device_address is Some, constructed from an owned DevAddr");
+        stream.launch_h2d(params, None).map_err(HwError::Stream)
     }
 
     /// Async D2H into `bytes` from the device window `addr`.
@@ -1765,6 +1865,37 @@ mod tests {
         }
         assert_eq!(walk(&addr, 8), old);
         assert_eq!(old.len(), 3);
+    }
+
+    /// ⭐ THE PRE-MAPPED DOOR'S REFUSALS ARE CARDLESS — the two facts of
+    /// [`Stream::h2d_premapped`]'s recipe, stated in [`premapped_pairing`] apart
+    /// from the door so they are checkable without a runtime: a window that
+    /// spans chunks, and a slice that is not the window's extent, are both
+    /// refused BY NAME before any stream is touched. The paired case — one
+    /// chunk, slice == extent — is the walk `Executor::prepare` feeds the door,
+    /// covered by the window-walk tests above.
+    #[test]
+    fn premapped_pairing_refuses_a_multi_chunk_window_and_a_mislength_slice() {
+        let multi = DevAddr(Arc::new(CompositeAddress::from_chunks(vec![
+            chunk(7, 4096, 20, 0),
+            chunk(9, 0, 8, 1),
+        ])));
+        let bytes = vec![0u8; 28];
+        match premapped_pairing(&bytes, &multi) {
+            Err(PremappedH2dRefusal::NotOneChunk { chunks }) => assert_eq!(chunks, 2),
+            other => panic!("a 2-chunk window is refused by name, got {other:?}"),
+        }
+
+        let one = DevAddr(Arc::new(CompositeAddress::from_chunk(chunk(5, 256, 17, 0))));
+        match premapped_pairing(&bytes, &one) {
+            Err(PremappedH2dRefusal::LengthMismatch { len, window }) => {
+                assert_eq!((len, window), (28, 17));
+            }
+            other => panic!("a 28 B slice into a 17 B window is refused by name, got {other:?}"),
+        }
+
+        let one28 = DevAddr(Arc::new(CompositeAddress::from_chunk(chunk(5, 256, 28, 0))));
+        assert!(premapped_pairing(&bytes, &one28).is_ok());
     }
 }
 
