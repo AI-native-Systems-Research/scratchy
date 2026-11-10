@@ -842,6 +842,9 @@ impl SpyreWorker {
         // metal uses — and the bundle, the weight binding and the embed
         // table are all read off THAT model.
         let _t_try = std::time::Instant::now();
+        // `SCRATCHY_LOAD_TIME`: arm before the load records, print after it —
+        // the whole instrument lives inside the pass this times.
+        scratchy_layers::load_time::arm();
         let model = scratchy_forward_compiler::try_load(
             &mut gw,
             (),
@@ -875,10 +878,18 @@ impl SpyreWorker {
         // `try_load` runs the GENERATED loader over every tensor, so it is a whole pass
         // across the checkpoint in its own right — timed apart from the raw byte extraction
         // that follows it.
+        let try_load_elapsed = _t_try.elapsed();
         tracing::debug!(
             "[timing] try_load ({arch}) took {:.2}s",
-            _t_try.elapsed().as_secs_f64()
+            try_load_elapsed.as_secs_f64()
         );
+        // `SCRATCHY_LOAD_TIME`: the same pass decomposed — cast, the allocator's
+        // zero-fill and copy, take_cpu's to_vec, transpose — plus the residual those
+        // leave (fingerprint match, store ops, struct building). The boot layer
+        // between "Using cached model" and the line above is this pass almost whole.
+        if scratchy_layers::load_time::enabled() {
+            eprintln!("{}", scratchy_layers::load_time::summary(try_load_elapsed));
+        }
         #[cfg(not(feature = "spyre-hw"))]
         let bundle: &'static KtirBundle = model
             .ktir_bundle()
