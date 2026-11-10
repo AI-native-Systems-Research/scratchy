@@ -54,6 +54,11 @@ static ALLOC_COPY: Counters = Counters {
     bytes: AtomicU64::new(0),
     elapsed_ns: AtomicU64::new(0),
 };
+static ALLOC_VIEW: Counters = Counters {
+    calls: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+    elapsed_ns: AtomicU64::new(0),
+};
 static TO_VEC: Counters = Counters {
     calls: AtomicU64::new(0),
     bytes: AtomicU64::new(0),
@@ -106,6 +111,17 @@ pub fn record_alloc_copy(bytes: usize, start: Instant) {
     }
 }
 
+/// The backend allocator's ALIAS of its source instead of a copy — the bytes
+/// already live where the backend wants them (a registered mmap under spyre's
+/// host-memory allocator), so the "allocation" is a keepalive handle and this
+/// records the bytes that DID NOT copy. A load where every weight views is a
+/// load whose `alloc-copy` line reads zero calls.
+pub fn record_alloc_view(bytes: usize) {
+    if enabled() {
+        ALLOC_VIEW.record(bytes, 0);
+    }
+}
+
 /// `take_cpu`/`copy_cpu`'s `.to_vec()` — a whole-tensor copy out of the store
 /// or the cast scratch.
 pub fn record_to_vec(bytes: usize, start: Instant) {
@@ -153,6 +169,7 @@ pub fn summary(total: std::time::Duration) -> String {
     push_line(&mut out, "cast", &CAST);
     push_line(&mut out, "alloc-zero", &ALLOC_ZERO);
     push_line(&mut out, "alloc-copy", &ALLOC_COPY);
+    push_line(&mut out, "alloc-view", &ALLOC_VIEW);
     push_line(&mut out, "to-vec", &TO_VEC);
     push_line(&mut out, "transpose", &TRANSPOSE);
     let _ = writeln!(

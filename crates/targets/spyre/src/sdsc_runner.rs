@@ -84,8 +84,11 @@ pub struct SuperDscSession<'c, T: ktir_superdsc::collective::Tp> {
     pub pmask_slots: Option<usize>,
 }
 
-/// One card's resident weights, `(source id, device bytes, dtype, shape)` each.
-pub type CardWeights = Vec<(usize, Vec<u8>, SDType, Vec<usize>)>;
+/// One card's resident weights, `(source id, bytes, dtype, shape)` each. The bytes are by
+/// provenance ([`crate::allocator::HostBytes`]): a weight the load viewed off its mmap stays a
+/// `View` through the bind — the executor's staging walk reads the page cache directly and the
+/// keepalive lives as long as the bound entry does.
+pub type CardWeights = Vec<(usize, crate::allocator::HostBytes, SDType, Vec<usize>)>;
 
 /// The resident weights of every card a session spans — one set per rank, rank `r`'s its own shard.
 /// The OWNER session's only; a borrower binds none (`None`), so "one set per card" is a type, never a
@@ -316,14 +319,19 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
             }
 
             // Bind every weight to its input `t{id}` as device-dtype bytes. Prepare packs them, so they
-            // must be bound before prepare. Ownership MOVES in — no copy anywhere on this path.
+            // must be bound before prepare. Ownership MOVES in — no copy anywhere on this path: a
+            // VIEW moves as its keepalive handle and the staging walk reads the mmap itself.
             let t_bind = std::time::Instant::now();
             let n_bound = card_weights.len();
             for (id, data, dt, _shape) in card_weights {
                 let bytes = match dt {
-                    SDType::F16 => data,
-                    SDType::Fp8E4m3 => data, // fp8 binds VERBATIM (1-byte); do NOT dequant to f16
-                    other => f32_to_f16_le(&bytes_to_f32(&data, other)),
+                    // Already the device dtype (the narrowing pass's product, or fp8 verbatim —
+                    // do NOT dequant to f16): the bytes bind as they are, view or owned.
+                    SDType::F16 | SDType::Fp8E4m3 => data,
+                    other => crate::allocator::HostBytes::Owned(f32_to_f16_le(&bytes_to_f32(
+                        data.as_slice(),
+                        other,
+                    ))),
                 };
                 exec.bind_weight(crate::bundle_code::PlaceId::Act(id as u32), bytes);
             }

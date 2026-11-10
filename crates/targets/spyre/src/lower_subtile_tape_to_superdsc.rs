@@ -4439,6 +4439,13 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .enumerate()
         .map(|(i, t)| (i as u64, t.rows as usize * t.cols as usize))
         .collect();
+    // The gate's weights are SYNTHESIZED bytes (random draws, built tables, word rows) —
+    // built, so owned; stated by wrapping at the boundary the session's provenance type
+    // demands.
+    let emu_weights = emu_weights
+        .into_iter()
+        .map(|(id, b, dt, s)| (id, crate::allocator::HostBytes::Owned(b), dt, s))
+        .collect::<Vec<_>>();
     let mut session =
         crate::runner::SpyreSession::new_multi_floored(&refs, emu_weights, &shape_floor)
             .map_err(|e| format!("gate session: {e}"))?;
@@ -5119,7 +5126,10 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .collect();
         let session = crate::runner::SpyreSession::new_multi_floored(
             &refs,
-            std::mem::take(&mut probes[r].emu_weights),
+            std::mem::take(&mut probes[r].emu_weights)
+                .into_iter()
+                .map(|(id, b, dt, s)| (id, crate::allocator::HostBytes::Owned(b), dt, s))
+                .collect::<Vec<_>>(),
             &shape_floor,
         )
         .map_err(|e| format!("rank {r}'s gate session: {e}"))?;
