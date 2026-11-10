@@ -59,7 +59,11 @@ impl<'a> RetileWalk<'a> {
         self.device_size.last().copied().unwrap_or(1) as usize
     }
 
-    fn inner_contig(&self) -> bool {
+    /// The walk's own contiguity statement: the innermost device axis is a run of consecutive
+    /// host elements (`stride_map` tail 1, extent > 1), so the walk can copy whole rows.
+    /// `stage_weight_tiled` branches on it; the stage-time diagnostic reports by it — one
+    /// statement, both readers.
+    pub(crate) fn inner_contig(&self) -> bool {
         let inner = self.inner();
         !self.device_size.is_empty() && self.stride_map.last() == Some(&1) && inner > 1
     }

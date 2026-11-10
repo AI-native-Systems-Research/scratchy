@@ -321,6 +321,10 @@ struct Diag {
     phase_time: bool,
     /// `SCRATCHY_SDSC_PREP_TIME`: sub-phase timing of prepare.
     prep_time: bool,
+    /// `SCRATCHY_SDSC_STAGE_TIME`: per-mode timing of the LPT weight staging (which walk arm
+    /// and which transform each byte took, and the slowest items) — the instrument for the
+    /// boot layer that runs BEFORE prepare, off its laps.
+    stage_time: bool,
     /// `SCRATCHY_SDSC_OPTRACE`: after each on-card op, D2H every segment and print nonzero-count +
     /// max|.| — the op index where the signal collapses IS the divergence.
     optrace: bool,
@@ -361,6 +365,7 @@ impl Diag {
                 prog_verify: on("SCRATCHY_SDSC_PROG_VERIFY"),
                 phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
                 prep_time: on("SCRATCHY_SDSC_PREP_TIME"),
+                stage_time: on("SCRATCHY_SDSC_STAGE_TIME"),
                 optrace: on("SCRATCHY_SDSC_OPTRACE"),
                 tensordump: std::env::var_os("SCRATCHY_SDSC_TENSORDUMP")
                     .map(std::path::PathBuf::from),
@@ -393,6 +398,7 @@ impl Diag {
             prog_verify,
             phase_time,
             prep_time,
+            stage_time,
             optrace,
             tensordump,
             launch_mark,
@@ -408,6 +414,7 @@ impl Diag {
             || *prog_verify
             || *phase_time
             || *prep_time
+            || *stage_time
             || *optrace
             || *launch_mark)
             && tensordump.is_none()
@@ -2186,6 +2193,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             Verbatim,
         }
         struct Item<'a> {
+            /// The weight's own id — what the stage-time diagnostic names a row by.
+            name: &'a str,
             /// The SHADOW SLOT this weight stages into — a segment, or a weight bank beyond bank 0.
             /// See [`Executor::slot_of`]: banking gives one segment several regions, so the segment
             /// index alone stopped being an address.
@@ -2293,6 +2302,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
             };
             items.push(Item {
+                name: nm.as_str(),
                 slot,
                 offset: p.offset as usize,
                 src,
@@ -2337,9 +2347,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         //    is what makes the parallel stage safe with no unsafe at all — and it PROVES the
         //    placements are disjoint (an overlap shows up as a backwards cursor, which is a
         //    refusal, where the C++ would simply have raced).
-        /// One weight's staging work: its source bytes, its OWN destination sub-slice, and its
-        /// staging transform ([`StageMode`]).
-        type StageTask<'a> = (&'a [u8], &'a mut [u8], StageMode<'a>);
+        /// One weight's staging work: its source bytes, its OWN destination sub-slice, its
+        /// staging transform ([`StageMode`]), and its destination's own address — slot and byte
+        /// offset, the identity the stage-time diagnostic reports a row by.
+        type StageTask<'a> = (&'a [u8], &'a mut [u8], StageMode<'a>, usize, usize);
         let n_items = items.len();
         items.sort_by_key(|i| (i.slot, i.offset));
         let mut tasks: Vec<StageTask<'_>> = Vec::with_capacity(n_items);
@@ -2381,14 +2392,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 let (dst, r2) = r.split_at_mut(it.src.len());
                 rests[it.slot] = Some(r2);
                 cursor[it.slot] = it.offset + it.src.len();
-                tasks.push((it.src, dst, it.mode));
+                tasks.push((it.src, dst, it.mode, it.slot, it.offset));
             }
         }
 
         // ── LPT deal across the cores: sort by size descending and deal round-robin, which is
         //    better balanced than equal chunking (weights differ by orders of magnitude) and needs
         //    no shared counter — the C++ used an atomic work-stealing index for the same reason.
-        tasks.sort_by_key(|(src, _, _)| std::cmp::Reverse(src.len()));
+        tasks.sort_by_key(|(src, _, _, _, _)| std::cmp::Reverse(src.len()));
         let nthreads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -2397,10 +2408,59 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         for (i, t) in tasks.into_iter().enumerate() {
             buckets[i % nthreads].push(t);
         }
+
+        // ── STAGE-TIME DIAGNOSTIC (`SCRATCHY_SDSC_STAGE_TIME`): the boot layer this loop is
+        //    runs BEFORE prepare, off its laps — the silent multi-second gap between "staged N
+        //    weights" and the device opening. This instrument states which transform arm each
+        //    weight's bytes took (row-copy vs per-element walk, by the walk's own
+        //    [`RetileWalk::inner_contig`] statement), what each arm cost in aggregate, and the
+        //    slowest items by name and walk shape. Off by default; on, it costs one
+        //    `Instant::now` and one mutex push per weight. ──
+        let stage_diag = Diag::get().stage_time;
+        /// Which arm of the staging transforms a weight's bytes took.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ArmKind {
+            Fp8RowCopy,
+            Fp8PerElement,
+            F16RowConvert,
+            F16PerElement,
+            Convert,
+            Verbatim,
+        }
+        /// One weight's measured staging: its destination address, its arm, its bytes, its time.
+        struct StageRow {
+            slot: usize,
+            offset: usize,
+            arm: ArmKind,
+            bytes: usize,
+            nanos: u64,
+        }
+        let rows: std::sync::Mutex<Vec<StageRow>> = std::sync::Mutex::new(Vec::new());
+        let t_stage = stage_diag.then(Instant::now);
+        let stage_arm = |mode: StageMode<'_>| match mode {
+            StageMode::Retile(k, elem) => {
+                let contig = RetileWalk {
+                    device_size: &k.device_size,
+                    stride_map: &k.stride_map,
+                }
+                .inner_contig();
+                match (elem, contig) {
+                    (Element::Fp8, true) => ArmKind::Fp8RowCopy,
+                    (Element::Fp8, false) => ArmKind::Fp8PerElement,
+                    (Element::F16, true) => ArmKind::F16RowConvert,
+                    (Element::F16, false) => ArmKind::F16PerElement,
+                }
+            }
+            StageMode::Convert => ArmKind::Convert,
+            StageMode::Verbatim => ArmKind::Verbatim,
+        };
+
         std::thread::scope(|scope| {
             for bucket in buckets {
+                let rows = &rows;
                 scope.spawn(move || {
-                    for (src, dst, mode) in bucket {
+                    for (src, dst, mode, slot, offset) in bucket {
+                        let t0 = stage_diag.then(Instant::now);
                         match mode {
                             StageMode::Retile(k, elem) => stage_weight_tiled(
                                 src,
@@ -2414,10 +2474,97 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                             StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
                             StageMode::Verbatim => dst.copy_from_slice(src),
                         }
+                        if let Some(t0) = t0
+                            && let Ok(mut rows) = rows.lock()
+                        {
+                            rows.push(StageRow {
+                                slot,
+                                offset,
+                                arm: stage_arm(mode),
+                                bytes: src.len(),
+                                nanos: t0.elapsed().as_nanos() as u64,
+                            });
+                        }
                     }
                 });
             }
         });
+
+        if stage_diag {
+            let rows = rows.into_inner().unwrap_or_default();
+            let wall = t_stage.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let work = rows.iter().map(|r| r.nanos as f64).sum::<f64>() / 1e9;
+            let bytes = rows.iter().map(|r| r.bytes).sum::<usize>();
+            eprintln!(
+                "[sdsc-stage-time] {} weights, {:.1} MiB staged in {:.3}s wall across {} threads \
+                 ({:.3}s summed work, {:.2} GB/s wall, {:.2} GB/s single-thread)",
+                rows.len(),
+                bytes as f64 / (1 << 20) as f64,
+                wall,
+                nthreads,
+                work,
+                if wall > 0.0 {
+                    bytes as f64 / wall / 1e9
+                } else {
+                    0.0
+                },
+                if work > 0.0 {
+                    bytes as f64 / work / 1e9
+                } else {
+                    0.0
+                },
+            );
+            for (arm, name) in [
+                (ArmKind::Fp8RowCopy, "retile fp8 row-copy"),
+                (ArmKind::Fp8PerElement, "retile fp8 per-element"),
+                (ArmKind::F16RowConvert, "retile f16 row-convert"),
+                (ArmKind::F16PerElement, "retile f16 per-element"),
+                (ArmKind::Convert, "ieee-f16 -> sen convert"),
+                (ArmKind::Verbatim, "verbatim"),
+            ] {
+                let rs: Vec<&StageRow> = rows.iter().filter(|r| r.arm == arm).collect();
+                if rs.is_empty() {
+                    continue;
+                }
+                let b = rs.iter().map(|r| r.bytes).sum::<usize>();
+                let s = rs.iter().map(|r| r.nanos).sum::<u64>() as f64 / 1e9;
+                eprintln!(
+                    "[sdsc-stage-time]   {name:<28} {:>3} items {:>8.1} MiB {:>7.3}s {:>6.2} GB/s",
+                    rs.len(),
+                    b as f64 / (1 << 20) as f64,
+                    s,
+                    if s > 0.0 { b as f64 / s / 1e9 } else { 0.0 },
+                );
+            }
+            // The slowest weights by name and walk shape — the rows that name the fix.
+            let mut rows = rows;
+            rows.sort_by_key(|r| std::cmp::Reverse(r.nanos));
+            for r in rows.iter().take(10) {
+                let Some(it) = items
+                    .iter()
+                    .find(|i| i.slot == r.slot && i.offset == r.offset)
+                else {
+                    continue;
+                };
+                let shape = match it.mode {
+                    StageMode::Retile(k, _) => {
+                        format!(
+                            " device_size={:?} stride_map={:?}",
+                            k.device_size, k.stride_map
+                        )
+                    }
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "[sdsc-stage-time]   {:.3}s {:>7.1} MiB slot{}+{} '{}'{shape}",
+                    r.nanos as f64 / 1e9,
+                    r.bytes as f64 / (1 << 20) as f64,
+                    r.slot,
+                    r.offset,
+                    it.name,
+                );
+            }
+        }
 
         self.n_weights_staged = n_items;
         self.staged_host = true;
