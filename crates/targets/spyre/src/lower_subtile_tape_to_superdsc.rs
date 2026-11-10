@@ -6642,12 +6642,46 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         kernel_weights: std::borrow::Cow::Owned(
             kernel_weights
                 .iter()
-                .map(|(tid, k)| bundle::KernelWeight {
-                    id: bundle::PlaceId::Act(*tid),
-                    device_size: std::borrow::Cow::Owned(k.device_size.clone()),
-                    stride_map: std::borrow::Cow::Owned(k.stride_map.clone()),
-                    stick_size: k.stick_size,
-                    word_length: k.word_length,
+                .map(|(tid, k)| {
+                    // ⭐ ONE (EXTENT, STRIDE) SLICE, PAIRED HERE — a device axis's extent and
+                    // its stride are ONE fact, and two separate lists could disagree in length.
+                    // The bake refuses a descriptor that does, or one that states no axes at
+                    // all, instead of letting the boot find out one walk later. The arm
+                    // verdict is the walk's own law ([`crate::stage_weight::RetileWalk::arm`]),
+                    // stated once here so the boot dispatches on it and does no analysis.
+                    assert_eq!(
+                        k.device_size.len(),
+                        k.stride_map.len(),
+                        "a retile's device_size and stride_map disagree in length"
+                    );
+                    assert!(
+                        !k.device_size.is_empty(),
+                        "a rank-0 retile has no axes to stage"
+                    );
+                    let axes: Vec<(u64, u64)> = k
+                        .device_size
+                        .iter()
+                        .copied()
+                        .zip(k.stride_map.iter().copied())
+                        .collect();
+                    let walk = crate::stage_weight::RetileWalk { axes: &axes };
+                    let arm = walk.arm();
+                    let order = walk.permutation().unwrap_or_default();
+                    assert!(
+                        order.len() <= u8::MAX as usize,
+                        "a rank-{} walk exceeds the axis order's u8",
+                        order.len()
+                    );
+                    bundle::KernelWeight {
+                        id: bundle::PlaceId::Act(*tid),
+                        axes: std::borrow::Cow::Owned(axes),
+                        arm,
+                        order: std::borrow::Cow::Owned(
+                            order.iter().map(|&i| i as u8).collect(),
+                        ),
+                        stick_size: k.stick_size,
+                        word_length: k.word_length,
+                    }
                 })
                 .collect(),
         ),

@@ -41,42 +41,46 @@ impl Element {
     }
 }
 
-/// One weight's device-tile walk: device axis extents + the host-element stride per device axis.
-/// Slices, not owned Vecs — the caller (Rust or the C++ shim) owns the descriptor.
+/// One weight's device-tile walk: (device extent, host-element stride) per device axis —
+/// ONE slice, because an axis's extent and its stride are one fact, and two separate lists
+/// could disagree in length. A slice, not an owned Vec — the caller owns the descriptor (at
+/// runtime that is the bake's [`crate::bundle_code::KernelWeight::axes`]; the C++ shim consumes
+/// the serialized `RetileDescriptor`, a separate artifact).
 #[derive(Clone, Copy, Debug)]
 pub struct RetileWalk<'a> {
-    pub device_size: &'a [u64],
-    pub stride_map: &'a [u64],
+    pub axes: &'a [(u64, u64)],
 }
 
+/// The staging-arm verdict, stated per weight by the bake — see [`crate::bundle_code::WalkArm`].
+/// Re-exported here so the walker's law and the artifact's field name one type.
+pub use crate::bundle_code::WalkArm;
+
 impl<'a> RetileWalk<'a> {
-    /// Total device elements = prod(device_size).
+    /// Total device elements = prod(extents).
     pub fn total_elems(&self) -> usize {
-        self.device_size.iter().product::<u64>() as usize
+        self.axes.iter().map(|&(e, _)| e).product::<u64>() as usize
     }
 
     fn inner(&self) -> usize {
-        self.device_size.last().copied().unwrap_or(1) as usize
+        self.axes.last().map(|&(e, _)| e).unwrap_or(1) as usize
     }
 
     /// The walk's own contiguity statement: the innermost device axis is a run of consecutive
-    /// host elements (`stride_map` tail 1, extent > 1), so the walk can copy whole rows.
-    /// `stage_weight_tiled` branches on it; the stage-time diagnostic reports by it — one
-    /// statement, both readers.
+    /// host elements (innermost stride 1, extent > 1), so the walk can copy whole rows.
     pub(crate) fn inner_contig(&self) -> bool {
         let inner = self.inner();
-        !self.device_size.is_empty() && self.stride_map.last() == Some(&1) && inner > 1
+        !self.axes.is_empty() && self.axes.last().map(|&(_, s)| s) == Some(1) && inner > 1
     }
 
-    /// Host element offset for the device coordinate `coord` (dot with `stride_map`, excluding
+    /// Host element offset for the device coordinate `coord` (dot with the strides, excluding
     /// the last `skip_tail` axes — the fast path computes per-row offsets with the innermost
     /// axis at 0).
     fn host_off(&self, coord: &[u64], skip_tail: usize) -> usize {
         coord
             .iter()
-            .zip(self.stride_map)
+            .zip(self.axes.iter().map(|&(_, s)| s))
             .take(coord.len() - skip_tail)
-            .map(|(&c, &s)| c * s)
+            .map(|(&c, s)| c * s)
             .sum::<u64>() as usize
     }
 
@@ -84,7 +88,7 @@ impl<'a> RetileWalk<'a> {
     fn advance(&self, coord: &mut [u64], skip_tail: usize) {
         for r in (0..coord.len() - skip_tail).rev() {
             coord[r] += 1;
-            if coord[r] < self.device_size[r] {
+            if coord[r] < self.axes[r].0 {
                 break;
             }
             coord[r] = 0;
@@ -104,21 +108,25 @@ impl<'a> RetileWalk<'a> {
     /// with gather/broadcast structure (repeated or gapped strides) is NOT a permutation and
     /// takes the arms below.
     pub fn permutation(&self) -> Option<Vec<usize>> {
-        let mut order: Vec<usize> = (0..self.device_size.len()).collect();
-        order.sort_by_key(|&i| self.stride_map[i]);
+        if self.axes.is_empty() {
+            return None; // rank-0: one element, host[0] → dev[0]; the per-element arm's case
+        }
+        let mut order: Vec<usize> = (0..self.axes.len()).collect();
+        order.sort_by_key(|&i| self.axes[i].1);
         let mut run = 1u64;
         for &ax in &order {
-            if self.stride_map[ax] != run {
+            if self.axes[ax].1 != run {
                 return None;
             }
-            run = run.saturating_mul(self.device_size[ax]);
+            run = run.saturating_mul(self.axes[ax].0);
         }
         Some(order)
     }
 
-    /// Which arm [`stage_weight_tiled`] takes for this walk — one statement, read by the
-    /// walker's own branch and by the stage-time diagnostic.
-    pub(crate) fn arm(&self) -> WalkArm {
+    /// Which arm stages this walk — ONE statement: the bake reads it to state
+    /// [`crate::bundle_code::KernelWeight::arm`], and `stage_weight_tiled`'s own branch follows it
+    /// for callers that hold a walk but not a bundle.
+    pub fn arm(&self) -> WalkArm {
         if self.permutation().is_some() {
             WalkArm::Permutation
         } else if self.inner_contig() {
@@ -129,19 +137,6 @@ impl<'a> RetileWalk<'a> {
     }
 }
 
-/// Which arm [`stage_weight_tiled`] takes for a walk — the walker branches on it and the
-/// stage-time diagnostic reports by it: ONE statement, both readers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum WalkArm {
-    /// A mixed-radix permutation ([`RetileWalk::permutation`]): linear host scan,
-    /// incremental device offsets.
-    Permutation,
-    /// Innermost device axis host-contiguous: whole-row copies/converts.
-    InnerContig,
-    /// Everything else: per-element dot-product walk.
-    PerElement,
-}
-
 /// Increment the odometer over the OUTER axes (host-scan order, `order[1..]`), adjusting the
 /// device offset INCREMENTALLY: `dev_stride[ax]` per step, minus the axis's whole span on
 /// carry. Returns false when every axis has wrapped — the walk is complete. `d` is always
@@ -150,20 +145,28 @@ pub(crate) enum WalkArm {
 fn advance_outer(
     coord: &mut [u64],
     d: &mut usize,
-    order: &[usize],
+    order: &[u8],
     dev_stride: &[u64],
-    ext: &[u64],
+    axes: &[(u64, u64)],
 ) -> bool {
     for &ax in order.iter().skip(1) {
+        let ax = ax as usize;
         coord[ax] += 1;
         *d += dev_stride[ax] as usize;
-        if coord[ax] < ext[ax] {
+        if coord[ax] < axes[ax].0 {
             return true;
         }
         coord[ax] = 0;
-        *d -= dev_stride[ax] as usize * ext[ax] as usize;
+        *d -= dev_stride[ax] as usize * axes[ax].0 as usize;
     }
     false
+}
+
+/// Fixtures and harnesses spell walks the way the emitter does — an extent list, then a
+/// stride list — and this pairs them into the walk's one slice.
+#[cfg(any(test, kani))]
+fn axes_of(ds: &[u64], sm: &[u64]) -> Vec<(u64, u64)> {
+    ds.iter().zip(sm).map(|(&d, &s)| (d, s)).collect()
 }
 
 /// Stage one weight: read `host` (the on-disk layout, IEEE-fp16 or fp8 bytes) and write `dev`
@@ -180,10 +183,16 @@ pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, ele
     // (measured: the fp8 packed-tile walk's "row copy" was TWO BYTES — a dot product and a
     // 4-axis odometer per 2 bytes, 0.33 GB/s per thread).
     if let Some(order) = walk.permutation() {
-        stage_weight_permuted(host, dev, &walk, &order, elem);
+        assert!(
+            order.len() <= u8::MAX as usize,
+            "stage_weight_tiled: a rank-{} walk exceeds the axis order's u8",
+            order.len()
+        );
+        let order: Vec<u8> = order.iter().map(|&i| i as u8).collect();
+        stage_weight_permuted(host, dev, walk.axes, &order, elem);
         return;
     }
-    let rank = walk.device_size.len();
+    let rank = walk.axes.len();
     let total = walk.total_elems();
     let inner = walk.inner();
     let inner_contig = walk.inner_contig();
@@ -248,23 +257,25 @@ pub fn stage_weight_tiled(host: &[u8], dev: &mut [u8], walk: RetileWalk<'_>, ele
 /// the run is contiguous on BOTH sides and copies/converts as one block; otherwise the run's
 /// device positions step by `dev_stride[order[0]]` and the loop writes them element-wise —
 /// still no dot product, still no full-rank odometer.
-fn stage_weight_permuted(
+///
+/// `order` is the bake's stated host-scan axis order ([`crate::bundle_code::KernelWeight::order`],
+/// u8 axis indices); `stage_weight_tiled` derives it itself for callers without a bundle.
+pub(crate) fn stage_weight_permuted(
     host: &[u8],
     dev: &mut [u8],
-    walk: &RetileWalk<'_>,
-    order: &[usize],
+    axes: &[(u64, u64)],
+    order: &[u8],
     elem: Element,
 ) {
-    let rank = walk.device_size.len();
-    let ext = walk.device_size;
+    let rank = axes.len();
     // Device row-major stride per axis: the last axis is 1, each earlier axis the product of
     // the extents after it.
     let mut dev_stride = vec![1u64; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
-        dev_stride[i] = dev_stride[i + 1] * ext[i + 1];
+        dev_stride[i] = dev_stride[i + 1] * axes[i + 1].0;
     }
-    let inner = order[0];
-    let run = ext[inner] as usize;
+    let inner = order[0] as usize;
+    let run = axes[inner].0 as usize;
     let block = dev_stride[inner] == 1;
     let dstep = dev_stride[inner] as usize;
     let mut coord = vec![0u64; rank];
@@ -300,7 +311,7 @@ fn stage_weight_permuted(
             }
         }
         h += run;
-        if !advance_outer(&mut coord, &mut d, order, &dev_stride, ext) {
+        if !advance_outer(&mut coord, &mut d, order, &dev_stride, axes) {
             break;
         }
     }
@@ -326,7 +337,7 @@ mod kani_proofs {
         for lin in 0..total {
             let hoff: usize = coord
                 .iter()
-                .zip(walk.stride_map)
+                .zip(walk.axes.iter().map(|&(_, s)| s))
                 .map(|(&c, &s)| c * s)
                 .sum::<u64>() as usize;
             match elem {
@@ -369,10 +380,8 @@ mod kani_proofs {
         // Host must cover the largest reachable offset: Σ (dim-1)·stride + 1.
         let max_off: u64 = (0..R).map(|r| (ds[r] - 1) * sm[r]).sum::<u64>() + 1;
         let host: Vec<u8> = (0..max_off as u8).collect();
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         let mut dev = vec![0u8; walk.total_elems()];
         stage_weight_tiled(&host, &mut dev, walk, Element::Fp8);
         assert_eq!(dev, naive(&host, walk, Element::Fp8));
@@ -399,10 +408,8 @@ mod kani_proofs {
         for b in host.iter_mut() {
             *b = kani::any();
         }
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         let mut dev = vec![0u8; walk.total_elems() * 2];
         stage_weight_tiled(&host, &mut dev, walk, Element::F16);
         assert_eq!(dev, naive(&host, walk, Element::F16));
@@ -421,13 +428,13 @@ mod tests {
         };
         let total = walk.total_elems();
         let mut dev = vec![0u8; total * wl];
-        let rank = walk.device_size.len();
+        let rank = walk.axes.len();
         let mut coord = vec![0u64; rank];
         for lin in 0..total {
             let hoff: usize = coord
                 .iter()
-                .zip(walk.stride_map)
-                .map(|(&c, &s)| c * s)
+                .zip(walk.axes.iter().map(|&(_, s)| s))
+                .map(|(&c, s)| c * s)
                 .sum::<u64>() as usize;
             match elem {
                 Element::Fp8 => dev[lin] = host[hoff],
@@ -439,7 +446,7 @@ mod tests {
             }
             for r in (0..rank).rev() {
                 coord[r] += 1;
-                if coord[r] < walk.device_size[r] {
+                if coord[r] < walk.axes[r].0 {
                     break;
                 }
                 coord[r] = 0;
@@ -459,10 +466,8 @@ mod tests {
             .collect();
         let ds = [out / stick, inn, stick];
         let sm = [stick, out, 1];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         let mut dev = vec![0u8; host.len()];
         stage_weight_tiled(&host, &mut dev, walk, Element::F16);
         assert_eq!(dev, naive(&host, walk, Element::F16));
@@ -483,10 +488,8 @@ mod tests {
     fn permutation_scan_matches_naive_fp8() {
         let ds = [4u64, 8, 4, 2];
         let sm = [64u64, 2, 16, 1];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         assert_eq!(walk.arm(), WalkArm::Permutation);
         // Distinct bytes: identity is host offset — a wrong law reads a different byte.
         let host: Vec<u8> = (0..ds.iter().product::<u64>() as usize)
@@ -505,10 +508,8 @@ mod tests {
     fn strided_permutation_scan_matches_naive() {
         let ds = [3u64, 4, 2];
         let sm = [8u64, 1, 4];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         assert_eq!(walk.arm(), WalkArm::Permutation);
         // device stride of the host-innermost axis (axis 1) is 2 ≠ 1 ⇒ the strided arm.
         let host8: Vec<u8> = (0..24u8).collect();
@@ -524,6 +525,28 @@ mod tests {
         assert_eq!(dev16, naive(&host16, walk, Element::F16));
     }
 
+    /// The CONTIGUOUS-BLOCK f16 arm — the scan's other half: the host-innermost axis (stride 1,
+    /// extent 2) is also the DEVICE-LAST axis (`dev_stride == 1`), so each inner run is contiguous
+    /// on both sides and converts as one block. The fp8 packed tile's shape with f16 elements:
+    /// no granite-2b walk lands here (measured: its f16 permutation items are all the strided
+    /// arm — the shapes are in the stage-time table), so this fixture is the arm's coverage.
+    #[test]
+    fn contiguous_block_permutation_scan_matches_naive_f16() {
+        let ds = [4u64, 8, 4, 2];
+        let sm = [64u64, 2, 16, 1];
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
+        assert_eq!(walk.arm(), WalkArm::Permutation);
+        // Distinct finite fp16 values: the convert is in the claim, so every element must
+        // round-trip through ieee_to_sen exactly as the naive walk converts it.
+        let host: Vec<u8> = (0..ds.iter().product::<u64>() as u16)
+            .flat_map(|i| (0x3C00 + i).to_le_bytes())
+            .collect();
+        let mut dev = vec![0u8; host.len()];
+        stage_weight_tiled(&host, &mut dev, walk, Element::F16);
+        assert_eq!(dev, naive(&host, walk, Element::F16));
+    }
+
     /// A NEAR-MISS is LEFT UNCLAIMED: one stride off the mixed-radix law and the walk is not
     /// a permutation — it must fall to the older arms (here the inner-contig row-copy, and
     /// with a non-1 tail stride the per-element walk) and still equal the naive walk. A walk
@@ -533,22 +556,16 @@ mod tests {
         let ds = [4u64, 8, 4, 2];
         // Off by one on axis 2: 17 where the mixed-radix law says 16.
         let miss_sm = [64u64, 2, 17, 1];
-        let miss = RetileWalk {
-            device_size: &ds,
-            stride_map: &miss_sm,
-        };
+        let miss_axes = axes_of(&ds, &miss_sm);
+        let miss = RetileWalk { axes: &miss_axes };
         assert_eq!(miss.arm(), WalkArm::InnerContig);
         // A broadcast stride (two axes at stride 1) is not a permutation either.
-        let bcast = RetileWalk {
-            device_size: &[4u64, 8, 4],
-            stride_map: &[32u64, 1, 1],
-        };
+        let bcast_axes = axes_of(&[4u64, 8, 4], &[32u64, 1, 1]);
+        let bcast = RetileWalk { axes: &bcast_axes };
         assert_eq!(bcast.arm(), WalkArm::InnerContig);
         // A non-1 innermost stride: per-element.
-        let tail = RetileWalk {
-            device_size: &[4u64, 8, 4, 2],
-            stride_map: &[64u64, 2, 16, 3],
-        };
+        let tail_axes = axes_of(&[4u64, 8, 4, 2], &[64u64, 2, 16, 3]);
+        let tail = RetileWalk { axes: &tail_axes };
         assert_eq!(tail.arm(), WalkArm::PerElement);
         // And each of them still stages exactly the naive walk. The host stays whole: a
         // near-miss walk can reach offsets past total (that is exactly what makes it not a
@@ -568,10 +585,8 @@ mod tests {
         let host: Vec<u8> = (0..128u8).collect();
         let ds = [2u64, 4, 16];
         let sm = [16u64, 32, 1];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         let mut dev = vec![0u8; host.len()];
         stage_weight_tiled(&host, &mut dev, walk, Element::Fp8);
         assert_eq!(dev, naive(&host, walk, Element::Fp8));
@@ -588,10 +603,8 @@ mod tests {
     fn non_contig_inner_axis() {
         let ds = [4u64, 4];
         let sm = [1u64, 4]; // innermost stride 4 ⇒ no fast path
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         let host8: Vec<u8> = (0..16u8).collect();
         let mut dev8 = vec![0u8; 16];
         stage_weight_tiled(&host8, &mut dev8, walk, Element::Fp8);
@@ -635,14 +648,10 @@ mod tests {
         let norm_sm = [64 * K, 2, K, 1];
         let perm_ds = [N / 64, HD / 64, NQH, 32, 64, 2];
         let perm_sm = [64 * K, 64, HD, 2, K, 1];
-        let norm = RetileWalk {
-            device_size: &norm_ds,
-            stride_map: &norm_sm,
-        };
-        let perm = RetileWalk {
-            device_size: &perm_ds,
-            stride_map: &perm_sm,
-        };
+        let norm_axes = axes_of(&norm_ds, &norm_sm);
+        let norm = RetileWalk { axes: &norm_axes };
+        let perm_axes = axes_of(&perm_ds, &perm_sm);
+        let perm = RetileWalk { axes: &perm_axes };
         assert_eq!(norm.total_elems(), perm.total_elems());
         let mut norm_dev = vec![0u8; norm.total_elems()];
         let mut perm_dev = vec![0u8; perm.total_elems()];
@@ -717,14 +726,10 @@ mod tests {
         let norm_sm = [64 * K, 2, K, 1];
         let perm_ds = [N / 64, HD / 64, NQH, 32, 64, 2];
         let perm_sm = [64 * K, 64, HD, 2, K, 1];
-        let norm = RetileWalk {
-            device_size: &norm_ds,
-            stride_map: &norm_sm,
-        };
-        let perm = RetileWalk {
-            device_size: &perm_ds,
-            stride_map: &perm_sm,
-        };
+        let norm_axes = axes_of(&norm_ds, &norm_sm);
+        let norm = RetileWalk { axes: &norm_axes };
+        let perm_axes = axes_of(&perm_ds, &perm_sm);
+        let perm = RetileWalk { axes: &perm_axes };
         let mut norm_dev = vec![0u8; norm.total_elems()];
         let mut perm_dev = vec![0u8; perm.total_elems()];
         stage_weight_tiled(&host, &mut norm_dev, norm, Element::Fp8);
@@ -767,10 +772,8 @@ mod tests {
         let n = e * out;
         let ds = [n / 64, inn / 2, 64, 2];
         let sm = [64 * inn, 2, inn, 1];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         // Distinct host bytes: host[o * inn + i] = ((o*inn + i) mod 251) — 251 prime, so a wrong
         // map cannot pass by permutation luck; every element's identity is its own host offset.
         let host: Vec<u8> = (0..(n * inn) as usize).map(|x| (x % 251) as u8).collect();
@@ -782,10 +785,8 @@ mod tests {
         let slab = (out * inn) as usize;
         let one_ds = [out / 64, inn / 2, 64, 2];
         let one_sm = [64 * inn, 2, inn, 1];
-        let one = RetileWalk {
-            device_size: &one_ds,
-            stride_map: &one_sm,
-        };
+        let one_axes = axes_of(&one_ds, &one_sm);
+        let one = RetileWalk { axes: &one_axes };
         for e in 0..e as usize {
             let base = e * slab;
             let standalone = naive(&host[base..base + slab], one, Element::Fp8);
@@ -837,10 +838,8 @@ mod tests {
         let chunk_elems = chunk_n * inn;
         let ds = [chunks, e, chunk_groups, inn / 2, 64, 2];
         let sm = [chunk_n * inn, out * inn, 64 * inn, 2, inn, 1];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         // ⭐ TOTATALITY first: the 6-axis walk covers exactly the bank's own elements.
         assert_eq!(
             ds.iter().product::<u64>(),
@@ -857,10 +856,8 @@ mod tests {
         // local form of the 4-axis map at `[chunk_groups, in/2, 64, 2]`.
         let one_ds = [chunk_groups, inn / 2, 64, 2];
         let one_sm = [64 * inn, 2, inn, 1];
-        let one = RetileWalk {
-            device_size: &one_ds,
-            stride_map: &one_sm,
-        };
+        let one_axes = axes_of(&one_ds, &one_sm);
+        let one = RetileWalk { axes: &one_axes };
         for chi in 0..chunks as usize {
             for exp in 0..e as usize {
                 let dev_base = (chi * e as usize + exp) * chunk_elems as usize;
@@ -920,10 +917,8 @@ mod tests {
         let n = groups * 64; // ONE EXPERT's scale row — the e-stride's own unit
         let ds = [groups, e, 64];
         let sm = [64, n, 1];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         // ⭐ TOTALITY first: the 3-axis walk covers exactly the bank's own elements.
         assert_eq!(
             ds.iter().product::<u64>(),
@@ -998,10 +993,8 @@ mod tests {
         let chunk_elems = chunk_n * in_pad; // the chunk's fp8 elements AT THE PADDED K
         let ds = [chunks, e, chunk_groups, in_pad / 2, 64, 2];
         let sm = [chunk_n * in_pad, out * in_pad, 64 * in_pad, 2, in_pad, 1];
-        let walk = RetileWalk {
-            device_size: &ds,
-            stride_map: &sm,
-        };
+        let walk_axes = axes_of(&ds, &sm);
+        let walk = RetileWalk { axes: &walk_axes };
         // ⭐ TOTALITY AT THE PAD: the walk covers exactly the PADDED rebuild's elements.
         assert_eq!(
             ds.iter().product::<u64>(),
@@ -1023,10 +1016,8 @@ mod tests {
         // retile of the chunk's PADDED host rows, at `(χ·E + e)·chunk_elems`.
         let one_ds = [chunk_groups, in_pad / 2, 64, 2];
         let one_sm = [64 * in_pad, 2, in_pad, 1];
-        let one = RetileWalk {
-            device_size: &one_ds,
-            stride_map: &one_sm,
-        };
+        let one_axes = axes_of(&one_ds, &one_sm);
+        let one = RetileWalk { axes: &one_axes };
         for chi in 0..chunks as usize {
             for exp in 0..e as usize {
                 let dev_base = (chi * e as usize + exp) * chunk_elems as usize;

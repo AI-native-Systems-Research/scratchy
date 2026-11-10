@@ -34,7 +34,9 @@ use crate::runtime::{
     HwError, PeerLink, Stream,
 };
 use crate::sen_convert;
-use crate::stage_weight::{Element, RetileWalk, WalkArm, stage_weight_tiled};
+use crate::stage_weight::{
+    Element, RetileWalk, WalkArm, stage_weight_permuted, stage_weight_tiled,
+};
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  Typed quantities. Every number below names WHICH number it is; the executor never takes a bare
@@ -2281,7 +2283,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             } else {
                 match self.kernel_weights.get(nm) {
                     Some(&k) => {
-                        let dev_elems: u64 = k.device_size.iter().product();
+                        let dev_elems: u64 = k.axes.iter().map(|&(e, _)| e).product();
                         if dev_elems as usize * k.word_length as usize != src.len() {
                             bail!(
                                 "stage: kernel weight '{nm}' host size {} B != \
@@ -2440,20 +2442,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         let rows: std::sync::Mutex<Vec<StageRow>> = std::sync::Mutex::new(Vec::new());
         let t_stage = stage_diag.then(Instant::now);
         let stage_arm = |mode: StageMode<'_>| match mode {
-            StageMode::Retile(k, elem) => {
-                let walk = RetileWalk {
-                    device_size: &k.device_size,
-                    stride_map: &k.stride_map,
-                };
-                match (walk.arm(), elem) {
-                    (WalkArm::Permutation, Element::Fp8) => ArmKind::PermFp8,
-                    (WalkArm::Permutation, Element::F16) => ArmKind::PermF16,
-                    (WalkArm::InnerContig, Element::Fp8) => ArmKind::RowCopyFp8,
-                    (WalkArm::InnerContig, Element::F16) => ArmKind::RowConvertF16,
-                    (WalkArm::PerElement, Element::Fp8) => ArmKind::PerElementFp8,
-                    (WalkArm::PerElement, Element::F16) => ArmKind::PerElementF16,
-                }
-            }
+            // The arm label reads the BAKE'S verdict (`k.arm`), not a re-derivation — the
+            // table is the record of what the boot dispatched on.
+            StageMode::Retile(k, elem) => match (k.arm, elem) {
+                (WalkArm::Permutation, Element::Fp8) => ArmKind::PermFp8,
+                (WalkArm::Permutation, Element::F16) => ArmKind::PermF16,
+                (WalkArm::InnerContig, Element::Fp8) => ArmKind::RowCopyFp8,
+                (WalkArm::InnerContig, Element::F16) => ArmKind::RowConvertF16,
+                (WalkArm::PerElement, Element::Fp8) => ArmKind::PerElementFp8,
+                (WalkArm::PerElement, Element::F16) => ArmKind::PerElementF16,
+            },
             StageMode::Convert => ArmKind::Convert,
             StageMode::Verbatim => ArmKind::Verbatim,
         };
@@ -2465,15 +2463,24 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                     for (src, dst, mode, slot, offset) in bucket {
                         let t0 = stage_diag.then(Instant::now);
                         match mode {
-                            StageMode::Retile(k, elem) => stage_weight_tiled(
-                                src,
-                                dst,
-                                RetileWalk {
-                                    device_size: &k.device_size,
-                                    stride_map: &k.stride_map,
-                                },
-                                elem,
-                            ),
+                            // ⭐ THE BAKE'S VERDICT DISPATCHES — no analysis at boot. The
+                            // permutation arm plays the bake's stated order; every other
+                            // arm is the tiled walk over the bake's paired axes.
+                            StageMode::Retile(k, elem) => match k.arm {
+                                WalkArm::Permutation => stage_weight_permuted(
+                                    src,
+                                    dst,
+                                    &k.axes,
+                                    &k.order,
+                                    elem,
+                                ),
+                                _ => stage_weight_tiled(
+                                    src,
+                                    dst,
+                                    RetileWalk { axes: &k.axes },
+                                    elem,
+                                ),
+                            },
                             StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
                             StageMode::Verbatim => dst.copy_from_slice(src),
                         }
@@ -2553,10 +2560,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 };
                 let shape = match it.mode {
                     StageMode::Retile(k, _) => {
-                        format!(
-                            " device_size={:?} stride_map={:?}",
-                            k.device_size, k.stride_map
-                        )
+                        format!(" axes={:?} arm={:?}", k.axes, k.arm)
                     }
                     _ => String::new(),
                 };

@@ -10340,10 +10340,23 @@ fn cow_str(s: &str) -> proc_macro2::TokenStream {
     quote! { ::std::borrow::Cow::Borrowed(#lit) }
 }
 
-/// A `Cow::Borrowed` slice of unsuffixed integer literals.
+/// A `Cow::Borrowed` slice of `(u64, u64)` pairs — the walk's ONE (extent, stride) slice.
 #[cfg(feature = "spyre")]
-fn cow_u64s(v: &[u64]) -> proc_macro2::TokenStream {
-    let lits = v.iter().map(|x| proc_macro2::Literal::u64_unsuffixed(*x));
+fn cow_axis_pairs(v: &[(u64, u64)]) -> proc_macro2::TokenStream {
+    let lits = v.iter().map(|&(e, s)| {
+        let (e, s) = (
+            proc_macro2::Literal::u64_unsuffixed(e),
+            proc_macro2::Literal::u64_unsuffixed(s),
+        );
+        quote! { (#e, #s) }
+    });
+    quote! { ::std::borrow::Cow::Borrowed(&[#(#lits),*]) }
+}
+
+/// A `Cow::Borrowed` slice of unsuffixed `u8` literals — the bake's host-scan axis order.
+#[cfg(feature = "spyre")]
+fn cow_u8s(v: &[u8]) -> proc_macro2::TokenStream {
+    let lits = v.iter().map(|x| proc_macro2::Literal::u8_unsuffixed(*x));
     quote! { ::std::borrow::Cow::Borrowed(&[#(#lits),*]) }
 }
 
@@ -10553,22 +10566,38 @@ fn placement_tokens(
 fn kernel_weight_tokens(
     k: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KernelWeight<'_>,
 ) -> proc_macro2::TokenStream {
-    let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KernelWeight {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle;
+    let bundle::KernelWeight {
         id,
-        device_size,
-        stride_map,
+        axes,
+        arm,
+        order,
         stick_size,
         word_length,
     } = k;
     let id = place_id_tokens(id);
-    let (device_size, stride_map) = (cow_u64s(device_size), cow_u64s(stride_map));
+    // ⭐ AN EXHAUSTIVE MATCH, NOT A DERIVATION: the bake holds the arm verdict and the macro
+    // emits it verbatim — a variant ADDED to `WalkArm` breaks THIS match at build time, and
+    // the boot receives the statement, never a re-analysis of the axes.
+    let arm = match arm {
+        bundle::WalkArm::Permutation => {
+            quote! { ::scratchy_target_spyre::bundle_code::WalkArm::Permutation }
+        }
+        bundle::WalkArm::InnerContig => {
+            quote! { ::scratchy_target_spyre::bundle_code::WalkArm::InnerContig }
+        }
+        bundle::WalkArm::PerElement => {
+            quote! { ::scratchy_target_spyre::bundle_code::WalkArm::PerElement }
+        }
+    };
+    let (axes, order) = (cow_axis_pairs(axes), cow_u8s(order));
     let (stick_size, word_length) = (
         proc_macro2::Literal::u32_unsuffixed(*stick_size),
         proc_macro2::Literal::u32_unsuffixed(*word_length),
     );
     quote! {
         ::scratchy_target_spyre::bundle_code::KernelWeight {
-            id: #id, device_size: #device_size, stride_map: #stride_map,
+            id: #id, axes: #axes, arm: #arm, order: #order,
             stick_size: #stick_size, word_length: #word_length,
         }
     }
