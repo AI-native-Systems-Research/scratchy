@@ -5296,7 +5296,11 @@ pub fn assemble_convert_band<T: crate::collective::Tp>(
             arg.set_offset_elems(w.dev().into_raw_elems());
             if !w.spans_one_stick() {
                 arg.set_axis("mb", |mb| mb.pitch(&plan, w.parent_rows()))
-                    .unwrap_or_else(|e| panic!("assemble_convert_band {op_name}: {e}"));
+                    .map_err(|e| {
+                        crate::superdsc_error::SuperDscError(format!(
+                            "assemble_convert_band {op_name}: {e}"
+                        ))
+                    })?;
             }
         }
     }
