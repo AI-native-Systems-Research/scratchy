@@ -55,16 +55,16 @@ fn dim(name: &'static str, size: u32, is_stick: bool) -> ItDim {
 }
 
 fn tile(rows: u32, cols: u32) -> TileOp {
-    TileOp {
-        // The scalar rides as an operand, so three live tensors: scalar, table, output.
-        kind: TileOpKind::PointwiseOrReduce { n_operands: 3 },
-        dims: vec![
+    // The scalar rides as an operand, so three live tensors: scalar, table, output.
+    TileOp::new(
+        TileOpKind::PointwiseOrReduce { n_operands: 3 },
+        vec![
             dim("mb", rows, false),
             dim("out", cols, true),
             dim("y", 1, false),
         ],
-        df: Df::Fp16,
-    }
+        Df::Fp16,
+    )
 }
 
 fn h(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {

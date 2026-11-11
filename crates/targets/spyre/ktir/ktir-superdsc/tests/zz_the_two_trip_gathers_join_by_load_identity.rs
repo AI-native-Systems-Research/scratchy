@@ -418,7 +418,9 @@ fn swapping_the_trips_swaps_the_index_offsets() {
 
 // ── THE DEVICE-WIDTH RESERVATION AND THE WINDOWED PAD DROP (items 4 and 5) ─────────────────
 
-use ktir_superdsc::work::{DeviceWidth, UTIL_FLOOR_CORES};
+use ktir_superdsc::device_gen::{DeviceGen, Gen1};
+use ktir_superdsc::work::DeviceWidth;
+const UTIL_FLOOR_CORES: u32 = <Gen1 as DeviceGen>::UTIL_FLOOR_CORES;
 
 /// ⭐⭐⭐ `for_matmul` IS THE ONE WIDTH DECISION, AND `windowed` DROPS ONLY THE UTIL-FLOOR BUMP
 /// (item 5's own numbers): an unaligned logical `n` whose `CoreSplit` already meets the floor

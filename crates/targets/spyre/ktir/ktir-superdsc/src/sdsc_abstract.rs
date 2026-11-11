@@ -6279,7 +6279,7 @@ impl PagePlaneExtent {
     ///
     /// ⭐ WHICH IS WHY IT DOES NOT BIND AT ANY SHIPPED HEAD DIM, and that is a derived answer rather
     /// than a hope. [`crate::superdsc_opspec::gather_copy_cores`]-equivalent division splits `mb` into
-    /// WHOLE entries, so at `entries <= MAX_CORES` every core owns exactly one and the resident is
+    /// WHOLE entries, so at `entries <=` the core count every core owns exactly one and the resident is
     /// `4 * entry_bytes`: 32 KB at hd=64, 64 KB at hd=128, 128 KB at hd=256, against
     /// [`crate::superdsc_opspec::USABLE_LX_BYTES`] = 1.6 MB. It binds at hd >= 3277, where one entry's
     /// own double-buffered pair leaves LX — and there this returns `0`, which [`PageScratch::of_pass`]
@@ -6287,7 +6287,7 @@ impl PagePlaneExtent {
     pub const fn lx_entries_per_op(self) -> u64 {
         // Source chunk + destination chunk, each double buffered: four copies of one core's entries.
         let per_core = crate::superdsc_opspec::USABLE_LX_BYTES / (4 * self.entry_bytes());
-        per_core * crate::superdsc_opspec::MAX_CORES as u64
+        per_core * crate::device_gen::BUILD_CORES as u64
     }
 
     /// Elements of ONE kv head's block inside the plane — `hd * POOL_PAGE_SLOTS`, the whole of one head's
@@ -7036,7 +7036,7 @@ impl ChunkScratch {
     ///   * the chunk has ONE or TWO feature slabs ([`Self::LX_SLABS`]): head dim 64 (card-proven,
     ///     granite-2b) or 128 (granite-8b, whose 16 KiB Kᵗ entry under a two-stick score contraction dxp
     ///     accepts);
-    ///   * `ENTRIES_PER_OP == MAX_CORES`, and each leg's part is a whole number of pages;
+    ///   * `ENTRIES_PER_OP ==` the generation's core count, and each leg's part is a whole number of pages;
     ///   * at least one leg has a whole part in LX: a whole V part, or Kᵗ alone when the chunk is a
     ///     whole number of Kᵗ parts. That second case is granite-8b's 8-page rung (~1k tokens), whose V
     ///     part would be 16 pages: Kᵗ is one 8-page part in LX, and V is all tail, which is main's HBM
@@ -7069,7 +7069,7 @@ impl ChunkScratch {
         if matches!(rows, ChunkRowKind::Prompt)
             || slabs == 0
             || slabs > Self::LX_SLABS
-            || one_stick != crate::superdsc_opspec::MAX_CORES
+            || one_stick != crate::device_gen::BUILD_CORES
             || eph == 0
             || !one_stick.is_multiple_of(eph)
             || !eph.is_multiple_of(slabs)

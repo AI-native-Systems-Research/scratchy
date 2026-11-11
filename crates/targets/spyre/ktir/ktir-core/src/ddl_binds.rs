@@ -360,7 +360,7 @@ pub trait DeviceGen {
         }
     };
     /// The card's compute cores — the count every work plan caps at (one
-    /// entry per core on the gather's index stick; `MaxCores` in the work
+    /// entry per core on the gather's index stick; `CoreBudget` in the work
     /// planner). The frontend's default core count is the SAME fact.
     const CORES: u32;
     /// Corelets per compute tile.
@@ -380,6 +380,14 @@ pub trait DeviceGen {
     /// counts in, and (by the device's own stick law) the width of every
     /// format's stick: elems per stick = `FLIT_BYTES / element size`.
     const FLIT_BYTES: u64;
+    /// The bytes one core's share of an elementwise op may carry before another core pays for
+    /// itself. A descriptor's fixed cost grows with the cores it is spread over while its byte cost
+    /// is flat for a few KiB a core, so a free elementwise division spends one core per this many of
+    /// the bytes the op moves (`ktir-superdsc`'s `CoreBudget::for_bytes`).
+    const BYTES_PER_CORE: u64;
+    /// The fewest cores a FLOP-heavy matmul (`macs ≥ 2^20`) may be split onto — the floor the
+    /// windowed drop test, guard #11 and the bridge's floor test share.
+    const UTIL_FLOOR_CORES: u32;
     /// This generation's `dl16tofp32` lane permutation:
     /// `DL16TOFP32_PERMUTATION[i]` is the buffer position logical lane `i`
     /// of a 64-element block occupies in a staggered buffer. A const
@@ -750,6 +758,18 @@ impl DeviceGen for Gen1 {
     /// util/sendefs/sendefs.h:65-72 — holds exactly that quotient for all
     /// twelve of its rows, packed int2/int4 included).
     const FLIT_BYTES: u64 = 128;
+
+    /// BYTES_PER_CORE = 3 KiB: measured on the card (2026-11-08, the cycle counter over 200 launches
+    /// of 32 chained descriptors, pinned). A `[1, 2048]` add costs 0.51 µs a descriptor on 4–8 cores
+    /// against 0.80 µs on 32, flat from 1 to 8 cores; 32 cores win from 24–32 KiB of output up (6%
+    /// at 24 KiB, 16–19% at 32 KiB). A binary op moves three times its output, so 32 KiB of output
+    /// is 96 KiB = 32 cores at 3 KiB a core.
+    const BYTES_PER_CORE: u64 = 3 * 1024;
+
+    /// UTIL_FLOOR_CORES = 8: the fewest cores a FLOP-heavy matmul may land on — below it the gemm
+    /// streams its weight through a quarter of the machine (the 1.45× sengraph regression the
+    /// emitter's guard #11 names; issue 201 item 5 unified the three readers' `8`s).
+    const UTIL_FLOOR_CORES: u32 = 8;
 
     /// GEN1'S `dl16tofp32` LANE PERMUTATION — measured on the card
     /// (2026-10-26, granite-2b fp8, probe-8): within each 64-element block
