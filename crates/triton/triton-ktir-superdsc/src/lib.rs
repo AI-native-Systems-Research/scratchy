@@ -66,7 +66,7 @@ pub mod cases;
 pub mod layout;
 
 /// What went wrong, and at which stage.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Error {
     pub stage: &'static str,
     pub message: String,
@@ -82,11 +82,89 @@ impl std::fmt::Display for Error {
 ///
 /// Run [`triton_ktir::passes::to_ktir`] first — [`triton_ktir::handoff::lower`] refuses every
 /// `tt.*` op by name, which is what keeps a half-converted module from reaching a device program.
+///
+/// This is the UNCACHED door: it lowers the handoff (`to_ktir_emit::lower`, with
+/// `verify_defs` inside it) every call. The splice's per-bake path goes through
+/// [`node_for_keyed`], which lowers each distinct kernel once.
 pub fn node_for(m: &triton_ktir::ir::Module, program: Program) -> Result<KtirNode, Error> {
-    let func = triton_ktir::passes::to_ktir_emit::lower(m, Arena::global()).map_err(|e| Error {
+    mint_node(lower_handoff(m)?, program)
+}
+
+/// [`node_for`] with the key of the memoized compile that produced `m`.
+///
+/// A bake splices the SAME kernel many times over — once per layer, per rung, per world —
+/// and every one of those mints re-ran the whole handoff (`to_ktir_emit::lower` plus the
+/// `verify_defs` at its boundary) over an identical module (MEASURED on the tp/8 fp8
+/// bake, 2026-11-11: ~666% CPU / 40+ CPU-min / 17-25 GB RSS in the build script, the
+/// handoff and its arena interning high in the profile). The handoff is a pure function
+/// of the module, and the key is the caller's own compile-memo key — (source, spec,
+/// grid), under which that compile is deterministic — so key equality IS module
+/// equality, and the lowered [`IRFunction`] is computed once per key and shared.
+///
+/// ⛔ THE KEY'S CONTRACT: the caller must pass the key its compile memoized THIS module
+/// under (`scratchy-triton-splice`'s `compile_kernel`). A key paired with a module it
+/// did not produce would be served that key's function. `None` lowers uncached.
+///
+/// WHY CACHING THE `IRFunction` IS SOUND: every borrow in it comes from
+/// [`Arena::global()`], which is process-lived and append-only (it pins every string,
+/// argument list and op it hands out and never removes one), so a cached borrow stays
+/// valid and identical for the life of the process; and `IRFunction` is `Copy` over
+/// those borrows, so every mint gets its own struct while SHARING the immutable
+/// operations — nothing downstream can mutate what it does not own. The node's own
+/// re-statements (name, bindings, mask, `node_out_tid`, `answer_rows`) are fields of
+/// the `KtirNode`, rebuilt per mint, never of the cached function.
+pub fn node_for_keyed(
+    m: &triton_ktir::ir::Module,
+    key: Option<&str>,
+    program: Program,
+) -> Result<KtirNode, Error> {
+    let func = match key {
+        Some(key) => cached_handoff(m, key)?,
+        None => lower_handoff(m)?,
+    };
+    mint_node(func, program)
+}
+
+/// The handoff itself, unstated above so the cache's key handling cannot interleave
+/// with the lowering.
+fn lower_handoff(m: &triton_ktir::ir::Module) -> Result<ktir_core::ir::IRFunction<'static>, Error> {
+    triton_ktir::passes::to_ktir_emit::lower(m, Arena::global()).map_err(|e| Error {
         stage: "handoff",
         message: e.to_string(),
-    })?;
+    })
+}
+
+/// One key's handoff: computed at most once, by whichever caller gets there first — the
+/// splice's `MemoCell` law, restated for this crate's value.
+type HandoffCell =
+    std::sync::Arc<std::sync::OnceLock<Result<ktir_core::ir::IRFunction<'static>, Error>>>;
+
+/// ⭐ ONE HANDOFF PER KEY, EVER — the same memo law the splice's `compile_kernel` states:
+/// process-wide, shared by every thread, each key owning a `OnceLock` (the first caller
+/// computes, a concurrent caller for the same key waits on that one computation, and a
+/// failure is memoized like a success — the handoff is pure, so a retry could only say
+/// the same thing).
+fn cached_handoff(
+    m: &triton_ktir::ir::Module,
+    key: &str,
+) -> Result<ktir_core::ir::IRFunction<'static>, Error> {
+    static CELLS: std::sync::Mutex<std::collections::BTreeMap<String, HandoffCell>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let cell = {
+        let mut cells = CELLS.lock().unwrap_or_else(|p| p.into_inner());
+        std::sync::Arc::clone(cells.entry(key.to_string()).or_default())
+    };
+    match cell.get_or_init(|| lower_handoff(m)) {
+        Ok(func) => Ok(*func),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// The mint both doors share: positional `BufferId`s over the lowered function.
+fn mint_node(
+    func: ktir_core::ir::IRFunction<'static>,
+    program: Program,
+) -> Result<KtirNode, Error> {
     // PARAMETER POSITION IS THE BUFFER NUMBER. Their crate documents `BufferId` as opaque —
     // it renders an operand name for it and looks it up in a `BundleLayout`, never asking what
     // the buffer holds, because extents/strides/format all come from the program's own
