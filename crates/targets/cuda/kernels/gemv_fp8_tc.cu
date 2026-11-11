@@ -67,7 +67,9 @@ constexpr uint32_t N_MULTIPLE = 64;
 //     in flight (the same WGMMAs in the same order: the same bits);
 //   B3 `k128`: 128-wide K steps (`st_fp8e4m3<128, 128>` B and `<64, 128>` A boxes, 128-byte
 //     swizzle), four `m64n128k32` a stage, 8 stages;
-//   B4 `2cta`: 264 CTAs, two per SM, 6 stages each.
+//   B4 `2cta`: 264 CTAs, two per SM, 6 stages each;
+//   B6 `k256`: B3 at 256-wide K steps (`st_fp8e4m3<128, 256>` B, `<64, 256>` A: P-A's 256-byte
+//     rows), eight `m64n128k32` a stage, 4 stages (193 KB).
 // B3 and B4 change the K grouping and the stream-K split: the approved kind, under S3's bound.
 template <int K_STEP_, int STAGES_, int CTAS_, bool WAIT1_>
 struct tc_variant {
@@ -85,12 +87,13 @@ using tc_b1 = tc_variant<K_STEP, 12, CTAS, false>;
 using tc_b2 = tc_variant<K_STEP, 12, CTAS, true>;
 using tc_b3 = tc_variant<128, 8, CTAS, false>;
 using tc_b4 = tc_variant<K_STEP, 6, MAX_CTAS, false>;
+using tc_b6 = tc_variant<256, 4, CTAS, false>;
 
 using acc_tile = rt_fl<16, TILE_N>;
 using piece_rv = acc_tile::row_vec;
 using reduce_rv = rv_fl<REDUCE_ROWS>;
-using a_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::a_tile, tc_b3::a_tile>;
-using b_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::b_tile, tc_b3::b_tile>;
+using a_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::a_tile, tc_b3::a_tile, tc_b6::a_tile>;
+using b_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::b_tile, tc_b3::b_tile, tc_b6::b_tile>;
 // `[CTAS + tiles, 128]` f32 pieces, `[1, n]` scales and outputs: no tensor map.
 using partial_gl = gl<float, 1, 1, -1, -1>;
 using scale_gl = gl<float, 1, 1, -1, -1>;
@@ -332,7 +335,8 @@ int launch(const void* q, const void* a_scale, const void* const* b, const void*
 // attribute inside a timed region). 0 = done; any other value = the first failing cudaError_t.
 extern "C" int scratchy_cuda_gemv_fp8_tc_prepare(void) {
     cudaError_t e = cudaSuccess;
-    for (const cudaError_t r : {allow<tc_b1>(), allow<tc_b2>(), allow<tc_b3>(), allow<tc_b4>()}) {
+    for (const cudaError_t r : {allow<tc_b1>(), allow<tc_b2>(), allow<tc_b3>(), allow<tc_b4>(),
+                               allow<tc_b6>()}) {
         if (e == cudaSuccess) {
             e = r;
         }
@@ -362,7 +366,8 @@ extern "C" uint64_t scratchy_cuda_gemv_fp8_tc_partial_bytes(const uint32_t* n, u
 
 // The ceiling probe's test-only form (/tmp/d-cap.md §3 P-B): as `scratchy_cuda_gemv_fp8_tc` at
 // instance `variant` (0 B1, the launcher's; 1 B2 `wait1`; 2 B3 `k128`, which also needs `k` a
-// multiple of 128; 3 B4 `2cta`), and with `main_only` (B5 `noreduce`) the stream-K kernel alone,
+// multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, `k` a multiple of 256), and with `main_only` (B5
+// `noreduce`) the stream-K kernel alone,
 // leaving `c` unwritten. No tape launches it.
 extern "C" int scratchy_cuda_gemv_fp8_tc_variant(const void* q, const void* a_scale,
                                                  const void* const* b, const void* const* b_scale,
@@ -370,7 +375,7 @@ extern "C" int scratchy_cuda_gemv_fp8_tc_variant(const void* q, const void* a_sc
                                                  uint32_t count, uint32_t k, void* partials,
                                                  uint32_t variant, uint32_t main_only,
                                                  void* stream /* cudaStream_t */) {
-    if (scratchy_cuda_gemv_fp8_tc_partial_bytes(n, count, k) == 0 || variant > 3) {
+    if (scratchy_cuda_gemv_fp8_tc_partial_bytes(n, count, k) == 0 || variant > 4) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -380,7 +385,8 @@ extern "C" int scratchy_cuda_gemv_fp8_tc_variant(const void* q, const void* a_sc
             case 0: return launch<tc_b1>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
             case 1: return launch<tc_b2>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
             case 2: return launch<tc_b3>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
-            default: return launch<tc_b4>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            case 3: return launch<tc_b4>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            default: return launch<tc_b6>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
         }
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
