@@ -52,17 +52,88 @@ fn spec_anchors() {
     assert_eq!(e4m3_to_f32(0x00), 0.0);
 }
 
-/// ⛔ PAST THE MAXIMUM IS 448, NOT INF. The encoding that would be inf is the NaN, so an
-/// out-of-range activation must CLAMP: a quantize step is lossy-but-finite, never a tile poisoned
-/// with NaN that then propagates through every downstream matmul.
+/// ⭐⭐⭐ THE ENCODER IS THE CARD'S `qfp8ch`, BYTE FOR BYTE — the bytes ONE `qfp8ch` descriptor wrote on
+/// the card (32 cores, a `[1, 16384]` fp16 row → fp8, 2026-11-08; the cell and its readback are
+/// `/work/tp-fp8mm-runs/qfp8-cell` on the TP pod: `in.bin`, `out.bin`, and a lane-identifying twin
+/// that fixed the convert's in-stick output order). Every row below is an (fp16 input, card byte)
+/// pair from that run.
+///
+/// ⛔ PAST THE FINITE RANGE THE CARD WRITES NaN, NOT 448. e4m3fn's largest finite is 448 (`0x7E`);
+/// the next step it would have is 480, and that is the NaN encoding. Rounding to nearest sends
+/// `[448, 464)` to 448 and everything at or past the midpoint 464 — `±inf` included — to
+/// `0x7F`/`0xFF`. MEASURED over every finite fp16 value in `[448, 65504]` and its negation (plus the
+/// head rows below, which repeat a few of them): every positive lane in `[448, 464)` was `0x7E` and
+/// every one at or past 464 `0x7F` (68 / 7,370 of 7,438 lanes), and likewise `0xFE`/`0xFF` for the
+/// negations (66 / 7,364 of 7,430). A program must state its own clamp to ±448 before
+/// the convert — the W8A8 chain's `clip`, the MoE kernel's `tl.minimum`/`tl.maximum` — and the
+/// emulator now poisons what the card poisons when it does not.
 #[test]
-fn out_of_range_saturates_and_does_not_become_nan() {
-    for v in [449.0f32, 1.0e9, f32::MAX, f32::INFINITY] {
-        assert_eq!(f32_to_e4m3(v), 0x7E, "{v} must clamp to +448");
-        assert_eq!(f32_to_e4m3(-v), 0xFE, "-{v} must clamp to -448");
-        assert!(!e4m3_to_f32(f32_to_e4m3(v)).is_nan());
+fn the_encoder_is_the_cards_qfp8ch() {
+    const CARD: &[(f32, u8)] = &[
+        (0.0, 0x00),
+        (1.0, 0x38),
+        (-1.0, 0xB8),
+        (240.0, 0x77),
+        (416.0, 0x7D),
+        (432.0, 0x7E),
+        (447.75, 0x7E),
+        (448.0, 0x7E),
+        (448.25, 0x7E),
+        (448.5, 0x7E),
+        (449.0, 0x7E),
+        (456.0, 0x7E),
+        (464.0, 0x7F),
+        (480.0, 0x7F),
+        (500.0, 0x7F),
+        (512.0, 0x7F),
+        (1024.0, 0x7F),
+        (4096.0, 0x7F),
+        (30000.0, 0x7F),
+        (65504.0, 0x7F),
+        (f32::INFINITY, 0x7F),
+        (-448.0, 0xFE),
+        (-448.25, 0xFE),
+        (-448.5, 0xFE),
+        (-464.0, 0xFF),
+        (-65504.0, 0xFF),
+        (f32::NEG_INFINITY, 0xFF),
+    ];
+    for &(v, byte) in CARD {
+        assert_eq!(
+            f32_to_e4m3(v),
+            byte,
+            "{v}: the card's qfp8ch wrote 0x{byte:02x}, the encoder 0x{:02x}",
+            f32_to_e4m3(v)
+        );
     }
+    // The band edge, at every fp16 value the card swept: `[448, 464)` is ±448 and `[464, 65504]`
+    // NaN, both signs — the split the card's lanes showed.
+    let fp16 = |bits: u16| half::f16::from_bits(bits).to_f32();
+    for bits in 0x5F00u16..=0x7BFF {
+        let v = fp16(bits);
+        if v < 448.0 {
+            continue;
+        }
+        let (pos, neg) = if v < 464.0 {
+            (0x7E, 0xFE)
+        } else {
+            (0x7F, 0xFF)
+        };
+        assert_eq!(f32_to_e4m3(v), pos, "{v}");
+        assert_eq!(f32_to_e4m3(-v), neg, "-{v}");
+    }
+    assert_eq!(
+        (0x5F00u16..=0x7BFF)
+            .map(fp16)
+            .filter(|&v| (448.0..464.0).contains(&v))
+            .count(),
+        64,
+        "the fp16 grid holds 64 values in [448, 464) (448 .. 463.75 at a 0.25 step)"
+    );
     assert_eq!(f32_to_e4m3(f32::NAN), NAN_MAG);
+    // A finite input that overflows is NaN on decode, exactly as on the card.
+    assert!(e4m3_to_f32(f32_to_e4m3(464.0)).is_nan());
+    assert_eq!(e4m3_to_f32(f32_to_e4m3(463.75)), 448.0);
 }
 
 /// Rounding is to NEAREST, so a value between two grid points lands on the closer one and a value
@@ -108,7 +179,7 @@ use ktir_core::dtypes::DType;
 use ktir_core::tile::Tile;
 
 /// The values used below, chosen to land on both grids: exact powers of two, a subnormal, the
-/// boundary the encoder got wrong, and the saturating extreme.
+/// boundary the encoder got wrong, and a value past the finite range (NaN on the card).
 fn sample() -> Vec<f32> {
     vec![
         0.0,
@@ -119,7 +190,7 @@ fn sample() -> Vec<f32> {
         0.015_380_859,   // the subnormal→normal boundary that clamp(0, 7) rounded the wrong way
         448.0,
         -448.0,
-        1.0e9, // saturates
+        1.0e9, // past the finite range: NaN, as on the card
     ]
 }
 
@@ -142,8 +213,10 @@ fn slice_round_trip_equals_the_scalar_grid() {
     assert_eq!(back.len(), v.len());
     for (i, (&orig, &got)) in v.iter().zip(back.iter()).enumerate() {
         let want = e4m3_to_f32(f32_to_e4m3(orig));
+        // By BITS: a value past the finite range decodes to NaN on both paths, and NaN != NaN.
         assert_eq!(
-            got, want,
+            got.to_bits(),
+            want.to_bits(),
             "element {i}: {orig} decoded to {got}, want {want}"
         );
     }
@@ -159,6 +232,10 @@ fn fp8_tile_len_and_widening() {
     let widened = t.as_f32();
     assert_eq!(widened.len(), v.len());
     for (i, (&orig, &got)) in v.iter().zip(widened.iter()).enumerate() {
-        assert_eq!(got, e4m3_to_f32(f32_to_e4m3(orig)), "element {i} of {orig}");
+        assert_eq!(
+            got.to_bits(),
+            e4m3_to_f32(f32_to_e4m3(orig)).to_bits(),
+            "element {i} of {orig}"
+        );
     }
 }

@@ -37,8 +37,7 @@
 //! leaf crate must not own it, and it cannot be received as data either.
 //!
 //! ⚠️ NOT YET LEAF-CLEAN: [`emit::EmittedOp`], this crate's own output type, still carries a
-//! consumer's bake plan (`kv_page_fold`, `kv_batched_requests`, `kv_fold_rows`, `kv_page_slots`,
-//! `kv_request`, `host_kv_write`, `kv_n_skip`, `slot_no_fuse`) alongside the descriptors it emits.
+//! consumer's bake plan (`kv_page_fold`, `kv_gathered`, `walk`) alongside the descriptors it emits.
 //! Separating what the lowering EMITS from what the caller SCHEDULES is outstanding work.
 //!
 //! Citations to `ibm/main` line numbers throughout are the port's provenance — the body each
@@ -95,6 +94,11 @@ pub mod superdsc_error;
 /// Typed FRONTEND core for the SuperDSC emitter — `OpSpec`/`TensorArg`/`WorkPlan` and the sealed
 /// witnesses that make the historical SDSC bug classes unrepresentable rather than runtime-checked.
 pub mod superdsc_opspec;
+/// ⭐ THE CONSTRAINT SOLVE'S ONE UNION-FIND — weighted joins (a group: the frame pass's
+/// equalities, the element-arrangement solve's mod-4 lane shifts), per-component anchors
+/// with first-op-wins naming, and the one unanchored default. Every class-bearing solve in
+/// the crate lowers through it; no reader re-derives a class the solve already stated.
+pub mod union_find;
 /// THE WIRE LAYER — `Dsc`/`SdscOp` and the whole `#[derive(Serialize)]` family, the three fp8
 /// nested-fold generators, and the HBM segment constants. The SuperDSC TYPE itself: this is the
 /// JSON dxp reads, and the typed core in [`superdsc_opspec`] lowers into it.

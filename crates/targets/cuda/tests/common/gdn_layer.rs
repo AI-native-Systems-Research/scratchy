@@ -31,6 +31,7 @@
 //! `core` (not `z`'s colour 3: the GDN op reads its inputs across the step); 7 `y`. After the
 //! colours: the GDN sequence region (16 bytes in a 256-byte slot), then the GDN scratch.
 
+use scratchy_subtile::fixtures::rebind;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
@@ -121,10 +122,12 @@ pub fn gdn_layer_input(m: u32) -> LoweringInput {
 /// 0's `linear_attn` weight.
 pub fn gdn_layer(m: u32) -> LoweredDecode {
     let mut l = with_hidden(gdn_layer_input(m));
-    l.bindings[BUNDLE as usize] = SourceBinding::Weight {
-        id: BUNDLE,
-        index: Some(UnrollIndex(u64::from(LAYER))),
-    };
+    rebind(&mut l, |b| {
+        b[BUNDLE as usize] = SourceBinding::Weight {
+            id: BUNDLE,
+            index: Some(UnrollIndex(u64::from(LAYER))),
+        }
+    });
     l
 }
 

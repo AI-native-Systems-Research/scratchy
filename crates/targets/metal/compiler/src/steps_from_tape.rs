@@ -618,7 +618,7 @@ impl Recording<'_> {
     }
 
     fn embedded(&self, i: usize, k: u8, e: usize) -> Result<Slot, StepRefusal> {
-        match self.l.bindings[e] {
+        match self.l.bindings()[e] {
             SourceBinding::EmbeddedHidden => Ok(self.embedded_hidden(e)),
             _ => Err(self.no(i, Refused::ForeignActivation(k))),
         }
@@ -655,7 +655,7 @@ impl Recording<'_> {
         self.steps.args[i].iter().find_map(|r| match r {
             InputRef::Ext(e)
                 if matches!(
-                    self.l.bindings[*e],
+                    self.l.bindings()[*e],
                     SourceBinding::Weight { .. }
                         | SourceBinding::WeightScale { .. }
                         | SourceBinding::BundleTensor { .. }
@@ -673,7 +673,7 @@ impl Recording<'_> {
 
     /// A weight's layer: its unroll index, else 0.
     fn layer(&self, e: usize) -> LayerId {
-        match &self.l.bindings[e] {
+        match &self.l.bindings()[e] {
             SourceBinding::Weight { index, .. }
             | SourceBinding::WeightScale { index, .. }
             | SourceBinding::BundleTensor { index, .. } => LayerId(index.map_or(0, |u| u.0 as u32)),
@@ -692,7 +692,7 @@ impl Recording<'_> {
     /// BUNDLE's path — the tensor inside it resolves by `WeightTensor` at command lowering, so the
     /// base is the bundle's own.
     fn base(&self, i: usize, e: usize) -> Result<String, StepRefusal> {
-        match &self.l.bindings[e] {
+        match &self.l.bindings()[e] {
             SourceBinding::Weight { id, .. }
             | SourceBinding::WeightScale { id, .. }
             | SourceBinding::BundleTensor { id, .. } => {
@@ -736,7 +736,7 @@ impl Recording<'_> {
     /// The DSL weight weight operand `e` binds — a plain weight, its scale, or one tensor of a
     /// bundle (the bundle's own weight).
     fn weight_id(&self, i: usize, e: usize) -> Result<u32, StepRefusal> {
-        match self.l.bindings[e] {
+        match self.l.bindings()[e] {
             SourceBinding::Weight { id, .. }
             | SourceBinding::WeightScale { id, .. }
             | SourceBinding::BundleTensor { id, .. } => Ok(id),
@@ -748,7 +748,7 @@ impl Recording<'_> {
     fn rotary(&self, i: usize) -> WeightSlot {
         let local = self.steps.args[i].iter().any(|r| match r {
             InputRef::Ext(e) => matches!(
-                self.l.bindings[*e],
+                self.l.bindings()[*e],
                 SourceBinding::Cos { local: true } | SourceBinding::Sin { local: true }
             ),
             InputRef::Op(_) => false,
@@ -897,7 +897,7 @@ impl Recording<'_> {
             _ => return self.codec_writer(i, self.step_arg(i, k)?),
         };
         let no = || self.no(i, Refused::CodecUnanchored);
-        let layer = match self.l.bindings[e] {
+        let layer = match self.l.bindings()[e] {
             SourceBinding::PrefixK { layer } | SourceBinding::PrefixV { layer } => layer,
             _ => return Err(no()),
         };
@@ -1159,8 +1159,7 @@ impl Recording<'_> {
         if !ops.clone().any(norm) {
             return Err(canonical_refusal(Refused::NoFirstNorm));
         }
-        let embedded = SourceBinding::EmbeddedHidden;
-        let Some(e) = self.l.bindings.iter().position(|b| *b == embedded) else {
+        let Some(e) = self.l.embed_row().map(|r| r.index()) else {
             return Ok((Vec::new(), None));
         };
         // Each head row's arena operands, as it names them.
@@ -1782,7 +1781,7 @@ impl Recording<'_> {
     /// The layer the cache an attention reads belongs to, from its prefix K source.
     fn prefix_layer(&self, i: usize) -> Option<LayerId> {
         match self.arg(i, 1).ok()? {
-            InputRef::Ext(e) => match self.l.bindings[e] {
+            InputRef::Ext(e) => match self.l.bindings()[e] {
                 SourceBinding::PrefixK { layer } => Some(LayerId(layer as u32)),
                 _ => None,
             },
@@ -2235,7 +2234,7 @@ impl Recording<'_> {
                 // tape — refuse rather than silently drop the sinks.
                 let sites = match self.arg(i, 5) {
                     Ok(InputRef::Ext(e)) => {
-                        if !matches!(self.l.bindings[e], SourceBinding::Weight { .. }) {
+                        if !matches!(self.l.bindings()[e], SourceBinding::Weight { .. }) {
                             return Err(self.no(i, Refused::NotAWeight(e)));
                         }
                         let mut sites = sites;
@@ -2285,7 +2284,7 @@ impl Recording<'_> {
                 // rather than silently drop the sinks.
                 match self.arg(i, 4) {
                     Ok(InputRef::Ext(e)) => {
-                        if !matches!(self.l.bindings[e], SourceBinding::Weight { .. }) {
+                        if !matches!(self.l.bindings()[e], SourceBinding::Weight { .. }) {
                             return Err(self.no(i, Refused::NotAWeight(e)));
                         }
                         sites.extend(self.site(i, WeightKind::AttnSinks, e)?);

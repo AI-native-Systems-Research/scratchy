@@ -265,6 +265,13 @@ fn executor_bg_loop(
     rx: std::sync::mpsc::Receiver<PipelineMsg>,
     tx: std::sync::mpsc::SyncSender<PipelineResult>,
 ) {
+    // First act: run where the executor's devices want their driver. A refusal ends the thread
+    // by name; the client's next receive reports the thread gone.
+    if let Err(e) = executor.pin_driving_thread() {
+        tracing::error!("executor thread: {e}");
+        executor.shutdown();
+        return;
+    }
     while let Ok(msg) = rx.recv() {
         match msg {
             PipelineMsg::Step(sched) => {
@@ -622,7 +629,7 @@ impl EngineCoreClient for InprocClient {
 mod tests {
     use super::*;
     use crate::executor::NoopExecutor;
-    use scratchy_core_common::SamplingParams;
+    use scratchy_core_common::{KvBlockTokens, SamplingParams};
     use scratchy_core_config::{SchedulerConfig, SchedulerPolicy};
 
     fn make_test_config() -> EngineCoreConfig {
@@ -638,7 +645,7 @@ mod tests {
             },
             max_model_len: 4096,
             num_gpu_blocks: 1024,
-            block_size: 16,
+            block_size: KvBlockTokens::new(16).expect("16 > 0"),
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,

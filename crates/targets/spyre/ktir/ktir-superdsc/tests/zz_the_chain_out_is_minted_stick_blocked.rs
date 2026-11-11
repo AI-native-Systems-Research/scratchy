@@ -80,6 +80,7 @@ fn node() -> KtirNode {
         ],
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     }

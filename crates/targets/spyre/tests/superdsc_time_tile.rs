@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// ⛔ RUN THIS FILE WITH `SCRATCHY_PLAN_ONLY_BAKE=1`.
+// `tiled_matmul_trips_do_not_alias_and_advance` drives a real bake; under `spyre-lower` without
+// `spyre-hw` that bake lowers every group and compiles none (`superdsc_bake::global()` is `None` by
+// feature), so the PLAN it inspects is built with no device compiler on the host:
 //
-// `tiled_matmul_trips_do_not_alias_and_advance` drives a real bake, and the bake
-// REFUSES on a host with no device compiler (`no_dxp_or_die`) — deliberately, so
-// a build cannot ship a memory plan with no device programs, which links and
-// serves and returns empty completions with no error anywhere. A test that only
-// inspects the PLAN is the one legitimate caller of that escape hatch, so it
-// must state it on purpose:
+//     cargo test -p scratchy-target-spyre --features spyre-lower --test superdsc_time_tile
 //
-//     SCRATCHY_PLAN_ONLY_BAKE=1 cargo test -p scratchy-target-spyre
-//
-// It is NOT set from inside the test: `std::env::set_var` is `unsafe` in edition
-// 2024 and races every other thread in this binary that bakes.
 //! LX-fit TIME-TILING (coarse_tile) gate for the typed SuperDSC IR.
 //!
 //! Pins the **TimeTile** / **TiledStickExtent** / **SymbolicWhenTiled** witnesses:
@@ -205,7 +198,8 @@ fn reduce_and_multiop_invariants() {
         &emit::rb("r_x", 64, 576),
         &emit::rb("r_acc", 64, 1),
         None,
-    );
+    )
+    .expect("assemble_reduce builds");
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&emitted.op).unwrap()).unwrap();
     // (1) coreIdToDsc_ spans exactly numCoresUsed_ cores (consistent with the schedule).
@@ -250,11 +244,12 @@ fn reduce_and_multiop_invariants() {
         576,
         "x",
         "w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+        ktir_superdsc::place::SynthId::Act(7),
         "eps",
         None,
         &mut sym,
         None,
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
     .expect("the rmsnorm chain lowers — its long-reduce split, when it fires, is the same law");
     assert_eq!(ops.len(), 5, "the exx2 head fuses rmsq+rmmean: 6 ops → 5");
@@ -393,7 +388,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
             576,
             "t1",
             "t2",
-            PlaceId::Act(7),
+            ktir_superdsc::place::SynthId::Act(7),
             "t3",
             // The Scale convention — no `γ+1` row, byte-identical to the emission before
             // the OnePlusScale row existed. The oneplus law has its own golden
@@ -401,6 +396,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
             None,
             &mut sym,
             Some(&l),
+            &mut ktir_superdsc::placement::LxScope::for_test(),
         )
         .expect("the rmsnorm chain lowers at every rung — a refusal is a broken rung, not a skip")
     };
@@ -509,16 +505,14 @@ fn rmsnorm_rinv_is_pinned_lx() {
     );
 }
 
-// ── #645 fix (a), STEP 3: THE OP-LOCAL SLOT ALTERNATION WALK ───────────────────
+// ── #645 fix (a): OP-LOCAL PINS SHARE A SLOT PER CLASS ─────────────────────────
 //    Two norms of ONE footprint class share ONE top-down slot (pinned above: every
 //    same-class rinv resolves to the same address below LX_PIN_END), so a name's bytes
-//    survive exactly until the next same-class name's program runs. The walk proves the
-//    touching names form CONTIGUOUS RUNS over the bundle's emitted order — per launch
-//    group over its programs, with the run state carried ACROSS groups (a bundle's
-//    launches are ordered on one stream). Every test here drives it the way
-//    `ktir_groups_via_superdsc` does: real `assemble_rmsnorm` chains against one
-//    layout, `per_prog` one (program, descriptor-count) entry per chain, the SAME
-//    partition (`trip_kinds_for` + `group_ranges`) the launch index uses.
+//    survive exactly until the next same-class name's program runs. That is sound by
+//    construction: each pin's writer and reader are built by its pair, inside one
+//    program's scope, which refuses a second same-class pin. The tests here drive real
+//    `assemble_rmsnorm` chains against one layout, and read the pin ledger over the
+//    programs with their own descriptors, the way `ktir_groups_via_superdsc` does.
 
 /// The walk tests' fixture: one layout holding both norms' operands — x/gamma/eps shared
 /// (placed tensors; the pins are keyed on the OUT), outs `t7` and `t17` — so two real
@@ -564,19 +558,41 @@ fn norm(
     out: u32,
     sym: &mut i64,
 ) -> Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
+    // One norm, one program: its own scope.
+    norm_in(
+        l,
+        prefix,
+        out,
+        sym,
+        &mut ktir_superdsc::placement::LxScope::for_test(),
+    )
+    .expect("the interleave fixture's norm lowers — the LX slot laws it pins need the ops")
+}
+
+/// [`norm`] inside a GIVEN program's scope — the shape two norms of one program would take.
+fn norm_in(
+    l: &ktir_superdsc::placement::BundleLayout,
+    prefix: &str,
+    out: u32,
+    sym: &mut i64,
+    scope: &mut ktir_superdsc::placement::LxScope,
+) -> Result<
+    Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>,
+    ktir_superdsc::superdsc_error::SuperDscError,
+> {
     assemble_rmsnorm(
         prefix,
         64,
         576,
         "t1",
         "t2",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(out),
+        ktir_superdsc::place::SynthId::Act(out),
         "t3",
         None,
         sym,
         Some(l),
+        scope,
     )
-    .expect("the interleave fixture's norm lowers — the LX slot laws it pins need the ops")
 }
 
 #[test]
@@ -604,17 +620,9 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
         "one shared top-down slot"
     );
     assert_eq!(pin_of("t7_rinv").2, LX_PIN_END - 8192);
-    // The walk: two programs in order, one name per class each — the accepting shape.
-    let mut ops = a.clone();
-    ops.extend(b.iter().cloned());
-    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
-    let ledger = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
-    )
-    .unwrap();
+    // The ledger: two programs in order, one name per class each — the pairs' own record.
+    let programs = [("rms_a", a.as_slice()), ("rms_b", b.as_slice())];
+    let ledger = superdsc::lx_slot_ledger(&programs, Some(&l));
     assert_eq!(ledger.len(), 2, "one ledger row per pin");
     let row_of = |n: &str| ledger.iter().find(|r| r.name == n).unwrap();
     for (pin, prog) in [("t7_rinv", "rms_a"), ("t17_rinv", "rms_b")] {
@@ -628,234 +636,116 @@ fn two_norms_of_one_class_alternate_the_one_shared_slot() {
              program touches it"
         );
     }
-    // The walk keys strictly off the layout's pin table: the same ops against no layout (a
-    // layout-less emission mints no pins) and against a layout that declared none both walk
-    // clean and empty.
-    assert!(
-        superdsc::walk_lx_slot_alternation(&ops, &per_prog, superdsc::FoldGrouping::Fused, None)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        superdsc::walk_lx_slot_alternation(
-            &ops,
-            &per_prog,
-            superdsc::FoldGrouping::Fused,
-            Some(&two_norm_layout())
-        )
-        .unwrap()
-        .is_empty()
-    );
+    // The ledger keys strictly off the layout's pin table: no layout, or a layout that declared
+    // none, records nothing.
+    assert!(superdsc::lx_slot_ledger(&programs, None).is_empty());
+    assert!(superdsc::lx_slot_ledger(&programs, Some(&two_norm_layout())).is_empty());
 }
 
+/// ⭐ ONE NAME PER CLASS PER PROGRAM — two same-class norms in ONE program's scope: the second pair
+/// is refused AT THE PAIR, naming both pins. One program is one SDSC phase, and dxp may order two
+/// chains' descriptors within it either way, so the second writer could land on the first pin
+/// before its reader runs. The class set is keyed by footprint bytes (a bake-time value), so the
+/// refusal is a named build error, not a per-class field.
 #[test]
-fn the_walk_refuses_one_program_touching_two_same_class_pins() {
+fn a_second_same_class_pin_in_one_program_refuses_at_the_pair() {
     let l = two_norm_layout();
     let mut sym = 0i64;
-    let mut ops = norm(&l, "a", 7, &mut sym);
-    ops.extend(norm(&l, "b", 17, &mut sym));
-    // ONE program owning both chains' ops — the shape a collapsed lowering would produce.
-    // One program's descriptors are one SDSC phase (the citations schedule per node, one
-    // phase each), so both pins live in the SAME phase with no phase boundary between
-    // their touches for a shared slot to alternate across: refused outright, both named.
-    let per_prog = vec![("rms_pair".to_string(), 10)];
-    let err = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
-    )
-    .unwrap_err();
-    assert!(err.contains("same-class op-local LX pins"), "{err}");
-    assert!(err.contains("'rms_pair'"), "{err}");
+    let mut scope = ktir_superdsc::placement::LxScope::for_test();
+    norm_in(&l, "a", 7, &mut sym, &mut scope).expect("the program's first norm of the class");
+    let Err(ktir_superdsc::superdsc_error::SuperDscError(err)) =
+        norm_in(&l, "b", 17, &mut sym, &mut scope)
+    else {
+        panic!("a second same-class pin in one program must refuse");
+    };
+    assert!(
+        err.contains("both of the 8192-byte class in ONE program"),
+        "{err}"
+    );
     assert!(
         err.contains("t7_rinv") && err.contains("t17_rinv"),
-        "names both pins of the class: {err}"
+        "names both: {err}"
     );
 }
 
+/// The rule is the PROGRAM's, not the layout's: with no layout to place them in, two same-class
+/// norms in one program still refuse at their pins, at the same class.
 #[test]
-fn the_walk_refuses_a_name_returning_after_its_sibling_took_the_slot() {
-    let l = two_norm_layout();
-    let mut sym = 0i64;
-    let mut ops = norm(&l, "a", 7, &mut sym);
-    ops.extend(norm(&l, "b", 17, &mut sym));
-    ops.extend(norm(&l, "a2", 7, &mut sym)); // A′: A's pin again, a THIRD program
-    let per_prog = vec![
-        ("rms_a".to_string(), 5),
-        ("rms_b".to_string(), 5),
-        ("rms_a2".to_string(), 5),
-    ];
-    let err = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
-    )
-    .unwrap_err();
-    assert!(err.contains("touched again"), "{err}");
-    assert!(err.contains("'rms_a2'"), "{err}");
-    assert!(err.contains("t7_rinv"), "names the RETURNING pin: {err}");
+fn a_second_same_class_pin_refuses_without_a_layout_too() {
+    let mut scope = ktir_superdsc::placement::LxScope::for_test();
+    let norm_no_layout = |out: u32, scope: &mut ktir_superdsc::placement::LxScope| {
+        let mut sym = 0i64;
+        assemble_rmsnorm::<ktir_superdsc::collective::TpWorld<1>>(
+            &format!("n{out}"),
+            64,
+            576,
+            "t1",
+            "t2",
+            ktir_superdsc::place::SynthId::Act(out),
+            "t3",
+            None,
+            &mut sym,
+            None,
+            scope,
+        )
+    };
+    norm_no_layout(7, &mut scope).expect("the program's first norm of the class");
+    let Err(ktir_superdsc::superdsc_error::SuperDscError(err)) = norm_no_layout(17, &mut scope)
+    else {
+        panic!("a second same-class pin in one program, layout or not, must refuse");
+    };
     assert!(
-        err.contains("t17_rinv"),
-        "names the sibling that took the slot: {err}"
+        err.contains("both of the 8192-byte class in ONE program"),
+        "{err}"
     );
+    norm_no_layout(17, &mut ktir_superdsc::placement::LxScope::for_test())
+        .expect("the same norm in its own program");
 }
 
+/// The neighbour: the same two norms as two PROGRAMS (two scopes) — the shared slot alternates.
 #[test]
-fn the_walk_carries_run_state_across_launch_groups() {
+fn same_class_pins_in_two_programs_share_the_slot() {
     let l = two_norm_layout();
     let mut sym = 0i64;
-    let a = norm(&l, "a", 7, &mut sym);
-    let b = norm(&l, "b", 17, &mut sym);
-    let a2 = norm(&l, "a2", 7, &mut sym);
-    // A trip of ANOTHER kind between the runs — a distinct-slot KV cachewr
-    // (`slot_stride_bytes` = 128, the decode write's head_dim·2) — cuts the partition:
-    // [A's 5 Pure] [the Slot singleton] [B's and A′'s 10 Pure] are THREE launch groups.
-    // The clone binds no op-local pin (A's reduce reads x and writes its mean synth), so it
-    // contributes no touch — only its trip KIND matters.
-    let mut slot = a[0].clone();
-    slot.op_name = "cachewr_slot".to_string();
-    slot.slot_stride_bytes = 128;
-    let mut ops = a.clone();
-    ops.push(slot);
-    ops.extend(b.iter().cloned());
-    let per_prog = vec![
-        ("rms_a".to_string(), 5),
-        ("cachewr".to_string(), 1),
-        ("rms_b".to_string(), 5),
-    ];
-    // Without the returning name, the group boundary alone is NOT a refusal: A's run simply
-    // stays open across the Slot's group and B closes it in the third.
-    let ledger = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
+    norm_in(
+        &l,
+        "a",
+        7,
+        &mut sym,
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
-    .unwrap();
-    assert_eq!(ledger.len(), 2, "A | Slot | B walks clean");
-    // With A′ following B in the LAST group, the refusal fires ONLY because A's run — opened
-    // in the FIRST group — was closed and remembered ACROSS the Slot boundary: were the run
-    // state reset per group, the third group would start empty and A′'s touch would merely
-    // close B's run, with no refusal.
-    ops.extend(a2);
-    let per_prog = vec![
-        ("rms_a".to_string(), 5),
-        ("cachewr".to_string(), 1),
-        ("rms_b".to_string(), 5),
-        ("rms_a2".to_string(), 5),
-    ];
-    let err = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
+    .expect("program A");
+    norm_in(
+        &l,
+        "b",
+        17,
+        &mut sym,
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
-    .unwrap_err();
-    assert!(err.contains("touched again"), "{err}");
-    assert!(err.contains("'rms_a2'"), "{err}");
-    assert!(err.contains("t7_rinv"), "names the returning pin: {err}");
+    .expect("program B");
 }
 
-// ── THE DIRECTION GUARD: every op-local pin this bundle TOUCHES is touched in BOTH directions —
-//    ≥1 write and ≥1 read, both through NAMED arg bindings (the only consult the walk has).
-//    A read with no write is a producer the emission lost, or one addressing the pin through a
-//    RAW OFFSET no walk over arg_bindings can see; a write with no read is dead scratch minted
-//    against the window budget. Both are build failures here, never card-time stale bytes.
+// ── The layout is RUNG-shared (the declare pass pre-declares prefix, bodies and suffix alike), so
+//    ANOTHER bundle's pins sit untouched in this bundle's table; the ledger records them as empty.
 #[test]
-fn the_walk_refuses_a_pin_no_program_writes() {
-    let l = two_norm_layout();
-    let mut sym = 0i64;
-    // A's chain with its WRITER dropped — `rmrsqrt`, the op whose OUTPUT binding is the pin's
-    // one write. The pin is still declared (the chain's own mint), and `rmxn` still READS it
-    // by name, so the walk sees a read-only touch.
-    let a: Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = norm(&l, "a", 7, &mut sym)
-        .into_iter()
-        .filter(|e| e.op_name != "rmrsqrt_a")
-        .collect();
-    assert_eq!(a.len(), 4, "the writer dropped, the reader kept");
-    let b = norm(&l, "b", 17, &mut sym);
-    let mut ops = a.clone();
-    ops.extend(b.iter().cloned());
-    let per_prog = vec![
-        ("rms_a".to_string(), a.len()),
-        ("rms_b".to_string(), b.len()),
-    ];
-    let err = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
-    )
-    .unwrap_err();
-    assert!(err.contains("no program WRITES it"), "{err}");
-    assert!(err.contains("t7_rinv"), "names the orphaned pin: {err}");
-    assert!(
-        !err.contains("t17_rinv"),
-        "B's intact chain is not the refusal's subject: {err}"
-    );
-}
-
-#[test]
-fn the_walk_refuses_a_pin_no_program_reads() {
-    let l = two_norm_layout();
-    let mut sym = 0i64;
-    // A's chain with its READER dropped — `rmxn`, the op whose INPUT binding (the `col_at`
-    // view of the pin) is the pin's one read. The writer still declares it, so the walk sees
-    // a write-only touch: dead scratch against the LX window.
-    let a: Vec<emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> = norm(&l, "a", 7, &mut sym)
-        .into_iter()
-        .filter(|e| e.op_name != "rmxn_a")
-        .collect();
-    assert_eq!(a.len(), 4, "the reader dropped, the writer kept");
-    let b = norm(&l, "b", 17, &mut sym);
-    let mut ops = a.clone();
-    ops.extend(b.iter().cloned());
-    let per_prog = vec![
-        ("rms_a".to_string(), a.len()),
-        ("rms_b".to_string(), b.len()),
-    ];
-    let err = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
-    )
-    .unwrap_err();
-    assert!(err.contains("no program READS it"), "{err}");
-    assert!(err.contains("t7_rinv"), "names the dead pin: {err}");
-    assert!(
-        !err.contains("t17_rinv"),
-        "B's intact chain is not the refusal's subject: {err}"
-    );
-}
-
-// ── THE CARVE-OUT the guard's scoping owes its safety to: the layout is RUNG-shared (the
-//    declare pass pre-declares prefix, bodies and suffix alike), so ANOTHER bundle's pins sit
-//    untouched in this bundle's table. They carry empty ledger rows and are not this walk's
-//    to judge — a guard over every pin in the table would refuse every bundle that shares a
-//    rung with a norm it never runs.
-#[test]
-fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
+fn the_ledger_records_a_pin_this_bundle_never_touches_as_empty() {
     use ktir_superdsc::place::SynthRole;
     use scratchy_target_spyre::bundle_code::PlaceId;
 
     let l = two_norm_layout();
-    // A third pin of the SAME class, minted straight into the shared layout the way the
-    // declare pass mints another bundle's norm — declared there, never touched here.
-    l.synth_lx_op_local(PlaceId::Act(27).synth(SynthRole::Rinv), &[64, 64]);
+    // A third norm of the SAME class, declared into the shared layout the way the declare pass
+    // mints another bundle's norm — its own program's pair — and never touched here.
+    let _ = norm_in(
+        &l,
+        "c",
+        27,
+        &mut 0i64,
+        &mut ktir_superdsc::placement::LxScope::for_test(),
+    );
     let mut sym = 0i64;
-    let mut ops = norm(&l, "a", 7, &mut sym);
-    ops.extend(norm(&l, "b", 17, &mut sym));
-    let per_prog = vec![("rms_a".to_string(), 5), ("rms_b".to_string(), 5)];
-    let ledger = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&l),
-    )
-    .unwrap();
+    let (a, b) = (norm(&l, "a", 7, &mut sym), norm(&l, "b", 17, &mut sym));
+    let programs = [("rms_a", a.as_slice()), ("rms_b", b.as_slice())];
+    let ledger = superdsc::lx_slot_ledger(&programs, Some(&l));
     assert_eq!(
         ledger.len(),
         3,
@@ -892,7 +782,8 @@ fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
 fn slice_operand_offsets_startaddr() {
     let e = emit::assemble_slice_add_gate::<ktir_superdsc::collective::TpWorld<1>>(
         "slice_g", 64, 64, "sx", "so",
-    );
+    )
+    .expect("assemble_slice_add_gate builds");
     let j: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&e.op).unwrap()).unwrap();
     let nodes = &j["dscs_"][0]["slice_g"]["scheduleTree_"];
@@ -964,7 +855,8 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "w"),
         &emit::rb("o", 384, 384),
         None,
-    );
+    )
+    .expect("assemble_matmul builds");
     assert_eq!(e.time, 1, "bmm fits LX in one trip");
     let seg = 0x4_0000_0000u64;
     let a = per_core_addrs(&e, "mm", 0); // INPUT  [mb,in,x,y] split on mb
@@ -1034,16 +926,35 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     // LOWERED descriptor, and the bundle off the PROGRAMS.
     let ir = single_matmul_ir(64, 16384, 2048);
     let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-    let (programs, layout) = superdsc::lower_graph_to_ktir::<
-        ktir_superdsc::collective::TpWorld<1>,
-        _,
-    >(&ir, &weight_ids, superdsc::ActiveCap::FULL, true)
-    .expect("KTIR for a 64x16384x2048 matmul");
+    let (programs, layout) =
+        superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+            &ir,
+            &weight_ids,
+            superdsc::ActiveCap::FULL,
+            true,
+            // The graph's own extent pair: 64 rows that are 64 requests — one row each.
+            scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+                scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                    .expect("one row is nonzero"),
+                scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(64)
+                    .expect("64 requests is nonzero"),
+            )
+            .expect("64 rows fit a u32"),
+        )
+        .expect("KTIR for a 64x16384x2048 matmul");
     let (dscs, _) = superdsc::lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
         &ir,
         &weight_ids,
         superdsc::ActiveCap::FULL,
         true,
+        // Same pair as the KTIR half above: 64 requests of one row.
+        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                .expect("one row is nonzero"),
+            scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(64)
+                .expect("64 requests is nonzero"),
+        )
+        .expect("64 rows fit a u32"),
     )
     .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {
@@ -1054,15 +965,13 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     };
     assert_eq!(e.time, 1, "an unbatched fp16 matmul is staged by dxp");
     assert_eq!(superdsc::concrete_trips(e).len(), 1);
-    // SAFETY: single-threaded test; the multi-op stitch opt-in only.
-    unsafe { std::env::set_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP", "1") };
     let r = superdsc::emit_bundle(
         &programs,
         Some(&layout),
         superdsc::FoldGrouping::Split,
         None,
+        superdsc::DumpRoot::NONE,
     );
-    unsafe { std::env::remove_var("SCRATCHY_SUPERDSC_ALLOW_MULTIOP") };
     assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");
 }
 
@@ -1084,6 +993,7 @@ fn batched_lx_overflowing_matmul() -> emit::EmittedOp<ktir_superdsc::collective:
         &emit::rb("o", m, n),
         None,
     )
+    .expect("assemble_matmul builds")
 }
 
 /// The `y`-batched shape the trip tests drove before the one-stick refusal, 64×16384×2048 at two kernel
@@ -1363,7 +1273,8 @@ fn time1_bundle_mlir_is_byte_identical_to_flat() {
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "wt"),
         &emit::rb("out", 384, 384),
         None,
-    );
+    )
+    .expect("assemble_matmul builds");
     assert_eq!(emitted.time, 1, "bmm must NOT time-tile");
     let via_emitted = superdsc::emit_bundle_mlir(&[emitted]);
     let flat = superdsc::bundle_mlir(&["sdsc_0.json".to_string()]);
@@ -1395,7 +1306,8 @@ fn dump_gate_bundles() {
         &Stk::<KernelTag>::kernel(64_usize, 64_usize, "g1_w"),
         &emit::rb("g1_o", 64, 64),
         None,
-    );
+    )
+    .expect("assemble_matmul builds");
     assert_eq!(fit.time, 1, "64^3 must fit LX in one trip");
     superdsc::write_dxp_input(&root.join("fit64"), &[fit], superdsc::FoldGrouping::Split).unwrap();
     // (B) OVERFLOWING but TILEABLE-ON-`out` — must overflow the full per-core tile
@@ -1430,7 +1342,8 @@ fn dump_gate_bundles() {
                 &Stk::<KernelTag>::kernel(k as usize, n as usize, "gb_w"),
                 &emit::rb("gb_o", m, n),
                 None,
-            );
+            )
+            .expect("assemble_matmul builds");
             assert!(ov.time > 1, "{label} must time-tile");
             eprintln!("→ BAKING {label} as GATE-1b: time = {}", ov.time);
             superdsc::write_dxp_input(&root.join("ov_tiled"), &[ov], superdsc::FoldGrouping::Split)
@@ -1453,7 +1366,8 @@ fn dump_gate_bundles() {
         "bc_x",
         "bc_v",
         "bc_o",
-    );
+    )
+    .expect("assemble_broadcast_mul_gate builds");
     eprintln!("→ BAKING broadcast-mul gate: time={}", bc.time);
     superdsc::write_dxp_input(&root.join("bcast"), &[bc], superdsc::FoldGrouping::Split).unwrap();
     // (D) RMSNORM gate: the full 5-op decomposition (the vendor's spyre_rms_norm formula with the
@@ -1466,11 +1380,12 @@ fn dump_gate_bundles() {
         576,
         "rms_x",
         "rms_w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+        ktir_superdsc::place::SynthId::Act(7),
         "eps",
         None,
         &mut sym,
         None,
+        &mut ktir_superdsc::placement::LxScope::for_test(),
     )
     .expect("the card gate's rmsnorm chain lowers — there is nothing to bake otherwise");
     eprintln!("→ BAKING rmsnorm gate: {} ops", rms.len());
@@ -1482,7 +1397,8 @@ fn dump_gate_bundles() {
         64,
         "sl_x",
         "sl_o",
-    );
+    )
+    .expect("assemble_slice_add_gate builds");
     eprintln!("→ BAKING slice-add gate: time={}", sl.time);
     superdsc::write_dxp_input(&root.join("slice"), &[sl], superdsc::FoldGrouping::Split).unwrap();
     eprintln!("wrote fit64, ov_tiled, bcast, rmsnorm, slice");

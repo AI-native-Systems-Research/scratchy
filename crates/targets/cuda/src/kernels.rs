@@ -840,6 +840,60 @@ unsafe extern "C" {
         window: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_attn_decode_fp8kv_split(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        splits: u32,
+        min_tiles: u32,
+        o_split: *mut c_void,
+        ml_split: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_decode_d512_fp8kv_split(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        splits: u32,
+        min_tiles: u32,
+        o_split: *mut c_void,
+        ml_split: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_decode_merge(
+        o_split: *const c_void,
+        ml_split: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        window: u32,
+        splits: u32,
+        min_tiles: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_attn_decode_d512_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_d512_bf16(
         q: *const c_void,
@@ -2987,6 +3041,129 @@ pub unsafe fn attn_decode_d512_fp8kv(
             head_dim,
             block_size,
             num_blocks,
+        },
+    )
+}
+
+/// The split decode's split (FP8 S8 W6b): `(splits, min_tiles)`, and its f32 partials `o_split`
+/// (`[splits, kv_heads, 16, head_dim]`) and `ml_split` (`[splits, kv_heads, 2, 16]`). Of the
+/// window's `n` tiles of 64 keys, split `s` takes `per = max(min_tiles, ceil(n / splits))` from
+/// `s · per`; when one split has keys the decode writes `out` itself (the unsplit kernel's bits),
+/// else [`attn_decode_merge`] does.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeSplit {
+    pub splits: u32,
+    pub min_tiles: u32,
+    pub o_split: *mut c_void,
+    pub ml_split: *mut c_void,
+}
+
+/// [`attn_decode_windowed_fp8kv`] (head dim 256) or [`attn_decode_d512_fp8kv`] (512, by
+/// `head_dim`) on a grid of `kv_heads × splits` ([`DecodeSplit`]). Asynchronous; when more than
+/// one split has keys, `out` is written by [`attn_decode_merge`], launched after it.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] as those, and when `splits` is zero or above
+/// [`crate::step::ATTN_DECODE_MAX_SPLITS`], `min_tiles` zero or above 128, or a partial null at
+/// `splits > 1`.
+///
+/// # Safety
+///
+/// As [`attn_decode_windowed_fp8kv`]'s, and the partials device pointers to their f32 elements,
+/// overlapping nothing else.
+pub unsafe fn attn_decode_fp8kv_split(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window, split): (f32, u32, DecodeSplit),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let launcher = if head_dim == 512 {
+        scratchy_cuda_attn_decode_d512_fp8kv_split
+    } else {
+        scratchy_cuda_attn_decode_fp8kv_split
+    };
+    // SAFETY: as `attn_decode_windowed_fp8kv`'s; the launcher refuses the split before it touches
+    // a pointer.
+    let code = unsafe {
+        launcher(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
+            split.splits,
+            split.min_tiles,
+            split.o_split,
+            split.ml_split,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnDecodeShape {
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// The split decode's merge (`kernels/attn_decode_merge.cu`): `out` from the partials of
+/// [`attn_decode_fp8kv_split`] at the same shape, `(scale, window)`, `split` and `sequence`, the
+/// splits merged in split order. A kv head whose decode used one split is left as it is.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] (`block_size` 64, `num_blocks` 0 in it) for
+/// `head_dim` not 256 or 512, the decode's head and scale refusals, and the split's.
+///
+/// # Safety
+///
+/// The partials, `sequence` and `out` as [`attn_decode_fp8kv_split`]'s, written by it before this
+/// launch on `stream`.
+pub unsafe fn attn_decode_merge(
+    (sequence, out): (*const c_void, *mut c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (scale, window): (f32, u32),
+    split: DecodeSplit,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller's contract; the launcher checks every count and null first.
+    let code = unsafe {
+        scratchy_cuda_attn_decode_merge(
+            split.o_split.cast_const(),
+            split.ml_split.cast_const(),
+            sequence,
+            out,
+            q_heads,
+            kv_heads,
+            head_dim,
+            scale,
+            window,
+            split.splits,
+            split.min_tiles,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnDecodeShape {
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size: 64,
+            num_blocks: 0,
         },
     )
 }

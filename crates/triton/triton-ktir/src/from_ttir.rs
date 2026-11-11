@@ -93,7 +93,7 @@ pub const OP_SET: &[&str] = &[
     "arith.minnumf",
     "arith.extf",
     "arith.truncf",
-    "arith.negf", // Other, on purpose
+    "arith.negf",
     // THE ROUTER-INDEX EXTENSION (Phase 2b): the MoE router rows spell a
     // 0/1 compare mask and slot selection, which have no compare-free form,
     // and their index arithmetic integerizes through fp<->int casts. The
@@ -101,26 +101,27 @@ pub const OP_SET: &[&str] = &[
     // emulator has served `ArithCmpf`/`ArithCmpi`/`ArithSelect`/
     // `ArithSitofp`/`ArithFptosi` all along, and `predicate` rides
     // `ATTR_KEYS` below (`Attr::Pred` is carried by `attr_value`, whose own
-    // comment says that hole was found by reading the reader). `cmpf`/
-    // `sitofp`/`fptosi` ride `Other` exactly like `negf`: `to_ktir_emit`'s
-    // Other arm names their variant.
+    // comment says that hole was found by reading the reader). `sitofp` and
+    // `negf` are NAMED variants of our `OpKind` (they are device-facts keys);
+    // `cmpf`/`fptosi` still ride `Other`, with `to_ktir_emit`'s Other arm
+    // naming their variant.
     "arith.cmpf", // Other, on purpose
     "arith.cmpi",
     "arith.select",
-    "arith.sitofp", // Other, on purpose
+    "arith.sitofp",
     "arith.fptosi", // Other, on purpose
     // THE MASK-WIDENING CAST (the sampler's ladder extension): `(x == m).to(tl.float32)` --
     // a 0/1 compare mask widened to the float domain for the ramp multiply -- lowers to
     // `arith.uitofp` (i1 -> f32), a spelling no golden carries because the router rows
     // select their way around casts of the mask itself (`tl.where(mask, 1.0, 0.0)` is a
     // select, not a cast). The emulator has served `ArithUitofp` all along
-    // (`ktir-emulator:src/dialects/arith.rs:100`), and like the five above it rides `Other`
-    // with `to_ktir_emit`'s Other arm naming its `KOpKind`. The executed proof is
+    // (`ktir-emulator:src/dialects/arith.rs:100`), and like `cmpf`/`fptosi` it rides
+    // `Other`, with `to_ktir_emit`'s Other arm naming its `KOpKind`. The executed proof is
     // `triton-numeric:tests/argmax_first_max.rs`, whose kernel widens a live mask.
     "arith.uitofp", // Other, on purpose
     // `tl.min` over an int32 index (`standard.py:228`'s `_elementwise_min` → `core.minimum`):
     // the paged decode kernel's first row of an ascending `kv_row_pool` run under Triton's gather
-    // floor. Rides `Other` like `uitofp`; `to_ktir_emit`'s Other arm names `KOpKind::ArithMinsi`,
+    // floor. Still rides `Other` (uitofp's neighbor); `to_ktir_emit`'s Other arm names `KOpKind::ArithMinsi`,
     // which the emulator serves.
     "arith.minsi", // Other, on purpose
     // math
@@ -133,11 +134,11 @@ pub const OP_SET: &[&str] = &[
     // modelled in `OpKind` (`MathLog`), mapped in `to_ktir_emit` (`KOpKind::MathLog`, which
     // ktir-core has served all along), no attrs.
     "math.log",
-    "math.rsqrt", // Other, on purpose
+    "math.rsqrt",
     "math.tanh",
-    // `tl.abs` on a float (`moe.py`'s per-token `amax(|x|)`). Rides `Other` like `rsqrt`:
-    // `to_ktir_emit`'s Other arm names `KOpKind::MathAbsf`.
-    "math.absf", // Other, on purpose
+    // `tl.abs` on a float (`moe.py`'s per-token `amax(|x|)`). A named variant, like
+    // `rsqrt`/`tanh` beside it: a device-facts key (`DeviceOp::Abs`).
+    "math.absf",
     // `x.to(tl.float8e4nv)` and back (`semantic.py:840`): the fp8 weight widening and the
     // MoE kernel's activation codes. [`fp_to_fp_as_arith`] admits it AS `arith.extf` /
     // `arith.truncf` at the fp8 element type, so no `tt.fp_to_fp` exists past this adapter.

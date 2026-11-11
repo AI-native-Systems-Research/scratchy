@@ -10,7 +10,7 @@ use crate::carbon::{
 };
 use crate::charts::{RATIO_STEPS, ScaleFit, ratio_scale, ratio_step};
 
-use super::data::{At, Model, RequestTiming, TaskCell};
+use super::data::{At, Model, RequestTiming, Run, TaskCell};
 use super::numbers::{Engine, served};
 use super::buckets;
 use super::{
@@ -29,13 +29,23 @@ const ACCURACY: &str = "rag-accuracy";
 pub(super) const RANDOM: &str = "random";
 
 /// Every dataset a shown model measured, in the page's order, then [`RANDOM`] if any shown model
-/// measured the random-token grid. A model counts by its newest run on each machine.
-pub(super) fn shown<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Vec<&'a str> {
-    let newest = || {
-        (machines.values()).flat_map(|mr| mr.models.iter().filter_map(|(stem, _)| mr.latest(stem)))
+/// measured the random-token grid. A model counts by every run of it on each machine, in `all`,
+/// the runs a newer one replaced too: a run of one dataset leaves another's section standing.
+pub(super) fn shown<'a>(
+    machines: &BTreeMap<&str, MachineRuns<'_>>,
+    all: &BTreeMap<&str, MachineRuns<'a>>,
+) -> Vec<&'a str> {
+    let every = || {
+        (machines.iter())
+            .filter_map(|(chip, mr)| Some((mr, all.get(chip)?)))
+            .flat_map(|(mr, every)| {
+                (every.models.iter())
+                    .filter(|(stem, _)| mr.latest(stem).is_some())
+                    .flat_map(|(_, es)| es.iter().copied())
+            })
     };
     let mut shown: Vec<&'a str> = Vec::new();
-    for e in newest() {
+    for e in every() {
         // The accuracy cell is MuSiQue's, a row of its detail table, not a section of its own.
         for w in tasks::workloads(e.m).into_iter().filter(|&w| w != ACCURACY) {
             if !shown.contains(&w) {
@@ -44,7 +54,7 @@ pub(super) fn shown<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Vec<&'a s
         }
     }
     shown.sort_by_key(|w| tasks::order(w));
-    let grid = newest().any(|e| ran_grid(e.m));
+    let grid = every().any(|e| ran_grid(e.m));
     if grid {
         shown.push(RANDOM);
     }
@@ -68,6 +78,79 @@ fn ran_grid(m: &Model) -> bool {
     (m.scaling.iter().flatten()).any(|c| matches!(c.at, At::Grid { .. }))
 }
 
+/// Whether a model's run measured `dataset`: the grid for [`RANDOM`], else scratchy's cells of it.
+fn measures(dataset: &str, m: &Model) -> bool {
+    match dataset {
+        RANDOM => ran_grid(m),
+        w => tasks::workloads(m).contains(&w),
+    }
+}
+
+/// Each shown machine's runs as `dataset`'s section reads them: from `all`, the runs a newer one
+/// replaced too, each shown model's entries only those that measured the dataset, so its newest
+/// is the newest run that did. The machine's runs are the page's, and any older one a model's
+/// numbers come from.
+fn measured<'a>(
+    dataset: &str,
+    machines: &BTreeMap<&str, MachineRuns<'_>>,
+    all: &BTreeMap<&'a str, MachineRuns<'a>>,
+) -> BTreeMap<&'a str, MachineRuns<'a>> {
+    (all.iter())
+        .filter_map(|(&chip, every)| {
+            let page = machines.get(chip)?;
+            let models: Vec<(&'a str, Vec<Entry<'a>>)> = (every.models.iter())
+                .filter(|(stem, _)| page.latest(stem).is_some())
+                .map(|(stem, es)| {
+                    let kept = es.iter().copied().filter(|e| measures(dataset, e.m));
+                    (*stem, kept.collect())
+                })
+                .collect();
+            let on_page = |r: &Run| page.runs.iter().any(|p| p.generated_utc == r.generated_utc);
+            let drawn = |r: &Run| {
+                let when = &r.generated_utc;
+                (models.iter())
+                    .any(|(_, es)| es.last().is_some_and(|e| &e.run.generated_utc == when))
+            };
+            let runs = (every.runs.iter().copied())
+                .filter(|r| on_page(r) || drawn(r))
+                .collect();
+            Some((chip, MachineRuns { runs, models }))
+        })
+        .collect()
+}
+
+/// Under a section's summary: each machine some of whose numbers there are from a run older than
+/// its newest, and which run, so an old grid is not read as current. Nothing where every one is
+/// from the newest.
+fn older_runs(ran: &[(&str, Vec<&str>)], machines: &BTreeMap<&str, MachineRuns>) -> Element {
+    let older: Vec<String> = (ran.iter())
+        .filter_map(|&(chip, ref stems)| {
+            let mr = &machines[chip];
+            let newest = &mr.runs.last()?.generated_utc;
+            let mut days: Vec<&str> = (stems.iter())
+                .filter_map(|stem| mr.latest(stem))
+                .filter(|e| &e.run.generated_utc < newest)
+                .map(|e| e.run.generated_utc.month_day())
+                .collect();
+            days.sort_unstable();
+            days.dedup();
+            (!days.is_empty()).then(|| {
+                let runs = if days.len() == 1 { "run" } else { "runs" };
+                format!("{chip} from its {} {runs}", days.join(" and "))
+            })
+        })
+        .collect();
+    if older.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        p { style: "font-size: 0.875rem",
+            "Older than the machine's newest run, which did not measure this: {older.join(\"; \")}. \
+             Each pair's detail names the run its numbers are from."
+        }
+    }
+}
+
 /// The machines that ran `dataset`, fewest GB first, each with every model it ran that measured
 /// it, in the order it first ran them: every model, not only its lineup class's current one, so a
 /// model an earlier round ran keeps its numbers on the page.
@@ -79,13 +162,7 @@ fn ran<'a>(
         .filter_map(|chip| {
             let mr = &machines[chip];
             let stems: Vec<&str> = (mr.models.iter())
-                .filter(|(stem, _)| {
-                    mr.latest(stem)
-                        .is_some_and(|Entry { m, .. }| match dataset {
-                            RANDOM => ran_grid(m),
-                            w => tasks::workloads(m).contains(&w),
-                        })
-                })
+                .filter(|(stem, _)| mr.latest(stem).is_some_and(|e| measures(dataset, e.m)))
                 .map(|(stem, _)| *stem)
                 .collect();
             (!stems.is_empty()).then_some((chip, stems))
@@ -96,12 +173,15 @@ fn ran<'a>(
 /// One dataset's section: its summary map, its timelines where two or more runs measured it, then
 /// one tab strip of machine and model, each pair its latency distributions, what its numbers came
 /// from, its numbers and its users curves. The random-token grid is laid out the same way, from its
-/// own cells ([`random`]). Nothing when no shown machine ran it.
+/// own cells ([`random`]). Each pair is its model's newest run that measured the dataset
+/// ([`measured`]). Nothing when no shown machine ran it.
 pub(super) fn section(
     dataset: &str,
     machines: &BTreeMap<&str, MachineRuns>,
     all: &BTreeMap<&str, MachineRuns>,
 ) -> Element {
+    let view = measured(dataset, machines, all);
+    let machines = &view;
     let ran = ran(dataset, machines);
     if ran.is_empty() {
         return rsx! {};
@@ -133,6 +213,7 @@ pub(super) fn section(
                  engine, and a borrowed rival's run."
             }
             {summary_map(dataset, &id, &ran, machines, &summary_columns)}
+            {older_runs(&ran, machines)}
         }
     };
     rsx! {
@@ -437,7 +518,9 @@ fn random(
                     Heading { "{title(RANDOM)}" }
                     p { "random-token prompts at fixed lengths, the matrix's diagnostic grid (--random)" }
                 }
-                {tabbed(id, &Pairs::of(ran, machines), grid_glance(machines), over_time_panel(&timelines),
+                {tabbed(id, &Pairs::of(ran, machines),
+                    rsx! { Stack { gap: 4, {grid_glance(machines)} {older_runs(ran, machines)} } },
+                    over_time_panel(&timelines),
                     |chip, stem| grid_latency(id, &machines[chip], stem, chip),
                     |chip, stem| grid_pair(id, &machines[chip], stem, chip))}
             }
@@ -654,6 +737,9 @@ fn summary_map(
         let (Some(ours), Some(theirs)) = (ours, theirs) else {
             return Err("not run at this load");
         };
+        if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
+            return Err("most requests failed");
+        }
         let a = buckets::median_in(ours, row.timing, b);
         let t = buckets::median_in(theirs, row.timing, b);
         let r = tasks::times(a, t, true).ok_or("no requests this long")?;

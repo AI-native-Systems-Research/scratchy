@@ -74,7 +74,7 @@
 //! needs more than that is refused LOUDLY, naming the kernel capability that must land.
 //! The historical items (windowed regions, LX row-blocking, the odd-N vocab matmul, the
 //! prefill lm-head fold) have all LANDED — their kernels state the corner (`C_START`),
-//! the row blocks, the device width, and the fold (`lmlast.py` + the m=1 tail); what
+//! the row blocks, the device width, and the fold (`lmlast.py` + the m=S tail); what
 //! remains is whatever the current guards name, which is the honest work list.
 //!
 //! ⭐ ROPE SPLICES — the module-header claim that it could not was OVERSTATED, audited
@@ -291,6 +291,8 @@ pub fn lmlast_row() -> TritonKernelRow {
 /// [`lower_block_copy`], which the spyre emitter's collective arm calls; no `SubOp` reaches it
 /// through [`row`].
 pub fn blockcopy_row() -> TritonKernelRow {
+    // The row's `entry` is the whole-block copy; a copy whose rows leave a tail is
+    // `BLOCKCOPY_TAIL_ENTRY`, the same file's other entry (`blockcopy.py` says why there are two).
     TritonKernelRow::Spliced {
         src: include_str!("../../../targets/spyre/kernels/blockcopy.py"),
         file: "blockcopy.py",
@@ -298,6 +300,9 @@ pub fn blockcopy_row() -> TritonKernelRow {
         program: Program::BlockCopy,
     }
 }
+
+/// `blockcopy.py`'s second entry: the whole-block copy followed by its one shorter tail.
+const BLOCKCOPY_TAIL_ENTRY: &str = "blockcopy_tail_fwd";
 
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice has a family below (attention rides its own `lower_attn` entry); the ops the
@@ -498,13 +503,17 @@ pub fn lower<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
 /// (the `lower_all` rewrite, the one-op `lower`'s routing echo below, and the
 /// bake-time numeric gate's tail compare, which states the fold's last-row law
 /// against the golden) reads
-/// the SAME four conjuncts, because the width test alone was falsified by the
+/// the SAME five conjuncts, because the width test alone was falsified by the
 /// gemma-4 parity fixture (vocab 512), whose GLOBAL-layer q projection is ALSO
 /// 512 cols (4 heads × hd 128) — the fold fired on every global layer's Q, and
 /// the model's first sampled token was garbage while every width-128 tensor
 /// stayed fp16-clean. A width COLLISION is not an identity: only the tail's own
 /// rows are dead, and only the result's ancestors are the tail. The walk is
-/// [`tensor_feeds_result_through_row_local_ops`] (main's own law).
+/// [`tensor_feeds_result_through_row_local_ops`] (main's own law). The fifth
+/// conjunct names the fold's own product: a matmul whose activation is the
+/// beyond-the-graph `LAST_HIDDEN` staging is the fold's re-lowered half-2
+/// ALREADY — never a tail to fold (at m=1 the rows conjunct excluded it; at
+/// m=S the activation must).
 pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -527,9 +536,14 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
         .nodes
         .iter()
         .find(|n| matches!(n.op, SubOp::Sample { .. }));
+    // ⭐ A SPLIT HEAD IS THE TAIL'S PRODUCT TOO. A vocabulary projection split across ranks is one
+    // rank's block (`n` < vocab), and it reaches the draw through the all-gather that restores the
+    // whole vocabulary — the same product, gathered.
     let feeds_the_tail_product = match (&draw, &node.op) {
         (Some(sample), SubOp::MatmulTile { n, .. }) => match &sample.op {
-            SubOp::Sample { vocab, .. } => *n == *vocab,
+            SubOp::Sample { vocab, .. } => {
+                *n == *vocab || gathers_to_width(ir, node.output.tensor, *vocab)
+            }
             _ => false,
         },
         (Some(sample), _) => match &sample.op {
@@ -541,21 +555,63 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.output.region.cols.len == result_cols
         }
     };
+    // A projection's rows are its ACTIVATION's: a folded tail that gathers is declared one row from
+    // the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a whole
+    // one-row tensor), while the prompt rows it folds over are still `mq`. Every other tail op, and
+    // every projection of a tail that does not gather, has the same rows in and out.
+    let rows = match &node.op {
+        SubOp::MatmulTile { .. } => node.inputs.first().map_or(0, |a| a.region.rows.len),
+        _ => node.output.region.rows.len,
+    };
     feeds_the_tail_product
-        && node.output.region.rows.len > 1
+        && rows > 1
         && !rows_are_requests
+        // ⭐ THE FOLD'S HALF-2 IS NEVER A TAIL TO FOLD — its activation is the
+        // reserved `LAST_HIDDEN` staging, a synthetic BEYOND the graph (an id
+        // past `ir.tensors`); a graph matmul's activation is always a graph
+        // tensor. At m=1 the rows conjunct alone excluded the half-2; at m=S
+        // this conjunct does, and no graph node changes side.
+        && node
+            .inputs
+            .first()
+            .is_some_and(|a| a.tensor.index() < ir.tensors.len())
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
 }
 
+/// Whether `t` reaches an all-gather restoring `width` columns through single-input logit
+/// epilogues — the path a split vocabulary projection takes to the draw.
+fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+    width: u32,
+) -> bool {
+    ir.nodes
+        .iter()
+        .filter(|n| n.inputs.iter().any(|i| i.tensor == t))
+        .any(|n| match &n.op {
+            SubOp::AllGather { cols } => *cols == width,
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if n.inputs.len() == 1 => {
+                gathers_to_width(ir, n.output.tensor, width)
+            }
+            _ => false,
+        })
+}
+
 /// EVERY OP THE SPLICE EMITS FOR ONE NODE. Every kind is one op except the prefill
-/// lm-head tail, whose fold is TWO — the last-row extraction (its own program, the
-/// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul — exactly the
-/// shape of main's `lower_prefill_lm_head_at_m1`, which the fold kernel must
-/// reproduce.
+/// lm-head tail, whose fold is TWO — the answer-row extraction (its own program, the
+/// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=S matmul — main's
+/// `lower_prefill_lm_head_at_m1` shape, stated at the rung's own request count
+/// (exactly m=1 there, byte-identical).
 pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
+    // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, the same mint
+    // `lower_attn` takes. The lm-head tail's fold is the reader here: it mints the tail's
+    // [`AnswerRows`] from the pair and refuses a mint that does not describe the graph
+    // being lowered. Every other interception ignores it, exactly as the decode and batch
+    // arms of `lower_attn` read the graph's rows and never the pair's split.
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     // ── THE HEAD-NORM SANDWICH'S THREE SEATS — the split (head) is where the fused
     // program is emitted; the flatten-back (tail) and the middle (norm) self-identify
@@ -586,44 +642,39 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     if let SubOp::MatmulTile { .. } = &node.op
         && is_prefill_lm_head_tail
     {
-        return lower_prefill_lm_head_fold(node, ir);
+        return lower_prefill_lm_head_fold(node, ir, query_rows);
     }
     // ⭐ THE LOGITS SCALARMUL IS THE TAIL'S SECOND HALF — main's own law
     // (`lower_scalarmul_node(&node_at_one_row(node), …)` under the same
-    // `is_prefill_lm_head_tail`): the m>1 matmul above it is folded to the m=1
-    // tail that writes ONE logits row, so the scale must run over that one row
-    // too. Left un-folded it scales mq × vocab logits of which mq−1 rows were
-    // never written — row 0 is still right (which is why text A/Bs pass), but
-    // the device pays mq−1 rows of reads of unwritten logits for nothing.
+    // `is_prefill_lm_head_tail`), stated at the rung's own request count: the
+    // m>1 matmul above it is folded to the m=S tail that writes S logits rows,
+    // so the scale must run over those S rows too. Left un-folded it scales
+    // mq × vocab logits of which mq−S rows were never written — row 0 is still
+    // right (which is why text A/Bs pass), but the device pays mq−S rows of
+    // reads of unwritten logits for nothing.
     if let SubOp::ScalarMul { .. } = &node.op
         && is_prefill_lm_head_tail
     {
-        let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+        let at_tail = node_at_tail_rows(node, tail_requests(query_rows));
+        return lower_one(&at_tail, ir, rows_are_requests).map(|e| vec![e]);
     }
     // ⭐ AND THE LOGITS TANH-SOFTCAP IS THE TAIL'S THIRD KIND — the same
-    // `node_at_one_row` law (main gives TanhSoftCap the fold ScalarMul has): the
-    // softcap sits ON the logits, so the folded tail caps ONE row of them instead
-    // of mq rows of which mq−1 were never written.
+    // `node_at_tail_rows` law (main gives TanhSoftCap the fold ScalarMul has):
+    // the softcap sits ON the logits, so the folded tail caps the S written rows
+    // of them instead of mq rows of which mq−S were never written.
     if let SubOp::TanhSoftCap { .. } = &node.op
         && is_prefill_lm_head_tail
     {
-        let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+        let at_tail = node_at_tail_rows(node, tail_requests(query_rows));
+        return lower_one(&at_tail, ir, rows_are_requests).map(|e| vec![e]);
     }
-    // ⭐ AND THE TOKEN DRAW'S ROW INPUT IS THE FOLDED TAIL'S ONE ROW — the same
-    // `node_at_one_row` law the tail's ScalarMul and TanhSoftCap get: the mint
-    // states the prefill draw at rows = 1 reading the result's row 0 (the row
-    // the fold writes), so the kernel is handed the whole one-row region at
-    // corner 0. The gate is the mint's own typed fact — a one-row region of a
-    // taller tensor — never a model name or a rung label.
-    if let SubOp::Sample { .. } = &node.op
-        && node.inputs[0].region.rows.len == 1
-        && ir.tensors[node.inputs[0].tensor.index()].rows > 1
-    {
-        let at_m1 = node_at_one_row(node);
-        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
-    }
+    // ⭐ THE TOKEN DRAW NEEDS NO ARM OF ITS OWN — the mint states its window:
+    // `mint_sample`'s Folded arm reads the rung's request count and hands the
+    // node the `[S, vocab]` region the folded tail writes (row 0 alone at
+    // S = 1), so the ordinary one-op row below lowers the draw as minted and
+    // the splice never re-derives the window (the draw's kernel view IS the
+    // region — both corners 0, extents free — the law `lower_one`'s
+    // whole-region guard already states for it).
     // ⭐ A KV WRITER IS TWO PROGRAMS: the rotation (`rope.py`, the node's own output) and the paged
     // write that scatters the rotated K and the V into the pools (`reshape_and_cache_head_major.py`) — spyre-
     // inference's `do_kv_cache_update`, run before the step's attention reads the pages.
@@ -636,31 +687,43 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
 }
 
-/// Main's own `node_at_one_row`, verbatim law: slice the FIRST row (the region's
-/// own `rows.start`, length 1) of the input and the output — the m=1 tail's
-/// addressing, which the folded matmul's output row 0 matches.
-fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
+/// The folded lm-head tail's own row window — the FIRST `s` rows (the region's own
+/// `rows.start`, length `s`) of the input and the output, where `s` is the rung's
+/// request CAPACITY: the folded tail writes the `[S, vocab]` prefix of the `[mq, vocab]`
+/// logits storage (request r's row is row r), so its consumers run over exactly those
+/// rows. At `s = 1` this is main's own one-row law, byte-identical.
+fn node_at_tail_rows<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
+    s: u32,
 ) -> SubtileNode<F> {
-    let one_row = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+    let s_rows = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
         scratchy_subtile::subtile_ir::TensorRegion {
             tensor: tr.tensor,
             region: scratchy_subtile::subtile_ir::Region {
-                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, 1),
+                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, s),
                 cols: tr.region.cols,
             },
         }
     };
     let mut inputs = node.inputs.clone();
     if let Some(a) = inputs.first_mut() {
-        *a = one_row(a);
+        *a = s_rows(a);
     }
     SubtileNode {
         id: node.id,
         op: node.op,
         inputs,
-        output: one_row(&node.output),
+        output: s_rows(&node.output),
     }
+}
+
+/// The folded tail's own row count — the rung's request capacity `S` off the extent
+/// pair the walk hands every lowering. The tail writes `S` rows on every launch of the
+/// rung, including the empty windows a launch seated fewer requests leaves (their
+/// logits rows are pads, never read); the readback takes the live count off the
+/// launch's own slot list.
+fn tail_requests(query_rows: ktir_superdsc::sdsc_abstract::QueryExtent) -> u32 {
+    query_rows.requests().get()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1007,6 +1070,9 @@ pub fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F
             // stick — no row mixing — so a minted graph's feeds-walk traverses
             // it from the tail to the re-pointed result.
             | SubOp::Sample { .. }
+            // ⭐ AN ALL-GATHER IS ROW-LOCAL: row `r` of its output is row `r` of every rank's
+            // block, side by side — a split vocabulary projection's tail passes through it.
+            | SubOp::AllGather { .. }
     )
 }
 
@@ -1085,7 +1151,7 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         ));
     };
     // ⛔ THE LM-HEAD TAIL'S FOLD IS `lower_all`'s now — the vocab-wide m>1 matmul is
-    // rewritten THERE (last-row extraction + the re-lowered m=1 matmul), so a
+    // rewritten THERE (answer-row extraction + the re-lowered m=S matmul), so a
     // MatmulTile reaching THIS one-op body as the tail means the one-op `lower`
     // was called where the walk's `lower_all` belongs. The test is the FULL
     // [`is_prefill_lm_head_tail`] — width, m>1, rows-not-requests, AND the
@@ -1130,9 +1196,9 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
     // `store_region` state, so the door reads the SAME region off the spliced
     // program. AND THE MATMUL FAMILY SPELLS ITS OWN ROW-0 WINDOW: `matmul.py` /
     // `matmul_fp8.py` state `M_TOTAL` (the output tensor's row extent) with the
-    // `[M, N]` tile at row 0 — the prefill lm-head fold's m=1 tail, whose activation
-    // is the LAST_HIDDEN synthetic and whose output is row 0 of the `[mq, vocab]`
-    // logits storage. Every OTHER row states ONE whole-tensor tile at corner 0 and
+    // `[M, N]` tile at row 0 — the prefill lm-head fold's m=S tail, whose activation
+    // is the LAST_HIDDEN synthetic and whose output is the `[S, vocab]` prefix of
+    // the `[mq, vocab]` logits storage. Every OTHER row states ONE whole-tensor tile at corner 0 and
     // cannot name a window, so the refusal stands for it (rope regions are whole in
     // production today), and this guard reads the REGION, not the op kind, so a
     // front-end change that windows any other op's regions reproduces the same
@@ -1159,14 +1225,14 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         // ⭐ THE TANH-SOFTCAP AND THE TOKEN DRAW STATE NEITHER CORNER — the softcap
         // kernel's view IS the region (`[M, N]`, tiles from row 0 / column 0), so BOTH
         // corners must be 0 while the extents are free: the prefill lm-head fold
-        // re-lowers the vocab-wide softcap at m=1 (row 0 of the `[mq, vocab]` logits
-        // storage, a legal prefix view), and the front end's chunker never tiles this
+        // re-lowers the vocab-wide softcap at m=S (the `[S, vocab]`
+        // prefix of the `[mq, vocab]` logits storage, a legal prefix view), and the front end's chunker never tiles this
         // op (its chunk set is the elementwise/scalarmul/silumul family), so a column
         // window never arises. The draw's kernel is the same law: its view is the
-        // region — the minted prefill draw reads row 0 of the `[mq, pad_vocab]`
-        // storage at rows = 1, a legal prefix view — and every operand the draw
-        // binds (the per-row pair, the nine tables, the idx stick) is whole at
-        // corner 0.
+        // region — the minted prefill draw reads rows 0..S of the `[mq, pad_vocab]`
+        // storage (row 0 alone at S = 1), a legal prefix view — and every operand
+        // the draw binds (the per-row pair, the nine tables, the idx stick) is
+        // whole at corner 0.
         let states_neither_corner =
             matches!(&node.op, SubOp::TanhSoftCap { .. } | SubOp::Sample { .. });
         if states_neither_corner {
@@ -1293,30 +1359,48 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
 
 /// ⭐ THE PREFILL LM-HEAD FOLD — main's `lower_prefill_lm_head_at_m1` shape, with the
 /// Triton `lmlast.py` kernel as the extraction's body. The vocab-wide lm_head cannot
-/// run at m>1 (it time-tiles; per-row time-tiling is unimplemented), and only the LAST
-/// prompt token's logits are ever read, so the tail is TWO ops:
+/// run at m>1 (it time-tiles; per-row time-tiling is unimplemented), and only each
+/// request's LAST prompt token's logits are ever read, so the tail is TWO ops:
 ///
-/// 1. THE EXTRACTION — `lmlast_fwd` copies row `selector_lastrow_col(mq) = mq - 1` of
-///    the `[mq, hidden]` activation into the reserved `[1, hidden]` `LAST_HIDDEN_TID`
-///    staging, one single-stick tile per stick-group (the only representable form: the
-///    source buffer is stick-major, so a wider window over the row is not expressible).
-///    Its KtirNode carries `node_out_tid` = the tail's OWN output tid — the door's
-///    `lmlast` arm names its copies `lmlast{j}_o{tid}` after it, the same suffix the
-///    m=1 matmul's `matmul_o{tid}` uses, so the whole tail reads as one node's.
-/// 2. THE MATMUL — the SAME node at m=1, reading the staging at row 0, through the
-///    ordinary matmul row (`lower_one`). At m=1 the tail is exactly the shape the
-///    PROVEN decode path lowers, fp8 chain included.
+/// 1. THE EXTRACTION — `lmlast_fwd` copies each request window's answer row (its
+///    `r·w + selector_lastrow_col(w)`, the [`AnswerRows`] law minted from the rung's
+///    own extent pair) of the `[mq, hidden]` activation into the reserved `[S, hidden]`
+///    `LAST_HIDDEN_TID` staging, one single-stick tile per `(request, stick-group)`
+///    (the only representable form: the source buffer is stick-major, so a wider
+///    window over the row is not expressible). Its KtirNode carries `node_out_tid` =
+///    the tail's OWN output tid — the door's `lmlast` arm names its copies
+///    `lmlast{j}_o{tid}` after it, the same suffix the tail matmul's `matmul_o{tid}`
+///    uses, so the whole tail reads as one node's — and `answer_rows` = the rows
+///    themselves, the ONE statement the door's copies take each request's row from.
+/// 2. THE MATMUL — the SAME node at m=S, reading the staging's whole `[S, hidden]`
+///    and writing the `[S, vocab]` prefix of the `[mq, vocab]` logits storage
+///    (request r's logits row is row r), through the ordinary matmul row
+///    (`lower_one`, `M_TOTAL` naming the storage while the store takes the `[S, n]`
+///    tile at row 0). At `S = 1` the tail is exactly the shape the PROVEN decode
+///    path lowers, fp8 chain included — byte-identical, the same one-row window.
 ///
-/// ⛔ THE ROW IS `selector_lastrow_col(mq)`, THE SSOT THE KANI PROOF PINS — not
-/// `rows.start + mq - 1`: the extraction addresses the buffer the tape takes to be
-/// exactly `[mq, hidden]` at row 0, which is the only shape that reaches the fold (a
-/// non-whole activation region is refused by the whole-region guard before this).
+/// ⛔ THE ROWS ARE THE EXTENT PAIR'S OWN, STATED ONCE — not `rows.start + mq - 1`:
+/// the extraction addresses the buffer the tape takes to be exactly `[mq, hidden]`
+/// at row 0, which is the only shape that reaches the fold (a non-whole activation
+/// region is refused by the whole-region guard before this), and the pair's held
+/// product must BE that `mq` — the same agreement check `lower_attn` runs, so a mint
+/// that does not describe the graph being lowered is a refusal by name, never a
+/// silently-wrong row. At `S = 1` (`w = mq`) request 0's row is
+/// `selector_lastrow_col(mq)`, exactly the single-row law, and every tile, corner and
+/// constexpr the fold states is byte-identical to it.
+///
+/// ⛔ THE COUNT IS THE RUNG'S CAPACITY, NOT THE LAUNCH'S LIVE REQUESTS. The splice
+/// extracts `S` rows on every launch of the rung — including the empty windows a
+/// launch seated fewer requests than the rung packs leaves. An empty window's hidden
+/// is a PAD row's: the copy is harmless, and the row is never read (the readback
+/// takes `rows().take(live)` with the live count off the launch's own slot list).
 fn lower_prefill_lm_head_fold<
     T: ktir_superdsc::collective::Tp,
     F: scratchy_subtile::subtile_ir::RopeForm,
 >(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     use scratchy_subtile::subtile_ir::Region as SubRegion;
 
@@ -1331,16 +1415,41 @@ fn lower_prefill_lm_head_fold<
             node.id.index()
         ));
     }
-    let row = scratchy_subtile::sdsc_abstract::selector_lastrow_col(mq as usize) as u32;
+    // ⭐ THE PAIR MEETS THE GRAPH HERE, ONCE — the same check `lower_attn` runs: the
+    // mint's held product must be this graph's own row count, or the mint describes a
+    // different rung than the one being lowered. A disagreement is a REFUSAL by name,
+    // never a silently-wrong answer row.
+    if query_rows.graph_rows().get() != mq {
+        return Err(format!(
+            "triton splice: matmul_s{} (prefill lm-head tail): the graph's {} row(s) are not the \
+             extent pair's {} (per-request {} × {} request(s)) — the mint does not describe the \
+             graph it lowers",
+            node.id.index(),
+            mq,
+            query_rows.graph_rows().get(),
+            query_rows.per_request().get(),
+            query_rows.requests().get(),
+        ));
+    }
+    let answers = ktir_superdsc::sdsc_abstract::AnswerRows::of_extent(query_rows);
+    let (w, s) = (
+        query_rows.per_request().get(),
+        u32::try_from(answers.count())
+            .map_err(|_| "triton splice: the rung's request capacity overflows u32".to_string())?,
+    );
     let last_hidden = ktir_superdsc::reserved_tids::LAST_HIDDEN_TID;
     // The bake-log proof the fold fired: every prefill rung's bake names its
-    // own LAST_HIDDEN extraction — the op, the row it takes, and the staging
-    // it lands in. A rung whose bake lacks this line folded nothing.
+    // own LAST_HIDDEN extraction — the op, the rows it takes, and the staging
+    // it lands in. A rung whose bake lacks this line folded nothing. The count
+    // stated is the rung's CAPACITY: a launch seated fewer requests still
+    // extracts S rows, and the empty windows' rows are pad rows, never read.
     eprintln!(
-        "[spyre-superdsc] prefill lm-head tail folded — lmlast_s{} extracts row {} of {} \
-         (hidden {}) into LAST_HIDDEN t{}",
+        "[spyre-superdsc] prefill lm-head tail folded — lmlast_s{} extracts {} answer row(s) \
+         (request r's at r·{} + {}) of {} (hidden {}) into LAST_HIDDEN t{}",
         node.id.index(),
-        row,
+        s,
+        w,
+        scratchy_subtile::sdsc_abstract::selector_lastrow_col(w as usize) as u32,
         mq,
         hidden,
         last_hidden
@@ -1366,7 +1475,8 @@ fn lower_prefill_lm_head_fold<
     };
     ce("MQ", Val::Int(i128::from(mq)))?;
     ce("HIDDEN", Val::Int(i128::from(hidden)))?;
-    ce("ROW", Val::Int(i128::from(row)))?;
+    ce("W", Val::Int(i128::from(w)))?;
+    ce("S", Val::Int(i128::from(s)))?;
     ce("N_STICKS", Val::Int(i128::from(hidden / stk)))?;
     let spec = KernelSpec {
         file: "lmlast.py".to_string(),
@@ -1382,7 +1492,7 @@ fn lower_prefill_lm_head_fold<
         output: scratchy_subtile::subtile_ir::TensorRegion {
             tensor: scratchy_subtile::subtile_ir::TensorId::from_index(last_hidden as usize),
             region: SubRegion {
-                rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                rows: scratchy_subtile::subtile_ir::Range::new(0, s),
                 cols: scratchy_subtile::subtile_ir::Range::new(0, hidden),
             },
         },
@@ -1398,37 +1508,40 @@ fn lower_prefill_lm_head_fold<
         default_bindings(&extraction_node),
     )?;
     // The KtirNode's own fields: `node_out_tid` names the TAIL'S output (the door
-    // names its copies `lmlast{j}_o{tid}` after it), and the name is the builder's
-    // `lmlast_s{id}` law.
+    // names its copies `lmlast{j}_o{tid}` after it), and `answer_rows` states the rows
+    // themselves — the ONE statement the door's `S · hidden/64` copies take each
+    // request's row from, never re-derived from the view extents. The name is the
+    // builder's `lmlast_s{id}` law.
     k.node_out_tid = Some(BufferId::new(node.output.tensor.index() as u32));
+    k.answer_rows = Some(answers);
     let xname = format!("lmlast_s{}", node.id.index());
     k.func.name = Arena::global().str(xname.clone());
     let mut extract = EmittedOp::bare(xname);
     extract.ktir = Some(k);
 
-    // ── Half 2: the SAME node at m=1, reading the staging at row 0. ──
-    let mut at_m1 = node.clone();
-    let one_row = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+    // ── Half 2: the SAME node at m=S, reading the staging's whole [S, hidden] ──
+    let mut at_ms = node.clone();
+    let s_rows = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
         scratchy_subtile::subtile_ir::TensorRegion {
             tensor: tr.tensor,
             region: SubRegion {
-                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, 1),
+                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, s),
                 cols: tr.region.cols,
             },
         }
     };
-    at_m1.inputs[0] = scratchy_subtile::subtile_ir::TensorRegion {
+    at_ms.inputs[0] = scratchy_subtile::subtile_ir::TensorRegion {
         tensor: scratchy_subtile::subtile_ir::TensorId::from_index(last_hidden as usize),
         region: SubRegion {
-            rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+            rows: scratchy_subtile::subtile_ir::Range::new(0, s),
             cols: scratchy_subtile::subtile_ir::Range::new(0, hidden),
         },
     };
-    if let Some(w) = at_m1.inputs.get_mut(1) {
-        *w = one_row(w);
+    if let Some(w) = at_ms.inputs.get_mut(1) {
+        *w = s_rows(w);
     }
-    at_m1.output = one_row(&at_m1.output);
-    let matmul = lower_one(&at_m1, ir, false)?;
+    at_ms.output = s_rows(&at_ms.output);
+    let matmul = lower_one(&at_ms, ir, false)?;
 
     Ok(vec![extract, matmul])
 }
@@ -1447,17 +1560,31 @@ pub fn lower_block_copy<
     dst_cols: u32,
     name: &str,
 ) -> Result<EmittedOp<T>, String> {
-    let (rows, c_src) = (src.region.rows.len, src.region.cols.len);
-    let off = dst.region.cols.start;
-    let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's block copy checks
-    if !c_src.is_multiple_of(stk) || !dst_cols.is_multiple_of(stk) || !off.is_multiple_of(stk) {
-        return Err(format!(
-            "triton splice: {name}: a block of {c_src} columns at column {off} of a {dst_cols}-wide \
-             destination is not a run of whole {stk}-fp16 sticks"
-        ));
-    }
-    let src_py = match blockcopy_row() {
-        TritonKernelRow::Spliced { src, .. } => src,
+    use ktir_superdsc::superdsc_opspec::{Fp16, StickExtent};
+    let rows = src.region.rows.len;
+    // ⭐ THE WHOLE-STICK LAW, STATED ONCE: both widths are `StickExtent`s and the column is a
+    // `ColWindow`, each refusing a sub-stick value at its own constructor, so the kernel and the
+    // door are handed whole sticks and restate no check of their own.
+    let whole = |what: &str, r: Result<u32, String>| {
+        r.map_err(|e| format!("triton splice: {name}: the block copy's {what}: {e}"))
+    };
+    let c_src = whole(
+        "source width",
+        StickExtent::<Fp16>::new(src.region.cols.len).map(|s| s.elems()),
+    )?;
+    let c_dst = whole(
+        "destination width",
+        StickExtent::<Fp16>::new(dst_cols).map(|s| s.elems()),
+    )?;
+    let off = whole(
+        "destination column",
+        ktir_superdsc::addr::col_window_of(rows, c_dst, dst.region.cols.start, Df::Fp16)
+            .map(|w| w.column()),
+    )?;
+    let (src_py, file, whole_entry) = match blockcopy_row() {
+        TritonKernelRow::Spliced {
+            src, file, entry, ..
+        } => (src, file, entry),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
@@ -1468,19 +1595,37 @@ pub fn lower_block_copy<
             ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
         );
     }
-    for (k, v) in [
-        ("R", rows),
+    // The row blocks: the elementwise LX law over the copy's one live tile, so the program is
+    // `O(rows / BLOCK_M)` straight-line copies at any width (`blockcopy.py`'s own doc says why).
+    // The row count is not a constexpr: the kernel states it as `N_BLOCKS · BLOCK_M (+ TAIL_H)`.
+    // A copy with no tail takes the whole-block entry, which has no `TAIL_H` to state.
+    let (block_m, n_blocks, tail_h) = blocks_of(
+        rows,
+        c_src,
+        ktir_superdsc::superdsc_opspec::BLOCK_COPY_LIVE_TILES,
+    );
+    let tail = std::num::NonZeroU32::new(tail_h);
+    let mut stated = vec![
         ("C_SRC", c_src),
-        ("C_DST", dst_cols),
+        ("C_DST", c_dst),
         ("COL_OFF", off),
-        ("N_STICKS", rows * (c_src / stk)),
-    ] {
+        ("BLOCK_M", block_m),
+        ("N_BLOCKS", n_blocks),
+    ];
+    let entry = match tail {
+        None => whole_entry,
+        Some(t) => {
+            stated.push(("TAIL_H", t.get()));
+            BLOCKCOPY_TAIL_ENTRY
+        }
+    };
+    for (k, v) in stated {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
     }
     let spec = KernelSpec {
-        file: "blockcopy.py".to_string(),
-        kernel: "blockcopy_fwd".to_string(),
+        file: file.to_string(),
+        kernel: entry.to_string(),
         signature,
         constexprs,
     };
@@ -1608,6 +1753,17 @@ impl BatchChunking {
     /// sticks of it, or the gather has no addressing for it.
     pub const STICK: u32 = 64;
 
+    /// The fold's page-side law, stated rather than relied on: the cut is `kv_heads · 2^i` rows a
+    /// page with `2^i < GATHER_FLOOR`, so a page's share is `page_slots · head_size / 2^i`, whole
+    /// rows of a one-stick head exactly when the floor divides the page's slots. The scheduler's
+    /// block is a const, so this is a build fact.
+    const PAGE_TAKES_THE_CUT: () = assert!(
+        SchedulerBlockTokens::REFERENCE
+            .get()
+            .is_multiple_of(Self::GATHER_FLOOR),
+        "a page's slots must divide by the gather floor, or a fold cut of a page is not whole rows"
+    );
+
     /// ⛔ `seqs` AND `nkvh` ARE COUNTS, ONE OR MORE. Both divide here, so a zero is a panic at BAKE
     /// and not a wrong answer — `seqs` has divided since this function existed (`CORES / seqs`) and
     /// `nkvh` since the fold was added (`GATHER_FLOOR.div_ceil(seqs · rows_per_page)`). Every
@@ -1639,6 +1795,7 @@ impl BatchChunking {
         q_width: u32,
         head_size: u32,
     ) -> BatchChunking {
+        let () = Self::PAGE_TAKES_THE_CUT;
         let seqs = if seqs < 1 { 1 } else { seqs };
         let theirs = {
             let j = Self::CORES / seqs;
@@ -1893,6 +2050,13 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     ir: &SubtileIR<F>,
     scale_site: AttnScaleSite,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, minted once at the bake and
+    // never divided back out of the graph's rows. The PREFILL arm spends it as the kernel's two
+    // extents (`NUM_TOKENS` = the graph's rows, `PADDED_QUERY_LEN` = one request's width) and as
+    // the walk's extent; the DECODE and BATCH arms read the graph's rows exactly as they did
+    // before (one row per request, so the pair's product IS the row count by construction). The
+    // agreement check below refuses a mint that does not describe the graph being lowered.
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     paged_rows: PagedRows,
 ) -> Result<EmittedOp<T>, String> {
     let batch = paged_rows == PagedRows::Batch;
@@ -1969,6 +2133,22 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let hd = HeadWidth::of_whole_sticks(g.head_dim().get());
     let scale = scale_site.scale(*attention);
     let mq = node.output.region.rows.len;
+    // ⭐ THE PAIR MEETS THE GRAPH HERE, ONCE — the mint's held product must be this graph's own row
+    // count, or the mint describes a different rung than the one being lowered. A disagreement is a
+    // REFUSAL by name (a bake bug, caught at the splice), never a silently-wrong extent: nothing
+    // downstream may divide `mq` back to a per-request width, so this is the one place the two are
+    // proven to agree.
+    if query_rows.graph_rows().get() != mq {
+        return Err(format!(
+            "triton splice: AttnDecode t{}: the graph's {} row(s) are not the extent pair's \
+             {} (per-request {} × {} request(s)) — the mint does not describe the graph it lowers",
+            node.output.tensor.index(),
+            mq,
+            query_rows.graph_rows().get(),
+            query_rows.per_request().get(),
+            query_rows.requests().get(),
+        ));
+    }
     let kv_width = nkvh * hd.get();
     let pages = pool_pages(ir, &node.inputs[1], kv_width, "K")?;
     if pool_pages(ir, &node.inputs[2], kv_width, "V")? != pages {
@@ -1979,7 +2159,17 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     }
     whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
     whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
-    let blocks = walk_pages(pages, mq, active_cap);
+    // ⭐ THE WALK'S EXTENT IS PER-REQUEST FOR A PREFILL CHUNK, THE GRAPH'S ROWS FOR THE BATCHED
+    // KERNELS. The prefill kernel walks ONE request's pages — at one request the two are the same
+    // number, which is why one `mq` served until S > 1; a packed rung's walk must cover one
+    // request's `width` rows of its own record, not `width · S` rows of both records fused. The
+    // decode kernel (one query row) and the batched kernel (the request axis carried inside one
+    // launch) keep the graph's row count, exactly as before.
+    let blocks = if batch || decode {
+        walk_pages(pages, mq, active_cap)
+    } else {
+        walk_pages(pages, query_rows.per_request().get(), active_cap)
+    };
     let tids = PagedStepTids::RESERVED;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
@@ -2090,7 +2280,11 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         ("NUM_BLOCKS", blocks),
     ];
     if !decode {
-        sizes.push(("PADDED_QUERY_LEN", mq));
+        // ⭐ ONE REQUEST'S QUERY WIDTH, NOT THE GRAPH'S ROWS — the kernel gathers `P` rows through
+        // `query_row_index` (a per-request table) and scatters them back through the same rows, so
+        // its padded query length is the rung's per-request width. At one request the two agree,
+        // which is why one `mq` served until S > 1.
+        sizes.push(("PADDED_QUERY_LEN", query_rows.per_request().get()));
     }
     for (k, v) in sizes {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -2107,6 +2301,15 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let module = compile_kernel(src, &spec, &[1])?;
     let positional = triton_ktir_superdsc::node_for(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    // ⭐ THE BINDINGS ARE THE REQUEST SHIFT'S WHOLE REACH. A launch serving several requests
+    // relaunches this program's whole group span once per request (`fold_plan`'s request law),
+    // shifting the activation segment by one table pitch — so the activation-segment operands the
+    // span reads must be EXACTLY the per-request tables the host stages at that pitch
+    // (`query_row_index`, `page_index_table`, `mask_stack`), and nothing else. The list below is
+    // that law stated literally: `query`/`out` are the graph's own rows (gathered and scattered
+    // through `query_row_index` — absolute rows, never shifted), the pools are append-only KV, and
+    // the three reserved-tid buffers are the tables. A new activation-segment operand added here
+    // is a new table the host must stage per request — it does not ride the shift for free.
     let mut bindings = vec![
         t(&node.inputs[0]),
         BufferId::new(tids.query_rows),
@@ -2272,6 +2475,7 @@ fn rebind(
         bindings,
         mask,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     })
@@ -2503,8 +2707,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // ONE tile, the whole region — `KtirFunc::matmul`'s own whole-region law
             // (one linalg.matmul, no K loop). `M_TOTAL` names the OUTPUT TENSOR's row
             // extent (the storage the descriptor addresses) while the store takes the
-            // `[M, N]` tile at row 0 — the prefill lm-head fold's m=1 tail, whose
-            // output is row 0 of the `[mq, vocab]` logits storage.
+            // `[M, N]` tile at row 0 — the prefill lm-head fold's m=S tail, whose
+            // output is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage.
             // ⛔ `N` IS THE DEVICE WIDTH — the door's own padding law, stated here so
             // the view/tile name the storage every consumer addresses: the card writes
             // `n_dev` columns (`out_width_the_weight_holds`'s staged-weight contract),
@@ -3029,7 +3233,7 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok((n_total, c_start))
 }
 
-/// THE MATMUL'S WINDOW FACTS — the row-0 window form the prefill lm-head fold's m=1
+/// THE MATMUL'S WINDOW FACTS — the row-0 window form the prefill lm-head fold's m=S
 /// tail states: the out descriptor names the OUTPUT TENSOR's row extent (`M_TOTAL`,
 /// the storage the layout reserved) while the store takes the `[M, N]` tile at row 0,
 /// and the activation names its own `[M, K]` window. A whole-region node answers
@@ -3037,7 +3241,7 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 ///
 /// ⛔ THE ROW CORNER MUST BE 0 — the door's `base_addressed` refuses a nonzero row
 /// corner on both the activation and the output, and no matmul kernel in this family
-/// spells one. The fold's m=1 tail is row 0 of the `[mq, vocab]` logits storage, so
+/// spells one. The fold's m=S tail is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage, so
 /// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
 /// silently mis-address.
 /// ⭐ THE WIDTH A DENSE MATMUL'S PROGRAM STATES FOR ITS OUTPUT — the width its READERS address.
@@ -3573,6 +3777,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         bindings,
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     })
@@ -3997,26 +4202,31 @@ mod production_ktir_dump {
             ),
             vec![1],
         ));
-        // ── lmlast.py: the extraction, at the row the SSOT names for MQ=5. ──
-        v.push((
-            "lmlast_fwd",
-            LMLAST,
-            spec(
-                "lmlast.py",
-                "lmlast_fwd",
-                &[("desc_src", "*fp16"), ("desc_dst", "*fp16")],
-                &[
-                    ("MQ", Val::Int(5)),
-                    ("HIDDEN", Val::Int(2048)),
-                    (
-                        "ROW",
-                        Val::Int(scratchy_subtile::sdsc_abstract::selector_lastrow_col(5) as i128),
-                    ),
-                    ("N_STICKS", Val::Int(32)),
-                ],
-            ),
-            vec![1],
-        ));
+        // ── lmlast.py: the extraction, one entry per request count — k = 1, 2 and 3 (3 is
+        // not a power of two), each at w = 5 so MQ is the pair's own product. ──
+        for (name, s) in [
+            ("lmlast_fwd_s1", 1i128),
+            ("lmlast_fwd_s2", 2),
+            ("lmlast_fwd_s3", 3),
+        ] {
+            v.push((
+                name,
+                LMLAST,
+                spec(
+                    "lmlast.py",
+                    "lmlast_fwd",
+                    &[("desc_src", "*fp16"), ("desc_dst", "*fp16")],
+                    &[
+                        ("MQ", Val::Int(5 * s)),
+                        ("HIDDEN", Val::Int(2048)),
+                        ("W", Val::Int(5)),
+                        ("S", Val::Int(s)),
+                        ("N_STICKS", Val::Int(32)),
+                    ],
+                ),
+                vec![1],
+            ));
+        }
         // ── windowedrmsnorm.py: all three entries of the one body. ──
         for (entry, gained, oneplus) in [
             ("windowedrmsnorm_gained_fwd", true, false),
@@ -4108,6 +4318,49 @@ mod production_ktir_dump {
                 )
             };
             v.push((name, src, spec(file, entry, &ptrs, &ces), vec![1]));
+        }
+        // ── and the PREFILL kernel at a PACKED rung's split extents (M2's S=2 shape, stated at the
+        // splice level): `NUM_TOKENS` is the graph's rows (two requests of 64) while
+        // `PADDED_QUERY_LEN` and the walk are ONE request's 64 rows — the two extents
+        // [`QueryExtent`] separates, compiled at the pair a (64, 2) rung mints. The walk is the
+        // rung's own law at `ActiveCap::NONE` (a start==0 chunk: the pages its own per-request
+        // rows fill), stated by the same [`walk_pages`] the splice bakes it with.
+        {
+            let ptrs: Vec<(&str, &str)> = vec![
+                ("query", "*fp16"),
+                ("query_row_index", "*i32"),
+                ("k_pages", "*fp16"),
+                ("v_pages", "*fp16"),
+                ("page_index_table", "*i32"),
+                ("mask_stack", "*fp16"),
+                ("out", "*fp16"),
+            ];
+            let blocks = walk_pages(4, 64, ktir_superdsc::ktir_node::ActiveCap::NONE);
+            let ces = vec![
+                ("NUM_TOKENS", Val::Int(128)),
+                ("NUM_HEADS", Val::Int(32)),
+                ("NUM_KV_HEADS", Val::Int(8)),
+                ("HEAD_SIZE", Val::Int(64)),
+                (
+                    "BLOCK_SIZE",
+                    Val::Int(i128::from(SchedulerBlockTokens::REFERENCE.get())),
+                ),
+                ("NUM_PAGES", Val::Int(4)),
+                ("NUM_BLOCKS", Val::Int(i128::from(blocks))),
+                ("PADDED_QUERY_LEN", Val::Int(64)),
+                ("SCALE", Val::Float(0.125)),
+            ];
+            v.push((
+                "paged_attn_prefill_packed",
+                PAGED_PREFILL,
+                spec(
+                    "page_attn_head_major_prefill.py",
+                    "page_attn_head_major_prefill_kernel",
+                    &ptrs,
+                    &ces,
+                ),
+                vec![1],
+            ));
         }
         // ...and `batched_decode_head_major` over that pool, the chunkings a decode batch rung
         // states (`BatchChunking::of`): 4 sequences on the 4-page rung (one chunk), on the 64-page
@@ -4347,7 +4600,7 @@ mod production_ktir_dump {
             "rmsnormunit_fwd" => Program::RmsNormUnit,
             "scalarwmul_fwd" => Program::ScalarWeightMul,
             "reshape_fwd" => Program::Reshape,
-            "lmlast_fwd" => Program::LmLast,
+            "lmlast_fwd_s1" | "lmlast_fwd_s2" | "lmlast_fwd_s3" => Program::LmLast,
             "windowedrmsnorm_gained_fwd" | "windowedrmsnorm_oneplus_fwd" => {
                 Program::WindowedRmsNorm { unit: false }
             }
@@ -4355,6 +4608,7 @@ mod production_ktir_dump {
             "sample_fwd_b1" | "sample_fwd_b2" | "sample_fwd_b32" => Program::Sample,
             "paged_attn_decode"
             | "paged_attn_prefill"
+            | "paged_attn_prefill_packed"
             | "paged_attn_decode_pool"
             | "paged_attn_prefill_walk"
             | "paged_attn_decode_hd128"
@@ -4427,15 +4681,8 @@ mod production_ktir_dump {
             "affine_strides".into(),
             serde_json::json!(format!("{:?}", op.affine_strides)),
         );
-        obj.insert(
-            "slot_stride_bytes".into(),
-            serde_json::json!(op.slot_stride_bytes),
-        );
-        obj.insert("slab_write".into(), serde_json::json!(op.slab_write));
-        obj.insert(
-            "slab_stride_bytes".into(),
-            serde_json::json!(op.slab_stride_bytes),
-        );
+        obj.insert("kv_page_fold".into(), serde_json::json!(op.kv_page_fold));
+        obj.insert("kv_gathered".into(), serde_json::json!(op.kv_gathered));
         obj.insert("walk".into(), serde_json::json!(format!("{:?}", op.walk)));
         serde_json::Value::Object(obj).to_string()
     }
@@ -4552,6 +4799,62 @@ mod production_ktir_dump {
             ));
         }
         Ok(ops.iter().map(sdsc_line).collect())
+    }
+
+    /// ⭐ THE STRUCTURAL TWIN, RUN IN EVERY TEST PASS — the same driver over the same `entries()`,
+    /// writing nothing and asserting the SHAPE of the result rather than its bytes. Every production
+    /// kernel compiles to a non-empty KTIR module; every one the door lowers emits at least one op;
+    /// and the kernels the door does NOT lower are exactly the two named tables — the skips
+    /// (`sdsc_skip_of`, kernels with no door row) and the refusals below (kernels whose door
+    /// refuses them by name, each with the substring its refusal must carry). A kernel that starts
+    /// refusing, stops refusing, or refuses for another reason fails here, by name, with no golden
+    /// to regenerate: the byte-level proof stays the ignored driver's diff.
+    #[test]
+    fn every_production_kernel_lowers_or_is_refused_by_name() {
+        // (kernel, a substring its door refusal carries).
+        const EXPECTED_REFUSALS: &[(&str, &str)] = &[
+            ("lmlast_fwd_s1", "states no `node_out_tid`"),
+            ("lmlast_fwd_s2", "states no `node_out_tid`"),
+            ("lmlast_fwd_s3", "states no `node_out_tid`"),
+        ];
+        let mut refused: Vec<(&str, String)> = Vec::new();
+        let mut skipped: Vec<&str> = Vec::new();
+        for (name, src, spec, grid) in entries() {
+            let module = compile_kernel(src, &spec, &grid)
+                .unwrap_or_else(|e| panic!("`{name}` did not compile: {e}"));
+            assert!(
+                !triton_ktir::text::print::print(&module).trim().is_empty(),
+                "`{name}` printed an empty module"
+            );
+            if sdsc_skip_of(name).is_some() {
+                skipped.push(name);
+                continue;
+            }
+            let node = triton_ktir_superdsc::node_for(&module, program_of(name))
+                .unwrap_or_else(|e| panic!("`{name}` did not mint a node: {e}"));
+            match emit_sdsc(name, &node) {
+                Ok(lines) => assert!(!lines.is_empty(), "`{name}` emitted no ops"),
+                Err(reason) => refused.push((name, reason)),
+            }
+        }
+        let names: Vec<&str> = refused.iter().map(|(n, _)| *n).collect();
+        let expected: Vec<&str> = EXPECTED_REFUSALS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names, expected,
+            "the kernels the door refuses moved — refusals: {refused:#?}"
+        );
+        for ((name, reason), (_, why)) in refused.iter().zip(EXPECTED_REFUSALS) {
+            assert!(
+                reason.contains(why),
+                "`{name}` is refused, but not for the named reason ({why:?}): {reason}"
+            );
+        }
+        skipped.sort_unstable();
+        assert_eq!(
+            skipped,
+            ["moe_fwd", "moe_prefill_fwd", "rope_fwd"],
+            "the named skips moved"
+        );
     }
 
     #[test]
@@ -5803,7 +6106,7 @@ mod walk_on_the_card {
                     e.op_name
                 );
                 let synth = layout.synth.borrow();
-                let footprint = *synth.sizes.get(dst).unwrap_or_else(|| {
+                let footprint = synth.size(dst).unwrap_or_else(|| {
                     panic!(
                         "mq={mq} hd={hd}: {}: the landing {dst} is no HBM synthetic of the \
                          Intermediate segment",

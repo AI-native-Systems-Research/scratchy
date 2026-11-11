@@ -643,11 +643,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // seg_bytes[Intermediate]`, synthetics packed ABOVE the colored intermediates in one segment),
     // and the day a role here becomes `Intermediate` the allocator must start above it rather than
     // on top of it.
-    let synth = std::cell::RefCell::new(SynthAlloc {
-        next: segment_bytes[SegRole::Intermediate.segment()],
-        map: Default::default(),
-        sizes: Default::default(),
-    });
+    let synth = std::cell::RefCell::new(SynthAlloc::new(
+        segment_bytes[SegRole::Intermediate.segment()],
+    ));
 
     // IDENTITY BY OPERAND SPELLING, for every placed tensor, from the one site that knows the whole
     // set — `compute_bundle_layout`'s construction verbatim. A placement without its `ids` entry is
@@ -1351,6 +1349,7 @@ mod tests {
             ],
             mask: None,
             node_out_tid: None,
+            answer_rows: None,
             minted: Default::default(),
             lx_plan: Default::default(),
         };

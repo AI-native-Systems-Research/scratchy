@@ -45,7 +45,7 @@
 use ktir_core::attrkey::AttrKey;
 use ktir_core::dtypes::DType;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
-use ktir_core::opkind::OpKind;
+use ktir_core::opkind::{FrameStatement, OpKind};
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
 use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind, Scratch};
@@ -171,10 +171,24 @@ pub fn matmul_b_orientation(
     f: &IRFunction<'static>,
     op: &ktir_core::ir::Operation<'static>,
 ) -> Result<BOrient, Error> {
-    let maps = op.attributes.iter().find_map(|(k, v)| match (k, v) {
-        (AttrKey::IndexingMaps, Attr::AffineMapList(m)) => Some(*m),
+    // The maps as the matmul states them. NOT STATED is MLIR's own default (`is_plain_b` below
+    // reads it); stated in a form this proof does not read is refused by name, never treated as
+    // absent — the two are different facts about the op, and folding them would lower a matmul
+    // that tried to state its maps in the wrong form as the plain orientation from a clean bake.
+    let maps = match op.attributes.iter().find_map(|(k, v)| match k {
+        AttrKey::IndexingMaps => Some(v),
         _ => None,
-    });
+    }) {
+        None => None,
+        Some(Attr::AffineMapList(m)) => Some(*m),
+        Some(other) => {
+            return err(format!(
+                "{}: this `{:?}` states its `indexing_maps` in an unreadable form, as {other:?}, \
+                 not the affine map list the orientation proof reads",
+                f.name, op.op_type
+            ));
+        }
+    };
     // `[[d0,d2],[d1,d2],[d0,d1]]` — A row-major, B TRANSPOSED (its map ends in the reduction dim
     // d2), C row-major.
     let is_transpose_b = maps.is_some_and(|m| {
@@ -1405,6 +1419,20 @@ fn indirect_tile_of(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
     })
 }
 
+/// The `ktdp.store` that writes a value into a parameter — NOT one through an indirect access
+/// tile, which is a scatter ([`indirect_store_of`]'s business), and not one reading the value
+/// through a shape op ([`stored_through_shape`]'s business).
+fn plain_store_of<'f>(
+    f: &'f IRFunction<'static>,
+    v: Option<Ssa>,
+) -> Option<&'f ktir_core::ir::Operation<'static>> {
+    f.operations.iter().find(|s| {
+        s.op_type == OpKind::KtdpStore
+            && s.operands.first().copied() == v
+            && !indirect_tile_of(f, s.operands.get(1).copied())
+    })
+}
+
 /// ⭐ THE SCATTER A VALUE IS STORED THROUGH — `res`, or a shape op that moves no byte of it, written
 /// by a `ktdp.store` through an indirect access tile: its rows land on the rows of the destination
 /// parameter its index names. `None` when no such store reads it.
@@ -1413,18 +1441,11 @@ fn indirect_store_of(
     res: Ssa,
 ) -> Result<Option<super::lower_ktir_to_superdsc::RowScatter>, Error> {
     let f = &k.func;
-    let dims = |v: Ssa| -> Vec<i64> {
-        f.ops_deep()
-            .into_iter()
-            .find(|o| o.result == Some(v))
-            .and_then(|o| o.result_type)
-            .and_then(|t| t.dims())
-            .map(<[i64]>::to_vec)
-            .unwrap_or_default()
-    };
     // Through a shape op only when it moves no byte: one that does is a relayout, and the scatter
-    // reads its result (the reshape's own stick permute).
-    let reshaped = f
+    // reads its result (the reshape's own stick permute). Both shapes must be STATED — a pair
+    // nobody stated passes `same_card_bytes` with neither side proven, so [`stated_dims`] refuses
+    // the value that states no tensor type rather than read it as an empty shape.
+    let reshaped = match f
         .operations
         .iter()
         .find(|o| {
@@ -1434,7 +1455,10 @@ fn indirect_store_of(
             ) && o.operands.first() == Some(&res)
         })
         .and_then(|o| o.result)
-        .filter(|&v| same_card_bytes(&dims(res), &dims(v)));
+    {
+        Some(v) if same_card_bytes(&stated_dims(f, res)?, &stated_dims(f, v)?) => Some(v),
+        _ => None,
+    };
     let Some(store) = f.operations.iter().find(|s| {
         s.op_type == OpKind::KtdpStore
             && (s.operands.first() == Some(&res) || s.operands.first().copied() == reshaped)
@@ -2241,6 +2265,12 @@ struct Bcast {
     src: Ssa,
     axis: BcastAxis,
     flat: bool,
+    /// ⭐ THE SPRAY COUNT — the product of the extents the broadcast itself sprays, on the folded
+    /// frame the classification read. The ONE mode choice ([`spray_operand_axis`]) reads it when
+    /// a leading spray over a solved COLUMN re-routes to the outer row-split: `y` is the
+    /// broadcast's own stated extent, a program fact — never a region ratio and never a
+    /// `v_rows > 1` guard.
+    count: u32,
 }
 
 /// ⭐⭐⭐ A BROADCAST IS ADDRESSING, NOT A NODE — so its ops are PLUMBING and the CONSUMER carries it.
@@ -2340,14 +2370,14 @@ fn program_broadcast_chains(
                     .as_ref()
                     .and_then(|t| t.dims().map(|d| d.to_vec()))
             });
-        let rank = res_dims.as_ref().map(Vec::len);
-        let Some(rank) = rank else {
+        let Some(res_dims) = res_dims else {
             return err(format!(
                 "{}: `linalg.broadcast` states no shaped result, so its rank — the frame the \
                  `Dimensions` axis is read in — is unknown",
                 f.name
             ));
         };
+        let rank = res_dims.len();
         // ⭐⭐⭐ THE FOLD: A UNIT-EXTENT RESULT AXIS THE BROADCAST DOES NOT SPRAY IS INVISIBLE TO
         // THE FLAT FRAME. The flat frame folds every axis but the last into its rows, so a
         // result axis of extent 1 that is NOT in `Dimensions` moves no element and names no
@@ -2366,12 +2396,9 @@ fn program_broadcast_chains(
         // counts — rows, numel — which a unit axis cannot change), and every read below — the
         // rank, the leading run, the sprayed extents, the admission's split frame, both covers
         // — is the FOLDED frame, one statement of the shape for the whole classification.
-        let (res_dims, dims, rank): (Option<Vec<i64>>, Vec<i64>, usize) = if rank > 2 {
-            let s = res_dims
-                .as_ref()
-                .expect("rank is Some only when res_dims is");
-            let keeps = |i: usize| s[i] != 1 || dims.contains(&(i as i64));
-            let folded: Vec<i64> = s
+        let (res_dims, dims, rank): (Vec<i64>, Vec<i64>, usize) = if rank > 2 {
+            let keeps = |i: usize| res_dims[i] != 1 || dims.contains(&(i as i64));
+            let folded: Vec<i64> = res_dims
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| keeps(*i))
@@ -2380,7 +2407,7 @@ fn program_broadcast_chains(
             let folded_dims: Vec<i64> = dims
                 .iter()
                 .map(|&d| {
-                    d - s
+                    d - res_dims
                         .iter()
                         .enumerate()
                         .take(d as usize)
@@ -2389,7 +2416,7 @@ fn program_broadcast_chains(
                 })
                 .collect();
             let rank = folded.len();
-            (Some(folded), folded_dims, rank)
+            (folded, folded_dims, rank)
         } else {
             (res_dims, dims.to_vec(), rank)
         };
@@ -2424,10 +2451,7 @@ fn program_broadcast_chains(
                         .all(|(i, &d)| d == i as i64) =>
             {
                 let k = ds.len() - 1;
-                let count: i64 = res_dims
-                    .as_ref()
-                    .map(|s| s[..k].iter().product())
-                    .unwrap_or(0);
+                let count: i64 = res_dims[..k].iter().product();
                 if count <= 1 {
                     return err(format!(
                         "{}: `linalg.broadcast` adds the leading run {:?} and the stick axis of a \
@@ -2450,7 +2474,7 @@ fn program_broadcast_chains(
             // (the source's rows ARE the result's rows before it) is proved after the walk-back,
             // as the outer spray's is.
             (r, [d]) if r > 2 && *d as usize == r - 2 && *d > 0 => {
-                match res_dims.as_ref().and_then(|s| s.get(*d as usize)) {
+                match res_dims.get(*d as usize) {
                     Some(&y) if y > 1 => (
                         BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::inner(y as u32)),
                         false,
@@ -2785,17 +2809,7 @@ fn program_broadcast_chains(
                 // axis is invisible to the flat frame, so the split is proved in the folded
                 // one; re-reading the attribute here would state the pre-fold shape and the
                 // two statements of the split would disagree by exactly the folded axes).
-                let Some(s) = res_dims.clone() else {
-                    return err(format!(
-                        "{}: `linalg.broadcast` sprays a rank > 2 source of {} flat rows down its \
-                         LEADING axis but states no shaped result, so the row-split frame — the \
-                         `[y, mb, ..]` the leading dim would have to name — cannot be proven. The \
-                         `mb` operand mode addresses ONE row once and the row-split mode needs the \
-                         spray count, so neither can be chosen for it",
-                        f.name,
-                        source_rows.unwrap_or(0)
-                    ));
-                };
+                let s = &res_dims;
                 // The spray count: the leading axes the broadcast adds, folded; the source's rows must
                 // then be the rest of the row axes, folded.
                 let lead = dims.len().min(s.len());
@@ -2861,14 +2875,14 @@ fn program_broadcast_chains(
             let source_rows = def_of(cursor)
                 .and_then(super::lower_ktir_to_superdsc::shape_2d)
                 .map(|(r, _)| r as i64);
-            let before: Option<i64> = res_dims
-                .as_ref()
-                .map(|s| s[..s.len().saturating_sub(2)].iter().product());
-            if source_rows.is_none() || source_rows != before {
+            let before: i64 = res_dims[..res_dims.len().saturating_sub(2)]
+                .iter()
+                .product();
+            if source_rows != Some(before) {
                 return err(format!(
                     "{}: `linalg.broadcast` sprays its second-to-last axis {} times over a source \
                      of {source_rows:?} flat rows, but the result's rows before that axis are \
-                     {before:?} — the inner row spray repeats each SOURCE row in place, so the \
+                     {before} — the inner row spray repeats each SOURCE row in place, so the \
                      two must be the same rows, or the copies read rows the source does not have",
                     f.name, sp.count
                 ));
@@ -2884,13 +2898,14 @@ fn program_broadcast_chains(
             let numel = def_of(cursor)
                 .and_then(super::lower_ktir_to_superdsc::shape_2d)
                 .map(|(r, c)| i64::from(r) * i64::from(c));
-            let rows: Option<i64> = res_dims.as_ref().map(|s| {
-                s[..s.len().saturating_sub(1)].iter().product::<i64>() / i64::from(sp.count)
-            });
-            if numel.is_none() || numel != rows {
+            let rows: i64 = res_dims[..res_dims.len().saturating_sub(1)]
+                .iter()
+                .product::<i64>()
+                / i64::from(sp.count);
+            if numel != Some(rows) {
                 return err(format!(
                     "{}: `linalg.broadcast` sprays {numel:?} per-row values down {} leading \
-                     copies of {rows:?} rows each — one value per row is the cover, or the read \
+                     copies of {rows} rows each — one value per row is the cover, or the read \
                      reaches values the source does not have",
                     f.name, sp.count
                 ));
@@ -2968,6 +2983,16 @@ fn program_broadcast_chains(
         for v in chain {
             consumed.insert(v);
         }
+        // ⭐ THE SPRAY COUNT — the product of the extents the broadcast itself sprays, read on
+        // the folded frame the classification read (a unit non-spray axis is invisible to it, so
+        // the pre-fold extents would state the wrong `y`). An unsprayed extent contributes 1 —
+        // the count is read only where the mode choice re-routes a leading spray to a row-split,
+        // and the admissions that mint `Y` directly compute their own.
+        let count: u32 = dims
+            .iter()
+            .filter_map(|&d| res_dims.get(d as usize).copied())
+            .product::<i64>()
+            .max(1) as u32;
         map.insert(
             res,
             Bcast {
@@ -2981,6 +3006,7 @@ fn program_broadcast_chains(
                 src: crossed_convert.unwrap_or(cursor),
                 axis,
                 flat,
+                count,
             },
         );
     }
@@ -4133,7 +4159,7 @@ fn mint(k: &KtirNode, layout: &BundleLayout, floor: u32, key: crate::ktir_node::
     // plan kept there ([`super::lx_plan`]).
     if let Some(&tid) = minted.get(&key) {
         let name = crate::place::act_name(tid);
-        if layout.synth.borrow().map.contains_key(&name) || layout.lx_core_local(&name) {
+        if layout.synth.borrow().contains(&name) || layout.lx_core_local(&name) {
             return tid;
         }
     }
@@ -4159,7 +4185,8 @@ pub(super) fn mint_floor(k: &KtirNode) -> u32 {
 ///
 /// The `dl16tofp32` widen writes its output lane-permuted when both operands are standard (the
 /// measured stagger — see [`crate::element_arrangement`]). That is a fact about the OPCODE, so
-/// it is stated as a const table row ([`crate::element_arrangement::OP_OUTPUT_ARRANGEMENT`])
+/// it is stated as a row of the device-facts table
+/// ([`ktir_core::ddl_binds::DEVICE_OPS`], via [`ktir_core::ddl_binds::output_arrangement`])
 /// and THIS pass takes the table as input: a convert's output carries whatever arrangement its
 /// row states, a POINTWISE op propagates the stagger to every same-width operand and its output
 /// (the device reads operand buffers lane-for-lane, so a standard-staged operand of a staggered
@@ -4181,7 +4208,10 @@ pub(super) fn mint_floor(k: &KtirNode) -> u32 {
 /// Returns the marked parameters: buffer tid → the arrangement to stage. Parameters the pass
 /// never marks stay [`ElementArrangement::Standard`], and the map is EMPTY for every program
 /// with no staggered convert — a decoder layer changes nothing.
-pub fn staggered_sources(
+/// Generic over the generation `G` — the BAKE names it once at its entry
+/// (`staggered_sources::<Baked>` in `lower_subtile_tape_to_ktir`); this
+/// pass never chooses a generation itself.
+pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
     k: &KtirNode,
 ) -> Result<std::collections::BTreeMap<u32, crate::element_arrangement::ElementArrangement>, Error>
 {
@@ -4197,6 +4227,14 @@ pub fn staggered_sources(
     let gelus = program_gelu_chains(f)?;
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
     let equal_masks = program_equal_masks(f)?;
+    // The ONE frame assignment, read here and nowhere re-derived: the classification's
+    // order-freeness question — does this operand supply one scalar per output row? — is the
+    // value's WORLD, and the pass is its one answer. ⭐ `None`: both of this helper's callers
+    // (the A-seam and the batched-decode seat, `lower_subtile_tape_to_ktir`) run on PRE-FLATTEN
+    // `KtirNode`s from `lower_one_node` — the loop fold happens later, inside the whole-function
+    // walk — so the carries here are the for's own `IterArgs`/`ResultNames`/yield, which the
+    // solve joins by itself.
+    let frames = assign_frames(f, None)?;
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -4283,65 +4321,42 @@ pub fn staggered_sources(
             Lowering::BatchTranspose { .. } => 1,
             Lowering::Node(_) => op.operands.len(),
         };
-        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect`
-        // below would re-state the match's own fact as a runtime check.
-        let raw_in: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
-            _ if rms.is_some() => {
-                let c = rms.expect("just matched");
-                match c.gain {
-                    // The two tensors the recogniser proved, walked back through the rank
-                    // plumbing to values a `Region` exists for.
-                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
-                    // The identity gain is the constant 1 — not a parameter.
-                    GainLeg::Identity => vec![c.x],
-                }
-            }
-            _ if equal.is_some() => {
-                let (a, b) = equal.expect("just matched");
-                vec![a, b]
-            }
+        // The recognised chains ride the scrutinee so their arms BIND them — a guard plus an
+        // `expect` below would re-state the match's own fact as a runtime check.
+        let raw_in: Vec<Ssa> = match (rms, equal, gelu, terminal, scalar, bound_scale) {
+            (Some(c), ..) => match c.gain {
+                // The two tensors the recogniser proved, walked back through the rank
+                // plumbing to values a `Region` exists for.
+                GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
+                // The identity gain is the constant 1 — not a parameter.
+                GainLeg::Identity => vec![c.x],
+            },
+            (None, Some((a, b)), ..) => vec![a, b],
             // The gelu's one input is the chain's own `x` — the value the cubic's base and the
             // divide's numerator both are — never the divide's own operands.
-            (_, _, _, Some(g)) => vec![g.x],
-            (Some(c), _, _, _) => match c.up {
+            (None, None, Some(g), ..) => vec![g.x],
+            (None, None, None, Some(c), ..) => match c.up {
                 Some(up) => vec![c.gate, up],
                 None => vec![c.gate],
             },
-            (None, Some((_, tensor)), _, _) => vec![tensor],
-            (None, None, Some(b), _) => vec![b.tensor],
-            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, None, None, None, Some((_, tensor)), _) => vec![tensor],
+            (None, None, None, None, None, Some(b)) => vec![b.tensor],
+            (None, None, None, None, None, None) => {
+                op.operands.iter().copied().take(n_in).collect()
+            }
         };
         // One input's (SOURCE, ORDER-FREENESS). The ruling's semantics are a SHAPE fact, not a
         // spelling fact: an operand that supplies ONE SCALAR PER OUTPUT ROW is order-free — a
-        // `Col` broadcast chain, a `[·, 1]` parameter, or a computed per-row value (a reduce
-        // result) whose own type states the degenerate column — while a dense operand, an
-        // `Mb`/`Y` spray and a `[1, ·]` row are read LANE FOR LANE, so the consumer's
-        // arrangement is the operand's. Read off the broadcast chain when the program spells
-        // one, and off the operand's OWN region/type when it does not (Triton's implicit
-        // broadcast needs no chain, and the emitter selects the operand mode from the same
-        // degenerate extent).
-        let dims_of = |v: Ssa| -> Option<&'static [i64]> {
-            f.operations
-                .iter()
-                .find(|o| o.result == Some(v))
-                .and_then(|o| o.result_type)
-                .and_then(|t| t.dims())
-        };
-        let resolved = |v: Ssa| -> (Ssa, bool) {
+        // `Col` broadcast chain, or a value the frame pass holds columnar — while a dense
+        // operand, an `Mb`/`Y` spray and a `[1, ·]` row are read LANE FOR LANE, so the
+        // consumer's arrangement is the operand's. Read off the broadcast chain when the
+        // program spells one (the chain's source is what the consumer binds); otherwise off the
+        // ONE frame assignment, whose load arm is the same degenerate-column read this
+        // classifier used to re-derive here.
+        let resolved = |v: Ssa| -> Result<(Ssa, bool), Error> {
             match bcasts.get(&v) {
-                Some(b) => (b.src, b.axis == BcastAxis::Col),
-                None => {
-                    let per_row = match region_for_operand(k, v) {
-                        // A parameter: the VIEW's own column extent decides.
-                        Ok(Some(r)) => r.c_len == 1,
-                        // A value this function computed: its own result type's shape decides —
-                        // `[·, 1]` or rank-1 `[rows]` is the per-row vector a reduce produces.
-                        _ => {
-                            matches!(dims_of(v), Some(d) if d.len() == 1 || *d.last().unwrap_or(&0) == 1)
-                        }
-                    };
-                    (v, per_row)
-                }
+                Some(b) => Ok((b.src, b.axis == BcastAxis::Col)),
+                None => Ok((v, frames.world_of(f, v)? == World::Column)),
             }
         };
         // `arr` is mutated inside the marking loop below, so this is a fn taking the map rather
@@ -4353,10 +4368,12 @@ pub fn staggered_sources(
             // A REDUCTION IS ORDER-FREE: the stagger permutes within 64-element blocks and the
             // reduction's answer is a function of the multiset, so the stagger ends here.
             Lowering::Reduce(_) => ElementArrangement::Standard,
-            // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table row.
+            // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table
+            // row — one row per op by construction (the table is an array keyed by the
+            // op, pinned at its length), so there is no absent row to guess a default
+            // for and nothing to refuse here.
             Lowering::Convert(kind) => {
-                crate::element_arrangement::output_arrangement_of(kind.op_func())
-                    .unwrap_or(ElementArrangement::Standard)
+                ktir_core::ddl_binds::output_arrangement::<G>(kind.device_op())
             }
             // POINTWISE — the stagger propagates through it, and every same-width operand that
             // is read lane-for-lane must agree with the output's arrangement.
@@ -4368,14 +4385,14 @@ pub fn staggered_sources(
             | Lowering::Node(Program::Elementwise(_)) => {
                 let mut out = ElementArrangement::Standard;
                 for v in &raw_in {
-                    let (src, order_free) = resolved(*v);
+                    let (src, order_free) = resolved(*v)?;
                     if !order_free && staggered(&arr, src) {
                         out = ElementArrangement::Dl16ToFp32;
                     }
                 }
                 if out == ElementArrangement::Dl16ToFp32 {
                     for v in &raw_in {
-                        let (src, order_free) = resolved(*v);
+                        let (src, order_free) = resolved(*v)?;
                         if order_free || staggered(&arr, src) {
                             continue;
                         }
@@ -4415,7 +4432,7 @@ pub fn staggered_sources(
             // correct. Refused by name rather than lowered as the nearest arrangement.
             _ => {
                 for v in &raw_in {
-                    let (src, order_free) = resolved(*v);
+                    let (src, order_free) = resolved(*v)?;
                     if !order_free && staggered(&arr, src) {
                         return err(format!(
                             "{}: a staggered value reaches `{:?}`, whose addressing is not \
@@ -4431,15 +4448,19 @@ pub fn staggered_sources(
         };
         // ⛔ A CONVERT'S OWN STAGGERED INPUT is a composition of two arrangements the table
         // does not state — refused before the output's row is applied.
-        if matches!(program, Lowering::Convert(_))
-            && raw_in
-                .first()
-                .is_some_and(|v| staggered(&arr, resolved(*v).0))
-        {
+        let convert_input_staggered = match (program, raw_in.first()) {
+            (Lowering::Convert(_), Some(&v)) => {
+                let (src, _) = resolved(v)?;
+                staggered(&arr, src)
+            }
+            _ => false,
+        };
+        if convert_input_staggered {
             return err(format!(
-                "{}: a staggered value enters a dtype-convert — the composition of the stagger \
-                 with the convert's own output arrangement is not a fact the const table \
-                 states, so it is refused rather than guessed. Reduce before the convert",
+                "{}: a staggered value enters a dtype-convert — the composition of the \
+                 stagger with the convert's own output arrangement is not a fact the \
+                 const table states, so it is refused rather than guessed. Reduce \
+                 before the convert",
                 f.name
             ));
         }
@@ -4559,6 +4580,16 @@ fn lower_function_folded<T: crate::collective::Tp>(
     quantized: &mut super::ktir_matmul_fp8::QuantizedActivations,
 ) -> Result<Vec<super::EmittedOp<T>>, Error> {
     let f = &k.func;
+    // ⭐ THIS PROGRAM's op-local LX scope — made here because this function lowers exactly ONE
+    // program; every op-local pin the program states takes it `&mut` (`lx_op_local_pair`).
+    let mut lx_scope = crate::placement::LxScope::program();
+    // Every value's world, minted once by the ONE frame assignment, and read here and nowhere
+    // re-derived: the carried-state mint, the shape-op reframe and the splatted constants below
+    // all ask this table. ⭐ THE FOLD IS THE WALK'S CARRY STATEMENT: `loop_fold::flatten` drops
+    // the `scf.for`, the `RegionBb0Args` and the yield op — and NOTHING ELSE — so the carries'
+    // correspondence (arg ≡ init ≡ yielded ≡ result) lives in the ONE `LoopFold` this walk was
+    // handed, which the solve joins rather than re-derives.
+    let frames = assign_frames(f, fold)?;
     let mut out = Vec::new();
     let mut lowered = 0usize;
 
@@ -4709,9 +4740,9 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name, c.arg.0
                 ));
             }
-            let frame = value_frame(f, &dims);
+            let frame = frames.frame_of(f, c.init, &dims)?;
             let tid = mint_inter(k, layout, floor, c.arg);
-            layout.synth(crate::place::PlaceId::Act(tid), &frame);
+            layout.synth(crate::place::SynthId::Act(tid), &frame);
             let r = Region {
                 tid,
                 v_rows: frame[0],
@@ -4778,7 +4809,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         if inter.contains_key(&v) {
                             continue;
                         }
-                        if let Some((r, value)) = splat_buffer(k, layout, floor, v)? {
+                        if let Some((r, value)) = splat_buffer(k, layout, floor, &frames, v)? {
                             out.extend(super::lower_ktir_to_superdsc::fill(
                                 f.name,
                                 value,
@@ -4820,7 +4851,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         };
                         let tid =
                             mint_scratch(k, layout, floor, c.result, Scratch::CarriedHandback);
-                        layout.synth(crate::place::PlaceId::Act(tid), &[r.v_rows, r.v_cols]);
+                        layout.synth(crate::place::SynthId::Act(tid), &[r.v_rows, r.v_cols]);
                         let copy = Region { tid, ..r };
                         out.extend(super::lower_ktir_to_superdsc::elementwise(
                             f.name,
@@ -4915,16 +4946,10 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name, op.op_type, r.tid
                 ));
             }
-            let def_dims = |v: Ssa| -> Vec<i64> {
-                f.operations
-                    .iter()
-                    .find(|o| o.result == Some(v))
-                    .and_then(|o| o.result_type)
-                    .and_then(|t| t.dims())
-                    .map(<[i64]>::to_vec)
-                    .unwrap_or_default()
-            };
-            let (mut from, to) = (def_dims(src), def_dims(res));
+            // The shapes both sides state — a value that states no tensor type is refused by name
+            // ([`stated_dims`]), never read as an empty one: an unstated pair would pass the
+            // moves-bytes gate below and claim the reframe preserved bytes nobody proved.
+            let (mut from, to) = (stated_dims(f, src)?, stated_dims(f, res)?);
             // A GATHER FROM A ROW-OUTERMOST BUFFER (the paged cache's allocation,
             // [`BundleLayout::allocate_row_outermost`]) is held as the page gather lands it —
             // one-stick sub-rows, its slabs' own row-major bytes — whatever shape the load states.
@@ -5060,7 +5085,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     None => {
                         let tid = mint_inter(k, layout, floor, res);
                         layout.synth(
-                            crate::place::PlaceId::Act(tid),
+                            crate::place::SynthId::Act(tid),
                             &[rows, sticks * stick as u32],
                         );
                         Region {
@@ -5257,7 +5282,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         // The stick-major `[entries, cols]` the gathered rows land in.
                         let mint_rows = || {
                             let tid = mint_inter(k, layout, floor, src);
-                            layout.synth(crate::place::PlaceId::Act(tid), &[g.entries, cols]);
+                            layout.synth(crate::place::SynthId::Act(tid), &[g.entries, cols]);
                             Region {
                                 tid,
                                 v_rows: g.entries,
@@ -5650,7 +5675,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                             };
                             let run = mint_scratch(k, layout, floor, src, Scratch::IndexRun);
                             layout.synth_df(
-                                crate::place::PlaceId::Act(run),
+                                crate::place::SynthId::Act(run),
                                 &[1, super::lower_ktir_to_superdsc::INDEX_RUN_WORDS],
                                 crate::superdsc_opspec::Df::SenUint32,
                             );
@@ -5766,7 +5791,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                             let land_tid =
                                 mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
                             layout.synth(
-                                crate::place::PlaceId::Act(land_tid),
+                                crate::place::SynthId::Act(land_tid),
                                 &[t_rows.get(), w.elems()],
                             );
                             let land = Region {
@@ -5862,8 +5887,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
             };
             // The same bytes, in the frame the result is held in — the frame its consumers read
             // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`; a
-            // per-row column stays one value per stick row, [`value_frame`]).
-            let [rr, rc] = value_frame(f, &to);
+            // per-row column stays one value per stick row, the frame pass's one table).
+            let [rr, rc] = frames.frame_of(f, res, &to)?;
             let whole = source.r_start == 0
                 && source.c_start == 0
                 && source.r_len == source.v_rows
@@ -6100,7 +6125,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                                 &dst.name(),
                                 sym_id_base,
                                 Some(layout),
-                            ),
+                            )?,
                         );
                         Region {
                             is_out: false,
@@ -6219,7 +6244,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // port never bakes (`J = min(32 / seqs, blocks)` over power-of-two buckets is always one).
             let halving = matches!(kind, ReduceKind::Max) && blocks.is_power_of_two();
             let tid = mint_inter(k, layout, floor, res);
-            layout.synth(crate::place::PlaceId::Act(tid), &[rows, src.v_cols]);
+            layout.synth(crate::place::SynthId::Act(tid), &[rows, src.v_cols]);
             // ⛔ THE TREE'S WIDE LEVELS GET THEIR OWN BUFFER, NOT A TALLER RESULT. A level above the
             // last writes several windows, and the result buffer is ONE window — the shape every
             // consumer of this reduction reads. Widening it instead made the result present as its
@@ -6231,7 +6256,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // is this arm's alone.
             let wide = (halving && blocks > 2).then(|| {
                 let t = mint_scratch(k, layout, floor, data, Scratch::FoldTreeWide);
-                layout.synth(crate::place::PlaceId::Act(t), &[src.v_rows / 2, src.v_cols]);
+                layout.synth(crate::place::SynthId::Act(t), &[src.v_rows / 2, src.v_cols]);
                 (t, src.v_rows / 2)
             });
             let acc = Region {
@@ -6593,32 +6618,34 @@ fn lower_function_folded<T: crate::collective::Tp>(
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
-        // The gelu rides the scrutinee so its arm BINDS the chain — a guard plus an `expect` below
-        // would re-state the match's own fact as a runtime check.
-        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale, gelu) {
+        // Every recognised chain rides the scrutinee so its arm BINDS it — a guard plus an `expect`
+        // below would re-state the match's own fact as a runtime check.
+        let in_values: Vec<Ssa> = match (
+            rms,
+            equal,
+            gelu,
+            terminal,
+            scalar,
+            bound_scale,
+            scalar_binary,
+        ) {
             // The two tensors the rmsnorm recogniser proved, walked back through the rank plumbing to
             // values a `Region` exists for.
-            _ if rms.is_some() => {
-                let c = rms.expect("just matched");
-                match c.gain {
-                    // The two tensors the recogniser proved, walked back through the rank
-                    // plumbing to values a `Region` exists for.
-                    GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
-                    // The identity gain is the constant 1 — not a parameter.
-                    GainLeg::Identity => vec![c.x],
-                }
-            }
+            (Some(c), ..) => match c.gain {
+                // The two tensors the recogniser proved, walked back through the rank
+                // plumbing to values a `Region` exists for.
+                GainLeg::Scale(gamma) | GainLeg::OnePlusScale(gamma) => vec![c.x, gamma],
+                // The identity gain is the constant 1 — not a parameter.
+                GainLeg::Identity => vec![c.x],
+            },
             // THE EQUALITY MASK's inputs are the comparison's own two operands, not the retype's
             // (the retype reads the i1 the fold destroys). The broadcast resolution below then
             // applies to them exactly as it would to a spelled two-tensor op's.
-            _ if equal.is_some() => {
-                let (a, b) = equal.expect("just matched");
-                vec![a, b]
-            }
+            (None, Some((a, b)), ..) => vec![a, b],
             // The gelu's one input is the chain's own `x` — the value the cubic's base and the
             // divide's numerator both are — never the divide's own operands.
-            (_, _, _, Some(g)) => vec![g.x],
-            (Some(c), _, _, _) => match c.up {
+            (None, None, Some(g), ..) => vec![g.x],
+            (None, None, None, Some(c), ..) => match c.up {
                 Some(up) => vec![c.gate, up],
                 // The bare form's one input is the gate; the divide's other operand is the
                 // chain-interior `1 + e^-x`, which the fused op never materialises.
@@ -6626,15 +6653,15 @@ fn lower_function_folded<T: crate::collective::Tp>(
             },
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
-            (None, Some((_, tensor)), _, _) => vec![tensor],
+            (None, None, None, None, Some((_, tensor)), ..) => vec![tensor],
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
-            (None, None, Some(b), _) => vec![b.tensor],
+            (None, None, None, None, None, Some(b), _) => vec![b.tensor],
             // A splatted-constant binary's tensor side, wherever the splat sits.
-            (None, None, None, _) if scalar_binary.is_some() => {
-                vec![scalar_binary.expect("just matched").2]
+            (None, None, None, None, None, None, Some((_, _, tensor))) => vec![tensor],
+            (None, None, None, None, None, None, None) => {
+                op.operands.iter().copied().take(n_in).collect()
             }
-            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
         // A BROADCAST OPERAND READS ITS SOURCE. The chain minted no buffer (it emitted no op), so the
@@ -6668,9 +6695,16 @@ fn lower_function_folded<T: crate::collective::Tp>(
         // is the `[1024, 1]` column vector of the flat frame — so the region handed downstream
         // is PRESENTED flat (see the presentation in the region loop below) rather than being
         // the source's own `[256, 4]` window. Rank 2 keeps `false` and its verbatim behavior.
-        let bcast_flat: Vec<bool> = in_values
+        let mut bcast_flat: Vec<bool> = in_values
             .iter()
             .map(|v| bcasts.get(v).is_some_and(|b| b.flat))
+            .collect();
+        // ⭐ THE SPRAY COUNTS ride beside the axes for the ONE mode choice: a leading spray over a
+        // solved COLUMN re-routes to the outer row-split at the count the broadcast itself states
+        // ([`Bcast::count`], a program fact).
+        let bcast_counts: Vec<u32> = in_values
+            .iter()
+            .map(|v| bcasts.get(v).map_or(1, |b| b.count))
             .collect();
         let in_values: Vec<Ssa> = in_values
             .iter()
@@ -6772,7 +6806,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     // registry's bound const ([`super::lower_ktir_to_superdsc::fill`]). The op that
                     // reads it keeps its own kind; only a multiply/min/max beside a dense tensor
                     // reads its constant side as a scalar instead (`ScalarMul`, `ScalarBinary`).
-                    None => match splat_buffer(k, layout, floor, *v)? {
+                    None => match splat_buffer(k, layout, floor, &frames, *v)? {
                         Some((r, value)) => {
                             out.extend(super::lower_ktir_to_superdsc::fill(
                                 f.name,
@@ -6813,41 +6847,21 @@ fn lower_function_folded<T: crate::collective::Tp>(
         for i in 0..bcast_axes.len() {
             let Some(axis) = bcast_axes[i] else { continue };
             let r = per_op[i];
-            // ⭐ A ROW VECTOR HELD AS A STICK COLUMN, SPRAYED DOWN A TILE HELD AS A STICK COLUMN, IS
-            // THE OUTER ROW-SPLIT OF THE COLUMN — an addressing identity, not a new mode. The row
-            // reductions keep per-row scalars one a stick row (`[n, 1]`), so a leading-axis combine
-            // of such scalars (a decode batch's `J`-slot merge at ONE kv head: `[J, 1, 1, G] ->
-            // [1, 1, G]`, the unit kv axis folded) holds its one semantic row of `G` values as the
-            // column `[G, 1]`, and the consumer's own tile `[J, 1, 1, G]` as the column `[J·G, 1]`.
-            // Row-major the result's element `(j, g)` sits at `j·G + g` and the source's `g` at
-            // `g`, which is exactly the `Y` outer spray of the `[G, 1]` column `J` times. Stated over
-            // the REGIONS alone: a whole one-stick-column source of `mb` rows beside a dense
-            // one-stick-column operand of `y·mb` rows, `y > 1`. The consumer's want check and the
-            // `split_rows` frame law re-prove the cover before any operand is built.
-            let axis = match axis {
-                BcastAxis::Mb
-                    if r.c_len == 1
-                        && r.c_start == 0
-                        && r.r_start == 0
-                        && r.r_len == r.v_rows
-                        && r.v_rows > 1 =>
-                {
-                    let dense_rows = (0..per_op.len().min(bcast_axes.len()))
-                        .filter(|&j| j != i && bcast_axes[j].is_none())
-                        .map(|j| per_op[j])
-                        .find(|d| d.c_len == 1 && d.r_len > r.r_len && d.r_len % r.r_len == 0)
-                        .map(|d| d.r_len / r.r_len);
-                    match dense_rows {
-                        Some(y) if y > 1 => {
-                            let ax = BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(y));
-                            bcast_axes[i] = Some(ax);
-                            ax
-                        }
-                        _ => axis,
-                    }
-                }
-                other => other,
-            };
+            // ⭐ THE ONE MODE CHOICE — (spray axis, the solved source world) → the operand mode, and
+            // NOTHING ELSE decides it. This replaces the `c_len`-keyed region promotion main needed
+            // (and its `v_rows > 1` guard): a leading spray over a solved COLUMN is the column
+            // frame's own reading of "add leading rows" — the outer row-split at the broadcast's
+            // own stated count — and a leading spray over a ROW source is `In::mb`, whatever the
+            // neighbouring regions' extents are. There is no second road: if this choice and the
+            // regions disagree, the degenerate check below names it, and the four-scope gate
+            // proves the equivalence on every scope main ran.
+            let axis = spray_operand_axis(f, &frames, in_values[i], axis, bcast_counts[i])?;
+            if bcast_axes[i] != Some(axis) {
+                bcast_axes[i] = Some(axis);
+                // The flat presentation described the `Mb` reading; the row-split addresses the
+                // source at its own frame.
+                bcast_flat[i] = false;
+            }
             let degenerate = match axis {
                 BcastAxis::Col => r.c_len == 1,
                 // One row of its view: the whole view at one row, or a one-row window of a taller
@@ -7011,7 +7025,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
         } else {
             false
         };
-        if op_gather.is_some()
+        if let Some((g, _, _)) = op_gather
             && !gathered_b
             && !matches!(
                 program,
@@ -7025,10 +7039,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                  would emit a descriptor reading the table DIRECTLY at its base, which is the right \
                  shape and the wrong rows, from a clean bake. Give the gathered operand its own \
                  `ScalarMul` node, or add the index to the assembler this op needs.",
-                f.name,
-                op.op_type,
-                op_gather.map_or(0, |(g, _, _)| g.value_tid),
-                op_gather.map_or(0, |(g, _, _)| g.index_tid),
+                f.name, op.op_type, g.value_tid, g.index_tid,
             ));
         }
 
@@ -7155,40 +7166,24 @@ fn lower_function_folded<T: crate::collective::Tp>(
         // ⭐ A STORE THROUGH AN INDIRECT TILE IS A SCATTER, NOT THIS OP's OUTPUT: the value is an
         // intermediate, and [`indirect_store_of`] copies it to the rows its index names after the op
         // writes it (spyre-inference's `out.index_copy_(0, query_row_index, attn)`).
-        let stores_of = |v: Option<Ssa>| {
-            f.operations.iter().find(|s| {
-                s.op_type == OpKind::KtdpStore
-                    && s.operands.first().copied() == v
-                    && !indirect_tile_of(f, s.operands.get(1).copied())
-            })
-        };
-        let op_dims: Vec<i64> = op
-            .result_type
-            .and_then(|t| t.dims())
-            .map(<[i64]>::to_vec)
-            .unwrap_or_default();
         // Stored through a shape op: the op writes the stored parameter's bytes in its OWN frame.
+        // [`stored_through_shape`] attempts that path whole — the shape op, the store reading its
+        // result, and the byte proof — only when the direct store is missing, and refuses by name
+        // when a live through-path's shapes are unstated: a pair nobody stated passes
+        // `same_card_bytes` with neither side proven.
         let mut through_shape = false;
-        let mut stored = stores_of(op.result).or_else(|| {
-            let res = op.result?;
-            let shape = f.operations.iter().find(|o| {
-                matches!(
-                    o.op_type,
-                    OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
-                ) && o.operands.first() == Some(&res)
-            })?;
-            // Only through a shape op that moves no byte: one that does is a stick permute, which
-            // the shape op's own arm lowers into the stored parameter.
-            let shape_dims = shape
-                .result_type
-                .and_then(|t| t.dims())
-                .map(<[i64]>::to_vec)
-                .unwrap_or_default();
-            same_card_bytes(&op_dims, &shape_dims).then_some(())?;
-            let s = stores_of(shape.result);
-            through_shape = s.is_some();
-            s
-        });
+        let mut op_dims: Vec<i64> = Vec::new();
+        let mut stored = match plain_store_of(f, op.result) {
+            Some(s) => Some(s),
+            None => match stored_through_shape(f, op)? {
+                Some((store, dims)) => {
+                    through_shape = true;
+                    op_dims = dims;
+                    Some(store)
+                }
+                None => None,
+            },
+        };
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
         // the dot's result is never stored directly: without this arm the walk would mint it an
@@ -7313,62 +7308,43 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name, op.op_type
                 ));
             };
-            // ⭐⭐⭐ A PER-ROW SCALAR OF A RANK-N TILE IS A COLUMN — a reduction over a rank-N
+            // ⭐⭐⭐ THE MINT ASKS THE FRAME TABLE — read through `Frames::frame_of`, the one derivation of
+            // whether this result is a column. A per-row scalar of a rank-N tile is a COLUMN: a reduction over a rank-N
             // tile's last axis writes one value per row of its `[rows, cols]` flat frame, i.e. the
             // `[rows, 1]` column `assemble_reduce_seeded` writes, whatever rank the program states
             // it at (`[B, G]` for a `[B, G, PS]` tile); and a pointwise op over such a column (the
             // running max's `max`, the rescale's `exp`) keeps it one. Framed `[numel, 1]`, not the
-            // stated shape's own `[B, G]`, which would be a different stick per row.
-            let numel: Option<i64> = op
-                .result_type
-                .and_then(|t| t.dims())
-                .filter(|d| d.len() >= 2)
-                .map(|d| d.iter().product());
-            let per_row_scalar = numel.is_some_and(|n| {
-                matches!(program, Lowering::Reduce(_))
-                    || per_op
-                        .iter()
-                        .any(|r| !r.is_out && r.c_len == 1 && i64::from(r.r_len) == n)
-            });
-            let dims = match op.result_type {
-                _ if per_row_scalar => [numel.expect("just checked") as u32, 1],
-                Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
-                    [dims[0] as u32, dims[1] as u32]
-                }
-                // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
-                // last folded into rows — the same reading [`shape_2d`] states and every consumer
-                // of the minted buffer addresses through. Row-major, the rank-N tile and its flat
-                // pair are the same bytes at the same offsets, so one buffer serves both; minting
-                // the STATED shape instead (`[256, 4, 256]`) would be a `[4, 256]` buffer under
-                // the old reading — a quarter of the footprint the flat `[1024, 256]` consumers
-                // address. The batched paged-decode kernel's score tiles and softmax states are
-                // all rank-3; without this arm every one of them was refused below as "states no
-                // 2-D tensor type". Rank 2 keeps the arm above verbatim.
-                Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() > 2 => {
-                    let rows: i64 = dims[..dims.len() - 1].iter().copied().product();
-                    [rows as u32, *dims.last().expect("dims.len() > 2") as u32]
-                }
-                // A RANK-1 INTERMEDIATE IS `[rows, 1]` WHEN ITS VALUE CAME FROM A ROW REDUCTION, and
-                // that is decided by PROVENANCE rather than by this op's kind.
-                //
-                // `linalg.reduce` over the trailing axis of `[rows, cols]` yields `[rows]` — one value
-                // per row, exactly the `[rows, 1]` accumulator `assemble_reduce_seeded` writes. A
-                // decoder's rmsnorm then keeps that column shape through `ms = sum(x*x) * INV_D` and
-                // `rsqrt(ms + eps)`, so the SAME footprint is right for every pointwise op along that
-                // chain — but for the same reason it is NOT right for a rank-1 value that is a `[cols]`
-                // ROW vector (a broadcast source), where `[cols, 1]` would size the buffer correctly
-                // and address it wrong.
-                //
-                // The discriminator is therefore the INPUT's own column extent, which is already known
-                // here: a reduce writes `c_len == 1`, so anything reading a one-column tile is on the
-                // reduction's side of the program. A reduce's own result qualifies by its kind because
-                // it has no such input to consult.
-                Some(ktir_core::irtype::IrType::Tensor { dims, .. })
-                    if dims.len() == 1
-                        && (matches!(program, Lowering::Reduce(_))
-                            || per_op.iter().any(|r| !r.is_out && r.c_len == 1)) =>
-                {
-                    [dims[0] as u32, 1]
+            // stated shape's own `[B, G]`, which would be a different stick per row. The deleted
+            // `per_row_scalar` read this fact off THIS op's own inputs — a second derivation that
+            // could disagree with the pass (and with the chase, and with the classifier); the
+            // table's world is now the only answer, at every rank: a rank-1 column provenance
+            // (`linalg.reduce` over the trailing axis, kept through the rmsnorm chain) mints
+            // `[rows, 1]` here exactly as the deleted provenance test did.
+            let dims: [u32; 2] = match op.result_type {
+                Some(ktir_core::irtype::IrType::Tensor { dims, .. }) => {
+                    // A RANK-1 (or RANK-0) ROW VALUE KEEPS THE MINT'S OWN REFUSAL — the provenance
+                    // question ("did this value come from a row reduction?") is now the table's to
+                    // answer, and a value the table holds ROW is a `[cols]` row vector (a broadcast
+                    // source) to this door whatever its producer: `[cols, 1]` would size the buffer
+                    // correctly and address it wrong, and `[1, cols]` is no frame a minted buffer's
+                    // consumers address, so no buffer can be sized for it.
+                    if frames.world_of(f, res)? == World::Row && dims.len() < 2 {
+                        return err(format!(
+                            "{}: `{:?}`'s result is an intermediate but states no 2-D tensor type, so \
+                             its footprint is unknown and no buffer can be sized for it",
+                            f.name, op.op_type
+                        ));
+                    }
+                    // ⭐⭐⭐ A RANK > 2 INTERMEDIATE IS MINTED IN THE FLAT FRAME — every axis but the
+                    // last folded into rows — the same reading [`shape_2d`] states and every consumer
+                    // of the minted buffer addresses through. Row-major, the rank-N tile and its flat
+                    // pair are the same bytes at the same offsets, so one buffer serves both; minting
+                    // the STATED shape instead (`[256, 4, 256]`) would be a `[4, 256]` buffer under
+                    // the old reading — a quarter of the footprint the flat `[1024, 256]` consumers
+                    // address. The batched paged-decode kernel's score tiles and softmax states are
+                    // all rank-3; without this arm every one of them was refused below as "states no
+                    // 2-D tensor type". Rank 2 keeps its stated frame verbatim.
+                    frames.frame_of(f, res, dims)?
                 }
                 _ => {
                     return err(format!(
@@ -7544,7 +7520,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
             // threads into the descriptors.
             if carried.is_none() {
-                layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+                layout.synth_df(crate::place::SynthId::Act(tid), &dev_dims, op_df);
             }
             // ⭐⭐⭐ THE BAND PROPAGATES THROUGH THE MINT — a banded op's intermediate is a
             // banded operand of the NEXT op. The minted region states the band its inputs
@@ -7721,6 +7697,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                 BundleFacts {
                     headmajor,
                     quantized: &mut *quantized,
+                    lx_scope: &mut lx_scope,
                 },
             )?;
             out.append(&mut emitted);
@@ -7830,6 +7807,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             BundleFacts {
                 headmajor,
                 quantized: &mut *quantized,
+                lx_scope: &mut lx_scope,
             },
         )?;
         out.append(&mut emitted);
@@ -8019,64 +7997,804 @@ fn every_store_is_written<T: crate::collective::Tp>(
     Ok(())
 }
 
-/// THE FRAME A VALUE OF `dims` IS HELD IN: a per-row scalar of a reduction — a value shaped as a
-/// `linalg.reduce` result of this function, the running max and sum — is the `[numel, 1]` column the
-/// reduction writes; anything else is its flat frame.
-fn value_frame(f: &IRFunction<'static>, dims: &[i64]) -> [u32; 2] {
-    // The shapes a per-row column takes: a stick fold's result, a leading fold of a per-row
-    // column (a decode batch's `J` block slots' running max, folded), and a shape op over one (the
-    // folded max expanded back over the slots: one value per stick row in either shape) — to a
-    // fixed point.
-    let deep = f.ops_deep();
-    let dims_of = |o: &Operation<'_>| o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec);
-    let mut columns: Vec<Vec<i64>> = deep
-        .iter()
-        .filter(|o| o.op_type == OpKind::LinalgReduce && folds_the_stick(o))
-        .filter_map(|o| dims_of(o))
-        .collect();
-    loop {
-        let more: Vec<Vec<i64>> = deep
-            .iter()
-            .filter(|o| {
-                (o.op_type == OpKind::LinalgReduce && !folds_the_stick(o))
-                    || matches!(
-                        o.op_type,
-                        OpKind::TensorReshape
-                            | OpKind::TensorExpandShape
-                            | OpKind::TensorCollapseShape
-                    )
-            })
-            .filter(|o| {
-                o.operands
-                    .first()
-                    .and_then(|&v| deep.iter().find(|d| d.result == Some(v)))
-                    .and_then(|d| dims_of(d))
-                    .is_some_and(|d| columns.contains(&d))
-            })
-            .filter_map(|o| dims_of(o))
-            .filter(|d| !columns.contains(d))
-            .collect();
-        if more.is_empty() {
-            break;
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE FRAME ASSIGNMENT — one pass, every value's world, and no second statement anywhere
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐⭐⭐⭐ THE WORLD A VALUE'S FRAME IS HELD IN. `Column` is the per-row column a reduction that
+/// folds its input's last axis writes — one value per stick row, presented `[numel, 1]`, the frame
+/// the `In::col` operand mode addresses. `Row` is the flat frame — every axis but the last folded
+/// into rows ([`flat_frame`]) — the frame a dense tile's bytes already are. The two are DIFFERENT
+/// BYTES for any value with more than one element per row (a dense frame packs a row's values into
+/// its sticks; a column holds one), which is the whole question: a reader that answers it wrong
+/// addresses the same value at the wrong stride.
+///
+/// ONE pass assigns it ([`assign_frames`], a total function over the op kinds), and every reader
+/// asks the result: the walk's carried-state mint, the shape-op reframe, a splatted constant's
+/// buffer, and the arrangement classifier's order-freeness. Before the pass, three readers derived
+/// the frame three ways and could disagree — the deleted `value_frame`'s shape-lineage fixpoint,
+/// the classifier's degenerate-extent read, the broadcast chase's `shape_2d` — and a disagreement
+/// of exactly that kind is what stopped gemma-4-12b's `attn_s147` at a bake. Now it is
+/// unrepresentable: there is one table and every reader reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum World {
+    /// One value per stick row, presented `[numel, 1]`.
+    Column,
+    /// Every axis but the last folded into rows.
+    Row,
+}
+
+/// A class nothing anchors has no lanes of its own, so it reads the same in every frame; `Row`
+/// is the dense frame. THE ONE DEFAULT the solve resolves an unanchored class through — the only
+/// value passed at the resolve site, so no reader can state a second one.
+const UNSTATED_IS: World = World::Row;
+
+/// Every value's [`World`], minted once by [`assign_frames`].
+struct Frames {
+    world: std::collections::HashMap<Ssa, World>,
+    /// The `linalg.broadcast` RESULTS — values the solve holds NO world for: a sprayed result is
+    /// dense, however its source is held, and the reader that wants it addresses the SOURCE
+    /// through the spray's operand mode ([`spray_operand_axis`]). A world asked of one is the
+    /// bake error — the question the pass exists to answer was replaced by the mode choice, and
+    /// silently reading it as a row is how the softmax tail's chain was mis-held.
+    sprayed: std::collections::HashSet<Ssa>,
+}
+
+impl Frames {
+    /// The world of `v` — the one answer the solve stated, refused by name when it stated none.
+    /// ⭐ THE SPRAYED RESULT IS HELD IN NO WORLD ([`Frames::sprayed`]): a world asked of one is
+    /// the bake error naming the spray — the one predicate, stated here for [`frame_of`] too.
+    /// After the solve that domain is STATED, not assumed: every value the program names is a
+    /// node, and an unanchored class resolving [`UNSTATED_IS`] is a decision, not a gap — so no
+    /// entry means the solve indexed no class for the value at all, and its lanes are a
+    /// question the pass was not asked. Named rather than silently read as a row: the old
+    /// default answered it anyway, and a reader pointing at a value nobody framed would have
+    /// addressed it lane-for-lane on a fact nobody stated.
+    fn world_of(&self, f: &IRFunction<'static>, v: Ssa) -> Result<World, Error> {
+        if self.sprayed.contains(&v) {
+            return err(format!(
+                "{}: `%{}` is a `linalg.broadcast` result — a spray is addressing, not data, so \
+                 it is held in no world of its own; the consumer reads its source through the \
+                 spray's operand mode. A world asked of the sprayed result is a reader pointing \
+                 at the wrong value",
+                f.name, v.0
+            ));
         }
-        columns.extend(more);
+        match self.world.get(&v) {
+            Some(&w) => Ok(w),
+            None => err(format!(
+                "{}: `%{}` carries no frame fact — the solve indexed no class for it. A value \
+                 the pass never indexed is stated through other means (plumbing, a view, a \
+                 store), and a world asked of it is a reader pointing at the wrong value",
+                f.name, v.0
+            )),
+        }
     }
-    let per_row = columns.iter().any(|d| d == dims);
-    if per_row {
-        [dims.iter().product::<i64>() as u32, 1]
-    } else {
-        flat_frame(dims)
+
+    /// The `[rows, cols]` frame `v` is held in, at `dims` — the value's own stated shape, the same
+    /// dims its producer's result type states: the column's `[numel, 1]`, or the flat frame.
+    /// ⭐ THE SPRAYED RESULT IS NOT HELD IN ANY FRAME — it is addressing, not data, and the
+    /// consumer reads its SOURCE through the spray's mode. A frame asked of one is [`world_of`]'s
+    /// refusal, inherited — never a silently-read row.
+    fn frame_of(&self, f: &IRFunction<'static>, v: Ssa, dims: &[i64]) -> Result<[u32; 2], Error> {
+        Ok(match self.world_of(f, v)? {
+            World::Column => [dims.iter().product::<i64>() as u32, 1],
+            World::Row => flat_frame(dims),
+        })
     }
 }
 
-/// Whether a `linalg.reduce` folds its input's LAST axis — the stick, one value per row of the
-/// flat frame, the per-row column a row reduction writes. A fold of any other axis (the leading
-/// `J` of a decode batch's block slots) writes a tile of the input's own rows.
-fn folds_the_stick(o: &Operation<'_>) -> bool {
-    let rank = o.result_type.and_then(|t| t.dims()).map_or(0, <[i64]>::len);
-    o.attributes.iter().any(
+/// Whether a `linalg.reduce` folds its input's LAST axis — the pass's reduction arm's own
+/// predicate: such a reduce writes one value per stick row, a [`World::Column`], while a fold of
+/// any other axis (the leading `J` of a decode batch's block slots) writes a tile of the input's
+/// own rows. Which axis the fold is, is the RANK's own fact: a reduce that states no shaped
+/// result is REFUSED by name, never read as rank 0 — rank 0 is not "unknown", it is a stated
+/// rank-0, and an unstated one must not anchor `World::Column` by matching `Dimensions == [0]`.
+fn folds_its_stick(f: &IRFunction<'static>, res: Ssa, o: &Operation<'_>) -> Result<bool, Error> {
+    let rank = match o.result_type.and_then(|t| t.dims()) {
+        Some(dims) => dims.len(),
+        None => {
+            return err(format!(
+                "{}: the reduce `%{}` states no shaped result, so which axis it folds — its \
+                 input's own stick axis or a leading one — cannot be decided",
+                f.name, res.0
+            ));
+        }
+    };
+    Ok(o.attributes.iter().any(
         |(k, v)| matches!((k, v), (AttrKey::Dimensions, Attr::IntList(d)) if *d == [rank as i64]),
-    )
+    ))
+}
+
+/// Every value's defining operation, by result — the ONE index the frame pass and its helpers
+/// read. Built once per function by [`assign_frames`] and handed to every helper that used to
+/// re-walk `ops_deep` and linearly `find` per lookup (an O(n²) walk with an allocation per op);
+/// the def-uniqueness the SSA verifier proves is what makes one entry per result total. The index
+/// carries the borrow of the function it was built from (`'d`), not `'static`: `ops_deep` returns
+/// references that live as long as the borrow they were walked through, and the index never
+/// outlives the assignment that built it.
+///
+/// The index also holds the SHAPES of the values with no defining operation — the function's own
+/// arguments (their types, as the signature states them) and every loop's carried args (each
+/// typed as its init: the program's own statement of a carry's shape) — so a helper reading an
+/// operand's count sees a region arg's shape, not a missing one silently read as a scalar.
+struct Defs<'d> {
+    def: std::collections::HashMap<Ssa, &'d Operation<'static>>,
+    shape: std::collections::HashMap<Ssa, Vec<i64>>,
+}
+
+/// A `scf.for` carry's four names — arg, init, yielded, result — as [`Defs::carries`] states
+/// them. The names the for does not state are `None`; the quads are index-paired, so a name is
+/// never silently read as another carry's.
+struct CarryNames {
+    arg: Ssa,
+    init: Option<Ssa>,
+    yielded: Option<Ssa>,
+    result: Option<Ssa>,
+}
+
+impl<'d> Defs<'d> {
+    fn new(
+        f: &'d IRFunction<'static>,
+        fold: Option<&super::loop_fold::LoopFold>,
+    ) -> Result<Self, Error> {
+        let mut def = std::collections::HashMap::new();
+        for o in f.ops_deep() {
+            if let Some(r) = o.result {
+                def.insert(r, o);
+            }
+        }
+        let mut shape = std::collections::HashMap::new();
+        for (v, t) in f.arguments {
+            if let Some(d) = t.dims() {
+                shape.insert(*v, d.to_vec());
+            }
+        }
+        // ⭐ THE WALK'S CARRIES STATE THEIR SHAPES THROUGH THEIR INITS — the one buffer's four
+        // names all carry the init's shape (args/inits/results/yields arity-equal, the fold's own
+        // law). A function that still states its loop seeds them from the for's
+        // `IterArgs`/`ResultNames`; the FLATTENED function drops the for, so its carries are
+        // seeded from the ONE `LoopFold` the flattening handed back — without this, a carried
+        // result read as an operand (`attn_s8`'s `%260 = ArithSubf(%246, %259)`, `%246` the max
+        // carry's result) states no shape and no lane could be read at all.
+        // The shape an init states — off the program's statement of it, or off the init's own
+        // def. One spelling, read by both seeds below: the for's own carries and the flattened
+        // function's `LoopFold`. The map is a PARAMETER, not a capture — the seeds mutate it.
+        let init_dims = |shape: &std::collections::HashMap<Ssa, Vec<i64>>, init: Ssa| {
+            shape.get(&init).cloned().or_else(|| {
+                def.get(&init)
+                    .and_then(|d| d.result_type)
+                    .and_then(|t| t.dims())
+                    .map(<[i64]>::to_vec)
+            })
+        };
+        for o in f.ops_deep().iter().filter(|o| o.op_type == OpKind::ScfFor) {
+            for c in Self::carries(f, o)? {
+                // A carry whose init the for does not state seeds no shape — the truncation
+                // the old args/inits zip spelled, now stated by the quad's own `Option`.
+                let Some(init) = c.init else { continue };
+                let d = init_dims(&shape, init);
+                if let Some(d) = d {
+                    shape.insert(c.arg, d);
+                }
+                // ⭐ THE RESULT PAIRED WITH THIS CARRY, BY INDEX — args/inits/results are
+                // arity-equal (the fold's own law), so carry `i`'s result is `results[i]`: a
+                // result never takes another carry's shape, and a carry that states no shape
+                // leaves its result unstated too — never a made-up `[]`.
+                if let Some(r) = c.result
+                    && let Some(d) = shape.get(&c.arg).cloned()
+                {
+                    shape.entry(r).or_insert(d);
+                }
+            }
+        }
+        if let Some(fold) = fold {
+            for c in &fold.carried {
+                let d = init_dims(&shape, c.init);
+                if let Some(d) = d {
+                    shape.insert(c.arg, d.clone());
+                    shape.insert(c.result, d.clone());
+                    shape.entry(c.yielded).or_insert(d);
+                }
+            }
+        }
+        Ok(Defs { def, shape })
+    }
+
+    /// A `scf.for` carry's four names — its arg, init, yield and result name ONE buffer
+    /// (the fold's own law, `loop_fold`). A name the for does not state is `None`; no
+    /// carry is ever silently paired with another carry's name. An attr the for states
+    /// in a form the walk does not read is refused by name — never treated as absent —
+    /// and so is a for that states no body region: never read as an empty one.
+    fn carries(f: &IRFunction<'_>, o: &'d Operation<'static>) -> Result<Vec<CarryNames>, Error> {
+        let args: &[Ssa] = match o.attr(AttrKey::IterArgs) {
+            Some(Attr::Ssas(v)) => v,
+            // A for that states no iter_args carries nothing — the plain for, legitimate.
+            None => &[],
+            Some(other) => {
+                return err(format!(
+                    "{}: a scf.for states its IterArgs as {other:?}, not the carry-arg name \
+                     list the walk pairs with its inits",
+                    f.name
+                ));
+            }
+        };
+        let inits = &o.operands[3.min(o.operands.len())..];
+        let results: Vec<Ssa> = match o.attr(AttrKey::ResultNames) {
+            Some(Attr::Ssas(v)) => v.to_vec(),
+            None => o.result.into_iter().collect(),
+            Some(other) => {
+                return err(format!(
+                    "{}: a scf.for states its ResultNames as {other:?}, not the name list \
+                     the walk pairs with its carries",
+                    f.name
+                ));
+            }
+        };
+        // A for with no body region is refused, never read as an empty one — the walk reads
+        // the body's trailing scf.yield, and a for that states no body states no yield.
+        let Some(body) = o.regions.first().copied() else {
+            return err(format!(
+                "{}: a scf.for states no body region — the walk reads its trailing scf.yield",
+                f.name
+            ));
+        };
+        let yields: Option<&[Ssa]> = body
+            .split_last()
+            .and_then(|(y, _)| (y.op_type == OpKind::ScfYield).then_some(y.operands));
+        Ok((0..args.len())
+            .map(|i| CarryNames {
+                arg: args[i],
+                init: inits.get(i).copied(),
+                yielded: yields.and_then(|y| y.get(i)).copied(),
+                result: results.get(i).copied(),
+            })
+            .collect())
+    }
+
+    fn of(&self, v: Ssa) -> Option<&'d Operation<'static>> {
+        self.def.get(&v).copied()
+    }
+
+    /// The value's own stated shape: off its def, or off the program's statement of a value
+    /// with no def (an argument, a carried arg).
+    fn dims_of(&self, v: Ssa) -> Option<Vec<i64>> {
+        self.shape.get(&v).cloned().or_else(|| {
+            self.of(v)
+                .and_then(|d| d.result_type)
+                .and_then(|t| t.dims())
+                .map(<[i64]>::to_vec)
+        })
+    }
+}
+
+/// ⭐ THE PARAMETERS THIS FUNCTION STORES PER-ROW COLUMNS INTO — the one fact that flows AGAINST
+/// the pass's forward order, stated as its own function the pass takes as INPUT so no arm of the
+/// table can reorder it: a `ktdp.store` whose VALUE's own stated shape is a column (`[..., 1]`,
+/// rank ≥ 2 — a shape that cannot be a row vector) writes that column into a parameter, and a
+/// `ktdp.load` of the parameter reads it back as one. A load's own tile states its window's
+/// column extent, and a rank-1 restatement of a column (`[N]` for `[N, 1]`) states the WRONG one
+/// — `[N]` is a row to a tile — so the store is the statement that holds. The parameter is the
+/// memory view's pointer operand, the same chain `region_of_view_operand` walks on the region
+/// side, so the two walks cannot disagree about which parameter a tile addresses.
+fn column_fed_params(defs: &Defs) -> std::collections::HashSet<Ssa> {
+    let def_of = |v: Ssa| defs.of(v);
+    let mut out = std::collections::HashSet::new();
+    for o in defs.def.values().filter(|o| o.op_type == OpKind::KtdpStore) {
+        // `ktdp.store(value, tile)`: the value is operand 0, the tile operand 1.
+        let (Some(&value), Some(&tile)) = (o.operands.first(), o.operands.get(1)) else {
+            continue;
+        };
+        let column = def_of(value).is_some_and(|d| {
+            d.result_type
+                .and_then(|t| t.dims())
+                // rank ≥ 2 with a one-element trailing axis — the trailing-axis comparison is
+                // stated against the Option itself, so no panic path and no made-up default.
+                .is_some_and(|ds| ds.len() >= 2 && ds.last() == Some(&1))
+        });
+        if column && let Some(ptr) = def_of(tile).and_then(|t| view_param(defs, t)) {
+            out.insert(ptr);
+        }
+    }
+    out
+}
+
+/// The parameter a tile addresses — the memory view's pointer operand: the tile's first
+/// operand's def must be the `ktdp.construct_memory_view(param, …)` that built the tile, and
+/// the parameter is that view's first operand. One spelling, read by both the store side
+/// ([`column_fed_params`]) and the load side ([`load_world`]), so the two walks cannot disagree
+/// about which parameter a tile addresses.
+fn view_param(defs: &Defs, tile: &Operation<'static>) -> Option<Ssa> {
+    let view = tile.operands.first().and_then(|&v| defs.of(v))?;
+    (view.op_type == OpKind::KtdpConstructMemoryView)
+        .then(|| view.operands.first().copied())
+        .flatten()
+}
+
+/// ⭐ THE LOAD'S WORLD — what the load reads is a per-row column iff the tile states a one-column
+/// window (the same fact `windowed_region` reads on the region side, so the two walks cannot
+/// disagree about one tile), or — for a gathered (indirect) tile, whose region is the TABLE's
+/// rather than the window's — the data view states one. A tile that states no shape at all leaves
+/// the load's own result shape the fallback the classifier always had: rank-1, or a degenerate
+/// trailing axis. And a parameter this function stores a column into ([`column_fed_params`]) is
+/// read as one whatever its tile restates — the store is the statement that holds where the
+/// tile's rank-1 restatement lies.
+fn load_world(
+    o: &Operation<'static>,
+    defs: &Defs,
+    column_fed: &std::collections::HashSet<Ssa>,
+) -> World {
+    let def_of = |v: Ssa| defs.of(v);
+    let tile = o.operands.first().and_then(|&t| def_of(t));
+    // The op the column extent is read from: the tile itself, or the gathered tile's DATA view.
+    let states_extent = tile.and_then(|t| {
+        if t.op_type == OpKind::KtdpConstructIndirectAccessTile {
+            t.operands.first().and_then(|&v| def_of(v))
+        } else {
+            Some(t)
+        }
+    });
+    let col_one = match states_extent.and_then(super::lower_ktir_to_superdsc::shape_2d) {
+        Some((_, c)) => c == 1,
+        None => o
+            .result_type
+            .and_then(|t| t.dims())
+            // rank-1, or a degenerate trailing axis — the trailing-axis comparison is stated
+            // against the Option itself; an EMPTY stated shape answers no element, so it is
+            // not column, with no made-up default value.
+            .is_some_and(|d| d.len() == 1 || d.last() == Some(&1)),
+    };
+    let param = tile.and_then(|t| view_param(defs, t));
+    if col_one || param.is_some_and(|p| column_fed.contains(&p)) {
+        World::Column
+    } else {
+        World::Row
+    }
+}
+
+/// ⭐ A DEFERRED `In::col` CHECK — one operand of a pointwise op that reads one value per result
+/// row (`operand_numel == res_rows` elements beside a `res_numel`-element result), collected by
+/// the pass and decided after the closed solve: only the column frame supplies it. Every field
+/// is one the refusal names — the op, the operand, and both counts.
+struct PerRowCheck<'a, 'o> {
+    /// The pointwise op reading the operand — the refusal names the op.
+    op: &'a Operation<'o>,
+    /// The operand that reads one value per result row.
+    operand: Ssa,
+    /// The operand's element count.
+    operand_numel: i64,
+    /// The result's element count.
+    res_numel: i64,
+    /// The result's flat-frame rows.
+    res_rows: u32,
+}
+
+/// ⭐⭐⭐⭐⭐ THE ONE FRAME ASSIGNMENT — a CONSTRAINT SOLVE over [`crate::union_find`]: the program
+/// STATES equalities and absolutes, the solve closes them, and every value's [`World`] is the
+/// solution. One pass in the program's own order — no fixpoint, because a join is order-free:
+/// the class a value belongs to is every class its constraints reach, whenever stated. The
+/// forward sweep this replaces (and main's `value_frame` fixpoint before it) needed a fixed
+/// point precisely because a copy is not a join: a value's world was read before the statement
+/// that decided it had been seen, and the lineage's shape-keyed census existed only to paper
+/// over the ordering. The solve states the laws once:
+///
+/// **THE EQUALITIES** (joins — one class, one frame):
+/// * the walk's carries — a carried value's arg, init, yield and result are ONE BUFFER. The
+///   flattened function drops the `scf.for`, the `RegionBb0Args` and the yield op, so the
+///   correspondence lives in the ONE [`LoopFold`] this pass takes as its parameter
+///   (`fold.carried`, the walk's own statement — never re-derived here); a function that still
+///   states its loop joins the same four through the for's own `IterArgs`/`ResultNames`/yield.
+/// * the elementwise family, LANE FOR LANE — one result element per operand element, so the
+///   result and each lane operand are one frame. An operand that is a `linalg.broadcast` RESULT
+///   is skipped BEFORE the lane rule — a stated spray explains its own mismatch (measured: the
+///   attn_s8 softmax tail's `%260 = ArithSubf(%246, %259)` read the Mb spray's dense result as
+///   the lane, and the whole tail was mis-held Row). A scalar — one element, or no stated shape
+///   at all — names no frame.
+/// * the shape ops — no element moves, so the result and its operand are one frame.
+/// * a `linalg.reduce` that does NOT fold its input's last axis — it writes a tile of the
+///   operand's own rows, so the result joins its FIRST operand (the seed is the op's own, never
+///   a class member).
+/// * the `In::col` reading, DEFERRED — an operand with one value per RESULT ROW (its count
+///   equals the result's flat rows) is consumed, not joined: only the column frame supplies one
+///   value per row, so the check — the operand's SOLVED world must be `Column` — runs after the
+///   solve, when the class is closed. A row-world operand at that count is a BAKE ERROR naming
+///   the op and the operand, as it always was.
+///
+/// **THE ABSOLUTES** (anchors — first stated wins, a second different one is the bake error
+/// naming the op that stated EACH):
+/// * a reduce that folds its input's LAST axis (the stick) — one value per stick row:
+///   [`World::Column`].
+/// * a trailing-axis (`Col`) spray's SOURCE — one value per output row is only possible in the
+///   column frame: [`World::Column`]. The same for a per-row-scalars `Y` spray's source.
+/// * a load — the world its own tile, shape, or store-fed parameter states ([`load_world`]).
+/// * the contractions and `linalg.transpose` — dense outputs: [`World::Row`].
+///
+/// **WHAT ANCHORS NOTHING**: an `Mb` (leading-axis) spray anchors NOTHING on its source — its
+/// operand MODE is chosen from the solved world ([`spray_operand_axis`]), never an anchor. A
+/// `Y` row-split over whole rows states a shape fact the chase already proved, not a frame.
+///
+/// **THE SPRAYED RESULTS ARE NOT NODES** — a `linalg.broadcast` result is dense however its
+/// source is held; it is held in no world, and [`Frames::frame_of`] refuses one by name.
+///
+/// **UNANCHORED IS NOT UNDETERMINED** — a class no absolute was stated for resolves the ONE
+/// row default. There is no second default and no third case.
+///
+/// ⭐ DETERMINISM: the walk is the program's own order (`ops_deep`); joins attach the second
+/// side's root under the first's; the maps are lookups, never iteration order.
+fn assign_frames(
+    f: &IRFunction<'static>,
+    fold: Option<&super::loop_fold::LoopFold>,
+) -> Result<Frames, Error> {
+    let deep = f.ops_deep();
+    let defs = Defs::new(f, fold)?;
+    let column_fed = column_fed_params(&defs);
+    // The spray facts: which source each broadcast sprays, and along what axis — the chase's own
+    // statement, read here for the anchors and never re-derived.
+    let (bcasts, _) = program_broadcast_chains(f)?;
+    // ── THE NODE INDEX: every value the program names — every result, every operand, every
+    // argument, every carried name — except the broadcast results (not nodes: a sprayed
+    // result is held in no world, so NO join may be stated through it). `sprayed` is
+    // stated FIRST, in its own pass over the program, and `node` skips every value in
+    // it: a spray never enters the index, so a join site that forgets the skip is REFUSED
+    // BY NAME at the read (`idx` below) rather than welding a class through a value held
+    // in no world — the skip is by construction, not by remembering. The index order is
+    // plumbing; every decision below is the program's own order.
+    let mut index: std::collections::HashMap<Ssa, u32> = std::collections::HashMap::new();
+    let mut sprayed: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
+    for o in deep.iter() {
+        if o.op_type == OpKind::LinalgBroadcast
+            && let Some(r) = o.result
+        {
+            sprayed.insert(r);
+        }
+    }
+    let mut node = |v: Ssa| {
+        if sprayed.contains(&v) {
+            return;
+        }
+        let n = index.len() as u32;
+        index.entry(v).or_insert(n);
+    };
+    for (a, _) in f.arguments {
+        node(*a);
+    }
+    if let Some(fold) = fold {
+        for c in &fold.carried {
+            node(c.arg);
+            node(c.init);
+            node(c.yielded);
+            node(c.result);
+        }
+    }
+    for o in deep.iter() {
+        for &v in o.operands.iter() {
+            node(v);
+        }
+        if let Some(r) = o.result {
+            node(r);
+        }
+        if o.op_type == OpKind::ScfFor {
+            for c in Defs::carries(f, o)? {
+                node(c.arg);
+                if let Some(r) = c.result {
+                    node(r);
+                }
+            }
+        }
+    }
+    let mut uf: crate::union_find::UnionFind<World> =
+        crate::union_find::UnionFind::with_len(index.len());
+    // ⭐ THE READ STATES THE LAW: a sprayed value is held in no world, so NO join or anchor
+    // may be stated through it — and the node index holds no slot for it. `idx` refuses the
+    // read BY NAME, naming the sprayed value, instead of missing the index with a bare map
+    // panic: the arms that may meet a sprayed operand (the reduction, the shape ops, the
+    // elementwise lanes) skip it before asking, and a site that does not — a carry seeded
+    // by a spray, a spray whose own source is a spray — learns the spray, not a key error.
+    let idx = |v: Ssa| -> Result<u32, Error> {
+        if sprayed.contains(&v) {
+            err(format!(
+                "{}: `%{}` is the result of a `linalg.broadcast` — a sprayed value the frame \
+                 solve holds in NO world, so no join or anchor may be stated through it. The site \
+                 that read it must skip it as the reduction, the shape ops, and the elementwise \
+                 lanes do, or address it through its spray's own operand mode",
+                f.name, v.0
+            ))
+        } else {
+            Ok(index[&v])
+        }
+    };
+    // The union-find's own refusals are typed facts, worded once by their Display —
+    // one adapter renders that wording into the bake error, no re-wording.
+    let as_err = |e: crate::union_find::Refusal<World>| Error {
+        message: e.to_string(),
+    };
+    // ── THE WALK'S CARRIES, when the function still states its loop: the for's own
+    // correspondence — arg, init, yield and result, stated once by [`Defs::carries`]
+    // (the same law [`loop_fold::flatten`] proves and drops). ──
+    for o in deep.iter() {
+        if o.op_type != OpKind::ScfFor {
+            continue;
+        }
+        for (i, c) in Defs::carries(f, o)?.into_iter().enumerate() {
+            let why = format!(
+                "{}: the walk carries %{}/{} — its arg, init, yield and result are one buffer",
+                f.name, c.arg.0, i
+            );
+            if let Some(init) = c.init {
+                uf.join(idx(c.arg)?, idx(init)?, &why).map_err(as_err)?;
+            }
+            if let Some(y) = c.yielded {
+                uf.join(idx(c.arg)?, idx(y)?, &why).map_err(as_err)?;
+            }
+            if let Some(r) = c.result {
+                uf.join(idx(c.arg)?, idx(r)?, &why).map_err(as_err)?;
+            }
+        }
+    }
+    // ── THE WALK'S CARRIES, when the loop is already folded: the ONE fold's own statement. ──
+    if let Some(fold) = fold {
+        for c in &fold.carried {
+            let why = format!(
+                "{}: the walk carries %{} — its arg, init, yield and result are one buffer",
+                f.name, c.arg.0
+            );
+            uf.join(idx(c.arg)?, idx(c.init)?, &why).map_err(as_err)?;
+            uf.join(idx(c.arg)?, idx(c.yielded)?, &why)
+                .map_err(as_err)?;
+            uf.join(idx(c.arg)?, idx(c.result)?, &why).map_err(as_err)?;
+        }
+    }
+    // ── THE DEFERRED `In::col` CHECKS: one value per result row, decided after the solve. ──
+    let mut per_row: Vec<PerRowCheck<'_, '_>> = Vec::new();
+    // ── THE ONE PASS, in the program's own order ──
+    for o in deep.iter() {
+        let res = o.result;
+        // The law each op states is the op's own property ([`OpKind::frame_statement`]) —
+        // exhaustive, stated once, never re-derived here: a new op kind that states no
+        // law is a compile error in the vocabulary, never a silent resolution in the
+        // solve. The integer pointwise kinds join their operands exactly as the float
+        // ones do.
+        match o.op_type.frame_statement() {
+            // ── THE SPRAY: the sprayed result is not a node; the spray's own anchors ──
+            FrameStatement::Spray => {
+                let Some(res) = res else { continue };
+                let Some(b) = bcasts.get(&res) else { continue };
+                match b.axis {
+                    // One value per output row is only possible in the column frame.
+                    BcastAxis::Col => uf
+                        .anchor(
+                            idx(b.src)?,
+                            World::Column,
+                            &format!(
+                                "{}: the trailing-axis spray of `%{}` states one value per output \
+                                 row",
+                                f.name, res.0
+                            ),
+                        )
+                        .map_err(as_err)?,
+                    BcastAxis::Y(super::lower_ktir_to_superdsc::Spray {
+                        of: super::lower_ktir_to_superdsc::SprayOf::RowScalars,
+                        ..
+                    }) => uf
+                        .anchor(
+                            idx(b.src)?,
+                            World::Column,
+                            &format!(
+                                "{}: the per-row scalars' spray of `%{}` states one value per row",
+                                f.name, res.0
+                            ),
+                        )
+                        .map_err(as_err)?,
+                    // An `Mb` or row-split `Y` spray anchors NOTHING on its source: the mode is
+                    // chosen from the solved world ([`spray_operand_axis`]).
+                    _ => {}
+                }
+            }
+            // ── THE REDUCTION: the axis it folds decides the world it writes ──
+            FrameStatement::Reduction => {
+                let Some(res) = res else { continue };
+                if folds_its_stick(f, res, o)? {
+                    uf.anchor(
+                        idx(res)?,
+                        World::Column,
+                        &format!(
+                            "{}: the stick fold `%{}` writes one value per row",
+                            f.name, res.0
+                        ),
+                    )
+                    .map_err(as_err)?;
+                } else if let Some(&x) = o.operands.first() {
+                    // A sprayed operand is held in no world — it states no class for the
+                    // fold. The fold's own anchors decide it.
+                    if !sprayed.contains(&x) {
+                        uf.join(
+                            idx(res)?,
+                            idx(x)?,
+                            &format!(
+                                "{}: the leading fold `%{}` writes a tile of its operand's rows",
+                                f.name, res.0
+                            ),
+                        )
+                        .map_err(as_err)?;
+                    }
+                }
+            }
+            // ── THE SHAPE OPS: no element moves ──
+            FrameStatement::MovesNoElement => {
+                if let (Some(res), Some(&x)) = (res, o.operands.first()) {
+                    // A sprayed operand is held in no world — the spray states no class
+                    // for the shape op's result, however many elements it moves.
+                    if !sprayed.contains(&x) {
+                        uf.join(
+                            idx(res)?,
+                            idx(x)?,
+                            &format!("{}: the shape op `%{}` moves no element", f.name, res.0),
+                        )
+                        .map_err(as_err)?;
+                    }
+                }
+            }
+            // ── CONTRACTIONS AND THE TRANSPOSE: dense outputs ──
+            FrameStatement::DenseTile => {
+                if let Some(res) = res {
+                    uf.anchor(
+                        idx(res)?,
+                        World::Row,
+                        &format!(
+                            "{}: the contraction `%{}` writes a dense tile",
+                            f.name, res.0
+                        ),
+                    )
+                    .map_err(as_err)?;
+                }
+            }
+            // ── THE LOAD: the world its tile, shape, or store states ──
+            FrameStatement::Load => {
+                if let Some(res) = res {
+                    uf.anchor(
+                        idx(res)?,
+                        load_world(o, &defs, &column_fed),
+                        &format!(
+                            "{}: the load `%{}` reads the frame its tile states",
+                            f.name, res.0
+                        ),
+                    )
+                    .map_err(as_err)?;
+                }
+            }
+            // ── THE ELEMENTWISE FAMILY: the mixed-worlds law, as joins — float and
+            // integer pointwise alike, the casts and the comparisons with them ──
+            FrameStatement::Elementwise => {
+                let Some(res) = res else { continue };
+                let Some(res_dims) = o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec)
+                else {
+                    // A value that states no shape names no column: no lane can be read, no
+                    // count checked — the class is whatever else joins it.
+                    continue;
+                };
+                let res_numel: i64 = res_dims.iter().product();
+                let [res_rows, _] = flat_frame(&res_dims);
+                for &v in o.operands.iter() {
+                    // ⭐ A STATED SPRAY EXPLAINS ITS OWN MISMATCH — checked BEFORE the lane
+                    // rule: a broadcast result at the result's own count is the spray the
+                    // consumer addresses through its mode, not a lane (the attn_s8 tail's Mb
+                    // spray was read as the lane and the tail mis-held Row). `sprayed` is the
+                    // one spelling of that fact — stated where the node index is built.
+                    if sprayed.contains(&v) {
+                        continue;
+                    }
+                    let Some(d) = defs.dims_of(v) else {
+                        // A scalar operand names no frame.
+                        continue;
+                    };
+                    let n: i64 = d.iter().product();
+                    if n == res_numel {
+                        // LANE-FOR-LANE, AT EVERY COUNT — 1 included, the M=1 decode
+                        // normalizer chain (`%45 = ArithMulf(%61, %44)`, both `[1]`, `%61` the
+                        // `[1, 2048]` stick fold's column): the operand and the result are one
+                        // frame.
+                        uf.join(
+                            idx(res)?,
+                            idx(v)?,
+                            &format!(
+                                "{}: `{:?}` reads `%{}` lane for lane — one frame",
+                                f.name, o.op_type, v.0
+                            ),
+                        )
+                        .map_err(as_err)?;
+                    } else if n == 1 {
+                        // A scalar beside a wider result: the same value in every frame.
+                    } else if n == i64::from(res_rows) {
+                        // One value per result row — the `In::col` reading, consumed by the
+                        // operand mode; the check is DEFERRED to the closed solve.
+                        per_row.push(PerRowCheck {
+                            op: o,
+                            operand: v,
+                            operand_numel: n,
+                            res_numel,
+                            res_rows,
+                        });
+                    } else {
+                        return err(format!(
+                            "{}: `{:?}` reads %{} — {} elements — beside its other operands for \
+                             a {res_numel}-element result of {} rows: a count the result's own \
+                             rows do not explain and no stated broadcast sprays. The device's \
+                             pointwise modes address a lane-for-lane tile, one scalar per row, \
+                             and a stated spray; this operand is none of them, so its frame is \
+                             named rather than guessed",
+                            f.name, o.op_type, v.0, n, res_rows
+                        ));
+                    }
+                }
+            }
+            // ── UNSTATED states no equality and no absolute of its own: a splat, a
+            // slice, a region arg, a constant, a collective, a generated tile — plain
+            // nodes, joined by their consumers or resolved by the one default. The
+            // loop's own carries were joined above; plumbing (tiles, views, stores,
+            // yields) names no data frame. ──
+            FrameStatement::Unstated => {}
+        }
+    }
+    // ── THE SOLUTION: every node's world — its component's anchor, or [`UNSTATED_IS`]. ──
+    let mut world: std::collections::HashMap<Ssa, World> = std::collections::HashMap::new();
+    for (v, &i) in index.iter() {
+        world.insert(*v, uf.resolve(i, UNSTATED_IS));
+    }
+    let frames = Frames { world, sprayed };
+    // ── THE DEFERRED `In::col` CHECKS — only the column frame supplies one value per row. ──
+    for c in per_row {
+        let have = frames.world_of(f, c.operand)?;
+        if have != World::Column {
+            return err(format!(
+                "{}: `{:?}` reads %{} — {} elements in the {have:?} world — beside its other \
+                 operands for a {}-element result of {} rows: one value per result row \
+                 is the `In::col` reading, and only the column frame supplies it. The device's \
+                 pointwise modes address a lane-for-lane tile, one scalar per row, and a stated \
+                 spray; this operand is none of them, so its frame is named rather than guessed",
+                f.name, c.op.op_type, c.operand.0, c.operand_numel, c.res_numel, c.res_rows
+            ));
+        }
+    }
+    Ok(frames)
+}
+
+/// ⭐⭐⭐⭐⭐ THE ONE SPRAY-MODE CHOICE — (spray axis, the solved source world) → the operand mode
+/// the consumer addresses the source in. ONE function: the emitter calls it for every broadcast
+/// operand, and no other road decides a mode from a region's extents.
+///
+/// * `Col` and the per-row-scalar `Y` — one value per output row: the solve ANCHORED the source
+///   [`World::Column`] (a clash was refused at anchor time, naming the op that stated each), so
+///   the mode is the axis verbatim.
+/// * a `Y` row-split over whole rows — the chase's own shape admission ([`program_broadcast_chains`]
+///   proves `rows == y·mb` from the program's stated extents); it states a shape fact, not a
+///   frame, and the mode is the axis verbatim.
+/// * `Mb` — a leading-axis spray anchors NOTHING on its source; the mode is chosen FROM the
+///   solved world. A ROW source is one row of values sprayed down the rows (`In::mb`). A COLUMN
+///   source sprayed down a leading axis is the column frame's own reading of "add leading rows"
+///   — the outer row-split `Y(Spray::outer(count))`, `count` the broadcast's own stated sprayed
+///   extent ([`Bcast::count`], a program fact).
+///
+/// ⭐ THIS IS MAIN'S OWN BEHAVIOR, STATED AS A LAW (maincc2 probe, main `ccfefbb9b7`,
+/// granite-2b fp16 — evidence under `.claude/scratch/moe-lead/gate/results/nickm/maincc2-probe/`):
+/// main mints the attn_s8 `%296` class `[32, 1]` (a column) and resolves its leading spray
+/// `Y(Spray::outer(N))` at every decode bucket; the one `Mb` it keeps is a one-row `[1, 128]`
+/// source. The `c_len`-keyed region promotion main needed (and its `v_rows > 1` guard) is
+/// DELETED — the solved world decides, and nothing else does. No third default: an unanchored
+/// source resolves through [`UNSTATED_IS`] like every other class.
+fn spray_operand_axis(
+    f: &IRFunction<'static>,
+    frames: &Frames,
+    src: Ssa,
+    axis: BcastAxis,
+    count: u32,
+) -> Result<BcastAxis, Error> {
+    match axis {
+        BcastAxis::Col | BcastAxis::Y(_) => Ok(axis),
+        BcastAxis::Mb => Ok(match frames.world_of(f, src)? {
+            World::Row => BcastAxis::Mb,
+            World::Column => BcastAxis::Y(super::lower_ktir_to_superdsc::Spray::outer(count)),
+        }),
+    }
 }
 
 /// The values of the splatted constants the walk MATERIALIZES — a splat read as a dense operand of a
@@ -8158,12 +8876,14 @@ fn dense_splat_operands(f: &IRFunction<'static>, o: &Operation<'static>) -> Vec<
         .collect()
 }
 
-/// A splatted float constant's BUFFER — minted at its frame ([`value_frame`]) and declared to the
-/// layout, with the value it holds — or `None` when `v` is not a `tensor.splat` of a float constant.
+/// A splatted float constant's BUFFER — minted at its frame (the frame pass's one table) and
+/// declared to the layout, with the value it holds — or `None` when `v` is not a `tensor.splat`
+/// of a float constant.
 fn splat_buffer(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
     floor: u32,
+    frames: &Frames,
     v: Ssa,
 ) -> Result<Option<(Region, f32)>, Error> {
     let f = &k.func;
@@ -8192,9 +8912,9 @@ fn splat_buffer(
             f.name
         ));
     };
-    let [rows, cols] = value_frame(f, dims);
+    let [rows, cols] = frames.frame_of(f, v, dims)?;
     let tid = mint_inter(k, layout, floor, v);
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, cols]);
     Ok(Some((
         Region {
             tid,
@@ -8306,7 +9026,7 @@ impl HeadRows {
 /// A minted row-major `[rows, stick]` buffer's region.
 fn row_major_region(tid: u32, rows: u32, layout: &BundleLayout) -> Region {
     let stick = crate::work::FP16_ELEMS_PER_STICK;
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, stick]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, stick]);
     Region {
         tid,
         v_rows: rows,
@@ -8338,7 +9058,7 @@ fn block_landing_cols(cols: u32, stick: i64) -> Option<u32> {
 /// A minted stick-major `[rows, sticks · stick]` buffer's region.
 fn stick_major_region(tid: u32, rows: u32, sticks: u32, layout: &BundleLayout) -> Region {
     let cols = sticks * crate::work::FP16_ELEMS_PER_STICK;
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, cols]);
     Region {
         tid,
         v_rows: rows,
@@ -8554,6 +9274,67 @@ fn heads_inner_pair<T: crate::collective::Tp>(
     ))
 }
 
+/// The shape a value states for its own bytes — its defining op's result type (at any region
+/// depth, `ops_deep`), or the function's own argument type for a value with no definer. A value
+/// that states no tensor type anywhere is REFUSED by name, never read as an empty one: the
+/// card-bytes proofs below compare two of these, and a pair nobody stated passes every one of
+/// them as "the same bytes" — a scatter reading through a reshape, a store claimed through a
+/// shape op, a reframe of a relayout — from a clean bake. A STATED rank-0 tensor is `[]` and
+/// compares honestly; it is the UNSTATED shape that must not default.
+fn stated_dims(f: &IRFunction<'static>, v: Ssa) -> Result<Vec<i64>, Error> {
+    let stated = f
+        .ops_deep()
+        .into_iter()
+        .find(|o| o.result == Some(v))
+        .and_then(|o| o.result_type)
+        .or_else(|| f.arguments.iter().find(|(s, _)| *s == v).map(|(_, t)| *t));
+    let Some(dims) = stated.and_then(|t| t.dims()) else {
+        return err(format!(
+            "{}: %{} states no tensor type, so whether a shape op re-frames it or moves its \
+             bytes cannot be decided",
+            f.name, v.0
+        ));
+    };
+    Ok(dims.to_vec())
+}
+
+/// The shape op a store may read this op's result through — the result's own shape op when it
+/// moves no byte of it (`same_card_bytes`), so the op writes the stored parameter's bytes in its
+/// OWN frame. The path is attempted WHOLE: no result, no shape op reading it, no store reading
+/// the shape op's result, or a reframe that moves bytes (a stick permute the shape op's own arm
+/// lowers into the stored parameter instead) each leave it unclaimed, `Ok(None)`. A path that IS
+/// claimed with a shape nobody stated on either side is REFUSED by name ([`stated_dims`]): an
+/// unstated pair passes `same_card_bytes` with neither side proven.
+fn stored_through_shape<'f>(
+    f: &'f IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Result<Option<(&'f ktir_core::ir::Operation<'static>, Vec<i64>)>, Error> {
+    let Some(res) = op.result else {
+        return Ok(None);
+    };
+    let Some(shape) = f.operations.iter().find(|o| {
+        matches!(
+            o.op_type,
+            OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+        ) && o.operands.first() == Some(&res)
+    }) else {
+        return Ok(None);
+    };
+    let Some(shape_res) = shape.result else {
+        return Ok(None);
+    };
+    // The through-path is attempted only where the old walk claimed it: when a store actually
+    // reads the shape op's result. Otherwise nothing is claimed through the shape op, and there
+    // is no byte-preservation to prove.
+    let Some(store) = plain_store_of(f, Some(shape_res)) else {
+        return Ok(None);
+    };
+    // Only through a shape op that moves no byte: one that does is a stick permute, which the
+    // shape op's own arm lowers into the stored parameter.
+    let (op_dims, shape_dims) = (stated_dims(f, res)?, stated_dims(f, shape_res)?);
+    Ok(same_card_bytes(&op_dims, &shape_dims).then_some((store, op_dims)))
+}
+
 /// Whether two shapes of one value are the SAME BYTES on the card: every element at the same address
 /// in both stick-major flat frames (`(c / stick)·(rows·stick) + r·stick + c % stick`, a row padded to
 /// whole sticks). True for equal frames, and for a re-framing that keeps every row one stick wide or
@@ -8698,6 +9479,9 @@ struct WalkProof<'a> {
 struct BundleFacts<'q> {
     headmajor: Option<super::lower_ktir_to_superdsc::HeadmajorOproj>,
     quantized: &'q mut super::ktir_matmul_fp8::QuantizedActivations,
+    /// THIS program's op-local LX scope ([`crate::placement::LxScope`]) — one per program, made by
+    /// [`lower_function_folded`], the one function that lowers one program.
+    lx_scope: &'q mut crate::placement::LxScope,
 }
 
 /// Hand ONE op's regions to the body its `Program` names.
@@ -8723,6 +9507,7 @@ fn emit_one<T: crate::collective::Tp>(
     let BundleFacts {
         headmajor,
         quantized,
+        lx_scope,
     } = bundle;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
@@ -8791,6 +9576,7 @@ fn emit_one<T: crate::collective::Tp>(
                 per_op,
                 sym_id_base,
                 layout,
+                lx_scope,
             );
         }
         // THE FUSED GAINLESS RMSNORM — the chain whose gain leg closed as the identity. `per_op`
@@ -9061,7 +9847,7 @@ fn gathered_matmul_materializes<T: crate::collective::Tp>(
         ));
     };
     let tid = mint_inter(k, layout, *floor, gathered_result);
-    layout.synth(crate::place::PlaceId::Act(tid), &[rows, head]);
+    layout.synth(crate::place::SynthId::Act(tid), &[rows, head]);
     let r = Region {
         tid,
         v_rows: rows,
@@ -10156,6 +10942,152 @@ mod swept_window_law_tests {
     }
 }
 
+/// The card-bytes proofs' own fixtures: [`stated_dims`], [`plain_store_of`] and
+/// [`stored_through_shape`] — the refusal of a shape nobody stated, and the controls that keep
+/// it from eating real programs.
+#[cfg(test)]
+mod card_bytes_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    fn tensor(dims: &[i64]) -> IrType<'static> {
+        IrType::Tensor {
+            dims: Box::leak(dims.to_vec().into_boxed_slice()),
+            elem: ktir_core::dtypes::DType::F16,
+        }
+    }
+
+    /// The store-through-shape probe: `%5` defined by an `arith.mulf` (its type stated only when
+    /// `op_type` is `Some`), read by a `tensor.reshape` to `%6` (its type stated only when
+    /// `shape_type` is `Some`), stored from `%6` by a `ktdp.store` when `with_store`.
+    fn probe(
+        op_type: Option<IrType<'static>>,
+        shape_type: Option<IrType<'static>>,
+        with_store: bool,
+    ) -> (&'static IRFunction<'static>, &'static Operation<'static>) {
+        let a: &'static Arena = Arena::global();
+        let op = Operation {
+            result_type: op_type,
+            ..Operation::new(a, Some(Ssa(5)), OpKind::ArithMulf, &[Ssa(0), Ssa(1)])
+        };
+        let reshape = Operation {
+            result_type: shape_type,
+            ..Operation::new(a, Some(Ssa(6)), OpKind::TensorReshape, &[Ssa(5)])
+        };
+        let mut ops = vec![op, reshape];
+        if with_store {
+            ops.push(Operation::new(
+                a,
+                None,
+                OpKind::KtdpStore,
+                &[Ssa(6), Ssa(7)],
+            ));
+        }
+        let f = IRFunction {
+            name: "store_probe",
+            arguments: a.args(vec![]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        (Box::leak(Box::new(f)), Box::leak(Box::new(op)))
+    }
+
+    /// ⛔ THE DEFECT THIS COMMITS CLOSES: a store IS claimed through a shape op whose shapes
+    /// nobody stated. Before [`stated_dims`], both sides read as `[]`, `same_card_bytes([], [])`
+    /// claimed "the same bytes", and the walk framed the op's output in a frame neither side of
+    /// the reshape had proven. The refusal names the value and the missing fact.
+    #[test]
+    fn an_unstated_shape_a_store_is_claimed_through_is_refused_by_name() {
+        let (f, op) = probe(None, None, true);
+        let e = stored_through_shape(f, op)
+            .expect_err("a live through-path with unstated shapes is refused, not defaulted");
+        assert!(
+            e.message.contains("states no tensor type"),
+            "names the missing fact: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("%5"),
+            "names the value that states it: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE OVER-REFUSAL CONTROL, one variable from the case above: the store is gone. Nothing
+    /// is claimed through the reshape, so there is no byte-preservation to prove, and the
+    /// unstated pair must leave the path unclaimed — the old walk's own control flow, kept.
+    #[test]
+    fn an_unstated_pair_no_store_claims_is_left_unclaimed() {
+        let (f, op) = probe(None, None, false);
+        assert!(
+            stored_through_shape(f, op).expect("no live path").is_none(),
+            "the refusal fires only where the old walk claimed the store"
+        );
+    }
+
+    /// ⛔ A STATED RANK-0 TENSOR IS `[]`, NOT AN UNKNOWN: the near-miss that keeps the refusal
+    /// from eating real scalars. A scalar reshaped as a scalar moves no byte, and the proof
+    /// says so honestly — both shapes stated, both empty.
+    #[test]
+    fn a_stated_rank_zero_pair_is_decided_not_refused() {
+        let (f, op) = probe(Some(tensor(&[])), Some(tensor(&[])), true);
+        assert!(
+            stored_through_shape(f, op)
+                .expect("a stated pair is decided")
+                .is_some(),
+            "[] and [] are the same one element"
+        );
+    }
+
+    /// The accepting case: both shapes stated, equal frames — the same card bytes, and the
+    /// through-path is claimed with the op's own dims.
+    #[test]
+    fn a_stated_same_bytes_pair_claims_the_path() {
+        let (f, op) = probe(Some(tensor(&[2, 64])), Some(tensor(&[2, 64])), true);
+        let (store, dims) = stored_through_shape(f, op)
+            .expect("a stated pair is decided")
+            .expect("equal frames move no byte");
+        assert_eq!(store.op_type, OpKind::KtdpStore);
+        assert_eq!(dims, vec![2, 64]);
+    }
+
+    /// A stated pair that MOVES bytes: `[1, 64]` is a row, `[64, 1]` is a column — the same
+    /// elements at different stick-major addresses, a stick permute. The path stays unclaimed
+    /// (`Ok(None)`, the shape op's own arm lowers the store), never refused: both sides stated
+    /// their facts and the proof answered.
+    #[test]
+    fn a_stated_pair_that_moves_bytes_is_unclaimed_not_refused() {
+        let (f, op) = probe(Some(tensor(&[1, 64])), Some(tensor(&[64, 1])), true);
+        assert!(
+            stored_through_shape(f, op)
+                .expect("a stated pair is decided")
+                .is_none(),
+            "the bytes provably move; the shape op's own arm lowers the store"
+        );
+    }
+
+    /// A value with no definer is stated by the SIGNATURE: the function's own argument type is
+    /// a shape source, so an argument never reads as the empty default.
+    #[test]
+    fn a_function_arguments_own_type_states_its_shape() {
+        let a: &'static Arena = Arena::global();
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(IRFunction {
+            name: "arg_probe",
+            arguments: a.args(vec![(Ssa(0), tensor(&[3, 5]))]),
+            operations: a.ops(vec![]),
+            grid: (1, 1, 1),
+            return_type: None,
+        }));
+        assert_eq!(
+            stated_dims(f, Ssa(0)).expect("the signature states the shape"),
+            vec![3, 5]
+        );
+    }
+}
+
 /// WHICH CONTRACTION FORM a `linalg.matmul` states, and the two this door lowers.
 #[cfg(test)]
 mod matmul_orientation_tests {
@@ -10288,6 +11220,37 @@ mod matmul_orientation_tests {
         assert!(
             e.message.contains("NEITHER") && e.message.contains("k == n"),
             "names that it is neither, and why an extent guard cannot catch it: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE UNREADABLE-FORM CONTROL: the attribute IS there, stated in a form this proof does
+    /// not read. Folding that into "not stated" would return `PlainB` from a clean bake for a
+    /// matmul that tried to state its maps — silently contracting the other way round, exactly
+    /// the defect the missing-attribute case's own comment warns about.
+    #[test]
+    fn maps_stated_in_an_unreadable_form_are_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let op = Operation::new(
+            a,
+            Some(Ssa(9)),
+            OpKind::LinalgMatmul,
+            &[Ssa(0), Ssa(1), Ssa(2)],
+        )
+        .with_attr(a, AttrKey::IndexingMaps, Attr::Int(0));
+        let f = IRFunction {
+            name: "mm_probe",
+            arguments: a.args(vec![]),
+            operations: a.ops(vec![op]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(f));
+        let op = &f.operations[0];
+        let e = matmul_b_orientation(f, op).expect_err("an unreadable form is not the default");
+        assert!(
+            e.message.contains("unreadable") && e.message.contains("indexing_maps"),
+            "names the attribute and that its form, not its absence, is the problem: {}",
             e.message
         );
     }
@@ -11477,5 +12440,1382 @@ mod gelu_chain_tests {
         );
         let gelus = program_gelu_chains(&f).expect("the gelu is still recognised");
         assert_eq!(gelus.len(), 1, "and the gelu recogniser owns it");
+    }
+}
+
+#[cfg(test)]
+mod frame_pass_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::dtypes::DType;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// An op whose result is a `dims`-shaped f32 tensor — the pass reads `result_type` for the
+    /// shape a value states, so every fixture states it.
+    fn tensor(
+        a: &'static Arena,
+        res: Ssa,
+        kind: OpKind,
+        operands: &[Ssa],
+        dims: &'static [i64],
+    ) -> Operation<'static> {
+        Operation {
+            result_type: Some(IrType::Tensor {
+                dims,
+                elem: DType::F32,
+            }),
+            ..Operation::new(a, Some(res), kind, operands)
+        }
+    }
+
+    /// The splat's own producer — `ArithConstant() Value=Float(0.0)` with a scalar type, the
+    /// operand every `tensor.splat` takes (the granite-2b dump's `%91 = ArithConstant()` /
+    /// `%92 = TensorSplat(%91)`, probe-wfdump/wfdump.stderr:162-163).
+    fn zero(a: &'static Arena, res: Ssa) -> Operation<'static> {
+        Operation {
+            result_type: Some(IrType::Scalar(DType::F32)),
+            ..Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(0.0),
+            )
+        }
+    }
+
+    /// A `linalg.reduce` over `x` seeded by `init`, with its combine and fold axis stated — the
+    /// rmsnorm's own spelling in the granite-2b dump (`%61 = LinalgReduce(%30, %92)
+    /// ReduceFn=Op(ArithAddf) Dimensions=IntList([1])`, probe-wfdump/wfdump.stderr:164): data and
+    /// init as the two operands, the combine and the axis as attrs.
+    fn fold_reduce(
+        a: &'static Arena,
+        res: Ssa,
+        x: Ssa,
+        init: Ssa,
+        dims: &'static [i64],
+        axes: &'static [i64],
+    ) -> Operation<'static> {
+        tensor(a, res, OpKind::LinalgReduce, &[x, init], dims)
+            .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf))
+            .with_attr(a, AttrKey::Dimensions, Attr::IntList(axes))
+    }
+
+    fn func(
+        a: &'static Arena,
+        name: &'static str,
+        ops: Vec<Operation<'static>>,
+    ) -> IRFunction<'static> {
+        IRFunction {
+            name,
+            arguments: a.args(vec![]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// `func` with ARGUMENTS — a flattened walk's free values stated as the function's own
+    /// boundary (the carried max `%246`, `[32, 1, 8, 4]`, read by the tail's first reduce).
+    fn func_args(
+        a: &'static Arena,
+        name: &'static str,
+        args: Vec<(Ssa, &'static [i64])>,
+        ops: Vec<Operation<'static>>,
+    ) -> IRFunction<'static> {
+        IRFunction {
+            name,
+            arguments: a.args(
+                args.into_iter()
+                    .map(|(v, d)| {
+                        (
+                            v,
+                            IrType::Tensor {
+                                dims: d,
+                                elem: DType::F32,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// A walk's ONE fold, from its carries — the statement `loop_fold::flatten` hands the
+    /// whole-function walk (`fold.carried`, the arg/init/yielded/result quadruples that name
+    /// one buffer each). The walk facts this pass reads are the carries alone.
+    fn fold_of(carried: Vec<crate::emit::loop_fold::Carried>) -> crate::emit::loop_fold::LoopFold {
+        crate::emit::loop_fold::LoopFold {
+            trips: 1,
+            step_bytes: 0,
+            stepped_params: Vec::new(),
+            pitched: Vec::new(),
+            body: std::collections::HashSet::new(),
+            carried,
+        }
+    }
+
+    /// ⭐ THE REDUCTION'S AXIS DECIDES THE WORLD IT WRITES: a fold of the LAST axis (the stick)
+    /// writes one value per stick row — the `[numel, 1]` column — while a fold of any other axis
+    /// (the leading `J` of a decode batch's block slots) writes a tile of the input's own rows.
+    #[test]
+    fn a_stick_fold_writes_a_column_a_leading_fold_keeps_the_operands_world() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, red, lead, seed64, seed128) =
+            (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let f = func(
+            a,
+            "reduce_worlds",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed64, OpKind::TensorSplat, &[scalar], &[64]),
+                tensor(a, seed128, OpKind::TensorSplat, &[scalar], &[128]),
+                fold_reduce(a, red, dense, seed64, &[64], &[1]),
+                fold_reduce(a, lead, dense, seed128, &[128], &[0]),
+            ],
+        );
+        let frames = assign_frames(&f, None).expect("both folds state their worlds");
+        assert_eq!(
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the stick fold writes one value per stick row"
+        );
+        assert_eq!(
+            frames
+                .frame_of(&f, red, &[64])
+                .expect("the column presents"),
+            [64, 1],
+            "the column presents as [numel, 1]"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, lead)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "a leading fold writes a tile of the input's own rows"
+        );
+    }
+
+    /// ⛔ THE RANK DEFAULT THIS COMMITS CLOSES: a reduce stating NO shaped result used to read
+    /// as rank 0, so `Dimensions=[0]` matched `[rank]` and the fold anchored `World::Column`
+    /// without proof — a leading-axis fold of an unstated-rank reduce was misclassified from a
+    /// clean bake. Which axis a fold folds is the RANK's own fact, and it is refused by name:
+    /// rank 0 is not "unknown", it is a stated rank-0.
+    #[test]
+    fn a_reduce_stating_no_shaped_result_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let unstated = Operation::new(a, Some(red), OpKind::LinalgReduce, &[dense, seed])
+            .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf))
+            .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[0]));
+        let f = func(
+            a,
+            "reduce_unstated",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                unstated,
+            ],
+        );
+        let e = match assign_frames(&f, None) {
+            Ok(_) => panic!("the fold axis is the rank's own fact, refused when unstated"),
+            Err(e) => e,
+        };
+        assert!(
+            e.message.contains("states no shaped result"),
+            "names the missing fact: {}",
+            e.message
+        );
+        assert!(e.message.contains("%3"), "names the reduce: {}", e.message);
+    }
+
+    /// ⭐ THE CARRY'S INIT IS THE COLUMN IT SEEDS — the walk's carried init is a splat whose dims
+    /// are the stick-fold reduce's result dims, and the carry join (arg ≡ init ≡ yielded ≡
+    /// result, the ONE `LoopFold` the flattening states) makes the seed the fold's column,
+    /// however early it is spelled. The seed is NOT anchored by its shape — no shape keyed to a
+    /// column exists anymore — it is JOINED, through the buffer the loop carries.
+    #[test]
+    fn a_carried_seed_is_the_column_it_seeds() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (arg, res) = (Ssa(4), Ssa(5));
+        let f = func(
+            a,
+            "walk_carried_seed",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                // The body's own spelling: the reduce sits inside the loop, seeded by the
+                // CARRIED ARG (the buffer), not by the init splat outside it.
+                fold_reduce(a, red, dense, arg, &[64], &[1]),
+            ],
+        );
+        let fold = fold_of(vec![crate::emit::loop_fold::Carried {
+            arg,
+            init: seed,
+            yielded: red,
+            result: res,
+            seed: 0.0,
+        }]);
+        let frames =
+            assign_frames(&f, Some(&fold)).expect("the seed states its world by the carry");
+        assert_eq!(
+            frames
+                .world_of(&f, seed)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the seed is the column the carried buffer holds, however early it is spelled"
+        );
+        assert_eq!(
+            frames
+                .frame_of(&f, seed, &[64])
+                .expect("the column presents"),
+            [64, 1]
+        );
+    }
+
+    /// ⭐ A BROADCAST RESULT IS DENSE HOWEVER ITS SOURCE IS HELD — the spray writes every lane,
+    /// so the sprayed value is held in NO world of its own (the softmax walk's folded max
+    /// expanded back over the lanes): asking its world or its frame is the bake error, named —
+    /// never the deleted silent row.
+    #[test]
+    fn a_broadcast_result_is_dense_however_its_source_is_held() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (exp, col, empty, bc) = (Ssa(4), Ssa(5), Ssa(6), Ssa(7));
+        let f = func(
+            a,
+            "column_spray",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                fold_reduce(a, red, dense, seed, &[64], &[1]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[red], &[64, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[64, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[64]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[64]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[col, empty], &[64, 128]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+            ],
+        );
+        let frames = assign_frames(&f, None).expect("the spray states its own world");
+        // The source keeps the column the spray reads — the spray addresses it, never replaces it.
+        assert_eq!(
+            frames
+                .world_of(&f, col)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the SOURCE's column is the source's own row"
+        );
+        let Err(e) = frames.world_of(&f, bc) else {
+            panic!("a broadcast result is held in no world of its own");
+        };
+        assert!(
+            e.message.contains("`linalg.broadcast` result"),
+            "the refusal names the sprayed result: {}",
+            e.message
+        );
+        let Err(e) = frames.frame_of(&f, bc, &[64, 128]) else {
+            panic!("a broadcast result is held in no world of its own");
+        };
+        assert!(
+            e.message.contains("`linalg.broadcast` result"),
+            "the frame refusal is the world refusal, inherited: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ A SPRAY OF A SPRAY IS REFUSED BY NAME, NEVER A MAP PANIC. The flat `Col` form's source
+    /// proof is a COUNT — one source element per result row — so it holds for a source that is
+    /// ITSELF a broadcast's result: the `[64, 128]` inner spray re-sprayed over a rank-3
+    /// trailing axis is admitted by the chase, which binds its `src` to the sprayed inner
+    /// result. The spray arm's own anchor then reads the index for a value the node index
+    /// holds no slot for — and the law is stated at the read (`idx`): the anchor is refused
+    /// by name, naming the sprayed value, never the bare map panic the index miss was.
+    #[test]
+    fn a_broadcast_of_a_broadcast_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (exp, col, empty, bc, outer) = (Ssa(4), Ssa(5), Ssa(6), Ssa(7), Ssa(8));
+        let f = func(
+            a,
+            "spray_of_spray",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                fold_reduce(a, red, dense, seed, &[64], &[1]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[red], &[64, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[64, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[64]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[64]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[col, empty], &[64, 128]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+                // The OUTER spray: rank-3 trailing-axis (`Col`, flat), over the inner spray's
+                // own result — a source the flat count proof ACCEPTS (its 8192 elements are
+                // the result's 8192 leading-product rows), so the chase admits the spray and
+                // binds `src` to the sprayed `%7`.
+                tensor(
+                    a,
+                    outer,
+                    OpKind::LinalgBroadcast,
+                    &[bc, empty],
+                    &[64, 128, 2],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[2]))
+                .with_attr(a, AttrKey::Shape, Attr::IntList(&[64, 128, 2])),
+            ],
+        );
+        let e = match assign_frames(&f, None) {
+            Ok(_) => panic!("a spray's own source is held in no world — no anchor through it"),
+            Err(e) => e,
+        };
+        assert!(
+            e.message.contains("result of a `linalg.broadcast`"),
+            "names the sprayed source: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("%7"),
+            "names the inner spray: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ A CARRY SEEDED BY A SPRAY IS REFUSED BY NAME, NEVER A MAP PANIC. The folded carry's
+    /// join reads arg ≡ init ≡ yielded ≡ result — one buffer — and an init that is a
+    /// broadcast's result is a sprayed value the node index holds no slot for. The join is
+    /// refused by name, naming the sprayed seed, never the bare map panic the index miss was.
+    #[test]
+    fn a_carry_seeded_by_a_broadcast_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, red) = (Ssa(0), Ssa(1), Ssa(2));
+        let (exp, col, empty, bc) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let (arg, res) = (Ssa(7), Ssa(8));
+        let f = func(
+            a,
+            "walk_seeded_by_spray",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                // The body's own spelling: the reduce sits inside the loop, seeded by the
+                // CARRIED ARG (the buffer), and its column is what the spray re-expands.
+                fold_reduce(a, red, dense, arg, &[64], &[1]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[red], &[64, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[64, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[64]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[64]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[col, empty], &[64, 128]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+            ],
+        );
+        // The carried init is the spray's own result — the value the join would weld the
+        // loop's buffer to, held in no world.
+        let fold = fold_of(vec![crate::emit::loop_fold::Carried {
+            arg,
+            init: bc,
+            yielded: red,
+            result: res,
+            seed: 0.0,
+        }]);
+        let e = match assign_frames(&f, Some(&fold)) {
+            Ok(_) => panic!("a sprayed seed is held in no world — no carry through it"),
+            Err(e) => e,
+        };
+        assert!(
+            e.message.contains("result of a `linalg.broadcast`"),
+            "names the sprayed seed: {}",
+            e.message
+        );
+        assert!(e.message.contains("%6"), "names the spray: {}", e.message);
+    }
+
+    /// ⭐ A COLUMN READ BESIDE ITS LANES IS CONSUMED — the softmax walk body's `max(m, x)`: the
+    /// carried running max supplies one value per result row, the `In::col` reading, and the
+    /// result keeps the lanes' dense world. No refusal, and no quiet column either: the check
+    /// runs after the solve, on the CLOSED class.
+    #[test]
+    fn a_column_read_beside_its_lanes_is_consumed() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (m, res) = (Ssa(4), Ssa(5));
+        let f = func(
+            a,
+            "softmax_max",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                // The body's stick fold, seeded by the CARRIED ARG — the buffer the loop
+                // holds the running max in.
+                fold_reduce(a, red, dense, m, &[64], &[1]),
+                tensor(a, res, OpKind::ArithMaxf, &[m, dense], &[64, 128]),
+            ],
+        );
+        let fold = fold_of(vec![crate::emit::loop_fold::Carried {
+            arg: m,
+            init: seed,
+            yielded: red,
+            result: Ssa(6),
+            seed: 0.0,
+        }]);
+        let frames = assign_frames(&f, Some(&fold))
+            .expect("the per-row column beside its lanes is a reading");
+        assert_eq!(
+            frames
+                .world_of(&f, res)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "the consumed column sets no frame; the lanes' world is the result's"
+        );
+    }
+
+    /// ⛔ AN UNEXPLAINED MIXED WORLD IS REFUSED BY NAME — an operand at a count the result's rows
+    /// do not explain, with no stated broadcast: the device's pointwise modes address a
+    /// lane-for-lane tile, one scalar per row, and a stated spray, so this is named rather than
+    /// silently read as a row.
+    #[test]
+    fn an_unexplained_mixed_world_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, odd, res) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let f = func(
+            a,
+            "mixed_world",
+            vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, odd, OpKind::TensorSplat, &[scalar], &[32]),
+                tensor(a, res, OpKind::ArithAddf, &[dense, odd], &[64, 128]),
+            ],
+        );
+        let Err(e) = assign_frames(&f, None) else {
+            panic!("a 32-element operand beside an 8192-element result is not a reading");
+        };
+        assert!(
+            e.message.contains("ArithAddf") && e.message.contains("%2"),
+            "the refusal names the op and the operand: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ THE LOAD'S WORLD IS WHAT IT READS — the tile's own column extent for a direct window
+    /// (the same fact `windowed_region` reads), stated by the tile; the load states its result
+    /// type too (the dump's own spelling — `%54 = KtdpLoad(%80) ... ty=Some(Tensor { dims:
+    /// [2048] })`, probe-wfdump/wfdump.stderr:169), and the tile's statement is the one that
+    /// holds.
+    #[test]
+    fn a_load_takes_its_tiles_column_extent() {
+        let a: &'static Arena = Arena::global();
+        let (p, view, tile, load) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let f = IRFunction {
+            name: "column_window_load",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[64, 1] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[64, 1]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let frames = assign_frames(&f, None).expect("the tile states the window");
+        assert_eq!(
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "a one-column window reads the per-row column"
+        );
+    }
+
+    /// ⭐ THE CENSUS FIXTURE — a rank-1 tile (`[N]`, a row to a tile) over a `[N, 1]`-shaped store
+    /// states the WRONG extent, so the parameter this function stores a column into is read as
+    /// one whatever its tile restates: the store is the statement that holds.
+    #[test]
+    fn a_store_fed_column_load_reads_the_parameter_as_one() {
+        let a: &'static Arena = Arena::global();
+        let (p, view, tile, val, store, load, scalar) =
+            (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let f = IRFunction {
+            name: "store_fed_column",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                zero(a, scalar),
+                tensor(a, val, OpKind::TensorSplat, &[scalar], &[64, 1]),
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[64] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                Operation::new(a, Some(store), OpKind::KtdpStore, &[val, tile]),
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[64]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let frames = assign_frames(&f, None).expect("the store states the parameter's world");
+        assert_eq!(
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the rank-1 tile restates the window; the [N, 1] store names the column"
+        );
+    }
+
+    /// ⭐ A LOOP'S CARRIES ARE THE CLASS THEIR CONSTRAINTS STATE — never their shape's: the walk's
+    /// carried max is a `[64]` buffer whose body stick-folds it (a column), and beside it a
+    /// `[64]` load off a `[64]` tile is a row vector. One shape, two worlds — the carry, its
+    /// init, the fold the body yields, and the result the loop returns for it are ONE class,
+    /// anchored by the body's own stick fold.
+    #[test]
+    fn a_carried_value_takes_its_inits_world_not_its_shapes() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, dense, seed) = (Ssa(0), Ssa(1), Ssa(2));
+        let (p, view, tile, load, row) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6), Ssa(7));
+        let (lb, ub, step, iv, carry, red, lres) =
+            (Ssa(8), Ssa(9), Ssa(10), Ssa(11), Ssa(12), Ssa(13), Ssa(14));
+        // The body's own ops: the stick fold seeded by the CARRIED ARG (the buffer the loop
+        // holds), yielded back as the carry — the walk's own spelling (the rmsnorm's reduce
+        // reads its accumulator, not the init splat outside the loop).
+        let body_ops = a.ops(vec![
+            fold_reduce(a, red, dense, carry, &[64], &[1]),
+            Operation::new(a, None, OpKind::ScfYield, &[red]),
+        ]);
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
+        };
+        let f = IRFunction {
+            name: "carried_worlds",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                zero(a, scalar),
+                tensor(a, dense, OpKind::TensorSplat, &[scalar], &[64, 128]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[64] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[64]),
+                tensor(a, row, OpKind::MathExp, &[load], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![body_ops]),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Ssas(a.ssa(vec![carry])))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Ssas(a.ssa(vec![lres])))
+                },
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let frames =
+            assign_frames(&f, None).expect("the carry and the load both state their worlds");
+        assert_eq!(
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "a [64] tile states a row vector's window"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, row)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "the row's elementwise keeps the lane it reads"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, carry)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the carry is the class its body's stick fold anchors — not its shape's"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, seed)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the init is the same buffer the loop carries"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the body's stick fold writes one value per stick row"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, lres)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the loop returns the carry it holds"
+        );
+    }
+
+    /// ⭐ A FOR STATING ITS RESULTNAMES IN A FORM THE WALK DOES NOT READ IS REFUSED BY NAME —
+    /// the census discipline: a for that states NO ResultNames (`None`) has its results as
+    /// the names, and a for that states a DIFFERENT attr variant is malformed. The two facts
+    /// are not one default: the malformed case is a refusal naming the function and the
+    /// attr it found — never a silent empty name list paired against the carries.
+    #[test]
+    fn a_for_stating_unreadable_result_names_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, seed) = (Ssa(0), Ssa(1));
+        let (lb, ub, step, iv, carry, red, lres) =
+            (Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6), Ssa(7), Ssa(8));
+        let body_ops = a.ops(vec![
+            fold_reduce(a, red, seed, carry, &[64], &[1]),
+            Operation::new(a, None, OpKind::ScfYield, &[red]),
+        ]);
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
+        };
+        let f = func(
+            a,
+            "unreadable_result_names",
+            vec![
+                zero(a, scalar),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![body_ops]),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Ssas(a.ssa(vec![carry])))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Int(0))
+                },
+            ],
+        );
+        let Err(e) = assign_frames(&f, None) else {
+            panic!("a scf.for stating its ResultNames as an Int is not a name list");
+        };
+        assert!(
+            e.message.contains("unreadable_result_names") && e.message.contains("ResultNames"),
+            "the refusal names the function and the attr it found: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ A FOR STATING NO BODY REGION IS REFUSED BY NAME — never read as an empty one. The
+    /// walk reads the body's trailing scf.yield to pair each carry's yield with its arg, and
+    /// a for that states no body states no yield: an empty body read as one would pair every
+    /// carry with `None` silently, the same folded default the ResultNames refusal splits.
+    #[test]
+    fn a_for_stating_no_body_region_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, seed) = (Ssa(0), Ssa(1));
+        let (lb, ub, step, iv, carry, lres) = (Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6), Ssa(7));
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
+        };
+        let f = func(
+            a,
+            "no_body_region",
+            vec![
+                zero(a, scalar),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![]),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Ssas(a.ssa(vec![carry])))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Ssas(a.ssa(vec![lres])))
+                },
+            ],
+        );
+        let Err(e) = assign_frames(&f, None) else {
+            panic!("a scf.for stating no body region states no yield to pair with its carries");
+        };
+        assert!(
+            e.message.contains("no_body_region") && e.message.contains("no body region"),
+            "the refusal names the function and the missing body: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ A FOR STATING ITS ITERARGS IN A FORM THE WALK DOES NOT READ IS REFUSED BY NAME —
+    /// the same census split as the ResultNames refusal: a for that states NO iter_args is
+    /// the plain for that carries nothing (legitimate), and a for that states a DIFFERENT
+    /// attr variant is malformed — refused by name, never silently read as a for with no
+    /// carries while its inits and ResultNames state some.
+    #[test]
+    fn a_for_stating_unreadable_iter_args_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, seed) = (Ssa(0), Ssa(1));
+        let (lb, ub, step, iv, lres) = (Ssa(2), Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let constant = |res: Ssa, value: i64| {
+            Operation::new(a, Some(res), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(value),
+            )
+        };
+        let f = func(
+            a,
+            "unreadable_iter_args",
+            vec![
+                zero(a, scalar),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[64]),
+                constant(lb, 0),
+                constant(ub, 8),
+                constant(step, 1),
+                Operation {
+                    regions: a.regions(vec![]),
+                    result_type: Some(IrType::Tensor {
+                        dims: &[64],
+                        elem: DType::F32,
+                    }),
+                    ..Operation::new(a, Some(lres), OpKind::ScfFor, &[lb, ub, step, seed])
+                        .with_attr(a, AttrKey::IterVar, Attr::Ssas(a.ssa(vec![iv])))
+                        .with_attr(a, AttrKey::IterArgs, Attr::Int(0))
+                        .with_attr(a, AttrKey::ResultNames, Attr::Ssas(a.ssa(vec![lres])))
+                },
+            ],
+        );
+        let Err(e) = assign_frames(&f, None) else {
+            panic!("a scf.for stating its IterArgs as an Int is not a carry-arg name list");
+        };
+        assert!(
+            e.message.contains("unreadable_iter_args") && e.message.contains("IterArgs"),
+            "the refusal names the function and the attr it found: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ THE LANE CHECK COMES FIRST, AT EVERY COUNT — the M=1 decode normalizer chain, spelled
+    /// from the granite-2b dump verbatim (probe-wfdump/wfdump.stderr:164-172): the `[1, 2048]`
+    /// stick fold's column (`%61`) flows through `%45 = ArithMulf(%61, %44)` and `%49 =
+    /// ArithAddf(%45, %48)` to `%51 = MathRsqrt(%49)` — every link `[1]`, both operands and the
+    /// result the same count — and is then sprayed along `Col` (`%56 = LinalgBroadcast(%93)
+    /// Dimensions=[1]` → `[1, 2048]`). An operand is a broadcast SCALAR only when it is narrower
+    /// than the result; at the result's own count — 1 included — it is a lane, so the chain keeps
+    /// the fold's column and the chase's axis and the table agree. Skipping the scalar first
+    /// dropped the column at `%45` and the cross-check refused every model's rmsnorm.
+    #[test]
+    fn a_normalizer_chain_at_count_one_keeps_the_folds_column() {
+        let a: &'static Arena = Arena::global();
+        let (scalar, x, sq, seed, red) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (eps1, eps2, mul, add, inv) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9));
+        let (exp, col, empty, bc) = (Ssa(10), Ssa(11), Ssa(12), Ssa(13));
+        let f = func(
+            a,
+            "m1_normalizer",
+            vec![
+                zero(a, scalar),
+                tensor(a, x, OpKind::TensorSplat, &[scalar], &[1, 2048]),
+                tensor(a, sq, OpKind::ArithMulf, &[x, x], &[1, 2048]),
+                tensor(a, seed, OpKind::TensorSplat, &[scalar], &[1]),
+                fold_reduce(a, red, sq, seed, &[1], &[1]),
+                tensor(a, eps1, OpKind::TensorSplat, &[scalar], &[1]),
+                tensor(a, eps2, OpKind::TensorSplat, &[scalar], &[1]),
+                tensor(a, mul, OpKind::ArithMulf, &[red, eps1], &[1]),
+                tensor(a, add, OpKind::ArithAddf, &[mul, eps2], &[1]),
+                tensor(a, inv, OpKind::MathRsqrt, &[add], &[1]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[inv], &[1, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[1]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, bc, OpKind::LinalgBroadcast, &[col, empty], &[1, 2048]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+            ],
+        );
+        let frames = assign_frames(&f, None).expect("the chain states its world at every link");
+        assert_eq!(
+            frames
+                .world_of(&f, mul)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the fold's column is a lane at count 1, not a skipped scalar"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, add)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the add keeps the lane it reads"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, inv)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the rsqrt keeps the lane it reads — the value the chase sprays along Col"
+        );
+        let Err(e) = frames.world_of(&f, bc) else {
+            panic!("a broadcast result is held in no world of its own");
+        };
+        assert!(
+            e.message.contains("`linalg.broadcast` result"),
+            "the sprayed result is dense, however its source is held — held in no world, \
+             refused by name: {}",
+            e.message
+        );
+        // The chase's Col axis and the solved column world are ONE fact now — the Col spray's
+        // ANCHOR is the chase's own statement — so there is no second check to run: the anchor
+        // itself refused any disagreement, by name.
+    }
+
+    /// ⭐ THE WALK'S SOFTMAX TAIL IS ONE PER-ROW CLASS — spelled verbatim from the attn_s8
+    /// re-roll dump (probe fp4bd94c8r1, granite-2b fp16): the flattened walk reads its
+    /// carried max and scale as the fold's RESULTS — values with no defining op, whose
+    /// shapes and carries the ONE `LoopFold` states — the centered scores' exp is
+    /// multiplied by the scale and folded over the leading axis, and the fold's result is
+    /// sprayed back over the lanes along Col. The whole chain — sub, exp, mul, fold — is
+    /// the per-row class that spray states. Measured RED at 157ab2917f: the pass held
+    /// %261/%263/%291 Row (the sub's lane operand was the Mb spray's own dense result,
+    /// and the carries — stated by no fold — gave the lane rule no dims to read), and the
+    /// re-roll declare pass refused the wiring: "the broadcast chase holds %282 sprayed
+    /// from %291 along Col, but the frame pass holds the source Row".
+    #[test]
+    fn the_colsprayed_softmax_tail_is_one_per_row_class() {
+        let a: &'static Arena = Arena::global();
+        let (zero_, seed291, seed296, carry_m, carry_s) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let (red296, exp257, col393, empty394, mb259) = (Ssa(5), Ssa(6), Ssa(7), Ssa(8), Ssa(9));
+        let (sub260, exp261, mul263, red291) = (Ssa(10), Ssa(11), Ssa(12), Ssa(13));
+        let (exp281, col385, empty386, bc282) = (Ssa(14), Ssa(15), Ssa(16), Ssa(17));
+        let (m_init, s_init, m_arg, m_yld, s_arg, s_yld) =
+            (Ssa(18), Ssa(19), Ssa(20), Ssa(21), Ssa(22), Ssa(23));
+        let f = func(
+            a,
+            "softmax_tail",
+            vec![
+                zero(a, zero_),
+                // `%378 = TensorSplat` — the `%291` fold's seed; `%246`/`%247` are the
+                // walk's carried max and scale, the fold's RESULTS in the flattened
+                // program (`%50`/`%221` their init splats, `[32, 1, 8, 4]` each).
+                tensor(a, seed291, OpKind::TensorSplat, &[zero_], &[1, 8, 4]),
+                tensor(a, seed296, OpKind::TensorSplat, &[zero_], &[1, 8, 4]),
+                tensor(a, m_init, OpKind::TensorSplat, &[zero_], &[32, 1, 8, 4]),
+                tensor(a, s_init, OpKind::TensorSplat, &[zero_], &[32, 1, 8, 4]),
+                // `%296 = LinalgReduce(%246, %380) [1,8,4] dims=[0]` — the batch-max
+                // twin, sprayed back along the LEADING axis by `%259`.
+                fold_reduce(a, red296, carry_m, seed296, &[1, 8, 4], &[0]),
+                tensor(
+                    a,
+                    exp257,
+                    OpKind::TensorExpandShape,
+                    &[red296],
+                    &[1, 1, 8, 4],
+                )
+                .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 1, 8, 4]))
+                .with_attr(a, AttrKey::Dimensions, Attr::Int(0)),
+                tensor(
+                    a,
+                    col393,
+                    OpKind::TensorCollapseShape,
+                    &[exp257],
+                    &[1, 8, 4],
+                )
+                .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 8, 4])),
+                Operation::new(a, Some(empty394), OpKind::TensorEmpty, &[]),
+                tensor(
+                    a,
+                    mb259,
+                    OpKind::LinalgBroadcast,
+                    &[col393, empty394],
+                    &[32, 1, 8, 4],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[0])),
+                // `%260 = ArithSubf(%246, %259)`, `%261 = MathExp`, `%263 = ArithMulf`
+                // with the carried scale.
+                tensor(
+                    a,
+                    sub260,
+                    OpKind::ArithSubf,
+                    &[carry_m, mb259],
+                    &[32, 1, 8, 4],
+                ),
+                tensor(a, exp261, OpKind::MathExp, &[sub260], &[32, 1, 8, 4]),
+                tensor(
+                    a,
+                    mul263,
+                    OpKind::ArithMulf,
+                    &[exp261, carry_s],
+                    &[32, 1, 8, 4],
+                ),
+                // `%291 = LinalgReduce(%263, %378) [1,8,4] dims=[0]` — the sum, Col-sprayed
+                // back over the lanes by `%282 = LinalgBroadcast dims=[3] → [1,8,4,64]`.
+                fold_reduce(a, red291, mul263, seed291, &[1, 8, 4], &[0]),
+                tensor(
+                    a,
+                    exp281,
+                    OpKind::TensorExpandShape,
+                    &[red291],
+                    &[1, 8, 4, 1],
+                )
+                .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 8, 4, 1]))
+                .with_attr(a, AttrKey::Dimensions, Attr::Int(3)),
+                tensor(
+                    a,
+                    col385,
+                    OpKind::TensorCollapseShape,
+                    &[exp281],
+                    &[1, 8, 4],
+                )
+                .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 8, 4])),
+                Operation::new(a, Some(empty386), OpKind::TensorEmpty, &[]),
+                tensor(
+                    a,
+                    bc282,
+                    OpKind::LinalgBroadcast,
+                    &[col385, empty386],
+                    &[1, 8, 4, 64],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[3])),
+            ],
+        );
+        // The ONE fold the flattening states: the max and scale carries, each an
+        // arg/init/yielded/result quadruple naming one buffer.
+        let fold = fold_of(vec![
+            crate::emit::loop_fold::Carried {
+                arg: m_arg,
+                init: m_init,
+                yielded: m_yld,
+                result: carry_m,
+                seed: 0.0,
+            },
+            crate::emit::loop_fold::Carried {
+                arg: s_arg,
+                init: s_init,
+                yielded: s_yld,
+                result: carry_s,
+                seed: 0.0,
+            },
+        ]);
+        let frames =
+            assign_frames(&f, Some(&fold)).expect("the tail states its world at every link");
+        assert_eq!(
+            frames
+                .world_of(&f, sub260)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the centered scores are the per-row class the Col spray states"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, exp261)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the exp keeps the lane it reads"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, mul263)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the scale's product keeps the lane"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, red291)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the leading-axis fold keeps the operand's class — one value per row of it"
+        );
+    }
+
+    /// ⭐ THE BATCH-MAX TWIN KEEPS THE ROW — the same reduce pattern as the softmax
+    /// tail's sum (`LinalgReduce dims=[0]` of a `[32,1,8,4]` free value), but its own
+    /// spray is the LEADING axis (`%259 = LinalgBroadcast dims=[0] → [32,1,8,4]`). A
+    /// leading-axis spray ANCHORS NOTHING on its source — main's own behavior (maincc2
+    /// probe, main ccfefbb9b7): the spray over `%296` resolves `Y(Spray::outer(32))`, the
+    /// column frame's reading of "add leading rows", never `In::mb`. The twin stays Row
+    /// because its class is UNANCHORED — no Col spray, no stick fold, no `In::col` reader
+    /// states a column for it — and an unanchored class resolves the one row default.
+    /// Not because a leading spray anchors a row: it anchors nothing.
+    #[test]
+    fn an_mbsprayed_row_fold_stays_a_row() {
+        let a: &'static Arena = Arena::global();
+        let (zero_, seed, scores) = (Ssa(0), Ssa(1), Ssa(2));
+        let (red, exp, col, empty, mb) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6), Ssa(7));
+        let f = func_args(
+            a,
+            "batch_max_twin",
+            vec![(scores, &[32, 1, 8, 4])],
+            vec![
+                zero(a, zero_),
+                tensor(a, seed, OpKind::TensorSplat, &[zero_], &[1, 8, 4]),
+                // `%296` and its shape-op chain, exactly as the dump spells them — the
+                // input `%246`, the carried max `[32, 1, 8, 4]`.
+                fold_reduce(a, red, scores, seed, &[1, 8, 4], &[0]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[red], &[1, 1, 8, 4])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 1, 8, 4]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(0)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[1, 8, 4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1, 8, 4]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(
+                    a,
+                    mb,
+                    OpKind::LinalgBroadcast,
+                    &[col, empty],
+                    &[32, 1, 8, 4],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[0])),
+            ],
+        );
+        let frames = assign_frames(&f, None).expect("the twin states its world");
+        assert_eq!(
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "a class nothing anchors as a column resolves the one row default"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, col)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "the shape-op chain keeps the frame of the value it re-shapes"
+        );
+    }
+
+    /// ⭐ A RESHAPE OF A SPRAY GETS NO WORLD THROUGH IT — a sprayed value names no frame,
+    /// so it states no equality for the ops that read it: the shape op that reshapes the
+    /// spray, and the leading fold that reduces it, join NOTHING through it, and whatever
+    /// class the spray's OTHER consumers anchor cannot reach the reshape's result across
+    /// a value held in no world. Here the same Col spray feeds a collapse (the reshape)
+    /// and a leading fold whose own class a second Col spray anchors Column — the fold
+    /// carries that anchor, the reshape stays on the row default. Measured red before
+    /// the spray stopped being a node: the collapse joined the spray's node and
+    /// inherited the fold's Column through it.
+    #[test]
+    fn a_reshape_of_a_spray_gets_no_world_through_it() {
+        let a: &'static Arena = Arena::global();
+        let (zero_, seed, src) = (Ssa(0), Ssa(1), Ssa(2));
+        let (exp, col, empty, spray) = (Ssa(3), Ssa(4), Ssa(5), Ssa(6));
+        let (rs, red) = (Ssa(7), Ssa(8));
+        let (exp2, col2, empty2, spray2) = (Ssa(9), Ssa(10), Ssa(11), Ssa(12));
+        let f = func_args(
+            a,
+            "reshape_of_spray",
+            vec![(src, &[1, 8, 4])],
+            vec![
+                zero(a, zero_),
+                tensor(a, seed, OpKind::TensorSplat, &[zero_], &[1, 8, 4]),
+                // The spray's own source chain, spelled as the softmax tail spells it —
+                // the trailing-axis spray `[1,8,4] → [1,8,4,64]` that anchors its
+                // source Column.
+                tensor(a, exp, OpKind::TensorExpandShape, &[src], &[1, 8, 4, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 8, 4, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(3)),
+                tensor(a, col, OpKind::TensorCollapseShape, &[exp], &[1, 8, 4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1, 8, 4]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(
+                    a,
+                    spray,
+                    OpKind::LinalgBroadcast,
+                    &[col, empty],
+                    &[1, 8, 4, 64],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[3])),
+                // THE RESHAPE OF THE SPRAY — the shape op under test.
+                tensor(a, rs, OpKind::TensorCollapseShape, &[spray], &[1, 8, 4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1, 8, 4]),
+                ),
+                // The SAME spray's other consumer: a leading fold of it, whose own class
+                // a second trailing spray anchors Column — the anchor the reshape must
+                // not inherit through the value they share.
+                fold_reduce(a, red, spray, seed, &[1, 8, 4], &[0]),
+                tensor(a, exp2, OpKind::TensorExpandShape, &[red], &[1, 8, 4, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1, 8, 4, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(3)),
+                tensor(a, col2, OpKind::TensorCollapseShape, &[exp2], &[1, 8, 4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[1, 8, 4]),
+                ),
+                Operation::new(a, Some(empty2), OpKind::TensorEmpty, &[]),
+                tensor(
+                    a,
+                    spray2,
+                    OpKind::LinalgBroadcast,
+                    &[col2, empty2],
+                    &[1, 8, 4, 64],
+                )
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(&[3])),
+            ],
+        );
+        let frames = assign_frames(&f, None).expect("the reshape states no contradiction");
+        assert_eq!(
+            frames
+                .world_of(&f, red)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Column,
+            "the fold of the spray carries the anchor its own trailing spray states"
+        );
+        assert_eq!(
+            frames
+                .world_of(&f, rs)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "a reshape of a spray gets no world through it — the row default, never the \
+             class another consumer anchored on the value they share"
+        );
+    }
+
+    /// ⛔ A LANE JOIN THAT WELDS TWO ANCHORED CLASSES IS THE BAKE ERROR naming the op that
+    /// stated EACH anchor — the principled refusal that replaces the old Column-wins merge: a
+    /// class a Col spray anchors Column, lane-joined into a class a load anchors Row, states
+    /// two absolutes for one value, and no merge may pick a side. The refusal is
+    /// order-free: stated before the join it is the two-anchors error, after it the
+    /// two-paths one — either way both absolutes are named.
+    #[test]
+    fn a_lane_join_of_two_anchored_worlds_is_refused_by_name() {
+        let a: &'static Arena = Arena::global();
+        let (p, view, tile, load) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (zero_, s, exp, co, empty, bc, e, res) = (
+            Ssa(4),
+            Ssa(5),
+            Ssa(6),
+            Ssa(7),
+            Ssa(8),
+            Ssa(9),
+            Ssa(10),
+            Ssa(11),
+        );
+        let f = IRFunction {
+            name: "anchor_clash",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                zero(a, zero_),
+                tensor(a, s, OpKind::TensorSplat, &[zero_], &[4]),
+                tensor(a, exp, OpKind::TensorExpandShape, &[s], &[4, 1])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[4, 1]))
+                    .with_attr(a, AttrKey::Dimensions, Attr::Int(1)),
+                tensor(a, co, OpKind::TensorCollapseShape, &[exp], &[4]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[4]),
+                ),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                // The Col spray anchors its source's class Column.
+                tensor(a, bc, OpKind::LinalgBroadcast, &[co, empty], &[4, 8]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[1]),
+                ),
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[4] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                // The load anchors its own class Row — one shape, the other world.
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[4]),
+                tensor(a, e, OpKind::MathExp, &[s], &[4]),
+                // Lane-for-lane at the result's own count: the weld of the two classes.
+                tensor(a, res, OpKind::ArithAddf, &[e, load], &[4]),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let Err(e) = assign_frames(&f, None) else {
+            panic!(
+                "a Column-anchored lane beside a Row-anchored lane is two absolutes for one value"
+            );
+        };
+        assert!(
+            e.message.contains("Column") && e.message.contains("Row"),
+            "the refusal names both anchors: {}",
+            e.message
+        );
+    }
+
+    /// ⭐ A LEADING SPRAY OVER A ONE-ROW ROW-WORLD SOURCE STAYS `Mb` — the maincc2 probe's own
+    /// site (main `ccfefbb9b7`: `WF-BCAST attn_s8 op=%353 in=1 val=%348 axis_before=Mb
+    /// axis_after=Mb v_rows=1 v_cols=128`, evidence under
+    /// `.claude/scratch/moe-lead/gate/results/nickm/maincc2-probe/`): a one-row load is the
+    /// row world, and the ONE mode choice addresses it `In::mb` BECAUSE ITS SOLVED WORLD IS
+    /// ROW. Main's `v_rows > 1` guard fails on this site and main keeps `Mb` for the same
+    /// reason the solve states — but the guard decides nothing here: it is deleted, and the
+    /// solved world is the only road.
+    #[test]
+    fn a_one_row_rowworld_source_keeps_its_leading_spray_mb() {
+        let a: &'static Arena = Arena::global();
+        let (p, view, tile, load, empty, mb) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4), Ssa(5));
+        let f = IRFunction {
+            name: "one_row_mb",
+            arguments: a.args(vec![(p, IrType::Index)]),
+            operations: a.ops(vec![
+                Operation::new(a, Some(view), OpKind::KtdpConstructMemoryView, &[p]),
+                Operation {
+                    result_type: Some(IrType::AccessTile { dims: &[1, 128] }),
+                    ..Operation::new(a, Some(tile), OpKind::KtdpConstructAccessTile, &[view])
+                },
+                tensor(a, load, OpKind::KtdpLoad, &[tile], &[1, 128]),
+                Operation::new(a, Some(empty), OpKind::TensorEmpty, &[]),
+                tensor(a, mb, OpKind::LinalgBroadcast, &[load, empty], &[32, 128]).with_attr(
+                    a,
+                    AttrKey::Dimensions,
+                    Attr::IntList(&[0]),
+                ),
+            ]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let frames = assign_frames(&f, None).expect("the one-row load states its world");
+        assert_eq!(
+            frames
+                .world_of(&f, load)
+                .expect("the solve indexed a class for every value the program names"),
+            World::Row,
+            "a one-row window is the row world"
+        );
+        let (bcasts, _) =
+            program_broadcast_chains(&f).expect("the chase admits the one-row leading spray");
+        let b = bcasts.get(&mb).expect("the spray is in the chase");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Mb,
+            "the chase keeps the one-row source's Mb verbatim"
+        );
+        let axis = spray_operand_axis(&f, &frames, b.src, b.axis, b.count)
+            .expect("the mode choice is a law, not a guess");
+        assert_eq!(
+            axis,
+            BcastAxis::Mb,
+            "Mb over the ROW world is In::mb — the solved world decides, no guard"
+        );
+    }
+
+    /// ⭐ THE ONE MODE CHOICE READS THE SOLVED WORLD — (spray axis, solved source world) → the
+    /// operand mode, spelled from the maincc2 probe's two binding facts (main `ccfefbb9b7`,
+    /// evidence under `.claude/scratch/moe-lead/gate/results/nickm/maincc2-probe/`): the
+    /// leading spray over the solved-Column `%296` resolves `Y(Spray::outer(N))` at EVERY
+    /// decode bucket (count 2/4/8/16/32), and the one surviving `Mb` in the whole dump is the
+    /// one-row `[1, 128]` row-world source. The end-to-end legs are the fixtures beside this
+    /// one (the `%296` world in the softmax tail, the one-row site through the chase); this
+    /// one states the law's whole table, including the counts.
+    #[test]
+    fn the_spray_mode_reads_the_solved_world_not_the_regions() {
+        // The mode choice names the value it refuses on, so even a hand-built table carries a
+        // function to name — the values below are both indexed, so it is never read.
+        let a: &'static Arena = Arena::global();
+        let f = func(a, "the mode choice", vec![]);
+        let mut world = std::collections::HashMap::new();
+        world.insert(Ssa(0), World::Column);
+        world.insert(Ssa(1), World::Row);
+        let frames = Frames {
+            world,
+            sprayed: std::collections::HashSet::new(),
+        };
+        // Mb over the COLUMN world — the probe's `%296` reading, at every bucket count:
+        assert_eq!(
+            spray_operand_axis(&f, &frames, Ssa(0), BcastAxis::Mb, 32).expect("the law states it"),
+            BcastAxis::Y(crate::emit::lower_ktir_to_superdsc::Spray::outer(32)),
+            "a leading spray over the column is the outer row-split at the stated count"
+        );
+        // Mb over the ROW world — the probe's one surviving site, the one-row [1, 128] source:
+        assert_eq!(
+            spray_operand_axis(&f, &frames, Ssa(1), BcastAxis::Mb, 32).expect("the law states it"),
+            BcastAxis::Mb,
+            "a leading spray over the row is In::mb — the solved world, not a guard"
+        );
+        // Col and the row-splits pass through verbatim — the solve anchored their sources,
+        // so a clash was already refused at anchor time, naming the op that stated each.
+        assert_eq!(
+            spray_operand_axis(&f, &frames, Ssa(1), BcastAxis::Col, 32).expect("the law states it"),
+            BcastAxis::Col
+        );
+        assert_eq!(
+            spray_operand_axis(
+                &f,
+                &frames,
+                Ssa(1),
+                BcastAxis::Y(crate::emit::lower_ktir_to_superdsc::Spray::outer(8)),
+                32
+            )
+            .expect("the law states it"),
+            BcastAxis::Y(crate::emit::lower_ktir_to_superdsc::Spray::outer(8))
+        );
     }
 }

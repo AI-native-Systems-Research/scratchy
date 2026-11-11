@@ -478,6 +478,14 @@ pub trait Executor: Send {
     /// defers has nothing to knock on.
     fn set_drain_door(&mut self, _door: crate::core_client::DrainDoor) {}
 
+    /// ⭐ RUN THE CALLING THREAD WHERE THIS EXECUTOR'S DEVICES WANT THE THREAD THAT DRIVES THEM:
+    /// the first act of the thread that runs the decode loop (the pipelined client's executor
+    /// thread, `scr serve`'s). A spyre worker answers with its cards' NUMA node. Default: nothing
+    /// to place.
+    fn pin_driving_thread(&self) -> EngineResult<()> {
+        Ok(())
+    }
+
     /// ⭐ #32 (C) — A KNOCK: drain the worker's in-flight queue until `cell`
     /// is filled. Runs on the executor thread (the knock arrived from a
     /// resolver on another thread); the pop inside the worker's drain is the

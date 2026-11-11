@@ -534,24 +534,67 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-impl From<crate::control_block_wire::ControlBlockWire> for SenlibControlBlockSbf {
-    /// `ControlBlockWire::to_bytes()` is byte-for-byte the same 128-byte
-    /// `SentientSoc::V1::ControlBlockSBF` layout this type mirrors — see
-    /// `crate::control_block_wire`'s module doc for the verified layout.
-    fn from(wire: crate::control_block_wire::ControlBlockWire) -> Self {
-        Self {
-            bytes: wire.to_bytes(),
-        }
-    }
+/// `ControlBlockWire` and `SenlibControlBlockSbf` are one layout: both
+/// `#[repr(C)]` wrappers around the same `[u8; 128]` (`CB_NUM_BYTES`, pinned
+/// by the SDK's own `static_assert(sizeof(ControlBlockSBF) == CB_NUM_BYTES)`).
+/// These asserts make that identity a compile-time fact: if either side ever
+/// changes a field or a repr, this crate stops building instead of silently
+/// mis-striding every queued CB.
+const _: () = {
+    assert!(
+        size_of::<crate::control_block_wire::ControlBlockWire>()
+            == size_of::<SenlibControlBlockSbf>()
+    );
+    assert!(
+        align_of::<crate::control_block_wire::ControlBlockWire>()
+            == align_of::<SenlibControlBlockSbf>()
+    );
+};
+
+/// Reinterpret a batch of [`ControlBlockWire`]s as the senlib wire type —
+/// zero-copy, because they are the same 128 bytes (see the `const _` asserts
+/// above). This replaces a per-launch `Vec` collect that memcpy'd the whole
+/// batch on the submission path.
+pub fn control_blocks_as_sbf(
+    cbs: &[crate::control_block_wire::ControlBlockWire],
+) -> &[SenlibControlBlockSbf] {
+    // SAFETY: same element size and alignment (asserted above), both
+    // `#[repr(C)]` over one `[u8; CB_NUM_BYTES]` field, so every
+    // `ControlBlockWire` is bit-for-bit a valid `SenlibControlBlockSbf`.
+    // `cbs.len()` elements remain `cbs.len()` elements.
+    unsafe { core::slice::from_raw_parts(cbs.as_ptr().cast(), cbs.len()) }
 }
 
-impl SenlibResponseBlockSbf {
-    /// Decode the RB's `ReturnSectionSBF` (completion status/tag/cancel).
-    /// See `crate::control_block_wire::ResponseBlockWire` for the verified
-    /// bit layout this delegates to.
-    pub fn decode(&self) -> crate::control_block_wire::ResponseBlockWire {
-        crate::control_block_wire::ResponseBlockWire::from_bytes(&self.bytes)
-    }
+/// `ResponseBlockWire` and `SenlibResponseBlockSbf` are one layout: both
+/// `#[repr(C)]` wrappers around the same `[u8; RB_NUM_BYTES]` (64, pinned by
+/// the SDK's own `static_assert(sizeof(ResponseBlockSBF) == RB_NUM_BYTES)`).
+/// Same discipline as the control-block pair above: a drift on either side
+/// is a compile error, not silent corruption.
+const _: () = {
+    assert!(
+        size_of::<crate::control_block_wire::ResponseBlockWire>()
+            == size_of::<SenlibResponseBlockSbf>()
+    );
+    assert!(
+        align_of::<crate::control_block_wire::ResponseBlockWire>()
+            == align_of::<SenlibResponseBlockSbf>()
+    );
+};
+
+/// Reinterpret the drain's response-block buffer as the senlib wire type —
+/// zero-copy, because they are the same 64 bytes (see the `const _` asserts
+/// above). This is what lets `ReceiveResponsesSBF` write straight into the
+/// caller's buffer instead of a staging `Vec` that then decodes element by
+/// element.
+pub fn response_blocks_as_sbf_mut(
+    rbs: &mut [crate::control_block_wire::ResponseBlockWire],
+) -> &mut [SenlibResponseBlockSbf] {
+    // SAFETY: same element size and alignment (asserted above), both
+    // `#[repr(C)]` over one `[u8; RB_NUM_BYTES]` field, so every
+    // `ResponseBlockWire` is bit-for-bit a valid `SenlibResponseBlockSbf`.
+    // `rbs.len()` elements remain `rbs.len()` elements; the caller's
+    // mutable borrow is passed through unchanged.
+    unsafe { core::slice::from_raw_parts_mut(rbs.as_mut_ptr().cast(), rbs.len()) }
 }
 
 /// The calling thread's most recent shim error message, for attaching to a
@@ -796,6 +839,15 @@ impl Card {
     /// The PCI address senlib resolved for this card.
     pub fn pci(&self) -> &str {
         &self.pci
+    }
+
+    /// This card's key in the RB telemetry ring ([`crate::rb_telemetry::RbTiming::source`]): the
+    /// card's own address. A `Card` is opened into its one shared home and never moves out of it,
+    /// so the address is fixed for the card's life and distinct between the cards one process
+    /// holds open. The submitter records under it and every reader drains under it — one
+    /// definition, so the two cannot disagree.
+    pub fn telemetry_key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
     }
 
     /// The raw handle, for this crate's FFI calls only. Null only for a [`Card::detached`] test

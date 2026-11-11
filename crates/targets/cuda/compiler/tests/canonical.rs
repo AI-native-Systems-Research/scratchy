@@ -5,7 +5,7 @@
 
 use scratchy_subtile::fixtures::one_layer_input_shaped;
 use scratchy_subtile::fixtures::{
-    add_only_input, front_end_lowered, gemm_m1_only_input, n_layer_input, one_layer_input,
+    add_only_input, front_end_lowered, gemm_m1_only_input, n_layer_input, one_layer_input, rebind,
     rmsnorm_only_input, rope_rotate_only_input, silu_mul_only_input,
 };
 use std::num::NonZeroU32;
@@ -240,8 +240,8 @@ fn lower_canonical_refuses_the_first_computed_op() {
 #[test]
 fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
     let mut l = with_hidden(rope_rotate_only_input());
-    l.bindings[1] = SourceBinding::Cos { local: false };
-    l.bindings[2] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[1] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[2] = SourceBinding::Sin { local: false });
     let facts = CudaModelFacts {
         head_dim: 64,
         rot_dim: 32,
@@ -329,8 +329,8 @@ fn attn_gate(m: u32) -> LoweredDecode {
         ],
         result: 9,
     });
-    l.bindings[4] = SourceBinding::Cos { local: false };
-    l.bindings[5] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[4] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[5] = SourceBinding::Sin { local: false });
     l
 }
 
@@ -361,7 +361,7 @@ fn the_attention_gates_second_colour_is_sized() {
 /// `input` as the shared front end binds it, with source 0 rebound to the embedded hidden.
 fn with_hidden(input: LoweringInput) -> LoweredDecode {
     let mut l = front_end_lowered(input);
-    l.bindings[0] = SourceBinding::EmbeddedHidden;
+    rebind(&mut l, |b| b[0] = SourceBinding::EmbeddedHidden);
     l
 }
 
@@ -575,8 +575,8 @@ fn rope_only(tokens: u32, cols: u32, head_dim: u32) -> LoweredDecode {
         }],
         result: 0,
     });
-    l.bindings[1] = SourceBinding::Cos { local: false };
-    l.bindings[2] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[1] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[2] = SourceBinding::Sin { local: false });
     l
 }
 
@@ -614,7 +614,7 @@ fn a_rope_whose_cos_is_computed_is_refused() {
         ],
         result: 1,
     });
-    l.bindings[1] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[1] = SourceBinding::Sin { local: false });
     let e = refusal(&l, FACTS);
     assert!(e.to_string().contains("computed value"), "{e}");
     assert!(matches!(
@@ -726,10 +726,10 @@ fn a_gate_split_off_the_instantiated_head_dim_is_refused() {
 #[test]
 fn a_decode_attention_above_the_largest_group_is_refused() {
     let mut l = with_hidden(one_layer_input_shaped(34 * 256, 2 * 256, 1024, 256));
-    l.bindings[5] = SourceBinding::Cos { local: false };
-    l.bindings[6] = SourceBinding::Sin { local: false };
-    l.bindings[7] = SourceBinding::PrefixK { layer: 0 };
-    l.bindings[8] = SourceBinding::PrefixV { layer: 0 };
+    rebind(&mut l, |b| b[5] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[6] = SourceBinding::Sin { local: false });
+    rebind(&mut l, |b| b[7] = SourceBinding::PrefixK { layer: 0 });
+    rebind(&mut l, |b| b[8] = SourceBinding::PrefixV { layer: 0 });
     let e = refusal(&l, FACTS);
     assert!(e.to_string().contains("q_heads / kv_heads = 17"), "{e}");
     assert!(matches!(
@@ -753,7 +753,7 @@ fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
     let p = plan_canonical(&l, FACTS, AT).expect("plan_canonical on the MLP block");
     let cx = StepCx {
         graph: &p.graph,
-        bindings: &p.lowered.bindings,
+        bindings: p.lowered.bindings(),
         colouring: &p.colouring,
         folds: &p.folds,
         facts: p.facts,
@@ -839,17 +839,24 @@ fn two_adds() -> LoweredDecode {
     })
 }
 
-/// Two sources bound to the embedded hidden: colour 0 is one buffer.
+/// Two sources bound to the embedded hidden: colour 0 is one buffer. Since main's
+/// `LoweredDecode` reads its roles off its bindings once, such a canonical is refused where it is
+/// built (`LoweredDecode::new`), before it can reach CUDA's arena.
 #[test]
 fn two_embedded_hidden_sources_are_refused() {
-    let mut l = two_adds();
-    l.bindings[1] = SourceBinding::EmbeddedHidden;
-    let e = refusal(&l, FACTS);
-    assert!(e.to_string().contains("several sources"), "{e}");
-    assert!(matches!(
-        e,
-        CanonicalRefusal::Arena(ArenaRefusal::SeveralEmbeddedHidden)
-    ));
+    let l = two_adds();
+    let mut bindings = l.bindings().to_vec();
+    bindings[1] = SourceBinding::EmbeddedHidden;
+    let e = LoweredDecode::new(
+        l.input,
+        bindings,
+        l.op_tiles,
+        l.norm_gain_add_tiles,
+        l.op_expansion,
+        l.unnamed_reads,
+    )
+    .expect_err("two embed rows");
+    assert_eq!((e.first, e.second), (0, 1), "{e}");
 }
 
 /// Step 1's second operand reads only part of its tensor.
@@ -912,7 +919,7 @@ fn lower_second_add(
     let p = plan_canonical(&two_adds(), FACTS, AT).expect("the adds plan");
     let cx = StepCx {
         graph: &p.graph,
-        bindings: &p.lowered.bindings,
+        bindings: p.lowered.bindings(),
         colouring: &p.colouring,
         folds: &p.folds,
         facts: p.facts,
@@ -1014,7 +1021,7 @@ fn a_colour_with_no_shape_is_refused() {
     p.colouring = colour_tape(
         &p.graph,
         &p.tape,
-        &p.lowered.bindings,
+        p.lowered.bindings(),
         &p.folds.fold_facts(),
         &facts,
     )
@@ -1263,7 +1270,9 @@ fn a_weight_with_no_prefix_is_refused() {
 #[test]
 fn buckets_binding_other_sources_are_refused() {
     let mut input = tied_model(&[128, 256], "lm_head", 256);
-    input.buckets[1].lowered.bindings[1] = SourceBinding::Weight { id: 7, index: None };
+    rebind(&mut input.buckets[1].lowered, |b| {
+        b[1] = SourceBinding::Weight { id: 7, index: None }
+    });
     let e = lower_model(&input).expect_err("refused");
     assert!(matches!(e, ModelRefusal::Bindings { m: 256, ix: 1 }), "{e}");
 }
@@ -1274,8 +1283,7 @@ fn a_weight_no_step_reads_is_refused() {
     let mut input = tied_model(&[128], "lm_head", 256);
     let l = &mut input.buckets[0].lowered;
     l.input.sources.push(SourceShape { rows: 1, cols: 512 });
-    l.bindings
-        .push(SourceBinding::Weight { id: 3, index: None });
+    rebind(l, |b| b.push(SourceBinding::Weight { id: 3, index: None }));
     let e = lower_model(&input).expect_err("refused");
     assert!(
         matches!(e, ModelRefusal::UnreadWeight { ix: 3, bytes: 1024 }),
@@ -1296,7 +1304,7 @@ fn bundle_gain_model(named: bool) -> TargetModelInput {
         tensor: BundleTensor::RouterScale,
     };
     for b in &mut input.buckets {
-        b.lowered.bindings[1] = binding.clone();
+        rebind(&mut b.lowered, |b| b[1] = binding.clone());
     }
     if named {
         input.bundle_tensor_names.push((

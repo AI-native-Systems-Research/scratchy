@@ -154,7 +154,11 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let card = CardRuntime::open(0).map_err(|e| anyhow!("open card 0: {e}"))?;
+    let card = scratchy_target_spyre::runtime::WorldCards::<
+        scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
+    >::open_all()
+    .map_err(|e| anyhow!("{e}"))?
+    .into_first();
     let addr = DevAddr::alloc(
         &card,
         flex_rs::address::ByteSize(SIZE_BYTES as u64),

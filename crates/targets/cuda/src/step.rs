@@ -1103,6 +1103,53 @@ pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
 /// stacked as the rows of one query tile, and only the 16 rows of each consumer warpgroup's warp 0
 /// are merged and stored (`kernels/attn_decode_bf16.cu`). The target models' groups are 2 to 12.
 pub const ATTN_DECODE_BF16_MAX_GROUP: u32 = 16;
+/// The most splits over keys a split decode takes (FP8 S8 W6b, `kernels/attn_decode_merge.cu`).
+pub const ATTN_DECODE_MAX_SPLITS: u32 = 64;
+/// The decode attention's split over keys per head dim (FP8 S8 W6b): `(head_dim, splits,
+/// min_tiles)`. Of the window's tiles of 64 keys a split takes at least `min_tiles`, so a sequence
+/// of `2 · 64` keys or fewer is one split, the unsplit kernel's bits; longer ones take up to
+/// `splits` CTAs a kv head, merged in split order (`kernels/attn_decode_merge.cu`). The H100 pod at
+/// a8ce5637 chose 16 × 2 at both head dims: faster than one split at every kv_len 192 to 8192.
+pub const ATTN_DECODE_SPLITS: [(u32, u32, u32); 2] = [
+    (ATTN_DECODE_BF16_HEAD_DIM, 16, 2),
+    (ATTN_D512_BF16_HEAD_DIM, 16, 2),
+];
+const _: () = assert!(
+    ATTN_DECODE_SPLITS[0].1 <= ATTN_DECODE_MAX_SPLITS
+        && ATTN_DECODE_SPLITS[1].1 <= ATTN_DECODE_MAX_SPLITS
+);
+
+/// `(splits, min_tiles)` of the decode attention at `head_dim` ([`ATTN_DECODE_SPLITS`]); `None`
+/// at a head dim with no decode kernel.
+pub const fn attn_decode_split(head_dim: u32) -> Option<(u32, u32)> {
+    let mut i = 0;
+    while i < ATTN_DECODE_SPLITS.len() {
+        let (hd, splits, min_tiles) = ATTN_DECODE_SPLITS[i];
+        if hd == head_dim {
+            return Some((splits, min_tiles));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The split decode's f32 partials at `kv_heads` × `head_dim` ([`attn_decode_split`]'s splits):
+/// the rows `[splits, kv_heads, 16, head_dim]`, then each row's max and sum `[splits, kv_heads, 2,
+/// 16]`, in this order in the tape's split scratch. `(rows bytes, all bytes)`; `None` at a head dim
+/// with no decode kernel, or on overflow.
+pub const fn attn_decode_scratch_bytes(kv_heads: u32, head_dim: u32) -> Option<(u64, u64)> {
+    let Some((splits, _)) = attn_decode_split(head_dim) else {
+        return None;
+    };
+    let heads = splits as u64 * kv_heads as u64 * ATTN_DECODE_BF16_MAX_GROUP as u64;
+    let Some(rows) = heads.checked_mul(head_dim as u64 * 4) else {
+        return None;
+    };
+    let Some(all) = rows.checked_add(heads * 2 * 4) else {
+        return None;
+    };
+    Some((rows, all))
+}
 /// The head dims the KV append is instantiated for (`kernels/kv_append_bf16.cu`): a head's row is
 /// one `sv_bf<256>`, one 512-byte box of the cache's vector tensor map, or one `sv_bf<512>`, two
 /// such boxes (Gemma 4's global layers). The lowering already refuses any other head dim for a
@@ -2190,10 +2237,19 @@ impl CudaStep {
         [Some(*self), None, None]
     }
 
-    /// The GEMV scratch bytes the step writes: [`gemv_scratch_bytes`] of [`Self::gemv_split`], 0
+    /// The split scratch bytes the step writes: [`gemv_scratch_bytes`] of [`Self::gemv_split`], 0
     /// for a step that is no decode GEMV or runs at one split; a grouped GEMV's, the sum of its
-    /// members' (each holds its partials at once); `None` on overflow.
+    /// members' (each holds its partials at once); a decode attention's, its split partials
+    /// ([`attn_decode_scratch_bytes`], written by its split launch and read by its merge, the
+    /// same step's second launch); `None` on overflow.
     pub const fn gemv_scratch(&self) -> Option<u64> {
+        if let Self::AttnDecode(a) = self {
+            return match attn_decode_scratch_bytes(a.kv_heads, a.head_dim) {
+                Some((_, all)) => Some(all),
+                // No decode kernel at that head dim: `validate` refuses the step itself.
+                None => Some(0),
+            };
+        }
         if let Self::GemvGroup(g) | Self::GemvGroupFp8(g) = self {
             return g.gemv_scratch_before(3);
         }

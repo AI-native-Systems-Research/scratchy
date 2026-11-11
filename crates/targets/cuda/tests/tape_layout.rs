@@ -30,7 +30,7 @@ use common::mlp::{EPS, H, I, MLP_M128, MLP_M256, mlp};
 use scratchy_ir::model_facts::{Attention, HeadDim, HeadGeometry};
 use scratchy_subtile::fixtures::attention_at;
 use scratchy_subtile::fixtures::{
-    front_end_lowered, gemm_m1_only_input, one_layer_input, silu_mul_only_input,
+    front_end_lowered, gemm_m1_only_input, one_layer_input, rebind, silu_mul_only_input,
 };
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding, UnrollIndex};
 use scratchy_subtile::lower::{
@@ -598,7 +598,7 @@ fn a_row_op_activation_that_is_a_weight_is_refused() {
 #[test]
 fn a_norm_gain_that_is_not_a_weight_is_refused() {
     let mut l = norm_only(256, H, EPS, shape(1, H));
-    l.bindings[1] = SourceBinding::Cos { local: false };
+    rebind(&mut l, |b| b[1] = SourceBinding::Cos { local: false });
     let e = refused(&l, &["operand 1", "source 1", "must be a model weight"]);
     assert!(matches!(
         e,
@@ -750,7 +750,9 @@ fn a_view_of_a_source_is_refused() {
 #[test]
 fn a_rope_operand_that_is_not_the_global_table_is_refused() {
     let mut l = attn_gate(256);
-    l.bindings[4] = SourceBinding::Weight { id: 4, index: None };
+    rebind(&mut l, |b| {
+        b[4] = SourceBinding::Weight { id: 4, index: None }
+    });
     let e = refused(&l, &["RopeRotate", "operand 1", "Weight"]);
     assert!(matches!(
         e,
@@ -763,7 +765,7 @@ fn a_rope_operand_that_is_not_the_global_table_is_refused() {
         }
     ));
     let mut l = attn_gate(256);
-    l.bindings[5] = SourceBinding::Sin { local: true };
+    rebind(&mut l, |b| b[5] = SourceBinding::Sin { local: true });
     let e = refused(&l, &["RopeRotate", "operand 2", "local: true"]);
     assert!(matches!(
         e,
@@ -793,8 +795,8 @@ fn rope_only(tokens: u32, cols: u32, head_dim: u32) -> LoweredDecode {
         }],
         result: 0,
     });
-    l.bindings[1] = SourceBinding::Cos { local: false };
-    l.bindings[2] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[1] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[2] = SourceBinding::Sin { local: false });
     l
 }
 
@@ -888,8 +890,8 @@ fn a_rope_whose_rows_are_not_the_tokens_is_refused() {
         ],
         result: 2,
     });
-    l.bindings[1] = SourceBinding::Cos { local: false };
-    l.bindings[2] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[1] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[2] = SourceBinding::Sin { local: false });
     let e = refused(&l, &["rows=512", "256 tokens"]);
     assert!(matches!(
         e,
@@ -941,8 +943,8 @@ fn a_gate_apply_whose_gate_is_not_a_split_is_refused() {
     let mut input = attn_gate_input(256);
     input.ops[7].inputs[1] = InputRef::Op(6);
     let mut l = with_hidden(input);
-    l.bindings[4] = SourceBinding::Cos { local: false };
-    l.bindings[5] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[4] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[5] = SourceBinding::Sin { local: false });
     let e = refused(&l, &["GateApply", "operand 1", "GateSplit"]);
     assert!(matches!(e, CanonicalRefusal::GateOperand { step: 7 }));
 }
@@ -1188,14 +1190,18 @@ fn rope_append_only(tokens: u32, cols: u32) -> LoweredDecode {
         }],
         result: 0,
     });
-    l.bindings[1] = SourceBinding::Cos { local: false };
-    l.bindings[2] = SourceBinding::Sin { local: false };
-    l.bindings[4] = SourceBinding::PrefixK {
-        layer: u64::from(LAYER),
-    };
-    l.bindings[5] = SourceBinding::PrefixV {
-        layer: u64::from(LAYER),
-    };
+    rebind(&mut l, |b| b[1] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[2] = SourceBinding::Sin { local: false });
+    rebind(&mut l, |b| {
+        b[4] = SourceBinding::PrefixK {
+            layer: u64::from(LAYER),
+        }
+    });
+    rebind(&mut l, |b| {
+        b[5] = SourceBinding::PrefixV {
+            layer: u64::from(LAYER),
+        }
+    });
     l
 }
 
@@ -1258,7 +1264,7 @@ fn a_rope_append_whose_k_is_a_source_is_refused() {
 #[test]
 fn a_rope_append_whose_rotary_operand_is_not_the_global_table_is_refused() {
     let mut l = attn_layer(256);
-    l.bindings[9] = SourceBinding::Cos { local: true };
+    rebind(&mut l, |b| b[9] = SourceBinding::Cos { local: true });
     let e = refused(&l, &["RopeAppend", "operand 1", "local: true"]);
     assert!(matches!(
         e,
@@ -1300,12 +1306,16 @@ fn a_rope_append_whose_prefix_operand_is_another_layers_is_refused() {
         }
     ));
     let mut l = attn_layer(256);
-    l.bindings[12] = SourceBinding::Weight {
-        id: 12,
-        index: None,
-    };
-    l.bindings.push(SourceBinding::PrefixV {
-        layer: u64::from(LAYER),
+    rebind(&mut l, |b| {
+        b[12] = SourceBinding::Weight {
+            id: 12,
+            index: None,
+        }
+    });
+    rebind(&mut l, |b| {
+        b.push(SourceBinding::PrefixV {
+            layer: u64::from(LAYER),
+        })
     });
     l.input.sources.push(shape(PREFIX_CAPACITY, 512));
     let e = refused(&l, &["RopeAppend", "operand 5", "PrefixV"]);
@@ -1327,7 +1337,7 @@ fn a_rope_append_whose_prefix_operand_is_another_layers_is_refused() {
 fn a_prefix_k_with_no_prefix_v_is_refused() {
     let mut l = attn_layer(256);
     l.input.sources.push(shape(PREFIX_CAPACITY, 512));
-    l.bindings.push(SourceBinding::PrefixK { layer: 7 });
+    rebind(&mut l, |b| b.push(SourceBinding::PrefixK { layer: 7 }));
     let e = refused(
         &l,
         &["KV cache", "layer 7", "only one of PrefixK and PrefixV"],
@@ -1337,7 +1347,7 @@ fn a_prefix_k_with_no_prefix_v_is_refused() {
         CanonicalRefusal::KvCache(KvCacheRefusal::Unpaired { layer: 7 })
     ));
     let mut l = attn_layer(256);
-    l.bindings[12] = SourceBinding::PrefixV { layer: 4 };
+    rebind(&mut l, |b| b[12] = SourceBinding::PrefixV { layer: 4 });
     let e = refused(&l, &["RopeAppend", "operand 5", "layer 3's PrefixV"]);
     assert!(matches!(
         e,
@@ -1358,8 +1368,8 @@ fn a_kv_pool_of_two_widths_or_off_the_head_is_refused() {
     let mut l = attn_layer(256);
     l.input.sources.push(shape(PREFIX_CAPACITY, 768));
     l.input.sources.push(shape(PREFIX_CAPACITY, 768));
-    l.bindings.push(SourceBinding::PrefixK { layer: 7 });
-    l.bindings.push(SourceBinding::PrefixV { layer: 7 });
+    rebind(&mut l, |b| b.push(SourceBinding::PrefixK { layer: 7 }));
+    rebind(&mut l, |b| b.push(SourceBinding::PrefixV { layer: 7 }));
     let e = refused(&l, &["layer 7", "768", "512"]);
     assert!(matches!(
         e,
@@ -1391,8 +1401,8 @@ fn a_kv_layer_above_u32_is_refused() {
     l.input.sources.push(shape(PREFIX_CAPACITY, 512));
     l.input.sources.push(shape(PREFIX_CAPACITY, 512));
     let big = u64::from(u32::MAX) + 1;
-    l.bindings.push(SourceBinding::PrefixK { layer: big });
-    l.bindings.push(SourceBinding::PrefixV { layer: big });
+    rebind(&mut l, |b| b.push(SourceBinding::PrefixK { layer: big }));
+    rebind(&mut l, |b| b.push(SourceBinding::PrefixV { layer: big }));
     let e = refused(&l, &["4294967296", "u32"]);
     assert!(matches!(
         e,
@@ -1420,12 +1430,16 @@ fn attn_only(m: u32, a: Attention) -> LoweredDecode {
         }],
         result: 0,
     });
-    l.bindings[1] = SourceBinding::PrefixK {
-        layer: u64::from(LAYER),
-    };
-    l.bindings[2] = SourceBinding::PrefixV {
-        layer: u64::from(LAYER),
-    };
+    rebind(&mut l, |b| {
+        b[1] = SourceBinding::PrefixK {
+            layer: u64::from(LAYER),
+        }
+    });
+    rebind(&mut l, |b| {
+        b[2] = SourceBinding::PrefixV {
+            layer: u64::from(LAYER),
+        }
+    });
     l
 }
 
@@ -1566,9 +1580,11 @@ fn a_sliding_window_attention_is_refused() {
 fn an_attention_with_sinks_is_refused() {
     let mut l = attn_layer(256);
     l.input.sources.push(shape(1, 8));
-    l.bindings.push(SourceBinding::Weight {
-        id: 14,
-        index: None,
+    rebind(&mut l, |b| {
+        b.push(SourceBinding::Weight {
+            id: 14,
+            index: None,
+        })
     });
     l.input.ops[13].inputs.push(InputRef::Ext(14));
     let e = refused(&l, &["AttnDecode", "sinks"]);
@@ -1609,8 +1625,8 @@ fn an_attention_whose_new_k_or_v_is_not_its_rope_appends_is_refused() {
     let mut l = attn_layer(256);
     l.input.sources.push(shape(PREFIX_CAPACITY, 512));
     l.input.sources.push(shape(PREFIX_CAPACITY, 512));
-    l.bindings.push(SourceBinding::PrefixK { layer: 5 });
-    l.bindings.push(SourceBinding::PrefixV { layer: 5 });
+    rebind(&mut l, |b| b.push(SourceBinding::PrefixK { layer: 5 }));
+    rebind(&mut l, |b| b.push(SourceBinding::PrefixV { layer: 5 }));
     l.input.ops[12].op = rope_append_op(256, 5, AttnMask::Causal, RopeFormTag::NeoX);
     l.input.ops[12].inputs[4] = InputRef::Ext(14);
     l.input.ops[12].inputs[5] = InputRef::Ext(15);
@@ -1630,9 +1646,11 @@ fn an_attention_whose_new_k_or_v_is_not_its_rope_appends_is_refused() {
 fn an_attention_whose_prefix_operand_is_not_its_layers_is_refused() {
     let mut l = attn_layer(256);
     l.input.sources.push(shape(PREFIX_CAPACITY, 512));
-    l.bindings.push(SourceBinding::Weight {
-        id: 14,
-        index: None,
+    rebind(&mut l, |b| {
+        b.push(SourceBinding::Weight {
+            id: 14,
+            index: None,
+        })
     });
     l.input.ops[13].inputs[2] = InputRef::Ext(14);
     let e = refused(&l, &["AttnDecode", "operand 2", "PrefixV"]);
@@ -1896,7 +1914,9 @@ fn a_gdn_op_with_no_gdn_facts_is_refused() {
 #[test]
 fn a_gdn_bundle_of_no_layer_is_refused() {
     let mut l = gdn_layer(256);
-    l.bindings[6] = SourceBinding::Weight { id: 6, index: None };
+    rebind(&mut l, |b| {
+        b[6] = SourceBinding::Weight { id: 6, index: None }
+    });
     let e = gdn_refused(&l, &["GatedDeltaNet", "no model layer"]);
     assert!(matches!(e, CanonicalRefusal::GdnLayer { step: 5 }));
 }
@@ -1905,7 +1925,7 @@ fn a_gdn_bundle_of_no_layer_is_refused() {
 #[test]
 fn a_gdn_bundle_that_is_not_a_weight_is_refused() {
     let mut l = gdn_layer(256);
-    l.bindings[6] = SourceBinding::Cos { local: false };
+    rebind(&mut l, |b| b[6] = SourceBinding::Cos { local: false });
     let e = gdn_refused(&l, &["GatedDeltaNet", "operand 4"]);
     assert!(matches!(
         e,
@@ -2050,10 +2070,12 @@ fn a_gdn_op_whose_rows_disagree_is_refused() {
         ],
         result: 4,
     });
-    l.bindings[4] = SourceBinding::Weight {
-        id: 4,
-        index: Some(UnrollIndex(0)),
-    };
+    rebind(&mut l, |b| {
+        b[4] = SourceBinding::Weight {
+            id: 4,
+            index: Some(UnrollIndex(0)),
+        }
+    });
     let e = gdn_refused(&l, &["GatedDeltaNet", "rows"]);
     assert!(matches!(
         e,
@@ -2118,10 +2140,12 @@ fn two_gdn_layers_of_two_geometries_are_refused() {
     input.result = input.ops.len() - 1;
     let mut l = with_hidden(input);
     for (ix, layer) in [(6, 0), (base + 5, 1)] {
-        l.bindings[ix] = SourceBinding::Weight {
-            id: ix as u32,
-            index: Some(UnrollIndex(layer)),
-        };
+        rebind(&mut l, |b| {
+            b[ix] = SourceBinding::Weight {
+                id: ix as u32,
+                index: Some(UnrollIndex(layer)),
+            }
+        });
     }
     let e = gdn_refused(&l, &["another geometry"]);
     assert!(matches!(e, CanonicalRefusal::GdnPool { step: 13 }), "{e}");
@@ -2163,7 +2187,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
     let lower = |geometry| {
         let cx = StepCx {
             graph: &p.graph,
-            bindings: &p.lowered.bindings,
+            bindings: p.lowered.bindings(),
             colouring: &p.colouring,
             folds: &p.folds,
             facts: p.facts,
@@ -2572,7 +2596,7 @@ fn sliding_layer(m: u32, window: u32) -> LoweredDecode {
         (9, SourceBinding::Cos { local: true }),
         (10, SourceBinding::Sin { local: true }),
     ] {
-        l.bindings[ix] = binding;
+        rebind(&mut l, |b| b[ix] = binding);
     }
     let mask = AttnMask::SlidingWindow {
         window: NonZeroU32::new(window).expect("a window"),
@@ -2673,11 +2697,13 @@ fn gemma_moe_model(
     };
     let mut lowered = gemma_moe(512);
     let index = Some(UnrollIndex(LAYER));
-    lowered.bindings[6] = SourceBinding::BundleTensor {
-        id: down_bank,
-        index,
-        tensor: T::ExpertDownW,
-    };
+    rebind(&mut lowered, |b| {
+        b[6] = SourceBinding::BundleTensor {
+            id: down_bank,
+            index,
+            tensor: T::ExpertDownW,
+        }
+    });
     let name = |id, tensor, n: &str| (id, index, tensor, n.to_string());
     let mut names = vec![
         name(ROUTER, T::RouterScale, "m.layers.0.router.scale"),
@@ -2776,10 +2802,12 @@ fn an_affine_expert_bank_is_refused() {
         rows: common::gemma_moe::EXPERTS * common::gemma_moe::I,
         cols: 1,
     });
-    l.bindings.push(SourceBinding::BundleTensor {
-        id: common::gemma_moe::BANK,
-        index: Some(UnrollIndex(common::gemma_moe::LAYER)),
-        tensor: BundleTensor::ExpertGateS,
+    rebind(&mut l, |b| {
+        b.push(SourceBinding::BundleTensor {
+            id: common::gemma_moe::BANK,
+            index: Some(UnrollIndex(common::gemma_moe::LAYER)),
+            tensor: BundleTensor::ExpertGateS,
+        })
     });
     let scale = l.input.sources.len() - 1;
     let SubOp::ExpertMatmul { weight, .. } = &mut l.input.ops[9].op else {

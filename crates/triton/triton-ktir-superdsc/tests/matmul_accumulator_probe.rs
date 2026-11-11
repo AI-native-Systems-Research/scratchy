@@ -240,6 +240,7 @@ fn pv_program(acc: Acc) -> KtirNode {
         bindings: vec![BufferId::new(101), BufferId::new(102), BufferId::new(103)],
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     }

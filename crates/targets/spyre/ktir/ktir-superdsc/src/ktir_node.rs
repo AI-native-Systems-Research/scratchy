@@ -637,6 +637,20 @@ pub struct KtirNode {
     /// dispatch happens per BUNDLE and later than the producer that knows. So it is stated here, as a
     /// [`BufferId`] like every other buffer this type names.
     pub node_out_tid: Option<BufferId>,
+    /// ⭐ THE ANSWER ROWS A PACKED PREFILL TAIL EXTRACTS — one per request window, the rung's
+    /// own `(w, S)` pair minted once at the bake ([`AnswerRows`]). `None` for every program
+    /// that is not the lm-head tail's extraction half.
+    ///
+    /// ⛔ A BINDING, LIKE [`Self::node_out_tid`], AND FOR THE SAME REASON. The extraction's
+    /// parameters are the `[mq, hidden]` activation it reads and the `[S, hidden]` staging it
+    /// writes; neither states the row LAW — which row of each request's window is the answer
+    /// row — and the door that emits the `S · hidden/64` copies must take each request's row
+    /// from ONE statement, not re-derive `r·w + (w−1)` from the view extents by dividing `mq`
+    /// back apart. So the producer that holds the graph's [`QueryExtent`] (the splice's fold,
+    /// the same site that states `node_out_tid`) states the rows here, and
+    /// [`lmlast`](crate::emit::lower_ktir_to_superdsc::lmlast) refuses by name when they are
+    /// absent — the one reader, the one mint.
+    pub answer_rows: Option<crate::sdsc_abstract::AnswerRows>,
     /// ⭐ THE MINT RECORD — every intermediate tid this node's lowering minted, by the SSA
     /// value that needed it. `whole_function`'s `mint_inter` consults it FIRST and replays
     /// the recorded tid when the SAME layout already declared that tid's synthetic — which is
@@ -746,6 +760,7 @@ impl Clone for KtirNode {
             bindings: self.bindings.clone(),
             mask: self.mask,
             node_out_tid: self.node_out_tid,
+            answer_rows: self.answer_rows,
             minted: std::sync::Mutex::new(
                 self.minted
                     .lock()

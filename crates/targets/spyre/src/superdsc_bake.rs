@@ -1649,18 +1649,6 @@ impl BakeQueue {
     /// Start the workers. `None` when this build has no dxp (cardless): the caller then writes json
     /// and leaves it for `build.rs`, exactly as before.
     pub fn start() -> Option<Bake> {
-        // ⭐ PLAN-ONLY OVERRIDES A PRESENT COMPILER TOO. `no_dxp_or_die` below reads
-        // `SCRATCHY_PLAN_ONLY_BAKE` as the cardless host's stated intent — but it was read
-        // ONLY there, so the variable pardoned a MISSING tool and nothing else: on a host
-        // that HAS dxp the queue started anyway and compiled every group the expansion
-        // produced, binaries nobody asked for and nobody would load (MEASURED: a plan-only
-        // check of a fresh kernel family spent 582 s compiling 723 such groups). The
-        // variable is a claim about the BUILD the host is doing, not merely about the
-        // hardware, so it is honored here too — plan-only takes the cardless arm by
-        // choice, dxp present or not.
-        if std::env::var_os("SCRATCHY_PLAN_ONLY_BAKE").is_some() {
-            return None;
-        }
         let tool = DxpTool::resolve()?;
         let reaper: Arc<Reaper> = Arc::new(Reaper::default());
         // Arm both teardowns before the first child can exist: the emit's own panics unwind only the
@@ -1879,8 +1867,14 @@ impl BakeQueue {
 /// down to a single running `dxp_standalone` before the next wound up. Across a 27-bundle ladder that
 /// is 27 serialisation points, and it shows up exactly as "sometimes 8, sometimes 3, sometimes 1".
 ///
-/// Process-wide, so group N of bundle 3 compiles while bundle 4 is being written. `None` on a
-/// cardless build (no dxp), which is what keeps `cargo check` working.
+/// Process-wide, so group N of bundle 3 compiles while bundle 4 is being written.
+///
+/// ⭐ WHETHER THERE IS A QUEUE IS THE BUILD'S FEATURE, NOT THE HOST'S ENVIRONMENT. A `spyre-hw` build
+/// compiles device images, so it has the queue or refuses ([`no_dxp_or_die`]); a `spyre-lower` build
+/// lowers every rung and compiles none, so it has no queue — `None`, by `cfg`, dxp present or not (a
+/// plan-only check never pays compile time: MEASURED, a lowering check of a fresh kernel family once
+/// spent 582 s compiling 723 groups nobody would load).
+#[cfg(feature = "spyre-hw")]
 pub fn global() -> Option<&'static Bake> {
     static Q: std::sync::OnceLock<Option<Bake>> = std::sync::OnceLock::new();
     let q = Q.get_or_init(Bake::start).as_ref();
@@ -1888,6 +1882,12 @@ pub fn global() -> Option<&'static Bake> {
         no_dxp_or_die();
     }
     q
+}
+
+/// See the `spyre-hw` [`global`]: a build without a card compiles no device image.
+#[cfg(not(feature = "spyre-hw"))]
+pub fn global() -> Option<&'static Bake> {
+    None
 }
 
 /// ⛔⛔⛔ A PLAN-ONLY BAKE IS NOT A BUILD — IT IS A BINARY THAT CANNOT COMPUTE, AND IT USED TO EXIT 0.
@@ -1904,15 +1904,12 @@ pub fn global() -> Option<&'static Bake> {
 /// even a warning would not have reached the build log. The image build then set `DEEPTOOLS_PATH` in its
 /// RUNTIME stage but not in the stage that runs `cargo build`, and there was nothing anywhere to say so.
 ///
-/// So: FAIL, naming the variable and the stage. A host that genuinely has no card must say so on purpose
-/// via `SCRATCHY_PLAN_ONLY_BAKE=1` — which is a claim about the build being done, not a fallback the build
-/// picks by itself: it pardons a missing compiler HERE, and it takes the plan-only arm in
-/// [`BakeQueue::start`] even when the compiler is present, so a plan-only check never pays compile time.
-/// Type-checking without a card stays possible; shipping a model that cannot compute does not.
+/// So: FAIL, naming the variable and the stage. A build that needs no device image says so by its FEATURE
+/// (`spyre-lower` without `spyre-hw`), which never reaches here — a claim about the build, made where the
+/// build is chosen, not a variable a host sets. Lowering without a card stays possible; shipping a model
+/// that cannot compute does not.
+#[cfg(feature = "spyre-hw")]
 fn no_dxp_or_die() {
-    if std::env::var_os("SCRATCHY_PLAN_ONLY_BAKE").is_some() {
-        return;
-    }
     panic!(
         "SuperDSC bake: no device compiler — `DEEPTOOLS_PATH` is unset or `dxp_standalone` is missing, \
          so this bundle would be emitted as a memory PLAN WITH NO DEVICE PROGRAMS. That binary links and \
@@ -1922,8 +1919,8 @@ fn no_dxp_or_die() {
          • Set `DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share` (and the deeptools `LD_LIBRARY_PATH`) in \
          the stage that runs `cargo build` — in a Dockerfile that is the BUILD stage, not the runtime \
          stage. Setting it only at runtime is exactly this failure.\n\
-         • Or, on a machine that truly has no card and only needs a type-check, state it: \
-         `SCRATCHY_PLAN_ONLY_BAKE=1`."
+         • Or, on a machine with no card that only needs the lowering checked, build \
+         `--features spyre-lower` (no `spyre-hw`): every rung lowers, no device image is compiled."
     );
 }
 

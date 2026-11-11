@@ -61,7 +61,8 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         &wide("t_pre", 31, 2048),
         &mut s,
         None,
-    );
+    )
+    .expect("assemble_pointwise_broadcast builds");
     let mut s = 0i64;
     let wide_col = emit::assemble_pointwise_broadcast(
         "wide_col",
@@ -75,7 +76,8 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         &wide("t_sc", 31, 2048),
         &mut s,
         None,
-    );
+    )
+    .expect("assemble_pointwise_broadcast builds");
     let mut s = 0i64;
     let wide_mb = emit::assemble_pointwise_broadcast(
         "wide_mb",
@@ -89,7 +91,8 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         &wide("t_out", 31, 2048),
         &mut s,
         None,
-    );
+    )
+    .expect("assemble_pointwise_broadcast builds");
     let mut s = 0i64;
     let narrow_scalar = emit::assemble_pointwise_broadcast(
         "narrow_scalar",
@@ -103,7 +106,8 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
         &wide("t_mean", 31, 64),
         &mut s,
         None,
-    );
+    )
+    .expect("assemble_pointwise_broadcast builds");
 
     let ws = broadcast_operand_coordinfo(&wide_scalar, "wide_scalar");
     let wc = broadcast_operand_coordinfo(&wide_col, "wide_col");

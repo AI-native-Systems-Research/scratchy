@@ -160,7 +160,7 @@ fn main() {
                 for (i, s) in l.scalarmul_scales.iter().enumerate() {
                     println!("scale[{i}] = {s:e}  -> const t{}", u32::MAX - 20 - i as u32);
                 }
-                println!("synth.next = {}", l.synth.borrow().next);
+                println!("synth.next = {}", l.synth.borrow().high_water());
             }
         }
     }

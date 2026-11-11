@@ -22,15 +22,19 @@ use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
 pub(crate) type World = scratchy_target_spyre::bundle_code::collective::Build;
 
-/// A session over the build's world: one executor per rank of [`World`].
+/// A session over the build's world: one executor per rank of [`World`], each BORROWING its card
+/// for `'static` — the loaded model lives for the process, and so do the cards it runs on (the
+/// loader opens them once and hands out `&'static Cards`; see `load_inner`).
 #[cfg(feature = "spyre-hw")]
-pub(crate) type SuperDscSession = scratchy_target_spyre::sdsc_runner::SuperDscSession<World>;
+pub(crate) type SuperDscSession =
+    scratchy_target_spyre::sdsc_runner::SuperDscSession<'static, World>;
 
-/// The build's cards, one per rank of [`World`].
+/// The build's cards, one per rank of [`World`] — OWNED here, once, for the process; every session
+/// borrows them.
 #[cfg(feature = "spyre-hw")]
 pub(crate) type Cards = scratchy_target_spyre::bundle_code::collective::PerRank<
     World,
-    std::sync::Arc<scratchy_target_spyre::runtime::CardRuntime<World>>,
+    scratchy_target_spyre::runtime::CardRuntime<World>,
 >;
 
 /// One layer's KV pools: the K and V cache tensors its paged attention gathers from and its KV
@@ -523,6 +527,11 @@ pub(crate) struct Loaded {
     /// own limit), which the pool the bake placed must hold: a declaration past the pool is refused at
     /// load, never clamped. `usize::MAX` on the emulator (no cap).
     pub(crate) served_context: usize,
+    /// ⭐ WHERE THIS WORKER'S SHARED HOST THREADS RUN — the load thread (pinned when the cards
+    /// join) and the decode-loop thread (pinned as its first act, `Worker::pin_driving_thread`):
+    /// the node every card sits on, or rank 0's when they span nodes.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) world_cpus: scratchy_target_spyre::runtime::WorldCpus,
 }
 
 /// Per-request generation state the worker keeps beside `InputBatch`.

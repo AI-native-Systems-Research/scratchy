@@ -63,23 +63,26 @@ fn ops_with(
         for s in 0..NSLAB {
             let src = q.copy_src(kvh, s).expect("in range");
             let dst = dest(kvh, s);
-            ops.push(assemble_matmul_placed(
-                &format!("attn_cqg_g{kvh}s{s}_o0"),
-                MatM::of_query_rows(QueryRowCount::of_mq(1)),
-                MatN::one_stick(Lanes::FP16),
-                MatK::one_stick(Lanes::FP16),
-                MatY::of_gqa_group(GQA, src, dst),
-                SharedKernelBmmForm::of_query_group_copy(),
-                &rbh("t_qs", 1, NQH * HD),
-                src,
-                // I[64,64] at offset 0 of the class's `[hd, hd]` identity — the cache write's kernel.
-                &Stk::<KernelTag>::kernel(STICK as usize, STICK as usize, "t_ident"),
-                DevOff::ZERO,
-                &rbh("t_qg", NKVH.get() * GQA, HD),
-                dst,
-                &mut sym,
-                None,
-            ));
+            ops.push(
+                assemble_matmul_placed(
+                    &format!("attn_cqg_g{kvh}s{s}_o0"),
+                    MatM::of_query_rows(QueryRowCount::of_mq(1)),
+                    MatN::one_stick(Lanes::FP16),
+                    MatK::one_stick(Lanes::FP16),
+                    MatY::of_gqa_group(GQA, src, dst),
+                    SharedKernelBmmForm::of_query_group_copy(),
+                    &rbh("t_qs", 1, NQH * HD),
+                    src,
+                    // I[64,64] at offset 0 of the class's `[hd, hd]` identity — the cache write's kernel.
+                    &Stk::<KernelTag>::kernel(STICK as usize, STICK as usize, "t_ident"),
+                    DevOff::ZERO,
+                    &rbh("t_qg", NKVH.get() * GQA, HD),
+                    dst,
+                    &mut sym,
+                    None,
+                )
+                .expect("each group's copy builds"),
+            );
         }
     }
     ops

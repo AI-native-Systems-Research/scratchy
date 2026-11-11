@@ -186,7 +186,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
                 },
             )
             .expect("the gather-copy op builds");
-            let value_idx = op.indirect.expect("a declared gather").value;
+            let value_idx = op.indirect().expect("a declared gather").value;
             let folds = SdscFoldSet::new(op.iter.cores_used());
             let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
             let j = serde_json::to_value(&e).unwrap();
@@ -272,7 +272,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                     },
                 )
                 .expect("the page gather-copy op builds");
-                let value_idx = op.indirect.expect("a declared gather").value;
+                let value_idx = op.indirect().expect("a declared gather").value;
                 let cores = op.iter.cores_used().get();
                 let folds = SdscFoldSet::new(op.iter.cores_used());
                 let e = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
@@ -372,7 +372,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
         },
     )
     .expect("the gather-copy op builds");
-    let value_idx = op.indirect.expect("a declared gather").value;
+    let value_idx = op.indirect().expect("a declared gather").value;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
@@ -508,7 +508,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
             },
         )
         .expect("the gather-copy op builds at both pins");
-        let value_idx = op.indirect.expect("a declared gather").value;
+        let value_idx = op.indirect().expect("a declared gather").value;
         let folds = SdscFoldSet::new(op.iter.cores_used());
         let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
         let j = serde_json::to_value(&e).unwrap();

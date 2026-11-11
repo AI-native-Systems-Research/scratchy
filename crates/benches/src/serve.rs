@@ -1830,11 +1830,9 @@ fn run_tasks(
     let mut json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
     add_task_percentiles(&mut json, &results, &tasks, &count, &pcts);
     add_task_requests(&mut json, &results, args.request_rate, &count);
-    // Forced answers are no reading of accuracy, and every one ran to its length by design.
     json["timed_answers"] = serde_json::json!(args.timed_answers);
     if args.timed_answers {
-        json["accuracy"] = serde_json::Value::Null;
-        json["capped_answers"] = serde_json::Value::Null;
+        unscore(&mut json);
     }
     print_task_summary(&dataset, &json);
     write_results(args, model, &json)
@@ -1861,6 +1859,22 @@ fn answer_tokens(r: &RequestResult, count_tokens: &dyn Fn(&str) -> usize) -> usi
         r.output_tokens
     } else {
         count_tokens(&r.generated_text)
+    }
+}
+
+/// A timed cell's JSON without its scores: forced answers are no reading of accuracy, and every
+/// one ran to its length by design, so its accuracy, its accuracy by group and each task's right
+/// or wrong are left out, and its capped count with them. Which tasks it sent stays.
+fn unscore(json: &mut serde_json::Value) {
+    for k in [
+        "accuracy",
+        "capped_answers",
+        "accuracy_by_group",
+        "task_right",
+    ] {
+        if json.get(k).is_some() {
+            json[k] = serde_json::Value::Null;
+        }
     }
 }
 
@@ -2508,6 +2522,41 @@ mod tests {
             serde_json::json!([1800, null, null, null])
         );
         assert_eq!(j["tpots_ms"], serde_json::json!([100.0, 100.0, null, null]));
+    }
+
+    /// A timed cell's answers are forced to one length, so none is scored: it records no accuracy,
+    /// none by group and no task's right or wrong, though it still says which tasks it sent.
+    #[test]
+    fn a_timed_cell_records_no_score_of_any_kind() {
+        let words = |t: &str| t.split_whitespace().count();
+        let mut r = req(2, 2, 0.1, 0.5);
+        r.generated_text = "Lyon.".into();
+        let mut t = rag("Paris");
+        t.label = Some(crate::workloads::TaskLabel {
+            id: "a".into(),
+            group: 2,
+        });
+        let mut j = task_metrics(&[r], &[t], &words, 1.0, "musique", 7);
+        assert_eq!(
+            j["accuracy_by_group"],
+            serde_json::json!({"2": 0.0}),
+            "scored before"
+        );
+        unscore(&mut j);
+        for k in [
+            "accuracy",
+            "capped_answers",
+            "accuracy_by_group",
+            "task_right",
+        ] {
+            assert!(j[k].is_null(), "{k} kept on a timed cell");
+        }
+        assert_eq!(
+            j["task_ids"],
+            serde_json::json!(["a"]),
+            "the tasks it sent stay"
+        );
+        assert_eq!(j["task_groups"], serde_json::json!([2]));
     }
 
     /// A labelled task's result is recorded task by task, in the order sent, with its id, its

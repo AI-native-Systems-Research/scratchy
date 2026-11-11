@@ -20,7 +20,7 @@ use scratchy_models::qwen3_5::qwen3_8_27b_fp8_dynamic_per_channel::{
 include!("common/cuda_tapes_fp8_body.rs");
 
 const STEM: &str = "qwen3.8-27b";
-const FEATURE: &str = "CARGO_FEATURE_QWEN3.8_27B_TEXT_ONLY";
+const FEATURE: &str = "QWEN3.8_27B_TEXT_ONLY";
 const ARCH: &str = "qwen3-5";
 
 const DECODE_STEPS: [(&str, usize); 11] = [

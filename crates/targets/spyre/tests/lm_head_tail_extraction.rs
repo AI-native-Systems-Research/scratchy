@@ -1,12 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// ⛔ RUN THIS FILE WITH `SCRATCHY_PLAN_ONLY_BAKE=1` — the door side of these gates
-// runs the KTIR→SuperDSC lowering, whose fixtures must not demand a device compiler.
-//
-//     SCRATCHY_PLAN_ONLY_BAKE=1 cargo test -p scratchy-target-spyre \
-//         --features spyre-emu --test lm_head_tail_extraction
-//
-// (See `superdsc_time_tile.rs`' header for why the variable is not set from
-// inside the test.)
 #![cfg(feature = "spyre-emu")]
 //! THE PREFILL LM-HEAD TAIL, END TO END — the extraction must feed the matmul the
 //! LAST REAL prompt row, at every `n <= m_cap`.
@@ -161,6 +153,18 @@ fn weight_pair(k: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
     (fuf, disk)
 }
 
+/// The extent pair every lowering call here states for its graph: one request of the
+/// graph's own `m` rows — the S=1 prefill pair (no AttnDecode in these tail graphs;
+/// the pair still must describe the graph it is handed, and it does).
+fn pair_of_one_request(m: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
+    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(m)
+            .expect("the fixture's row count is nonzero"),
+        scratchy_subtile::sdsc_abstract::RungCap::ONE,
+    )
+    .expect("one request's rows fit a u32")
+}
+
 /// Drive the graph through the real session path and return `(t5 result, t4 raw
 /// logits)` for the given pre-staged sources.
 fn run_tail(
@@ -174,6 +178,7 @@ fn run_tail(
         &weight_ids,
         superdsc::ActiveCap::FULL,
         false,
+        pair_of_one_request(ir.tensors[ir.result.index()].rows),
     )
     .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     // The window is stated EXPLICITLY: this hand-lowered test graph minted no LX
@@ -233,6 +238,7 @@ fn the_prefill_lm_head_tail_extracts_the_last_row() {
         &weight_ids,
         superdsc::ActiveCap::FULL,
         false,
+        pair_of_one_request(m),
     )
     .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
     let lmlast: Vec<&str> = ops
@@ -337,6 +343,7 @@ fn the_tail_at_m1_still_matches_the_reference() {
         &weight_ids,
         superdsc::ActiveCap::FULL,
         false,
+        pair_of_one_request(m),
     )
     .unwrap_or_else(|e| panic!("lower the m=1 tail: {e:?}"));
     let lmlast: Vec<&str> = ops
@@ -455,6 +462,7 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
         &weight_ids,
         superdsc::ActiveCap::FULL,
         false,
+        pair_of_one_request(m),
     )
     .unwrap_or_else(|e| panic!("lower the collision graph: {e:?}"));
     let lmlast: Vec<&str> = ops

@@ -16,19 +16,53 @@
 //! change was semantics-preserving for arches the host cannot compile.
 //!
 //! ```text
-//! cargo run -p scratchy-forward-compiler-macro --example emit_arch -- qwen3
+//! cargo run -p scratchy-forward-compiler-macro --example emit_arch -- qwen3 "" qwen3-0.6b
 //! ```
 //!
 //! Writes nothing; redirect stdout to capture. Stderr carries progress.
 
-use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
+use scratchy_forward_compiler_macro::{Scope, compile_carrier, parse_python_file, render_tokens};
 use std::path::PathBuf;
 
 fn main() {
-    let arch = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("usage: emit_arch <arch>   (e.g. qwen3, gemma3-mm, deepseek-v2)");
+    let mut args = std::env::args().skip(1);
+    let arch = args.next().unwrap_or_else(|| {
+        eprintln!(
+            "usage: emit_arch <arch> [presets] [stems...]   (e.g. qwen3, gemma3-mm, deepseek-v2)"
+        );
         std::process::exit(2);
     });
+    // The quant presets the emission synthesizes variants for — a value, stated
+    // here in one place with all three cases:
+    //   - `emit_arch qwen3 fp8-dynamic-per-channel,ggml qwen3-0.6b` — a comma
+    //     list: only those presets synthesize (what a build with those
+    //     `quant/<preset>` features emits).
+    //   - `emit_arch qwen3 "" qwen3-0.6b` — the empty string: dense-only,
+    //     matching a plain `-Fmodel/<stem>` build with no quant features (the
+    //     form `scripts/emit-arch.sh` passes by default).
+    //   - `emit_arch qwen3` — no argument at all: every preset and every stem
+    //     in the arch, the legacy bare-invocation behaviour.
+    let quants = args.next().map(|presets| {
+        presets
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    // The models to emit, as explicit stems of this arch — a value too: the
+    // scope is never read out of the environment here. Zero stems = every
+    // config in the arch (the bare verification run); `scripts/emit-arch.sh`
+    // passes the one stem it means as this argument.
+    let stems: Vec<String> = args.collect();
+    let mut scope = if stems.is_empty() {
+        Scope::all()
+    } else {
+        let pairs: Vec<(&str, &str)> = stems.iter().map(|s| (arch.as_str(), s.as_str())).collect();
+        Scope::stems(&pairs)
+    };
+    if let Some(presets) = quants {
+        scope = scope.with_quants(presets);
+    }
 
     // This example lives in crates/compiler/macros/, so the repo root is
     // three levels up. Resolved from CARGO_MANIFEST_DIR so the tool works
@@ -51,7 +85,7 @@ fn main() {
     let text = std::fs::read_to_string(&dsl_path).expect("read DSL");
     let carrier =
         parse_python_file(&text).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let tokens = compile_carrier(carrier, &configs_dir)
+    let tokens = compile_carrier(carrier, &configs_dir, None, &scope)
         .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
 
     let mut rendered = String::with_capacity(1 << 20);

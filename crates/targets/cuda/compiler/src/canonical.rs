@@ -1436,7 +1436,7 @@ pub fn plan_canonical_folding(
     let colouring = colour_tape(
         &graph,
         &tape,
-        &lowered.bindings,
+        lowered.bindings(),
         &folds.fold_facts(),
         &CUDA_COLOUR_FACTS,
     )
@@ -1479,7 +1479,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let moe = arena.as_ref().ok().and_then(|a| a.moe);
     let cx = StepCx {
         graph: &plan.graph,
-        bindings: &plan.lowered.bindings,
+        bindings: plan.lowered.bindings(),
         colouring: &plan.colouring,
         folds: &plan.folds,
         facts: plan.facts,
@@ -1566,7 +1566,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             _ => None,
         })
         .collect();
-    let weight_bytes = (plan.lowered.bindings.iter().enumerate())
+    let weight_bytes = (plan.lowered.bindings().iter().enumerate())
         .map(|(t, binding)| match binding {
             // An fp8 bank's per-channel scales are packed into its bank's buffer
             // (`step::fp8_moe_layout`), so their own sources hold nothing, as an fp8 weight's
@@ -1914,7 +1914,7 @@ fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
     let head_dim = plan.facts.head_dim;
     let mut k_layers = BTreeMap::new();
     let mut v_layers = BTreeMap::new();
-    for (t, binding) in plan.lowered.bindings.iter().enumerate() {
+    for (t, binding) in plan.lowered.bindings().iter().enumerate() {
         let cols = plan.graph.tensors[t].cols;
         match *binding {
             SourceBinding::PrefixK { layer } => {
@@ -1977,7 +1977,7 @@ fn kv_cache_of_classes(
     };
     let mut k_layers = BTreeMap::new();
     let mut v_layers = BTreeMap::new();
-    for (t, binding) in plan.lowered.bindings.iter().enumerate() {
+    for (t, binding) in plan.lowered.bindings().iter().enumerate() {
         let cols = plan.graph.tensors[t].cols;
         match *binding {
             SourceBinding::PrefixK { layer } => {
@@ -2228,7 +2228,7 @@ fn tape_steps<'p>(plan: &'p CudaPlan) -> impl Iterator<Item = TapeStep<'p>> + 'p
 /// step is refused as `GdnLayer`).
 fn gdn_layers(plan: &CudaPlan) -> Vec<u32> {
     let layers: std::collections::BTreeSet<u32> = gdn_steps(plan)
-        .filter_map(|s| gdn_bundle_layer(&plan.lowered.bindings, &s))
+        .filter_map(|s| gdn_bundle_layer(plan.lowered.bindings(), &s))
         .collect();
     layers.into_iter().collect()
 }
@@ -2258,7 +2258,7 @@ fn embedded_hidden(plan: &CudaPlan) -> Result<TensorShape, ArenaRefusal> {
 
 /// The index and shape of the one source bound to the embedded hidden.
 fn embedded_hidden_source(plan: &CudaPlan) -> Result<(usize, TensorShape), ArenaRefusal> {
-    let mut hidden = (plan.lowered.bindings.iter().enumerate())
+    let mut hidden = (plan.lowered.bindings().iter().enumerate())
         .filter(|(_, b)| **b == SourceBinding::EmbeddedHidden)
         .map(|(t, _)| (t, plan.graph.tensors[t]));
     match (hidden.next(), hidden.next()) {
@@ -2319,7 +2319,7 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     }
     let mut table = |local: bool| {
         let class = plan.facts.table_class(local);
-        let bound = (plan.lowered.bindings).contains(&SourceBinding::Cos { local });
+        let bound = (plan.lowered.bindings()).contains(&SourceBinding::Cos { local });
         class
             .filter(|_| bound)
             .map(|c| {
@@ -2334,7 +2334,7 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     let rotary = table(false)?;
     let rotary_local = table(true)?;
     let binds_prefix =
-        (plan.lowered.bindings.iter()).any(|b| matches!(b, SourceBinding::PrefixK { .. }));
+        (plan.lowered.bindings().iter()).any(|b| matches!(b, SourceBinding::PrefixK { .. }));
     let kv = binds_prefix
         .then(|| {
             let mut region = |entries: u64| -> Result<ArenaSpan, ArenaRefusal> {

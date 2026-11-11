@@ -454,9 +454,11 @@ pub struct CudaTape {
     /// The MoE scratch, exactly when a step is a MoE step (a router, a routing, a sort, an expert
     /// projection or a combine); `None` for a tape with no mixture of experts.
     pub moe: Option<MoeTape>,
-    /// The decode GEMVs' split-K scratch (#1031): the f32 partials of the one GEMV running at a
-    /// time, `step::gemv_scratch_bytes` of the largest split step, exactly when a `Gemv`, a GEMV
-    /// `RouterLogits` or an `ExpertGemv` takes more than one K split; `None` otherwise. Only those
+    /// The decode's split scratch: the f32 partials of the one split step running at a time,
+    /// `CudaStep::gemv_scratch` of the largest. That is a decode GEMV's split-K partials (#1031:
+    /// a `Gemv`, a GEMV `RouterLogits` or an `ExpertGemv` above one K split), or a decode
+    /// attention's split partials (W6b: every `AttnDecode`, `step::attn_decode_scratch_bytes`,
+    /// written by its split launch and read by its merge). `None` when no step splits. Only those
     /// steps read or write it, and nothing in it outlives the step.
     pub gemv_scratch: Option<ArenaSpan>,
 }
@@ -4043,12 +4045,27 @@ mod tests {
         };
         // `kv_tape` is a 256-row bucket: a one-row decode in it is refused for the bucket, a
         // 256-row one for its rows. (The whole one-row qwen3.5 tape validates: `cuda_tapes`.)
+        // Each with the split scratch its decode's partials need (W6b), at the arena's end, as the
+        // canonical places it.
+        let with_scratch = |t: CudaTape| {
+            let want = (crate::step::attn_decode_scratch_bytes(2, 256))
+                .expect("the partials")
+                .1;
+            CudaTape {
+                gemv_scratch: Some(span(t.arena.total_bytes, want)),
+                arena: ArenaLayout {
+                    total_bytes: t.arena.total_bytes + want,
+                    ..t.arena
+                },
+                ..t
+            }
+        };
         assert_eq!(
-            kv_tape(KV, &[decode(1, 2)]).validate(),
+            with_scratch(kv_tape(KV, &[decode(1, 2)])).validate(),
             Err(TapeError::OneRowStep { step: 0, rows: 1 })
         );
         assert_eq!(
-            kv_tape(KV, &[decode(256, 2)]).validate(),
+            with_scratch(kv_tape(KV, &[decode(256, 2)])).validate(),
             Err(TapeError::OneRowStep { step: 0, rows: 256 })
         );
         let e = decode(1, 2).extents().expect("the decode's extents");

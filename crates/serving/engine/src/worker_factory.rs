@@ -32,7 +32,7 @@ pub struct WorkerCreateConfig {
     /// Optional HuggingFace token for gated models.
     pub hf_token: Option<String>,
     /// KV cache block size in tokens (must match the scheduler's block size).
-    pub block_size: usize,
+    pub block_size: scratchy_core_common::KvBlockTokens,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
     /// Maximum concurrently-resident sequences (scheduler `max_num_seqs`).

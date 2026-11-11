@@ -95,18 +95,34 @@ pub enum ConvertModel {
 impl ConvertModel {
     /// Whether a `from` → `to` `arith.extf` writes LANE-PERMUTED output under
     /// this model: only the card's f16→f32 (the pair the bake maps 1:1 to
-    /// `dl16tofp32`), with the arrangement read from the same const table the
-    /// bake reads — the row says `Standard`, nothing permutes.
+    /// `dl16tofp32`), with the arrangement read from the same device-facts
+    /// table the bake reads (`ktir_core::ddl_binds`, keyed by the typed
+    /// `DeviceOp`) — no row, or a `Standard` row, permutes nothing.
     ///
     /// The ONE decision: a widen runs either on the interpreter (`extf`) or inside
     /// a fused Metal map window, and both ask here, so the two paths a window can
     /// take cannot disagree on which widens permute.
     pub fn widen_staggers(self, from: Option<DType>, to: Option<DType>) -> bool {
+        // The emulator's ONE entry into the table: it consumes the generation
+        // the bake baked for, it does not choose one — `Baked` is named here
+        // alone, and the consult itself is generic over `G` below.
+        self.widen_staggers_for_generation::<ktir_core::ddl_binds::Baked>(from, to)
+    }
+
+    /// The consult, generic over the generation `G` — the same reader shape
+    /// the bake's readers take (`legalize_types::run`, `staggered_sources`);
+    /// the entry above chooses the baked generation once.
+    pub fn widen_staggers_for_generation<G: ktir_core::ddl_binds::DeviceGen>(
+        self,
+        from: Option<DType>,
+        to: Option<DType>,
+    ) -> bool {
         self == ConvertModel::Card
             && from == Some(DType::F16)
             && to == Some(DType::F32)
-            && ktir_superdsc::element_arrangement::output_arrangement_of("dl16tofp32")
-                == Some(ktir_superdsc::element_arrangement::ElementArrangement::Dl16ToFp32)
+            && ktir_core::ddl_binds::output_arrangement::<G>(
+                ktir_core::ddl_binds::DeviceOp::Dl16ToFp32,
+            ) == ktir_core::ddl_binds::ElementArrangement::Dl16ToFp32
     }
 }
 

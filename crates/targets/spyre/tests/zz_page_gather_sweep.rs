@@ -575,6 +575,7 @@ fn paged_program(frame: Frame, entries: u64, slab: u64, pages: u64) -> KtirNode 
         ],
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     }
@@ -763,7 +764,7 @@ fn write_cell(
     let synth = l.synth.borrow();
     let mut seg_bytes = l.segment_bytes;
     let intermediate = SegRole::Intermediate.segment();
-    seg_bytes[intermediate] = seg_bytes[intermediate].max(synth.next);
+    seg_bytes[intermediate] = seg_bytes[intermediate].max(synth.high_water());
     let mut s = String::new();
     s.push_str("{\n  \"segment_bytes\": [");
     for (i, b) in seg_bytes.iter().enumerate() {
@@ -787,7 +788,7 @@ fn write_cell(
             )
         })
         .collect();
-    for (name, off) in synth.map.iter() {
+    for (name, off, size) in synth.iter() {
         let tid: u32 = name
             .trim_start_matches('t')
             .parse()
@@ -803,19 +804,19 @@ fn write_cell(
             },
             intermediate,
             off,
-            synth.sizes.get(name).copied().unwrap_or(0),
+            size,
         ));
     }
     s.push_str(&rows.join(",\n"));
     s.push_str("\n  ],\n  \"synth\": [\n");
-    for (i, (name, off)) in synth.map.iter().enumerate() {
+    for (i, (name, off, size)) in synth.iter().enumerate() {
         s.push_str(&format!(
             "    {{\"name\": \"{}\", \"segment\": {}, \"offset\": {}, \"size\": {}}}{}\n",
             name,
             intermediate,
             off,
-            synth.sizes.get(name).copied().unwrap_or(0),
-            if i + 1 == synth.map.len() { "" } else { "," },
+            size,
+            if i + 1 == synth.len() { "" } else { "," },
         ));
     }
     s.push_str("  ],\n  \"scalarmul_scales\": [\n  ]\n}\n");

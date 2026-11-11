@@ -210,14 +210,14 @@ fn trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec<SdscOp> {
             let mut op = e.dsc().clone();
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for node in dsc.scheduleTree_.iter_mut() {
-                        let ti = node.ldsIdx_ as usize;
+                    for mut node in dsc.scheduleTree_.edit() {
+                        let ti = node.operand();
                         let Some(stride) = e.affine_strides.get(ti).and_then(|m| m.get("out"))
                         else {
                             continue; // non-tiled tensor — base address unchanged.
                         };
                         let bump = t as i64 * *stride;
-                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                        for v in node.start_addrs().values_mut() {
                             // The address is a STRING on the wire (the torch-spyre frontend's form).
                             // A value that does not parse is a descriptor this bump cannot express,
                             // and silently treating it as 0 would move the tensor to segment 0 — so
@@ -274,7 +274,7 @@ pub fn write_placements(
     let mut seg_bytes = layout.segment_bytes;
     let intermediate = ktir_superdsc::placement::SegRole::Intermediate.segment();
     if intermediate < seg_bytes.len() {
-        seg_bytes[intermediate] = seg_bytes[intermediate].max(synth.next);
+        seg_bytes[intermediate] = seg_bytes[intermediate].max(synth.high_water());
     }
     s.push_str("{\n  \"segment_bytes\": [");
     for (i, b) in seg_bytes.iter().enumerate() {
@@ -299,15 +299,15 @@ pub fn write_placements(
         );
     }
     s.push_str("  ],\n  \"synth\": [\n");
-    for (i, (name, off)) in synth.map.iter().enumerate() {
+    for (i, (name, off, size)) in synth.iter().enumerate() {
         let _ = writeln!(
             s,
             "    {{\"name\": \"{}\", \"segment\": {}, \"offset\": {}, \"size\": {}}}{}",
             name,
             intermediate,
             off,
-            synth.sizes.get(name).copied().unwrap_or(0),
-            if i + 1 == synth.map.len() { "" } else { "," }
+            size,
+            if i + 1 == synth.len() { "" } else { "," }
         );
     }
     // ⛔⛔⛔ THE SCALARMUL SCALES, AND WITHOUT THEM A DECODER SILENTLY COMPUTES ITS OWN RESIDUAL.

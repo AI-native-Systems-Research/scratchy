@@ -24,8 +24,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use scratchy_core_common::{
-    EngineCoreOutput, EngineCoreOutputs, FinishReason, Request, RequestStatus, SchedulerStats,
-    StopReason,
+    EngineCoreOutput, EngineCoreOutputs, FinishReason, KvBlockTokens, Request, RequestStatus,
+    SchedulerStats, StopReason,
 };
 use scratchy_core_config::SchedulerConfig;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
@@ -83,8 +83,9 @@ pub struct EngineCore {
     /// Whether the engine is in pooling mode (embedding-only).
     is_pooling: bool,
 
-    /// KV cache block size in tokens (for seal-pad block alignment checks).
-    block_size: usize,
+    /// KV cache block size in tokens (for seal-pad block alignment checks) — the one
+    /// typed value minted at the engine's door ([`crate::init`]); never re-minted here.
+    block_size: KvBlockTokens,
 
     /// 🦭 Sealed request IDs that have already generated an EOS/stop token.
     /// Tracked so check_stop_criteria can defer stopping until block-aligned.
@@ -107,8 +108,8 @@ pub struct EngineCoreConfig {
     pub max_model_len: usize,
     /// Number of GPU blocks available for KV cache.
     pub num_gpu_blocks: usize,
-    /// Block size (tokens per block).
-    pub block_size: usize,
+    /// Block size (tokens per block) — the typed value minted once at the engine's door.
+    pub block_size: KvBlockTokens,
     /// Engine index for data-parallel setups.
     pub engine_index: u32,
     /// Whether to enable async scheduling.
@@ -138,7 +139,7 @@ pub struct EngineCoreConfig {
 
 /// Hybrid SWA KV config for [`EngineCoreConfig::hybrid_kv`]: the shared-pool
 /// size and the per-group specs `(is_sliding, window_tokens, block_size)`.
-pub type HybridKvConfig = (usize, Vec<(bool, usize, usize)>);
+pub type HybridKvConfig = (usize, Vec<(bool, usize, KvBlockTokens)>);
 
 /// Output from a single engine step, grouped by client index.
 pub type StepOutputs = HashMap<u32, EngineCoreOutputs>;
@@ -367,7 +368,7 @@ impl EngineCore {
             "EngineCore initialized: max_model_len={}, num_gpu_blocks={}, block_size={}, eos_token_ids={:?}, spec_decode={}, pooling={}",
             config.max_model_len,
             config.num_gpu_blocks,
-            config.block_size,
+            config.block_size.get(),
             config.eos_token_ids,
             proposer.is_some(),
             config.is_pooling,
@@ -1146,7 +1147,7 @@ impl EngineCore {
         // 1. For sealed requests in padding mode, check block alignment.
         if is_sealed && self.seal_eos_seen.contains(req_id) {
             let total_tokens = request.all_token_ids.len();
-            if total_tokens % self.block_size == 0 {
+            if total_tokens % self.block_size.get() == 0 {
                 self.seal_eos_seen.remove(req_id);
                 return (Some(FinishReason::Stop), Some(StopReason::Token(0)));
             }
@@ -1155,7 +1156,7 @@ impl EngineCore {
 
         // 2. Check max_tokens. For sealed requests, defer until block-aligned.
         if num_output_tokens >= request.max_tokens {
-            if is_sealed && request.all_token_ids.len() % self.block_size != 0 {
+            if is_sealed && request.all_token_ids.len() % self.block_size.get() != 0 {
                 self.seal_eos_seen.insert(req_id.to_string());
                 return (None, None);
             }
@@ -1358,7 +1359,7 @@ mod tests {
             },
             max_model_len: 4096,
             num_gpu_blocks: 1024,
-            block_size: 16,
+            block_size: KvBlockTokens::new(16).expect("16 > 0"),
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
@@ -1886,7 +1887,7 @@ mod tests {
             },
             max_model_len: 4096,
             num_gpu_blocks: 1024,
-            block_size: 16,
+            block_size: KvBlockTokens::new(16).expect("16 > 0"),
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: true,
@@ -2461,7 +2462,7 @@ mod tests {
         // A sealed request hitting EOS should NOT stop immediately.
         // It should continue generating (SealPadProcessor forces pads on GPU).
         let mut config = make_test_config();
-        config.block_size = 4;
+        config.block_size = KvBlockTokens::new(4).expect("4 > 0");
         config.eos_token_ids = vec![1000]; // NoopExecutor's first token
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);
@@ -2509,7 +2510,7 @@ mod tests {
         // A sealed request should stop when total tokens reach block alignment
         // after EOS has been seen.
         let mut config = make_test_config();
-        config.block_size = 4;
+        config.block_size = KvBlockTokens::new(4).expect("4 > 0");
         config.eos_token_ids = vec![1000];
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);
@@ -2582,7 +2583,7 @@ mod tests {
         // Step 1: 1 output → 3 total, max_tokens hit, not aligned → defer.
         // Step 2: 4 total, aligned → stop.
         let mut config = make_test_config();
-        config.block_size = 4;
+        config.block_size = KvBlockTokens::new(4).expect("4 > 0");
         config.eos_token_ids = vec![9999]; // won't be generated
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);
@@ -2633,7 +2634,7 @@ mod tests {
         //   Step 3: 4 tokens. 4%4==0 → stop. Total output = 3.
 
         let mut config = make_test_config();
-        config.block_size = 4;
+        config.block_size = KvBlockTokens::new(4).expect("4 > 0");
         config.eos_token_ids = vec![1000];
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);
@@ -2673,7 +2674,7 @@ mod tests {
     fn test_non_sealed_request_still_stops_on_eos() {
         // Verify we didn't break normal (non-sealed) EOS behavior.
         let mut config = make_test_config();
-        config.block_size = 4;
+        config.block_size = KvBlockTokens::new(4).expect("4 > 0");
         config.eos_token_ids = vec![1000];
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);

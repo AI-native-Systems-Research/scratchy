@@ -20,7 +20,7 @@ use scratchy_models::gemma4_moe::gemma_4_26b_a4b_it_fp8_dynamic_per_channel::{
 include!("common/cuda_tapes_fp8_body.rs");
 
 const STEM: &str = "gemma-4-26b-a4b-it";
-const FEATURE: &str = "CARGO_FEATURE_GEMMA_4_26B_A4B_IT";
+const FEATURE: &str = "GEMMA_4_26B_A4B_IT";
 const ARCH: &str = "gemma4-moe";
 
 const DECODE_STEPS: [(&str, usize); 19] = [

@@ -1224,6 +1224,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "libc",
+ "rustix",
  "tracing",
 ]
 
@@ -1954,6 +1955,7 @@ version = "0.1.0"
 dependencies = [
  "half",
  "ktir-core",
+ "ktir-superdsc",
  "scratchy-tp-world",
  "serde",
  "serde_json",
@@ -3479,6 +3481,7 @@ dependencies = [
  "objc2-metal",
  "proc-macro2",
  "rayon",
+ "scratchy-core-common",
  "scratchy-core-config",
  "scratchy-core-model",
  "scratchy-forward-compiler",

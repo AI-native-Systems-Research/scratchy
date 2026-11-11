@@ -132,6 +132,143 @@ pub struct ModelParams {
     /// evaluates to the bound's value, which makes its derivation's law (an exact quotient) a bound
     /// rustc checks.
     pub derived: BTreeMap<String, crate::dim::Dim>,
+    /// ⭐ THE TEXT BACKBONE'S GEOMETRY, typed at load ([`TextGeometry`]): the layer count, the
+    /// attention head dim and the RoPE base, each resolved ONCE where the config is read. A config
+    /// that cannot state one is a load error every scope reaches; no reader re-reads the keys, and
+    /// none defaults them.
+    pub text: TextGeometry,
+}
+
+/// The decoder layer count a config states (`num_hidden_layers`, or the length of its block
+/// schedule). Never zero: a decoder of no layers is not a config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerCount(std::num::NonZeroU32);
+
+impl LayerCount {
+    pub fn get(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+/// The attention head dim a config states, or the one the loader derives where it states none
+/// (`hidden_size / num_attention_heads`, MLA's `qk_nope + qk_rope`: [`derive_implicit_bounds`],
+/// the one derivation). Never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadDim(std::num::NonZeroU32);
+
+impl HeadDim {
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// The RoPE base frequency θ the model computes with: the config's stated `rope_theta` (after
+/// [`normalize_hf_config`]'s hoists and the arch's `config_aliases`), else the ARCH's own default
+/// (`scalar_defaults.rope_theta` in its `arch.json` — the architecture's config class default, the
+/// value its checkpoints were trained against when they omit it, never a value this compiler
+/// picks). A config that states none of an arch that declares none is a load error. Finite and
+/// positive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeTheta(f64);
+
+impl RopeTheta {
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// The text backbone's geometry, typed at load — see [`ModelParams::text`]. A `#[vision_forward]`
+/// config is a VL wrapper whose `text_config` states the decoder it feeds; its tower's own
+/// geometry is the `vision_*` bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextGeometry {
+    pub layers: LayerCount,
+    pub head_dim: HeadDim,
+    pub rope_theta: RopeTheta,
+    /// The sliding (local) attention class's RoPE base, when the config states one
+    /// (`rope_local_base_freq`, after the hoists and the arch's aliases: gemma-3/4's
+    /// `rope_parameters.sliding_attention.rope_theta`, modernbert's `local_rope_theta`). NOT
+    /// defaulted to [`Self::rope_theta`]: no architecture in tree defines its local base as the
+    /// global one, so a body that reads a local rotary table takes it through
+    /// [`Self::rope_local_for`], which refuses a config that states none.
+    pub rope_local: Option<RopeTheta>,
+}
+
+impl TextGeometry {
+    /// Resolve the geometry from a config's normalized json and its harvested bounds/scalars (after
+    /// every derivation and arch default has run), or name the fact the config does not state.
+    pub(crate) fn of(
+        bounds: &BTreeMap<String, u64>,
+        scalars: &BTreeMap<String, f64>,
+        source_path: &Path,
+    ) -> Result<Self, ConfigError> {
+        let missing = |reason: String| ConfigError::Geometry {
+            path: source_path.to_path_buf(),
+            reason,
+        };
+        let layers = bounds
+            .get("num_hidden_layers")
+            .and_then(|&n| u32::try_from(n).ok())
+            .and_then(std::num::NonZeroU32::new)
+            .map(LayerCount)
+            .ok_or_else(|| {
+                missing(
+                    "no `num_hidden_layers` (nor a block schedule to count): a decoder states \
+                     how many layers it has"
+                        .to_string(),
+                )
+            })?;
+        let head_dim = bounds
+            .get("head_dim")
+            .and_then(|&hd| u32::try_from(hd).ok())
+            .and_then(std::num::NonZeroU32::new)
+            .map(HeadDim)
+            .ok_or_else(|| {
+                missing(format!(
+                    "no nonzero `head_dim`, stated or derived (`hidden_size / \
+                     num_attention_heads` where it divides): `head_dim` {:?}, `hidden_size` {:?}, \
+                     `num_attention_heads` {:?}",
+                    bounds.get("head_dim"),
+                    bounds.get("hidden_size"),
+                    bounds.get("num_attention_heads"),
+                ))
+            })?;
+        let theta = scalars.get("rope_theta").copied().ok_or_else(|| {
+            missing(
+                "no `rope_theta`, and its arch declares no default \
+                 (`scalar_defaults.rope_theta` in the arch's arch.json, cited to the \
+                 architecture's own config class)"
+                    .to_string(),
+            )
+        })?;
+        if !(theta.is_finite() && theta > 0.0) {
+            return Err(missing(format!("`rope_theta` is {theta}")));
+        }
+        let rope_local = match scalars.get("rope_local_base_freq").copied() {
+            None => None,
+            Some(t) if t.is_finite() && t > 0.0 => Some(RopeTheta(t)),
+            Some(t) => return Err(missing(format!("`rope_local_base_freq` is {t}"))),
+        };
+        Ok(Self {
+            layers,
+            head_dim,
+            rope_theta: RopeTheta(theta),
+            rope_local,
+        })
+    }
+
+    /// The local rotary class's base for a body that READS a local rotary table (`RotaryLocal`):
+    /// the config's stated value, or a build error naming the config — a local table baked at the
+    /// global base would rotate every sliding layer at the wrong frequency, silently.
+    pub fn rope_local_for(&self, stem: &str) -> RopeTheta {
+        self.rope_local.unwrap_or_else(|| {
+            panic!(
+                "model `{stem}`: its body reads a local (sliding) rotary table, but its config \
+                 states no `rope_local_base_freq` (nor an arch alias for one) — the local base is \
+                 the checkpoint's fact, never the global base"
+            )
+        })
+    }
 }
 
 pub use crate::bundles::ExpertActivation;
@@ -302,6 +439,12 @@ pub enum ConfigError {
         stem: String,
         tensors: Vec<String>,
     },
+    /// A config whose text geometry ([`TextGeometry`]) cannot be stated: no layer count, a zero
+    /// head dim, no RoPE base where neither it nor its arch states one.
+    Geometry {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -341,6 +484,9 @@ impl std::fmt::Display for ConfigError {
                  tensors: {}",
                 tensors.join(", ")
             ),
+            Self::Geometry { path, reason } => {
+                write!(f, "text geometry of {}: {reason}", path.display())
+            }
         }
     }
 }
@@ -372,8 +518,9 @@ impl std::error::Error for ConfigError {}
 pub fn load_dir(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    scope: &Scope,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Decoder, spec)
+    load_dir_mode(dir, ConfigMode::Decoder, spec, scope)
 }
 
 /// [`load_dir`] for a `#[vision_forward]` crate's configs/ dir.
@@ -384,42 +531,9 @@ pub fn load_dir(
 pub fn load_dir_vision(
     dir: &Path,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    scope: &Scope,
 ) -> Result<Vec<ModelParams>, ConfigError> {
-    load_dir_mode(dir, ConfigMode::Vision, spec)
-}
-
-/// Process-wide set of `SCRATCHY_BUILD_FILTER` tags that matched at least
-/// one stem, across every arch directory `load_dir`/`load_dir_vision` has
-/// processed so far. One arch not containing a tag (e.g. "3.2-instruct"
-/// matching granite but not llama) is expected and not an error — only a
-/// tag matching NOTHING anywhere is, which `unmatched_build_filter_tags`
-/// (called once, after every arch has been emitted) catches.
-fn build_filter_seen() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-/// `SCRATCHY_BUILD_FILTER` tags that never matched a single stem in any
-/// arch, across the whole build. Call once, after every `load_dir`/
-/// `load_dir_vision` invocation has run (i.e. from `scratchy-forwards.rs`
-/// after its `par_iter` over arches completes) — a typo'd tag should fail
-/// the build loudly instead of silently compiling nothing.
-pub fn unmatched_build_filter_tags() -> Vec<String> {
-    let requested: Vec<String> = std::env::var("SCRATCHY_BUILD_FILTER")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_lowercase())
-                .filter(|x| !x.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let seen = build_filter_seen().lock().unwrap();
-    requested
-        .into_iter()
-        .filter(|t| !seen.contains(t))
-        .collect()
+    load_dir_mode(dir, ConfigMode::Vision, spec, scope)
 }
 
 /// Process-wide count of models actually forward-expanded (dense bases +
@@ -449,6 +563,195 @@ fn selected_configs() -> &'static std::sync::Mutex<std::collections::BTreeSet<Pa
 
 pub fn selected_config_paths() -> Vec<PathBuf> {
     selected_configs().lock().unwrap().iter().cloned().collect()
+}
+
+/// What a build selects: the one fact every config-loading pass reads — which models, which
+/// heads, which quant presets. A PURE VALUE: no fact enters a scope except as an argument,
+/// and this crate reads no environment. The build script of the crate that owns the feature
+/// flags states it — [`Scope::from_feature_flags`] with cargo's own delivery of those flags
+/// (the `CARGO_FEATURE_*` names for the stem list, `cfg!` for `mtp`/`mtp-heads`) plus the
+/// `quant/<preset>` union via [`Scope::with_quants`]; a test states [`Scope::all`] or
+/// [`Scope::stems`] — the scope it means, never an env var hand-set into a test invocation.
+#[derive(Clone, Debug)]
+pub struct Scope {
+    /// Which models are selected, as the Cargo feature names their gates probe.
+    stems: StemSelection,
+    /// `mtp` (`spec/mtp`): drafters published as checkpoints of their own compile too.
+    mtp: bool,
+    /// `mtp-heads`: heads shipping inside their targets' checkpoints compile beside them.
+    mtp_heads: bool,
+    /// The quant presets the enabled `quant/<preset>` features named, as the
+    /// build computed them. `None` = unset = legacy behaviour (every
+    /// backend-applicable preset; see `quant_preset_active`).
+    quants: Option<std::collections::HashSet<String>>,
+}
+
+/// The selected-models predicate's data. Cargo feature names are one flat namespace with no
+/// directory scoping, so the scope stores NAMES and the predicate probes the exact candidates
+/// an `(arch, stem)` pair legitimately owns — never a blind OR across candidates belonging to
+/// a different arch (the `VISION_ARCH_FOR_STEM` cross-contamination trap, documented at its
+/// table).
+#[derive(Clone, Debug)]
+enum StemSelection {
+    /// Every stem selected — what a test means by "the configs on disk, all of them".
+    All,
+    /// The enabled feature names, exactly as [`Scope::from_feature_flags`] received them.
+    Features(std::collections::HashSet<String>),
+}
+
+/// A handful of stems are byte-identical files checked into two arch dirs at once (the same
+/// checkpoint, loadable via a vision arch or its non-vision base arch — e.g. `qwen2-vl-2b-mlx`
+/// under both `qwen2/` and `qwen2-vl/`); for those the vision arch keeps the bare stem and the
+/// base arch's copy is `<stem>-text-only` (this table, verified per pair against
+/// crates/models/arch/Cargo.toml — mirrors the Cargo.toml feature-name generator exactly,
+/// must stay in sync with it). The table matters for correctness, not just naming: the bare
+/// `<stem>` feature genuinely exists (scoped to the vision arch), so a naive "check bare OR
+/// arch-prefixed OR text-only-suffixed, any hit counts" probe would cross-contaminate —
+/// enabling the vision arch's bare feature would ALSO look enabled to the base arch's
+/// identical-stem file, since Cargo features are one flat namespace with no directory
+/// scoping baked into the env var. So each (arch, stem) pair here checks EXACTLY the one
+/// candidate name that arch could legitimately own, never a blind OR across candidates that
+/// belong to a different arch.
+///
+/// Any other collision not covered by the table falls back to `<arch>-<stem>` — safe to also
+/// probe bare `<stem>` there without cross-contamination risk, because in that fallback
+/// shape Cargo never declares a bare `<stem>` feature for EITHER colliding arch (only the
+/// two `<arch>-<stem>` forms), so the bare env var can never be set.
+const VISION_ARCH_FOR_STEM: &[(&str, &str)] = &[
+    ("qwen2-vl-2b-mlx", "qwen2-vl"),
+    ("qwen2.5-vl-3b-mlx", "qwen2-5-vl"),
+    ("locateanything-3b", "locateanything"),
+    ("qwen3.5-9b", "qwen3-5-vl"),
+    ("qwen3.6-27b", "qwen3-5-vl"),
+    ("qwen3.8-27b", "qwen3-5-vl"),
+];
+
+/// The Cargo feature names an `(arch, stem)` pair's gate probes, in the priority the ambient
+/// reads established: a `VISION_ARCH_FOR_STEM` stem owns EXACTLY ONE candidate (the bare
+/// stem under its vision arch, `<stem>-text-only` under the base arch sharing the identical
+/// file); any other stem falls back to the bare name OR'd with `<arch>-<stem>`, where Cargo
+/// never declares the bare name for either colliding arch, so probing it is safe.
+fn feature_candidates(arch_name: &str, stem: &str) -> [String; 2] {
+    match VISION_ARCH_FOR_STEM.iter().find(|(s, _)| *s == stem) {
+        Some((_, vision_arch)) if arch_name == *vision_arch => [stem.to_string(), String::new()],
+        Some(_) => [format!("{stem}-text-only"), String::new()],
+        None => [stem.to_string(), format!("{arch_name}-{stem}")],
+    }
+}
+
+/// Cargo's own feature-name → env-var transform: uppercase, `-` → `_`, every other byte
+/// verbatim — including `.`.
+fn feature_env_name(feature: &str) -> String {
+    feature.to_uppercase().replace('-', "_")
+}
+
+impl Scope {
+    /// The build's own statement, as pure values. `stems` is cargo's delivery of the
+    /// target crate's `model/*` feature flags — the `CARGO_FEATURE_*` names, read by the
+    /// build script of the crate that owns them (the ONE dynamic read: `cfg!` cannot
+    /// loop over the stem list, and a hand-restated probe table would be a second copy
+    /// of Cargo.toml). `mtp`/`mtp_heads` arrive as the booleans that crate's own `cfg!`
+    /// states — valid there, invalid here, where `cfg!` would see only the macro
+    /// crate's features. Quant presets are not part of this call: they live on
+    /// scratchy-quantizations and arrive via [`Scope::with_quants`].
+    pub fn from_feature_flags<I, S>(stems: I, mtp: bool, mtp_heads: bool) -> Scope
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Scope {
+            stems: StemSelection::Features(stems.into_iter().map(Into::into).collect()),
+            mtp,
+            mtp_heads,
+            quants: None,
+        }
+    }
+
+    /// Every model selected, no heads, every backend-applicable preset —
+    /// the scope a test means when it pins what an arch's configs/ on disk contain. An
+    /// explicit scope selecting nothing is caught by those pins; vacuity is impossible by
+    /// construction.
+    pub fn all() -> Scope {
+        Scope {
+            stems: StemSelection::All,
+            mtp: false,
+            mtp_heads: false,
+            quants: None,
+        }
+    }
+
+    /// The same scope with its presets stated: `Some` of exactly these names — an empty
+    /// iteration is the build's "no quant features enabled" (dense-only), a non-empty one
+    /// is the forwarded `quant/<preset>` union — replacing the every-preset `None` default.
+    pub fn with_quants<I, S>(mut self, presets: I) -> Scope
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.quants = Some(presets.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// A test's statement of the models it means, as explicit `(arch, stem)` pairs. Each
+    /// pair enables exactly the feature name its own gate probes: the one candidate a
+    /// `VISION_ARCH_FOR_STEM` pair owns, else the arch-qualified `<arch>-<stem>` — never
+    /// the bare `<stem>`, which belongs to no arch and would leak into every other arch
+    /// probing the same name.
+    pub fn stems(pairs: &[(&str, &str)]) -> Scope {
+        let mut on = std::collections::HashSet::new();
+        for (arch, stem) in pairs {
+            let name = match VISION_ARCH_FOR_STEM.iter().find(|(s, _)| *s == *stem) {
+                Some((_, vision_arch)) if *arch == *vision_arch => stem.to_string(),
+                Some(_) => format!("{stem}-text-only"),
+                None => format!("{arch}-{stem}"),
+            };
+            on.insert(feature_env_name(&name));
+        }
+        Scope {
+            stems: StemSelection::Features(on),
+            mtp: false,
+            mtp_heads: false,
+            quants: None,
+        }
+    }
+
+    /// Whether this scope enables the model feature `feature` — membership in the names
+    /// [`Scope::from_feature_flags`] received (or [`Scope::stems`] stated), never an env
+    /// probe.
+    fn feature_on(&self, feature: &str) -> bool {
+        match &self.stems {
+            StemSelection::All => true,
+            StemSelection::Features(on) => on.contains(&feature_env_name(feature)),
+        }
+    }
+
+    /// Whether `(arch, stem)` is selected: the pair's own candidates, probed against the
+    /// scope's stated names.
+    fn model_selected(&self, arch_name: &str, stem: &str) -> bool {
+        match &self.stems {
+            StemSelection::All => true,
+            StemSelection::Features(_) => feature_candidates(arch_name, stem)
+                .iter()
+                .filter(|c| !c.is_empty())
+                .any(|c| self.feature_on(c)),
+        }
+    }
+
+    /// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a
+    /// backend — probed against the scope's stated feature names, never the environment.
+    /// `scratchy-models`' build script runs an arch's pipeline only then (its `src/lib.rs`
+    /// gates each arch's `pub mod` the same way), and a target bakes in the facts of the
+    /// heads that compile beside it alone. Whether an arch ACTUALLY lowers is each
+    /// lowering's verdict — an op with no spyre lowering is a build error naming it, not a
+    /// silent skip here.
+    pub fn arch_compiled(&self, arch: &str) -> bool {
+        match &self.stems {
+            StemSelection::All => true,
+            StemSelection::Features(on) => {
+                arch_compiled_with(arch, |feature| on.contains(&feature_env_name(feature)))
+            }
+        }
+    }
 }
 
 /// Which macro is consuming the configs — `#[forward]` (Decoder) or
@@ -490,6 +793,7 @@ fn load_dir_mode(
     dir: &Path,
     mode: ConfigMode,
     spec: &crate::arch_spec::DeclaredArchSpec,
+    scope: &Scope,
 ) -> Result<Vec<ModelParams>, ConfigError> {
     init_stem_logging();
     if !dir.is_dir() {
@@ -502,66 +806,22 @@ fn load_dir_mode(
     // depends on this crate under the local rename `model = { package =
     // "scratchy-models", ... }`, so Cargo's `pkg/feature` CLI syntax already
     // reads as `--features model/granite-3.1-2b-instruct` — the alias
-    // carries the "this is a model" meaning.
-    //
-    // A handful of stems are byte-identical files checked into two arch
-    // dirs at once (the same checkpoint, loadable via a vision arch or its
-    // non-vision base arch — e.g. `qwen2-vl-2b-mlx` under both `qwen2/` and
-    // `qwen2-vl/`); for those the vision arch keeps the bare stem and the
-    // base arch's copy is `<stem>-text-only` (VISION_ARCH_FOR_STEM below,
-    // verified per pair against crates/models/arch/Cargo.toml — mirrors the
-    // Cargo.toml feature-name generator exactly, must stay in sync with it).
-    // This table matters for correctness, not just naming: the bare `<stem>`
-    // feature genuinely exists (scoped to the vision arch), so a naive
-    // "check bare OR arch-prefixed OR text-only-suffixed, any hit counts"
-    // probe would cross-contaminate — enabling the vision arch's bare
-    // feature would ALSO look enabled to the base arch's identical-stem
-    // file, since Cargo features are one flat namespace with no directory
-    // scoping baked into the env var. So each (arch, stem) pair here checks
-    // EXACTLY the one candidate name that arch could legitimately own, never
-    // a blind OR across candidates that belong to a different arch.
-    //
-    // Any other collision not covered by the table below falls back to
-    // `<arch>-<stem>` — safe to also probe bare `<stem>` there without
-    // cross-contamination risk, because in that fallback shape Cargo never
-    // declares a bare `<stem>` feature for EITHER colliding arch (only the
-    // two `<arch>-<stem>` forms), so the bare env var can never be set.
+    // carries the "this is a model" meaning. Which features are enabled is
+    // the SCOPE's statement (see `Scope`): the build states
+    // `Scope::from_feature_flags`, a test states `Scope::all`/`Scope::stems`
+    // — the candidate-name law
+    // itself (which name an (arch, stem) pair legitimately owns) lives at
+    // `VISION_ARCH_FOR_STEM` and `feature_candidates` above.
     //
     // A base whose feature isn't enabled is skipped BEFORE `read_json_file`
     // ever opens it below — the point being an unselected model's JSON is
-    // never even read, let alone forward-expanded. Read straight from
-    // Cargo's own `CARGO_FEATURE_*` env vars — this runs in the same
-    // build-script process as the feature-gated crate, so there's no
-    // proc-macro/IPC boundary to relay across and no need for a self-invented
-    // env var. Mirrors Cargo's own feature-name -> env-var transform
-    // (uppercase, `-` -> `_`, every other byte verbatim — including `.`).
-    const VISION_ARCH_FOR_STEM: &[(&str, &str)] = &[
-        ("qwen2-vl-2b-mlx", "qwen2-vl"),
-        ("qwen2.5-vl-3b-mlx", "qwen2-5-vl"),
-        ("locateanything-3b", "locateanything"),
-        ("qwen3.5-9b", "qwen3-5-vl"),
-        ("qwen3.6-27b", "qwen3-5-vl"),
-        ("qwen3.8-27b", "qwen3-5-vl"),
-    ];
+    // never even read, let alone forward-expanded.
     let arch_name = dir
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
-    let feature_env_var = |feature: &str| -> String {
-        format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"))
-    };
-    let model_feature_enabled = |arch_name: &str, stem: &str| -> bool {
-        if let Some((_, vision_arch)) = VISION_ARCH_FOR_STEM.iter().find(|(s, _)| *s == stem) {
-            let candidate = if arch_name == *vision_arch {
-                stem.to_string()
-            } else {
-                format!("{stem}-text-only")
-            };
-            return std::env::var(feature_env_var(&candidate)).is_ok();
-        }
-        std::env::var(feature_env_var(stem)).is_ok()
-            || std::env::var(feature_env_var(&format!("{arch_name}-{stem}"))).is_ok()
-    };
+    let model_feature_enabled =
+        |arch_name: &str, stem: &str| -> bool { scope.model_selected(arch_name, stem) };
     // A head (an arch registering under an identity of its own, `hf_architectures`) compiles beside
     // the targets it drafts for: one that ships inside its targets' checkpoints (`checkpoint_of`)
     // under scratchy-models' `mtp-heads` feature (which `metal` turns on, and `mtp` implies), on
@@ -571,8 +831,8 @@ fn load_dir_mode(
     // drafts with by default (`published_as`), under `mtp` (`spec/mtp`) every one, which drafts
     // when `--speculative-model` names it. Either way the target's verify steps carry the head's
     // drafts (`spec_drafts`, the head's arch.json).
-    let mtp = std::env::var(feature_env_var("mtp")).is_ok();
-    let mtp_heads = std::env::var(feature_env_var("mtp-heads")).is_ok();
+    let mtp = scope.mtp;
+    let mtp_heads = scope.mtp_heads;
     let configs_root = dir
         .parent()
         .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
@@ -591,7 +851,7 @@ fn load_dir_mode(
     // What the heads compiled beside a target config bake into it: the most drafts one of them
     // carries a sequence (its verify steps hold that many), and the layers whose outputs one reads
     // (`target_capture_layers`, its arch.json: a path into its own config), which the target
-    // captures. A head that does not compile in this build ([`arch_compiled`]: a metal-only
+    // captures. A head that does not compile in this build ([`Scope::arch_compiled`]: a metal-only
     // drafter under cuda) bakes nothing into it.
     let head_facts = |stem: &str, json: &serde_json::Value| -> Result<HeadFacts, ConfigError> {
         let mut facts = HeadFacts::default();
@@ -601,7 +861,7 @@ fn load_dir_mode(
         let this = format!("{arch_name}/{stem}");
         for arch_dir in arch_dirs(configs_root)? {
             let head_arch = (arch_dir.file_name()).and_then(|n| n.to_str());
-            if !head_arch.is_some_and(arch_compiled) {
+            if !head_arch.is_some_and(|a| scope.arch_compiled(a)) {
                 continue;
             }
             let head = load_arch_json(&arch_dir)?;
@@ -647,21 +907,15 @@ fn load_dir_mode(
         Ok(facts)
     };
 
-    // Quant scoping. `SCRATCHY_QUANTS=preset1,preset2,...` restricts the
-    // synthesized `<base>-<preset>` variants to those presets (dense bases
-    // always emit). The per-arch build.rs forward-maps the enabled `quant-*`
-    // Cargo features (CARGO_FEATURE_QUANT_*) to preset names and forwards them
-    // here via `cargo:rustc-env` — so this is driven by Cargo FEATURES, not a
-    // hand-set env var. UNSET = legacy behaviour (every backend-applicable
-    // preset emits), so un-migrated arch crates are unaffected; SET (even to an
-    // empty list) = emit only the listed presets, i.e. dense-only by default.
-    let enabled_quants: Option<std::collections::HashSet<String>> =
-        std::env::var("SCRATCHY_QUANTS").ok().map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        });
+    // Quant scoping. The scope's `quants` restricts the synthesized
+    // `<base>-<preset>` variants to those presets (dense bases always emit).
+    // The build states them as a value — the union of the enabled
+    // `quant/<preset>` features (scratchy-quantizations, via its own `cfg!`),
+    // handed to the scope by the build script; a test states `None`.
+    // `None` = legacy behaviour (every backend-applicable preset emits);
+    // `Some` (even an empty set) = emit only the listed presets, i.e.
+    // dense-only by default.
+    let enabled_quants = &scope.quants;
     // Whether `preset_name` both survived Cargo-feature quant scoping AND is
     // one this backend can actually claim. Shared by the dense-suppression
     // pre-check (below, before the base loop) and the overlay-synthesis
@@ -669,9 +923,9 @@ fn load_dir_mode(
     // wouldn't actually synthesize must never suppress the dense fallback,
     // or a model ends up with ZERO compiled variants.
     //
-    // Quant feature scoping: when SCRATCHY_QUANTS is set (the arch build.rs
-    // forward-maps the enabled `quant-*`-equivalent Cargo features from
-    // scratchy-quantizations), only listed presets are active. Unset ⇒
+    // Quant feature scoping: when the scope's `quants` is `Some` (the build
+    // computed the union of the enabled `quant/<preset>` features from
+    // scratchy-quantizations), only listed presets are active. `None` ⇒
     // legacy all-presets behaviour.
     //
     // Backend claimability — metal: `mlx-affine-*` variants reach the
@@ -694,50 +948,6 @@ fn load_dir_mode(
             return false;
         }
         true
-    };
-
-    // Stopgap for the one precision `arch-*`/`size-*`/`quant-*` can't express:
-    // picking a specific version + base-vs-instruct pair (e.g. a size tier
-    // still spans every generation and variant in that param range).
-    // `SCRATCHY_BUILD_FILTER=<tag>,<tag>,...` (case-insensitive substring,
-    // OR'd across tags) restricts both base configs and synthesized quant
-    // variants to stems containing at least one tag. UNSET = no filter, same
-    // as every other scoping knob in this file. Hand-set, so it needs
-    // `cargo:rerun-if-env-changed=SCRATCHY_BUILD_FILTER` in
-    // scratchy-forwards.rs (already wired) to avoid a stale-cache footgun.
-    // Tags are recorded as matched in `build_filter_seen`
-    // so `unmatched_build_filter_tags` can catch a typo'd tag at the end of
-    // the whole build instead of silently compiling nothing.
-    // Stems are `<arch>-<version>-<size>-<variant>` (e.g.
-    // `granite-3.2-2b-instruct`), so a tag like `3.2-instruct` never
-    // appears as one contiguous substring — `2b` sits between the version
-    // and the variant. Each tag is matched as a SET of `-`-separated parts,
-    // ALL of which must appear as substrings of the stem (any order, not
-    // necessarily adjacent); tags themselves are OR'd.
-    let build_filter: Vec<Vec<String>> = std::env::var("SCRATCHY_BUILD_FILTER")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|tag| tag.trim().to_lowercase())
-                .filter(|tag| !tag.is_empty())
-                .map(|tag| tag.split('-').map(|p| p.to_string()).collect())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let stem_matches_build_filter = |stem: &str| -> bool {
-        if build_filter.is_empty() {
-            return true;
-        }
-        let lower = stem.to_lowercase();
-        let mut any = false;
-        for parts in &build_filter {
-            if parts.iter().all(|p| lower.contains(p.as_str())) {
-                build_filter_seen().lock().unwrap().insert(parts.join("-"));
-                any = true;
-            }
-        }
-        any
     };
 
     // An in-checkpoint head's configs are the selected configs of its target arches that carry it.
@@ -763,12 +973,11 @@ fn load_dir_mode(
     // A quant preset means "compile this precision instead of dense", not
     // "compile this precision too" — if this arch has at least one preset
     // that's both selected (via `quant/<preset>`, forwarded through
-    // SCRATCHY_QUANTS) and actually claimable on this backend, every
+    // the scope's `quants`) and actually claimable on this backend, every
     // selected base in this arch gets its quant variant(s) INSTEAD of the
     // dense/bf16 one below, not alongside it. Deliberately arch-wide, not
     // per-base: `quantizations.json` is arch-wide too, so there is no
-    // per-model "just this one dense" escape hatch today — if that's ever
-    // needed, `SCRATCHY_BUILD_FILTER` can still narrow further.
+    // per-model "just this one dense" escape hatch today.
     let arch_has_active_quant = declared_preset_names(&dir.join("quantizations.json"))?
         .iter()
         .any(|name| quant_preset_active(name));
@@ -811,12 +1020,11 @@ fn load_dir_mode(
         // rebuilds on override edits.
         let mut tracked: Vec<PathBuf> = Vec::new();
         apply_overrides_file(dir, &stem, &mut json, &mut tracked)?;
-        // Build filter gates the DENSE emission only — a filter naming a
-        // quant suffix never matches a base's own stem, but the base still
-        // needs to stay in `base_raw` so a matching quant variant can be
-        // synthesized from it below. `arch_has_active_quant` gates it too:
-        // a selected quant preset replaces dense, it doesn't add to it.
-        if stem_matches_build_filter(&stem) && !arch_has_active_quant {
+        // `arch_has_active_quant` gates the dense emission: a selected quant
+        // preset replaces dense, it doesn't add to it. The base still needs
+        // to stay in `base_raw` below so a quant variant can be synthesized
+        // from it.
+        if !arch_has_active_quant {
             tracing::info!("[COMPILING] base {}", stem);
             let model = model_params_from_json_mode(&json, &stem, p, tracked, mode, spec)?;
             out.push(model);
@@ -887,7 +1095,7 @@ fn load_dir_mode(
         };
 
         for preset_name in &presets {
-            // Quant feature scoping (SCRATCHY_QUANTS) + backend claimability
+            // Quant feature scoping (the scope's `quants`) + backend claimability
             // (metal only claims mlx-affine-*/nvfp4 as those route through
             // Dense/MetalNvfp4QmmImpl — see
             // `quant_preset_active`'s definition above for the full backend
@@ -901,9 +1109,6 @@ fn load_dir_mode(
 
             for (base_path, base_stem, base_json) in &base_raw {
                 let variant_stem = format!("{base_stem}-{preset_name}");
-                if !stem_matches_build_filter(&variant_stem) {
-                    continue;
-                }
                 let mut extra_tracked = vec![preset_path.clone()];
                 let merged = merge_variant_config(
                     dir,
@@ -977,22 +1182,9 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     Ok(configs)
 }
 
-/// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a
-/// backend. `scratchy-models`' build script runs an arch's pipeline only then (its
-/// `src/lib.rs` gates each arch's `pub mod` the same way), and a target bakes in the facts
-/// of the heads that compile beside it alone. Read from Cargo's `CARGO_FEATURE_*`, in the
-/// build script's process. Whether an arch ACTUALLY lowers is each lowering's verdict —
-/// an op with no spyre lowering is a build error naming it, not a silent skip here.
-pub fn arch_compiled(arch: &str) -> bool {
-    arch_compiled_with(arch, |feature| {
-        let var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
-        std::env::var(var).is_ok()
-    })
-}
-
-/// [`arch_compiled`] under the features `on` reports.
+/// [`Scope::arch_compiled`] under the features `on` reports.
 fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
-    on(&format!("arch-{arch}")) && (on("metal") || on("spyre"))
+    on(&format!("arch-{arch}")) && (on("metal") || on("spyre") || on("cuda"))
 }
 
 /// Every arch dir under `configs/`.
@@ -1028,13 +1220,12 @@ pub(crate) fn carries_head(
 pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     let (_, json) = read_json_file(path)?;
     let stem = stem_of(path)?;
-    model_params_from_json(
-        &json,
-        &stem,
-        path,
-        Vec::new(),
-        &crate::arch_spec::DeclaredArchSpec::default(),
-    )
+    // The arch's declarations are part of what a config means (its RoPE base where the config
+    // omits it, its key aliases): read them as the walk does, never a default spec.
+    let dir = path
+        .parent()
+        .ok_or_else(|| ConfigError::NotADirectory(path.to_path_buf()))?;
+    model_params_from_json(&json, &stem, path, Vec::new(), &load_arch_json(dir)?)
 }
 
 /// Deep-merge `<stem>.overrides.json` onto `json` when the file exists, pushing
@@ -1779,6 +1970,7 @@ fn model_params_from_json(
     let expert_activation = ExpertActivation::of(json);
 
     derived.extend(apply_generic_bound_defaults(&mut bounds));
+    let text = TextGeometry::of(&bounds, &scalars, source_path)?;
 
     Ok(ModelParams {
         name,
@@ -1801,6 +1993,7 @@ fn model_params_from_json(
         arch,
         expert_activation,
         derived,
+        text,
     })
 }
 
@@ -1912,6 +2105,25 @@ fn vision_params_from_json(
 
     let expert_activation = ExpertActivation::of(json);
     derived.extend(apply_generic_bound_defaults(&mut bounds));
+    // The decoder this tower feeds, as the wrapper's `text_config` states it — read through the
+    // decoder path's own harvest (normalize, bounds, derivations, the arch's defaults), so the two
+    // loaders state one geometry for one config.
+    let text = {
+        let text_json = normalize_hf_config(json, &spec.config_aliases);
+        let mut text_bounds = extract_bounds(&text_json);
+        derive_layer_sets(&text_json, &mut text_bounds).map_err(|reason| {
+            ConfigError::LayerPattern {
+                path: source_path.to_path_buf(),
+                reason,
+            }
+        })?;
+        derive_implicit_bounds(&mut text_bounds);
+        let mut text_scalars = extract_scalars(&text_json);
+        for (k, v) in &spec.scalar_defaults {
+            text_scalars.entry(k.clone()).or_insert(*v);
+        }
+        TextGeometry::of(&text_bounds, &text_scalars, source_path)?
+    };
 
     Ok(ModelParams {
         name,
@@ -1934,6 +2146,7 @@ fn vision_params_from_json(
         arch,
         expert_activation,
         derived,
+        text,
     })
 }
 
@@ -2874,24 +3087,75 @@ mod tests {
         assert!(stem_to_ident("").is_err());
     }
 
+    /// The presets of an arch's `quantizations.json` the backend this test binary is built
+    /// for can lower (`quant_preset_active`): metal claims the MLX affine presets and
+    /// NVFP4; any other backend claims every preset.
+    #[cfg(feature = "metal")]
+    const LLAMA_PRESETS: &[&str] = &["mlx-affine-b4-g64", "mlx-affine-b4-g64-qembed", "nvfp4"];
+    #[cfg(not(feature = "metal"))]
+    const LLAMA_PRESETS: &[&str] = &[
+        "awq-gemm",
+        "bnb-nf4-dq",
+        "ct-int4-sym",
+        "fp8-dynamic-per-tensor",
+        "fp8-static-per-tensor",
+        "ggml",
+        "gptq-sym",
+        "gptq-sym-desc_act",
+        "mlx-affine-b4-g64",
+        "mlx-affine-b4-g64-qembed",
+        "nvfp4",
+    ];
+    #[cfg(feature = "metal")]
+    const QWEN2_PRESETS: &[&str] = &["mlx-affine-b4-g64", "mlx-affine-b4-g64-qembed"];
+    #[cfg(not(feature = "metal"))]
+    const QWEN2_PRESETS: &[&str] = &[
+        "awq-gemm",
+        "bnb-nf4-dq",
+        "ct-int4-sym",
+        "fp8-dynamic-per-tensor",
+        "fp8-static-per-tensor",
+        "ggml",
+        "gptq-sym",
+        "mlx-affine-b4-g64",
+        "mlx-affine-b4-g64-qembed",
+    ];
+
+    /// What `dir`'s configs load as, under a build of every one of them: dense-only (no
+    /// preset forwarded), one variant per base; and with every preset the backend claims,
+    /// each base's variants exactly `<base>-<preset>` for `presets` — a selected preset
+    /// replaces the dense variant, it doesn't add to it. Returns the dense variants.
+    fn every_variant_of(dir: &Path, presets: &[&str]) -> Vec<ModelParams> {
+        let spec =
+            load_arch_json(dir).unwrap_or_else(|e| panic!("{} arch.json: {e}", dir.display()));
+        let dense = load_dir(dir, &spec, &Scope::all().with_quants(Vec::<String>::new()))
+            .unwrap_or_else(|e| panic!("load {} dense: {e}", dir.display()));
+        let mut bases: Vec<&str> = dense.iter().map(|c| c.source_stem.as_str()).collect();
+        bases.sort();
+        let mut files: Vec<String> = model_configs(dir)
+            .expect("list configs")
+            .iter()
+            .map(|p| stem_of(p).expect("stem"))
+            .collect();
+        files.sort();
+        assert_eq!(bases, files, "every config loads as one dense variant");
+
+        let quantized = load_dir(dir, &spec, &Scope::all())
+            .unwrap_or_else(|e| panic!("load {} with every preset: {e}", dir.display()));
+        let mut got: Vec<&str> = quantized.iter().map(|c| c.source_stem.as_str()).collect();
+        got.sort();
+        let mut want: Vec<String> = bases
+            .iter()
+            .flat_map(|b| presets.iter().map(move |p| format!("{b}-{p}")))
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "every base × every preset this backend claims");
+        dense
+    }
+
     #[test]
     fn load_real_llama_configs() {
-        let dir = repo_model_archs("llama");
-        let configs = load_dir(&dir, &Default::default()).expect("load llama configs");
-
-        // 12 dense bases (9 Llama + 2 smollm2 + 1 tinyllama) ×
-        // (1 dense + 8 quant presets from `quantizations.json`:
-        //  awq-gemm, bnb-nf4-dq, gptq-sym, gptq-sym-desc_act,
-        //  ct-int4-sym, fp8-dynamic-per-tensor, fp8-static-per-tensor,
-        //  ggml) = 108. Individual sizes don't always have real HF
-        //  repos in every preset, but the compiler emits variants for
-        //  all of them so fingerprint dispatch stays open-set at
-        //  runtime.
-        assert_eq!(
-            configs.len(),
-            108,
-            "expected 108 Llama variants (12 bases × 9 variants)"
-        );
+        let configs = every_variant_of(&repo_model_archs("llama"), LLAMA_PRESETS);
 
         // Ground-truth check on llama-3.2-1b. Published values:
         //   num_hidden_layers = 16
@@ -2920,17 +3184,7 @@ mod tests {
 
     #[test]
     fn load_real_qwen2_configs() {
-        let dir = repo_model_archs("qwen2");
-        let configs = load_dir(&dir, &Default::default()).expect("load qwen2 configs");
-        // 13 dense (11 text + qwen2-vl-2b + qwen2.5-vl-3b text
-        // decoders) × (1 dense + 7 presets: awq-gemm, bnb-nf4-dq,
-        // ct-int4-sym, gptq-sym, fp8-dynamic-per-tensor,
-        // fp8-static-per-tensor, ggml) = 104.
-        assert_eq!(
-            configs.len(),
-            104,
-            "expected 104 Qwen2 variants (13 bases × 8 variants)"
-        );
+        let configs = every_variant_of(&repo_model_archs("qwen2"), QWEN2_PRESETS);
 
         // Ground-truth check on Qwen2-0.5B:
         //   num_hidden_layers    = 24
@@ -2968,12 +3222,24 @@ mod tests {
         //      anchoring `vision_in_features` / `vision_rope_half_dim`)
         //      lands in `bounds`.
         let dir = repo_model_archs("qwen2-vl");
-        let configs =
-            load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl vision configs");
+        let configs = load_dir_vision(
+            &dir,
+            &load_arch_json(&dir).expect("qwen2-vl arch.json"),
+            &Scope::all(),
+        )
+        .expect("load qwen2-vl vision configs");
+        let mut stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
+        stems.sort();
         assert_eq!(
-            configs.len(),
-            3,
-            "expected 3 Qwen2-VL vision variants (2b/7b/72b)"
+            stems,
+            [
+                "qwen2-vl-2b-instruct",
+                "qwen2-vl-2b-instruct-parity-tiny",
+                "qwen2-vl-2b-mlx",
+                "qwen2-vl-72b-instruct",
+                "qwen2-vl-7b-instruct",
+            ],
+            "every Qwen2-VL vision config loads"
         );
 
         // Per-variant `d_model` (= text-decoder hidden), vision tower
@@ -3086,7 +3352,7 @@ mod tests {
     #[test]
     fn bounds_are_sorted_by_stem_for_determinism() {
         let dir = repo_model_archs("llama");
-        let configs = load_dir(&dir, &Default::default()).unwrap();
+        let configs = load_dir(&dir, &load_arch_json(&dir).unwrap(), &Scope::all()).unwrap();
         let stems: Vec<&str> = configs.iter().map(|c| c.source_stem.as_str()).collect();
         let mut sorted = stems.clone();
         sorted.sort();
@@ -3382,7 +3648,8 @@ mod tests {
         };
         assert!(arch_compiled_with(&arch, with("metal")));
         assert!(arch_compiled_with(&arch, with("spyre")));
-        // Both backends off: not compiled, whatever the arch feature.
+        assert!(arch_compiled_with(&arch, with("cuda")));
+        // Every backend off: not compiled, whatever the arch feature.
         let neither = {
             let f = feature.clone();
             move |feat: &str| feat == f
@@ -3862,7 +4129,7 @@ mod tests {
         assert_eq!(mp.scalars.get("attention_multiplier"), Some(&1.0));
         // Logit softcap is verbatim in-config.
         assert_eq!(mp.scalars.get("final_logit_softcapping"), Some(&30.0));
-        assert_eq!(mp.tie_word_embeddings, true);
+        assert!(mp.tie_word_embeddings);
     }
 
     /// End-to-end: the VERBATIM upstream `gemma-4-12b-it` config (the
@@ -3908,6 +4175,7 @@ mod tests {
         let result = load_dir(
             Path::new("/nonexistent/path/to/configs"),
             &Default::default(),
+            &Scope::all(),
         );
         assert!(matches!(result, Err(ConfigError::NotADirectory(_))));
     }
@@ -3922,6 +4190,8 @@ mod tests {
             r#"{
                 "num_hidden_layers": 16,
                 "hidden_size": 2048,
+                "num_attention_heads": 16,
+                "rope_theta": 10000.0,
                 "rms_norm_eps": 0.000001,
                 "query_pre_attn_scalar": 256.0,
                 "attn_logit_softcapping": 50.0
@@ -3953,7 +4223,12 @@ mod tests {
         // hardcoded softmax scale in `AttentionViaCacheImpl`. The
         // Llama path has no such field today; lock that in.
         let dir = repo_model_archs("llama");
-        let configs = load_dir(&dir, &Default::default()).expect("load llama configs");
+        let configs = load_dir(
+            &dir,
+            &load_arch_json(&dir).expect("llama arch.json"),
+            &Scope::all(),
+        )
+        .expect("load llama configs");
         for cfg in &configs {
             assert!(
                 !cfg.scalars.contains_key("query_pre_attn_scalar"),
@@ -3974,10 +4249,14 @@ mod tests {
         let tmp = std::env::temp_dir().join("scratchy_forward_compiler_phase3_test");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("model.json"), r#"{"num_hidden_layers": 4}"#).unwrap();
+        fs::write(
+            tmp.join("model.json"),
+            r#"{"num_hidden_layers": 4, "rope_theta": 10000.0, "head_dim": 64}"#,
+        )
+        .unwrap();
         fs::write(tmp.join("README.txt"), "ignore me").unwrap();
 
-        let configs = load_dir(&tmp, &Default::default()).unwrap();
+        let configs = load_dir(&tmp, &Default::default(), &Scope::all()).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].source_stem, "model");
 

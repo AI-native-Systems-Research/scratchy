@@ -455,7 +455,6 @@ fn sharded_bundle(
         .first()
         .ok_or_else(|| werr("the one-rank bundle has no layer group"))?;
     let named = |fp: &str| SengraphBundleData {
-        manifest_json: "",
         graph_json: Box::leak(format!("{SUPERDSC_SENTINEL}{fp}").into_boxed_str()),
         g2_fingerprint: "",
     };
@@ -762,25 +761,26 @@ impl SpyreWorker {
         // without a `tp/N`), from `local_rank` up — each opened on its own background thread NOW,
         // so their ~5.7 s bring-ups overlap each other and the host-side weight load below. Joined
         // where the first session needs them; every session of this worker spans all of them.
+        // ⭐ THE WORLD'S CARDS, CLAIMED ONCE: the first `World::RANKS` cards senlib enumerates,
+        // distinct by construction (`WorldCards::claim`). Rank r opens `cards.get(r)` by its PCIe
+        // address — no index arithmetic, and nothing in the environment chooses the set.
         #[cfg(feature = "spyre-hw")]
-        let card_open =
-            scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::try_from_fn(
-                |r| -> ExecutorResult<_> {
-                    let index = u32::try_from(self.config.local_rank)
-                        .ok()
-                        .and_then(|base| base.checked_add(r.get()))
-                        .ok_or_else(|| {
-                            werr(format!(
-                                "local_rank {} + rank {} is not a Spyre card index",
-                                self.config.local_rank,
-                                r.get()
-                            ))
-                        })?;
-                    Ok(std::thread::spawn(move || {
-                        scratchy_target_spyre::runtime::CardRuntime::<World>::open(index)
-                    }))
-                },
-            )?;
+        let card_open = {
+            let table = scratchy_target_spyre::runtime::CardTable::enumerate()
+                .map_err(|e| werr(format!("Spyre card table: {e}")))?;
+            let world = scratchy_target_spyre::runtime::WorldCards::<World>::claim(&table)
+                .map_err(|e| werr(e.to_string()))?;
+            info!("[spyre-worker] this world's cards: {}", world.describe());
+            let world = std::sync::Arc::new(world);
+            scratchy_target_spyre::bundle_code::collective::PerRank::<World, _>::from_fn(|r| {
+                let world = std::sync::Arc::clone(&world);
+                std::thread::spawn(move || {
+                    scratchy_target_spyre::runtime::CardRuntime::<World>::open(
+                        world.per_rank().get(r),
+                    )
+                })
+            })
+        };
 
         let model_dir = resolve_model_path(
             &self.model_path,
@@ -915,7 +915,7 @@ impl SpyreWorker {
         // KTIR bakes one decode program PER CAP BUCKET (all share weight ids — same graph,
         // different prefix cap), so parse every one. sendnn bakes a single group-0 program.
         // ⭐ NO PARSING. The wiring is a GENERATED static on the loaded model —
-        // the same facts the `manifest_json` string carried, as typed values.
+        // the launch facts as typed values, from the bake's one walk of the bindings.
         // ⛔ NOT `sendnn`-GATED. The wiring is GENERATED data, emitted for every spyre build, and
         // `stage_bound_weights` reads its `tensor_shapes` on both paths — that is where the staged
         // `[rows, cols]` comes from now that the manifest no longer supplies it. Gating it left the
@@ -1054,7 +1054,9 @@ impl SpyreWorker {
                 .iter()
                 .chain(wirings.prefill.iter().flat_map(|p| p.load_consts.iter()));
             for &(tid, kind) in consts {
-                let (bytes, dt, shape) = kind.build();
+                // The emulator serves one card: no rank's block, the whole table.
+                let (bytes, dt, shape) =
+                    kind.build::<scratchy_target_spyre::bundle_code::collective::TpWorld<1>>(None);
                 match staged.get(&tid) {
                     Some(prev) if *prev != bytes => {
                         return Err(werr(format!(
@@ -1232,6 +1234,9 @@ impl SpyreWorker {
         // assignment under spyre-hw, where the block always runs).
         #[cfg(feature = "spyre-hw")]
         let pool_stride_bytes_v: Option<u64>;
+        // Where the shared host threads run, read from the cards when they join (below).
+        #[cfg(feature = "spyre-hw")]
+        let world_cpus_v: scratchy_target_spyre::runtime::WorldCpus;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -1374,11 +1379,28 @@ impl SpyreWorker {
                 // ⭐ THE CARD, JOINED. Its capacity was read from the card when it opened — a card
                 // that cannot report one does not open — so the KV pool below is sized from the real
                 // card, with no default to fall back to.
-                let cards: Cards = card_open.try_map_into(|r, h| -> ExecutorResult<_> {
+                //
+                // ⭐ OPENED ONCE, FOR THE PROCESS, AND BORROWED BY EVERY SESSION. The sessions land in
+                // `Loaded`, which the worker holds for the life of the process (a `Box<dyn Worker>`,
+                // so `'static`), and each borrows its card: `&'static` is the borrow that outlives
+                // them, given to the cards ONCE here — the same as the bundles this load leaks — so
+                // the compiler, not a refcount, checks that no session outlives its card.
+                let opened: Cards = card_open.try_map_into(|r, h| -> ExecutorResult<_> {
                     h.join()
                         .map_err(|_| werr(format!("card {}'s bring-up thread panicked", r.get())))?
                         .map_err(|e| werr(format!("open Spyre card {}: {e}", r.get())))
                 })?;
+                let cards: &'static Cards = Box::leak(Box::new(opened));
+                // ⭐ THIS THREAD BUILDS EVERY SESSION, so it runs where the world's shared work
+                // runs before the first one is built: each session's host copies and the
+                // activation shadows faulted in below are allocated and first touched there.
+                let world_cpus =
+                    scratchy_target_spyre::runtime::WorldCpus::of(cards.values().map(|c| c.cpus()));
+                world_cpus
+                    .pin_current_thread()
+                    .map_err(|e| werr(format!("the load thread: {e}")))?;
+                info!("[spyre-worker] load and decode-loop threads: {world_cpus}");
+                world_cpus_v = world_cpus;
                 // ⭐ THE CARDS' P2P LINK, BEFORE THE FIRST SESSION LOADS. A sharded world's decode
                 // bundle bakes its receive window for that world; every card's base-address table
                 // gets every peer's card and its `XSEG` entries every peer's landing slots, so every
@@ -1388,7 +1410,7 @@ impl SpyreWorker {
                     scratchy_target_spyre::superdsc_exec::RankSeat::baked_window(code)
                         .map_err(|e| werr(format!("bundle {fp}: {e}")))?
                 {
-                    scratchy_target_spyre::runtime::link_peers(&cards, window)
+                    scratchy_target_spyre::runtime::link_peers(cards, window)
                         .map_err(|e| werr(e.to_string()))?;
                     info!(
                         "[spyre-worker] linked {} cards over device p2p RDMA, window {window:?}: {}",
@@ -1660,7 +1682,9 @@ impl SpyreWorker {
                 let n_consts =
                     scratchy_target_spyre::wiring::synthetic_constants(&df.constant_env(
                         &wirings.decode,
-                        64,
+                        // The emitter's own row pad (one stick) — the ONE home
+                        // (`mq_pad`), never a second spelling of the stick here.
+                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::mq_pad(1),
                         scratchy_target_spyre::wiring::StagedRows::ONE,
                     ))
                     .len();
@@ -1804,7 +1828,7 @@ impl SpyreWorker {
                         let anchor_pool = prefill_pool_statics(wirings)?;
                         let pss = if anchor_reserves {
                             SuperDscSession::new_reserving(
-                                &cards,
+                                cards,
                                 pcode,
                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                     vocab,
@@ -1817,7 +1841,7 @@ impl SpyreWorker {
                             )
                         } else {
                             SuperDscSession::new_borrowing_with_consts(
-                                &cards,
+                                cards,
                                 pcode,
                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                     vocab,
@@ -1888,7 +1912,7 @@ impl SpyreWorker {
                 let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
                     .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
-                    &cards,
+                    cards,
                     code,
                     scratchy_target_spyre::sdsc_runner::SessionDims {
                         vocab,
@@ -1904,7 +1928,7 @@ impl SpyreWorker {
                 // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
                 // placement in it, so where peers' sends land is the allocator's answer for THIS
                 // session's region — pointed before any step, and checked equal on every rank.
-                ss.point_landing_slots(&cards)
+                ss.point_landing_slots(cards)
                     .map_err(|e| werr(format!("the receive window's landing slots: {e}")))?;
                 // ⛔ THE LADDER STARTS ONLY ONCE THE OWNER HAS ALLOCATED. A rung build allocates on
                 // every card, and a background build racing the owner's allocation lands the owner's
@@ -1976,7 +2000,8 @@ impl SpyreWorker {
                     // These are PREFILL rungs (`rung_consts = prefill_consts`), so each stages the
                     // pool's tables for itself ([`prefill_pool_statics`]).
                     let ladder_pool = prefill_pool_statics(wirings)?;
-                    let ladder_cards = cards.clone();
+                    // The cards are the loader's `&'static` borrow, so the background build takes
+                    // the reference itself — nothing to clone, nothing kept alive by the build.
                     std::thread::spawn(move || {
                         let workers: Vec<_> = chunks
                             .into_iter()
@@ -1984,12 +2009,11 @@ impl SpyreWorker {
                                 let rung_spill = ladder_spill.clone();
                                 let rung_consts = prefill_consts;
                                 let rung_pool = ladder_pool.clone();
-                                let rung_cards = ladder_cards.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
                                             let r = SuperDscSession::new_borrowing_with_consts(
-                                                &rung_cards,
+                                                cards,
                                                 rcode,
                                                 scratchy_target_spyre::sdsc_runner::SessionDims {
                                                     vocab,
@@ -2062,9 +2086,8 @@ impl SpyreWorker {
                 );
                 info!(
                     "[spyre-worker] sendnn: SUPERDSC dxp session ready (fp={fp}, vocab {vocab}, \
-                     kv_dim {kv_dim}, num_blocks {num_blocks}, cap {} slots, paged={} \
-                     page_slots={}, pmask reserves {:?} column(s))",
-                    ss.cap, ss.paged, ss.page_slots, ss.pmask_slots,
+                     kv_dim {kv_dim}, num_blocks {num_blocks}, pmask reserves {:?} column(s))",
+                    ss.pmask_slots,
                 );
                 // ── SHARE seg2 (the resident KV) between the PREFILL and DECODE sessions ──
                 // Both bundles place seg2 identically by construction (kc/vc at nqh·hd·cap·2, the
@@ -2210,7 +2233,6 @@ impl SpyreWorker {
                                 // ([`prefill_pool_statics`]). Borrowed from outside the scope, as
                                 // `spill` is — a binding inside it would not outlive the spawn.
                                 let pool = &pool_for_prefix;
-                                let cards = &cards;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
                                         cards,
@@ -2425,7 +2447,6 @@ impl SpyreWorker {
                             .iter()
                             .map(|job| {
                                 let spill = &spill_tids;
-                                let cards = &cards;
                                 scope.spawn(move || {
                                     SuperDscSession::new_borrowing_with_consts(
                                         cards,
@@ -2716,6 +2737,8 @@ impl SpyreWorker {
                 stride
             },
             served_context: served_context_v,
+            #[cfg(feature = "spyre-hw")]
+            world_cpus: world_cpus_v,
         })
     }
 }

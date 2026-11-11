@@ -99,7 +99,9 @@ mod parse_python {
     /// unroll → schedule → codegen chain to a NON-EMPTY, complete
     /// emission, without pinning bytes. Numerical equivalence of the
     /// emission is covered by the scratchy-models `qwen3_py_parity`
-    /// e2e gate.
+    /// e2e gate. The scope names the one model the test means — the
+    /// emission cannot be empty by accident, so no non-vacuity guard
+    /// is needed (nor an env var hand-set into the invocation).
     #[test]
     fn python_costume_emits_the_qwen3_tape() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -112,25 +114,16 @@ mod parse_python {
         let py_text =
             std::fs::read_to_string(root.join("crates/models/arch/dsl/qwen3.py")).unwrap();
         let py_carrier = crate::parse_python::parse_python_file(&py_text).expect("python parse");
-        let py_tokens =
-            crate::compile_carrier(py_carrier, &configs_dir).expect("python-costume pipeline");
+        let py_tokens = crate::compile_carrier(
+            py_carrier,
+            &configs_dir,
+            None,
+            &crate::Scope::stems(&[("qwen3", "qwen3-0.6b")]),
+        )
+        .expect("python-costume pipeline");
 
         let mut py_rendered = String::with_capacity(1 << 20);
         crate::render_tokens(py_tokens, &mut py_rendered);
-
-        // Non-vacuity guard: model selection reads `CARGO_FEATURE_*`
-        // ambient env vars (they belong to the scratchy-models crate,
-        // so they are only set when the test is invoked as
-        // `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test ...`). Without
-        // this check, an unscoped run emits an EMPTY token stream and
-        // the test passes having verified nothing.
-        assert!(
-            py_rendered.len() > 100_000,
-            "qwen3 emission is {} bytes — model selection filtered everything out. \
-             Run with `env 'CARGO_FEATURE_QWEN3_0.6B=1' cargo test -p \
-             scratchy-forward-compiler-macro --features metal --lib parse_python`",
-            py_rendered.len(),
-        );
 
         // The emission must be COMPLETE, not just big: the flip pinned
         // per-bucket tape symbols + the load/forward entry points. Check

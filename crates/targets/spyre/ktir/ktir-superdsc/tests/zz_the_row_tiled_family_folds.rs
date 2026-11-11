@@ -167,6 +167,7 @@ fn add_family(view: (i64, i64), blocks: &[(i64, i64, i64, i64)]) -> KtirNode {
         bindings: vec![BufferId::new(401), BufferId::new(402), BufferId::new(403)],
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     }
@@ -302,6 +303,7 @@ fn silu_family(view: (i64, i64), blocks: &[(i64, i64, i64, i64)]) -> KtirNode {
         bindings: vec![BufferId::new(401), BufferId::new(402)],
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     }

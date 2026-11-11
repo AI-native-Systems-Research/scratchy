@@ -124,14 +124,20 @@ pub trait Worker: Send {
         None
     }
 
-    /// Bytes one block of `block_size` tokens costs in this worker's KV pool,
+    /// Bytes one block of `block` tokens costs in this worker's KV pool,
     /// when that is not the dense row the engine derives from the HF config
     /// (`layers × 2 × kv_heads × head_dim × dtype`): a metal model built with
     /// TurboQuant stores packed codes, and a hybrid-SWA model's block is a page
     /// in each group-shared tensor plus its TurboQuant global store. The engine
     /// sizes `num_gpu_blocks` from the memory budget by this instead. `None` =
     /// the dense row. Valid after `load_model`.
-    fn kv_block_bytes(&self, _block_size: usize) -> Option<usize> {
+    ///
+    /// ⭐ THE BLOCK ARRIVES TYPED, as the scheduler's own [`KvBlockTokens`] — for a
+    /// backend that declares [`required_block_size`](WorkerFactory::required_block_size)
+    /// it is the very value the backend declared (`effective_block_size` threads the
+    /// declaration through), so "a block is this pool's page" is a fact of construction
+    /// the type carries, not a number each impl re-asserts against its own constant.
+    fn kv_block_bytes(&self, _block: scratchy_core_common::KvBlockTokens) -> Option<usize> {
         None
     }
 
@@ -320,6 +326,13 @@ pub trait Worker: Send {
     /// steps resolves them by knocking through it. Default no-op: a worker
     /// that never defers has nothing to knock on.
     fn set_drain_door(&mut self, _door: crate::core_client::DrainDoor) {}
+
+    /// Run the calling thread where this worker's devices want the thread that drives its steps
+    /// (the executor trait's [`crate::executor::Executor::pin_driving_thread`], through to the
+    /// worker that owns the devices). Default: nothing to place.
+    fn pin_driving_thread(&self) -> ExecutorResult<()> {
+        Ok(())
+    }
 
     /// ⭐ #32 (C) — A KNOCK: drain the in-flight queue until `cell` is filled.
     /// The worker's own spelling of the executor trait's hook — the drain's

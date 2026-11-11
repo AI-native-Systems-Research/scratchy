@@ -35,17 +35,17 @@ use super::{CudaError, check};
 use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 
-use crate::kernels::{self, KernelError};
+use crate::kernels::{self, DecodeSplit, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
-    ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
-    AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16,
-    ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
-    GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16,
-    GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16,
-    MoeWeight, NormAddBf16, PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
-    RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, fp8_moe_layout,
-    fp8_weight, gemv_splits,
+    ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16, CudaStep,
+    EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16,
+    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
+    ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_scratch_bytes, attn_decode_split,
+    fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KV_ELEM_BYTES,
@@ -704,18 +704,6 @@ type PrefillLaunch = unsafe fn(
     (*const c_void, *const c_void),
     (*const c_void, *const c_void),
     (u32, u32, u32, u32),
-    (u32, u32),
-    (f32, u32),
-    *mut c_void,
-) -> Result<(), KernelError>;
-
-/// A decode attention launcher over the e4m3 cache: [`kernels::attn_decode_windowed_fp8kv`]'s
-/// signature, which the head-dim-512 one shares.
-type DecodeLaunch = unsafe fn(
-    (*const c_void, *mut c_void),
-    (*const c_void, *const c_void),
-    (*const c_void, *const c_void),
-    (u32, u32, u32),
     (u32, u32),
     (f32, u32),
     *mut c_void,
@@ -2297,37 +2285,56 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         let pool = kv.expect("`new` made a pool for a KV tape");
                         let l = layer as usize;
                         let layout = pool.layer_layout(l);
-                        let launch: DecodeLaunch = match head_dim {
-                            ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_fp8kv,
-                            ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_fp8kv,
+                        // The split over keys (W6b): the head dim's `(splits, min_tiles)`, its
+                        // partials in the tape's split scratch, rows then maxima and sums.
+                        let (Some((splits, min_tiles)), Some((rows_bytes, _))) = (
+                            attn_decode_split(head_dim),
+                            attn_decode_scratch_bytes(kv_heads, head_dim),
+                        ) else {
                             // No decode attention kernel at another head dim: refused, nothing
                             // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
-                            other => {
-                                let error = KernelError::AttnDecodeShape {
-                                    q_heads,
-                                    kv_heads,
-                                    head_dim: other,
-                                    block_size: layout.block_size,
-                                    num_blocks: layout.num_blocks,
-                                };
-                                return Err((step, error));
-                            }
+                            let error = KernelError::AttnDecodeShape {
+                                q_heads,
+                                kv_heads,
+                                head_dim,
+                                block_size: layout.block_size,
+                                num_blocks: layout.num_blocks,
+                            };
+                            return Err((step, error));
+                        };
+                        let split = DecodeSplit {
+                            splits,
+                            min_tiles,
+                            o_split: partials,
+                            ml_split: partials.wrapping_byte_add(rows_bytes as usize),
                         };
                         // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
                         // its rows are 1: `validate`), and the block table and sequence uploaded
                         // above, which `forward` checked: every block the keys `0 .. P + L` need is a
                         // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s,
-                        // of its class's layout.
+                        // of its class's layout. The partials are the tape's split scratch, at least
+                        // this step's `attn_decode_scratch_bytes` (`CudaStep::gemv_scratch`, which
+                        // `validate` checked), no step's operand; the merge, launched after the split
+                        // on this stream, reads them and writes `out`.
                         unsafe {
-                            launch(
+                            kernels::attn_decode_fp8kv_split(
                                 (slot(q), slot(out)),
                                 (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                                 (slot(block_table), slot(sequence)),
                                 (q_heads, kv_heads, head_dim),
                                 (layout.block_size, layout.num_blocks),
-                                (attn.scale(), window.unwrap_or(0)),
+                                (attn.scale(), window.unwrap_or(0), split),
                                 stream.0,
                             )
+                            .and_then(|()| {
+                                kernels::attn_decode_merge(
+                                    (slot(sequence), slot(out)),
+                                    (q_heads, kv_heads, head_dim),
+                                    (attn.scale(), window.unwrap_or(0)),
+                                    split,
+                                    stream.0,
+                                )
+                            })
                         }
                     }
                 }

@@ -1,12 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// ⛔ RUN THIS FILE WITH `SCRATCHY_PLAN_ONLY_BAKE=1` — the door side of these gates
-// runs the KTIR→SuperDSC lowering, whose fixtures must not demand a device compiler.
-//
-//     SCRATCHY_PLAN_ONLY_BAKE=1 cargo test -p scratchy-target-spyre \
-//         --features spyre-emu --test head_norm_sandwich
-//
-// (See `superdsc_time_tile.rs`'s header for why the variable is not set from inside
-// the test.)
 // The numerics gate drives the emulator session (`runner::SpyreSession`), which the
 // `spyre`-only build does not link — the file is empty there, not compiled-out per
 // test, because gates (ii) and (iii) would also be meaningless without the program
@@ -48,6 +40,18 @@ use scratchy_subtile::subtile_ir::{
     TensorRegion, TensorShape,
 };
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
+
+/// The extent pair every lowering call here states for its graph: one request of the
+/// graph's own `m` rows — the S=1 prefill pair. None of these graphs carries an
+/// `AttnDecode`; the pair still must describe the graph it is handed, and it does.
+fn superdsc_pair_of_one_request(m: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
+    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(m)
+            .expect("the fixture's row count is nonzero"),
+        scratchy_subtile::sdsc_abstract::RungCap::ONE,
+    )
+    .expect("one request's rows fit a u32")
+}
 
 // ── FIXTURES ────────────────────────────────────────────────────────────────────
 
@@ -261,11 +265,17 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
 
             // The fused lowering: one WindowedRmsNorm program + the sink's elementwise.
             let weight_ids = std::collections::HashSet::new();
-            let (ops, _layout) = superdsc::lower_graph_to_ktir::<
-                ktir_superdsc::collective::TpWorld<1>,
-                _,
-            >(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-            .unwrap_or_else(|e| panic!("lower the sandwich (m={m}, H={heads}, D={d}): {e:?}"));
+            let (ops, _layout) =
+                superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+                    &ir,
+                    &weight_ids,
+                    superdsc::ActiveCap::FULL,
+                    false,
+                    // One request of the graph's m rows — the S=1 prefill pair (no
+                    // AttnDecode here; the pair still states what the graph is).
+                    superdsc_pair_of_one_request(m),
+                )
+                .unwrap_or_else(|e| panic!("lower the sandwich (m={m}, H={heads}, D={d}): {e:?}"));
             let windowed: Vec<&str> = ops
                 .iter()
                 .filter_map(|e| e.ktir.as_ref().map(|k| k.func.name))
@@ -374,6 +384,7 @@ fn a_whole_row_rmsnorm_never_enters_the_windowed_path() {
         &weight_ids,
         superdsc::ActiveCap::FULL,
         false,
+        superdsc_pair_of_one_request(m),
     )
     .expect("lower the granite-shaped norm");
     for e in &ops {
@@ -409,11 +420,15 @@ fn an_extra_consumer_of_the_split_refuses_the_fusion() {
         // The refused graph: the split's output has a second reader.
         let ir = sandwich_ir(m, heads, d, gain, true);
         let weight_ids = std::collections::HashSet::new();
-        let (ops, _layout) = superdsc::lower_graph_to_ktir::<
-            ktir_superdsc::collective::TpWorld<1>,
-            _,
-        >(&ir, &weight_ids, superdsc::ActiveCap::FULL, false)
-        .expect("lower the refused sandwich");
+        let (ops, _layout) =
+            superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
+                &ir,
+                &weight_ids,
+                superdsc::ActiveCap::FULL,
+                false,
+                superdsc_pair_of_one_request(m),
+            )
+            .expect("lower the refused sandwich");
         // NO windowed program was minted...
         for e in &ops {
             if let Some(k) = e.ktir.as_ref() {

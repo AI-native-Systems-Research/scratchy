@@ -306,11 +306,11 @@ pub fn gather_copy_opspec(
     // exist yet: `attach_gather_index` below appends it with SENUINT32 FORCED, the one format a
     // gather's index may carry, whatever the value operands are. The gathered SOURCE takes the
     // chunk base AFTER the df is set (`set_offset_elems` scales by the word length itself).
-    for a in op.args.iter_mut() {
+    for a in op.args_mut().iter_mut() {
         a.set_df(df);
     }
     if run.src_elems > 0 {
-        op.args[0].set_offset_elems(run.src_elems);
+        op.args_mut()[0].set_offset_elems(run.src_elems);
     }
     // ⛔ OPERAND 0 IS THE GATHERED ONE, AND IT IS NOT THE OUTPUT. `attach_gather_index` refuses the
     // output slot itself (gathering INTO a destination is a scatter), so this cannot silently become
@@ -378,7 +378,7 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
     index: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // ⛔ ALL THREE EXTENTS FROM THE SCRATCH, AS ONE VALUE, NOT THREE REACHES. `mb` is the copy's own
     // extent, the index's live entry count and the scratch's row count; `out` is the pool's stick; the
     // `page` the walk pins is the `page` the index declares. They were three separate calls here
@@ -415,7 +415,9 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
                 d.out(),
                 layout,
             )
-            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+            .map_err(|e| {
+                crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+            })?;
         }
         // ⭐ THE SCATTER DESTINATION'S PLACEMENT HALF — the same stride-aware mint the raw door
         // ran, now with the layout at hand so the ChainRow's reservation answers for the bytes
@@ -433,18 +435,20 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
                 d.mb(),
                 layout,
             )
-            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+            .map_err(|e| {
+                crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+            })?;
         }
         crate::sdsc_abstract::GatherDest::CoreLocalLx => {
             if let Some(l) = layout
                 && !l.lx_core_local(dst)
             {
-                panic!(
+                return Err(crate::superdsc_error::SuperDscError(format!(
                     "assemble_gather_copy {op_name}: the copy states a CORE-LOCAL destination but \
                      the layout does not hold '{dst}' as core-local LX — the minted law and the \
                      layout disagree about where this run lands, so it addresses bytes neither \
                      authority stands behind"
-                );
+                )));
             }
         }
     }
@@ -477,14 +481,17 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
             dest: copy.dest(),
         },
     )
-    .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+    })?;
     // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
     // PV contracts it (`ChunkScratch::lx_form`). The copy keeps its own one-entry-per-core division; the
     // read law holds the PV to it. No-op for an HBM scratch.
     crate::emit::apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_gather_copy {op_name}: {e}"))
+    })
 }
 
 /// ⭐⭐⭐ THE SCATTER'S COPY — the mirror of [`gather_copy_opspec`]: an `identity` from a contiguous
@@ -576,11 +583,11 @@ pub fn scatter_copy_opspec(
         // The destination is addressed THROUGH the index from the pool's own base.
         OutView::at(0),
     )?;
-    for a in op.args.iter_mut() {
+    for a in op.args_mut().iter_mut() {
         a.set_df(df);
     }
     if src_elems > 0 {
-        op.args[0].set_offset_elems(src_elems);
+        op.args_mut()[0].set_offset_elems(src_elems);
     }
     op.attach_scatter_index(scatter).ok_or_else(|| {
         format!(
@@ -588,10 +595,8 @@ pub fn scatter_copy_opspec(
              its dims are [mb, out, y], so the paged axis must be `mb`"
         )
     })?;
-    if dst_elems > 0
-        && let Some(o) = op.args.last_mut()
-    {
-        o.set_offset_elems(dst_elems);
+    if dst_elems > 0 {
+        op.output_mut().set_offset_elems(dst_elems);
     }
     Ok(op)
 }
@@ -691,7 +696,7 @@ pub fn page_gather_copy_opspec(
         },
         OutView::at(0),
     )?;
-    for a in op.args.iter_mut() {
+    for a in op.args_mut().iter_mut() {
         a.set_df(df);
     }
     op.attach_gather_index(gather, ins.len() - 1).ok_or_else(|| {
@@ -736,12 +741,10 @@ pub fn assemble_page_gather_copy<T: crate::collective::Tp>(
     let mut op =
         page_gather_copy_opspec(src, dst, gather, rows, words.df().elems_per_stick(), words)?;
     if src_elems > 0 {
-        op.args[gathered].set_offset_elems(src_elems);
+        op.args_mut()[gathered].set_offset_elems(src_elems);
     }
-    if dst_elems > 0
-        && let Some(o) = op.args.last_mut()
-    {
-        o.set_offset_elems(dst_elems);
+    if dst_elems > 0 {
+        op.output_mut().set_offset_elems(dst_elems);
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -896,31 +899,26 @@ pub fn index_select_opspec(
         crate::superdsc_opspec::Fp16,
     >| -> crate::superdsc_opspec::ViewFrame {
         if entries.get() * blocks.get() == 1 && cols.elems() > df.elems_per_stick() {
-            crate::superdsc_opspec::ViewFrame::LandedBlocks
+            // The one block's stick-major `[rows, cols]` — the arrangement the frame declares.
+            crate::superdsc_opspec::ViewFrame::LandedBlocks(
+                crate::sdsc_abstract::StickLayout::row_blocked_df(
+                    rows.get() as usize,
+                    cols.elems() as usize,
+                    df,
+                ),
+            )
         } else {
             crate::superdsc_opspec::ViewFrame::Own
         }
     };
-    let args = vec![
-        arg(
-            true,
-            src,
-            ["out", "x", "y", "mb"],
-            crate::superdsc_opspec::ViewFrame::Own,
-        )?,
-        arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?,
-    ];
-    let mut op = OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    };
+    let input = arg(
+        true,
+        src,
+        ["out", "x", "y", "mb"],
+        crate::superdsc_opspec::ViewFrame::Own,
+    )?;
+    let output = arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?;
+    let mut op = OpSpec::new(OpFunc::Identity, plan, vec![input], output).map_err(|e| e.0)?;
     op.attach_gather_index(gather.gather_index(), 0)
         .ok_or_else(|| {
             format!(
@@ -928,10 +926,8 @@ pub fn index_select_opspec(
              op — its dims are [mb, y, x, out], so the paged axis must be `mb`"
             )
         })?;
-    if page_dst.get() > 0
-        && let Some(o) = op.args.last_mut()
-    {
-        o.set_offset_elems(page_dst.get());
+    if page_dst.get() > 0 {
+        op.output_mut().set_offset_elems(page_dst.get());
     }
     Ok(op)
 }
@@ -1028,30 +1024,18 @@ pub fn expand_blocks_opspec(
             .map_err(|e| e.0)?,
         ))
     };
-    let args = vec![
-        arg(
-            true,
-            src,
-            [
-                Scale::Active,
-                Scale::RedNonStick,
-                Scale::Active,
-                Scale::Active,
-            ],
-        )?,
-        arg(false, dst, [Scale::Active; 4])?,
-    ];
-    Ok(OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    let input = arg(
+        true,
+        src,
+        [
+            Scale::Active,
+            Scale::RedNonStick,
+            Scale::Active,
+            Scale::Active,
+        ],
+    )?;
+    let output = arg(false, dst, [Scale::Active; 4])?;
+    OpSpec::new(OpFunc::Identity, plan, vec![input], output).map_err(|e| e.0)
 }
 
 /// [`expand_blocks_opspec`] + `emit_sdsc_tiled`.
@@ -1141,19 +1125,10 @@ pub fn stick_permute_opspec(
             .map_err(|e| e.0)?,
         ))
     };
-    let args = vec![arg(true, src, from)?, arg(false, dst, to)?];
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    let (input, output) = (arg(true, src, from)?, arg(false, dst, to)?);
+    Ok(OpSpec::new(OpFunc::Identity, plan, vec![input], output)
+        .map_err(|e| e.0)?
+        .with_time_tile(time_tile))
 }
 
 /// One stick permute's extents: `rows` rows of `sticks` sticks of `df`, in `direction`, read from
@@ -1186,10 +1161,10 @@ pub fn assemble_stick_permute<T: crate::collective::Tp>(
 ) -> Result<EmittedOp<T>, String> {
     let mut op = stick_permute_opspec(src, dst, rows, sticks, df, direction)?;
     if src_elems > 0 {
-        op.args[0].set_offset_elems(src_elems);
+        op.args_mut()[0].set_offset_elems(src_elems);
     }
     if dst_elems > 0 {
-        op.args[1].set_offset_elems(dst_elems);
+        op.args_mut()[1].set_offset_elems(dst_elems);
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -1266,22 +1241,11 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
             };
             Ok(AnyTensorArg::R3(t))
         };
-    let args = vec![
-        arg(true, src, src_pitch, src_elems)?,
-        arg(false, dst, dst_pitch, dst_elems)?,
-    ];
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op: OpFunc::Identity,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: OpInfo::None,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+    let input = arg(true, src, src_pitch, src_elems)?;
+    let output = arg(false, dst, dst_pitch, dst_elems)?;
+    Ok(OpSpec::new(OpFunc::Identity, plan, vec![input], output)
+        .map_err(|e| e.0)?
+        .with_time_tile(time_tile))
 }
 
 /// [`stick_runs_copy_opspec`] + `emit_sdsc_tiled`.
@@ -1470,15 +1434,15 @@ fn pointwise_opspec_from_tile_split(
             ))
         }
     };
-    let mut args = Vec::with_capacity(in_names.len() + 1);
+    let mut ins = Vec::with_capacity(in_names.len());
     for name in in_names {
-        args.push(mk(true, name, 0)?);
+        ins.push(mk(true, name, 0)?);
     }
     // The scatter-row output (see `OutView`): `["mb", "y", "out"]`, stick innermost, the
     // physical `y` extent carrying the scatter's width W. The scales stay all-Active so the
     // `y` dim is scale-active — the one `DeviceExtents::of_view` keys on when it lifts the
     // view's physical extent over the plan's iterated one.
-    args.push(match out_view.scatter_interleave {
+    let output = match out_view.scatter_interleave {
         None => mk(false, o_name, out_view.offset)?,
         Some(interleave) => AnyTensorArg::R3(
             TensorArg::<3>::new(
@@ -1496,24 +1460,16 @@ fn pointwise_opspec_from_tile_split(
             .with_device_extent("y", interleave)
             .map_err(|e| e.0)?,
         ),
-    });
+    };
 
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: if op.needs_sfp_const_table() {
+    Ok(OpSpec::new(op, plan, ins, output)
+        .map_err(|e| e.0)?
+        .with_op_info(if op.needs_sfp_const_table() {
             OpInfo::SfpConstTable
         } else {
             OpInfo::None
-        },
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+        })
+        .with_time_tile(time_tile))
 }
 
 /// TileIR → SdscOp for the [`EwOperand`]-broadcast pointwise family: takes an ALREADY-LOWERED
@@ -1807,9 +1763,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
             }))
         }
     };
-    let mut args = Vec::with_capacity(inputs.len() + 1);
+    let mut ins = Vec::with_capacity(inputs.len());
     for inp in inputs {
-        args.push(mk(
+        ins.push(mk(
             true,
             inp.name(),
             match spray {
@@ -1827,7 +1783,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // distinct half of the roped output. `per_core_addr` adds this on top of the
     // global placement (task #55). 0 = whole-tensor output (every existing caller;
     // and the `stickmajor` predicate requires out_offset==0, so rank-2 is whole-tensor).
-    args.push(mk(
+    let output = mk(
         false,
         o_name,
         [Scale::Active, Scale::Active, Scale::Active],
@@ -1835,23 +1791,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
         out_row_window
             .filter(|w| !w.spans_one_stick())
             .map(|w| w.parent_rows()),
-    )?);
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
-    Ok(OpSpec {
-        op,
-        is_reduction: false,
-        iter: plan,
-        args,
-        op_info: if op.needs_sfp_const_table() {
+    )?;
+    Ok(OpSpec::new(op, plan, ins, output)
+        .map_err(|e| e.0)?
+        .with_op_info(if op.needs_sfp_const_table() {
             OpInfo::SfpConstTable
         } else {
             OpInfo::None
-        },
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask: None,
-    })
+        })
+        .with_time_tile(time_tile))
 }
 
 /// `assemble_pointwise_broadcast_off` TAKING AN ALREADY-LOWERED `TileOp` — the TileIR→SdscOp entry
@@ -1871,7 +1819,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
     out_offset: impl Into<OutCorner>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let out_offset = out_offset.into();
     let o_name = o.name();
     let head_major = O::kind() == StickKind::Flat;
@@ -1887,7 +1835,9 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
         tile_op.df,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })?;
     // ⛔ ONE SHARED LIST, NOT A SECOND COPY. This was a verbatim duplicate of the `const` in
     // `emit::assemble_pointwise_broadcast_off`, so a fix had to land in both — and `"mish"` had been
     // added to neither. See [`crate::emit::SFP_SPLIT_TRANSCENDENTALS`] for the geometry, the dxp
@@ -1896,7 +1846,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
         && cols > Fp16::ELEMS_PER_STICK
         && inputs.iter().any(|i| i.out_broadcast())
     {
-        panic!(
+        return Err(crate::superdsc_error::SuperDscError(format!(
             "[superdsc sfp-transcendental-guard] {op_name}: SFP `{op_func}` emitted at \
              multi-stick width (cols={cols} > {}) with an OUT-BROADCAST (reduction) input — \
              the full-width-transcendental geometry that CRASHES the dxp compile (map::at in \
@@ -1904,7 +1854,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
              (cols={}); broadcast in the following multiply. (guard-every-crash-at-build-time)",
             Fp16::ELEMS_PER_STICK,
             Fp16::ELEMS_PER_STICK,
-        );
+        )));
     }
     let op = pointwise_broadcast_opspec_from_tile(
         tile_op,
@@ -1918,10 +1868,13 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
         layout,
         CoreDivision::Ew(EwDivision::Law),
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
+    })
 }
 
 /// `assemble_pointwise_seeded` TAKING AN ALREADY-LOWERED `TileOp` instead of raw `rows`/`cols` — the
@@ -1935,7 +1888,7 @@ pub fn assemble_pointwise_seeded_from_tile<T: crate::collective::Tp>(
     o_name: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let op = pointwise_opspec_from_tile(
         tile_op,
         op_func_from_str(op_func),
@@ -1944,10 +1897,13 @@ pub fn assemble_pointwise_seeded_from_tile<T: crate::collective::Tp>(
         false,
         layout,
     )
-    .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_pointwise {op_name}: {e}"))
+    })
 }
 
 #[cfg(test)]
@@ -1976,8 +1932,8 @@ mod scatter_tests {
             },
         )
         .expect("an 8-row, two-stick-per-row scatter builds");
-        let ia = op.indirect.expect("the scatter declares its pair");
-        assert_eq!(op.args.len(), 3, "input, index, output");
+        let ia = op.indirect().expect("the scatter declares its pair");
+        assert_eq!(op.args().len(), 3, "input, index, output");
         assert_eq!(ia.value, 2, "the output is the paged value");
         assert_eq!(ia.index, 1, "the index sits between input and output");
     }
@@ -2011,13 +1967,13 @@ mod scatter_tests {
 #[cfg(test)]
 mod stick_permute_tests {
     use super::*;
-    use crate::place::{PlaceId, act_name};
+    use crate::place::act_name;
     use crate::sdsc_abstract::StickLayout;
 
     fn layout() -> BundleLayout {
         let l = BundleLayout::default();
-        l.synth(PlaceId::Act(1), &[32, 128]);
-        l.synth(PlaceId::Act(2), &[64, 64]);
+        l.synth(crate::place::SynthId::Act(1), &[32, 128]);
+        l.synth(crate::place::SynthId::Act(2), &[64, 64]);
         l
     }
 
@@ -2144,7 +2100,7 @@ mod stick_runs_tests {
     #[test]
     fn each_side_states_its_own_pitch() {
         let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
-        let v: Vec<_> = op.args.iter().map(|a| a.view()).collect();
+        let v: Vec<_> = op.args().iter().map(|a| a.view()).collect();
         assert_eq!(
             v[0].device_extent,
             [None, Some(128), None],
@@ -2172,7 +2128,7 @@ mod stick_runs_tests {
 #[cfg(test)]
 mod index_select_tests {
     use super::*;
-    use crate::place::{PlaceId, act_name};
+    use crate::place::act_name;
     use crate::sdsc_abstract::StickLayout;
     use crate::superdsc_opspec::EntryBase;
 
@@ -2437,9 +2393,9 @@ mod index_select_tests {
     fn gathered(entries: u32, rows: u32, cols: u32) -> BundleLayout {
         let l = BundleLayout::default();
         let flat = || [entries * rows, cols];
-        l.synth(PlaceId::Act(1), &flat());
-        l.synth(PlaceId::Act(2), &flat());
-        l.synth(PlaceId::Act(9), &[1, 32]);
+        l.synth(crate::place::SynthId::Act(1), &flat());
+        l.synth(crate::place::SynthId::Act(2), &flat());
+        l.synth(crate::place::SynthId::Act(9), &[1, 32]);
         l
     }
 
@@ -2653,92 +2609,6 @@ mod index_select_tests {
         assert!(
             l.arrangements.borrow()[&act_name(2)].addr_eq(&StickLayout::flat(1, 8 * 128 * 64)),
             "a one-stick landing is the flat frame's own bytes, at any batch count"
-        );
-    }
-
-    /// ⭐ A STAMP/VIEW DISAGREEMENT IS LOUD — [`crate::superdsc_opspec::ViewFrame::LandedBlocks`]
-    /// is stamped from the opspec's own cols, so a view whose emit-time extents are not a
-    /// several-stick landing (here: one stick wide) is a stamping bug, and it is a build `Err`
-    /// naming the tensor — never a silent flat declaration of a frame the bytes are not in.
-    #[test]
-    fn a_landed_blocks_stamp_on_a_one_stick_view_is_refused_by_name() {
-        let df = Df::Fp16;
-        let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
-            name,
-            size,
-            is_reduction: false,
-            is_stick,
-            df,
-        };
-        // One stick wide (`out` = 64): the stamping law never puts LandedBlocks here — stamped
-        // anyway, exactly the disagreement the arm must refuse.
-        let dims = [
-            dim("mb", 2, false),
-            dim("y", 1, false),
-            dim("x", 32, false),
-            dim("out", 64, true),
-        ];
-        let plan =
-            crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
-                gather_copy_cores(d, max, 1)
-            })
-            .expect("the plan divides");
-        let layout = ["mb", "y", "x", "out"];
-        let arg = |is_input: bool,
-                   name: &str,
-                   frame: crate::superdsc_opspec::ViewFrame|
-         -> Result<_, String> {
-            Ok(AnyTensorArg::R4(
-                TensorArg::<4>::new(
-                    is_input,
-                    name.to_string(),
-                    Role::Output,
-                    [Scale::Active; 4],
-                    plan.iter_syms(layout),
-                    layout,
-                    "out",
-                    Allocation::Hbm,
-                )
-                .map_err(|e| e.0)?
-                .with_device_order(["x", "out", "y", "mb"])
-                .map_err(|e| e.0)?
-                .with_frame(frame),
-            ))
-        };
-        let src_arg = arg(true, &act_name(1), crate::superdsc_opspec::ViewFrame::Own)
-            .expect("the source arg builds");
-        let dst_arg = arg(
-            false,
-            &act_name(2),
-            crate::superdsc_opspec::ViewFrame::LandedBlocks,
-        )
-        .expect("the stamped arg builds");
-        let op = OpSpec {
-            op: OpFunc::Identity,
-            is_reduction: false,
-            iter: plan,
-            args: vec![src_arg, dst_arg],
-            op_info: OpInfo::None,
-            tiled_symbols: vec![],
-            time_tile: None,
-            indirect: None,
-            coordinate_mask: None,
-        };
-        let l = BundleLayout::default();
-        l.synth(PlaceId::Act(1), &[64, 64]);
-        l.synth(PlaceId::Act(2), &[64, 64]);
-        let folds = SdscFoldSet::new(op.iter.cores_used());
-        let err = crate::emit::emit_sdsc("probe_o1", &op, &folds, Some(&l))
-            .expect_err("the stamp/view disagreement refuses");
-        assert!(
-            err.0.contains(&act_name(2)),
-            "names the tensor whose stamp and view disagree: {}",
-            err.0
-        );
-        assert!(
-            err.0.contains("LandedBlocks"),
-            "names the stamped frame: {}",
-            err.0
         );
     }
 }

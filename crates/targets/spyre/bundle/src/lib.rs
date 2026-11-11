@@ -113,8 +113,11 @@ impl SweptCols {
 //  Placements — the memory plan
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The ≤7-packed-segment executor model: one device region per occupied segment.
-pub const NUM_SEGMENTS: usize = 7;
+/// The ≤7-packed-segment executor model: one device region per occupied segment —
+/// READ from the baked generation's table (`<Baked as DeviceGen>::NUM_SEGMENTS`,
+/// senlib's 8 VA segments with the executor packing 7, under its citation).
+pub const NUM_SEGMENTS: usize =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::NUM_SEGMENTS;
 
 /// ⛔⛔⛔ THE BYTES ONE SEGMENT MAY HOLD — because "one device region per occupied segment" (above)
 /// is not just a mental model, it is an ALLOCATION, and a flex region is capped at 16 GiB
@@ -130,8 +133,12 @@ pub const NUM_SEGMENTS: usize = 7;
 /// (`requested_bytes=17365082112, free_space_bytes=103048964224`) because the free space is spread
 /// across the five regions the request cannot reach. Every byte in that sum is a compile-time
 /// constant of the bundle, so the refusal belongs at `cargo build`, naming the segment — see
-/// `audit_layout_addresses`.
-pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// `audit_layout_addresses`. READ from the baked generation's table
+/// (`<Baked as DeviceGen>::MAX_SEGMENT_BYTES`, senlib's `XLAT_LEN_MAX_FLITS`
+/// = 2^27 flits of 128 B, under its citation); the flex-rs pin this crate
+/// already carried stays.
+pub const MAX_SEGMENT_BYTES: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::MAX_SEGMENT_BYTES;
 
 /// WHAT A LAUNCH'S PROGRAM COMPUTES, and the pointwise kinds it names — re-exported for the same
 /// reason as [`PlaceId`]: [`LaunchProgram::program`] carries the kind, so the token emitter
@@ -148,7 +155,7 @@ pub use ktir_superdsc::ktir_node::{Elementwise, Program};
 /// scratchy dependency of its own, and all three still reach these types through this crate.
 /// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
 /// not name.
-pub use ktir_superdsc::place::{PlaceId, SynthRole};
+pub use ktir_superdsc::place::{OpLocalKind, OpLocalRole, PlaceId, SynthId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
@@ -195,14 +202,36 @@ pub struct Placement {
 pub struct KernelWeight<'a> {
     /// The tensor this describes.
     pub id: PlaceId,
-    /// Device extents in dim_map order.
-    pub device_size: Cow<'a, [u64]>,
-    /// Host-element stride per device axis.
-    pub stride_map: Cow<'a, [u64]>,
+    /// (device extent, host-element stride) per device axis — ONE slice, not an extent list and
+    /// a stride list: the two are one fact per axis, and separate slices could disagree in
+    /// length. The bake pairs the emitter's descriptor or refuses.
+    pub axes: Cow<'a, [(u64, u64)]>,
+    /// The bake's verdict on which staging arm walks this weight ([`WalkArm`]) — the walk's own
+    /// law, read once at bake and stated here the way [`WeightTail`] is stated, so the boot does
+    /// no analysis. The permutation arm carries its own host-scan order: the arm and its order
+    /// are one fact, and separate fields could disagree.
+    pub arm: WalkArm<'a>,
     /// Elements per stick (64 for fp16).
     pub stick_size: u32,
     /// Bytes per element (2 for fp16, 1 for fp8/int8).
     pub word_length: u32,
+}
+
+/// Which staging arm walks a kernel weight — the BAKE's verdict, stated per weight on
+/// [`KernelWeight`] the way [`WeightTail`] is, so the boot does no analysis. The law itself
+/// lives in `scratchy-target-spyre`'s `RetileWalk::arm` (the walker's own statement over the
+/// paired axes); the bake reads it once and this carries the result to the runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WalkArm<'a> {
+    /// A mixed-radix permutation: the host offsets are exactly `0..total` in the carried
+    /// order's order — one linear host scan, device offsets carried incrementally. The order
+    /// (ascending-stride axis indices) is the arm's own: a permutation without its order, or
+    /// another arm with one, is not a state this type can hold.
+    Permutation { order: Cow<'a, [u8]> },
+    /// The innermost device axis is host-contiguous: whole-row copies/converts.
+    InnerContig,
+    /// Everything else: per-element dot-product walk.
+    PerElement,
 }
 
 /// The whole-bundle memory plan.
@@ -341,56 +370,18 @@ impl<'a> BundleLayout<'a> {
 //  The per-op launch index
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Which rows one fold pass of a bundle's page-fold group covers.
-///
-/// ⛔ A CLOSED ENUM AND NOT A `bool`, so "whole batch" is a value and not the absence of one. The
-/// worker derives its intermediate-segment rebase stride from this, and a wrong stride is a request
-/// answering from another request's history: fluent, wrong, and undetectable downstream.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FoldRows {
-    /// One pass covers the WHOLE batch — the intermediate segment is not rebased per row.
-    #[default]
-    WholeBatch,
-    /// One pass covers ONE request — each row rebases the intermediate segment by its own stride.
-    PerRequest,
-}
-
-/// The address shifts a launch applies to its program's segment bases.
-///
-/// A group that carries any of these is a SINGLETON at every group size, because the shift is applied
-/// once to the whole group — `group_ranges` breaks a run at such a trip for exactly that reason.
+/// How a launch group relaunches and what its segment bases read: a walk's body, a gathered read, or a
+/// collective's consume.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvShifts<T: ktir_superdsc::collective::Tp> {
-    /// seg2 shift per write slot, for a group that writes one token into the KV cache. `0` for a group
-    /// that needs no slot shift.
-    pub slot_stride_bytes: u32,
-    /// seg2 shift per 64-slot slab, for a group that restickifies Kᵀ. `0` when not a slab group.
-    pub slab_stride_bytes: u32,
-    /// The write-slot modulus AND the declaration that this bundle is PAGED — a runtime that does not
-    /// know the key must refuse rather than apply an absolute-position shift and land past the page.
-    /// `0` for an unpaged bundle.
-    pub page_slots: u32,
-    /// Which request's KV this group addresses (batched decode). `0` when unbatched.
-    pub request: u32,
-    /// Slots past the launch's write cursor where this group's KV starts — a whole number of pages,
-    /// non-zero only for a later PAGE PART of a prefill window wider than one page. The runtime resolves
-    /// the group's page at `cursor + slot_offset` through the request's block table, and SKIPS the group
-    /// when the request holds no such page. `0` for every other group.
-    pub slot_offset: u32,
-    /// This is the group the runtime re-launches once per page of resident KV.
+    /// This is a walk's body group: the runtime relaunches it [`Walk::trips`] times.
     pub page_fold: bool,
-    /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
-    /// (request, page).
-    pub batched_requests: bool,
     /// ⭐ This group reads the pool through the GATHER — each page came from the index the host stages
     /// rather than from a segment shift. Two consequences the runtime must know: the group's KV shift
     /// must be ZERO (an absolute entry plus a page base composes two bases and lands inside neither),
-    /// and the host must stage the index table for any body carrying such a group. On a fold group it
-    /// also lets the passes collapse with no single pool stride (with [`Self::batched_requests`]); on a
-    /// non-fold group it is the split-KV chunk's gather copies, launched once.
+    /// and the host must stage the index table for any body carrying such a group. On a non-fold group
+    /// it is the split-KV chunk's gather copies, launched once.
     pub gathered: bool,
-    /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
-    pub fold_rows: FoldRows,
     /// ⭐ `Some` iff this group is a COLLECTIVE'S CONSUME. Its launch is preceded by this rank's send
     /// of the operand fragment — an F-send control block, device p2p RDMA — and the wait for the
     /// peer's ([`collective::cb_pipeline`]), and it reads the receive window — a weight-segment
@@ -414,17 +405,6 @@ pub struct Walk {
 }
 
 impl<T: ktir_superdsc::collective::Tp> KvShifts<T> {
-    /// Does this group write one token into the KV cache? DERIVED from the stride, so a stride and its
-    /// flag cannot disagree.
-    pub const fn slot_write(self) -> bool {
-        self.slot_stride_bytes > 0
-    }
-
-    /// Does this group restickify a Kᵀ slab? Derived, for the same reason.
-    pub const fn slab_write(self) -> bool {
-        self.slab_stride_bytes > 0
-    }
-
     /// ⭐ WHERE THIS LAUNCH'S WEIGHT SLOT RESOLVES — `(byte shift, bank)` from the layer's own
     /// `(layer_shift, layer_bank)`.
     ///
@@ -783,35 +763,6 @@ pub struct BundleCode<'a, T: ktir_superdsc::collective::Tp> {
     pub reroll: Option<RerollMeta<'a>>,
 }
 
-impl<'a, T: ktir_superdsc::collective::Tp> BundleCode<'a, T> {
-    /// ⭐ THE FOLD-ROW REGIME THIS BUNDLE DECLARES — what the launch derives its intermediate-segment
-    /// rebase stride from.
-    ///
-    /// No fold groups at all ⇒ [`FoldRows::WholeBatch`]: nothing re-launches, so there is no pass to
-    /// rebase. Fold groups that DISAGREE are refused — a session carries ONE intermediate stride, so a
-    /// mixed bundle has no stride that is right for all of its passes.
-    ///
-    /// [`FoldRows`] is a closed enum every entry carries, so "whole batch" is a declaration rather
-    /// than a silence.
-    pub fn fold_rows(&self) -> Result<FoldRows, String> {
-        let mut seen: Option<FoldRows> = None;
-        for g in self.groups.iter().filter(|g| g.kv.page_fold) {
-            match seen {
-                None => seen = Some(g.kv.fold_rows),
-                Some(s) if s == g.kv.fold_rows => {}
-                Some(s) => {
-                    return Err(format!(
-                        "bundle {}: fold groups disagree about their row regime ({s:?} vs {:?}) — a \
-                         session carries one intermediate stride, so a mixed bundle cannot be launched",
-                        self.fp, g.kv.fold_rows
-                    ));
-                }
-            }
-        }
-        Ok(seen.unwrap_or_default())
-    }
-}
-
 /// ⭐ ONE REGISTERED BUNDLE, OF ITS OWN WORLD. A bundle's world is its type, so the registry holds
 /// each one type-erased and a lookup names its world: [`bundle::<T>`] finds only the bundles that
 /// are `BundleCode<'static, T>`, so a bundle baked for one world is never found by a session of
@@ -957,10 +908,7 @@ mod tests {
             layout: BundleLayout::default(),
             groups: Cow::Borrowed(&[
                 LaunchGroup::<ktir_superdsc::collective::TpWorld<1>> {
-                    kv: KvShifts {
-                        slot_stride_bytes: 128,
-                        ..KvShifts::default()
-                    },
+                    kv: KvShifts::default(),
                     programs: Cow::Borrowed(PROGS_A),
                     init_binary: Cow::Borrowed(&[1, 2, 3]),
                     job_bin_ptr: 64,
@@ -985,10 +933,6 @@ mod tests {
         assert_eq!(code.groups[1].programs[0].func.grid, (2, 1, 1));
         assert_eq!(code.groups[0].job_bin_ptr, 64);
         assert_eq!(code.groups[1].init_binary.as_ref(), &[4]);
-        // The write predicates are DERIVED from the strides, so a stride and its flag cannot disagree.
-        assert!(code.groups[0].kv.slot_write());
-        assert!(!code.groups[0].kv.slab_write());
-        assert!(!code.groups[1].kv.slot_write());
     }
 
     /// ⭐ A LADDER OF ONE RUNG IS A LADDER — every position up to its sweep runs that rung — and a
@@ -1109,7 +1053,7 @@ mod tests {
                     is_logits: true,
                 },
                 Placement {
-                    id: PlaceId::Act(728).synth(SynthRole::Sq16),
+                    id: PlaceId::Act(728).synth(SynthRole::Sq16).place(),
                     segment: 0,
                     bank: 0,
                     offset: 4096,
@@ -1122,7 +1066,7 @@ mod tests {
         assert_eq!(l.logits().unwrap().id, PlaceId::Act(788));
         assert_eq!(l.place_of_tid(788).unwrap().size, 98304);
         assert_eq!(
-            l.place(PlaceId::Act(728).synth(SynthRole::Sq16))
+            l.place(PlaceId::Act(728).synth(SynthRole::Sq16).place())
                 .unwrap()
                 .offset,
             4096
@@ -1160,7 +1104,7 @@ mod place_id_tests {
     #[test]
     fn a_synthetic_is_not_bindable_even_though_it_shares_a_tid() {
         let a = PlaceId::Act(7);
-        let s = a.synth(SynthRole::Rot);
+        let s = a.synth(SynthRole::Rot).place();
         assert_eq!(a.tid(), s.tid(), "same tid");
         assert_ne!(a, s, "different identities");
         assert_eq!(a.bindable(), Some(7));

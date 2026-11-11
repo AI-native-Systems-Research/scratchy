@@ -1088,3 +1088,259 @@ fn the_w4_fused_end_times_are_recorded() {
         }
     }
 }
+
+/// FP8 S8's full-wave gate/up GEMV (/tmp/d-m0.md §4): the one-row gate/up launch takes the plain
+/// GEMV's `rows_per_warp`, not a fixed 4 rows. One gate/up of the tape's shapes, `(what, n, k,
+/// act, expert)`, `expert` the bank's `(experts, top_k)`: the 27B's dense (17,408 × 5,120, 544 ->
+/// 726 CTAs), Gemma's dense (2,112 × 2,816, GeGLU, 66 -> 132), the 35B's routed experts (8 picks
+/// of 512 × 2,048 from 256, 128 -> 256) and Gemma's (8 picks of 704 × 2,816 from 128, 176 -> 240).
+/// A gate/up shape: `(what, n, k, act, expert)`, `expert` the bank's `(experts, top_k)`.
+type GateUpShape = (&'static str, u32, u32, u32, Option<(u32, u32)>);
+
+const GATE_UP_WAVE_SHAPES: &[GateUpShape] = &[
+    ("27B dense", 17408, 5120, 0, None),
+    ("Gemma dense", 2112, 2816, 1, None),
+    ("35B experts", 512, 2048, 0, Some((256, 8))),
+    ("Gemma experts", 704, 2816, 1, Some((128, 8))),
+];
+
+/// Rows at which `rows_per_warp` keeps 4 rows a warp at one split: 792 dense blocks (3 waves of
+/// 264 CTAs), or 30 blocks × 8 picks (240 CTAs, one wave; the expert rule wants a multiple of 64).
+/// Every shape above has at most as many rows.
+const fn four_row_rows(expert: bool) -> u32 {
+    if expert { 960 } else { 25344 }
+}
+
+/// A gate/up of `n` rows, act `act`, off `x` (`[1, k]` bf16), its gate and up each the first `n`
+/// rows of `rows`-row weights (a dense `[rows, k]` or a bank `[experts, rows, k]`), into `c`
+/// (`pairs · n` bf16); one split, asynchronous on the default stream.
+fn gate_up_rows(
+    (x, gate, up, ids): (&DeviceBuffer, &Fp8Buf, &Fp8Buf, Option<&DeviceBuffer>),
+    (n, k, act, rows, expert): (u32, u32, u32, u32, Option<(u32, u32)>),
+    c: *mut c_void,
+) {
+    let a = x.ptr().cast_const();
+    match (expert, ids) {
+        (Some((experts, top_k)), Some(ids)) => {
+            // SAFETY: `x` holds k bf16, each bank experts·rows·k bytes and experts·rows f32,
+            // `ids` top_k u32 under `experts`, `c` top_k·n bf16, all their own allocations.
+            unsafe {
+                expert_gate_up_gemv_fp8(
+                    (a, gate.op(), up.op(), ids.ptr().cast_const()),
+                    (c, std::ptr::null_mut()),
+                    (1, top_k, n, k),
+                    (experts, rows, 1),
+                    act,
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("expert_gate_up_gemv_fp8 launch");
+        }
+        _ => {
+            // SAFETY: `x` holds k bf16, each weight rows·k bytes and rows f32 (rows >= n), `c`
+            // n bf16, all their own allocations.
+            unsafe {
+                gate_up_gemv_fp8(
+                    (a, gate.op(), up.op()),
+                    (c, std::ptr::null_mut()),
+                    (n, k, 1),
+                    act,
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("gate_up_gemv_fp8 launch");
+        }
+    }
+}
+
+/// The gate/up's weights for one shape at `rows` rows (a bank of `experts` blocks for an expert
+/// shape), its activation and its 8 distinct picks.
+fn gate_up_operands(
+    device: &CudaDevice,
+    (n, k, expert): (u32, u32, Option<(u32, u32)>),
+    rows: u32,
+) -> (DeviceBuffer, Fp8Buf, Fp8Buf, Option<DeviceBuffer>) {
+    let ku = k as usize;
+    let blocks = expert.map_or(1, |(e, _)| e as usize);
+    let len = blocks * rows as usize;
+    let w = |seed| {
+        let (q, s) = weight(len, ku, seed ^ u64::from(n));
+        Fp8Buf::new(device, &q, &s)
+    };
+    let x = DeviceBuffer::upload(device, &bf16_inputs(ku, 0xF0A ^ u64::from(k))).expect("x");
+    let ids = expert.map(|(e, top_k)| {
+        up_u32(
+            device,
+            &(0..top_k).map(|i| (i * 37 + 5) % e).collect::<Vec<_>>(),
+        )
+    });
+    (x, w(0xF0B), w(0xF0C), ids)
+}
+
+/// The gate/up at its new rows per warp is the 4-row gate/up's bits: each shape's `n` rows
+/// against the same weights' first `n` rows of a launch at [`four_row_rows`] (4 rows a warp, one
+/// split), every pair. A row's dot is the same per-row code at any rows, so `mismatched_bits` must
+/// be 0.
+#[test]
+fn the_full_wave_gate_up_is_the_four_row_gate_up_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for &(what, n, k, act, expert) in GATE_UP_WAVE_SHAPES {
+        let rows = four_row_rows(expert.is_some());
+        let (x, gate, up, ids) = gate_up_operands(&device, (n, k, expert), rows);
+        let pairs = expert.map_or(1, |(_, t)| t as usize);
+        let (nu, ru) = (n as usize, rows as usize);
+        let new = DeviceBuffer::upload(&device, &vec![SENTINEL; pairs * nu + TAIL]).expect("c");
+        let old = DeviceBuffer::upload(&device, &vec![SENTINEL; pairs * ru]).expect("c");
+        gate_up_rows(
+            (&x, &gate, &up, ids.as_ref()),
+            (n, k, act, rows, expert),
+            new.ptr(),
+        );
+        gate_up_rows(
+            (&x, &gate, &up, ids.as_ref()),
+            (rows, k, act, rows, expert),
+            old.ptr(),
+        );
+        let (new, old) = (new.download().expect("c"), old.download().expect("c"));
+        let want: Vec<u16> = (0..pairs)
+            .flat_map(|p| old[p * ru..][..nu].to_vec())
+            .collect();
+        let bad = mismatched_bits(&new[..pairs * nu], &want);
+        let tail = new[pairs * nu..].iter().all(|&v| v == SENTINEL);
+        let finite = new[..pairs * nu]
+            .iter()
+            .all(|&v| bf16::from_bits(v).is_finite());
+        let ok = bad == 0 && tail && finite;
+        eprintln!(
+            "GATEUP_WAVE bits {what} n={n} k={k} pairs={pairs}: mismatched_bits={bad} \
+             vs the 4-row launch at {rows} rows, tail_intact={tail} finite={finite} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the full-wave gate/up is not the 4-row gate/up's bits"
+    );
+}
+
+/// `(median, min, max)` µs of 20 launches of `launch` after 3 warm-ups between two CUDA events on
+/// the default stream, `before` run untimed on the same stream before each.
+fn timed_after(mut before: impl FnMut(), mut launch: impl FnMut()) -> (f64, f64, f64) {
+    let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event is
+    // destroyed below.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut start), 0, "cudaEventCreate");
+        assert_eq!(cudaEventCreate(&mut end), 0, "cudaEventCreate");
+    }
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let mut ms = 0.0f32;
+        before();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(cudaEventRecord(start, std::ptr::null_mut()), 0, "record");
+            launch();
+            assert_eq!(cudaEventRecord(end, std::ptr::null_mut()), 0, "record");
+            assert_eq!(cudaEventSynchronize(end), 0, "synchronize");
+            assert_eq!(cudaEventElapsedTime(&mut ms, start, end), 0, "elapsed");
+        }
+        if i >= 3 {
+            times.push(f64::from(ms) * 1e3);
+        }
+    }
+    // SAFETY: both events were created above and are no longer used.
+    unsafe {
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    times.sort_by(f64::total_cmp);
+    (times[times.len() / 2], times[0], times[times.len() - 1])
+}
+
+/// The gate/up GEMV's time at each shape of [`GATE_UP_WAVE_SHAPES`] and the 35B's shared expert
+/// (512 × 2,048, 4 splits: unchanged), read-cold (a 100 MiB read by today's GEMV before each, so
+/// L2 holds clean lines of other data, as in the decode tape) and hot, as `GATEUP_WAVE time`
+/// lines in TB/s of the weight bytes read. Recorded, not asserted; the pod runs it at the base
+/// and at the PR, A, B, A, B.
+#[test]
+fn the_full_wave_gate_up_times_are_recorded() {
+    let device = h100();
+    let (fn_, fk) = (20480u32, 5120u32);
+    let fsplits = gemv_splits(fn_, fk, 1);
+    let fx = DeviceBuffer::upload(&device, &vec![0x3F80u16; fk as usize]).expect("x");
+    let fw = Fp8Buf::new(
+        &device,
+        &vec![0x38u8; (fn_ * fk) as usize],
+        &vec![0.0; fn_ as usize],
+    );
+    let fc = DeviceBuffer::upload(&device, &vec![0u16; fn_ as usize]).expect("c");
+    let fp = scratch(&device, gemv_scratch_bytes(fn_, 1, fsplits).expect("bytes"));
+    let flush = || {
+        // SAFETY: `fx` k bf16, `fw` n·k bytes and n f32, `fc` n bf16, `fp` the split's partials.
+        unsafe {
+            gemv_fp8_abt(
+                (fx.ptr().cast_const(), fw.op(), fc.ptr()),
+                fp.ptr(),
+                (fn_, fk, fsplits),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("read flush");
+    };
+    for &(what, n, k, act, expert) in GATE_UP_WAVE_SHAPES {
+        let (x, gate, up, ids) = gate_up_operands(&device, (n, k, expert), n);
+        let pairs = expert.map_or(1, |(_, t)| t as usize);
+        let c = DeviceBuffer::upload(&device, &vec![0u16; pairs * n as usize]).expect("c");
+        let bytes = 2 * pairs * (n * k) as usize;
+        let mut launch = || {
+            gate_up_rows(
+                (&x, &gate, &up, ids.as_ref()),
+                (n, k, act, n, expert),
+                c.ptr(),
+            )
+        };
+        let cold = timed_after(flush, &mut launch);
+        let hot = timed_after(|| {}, &mut launch);
+        for (temp, (med, lo, hi)) in [("readcold", cold), ("hot", hot)] {
+            eprintln!(
+                "GATEUP_WAVE time {temp} {what}: median={med:.1}us min={lo:.1}us max={hi:.1}us \
+                 {:.2} TB/s",
+                bytes as f64 / med / 1e6
+            );
+        }
+    }
+    // The 35B's shared expert: 4 splits, so 4 rows a warp before and after.
+    let (n, k) = (512u32, 2048u32);
+    let splits = gemv_splits(n, k, 1);
+    let (x, gate, up, _) = gate_up_operands(&device, (n, k, None), n);
+    let c = DeviceBuffer::upload(&device, &vec![0u16; n as usize]).expect("c");
+    let p = scratch(
+        &device,
+        2 * gemv_scratch_bytes(n, 1, splits).expect("bytes"),
+    );
+    let mut launch = || {
+        // SAFETY: as `gate_up_rows`', with the two splits' partials in `p`.
+        unsafe {
+            gate_up_gemv_fp8(
+                (x.ptr().cast_const(), gate.op(), up.op()),
+                (c.ptr(), p.ptr()),
+                (n, k, splits),
+                0,
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("gate_up_gemv_fp8 launch");
+    };
+    let cold = timed_after(flush, &mut launch);
+    let hot = timed_after(|| {}, &mut launch);
+    for (temp, (med, lo, hi)) in [("readcold", cold), ("hot", hot)] {
+        eprintln!(
+            "GATEUP_WAVE time {temp} 35B shared expert: median={med:.1}us min={lo:.1}us \
+             max={hi:.1}us {:.2} TB/s",
+            (2 * n * k) as f64 / med / 1e6
+        );
+    }
+}

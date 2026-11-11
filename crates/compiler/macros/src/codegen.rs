@@ -1974,17 +1974,6 @@ fn plan_field_load(
     }
 }
 
-/// The rope base frequency the config DECLARES: `scalars["rope_theta"]`, else
-/// `bounds["rope_theta"]`, and `None` when it declares neither — no default is invented here
-/// (a caller that needs one picks it, and says why).
-pub(crate) fn declared_rope_theta(model: &ModelParams) -> Option<f64> {
-    model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-}
-
 /// The global attention class's geometry: a hybrid sliding/global arch's full-attention layers
 /// (`GLOBAL_HEAD_DIM`, `NUM_GLOBAL_KV_HEADS`, `GLOBAL_ROT_DIM`, `ROPE_PROPORTIONAL`), the base
 /// class's on a uniform model. One derivation, read by metal's `CanonicalParams` impl and by the
@@ -2255,10 +2244,7 @@ fn emit_fingerprint_check(
     affine_rows: &[(String, u32, u32)],
     expert_input: Option<&ExpertInputProbe>,
 ) -> TokenStream {
-    let num_hidden_layers = *model
-        .bounds
-        .get("num_hidden_layers")
-        .unwrap_or_else(|| panic!("model `{}` missing `num_hidden_layers`", model.source_stem));
+    let num_hidden_layers = model.text.layers.get() as u64;
     let hidden_size = *model
         .bounds
         .get("hidden_size")
@@ -2558,37 +2544,30 @@ fn emit_fingerprint_check(
     // the type nor the hash check above can tell them apart; before this gate the
     // winner was whichever `inventory` registered first.
     //
-    // Emitted ONLY when this variant's config declares a theta. 19 in-tree configs
-    // don't (gemma3/gemma4/qwen3.5 carry per-attention-class thetas nested under
-    // `rope_parameters`; modernbert and llama-2-70b omit it and take HF's implicit
-    // 10⁴ default) — for those there is no declared value to compare against, and
-    // synthesizing the default here would invent a constraint the config never
-    // stated and false-reject a checkpoint that spells `10000.0` out.
-    //
-    // Resolution order mirrors `rotary_load`'s exactly, MINUS its
-    // `.unwrap_or(10000.0)` fallback, so the gate can never claim a value the
-    // config didn't state.
+    // The gate compares against the θ this variant COMPUTES WITH — the config's typed
+    // `RopeTheta`, resolved once at load (stated, hoisted from `rope_parameters`, aliased, or the
+    // arch's own default for a config that omits it: llama-2-70b's 10⁴ is `LlamaConfig`'s). A
+    // checkpoint that spells a different θ is not this variant; one whose config states none
+    // passes `None` and stays permissive (`HfFingerprint::rope_theta`).
     //
     // The tolerance is relative and computed HERE, at expansion, so the emitted
     // code is a single compare against two literals — and so a config spelling
     // `1000000` where the checkpoint spells `1000000.0` cannot trip it. It is far
     // tighter than any real theta gap (the closest in-tree pair differs by 2×).
-    let rope_theta_check: TokenStream = match declared_rope_theta(model) {
-        Some(theta) => {
-            let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
-            let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
-            quote! {
-                // Permissive on `None` (see `HfFingerprint::rope_theta`): a caller
-                // that cannot trust its source's value — the cuda worker for GGUF —
-                // leaves the variant's baked value authoritative.
-                if let Some(theta) = hf.rope_theta
-                    && (theta - #theta_lit).abs() > #tol_lit
-                {
-                    return false;
-                }
+    let rope_theta_check: TokenStream = {
+        let theta = model.text.rope_theta.get();
+        let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
+        let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
+        quote! {
+            // Permissive on `None` (see `HfFingerprint::rope_theta`): a caller
+            // that cannot trust its source's value — the cuda worker for GGUF —
+            // leaves the variant's baked value authoritative.
+            if let Some(theta) = hf.rope_theta
+                && (theta - #theta_lit).abs() > #tol_lit
+            {
+                return false;
             }
         }
-        None => quote! {},
     };
 
     // Content-hash discriminator: reject checkpoints whose
@@ -3573,12 +3552,15 @@ fn emit_weights_struct(
         } else {
             "model.layers".to_string()
         };
-        let num_hidden_layers = *model.bounds.get(layer_count_key).unwrap_or_else(|| {
-            panic!(
-                "model `{}` has `__packed_splits__` but no `{}` bound",
-                model.source_stem, layer_count_key,
-            )
-        }) as usize;
+        let num_hidden_layers = match is_vision {
+            false => model.text.layers.get(),
+            true => *model.bounds.get(layer_count_key).unwrap_or_else(|| {
+                panic!(
+                    "model `{}` has `__packed_splits__` but no `{}` bound",
+                    model.source_stem, layer_count_key,
+                )
+            }) as usize,
+        };
         let mut calls: Vec<TokenStream> = Vec::new();
         for (packed_prefix, targets) in &manifest.packed_splits {
             let mut sized: Vec<(String, u64)> = Vec::with_capacity(targets.len());
@@ -3745,18 +3727,8 @@ fn emit_weights_struct(
     };
 
     let rotary_local_load_metal: TokenStream = if uses_rotary_local {
-        let head_dim = *model
-            .bounds
-            .get("head_dim")
-            .expect("model must have head_dim for RotaryLocal") as usize;
-        let local_theta = model
-            .scalars
-            .get("rope_local_base_freq")
-            .copied()
-            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            .or_else(|| model.scalars.get("rope_theta").copied())
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .expect("model must have rope_local_base_freq for RotaryLocal");
+        let head_dim = model.text.head_dim.get() as usize;
+        let local_theta = model.text.rope_local_for(&model.source_stem).get();
         quote! {
             let rotary_local = crate::__gpu::rotary::RotaryCache::new_from_gpuweights(
                 gw,
@@ -3836,16 +3808,8 @@ fn emit_weights_struct(
         quote! {}
     };
     let rotary_load_metal: TokenStream = if uses_rotary {
-        let head_dim = *model
-            .bounds
-            .get("head_dim")
-            .expect("model must have head_dim for Rotary") as usize;
-        let rope_theta = model
-            .scalars
-            .get("rope_theta")
-            .copied()
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .unwrap_or(10000.0);
+        let head_dim = model.text.head_dim.get() as usize;
+        let rope_theta = model.text.rope_theta.get();
         let partial = model
             .scalars
             .get("partial_rotary_factor")
@@ -7191,12 +7155,6 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor], dims: &ModelDims)
     }
 }
 
-/// The `WeightAccessors` trait method a [`WeightKind`] resolves through.
-/// Shared by [`emit_weight_accessors_impl`] (which keys its per-(op_idx,
-/// kind) slot-ordinal walk on this) and the PD-wavefront bridge's
-/// `to_wavefront::build_base_to_loc` (which must reproduce the IDENTICAL
-/// slot ordinals so the wavefront `WeightLoc`s key the SAME runtime match
-/// arms). Keep the two in lockstep by routing both through this fn.
 /// The accessor RETURN TYPE for a weight kind — the second half of
 /// the one accessor-ABI fact, beside
 /// [`weight_kind_accessor_method`]. Both the `WeightAccessors` trait
@@ -7212,6 +7170,8 @@ pub(crate) fn weight_kind_rust_type(kind: &crate::weight_vocab::WeightKind) -> T
         .expect("weight kind rust type is a valid type path")
 }
 
+/// The `WeightAccessors` trait method a [`WeightKind`] resolves through — the key of
+/// [`emit_weight_accessors_impl`]'s per-(op_idx, kind) slot-ordinal walk.
 pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind) -> &'static str {
     use crate::weight_vocab::WeightKind;
     match kind {
@@ -8139,7 +8099,7 @@ fn target_model_input(
     use scratchy_forward_compiler::LentWeight;
     let lm_head = program.weights.find(&["lm_head"]);
     let weights: std::collections::BTreeSet<(u32, Option<UnrollIndex>)> = (buckets.iter())
-        .flat_map(|b| b.lowered.bindings.iter())
+        .flat_map(|b| b.lowered.bindings().iter())
         .filter_map(|b| match *b {
             scratchy_subtile::handoff::SourceBinding::Weight { id, index } => Some((id, index)),
             _ => None,
@@ -8161,7 +8121,7 @@ fn target_model_input(
     // Every bundle tensor a canonical binds that has a checkpoint leaf, named in full: the
     // bundle's own prefix, its suffix rewritten as the shared table says, then the leaf.
     let bundle_tensors: std::collections::BTreeMap<_, _> = (buckets.iter())
-        .flat_map(|b| b.lowered.bindings.iter())
+        .flat_map(|b| b.lowered.bindings().iter())
         .filter_map(|b| match *b {
             scratchy_subtile::handoff::SourceBinding::BundleTensor { id, index, tensor } => {
                 Some(((id, index, tensor.name()), tensor))
@@ -8210,7 +8170,7 @@ fn target_model_input(
         facts: TargetModelFacts {
             head_dim,
             rot_dim: rot_dim(model, head_dim),
-            rope_theta: declared_rope_theta(model),
+            rope_theta: Some(model.text.rope_theta.get()),
             rms_norm_eps: rms_norm_eps(model),
             vocab_size: bound("vocab_size").unwrap_or(0),
             gdn,
@@ -8241,7 +8201,7 @@ fn target_attn_classes(
         / tp;
     let base_rot = rot_dim(model, head_dim);
     let global = global_attn_class(model, tp, (head_dim, kv_heads, base_rot));
-    let theta = declared_rope_theta(model);
+    let theta = Some(model.text.rope_theta.get());
     let local_theta = (model.scalars.get("rope_local_base_freq").copied())
         .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64));
     let window = (model.bounds.get("sliding_window"))
@@ -8357,8 +8317,7 @@ fn kv_codec_for(
         use scratchy_ir::{DenseReason, KvGeometry, codec_for};
         let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
         let pool_layers = (model.bounds.get("target_num_hidden_layers"))
-            .or(model.bounds.get("num_hidden_layers"))
-            .map_or(0, |&n| n as usize);
+            .map_or(model.text.layers.get(), |&n| n as usize);
         let geometry = KvGeometry {
             num_layers: pool_layers,
             num_kv_heads: bound("num_key_value_heads"),
@@ -8974,7 +8933,7 @@ pub(crate) fn fill_canonical_params(
     };
     let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, tq_bits);
 
-    let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or(&0) as usize;
+    let num_hidden_layers = model.text.layers.get();
 
     let facts = {
         use scratchy_ir::model_facts as mf;
@@ -9178,10 +9137,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
-    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
-        Some(&n) => n as usize,
-        None => return None,
-    };
+    let num_hidden_layers = model.text.layers.get();
     let mut linear = vec![false; num_hidden_layers];
     let mut is_hybrid = false;
     for node in &fuf.nodes {
@@ -9250,10 +9206,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
-    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
-        Some(&n) => n as usize,
-        None => return None,
-    };
+    let num_hidden_layers = model.text.layers.get();
     let mut sliding = vec![false; num_hidden_layers];
     let mut has_sliding = false;
     for node in &fuf.nodes {
@@ -9277,7 +9230,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
     if !has_sliding {
         return None;
     }
-    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as usize;
+    let head_dim = model.text.head_dim.get() as usize;
     let num_kv = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as usize;
     let g_hd = model
         .bounds
@@ -9361,138 +9314,74 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 ///
 /// The manifest is still emitted (the KTIR emulator's session takes it), so both answers exist at
 /// bake and this costs one parse per model.
+/// ⭐ THE ROW A TIED DECODE STEP GATHERS — the `RowGather` the sharding analysis reads for a
+/// forward whose input row the chained head fills: a tied model's decode, its embedded-hidden
+/// source read on device out of the vocabulary projection's own table at the token the previous
+/// step drew. `mint_embed_chain` builds that gather on the lowered graph; the analysis needs only
+/// the fact, and places the row's all-reduce where it is first read whole when the table splits.
+/// A prefill forward's rows are the prompt's, staged whole by the host, and an untied model's
+/// decode does not chain: both state none. `decode` is the predicate the chain's mint runs under
+/// (a decode rung, never a prefill one), so the two cannot disagree about which bakes chain.
+/// ⭐ A RUNG OF THE SHARDED WORLD READS THE DECODE'S STAGED WEIGHTS — one copy per rank, cut by the
+/// decode's slice laws — so a rung whose own analysis cuts a staged source differently would read
+/// the wrong slice. That is a BUILD error, naming the bundle, the binding and both cuts
+/// (`tensor_parallel::staged_cut_apart`).
 #[cfg(feature = "spyre")]
-fn refuse_if_wiring_disagrees_with_manifest(
+fn refuse_if_staged_cut_apart(
     stem: &str,
-    manifest_json: &str,
-    emitted_layers: &[(u64, u32, u32)],
-    emitted_embed: u32,
-    emitted_cos: &[(u32, u32, proc_macro2::TokenStream)],
-    emitted_sin: &[(u32, u32, proc_macro2::TokenStream)],
-    // Which source indices the GENERATED loader will emit a `BoundWeight` for.
-    emitted_weight_ids: &std::collections::BTreeSet<u32>,
+    bundle: &str,
+    decode: (
+        &[scratchy_subtile::handoff::SourceBinding],
+        &[scratchy_subtile::tensor_parallel::SourceShard],
+    ),
+    rung: (
+        &[scratchy_subtile::handoff::SourceBinding],
+        &[scratchy_subtile::tensor_parallel::SourceShard],
+    ),
 ) {
-    use scratchy_target_spyre::manifest::Manifest;
-    let m = match Manifest::from_json(manifest_json) {
-        Ok(m) => m,
-        // The manifest is a bake artifact of this same function; if it will not parse, the
-        // KTIR-emulator path is already broken and that is its own failure, not this check's.
-        Err(e) => panic!("[superdsc-wiring] {stem}: the bake's own manifest does not parse: {e}"),
-    };
-
-    // ── the OLD extraction, exactly as `parse_bundle` performed it ──
-    type LayerIds = Vec<(u64, usize)>;
-    let (mut pk, mut pv): (LayerIds, LayerIds) = (Vec::new(), Vec::new());
-    let (mut embed, mut cos, mut sin) = (None, Vec::new(), Vec::new());
-    for s in &m.sources {
-        match s.role.as_str() {
-            "prefix_k" => pk.push((s.layer.unwrap_or(0), s.id)),
-            "prefix_v" => pv.push((s.layer.unwrap_or(0), s.id)),
-            "embed" => embed = Some(s.id as u32),
-            "cos" => cos.push(s.id as u32),
-            "sin" => sin.push(s.id as u32),
-            _ => {}
-        }
-    }
-    pk.sort_by_key(|x| x.0);
-    pv.sort_by_key(|x| x.0);
-
-    let mut fail: Vec<String> = Vec::new();
-    if embed != Some(emitted_embed) {
-        fail.push(format!(
-            "embed source: manifest says {embed:?}, wiring says {emitted_embed}"
-        ));
-    }
-    let emit_cos: Vec<u32> = emitted_cos.iter().map(|&(i, ..)| i).collect();
-    let emit_sin: Vec<u32> = emitted_sin.iter().map(|&(i, ..)| i).collect();
-    if cos != emit_cos {
-        fail.push(format!(
-            "cos sources: manifest {cos:?}, wiring {emit_cos:?}"
-        ));
-    }
-    if sin != emit_sin {
-        fail.push(format!(
-            "sin sources: manifest {sin:?}, wiring {emit_sin:?}"
-        ));
-    }
-    // ── the WEIGHT set: what the loader stages must be what the bundle declares ──
-    //
-    // ⛔ `load_weights` walked `manifest.sources` filtering `role == "weight" || "weight_scale"`
-    // and used `s.id` as the tid. `stage_bound_weights` walks the GENERATED `BoundWeight` list and
-    // uses the binding index. Those are the same number only if the two lists agree, and nothing
-    // checked that they do — a weight in one and not the other is either a tensor the device reads
-    // that nobody staged, or bytes written into a placement that belongs to something else.
-    let manifest_weights: std::collections::BTreeSet<u32> = m
-        .sources
-        .iter()
-        .filter(|s| s.role == "weight" || s.role == "weight_scale")
-        .map(|s| s.id as u32)
-        .collect();
-    if &manifest_weights != emitted_weight_ids {
-        let only_manifest: Vec<u32> = manifest_weights
-            .difference(emitted_weight_ids)
-            .copied()
-            .collect();
-        let only_emitted: Vec<u32> = emitted_weight_ids
-            .difference(&manifest_weights)
-            .copied()
-            .collect();
-        if !only_manifest.is_empty() {
-            fail.push(format!(
-                "{} weight source(s) the bundle declares that the generated loader does NOT stage: \
-                 {:?} — the device reads a tensor nobody wrote",
-                only_manifest.len(),
-                only_manifest
-            ));
-        }
-        if !only_emitted.is_empty() {
-            fail.push(format!(
-                "{} weight source(s) the generated loader stages that the bundle does NOT declare: \
-                 {:?} — bytes land in a placement belonging to something else",
-                only_emitted.len(),
-                only_emitted
-            ));
-        }
-    }
-
-    if pk.len() != emitted_layers.len() {
-        fail.push(format!(
-            "layer count: manifest has {} prefix_k sources, wiring emits {} layers",
-            pk.len(),
-            emitted_layers.len()
-        ));
-    }
-    // ⛔ POSITION BY POSITION. The worker indexes `layers[i]` for layer `i`, so "same set, other
-    // order" is exactly as wrong as a missing entry.
-    for (i, (&(mlayer, mk), &(wlayer, wk, wv))) in pk.iter().zip(emitted_layers).enumerate() {
-        if mlayer != wlayer || mk != wk as usize {
-            fail.push(format!(
-                "layers[{i}]: manifest says layer {mlayer} prefix_k t{mk}, wiring says layer \
-                 {wlayer} prefix_k t{wk}"
-            ));
-        }
-        let _ = wv;
-    }
-    for (i, (&(mlayer, mv), &(_, _, wv))) in pv.iter().zip(emitted_layers).enumerate() {
-        if mv != wv as usize {
-            fail.push(format!(
-                "layers[{i}] (layer {mlayer}): manifest says prefix_v t{mv}, wiring says t{wv}"
-            ));
-        }
-    }
-
-    if !fail.is_empty() {
+    if let Some((binding, decode_cut, rung_cut)) =
+        scratchy_subtile::tensor_parallel::staged_cut_apart(decode, rung)
+    {
         panic!(
-            "\n⛔ [superdsc-wiring] {stem}: THE EMITTED WIRING DISAGREES WITH THE MANIFEST IT \
-             REPLACED. Refusing to bake.\n\n{}\n\nBoth are derived from one `GraphKtir`, so one \
-             of the two scans is wrong. The worker indexes `layers[i]` for layer `i`: a dropped or \
-             reordered entry binds one layer's K/V cache to another layer's tids, which on the \
-             device is a wrong address — a hang or silent corruption, reported by nothing.\n",
-            fail.iter()
-                .map(|f| format!("  • {f}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            "[spyre-tp] {stem}: {bundle} cuts {binding:?} as {rung_cut:?}, but the world's decode \
+             cuts it as {decode_cut:?} — one staged copy per rank cannot be both"
         );
+    }
+}
+
+/// A spyre bake's tape: a decoder's, whose embed row is a fact
+/// ([`scratchy_subtile::handoff::EmbedRow`]) — every read of it below takes the row, never looks
+/// for it.
+#[cfg(feature = "spyre")]
+type BakeTape = scratchy_subtile::handoff::LoweredDecode<scratchy_subtile::handoff::EmbedRow>;
+
+/// The bridge's tape as a spyre bake's ([`BakeTape`]): a decoder gathers an embed row, and a tape
+/// that gathers none is no decoder this bake serves — a build error naming the model.
+#[cfg(feature = "spyre")]
+fn bake_tape(stem: &str, l: crate::to_wavefront::LoweredDecode) -> BakeTape {
+    l.into_decode().unwrap_or_else(|scratchy_subtile::handoff::NoEmbedRow| {
+        panic!(
+            "[spyre-superdsc] {stem}: the lowered tape gathers no embed row — a spyre bake lowers \
+             a decoder, whose host gather lands in its one EmbeddedHidden source"
+        )
+    })
+}
+
+#[cfg(feature = "spyre")]
+fn chained_row_gathers(
+    lwd: &BakeTape,
+    model: &ModelParams,
+    decode: bool,
+) -> Vec<scratchy_subtile::tensor_parallel::RowGather> {
+    if !(decode && tie_word_embeddings(model)) {
+        return Vec::new();
+    }
+    match lwd.input.vocab_table() {
+        Some(table) => vec![scratchy_subtile::tensor_parallel::RowGather {
+            row: lwd.embed_row().index(),
+            table,
+        }],
+        None => Vec::new(),
     }
 }
 
@@ -9502,41 +9391,17 @@ fn refuse_if_wiring_disagrees_with_manifest(
 // `rope_cos_sin_kind` rows by the SAME value (`PrefillGate`). One law, two
 // consumers — the baked table and the gate's staged rows cannot drift apart.
 
-/// The model's attention head dim by the bounds the tape was lowered at —
-/// `head_dim` where the arch declares it, the `hidden/heads` quotient where it
-/// does not (the same fallback the emitter itself uses).
+/// The model's attention head dim — the config's, typed at load ([`crate::config::HeadDim`]: stated,
+/// or the loader's one `hidden/heads` derivation).
 #[cfg(feature = "spyre")]
 fn superdsc_model_head_dim(model: &ModelParams) -> u64 {
-    let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
-    let heads = b("num_attention_heads").max(1);
-    match b("head_dim") {
-        0 => b("hidden_size") / heads,
-        v => v,
-    }
-}
-
-/// `rope_theta`, scalars first, NO default — the same refusal the wiring bakes
-/// (a silent 1e4 would disagree with llama-3.2's 500000: fluent, subtly
-/// wrong output).
-#[cfg(feature = "spyre")]
-fn superdsc_model_rope_theta(model: &ModelParams) -> f64 {
-    model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-        .unwrap_or_else(|| {
-            panic!(
-                "[superdsc-wiring] {}: no rope_theta in scalars or bounds — refusing to bake a \
-                 default; the baked table would silently disagree with the checkpoint",
-                model.source_stem
-            )
-        })
+    u64::from(model.text.head_dim.get())
 }
 
 /// The rotary class a `local`-flagged source serves, as a VALUE: sliding
-/// sources take the local class's base frequency (falling back to the model's
-/// main θ, the precedence `rotary_local_load` uses); global sources take
+/// sources take the local class's base frequency (the config's stated
+/// `rope_local_base_freq`, typed at load — a body with a local source and no
+/// stated base is a build error, [`crate::config::TextGeometry::rope_local_for`]); global sources take
 /// proportional partial rotary when the config declares it on a WIDER global
 /// head dim (gemma-4), else the base class.
 #[cfg(feature = "spyre")]
@@ -9548,19 +9413,7 @@ fn superdsc_rotary_kind(
 ) -> scratchy_target_spyre::wiring::RotaryKind {
     let theta_bits = (theta as f32).to_bits();
     if local {
-        let local_theta = model
-            .scalars
-            .get("rope_local_base_freq")
-            .copied()
-            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            .or_else(|| model.scalars.get("rope_theta").copied())
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .unwrap_or_else(|| {
-                panic!(
-                    "[superdsc-wiring] {}: no rope_local_base_freq for a local rotary source",
-                    model.source_stem
-                )
-            });
+        let local_theta = model.text.rope_local_for(&model.source_stem).get();
         scratchy_target_spyre::wiring::RotaryKind::Default {
             head_dim: hd as u32,
             theta_bits: (local_theta as f32).to_bits(),
@@ -9726,17 +9579,20 @@ fn load_const_entry_tokens(
             pad_vocab,
             k,
             hidden,
+            block,
             operand,
         } => {
             let pad_vocab = proc_macro2::Literal::u32_unsuffixed(pad_vocab);
             let k = proc_macro2::Literal::u32_unsuffixed(k);
             let hidden = proc_macro2::Literal::u32_unsuffixed(hidden);
+            let block = proc_macro2::Literal::u32_unsuffixed(block);
             let operand = proc_macro2::Literal::u8_unsuffixed(operand);
             quote! {
                 ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
                     pad_vocab: #pad_vocab,
                     k: #k,
                     hidden: #hidden,
+                    block: #block,
                     operand: #operand,
                 }
             }
@@ -9748,12 +9604,9 @@ fn load_const_entry_tokens(
 #[cfg(feature = "spyre")]
 fn emit_superdsc_wiring(
     gk: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
-    lwd: &crate::to_wavefront::LoweredDecode,
+    lwd: &BakeTape,
     model: &ModelParams,
     decode_position: u32,
-    // The manifest this wiring REPLACES. Both come from `gk`; they must agree, and
-    // `refuse_if_wiring_disagrees_with_manifest` is what checks that they do.
-    manifest_json: &str,
 ) -> proc_macro2::TokenStream {
     use crate::to_wavefront::SourceBinding;
     let u32l = proc_macro2::Literal::u32_unsuffixed;
@@ -9767,35 +9620,22 @@ fn emit_superdsc_wiring(
     // over `SourceBinding` still happens, HERE, where a new variant is a build
     // error; what crosses to the runtime is its ANSWER.
     //
-    // Both lookups REFUSE rather than defaulting: a wiring whose host gather
-    // has nowhere to land, or which carries no rotary, is not a wiring.
-    let embed_src = lwd
-        .bindings
-        .iter()
-        .position(|b| matches!(b, SourceBinding::EmbeddedHidden))
-        .map(|i| i as u32)
-        .unwrap_or_else(|| {
-            panic!(
-                "[superdsc-wiring] {}: no EmbeddedHidden source — refusing to bake a wiring \
-                 whose host gather has nowhere to land",
-                model.source_stem
-            )
-        });
+    // The embed row is the tape's own ([`BakeTape`]: a decoder's always gathers one); the rotary
+    // lookup below REFUSES rather than defaulting: a wiring that carries no rotary is not a wiring.
+    let embed_src = lwd.embed_row().index() as u32;
     // ── Geometry, from the bounds the tape was lowered at ──
     let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
     let hidden = u32l(b("hidden_size") as u32);
     let vocab = u32l(b("vocab_size") as u32);
-    let n_layers = u32l(b("num_hidden_layers") as u32);
+    let n_layers_expected = model.text.layers.get();
+    let n_layers = u32l(n_layers_expected as u32);
     // head_dim is declared by most arches and derived by the rest — the same
     // `hidden/heads` fallback the emitter itself uses, resolved HERE so the
     // worker never re-derives it (that re-derivation, against a config whose
     // `num_attention_heads` disagreed with the baked bundle, is a known
     // gemma-4-class failure).
     let heads = b("num_attention_heads").max(1);
-    let hd = match b("head_dim") {
-        0 => b("hidden_size") / heads,
-        v => v,
-    };
+    let hd = superdsc_model_head_dim(model);
     let head_dim = u32l(hd as u32);
     // ⭐⭐⭐⭐⭐ THE HEAD COUNT ITSELF, NOT THE `hidden/hd` QUOTIENT. Baking `heads`
     // here is what retires the host-side `hidden / head_dim` derivation everywhere:
@@ -9807,25 +9647,9 @@ fn emit_superdsc_wiring(
     // mask. MEASURED on gemma-4 tiny-allglobal: heads 2-3 ran unmasked, every layer.
     let nqh = u32l(heads as u32);
     let kv_dim = u32l((b("num_key_value_heads").max(1) * hd) as u32);
-    // ⛔ SCALARS FIRST, AND NO DEFAULT. `rope_theta` is a FLOAT, so it lives in
-    // `model.scalars`; `bounds` is integer-valued and a bounds-only lookup
-    // misses it entirely. With an `unwrap_or(1e4)` behind it that miss is
-    // SILENT and emits θ=10000 for llama-3.2 (whose real θ is 500000) — a
-    // wrong baked constant that produces fluent, subtly-wrong output. The
-    // whole point of baking geometry is to have ONE answer, so a missing θ
-    // fails the build here exactly as metal's `.expect` does.
-    let theta = model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-        .unwrap_or_else(|| {
-            panic!(
-                "[superdsc-wiring] {}: no rope_theta in scalars or bounds — refusing to bake a \
-                 default; the baked table would silently disagree with the checkpoint",
-                model.source_stem
-            )
-        }) as f32;
+    // θ is the config's, typed at load (stated, or its arch's own default), the same value the
+    // numeric gate's prefill probe stages its rows by.
+    let theta = model.text.rope_theta.get() as f32;
     let theta_bits = u32l(theta.to_bits());
 
     // cos/sin carry their FULL column width: GQA gives more than one (Q vs K),
@@ -9874,7 +9698,7 @@ fn emit_superdsc_wiring(
         }
     };
     let rot_srcs = |want_cos: bool| -> Vec<(u32, u32, proc_macro2::TokenStream)> {
-        lwd.bindings
+        lwd.bindings()
             .iter()
             .enumerate()
             .filter(|(_, b)| match b {
@@ -9922,7 +9746,7 @@ fn emit_superdsc_wiring(
     let mut layers: Vec<(u64, u32, u32)> = Vec::new();
     if let Some(mask) = gk.attn_mask {
         let pk: std::collections::HashMap<u32, u64> = lwd
-            .bindings
+            .bindings()
             .iter()
             .enumerate()
             .filter_map(|(i, b)| match b {
@@ -9931,7 +9755,7 @@ fn emit_superdsc_wiring(
             })
             .collect();
         let pv: std::collections::HashSet<u32> = lwd
-            .bindings
+            .bindings()
             .iter()
             .enumerate()
             .filter_map(|(i, b)| match b {
@@ -9973,25 +9797,14 @@ fn emit_superdsc_wiring(
     //      Forty layers in, thirty-nine wired, no message.
     //    • `embed_src` is `.position(..)` — the FIRST `EmbeddedHidden`. A second one is never
     //      filled by anything.
-    //    • `cos_srcs`/`sin_srcs` are collected by filter, so they cannot miss one — asserted
-    //      anyway, because that is a property of the collection and not of the enum.
+    //    • `cos_srcs`/`sin_srcs` are collected by filter from the same bindings, so they cannot
+    //      miss one, and nothing here re-checks it.
     //
     //  This is the sibling of `superdsc_bake.rs`'s no-device-compiler refusal, and for the same
     //  reason it gives: the binary would link, every session would report ready, and the failure
     //  would surface as a hang or as empty output with no error anywhere.
     {
         use crate::to_wavefront::SourceBinding as SB;
-        let n_layers_expected = model
-            .bounds
-            .get("num_hidden_layers")
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "[superdsc-wiring] {}: no `num_hidden_layers` bound — cannot check that every \
-                     layer's prefix KV is wired, and an unwired layer reads a cache nobody filled",
-                    model.source_stem
-                )
-            }) as usize;
 
         let mut fail: Vec<String> = Vec::new();
 
@@ -10015,8 +9828,6 @@ fn emit_superdsc_wiring(
         }
 
         // ── every caller-filled source is covered by exactly one filler ──
-        let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
-        let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
         // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's
         // five tids (the seed quadruple's four word tables and inv_t) are minted
         // below the `LoweredDecode` binding layer (the mint's own law), so they
@@ -10110,7 +9921,7 @@ fn emit_superdsc_wiring(
         };
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
-            let Some(b) = lwd.bindings.get(id as usize) else {
+            let Some(b) = lwd.bindings().get(id as usize) else {
                 // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
                 // binding layer, so it carries NO `SourceBinding`: the wiring's
                 // `load_consts` list names it (BY MEMBERSHIP in the generic
@@ -10170,16 +9981,9 @@ fn emit_superdsc_wiring(
                         ));
                     }
                 }
-                SB::Cos { .. } => {
-                    if !cos_ids.contains(&id) {
-                        fail.push(format!("Cos source t{id} is not in the tape's cos_srcs"));
-                    }
-                }
-                SB::Sin { .. } => {
-                    if !sin_ids.contains(&id) {
-                        fail.push(format!("Sin source t{id} is not in the tape's sin_srcs"));
-                    }
-                }
+                // `cos_srcs`/`sin_srcs` ARE every `Cos`/`Sin` binding (`rot_srcs` collects them
+                // from these bindings), so each is in its list by construction.
+                SB::Cos { .. } | SB::Sin { .. } => {}
                 // Device-resident, bound per layer through `LayerWiring` — covered by the layer
                 // count check above.
                 SB::PrefixK { .. } | SB::PrefixV { .. } => {}
@@ -10238,7 +10042,7 @@ fn emit_superdsc_wiring(
                 continue;
             };
             // Only a real weight has a staged shape; a fp8 scale is a different tensor.
-            if !matches!(lwd.bindings.get(*e), Some(SB::Weight { .. })) {
+            if !matches!(lwd.bindings().get(*e), Some(SB::Weight { .. })) {
                 continue;
             }
             let Some(&(rows, cols)) = gk.tensor_shapes.get(*e) else {
@@ -10266,30 +10070,6 @@ fn emit_superdsc_wiring(
             );
         }
     }
-
-    // Exactly the sources `weight_bindings` emits a `BoundWeight` for — the same
-    // `SourceBinding::{Weight, WeightScale}` filter, over the same list, at the same indices.
-    let emitted_weight_ids: std::collections::BTreeSet<u32> = lwd
-        .bindings
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| {
-            matches!(
-                b,
-                SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. }
-            )
-        })
-        .map(|(i, _)| i as u32)
-        .collect();
-    refuse_if_wiring_disagrees_with_manifest(
-        &model.source_stem,
-        manifest_json,
-        &layers,
-        embed_src,
-        &cos_v,
-        &sin_v,
-        &emitted_weight_ids,
-    );
 
     let layer_toks = layers.iter().map(|(_, ks, vs)| {
         let (ks, vs) = (u32l(*ks), u32l(*vs));
@@ -10348,6 +10128,41 @@ fn emit_superdsc_wiring(
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
             let (q_width, head_size) = (u32l(p.q_width), u32l(p.head_size));
+            // ⭐ THE EXTENT PAIR, re-minted in the wiring's own static by the ONE mint
+            // (`QueryExtent::of_baked_rung`, the same constructor the bake's codegen minted
+            // the pair by) — const, so the static carries it. Every `None` arm names a pair
+            // that does not describe a rung, which the bake's own mint already refused, so it
+            // is a build failure here and never a runtime fact (const panic takes a literal, so
+            // the messages are). The types ride the spyre crate's own wiring re-export (the
+            // models crate does not name `scratchy-subtile` directly).
+            let (ew, es) = (
+                u32l(p.extent.per_request().get()),
+                u32l(p.extent.requests().get()),
+            );
+            let extent = quote! {
+                match ::scratchy_target_spyre::wiring::QueryExtent::of_baked_rung(
+                    match ::scratchy_target_spyre::wiring::RungWidth::of_baked_rows(#ew) {
+                        ::core::option::Option::Some(w) => w,
+                        ::core::option::Option::None => ::core::panic!(
+                            "the wiring's per-request width does not name a baked rung — a bake \
+                             bug this static cannot carry"
+                        ),
+                    },
+                    match ::scratchy_target_spyre::wiring::RungCap::of_baked_seqs(#es) {
+                        ::core::option::Option::Some(s) => s,
+                        ::core::option::Option::None => ::core::panic!(
+                            "the wiring's request count does not name a baked rung — a bake bug \
+                             this static cannot carry"
+                        ),
+                    },
+                ) {
+                    ::core::option::Option::Some(e) => e,
+                    ::core::option::Option::None => ::core::panic!(
+                        "the wiring's query extent does not name a baked rung — a bake bug this \
+                         static cannot carry"
+                    ),
+                }
+            };
             let paged_rows = match p.paged_rows {
                 scratchy_target_spyre::paged_step::PagedRows::Batch => {
                     quote! { ::scratchy_target_spyre::paged_step::PagedRows::Batch }
@@ -10363,6 +10178,7 @@ fn emit_superdsc_wiring(
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, q_width: #q_width,
                     head_size: #head_size, walk: #walk,
                     paged_rows: #paged_rows,
+                    extent: #extent,
                 })
             }
         }
@@ -10492,6 +10308,7 @@ fn emit_superdsc_wiring(
             let pad_vocab = u32l(seat.pad_vocab);
             let seed_row_words = u32l(seat.seed_row_words);
             let gate_row_words = u32l(seat.gate_row_words);
+            let idx_row_words = u32l(seat.idx_row_words);
             quote! {
                 ::core::option::Option::Some(
                     ::scratchy_target_spyre::wiring::SampleSeat {
@@ -10503,6 +10320,7 @@ fn emit_superdsc_wiring(
                         pad_vocab: #pad_vocab,
                         seed_row_words: #seed_row_words,
                         gate_row_words: #gate_row_words,
+                        idx_row_words: #idx_row_words,
                     }
                 )
             }
@@ -10521,6 +10339,7 @@ fn emit_superdsc_wiring(
             let k = u32l(chain.k);
             let hidden = u32l(chain.hidden);
             let replaces = u32l(chain.replaces);
+            let block = u32l(chain.block);
             quote! {
                 ::scratchy_target_spyre::forward_tape::ForwardPhase::Decode {
                     chain: ::scratchy_target_spyre::wiring::ChainWiring {
@@ -10529,6 +10348,7 @@ fn emit_superdsc_wiring(
                         k: #k,
                         hidden: #hidden,
                         replaces: #replaces,
+                        block: #block,
                     },
                 }
             }
@@ -10592,7 +10412,7 @@ fn emit_superdsc_wiring(
 /// nothing parses it, at build time or after. `OUT_DIR` is cargo's own per-build directory for the crate
 /// being expanded, and every arch crate has a `build.rs`, so it is set here.
 #[cfg(feature = "spyre")]
-#[cfg_attr(not(feature = "spyre-hw"), allow(unused_variables))]
+#[cfg_attr(not(feature = "spyre-lower"), allow(unused_variables))]
 fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     // ⭐⭐⭐ WHAT IS INVENTORIED DEPENDS ON THE DEVICE, AND ONLY ON THE DEVICE.
     //
@@ -10685,12 +10505,9 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     //    measured 25 groups/layer (granite-2b, 40 layers) to 73 (gemma-4-12b, 48): a flat
     //    ceiling tight enough to hold the 2b refuses the 12b. Card-only: on the emulator the
     //    drained groups are one-per-op KTIR programs, a different unit this budget never sees.
-    #[cfg(feature = "spyre-hw")]
+    #[cfg(feature = "spyre-lower")]
     {
-        let layers: usize =
-            *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
-                panic!("model `{}` missing `num_hidden_layers`", model.source_stem)
-            }) as usize;
+        let layers = model.text.layers.get();
         let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
         let ceiling = layers * per_layer;
         if n_groups > ceiling {
@@ -10774,10 +10591,23 @@ fn cow_str(s: &str) -> proc_macro2::TokenStream {
     quote! { ::std::borrow::Cow::Borrowed(#lit) }
 }
 
-/// A `Cow::Borrowed` slice of unsuffixed integer literals.
+/// A `Cow::Borrowed` slice of `(u64, u64)` pairs — the walk's ONE (extent, stride) slice.
 #[cfg(feature = "spyre")]
-fn cow_u64s(v: &[u64]) -> proc_macro2::TokenStream {
-    let lits = v.iter().map(|x| proc_macro2::Literal::u64_unsuffixed(*x));
+fn cow_axis_pairs(v: &[(u64, u64)]) -> proc_macro2::TokenStream {
+    let lits = v.iter().map(|&(e, s)| {
+        let (e, s) = (
+            proc_macro2::Literal::u64_unsuffixed(e),
+            proc_macro2::Literal::u64_unsuffixed(s),
+        );
+        quote! { (#e, #s) }
+    });
+    quote! { ::std::borrow::Cow::Borrowed(&[#(#lits),*]) }
+}
+
+/// A `Cow::Borrowed` slice of unsuffixed `u8` literals — the bake's host-scan axis order.
+#[cfg(feature = "spyre")]
+fn cow_u8s(v: &[u8]) -> proc_macro2::TokenStream {
+    let lits = v.iter().map(|x| proc_macro2::Literal::u8_unsuffixed(*x));
     quote! { ::std::borrow::Cow::Borrowed(&[#(#lits),*]) }
 }
 
@@ -10932,6 +10762,26 @@ fn place_id_tokens(
                 ::scratchy_target_spyre::bundle_code::PlaceId::Synth { of: #of, role: #role }
             }
         }
+        P::OpLocal { of, role } => {
+            let of = proc_macro2::Literal::u32_unsuffixed(*of);
+            let role = op_local_role_tokens(role);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::PlaceId::OpLocal { of: #of, role: #role }
+            }
+        }
+    }
+}
+
+/// One op-local pin role as tokens — its named constant. Exhaustive over the kinds, so a new
+/// op-local pin breaks THIS match at build, as a new [`SynthRole`] breaks `synth_role_tokens`.
+#[cfg(feature = "spyre")]
+pub(crate) fn op_local_role_tokens(
+    r: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::OpLocalRole,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::OpLocalKind as K;
+    let b = quote! { ::scratchy_target_spyre::bundle_code::OpLocalRole };
+    match r.kind() {
+        K::Rinv => quote! { #b::RINV },
     }
 }
 
@@ -10967,22 +10817,41 @@ fn placement_tokens(
 fn kernel_weight_tokens(
     k: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KernelWeight<'_>,
 ) -> proc_macro2::TokenStream {
-    let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KernelWeight {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle;
+    let bundle::KernelWeight {
         id,
-        device_size,
-        stride_map,
+        axes,
+        arm,
         stick_size,
         word_length,
     } = k;
     let id = place_id_tokens(id);
-    let (device_size, stride_map) = (cow_u64s(device_size), cow_u64s(stride_map));
+    // ⭐ AN EXHAUSTIVE MATCH, NOT A DERIVATION: the bake holds the arm verdict and the macro
+    // emits it verbatim — a variant ADDED to `WalkArm` breaks THIS match at build time, and
+    // the boot receives the statement, never a re-analysis of the axes. The permutation arm
+    // carries its own order, so the macro cannot emit an arm and an order that disagree.
+    let arm = match arm {
+        bundle::WalkArm::Permutation { order } => {
+            let order = cow_u8s(order);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::WalkArm::Permutation { order: #order }
+            }
+        }
+        bundle::WalkArm::InnerContig => {
+            quote! { ::scratchy_target_spyre::bundle_code::WalkArm::InnerContig }
+        }
+        bundle::WalkArm::PerElement => {
+            quote! { ::scratchy_target_spyre::bundle_code::WalkArm::PerElement }
+        }
+    };
+    let axes = cow_axis_pairs(axes);
     let (stick_size, word_length) = (
         proc_macro2::Literal::u32_unsuffixed(*stick_size),
         proc_macro2::Literal::u32_unsuffixed(*word_length),
     );
     quote! {
         ::scratchy_target_spyre::bundle_code::KernelWeight {
-            id: #id, device_size: #device_size, stride_map: #stride_map,
+            id: #id, axes: #axes, arm: #arm,
             stick_size: #stick_size, word_length: #word_length,
         }
     }
@@ -11158,15 +11027,8 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
         correction,
     } = g;
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KvShifts {
-        slot_stride_bytes,
-        slab_stride_bytes,
-        page_slots,
-        request,
-        slot_offset,
         page_fold,
-        batched_requests,
         gathered,
-        fold_rows,
         walk,
         tp,
     } = kv;
@@ -11231,22 +11093,6 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
         }
         None => quote! { ::std::option::Option::None },
     };
-    let [slot, slab, slots, req, slot_off] = [
-        *slot_stride_bytes,
-        *slab_stride_bytes,
-        *page_slots,
-        *request,
-        *slot_offset,
-    ]
-    .map(proc_macro2::Literal::u32_unsuffixed);
-    let fold_rows = match fold_rows {
-        scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::WholeBatch => {
-            quote! { ::scratchy_target_spyre::bundle_code::FoldRows::WholeBatch }
-        }
-        scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::PerRequest => {
-            quote! { ::scratchy_target_spyre::bundle_code::FoldRows::PerRequest }
-        }
-    };
     let jbp = proc_macro2::Literal::u64_unsuffixed(*job_bin_ptr);
     // Launch order is the slice position, so the image path is keyed by it.
     let image = out_dir_bytes(images, &format!("{fp}/group_{index}.bin"), init_binary);
@@ -11265,15 +11111,8 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
     quote! {
         ::scratchy_target_spyre::bundle_code::LaunchGroup {
             kv: ::scratchy_target_spyre::bundle_code::KvShifts {
-                slot_stride_bytes: #slot,
-                slab_stride_bytes: #slab,
-                page_slots: #slots,
-                request: #req,
-                slot_offset: #slot_off,
                 page_fold: #page_fold,
-                batched_requests: #batched_requests,
                 gathered: #gathered,
-                fold_rows: #fold_rows,
                 walk: #walk,
                 tp: #tp,
             },
@@ -11436,10 +11275,9 @@ const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES 
 // collides with no common dim (head_dim 64/128, half 32/64, n_heads,
 // hidden, intermediate, block_size 64). `KTIR_PREFILL_LEN` overrides (must
 // also be collision-free). Referenced only inside dump_wavefront_mega's
-// `#[cfg(feature = "spyre")]` block and by the pinned test below — dead in
-// a non-spyre LIB build (the `not(test)` leg keeps the expectation
-// satisfied exactly where it's true).
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+// `#[cfg(feature = "spyre")]` block and by its spyre-gated pinned test, so it is
+// gated on `spyre` as they are.
+#[cfg(feature = "spyre")]
 const PREFILL_LX_SAFE: u32 = 31;
 /// SuperDSC PREFILL WIDTH LADDER, ASCENDING. Each rung is baked as its own prefill bundle and
 /// the worker runs a chunk on the NARROWEST rung that holds it: per-chunk cost is
@@ -11728,7 +11566,7 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
 /// (attention, rope, an MoE block) makes the gemm's other rows live and the
 /// m=1 fold unsound on it. Mid-layer gemms are refused by their own layer's
 /// rope/attention, exactly as at subtile level.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+#[cfg(feature = "spyre")]
 fn fuf_feeds_result_through_row_local_ops(fuf: &Fuf, from: TileId, result: TileId) -> bool {
     if from == result {
         return true;
@@ -11756,7 +11594,7 @@ fn fuf_feeds_result_through_row_local_ops(fuf: &Fuf, from: TileId, result: TileI
 /// output row `i` reads only input row `i` (matmuls, last-dim
 /// norms/reductions, elementwise). RoPE is excluded deliberately — it also
 /// writes the paged KV cache, a consumer the prefill graph cannot see.
-#[cfg_attr(all(not(feature = "spyre"), not(test)), expect(dead_code))]
+#[cfg(feature = "spyre")]
 fn fuf_row_local_tail_op(op: OpKind) -> bool {
     matches!(
         op,
@@ -11779,7 +11617,7 @@ fn fuf_row_local_tail_op(op: OpKind) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-// `program`, `ktir_bundle_out`, and the `base_to_loc` locals are only
+// `program` and `ktir_bundle_out` are only
 // read inside the spyre cfg block below; without that feature the
 // function still lowers + reports stats but consumes none of them.
 #[cfg_attr(not(feature = "spyre"), allow(unused_variables))]
@@ -11792,15 +11630,20 @@ fn dump_wavefront_mega(
     fuf: &Fuf,
     inferred: &crate::shape::Inferred,
     decode_bounds: &BTreeMap<String, u64>,
-    backbone_slots: &[Vec<WeightSlot>],
-    lm_head_slots: &[Vec<WeightSlot>],
-    bb_bucket_id: u32,
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
     // (spliced into the per-model module); empty under metal.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
+    // Where the bake writes each bundle's dxp input, when the build asked (`superdsc-dump`): the
+    // build script's own output directory, passed down from `compile_carrier`'s caller.
+    dump_dir: Option<&std::path::Path>,
 ) {
     use crate::to_wavefront;
     let stem = model.source_stem.as_str();
+    #[cfg(feature = "spyre")]
+    let dump = match dump_dir {
+        Some(d) => scratchy_target_spyre::lower_subtile_tape_to_superdsc::DumpRoot::under(d),
+        None => scratchy_target_spyre::lower_subtile_tape_to_superdsc::DumpRoot::NONE,
+    };
     // ⭐ THE MODEL'S ATTENTION FACTS ride the ops themselves now, minted once at the
     // bridge: every consumer below (the rolls, the wiring, the SuperDSC lowering) reads
     // the op's own value. A canonical stating no attention facts (a vision tower) holds
@@ -11880,7 +11723,7 @@ fn dump_wavefront_mega(
     #[cfg(feature = "spyre")]
     let prefix_len = {
         let kv_slot_bytes: Option<u64> = first.as_ref().ok().map(|l| {
-            l.bindings
+            l.bindings()
                 .iter()
                 .zip(&l.input.sources)
                 .filter(|(b, _)| {
@@ -11942,7 +11785,11 @@ fn dump_wavefront_mega(
             );
             return;
         }
-        Ok(l) => l,
+        Ok(l) => {
+            #[cfg(feature = "spyre")]
+            let l = bake_tape(stem, l);
+            l
+        }
         Err(to_wavefront::BridgeError::UnsupportedWeight { detail, .. }) => {
             eprintln!(
                 "[wavefront] {stem}: no superdsc bundle — weight scheme unsupported here \
@@ -11963,8 +11810,6 @@ fn dump_wavefront_mega(
          {} prefix-kv), {} ops; ops {:?}",
         st.fuf_tiles, st.sources, st.weight_sources, st.prefix_sources, st.ops, st.op_histogram,
     );
-
-    let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
 
     // Spyre/KTIR (-Fspyre): emit the REAL model's per-op KTIR from the solver-produced
     // graph — every dim, rope form, GQA ratio, and eps is scratchy's, not a hand-built
@@ -12001,9 +11846,9 @@ fn dump_wavefront_mega(
         // `dir`. Factored so we drop BOTH a cheap m=1 decode bundle (fast
         // per-token generation) AND an m=M batched-prefill bundle — the worker
         // uses the right one per phase, so decode never pays the prefill tax.
-        // Returns (ktir_manifest_json, ktir_nodes, whole_graph_sengraph_json,
-        // group_graphs) where group_graphs[i] = (group_idx, input_tensor_id,
-        // result_tensor_id, group_graph_json) — the per-layer-group split graphs.
+        // Returns (whole_graph_sengraph_json, group_graphs) where group_graphs[i] =
+        // (group_idx, input_tensor_id, result_tensor_id, group_graph_json) — the
+        // per-layer-group split graphs.
         type GroupGraphs = Vec<(u32, u32, u32, String)>;
         // SuperDSC bundle fingerprint (set by the m=1 decode walk under
         // `SCRATCHY_SENDNN_MODE=superdsc`). When present, the SengraphBundle's
@@ -12179,7 +12024,6 @@ fn dump_wavefront_mega(
                 // borrow (`&gk` derefs through it where the wiring is built).
                 gk: Box<scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring>,
                 decode_position: u32,
-                man: String,
             },
             // ⭐ ONE WEIGHT-SEGMENT PARITY LEDGER ENTRY — this bundle's packed weight
             // segment (bank 0 bytes + extra banks), exactly as the runtime's alias guard
@@ -12197,15 +12041,13 @@ fn dump_wavefront_mega(
                 scales: Vec<f32>,
             },
         }
-        /// What one bake returns: its manifest, nodes, sengraph json and launch groups.
-        type BakeOut = (String, Vec<(String, String)>, String, GroupGraphs);
+        /// What one bake returns: its sengraph json and launch groups.
+        type BakeOut = (String, GroupGraphs);
         /// Which half of `wiring_tokens` a bake's wiring lands in, if either.
         enum WiringSlot {
             Decode,
             Prefill,
         }
-        // The bake names weights through this view, never through `program` — see `WeightNaming`.
-        let weight_naming = program.weight_naming();
         // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the concrete query-row count the
         // tape was lowered at — the ladder rung this bake belongs to. `None` = decode.
         // ⭐ ONE BAKE BODY, STAMPED PER WORLD. A bake's ops, launch groups and bundle are its
@@ -12214,7 +12056,7 @@ fn dump_wavefront_mega(
         // and the build's one `tp/N` (`Build`). `$W` is that world inside the body.
         macro_rules! world_bake {
             ($W:ty) => {
-            |lwd: &to_wavefront::LoweredDecode,
+            |lwd: &BakeTape,
              base: String,
              // The capacity THIS bundle is baked for. Decode cap buckets vary it;
              // every other call site passes the full `prefix_len`.
@@ -12243,6 +12085,47 @@ fn dump_wavefront_mega(
                 // spyre-inference decodes it with the batched kernel at one sequence (its sequence
                 // buckets start at 1). Every other reader of the fact short-circuits at one row.
                 let rows_are_requests = !is_prefill;
+                // ⭐ THE QUERY'S EXTENT PAIR, MINTED ONCE FROM THE RUNG — the rung's own
+                // `(per-request width, requests)`, never a division of the graph's rows. A
+                // prefill chunk is ONE request however many positions it spans (its pair is
+                // `(mq, ONE)`); a decode rung's every row is a request's one token (its pair
+                // is `(1 row, decode_rows)`). The attention splice spends the pair as the
+                // kernel's two extents and checks its held product against the graph it
+                // lowers — the one place the mint and the graph are proven to agree.
+                // ONE match on the one fact (`prefill_mq`'s presence IS `is_prefill`), one
+                // named bake panic for the whole mint: a half that does not name a baked
+                // rung — a zero or overflowing count, or a product past u32 — is refused
+                // here, never defaulted. (The u32 parameters `prefill_mq` / `decode_rows`
+                // are the missing source type: the rung walks should hand the closure a
+                // `RungWidth` / `RungCap` directly, follow-up.)
+                //
+                // ⭐ A SYMBOLIC BATCH TAPE states its width through `seq_sym`: the CB decode
+                // emission lowers at `CB_BATCH_TEMPLATE` rows (a batch SYMBOL the DEM
+                // resolves at runtime) while passing `decode_rows = 1` on purpose — its
+                // `DecodeRung` effect and slot discriminators read the CONCRETE rung
+                // count, which the symbolic tape does not have. Each arm says which
+                // source states the width for which kind of tape: a prefill — symbolic
+                // or concrete — takes its width from `prefill_mq` (one request however
+                // many positions), a symbolic decode batch from its symbol's template,
+                // a concrete decode rung from `decode_rows`.
+                let (per_request, requests) = match (prefill_mq, seq_sym) {
+                    (Some(mq), _) => (mq, 1u32),
+                    (None, Some((_, width))) => (1u32, width),
+                    (None, None) => (1u32, decode_rows),
+                };
+                let query_rows = (|| {
+                    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+                        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(per_request)?,
+                        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(requests)?,
+                    )
+                })()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{base}: the rung's query extents (per-request {per_request} row(s), \
+                         {requests} request(s)) do not name a baked rung — a zero or \
+                         overflowing count is a bake bug, named here at the mint"
+                    )
+                });
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
                 // rung whose reroll fails PANICS (no rung may fail to lower), but this
                 // closure's KTIR emission and wiring stamp run AFTER the reroll and
@@ -12304,15 +12187,24 @@ fn dump_wavefront_mega(
                 // takes. The mint's own tail walk IS the admission: a graph whose
                 // result tail is not the lm-head chain it knows PANICS at expansion —
                 // a build error naming the op, never a silent fall back to the host
-                // readback. A prefill rung's result is the FOLDED lm-head row (the
-                // emitter folds the tail to the last baked row): its prompt-final
-                // chunk's pick is the idx stick, read back exactly like decode's;
-                // a middle chunk's suffix never runs, so its draw is never taken.
+                // readback. A prefill rung's result is the FOLDED lm-head rows (the
+                // emitter folds the tail to the requests' last baked rows): its
+                // prompt-final chunk's picks are the idx stick, read back exactly
+                // like decode's; a middle chunk's suffix never runs, so its draw
+                // is never taken.
                 {
                     let mint = scratchy_subtile::subtile_ir::mint_sample(
                         &mut krg,
                         if is_prefill {
-                            scratchy_subtile::subtile_ir::SampleRows::Folded
+                            // The Folded draw serves the rung's OWN request
+                            // capacity — the same extent pair's `RungCap` the
+                            // attention and the lm-head fold read (one mint,
+                            // never a division of the graph's rows): the fold
+                            // writes S logits rows and the draw serves exactly
+                            // them.
+                            scratchy_subtile::subtile_ir::SampleRows::Folded {
+                                requests: query_rows.requests(),
+                            }
                         } else {
                             scratchy_subtile::subtile_ir::SampleRows::All
                         },
@@ -12348,6 +12240,23 @@ fn dump_wavefront_mega(
                     // fall to. Every width mints (the solo rung, every batch-ladder
                     // rung, the symbolic CB batch alike): the chain is the decode path,
                     // not a wide-batch extra.
+                    // ⛔ A PARTIAL ROW IS A CHAIN'S, AND A PREFILL HAS NO CHAIN. A source the
+                    // analysis cut as a gathered row's partial sum is filled by the chain's
+                    // per-rank gather; a prefill rung stages its rows whole from the host, so the
+                    // all-reduce would sum the prompt's rows once per rank.
+                    if is_prefill
+                        && let Some(e) = shards.and_then(|s| {
+                            s.iter().position(|c| {
+                                *c == scratchy_subtile::tensor_parallel::SourceShard::Partial
+                            })
+                        })
+                    {
+                        panic!(
+                            "[spyre-tp] {base}: source t{e} is a gathered row's partial sum, but a \
+                             prefill rung mints no chained head to gather it — the forward was \
+                             sharded with a decode's row gather"
+                        );
+                    }
                     if !is_prefill {
                         if !tied {
                             panic!(
@@ -12358,17 +12267,7 @@ fn dump_wavefront_mega(
                                  admission is not implemented."
                             );
                         }
-                        use crate::to_wavefront::SourceBinding;
-                        let embed_row = lwd
-                            .bindings
-                            .iter()
-                            .position(|b| matches!(b, SourceBinding::EmbeddedHidden))
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "[spyre-superdsc] {base}: no EmbeddedHidden source — the \
-                                     chained head's gather has no row to replace"
-                                )
-                            });
+                        let embed_row = lwd.embed_row().index();
                         let pick = krg.result;
                         let chain = scratchy_subtile::subtile_ir::mint_embed_chain(
                             &mut krg,
@@ -12390,7 +12289,7 @@ fn dump_wavefront_mega(
                 }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
-                    return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
+                    return ((String::new(), Vec::new()), fx);
                 }
                 // `--target sendnn`: lower the SAME real-model `krg` to a sendnn
                 // op-graph JSON (the DeepTools toolchain compiles + runs it on the
@@ -12408,7 +12307,7 @@ fn dump_wavefront_mega(
                 // (group, input_tensor, result_tensor, json).
                 let group_graphs: Vec<(u32, u32, u32, String)> = Vec::new();
                 // WEIGHT IDS for the fold pass: the sengraph source tensor id `t{i}` is a
-                // model WEIGHT iff `lwd.bindings[i]` is `SourceBinding::Weight` (the
+                // model WEIGHT iff `lwd.bindings()[i]` is `SourceBinding::Weight` (the
                 // binding index == the sengraph source id — both from the same
                 // `lwd.input`). Runtime activations (embed/cos/sin/prefix-kv) stay
                 // PrimaryInput. `fold_weights_into_model` reclassifies the weights to
@@ -12416,7 +12315,7 @@ fn dump_wavefront_mega(
                 // the per-job I/O descriptor table (the flit-cap fix).
                 let weight_ids: std::collections::HashSet<u32> = {
                     use crate::to_wavefront::SourceBinding;
-                    lwd.bindings
+                    lwd.bindings()
                         .iter()
                         .enumerate()
                         .filter_map(|(i, b)| match b {
@@ -12457,6 +12356,7 @@ fn dump_wavefront_mega(
                     &weight_ids,
                     active_cap,
                     scratchy_target_spyre::paged_step::PagedRows::of_requests(rows_are_requests),
+                    query_rows,
                 ) {
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
@@ -12491,12 +12391,16 @@ fn dump_wavefront_mega(
                         );
                         // A hand-authored matmul, so there is no attention node for the four
                         // attention facts to be facts of — main's own `false`/absent at such a site.
-                        match superdsc::emit_bundle::<$W>(
-                            &[g1],
-                            None,
-                            superdsc::FoldGrouping::Split,
-                            None,
-                        ) {
+                        match g1.map_err(|e| e.to_string()).and_then(|g1| {
+                            superdsc::emit_bundle::<$W>(
+                                &[g1],
+                                None,
+                                superdsc::FoldGrouping::Split,
+                                None,
+                                dump,
+                            )
+                            .map_err(|e| e.to_string())
+                        }) {
                             Ok(fp) => eprintln!(
                                 "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
                                  dxp compiles it inline"
@@ -12533,6 +12437,7 @@ fn dump_wavefront_mega(
                                 active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
                                 // start==0 chunk, FULL for the continuation bundle.
                                 rows_are_requests,
+                                query_rows,
                             ) {
                                 Ok(rolled) => {
                                     // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
@@ -12602,7 +12507,7 @@ fn dump_wavefront_mega(
                                     // applied upstream of both consumers, moved to the consumer that
                                     // wants it.
                                     let unrolled = superdsc::unroll_layers::<$W>(&rolled);
-                                    let card = cfg!(feature = "spyre-hw");
+                                    let card = cfg!(feature = "spyre-lower");
                                     let unrolled_params = rolled.attn_params;
                                     let pre = if card {
                                         superdsc::emit_bundle::<$W>(
@@ -12610,6 +12515,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            dump,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12645,6 +12551,7 @@ fn dump_wavefront_mega(
                                             } else {
                                                 unrolled_params
                                             },
+                                            dump,
                                         );
                                         match r {
                                             Ok(fp) => body_fps.push(fp),
@@ -12697,6 +12604,7 @@ fn dump_wavefront_mega(
                                                         Some(&rolled.layout),
                                                         superdsc::FoldGrouping::Fused,
                                                         rolled.attn_params,
+                                                        dump,
                                                     )
                                                     .map(superdsc::bundle::SiblingFp::from)
                                                     .unwrap_or_else(|e| {
@@ -12723,6 +12631,7 @@ fn dump_wavefront_mega(
                                             Some(&rolled.layout),
                                             superdsc::FoldGrouping::Split,
                                             rolled.attn_params,
+                                            dump,
                                         )
                                     } else {
                                         Ok(String::new())
@@ -12876,6 +12785,7 @@ fn dump_wavefront_mega(
                                                         &weight_ids,
                                                         rung,
                                                         rows_are_requests,
+                                                        query_rows,
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
                                                         // card bakes the ROLLED body, the emulator the
@@ -12917,6 +12827,7 @@ fn dump_wavefront_mega(
                                                                     } else {
                                                                         rung_params
                                                                     },
+                                                                    dump,
                                                                 ) {
                                                                     Ok(rfp) => {
                                                                         rfps.push(rfp);
@@ -12946,6 +12857,7 @@ fn dump_wavefront_mega(
                                                                             Some(&rr.layout),
                                                                             superdsc::FoldGrouping::Fused,
                                                                             rr.attn_params,
+                                                                            dump,
                                                                         )
                                                                         .map(
                                                                             superdsc::bundle::SiblingFp::from,
@@ -13214,10 +13126,10 @@ fn dump_wavefront_mega(
                                             let prefill_classes: Option<PrefillRotaryClasses> =
                                                 prefill_mq.map(|mq| {
                                                 let hd = superdsc_model_head_dim(model);
-                                                let theta = superdsc_model_rope_theta(model);
+                                                let theta = model.text.rope_theta.get();
                                                 let mut rotary_cos = Vec::new();
                                                 let mut rotary_sin = Vec::new();
-                                                for (i, b) in lwd.bindings.iter().enumerate() {
+                                                for (i, b) in lwd.bindings().iter().enumerate() {
                                                     let (want_cos, local) = match b {
                                                         crate::to_wavefront::SourceBinding::Cos { local } => {
                                                             (true, *local)
@@ -13319,6 +13231,7 @@ fn dump_wavefront_mega(
                                                     fp: &bfp,
                                                     cap,
                                                     active_cap,
+                                                    query_rows,
                                                     shards,
                                                 };
                                                 // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
@@ -13562,189 +13475,15 @@ fn dump_wavefront_mega(
                         folds,
                     });
                 }
-                // The programs ride the bundle (`bundle_code::bundle(fp)`), not a per-node text.
-                let nodes: Vec<(String, String)> = Vec::new();
-                let attn_mask_json = match gk.attn_mask {
-                    Some(id) => id.to_string(),
-                    None => "null".to_string(),
-                };
-                let mut man = format!(
-                    "{{\"result\":{},\"num_sources\":{},\"decode_position\":{},\"attn_mask\":{},\"tensors\":[",
-                    gk.result_tensor,
-                    gk.num_sources,
-                    cap.saturating_sub(1),
-                    attn_mask_json,
-                );
-                for (id, (r, c)) in gk.tensor_shapes.iter().enumerate() {
-                    if id > 0 {
-                        man.push(',');
-                    }
-                    let is_src = (id as u32) < gk.num_sources;
-                    man.push_str(&format!(
-                        "{{\"id\":{id},\"rows\":{r},\"cols\":{c},\"is_source\":{is_src}}}"
-                    ));
-                }
-                man.push_str("],\"sources\":[");
-                {
-                    use crate::to_wavefront::SourceBinding;
-                    use scratchy_subtile::lower::InputRef;
-                    use scratchy_subtile::subtile_ir::SubOp;
-                    let mut gemm_weight: std::collections::HashSet<usize> =
-                        std::collections::HashSet::new();
-                    for od in &fused.ops {
-                        if matches!(od.op, SubOp::MatmulTile { .. })
-                            && let Some(InputRef::Ext(e)) = od.inputs.get(1)
-                        {
-                            gemm_weight.insert(*e);
-                        }
-                    }
-                    for (i, b) in lwd.bindings.iter().enumerate() {
-                        if i > 0 {
-                            man.push(',');
-                        }
-                        let entry = match b {
-                            SourceBinding::EmbeddedHidden => {
-                                format!("{{\"id\":{i},\"role\":\"embed\"}}")
-                            }
-                            SourceBinding::Cos { .. } => format!("{{\"id\":{i},\"role\":\"cos\"}}"),
-                            SourceBinding::Sin { .. } => format!("{{\"id\":{i},\"role\":\"sin\"}}"),
-                            SourceBinding::PrefixK { layer } => {
-                                format!("{{\"id\":{i},\"role\":\"prefix_k\",\"layer\":{layer}}}")
-                            }
-                            SourceBinding::PrefixV { layer } => {
-                                format!("{{\"id\":{i},\"role\":\"prefix_v\",\"layer\":{layer}}}")
-                            }
-                            SourceBinding::Weight { id, index } => {
-                                let name = crate::emit::weight_field_stem(
-                                    weight_naming.weights,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let (wbase, _) = base_layer(&name, *index);
-                                let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let is_gemm = gemm_weight.contains(&i);
-                                let disk = safetensors_prefix(
-                                    weight_naming,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                // lm_head weight binding — resolve the tie decision HERE, at
-                                // bake (compile) time, from the SAME `tie_word_embeddings` flag
-                                // the metal `FieldLoad::LinearTiedToEmbedding` path uses. TIED
-                                // models (llama/smollm2) omit `lm_head.weight` and share the
-                                // embed table; UNTIED models (Granite) ship a distinct head.
-                                // Baking the on-disk name into the manifest means the spyre
-                                // worker binds `{disk}.weight` VERBATIM and can NOT re-derive it:
-                                // the old worker-side `disk == "lm_head" ⇒ embed` assumption
-                                // silently mis-bound an untied head to the embedding matrix
-                                // (garbage-but-consistent logits). Deciding it once, here, makes
-                                // that mishandle unconstructible downstream.
-                                let disk = if disk == "lm_head" && tie_word_embeddings(model) {
-                                    "model.embed_tokens".to_string()
-                                } else {
-                                    disk
-                                };
-                                let loc_json = match base_to_loc.get(&wbase) {
-                                    Some(li) => format!(
-                                        "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
-                                        li.bucket, li.op_idx, li.slot
-                                    ),
-                                    None => "null".to_string(),
-                                };
-                                format!(
-                                    "{{\"id\":{i},\"role\":\"weight\",\"name\":\"{name}\",\
-                                 \"base\":\"{wbase}\",\"disk\":\"{disk}\",\"layer\":{layer},\
-                                 \"is_gemm\":{is_gemm},\"loc\":{loc_json}}}"
-                                )
-                            }
-                            SourceBinding::WeightScale { id, index } => {
-                                // fp8 per-channel weight_scale: SAME disk prefix as the weight (worker loads
-                                // `{disk}.weight_scale`), role "weight_scale", resident like a weight. Its own
-                                // resident placement is registered under `{wbase}.weight_scale` by the layout.
-                                let name = crate::emit::weight_field_stem(
-                                    weight_naming.weights,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let (wbase, _) = base_layer(&name, *index);
-                                let scale_base = format!("{wbase}.weight_scale");
-                                let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let disk = safetensors_prefix(
-                                    weight_naming,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let loc_json = match base_to_loc.get(&scale_base) {
-                                    Some(li) => format!(
-                                        "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
-                                        li.bucket, li.op_idx, li.slot
-                                    ),
-                                    None => "null".to_string(),
-                                };
-                                format!(
-                                    "{{\"id\":{i},\"role\":\"weight_scale\",\"name\":\"{name}\",\
-                                 \"base\":\"{scale_base}\",\"disk\":\"{disk}\",\"layer\":{layer},\
-                                 \"is_gemm\":false,\"loc\":{loc_json}}}"
-                                )
-                            }
-                            SourceBinding::BundleTensor { id, index, tensor } => {
-                                // One tensor of a MULTI-TENSOR MoE bundle: same field, disk
-                                // prefix and layer as the bundle's own `Weight` binding; the
-                                // `tensor` discriminant says which staged tensor fills the
-                                // source. `is_gemm` follows the tensor: codes are gemm
-                                // operands, scales and gains are not.
-                                let name = crate::emit::weight_field_stem(
-                                    weight_naming.weights,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let (wbase, _) = base_layer(&name, *index);
-                                let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
-                                let disk = safetensors_prefix(
-                                    weight_naming,
-                                    &model.arch,
-                                    WeightId(*id),
-                                    *index,
-                                );
-                                let which = tensor.name();
-                                let is_gemm = tensor.is_gemm_operand();
-                                let loc_json = match base_to_loc.get(&wbase) {
-                                    Some(li) => format!(
-                                        "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
-                                        li.bucket, li.op_idx, li.slot
-                                    ),
-                                    None => "null".to_string(),
-                                };
-                                format!(
-                                    "{{\"id\":{i},\"role\":\"bundle_tensor\",\"name\":\"{name}\",\
-                                 \"base\":\"{wbase}\",\"disk\":\"{disk}\",\"layer\":{layer},\
-                                 \"tensor\":\"{which}\",\"is_gemm\":{is_gemm},\"loc\":{loc_json}}}"
-                                )
-                            }
-                        };
-                        man.push_str(&entry);
-                    }
-                }
-                // ⛔ NO PER-NODE ARRAY. It described a `node{i}.mlir` file per program and a
-                // `{name, tensor, is_output}` per argument; the programs are const data in the
-                // bundle, and what a launch binds is the typed `(Ssa, PlaceId)` pairs it carries.
-                man.push_str("],\"nodes\":[");
-                man.push_str("]}");
-                // ── THE SAME FACTS, TYPED ──────────────────────────────────
+                // ── THE LAUNCH FACTS, TYPED, FROM ONE WALK ─────────────────
                 //
-                // Everything `man` just stringified is a compile-time constant
-                // held HERE as a typed value: `gk.result_tensor`,
-                // `gk.tensor_shapes`, `gk.attn_mask` and — the one that matters
-                // — `lwd.bindings`, which is already the `SourceBinding` ENUM.
-                // Flattening it to `"role":"prefix_k"` for the worker to
-                // `match role.as_str()` back is a round-trip through strings
-                // that loses exhaustiveness on the way out and cannot express a
-                // weight whose on-disk key is not `{prefix}.weight`.
-                //
-                // So emit values of spyre's OWN types instead, exactly as
-                // metal is handed statics of the metal runtime's types.
+                // `gk.result_tensor`, `gk.tensor_shapes`, `gk.attn_mask` and — the
+                // one that matters — `lwd.bindings()`, already the `SourceBinding`
+                // ENUM, become values of spyre's OWN types (`wiring::Wiring`),
+                // exactly as metal is handed statics of the metal runtime's types.
+                // ONE walk states them: a second, stringified copy of the same
+                // bindings (the old `manifest.json`) and the check that the two
+                // agreed are gone with it — a fact stated once cannot disagree.
                 {
                     // Tensor ids are PER PROGRAM: the prefill graph numbers its
                     // own. Keeping only one would bind decode ids into prefill
@@ -13799,10 +13538,9 @@ fn dump_wavefront_mega(
                         slot,
                         gk: Box::new(gk),
                         decode_position: cap.saturating_sub(1),
-                        man: man.clone(),
                     });
                 }
-                ((man, nodes, sengraph_json, group_graphs), fx)
+                ((sengraph_json, group_graphs), fx)
             }
             };
         }
@@ -13812,9 +13550,7 @@ fn dump_wavefront_mega(
             world_bake!(scratchy_target_spyre::bundle_code::collective::Build);
         // Apply one bake's effects to `world`'s state, in the order the bake recorded them. Serial,
         // and the only code that touches the expansion's shared state.
-        let commit_bake = |world: &WorldBake<'_>,
-                           lwd: &to_wavefront::LoweredDecode,
-                           fx: Vec<BakeEffect>| {
+        let commit_bake = |world: &WorldBake<'_>, lwd: &BakeTape, fx: Vec<BakeEffect>| {
             for e in fx {
                 match e {
                     // Deduped on mq like the prefix-free ladder: a rebake of a width must not double-enter.
@@ -13878,9 +13614,8 @@ fn dump_wavefront_mega(
                         slot,
                         gk,
                         decode_position,
-                        man,
                     } => {
-                        let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
+                        let w = emit_superdsc_wiring(&gk, lwd, model, decode_position);
                         let mut s = world.wiring.borrow_mut();
                         let mut bound = registry_bound.borrow_mut();
                         match slot {
@@ -13912,7 +13647,7 @@ fn dump_wavefront_mega(
             }
         };
         let emit_bundle =
-            |lwd: &to_wavefront::LoweredDecode,
+            |lwd: &BakeTape,
              base: String,
              cap: u32,
              seq_sym: Option<(&'static str, u32)>,
@@ -13940,16 +13675,15 @@ fn dump_wavefront_mega(
         // (the offline_decoder CB-decode / SDPA-prefill bundle path was removed); a
         // PLAIN `cargo build -Fsendnn` (no env) produces it. This is also the TOP
         // decode cap bucket (cap == prefix_len); the narrower buckets are baked below.
-        let (decode_manifest, decode_nodes, _decode_graph_unused, mut default_decode_groups) =
-            emit_bundle(
-                &lowered,
-                format!("ktir_decode_{stem_id}"),
-                prefix_len.get(),
-                None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
-                None, // decode path (Store + PagedAttnCompute) -- no prefill width
-                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                primary_m,
-            );
+        let (_decode_graph_unused, mut default_decode_groups) = emit_bundle(
+            &lowered,
+            format!("ktir_decode_{stem_id}"),
+            prefix_len.get(),
+            None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
+            None, // decode path (Store + PagedAttnCompute) -- no prefill width
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+            primary_m,
+        );
 
         // ⭐ THE SHARDED WORLD — the same decode forward, sharded `TP_WORLD` ways by the shared
         // analysis and baked through the same pipeline into its own world's state. Every collective
@@ -13966,9 +13700,11 @@ fn dump_wavefront_mega(
         } else {
             let (tp_lwd, sf) = scratchy_subtile::tensor_parallel::shard_lowered::<
                 scratchy_target_spyre::bundle_code::collective::Build,
-            >(
+            _,
+        >(
                 &lowered,
                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                &chained_row_gathers(&lowered, model, true),
             )
             .unwrap_or_else(|e| {
                 panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank forward is malformed — {e:?}")
@@ -13991,7 +13727,7 @@ fn dump_wavefront_mega(
                     .inputs
                     .iter()
                     .filter_map(|i| match i {
-                        scratchy_subtile::lower::InputRef::Ext(s) => tp_lwd.bindings.get(*s),
+                        scratchy_subtile::lower::InputRef::Ext(s) => tp_lwd.bindings().get(*s),
                         scratchy_subtile::lower::InputRef::Op(_) => None,
                     })
                     .filter_map(|b| match b {
@@ -14004,9 +13740,23 @@ fn dump_wavefront_mega(
                     .collect()
             };
             for (k, c) in sf.collectives.iter().enumerate() {
+                let reads = match c.reads {
+                    scratchy_subtile::lower::InputRef::Op(r) => r,
+                    // A gathered row's partial sum: the gather is its contraction.
+                    scratchy_subtile::lower::InputRef::Ext(e) => {
+                        eprintln!(
+                            "[spyre-tp] {stem}: collective {k}: {:?} at op {} reading source t{e} \
+                             ({:?}), a row gathered from a column-split table",
+                            c.kind,
+                            c.op,
+                            tp_lwd.bindings().get(e),
+                        );
+                        continue;
+                    }
+                };
                 // The contraction behind the read: back along the first operand through the
                 // weightless ops between it and the collective (granite's residual multiplier).
-                let mut at = c.reads;
+                let mut at = reads;
                 while weights_of(at).is_empty() {
                     match tp_lwd.input.ops[at].inputs.first() {
                         Some(scratchy_subtile::lower::InputRef::Op(p)) => at = *p,
@@ -14018,92 +13768,42 @@ fn dump_wavefront_mega(
                      contracted at op {} ({:?}) over [{}]",
                     c.kind,
                     c.op,
-                    c.reads,
-                    tp_lwd.input.ops[c.reads].op,
+                    reads,
+                    tp_lwd.input.ops[reads].op,
                     at,
                     tp_lwd.input.ops[at].op,
                     weights_of(at).join(", ")
                 );
             }
-            if gathers > 0 && tie_word_embeddings(model) {
-                // ⛔ A VISIBLE SKIP, NAMING ITS ONE CAUSE: the decode rung's chained head gathers
-                // the drawn token's embedding row on device from the TIED table — the lm head's
-                // own staged weight — and here the analysis split that weight by vocabulary, so
-                // each rank holds half the rows a draw can name. The rank-aware chain (each rank
-                // gathers its share, a non-owner's row zero, the shares summed) is not built yet,
-                // and the chain is the only decode path, so this model ships its one-rank world.
-                println!(
-                    "cargo:warning=[spyre-tp] {stem}: no tp={TP_WORLD} bundle — its lm head splits by \
-                     vocabulary ({gathers} all-gather), and the decode chained head reads that \
-                     tied table whole; the rank-aware chained head is not built yet"
+            // ⭐ A VOCABULARY-SPLIT HEAD SHIPS ITS WORLD. The decode's chained head gathers the
+            // drawn token's row from the lm head's own table, which the analysis split by columns
+            // with the head; the gather fact (`chained_row_gathers`) made that row a partial sum the
+            // analysis reduces, and each rank's chain gathers its own block (`mint_embed_chain`
+            // over the split tail, the rank's `ChainBlock` in its tables and seeds).
+            for g in &sf.gathered {
+                eprintln!(
+                    "[spyre-tp] {stem}: the decode's input row t{} is gathered from the \
+                     column-split table t{} — each rank gathers its own vocabulary block",
+                    g.row, g.table
                 );
-                None
-            } else {
-                let (_, fx) = emit_bundle_deferred_sharded(
-                    &tp_lwd,
-                    format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
-                    prefix_len.get(),
-                    None,
-                    None,
-                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                    primary_m,
-                    Some(&sf.sources),
-                );
-                commit_bake(&sharded_world, &tp_lwd, fx);
-                Some(sf.sources)
             }
+            let (_, fx) = emit_bundle_deferred_sharded(
+                &tp_lwd,
+                format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
+                prefix_len.get(),
+                None,
+                None,
+                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                primary_m,
+                Some(&sf.sources),
+            );
+            commit_bake(&sharded_world, &tp_lwd, fx);
+            Some(sf.sources)
         };
-        // ── DECODE CAP BUCKETS (KTIR emulator path) ───────────────────────────────────────────────
-        // The emulator masks over the WHOLE prefix cache each step (decode is O(capacity)), so a
-        // single big-cap program makes every short-context token pay the max-context cost. Bake the
-        // decode program at a few static caps [256,512,1024,2048] below `prefix_len`; the worker runs
-        // the smallest cap covering the current position, so a short chat pays cap-256 cost even when
-        // the max context is large. Static shapes only — the emulator stays a dumb executor.
-        //
-        // NOT under superdsc: that path has its own, finer ActiveCap ladder baked inside `emit_bundle`
-        // (`ActiveCap::decode_ladder`), and re-entering the bake here would restamp `superdsc_fp` with
-        // a narrow-cap body — the last bucket would silently become the model's decode bundle.
-        const DECODE_CAP_BUCKETS: [u32; 4] = [256, 512, 1024, 2048];
-        let mut decode_bundles: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        if !sendnn_superdsc {
-            let mut caps: Vec<u32> = DECODE_CAP_BUCKETS
-                .iter()
-                .copied()
-                .filter(|&c| c < prefix_len.get())
-                .collect();
-            caps.sort_unstable();
-            caps.dedup();
-            for cap in caps {
-                let lwd = match crate::to_wavefront::lower_decode_to_wavefront(
-                    fuf,
-                    inferred,
-                    decode_bounds,
-                    &bridge,
-                    crate::to_wavefront::PrefixCapacity::new(
-                        std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
-                    ),
-                    primary_m,
-                    crate::to_wavefront::DenseExperts::Refuse,
-                ) {
-                    Ok(l) => l,
-                    Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
-                };
-                let (m, n, _g, _gs) = emit_bundle(
-                    &lwd,
-                    format!("ktir_decode_{stem_id}_cap{cap}"),
-                    cap,
-                    None,
-                    None,
-                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                    primary_m,
-                );
-                decode_bundles.push((m, n));
-            }
-        }
-        // The full-cap bundle is the last (widest) bucket, so the worker's "smallest cap covering the
-        // position" scan over an ascending slice always terminates on it.
-        decode_bundles.push((decode_manifest.clone(), decode_nodes.clone()));
-
+        // The decode's source bindings, named apart: every later rung of the sharded world checks
+        // its cuts against them (`refuse_if_staged_cut_apart`), and the prefill ladder's own
+        // per-width lowering is also called `lowered`.
+        let decode_bindings = lowered.bindings();
         // ── DECODE BATCH LADDER (superdsc) ────────────────────────────────────────────────────────
         // A decode step runs one token of each RUNNING request, and how many that is changes step to
         // step — the scheduler decides it. A SuperDSC bundle is a static-shape graph, so the emitter
@@ -14122,7 +13822,7 @@ fn dump_wavefront_mega(
         // through `superdsc_decode_rungs` / `BatchSlot`, which it consults under `spyre-hw` alone —
         // an emulator build sets `batched_prefill: None` (`spyre_load.rs:1713`) and never runs one.
         // Five more whole-model bakes for nothing.
-        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             // RUNGS PAST 8. A decode step's cost is dominated by a FIXED penalty for leaving the
             // mq==1 fast path — the body goes 271 ops/layer at one request to 612 at two, then only
             // +16 per further request — plus one launch per request. Measured 36 ms fixed + ~2 ms per
@@ -14154,6 +13854,7 @@ fn dump_wavefront_mega(
                     crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_b) => {
+                        let lwd_b = bake_tape(stem, lwd_b);
                         emit_bundle(
                             &lwd_b,
                             format!("ktir_decode_{stem_id}"),
@@ -14168,18 +13869,27 @@ fn dump_wavefront_mega(
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD: a sharded session serves every live
                         // request count on its own world's rung, never the one-rank ladder's.
                         if let Some(shards) = tp_sources.as_deref() {
-                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
-                                scratchy_target_spyre::bundle_code::collective::Build,
-                            >(
-                                &lwd_b,
-                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                            )
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank decode batch \
-                                     seqs={seqs} is malformed — {e:?}"
+                            let (tp_lwd, sf_b) =
+                                scratchy_subtile::tensor_parallel::shard_lowered::<
+                                    scratchy_target_spyre::bundle_code::collective::Build,
+                                    _,
+                                >(
+                                    &lwd_b,
+                                    scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                    &chained_row_gathers(&lwd_b, model, true),
                                 )
-                            });
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "[spyre-tp] {stem}: the {TP_WORLD}-rank decode batch \
+                                     seqs={seqs} is malformed — {e:?}"
+                                    )
+                                });
+                            refuse_if_staged_cut_apart(
+                                stem,
+                                &format!("ktir_decode_tp{TP_WORLD}_{stem_id} seqs={seqs}"),
+                                (lowered.bindings(), shards),
+                                (lwd_b.bindings(), &sf_b.sources),
+                            );
                             let (_, fx) = emit_bundle_deferred_sharded(
                                 &tp_lwd,
                                 format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
@@ -14188,7 +13898,7 @@ fn dump_wavefront_mega(
                                 None,
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 seqs,
-                                Some(shards),
+                                Some(&sf_b.sources),
                             );
                             commit_bake(&sharded_world, &tp_lwd, fx);
                         }
@@ -14206,25 +13916,24 @@ fn dump_wavefront_mega(
         // vocab-slice `t65` non-whole-region) so `default_decode_groups` is EMPTY. The SengraphBundle still
         // needs ONE [prefill,decode] group to carry the `SUPERDSC_BUNDLE:{fp}` sentinel (both slots are
         // overridden to it below), so synthesize a placeholder. `in_t`/`res_t` are UNUSED by the superdsc
-        // worker path (it reads the decode manifest_json for wiring); the graph_json is the sentinel. This
+        // worker path (it reads the generated `Wiring`); the graph_json is the sentinel. This
         // is the group STRUCTURE only — the actual compute is the proven dxp bundle, not a sengraph.
         if default_decode_groups.is_empty() && superdsc_fp.borrow().is_some() {
             default_decode_groups.push((0u32, 0u32, 0u32, String::new()));
         }
 
         // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
-        // ERROR that names the model and its head_dim. A model with no attention (no head_dim
-        // bound) keeps the sub-blocked ceiling — there is no head to type.
-        let prefill_head_width = model.bounds.get("head_dim").map(|&hd| {
-            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(hd, &model.name)
-        });
+        // ERROR that names the model and its head_dim (the config's, typed at load).
+        let prefill_head_width =
+            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
+                u64::from(model.text.head_dim.get()),
+                &model.name,
+            );
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {
             r <= SUB_BLOCKED_PREFILL_CEILING
-                || prefill_head_width.is_some_and(|hd| {
-                    scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, hd, false)
-                        == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
-                })
+                || scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, prefill_head_width, false)
+                    == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
         };
         let admitted_ceiling = PREFILL_RUNGS
             .into_iter()
@@ -14383,7 +14092,7 @@ fn dump_wavefront_mega(
                 // mq-INDEPENDENT ([nblk,64,nkv,hd]), so this mq-2 placeholder prefill graph's KV
                 // shapes still match the mq=1 decode exactly (the KV-shape-agreement guard passes).
                 DECODE_MQ.max(2)
-            } else if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+            } else if sendnn_superdsc && cfg!(feature = "spyre-lower") {
                 // SuperDSC bakes the whole WIDTH LADDER and lets the WIDEST rung that actually
                 // lowers become the ceiling (see the rung loop below), so this is just where the
                 // ladder STARTS looking — not a value that has to be right. That is what demotes
@@ -14422,7 +14131,7 @@ fn dump_wavefront_mega(
         // reached through `prefill_rungs`, which `spyre_forward.rs` reads under `spyre-hw` alone.
         // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (25 now, to 256) — the generated
         // model source and rustc's single-threaded pass over it both paid for all of them.
-        let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             let mut v: Vec<u32> = PREFILL_RUNGS
                 .into_iter()
                 .filter(|&r| r > 1 && r <= prefill_m && rung_admitted(r))
@@ -14448,10 +14157,10 @@ fn dump_wavefront_mega(
         // A rung's bake in each world: the one-rank lowering, its pick and effects, and — when the
         // sharded world baked its decode — the rung's sharded lowering and effects.
         type RungBake = (
-            to_wavefront::LoweredDecode,
+            BakeTape,
             PrefillPick,
             Vec<BakeEffect>,
-            Option<(to_wavefront::LoweredDecode, Vec<BakeEffect>)>,
+            Option<(BakeTape, Vec<BakeEffect>)>,
         );
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
@@ -14482,10 +14191,11 @@ fn dump_wavefront_mega(
             );
             match lowered {
                 Ok(lwd_p) => {
+                    let lwd_p = bake_tape(stem, lwd_p);
                     // One rung's bake, stamped for each world `lwd` may be lowered for.
                     macro_rules! bake_rung_with {
                         ($bake:ident) => {
-                            |lwd: &to_wavefront::LoweredDecode,
+                            |lwd: &BakeTape,
                                      base: String,
                                      shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>| $bake(
                         lwd,
@@ -14530,16 +14240,24 @@ fn dump_wavefront_mega(
                     let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
                     // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
                     // world ships whole or not at all.
-                    let tp2 = tp_sources.is_some().then(|| {
+                    let tp2 = tp_sources.as_deref().map(|decode_cuts| {
                         let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
                             scratchy_target_spyre::bundle_code::collective::Build,
-                        >(
+                        _,
+                    >(
                             &lwd_p,
                             scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                            &[],
                         )
                         .unwrap_or_else(|e| {
                             panic!("[spyre-tp] {stem}: the {TP_WORLD}-rank prefill m={pl} is malformed — {e:?}")
                         });
+                        refuse_if_staged_cut_apart(
+                            stem,
+                            &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} m={pl}"),
+                            (decode_bindings, decode_cuts),
+                            (lwd_p.bindings(), &sf_p.sources),
+                        );
                         let (_, fx) = bake_rung_sharded(
                             &tp_lwd,
                             format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
@@ -14579,7 +14297,7 @@ fn dump_wavefront_mega(
         // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on
         // the rungs codegen actually baked, never the const ladder. A short ladder runs, correctly and
         // slowly, with nothing anywhere saying so; see `PagedKvPool::prefill_ladder_reaches_the_window`.
-        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
@@ -14613,7 +14331,7 @@ fn dump_wavefront_mega(
         // narrowest.
         // ⛔ ONE WIDTH WAS THE MEASURED COST. This baked the widest rung alone, and a 52-row tail ran a
         // full 512-row chunk — granite-3.1-2b at ~2k tokens: 460 ms against 384 ms on the 256-row build.
-        if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+        if sendnn_superdsc && cfg!(feature = "spyre-lower") {
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
@@ -14631,6 +14349,7 @@ fn dump_wavefront_mega(
                     crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_p) => {
+                        let lwd_p = bake_tape(stem, lwd_p);
                         emit_bundle(
                             &lwd_p,
                             format!("ktir_prefill_{stem_id}"),
@@ -14642,12 +14361,14 @@ fn dump_wavefront_mega(
                         );
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
                         // continuation chunk on a sharded session runs on ITS world's prefix rung.
-                        if let Some(shards) = tp_sources.as_deref() {
-                            let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                        if let Some(decode_cuts) = tp_sources.as_deref() {
+                            let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
                                 scratchy_target_spyre::bundle_code::collective::Build,
-                            >(
+                            _,
+                        >(
                                 &lwd_p,
                                 scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                &[],
                             )
                             .unwrap_or_else(|e| {
                                 panic!(
@@ -14655,6 +14376,14 @@ fn dump_wavefront_mega(
                                      is malformed — {e:?}"
                                 )
                             });
+                            // The rung's OWN slice laws, as the prefix-free ladder passes its own:
+                            // a prompt's rows are staged whole, never the decode's gathered row.
+                            refuse_if_staged_cut_apart(
+                                stem,
+                                &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} prefix m={m}"),
+                                (decode_bindings, decode_cuts),
+                                (lwd_p.bindings(), &sf_p.sources),
+                            );
                             let (_, fx) = emit_bundle_deferred_sharded(
                                 &tp_lwd,
                                 format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
@@ -14663,7 +14392,7 @@ fn dump_wavefront_mega(
                                 Some(m),
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 1,
-                                Some(shards),
+                                Some(&sf_p.sources),
                             );
                             commit_bake(&sharded_world, &tp_lwd, fx);
                         }
@@ -14726,7 +14455,7 @@ fn dump_wavefront_mega(
         // worker stages one wiring's scales for every bundle of a phase. (A card launch binds its own
         // session's placed registry, `SuperDscSession::bake_facts`, so its rungs may differ: a decode
         // batch rung's carries the batched kernel's clamp.)
-        if !cfg!(feature = "spyre-hw") {
+        if !cfg!(feature = "spyre-lower") {
             let (decode_bound, prefill_bound) = &*registry_bound.borrow();
             let wrong: Vec<String> = registry_ledger
                 .borrow()
@@ -14803,7 +14532,8 @@ fn dump_wavefront_mega(
                 crate::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(lwd_cb) => {
-                    let (_m, _n, sg, groups) = emit_bundle(
+                    let lwd_cb = bake_tape(stem, lwd_cb);
+                    let (sg, groups) = emit_bundle(
                         &lwd_cb,
                         format!("ktir_decode_cb_{stem_id}"),
                         prefix_len.get(),
@@ -14854,9 +14584,7 @@ fn dump_wavefront_mega(
         // would see prefill_sg_present=false and CLEAR the paged decode groups below →
         // "bundle has no layer groups (split produced 0)" at worker load.
         let prefill_sg_present = if sendnn_paged {
-            prefill
-                .as_ref()
-                .is_some_and(|(_, _, _, pgs)| !pgs.is_empty())
+            prefill.as_ref().is_some_and(|(_, pgs)| !pgs.is_empty())
         } else {
             !default_decode_groups.is_empty()
         };
@@ -14931,16 +14659,12 @@ fn dump_wavefront_mega(
                     prefill: #prefill_tokens,
                 };
         };
-        let dml = proc_macro2::Literal::string(&decode_manifest);
 
         // ── `--target sendnn`: bake the LAYER-GROUP sub-bundles. Each group is a
         //    `[prefill, decode]` offline_decoder pair (the worker compiles each
         //    independently + threads the hidden state group→group on the host).
         //    Pair the prefill-group and decode-group by group index; carry the
-        //    group IO wiring (input/result tensor ids = the residual edge). The
-        //    per-group `manifest_json` is the SHARED full manifest (prefill `pml`
-        //    for prefill, decode `dml` for decode) — the worker filters sources by
-        //    the group graph's PrimaryInputs + uses the group's result tensor. ──
+        //    group IO wiring (input/result tensor ids = the residual edge). ──
         // DEFAULT mode: the "prefill" slot holds the SAME single static-SDPA graph as
         // the "decode" slot (one graph drives both phases; host-grown KV). PAGED mode:
         // pair the REAL paged prefill groups (SDPA+Store, distinct from the paged decode)
@@ -14949,14 +14673,10 @@ fn dump_wavefront_mega(
         let prefill_groups: &GroupGraphs = if sendnn_paged {
             prefill
                 .as_ref()
-                .map(|(_, _, _, pgs)| pgs)
+                .map(|(_, pgs)| pgs)
                 .unwrap_or(&default_decode_groups)
         } else {
             &default_decode_groups
-        };
-        let prefill_manifest_lit = match &prefill {
-            Some((pm, _, _, _)) => proc_macro2::Literal::string(pm),
-            None => proc_macro2::Literal::string(&decode_manifest),
         };
         // Pair groups by index (prefill ⟷ decode). They MUST agree in count (same
         // model, same group_size) — guard it.
@@ -15109,12 +14829,10 @@ fn dump_wavefront_mega(
                     input_tensor: #in_lit,
                     result_tensor: #res_lit,
                     prefill: ::scratchy_target_spyre::manifest::SengraphBundleData {
-                        manifest_json: #prefill_manifest_lit,
                         graph_json: #pre_json_lit,
                         g2_fingerprint: #pre_fp_lit,
                     },
                     decode: ::scratchy_target_spyre::manifest::SengraphBundleData {
-                        manifest_json: #dml,
                         graph_json: #dec_json_lit,
                         g2_fingerprint: #dec_fp_lit,
                     },
@@ -15192,6 +14910,31 @@ fn dump_wavefront_mega(
                         S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
                         S::Rows => quote! { ::scratchy_target_spyre::wiring::SourceShard::Rows },
                         S::Cols => quote! { ::scratchy_target_spyre::wiring::SourceShard::Cols },
+                        S::Partial => {
+                            quote! { ::scratchy_target_spyre::wiring::SourceShard::Partial }
+                        }
+                        S::ColBlocks { block } | S::RowBlocks { block } => {
+                            let b = proc_macro2::Literal::u32_unsuffixed(block.get());
+                            let block = quote! {
+                                match ::core::num::NonZeroU32::new(#b) {
+                                    ::core::option::Option::Some(n) => n,
+                                    ::core::option::Option::None => panic!("an empty block"),
+                                }
+                            };
+                            if matches!(s, S::ColBlocks { .. }) {
+                                quote! {
+                                    ::scratchy_target_spyre::wiring::SourceShard::ColBlocks {
+                                        block: #block,
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    ::scratchy_target_spyre::wiring::SourceShard::RowBlocks {
+                                        block: #block,
+                                    }
+                                }
+                            }
+                        }
                         S::HeadRows { heads } => {
                             let h = proc_macro2::Literal::u32_unsuffixed(heads.get());
                             quote! {
@@ -15276,6 +15019,9 @@ pub fn emit_model(
     // delegated load reads the canonical's widths, so its fingerprint
     // gate must too. `None` for canonicals themselves.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
+    // The build's own output directory for a `superdsc-dump` build (`compile_carrier`'s caller passes
+    // it); `None` writes no dump.
+    dump_dir: Option<&std::path::Path>,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
     // A head reading its target's KV (`reads_target_kv`) binds its target's TurboQuant runtime.
     let reads_target_kv = model.arch.reads_target_kv;
@@ -15954,10 +15700,6 @@ pub fn emit_model(
         let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
         match decode_wp {
             Some(decode_wp) => {
-                let idx = bucket_points.iter().position(|w| *w == decode_wp).unwrap();
-                let canonical = bucket_canonical[idx];
-                let bb_bucket_id = canonical_to_bucket_id[&canonical];
-                let (cl, ..) = &canonical_lowered[&canonical];
                 let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
                 dump_wavefront_mega(
                     program,
@@ -15966,10 +15708,8 @@ pub fn emit_model(
                     fuf,
                     inferred,
                     &decode_bounds,
-                    &cl.backbone.weight_slots,
-                    &cl.lm_head.weight_slots,
-                    bb_bucket_id,
                     &mut ktir_bundle_const,
+                    dump_dir,
                 );
             }
             None => eprintln!(
@@ -16580,7 +16320,7 @@ pub fn emit_model(
         // `rot_dim = partial_rotary_factor * head_dim` (Qwen3.5: 0.25*256
         // = 64), mirroring the rope-cache builder / `ROT_DIM` fn-const.
         let mrope_cos_sin_bytes = if model.mrope_section.is_some() {
-            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
+            let head_dim = u64::from(model.text.head_dim.get());
             let rot_dim = model
                 .scalars
                 .get("partial_rotary_factor")
@@ -16670,7 +16410,7 @@ pub fn emit_model(
     // 1D-rope arches, whose rope reads the positions.
     let metal_rope_rows_fn: proc_macro2::TokenStream = match model.mrope_section {
         Some([t, h, w]) => {
-            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
+            let head_dim = u64::from(model.text.head_dim.get());
             let rot_dim_val = model
                 .scalars
                 .get("partial_rotary_factor")
@@ -16678,12 +16418,7 @@ pub fn emit_model(
                 .filter(|&f| (f - 1.0).abs() > 1e-9)
                 .map(|f| (f * head_dim as f64).round() as u32)
                 .unwrap_or(head_dim as u32);
-            let rope_theta_val: f64 = model
-                .scalars
-                .get("rope_theta")
-                .copied()
-                .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-                .unwrap_or(10000.0);
+            let rope_theta_val: f64 = model.text.rope_theta.get();
             let rope_theta_lit = proc_macro2::Literal::f64_unsuffixed(rope_theta_val);
             let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
             let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
@@ -18171,12 +17906,16 @@ mod tests {
         bounds.insert("num_key_value_heads".into(), num_key_value_heads);
         bounds.insert("head_dim".into(), head_dim);
         bounds.insert("intermediate_size".into(), intermediate_size);
+        bounds.insert("num_hidden_layers".into(), 1);
+        let scalars = BTreeMap::from([("rope_theta".to_string(), 10_000.0)]);
+        let text = crate::config::TextGeometry::of(&bounds, &scalars, &PathBuf::new())
+            .expect("the shard test model states its geometry");
         crate::config::ModelParams {
             name: "shard_test".into(),
             source_stem: "shard-test".into(),
             source_path: PathBuf::new(),
             bounds,
-            scalars: BTreeMap::new(),
+            scalars,
             layer_sets: Default::default(),
             quantization: None,
             tie_word_embeddings: false,
@@ -18192,12 +17931,13 @@ mod tests {
             arch: Default::default(),
             expert_activation: crate::config::ExpertActivation::Silu,
             derived: BTreeMap::new(),
+            text,
         }
     }
 
     /// A uniform decoder's KV layers: all of them.
     fn every_layer(m: &ModelParams) -> KvCacheLayers {
-        let layers = m.bounds.get("num_hidden_layers").copied().unwrap_or(1) as u32;
+        let layers = m.text.layers.get() as u32;
         KvCacheLayers((0..layers).collect())
     }
 
@@ -18619,7 +18359,9 @@ mod tests {
             name,
             rust_type: quote! { crate::__gpu::layers::RmsNorm },
             kind: crate::weight_vocab::WeightKind::RmsNorm,
-            source_weights: vec![],
+            // The layer rides the source weight, as `accessor_base_layer`
+            // reads it in production.
+            source_weights: vec![(crate::classified::WeightId(0), layer.map(UnrollIndex))],
         }
     }
 
@@ -18941,14 +18683,22 @@ mod tests {
             "Replicate path must not route to sharded helper at tp>1 (got: {ts})",
         );
 
-        // Concat (always column-parallel) → `_concat_sharded`. Bakes
-        // `world` literal but no `dim` arg (concat-sharded is always
-        // dim=0 internally).
+        // Concat (always column-parallel). Under metal, which has no tensor-parallel load, the
+        // layered helper routes every concat to the stream-free `_concat_packed`, whatever the
+        // world; elsewhere a sharded world routes to `_concat_sharded`, which bakes the `world`
+        // literal but no `dim` arg (concat-sharded is always dim=0 internally).
         let c = FieldLoad::LinearConcat(vec![
             "model.layers.0.mlp.gate_proj".to_string(),
             "model.layers.0.mlp.up_proj".to_string(),
         ]);
         let ts = emit_layered_load_body(&c, 32, 4, false, None, "model.layers", None).to_string();
+        if cfg!(feature = "metal") {
+            assert!(
+                ts.contains("load_layered_linear_dense_concat_packed") && !ts.contains("_sharded"),
+                "metal routes a tp=4 gate_up concat to concat_packed (got: {ts})",
+            );
+            return;
+        }
         assert!(
             ts.contains("load_layered_linear_dense_concat_sharded"),
             "tp=4 gate_up concat must route to concat_sharded (got: {ts})",
@@ -19023,93 +18773,20 @@ mod fingerprint_tests {
         );
     }
 
-    /// MLA archs (DeepSeek V3 / Kimi K2) ship `q_a_proj` rather than
-    /// `q_proj`, so the FP8-block disambiguation tensor names must
-    /// follow the same `fp_leaf` selection the rest of the
-    /// fingerprint already uses. Regression for the bug where the
-    /// V3 FP8-block fingerprint hardcoded `q_proj.weight_scale_inv`
-    /// and silently rejected every V3 FP8-block checkpoint.
-    #[test]
-    fn fp8_block_disambiguation_uses_q_a_proj_for_mla_archs() {
-        let dir = arch_configs("deepseek-v3");
-        let configs =
-            crate::config::load_dir(&dir, &Default::default()).expect("load deepseek-v3 configs");
-        let manifest = crate::weights_manifest::load_or_empty(&dir)
-            .expect("load deepseek-v3 weights manifest");
-        // Pick a V3 variant with FP8-block quantization (block_size: Some).
-        let model = configs
-            .iter()
-            .find(|c| {
-                matches!(
-                    c.quantization.as_ref().map(|qc| &qc.method),
-                    Some(crate::quantization::QuantMethod::Fp8 {
-                        block_size: Some(_),
-                        ..
-                    })
-                )
-            })
-            .expect("at least one V3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
-        assert!(
-            ts.contains("q_a_proj.weight_scale_inv"),
-            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale_inv, got:\n{ts}",
-        );
-        assert!(
-            !ts.contains("q_proj.weight_scale_inv"),
-            "MLA arch FP8-block fingerprint must not reference q_proj.weight_scale_inv \
-             (V3/K2 ship q_a_proj on disk; q_proj presence would silently reject every \
-             real checkpoint), got:\n{ts}",
-        );
-        assert!(
-            ts.contains("q_a_proj.weight_scale"),
-            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale, got:\n{ts}",
-        );
-    }
-
-    /// Flat-Q MLA arches (Moonlight / K2 direct-q_proj) ship `q_proj`
-    /// rather than `q_a_proj`, so the FP8-block fingerprint must use
-    /// `q_proj.weight_scale_inv` even though the arch is otherwise
-    /// structurally MLA (kv_a_proj_with_mqa, kv_b_proj, etc.).
-    #[test]
-    fn fp8_block_disambiguation_uses_q_proj_for_flat_q_mla_archs() {
-        let dir = arch_configs("deepseek-v3-flat");
-        let configs = crate::config::load_dir(&dir, &Default::default())
-            .expect("load deepseek-v3-flat configs");
-        let manifest = crate::weights_manifest::load_or_empty(&dir)
-            .expect("load deepseek-v3-flat weights manifest");
-        let model = configs
-            .iter()
-            .find(|c| {
-                matches!(
-                    c.quantization.as_ref().map(|qc| &qc.method),
-                    Some(crate::quantization::QuantMethod::Fp8 {
-                        block_size: Some(_),
-                        ..
-                    })
-                )
-            })
-            .expect("at least one deepseek-v3-flat FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1, &[], None).to_string();
-        assert!(
-            ts.contains("q_proj.weight_scale_inv"),
-            "flat-Q MLA FP8-block fingerprint should use q_proj.weight_scale_inv \
-             (no q_a_proj on disk for q_lora_rank=null checkpoints), got:\n{ts}",
-        );
-        assert!(
-            !ts.contains("q_a_proj.weight_scale_inv"),
-            "flat-Q MLA FP8-block fingerprint must not reference q_a_proj \
-             (Moonlight ships q_proj, not q_a_proj), got:\n{ts}",
-        );
-    }
-
     /// Non-MLA arches (Llama / Qwen / etc.) keep the historical
     /// `q_proj` leaf — the fp_leaf selection is purely opt-in for
-    /// archs whose manifest declares `q_a_proj`.
+    /// archs whose manifest declares `q_a_proj`. (The MLA and flat-Q
+    /// MLA variants of this pin left with their deepseek-v3 configs,
+    /// #721.)
+    // FP8-block presets are not claimable under metal (`quant_preset_active`), so no
+    // FP8-block variant exists to fingerprint there; the spyre build's test step runs this.
+    #[cfg(not(feature = "metal"))]
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
         let dir = arch_configs("qwen3");
         let configs =
-            crate::config::load_dir(&dir, &Default::default()).expect("load qwen3 configs");
+            crate::config::load_dir(&dir, &Default::default(), &crate::config::Scope::all())
+                .expect("load qwen3 configs");
         let manifest =
             crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
         let model = configs
@@ -19133,13 +18810,13 @@ mod fingerprint_tests {
 
     /// Load ONE checked-in config as `ModelParams`.
     ///
-    /// ⛔ NOT `load_dir`. `load_dir` filters every stem through
-    /// `CARGO_FEATURE_<STEM>`, which is right for a build and unstateable for a
-    /// unit test — a proc-macro crate has no model features, so it selects ZERO
-    /// configs and a test that iterates the result passes vacuously. (The
-    /// `fp8_block_disambiguation_*` tests above are in exactly that state.) The
-    /// subject here is `emit_fingerprint_check`, a pure function of
-    /// `ModelParams`, so name the file and skip the build's scope entirely.
+    /// NOT `load_dir`: `load_dir` needs a `Scope`, and this helper exists for
+    /// the tests that mean ONE named model, not an arch's whole configs/ dir —
+    /// `Scope::stems` would work, but naming the file directly is the same
+    /// statement with no selection machinery between the test and the config.
+    /// (The `fp8_block_disambiguation_*` tests above mean the whole arch — they
+    /// pass `Scope::all()` to `load_dir`.) The subject here is
+    /// `emit_fingerprint_check`, a pure function of `ModelParams`.
     fn config_of(arch: &str, stem: &str) -> crate::config::ModelParams {
         let path = arch_configs(arch).join(format!("{stem}.json"));
         crate::config::load_file(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()))
@@ -19147,8 +18824,8 @@ mod fingerprint_tests {
 
     /// Load ONE synthesized `(stem, preset)` quant variant — the same deep
     /// merge `load_dir`'s overlay loop performs, for one pair. Same reason
-    /// [`config_of`] bypasses `load_dir`: a proc-macro crate has no quant
-    /// features, so the overlay loop synthesizes nothing here.
+    /// [`config_of`] bypasses `load_dir`: the subject is one named
+    /// `(stem, preset)` pair, not an arch's whole fan-out.
     /// Load one synthesized preset variant, under the load-OR-refuse law: a
     /// variant whose merged config ships a mixed-bit affine quantization
     /// refuses under a backend that can't lower it (asserted by name inside
@@ -19228,24 +18905,65 @@ mod fingerprint_tests {
         );
     }
 
-    /// A config that declares no `rope_theta` must emit NO gate. 19 in-tree
-    /// configs are in this bucket (gemma3/gemma4/qwen3.5 carry per-attention-
-    /// class thetas nested under `rope_parameters`; modernbert and llama-2-70b
-    /// omit it and take HF's implicit 10⁴ default). Synthesizing that default
-    /// here would invent a constraint the config never stated and false-reject
-    /// a checkpoint that spells `10000.0` out.
+    /// Every checked-in config of an arch whose body reads a LOCAL rotary table states the local
+    /// class's base itself — the fact `TextGeometry::rope_local_for` takes, never defaulted to the
+    /// global θ. A config that stopped stating it would be a build error; this names it first.
     #[test]
-    fn a_config_without_rope_theta_emits_no_theta_gate() {
+    fn every_local_rotary_config_states_its_local_base() {
+        for arch in [
+            "gemma3",
+            "gemma4",
+            "gemma4-moe",
+            "gemma4-assistant",
+            "modernbert",
+        ] {
+            let dir = arch_configs(arch);
+            let mut n = 0;
+            for e in std::fs::read_dir(&dir).expect("arch configs") {
+                let path = e.expect("entry").path();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if !name.ends_with(".json")
+                    || ["arch.json", "quantizations.json", "weights.json"].contains(&name)
+                    || name.ends_with(".overrides.json")
+                {
+                    continue;
+                }
+                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                let Some(model) = crate::config::assert_load_or_refuse_by_name(
+                    &stem,
+                    crate::config::load_file_declared(&path),
+                ) else {
+                    continue;
+                };
+                assert!(
+                    model.text.rope_local.is_some(),
+                    "{arch}/{stem}: no local rotary base stated"
+                );
+                n += 1;
+            }
+            assert!(n > 0, "{arch}: no config checked");
+        }
+    }
+
+    /// A config that omits `rope_theta` computes with its ARCH's default (llama: `LlamaConfig`'s
+    /// 10⁴, `configs/llama/arch.json`), and the gate compares against that value — the one the
+    /// model runs at — never against nothing.
+    #[test]
+    fn a_config_omitting_rope_theta_gates_on_its_arch_default() {
+        let path = arch_configs("llama").join("llama-2-70b.json");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert!(
+            raw.get("rope_theta").is_none(),
+            "premise broken: llama-2-70b now states a rope_theta, so it no longer exercises the \
+             arch default — repoint this test at another config that omits it",
+        );
         let model = config_of("llama", "llama-2-70b");
-        assert!(
-            model.scalars.get("rope_theta").is_none() && model.bounds.get("rope_theta").is_none(),
-            "premise broken: llama-2-70b now declares a rope_theta, so it no longer exercises \
-             the no-gate case — repoint this test at another config that declares none",
-        );
-        assert!(
-            emitted_rope_theta(&model, "llama").is_none(),
-            "a config with no declared rope_theta must not gate on one",
-        );
+        assert_eq!(model.text.rope_theta.get(), 10_000.0);
+        assert_eq!(emitted_rope_theta(&model, "llama"), Some(10_000.0));
     }
 
     /// `affine_role_bits` resolved against a variant's own config — the single

@@ -732,9 +732,9 @@ pub fn weight_table(
     let Some(first) = lowered.first() else {
         return Ok(Vec::new());
     };
-    let bindings = &first.lowered.bindings;
+    let bindings = first.lowered.bindings();
     for b in &lowered {
-        let theirs = &b.lowered.bindings;
+        let theirs = b.lowered.bindings();
         if let Some(ix) =
             (0..bindings.len().max(theirs.len())).find(|&i| bindings.get(i) != theirs.get(i))
         {

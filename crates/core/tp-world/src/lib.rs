@@ -209,6 +209,16 @@ impl<T: World, X> PerRank<T, X> {
         &self.items[0]
     }
 
+    /// Rank 0's value, by value — every world has one (a world of one's only value).
+    pub fn into_first(self) -> X {
+        // `T::RANKS >= 1` (`World::NONEMPTY`), so there is a rank 0.
+        let () = T::NONEMPTY;
+        match alloc::vec::Vec::from(self.items).into_iter().next() {
+            Some(x) => x,
+            None => unreachable!("a world has at least one rank"),
+        }
+    }
+
     /// `f` of every rank's value, as the same world's.
     pub fn map<Y>(&self, mut f: impl FnMut(Rank<T>, &X) -> Y) -> PerRank<T, Y> {
         PerRank::from_fn(|r| f(r, self.get(r)))

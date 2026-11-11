@@ -12,6 +12,11 @@ path = "src/lib.rs"
 tracing = "0.1"
 libc = "0.2"
 
+# `sched_{get,set}affinity` without `unsafe`, for `numa`'s thread placement. Already in the
+# lockfile (tempfile's and xattr's); only its `thread` API is added.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "thread"] }
+
 [build-dependencies]
 cc = "1"
 

@@ -22,21 +22,23 @@ use std::num::NonZeroU64;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+use flex_rs::iommu::PfIommuMapper;
 use flex_rs::memory_region::MemoryType;
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::cb_plan;
-use crate::fold_plan::{
-    self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
-};
+use crate::fold_plan::{self, OpKv};
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, PeerLink, Stream,
+    H2dPin, HwError, PeerLink, Stream,
 };
 use crate::sen_convert;
-use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
+use crate::stage_weight::{
+    Element, RetileWalk, WalkArm, stage_weight_per_element, stage_weight_permuted,
+    stage_weight_rows,
+};
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  Typed quantities. Every number below names WHICH number it is; the executor never takes a bare
@@ -89,6 +91,277 @@ pub const SEG_KV: SegIdx = SegIdx::known::<2>();
 /// without disturbing the running softmax state or any other activation.
 pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
 
+/// ⭐ THE HOST SHADOW'S OWN BUFFER — page-aligned, THP-advised anonymous memory.
+///
+/// Why not a `Vec`: prepare sends these bytes by the PRE-MAPPED door
+/// ([`Stream::pin_h2d`]), and that door's recipe — the vendor's own, stated where
+/// `DmaBuf::setup_dma_buf` skips its shadow copy for a caller-supplied iova — is an
+/// IOMMU-page-ALIGNED, fully-populated host buffer. A `Vec`'s pointer is the allocator's
+/// to place (glibc's huge blocks come back 16 B into their mapping), so alignment cannot be
+/// asked of one; `mmap` gives it by construction.
+///
+/// The huge-page advice is not decoration: the IOMMU pin that pre-mapped send rides walks
+/// the buffer's backing pages, and VFIO pins at the backing page's granularity — 4 KiB
+/// anonymous pages pin at 1.3-2.4 GB/s where THP-backed ones pin at 288 GB/s
+/// (card-measured, `h2d_streams_probe`, 2026-11-10), so a 2.5 GiB weight shadow pins in
+/// ~10 ms THP-backed or over a second not. The pod's THP defrag mode is `madvise`, so an
+/// un-advised mapping's huge pages are best-effort; [`advise_huge_pages`] is what makes
+/// them reliable. Population is [`fault_in`]'s job, at prepare, value-preserving — staged
+/// bytes are already faulted by the staging walk's writes, and the pad extents fault as
+/// born zeros without disturbing them.
+///
+/// `len` is the LOGICAL length (the byte count every reader sees through `Deref`); the
+/// mapping itself is [`pages_of`]` (len)` — the page-rounded extent, whose tail bytes past
+/// `len` read as zeros (anonymous `mmap` semantics) and are nobody's to write. The
+/// invariant `len == 0` ⟺ "never mapped" (a dangling pointer) is what [`Drop`] and
+/// [`HostBuf::resize`] both rest on.
+#[derive(Debug)]
+pub(crate) struct HostBuf {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+/// A host buffer's page-rounded extent — the size actually mapped for `len` logical bytes.
+fn pages_of(len: usize) -> usize {
+    len.div_ceil(HOST_PAGE) * HOST_PAGE
+}
+
+/// Why a host shadow buffer could not be made: the kernel's errno, by stage.
+#[derive(Debug)]
+pub(crate) enum HostBufError {
+    /// `mmap` refused the allocation.
+    Map { errno: std::io::Error },
+    /// `mremap` refused the growth (Linux; other targets grow by copy, which cannot fail
+    /// this way).
+    Remap { errno: std::io::Error },
+}
+
+impl std::fmt::Display for HostBufError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Map { errno } => write!(f, "mmap refused the host shadow: {errno}"),
+            Self::Remap { errno } => write!(f, "mremap refused the host shadow's growth: {errno}"),
+        }
+    }
+}
+
+impl std::error::Error for HostBufError {}
+
+/// `MADV_HUGEPAGE` over a mapping we own — see [`HostBuf`]'s doc for the pin-rate law that
+/// makes this load-bearing. Best-effort BY NATURE (it is an advice): a kernel without THP
+/// refuses it, and the buffer is still correct — only the pin's rate suffers, which the
+/// refusal line names when it happens.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(ptr: *mut std::ffi::c_void, mapped: usize) {
+    // SAFETY: `ptr`/`mapped` are our own live mapping (every caller passes a buffer this
+    // module mmap'd), and `madvise` reads only the VMA metadata.
+    unsafe {
+        if libc::madvise(ptr, mapped, libc::MADV_HUGEPAGE) != 0 {
+            let errno = std::io::Error::last_os_error();
+            debug!(
+                "MADV_HUGEPAGE refused ({errno}) — the shadow's pages will pin at 4 KiB \
+                    granularity"
+            );
+        }
+    }
+}
+
+/// Only Linux has `MADV_HUGEPAGE`, and only Linux drives a card — a shadow on any other
+/// target exists for cardless tests and is never pinned.
+#[cfg(not(target_os = "linux"))]
+fn advise_huge_pages(_ptr: *mut std::ffi::c_void, _mapped: usize) {}
+
+// SAFETY (both): the buffer is plain anonymous memory with no thread affinity — the same
+// statement `RaiiBuffer` makes for the vendor's own aligned host buffers
+// (`flex_rs::host_interface`), and the reason a `Vec<u8>` payload was `Send` and `Sync`
+// too.
+unsafe impl Send for HostBuf {}
+unsafe impl Sync for HostBuf {}
+
+impl HostBuf {
+    /// The empty buffer — no mapping at all. [`Executor::stage_weights`] is what sizes a
+    /// shadow; every other construction site of an empty one is a slot awaiting that.
+    pub(crate) const fn empty() -> Self {
+        Self {
+            ptr: std::ptr::NonNull::dangling(),
+            len: 0,
+        }
+    }
+
+    /// A page-aligned, zero-filled buffer of `len` bytes. "Zero-filled" is the mapping's
+    /// own semantics (anonymous `mmap` reads as zeros until written), so nothing is memset:
+    /// the staging walk's writes fault the pages it touches and [`fault_in`] faults the
+    /// rest at prepare — the kernel zeroes each page exactly once, on first touch, either
+    /// way.
+    pub(crate) fn zeroed(len: usize) -> Result<Self, HostBufError> {
+        if len == 0 {
+            return Ok(Self::empty());
+        }
+        let mapped = pages_of(len);
+        // SAFETY: a nonzero page count, no file, no fixed address — `mmap` has no
+        // preconditions left to violate, and the return is checked against `MAP_FAILED`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(HostBufError::Map {
+                errno: std::io::Error::last_os_error(),
+            });
+        }
+        advise_huge_pages(ptr, mapped);
+        Ok(Self {
+            // SAFETY: `mmap` succeeded, so the pointer is non-null.
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr.cast()) },
+            len,
+        })
+    }
+
+    /// `Vec::resize(new_len, 0)`'s contract on this buffer: grow with born-zero tail bytes,
+    /// shrink by dropping them. Growth on Linux is `mremap` — the kernel moves the pages,
+    /// so a weight shadow grown by its region's alignment pad does not copy 2 GiB to add
+    /// 2 MiB (the allocator's own `realloc` plays the same trick for its mmap'd blocks);
+    /// other targets grow by copy, and never run on a card anyway.
+    pub(crate) fn resize(&mut self, new_len: usize) -> Result<(), HostBufError> {
+        if new_len == self.len {
+            return Ok(());
+        }
+        if self.len == 0 || new_len == 0 {
+            // An empty buffer holds no mapping to keep, and a resize to empty drops the
+            // mapping outright — either way the result is a fresh buffer carrying the old
+            // prefix where one exists.
+            let mut next = Self::zeroed(new_len)?;
+            let keep = self.len.min(new_len);
+            if keep > 0 {
+                next[..keep].copy_from_slice(&self[..keep]);
+            }
+            *self = next;
+            return Ok(());
+        }
+        let old_mapped = pages_of(self.len);
+        let new_mapped = pages_of(new_len);
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `ptr`/`old_mapped` are this buffer's own live mapping; `MREMAP_MAYMOVE`
+            // is the only flag, and the return is checked against `MAP_FAILED`.
+            let grown = unsafe {
+                libc::mremap(
+                    self.ptr.as_ptr().cast(),
+                    old_mapped,
+                    new_mapped,
+                    libc::MREMAP_MAYMOVE,
+                )
+            };
+            if grown == libc::MAP_FAILED {
+                return Err(HostBufError::Remap {
+                    errno: std::io::Error::last_os_error(),
+                });
+            }
+            // SAFETY: `mremap` succeeded, so the pointer is non-null.
+            self.ptr = unsafe { std::ptr::NonNull::new_unchecked(grown.cast()) };
+            // The moved mapping carries its VMA flags, but the grown tail is new — advise
+            // the whole range again so it is covered either way.
+            advise_huge_pages(grown, new_mapped);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut next = Self::zeroed(new_len)?;
+            let keep = self.len.min(new_len);
+            next[..keep].copy_from_slice(&self[..keep]);
+            *self = next;
+            let _ = (old_mapped, new_mapped);
+        }
+        self.len = new_len;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for HostBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            // SAFETY: `ptr` names our own mapping of at least `len` bytes, uniquely held.
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+    }
+}
+
+impl std::ops::DerefMut for HostBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            // SAFETY: as `Deref`, and uniquely held through `&mut self`.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+    }
+}
+
+impl Drop for HostBuf {
+    fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // SAFETY: `ptr`/`pages_of(len)` are this buffer's own live mapping — the invariant
+        // `len == 0` ⟺ never-mapped is what makes the guard sufficient.
+        unsafe { libc::munmap(self.ptr.as_ptr().cast(), pages_of(self.len)) };
+    }
+}
+
+/// ⭐ ONE SLOT'S HOST SIDE — a real buffer, or the typed statement that the slot's bytes live
+/// only on the device.
+///
+/// A device-only slot (the KV pool, the intermediates) is not "a short shadow": `prepare`
+/// fills its region on the device and no forward ever touches its host side. Spelling that
+/// as a 128 B `Vec` made a forgotten reader a PANIC (an index past 128) or a silent
+/// truncation — this PR shipped one of each before the type existed. As a variant, a reader
+/// cannot get bytes out of a device-only slot without saying what to do about it: the
+/// read doors materialize through [`Executor::shadow_for_read`], and every other site
+/// refuses.
+#[derive(Debug)]
+enum HostShadow {
+    /// A real host buffer: staged weights, a per-step mirror (the activation and logits
+    /// segments), or one materialized on demand by a read. `Default` is the empty buffer —
+    /// the pre-staging state; [`Executor::stage_weights`] is what sizes it.
+    Host(HostBuf),
+    /// No host bytes, by the bundle's own statement (see [`Executor::host_owned_seg`]):
+    /// device-filled at boot, materialized only when a read asks.
+    DeviceOnly,
+}
+
+impl Default for HostShadow {
+    fn default() -> Self {
+        HostShadow::Host(HostBuf::empty())
+    }
+}
+
+impl HostShadow {
+    /// The buffer, or `None` on a device-only slot — the answer every reader must give a
+    /// reason for.
+    fn host(&self) -> Option<&[u8]> {
+        match self {
+            HostShadow::Host(v) => Some(v),
+            HostShadow::DeviceOnly => None,
+        }
+    }
+
+    /// The buffer mutably, same law as [`Self::host`].
+    fn host_buf_mut(&mut self) -> Option<&mut HostBuf> {
+        match self {
+            HostShadow::Host(v) => Some(v),
+            HostShadow::DeviceOnly => None,
+        }
+    }
+}
+
 /// ⭐ THE SEGMENTS A BORROWER ADOPTS INSTEAD OF FILLING — the resident ones. Three sites read this
 /// (host-shadow sizing, device sizing, H2D) and they MUST agree: a segment sized as a placeholder but
 /// then H2D'd from that placeholder writes 128 B of zeros over the owner's live data. Spelling the
@@ -110,9 +383,6 @@ pub struct KvDim(pub usize);
 /// Physical pages in the resident pool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PoolPages(pub i64);
-/// Positions per page.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct PageSlots(pub i64);
 /// An ABSOLUTE sequence position — how many positions are already resident for this forward.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SeqPos(pub i64);
@@ -129,32 +399,34 @@ pub struct LayerIdx(pub i64);
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The measurement switches, sampled once per process.
-/// WHERE a launch lands: the per-segment byte offsets it shifts by, which KV slot and page it writes,
-/// how many fold passes it makes, and which weight region fills the positional weight slot.
-///
-/// One value rather than five parameters because they are ONE fact — "this launch, at this position" —
-/// and they are always chosen together at the call site that knows the layer index. Passing them
-/// separately also pushed `launch_ops_inner` past the argument limit.
+/// WHERE a launch lands: the per-segment byte offsets it shifts by (the launch row's), which
+/// weight region fills the positional weight slot, and the request facts the relaunch law reads.
+/// Nothing about the step's position: a walk's body shifts by its own trip, and every other group
+/// launches where the bake placed it.
 #[derive(Clone, Copy)]
 pub(crate) struct LaunchWhere {
     pub(crate) byte_off: [u64; NUM_SEGMENTS],
-    pub(crate) slot_pos: SeqPos,
-    pub(crate) kv_page_base: Bytes,
-    pub(crate) n_fold_pages: i64,
     /// Which weight bank backs the positional weight slot — see `weight_bank_for`.
     pub(crate) weight_bank: usize,
+    /// ⭐ HOW MANY REQUESTS THIS LAUNCH SERVES, and the pitch their tables sit at — the request half
+    /// of `fold_plan`'s relaunch law (a walking bundle's span repeats once per request, its tables
+    /// `request · pitch` into the activation segment). ONE request at no pitch is every launch
+    /// today; a packed prefill launch is the one that states more, and it states the step's own
+    /// `card_request_pitch` with it.
+    pub(crate) requests: fold_plan::Requests,
 }
 
 /// One rung launch staged for the rung's single doorbell. `launch_ops_inner` collects these across
-/// its whole (op, rep) loop and flushes once at the end ([`crate::runtime::Stream::submit_batch`]
-/// — the vendor's multi-CB branch). The site context rides alongside the item because the per-op
-/// `fault` closure dumps from loop locals (`ta`/`off`/the fold rep), which are gone by flush time:
-/// a refused flush rebuilds the offending entry's dump from these, and the flex-rs error names the
-/// entry index it refused.
+/// its whole (op, request, rep) loop and flushes once at the end
+/// ([`crate::runtime::Stream::submit_batch`] — the vendor's multi-CB branch). The site context
+/// rides alongside the item because the per-op `fault` closure dumps from loop locals
+/// (`ta`/`off`/the request and fold rep), which are gone by flush time: a refused flush rebuilds
+/// the offending entry's dump from these, and the flex-rs error names the entry index it refused.
 struct PendingLaunch {
     item: BatchedCb,
-    /// Which op of the rung (`oi`) and which fold rep produced this entry.
+    /// Which op of the rung (`oi`), serving which request, at which fold rep produced this entry.
     op_index: usize,
+    request: u32,
     rep: i64,
     /// The per-segment shifts this entry launched with — what `dump_launch_site` prints.
     off: [u64; NUM_SEGMENTS],
@@ -164,24 +436,6 @@ struct PendingLaunch {
 //  #603 PR2 2c — the replay player's cached step images
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One launch row inside a step image: where the row's canvas sits in the
-/// concatenated step canvas, whether the row's render FOLLOWS the step
-/// scalars, and its patch plan.
-///
-/// `follows_step` is a law of [`Executor::launch_forward`], read here as
-/// data: the body rows launch at the STEP's position/page/count (their
-/// bytes move with the step — patched), while the prefix and suffix launch
-/// at slot 0 / page 0 / one page WHATEVER the step is (their bytes are the
-/// same every step — copied, never patched). A row that is fixed replayed
-/// through its plan would be wrong twice over: the plan was never verified
-/// for the step's slots, and the walk never renders it there.
-struct RowReplay {
-    base: usize,
-    len: usize,
-    follows_step: bool,
-    plan: cb_plan::PatchPlan,
-}
-
 /// The immutable half of a cached image — `Arc`'d because TWO handles must
 /// share it: the cache keeps one, and every step's `ComputeWireBatch` carries
 /// the canvas (one more `Arc`, to the same allocation) plus a stamp closure
@@ -189,12 +443,12 @@ struct RowReplay {
 /// closure is `Send` for free.
 struct StepImageData {
     canvas: std::sync::Arc<Vec<ControlBlockWire>>,
-    rows: Vec<RowReplay>,
+    /// How many launch rows the canvas concatenates — reported by the derivation line.
+    rows: usize,
 }
 
 /// One cached step image — the whole forward (prefix + every body row +
-/// suffix) as ONE canvas, the row table that patches it, and the host-fence
-/// OR the step's single submission carries (the walk's per-row ORs collapse
+/// suffix) as ONE canvas, and the host fence the step's single submission carries (the walk's per-row ORs collapse
 /// into it; see the flush at the end of `launch_ops_inner`).
 #[derive(Clone)]
 struct StepImage {
@@ -202,27 +456,12 @@ struct StepImage {
     barrier: bool,
 }
 
-/// What an image is keyed by — everything the render reads that is not
-/// per-step: WHICH body the ladder picks for this context, how many pages
-/// the resident prefix spans, and the fold shape (below).
+/// What an image is keyed by — WHICH body the ladder picks for this step. Nothing else a launch
+/// addresses varies with the step: a walk's body shifts by its own trip, and every other group
+/// launches where the bake placed it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StepImageKey {
     sel: BodySel,
-    n_fold_pages: i64,
-    /// The fold state the canvas was rendered under: the geometry and
-    /// request count, plus row 0's first `n_fold_pages` page ids. Those ids
-    /// are the ONE fold mutation that can invalidate an image: append-only
-    /// within a request's life (the prefix the fold sweeps is stable), but
-    /// a NEW request reuses the row with different pages.
-    ///
-    /// ⛔ NO ROW CURSORS IN THE KEY, ON PURPOSE. They advance every step —
-    /// keying on them would derive a fresh image per token. A single-request
-    /// launch is `LaunchWidth::Single`, and `RequestSlot::resolve`'s Single
-    /// arm answers the launch's own position without reading any cursor, so
-    /// the render genuinely does not depend on them. `fold_requests != 1`
-    /// never reaches the player (it takes the walk), which is what makes
-    /// that true for every image in this cache.
-    signature: Vec<i64>,
 }
 
 /// The image cache WITH its accounting. The counters live on the two arms
@@ -290,12 +529,7 @@ struct Diag {
     /// CB's five cycle counts (`flex_rs::rb_telemetry`) — so this knob costs nothing but the
     /// printing, and needs NO drain beyond the one `synchronize` a step already performs. It is
     /// the drain-free answer to what `group_time`/`prefix_time` pay ~11% of decode to estimate.
-    /// Combine it with `repeat_probe` and per-op attribution is skipped loudly (the probe's extra
-    /// launches are in the ring but not in the sequence).
     rb_time: bool,
-    /// `SCRATCHY_SDSC_REPEAT_PROBE`: launch the same program twice back to back — separates "a
-    /// launch is expensive" from "switching programs is expensive".
-    repeat_probe: bool,
     /// `SCRATCHY_SDSC_BODY_TRACE`: which body a step actually selected.
     body_trace: bool,
     /// `SCRATCHY_SDSC_SEGADDR_DIAG`: one-shot dump of every segment's resolved runtime base.
@@ -316,6 +550,10 @@ struct Diag {
     phase_time: bool,
     /// `SCRATCHY_SDSC_PREP_TIME`: sub-phase timing of prepare.
     prep_time: bool,
+    /// `SCRATCHY_SDSC_STAGE_TIME`: per-mode timing of the LPT weight staging (which walk arm
+    /// and which transform each byte took, and the slowest items) — the instrument for the
+    /// boot layer that runs BEFORE prepare, off its laps.
+    stage_time: bool,
     /// `SCRATCHY_SDSC_OPTRACE`: after each on-card op, D2H every segment and print nonzero-count +
     /// max|.| — the op index where the signal collapses IS the divergence.
     optrace: bool,
@@ -351,12 +589,12 @@ impl Diag {
                 submit_time: on("SCRATCHY_SDSC_SUBMIT_TIME"),
                 prefix_time: on("SCRATCHY_SDSC_PREFIX_TIME"),
                 rb_time: on("SCRATCHY_SDSC_RB_TIME"),
-                repeat_probe: on("SCRATCHY_SDSC_REPEAT_PROBE"),
                 body_trace: on("SCRATCHY_SDSC_BODY_TRACE"),
                 segaddr: on("SCRATCHY_SDSC_SEGADDR_DIAG"),
                 prog_verify: on("SCRATCHY_SDSC_PROG_VERIFY"),
                 phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
                 prep_time: on("SCRATCHY_SDSC_PREP_TIME"),
+                stage_time: on("SCRATCHY_SDSC_STAGE_TIME"),
                 optrace: on("SCRATCHY_SDSC_OPTRACE"),
                 tensordump: std::env::var_os("SCRATCHY_SDSC_TENSORDUMP")
                     .map(std::path::PathBuf::from),
@@ -384,12 +622,12 @@ impl Diag {
             submit_time,
             prefix_time,
             rb_time,
-            repeat_probe,
             body_trace,
             segaddr,
             prog_verify,
             phase_time,
             prep_time,
+            stage_time,
             optrace,
             tensordump,
             launch_mark,
@@ -400,12 +638,12 @@ impl Diag {
             || *submit_time
             || *prefix_time
             || *rb_time
-            || *repeat_probe
             || *body_trace
             || *segaddr
             || *prog_verify
             || *phase_time
             || *prep_time
+            || *stage_time
             || *optrace
             || *launch_mark)
             && tensordump.is_none()
@@ -484,7 +722,6 @@ struct Timers {
     /// so a map keyed on the index alone averages a 20-op body's group 2 with a 3-op prefix's.
     prefix_ms: BTreeMap<(usize, usize), (f64, u64, String)>,
     prefix_call: BTreeMap<usize, u64>,
-    repeat_ms: BTreeMap<usize, (f64, f64, u64, String)>,
     /// Per-op harvested RB cycles — keyed like `prefix_ms` (same rung-numbering hazard).
     rb_cycles: BTreeMap<(usize, usize), RbOpCycles>,
     /// The DMA crossings' harvested cycles — the preamble-H2D and logits-D2H, which no op owns.
@@ -514,18 +751,14 @@ struct Timers {
     /// derived (the rest paid a derivation, counted below).
     replay_steps: u64,
     replay_hits: u64,
-    /// Images derived (first use of a (body, page-count, fold-shape) key)
-    /// and what those derivations cost — amortized over every step that
-    /// reuses the image.
+    /// Images derived (first use of a body's key) and what those
+    /// derivations cost — amortized over every step that reuses the image.
     replay_derives: u64,
     replay_derive_ms: f64,
-    /// CBs replayed per step and moving-word patch sites carried by the
-    /// derived images — the player's per-step payload.
+    /// CBs replayed per step — the player's per-step payload.
     replay_cbs: u64,
-    replay_sites: u64,
-    /// The per-step host work: image lookup (key + fold-signature build +
-    /// map hit) and the submit call (canvas memcpy + patches + tag stamps +
-    /// ONE doorbell, all inside it).
+    /// The per-step host work: image lookup (key build + map hit) and the
+    /// submit call (canvas memcpy + tag stamps + ONE doorbell, all inside it).
     replay_lookup_ms: f64,
     replay_submit_ms: f64,
 }
@@ -573,7 +806,7 @@ pub(crate) struct OpProg<T: ktir_superdsc::collective::Tp> {
 /// The forget is kept by choice, and it costs nothing: the device region a session-lifetime
 /// handle describes lives until process exit regardless (see the `DevAddr` doc), so a freeing
 /// drop could reclaim only a descriptor value, once, at shutdown. Nothing crashes without it
-/// today — every session holds its card's `CardRuntime` by `Arc`, so the context outlives it, and
+/// today — every session borrows its card's `CardRuntime` (`&'c`), so the context outlives it, and
 /// `DevAddr`'s drop cannot reach the allocator — but the law stays load-bearing anyway:
 /// `CardRuntime::reset` (the leak probe) tears the context down MID-PROCESS, and a future
 /// `DevAddr` drop that learns to free must not find session handles betting on drop order
@@ -593,7 +826,7 @@ impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> Drop for Executor<T> {
+impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, T> {
     fn drop(&mut self) {
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
@@ -602,15 +835,15 @@ impl<T: ktir_superdsc::collective::Tp> Drop for Executor<T> {
 }
 
 impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
-    /// Pair one launch-index entry with the program it names.
-    ///
-    /// `slot_write`/`slab_write` stay DERIVED from their strides ("> 0", as the C++ had them) so a
-    /// stride and its flag cannot disagree.
+    /// Pair one launch-index entry with the program it names. `per_request` is the bundle's own
+    /// verdict — whether ANY of its groups walks — stamped here at load onto every group of the
+    /// bundle alike (see `fold_plan`'s request law); it is never baked, so no record states it.
     fn new(
         code: &'static bundle::LaunchGroup<'static, T>,
         fp: &'static str,
         index: usize,
         collective: Option<cb_plan::BoundCollective<T>>,
+        per_request: bool,
     ) -> Self {
         let kv = &code.kv;
         OpProg {
@@ -620,19 +853,11 @@ impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
             addr: None,
             collective,
             kv: OpKv {
-                request: kv.request as u64,
-                slot_offset: kv.slot_offset as u64,
                 page_fold: kv.page_fold,
-                slot_write: kv.slot_write(),
-                page_slots: kv.page_slots as u64,
-                slot_stride_bytes: kv.slot_stride_bytes as u64,
-                slab_write: kv.slab_write(),
-                slab_stride_bytes: kv.slab_stride_bytes as u64,
-                batched_requests: kv.batched_requests,
-                // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
-                // zero — a bake fact, carried on the group exactly like the axis itself.
+                // What sends the group's KV shift to zero — a bake fact, carried on the group.
                 gathered: kv.gathered,
                 walk: kv.walk,
+                per_request,
             },
         }
     }
@@ -688,6 +913,79 @@ fn h2d_run(offset: u64, len: u64) -> (u64, u64) {
 
 /// The H2D window alignment [`h2d_run`] rounds to.
 const H2D_ALIGN: u64 = 4096;
+
+/// The fill window step — the walk step of EVERY device-side zero fill, so `zero_seg` and
+/// `prepare`'s fills submit the same single-chunk window shapes (the window size only
+/// sets how many fill control blocks the walk submits; no host buffer rides the fill).
+const FILL_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
+    Some(w) => w,
+    None => unreachable!(),
+};
+
+/// The window step of a pre-mapped whole-region send ([`send_premapped`]) — the same 64 MiB
+/// the #606 pool's own copies cut, so one window is one DMA control block on the wire and a
+/// multi-GiB region costs tens of submissions, not thousands.
+const H2D_WINDOW: NonZeroU64 = match NonZeroU64::new(64 << 20) {
+    Some(w) => w,
+    None => unreachable!(),
+};
+
+/// ⭐ THE ONE ZERO-FILL WALK: [`DevAddr::windows`] at [`FILL_WINDOW`], so a multi-chunk
+/// (interleaved) region is filled chunk by chunk — every byte the region owns, none it does
+/// not — and each window is the single-chunk shape the fill control block resolves. Every
+/// device-side fill goes through here (`zero_seg`, `prepare`'s segment and bank fills); a
+/// second copy would drift from this one's window shape.
+fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
+    for w in addr.windows(FILL_WINDOW) {
+        stream.fill_zero(&w).map_err(|e| anyhow!("{what}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// ⭐ THE PRE-MAPPED SEND OF ONE WHOLE SHADOW — the boot-weight door's consumer side. The
+/// shadow's pages are faulted (value-preserving, by prepare's grow loop); here the buffer
+/// is pinned ONCE for its whole extent ([`Stream::pin_h2d`], which refuses a mapping that
+/// does not cover the shadow BY NAME — `PremappedH2dRefusal::ShortPin`) and the transfer
+/// goes out window by window through [`H2dPin::send_window`], each window's host slice AND
+/// iova derived from the pin itself — the same linear arithmetic the #606 pool's slot
+/// resolution rides and the law the scheduler states by advancing a caller iova with its
+/// host address. One pin, one submit per window, and none of the plain door's per-call
+/// DmaBuf setup and pin: ~59 GB/s against its 6-7 (card-measured, `h2d_streams_probe`,
+/// 2026-11-10), which is the whole point — a 2b model's ~2.5 GiB of weights.
+///
+/// The pin is parked in `alive` until the caller's `synchronize` has retired the transfers
+/// — but that is the happy path only, and not where the safety lives: the guard's own
+/// [`Drop`] synchronizes the stream BEFORE it unpins, so an early return (a refused
+/// window, a failed sync, an unwind) retires the DMA too. The unpin never races a
+/// transfer, on any exit.
+fn send_premapped<'a>(
+    stream: &'a Stream,
+    src: &'a [u8],
+    addr: &DevAddr,
+    mapper: &std::sync::Arc<PfIommuMapper>,
+    alive: &mut Vec<H2dPin<'a>>,
+    what: &str,
+) -> Result<()> {
+    let pin = stream
+        .pin_h2d(mapper, src)
+        .map_err(|e| anyhow!("{what}: pinning the {} B shadow: {e}", src.len()))?;
+    let mut off = 0usize;
+    for w in addr.windows(H2D_WINDOW) {
+        let win = w.total_size().as_u64() as usize;
+        pin.send_window(&w, off..off + win)
+            .map_err(|e| anyhow!("{what}: pre-mapped window at byte {off}: {e}"))?;
+        off += win;
+    }
+    assert_eq!(
+        off,
+        src.len(),
+        "{what}: the window walk covered {off} of {} B — DevAddr::windows' \
+         cover-each-chunk-once law is broken",
+        src.len()
+    );
+    alive.push(pin);
+    Ok(())
+}
 
 /// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
 /// whatever page size the host actually uses.
@@ -778,9 +1076,6 @@ struct Rolled {
     /// launch applies. `(body, w_bank, w_off, kv_off)`: the launch binds bank `w_bank` into
     /// positional slot 1, shifts seg1's base by `w_off` and seg2's by `kv_off`.
     launches: Vec<(usize, u8, u64, u64)>,
-    /// Bytes of ONE pool page — every layer of every class (`Σ_c n_c · stride_c`). Differs from
-    /// any single class's stride exactly when the classes have different KV geometry.
-    kv_page_stride: u64,
     /// The bank the PREFIX program's weight operands were baked in, and the SUFFIX's — the emitter
     /// proved each group's weights live in ONE bank, because a launch has one base per segment.
     prefix_weight_bank: usize,
@@ -792,28 +1087,19 @@ struct Rolled {
     // a bug that is fixed.
 }
 
-/// The paged-KV geometry the BUNDLE declares (an op carrying `kv_page_slots` was emitted against
-/// the paged pool), so a paged bundle can never be driven by the unpaged address path.
-#[derive(Clone, Copy, Default)]
-struct KvGeometry {
-    paged: bool,
-    page_slots: PageSlots,
-    /// Bytes per page = all layers of one page.
-    page_stride_bytes: u64,
-    pool_pages: PoolPages,
-}
-
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  The session
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// One resident SuperDSC session: program + weights + KV resident on-card.
-pub struct Executor<T: ktir_superdsc::collective::Tp> {
+pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     /// THE BAKED BUNDLE — this session's program, memory plan and launch index, straight out of the
     /// binary.
     code: &'static bundle::BundleCode<'static, T>,
-    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's.
-    card: std::sync::Arc<CardRuntime<T>>,
+    /// THE CARD THIS SESSION RUNS ON — every stream and allocation below is this card's. BORROWED:
+    /// the card's owner opened it once for the process, and `'c` is the proof, checked by the
+    /// compiler, that this session cannot outlive it.
+    card: &'c CardRuntime<T>,
 
     pub vocab: Vocab,
     pub kv_dim: KvDim,
@@ -855,19 +1141,9 @@ pub struct Executor<T: ktir_superdsc::collective::Tp> {
     /// (every model but the hybrid-attention ones) has exactly one.
     body_ops: Vec<Ops<T>>,
     suffix_ops: Ops<T>,
-    /// Each class's body with the per-page fold fused back in — one fewer launch per layer. Used
-    /// whenever the context fits ONE page, which is the case that must cost what unpaged cost.
-    /// `None` unless EVERY class has its twin ([`PerClass`]).
-    body_fused: Option<PerClass<Ops<T>>>,
     /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
     /// is the full cap.
     body_rungs: Vec<(SweptCols, Vec<Ops<T>>)>,
-    /// The rungs whose EVERY class has a fold-fused twin, ascending, each with its twins in class
-    /// order ([`fused_rungs`]). A rung with any class sitting out is absent, so it runs split.
-    body_rungs_fused: Vec<(SweptCols, PerClass<Ops<T>>)>,
-    /// PAGED: the SPLIT bodies are only reachable once a context outgrows one page, so their
-    /// Program memory is allocated on first selection.
-    split_bodies_ready: bool,
 
     // ── Device state ──
     // ⛔ The `DevAddr`s below are leaked at shutdown by `impl Drop for Executor` — see the note on
@@ -883,14 +1159,16 @@ pub struct Executor<T: ktir_superdsc::collective::Tp> {
     /// segment 1); it is a different REGION bound into the same positional slot by the launch that
     /// needs it. See [`bundle::Placement::bank`] and [`Executor::slot_of`].
     weight_bank_addr: Vec<Option<DevAddr>>,
-    weight_bank_host: Vec<Vec<u8>>,
+    weight_bank_host: Vec<HostShadow>,
     weight_bank_bytes: Vec<u64>,
     /// Per extra bank: its region is BORROWED from an owner session, so never H2D this session's
     /// shadow over it. Mirrors [`Self::seg_aliased`], which cannot cover banks because it is indexed
     /// by segment.
     weight_bank_aliased: Vec<bool>,
-    /// Host staging (sen bytes) per segment.
-    seg_host: [Vec<u8>; NUM_SEGMENTS],
+    /// One slot's host side (see [`HostShadow`]): a real staging/mirror buffer, or the typed
+    /// statement that the slot is device-only. Sized by [`Executor::stage_weights`] from the
+    /// bundle's own role statement (see [`Executor::host_owned_seg`]).
+    seg_host: [HostShadow; NUM_SEGMENTS],
     /// ⭐ #32 (C) — THE DEFERRED PICKS' LANDING RING: one slot per outstanding deferred
     /// read, allocated ONCE at first use at the read's own length and reused forever.
     /// The shadow slice a deferred read lands in today is the PLACEMENT's own window in
@@ -968,14 +1246,6 @@ pub struct Executor<T: ktir_superdsc::collective::Tp> {
     /// flag remembered by the bind call alone is a flag the loop can forget.
     const_fp32_ids: BTreeSet<bundle::PlaceId>,
 
-    // ── KV / fold ──
-    kv: KvGeometry,
-    /// The page maps, write cursors and declared strides — [`fold_plan`]'s state, owned here for
-    /// the session's lifetime and read by every launch.
-    fold: SessionKv,
-    /// Has a caller installed a REAL page map (vs the create-time identity default)?
-    block_table_set: bool,
-
     prepared: bool,
     staged_host: bool,
     n_weights_staged: usize,
@@ -1019,10 +1289,6 @@ fn dump_prog_index(fp: &str) -> usize {
     let n = reg.len();
     *reg.entry(fp.to_string()).or_insert(n)
 }
-
-// Driven single-threaded by the worker thread (the session moves between forwards, as the C++
-// session pointer did).
-unsafe impl<T: ktir_superdsc::collective::Tp> Send for Executor<T> {}
 
 /// ⭐⭐⭐⭐⭐ A RAW (device-format) PAYLOAD **AND THE PLACEMENT IT FITS**, as one value — the only thing
 /// [`Executor::bind_input_raw`] accepts, and the reason a raw bind can no longer overrun its tensor.
@@ -1220,7 +1486,7 @@ impl<T: ktir_superdsc::collective::Tp> RankSeat<T> {
     }
 }
 
-impl<T: ktir_superdsc::collective::Tp> Executor<T> {
+impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Create
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1231,12 +1497,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     ///
     /// Nothing is read from disk: `code` is `&'static` data in this binary.
     pub fn load(
-        card: std::sync::Arc<CardRuntime<T>>,
+        card: &'c CardRuntime<T>,
         code: &'static bundle::BundleCode<'static, T>,
         vocab: Vocab,
         kv_dim: KvDim,
         num_blocks: PoolPages,
-    ) -> Result<Executor<T>> {
+    ) -> Result<Executor<'c, T>> {
         // ⭐ ONE LOAD FOR EVERY WORLD. The bundle says whether it was baked sharded (it places a
         // receive window); the card says which rank it runs as (its [`CardRuntime::link`]). The
         // two must agree — see [`RankSeat::of`] — and a sharded session then binds only the launch
@@ -1253,7 +1519,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 ("SCRATCHY_SDSC_PEROP_SYNC", d.perop_sync),
                 ("SCRATCHY_SDSC_GROUP_TIME", d.group_time),
                 ("SCRATCHY_SDSC_PREFIX_TIME", d.prefix_time),
-                ("SCRATCHY_SDSC_REPEAT_PROBE", d.repeat_probe),
                 ("SCRATCHY_SDSC_OPTRACE", d.optrace),
                 ("SCRATCHY_SDSC_TENSORDUMP", d.tensordump.is_some()),
             ];
@@ -1318,10 +1583,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             prefix_ops: Vec::new(),
             body_ops: Vec::new(),
             suffix_ops: Vec::new(),
-            body_fused: None,
             body_rungs: Vec::new(),
-            body_rungs_fused: Vec::new(),
-            split_bodies_ready: false,
             stream: None,
             seg_addr: [const { None }; NUM_SEGMENTS],
             // ⭐ THE WEIGHT BANKS, STRAIGHT FROM THE BAKED LAYOUT — the bundle decided how many
@@ -1332,11 +1594,11 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 .layout
                 .weight_bank_bytes
                 .iter()
-                .map(|_| Vec::new())
+                .map(|_| HostShadow::Host(HostBuf::empty()))
                 .collect(),
             weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
             weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
-            seg_host: [const { Vec::new() }; NUM_SEGMENTS],
+            seg_host: [const { HostShadow::Host(HostBuf::empty()) }; NUM_SEGMENTS],
             read_ring: Vec::new(),
             read_ring_free: Vec::new(),
             last_h2d: None,
@@ -1348,9 +1610,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             keyed: BTreeMap::new(),
             staged: BTreeMap::new(),
             const_fp32_ids: BTreeSet::new(),
-            kv: KvGeometry::default(),
-            fold: SessionKv::default(),
-            block_table_set: false,
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
@@ -1367,9 +1626,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         }
         // The BODY's own launch groups (or the whole model's, unrolled).
         ex.load_bodies()?;
-        // AFTER every program is bound: let the BUNDLE declare whether the KV is paged, and size the
-        // pool from the create-time page count.
-        ex.latch_paged_geometry();
 
         debug!(
             "[sdsc-superdsc] load OK — bundle={}, {} placements, seg_bytes={:?}, logits={}, \
@@ -1402,16 +1658,15 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         bind_ops(code, self.session())
     }
 
-    /// An OPTIONAL sibling's launch groups — a fold-fused twin, which a bundle may not carry.
-    fn optional_sibling_ops(&self, fp: &bundle::SiblingFp<'static>) -> Result<Option<Ops<T>>> {
-        bundle::sibling(fp)
-            .map(|code| bind_ops(code, self.session()))
-            .transpose()
-    }
-
     /// The rank this session runs as, when it runs one rank of a sharded world.
     fn session(&self) -> Option<bundle::collective::Rank<T>> {
         self.seat.identity()
+    }
+
+    /// The rank this executor plays as — `None` alone. What the host stages per rank reads it:
+    /// the chained head's tables and seeds are its rank's vocabulary block.
+    pub fn tp_identity(&self) -> Option<bundle::collective::Rank<T>> {
+        self.session()
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
@@ -1466,7 +1721,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 .iter()
                 .map(|l| (l.body as usize, l.w_bank, l.w_off, l.kv_off))
                 .collect(),
-            kv_page_stride: m.kv_page_stride,
             prefix_weight_bank: m.prefix_weight_bank as usize,
             suffix_weight_bank: m.suffix_weight_bank as usize,
         });
@@ -1520,20 +1774,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 .collect::<Result<Vec<_>>>()?;
             self.body_rungs.push((r.active_cap, bodies));
         }
-        // A rung's fold-fused twins are optional: a rung where any class sits out runs its split
-        // bodies — correct, one launch per layer dearer. See [`fused_rungs`] for why it is per rung.
-        let mut twins = Vec::with_capacity(rungs.len());
-        for r in rungs {
-            twins.push((
-                r.active_cap,
-                r.bodies.len(),
-                r.bodies_fused
-                    .iter()
-                    .map(|fp| self.optional_sibling_ops(fp))
-                    .collect::<Result<Vec<_>>>()?,
-            ));
-        }
-        self.body_rungs_fused = fused_rungs(twins);
         // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
         //
         // A bundle carries a memory PLAN and a set of device PROGRAMS. The plan is what every session
@@ -1579,72 +1819,10 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         Ok(())
     }
 
-    /// Let the BUNDLE declare whether the KV is paged — any op carrying `kv_page_slots` was emitted
-    /// against the paged pool. Read from the OPS rather than a flag so a paged bundle can never be
-    /// driven by the unpaged path (which would apply an absolute-position write shift and land past
-    /// the page). seg2 is then sized `pool_pages * page_stride` at RUNTIME rather than from the
-    /// manifest, which is what makes the servable context an allocation instead of a baked constant.
-    fn latch_paged_geometry(&mut self) {
-        let mut page_slots = 0i64;
-        // A rung holds ONE `Ops` PER ATTENTION CLASS (the roll split by class), so the ladder's
-        // contribution to the sweep is the rungs' class vectors FLATTENED — the same `&Ops` items
-        // `lists()` yields.
-        for ops in self
-            .lists()
-            .into_iter()
-            .chain(self.body_rungs.iter().flat_map(|(_, o)| o))
-        {
-            for o in ops {
-                if o.kv.page_slots > 0 {
-                    page_slots = o.kv.page_slots as i64;
-                }
-            }
-        }
-        if page_slots == 0 {
-            return;
-        }
-        // ⭐ THE PAGE STRIDE IS BAKED, NOT DERIVED. It used to be `iters × kv_stride`, which is
-        // only right while every layer has the same KV geometry — a hybrid model's classes do not,
-        // and the emitter's `kv_page_stride` already sums every class's extent (`Σ n_c·stride_c`),
-        // proven against the placements. 0 on an UNROLLED bundle (no reroll meta) is the same value
-        // the old `iters × kv_stride` formula produced there (0 × 0), and the geometry latch below
-        // runs identically — an unrolled paged bundle keeps its pre-split behavior whole.
-        let page_stride_bytes = self.rolled.as_ref().map_or(0, |r| r.kv_page_stride);
-        self.kv = KvGeometry {
-            paged: true,
-            page_slots: PageSlots(page_slots),
-            page_stride_bytes,
-            pool_pages: PoolPages(if self.num_blocks.0 > 0 {
-                self.num_blocks.0
-            } else {
-                1
-            }),
-        };
-        self.fold.paged = true;
-        self.fold.page_slots = fold_plan::PageSlots::per_page(page_slots);
-        self.fold.page_stride_bytes = Bytes(self.kv.page_stride_bytes);
-        // CREATE-TIME IDENTITY MAP. A session forwarded before any `set_block_table` addresses
-        // logical page n as physical page n, which is what the unpaged path did.
-        let ident: Vec<i64> = (0..self.kv.pool_pages.0).collect();
-        self.install_page_map(RowIdx::from_launch_row(0), SeqPos(0), &ident);
-        self.block_table_set = false;
-        debug!(
-            "[sdsc-superdsc] PAGED KV: page={} slots, page_stride={} B, pool={} pages ({:.1} MB) \
-             => {} positions of context available to one request",
-            self.kv.page_slots.0,
-            self.kv.page_stride_bytes,
-            self.kv.pool_pages.0,
-            (self.kv.pool_pages.0 as u64 * self.kv.page_stride_bytes) as f64 / 1048576.0,
-            self.kv.pool_pages.0 * self.kv.page_slots.0,
-        );
-    }
-
-    fn lists(&self) -> Vec<&Ops<T>> {
-        vec![&self.prefix_ops]
-            .into_iter()
-            .chain(self.body_ops.iter())
-            .chain(std::iter::once(&self.suffix_ops))
-            .collect()
+    /// The CPUs this session's card's host threads run on (its NUMA node's): a thread that
+    /// submits this session's steps pins itself to them first.
+    pub fn card_cpus(&self) -> &flex_rs::numa::CardCpus {
+        self.card.cpus()
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1838,7 +2016,14 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // live across a `&mut self` call.
         let (segi, off) = (seg.get(), p.offset);
         self.quiet_shadow()?;
+        // An activation placement names the ACTIVATION segment, whose shadow is real by the
+        // role statement — a device-only slot here means the placement and the bundle's own
+        // role statement disagree, which is a refusal, never a write into nothing.
         let dst = self.seg_host[segi]
+            .host_buf_mut()
+            .ok_or_else(|| {
+                anyhow!("bind: activation '{id}' names seg{segi}, which is DEVICE-ONLY")
+            })?
             .get_mut(off as usize..(off + len) as usize)
             .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", segi))?;
         sen_convert::f32_to_sen_bytes(vals, dst);
@@ -1944,7 +2129,9 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let shadow = self
             .seg_host
             .get_mut(seg)
-            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?;
+            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?
+            .host_buf_mut()
+            .ok_or_else(|| anyhow!("the activation segment {seg} is DEVICE-ONLY"))?;
         fault_in(shadow);
         Ok(shadow.len() as u64)
     }
@@ -2110,7 +2297,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             );
         }
         for &(tid, kind) in consts {
-            let (bytes, dt, _shape) = kind.card_bytes();
+            // The chain's decompose tables are this rank's vocabulary block's (`chain_block`).
+            let (bytes, dt, _shape) = kind.card_bytes(self.session());
             let id = bundle::PlaceId::Act(tid);
             if kind.is_uniform_col() {
                 let placed = self.places.get(&id).map(|p| p.size);
@@ -2195,14 +2383,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         }
     }
 
-    /// Slot `s`'s host shadow (read-only). Slots past the segments are weight banks.
-    fn shadow(&self, s: usize) -> &[u8] {
-        match s.checked_sub(NUM_SEGMENTS) {
-            None => &self.seg_host[s],
-            Some(b) => &self.weight_bank_host[b],
-        }
-    }
-
     /// ⭐ WHETHER THIS SESSION BINDS ANYTHING INTO A RESIDENT SEGMENT — what "reserve only"
     /// asks. NOT `bound.is_empty()`: a reserving or borrowing session still binds its own staged
     /// constants (the sampler's tables, placed in the never-aliased activation segment), and
@@ -2216,42 +2396,71 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         })
     }
 
+    /// ⭐ WHETHER THIS SESSION STAGES WEIGHTS AT ALL — the session rule every
+    /// weight-carrying slot follows (the weight segment's banks and the spilled tail).
+    /// A session that binds nothing resident (a reserving anchor) or whose weight
+    /// segment is aliased from an owner (a borrower) stages no weights: its tail
+    /// arrives later through [`Self::write_seg_prefix`], which materializes exactly
+    /// the prefix, and its banks are never staged — so those slots are device-filled
+    /// at boot rather than host-allocated and zero-pushed over the wire.
+    fn stages_weights(&self) -> bool {
+        self.binds_resident() && !self.seg_borrowed[SEG_WEIGHT.get()]
+    }
+
+    /// ⭐ WHETHER A SEGMENT'S HOST SIDE EXISTS AT ALL — the bundle's own statement, not a
+    /// measurement of what staging wrote. `SegRole` names each segment's job; `WeightTail`
+    /// names the one intermediate-colour slot that carries spilled weights (a bare role
+    /// table would device-fill the spilled lm_head, so the spill is part of the statement).
+    /// The spill slot carries WEIGHTS, so it also carries the weight-carrying slots' own
+    /// SESSION rule ([`Self::stages_weights`]): a borrower stages no tail, and its slot is
+    /// device-filled at boot exactly like its banks.
+    ///
+    /// The segments named here are the ones the HOST owns: their boot content is the staged
+    /// shadow (weights, the spill tail, the activation segment's staged constants and born
+    /// zeros), sent by H2D, and the session keeps using their shadow after prepare (the
+    /// activation segment it writes every step, the logits segment the per-step D2H reads
+    /// back into). Every other segment — the KV pool, the intermediates — is DEVICE-ONLY:
+    /// `prepare` fills its region on the device ([`Stream::fill_zero`], ~62 GB/s measured,
+    /// vs ~6-7 GB/s for host-pushed zeros — for the KV pool alone that is ~10 GB of wire
+    /// time) and it gets NO host shadow, which deletes the ~10 GB a 2b model allocated,
+    /// memset, and held in RSS for the session's whole life.
+    fn host_owned_seg(&self, i: usize) -> bool {
+        use crate::lower_subtile_tape_to_superdsc::SegRole;
+        i == SegRole::Weight.segment()
+            || i == SegRole::Activation.segment()
+            || i == SegRole::Logits.segment()
+            || (matches!(
+                self.code.layout.weight_tail,
+                bundle::WeightTail::Spilled { segment, .. } if segment as usize == i
+            ) && self.stages_weights())
+    }
+
+    /// ⭐ THE ONE DOOR THAT MATERIALIZES A HOST SHADOW FOR A READ. A device-only slot holds
+    /// no host bytes by design; a read (`read_seg`, `read_tensor`, the deferred reads, the
+    /// logits readback) is what asks for some, so it lands D2H bytes in a fresh zeroed
+    /// buffer of exactly the window it reads. A mirrored buffer shorter than `want` grows —
+    /// the bytes past its old end are born zeros, and the D2H overwrites the window anyway.
+    /// The buffer is MAPPED memory, so a materialization or growth the kernel refuses is a
+    /// refusal the caller reports, never a panic or a shorter buffer.
+    fn shadow_for_read(&mut self, seg: SegIdx, want: usize) -> Result<()> {
+        let i = seg.get();
+        match self.seg_host[i].host_buf_mut() {
+            Some(v) if v.len() >= want => {}
+            Some(v) => v.resize(want)?,
+            // `None` carries no live borrow, so the slot can be replaced in this arm.
+            None => self.seg_host[i] = HostShadow::Host(HostBuf::zeroed(want)?),
+        }
+        Ok(())
+    }
+
     pub fn stage_weights(&mut self) -> Result<()> {
         if self.staged_host {
             return Ok(());
         }
         // NOTHING BOUND ⇒ this session holds allocations only; it is aliased onto an owner's
-        // populated regions before use, so every host shadow here is dead. Sizing them at the
-        // placeholder skips a 2.6 GB memset for the weight segment — measured as 2.134s on the
-        // batched-prefill session, which binds nothing precisely because its ALLOCATION is the
-        // point and its bytes are not.
+        // populated regions before use, so every host shadow here is dead. The shadows are sized
+        // BELOW, once the staged extents say which slots carry content at all.
         let reserve_only = !self.binds_resident();
-        for i in 0..NUM_SEGMENTS {
-            // A BORROWED segment is never staged or H2D'd by this session, so it gets the
-            // placeholder rather than a zero-fill the width of the whole segment. ...but ONLY for
-            // the segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segments are bound
-            // per-forward by this very session and must keep their real size.
-            let aliased_later = reserve_only && is_resident_seg(i);
-            let bytes = if self.seg_borrowed[i] || aliased_later {
-                128
-            } else if self.segment_bytes[i] > 0 {
-                self.segment_bytes[i] as usize
-            } else {
-                128
-            };
-            self.seg_host[i] = vec![0u8; bytes];
-        }
-        // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK, sized the same way. A bank holds only weights, so
-        // it follows the RESIDENT rule exactly: a session that binds nothing gets a placeholder
-        // because an owner's region will replace it.
-        for b in 0..self.weight_bank_bytes.len() {
-            let bytes = if reserve_only || self.seg_borrowed[SEG_WEIGHT.get()] {
-                128
-            } else {
-                self.weight_bank_bytes[b].max(128) as usize
-            };
-            self.weight_bank_host[b] = vec![0u8; bytes];
-        }
 
         // ── Collect the weight placements, validating each against its own extent. ──
         // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
@@ -2269,6 +2478,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             Verbatim,
         }
         struct Item<'a> {
+            /// The weight's own id — what the stage-time diagnostic names a row by.
+            name: String,
             /// The SHADOW SLOT this weight stages into — a segment, or a weight bank beyond bank 0.
             /// See [`Executor::slot_of`]: banking gives one segment several regions, so the segment
             /// index alone stopped being an address.
@@ -2328,14 +2539,22 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     self.weight_bank_bytes.len() + 1
                 );
             };
-            if p.offset as usize + src.len() > self.shadow(slot).len() {
+            // ⭐ MEASURED AGAINST THE SLOT'S DECLARED CAPACITY, not this session's shadow: the
+            // shadows are sized after this loop (a reserving or borrowing session stages nothing,
+            // so its shadows are placeholders), but the placement has to fit the segment the
+            // bundle DECLARES regardless of who stages it.
+            let cap = match slot.checked_sub(NUM_SEGMENTS) {
+                None => self.segment_bytes[slot],
+                Some(b) => self.weight_bank_bytes[b],
+            };
+            if p.offset as usize + src.len() > cap as usize {
                 bail!(
                     "stage: weight '{nm}' off {} + {} B exceeds seg{} bank {} ({} B)",
                     p.offset,
                     src.len(),
                     p.segment,
                     p.bank,
-                    self.shadow(slot).len()
+                    cap
                 );
             }
             let mode = if self.const_fp32_ids.contains(nm) {
@@ -2347,7 +2566,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             } else {
                 match self.kernel_weights.get(nm) {
                     Some(&k) => {
-                        let dev_elems: u64 = k.device_size.iter().product();
+                        let dev_elems: u64 = k.axes.iter().map(|&(e, _)| e).product();
                         if dev_elems as usize * k.word_length as usize != src.len() {
                             bail!(
                                 "stage: kernel weight '{nm}' host size {} B != \
@@ -2368,6 +2587,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 }
             };
             items.push(Item {
+                name: format!("{nm}"),
                 slot,
                 offset: p.offset as usize,
                 src,
@@ -2375,13 +2595,47 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             });
         }
 
+        // ── Size the host shadows BY THE BUNDLE'S OWN ROLE STATEMENT
+        //    ([`Self::host_owned_seg`]): a slot the host owns gets a real buffer (staged
+        //    weights, the spill tail, the activation segment's staged constants, the logits
+        //    readback mirror); every other slot — the KV pool, the intermediates — is
+        //    DEVICE-ONLY: no host bytes at all, `prepare` fills its region on the device.
+        //    That deletes the ~10 GB KV shadow a 2b model allocated, memset, and kept in RSS
+        //    for the session's whole life. ──
+        for i in 0..NUM_SEGMENTS {
+            // A BORROWED segment is never staged or H2D'd by this session, so its host side is
+            // dead too (an alias repoints the region at the owner's). ...but ONLY for the
+            // segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segment is bound
+            // per-forward by this very session and must keep its real size.
+            let aliased_later = reserve_only && is_resident_seg(i);
+            if self.seg_borrowed[i] || aliased_later || !self.host_owned_seg(i) {
+                self.seg_host[i] = HostShadow::DeviceOnly;
+            } else {
+                self.seg_host[i] =
+                    HostShadow::Host(HostBuf::zeroed(self.segment_bytes[i].max(128) as usize)?);
+            }
+        }
+        // ⭐ AND ONE SHADOW PER EXTRA WEIGHT BANK: a bank holds only weights, so it follows the
+        // weight segment's own session rule exactly ([`Self::stages_weights`]) — a session
+        // that stages no weights stages into no bank at all, so every bank of such a session
+        // is device-only.
+        for b in 0..self.weight_bank_bytes.len() {
+            if !self.stages_weights() {
+                self.weight_bank_host[b] = HostShadow::DeviceOnly;
+            } else {
+                self.weight_bank_host[b] =
+                    HostShadow::Host(HostBuf::zeroed(self.weight_bank_bytes[b].max(128) as usize)?);
+            }
+        }
+
         // ── Hand each item its OWN destination sub-slice. Splitting the segment buffers this way
         //    is what makes the parallel stage safe with no unsafe at all — and it PROVES the
         //    placements are disjoint (an overlap shows up as a backwards cursor, which is a
         //    refusal, where the C++ would simply have raced).
-        /// One weight's staging work: its source bytes, its OWN destination sub-slice, and its
-        /// staging transform ([`StageMode`]).
-        type StageTask<'a> = (&'a [u8], &'a mut [u8], StageMode<'a>);
+        /// One weight's staging work: its source bytes, its OWN destination sub-slice, its
+        /// staging transform ([`StageMode`]), and its destination's own address — slot and byte
+        /// offset, the identity the stage-time diagnostic reports a row by.
+        type StageTask<'a> = (&'a [u8], &'a mut [u8], StageMode<'a>, usize, usize);
         let n_items = items.len();
         items.sort_by_key(|i| (i.slot, i.offset));
         let mut tasks: Vec<StageTask<'_>> = Vec::with_capacity(n_items);
@@ -2391,11 +2645,14 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             // advance below (and its disjointness proof) is unchanged by banking. `chain` here rather
             // than a second staging loop: a bank holds ~half a model's weights, and a serial pass
             // over those would cost more than the whole parallel stage it bypassed.
-            let mut rests: Vec<&mut [u8]> = self
+            // A device-only slot holds `None` — no item may land in one (items stage weights, and
+            // weights only land in host-owned slots), so the take below refuses instead of
+            // silently staging into nothing.
+            let mut rests: Vec<Option<&mut [u8]>> = self
                 .seg_host
                 .iter_mut()
                 .chain(self.weight_bank_host.iter_mut())
-                .map(|v| &mut v[..])
+                .map(|s| s.host_buf_mut().map(|v| &mut v[..]))
                 .collect();
             let mut cursor = vec![0usize; rests.len()];
             for it in &items {
@@ -2407,19 +2664,27 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                         it.offset
                     );
                 };
-                let rest = std::mem::take(&mut rests[it.slot]);
+                let rest = rests[it.slot].take().ok_or_else(|| {
+                    anyhow!(
+                        "stage: a weight would land in slot {}, which is DEVICE-ONLY — weights \
+                         only stage into host-owned slots (the weight segment, its banks, the \
+                         spill slot), so the placement and the bundle's own role statement \
+                         disagree",
+                        it.slot
+                    )
+                })?;
                 let (_, r) = rest.split_at_mut(skip);
                 let (dst, r2) = r.split_at_mut(it.src.len());
-                rests[it.slot] = r2;
+                rests[it.slot] = Some(r2);
                 cursor[it.slot] = it.offset + it.src.len();
-                tasks.push((it.src, dst, it.mode));
+                tasks.push((it.src, dst, it.mode, it.slot, it.offset));
             }
         }
 
         // ── LPT deal across the cores: sort by size descending and deal round-robin, which is
         //    better balanced than equal chunking (weights differ by orders of magnitude) and needs
         //    no shared counter — the C++ used an atomic work-stealing index for the same reason.
-        tasks.sort_by_key(|(src, _, _)| std::cmp::Reverse(src.len()));
+        tasks.sort_by_key(|(src, _, _, _, _)| std::cmp::Reverse(src.len()));
         let nthreads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -2428,27 +2693,170 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         for (i, t) in tasks.into_iter().enumerate() {
             buckets[i % nthreads].push(t);
         }
+
+        // ── STAGE-TIME DIAGNOSTIC (`SCRATCHY_SDSC_STAGE_TIME`): the boot layer this loop is
+        //    runs BEFORE prepare, off its laps — the silent multi-second gap between "staged N
+        //    weights" and the device opening. This instrument states which transform arm each
+        //    weight's bytes took (row-copy vs per-element walk, by the walk's own
+        //    [`RetileWalk::inner_contig`] statement), what each arm cost in aggregate, and the
+        //    slowest items by name and walk shape. Off by default; on, it costs one
+        //    `Instant::now` and one mutex push per weight. ──
+        let stage_diag = Diag::get().stage_time;
+        /// Which arm of the staging transforms a weight's bytes took.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ArmKind {
+            PermFp8,
+            PermF16,
+            RowCopyFp8,
+            RowConvertF16,
+            PerElementFp8,
+            PerElementF16,
+            Convert,
+            Verbatim,
+        }
+        /// One weight's measured staging: its destination address, its arm, its bytes, its time.
+        struct StageRow {
+            slot: usize,
+            offset: usize,
+            arm: ArmKind,
+            bytes: usize,
+            nanos: u64,
+        }
+        let rows: std::sync::Mutex<Vec<StageRow>> = std::sync::Mutex::new(Vec::new());
+        let t_stage = stage_diag.then(Instant::now);
+        let stage_arm = |mode: StageMode<'_>| match mode {
+            // The arm label reads the BAKE'S verdict (`k.arm`), not a re-derivation — the
+            // table is the record of what the boot dispatched on.
+            StageMode::Retile(k, elem) => match (&k.arm, elem) {
+                (WalkArm::Permutation { .. }, Element::Fp8) => ArmKind::PermFp8,
+                (WalkArm::Permutation { .. }, Element::F16) => ArmKind::PermF16,
+                (WalkArm::InnerContig, Element::Fp8) => ArmKind::RowCopyFp8,
+                (WalkArm::InnerContig, Element::F16) => ArmKind::RowConvertF16,
+                (WalkArm::PerElement, Element::Fp8) => ArmKind::PerElementFp8,
+                (WalkArm::PerElement, Element::F16) => ArmKind::PerElementF16,
+            },
+            StageMode::Convert => ArmKind::Convert,
+            StageMode::Verbatim => ArmKind::Verbatim,
+        };
+
         std::thread::scope(|scope| {
             for bucket in buckets {
+                let rows = &rows;
                 scope.spawn(move || {
-                    for (src, dst, mode) in bucket {
+                    for (src, dst, mode, slot, offset) in bucket {
+                        let t0 = stage_diag.then(Instant::now);
                         match mode {
-                            StageMode::Retile(k, elem) => stage_weight_tiled(
-                                src,
-                                dst,
-                                RetileWalk {
-                                    device_size: &k.device_size,
-                                    stride_map: &k.stride_map,
-                                },
-                                elem,
-                            ),
+                            // ⭐ THE BAKE'S VERDICT DISPATCHES — no analysis at boot, for ANY
+                            // arm: each arm's own walker runs directly (no wildcard to re-slot,
+                            // no `stage_weight_tiled` to re-derive the walk's law), the
+                            // permutation arm playing the order the arm itself carries.
+                            StageMode::Retile(k, elem) => match &k.arm {
+                                WalkArm::Permutation { order } => {
+                                    stage_weight_permuted(src, dst, &k.axes, order, elem)
+                                }
+                                WalkArm::InnerContig => {
+                                    stage_weight_rows(src, dst, RetileWalk { axes: &k.axes }, elem)
+                                }
+                                WalkArm::PerElement => stage_weight_per_element(
+                                    src,
+                                    dst,
+                                    RetileWalk { axes: &k.axes },
+                                    elem,
+                                ),
+                            },
                             StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
                             StageMode::Verbatim => dst.copy_from_slice(src),
+                        }
+                        if let Some(t0) = t0
+                            && let Ok(mut rows) = rows.lock()
+                        {
+                            rows.push(StageRow {
+                                slot,
+                                offset,
+                                arm: stage_arm(mode),
+                                bytes: src.len(),
+                                nanos: t0.elapsed().as_nanos() as u64,
+                            });
                         }
                     }
                 });
             }
         });
+
+        if stage_diag {
+            let rows = rows.into_inner().unwrap_or_default();
+            let wall = t_stage.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let work = rows.iter().map(|r| r.nanos as f64).sum::<f64>() / 1e9;
+            let bytes = rows.iter().map(|r| r.bytes).sum::<usize>();
+            eprintln!(
+                "[sdsc-stage-time] {} weights, {:.1} MiB staged in {:.3}s wall across {} threads \
+                 ({:.3}s summed work, {:.2} GB/s wall, {:.2} GB/s single-thread)",
+                rows.len(),
+                bytes as f64 / (1 << 20) as f64,
+                wall,
+                nthreads,
+                work,
+                if wall > 0.0 {
+                    bytes as f64 / wall / 1e9
+                } else {
+                    0.0
+                },
+                if work > 0.0 {
+                    bytes as f64 / work / 1e9
+                } else {
+                    0.0
+                },
+            );
+            for (arm, name) in [
+                (ArmKind::PermFp8, "retile fp8 permutation scan"),
+                (ArmKind::PermF16, "retile f16 permutation scan"),
+                (ArmKind::RowCopyFp8, "retile fp8 row-copy"),
+                (ArmKind::RowConvertF16, "retile f16 row-convert"),
+                (ArmKind::PerElementFp8, "retile fp8 per-element"),
+                (ArmKind::PerElementF16, "retile f16 per-element"),
+                (ArmKind::Convert, "ieee-f16 -> sen convert"),
+                (ArmKind::Verbatim, "verbatim"),
+            ] {
+                let rs: Vec<&StageRow> = rows.iter().filter(|r| r.arm == arm).collect();
+                if rs.is_empty() {
+                    continue;
+                }
+                let b = rs.iter().map(|r| r.bytes).sum::<usize>();
+                let s = rs.iter().map(|r| r.nanos).sum::<u64>() as f64 / 1e9;
+                eprintln!(
+                    "[sdsc-stage-time]   {name:<28} {:>3} items {:>8.1} MiB {:>7.3}s {:>6.2} GB/s",
+                    rs.len(),
+                    b as f64 / (1 << 20) as f64,
+                    s,
+                    if s > 0.0 { b as f64 / s / 1e9 } else { 0.0 },
+                );
+            }
+            // The slowest weights by name and walk shape — the rows that name the fix.
+            let mut rows = rows;
+            rows.sort_by_key(|r| std::cmp::Reverse(r.nanos));
+            for r in rows.iter().take(10) {
+                let Some(it) = items
+                    .iter()
+                    .find(|i| i.slot == r.slot && i.offset == r.offset)
+                else {
+                    continue;
+                };
+                let shape = match it.mode {
+                    StageMode::Retile(k, _) => {
+                        format!(" axes={:?} arm={:?}", k.axes, k.arm)
+                    }
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "[sdsc-stage-time]   {:.3}s {:>7.1} MiB slot{}+{} '{}'{shape}",
+                    r.nanos as f64 / 1e9,
+                    r.bytes as f64 / (1 << 20) as f64,
+                    r.slot,
+                    r.offset,
+                    it.name,
+                );
+            }
+        }
 
         self.n_weights_staged = n_items;
         self.staged_host = true;
@@ -2488,7 +2896,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // 331,220 fences over 1,570 forwards with RSS flat to the kB). The resident
         // program/weight/KV allocations live on the runtime, not the stream.
         self.stream = Some(
-            Stream::create(&self.card)
+            Stream::create(self.card)
                 .map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?,
         );
         lap("stream-create", &mut t0);
@@ -2497,26 +2905,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         //    all SHARE the resident tensor segments below. ──
         {
             self.alloc_ops_at(ListSel::Prefix)?;
-            if self.body_rungs.is_empty() {
-                for c in 0..self.body_ops.len() {
-                    self.alloc_ops_at(ListSel::Body(c))?;
-                }
-                self.split_bodies_ready = true;
-            } else {
-                // When every rung has a fold-fused twin, the SPLIT bodies are dead weight until
-                // some context outgrows one page. Allocating both up front is what made the paged
-                // decode session carry 104 program allocations where the unpaged one carried 39,
-                // and the per-token cost of that lands in the DMA ENQUEUE (measured 1.21 ms to
-                // enqueue a 59 KB transfer against 0.58 ms unpaged). Deferring keeps the
-                // steady-state session the same size as the unpaged one.
-                let twins_cover_every_rung = self.body_rungs_fused.len() == self.body_rungs.len();
-                if !twins_cover_every_rung {
-                    for i in 0..self.body_rungs.len() {
-                        for c in 0..self.body_rungs[i].1.len() {
-                            self.alloc_ops_at(ListSel::Rung(i, c))?;
-                        }
-                    }
-                    self.split_bodies_ready = true;
+            for c in 0..self.body_ops.len() {
+                self.alloc_ops_at(ListSel::Body(c))?;
+            }
+            for i in 0..self.body_rungs.len() {
+                for c in 0..self.body_rungs[i].1.len() {
+                    self.alloc_ops_at(ListSel::Rung(i, c))?;
                 }
             }
             self.alloc_ops_at(ListSel::Suffix)?;
@@ -2530,10 +2924,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // ⛔⛔⛔⭐⭐⭐ THE ALLOCATION ORDER IS NATURAL (seg 0..N), AND WEIGHT-FIRST IS **MEASURABLY
         // WORSE** — tried and rejected 2026-08-16, so nobody spends another bake on the inference.
         //
-        // The note below this loop says "an allocation ahead of the weights therefore taxes decode and
-        // leaves prefill alone, which is the exact shape of the gap", and it is applied to the fused
-        // twins by allocating them LAST. It is TEMPTING to read that as "so allocate the weights
-        // first", especially since 8b puts 110 MB of SEG_INTERMEDIATE ahead of an 8.9 GB weight region
+        // An allocation ahead of the weights taxes decode and leaves prefill alone. It is TEMPTING to
+        // read that as "so allocate the weights first", especially since 8b puts 110 MB of SEG_INTERMEDIATE ahead of an 8.9 GB weight region
         // while 2b puts only 16 MB ahead of 5.07 GB, and 8b streams at 103 GB/s against 2b's 185.
         //
         // MEASURED, granite-3.1-8b fp8, 10 runs each:
@@ -2546,7 +2938,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // consistent with the recorded finding that flex exposes no placement input and only the region
         // table is readable.
         for i in 0..NUM_SEGMENTS {
-            let mut bytes = if self.seg_borrowed[i] {
+            let bytes = if self.seg_borrowed[i] {
                 // A BORROWED segment gets the same 128 B placeholder an empty one does: `alias_seg`
                 // replaces this address with the owner's region, so allocating the full extent
                 // would reserve device memory only to drop it immediately.
@@ -2556,14 +2948,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             } else {
                 128
             };
-            // PAGED: the manifest sizes seg2 for ONE page — that is the point, no baked pool — so
-            // the POOL extent is decided here, at run time.
-            if i == SEG_KV.get() && self.kv.paged && !self.seg_borrowed[i] {
-                let pool = self.kv.pool_pages.0 as u64 * self.kv.page_stride_bytes;
-                bytes = bytes.max(pool);
-            }
             self.seg_addr[i] = Some(
-                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor)
+                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
@@ -2573,13 +2959,16 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // banks (a bank is aliasable BECAUSE it holds only weights, placed identically in every
         // bundle), so allocating the full extent here would reserve tens of GB only to drop it.
         for b in 0..self.weight_bank_bytes.len() {
+            // A HOST placeholder allowance, NOT the flit (see the host-buffer twin
+            // of this loop above): a borrowed bank gets a minimal alloc so the
+            // address exists — an owner's region replaces it.
             let bytes = if self.seg_borrowed[SEG_WEIGHT.get()] {
                 128
             } else {
                 self.weight_bank_bytes[b].max(128)
             };
             self.weight_bank_addr[b] = Some(
-                DevAddr::alloc(&self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
+                DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
@@ -2617,66 +3006,72 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             );
         }
 
-        // ── FUSED TWINS ALLOCATE LAST ── They are the only allocation PAGING adds to this session,
-        //    and everything above now happens in the order, and at the sizes, the unpaged path used
-        //    — so the weight region lands exactly where it did before. Decode re-streams those
-        //    weights every token and is bandwidth-bound on them; prefill is compute-bound at the
-        //    roofline. An allocation ahead of the weights therefore taxes decode and leaves prefill
-        //    alone, which is the exact shape of the gap. They are KB each, so being last is free.
-        for i in 0..self.body_rungs_fused.len() {
-            for c in 0..self.body_rungs_fused[i].1.len() {
-                self.alloc_ops_at(ListSel::RungFused(i, c))?;
-            }
-        }
-        for c in 0..self.body_fused.as_ref().map_or(0, PerClass::len) {
-            self.alloc_ops_at(ListSel::BodyFused(c))?;
-        }
-        lap("fused-twin-program-h2d", &mut t0);
-
         // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
-        //    critical path. Then grow each seg_host to the device alloc's size (alignment pad,
-        //    zero) so the H2D copies a full region. ──
+        //    critical path. Then grow each HOST-OWNED seg_host to the device alloc's size
+        //    (alignment pad, zero) so the H2D copies a full region, and FAULT ITS PAGES IN —
+        //    value-preserving ([`fault_in`]), so the staged bytes cross untouched; what it
+        //    adds is residency for the extents the staging walk never wrote (the pad between
+        //    placements, a region's tail), which the pre-mapped pin below then walks as
+        //    THP-backed pages instead of faulting them itself at 4 KiB granularity.
+        //    Device-only slots never H2D their shadow — they have none, so a borrowed
+        //    segment (marked device-only at staging) faults nothing either. ──
         self.stage_weights()?;
         let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
-            // Same rule as the staging shadow: skip only what an alias replaces. Activation
-            // segments still grow to the device extent, because this session fills them itself.
-            if reserve_only && is_resident_seg(i) {
-                continue;
-            }
-            // NO HOST MIRROR OF THE KV POOL. seg2 is written by the DEVICE (the on-card `cachewr`
-            // ops) and read by the device; nothing on the host needs a copy, and sizing one to the
-            // pool cost 960 MB of RSS (3.84 GB at a 1024-slot page) to mirror bytes the host never
-            // looks at. Two owners of the KV is also the shape that produced the block-table bug.
-            if i == SEG_KV.get() && self.kv.paged {
+            // Same rule as the staging shadow: skip only what an alias replaces, and grow only
+            // what this send loop is about to H2D in full.
+            if (reserve_only && is_resident_seg(i)) || !self.host_owned_seg(i) {
                 continue;
             }
             let need = self.seg_addr[i]
                 .as_ref()
                 .map_or(0, |a| a.total_size().as_u64()) as usize;
-            if self.seg_host[i].len() < need {
-                self.seg_host[i].resize(need, 0);
+            if let Some(v) = self.seg_host[i].host_buf_mut() {
+                if v.len() < need {
+                    v.resize(need)?;
+                }
+                if let Some(pages) = v.get_mut(..need) {
+                    fault_in(pages);
+                }
             }
         }
-        // The weight banks follow the weight segment's own rule exactly: grow to the device extent
-        // unless an alias is about to replace the region.
-        if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
+        // The weight banks follow the weight segment's own session rule exactly
+        // ([`Self::stages_weights`]): grow to the device extent when this session stages.
+        if self.stages_weights() {
             for b in 0..self.weight_bank_bytes.len() {
                 let need = self.weight_bank_addr[b]
                     .as_ref()
                     .map_or(0, |a| a.total_size().as_u64()) as usize;
-                if self.weight_bank_host[b].len() < need {
-                    self.weight_bank_host[b].resize(need, 0);
+                if let Some(v) = self.weight_bank_host[b].host_buf_mut() {
+                    if v.len() < need {
+                        v.resize(need)?;
+                    }
+                    if let Some(pages) = v.get_mut(..need) {
+                        fault_in(pages);
+                    }
                 }
             }
         }
         let n_weights = self.n_weights_staged;
         lap("weight-convert", &mut t0);
 
-        // ── H2D every tensor-segment region ONCE (weights staged in seg1; the rest zero-init).
-        //    Activations refill per predict. ──
+        // ── SEND every tensor-segment region's content ONCE, ROUTED BY THE BUNDLE'S OWN ROLE
+        //    STATEMENT ([`Self::host_owned_seg`]): a host-owned slot (the weight segment, the
+        //    spill slot, the activation segment with its staged constants) goes out by the
+        //    PRE-MAPPED door ([`send_premapped`]) from its shadow — pinned once, ~59 GB/s,
+        //    where the plain per-call door pays its DmaBuf setup for 6-7; every other slot —
+        //    the KV pool, the intermediates — holds only zeros at boot, and those go out as
+        //    a DEVICE-SIDE FILL ([`Stream::fill_zero`], ~62 GB/s measured), which for the KV
+        //    pool alone is ~10 GB of wire time on a 2b model. Activations refill per
+        //    predict. ──
+        // The mapper is one per prepare (a page size and a table); `pinned` holds every
+        // guard the sends below take. Each guard owns its mapping and borrows the shadow
+        // it pinned, and its own Drop synchronizes before unpinning — so the guards are
+        // safe to drop on ANY exit from here on, not just the sync below.
+        let mapper = PfIommuMapper::new(self.card.card().clone());
+        let mut pinned: Vec<H2dPin<'_>> = Vec::new();
         for i in 0..NUM_SEGMENTS {
-            // BORROWED: the owner already H2D'd this region and `alias_seg` is about to point us at
+            // BORROWED: the owner already sent this region and `alias_seg` is about to point us at
             // it. DMA'ing our placeholder would be waste — and once aliased, writing our stale
             // shadow over the owner's live data would be WRONG.
             if self.seg_borrowed[i] {
@@ -2687,25 +3082,48 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             if reserve_only && is_resident_seg(i) {
                 continue;
             }
-            // The KV pool has NO host mirror to send (see the sizing loop), so it is zeroed
-            // separately and in chunks by `zero_seg`. DMA'ing from the empty vector here would be a
-            // null source for a pool-sized transfer.
-            if i == SEG_KV.get() && self.kv.paged {
+            let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
+            let host_owned = self.host_owned_seg(i);
+            if d.prep_time {
+                eprintln!(
+                    "[sdsc-prep-time] seg{i}: region {} B → {}",
+                    addr.total_size().as_u64(),
+                    if host_owned {
+                        "pre-mapped H2D"
+                    } else {
+                        "device fill"
+                    }
+                );
+            }
+            if !host_owned {
+                fill_zero_walk(stream, addr, &format!("prepare: seg{i} zero fill"))?;
                 continue;
             }
-            let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
-            // The shadow was grown to the device extent by the loop above, so this slice is the
-            // whole region — and taking it AS A SLICE is what proves the H2D cannot read past the
-            // shadow. `get` rather than `[..]`: a short shadow is a wiring bug to report, not a
-            // panic, and never a DMA over-read.
-            let src = whole_shadow(&self.seg_host[i], addr, i)?;
-            stream
-                .h2d(src, addr)
-                .map_err(|e| anyhow!("prepare: seg{i} H2D: {e}"))?;
+            // The shadow was grown (and its pages faulted in) by the loop above, so this slice
+            // is the whole region — and taking it AS A SLICE is what proves the H2D cannot read
+            // past the shadow. `get` rather than `[..]`: a short shadow is a wiring bug to
+            // report, not a panic, and never a DMA over-read. A host-owned slot with no shadow
+            // is the same disagreement, refused.
+            let src = whole_shadow(
+                self.seg_host[i].host().ok_or_else(|| {
+                    anyhow!("prepare: seg{i} is host-owned but holds no host shadow")
+                })?,
+                addr,
+                i,
+            )?;
+            send_premapped(
+                stream,
+                src,
+                addr,
+                &mapper,
+                &mut pinned,
+                &format!("prepare: seg{i}"),
+            )?;
         }
-        // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own conditions — it is the same
-        // segment, so "borrowed" and "nothing bound" mean the same thing for it.
-        if !(reserve_only || self.seg_borrowed[SEG_WEIGHT.get()]) {
+        // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own session rule
+        // ([`Self::stages_weights`]) — a bank holds only weights by construction, so it
+        // always follows the host-owned route when this session stages any.
+        if self.stages_weights() {
             for b in 0..self.weight_bank_bytes.len() {
                 let (stream, addr) = (
                     self.stream_ref()?,
@@ -2713,32 +3131,37 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                         .as_ref()
                         .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
                 );
-                let src = whole_shadow(&self.weight_bank_host[b], addr, NUM_SEGMENTS + b)?;
-                stream
-                    .h2d(src, addr)
-                    .map_err(|e| anyhow!("prepare: weight bank {} H2D: {e}", b + 1))?;
+                let src = whole_shadow(
+                    self.weight_bank_host[b].host().ok_or_else(|| {
+                        anyhow!(
+                            "prepare: weight bank {} is host-owned but holds no host shadow",
+                            b + 1
+                        )
+                    })?,
+                    addr,
+                    NUM_SEGMENTS + b,
+                )?;
+                send_premapped(
+                    stream,
+                    src,
+                    addr,
+                    &mapper,
+                    &mut pinned,
+                    &format!("prepare: weight bank {}", b + 1),
+                )?;
             }
         }
         lap("tensor-h2d", &mut t0);
-        // ⭐ THE PAGED POOL STARTS ZEROED, filled on the device by the session that allocated it — it
-        // has no host image to upload (above). An unwritten slot is read before its mask applies, and
-        // a decode batch reads page 0 (the null page) under an all-masked row for every block slot
-        // past a sequence's blocks, as spyre-inference does over its zeroed cache. Device memory left
-        // as found holds non-finite words, which no additive mask cancels: MEASURED on the card with
-        // the pool unfilled, 8,253 of them in page 0. A session that borrows the pool takes the
-        // owner's zeroed region by alias.
-        if self.kv.paged
-            && !self.seg_borrowed[SEG_KV.get()]
-            && !(reserve_only && is_resident_seg(SEG_KV.get()))
-        {
-            self.zero_seg(SEG_KV)
-                .map_err(|e| anyhow!("prepare: zeroing the paged KV pool: {e}"))?;
-            lap("kv-zero", &mut t0);
-        }
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("prepare: sync: {e}"))?;
         lap("sync", &mut t0);
+        // ⭐ THE PINS RETIRE HERE — and would on any earlier exit too: the sync above waited
+        // out every pre-mapped window, and each guard's own Drop synchronizes before it
+        // unpins, so no DMA reads a shadow's iova after its pin is gone on this path, a
+        // refused one, or an unwind. Dropping here (rather than at scope end) simply unpins
+        // before the parity gate and the ladder run on.
+        drop(pinned);
         // ⭐ #603 PR2 2a — THE CB PARITY GATE, before the session becomes loadable: a plan twin
         // that disagrees with the walk refuses the LOAD here, never a step.
         //
@@ -2780,18 +3203,26 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             }
             for (i, (host, has_act)) in self.seg_host.iter_mut().zip(seg_has_activation).enumerate()
             {
-                // The KV shadow backs read_seg/write_seg — keep it.
+                // The KV slot is device-only by the role statement (read doors materialize on
+                // demand), so this keep is about the mirrored segments: has_act covers the
+                // activation segment and anything else the host re-binds per step.
                 if i == SEG_KV.get() || has_act {
                     continue;
                 }
-                *host = Vec::new();
+                // Empty, not gone: a read door may still materialize this slot again, and a
+                // device-only slot stays device-only.
+                if let HostShadow::Host(v) = host {
+                    *v = HostBuf::empty();
+                }
             }
             // ⭐ AND EVERY BANK SHADOW, unconditionally: a bank holds ONLY weights (that is what
             // makes it aliasable), so there is no activation to keep one alive and nothing reads its
             // host bytes after the H2D. Not reclaiming these is the largest host allocation in the
             // process — a bank is up to 16 GiB.
             for host in self.weight_bank_host.iter_mut() {
-                *host = Vec::new();
+                if let HostShadow::Host(v) = host {
+                    *v = HostBuf::empty();
+                }
             }
         }
         debug!(
@@ -2814,67 +3245,20 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     /// rendered TWO ways — the submit walk's own enumeration (`cb_plan::walk_items`) and the data
     /// twin (`cb_plan::build_cb_plan` + `CbPlan::render`) — through ONE render door
     /// (`Stream::render_batch`, the same `build_compute_cb` the submit path runs), and a
-    /// differing byte REFUSES THE LOAD. This is the gate that will let 2c's player replay
-    /// pre-rendered images: it proves, at prepare, that the plan's data twin of the walk is
-    /// byte-identical, so no step ever needs to re-derive (or re-check) what it replays.
-    ///
-    /// ⭐ STAGE 2b rides along: per context, `cb_plan::patch_check` proves the IMAGE MODEL itself
-    /// — canvas + affine patches ≡ a fresh walk render, at off-sample steps — under the decode
-    /// player's own single-request shape, and ONLY over the body-class lists: those are the
-    /// lists the player launches at a step-following `where_` (prefix/suffix launch at a
-    /// constant one, so their patch table is empty by construction and their proof is the
-    /// parity leg alone). A geometry too narrow to host the off-sample proof around a mid-page
-    /// canvas (`canvas_room`) skips that leg loudly; every shipped bundle's page
-    /// is 2048 slots.
+    /// differing byte REFUSES THE LOAD. This is the gate that lets the player replay pre-rendered
+    /// images: it proves, at prepare, that the plan's data twin of the walk is byte-identical, so
+    /// no step ever needs to re-derive (or re-check) what it replays.
     ///
     /// ⛔ NOT A PER-STEP CHECK — a step never pays for this. It runs at [`Self::prepare`] (every
-    /// list that exists by then), at [`Self::alias_seg_from`] (a borrowing session's segments are
-    /// placeholder-poisoned at its prepare, so ITS gate waits for the alias that completes the
-    /// borrowed set — the rungs and the prefix-capable prefill session), and once more at
-    /// [`Self::ensure_split_bodies`] (the deferred rungs, at the one event that makes them exist).
-    ///
-    /// Both step shapes are SYNTHETIC, not the live session's. The parity gate's: 2 requests × 3
-    /// resident pages, a mid-page write slot, request 0's page 2 as the write base — the shape
-    /// that exercises the batched fold (reps > 1), the slot write, the non-fold page resolution
-    /// and the per-request intermediate shift, more than any single real step would, while both
-    /// parity sides read the SAME fold, so the gate's meaning (twin agreement) is independent of
-    /// which shape it runs under. The patch gate's: ONE request × 3 pages — under a single row
-    /// the launch slot IS the position every op's KV term reads (`op_slot_pos` resolves row
-    /// cursors only when the batch is wide), which is the single-request decode regime the
-    /// player serves; the batched shapes are PR4's. The geometry the synthetic folds must not
-    /// contradict (paged-ness, page slots, page stride) is grounded in THIS session's, because a
-    /// bundle that was never baked paged has no fold ops for a paged shape to exercise.
+    /// list that exists by then) and at [`Self::alias_seg_from`] (a borrowing session's segments
+    /// are placeholder-poisoned at its prepare, so ITS gate waits for the alias that completes the
+    /// borrowed set).
     fn check_cb_plan_parity(&self) -> Result<()> {
         let stream = self.stream_ref()?;
-        let per = self.kv.page_slots.0.max(1);
-        let fold = SessionKv {
-            paged: self.kv.paged,
-            page_slots: fold_plan::PageSlots::per_page(per),
-            page_stride_bytes: Bytes(self.kv.page_stride_bytes.max(1)),
-            // Two rows of three pages each — the rows AGREE about how many they hold (a uniform
-            // sweep exists) and neither row holds the other's pages (a per-request shift is real,
-            // not zero).
-            block_tables: vec![vec![0, 1, 2], vec![3, 4, 5]],
-            request_positions: RowCursors::bound(vec![2 * per + 5; 2]),
-            fold_requests: 2,
-            mask_rep_stride_bytes: 0,
-            mask_blocks: 64,
-            fold_pages: 3,
-            int_rep_stride_bytes: 65536,
-        };
-        // The write slot lands MID-PAGE (slot 5 of `per`), so the page a non-fold op works in and
-        // the slot a fold writes are different addresses; the write base is request 0's page 2 —
-        // a real block-table walk, not a zero.
-        let slot = SeqPos(2 * per + 5);
-        let kv_page_base = RowPage::of(&fold, RowIdx::from_launch_row(0), 2)
-            .map(|rp| fold_plan::page_base_bytes(&fold, rp))
-            .unwrap_or(Bytes(0));
-        let mk = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
+        let mk = |bank: usize, off: [u64; NUM_SEGMENTS], requests| LaunchWhere {
             byte_off: off,
-            slot_pos: slot,
-            kv_page_base,
-            n_fold_pages: 3,
             weight_bank: bank,
+            requests,
         };
         // One `LaunchWhere` per distinct weight bank the launch table names (a representative
         // row's shifts — parity is about the twin agreeing, not about covering every shift
@@ -2890,9 +3274,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     .is_some_and(|a| a.is_some())
             }
         };
-        // The launch ROWS both gates' sessions share: one (tag, bank, shifts) per distinct
-        // weight bank the session could launch, enumerated once and rendered at each session's
-        // own write slot and page.
+        // The launch ROWS: one (tag, bank, shifts) per distinct weight bank the session could
+        // launch.
         let mut rows: Vec<(String, usize, [u64; NUM_SEGMENTS])> = Vec::new();
         match self.rolled.as_ref() {
             // Unrolled: no layer boundary to bank on — bank 0 and zero shifts are the only shape
@@ -2927,57 +3310,26 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 }
             }
         }
+        // ⭐ EVERY ROW AT ONE REQUEST, AND AGAIN AT TWO — the request half of the relaunch law (a
+        // walking bundle's span repeats once per request, its tables `request · pitch` in) has to
+        // be proven twin-identical too, and no launch states more than one request yet. The
+        // two-request row states a SYNTHETIC pitch: parity is about the walk and its data twin
+        // composing the same request shift, never about this pitch being any model's — the same
+        // standing as the representative bank shifts above.
         let wheres: Vec<(String, LaunchWhere)> = rows
             .iter()
-            .map(|(tag, bank, off)| (tag.clone(), mk(*bank, *off)))
+            .flat_map(|(tag, bank, off)| {
+                let two = fold_plan::Requests {
+                    count: 2,
+                    pitch: 4096,
+                };
+                [
+                    (tag.clone(), mk(*bank, *off, fold_plan::Requests::default())),
+                    (format!("{tag}/req2"), mk(*bank, *off, two)),
+                ]
+            })
             .collect();
 
-        // ⭐ 2b — THE PATCH GATE'S SESSION: the PLAYER's shape, not the batched fold's. ONE
-        // request, three resident pages. The canvas slot is `cb_plan::canvas_slot` — the ONE
-        // recipe, shared with the player, that picks a slot with room on both sides for the
-        // differentials and the off-sample steps: mid-page, off every slab boundary, never
-        // slot 0 of a page.
-        let r_patch = cb_plan::canvas_slot(per, self.kv.paged);
-        let fold1 = SessionKv {
-            paged: self.kv.paged,
-            page_slots: fold_plan::PageSlots::per_page(per),
-            page_stride_bytes: Bytes(self.kv.page_stride_bytes.max(1)),
-            block_tables: vec![vec![0, 1, 2]],
-            request_positions: RowCursors::bound(vec![2 * per + r_patch.unwrap_or(1)]),
-            fold_requests: 1,
-            mask_rep_stride_bytes: 0,
-            mask_blocks: 64,
-            fold_pages: 3,
-            // A single request has no per-request intermediate shift to exercise — zero is
-            // the decode player's own value, not a skipped dimension.
-            int_rep_stride_bytes: 0,
-        };
-        // The canvas write base is a SYNTHETIC mid-pool page (2·stride): a
-        // stand-in for the table-sourced base the player's own canvas renders
-        // at, far enough from either end of the address range that no render
-        // clips. Nothing probes past it anymore — the patch model has no page
-        // term (the boundary step walks; see `StepScalars`), so this base is
-        // only where the canvas and every off-sample render sit.
-        let page_c = Bytes(2 * self.kv.page_stride_bytes.max(1));
-        let mk1 = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
-            byte_off: off,
-            slot_pos: SeqPos(2 * per + r_patch.unwrap_or(1)),
-            kv_page_base: page_c,
-            n_fold_pages: 3,
-            weight_bank: bank,
-        };
-        // The patch gate needs one image's worth of sampling room around its canvas: the
-        // `slot+65` off-sample (the slab-coefficient proof) must land strictly inside the
-        // image's page span. `canvas_room` is the ONE law, shared with the player — a page
-        // too narrow for it (or one no canvas slot fits at all) skips the leg loudly; every
-        // shipped bundle's page is 2048 slots.
-        let patch_room = r_patch.is_some_and(|r| cb_plan::canvas_room(per, self.kv.paged, r));
-        if !patch_room {
-            debug!(
-                "[sdsc-cbplan] patch gate SKIPPED: no canvas slot with sampling room fits a \
-                 {per}-slot page. The parity gate above still ran."
-            );
-        }
         // Every list the session could launch — the class dimension is enumerated whole here, so
         // a where need not be matched to the classes its rows name (parity reads the same ops
         // either way). A list whose programs are not allocated yet (the deferred rungs) is
@@ -2986,23 +3338,13 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         for c in 0..self.body_ops.len() {
             sels.push(ListSel::Body(c));
         }
-        for c in 0..self.body_fused.as_ref().map_or(0, PerClass::len) {
-            sels.push(ListSel::BodyFused(c));
-        }
         for i in 0..self.body_rungs.len() {
             for c in 0..self.body_rungs[i].1.len() {
                 sels.push(ListSel::Rung(i, c));
             }
         }
-        for i in 0..self.body_rungs_fused.len() {
-            for c in 0..self.body_rungs_fused[i].1.len() {
-                sels.push(ListSel::RungFused(i, c));
-            }
-        }
         let mut cbs = 0usize;
         let mut contexts = 0usize;
-        let mut sites = 0usize;
-        let mut patch_contexts = 0usize;
         for sel in sels {
             let ops = self.list(sel);
             if ops.is_empty() || !ops.iter().all(|o| o.addr.is_some()) {
@@ -3012,7 +3354,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 let label = format!("{sel:?}/{tag}");
                 cbs += cb_plan::parity_check(
                     ops,
-                    &fold,
                     &self.seg_addr,
                     &self.weight_bank_addr,
                     where_,
@@ -3021,58 +3362,20 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 )?;
                 contexts += 1;
             }
-            // ⭐ THE PLAYER'S ROW LAW, read here as the gate's scope: only the
-            // four body-class lists are ever launched at a step-following
-            // `where_` — prefix/suffix launch at a constant one (see
-            // `derive_step_image`), so their patch table is empty by
-            // construction and there is nothing for this leg to prove.
-            // Probing them at this leg's mid-pool `where_` measures a
-            // counterfactual no replay executes (measured on the first real
-            // bundle: the page differential's render returns a structurally
-            // different allocation and the affine solve refuses).
-            let step_following = !matches!(sel, ListSel::Prefix | ListSel::Suffix);
-            if patch_room && step_following {
-                for (tag, bank, off) in &rows {
-                    let label = format!("{sel:?}/{tag}");
-                    let (row_sites, _) = cb_plan::patch_check(
-                        ops,
-                        &fold1,
-                        &self.seg_addr,
-                        &self.weight_bank_addr,
-                        &mk1(*bank, *off),
-                        &label,
-                        stream,
-                    )?;
-                    sites += row_sites;
-                    patch_contexts += 1;
-                }
-            }
         }
         if contexts == 0 {
             // The gate may not pass vacuously: prepare allocates the prefix and suffix lists
             // unconditionally and bank 0's region exists by the time this runs, so zero
             // checkable contexts means the enumeration itself is broken — refuse rather than
-            // "prove" nothing. Both legs share this enumeration, so it covers the patch gate
-            // too (they cannot disagree about which (list × row) pairs exist).
+            // "prove" nothing.
             bail!(
                 "[cbplan] parity gate REFUSED: no (list × launch-row) context was checkable — \
                  every bank was skipped or no list is allocated"
             );
         }
-        if patch_room && patch_contexts == 0 {
-            // Not a refusal: the rungs allocate lazily, so a session whose every body-class
-            // list is still deferred legitimately has nothing to patch-prove here — each
-            // rung runs this same gate at its own allocation. Said loudly because a silent
-            // zero is indistinguishable from a broken enumeration.
-            debug!(
-                "[sdsc-cbplan] patch gate verified ZERO images: no body-class list is allocated \
-                 yet (deferred rungs gate at their own allocation)"
-            );
-        }
         debug!(
             "[sdsc-cbplan] parity gate: {cbs} CB(s) proven byte-identical across {contexts} \
-             (list × launch-row) context(s); patch gate: {sites} moving word(s) verified \
-             off-sample across {patch_contexts} image(s)"
+             (list × launch-row) context(s)"
         );
         Ok(())
     }
@@ -3124,7 +3427,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     })?;
                 let head = img.bootstrap();
                 let addr = DevAddr::alloc(
-                    &self.card,
+                    self.card,
                     ByteSize(img.alloc_bytes()),
                     MemoryType::Program,
                 )
@@ -3203,13 +3506,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             ListSel::Prefix => &mut self.prefix_ops,
             ListSel::Body(c) => &mut self.body_ops[c],
             ListSel::Suffix => &mut self.suffix_ops,
-            ListSel::BodyFused(c) => self
-                .body_fused
-                .as_mut()
-                .expect("BodyFused is selected only when every class has its twin")
-                .class_mut(c),
             ListSel::Rung(i, c) => &mut self.body_rungs[i].1[c],
-            ListSel::RungFused(i, c) => self.body_rungs_fused[i].1.class_mut(c),
         }
     }
 
@@ -3220,22 +3517,16 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             ListSel::Prefix => &self.prefix_ops,
             ListSel::Body(c) => &self.body_ops[c],
             ListSel::Suffix => &self.suffix_ops,
-            ListSel::BodyFused(c) => self
-                .body_fused
-                .as_ref()
-                .expect("BodyFused is selected only when every class has its twin")
-                .class(c),
             ListSel::Rung(i, c) => &self.body_rungs[i].1[c],
-            ListSel::RungFused(i, c) => self.body_rungs_fused[i].1.class(c),
         }
     }
 
     /// ⭐⭐⭐⭐⭐ **THE BODY THIS STEP WILL RUN**, and the only way anyone gets one.
     ///
-    /// ⛔⛔⛔ IT TAKES THE WRITE SLOT AND NOTHING ELSE, WHICH IS THE WHOLE POINT. The selector's two
-    /// inputs are `valid_len` and `n_fold_pages`, and BOTH are functions of the slot this step writes —
-    /// so if a caller could pass them it could pass a pair the launch will not use, and then the host's
-    /// index table, the host's mask FORM and the launched descriptor would be about different bodies.
+    /// ⛔⛔⛔ IT TAKES THE WRITE SLOT AND NOTHING ELSE, WHICH IS THE WHOLE POINT. The selector's input
+    /// is `valid_len`, a function of the slot this step writes — so if a caller could pass it, it could
+    /// pass one the launch will not use, and then the host's index table, the host's mask FORM and the
+    /// launched descriptor would be about different bodies.
     /// Derived here, from the one value the host also hands to `run_step` as `start`, there is no second
     /// derivation to drift.
     ///
@@ -3253,16 +3544,14 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     }
 
     pub fn step_body(&mut self, seq_pos: SeqPos) -> Result<StepBody> {
-        let n_fold_pages = self.n_fold_pages(seq_pos);
         // `valid_len = seq_pos + 1` — positions [0..seq_pos] are filled, including the token written to
-        // KV before attention. Spelled ONCE, here, for both readers of the selection.
-        let sel = self.select_body_paged(seq_pos.0 + 1, n_fold_pages)?;
+        // KV before attention. Spelled ONCE, here, for every reader of the selection.
+        let sel = self.select_body(seq_pos.0 + 1)?;
         // ⭐ EVERY CLASS'S OWN OPS ANSWER IT, folded to the strongest claim: the gather scratch must
         // satisfy every class that reads through one, and the unswept-slot guard must use the
         // NARROWEST sweep any class runs (a rung's extent is shared by every class, so this is the
         // same number for each — but reading it per class keeps the fact with the ops that carry
-        // it). Same discipline as `latch_paged_geometry` reading `page_slots` off the ops: a bake
-        // fact rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body
+        // it). A bake fact rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body
         // that gathers cannot be driven as one that does not, or the reverse.
         let mut gathers_any = false;
         // Same authority, same reason: whether this body re-launches a page fold is the
@@ -3299,13 +3588,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
 
     /// THIS selection's swept extent — its own ladder rung's `active_cap`, which every class of a
     /// rung shares (a rung IS one swept extent; the classes are the programs baked for it). `None` for
-    /// the ladderless arms (`Body`/`BodyFused`: an UNROLLED bundle, which bakes no rung and so states
+    /// the ladderless arm (`Body`: an UNROLLED bundle, which bakes no rung and so states
     /// no sweep — there is no walk to stage for it, and none is made up).
     fn body_swept(&self, sel: BodySel) -> Option<SweptCols> {
         match sel {
             BodySel::Rung(i) => Some(self.body_rungs[i].0),
-            BodySel::RungFused(i) => Some(self.body_rungs_fused[i].0),
-            BodySel::Body | BodySel::BodyFused => None,
+            BodySel::Body => None,
         }
     }
 
@@ -3314,9 +3602,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     fn list_sel_for(&self, sel: BodySel, class: usize) -> ListSel {
         match sel {
             BodySel::Body => ListSel::Body(class),
-            BodySel::BodyFused => ListSel::BodyFused(class),
             BodySel::Rung(i) => ListSel::Rung(i, class),
-            BodySel::RungFused(i) => ListSel::RungFused(i, class),
         }
     }
 
@@ -3324,49 +3610,13 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     //  Body selection
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
-    /// Program memory for the split ladder, allocated on first need. Idempotent, and a no-op for a
-    /// session whose bodies were allocated at prepare.
-    ///
-    /// ⛔ ALLOCATING HERE MAKES SELECTION AND ALLOCATION THE SAME EVENT. The gate used to live at
-    /// ONE of the two call sites and re-spell the selector's rule, which is how a split body came to
-    /// be selected and never allocated: the launch took a null device address
-    /// (RAS::RUNTIMEOPERATION::NullArgument) and the whole batch returned no output. Twice, for two
-    /// different reasons. A caller cannot obtain a split body that is not backed.
-    fn ensure_split_bodies(&mut self) -> Result<()> {
-        if self.split_bodies_ready || self.body_rungs.is_empty() {
-            return Ok(());
-        }
-        for i in 0..self.body_rungs.len() {
-            for c in 0..self.body_rungs[i].1.len() {
-                self.alloc_ops_at(ListSel::Rung(i, c))?;
-            }
-        }
-        // Their binaries must land before the first launch.
-        self.stream_ref()?
-            .synchronize()
-            .map_err(|e| anyhow!("split-body sync: {e}"))?;
-        self.split_bodies_ready = true;
-        // ⭐ #603 PR2 2a — the DEFERRED rungs exist now, so the CB parity gate runs at this, the
-        // one event that made them (never per step; the lists prepare already saw were proven
-        // there and are merely re-proven here, once).
-        self.check_cb_plan_parity()?;
-        debug!(
-            "[sdsc-superdsc] allocated {} split decode bodies (a fold that re-launches needs them)",
-            self.body_rungs.len()
-        );
-        Ok(())
-    }
-
-    /// Select the SPLIT decode body for a valid KV length of `valid_len` positions: the smallest
-    /// rung whose `active_cap` ≥ it, which bounds the O(cap) attention sweep. Every return is a
-    /// split body, so this is also where they are guaranteed to EXIST.
+    /// Select the decode body for a valid KV length of `valid_len` positions: the smallest rung whose
+    /// `active_cap` ≥ it, which bounds the O(cap) attention sweep. Every body is allocated at prepare.
     fn select_body(&mut self, valid_len: i64) -> Result<BodySel> {
-        self.ensure_split_bodies()?;
-        let reqs = self.fold_requests_or_1();
         if self.body_rungs.is_empty() {
-            // The ladderless single body — traced for the same reason as the fused one: an untraced
-            // return is indistinguishable from a step that never reached the selector at all.
-            self.trace_body("split-noladder", valid_len, -1, reqs, 0, false);
+            // The ladderless single body — traced: an untraced return is indistinguishable from a
+            // step that never reached the selector at all.
+            self.trace_body("noladder", valid_len, 0);
             return Ok(BodySel::Body);
         }
         // ⭐ THE ONE SELECTION (`Ladder::rung_for`), which the bake ran over every position this bundle
@@ -3384,93 +3634,20 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
             .rung_for(valid_len.max(0) as u64);
         let variant = if rung.active_cap.covers(valid_len.max(0) as u64) {
-            "split"
+            "rung"
         } else {
-            "split-CEILING"
+            "rung-CEILING"
         };
-        self.trace_body(
-            variant,
-            valid_len,
-            -1,
-            reqs,
-            rung.active_cap.get() as i64,
-            false,
-        );
+        self.trace_body(variant, valid_len, rung.active_cap.get() as i64);
         Ok(BodySel::Rung(at))
     }
 
-    /// Pick the body for this step: the sk_bucket rung by live length, and — when the fold would
-    /// run exactly ONE pass — the FOLD-FUSED variant, which carries the baseline's launch count.
-    ///
-    /// ⛔ THE FUSED BODY HAS NO FOLD (`trip_kinds_for` rewrites `PageFold` to `Pure` for the fused
-    /// variant), so `reps` collapses to 1. That is correct for ONE request and WRONG for a batch:
-    /// `reps = n_fold_pages * fold_requests`, and asking only about PAGES picked the fused body for
-    /// a short context with N requests, ran the prefix fold once — the (request 0, page 0) pass —
-    /// and left every other request attending NO resident prefix. Request 0 looked fine, everyone
-    /// else produced garbage from their second token.
-    fn select_body_paged(&mut self, valid_len: i64, n_fold_pages: i64) -> Result<BodySel> {
-        let reqs = self.fold_requests_or_1();
-        let single_page = !self.kv.paged || (n_fold_pages <= 1 && reqs <= 1);
-        if single_page {
-            if !self.body_rungs_fused.is_empty() {
-                for (i, (swept, _)) in self.body_rungs_fused.iter().enumerate() {
-                    if swept.covers(valid_len.max(0) as u64) {
-                        self.trace_body(
-                            "fused",
-                            valid_len,
-                            n_fold_pages,
-                            reqs,
-                            swept.get() as i64,
-                            true,
-                        );
-                        return Ok(BodySel::RungFused(i));
-                    }
-                }
-                // ⛔ NO FUSED RUNG COVERS THIS CONTEXT — fall through to the SPLIT ladder, do NOT
-                // return the widest fused rung: that hands back a body whose sweep is NARROWER than
-                // the live context and silently DROPS every key past it, answering from a prefix
-                // that stops early, fluently and with no fault. The split ladder is the right
-                // destination because it can FOLD, so a context past the widest single-launch sweep
-                // is served by re-launching rather than by pretending it is shorter.
-                self.trace_body("fused-none-fits", valid_len, n_fold_pages, reqs, 0, false);
-                return self.select_body(valid_len);
-            }
-            // The ladderless fused bodies — present only when every class has its twin.
-            if self.body_fused.is_some() {
-                self.trace_body("fused-noladder", valid_len, n_fold_pages, reqs, 0, true);
-                return Ok(BodySel::BodyFused);
-            }
-        }
-        self.select_body(valid_len)
-    }
-
-    /// How many requests the fold sweeps, per `fold_plan` (which owns the page maps). 1 unbatched.
-    fn fold_requests_or_1(&self) -> i64 {
-        fold_plan::fold_requests(&self.fold).max(1)
-    }
-
     /// WHICH BODY A STEP ACTUALLY RUNS — printed, because it was unobservable and that cost a day.
-    /// `fold_reqs` is printed because it is the value the fused/split decision turns on: a ragged
-    /// bs=4 batch came back with row 0 byte-identical to a solo run and rows 1..3 wrong — the exact
-    /// fused-body signature — and the trace could not say whether the batch STEP had selected fused.
-    fn trace_body(
-        &self,
-        variant: &str,
-        valid_len: i64,
-        pages: i64,
-        reqs: i64,
-        rung: i64,
-        fused: bool,
-    ) {
+    fn trace_body(&self, variant: &str, valid_len: i64, rung: i64) {
         if !Diag::get().body_trace {
             return;
         }
-        eprintln!(
-            "[body-choice] {variant} state={:p} valid_len={valid_len} n_fold_pages={pages} \
-             fold_reqs={reqs} -> rung={rung}{}",
-            &self.fold as *const SessionKv,
-            if fused { " (fold-fused)" } else { " (split)" }
-        );
+        eprintln!("[body-choice] {variant} valid_len={valid_len} -> rung={rung}");
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -3486,9 +3663,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         &mut self,
         sel: ListSel,
         byte_off: [u64; NUM_SEGMENTS],
-        slot_pos: SeqPos,
-        kv_page_base: Bytes,
-        n_fold_pages: i64,
         // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
         // bundle, which is what makes banking invisible to every model whose weights fit one region.
         weight_bank: usize,
@@ -3503,10 +3677,10 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             &ops,
             LaunchWhere {
                 byte_off,
-                slot_pos,
-                kv_page_base,
-                n_fold_pages,
                 weight_bank,
+                // One request — the count a packed prefill launch states is a later law's; every
+                // launch today serves one, and the span law is inert at one.
+                requests: fold_plan::Requests::default(),
             },
             d,
         );
@@ -3515,13 +3689,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     }
 
     fn launch_ops_inner(&mut self, ops: &Ops<T>, where_: LaunchWhere, d: &Diag) -> Result<()> {
-        // `slot_pos`/`kv_page_base`/`weight_bank` are read only inside
-        // `cb_plan::launch_site`, through `where_` — nothing else in the walk uses them.
-        let LaunchWhere {
-            byte_off,
-            n_fold_pages,
-            ..
-        } = where_;
+        // `weight_bank` is read only inside `cb_plan::launch_site`, through `where_`.
+        let byte_off = where_.byte_off;
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
         // the stream is in-order, so at any moment the device is a whole layer behind the host.
         // Timing from an un-drained start measures `backlog + ops[0..j]`, and the backlog shrinks by
@@ -3541,69 +3710,59 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
 
         // ⛔ NO KNOB OF ITS OWN — THE BATCH IS THE PATH. Every launch this rung would make is
         // collected below and paid as ONE doorbell at the end (the vendor's multi-CB branch;
-        // `Stream::compute_batch`). The five knobs that sync or submit MID-RUNG cannot see a
+        // `Stream::compute_batch`). The knobs that sync MID-RUNG cannot see a
         // pending batch — a drain between ops of an unflushed rung observes nothing — so each of
-        // them falls back to this function's per-op submission, bit for bit: `repeat_probe`
-        // (double-submits per op), `perop_sync`/`group_time` (drain per op), `prefix_time`
+        // them falls back to this function's per-op submission, bit for bit:
+        // `perop_sync`/`group_time` (drain per op), `prefix_time`
         // (drains at a rotating MID-RUNG group), `optrace` and `tensordump` (drain + D2H after
         // each op). `prog_verify`/`segaddr`/`launch_mark`/`submit_time` are batch-safe: they read
         // program memory or host state this rung's compute ops never write, and `submit_time`
         // measures the flush itself as the enqueue.
-        let collect = !(d.repeat_probe
-            || d.perop_sync
-            || d.group_time
-            || d.prefix_time
-            || d.optrace
-            || d.tensordump.is_some());
+        let collect =
+            !(d.perop_sync || d.group_time || d.prefix_time || d.optrace || d.tensordump.is_some());
         let mut pending: Vec<PendingLaunch> = Vec::new();
         // The OR of every entry's per-op barrier — one head barrier on the batch is equivalent
         // to per-op barriers for an all-compute list (flex-rs drains the OTHER pipelines'
         // fences on the first true barrier and waits on nothing after; the ring stays FIFO).
         let mut batch_barrier = false;
 
-        for (oi, op) in ops.iter().enumerate() {
-            // ── PAGE FOLD ── Run this group once per page of resident prefix, rebased each time to
-            //    that page's KV and that page's validity row. The fold ACCUMULATES into the running
-            //    softmax state, so repeating it IS the loop. Zero passes when nothing is resident
-            //    yet — the common case for a first prefill chunk, which attends only itself and
-            //    would otherwise sweep an empty page. This is what makes context a RUNTIME page
-            //    count instead of a baked extent. Whose KV an op touches and how many passes it
-            //    takes are both `fold_plan`'s to answer — and the refusal for a count the pool
-            //    cannot honour is `cb_plan::op_reps`'s, shared with the plan build so the two
-            //    cannot disagree about how many passes an op takes.
-            let reps = cb_plan::op_reps(&op.kv, &self.fold, n_fold_pages, oi)?;
+        // ⭐ THE ONE ENUMERATION — `fold_plan::launches`: a walking bundle's span repeats once per
+        // request of the launch, request-outer (the seed re-runs ahead of each request's body), and
+        // every other op launches once. At one request this is exactly the op-major
+        // `for op { for rep }` sequence it has always been. The per-op diag epilogue below fires at
+        // each op's run end — a run is the op's contiguous stretch of the sequence, so at one
+        // request it fires exactly where the old nested loop's did.
+        let kvs: Vec<fold_plan::OpKv> = ops.iter().map(|o| o.kv).collect();
+        let seq = fold_plan::launches(&kvs, where_.requests.count);
+        let mut at = 0;
+        while at < seq.len() {
+            let oi = seq[at].op;
+            let op = &ops[oi];
 
-            for rep in 0..reps {
+            while at < seq.len() && seq[at].op == oi {
+                let l = seq[at];
+                at += 1;
+                let (request, rep) = (l.request, l.rep);
                 let stream = self.stream_ref()?;
-                // ⭐ ONE (op, PASS)'S ARITHMETIC, SINGLE-SOURCED. Everything from the sweep
-                //    witness through the fold deltas, the shifted tensor bases, the weight bank,
-                //    the program, the host-fence flag and the bootstrap is `cb_plan::launch_site`
-                //    — the submit walk below, the diag printers it feeds, and the CB-plan parity
-                //    gate (which proves the plan's data twin of exactly this computation
-                //    byte-identical at prepare) all read the ONE function, so no second
-                //    derivation of the addressing can drift. The law comments that lived on the
-                //    arithmetic moved with it.
-                // ⛔ A PAGE PART WITH NO PAGE DOES NOT LAUNCH — a short last chunk's padding past
-                //    the request's pages (#620). Its rows are never read, and the only base left
-                //    to aim it at is the cursor's own page, which is part 0's keys; the skip
-                //    lives in `launch_site`, shared by the walk and the plan twin.
-                let Some(site) = cb_plan::launch_site(
+                // ⭐ ONE (op, relaunch)'S ARITHMETIC, SINGLE-SOURCED. The request and walk shifts,
+                //    the shifted tensor bases, the weight bank, the program and the bootstrap are
+                //    `cb_plan::launch_site` — the submit walk below, the diag printers it feeds, and
+                //    the CB-plan parity gate (which proves the plan's data twin of exactly this
+                //    computation byte-identical at prepare) all read the ONE function.
+                let site = cb_plan::launch_site(
                     ops,
                     oi,
+                    request,
                     rep,
-                    &self.fold,
                     &self.seg_addr,
                     &self.weight_bank_addr,
                     &where_,
-                )?
-                else {
-                    continue;
-                };
+                )?;
                 // The walk's own locals, re-bound from the site: `ta` as the borrows the submit
                 // and dump paths take, everything else by copy or borrow.
                 let ta: Vec<&DevAddr> = site.ta.iter().collect();
-                let (off, prog, bootstrap, barrier) =
-                    (site.off, &site.prog, site.bootstrap, site.barrier);
+                // Every launch fences: the host fence is one call per launch, never a wire bit.
+                let (off, prog, bootstrap, barrier) = (site.off, &site.prog, site.bootstrap, true);
                 let gt0 = Instant::now();
                 if d.launch_mark {
                     // ⛔ ONE WRITE, and it must reach the fd BEFORE the submit: an abort from senlib's
@@ -3613,7 +3772,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     // moves ONLY by `delta.mask`, so "did the host shift pass p's index" is answered
                     // by this line and nothing else — `[gather]` prints the TABLE, not the base.
                     let one = format!(
-                        "[mark] op[{}] rep={rep} seg0+{} seg2+{} seg3+{} gathered={} pf={} {}\n",
+                        "[mark] op[{}] req={request} rep={rep} seg0+{} seg2+{} seg3+{} gathered={} \
+                         pf={} {}\n",
                         op.index,
                         off[SEG_INTERMEDIATE.get()],
                         off[SEG_KV.get()],
@@ -3669,38 +3829,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     }
                 }
 
-                if d.repeat_probe
-                    && !op.kv.page_fold
-                    && (op.kv.slot_write || op.kv.slab_write || op.kv.request > 0)
-                {
-                    // Both halves pay one drain, so the drain's host round trip cancels in the
-                    // comparison and only the cold-vs-warm program difference is left.
-                    let _ = stream.synchronize();
-                    let r0 = Instant::now();
-                    stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(launch_err)?;
-                    let _ = stream.synchronize();
-                    let r1 = Instant::now();
-                    stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(launch_err)?;
-                    let _ = stream.synchronize();
-                    let r2 = Instant::now();
-                    let mut t = timers();
-                    let e = t
-                        .repeat_ms
-                        .entry(oi)
-                        .or_insert((0.0, 0.0, 0, String::new()));
-                    e.0 += (r1 - r0).as_secs_f64() * 1e3;
-                    e.1 += (r2 - r1).as_secs_f64() * 1e3;
-                    e.2 += 1;
-                    if e.3.is_empty() {
-                        e.3 = op.label();
-                    }
-                    continue;
-                }
-
                 if d.rb_time {
                     // The launch sequence the post-synchronize drain zips against: entry i is the
                     // i-th compute CB of this forward in submission order, keyed by (rung length,
@@ -3724,6 +3852,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     pending.extend(cbs.into_iter().map(|item| PendingLaunch {
                         item,
                         op_index: oi,
+                        request,
                         rep,
                         off,
                     }));
@@ -3784,7 +3913,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                         report_group_time(&t);
                     }
                 }
-            } // end per-page fold repeat
+            } // end walk relaunch
 
             if Some(oi) == px_target {
                 // AFTER every rep of this group, so a fold's whole pass count lands in one rung.
@@ -3818,12 +3947,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         if !pending.is_empty() {
             // Split the site context from the items once, at the boundary: the items are what
             // the doorbell takes, the context is what a refusal dumps.
-            let mut sites: Vec<(usize, i64, [u64; NUM_SEGMENTS])> =
+            let mut sites: Vec<(usize, u32, i64, [u64; NUM_SEGMENTS])> =
                 Vec::with_capacity(pending.len());
             let items: Vec<BatchedCb> = pending
                 .drain(..)
                 .map(|p| {
-                    sites.push((p.op_index, p.rep, p.off));
+                    sites.push((p.op_index, p.request, p.rep, p.off));
                     p.item
                 })
                 .collect();
@@ -3838,12 +3967,12 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 // the failing element's index when it has one; a refusal that names no element
                 // (shutdown, capacity) still gets the sweep and the rung's shape.
                 if let HwError::Stream(RuntimeStreamError::BatchElement { index, .. }) = &e
-                    && let Some(&(oi, rep, off)) = sites.get(*index)
+                    && let Some(&(oi, request, rep, off)) = sites.get(*index)
                 {
                     // ⛔ ONE WRITE — same single-`format!` discipline as `[progverify]`.
                     let one = format!(
-                        "[flush] refused at batch entry {index} (op {oi}, rep {rep}) of {} \
-                         staged launch(es)\n",
+                        "[flush] refused at batch entry {index} (op {oi}, req {request}, rep \
+                         {rep}) of {} staged launch(es)\n",
                         items.len()
                     );
                     eprint!("{one}");
@@ -4146,10 +4275,14 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let mut line = format!("[optrace] op[{oi}]");
         for i in [0usize, 2, 3, 4, 5, 6] {
             let seg = SegIdx::checked(i as i64).expect("literal < NUM_SEGMENTS");
+            // Device-only segments hold no mirror; this probe wants their real bytes,
+            // so it materializes one first (`read_seg`'s own rule).
+            let _ = self.mirror_seg_shadow(seg);
             let got = self.d2h_seg_clamped(seg);
             let stat = match got {
                 Ok(got) => {
-                    let host = &self.seg_host[i][..got.min(self.seg_host[i].len())];
+                    let shadow = self.seg_host[i].host().unwrap_or(&[]);
+                    let host = &shadow[..got.min(shadow.len())];
                     let (mut nz, mut mx) = (0usize, 0.0f32);
                     let mut n_inf = 0usize;
                     // First NON-FINITE element offsets (element index in the segment), so a divergence
@@ -4215,8 +4348,11 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     /// `sen_to_f32` the optrace's stats use. RAW int32 tensors (the gather index table, in
     /// `raw_ids`) are dumped as i32→f32 with `.n = size/4` so the file stays comparable; the
     /// emulator never dumps those (host-bound sources), so they simply have no reference file.
-    /// Bank ≥ 1 weights and placements past a clamped shadow window are skipped (unreadable), each
-    /// with one `skip.txt` line so the gap is visible rather than silent.
+    /// Bank ≥ 1 weights are skipped (not in their segment's region), and a placement past what
+    /// was read back is a layout shock — each with one `skip.txt` line so the gap is visible
+    /// rather than silent. Every segment is materialized to its full region before the D2H, so
+    /// the intermediates the ops compute into are dumped exactly as they were when every shadow
+    /// was host-mirrored; nothing reads back as a quiet 0 B.
     fn tensordump(&mut self, oi: usize, op: &OpProg<T>) -> Result<()> {
         let Some(dir) = Diag::get().tensordump.clone() else {
             return Ok(());
@@ -4241,18 +4377,21 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             });
         }
         let _ = self.stream_ref()?.synchronize();
-        // D2H every segment a placement can live in. seg2's shadow is one page (clamped read), and
-        // an aliased segment's device region belongs to its owner — reading it back is still SOUND
-        // (a read never writes), it just reflects the owner's bytes, which is exactly what this
-        // session's launches compute against.
+        // D2H every segment a placement can live in — `read_seg`'s own rule: this tool exists to
+        // see the bytes the ops COMPUTE (the intermediates above all), which are device-only slots,
+        // so every segment with a region materializes its shadow first. An aliased segment's
+        // device region belongs to its owner — reading it back is still SOUND (a read never
+        // writes), it just reflects the owner's bytes, which is exactly what this session's
+        // launches compute against. And a failed read is an `Err`, never a quiet 0 B: a segment
+        // that reads as nothing would hide every placement in it from the diff.
         let mut got = [0usize; NUM_SEGMENTS];
         for (i, g) in got.iter_mut().enumerate() {
             if self.seg_addr[i].is_none() {
                 continue;
             }
-            *g = self
-                .d2h_seg_clamped(SegIdx::checked(i as i64).expect("< NUM_SEGMENTS"))
-                .unwrap_or(0);
+            let seg = SegIdx::checked(i as i64).expect("< NUM_SEGMENTS");
+            self.mirror_seg_shadow(seg)?;
+            *g = self.d2h_seg_clamped(seg)?;
         }
         let dump = self.dump.as_mut().expect("just initialized");
         dump.op += 1;
@@ -4277,19 +4416,26 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 continue;
             }
             // Only whole-tensor reads that the clamped D2H actually brought back: a placement past
-            // the shadow's window would read stale host bytes and masquerade as a write.
+            // what was read would read stale host bytes and masquerade as a write. Every segment
+            // was materialized to its full region above, so a miss here is a layout shock in ANY
+            // segment — and the skip is WRITTEN, never silent (the doc's own law).
             let avail = got[i] as u64;
             if avail == 0 || p.offset + p.size > avail {
-                if p.segment as usize == SEG_WEIGHT.get() {
-                    // The weight segment's shadow is full-size; a miss there is a layout shock.
-                    skipped.push_str(&format!(
-                        "op{opno} prog{prog} {id}: seg{} off {} size {} past the {} B read back\n",
-                        p.segment, p.offset, p.size, avail
-                    ));
-                }
+                skipped.push_str(&format!(
+                    "op{opno} prog{prog} {id}: seg{} off {} size {} past the {} B read back\n",
+                    p.segment, p.offset, p.size, avail
+                ));
                 continue;
             }
-            let cur = &self.seg_host[i][p.offset as usize..][..p.size as usize];
+            // The loop above materialized every segment with a region, and `avail > 0` proves the
+            // D2H brought its bytes back — a `DeviceOnly` slot here is a wiring bug, refused.
+            let Some(host) = self.seg_host[i].host() else {
+                bail!(
+                    "tensordump: placement {id} names seg{i}, which is DEVICE-ONLY despite the \
+                     materialize pass above — the shadow state and the dump loop disagree"
+                );
+            };
+            let cur = &host[p.offset as usize..][..p.size as usize];
             let moved = match dump.snap.get(id) {
                 Some(prev) => prev.as_slice() != cur,
                 None => cur.iter().any(|b| *b != 0),
@@ -4502,8 +4648,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         entries.sort_unstable_by_key(|e| e.id);
         if entries.len() != seq.len() {
             // LOUD, NOT SILENT: a mismatch means per-op attribution would be WRONG, not merely
-            // missing — `repeat_probe` launches computes that are in the ring but not in the
-            // sequence, and a rotated ring loses launches from its front. (The DMA crossings
+            // missing — a rotated ring loses launches from its front. (The DMA crossings
             // are NOT a mismatch source anymore: `dma` excludes them above.) Skip the
             // attribution entirely; the DMA totals above stay honest either way.
             eprintln!(
@@ -4747,6 +4892,10 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         if want == LogitsRead::ReadBack {
             let seg = SegIdx::checked(lp.segment as i64)
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
+            // The shadow the readback lands in must cover the window below (and the multi-chunk
+            // fallback reads the WHOLE region): the mirrored shadow is sized to the segment's
+            // placements, so grow it to the region's padded extent first.
+            self.mirror_seg_shadow(seg)?;
             d2h_seg = lp.segment as i64;
             let addr = self.seg_addr[seg.get()].as_ref().unwrap();
             let tot = addr.total_size().as_u64();
@@ -4792,7 +4941,16 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 None => (addr, 0, tot),
             };
             d2h_bytes = b - a;
-            let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
+            // The mirror grew the shadow to the whole region above (the multi-chunk fallback
+            // reads all of it), and the window is clamped to `tot`, so the slice is in range;
+            // the let-else is the shadow type's price — the logits segment is host-owned by
+            // the role statement, so this arm is a consistency refusal, not an expectation.
+            let host = {
+                let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
+                    bail!("predict: the logits segment {} is DEVICE-ONLY", seg.get());
+                };
+                &mut v[a as usize..b as usize]
+            };
             // ON THE COMPUTE PIPELINE (#544): the logits readback is the LAST op of every
             // step, right after the step's COMPUTE ops. Riding ASYNC_DMAO, its switch
             // barrier drained the COMPUTE deque — the readback submission HOST-BLOCKED until
@@ -4870,7 +5028,19 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             let seg = SegIdx::checked(lp.segment as i64)
                 .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
             let elems = self.vocab.0.min(out.len() / 2);
-            let src = &self.seg_host[seg.get()][lp.offset as usize..];
+            // The submit half materialized this shadow for its readback window; the convert
+            // reads inside that same window. A device-only logits segment would mean the two
+            // halves of the read disagree with the role statement — refuse, never convert
+            // nothing.
+            let src = self.seg_host[seg.get()]
+                .host()
+                .and_then(|h| h.get(lp.offset as usize..))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "predict_finish: the logits segment {} holds no host shadow",
+                        seg.get()
+                    )
+                })?;
             sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
         }
 
@@ -5006,8 +5176,16 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     p.offset
                 );
             }
-            if p.offset as usize + src.len() > self.seg_host[seg.get()].len() {
-                bail!("predict: activation '{nm}' overflows seg{}", p.segment);
+            match self.seg_host[seg.get()].host() {
+                None => bail!(
+                    "predict: activation '{nm}' names seg{}, which is DEVICE-ONLY — the \
+                     placement and the bundle's own role statement disagree",
+                    p.segment
+                ),
+                Some(h) if p.offset as usize + src.len() > h.len() => {
+                    bail!("predict: activation '{nm}' overflows seg{}", p.segment);
+                }
+                _ => {}
             }
             writes.push((seg.get(), p.offset, src.as_slice()));
             seg_dirty[seg.get()] = true;
@@ -5065,7 +5243,14 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             let Some(seg) = SegIdx::checked(p.segment as i64) else {
                 continue;
             };
-            let dst = &mut self.seg_host[seg.get()][p.offset as usize..][..src.len()];
+            // The convert loop's destinations are the ACTIVATION segment the collect pass just
+            // bounds-checked above — a device-only slot there is a role-statement mismatch, not
+            // a condition to carry on from (the convert would be writing into nothing).
+            let dst = self.seg_host[seg.get()]
+                .host_buf_mut()
+                .ok_or_else(|| anyhow!("predict: seg{} is DEVICE-ONLY", p.segment))?
+                .get_mut(p.offset as usize..p.offset as usize + src.len())
+                .ok_or_else(|| anyhow!("predict: activation '{nm}' overflows seg{}", p.segment))?;
             // ⛔ A RAW BIND IS COPIED, NOT RE-ENCODED. `ieee_to_sen_bytes` treats its source as fp16
             // pairs; for the gather's int32 index table that rewrites every entry into a different
             // valid block number. See [`Self::raw_ids`].
@@ -5146,7 +5331,16 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             if runs.is_empty() {
                 last_h2d = Some(
                     stream
-                        .h2d_on_compute_signaled(whole_shadow(&self.seg_host[i], addr, i)?, addr)
+                        .h2d_on_compute_signaled(
+                            whole_shadow(
+                                self.seg_host[i].host().ok_or_else(|| {
+                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
+                                })?,
+                                addr,
+                                i,
+                            )?,
+                            addr,
+                        )
                         .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?,
                 );
             } else {
@@ -5157,7 +5351,9 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     last_h2d = Some(
                         stream
                             .h2d_on_compute_signaled(
-                                &self.seg_host[i][a as usize..b as usize],
+                                &self.seg_host[i].host().ok_or_else(|| {
+                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
+                                })?[a as usize..b as usize],
                                 &win,
                             )
                             .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?,
@@ -5174,35 +5370,28 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     fn launch_forward(&mut self, seq_pos: SeqPos, suffix: SuffixLaunch) -> Result<()> {
         let zero = [0u64; NUM_SEGMENTS];
         let Some(rolled) = self.rolled.as_ref() else {
-            // Not rolled: one body over the whole model. Pages the RESIDENT PREFIX spans; the
-            // selector also picks the FOLD-FUSED twin when the context fits ONE page, which is the
-            // baseline's group count (3 vs the split body's 5) — selecting the split body
-            // regardless cost two extra launches per layer, ~1 ms/token, for a fold launched once.
+            // Not rolled: one body over the whole model.
             // ⭐ THE SAME DOOR THE HOST ASKS THROUGH — [`Executor::step_body`], from the same write slot.
             // Two call sites here and one on the host, all three taking `seq_pos` and nothing else, so
             // the body the host staged for IS the body launched.
-            let n_fold_pages = self.n_fold_pages(seq_pos);
             let sel = self.step_body(seq_pos)?.sel;
-            let base = self.page_base_for_write(seq_pos);
             // UNROLLED: one body over the whole model (class 0 — an unrolled bundle has no class
             // split), and an unrolled bundle has no layer boundary to bank on — its weights are one
             // region by construction (`bank_weight_segment` refuses to bank without layer classes),
             // so bank 0 is the only bank there is.
             let ls = self.list_sel_for(sel, 0);
-            return self.launch_ops(ls, zero, seq_pos, base, n_fold_pages, 0);
+            return self.launch_ops(ls, zero, 0);
         };
         let pre_bank = rolled.prefix_weight_bank;
         let suf_bank = rolled.suffix_weight_bank;
 
-        self.launch_ops(ListSel::Prefix, zero, SeqPos(0), Bytes(0), 1, pre_bank)?;
+        self.launch_ops(ListSel::Prefix, zero, pre_bank)?;
 
         // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
         // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
         // before attention). The same rung serves every layer this step; only the swept extents
         // differ, and the resident KV is shared.
-        let n_fold_pages = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
-        let base = self.page_base_for_write(seq_pos);
         // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in true layer
         // order, each naming its body's CLASS and the segment shifts the launch applies — no
         // `v·stride`, no `v / layers_per_bank`, no class base to add. The bake PROVED every row
@@ -5227,9 +5416,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             off[SEG_WEIGHT.get()] = woff;
             off[SEG_KV.get()] = kvoff;
             let ls = self.list_sel_for(sel, body);
-            // The WRITE lands in the page holding seq_pos; the FOLD covers every page the RESIDENT
-            // PREFIX [0, seq_pos) spans — zero of them when there is no prefix.
-            self.launch_ops(ls, off, seq_pos, base, n_fold_pages, wbank as usize)?;
+            self.launch_ops(ls, off, wbank as usize)?;
         }
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
@@ -5242,122 +5429,48 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
         // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
         match suffix {
-            SuffixLaunch::Launched => {
-                self.launch_ops(ListSel::Suffix, zero, SeqPos(0), Bytes(0), 1, suf_bank)
-            }
+            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank),
             SuffixLaunch::Skipped => Ok(()),
         }
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
-    //  #603 PR2 2c — the replay player: one decode step as canvas-copy + patches + ONE doorbell
+    //  #603 PR2 2c — the replay player: one decode step as canvas-copy + ONE doorbell
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
     /// ⭐ THE PLAYER — the decode step's whole forward from a cached image:
-    /// select the image by (body, page count, fold shape), let the submit
-    /// path copy the canvas and stamp it (the step's patches + the
-    /// pool-leased tags), and ring ONE doorbell for the step. The per-step
-    /// host work is a memcpy, K word patches, N tag stamps and one
-    /// submission — no per-op `launch_site`, no `BatchedCompute` build, no
-    /// per-rung flush. Everything the image is keyed by, and everything the
-    /// stamp writes, was proven at the image's derivation:
-    /// `cb_plan::patch_check` per body row (canvas ≡ walk, patched canvas ≡
-    /// fresh walk at steps the derivation never visited) and
-    /// `cb_plan::parity_check` per fixed row.
+    /// select the image by its body, let the submit path copy the canvas and
+    /// stamp the pool-leased tags, and ring ONE doorbell for the step. The
+    /// per-step host work is a memcpy, N tag stamps and one submission — no
+    /// per-op `launch_site`, no `BatchedCompute` build, no per-rung flush. The
+    /// image is proven at its derivation: `cb_plan::parity_check` per launch
+    /// row (canvas ≡ walk). Nothing a launch addresses moves with the step's
+    /// position, so the canvas IS every step's CBs for that body.
     ///
-    /// Returns `Ok(None)` — the caller takes the walk — for every step that
-    /// is not the player's regime, with the reason stated where it fires (a
-    /// per-step debug line would be noise at decode rate; the boundary reason
-    /// fires once per page): a BATCHED step (two or more requests installed —
-    /// PR4's images), any Diag instrument on ([`Diag::is_quiet`] — each one
-    /// reads walk state), a page boundary (slot 0 of a new page — a
-    /// write-base move, not a patchable one), or a page no canvas slot or
-    /// off-sample room fits. There is no third path and no toggle: the
-    /// production configuration (quiet diag, one request) is the player,
-    /// minus one step per page.
+    /// Returns `Ok(None)` — the caller takes the walk — when any Diag
+    /// instrument is on ([`Diag::is_quiet`] — each one reads walk state). There
+    /// is no other path and no toggle: the production configuration is the
+    /// player.
     fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<()>> {
-        if !Diag::get().is_quiet() || fold_plan::fold_requests(&self.fold) != 1 {
+        if !Diag::get().is_quiet() {
             return Ok(None);
         }
-        let per = self.kv.page_slots.0.max(1);
-        // ⭐ THE PAGE-BOUNDARY STEP WALKS. `pos % per == 0` writes slot 0 of a
-        // page no image of this key ever rendered — a WRITE-BASE move, and a
-        // moved write base is not affine in the patch model's scalars: a
-        // shifted write target's extent is END-PINNED (`DevAddr::shifted`
-        // returns the bytes remaining past the shift), so its XLAT word's
-        // paddr and length fields move together and no per-byte addend
-        // expresses the pair — measured on the first real bundle, where the
-        // page differential's render moved paddr `+stride/2` flits and
-        // length `-stride/2` flits for a one-stride base move and the solve
-        // refused. That includes pos 0 — slot 0 of page 0, whose image key
-        // (n = 0) has no page behind it. One step per page takes the walk;
-        // every step between boundaries writes the image's own page and
-        // replays.
-        if self.kv.paged && seq_pos.0 % per == 0 {
-            debug!(
-                "[sdsc-replay] page-boundary step {} walks: slot 0 of a new page is a \
-                 write-base move, not a patchable one",
-                seq_pos.0
-            );
-            return Ok(None);
-        }
-        let n = self.n_fold_pages(seq_pos);
         let sel = self.step_body(seq_pos)?.sel;
-        let Some(r) = cb_plan::canvas_slot(per, self.kv.paged) else {
-            debug!(
-                "[sdsc-replay] walking every step: no canvas slot fits a {per}-slot page, so no \
-                 image can be derived for this session"
-            );
-            return Ok(None);
-        };
-        if !cb_plan::canvas_room(per, self.kv.paged, r) {
-            debug!(
-                "[sdsc-replay] walking every step: a {per}-slot page leaves no off-sample room \
-                 around canvas slot {r}, so no slab-crossing proof fits — no image is derived"
-            );
-            return Ok(None);
-        }
-        // The canvas position: inside THIS image's page span (`(n-1)·per` is
-        // the image's first page; `r ≥ 1` keeps off the boundary), or any
-        // position at all for an unpaged session, whose one image covers
-        // them all. The write base is the page holding it — a RESIDENT page,
-        // unlike the boundary step's brand-new one, so the reference always
-        // reads a page the block table already names.
-        let pos_c = if self.kv.paged { (n - 1) * per + r } else { r };
-        let page_c = self.page_base_for_write(SeqPos(pos_c));
-        let key = StepImageKey {
-            sel,
-            n_fold_pages: n,
-            signature: fold_signature(&self.fold, n),
-        };
+        let key = StepImageKey { sel };
         let image = match self.step_images.lookup_cached(&key) {
             Some(hit) => hit,
             None => {
                 let t1 = Instant::now();
-                let image = self.derive_step_image(sel, n, pos_c, page_c)?;
+                let image = self.derive_step_image(sel)?;
                 self.step_images.note_derived(key, image.clone(), t1);
                 image
             }
         };
-        // The step's scalars — the two values every moving word of the body
-        // rows is affine in, measured at the position this step writes. The
-        // write page is not among them and cannot move between two replayed
-        // steps of one image: both write the image's own page (the boundary
-        // step that would move it walked, above).
-        let scalars = cb_plan::step_scalars(self.kv.paged, per, seq_pos.0);
-        // The stamp closure: patches the body rows onto the backend's canvas
-        // copy, then stamps the leased tags over the render-time ones. The
-        // fixed rows are skipped by `follows_step` — see `RowReplay`.
+        // The stamp closure stamps the leased tags over the render-time ones.
         let data = std::sync::Arc::clone(&image.data);
         let batch = ComputeWireBatch {
             canvas: std::sync::Arc::clone(&data.canvas),
             patch: Box::new(move |tags, cbs| {
-                for row in &data.rows {
-                    if row.follows_step {
-                        row.plan
-                            .apply(&mut cbs[row.base..row.base + row.len], &scalars);
-                    }
-                }
                 for (cb, tag) in cbs.iter_mut().zip(tags.iter()) {
                     cb.set_tag(*tag);
                 }
@@ -5369,26 +5482,17 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let r = stream.compute_wires(batch, image.barrier);
         let t2 = Instant::now();
         if let Err(e) = r {
-            // The image itself was proven at derivation (per-row gates above);
-            // a refused submit here is capacity or shutdown, not addressing —
-            // so the refusal names the image and the step, not an op site.
+            // The image itself was proven at derivation (per-row gates); a refused submit here is
+            // capacity or shutdown, not addressing — so the refusal names the image and the step.
             return Err(anyhow::Error::new(e).context(format!(
                 "replay submit refused: {cbs} CB(s) over {} launch row(s), barrier={}, \
-                 sel={sel:?}, n_fold_pages={n}, step at {}",
-                image.data.rows.len(),
-                image.barrier,
-                seq_pos.0
+                 sel={sel:?}, step at {}",
+                image.data.rows, image.barrier, seq_pos.0
             )));
         }
         let mut t = timers();
         t.replay_steps += 1;
         t.replay_cbs += cbs as u64;
-        t.replay_sites += image
-            .data
-            .rows
-            .iter()
-            .map(|row| row.plan.sites())
-            .sum::<usize>() as u64;
         t.replay_submit_ms += (t2 - t1).as_secs_f64() * 1e3;
         // First step AND the 256 cadence: the canonical gate cell is 64 tokens,
         // so a cadence-only marker would stay silent in exactly the run that
@@ -5403,28 +5507,13 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
 
     /// Derive one step image at its first use — the row sequence is
     /// EXACTLY `launch_forward`'s (that is the merge's one law: the step's
-    /// CBs, in the order the walk would submit them), each row rendered
-    /// through the gates that prove it, concatenated into one canvas.
-    ///
-    /// The body rows render at the CANVAS position (`pos_c`/`page_c`, inside
-    /// the image's own page span), not at the calling step's — the patch
-    /// model's reference can be any step of the image, and a fixed reference
-    /// keeps the derivation off the slab and page boundaries the calling
-    /// step might sit on. The fixed rows render at their own constant
-    /// `where_` (slot 0, page 0, one page), which is where the walk launches
-    /// them every step whatever the body is doing.
-    fn derive_step_image(
-        &self,
-        sel: BodySel,
-        n: i64,
-        pos_c: i64,
-        page_c: Bytes,
-    ) -> Result<StepImage> {
+    /// CBs, in the order the walk would submit them), each row proven by the
+    /// parity gate and rendered at its own `where_`, concatenated into one canvas.
+    fn derive_step_image(&self, sel: BodySel) -> Result<StepImage> {
         let stream = self.stream_ref()?;
-        // (list, where, follows-step) per launch row, mirroring
-        // `launch_forward` arm by arm. An empty list launches nothing in the
-        // walk (its flush stages zero CBs), so it contributes no row here.
-        let mut specs: Vec<(ListSel, LaunchWhere, bool)> = Vec::new();
+        // (list, where) per launch row, mirroring `launch_forward` arm by arm. An empty list
+        // launches nothing in the walk (its flush stages zero CBs), so it contributes no row here.
+        let mut specs: Vec<(ListSel, LaunchWhere)> = Vec::new();
         let zero = [0u64; NUM_SEGMENTS];
         match self.rolled.as_ref() {
             Some(r) => {
@@ -5432,12 +5521,9 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     ListSel::Prefix,
                     LaunchWhere {
                         byte_off: zero,
-                        slot_pos: SeqPos(0),
-                        kv_page_base: Bytes(0),
-                        n_fold_pages: 1,
                         weight_bank: r.prefix_weight_bank,
+                        requests: fold_plan::Requests::default(),
                     },
-                    false,
                 ));
                 for (class, wbank, woff, kvoff) in r.launches.clone() {
                     let mut off = [0u64; NUM_SEGMENTS];
@@ -5447,24 +5533,18 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                         self.list_sel_for(sel, class),
                         LaunchWhere {
                             byte_off: off,
-                            slot_pos: SeqPos(pos_c),
-                            kv_page_base: page_c,
-                            n_fold_pages: n,
                             weight_bank: wbank as usize,
+                            requests: fold_plan::Requests::default(),
                         },
-                        true,
                     ));
                 }
                 specs.push((
                     ListSel::Suffix,
                     LaunchWhere {
                         byte_off: zero,
-                        slot_pos: SeqPos(0),
-                        kv_page_base: Bytes(0),
-                        n_fold_pages: 1,
                         weight_bank: r.suffix_weight_bank,
+                        requests: fold_plan::Requests::default(),
                     },
-                    false,
                 ));
             }
             None => {
@@ -5473,84 +5553,44 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                     self.list_sel_for(sel, 0),
                     LaunchWhere {
                         byte_off: zero,
-                        slot_pos: SeqPos(pos_c),
-                        kv_page_base: page_c,
-                        n_fold_pages: n,
                         weight_bank: 0,
+                        requests: fold_plan::Requests::default(),
                     },
-                    true,
                 ));
             }
         }
         let mut canvas: Vec<ControlBlockWire> = Vec::new();
-        let mut rows: Vec<RowReplay> = Vec::new();
+        let mut rows = 0usize;
         let mut barrier = false;
-        let mut sites = 0usize;
-        for (ls, where_, follows_step) in specs {
+        for (ls, where_) in specs {
             let ops = self.list(ls);
             if ops.is_empty() {
                 continue;
             }
             let label = format!("{ls:?}/replay-canvas");
-            let (row_canvas, plan) = if follows_step {
-                // A body row: the FULL gate — parity at the canvas position,
-                // the patch table, and the off-sample proof that patched
-                // canvas ≡ fresh walk at steps the derivation never visited.
-                // This is the exact check the prepare gate ran under a
-                // synthetic session, now under the live one.
-                let (_, img) = cb_plan::patch_check(
-                    ops,
-                    &self.fold,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
-                    &where_,
-                    &label,
-                    stream,
-                )?;
-                (img.canvas, img.plan)
-            } else {
-                // A fixed row: the walk launches it at this SAME `where_`
-                // every step, so its replay target is its own canvas,
-                // unchanged — parity at that `where_` is the whole
-                // correctness statement. Its patch table is empty BY
-                // CONSTRUCTION (a constant `where_` makes every
-                // step-differential zero), so none is derived: probing one
-                // would measure a counterfactual no replay executes — the
-                // measured failure mode the prepare gate's scope law also
-                // encodes (its patch leg skips the prefix/suffix lists).
-                cb_plan::parity_check(
-                    ops,
-                    &self.fold,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
-                    &where_,
-                    &label,
-                    stream,
-                )?;
-                let img = cb_plan::render_row(
-                    ops,
-                    &self.fold,
-                    &self.seg_addr,
-                    &self.weight_bank_addr,
-                    &where_,
-                    stream,
-                )?;
-                (img.canvas, img.plan)
-            };
-            barrier |= plan.barrier;
-            sites += plan.sites();
-            rows.push(RowReplay {
-                base: canvas.len(),
-                len: row_canvas.len(),
-                follows_step,
-                plan,
-            });
+            cb_plan::parity_check(
+                ops,
+                &self.seg_addr,
+                &self.weight_bank_addr,
+                &where_,
+                &label,
+                stream,
+            )?;
+            let (row_canvas, row_barrier) = cb_plan::render_canvas(
+                ops,
+                &self.seg_addr,
+                &self.weight_bank_addr,
+                &where_,
+                stream,
+            )?;
+            barrier |= row_barrier;
+            rows += 1;
             canvas.extend(row_canvas);
         }
         if canvas.is_empty() {
             bail!(
-                "replay image derivation REFUSED: sel={sel:?} n_fold_pages={n} produced zero \
-                 CBs — the walk it mirrors launches nothing, which no body selection can do"
+                "replay image derivation REFUSED: sel={sel:?} produced zero CBs — the walk it \
+                 mirrors launches nothing, which no body selection can do"
             );
         }
         // The image's own first CB carries the same EDEP1 the submit path
@@ -5564,10 +5604,9 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // defect).
         canvas[0].set_edep(1);
         debug!(
-            "[sdsc-replay] derived image sel={sel:?} n_fold_pages={n}: {} CB(s) over {} \
-             launch row(s), {sites} patch site(s), barrier={barrier}",
-            canvas.len(),
-            rows.len()
+            "[sdsc-replay] derived image sel={sel:?}: {} CB(s) over {rows} launch row(s), \
+             barrier={barrier}",
+            canvas.len()
         );
         Ok(StepImage {
             data: std::sync::Arc::new(StepImageData {
@@ -5576,46 +5615,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             }),
             barrier,
         })
-    }
-
-    /// How many pages the RESIDENT PREFIX `[0, seq_pos)` spans.
-    /// THE PAGES OF **RESIDENT PREFIX** THIS STEP FOLDS OVER — `ceil(seq_pos / per)`, EXCLUSIVE of the
-    /// slot being written, because the page that slot lands in is the BODY's job and not a fold pass.
-    ///
-    /// ⛔ DO NOT "FIX" THIS TO `ceil((seq_pos + 1) / per)`. It looks one short — a row writing slot
-    /// 2048 does hold 2049 slots — and it is not: MEASURED 2026-08-12, that change REGRESSED the
-    /// ragged gate from 3/6 to 1/6 (`Rome` and `Cario` became `'The provided text does not contain…'`,
-    /// `Nairobi` became `Nariobi`), in both batch orders. The extra pass folds a page the body already
-    /// accounts for.
-    ///
-    /// The host's [`FoldPages`] staging must therefore match THIS count, which is what
-    /// `FoldPages::resident_before` is for. It used `covering` (= `ceil((slot + 1) / per)`), so at every
-    /// exact page multiple the host staged one block more than the launch walks and the fold refused:
-    ///
-    ///   `fold: 8 pass(es) REFUSED — the launch walks 8 page(s) but the host STAGED the mask for 9`
-    ///
-    /// That fired on the BATCHED path only (a lone request takes the solo path and stages no batched
-    /// mask, which is why single-request sweeps across 768 all passed and the 76..1840 gate probes
-    /// never hit it), and it read as a "2048 wall" only because `max_num_batched_tokens`' 2048 default
-    /// truncated long prompts to exactly 2048 — a page multiple.
-    fn n_fold_pages(&self, seq_pos: SeqPos) -> i64 {
-        if self.kv.paged {
-            let per = self.kv.page_slots.0.max(1);
-            (seq_pos.0 + per - 1) / per
-        } else {
-            1
-        }
-    }
-
-    /// The byte base of the page this step's WRITE lands in (request 0's — a batched step installs
-    /// per-request maps and the per-op request tag selects among them inside `fold_plan`).
-    fn page_base_for_write(&self, seq_pos: SeqPos) -> Bytes {
-        if !self.kv.paged {
-            return Bytes(0);
-        }
-        let lp = seq_pos.0 / self.kv.page_slots.0.max(1);
-        RowPage::of(&self.fold, RowIdx::from_launch_row(0), lp)
-            .map_or(Bytes(0), |rp| fold_plan::page_base_bytes(&self.fold, rp))
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -5634,7 +5633,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
             None => (ListSel::Body(0), 0),
         };
-        self.launch_ops(sel, zero, SeqPos(0), Bytes(0), 1, bank)?;
+        self.launch_ops(sel, zero, bank)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
@@ -5665,10 +5664,16 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
 
     /// D2H a whole tensor segment into its host shadow, CLAMPED to the shadow's allocated size.
     ///
-    /// The two sizes genuinely differ on the paged path: prepare sizes seg2's DEVICE region for the
-    /// whole pool but leaves its host shadow at ONE page ("NO HOST MIRROR OF THE KV POOL"), so a
-    /// whole-region D2H would write pool-many pages into a one-page buffer. When the shadow is
-    /// smaller, only its leading window transfers, and the clamped-vs-requested sizes are printed —
+    /// ⛔ A DEVICE-ONLY SLOT IS REFUSED, NOT READ AS 0 B. This is the clamped reader every read
+    /// door lands in; if it answered "0 B, `debug!`" for a slot with no host mirror, that answer
+    /// would stand in for every caller's own decision — and a caller that had nothing to say
+    /// about it (tensordump, once) would hand back a silently empty dump. The doors that want a
+    /// device-only slot's bytes (`read_seg`, `read_tensor`, `optrace`, `tensordump`, the logits
+    /// readback) materialize a shadow through [`Self::shadow_for_read`] FIRST; a caller that
+    /// reaches this reader with a `DeviceOnly` slot is a wiring bug, and this is its `Err`.
+    ///
+    /// The two sizes may still differ — a read may have materialized only a window — and then
+    /// only the shadow's leading window transfers, with the clamped-vs-requested sizes printed:
     /// a truncated readback is visible, never silent. Returns the bytes transferred.
     fn d2h_seg_clamped(&mut self, seg: SegIdx) -> Result<usize> {
         let i = seg.get();
@@ -5677,7 +5682,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             .ok_or_else(|| anyhow!("seg{i} has no region"))?
             .total_size()
             .as_u64();
-        let host = self.seg_host[i].len() as u64;
         // The shadow, the region and the stream are three disjoint fields of `self`; splitting the
         // borrow here is what lets the DMA write into a real `&mut [u8]` instead of a pointer
         // conjured from a shared reference.
@@ -5691,9 +5695,17 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let stream = stream
             .as_ref()
             .ok_or_else(|| anyhow!("no stream — prepare was not called"))?;
+        let Some(shadow) = seg_host[i].host_buf_mut() else {
+            bail!(
+                "read seg{i}: DEVICE-ONLY — no host mirror to read into. A read door that wants \
+                 these bytes materializes one first (shadow_for_read); one that does not know \
+                 what they mean has no business reading this segment"
+            );
+        };
+        let host = shadow.len() as u64;
         if host >= dev {
             stream
-                .d2h(&mut seg_host[i][..dev as usize], addr)
+                .d2h(&mut shadow[..dev as usize], addr)
                 .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
             stream
                 .synchronize()
@@ -5711,7 +5723,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 .window(ByteOffset(0), ByteSize(host))
                 .ok_or_else(|| anyhow!("seg{i} window unaddressable"))?;
             stream
-                .d2h(&mut seg_host[i][..host as usize], &win)
+                .d2h(&mut shadow[..host as usize], &win)
                 .map_err(|e| anyhow!("seg{i} D2H: {e}"))?;
             stream
                 .synchronize()
@@ -5747,6 +5759,17 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 p.bank
             );
         }
+        // ⭐ THE WHOLE SEGMENT, NOT WHAT A DEVICE-ONLY SLOT HAPPENS TO MIRROR: this is the
+        // probe harness's reader, and an intermediate's slot holds no host bytes until a read
+        // asks. Materialize the full region first (the same door `read_seg` takes), or the
+        // clamped D2H below would hand back 0 B and this door would report a truncated file
+        // as success.
+        let dev = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?
+            .total_size()
+            .as_u64() as usize;
+        self.shadow_for_read(seg, dev)?;
         let got = self.d2h_seg_clamped(seg)?;
         let mut elems = (p.size / 2) as usize;
         elems = elems.min(cap_elems);
@@ -5766,7 +5789,15 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         if elems == 0 {
             return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
         }
-        let src = &self.seg_host[seg.get()][p.offset as usize..][..elems * 2];
+        let src = self.seg_host[seg.get()]
+            .host()
+            .and_then(|h| h.get(p.offset as usize..p.offset as usize + elems * 2))
+            .ok_or_else(|| {
+                anyhow!(
+                    "read_tensor('{name}'): seg{} lost its host mirror",
+                    p.segment
+                )
+            })?;
         let mut out = vec![0u8; elems * 2];
         sen_convert::sen_to_ieee_bytes(src, &mut out);
         Ok(out)
@@ -5871,7 +5902,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         // The landing: the shadow window (one-shot law) or a ring slot (in-flight
         // law). Field-direct on purpose — `addr`/`win` hold the shared borrow of
         // `seg_addr` this whole body is written under, and the slot's take/grow is
-        // three field moves, not a method call.
+        // field moves on `seg_host`/`read_ring`, disjoint from that borrow.
         let (host, ring_slot) = if ring {
             let need = (b - a) as usize;
             let slot = match self.read_ring_free.pop() {
@@ -5891,7 +5922,33 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             }
             (&mut s[..need], Some(slot))
         } else {
-            (&mut self.seg_host[seg.get()][a as usize..b as usize], None)
+            // ⭐ A ONE-SHOT READ MAY NAME A DEVICE-ONLY SLOT — an intermediate, when the
+            // answer re-point reads the idx stick — and its landing window does not exist
+            // until this read asks for it; indexing it was a PANIC. Materialized to the
+            // window's END and never the whole region: this door sits on the token path,
+            // and the bytes past the window are nobody's.
+            if matches!(self.seg_host[seg.get()], HostShadow::DeviceOnly) {
+                self.seg_host[seg.get()] =
+                    HostShadow::Host(HostBuf::zeroed(b as usize).map_err(|e| {
+                        anyhow!(
+                            "read_tensor_raw('{id}'): materializing seg{}: {e}",
+                            seg.get()
+                        )
+                    })?);
+            } else if let Some(v) = self.seg_host[seg.get()].host_buf_mut()
+                && v.len() < b as usize
+            {
+                v.resize(b as usize).map_err(|e| {
+                    anyhow!("read_tensor_raw('{id}'): growing seg{}: {e}", seg.get())
+                })?;
+            }
+            let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
+                bail!(
+                    "read_tensor_raw('{id}'): seg{} lost its host mirror mid-read",
+                    seg.get()
+                );
+            };
+            (&mut v[a as usize..b as usize], None)
         };
         let done = self
             .stream
@@ -5991,13 +6048,30 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
                 self.read_ring_free.push(slot);
                 Ok(bytes)
             }
-            None => Ok(self.seg_host[read.seg.get()][read.offset as usize..][..n].to_vec()),
+            None => {
+                // The one-shot landing's window — materialized by the enqueue half
+                // (a device-only slot grows its shadow there); refuse rather than
+                // index if something tore it down in between.
+                let host = self.seg_host[read.seg.get()].host().ok_or_else(|| {
+                    anyhow!(
+                        "read_tensor_raw({}): seg{} lost its host mirror mid-read",
+                        read.id,
+                        read.seg.get()
+                    )
+                })?;
+                Ok(host[read.offset as usize..][..n].to_vec())
+            }
         }
     }
 
-    /// The host shadow's byte size for `seg` — what to size a [`Executor::read_seg`] buffer at.
+    /// The byte size a [`Executor::read_seg`] of `seg` returns: the DEVICE region's
+    /// extent — a read materializes the shadow to exactly that, whatever the slot's
+    /// role (`read_seg`'s own rule, via [`Self::mirror_seg_shadow`]).
     pub fn seg_bytes(&self, seg: SegIdx) -> usize {
-        self.seg_host[seg.get()].len()
+        self.seg_addr[seg.get()]
+            .as_ref()
+            .map(|a| a.total_size().as_u64() as usize)
+            .unwrap_or(0)
     }
 
     /// ZERO a whole tensor segment ON THE DEVICE, with the vendor's fill op.
@@ -6025,13 +6099,8 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         }
         // The window size only sets how many fill control blocks the walk submits (each is a
         // fixed enqueue cost on both host and device); no host buffer rides the fill.
-        const CHUNK: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
         let stream = self.stream_ref()?;
-        for win in addr.windows(CHUNK) {
-            stream
-                .fill_zero(&win)
-                .map_err(|e| anyhow!("zero fill (seg{i}): {e}"))?;
-        }
+        fill_zero_walk(stream, addr, &format!("zero fill (seg{i})"))?;
         stream
             .synchronize()
             .map_err(|e| anyhow!("zero sync (seg{i}): {e}"))?;
@@ -6039,9 +6108,33 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     }
 
     /// D2H the WHOLE tensor segment (raw sen-fp16 bytes, NO conversion).
+    ///
+    /// ⭐ MATERIALIZES THE SHADOW FIRST (see [`Self::mirror_seg_shadow`]): device-only
+    /// segments hold no mirror at all, and a clamped short read here would quietly
+    /// hide most of the segment this door exists to show.
     pub fn read_seg(&mut self, seg: SegIdx) -> Result<Vec<u8>> {
+        self.mirror_seg_shadow(seg)?;
         let got = self.d2h_seg_clamped(seg)?;
-        Ok(self.seg_host[seg.get()][..got.min(self.seg_host[seg.get()].len())].to_vec())
+        let host = self.seg_host[seg.get()].host().unwrap_or(&[]);
+        Ok(host[..got.min(host.len())].to_vec())
+    }
+
+    /// Materialize `seg`'s host shadow to its device region's full extent — the
+    /// one materialize rule ([`Self::shadow_for_read`]) applied at region scale.
+    /// Device-only segments (the KV pool, the intermediates) hold NO mirror after
+    /// [`Executor::stage_weights`] — nothing in a forward ever touches their host
+    /// side — so the inspection doors that DO want their bytes (`read_seg`,
+    /// `optrace`, the logits readback's multi-chunk fallback) materialize one
+    /// here, on demand. Returns the region's size in bytes.
+    fn mirror_seg_shadow(&mut self, seg: SegIdx) -> Result<usize> {
+        let i = seg.get();
+        let dev = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?
+            .total_size()
+            .as_u64() as usize;
+        self.shadow_for_read(seg, dev)?;
+        Ok(dev)
     }
 
     /// Overwrite the FIRST `data.len()` bytes of a tensor segment and H2D exactly that window.
@@ -6057,17 +6150,34 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     /// zeroed it is both the correct result and the smaller transfer.
     pub fn write_seg_prefix(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
         let i = seg.get();
-        if data.len() > self.seg_host[i].len() {
+        // ⭐ MEASURED AGAINST THE REGION, NOT THE SHADOW: a device-only slot holds no
+        // mirror at all (nothing staged into it), but the spilled tail this exists to
+        // hand a borrower still fits the REGION the bundle allocated — so the shadow
+        // materializes to the prefix and only the prefix is H2D'd, exactly the window
+        // the doc above promises.
+        // (The region is re-borrowed below: the address borrows `self` immutably, and the
+        // quiet point + the copy in between need it mutably.)
+        let dev = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?
+            .total_size()
+            .as_u64() as usize;
+        if data.len() > dev {
             bail!(
-                "write_seg_prefix(seg{i}): {} B does not fit this session's {} B segment",
-                data.len(),
-                self.seg_host[i].len()
+                "write_seg_prefix(seg{i}): {} B does not fit this session's {dev} B segment",
+                data.len()
             );
         }
         // The shadow's quiet point, at the door — this copy overwrites the whole
         // prefix while an earlier H2D may still be reading the shadow.
         self.quiet_shadow()?;
-        self.seg_host[i][..data.len()].copy_from_slice(data);
+        // The one materialize rule, at prefix scale: a Host slot shorter than the
+        // prefix grows; a DeviceOnly slot becomes one.
+        self.shadow_for_read(seg, data.len())?;
+        let dst = self.seg_host[i]
+            .host_buf_mut()
+            .ok_or_else(|| anyhow!("write_seg_prefix(seg{i}): lost the host mirror"))?;
+        dst[..data.len()].copy_from_slice(data);
         let addr = self.seg_addr[i]
             .as_ref()
             .ok_or_else(|| anyhow!("seg{i} has no region"))?;
@@ -6076,7 +6186,13 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
             .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
         let stream = self.stream_ref()?;
         stream
-            .h2d(&self.seg_host[i][..data.len()], &win)
+            .h2d(
+                self.seg_host[i]
+                    .host()
+                    .and_then(|h| h.get(..data.len()))
+                    .ok_or_else(|| anyhow!("write_seg_prefix(seg{i}): lost the host mirror"))?,
+                &win,
+            )
             .map_err(|e| anyhow!("write_seg_prefix H2D seg{i}: {e}"))?;
         stream
             .synchronize()
@@ -6110,7 +6226,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         let region = self.seg_addr[SEG_WEIGHT.get()]
             .as_ref()
             .ok_or_else(|| anyhow!("point_landing_slots: the weight segment is not allocated"))?;
-        crate::runtime::point_landing_slots(&self.card, region).map_err(|e| anyhow!("{e}"))
+        crate::runtime::point_landing_slots(self.card, region).map_err(|e| anyhow!("{e}"))
     }
 
     /// The receive window this session's bundle bakes, `None` in a world of one.
@@ -6119,7 +6235,7 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
         RankSeat::baked_window(self.code).map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))
     }
 
-    pub fn alias_seg_from(&mut self, owner: &Executor<T>, seg: SegIdx) -> Result<()> {
+    pub fn alias_seg_from(&mut self, owner: &Executor<'_, T>, seg: SegIdx) -> Result<()> {
         let i = seg.get();
         let (Some(dst), Some(src)) = (self.seg_addr[i].as_ref(), owner.seg_addr[i].as_ref()) else {
             bail!("alias_seg(seg{i}): a session has no region for it");
@@ -6245,16 +6361,6 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     //  Accessors + the declared session facts
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
-    pub fn is_paged(&self) -> bool {
-        self.kv.paged
-    }
-    pub fn pool_pages(&self) -> PoolPages {
-        self.kv.pool_pages
-    }
-    pub fn page_slots(&self) -> PageSlots {
-        self.kv.page_slots
-    }
-
     /// ⛔⛔⛔ THE COLUMNS THE BROADCAST PREFIX MASK RESERVES — **READ OFF THE PLACEMENT THE BIND GUARD
     /// CHECKS AGAINST**, so the extent the host stages and the size it is validated against are ONE
     /// FIELD and cannot disagree.
@@ -6270,116 +6376,28 @@ impl<T: ktir_superdsc::collective::Tp> Executor<T> {
     /// decode-BATCH bundle places `[nqh*mq, ...]` instead, and its staging is blocked by the DECLARED fold
     /// grid (`PrefixMaskShape` / `MaskBlocks`), not by this. `None` when the bundle placed no mask, or when
     /// the placement is not a whole number of pages — either way the caller must refuse rather than guess.
-    /// ⭐ BYTES PER PHYSICAL PAGE — `iters * kv_stride`, all layers of one page. THE number
-    /// `fold_plan::page_base_bytes` multiplies a block-table entry by, so it is also the number the
-    /// gather's index unit must divide. `0` for an unpaged bundle.
-    pub fn kv_page_stride_bytes(&self) -> u64 {
-        self.kv.page_stride_bytes
-    }
-
     pub fn pmask_slots(&self) -> Option<usize> {
         let nm = bundle::PlaceId::Act(crate::lower_subtile_tape_to_superdsc::ATTN_MASK_TID);
         let slots = (self.places.get(&nm)?.size / 2) as usize;
         let per_page = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
         (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
     }
-
-    /// Resident capacity in slots. PAGED: what ONE REQUEST can hold — the pages it has been given.
-    /// The pool is SHARED, so reporting it here would let a request run off its own pages into
-    /// another's.
-    pub fn cap(&self) -> i64 {
-        if self.kv.paged {
-            let held = self.fold.block_tables.first().map_or(0, |t| t.len() as i64);
-            held * self.kv.page_slots.0
-        } else {
-            self.num_blocks.0 * 64
-        }
-    }
-
-    /// Install request `req`'s logical→physical page map, its POOL ROW, and the position its next
-    /// token writes at. EVERY session that runs a forward for a request needs it — prefill rungs are
-    /// separate sessions, and one left on the create-time identity map writes the prompt into page 0
-    /// while decode reads the request's real pages.
-    ///
-    /// A page outside the pool is REFUSED, never clamped: a clamp points this request at another's
-    /// KV. The `row` is likewise the bundle's to bound — row `ROWS` of one kv head is row 0 of the
-    /// next — so a refusal from `fold_plan` is forwarded, never dropped.
-    pub fn set_block_table(&mut self, req: RowIdx, pos: SeqPos, pages: &[i64]) -> Result<()> {
-        if !self.kv.paged {
-            bail!("set_block_table on a NON-PAGED bundle — refused");
-        }
-        if pages.is_empty() {
-            bail!("set_block_table: empty page list");
-        }
-        for (i, &p) in pages.iter().enumerate() {
-            if p < 0 || p >= self.kv.pool_pages.0 {
-                bail!(
-                    "set_block_table: page {p} (entry {i}) outside the {}-page pool — refused",
-                    self.kv.pool_pages.0
-                );
-            }
-        }
-        self.block_table_set = true;
-        self.install_page_map(req, pos, pages);
-        Ok(())
-    }
-
-    /// The map install itself — shared by the create-time identity default and `set_block_table`.
-    /// The RULE (slot 0 retires the last forward's rows, so the inferred fold width is this
-    /// forward's and not a high-water mark) lives on [`SessionKv`], which owns the state.
-    fn install_page_map(&mut self, req: RowIdx, pos: SeqPos, pages: &[i64]) {
-        self.fold.install_row(req, SlotPos::of_launch(pos.0), pages);
-    }
-
-    /// The prefix mask's per-fold-pass stride in bytes. A batched decode's mask is one
-    /// `[nqh*mq, page]` block per (request, page) pass, so the runtime steps it by a whole block;
-    /// only the worker, which stages it, knows how deep a block is. 0 restores the one-row-per-page
-    /// step a prompt uses.
-    pub fn set_mask_stride(&mut self, stride_bytes: u64) {
-        self.fold.mask_rep_stride_bytes = stride_bytes;
-    }
-
-    /// HOW MANY BLOCKS the staged mask has. Only the worker knows — it allocated the buffer — and
-    /// the fold needs it to refuse a pass past the last block, where it would read unstaged zeros
-    /// that an additive mask treats as VALID.
-    pub fn set_mask_blocks(&mut self, blocks: u64) {
-        self.fold.mask_blocks = blocks;
-    }
-
-    /// HOW MANY PAGES THE FOLD WALKS, decided by the HOST from the batch's shared write slot. This
-    /// executor derives the same number itself (`n_fold_pages`); declaring the host's value lets
-    /// `fold_plan::reps` REFUSE on a disagreement instead of folding a mask blocked by one number
-    /// with passes indexed by another — a mismatch makes every row but row 0 read another row's
-    /// page, and an unstaged additive-mask byte reads as ZERO, i.e. VALID.
-    pub fn set_fold_pages(&mut self, pages: u64) {
-        self.fold.fold_pages = pages;
-    }
-
-    /// The per-request row-block stride in the INTERMEDIATE segment. A row-batched fold's ops are
-    /// baked for ONE request's `nqh` rows, so each pass has to be rebased onto its own request's
-    /// block; only the emitter knows it baked them that way. 0 = the fold spans the whole batch.
-    pub fn set_int_stride(&mut self, stride_bytes: u64) {
-        self.fold.int_rep_stride_bytes = stride_bytes;
-    }
 }
 
-/// ⭐ WHICH BODY — NOT WHICH LIST. The selector picks the BODY (a swept extent, possibly
-/// fold-fused); the launch table then names the CLASS whose list runs it. Splitting the two is
+/// ⭐ WHICH BODY — NOT WHICH LIST. The selector picks the BODY (a swept extent); the launch table then names the CLASS whose list runs it. Splitting the two is
 /// what keeps a hybrid model's selector identical to a single-class one: a rung is one extent
 /// shared by every class, so "which body serves this context" never needs a class argument.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum BodySel {
     Body,
-    BodyFused,
     Rung(usize),
-    RungFused(usize),
 }
 
 /// Which op list a selection names. An index rather than a reference so the selector can hand one
 /// back while `&mut self` is still needed to allocate it.
 ///
 /// ⭐ EVERY BODY ARM CARRIES A CLASS INDEX. A hybrid-attention model has one body per attention
-/// class; a single-class model has exactly one, so `Body(0)`/`BodyFused(0)`/`Rung(i, 0)` is the
+/// class; a single-class model has exactly one, so `Body(0)`/`Rung(i, 0)` is the
 /// case every existing rolled bundle was. The RUNG index names the ladder entry (shared by every
 /// class — a rung is one swept extent); the class index names which class's list inside it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -6387,9 +6405,7 @@ enum ListSel {
     Prefix,
     Body(usize),
     Suffix,
-    BodyFused(usize),
     Rung(usize, usize),
-    RungFused(usize, usize),
 }
 
 /// ⭐ WHAT A FORWARD'S CALLER DOES WITH ITS LOGITS — the one fact that decides both whether the suffix
@@ -6544,6 +6560,11 @@ fn bind_ops<T: ktir_superdsc::collective::Tp>(
             .map(|s| (s.group, s.send))
             .collect();
     let mut ops = Vec::with_capacity(code.groups.len());
+    // ⭐ DOES THIS BUNDLE WALK — stated once, from the bundle's own groups, and stamped onto every
+    // group of it below: a walking program's whole span (seed, walk body, epilogue) serves one
+    // request per relaunch, so the seed re-runs between requests. Derived here because the span is
+    // a fact of WHICH GROUPS SIT IN ONE BUNDLE — no single group's record can state it.
+    let per_request = code.groups.iter().any(|g| g.kv.walk.is_some());
     for (i, g) in code.groups.iter().enumerate() {
         let mut collective = None;
         if let Some(consume) = g.kv.tp {
@@ -6566,7 +6587,7 @@ fn bind_ops<T: ktir_superdsc::collective::Tp>(
             };
             collective = Some(cb_plan::BoundCollective { send, me });
         }
-        ops.push(OpProg::new(g, &code.fp, i, collective));
+        ops.push(OpProg::new(g, &code.fp, i, collective, per_request));
     }
     Ok(ops)
 }
@@ -6703,29 +6724,6 @@ fn report_rb_time(t: &Timers) {
     );
 }
 
-/// The fold shape an image was derived under, as one comparable value: every
-/// `SessionKv` field the render reads that is not per-step, plus row 0's
-/// first `n_fold_pages` page ids (see [`StepImageKey::signature`] for why
-/// those, and why no row cursors). Cheap to build and compare — a dozen
-/// i64s against a cached key — against a step whose device time is
-/// milliseconds.
-fn fold_signature(fold: &SessionKv, n_fold_pages: i64) -> Vec<i64> {
-    let mut s = vec![
-        fold.paged as i64,
-        fold.page_slots.get(),
-        fold.page_stride_bytes.0 as i64,
-        fold_plan::fold_requests(fold),
-        fold.mask_rep_stride_bytes as i64,
-        fold.mask_blocks as i64,
-        fold.fold_pages as i64,
-        fold.int_rep_stride_bytes as i64,
-    ];
-    if let Some(row0) = fold.block_tables.first() {
-        s.extend(row0.iter().take(n_fold_pages.max(0) as usize).copied());
-    }
-    s
-}
-
 /// The replay player's decomposition — cumulative since process start, on a
 /// 256-step cadence. ⛔ ONE WRITE: the same single-`format!` discipline as
 /// `[progverify]` — an abort from senlib's monitor thread takes the process
@@ -6737,13 +6735,11 @@ fn report_replay(t: &Timers) {
     let steps = t.replay_steps.max(1);
     let derives = t.replay_derives.max(1);
     debug!(
-        "[sdsc-replay] {} step(s) replayed: {:.1}% from cached image(s) | {:.1} CB(s)/step, {} \
-         patch site(s)/image | lookup {:.1} us/step, submit {:.3} ms/step | {} derivation(s) at \
-         {:.1} ms each",
+        "[sdsc-replay] {} step(s) replayed: {:.1}% from cached image(s) | {:.1} CB(s)/step | \
+         lookup {:.1} us/step, submit {:.3} ms/step | {} derivation(s) at {:.1} ms each",
         t.replay_steps,
         100.0 * t.replay_hits as f64 / steps as f64,
         t.replay_cbs as f64 / steps as f64,
-        t.replay_sites / derives,
         1000.0 * t.replay_lookup_ms / steps as f64,
         t.replay_submit_ms / steps as f64,
         t.replay_derives,
@@ -6751,7 +6747,7 @@ fn report_replay(t: &Timers) {
     );
 }
 
-/// The submit / prefix-ladder / repeat-probe reports, emitted with the phase line.
+/// The submit / prefix-ladder reports, emitted with the phase line.
 fn report_phase_timers(compute_ms: f64) {
     let d = Diag::get();
     let mut t = timers();
@@ -6807,27 +6803,63 @@ fn report_phase_timers(compute_ms: f64) {
         }
         t.prefix_ms.clear();
     }
-    // THE REPEAT PROBE: `1st` and `again` both contain one drain, so `switch` — their difference —
-    // is what the card pays to bring in a program it was not already holding. If `switch` is most of
-    // `1st`, the per-request groups are paying for being distinct baked programs rather than for
-    // being launches, and one program relaunched per request removes it.
-    if d.repeat_probe && !t.repeat_ms.is_empty() {
-        eprintln!("[sdsc-repeat] same program launched twice back to back");
-        for (oi, (first, again, n, prog)) in &t.repeat_ms {
-            let (a, b) = (first / *n as f64, again / *n as f64);
-            eprintln!(
-                "[sdsc-repeat]   op {oi:<3}  1st={a:7.3} ms  again={b:7.3} ms  switch={:+7.3} ms  \
-                 n={n:<4}  {prog}",
-                a - b
-            );
-        }
-        t.repeat_ms.clear();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐ THE SHADOW BUFFER'S OWN LAWS — everything the pre-mapped send rests on that a card
+    /// is not needed for: page alignment (the vendor's pre-mapped contract), born zeros
+    /// (mmap semantics — the pad extents a staging walk never touches still read as zero),
+    /// `Vec::resize`'s grow/shrink contract, and [`fault_in`] preserving written bytes while
+    /// it populates the rest.
+    #[test]
+    fn a_host_buf_is_page_aligned_born_zero_and_resizes_like_a_vec() {
+        let mut b = HostBuf::zeroed(3 * HOST_PAGE + 100).expect("mmap of a few pages");
+        assert_eq!(b.len(), 3 * HOST_PAGE + 100);
+        // Page alignment is the pre-mapped door's contract, so it is the type's contract.
+        assert_eq!(
+            b.as_ptr() as usize % HOST_PAGE,
+            0,
+            "the shadow buffer must be page-aligned for the pre-mapped door"
+        );
+        // Born zeros — every byte, including the mapping's whole page-rounded extent.
+        assert!(b.iter().all(|&x| x == 0));
+        assert_eq!(pages_of(b.len()), 4 * HOST_PAGE);
+
+        // Write, then grow: the prefix is carried, the tail is born zeros (Vec::resize's
+        // contract, which `shadow_for_read`'s mirror-growth and prepare's pad-growth both
+        // rely on).
+        b[..7].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+        b.resize(5 * HOST_PAGE).expect("growth by mremap or copy");
+        assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);
+        assert!(b[7..].iter().all(|&x| x == 0));
+        assert_eq!(b.len(), 5 * HOST_PAGE);
+
+        // Shrink drops the tail; a regrown buffer does not remember it.
+        b.resize(HOST_PAGE).expect("shrink");
+        assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);
+        b.resize(2 * HOST_PAGE).expect("regrow");
+        assert!(b[HOST_PAGE..].iter().all(|&x| x == 0));
+
+        // The fault sweep is value-preserving: staged bytes survive it byte for byte.
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = (i % 251) as u8;
+        }
+        let before = b.to_vec();
+        fault_in(&mut b[..]);
+        assert_eq!(&b[..], &before[..]);
+
+        // The empty buffer is a value like any other: no mapping, reads as empty, and a
+        // resize out of it is a fresh born-zero buffer.
+        let mut e = HostBuf::empty();
+        assert!(e.is_empty());
+        e.resize(64).expect("resize out of empty");
+        assert_eq!(&e[..], &[0u8; 64]);
+        e.resize(0).expect("resize to empty");
+        assert!(e.is_empty());
+    }
 
     /// The seat law: a bundle runs in a process only when both agree on the world — no window and
     /// no link, or the link's window exactly — and every disagreement refuses by name.
@@ -6977,14 +7009,12 @@ mod tests {
         };
         let mut cache = StepImageCache::default();
         let key = StepImageKey {
-            sel: BodySel::RungFused(0),
-            n_fold_pages: 1,
-            signature: vec![7],
+            sel: BodySel::Rung(0),
         };
         let dummy = StepImage {
             data: std::sync::Arc::new(StepImageData {
                 canvas: std::sync::Arc::new(Vec::new()),
-                rows: Vec::new(),
+                rows: 0,
             }),
             barrier: false,
         };

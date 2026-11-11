@@ -27,6 +27,14 @@
 // The bf16 kernel's description of the grid, the stacked query tile, the online softmax, the
 // merge, the window and the fixed order of additions holds unchanged (`attn_decode_bf16.cu`).
 //
+// The split over keys (FP8 S8 W6b, flash-decoding): the grid is `kv_heads × S`. Of the window's
+// `n` tiles, CTA `s` takes the `per = max(min_tiles, ceil(n / S))` tiles from `s · per`, so
+// `used = ceil(n / per)` CTAs have keys and the others leave at once. With one used split (S = 1,
+// or a short sequence) CTA 0 is this kernel as before, line for line, and stores the output. With
+// more, each stores its unnormalised `(o, m, l)` (`o_split`, `ml_split`, f32) after its two
+// warpgroups' merge, and `attn_decode_merge.cu` merges the splits in split order: no atomics, the
+// order of additions a function of `(n, S, min_tiles)` alone.
+//
 // Shared memory: the Q tile (32 KiB, also the merge tiles), per warpgroup an e4m3 K and V tile and
 // one bf16 tile (128 KiB), the bf16 output tile (8 KiB), plus 1,024 bytes of alignment slack =
 // 173,056 bytes of dynamic shared memory, set once by `scratchy_cuda_attn_decode_fp8kv_prepare`
@@ -93,6 +101,10 @@ using q_gl = gl<bf16, 1, 1, -1, HEAD_DIM, q_tile>;
 using kv_gl = gl<fp8e4m3, -1, -1, KV_HEIGHT, HEAD_DIM, kv8_tile>;
 // The output row `[1, q_heads · 256]`, no TMA type: written by bulk copy only.
 using out_gl = gl<bf16, 1, 1, -1, -1>;
+// The split partials (`[S, kv_heads, 16, 256]` f32 rows, `[S, kv_heads, 2, 16]` f32 for m and l),
+// written by register-to-global stores, no TMA type.
+using split_gl = gl<float, -1, -1, MAX_GROUP, HEAD_DIM>;
+using ml_gl = gl<float, -1, -1, 2, MAX_GROUP>;
 // An index region, `[1, entries]` int with no TMA type: read element by element. Its u32 values
 // are all below 2^31 (block ids below `num_blocks` ≤ INT_MAX, and `P + L` ≤ 8192), so they read
 // as the same ints.
@@ -113,6 +125,11 @@ struct decode_globals {
     int hr;
     // The sliding window `W`, a multiple of 64; 0 for every key.
     int window;
+    // The split: `S` and the fewest tiles a split takes, and its partials (unused at one split).
+    int splits;
+    int min_tiles;
+    split_gl o_split;
+    ml_gl ml_split;
 };
 
 constexpr size_t SMEM_TILES =
@@ -175,6 +192,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_fp8kv_ker(
         key_first = max(0, kv_len - g.window);
         kv_first = key_first / KV_HEIGHT;
     }
+    // This CTA's split: tiles `j_lo .. j_hi` of the window's. A split with no tiles leaves before
+    // any shared state, every thread of it alike.
+    const int split = blockIdx.y;
+    const int n_tiles = kv_iters - kv_first;
+    const int per = max(g.min_tiles, (n_tiles + g.splits - 1) / g.splits);
+    const int used = (n_tiles + per - 1) / per;
+    if (split >= used) {
+        return;
+    }
+    const int j_lo = kv_first + split * per;
+    const int j_hi = min(kv_iters, j_lo + per);
 
     __shared__ kittens::semaphore q_arrived, k_smem_arrived[CONSUMER_WARPGROUPS],
         v_smem_arrived[CONSUMER_WARPGROUPS], compute_done[CONSUMER_WARPGROUPS];
@@ -197,8 +225,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_fp8kv_ker(
         // buffer, after that warpgroup released its previous tile, the loop's `t - 2`-th.
         warpgroup::decrease_registers<24>();
         if (warpid == NUM_WARPS - 4) {
-            for (int j = kv_first; j < kv_iters; j++) {
-                const int t = j - kv_first;
+            for (int j = j_lo; j < j_hi; j++) {
+                const int t = j - j_lo;
                 const int w = t % CONSUMER_WARPGROUPS;
                 if (t >= CONSUMER_WARPGROUPS) {
                     wait(compute_done[w], ((t - CONSUMER_WARPGROUPS) / CONSUMER_WARPGROUPS) % 2);
@@ -228,9 +256,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_fp8kv_ker(
         wait(q_arrived, 0);
 
         const int w = warpgroupid;
-        for (int j = kv_first + w; j < kv_iters; j += CONSUMER_WARPGROUPS) {
+        for (int j = j_lo + w; j < j_hi; j += CONSUMER_WARPGROUPS) {
             // The loop's `t`-th tile, in the phase the producer loaded it with.
-            const int t = j - kv_first;
+            const int t = j - j_lo;
             const int phase = (t / CONSUMER_WARPGROUPS) % 2;
             wait(k_smem_arrived[w], phase);
             // K widened into this warpgroup's bf16 tile, whose last reader (the previous tile's
@@ -324,6 +352,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_fp8kv_ker(
             __syncwarp();
             warp::add(o_part[0], o_part[0], o_part[1]);
             __syncwarp();
+            if (used > 1) {
+                // A split's partials: its unnormalised rows, its max `M` and its sum.
+                warp::load(o_reg, o_part[0]);
+                warp::store(g.o_split, o_reg, {split, kv_head, 0, 0});
+                warp::store(g.ml_split, max_vec_scaled, {split, kv_head, 0, 0});
+                warp::store(g.ml_split, norm_vec, {split, kv_head, 1, 0});
+            } else {
             warp::div_row(o_part[0], o_part[0], l_part[0]);
             __syncwarp();
             warp::load(o_reg, o_part[0]);
@@ -333,6 +368,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_fp8kv_ker(
             const uint32_t bytes = uint32_t(g.hr) * HEAD_DIM * sizeof(bf16);
             warp::tma::store_async(g.out[{0, 0, 0, kv_head * g.hr * HEAD_DIM}], o_bf[0][0], bytes);
             warp::tma::store_async_wait();
+            }
         }
     }
 }
@@ -352,6 +388,56 @@ extern "C" int scratchy_cuda_attn_decode_fp8kv_prepare(void) {
     }
     return static_cast<int>(cudaFuncSetAttribute(
         attn_decode_fp8kv_ker<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, DECODE_SMEM_BYTES));
+}
+
+// The launch at `splits` × `min_tiles` (one split: the unsplit kernel), `o_split` and `ml_split`
+// its partials (`[splits, kv_heads, 16, 256]` and `[splits, kv_heads, 2, 16]` f32; unused, and may
+// be null, at one split). Its shape checks are the callers'. Can throw (a tensor-map encode).
+static int launch_decode(const void* q, const void* k_cache, const void* v_cache,
+                         const void* block_table, const void* sequence, void* out,
+                         uint32_t q_heads, uint32_t kv_heads, uint32_t num_blocks, float scale,
+                         uint32_t window, uint32_t splits, uint32_t min_tiles, void* o_split,
+                         void* ml_split, void* stream) {
+    bf16* qp = static_cast<bf16*>(const_cast<void*>(q));
+    bf16* op = static_cast<bf16*>(out);
+    fp8e4m3* kp = static_cast<fp8e4m3*>(const_cast<void*>(k_cache));
+    fp8e4m3* vp = static_cast<fp8e4m3*>(const_cast<void*>(v_cache));
+    // Building each `gl` with a TMA type encodes its tensor map into host memory; nothing is
+    // allocated on the device. Q as `[q_heads, 256]`; K and V as `[num_blocks, kv_heads, 64,
+    // 256]`, whose bound on the block axis makes TMA zero-fill, never read past, a bad block;
+    // `out` as `[1, q_heads · 256]`, with no tensor map.
+    q_gl qg{qp, nullptr, nullptr, size_t(q_heads), nullptr};
+    kv_gl kg{kp, size_t(num_blocks), size_t(kv_heads), nullptr, nullptr};
+    kv_gl vg{vp, size_t(num_blocks), size_t(kv_heads), nullptr, nullptr};
+    out_gl og{op, nullptr, nullptr, size_t(1), size_t(q_heads) * HEAD_DIM};
+    // The index regions as `[1, entries]` int views: the block table's `MAX_BLOCKS_PER_SEQ`
+    // entries, the sequence's two.
+    index_gl tg{static_cast<int*>(const_cast<void*>(block_table)), nullptr, nullptr, size_t(1),
+                size_t(MAX_BLOCKS_PER_SEQ)};
+    index_gl sg{static_cast<int*>(const_cast<void*>(sequence)), nullptr, nullptr, size_t(1),
+                size_t(2)};
+    // The partials' views (no tensor map), over `out` when a launch of one split has none.
+    split_gl osg{static_cast<float*>(o_split != nullptr ? o_split : out), size_t(splits),
+                 size_t(kv_heads), nullptr, nullptr};
+    ml_gl mlg{static_cast<float*>(ml_split != nullptr ? ml_split : out), size_t(splits),
+              size_t(kv_heads), nullptr, nullptr};
+    decode_globals G{qg,          kg,  vg,         og,  tg,  sg, scale * LOG2E, int(q_heads / kv_heads),
+                     int(window), int(splits), int(min_tiles), osg, mlg};
+    void* args[] = {&G};
+    const dim3 grid{kv_heads, splits}, block{uint32_t(NUM_THREADS)};
+    auto* ker = window == 0 ? attn_decode_fp8kv_ker<false> : attn_decode_fp8kv_ker<true>;
+    return static_cast<int>(
+        cudaLaunchKernel(ker, grid, block, args, DECODE_SMEM_BYTES, static_cast<cudaStream_t>(stream)));
+}
+
+// Whether the decode's shape is refused (the list below `scratchy_cuda_attn_decode_fp8kv`'s).
+static bool decode_refused(uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+                           uint32_t block_size, uint32_t num_blocks, float scale, uint32_t window) {
+    return head_dim != uint32_t(HEAD_DIM) || q_heads == 0 || kv_heads == 0 ||
+           q_heads % kv_heads != 0 || q_heads / kv_heads > uint32_t(MAX_GROUP) ||
+           block_size != BLOCK_SIZE || num_blocks == 0 || !std::isfinite(scale) || !(scale > 0.0f) ||
+           window % BLOCK_SIZE != 0 || q_heads > uint32_t(INT_MAX) || num_blocks > uint32_t(INT_MAX) ||
+           window > uint32_t(INT_MAX);
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -378,41 +464,42 @@ extern "C" int scratchy_cuda_attn_decode_fp8kv(const void* q, const void* k_cach
                                                uint32_t block_size, uint32_t num_blocks,
                                                float scale, uint32_t window,
                                                void* stream /* cudaStream_t; null = default */) {
-    if (head_dim != uint32_t(HEAD_DIM) || q_heads == 0 || kv_heads == 0 ||
-        q_heads % kv_heads != 0 || q_heads / kv_heads > uint32_t(MAX_GROUP) ||
-        block_size != BLOCK_SIZE || num_blocks == 0 || !std::isfinite(scale) || !(scale > 0.0f) ||
-        window % BLOCK_SIZE != 0 || q_heads > uint32_t(INT_MAX) || num_blocks > uint32_t(INT_MAX) ||
-        window > uint32_t(INT_MAX)) {
+    if (decode_refused(q_heads, kv_heads, head_dim, block_size, num_blocks, scale, window)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        bf16* qp = static_cast<bf16*>(const_cast<void*>(q));
-        bf16* op = static_cast<bf16*>(out);
-        fp8e4m3* kp = static_cast<fp8e4m3*>(const_cast<void*>(k_cache));
-        fp8e4m3* vp = static_cast<fp8e4m3*>(const_cast<void*>(v_cache));
-        // Building each `gl` with a TMA type encodes its tensor map into host memory; nothing is
-        // allocated on the device. Q as `[q_heads, 256]`; K and V as `[num_blocks, kv_heads, 64,
-        // 256]`, whose bound on the block axis makes TMA zero-fill, never read past, a bad block;
-        // `out` as `[1, q_heads · 256]`, with no tensor map.
-        q_gl qg{qp, nullptr, nullptr, size_t(q_heads), nullptr};
-        kv_gl kg{kp, size_t(num_blocks), size_t(kv_heads), nullptr, nullptr};
-        kv_gl vg{vp, size_t(num_blocks), size_t(kv_heads), nullptr, nullptr};
-        out_gl og{op, nullptr, nullptr, size_t(1), size_t(q_heads) * HEAD_DIM};
-        // The index regions as `[1, entries]` int views: the block table's `MAX_BLOCKS_PER_SEQ`
-        // entries, the sequence's two.
-        index_gl tg{static_cast<int*>(const_cast<void*>(block_table)), nullptr, nullptr, size_t(1),
-                    size_t(MAX_BLOCKS_PER_SEQ)};
-        index_gl sg{static_cast<int*>(const_cast<void*>(sequence)), nullptr, nullptr, size_t(1),
-                    size_t(2)};
-        decode_globals G{qg, kg, vg, og, tg, sg, scale * LOG2E, int(q_heads / kv_heads),
-                         int(window)};
-        void* args[] = {&G};
-        const dim3 grid(kv_heads), block(NUM_THREADS);
-        auto* ker = window == 0 ? attn_decode_fp8kv_ker<false> : attn_decode_fp8kv_ker<true>;
-        return static_cast<int>(cudaLaunchKernel(ker, grid, block, args,
-                                                 DECODE_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
+        return launch_decode(q, k_cache, v_cache, block_table, sequence, out, q_heads, kv_heads,
+                             num_blocks, scale, window, 1, 1, nullptr, nullptr, stream);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// The split decode (W6b): `scratchy_cuda_attn_decode_fp8kv` on a grid of `kv_heads × splits`,
+// each split at least `min_tiles` tiles of 64 keys. When more than one split has keys, each
+// writes its partials to `o_split` (`[splits, kv_heads, 16, 256]` f32) and `ml_split`
+// (`[splits, kv_heads, 2, 16]` f32) and `out` is left to `scratchy_cuda_attn_decode_merge`, launched
+// after it with the same `(splits, min_tiles, window)`; else CTA 0 writes `out` itself, the unsplit
+// kernel's bits. Return codes and refusals as `scratchy_cuda_attn_decode_fp8kv`'s, and refused
+// too: `splits` zero or above `step::ATTN_DECODE_MAX_SPLITS` (64), `min_tiles` zero, or a null
+// partial at `splits > 1`.
+extern "C" int scratchy_cuda_attn_decode_fp8kv_split(
+    const void* q, const void* k_cache, const void* v_cache, const void* block_table,
+    const void* sequence, void* out, uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t block_size, uint32_t num_blocks, float scale, uint32_t window, uint32_t splits,
+    uint32_t min_tiles, void* o_split, void* ml_split,
+    void* stream /* cudaStream_t; null = default */) {
+    if (decode_refused(q_heads, kv_heads, head_dim, block_size, num_blocks, scale, window) ||
+        splits == 0 || splits > 64 || min_tiles == 0 || min_tiles > uint32_t(MAX_BLOCKS_PER_SEQ) ||
+        (splits > 1 && (o_split == nullptr || ml_split == nullptr))) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        return launch_decode(q, k_cache, v_cache, block_table, sequence, out, q_heads, kv_heads,
+                             num_blocks, scale, window, splits, min_tiles, o_split, ml_split,
+                             stream);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

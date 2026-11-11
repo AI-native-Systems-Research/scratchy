@@ -585,8 +585,8 @@ impl Worker for CudaServingWorker {
     }
 
     /// Per KV layer, a K and a V block of `kv_heads · block_size · head_dim` e4m3.
-    fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
-        self.kv().and_then(|k| kv_block_bytes(&k, block_size))
+    fn kv_block_bytes(&self, block: scratchy_core_common::KvBlockTokens) -> Option<usize> {
+        self.kv().and_then(|k| kv_block_bytes(&k, block.get()))
     }
 
     /// One sequence at a time: the GDN pool holds one slot and every tape runs one sequence.
