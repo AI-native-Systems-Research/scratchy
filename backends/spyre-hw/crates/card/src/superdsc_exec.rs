@@ -2883,42 +2883,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         Ok(())
     }
 
-    /// ⭐ PRE-GROW + PRE-FAULT every host-owned segment's shadow to its MANIFEST extent —
-    /// the same zero-and-fault work [`Executor::prepare`]'s grow loop does at the ALLOC's
-    /// padded size, stated where the host half runs. The ladder's device half is
-    /// bandwidth-bound on exactly this work: 33 rung prepares growing ~210 MB activation
-    /// shadows at once serialized on the memory path for ~0.35 s of a ~0.5 s wave
-    /// (MEASURED 2b fp8, nickm3, 2026-11-11, `[sdsc-prep-time]` weight-convert laps rising
-    /// 0.02 s → 0.38 s across the wave). Done here, the zeroing rides whatever window the
-    /// caller is overlapping the host build with, and prepare tops up only the allocator's
-    /// alignment pad on top (its own loop still runs — same rule, `need` now mostly met).
-    ///
-    /// BORROWED segments are skipped: their shadows stay 128 B placeholders until the alias
-    /// replaces them, and their MANIFEST extent is the owner's, not this session's to hold.
-    /// A reserve-only session's resident segments are skipped for the same reason prepare's
-    /// grow loop skips them: never staged, never sent, aliased away.
-    pub fn pregrow_shadows(&mut self) -> Result<()> {
-        let reserve_only = !self.binds_resident();
-        for i in 0..NUM_SEGMENTS {
-            if self.seg_borrowed[i]
-                || (reserve_only && is_resident_seg(i))
-                || !self.host_owned_seg(i)
-            {
-                continue;
-            }
-            let need = self.segment_bytes[i] as usize;
-            if let Some(v) = self.seg_host[i].host_buf_mut() {
-                if v.len() < need {
-                    v.resize(need)?;
-                }
-                if let Some(pages) = v.get_mut(..need) {
-                    fault_in(pages);
-                }
-            }
-        }
-        Ok(())
-    }
-
     // ──────────────────────────────────────────────────────────────────────────────────────────
     //  Prepare
     // ──────────────────────────────────────────────────────────────────────────────────────────
