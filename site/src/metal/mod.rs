@@ -4356,8 +4356,19 @@ mod tests {
         assert!(html.contains("25% ±4.2"), "scratchy's, with its range");
         assert!(html.contains("2-hop 30%, 3-hop 20%, 4-hop 10%"));
         assert!(
-            html.contains("ran to its cap: 331 of 400"),
+            html.contains("cut off: 331 of 400 answers hit the length limit"),
             "oMLX's, held back"
+        );
+        // Above the table, a plot: scratchy's dot over its range, oMLX's reason on its own line.
+        assert!(html.contains("Each dot is an engine"), "the plot's note");
+        assert!(
+            html.contains("oMLX: 331 of 400 cut off"),
+            "a held-back mark says why, in short"
+        );
+        assert!(html.contains("left: 25.00%"), "scratchy's dot at its 25%");
+        assert!(
+            at("Each dot is an engine") < at("Table view"),
+            "the table folded under it"
         );
         assert!(
             !html.contains("timed, not scored"),

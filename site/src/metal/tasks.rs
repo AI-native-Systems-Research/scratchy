@@ -3,7 +3,8 @@
 
 use dioxus::prelude::*;
 
-use crate::carbon::{Stack, Table, TableCell, TableRow};
+use crate::carbon::{Fold, Stack, Table, TableCell, TableRow};
+use crate::charts::{RangeGroup, RangeMark, range_dots};
 
 use super::data::{Model, RequestTiming, TaskCell};
 use super::numbers::Engine;
@@ -149,7 +150,10 @@ fn no_accuracy(c: &TaskCell) -> String {
     if c.accuracy.is_none() {
         "not scored".to_string()
     } else if mostly_capped(c) {
-        format!("ran to its cap: {}", of(c.capped_answers))
+        format!(
+            "cut off: {} answers hit the length limit",
+            of(c.capped_answers)
+        )
     } else if mostly_thought(c) {
         format!("answered in reasoning: {}", of(c.thinking_answers))
     } else {
@@ -411,8 +415,8 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
         ),
         (
             "accuracy",
-            "The share of tasks answered right, a failed or capped answer counted \
-            wrong, ± its 95% range over the tasks. Not shown where most answers ran to their cap, \
+            "The share of tasks answered right, a failed or cut-off answer counted \
+            wrong, ± its 95% range over the tasks. Not shown where most answers were cut off at the length limit, \
             opened in reasoning, or failed: the cell says which.",
         ),
         (
@@ -420,8 +424,8 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
             "Accuracy over each hop count's questions: 2-hop, 3-hop and 4-hop.",
         ),
         (
-            "capped",
-            "Answers that ran to their cap rather than ending on their own.",
+            "cut off",
+            "Answers cut off at the length limit before they ended on their own.",
         ),
         ("J/right answer", "Energy over the right answers alone."),
     ];
@@ -429,10 +433,18 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
         .iter()
         .map(|(h, a)| (h.to_string(), a.to_string()))
         .unzip();
+    let groups = accuracy_dots(dataset, pairs);
     rsx! {
         Stack { gap: 2,
             // The dataset's own name, "MuSiQue accuracy": its scored cell's name is "MuSiQue, scored".
             strong { "{workload_label(dataset).0.split(',').next().unwrap_or_default()} accuracy" }
+            p { style: "font-size: 0.875rem",
+                "Each dot is an engine's accuracy on the same tasks, its bar the 95% range. Where two \
+                 engines' bars overlap they are within noise of each other; where they do not, the gap \
+                 is real. Hover a dot for its numbers; the table view has every one."
+            }
+            {range_dots(&groups)}
+            Fold { title: "Table view",
             Table { headers, abouts,
                 for (model, engine, c) in rows {
                     TableRow {
@@ -447,8 +459,80 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
                     }
                 }
             }
+            }
         }
     }
+}
+
+/// Why a cell has no accuracy, short enough for its line on the plot: "331 of 400 cut off",
+/// "268 of 2,415 answered"; the table view words it in full ([`right`]).
+fn short_reason(c: &TaskCell) -> String {
+    let done = c.completed.unwrap_or(0) as usize;
+    let of = |k: Option<u32>| {
+        format!(
+            "{} of {}",
+            crate::thousands(k.unwrap_or(0) as usize),
+            crate::thousands(done)
+        )
+    };
+    if mostly_failed(c) {
+        let sent = done + c.failed.unwrap_or(0) as usize;
+        format!(
+            "{} of {} answered",
+            crate::thousands(done),
+            crate::thousands(sent)
+        )
+    } else if mostly_capped(c) {
+        format!("{} cut off", of(c.capped_answers))
+    } else if mostly_thought(c) {
+        format!("reasoning {}", of(c.thinking_answers))
+    } else {
+        right(c)
+    }
+}
+
+/// [`accuracy_table`]'s plot: a group a model, in the order the section reads them, a row a Mac
+/// it ran on, a mark an engine, scratchy first: its accuracy and 95% range, or why it has none.
+fn accuracy_dots(dataset: &str, pairs: &[(&str, &Model)]) -> Vec<RangeGroup> {
+    let mut groups: Vec<RangeGroup> = Vec::new();
+    for &(chip, m) in pairs {
+        let mut engines = vec![Engine::Scratchy];
+        engines.extend(rival_of(m, dataset));
+        let marks: Vec<RangeMark> = (engines.iter().zip(["s1", "s2"]))
+            .filter_map(|(&e, class)| {
+                let c = (e.tasks(m).iter())
+                    .find(|c| of_dataset(c, dataset) && !c.timed_answers && c.accuracy.is_some())?;
+                let at = match (accuracy(c), range(c)) {
+                    (Some(a), Some(r)) => Ok((a, a - r / 100.0, a + r / 100.0)),
+                    (Some(a), None) => Ok((a, a, a)),
+                    _ => Err(short_reason(c)),
+                };
+                let mut tip = vec![
+                    format!("{} on {chip}", m.stem),
+                    format!("accuracy {}", scored(c)),
+                ];
+                tip.extend(by_hops(c).filter(|_| accuracy(c).is_some()));
+                if let Some(n) = c.num_tasks {
+                    tip.push(format!("over {} tasks", crate::thousands(n as usize)));
+                }
+                Some(RangeMark {
+                    class,
+                    name: e.label().to_string(),
+                    at,
+                    tip,
+                })
+            })
+            .collect();
+        if marks.is_empty() {
+            continue;
+        }
+        let row = (chip.to_string(), marks);
+        match groups.iter_mut().find(|(stem, _)| stem == &m.stem) {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((m.stem.clone(), vec![row])),
+        }
+    }
+    groups
 }
 
 /// [`tasks_table`]'s rows of one workload: its detail in a dataset's section. Nothing for a model
@@ -842,7 +926,10 @@ mod tests {
             }))
             .unwrap()
         };
-        assert_eq!(right(&cell(331, 0)), "ran to its cap: 331 of 400");
+        assert_eq!(
+            right(&cell(331, 0)),
+            "cut off: 331 of 400 answers hit the length limit"
+        );
         assert_eq!(right(&cell(0, 378)), "answered in reasoning: 378 of 400");
         assert_eq!(
             right(&cell(0, 1)),

@@ -11,7 +11,7 @@ use std::fmt;
 use dioxus::prelude::*;
 use serde::Serialize;
 
-use crate::carbon::{Alignment, Definition, Layer, Stack, Tile};
+use crate::carbon::{Alignment, Definition, Layer, Stack, Tile, TipHeading};
 
 /// Draws every chart from its rendered spec.
 pub const CHARTS_JS: &str = include_str!("charts.js");
@@ -837,6 +837,107 @@ pub fn ratio_ink(step: usize) -> &'static str {
         "light-dark(#ffffff, #161616)"
     } else {
         "light-dark(#161616, #ffffff)"
+    }
+}
+
+/// One engine's mark on a [`range_dots`] row: its series class (`s1`, `s2`, as the charts colour
+/// it), its name, and its value with its range on a 0 to 1 scale, the tooltip's lines; or, where
+/// it has none, why, written on its line instead.
+pub struct RangeMark {
+    pub class: &'static str,
+    pub name: String,
+    pub at: Result<(f64, f64, f64), String>,
+    pub tip: Vec<String>,
+}
+
+/// A [`range_dots`] group: its heading, and its rows, each a label and its engines' marks.
+pub type RangeGroup = (String, Vec<(String, Vec<RangeMark>)>);
+
+/// Values with their ranges on one 0 to 100% line a row, grouped: each group a heading, each row
+/// a label and a line an engine, its dot at the value and a bar over its range, so two engines'
+/// ranges read as overlapping or apart at a glance. The first series is a filled dot, the rest
+/// hollow, so they read apart without colour too. Plain HTML: no chart data to fetch.
+pub fn range_dots(groups: &[RangeGroup]) -> Element {
+    let grid = "light-dark(#e0e0e0, #393939)";
+    let pct = |v: f64| format!("{:.2}%", (v * 100.0).clamp(0.0, 100.0));
+    // The engines named in the legend, in their first row's order.
+    let mut legend: Vec<(&'static str, String)> = Vec::new();
+    for (_, rows) in groups {
+        for (_, marks) in rows {
+            for m in marks {
+                if !legend.iter().any(|(c, _)| *c == m.class) {
+                    legend.push((m.class, m.name.clone()));
+                }
+            }
+        }
+    }
+    let first = legend.first().map(|(c, _)| *c);
+    let dot = move |class: &str| {
+        let c = colour(class);
+        match Some(class) == first {
+            true => format!("background: {c}; border: 2px solid {c}"),
+            false => format!("background: light-dark(#ffffff, #161616); border: 2px solid {c}"),
+        }
+    };
+    // The axis a panel draws over its lines: 0 to 100% in quarters.
+    let axis = rsx! {
+        div {}
+        div { style: "position: relative; height: 1rem; font-size: 0.625rem; margin: 0 0.5rem",
+            for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                span { style: "position: absolute; left: {pct(t)}; transform: translateX(-50%)", "{t * 100.0:.0}%" }
+            }
+        }
+    };
+    rsx! {
+        Stack { gap: 3,
+            div { style: "display: flex; gap: 1.5rem; font-size: 0.75rem",
+                for (class, name) in &legend {
+                    span { style: "display: inline-flex; align-items: center; gap: 0.375rem",
+                        span { style: "width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; {dot(class)}" }
+                        "{name}"
+                    }
+                }
+            }
+            // A panel a group, side by side as the latency plots are, each with its own axis.
+            div { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: 1rem 1.5rem; align-items: start",
+                for (heading, rows) in groups {
+                    div { style: "display: grid; grid-template-columns: max-content minmax(0, 1fr); column-gap: 0.75rem; row-gap: 0.25rem; align-items: center",
+                        div { style: "grid-column: 1 / -1; font-weight: 600; font-size: 0.875rem; margin-bottom: 0.25rem", "{heading}" }
+                        {axis.clone()}
+                        for (label, marks) in rows {
+                            div { style: "font-size: 0.75rem; white-space: nowrap", "{label}" }
+                            div { style: "position: relative; height: calc({marks.len()} * 1rem + 0.25rem); margin: 0 0.5rem; background: linear-gradient(to right, {grid} 1px, transparent 1px) 0 0 / 25% 100%; border-right: 1px solid {grid}",
+                                for (k, m) in marks.iter().enumerate() {
+                                    {
+                                        let top = format!("calc({k} * 1rem + 0.625rem)");
+                                        match &m.at {
+                                            Ok((v, lo, hi)) => {
+                                                let c = colour(m.class);
+                                                rsx! {
+                                                    div { style: "position: absolute; top: {top}; left: {pct(*lo)}; width: calc({pct(*hi)} - {pct(*lo)}); height: 2px; transform: translateY(-50%); background: {c}" }
+                                                    cds-tooltip { "align": "top", style: "position: absolute; top: {top}; left: {pct(*v)}; transform: translate(-50%, -50%); display: flex",
+                                                        div { tabindex: "0", style: "width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; {dot(m.class)}" }
+                                                        cds-tooltip-content { style: "text-align: left",
+                                                            TipHeading { heading: m.name.clone() }
+                                                            for line in &m.tip { div { "{line}" } }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(why) => rsx! {
+                                                div { style: "position: absolute; top: {top}; left: 0.25rem; transform: translateY(-50%); font-size: 0.6875rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: calc(100% - 0.5rem)",
+                                                    "{m.name}: {why}"
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
