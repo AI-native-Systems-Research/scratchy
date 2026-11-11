@@ -412,8 +412,8 @@ pub(crate) struct LaunchWhere {
     /// ⭐ HOW MANY REQUESTS THIS LAUNCH SERVES, and the pitch their tables sit at — the request half
     /// of `fold_plan`'s relaunch law (a walking bundle's span repeats once per request, its tables
     /// `request · pitch` into the activation segment). ONE request at no pitch is every launch
-    /// today; a packed prefill launch is the one that states more, and it states the step's own
-    /// `card_request_pitch` with it.
+    /// today; ⛔ a packed prefill states none of it — the window unroll's launches are ordinary,
+    /// one program a window with its own table tids, so this stays at its default.
     pub(crate) requests: fold_plan::Requests,
 }
 

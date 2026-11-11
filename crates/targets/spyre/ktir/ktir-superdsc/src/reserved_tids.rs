@@ -446,7 +446,7 @@ pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
 pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 9] = [
+pub const RESERVED_REGIONS: [TidRegion; 10] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -518,6 +518,14 @@ pub const RESERVED_REGIONS: [TidRegion; 9] = [
         base: TP_RECV_TID,
         slots: TP_WINDOW_CUTS * TP_MAX_WORLD,
     },
+    // ⭐ THE PAGED PREFILL's PER-WINDOW TABLES — three slots a window past the first (window 0
+    // keeps the paged step's sentinels; see [`paged_window_tid`]). Below `tp_recv`'s floor, in
+    // tids no artifact has ever carried.
+    TidRegion {
+        name: "paged_window",
+        base: PAGED_WINDOW_TID,
+        slots: (PAGED_MAX_WINDOWS - 1) * 3,
+    },
 ];
 
 /// ⭐ RESERVED tid for the TENSOR-PARALLEL RECEIVE WINDOW — its first block
@@ -552,6 +560,59 @@ pub const fn tp_recv_block_tid(cut: u32, sender: u32) -> u32 {
         "a sender past the widest reserved world"
     );
     TP_RECV_TID - (cut * TP_MAX_WORLD + sender)
+}
+
+/// ⭐⭐⭐ THE PAGED PREFILL's PER-WINDOW TABLES — the splice-time window unroll's operand tids.
+///
+/// A packed prefill rung (one `AttnPrefill` node over `w·S` rows) lowers in the SPLICE to `S`
+/// one-sequence attention programs (the reference's own semantics: its flattened body loops
+/// `query_start_loc`, one launch a sequence). Every window's program is the SAME compiled kernel
+/// — `NUM_TOKENS` is the descriptor bound of the whole `query`/`out` tensors and
+/// `PADDED_QUERY_LEN` one request's width, identical across windows — so a window differs from
+/// the solo program only in which buffers its three host-staged tables (`query_row_index`,
+/// `page_index_table`, `mask_stack`) name. Those buffers are per-window OPERANDS at the tids
+/// this region mints, never a shifted copy of one segment: the runtime binds one address per
+/// segment, so a per-request fact that moves a segment drags every shared constant off its
+/// staged bytes (the dead packed-rung design's measured failure). Ordinary placements at
+/// ordinary tids are the only thing this ABI expresses cleanly — the same fact the decode
+/// batch's row-indexed tables state.
+///
+/// ## Window 0 keeps the sentinels — the `rope_p_class_tid(0)` law
+/// At `S = 1` the unroll is one program binding window 0's tids, which ARE
+/// [`PAGED_QUERY_ROWS_TID`] / [`PAGED_PAGE_TABLE_TID`] / [`PAGED_MASK_TID`]: a solo prefill's
+/// ops name exactly the tids they name today and its bundle is byte-identical. Windows `1..`
+/// take this region's slots.
+pub const PAGED_WINDOW_TID: u32 = TP_RECV_TID - TP_WINDOW_CUTS * TP_MAX_WORLD;
+
+/// The widest rung the window tids are reserved for — the largest request capacity a packed
+/// prefill rung bakes, pinned like `TP_MAX_WORLD` (an unbaked rung capacity is a bake refusal
+/// at `paged_window_tid`'s own assert, never an alias of the region below).
+pub const PAGED_MAX_WINDOWS: u32 = 64;
+
+/// The three host-staged tables a prefill window binds. Window 0 of each is the paged step's
+/// own sentinel; windows `1..` descend this region, three slots a window.
+pub const PAGED_WINDOW_QUERY_ROWS: u32 = 0;
+pub const PAGED_WINDOW_PAGE_TABLE: u32 = 1;
+pub const PAGED_WINDOW_MASK: u32 = 2;
+pub const fn paged_window_tid(window: u32, table: u32) -> u32 {
+    assert!(table < 3, "a prefill window binds three tables (query rows, page table, mask)");
+    if window == 0 {
+        // ⭐ DOCUMENTED WHY: window 0 IS the solo prefill's tid, for all three tables. Keeping
+        // them there is what makes a solo rung's ops name the sentinels exactly as before —
+        // byte-identical bundles — instead of renumbering the tables and silently repointing
+        // ids already baked into artifacts.
+        return match table {
+            0 => PAGED_QUERY_ROWS_TID,
+            1 => PAGED_PAGE_TABLE_TID,
+            _ => PAGED_MASK_TID,
+        };
+    }
+    assert!(
+        window < PAGED_MAX_WINDOWS,
+        "a prefill window past the widest reserved rung capacity"
+    );
+    // Window 1 takes the region's BASE slots (window 0 lives on the sentinels, so none wasted).
+    reserved_region("paged_window").at((window - 1) * 3 + table)
 }
 
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
@@ -632,6 +693,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
     assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
+    assert!(reserved_region("paged_window").base == PAGED_WINDOW_TID);
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
@@ -793,6 +855,37 @@ fn class_tids_keep_class_zero_on_the_sentinel_and_descend_their_own_regions() {
         rope_p_class_tid(8) >= reserved_region("rope_p_class").floor(),
         "rope class 8 walked below the rope_p_class region"
     );
+}
+
+/// ⭐ THE WINDOW LAWS, PINNED — window 0 answers the paged step's own sentinels (so a solo
+/// prefill's bundle is byte-identical), windows `1..` descend their own region three slots a
+/// window, and no window's table ever shares a tid with another window's or with any region the
+/// table below already owns.
+#[test]
+fn window_tids_keep_window_zero_on_the_sentinels_and_descend_their_own_region() {
+    // Window 0 IS the solo prefill's tid, for all three tables.
+    assert_eq!(paged_window_tid(0, 0), PAGED_QUERY_ROWS_TID);
+    assert_eq!(paged_window_tid(0, 1), PAGED_PAGE_TABLE_TID);
+    assert_eq!(paged_window_tid(0, 2), PAGED_MASK_TID);
+    // Window 1 descends into its own region, below tp_recv's floor.
+    let r = reserved_region("paged_window");
+    assert_eq!(paged_window_tid(1, 0), r.base);
+    assert!(r.base < reserved_region("tp_recv").floor());
+    // No two (window, table) pairs share a tid — including window 0's sentinels, which the
+    // paged step's other slots (write rows, kv row pool, the decode batch tables) must not
+    // collide with either.
+    let mut seen: std::collections::BTreeMap<u32, (u32, u32)> = Default::default();
+    for w in 0..PAGED_MAX_WINDOWS {
+        for t in 0..3u32 {
+            let tid = paged_window_tid(w, t);
+            let prev = seen.insert(tid, (w, t));
+            assert!(
+                prev.is_none(),
+                "window {w} table {t} shares a tid with window {prev:?} — two host-staged \
+                 tables would share one placement",
+            );
+        }
+    }
 }
 
 /// ⛔ THE OVERFLOW IS A REFUSAL, NOT A WRAP — a 9th rope class must not alias the identity classes.

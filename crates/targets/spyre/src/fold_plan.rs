@@ -63,9 +63,10 @@ pub struct OpKv {
 /// states it (the worker forwards one request at a time, and a decode batch's requests ride ONE
 /// launch of the batched kernel — its bundle's `per_request` span repeats once, by the same
 /// default), and a request's tables sit at `request · pitch` whatever the pitch is, so at one
-/// request the pitch is never read. A launch serving several is a packed prefill's statement to
-/// make, and it names its pitch with it — the step's own `card_request_pitch`, the same number the
-/// host stages the tables by.
+/// request the pitch is never read. ⛔ A PACKED PREFILL NEEDS NONE OF THIS — the window unroll
+/// (the splice's S one-sequence programs, each binding its own tables at `paged_window_tid`)
+/// makes every launch ordinary; this struct is the dead per-request-relaunch design's residue,
+/// held only by its own default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Requests {
     pub count: u32,

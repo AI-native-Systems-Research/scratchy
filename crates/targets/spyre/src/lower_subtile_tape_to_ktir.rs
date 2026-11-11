@@ -1170,7 +1170,7 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 query_rows,
                 scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
             ) {
-                Ok(e) => Ops(vec![e]),
+                Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }

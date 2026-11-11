@@ -145,8 +145,8 @@ pub fn kernel_values(
                  ZERO, and page 0 is a REAL page — every block would read page 0's keys"
             )
         })?;
-        if card.mask.0 == tid {
-            return Ok(Staged::F32(std::borrow::Cow::Owned(card.mask.1.clone())));
+        if let Some(values) = card.floats(tid) {
+            return Ok(Staged::F32(std::borrow::Cow::Owned(values.to_vec())));
         }
         return card
             .words(tid)
@@ -658,7 +658,7 @@ mod tests {
             }
         }
         match staged(ForwardKernel::Paged, STEP.mask, &inp).expect("a mask stack") {
-            Staged::F32(v) => assert_eq!(&v[..], &card.mask.1[..]),
+            Staged::F32(v) => assert_eq!(Some(&v[..]), card.floats(STEP.mask)),
             _ => panic!("a mask stack is a value tensor"),
         }
         // The pool's statics are staged at load, so the tape has no step for them.

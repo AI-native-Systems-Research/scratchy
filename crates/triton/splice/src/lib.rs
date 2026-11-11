@@ -2059,7 +2059,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // agreement check below refuses a mint that does not describe the graph being lowered.
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
     paged_rows: PagedRows,
-) -> Result<EmittedOp<T>, String> {
+) -> Result<Vec<EmittedOp<T>>, String> {
     let batch = paged_rows == PagedRows::Batch;
     let decode = !batch && node.output.region.rows.len == 1;
     let row = if batch {
@@ -2237,7 +2237,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
             .map_err(|e| format!("triton splice: node_for: {e}"))?;
         let k = rebind(
-            positional,
+            &positional,
             format!("attn_s{}", node.id.index()),
             vec![
                 t(&node.inputs[0]),
@@ -2252,7 +2252,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         )?;
         let mut e = EmittedOp::bare(format!("attn_s{}", node.id.index()));
         e.ktir = Some(k);
-        return Ok(e);
+        return Ok(vec![e]);
     }
     let mut pointers = vec![
         ("query", "*fp16"),
@@ -2302,35 +2302,52 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let module = compile_kernel(src, &spec, &[1])?;
     let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
-    // ⭐ THE BINDINGS ARE THE REQUEST SHIFT'S WHOLE REACH. A launch serving several requests
-    // relaunches this program's whole group span once per request (`fold_plan`'s request law),
-    // shifting the activation segment by one table pitch — so the activation-segment operands the
-    // span reads must be EXACTLY the per-request tables the host stages at that pitch
-    // (`query_row_index`, `page_index_table`, `mask_stack`), and nothing else. The list below is
-    // that law stated literally: `query`/`out` are the graph's own rows (gathered and scattered
-    // through `query_row_index` — absolute rows, never shifted), the pools are append-only KV, and
-    // the three reserved-tid buffers are the tables. A new activation-segment operand added here
-    // is a new table the host must stage per request — it does not ride the shift for free.
-    let mut bindings = vec![
-        t(&node.inputs[0]),
-        BufferId::new(tids.query_rows),
-        t(&node.inputs[1]),
-        t(&node.inputs[2]),
-        BufferId::new(tids.page_table),
-    ];
-    if decode {
-        bindings.push(BufferId::new(tids.kv_row_pool));
+    // ⭐⭐⭐ THE S AXIS IS A SPLICE-TIME UNROLL — S one-sequence programs of ONE compiled kernel.
+    // The kernel's own contract (censused in `page_attn_head_major_prefill.py`): `NUM_TOKENS` is
+    // the descriptor bound of the WHOLE `query`/`out` tensors (the graph's rows — a window's
+    // gather/scatter stays in bounds for any window), `PADDED_QUERY_LEN` one request's width, and
+    // `query_row_index` gathers this sequence's absolute rows. Every constexpr is therefore
+    // IDENTICAL across windows — the compiled module above is one object — and a window differs
+    // from the solo program only in which buffers its three host-staged tables name:
+    // `query_row_index`, `page_index_table`, `mask_stack` at `paged_window_tid(r, ·)`.
+    //
+    // ⛔ THE TABLES ARE ORDINARY OPERANDS AT ORDINARY TIDS, NEVER A SHIFTED SEGMENT. The runtime
+    // binds ONE address per activation segment, so a per-request fact expressed as a segment shift
+    // drags every shared constant (rope-P, RMS halves, fp8 bounds) off its staged bytes — the dead
+    // packed-rung design's measured failure. Window 0's tids ARE the paged step's sentinels
+    // (`paged_window_tid(0, ·)`, the `rope_p_class_tid(0)` law), so at one request the unroll is
+    // one program naming exactly the tids it names today — byte-identical. The pools are
+    // append-only KV, `query`/`out` the graph's own rows, and the decode leg's `kv_row_pool` is
+    // per-step state shared by every window (decode is one row, so its unroll is one window by
+    // construction). A new activation-segment operand added here is a new table the host must
+    // stage per window — it does not ride the unroll for free.
+    let windows = query_rows.requests().get();
+    let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(windows as usize);
+    for r in 0..windows {
+        let mut bindings = vec![
+            t(&node.inputs[0]),
+            BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, 0)),
+            t(&node.inputs[1]),
+            t(&node.inputs[2]),
+            BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, 1)),
+        ];
+        if decode {
+            bindings.push(BufferId::new(tids.kv_row_pool));
+        }
+        let mask_tid = ktir_superdsc::reserved_tids::paged_window_tid(r, 2);
+        bindings.extend([BufferId::new(mask_tid), t(&node.output)]);
+        // Window 0 keeps the solo name byte-for-byte; windows past the first suffix theirs.
+        let name = if r == 0 {
+            format!("attn_s{}", node.id.index())
+        } else {
+            format!("attn_s{}_w{}", node.id.index(), r)
+        };
+        let k = rebind(&positional, name.clone(), bindings, Some(BufferId::new(mask_tid)))?;
+        let mut e = EmittedOp::bare(name);
+        e.ktir = Some(k);
+        ops.push(e);
     }
-    bindings.extend([BufferId::new(tids.mask), t(&node.output)]);
-    let k = rebind(
-        positional,
-        format!("attn_s{}", node.id.index()),
-        bindings,
-        Some(BufferId::new(tids.mask)),
-    )?;
-    let mut e = EmittedOp::bare(format!("attn_s{}", node.id.index()));
-    e.ktir = Some(k);
-    Ok(e)
+    Ok(ops)
 }
 
 /// THE KV WRITE'S SPLICE — the scatter half of a `RopeAppend`: compile spyre-inference's
@@ -2444,7 +2461,7 @@ pub fn lower_kv_write<
         BufferId::new(PagedStepTids::RESERVED.write_rows),
     ];
     let name = format!("kvwrite_s{}", node.id.index());
-    let k = rebind(positional, name.clone(), bindings, None)?;
+    let k = rebind(&positional, name.clone(), bindings, None)?;
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
     Ok(e)
@@ -2452,13 +2469,17 @@ pub fn lower_kv_write<
 
 /// A compiled program re-stated with this node's own name and bindings (`node_for` mints positional
 /// buffer ids), refused if the kernel's parameter list and the bindings disagree in length.
+///
+/// Takes the positional node BY REFERENCE: `IRFunction` is `Copy` (the arena owns the ops), so ONE
+/// compiled module is re-bound many times — the window unroll's `S` programs of one kernel.
 fn rebind(
-    positional: KtirNode,
+    positional: &KtirNode,
     name: String,
     bindings: Vec<BufferId>,
     mask: Option<BufferId>,
 ) -> Result<KtirNode, String> {
-    let KtirNode { func, program, .. } = positional;
+    let func = positional.func;
+    let program = positional.program;
     if func.arguments.len() != bindings.len() {
         return Err(format!(
             "triton splice: {name} compiled to {} parameters but the node states {} bindings — \

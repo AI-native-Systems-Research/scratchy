@@ -2615,6 +2615,9 @@ fn the_paged_attention_splices_with_its_contract() {
             continue;
         }
         let spliced = spliced.unwrap_or_else(|e| panic!("splice compiled {at}: {e}"));
+        // One request ⇒ one window, binding the paged step's own sentinels.
+        assert_eq!(spliced.len(), 1, "{at}: the S=1 unroll is one window");
+        let spliced = &spliced[0];
         // ⛔ THE NAME LAW — `attn_s{id}`.
         assert_eq!(
             spliced.op_name,
@@ -2873,13 +2876,40 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
             .expect("the rung's capacity is nonzero"),
     )
     .expect("128 rows fit a u32");
-    let e = splice(packed)
+    let ops = splice(packed)
         .unwrap_or_else(|e| panic!("the packed (64, 2) mint splices the 128-row graph: {e}"));
-    assert!(
-        e.ktir
-            .as_ref()
-            .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn)),
-        "the packed mint is the prefill walk's own program"
+    // ⭐ THE S=2 MINT UNROLLS TO TWO WINDOWS of the one compiled kernel, each carrying the
+    // prefill walk's own program and binding its own table tids — window 0 the sentinels,
+    // window 1 the `paged_window` region's.
+    assert_eq!(ops.len(), 2, "the S=2 mint is two windows");
+    for (r, e) in ops.iter().enumerate() {
+        assert!(
+            e.ktir
+                .as_ref()
+                .is_some_and(|k| matches!(k.program, ktir_superdsc::ktir_node::Program::PagedAttn)),
+            "window {r} is the prefill walk's own program"
+        );
+        let k = e.ktir.as_ref().expect("window {r} carries its program");
+        let bound: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
+        let want_mask = ktir_superdsc::reserved_tids::paged_window_tid(r as u32, 2);
+        let want_pages = ktir_superdsc::reserved_tids::paged_window_tid(r as u32, 1);
+        let want_rows = ktir_superdsc::reserved_tids::paged_window_tid(r as u32, 0);
+        assert!(bound.contains(&want_mask), "window {r} binds its own mask stack");
+        assert!(bound.contains(&want_pages), "window {r} binds its own page table");
+        assert!(bound.contains(&want_rows), "window {r} binds its own query rows");
+        for other in 0..2u32 {
+            if other != r as u32 {
+                assert!(
+                    !bound.contains(&ktir_superdsc::reserved_tids::paged_window_tid(other, 2)),
+                    "window {r} does not bind window {other}'s mask stack"
+                );
+            }
+        }
+    }
+    // Window 0's tables ARE the sentinels — the solo degeneration law.
+    assert_eq!(
+        ktir_superdsc::reserved_tids::paged_window_tid(0, 2),
+        scratchy_triton_splice::PagedStepTids::RESERVED.mask
     );
     // The S=1 mint of the SAME graph — one request of all 128 rows — still splices.
     splice(pair_of_one_request(128))
@@ -2979,14 +3009,15 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
             pair_of_one_request(s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
-    programs.push(
+    programs.extend(
         scratchy_triton_splice::lower_attn(
             attn,
             &ir,
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
             s.active_cap(),
             // One request of the graph's `mq` rows — the S=1 extent pair this walk's
-            // constexprs state (`NUM_TOKENS` = mq, `PADDED_QUERY_LEN` = mq).
+            // constexprs state (`NUM_TOKENS` = mq, `PADDED_QUERY_LEN` = mq): the window
+            // unroll is ONE window, binding the paged step's own sentinels.
             pair_of_one_request(s.mq),
             PagedRows::Sequence,
         )
@@ -3277,7 +3308,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
             batch_pair_of_one_row_each(s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
-    programs.push(
+    programs.extend(
         scratchy_triton_splice::lower_attn(
             attn,
             &ir,
@@ -3712,8 +3743,10 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
                 PagedRows::Sequence,
             )
             .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
-        spliced
+        assert_eq!(spliced.len(), 1, "mq={mq}: one request is one window");
+        spliced[0]
             .ktir
+            .as_ref()
             .expect("spliced op carries its program")
             .func
             .ops_deep()
