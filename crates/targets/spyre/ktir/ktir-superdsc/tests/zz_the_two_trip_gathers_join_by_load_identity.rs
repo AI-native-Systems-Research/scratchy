@@ -438,7 +438,7 @@ fn the_windowed_drop_keeps_the_stick_rounding_and_drops_only_the_floor_bump() {
     let n = 100;
     let k = 2048;
     assert!(
-        ktir_superdsc::work::CoreSplit::plan::<Gen1>(m, n).ncores() >= UTIL_FLOOR_CORES,
+        ktir_superdsc::work::CoreSplit::plan(m, n).ncores() >= UTIL_FLOOR_CORES,
         "the control's premise: {m}×{n} already splits onto ≥{UTIL_FLOOR_CORES} cores, so the \
          windowed drop fires"
     );
@@ -477,7 +477,7 @@ fn the_windowed_drop_does_not_fire_below_the_util_floor() {
     let n = 64;
     let k = 2048;
     assert!(
-        ktir_superdsc::work::CoreSplit::plan::<Gen1>(m, n).ncores() < UTIL_FLOOR_CORES,
+        ktir_superdsc::work::CoreSplit::plan(m, n).ncores() < UTIL_FLOOR_CORES,
         "the premise: a 1×64 output strands on one core, below the floor"
     );
     assert_eq!(

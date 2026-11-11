@@ -12,9 +12,9 @@ use crate::superdsc_opspec::{CoreBudget, ItDim, WorkPlan};
 /// Core-split, LX-fit time-tiling and the reduction-split repair that reconciles them, as ONE
 /// target-neutral pass ([`WorkPlan::divide_and_time_tile_for_lx`]); this bridge supplies only the
 /// swappable `splitter` and the residency formula this op's kind selects.
-pub fn run_tiler<G: crate::device_gen::DeviceGen>(
+pub fn run_tiler(
     op: &TileOp,
-    budget: CoreBudget<G>,
+    budget: CoreBudget,
     splitter: impl Fn(&[ItDim], u32) -> std::collections::BTreeMap<&'static str, u32>,
     tiled_dim: &'static str,
 ) -> Result<TiledOp, crate::superdsc_error::SuperDscError> {

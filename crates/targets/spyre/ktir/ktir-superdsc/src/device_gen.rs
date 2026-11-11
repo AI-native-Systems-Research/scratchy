@@ -5,8 +5,7 @@
 //! ⛔ NO SECOND STATEMENT OF ANY FACT. The trait, the `Gen1` impl and every value live in
 //! `ktir_core::ddl_binds` alone; this module only names them for the lowering. Lowering code reads
 //! the baked generation ([`Baked`]), never a generation by name — `Gen1` is spelled in
-//! `ddl_binds.rs` (its impl and the `Baked` alias) and in tests, and
-//! `tests/zz_lowering_reads_only_the_build_generation.rs` fails the suite on any other occurrence.
+//! `ddl_binds.rs` (its impl and the `Baked` alias) and in tests.
 
 pub use ktir_core::ddl_binds::{Baked, DeviceGen, Gen1};
 
@@ -17,6 +16,6 @@ pub const BUILD_CORES: u32 = <Baked as DeviceGen>::CORES;
 pub const BUILD_UTIL_FLOOR_CORES: u32 = <Baked as DeviceGen>::UTIL_FLOOR_CORES;
 
 /// Every core of the baked generation — the budget of a division that is a law of its own.
-pub const fn whole() -> crate::superdsc_opspec::CoreBudget<Baked> {
+pub const fn whole() -> crate::superdsc_opspec::CoreBudget {
     crate::superdsc_opspec::CoreBudget::whole()
 }

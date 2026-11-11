@@ -10,6 +10,11 @@
 //!   of a wider destination, whole-width copies up to a `[512, 2048]` prefill rung, and a `[515,
 //!   2048]` column block whose rows leave a 3-row tail, the tail entry's one case) — the descriptor,
 //!   its bindings, the symbol counter. Both row-blocked entries emit exactly those bytes.
+//!   CHANGED EXPECTATION (the core budget): a copy spends the cores its bytes pay for
+//!   ([`ktir_superdsc::work::EwDivision::budget`]), so the five decode/rung-sized cases (0–4) run on
+//!   2/1/1/2/16 cores where the whole-machine split ran 16/8/2/32/32 — the two prefill-sized cases
+//!   (5–6) fill the machine and are byte-identical. Everything but the core geometry — the op, its
+//!   bindings, the walks, the symbol counter — is the per-stick kernel's.
 //! * THE PROGRAM IS SMALL. A `[512, 2048]` copy is a few dozen KTIR ops, not ~200K (313 MB of
 //!   build-script memory per such program, measured).
 

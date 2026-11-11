@@ -326,11 +326,7 @@ pub fn reduce_opspec_df_divided(
     // The pad-lane mask, stated before anything else so an unmaskable shape (fp32 + pad) is a
     // build Err here, not a descriptor that silently folds its padding into the result.
     let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, df, accum_name)?;
-    let tile_op = TileOp {
-        kind,
-        dims: dims.clone(),
-        df,
-    };
+    let tile_op = TileOp::new(kind, dims.clone(), df);
     let tiled = match division {
         ReduceDivision::Groups(n) => tile_op.tile(
             crate::device_gen::whole(),
@@ -751,11 +747,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     // The pad-lane mask (see `reduce_opspec_df`'s identical call): stated first so an
     // unmaskable shape is a build Err, never a silently-wrong descriptor.
     let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, df, accum_name)?;
-    let tile_op = TileOp {
-        kind,
-        dims: dims.clone(),
-        df,
-    };
+    let tile_op = TileOp::new(kind, dims.clone(), df);
     let tiled = match division {
         ReduceDivision::Rows => tile_op.tile(crate::device_gen::whole(), distribute_cores, "out"),
         ReduceDivision::Groups(n) => tile_op.tile(
@@ -1755,11 +1747,9 @@ mod the_arity_is_checked_where_the_op_is_built {
                 df: crate::superdsc_opspec::Df::Fp16,
             },
         ];
-        WorkPlan::divide(
-            &dims,
-            CoreBudget::<crate::device_gen::Gen1>::whole(),
-            |_, _| std::collections::BTreeMap::new(),
-        )
+        WorkPlan::divide(&dims, CoreBudget::whole(), |_, _| {
+            std::collections::BTreeMap::new()
+        })
         .expect("a two-dim plan divides")
     }
 

@@ -1141,7 +1141,7 @@ fn matmul_plan(m: u32, n: u32, k: u32, batch: u32, mb: u32, out: u32) -> WorkPla
     ];
     WorkPlan::divide(
         &dims,
-        ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+        ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
         |_, _| BTreeMap::from([("mb", mb), ("out", out)]),
     )
     .unwrap()

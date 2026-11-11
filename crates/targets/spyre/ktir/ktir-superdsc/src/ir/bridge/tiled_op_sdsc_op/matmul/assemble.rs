@@ -145,8 +145,7 @@ fn out_width_the_weight_holds(
         return n;
     }
     let held = ((p.size / row_bytes) as u32 / FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK;
-    let floor_ok = CoreSplit::plan::<crate::device_gen::Baked>(m, held).ncores()
-        >= crate::device_gen::BUILD_UTIL_FLOOR_CORES;
+    let floor_ok = CoreSplit::plan(m, held).ncores() >= crate::device_gen::BUILD_UTIL_FLOOR_CORES;
     if held < n && held > 0 && floor_ok && DeviceWidth::for_output(m, held, k).get() == n {
         held
     } else {

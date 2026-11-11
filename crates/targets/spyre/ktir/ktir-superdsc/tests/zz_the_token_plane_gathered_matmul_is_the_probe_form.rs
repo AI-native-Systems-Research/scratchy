@@ -325,7 +325,7 @@ fn a_split_unpinned_axis_of_the_kernel_is_refused() {
     let dims: Vec<ktir_superdsc::superdsc_opspec::ItDim> = op.iter.dims().to_vec();
     op.iter = ktir_superdsc::superdsc_opspec::WorkPlan::divide(
         &dims,
-        ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+        ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
         |_, _| {
             let mut m = std::collections::BTreeMap::new();
             m.insert("in", 2u32);

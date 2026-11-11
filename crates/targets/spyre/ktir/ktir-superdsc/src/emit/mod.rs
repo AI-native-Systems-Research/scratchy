@@ -567,11 +567,11 @@ fn pointwise_opspec(
         },
     ];
     let n_operands = (in_names.len() + 1) as u32;
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
         dims,
-        df: Df::Fp16,
-    };
+        Df::Fp16,
+    );
     pointwise_opspec_from_tile(&tile_op, op, in_names, o_name, head_major, layout)
 }
 
@@ -979,15 +979,15 @@ pub fn reduce_fits_untiled(rows: u32, cols: u32) -> bool {
         is_stick,
         df: Df::Fp16,
     };
-    crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: vec![
+    crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        vec![
             dim("mb", rows, false, false),
             dim("out", stick.elems(), true, true),
             dim("y", 1, false, false),
         ],
-        df: Df::Fp16,
-    }
+        Df::Fp16,
+    )
     .tile(
         crate::device_gen::whole(),
         crate::work::distribute_cores,
@@ -1022,26 +1022,34 @@ pub fn pointwise_untiled_slice_bytes_divided(
         is_stick,
         df: Df::Fp16,
     };
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
             n_operands: n_inputs + 1,
         },
-        dims: vec![
+        vec![
             dim("mb", rows, false),
             dim("out", stick.elems(), true),
             dim("y", 1, false),
         ],
-        df: Df::Fp16,
-    };
+        Df::Fp16,
+    );
     // The pin is sized under the budget its ops spend ([`crate::work::EwDivision::budget`]), or the
     // slice it reserves and the slice each op's core walks are two different divisions.
+    //
+    // ⚠ THIS MINT IS UNWINDOWED BY CONSTRUCTION, and that is a LAW OF ITS SIGNATURE, not an
+    // oversight: the sizer takes `(rows, cols, n_inputs)` — no operand presentation — and the
+    // windowed fact is minted from the operand presentation at the ONE door that holds it
+    // (`pointwise_broadcast_opspec_from_tile`, via `TileOp::with_windowed`); this lookalike
+    // cannot state it. So the budget below is the byte law's (`for_bytes`), and it is only the
+    // right budget for an op whose operands are its own extents. A caller sizing a WINDOWED op
+    // through this function — a row band of a taller parent — would reserve the pin under a
+    // different division than the op's cores walk (the windowed-stick law's `of_cores(sticks)`),
+    // and the windowed refusal cannot fire here to catch it. No such caller exists in this tree
+    // today (the function has none at all); one that appears must thread the door-minted
+    // `TileOp` through instead of re-deriving the shape.
     let division = division.resolve(true, true);
     tile_op
-        .tile(
-            division.budget::<crate::device_gen::Baked>(tile_op.operand_bytes()),
-            division.splitter(),
-            "out",
-        )
+        .tile(division.budget(&tile_op).ok()?, division.splitter(), "out")
         .ok()
         .filter(|t| t.time_tile.is_none())
         .map(|t| {
@@ -1110,11 +1118,11 @@ pub(crate) fn pointwise_broadcast_opspec_df(
         },
     ];
     let n_operands = (inputs.len() + 1) as u32;
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
         dims,
         df,
-    };
+    );
     pointwise_broadcast_opspec_from_tile(
         &tile_op,
         rows,
@@ -1630,9 +1638,9 @@ fn one_gathered_leg<T: crate::collective::Tp>(
     // moved. The tile is the program's statement of the axis NAMES the gather's pin resolves against
     // (which is why the caller passes a tile rather than `rows`/`cols`), so rebuilding one here would
     // be a second, unwitnessed declaration; overriding the one extent the cut changes is not.
-    let leg_tile = crate::ir::island::tile_op::TileOp {
-        kind: tile_op.kind,
-        dims: tile_op
+    let leg_tile = crate::ir::island::tile_op::TileOp::new(
+        tile_op.kind,
+        tile_op
             .dims
             .iter()
             .map(|d| {
@@ -1646,8 +1654,8 @@ fn one_gathered_leg<T: crate::collective::Tp>(
                 }
             })
             .collect(),
-        df: tile_op.df,
-    };
+        tile_op.df,
+    );
     // ⭐⭐⭐ THE LEG'S CORE SPLIT IS A `GatherSplit` — MINTED FROM THE LEG'S OWN FACTS, before any
     // operand is built. Only the entry axis (`mb`) may carry a split: dxp derives `skip_addr`
     // from the per-core extents of the unpinned dims, so a split elsewhere shrinks what one
@@ -5495,11 +5503,11 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
     // ⛔ THE SPLITTER IS THIS OP'S OWN, NOT `distribute_cores`: the transpose's output is a grid of
     // 8×8 inter-slice blocks, so the division must cut BOTH axes at the block — the law measured
     // against the vendor golden (see `transpose_core_split`).
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: dims.clone(),
-        df: Df::Fp16,
-    };
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims.clone(),
+        Df::Fp16,
+    );
     let tiled = tile_op
         .tile(crate::device_gen::whole(), transpose_core_split, "out")
         .map_err(|e| e.0)?;
@@ -6418,11 +6426,11 @@ fn topk_opspec(
     // own tokens, so time-tiling is semantically free. ⛔ THE SPLITTER IS THE PAIR'S OWN
     // (`topk_core_split`), NOT `distribute_cores`: the ring-over-k law and the never-split-the-
     // scan law are both outside `distribute_cores`' vocabulary.
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: dims.clone(),
-        df: Df::Fp16,
-    };
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims.clone(),
+        Df::Fp16,
+    );
     let tiled = tile_op
         .tile(crate::device_gen::whole(), topk_core_split, "y")
         .map_err(|e| e.0)?;
@@ -7589,11 +7597,11 @@ mod gather_cut {
             is_stick,
             df: Df::Fp16,
         };
-        TileOp {
-            kind: TileOpKind::PointwiseOrReduce { n_operands: 2 },
-            dims: vec![d("mb", rows, false), d("out", COLS, true), d("y", 1, false)],
-            df: Df::Fp16,
-        }
+        TileOp::new(
+            TileOpKind::PointwiseOrReduce { n_operands: 2 },
+            vec![d("mb", rows, false), d("out", COLS, true), d("y", 1, false)],
+            Df::Fp16,
+        )
     }
 
     /// The door, driven exactly as `scalarmul_at` drives it: the `[1,1]` scale first and the gathered
@@ -8367,7 +8375,7 @@ mod time_tiled_segment_law {
         ];
         let plan = WorkPlan::divide(
             &dims,
-            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+            crate::superdsc_opspec::CoreBudget::whole(),
             distribute_cores,
         )
         .expect("the plan divides");

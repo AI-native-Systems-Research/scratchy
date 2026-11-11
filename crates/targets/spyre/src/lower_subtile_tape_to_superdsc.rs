@@ -8669,7 +8669,7 @@ mod tests {
         // And the validated WorkPlan accepts it (≤32 by type).
         let plan = WorkPlan::divide(
             &dims,
-            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
             distribute_cores,
         )
         .unwrap();
@@ -10121,7 +10121,7 @@ mod tests {
         }];
         let err = WorkPlan::divide(
             &fp8_dim,
-            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
             |d, c| over(d[0].name, c),
         );
         assert!(
@@ -10138,7 +10138,7 @@ mod tests {
         }];
         let ok = WorkPlan::divide(
             &fp16_dim,
-            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
             |d, c| over(d[0].name, c),
         );
         assert!(

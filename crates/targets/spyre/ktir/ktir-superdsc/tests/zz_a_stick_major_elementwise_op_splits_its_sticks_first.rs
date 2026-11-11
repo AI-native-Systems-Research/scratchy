@@ -59,13 +59,13 @@ fn the_sticks_first_plan_tiles_every_shape_on_at_least_as_many_cores() {
         let d = dims(rows, cols);
         let plan = WorkPlan::divide(
             &d,
-            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
             distribute_cores_sticks_first,
         )
         .unwrap_or_else(|e| panic!("[{rows}, {cols}]: sticks-first plan refused: {e}"));
         let rows_first = WorkPlan::divide(
             &d,
-            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
             distribute_cores,
         )
         .unwrap_or_else(|e| panic!("[{rows}, {cols}]: rows-first plan refused: {e}"));
@@ -149,7 +149,7 @@ fn the_measured_shapes_split_their_sticks_first() {
     let split = |rows: u32, cols: u32| {
         let p = WorkPlan::divide(
             &dims(rows, cols),
-            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
             distribute_cores_sticks_first,
         )
         .unwrap();
@@ -171,7 +171,7 @@ fn the_measured_shapes_split_their_sticks_first() {
     // Rows-first, for contrast: the division it replaces.
     let rows_first = WorkPlan::divide(
         &dims(256, 8192),
-        ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+        ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
         distribute_cores,
     )
     .unwrap();

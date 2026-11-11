@@ -214,18 +214,18 @@ pub fn gather_copy_opspec(
         is_stick,
         df,
     };
-    let tile_op = TileOp {
-        // Two operands: the gathered source and the contiguous destination. The index is APPENDED by
-        // `attach_gather_index`, which is also what declares it — one call, so an operand cannot be
-        // pushed without the declaration that makes it an index.
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: vec![
+    // Two operands: the gathered source and the contiguous destination. The index is APPENDED by
+    // `attach_gather_index`, which is also what declares it — one call, so an operand cannot be
+    // pushed without the declaration that makes it an index.
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        vec![
             dim("mb", rows, false),
             dim("out", cols, true),
             dim("y", 1, false),
         ],
         df,
-    };
+    );
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
         OpFunc::Identity,
@@ -567,15 +567,15 @@ pub fn scatter_copy_opspec(
         is_stick,
         df,
     };
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: vec![
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        vec![
             dim("mb", rows, false),
             dim("out", cols, true),
             dim("y", 1, false),
         ],
         df,
-    };
+    );
     // Rank-3 and `mb`-only core splits: the gather copy's two card-measured laws (see its call).
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
@@ -685,17 +685,17 @@ pub fn page_gather_copy_opspec(
         GatheredWords::Fp16 => (OpFunc::Identity, vec![src]),
         GatheredWords::SenUint32 { zero } => (OpFunc::AddI32ToI32, vec![zero, src]),
     };
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
             n_operands: ins.len() as u32 + 1,
         },
-        dims: vec![
+        vec![
             dim("mb", rows, false),
             dim("out", cols, true),
             dim("y", 1, false),
         ],
         df,
-    };
+    );
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
         op_func,
@@ -1342,7 +1342,7 @@ pub fn pointwise_opspec_from_tile(
         o_name,
         head_major,
         Division {
-            budget: division.budget(tile_op.operand_bytes()),
+            budget: division.budget(tile_op)?,
             splitter: division.splitter(),
         },
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
@@ -1391,7 +1391,7 @@ impl OutView {
 /// core for a division that is a law of its own (a gather's entries) — so no caller can pair a budget
 /// with a splitter it was not chosen for.
 struct Division<S> {
-    budget: crate::superdsc_opspec::CoreBudget<crate::device_gen::Baked>,
+    budget: crate::superdsc_opspec::CoreBudget,
     splitter: S,
 }
 
@@ -1534,6 +1534,24 @@ pub fn pointwise_broadcast_opspec_from_tile(
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
     );
+    // ⭐⭐⭐ THE WINDOWED-STICK LAW, MINTED ONCE AT THIS DOOR. An operand whose declared `mb`
+    // device extent exceeds the op's swept rows — a multi-stick row band of a taller parent
+    // ([`crate::addr::RowWindow`], the parent's row count declared at
+    // [`TensorArg::with_device_extent`]) — is only safe because a core holding ONE stick never
+    // crosses a column plane; a multi-stick core would have to walk the parent's inter-plane
+    // stride, which nothing states without `backGapCore_`. So the door states the fact ONCE,
+    // from the operand presentation it already holds (the `mk` below is the presentation's other
+    // reader — it declares the same windows' parent rows as device extents), and
+    // [`crate::work::EwDivision::budget`] holds the op's cores to one stick a core. A ONE-STICK
+    // band declares no device extent (it never crosses a plane) and is not windowed; a band whose
+    // parent is exactly the op's rows (the batch-1 case, declared == swept) is not windowed
+    // either. No call site derives this — the callers' `TileOp`s state shape only.
+    let tile_op = tile_op.with_windowed(
+        out_row_window.is_some_and(|w| w.declares_past(rows))
+            || inputs
+                .iter()
+                .any(|i| i.row_window().is_some_and(|w| w.declares_past(rows))),
+    );
     let df = tile_op.df;
     // ⭐ THE FAMILY MINT — every operand's swept window (the per-form broadcast law,
     // `EwOperand::swept_extents`) checked against its handle's declared shape and, when a layout
@@ -1659,11 +1677,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 (d, _) => d.resolve(stickmajor, core_local),
             };
             tile_op
-                .tile(
-                    d.budget::<crate::device_gen::Baked>(tile_op.operand_bytes()),
-                    d.splitter(),
-                    "out",
-                )
+                .tile(d.budget(&tile_op)?, d.splitter(), "out")
                 .map_err(|e| e.0)?
         }
         (stated, Some(_)) => {

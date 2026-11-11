@@ -48,7 +48,7 @@ fn verify_attn_decode_pure_syntax() {
             println!("compute[{i}]: AttnDecode-shaped TileOp (n_operands=6) found");
             let tiled = op
                 .tile(
-                    ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+                    ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
                     |dims, n| {
                         let _ = (dims, n);
                         Default::default()
@@ -110,7 +110,7 @@ fn verify_rope_pure_syntax() {
 
     let tiled = tile_op
         .tile(
-            ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
             |dims, n| {
                 let _ = (dims, n);
                 Default::default()
@@ -175,7 +175,7 @@ fn verify_gemm_m1() {
 
         let tiled = tile_op
             .tile(
-                ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+                ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
                 |dims, n| {
                     let _ = (dims, n);
                     Default::default()
@@ -254,7 +254,7 @@ fn verify_add_only() {
         // (SubtileTape -> TileOp [TileIR] -> tiler -> TiledOp) end-to-end.
         let tiled = tile_op
             .tile(
-                ktir_superdsc::superdsc_opspec::CoreBudget::<ktir_superdsc::device_gen::Gen1>::whole(),
+                ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
                 |dims, n| {
                     // A trivial 1-core splitter (this fixture's mb=1,out=2048 fits without splitting) —
                     // real ops use `distribute_cores`; this example only proves the plumbing runs.

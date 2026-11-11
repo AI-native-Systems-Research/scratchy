@@ -410,11 +410,11 @@ where
     // SubtileTape dispatch (every `SubOp::MatmulTile`), same pattern as `pointwise_opspec`/
     // `reduce_opspec_df`. `DF::DF` bridges the compile-time format marker to the runtime `Df`
     // `TileOp::resident_bytes` dispatches on (fp8 ⇒ its 1-byte operand path, unchanged).
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::Matmul,
-        dims: dims.clone(),
-        df: operand_df,
-    };
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::Matmul,
+        dims.clone(),
+        operand_df,
+    );
     // ── WHO STAGES THE OPERANDS THROUGH LX ──
     // An UNBATCHED dense matmul is handed to dxp WHOLE — torch-spyre's form: ONE descriptor over
     // the cost model's split, HBM operands, no frontend LX-fit time trips; dxp stages the slab
@@ -864,11 +864,11 @@ pub fn matmul_opspec_batched_off(
     // Attention bmm operands are fp16 (SEN169) — 64-lane sticks.
     let dims = matmul_dims::<Fp16>(m, &n_ext, &k_ext, batch);
     // LOWER to TileIR: same pattern as `matmul_opspec_split` — the batched-attention bmm's TileOp.
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::Matmul,
-        dims: dims.clone(),
-        df: Df::Fp16,
-    };
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::Matmul,
+        dims.clone(),
+        Df::Fp16,
+    );
     let tiled = tile_op
         .tile(crate::device_gen::whole(), matmul_split_map, OutAxis::NAME)
         .map_err(|e| e.0)?;

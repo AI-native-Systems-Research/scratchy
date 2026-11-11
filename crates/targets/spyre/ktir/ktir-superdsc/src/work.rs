@@ -11,7 +11,7 @@
 //! ⛔ THE SPYRE MODEL, NOT THE KTIR EMITTER'S. 256 MB/core span and a 64-element fp16 stick; the
 //! `pick_k`/`n_block` formulas in the KTIR emitter are H100's and are the wrong hardware.
 
-use crate::device_gen::{Baked, DeviceGen};
+use crate::device_gen::DeviceGen;
 use crate::superdsc_opspec::{CoreBudget, DataFormat, Df, Fp16, ItDim, WorkPlan};
 use std::collections::BTreeMap;
 
@@ -125,13 +125,14 @@ pub struct CoreSplit {
 }
 
 impl CoreSplit {
-    /// Distribute up to generation `G`'s cores over `[rows, cols]`: split the larger output extent first
-    /// (rows by row-count, cols by stick-count), each by `core_split`, with the cores left after the
-    /// first. Lowering code calls it at [`Baked`]; the Kani proofs name the generation they prove.
-    pub fn plan<G: DeviceGen>(rows: u32, cols: u32) -> CoreSplit {
-        // ⭐ THE CAP IS THE GENERATION'S CORE COUNT, AND IT IS THE ONLY CAP — a const of `G`, so what
-        // the proofs check and what the emitter does are the same expression.
-        Self::plan_capped(rows, cols, G::CORES)
+    /// Distribute up to the BAKED generation's ([`Baked`]) cores over `[rows, cols]`: split the
+    /// larger output extent first (rows by row-count, cols by stick-count), each by `core_split`,
+    /// with the cores left after the first. The Kani proofs name the generation they prove through
+    /// [`Self::plan_capped`].
+    pub fn plan(rows: u32, cols: u32) -> CoreSplit {
+        // ⭐ THE CAP IS THE BAKED GENERATION'S CORE COUNT, AND IT IS THE ONLY CAP — the same const
+        // the bake reads, so what the proofs check and what the emitter does are the same expression.
+        Self::plan_capped(rows, cols, <crate::device_gen::Baked as DeviceGen>::CORES)
     }
 
     /// The PURE planning math (no env, no I/O): distribute up to `cap` cores over `[rows, cols]`,
@@ -378,7 +379,7 @@ impl DeviceWidth {
         if windowed {
             let n64 = logical_n.next_multiple_of(FP16_ELEMS_PER_STICK);
             if n64 > logical_n
-                && CoreSplit::plan::<Baked>(m, logical_n).ncores()
+                && CoreSplit::plan(m, logical_n).ncores()
                     >= crate::device_gen::BUILD_UTIL_FLOOR_CORES
             {
                 // The logical width already meets the util floor the bump was buying — and its
@@ -577,20 +578,51 @@ pub fn row_groups(dims: &[ItDim], max_cores: u32, n: u32) -> BTreeMap<&'static s
 }
 
 impl EwDivision {
-    /// ⭐ THE BUDGET THIS DIVISION SPENDS, for an op that moves `bytes` — the one place the byte law is
-    /// applied. The two divisions the elementwise law chooses between ([`Self::RowsFirst`],
-    /// [`Self::SticksFirst`]) are free choices of how to spread the op, so they spend the cores its
-    /// bytes pay for ([`CoreBudget::for_bytes`]): a decode-sized op runs on the few cores whose
-    /// fixed cost it needs, not on all of them. [`Self::Groups`] is a correctness law of its own —
-    /// one row group a core, so each core's LX holds the intermediates its group reads — and keeps
-    /// every core ([`CoreBudget::whole`]). [`Self::Law`] is not a division until it is resolved, and
-    /// spends what its resolution spends.
-    pub fn budget<G: DeviceGen>(self, bytes: u64) -> CoreBudget<G> {
+    /// ⭐ THE BUDGET THIS DIVISION SPENDS — the one place the byte law and the windowed-stick law
+    /// are applied, over the op's own [`TileOp`] declaration.
+    ///
+    /// **The byte law.** The two divisions the elementwise law chooses between
+    /// ([`Self::RowsFirst`], [`Self::SticksFirst`]) are free choices of how to spread the op, so
+    /// they spend the cores its bytes pay for ([`CoreBudget::for_bytes`] on
+    /// [`TileOp::operand_bytes`]): a decode-sized op runs on the few cores whose fixed cost it
+    /// needs, not on all of them.
+    ///
+    /// **The windowed-stick law.** A WINDOWED operand — one whose declared `mb` device extent
+    /// exceeds the op's swept rows, the row-band/batched-decode form
+    /// ([`crate::addr::RowWindow::parent_rows`], declared at
+    /// [`TensorArg::with_device_extent`]) — is only safe because a core holding ONE stick never
+    /// crosses a column plane: its own stick-major layout coincides with the parent's inside that
+    /// plane. A MULTI-STICK core must walk the parent's inter-plane stride (`parent_rows·lanes`
+    /// between column planes), and nothing states that stride without `backGapCore_` — so a
+    /// windowed operand's per-core stick count is 1, and the budget is the op's swept
+    /// whole-stick count, clamped to at least one core. A windowed op whose swept stick count
+    /// exceeds the generation's cores is REFUSED by name — a windowed operand too wide for one
+    /// stick a core — never silently clamped past the law. [`Self::Groups`] is a correctness law
+    /// of its own — one row group a core, so each core's LX holds the intermediates its group
+    /// reads — and keeps every core ([`CoreBudget::whole`]). [`Self::Law`] is not a division
+    /// until it is resolved, and spends what its resolution spends.
+    ///
+    /// [`TensorArg::with_device_extent`]: crate::superdsc_opspec::TensorArg::with_device_extent
+    pub fn budget(self, op: &crate::ir::island::tile_op::TileOp) -> Result<CoreBudget, String> {
         match self {
             EwDivision::Law | EwDivision::RowsFirst | EwDivision::SticksFirst => {
-                CoreBudget::for_bytes(bytes)
+                if op.windowed() {
+                    let sticks = op.swept_sticks();
+                    let cores = crate::device_gen::BUILD_CORES;
+                    if sticks > cores {
+                        return Err(format!(
+                            "a windowed operand too wide for one stick a core: the op sweeps \
+                             {sticks} sticks over {cores} cores — a multi-stick core would have \
+                             to walk the parent's inter-plane stride, which nothing states \
+                             without `backGapCore_`"
+                        ));
+                    }
+                    Ok(CoreBudget::of_cores(sticks.max(1)))
+                } else {
+                    Ok(CoreBudget::for_bytes(op.operand_bytes()))
+                }
             }
-            EwDivision::Groups(_) => CoreBudget::whole(),
+            EwDivision::Groups(_) => Ok(CoreBudget::whole()),
         }
     }
 
@@ -1624,7 +1656,7 @@ mod layout_first_tests {
                 for mb in (1..=64).chain([71, 96, 128, 256, 512]) {
                     let plan = WorkPlan::divide(
                         &dims(mb, y),
-                        crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+                        crate::superdsc_opspec::CoreBudget::whole(),
                         distribute_cores_layout_first(rows),
                     )
                     .unwrap_or_else(|e| panic!("{rows:?} y={y} mb={mb}: refused: {e}"));
@@ -1644,7 +1676,7 @@ mod layout_first_tests {
         let divide = |mb: u32, y: u32| {
             let plan = WorkPlan::divide(
                 &dims(mb, y),
-                crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+                crate::superdsc_opspec::CoreBudget::whole(),
                 distribute_cores_layout_first(["y", "mb"]),
             )
             .unwrap_or_else(|e| panic!("y={y} mb={mb}: {e}"));
@@ -1663,10 +1695,103 @@ mod layout_first_tests {
     fn the_rows_split_under_every_spray_is_refused() {
         let plan = WorkPlan::divide(
             &dims(21, 32),
-            crate::superdsc_opspec::CoreBudget::<crate::device_gen::Gen1>::whole(),
+            crate::superdsc_opspec::CoreBudget::whole(),
             |_, _| [("mb", 21)].into_iter().collect(),
         )
         .expect("a 21-way row split is a valid plan");
         assert!(layout_walk_is_whole(&plan, ["y", "mb"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod windowed_stick_law_tests {
+    use super::EwDivision;
+    use crate::ir::island::tile_op::{TileOp, TileOpKind};
+    use crate::superdsc_opspec::{CoreBudget, Df, ItDim};
+
+    /// A binary fp16 op's `[mb, out, y]` declaration — `out` the stick axis, `n_operands` = the two
+    /// inputs plus the output.
+    fn op(rows: u32, cols: u32) -> TileOp {
+        let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        TileOp::new(
+            TileOpKind::PointwiseOrReduce { n_operands: 3 },
+            vec![
+                dim("mb", rows, false),
+                dim("out", cols, true),
+                dim("y", 1, false),
+            ],
+            Df::Fp16,
+        )
+    }
+
+    /// ⭐⭐⭐ THE WINDOWED-STICK LAW: a windowed operand's per-core stick count is 1, so the budget
+    /// is the op's swept whole-stick count — one stick a core, never a multi-stick core that would
+    /// have to walk the parent's inter-plane stride. `[1, 512]` fp16 sweeps 8 whole sticks
+    /// (64 elems a stick): 8 cores.
+    #[test]
+    fn a_windowed_op_spends_one_stick_a_core() {
+        let windowed = op(1, 512).with_windowed(true);
+        assert_eq!(
+            EwDivision::Law.budget(&windowed).unwrap().get(),
+            8,
+            "the swept whole-stick count, one stick a core"
+        );
+        assert_eq!(
+            EwDivision::RowsFirst.budget(&windowed).unwrap().get(),
+            8,
+            "the law holds whichever way the free division splits"
+        );
+        assert_eq!(EwDivision::SticksFirst.budget(&windowed).unwrap().get(), 8);
+    }
+
+    /// The same op, NOT windowed, spends the cores its bytes pay for — the windowed fact is the
+    /// only thing that moves the budget, and it is minted from the operand presentation, never
+    /// from the shape alone.
+    #[test]
+    fn the_same_op_unwindowed_spends_by_bytes() {
+        assert_eq!(EwDivision::Law.budget(&op(1, 512)).unwrap().get(), 1);
+        assert_eq!(EwDivision::Law.budget(&op(1, 2048)).unwrap().get(), 4);
+    }
+
+    /// The near-miss: a row band whose declared extent EQUALS the op's swept rows (batch-1) is not
+    /// windowed — `RowWindow::declares_past` says false at the door, so the op mints `windowed:
+    /// false` and spends by bytes like any other op.
+    #[test]
+    fn a_batch_one_band_is_not_windowed() {
+        // declared == swept: the door's `declares_past(rows)` is false, the mint keeps `false`.
+        let batch_one = op(512, 512).with_windowed(false);
+        assert_eq!(EwDivision::Law.budget(&batch_one).unwrap().get(), 32);
+    }
+
+    /// A windowed op whose swept stick count exceeds the generation's cores is REFUSED by name —
+    /// never silently clamped past the law, never spread two sticks to a core.
+    #[test]
+    fn a_windowed_op_wider_than_one_stick_a_core_is_refused_by_name() {
+        let err = EwDivision::Law
+            .budget(&op(1, 4096).with_windowed(true))
+            .unwrap_err();
+        assert!(
+            err.contains("a windowed operand too wide for one stick a core"),
+            "refused by name, got: {err}"
+        );
+    }
+
+    /// A stated division (`Groups`) is a correctness law of the walk's LX plan, windowed or not —
+    /// it keeps every core.
+    #[test]
+    fn a_stated_division_keeps_every_core_windowed_or_not() {
+        assert_eq!(
+            EwDivision::Groups(8)
+                .budget(&op(1, 512).with_windowed(true))
+                .unwrap()
+                .get(),
+            CoreBudget::whole().get()
+        );
     }
 }

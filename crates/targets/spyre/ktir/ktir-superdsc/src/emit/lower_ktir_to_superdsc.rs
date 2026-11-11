@@ -1896,9 +1896,9 @@ pub(crate) fn pointwise_tile_op_df(
         // new format is an E0004 here, at the seam that would have to learn it.
         other => unreachable!("elementwise_df refused the {other:?} pointwise form by name"),
     };
-    TileOp {
-        kind: TileOpKind::PointwiseOrReduce { n_operands },
-        dims: vec![
+    TileOp::new(
+        TileOpKind::PointwiseOrReduce { n_operands },
+        vec![
             ItDim {
                 name: "mb",
                 size: rows,
@@ -1922,7 +1922,7 @@ pub(crate) fn pointwise_tile_op_df(
             },
         ],
         df,
-    }
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -6209,7 +6209,7 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
     //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for
     //    batch=1). A FLOP-heavy matmul left on <8 cores is the 1.45× sengraph regression this emitter
     //    exists to fix; the padding above is what fills them for a prime-stick output. ──
-    let sp = CoreSplit::plan::<crate::device_gen::Baked>(m, n_dev);
+    let sp = CoreSplit::plan(m, n_dev);
     let cores = sp.ncores();
     if macs >= (1 << 20) && cores < crate::device_gen::BUILD_UTIL_FLOOR_CORES {
         return err(format!(
@@ -9314,14 +9314,17 @@ mod elementwise_tests {
     }
 
     /// ⭐⭐⭐ THE LEAD'S OWN FIXTURE — the Mulf the moved refusal named: one operand the
-    /// converted 42-row PIECE (a whole `[42, 4096]` value), the other the whole 64-row VALUE's
+    /// converted 42-row PIECE (a whole `[42, 2048]` value), the other the whole 64-row VALUE's
     /// load of the same window `[0, 42)`. One window, two frames, TWO VALUES — the door places
     /// each: the piece whole (a reconstructing walk), the load a row band whose walk is PINNED
-    /// to the parent's `[64, 4096]` extents. And the tail block's Mulf — the piece `[0, 22)`
+    /// to the parent's `[64, 2048]` extents. And the tail block's Mulf — the piece `[0, 22)`
     /// beside the load `[42, 64)` — places its load at the band's own corner, 2688 elements in.
+    /// `cols = 2048` is the ADMITTED geometry — 32 fp16 sticks, one stick a core, the batch-2
+    /// decode band shape. At 4096 (64 sticks over 32 cores) the door REFUSES by name; that
+    /// refusal has its own fixture below (`a_window_wider_than_one_stick_a_core_is_refused`).
     #[test]
     fn a_split_piece_beside_its_parent_load_states_one_window_two_frames() {
-        let cols = 4096u32;
+        let cols = 2048u32;
         // HEAD: piece `[0,42)` of its own 42-row value, load `[0,42)` of the 64-row parameter.
         let head = node(
             reg(6, 42, cols, false),
@@ -9332,9 +9335,12 @@ mod elementwise_tests {
         let ops = elementwise("mulf_s9", Elementwise::Mul, &head, &[], &mut sym, None)
             .expect("two values each state the sweep in their own frame");
         assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
-        // The load (arg 1) is PINNED to the parent's extents — without the declaration dxp
-        // strides its stick groups by the sweep's 42 rows, short by 22 for every stick after
-        // the first. The piece (arg 0) and the output (arg 2) reconstruct.
+        // The load (arg 1) is PINNED to the parent's extents — the walk states them for
+        // reconstruction and sizing. The STRIDE safety is not the walk's to give (dxp reads
+        // `maxDimSizes_` as a size cap only, card-measured 2026-11-08: init_binary is
+        // byte-identical with or without it); it is the windowed-stick law's — one stick a
+        // core, so no core ever walks the parent's inter-plane stride. The piece (arg 0) and
+        // the output (arg 2) reconstruct.
         assert_eq!(
             walk_of(&ops[0], 1),
             serde_json::json!([64, cols]),
@@ -9986,13 +9992,15 @@ mod elementwise_tests {
 
     /// ⭐ THE HEAD BAND — a split piece's head block, `[0,42)` of a `[64, ·]` value, under a
     /// whole `[42, ·]` output: the input DECLARES the parent (its walk pinned to `[64, cols]`,
-    /// so the door strides the parent's column planes at the parent's pitch) and sits at corner
+    /// the extents the door reconstructs and sizes against) and sits at corner
     /// 0. This is the frame the `v_rows == rows` clause exists for: a row-0 window of a TALLER
     /// parent must never take the column-window form, whose corner math strides the planes at
-    /// the OP's own rows — the head-block mis-stride, unreachable here.
+    /// the OP's own rows — the head-block mis-stride, unreachable here. `cols = 2048` is the
+    /// admitted geometry (32 sticks, one stick a core); the stride safety past the walk is the
+    /// windowed-stick law's, not the walk's.
     #[test]
     fn a_head_band_scalarmul_declares_the_parent() {
-        let cols = 4096u32;
+        let cols = 2048u32;
         let r = vec![split(5, 64, 0, 42, cols), reg(7, 42, cols, true)];
         let mut sym = 0i64;
         let ops = scalarmul_scaled(
@@ -10022,9 +10030,10 @@ mod elementwise_tests {
     /// ⭐ THE TAIL BAND — `[42,64)` of the same `[64, ·]` value under a whole `[22, ·]` output:
     /// the same parent declaration, and the corner at the parent's OWN nest — `rc_of(64, ·, 42,
     /// 0)` = 42·64 — never the op-rows pitch, which would read the head's rows as the tail's.
+    /// `cols = 2048` is the admitted geometry (32 sticks, one stick a core).
     #[test]
     fn a_tail_band_scalarmul_sits_at_the_parent_s_own_corner() {
-        let cols = 4096u32;
+        let cols = 2048u32;
         let r = vec![split(5, 64, 42, 22, cols), reg(7, 22, cols, true)];
         let mut sym = 0i64;
         let ops = scalarmul_scaled(
@@ -10047,6 +10056,39 @@ mod elementwise_tests {
             42 * 64,
             "the tail band's corner is the parent's own `rc_of` nest: 42·64 = {}",
             42 * 64
+        );
+    }
+
+    /// ⛔ THE TOO-WIDE WINDOW IS REFUSED, NEVER EMITTED MIS-STRIDED. A `[42, ·]` band of a
+    /// `[64, 4096]` parent sweeps 64 fp16 sticks over 32 cores, so the windowed-stick law
+    /// refuses it by name: a core holding two sticks of the window would have to walk the
+    /// parent's inter-plane stride, and NOTHING states that stride. The walk's parent
+    /// declaration is NOT a fix — card-measured 2026-11-08, `maxDimSizes_` is inert as a
+    /// stride (a size cap only: `init_binary` is byte-identical with or without the pinned
+    /// walk, for pointwise bands and bmm alike), and without `backGapCore_` a multi-stick
+    /// operand's second stick lands at the op's own row count instead of the parent's —
+    /// 0% correct on the card's bmm legs. So a 64-stick window over 32 cores is REFUSED at
+    /// the budget, not baked and masked.
+    #[test]
+    fn a_window_wider_than_one_stick_a_core_is_refused() {
+        let cols = 4096u32;
+        let r = vec![split(5, 64, 0, 42, cols), reg(7, 42, cols, true)];
+        let mut sym = 0i64;
+        let Err(e) = scalarmul_scaled::<crate::collective::TpWorld<1>>(
+            "scalarmul_s5",
+            &ScaleSource::Bound { tid: 99 },
+            None,
+            &r,
+            &mut sym,
+            None,
+        ) else {
+            panic!("a 64-stick window over 32 cores is refused, never emitted mis-strided")
+        };
+        assert!(
+            e.message
+                .contains("a windowed operand too wide for one stick a core"),
+            "refused by name, got: {}",
+            e.message
         );
     }
 
