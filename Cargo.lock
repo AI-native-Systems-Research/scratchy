@@ -1222,7 +1222,6 @@ dependencies = [
 name = "flex-rs"
 version = "0.1.0"
 dependencies = [
- "cc",
  "libc",
  "rustix",
  "tracing",

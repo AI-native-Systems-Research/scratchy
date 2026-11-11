@@ -40,9 +40,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # `--workspace` builds scratchy-target-spyre (and its flex-rs path dep),
-      # whose build script compiles C++ against the IBM Spyre SDK headers. The
-      # runner has no SDK, so skip the C++ shim compile — check/clippy don't
-      # link it. This is the escape hatch that build script documents for
+      # whose build script links the FFI archives (libflex_shim.a +
+      # libsenlib_oco.a) from SENLIB_STATIC_LIB_DIR. The runner has no
+      # archives, so skip emitting the link directives — check/clippy don't
+      # link. This is the escape hatch that build script documents for
       # exactly this case.
       SCRATCHY_SKIP_SENDNN_CXX: "1"
     steps:
@@ -532,9 +533,11 @@ jobs:
       # runtime) compiles under no other step — the one above lints `spyre-emu`, and the
       # linux-workspace clippy builds the target featureless — so it rotted between card
       # runs, and #299's E0277s reached main green (#553). Lib only: the examples need a card
-      # host. Check-only, so the SDK's C++ shim is skipped as in the linux-workspace job; flex-rs,
-      # the shim's Rust side, is linted with it. The worker's hw surface can't join: its
-      # scratchy-models build script links flex-rs, which needs the SDK's libsenlib.
+      # host. Check-only, so the FFI archives are not needed (SCRATCHY_SKIP_SENDNN_CXX=1 keeps
+      # the build script from emitting its static-link directives, exactly as in the
+      # linux-workspace job); flex-rs, the declarations crate, is linted with it — it is an
+      # in-tree path dependency, so it is a workspace member. The worker's hw surface can't
+      # join: its scratchy-models build script would need the archives.
       - name: Clippy (spyre-hw card surface)
         env:
           SCRATCHY_SKIP_SENDNN_CXX: "1"
@@ -656,9 +659,9 @@ jobs:
   # `31` it declared inside itself, which proves only that `assert!` fails
   # in const context. ktir-core stays on the line below — it has no
   # doctests left, so the run is a no-op for it and covers the rest.
-  # `spyre-hw` pulls flex-rs, whose C++ shim needs the Spyre SDK; the shim is
-  # skipped as in the check-only jobs. Nothing links it: the crate's only
-  # runnable doctests are these compile_fail ones.
+  # `spyre-hw` pulls flex-rs, whose FFI archives are absent on this runner;
+  # the link directives are skipped as in the check-only jobs. Nothing links
+  # them: the crate's only runnable doctests are these compile_fail ones.
   #
   # Its own job (not a step in another): a second toolchain step would change the
   # default toolchain for every later step there. Not gated on macos-scope: that
