@@ -16,15 +16,21 @@
 //     nearest even, saturating), the conversion `quant_rows_fp8`'s `warp::copy` to `rt_fp8e4m3`
 //     and the fp8 GEMV's `fp8_round` both make.
 //
-// One CTA of 8 warps per row; warp `w` takes the row's 256-column chunks `w, w + 8, …` (at most 9:
-// `n` at most 17,408, the 27B's intermediate). Its gate and up chunks are TMA-loaded into shared
-// memory in one burst (TK's `sv_fl<256>` boxes: the `n` tail is TMA's zero fill, and
-// `OP(0, 0) = +0` adds nothing to the max), `warp::load`ed into naive `rv_fl<256>`, `OP`'d with
-// `warp::bin_op` and rounded with `round_bf16` (`with_residual`'s first rounding: bf16, widened
-// back exactly). They stay in registers for the quantization. The row's `amax` goes through an
-// `sv_fl<16>` (each warp's twice), every warp reduces the 16. Each element's byte, and, when
-// `act` is given, its bf16, is written through the `gl` accessor by the lane that holds it (naive
-// layout: slot `s` of lane `l` is the chunk's element `32 s + l`), columns past `n` skipped.
+// `quant_rows_fp8.cu`'s one-row form (Q1): one CTA of 8 warps per 256-column chunk of a row, CTA
+// `(t, r)` owning chunk `t` of row `r`:
+//   1. Every CTA computes the whole row's `act` and `amax`: warp `w` takes the row's chunks
+//      `w, w + 8, …` (at most 9: `n` at most 17,408, the 27B's intermediate). Its gate and up
+//      chunks are TMA-loaded into shared memory in one burst (TK's `sv_fl<256>` boxes: the `n`
+//      tail is TMA's zero fill, and `OP(0, 0) = +0` adds nothing to the max), `warp::load`ed into
+//      naive `rv_fl<256>`, `OP`'d with `warp::bin_op` and rounded with `round_bf16`
+//      (`with_residual`'s first rounding: bf16, widened back exactly), and `warp::store`d back over
+//      the gate chunk. The row's `amax` goes through an `sv_fl<16>` (each warp's twice), every warp
+//      reduces the 16.
+//   2. Each of the CTA's 256 threads quantizes one element of the owned chunk, read back from
+//      shared memory (so the same `act` the max saw), and writes its byte and, when `act` is given,
+//      its bf16 through the `gl` accessor, columns past `n` skipped.
+// (The earlier form, one CTA a row with each lane quantizing up to 72 elements, took ~25 µs at
+// 17,408: Q1's ~64-dependent-divisions slow path.)
 //
 // Shared memory: 8 warps × 9 chunks × 2 × 1 KiB, plus 1,024 bytes of alignment slack, set once by
 // `scratchy_cuda_act_quant_fp8_prepare`. The semaphores and the amax vector are static.
@@ -49,6 +55,7 @@ constexpr uint32_t COL_MULTIPLE = 64;
 constexpr int CHUNK = 256;
 constexpr int WARPS = 8;
 constexpr int THREADS = WARPS * kittens::WARP_THREADS;
+static_assert(THREADS == CHUNK, "one element of the owned chunk a thread");
 // The longest row's chunks (17,408 / 256), and a warp's share of them.
 constexpr int ROW_CHUNKS = 68;
 constexpr int WARP_CHUNKS = (ROW_CHUNKS + WARPS - 1) / WARPS;
@@ -91,7 +98,8 @@ __global__ __launch_bounds__(THREADS, 1) void act_quant_fp8_ker(
     __shared__ kittens::semaphore arrived[WARPS];
     __shared__ sv_fl<16> amax_s;
     const int w = kittens::warpid();
-    const int r = blockIdx.x;
+    const int t_own = blockIdx.x;
+    const int r = blockIdx.y;
     const int mine = (g.chunks - w + WARPS - 1) / WARPS;
     if (warp::laneid() == 0) {
         init_semaphore(arrived[w], 0, 1);
@@ -102,58 +110,43 @@ __global__ __launch_bounds__(THREADS, 1) void act_quant_fp8_ker(
         warp::tma::load_async(gate_s[w][i], g.gate, {0, 0, r, w + i * WARPS}, arrived[w]);
         warp::tma::load_async(up_s[w][i], g.up, {0, 0, r, w + i * WARPS}, arrived[w]);
     }
-    chunk_rv act[WARP_CHUNKS];
-    chunk_rv u, m;
+    chunk_rv a, u, m;
     warp::zero(m);
     if (mine > 0) {
         wait(arrived[w], 0);
     }
-#pragma unroll
-    for (int i = 0; i < WARP_CHUNKS; i++) {
-        if (i < mine) {
-            warp::load(act[i], gate_s[w][i]);
-            warp::load(u, up_s[w][i]);
-            warp::bin_op<OP>(act[i], act[i], u);
-            warp::unary_op<scratchy::ops::round_bf16>(act[i], act[i]);
-            warp::abs(u, act[i]);
-            warp::max(m, m, u);
-        }
+    // Pass 1: this warp's chunks' `act`, kept in shared memory over the gate, and their max.
+    for (int i = 0; i < mine; i++) {
+        warp::load(a, gate_s[w][i]);
+        warp::load(u, up_s[w][i]);
+        warp::bin_op<OP>(a, a, u);
+        warp::unary_op<scratchy::ops::round_bf16>(a, a);
+        warp::store(gate_s[w][i], a);
+        warp::abs(u, a);
+        warp::max(m, m, u);
     }
     const float part = warp::max(m);
     if (warp::laneid() == 0) {
         amax_s[w] = part;
         amax_s[w + WARPS] = part;
     }
+    // Also orders every warp's `act` store before pass 2 reads the owned chunk.
     __syncthreads();
     amax_rv all;
     warp::load(all, amax_s);
     const float scale = scratchy::ops::fp8_scale::op<float>(warp::max(all));
-    if (threadIdx.x == 0) {
+    if (t_own == 0 && threadIdx.x == 0) {
         g.scale[{0, 0, 0, r}] = scale;
     }
-    const int lane = warp::laneid();
-#pragma unroll
-    for (int i = 0; i < WARP_CHUNKS; i++) {
-        if (i < mine) {
-            const int c0 = (w + i * WARPS) * CHUNK;
-            if (g.store_act) {
-#pragma unroll
-                for (int s = 0; s < chunk_rv::outer_dim; s++) {
-                    const int col = c0 + 32 * s + lane;
-                    if (col < g.n) {
-                        g.act[{0, 0, r, col}] = base_types::convertor<bf16, float>::convert(act[i][s][0]);
-                    }
-                }
-            }
-            warp::bin_op<scratchy::ops::fp8_quant_pre>(act[i], act[i], scale);
-#pragma unroll
-            for (int s = 0; s < chunk_rv::outer_dim; s++) {
-                const int col = c0 + 32 * s + lane;
-                if (col < g.n) {
-                    g.q[{0, 0, r, col}] = base_types::convertor<fp8e4m3, float>::convert(act[i][s][0]);
-                }
-            }
+    // Pass 2, one element a thread: the owned chunk is warp `t_own % 8`'s load `t_own / 8`.
+    const int col = t_own * CHUNK + int(threadIdx.x);
+    if (col < g.n) {
+        const float v = gate_s[t_own % WARPS][t_own / WARPS][int(threadIdx.x)];
+        if (g.store_act) {
+            g.act[{0, 0, r, col}] = base_types::convertor<bf16, float>::convert(v);
         }
+        g.q[{0, 0, r, col}] = base_types::convertor<fp8e4m3, float>::convert(
+            scratchy::ops::fp8_quant_pre::op<float>(v, scale));
     }
 }
 
@@ -205,7 +198,7 @@ extern "C" int scratchy_cuda_act_quant_fp8(const void* gate, const void* up, voi
             int((n + uint32_t(CHUNK) - 1) / uint32_t(CHUNK)),
             act != nullptr ? 1 : 0};
         void* args[] = {&G};
-        const dim3 grid{rows}, block{uint32_t(THREADS)};
+        const dim3 grid{(n + uint32_t(CHUNK) - 1) / uint32_t(CHUNK), rows}, block{uint32_t(THREADS)};
         const auto ker = op == ACT_SILU ? act_quant_fp8_ker<scratchy::ops::silu_mul>
                                         : act_quant_fp8_ker<scratchy::ops::gelu_tanh_mul>;
         return static_cast<int>(cudaLaunchKernel(ker, grid, block, args, SMEM_BYTES,
