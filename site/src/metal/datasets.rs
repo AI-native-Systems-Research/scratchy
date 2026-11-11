@@ -8,7 +8,9 @@ use crate::carbon::{
     Alignment, ContentPanel, Definition, Heading, Section, Stack, TabItem, Tabs, TabsKind, Tile,
     TipHeading,
 };
-use crate::charts::{RATIO_STEPS, ScaleFit, ratio_ink, ratio_labels, ratio_scale, ratio_step};
+use crate::charts::{
+    RATIO_STEPS, STRIPED, ScaleFit, ratio_ink, ratio_labels, ratio_scale, ratio_step,
+};
 
 use super::buckets;
 use super::data::{At, Model, RequestTiming, Run, TaskCell};
@@ -909,10 +911,6 @@ struct Row {
     timing: RequestTiming,
     about: &'static str,
 }
-
-/// A square with no ratio: struck through, as the grid's are.
-const STRIPED: &str = "background: repeating-linear-gradient(135deg, transparent 0 4px, \
-                       light-dark(#c6c6c6, #525252) 4px 5px)";
 
 /// The engines a pair of `dataset` is drawn for, scratchy then its rival, and every users count
 /// either measured: one scratchy failed still shows its rival's.
