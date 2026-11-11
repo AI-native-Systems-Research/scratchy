@@ -454,6 +454,23 @@ __device__ inline kittens::bf16 with_residual(float v, kittens::bf16 r) {
     return convertor<kittens::bf16, float>::convert(sum);
 }
 
+// The residual epilogue's first rounding on a vector (FP8 S8 T1, the tensor-core GEMV): `v` rounded
+// to bf16 as the GEMV stores it and widened back exactly, `with_residual`'s `stored`, so the
+// residual's f32 add and the store's one rounding after it are `with_residual`'s bits.
+struct round_bf16 {
+    template <typename T>
+    static __device__ inline T op(const T& v);
+};
+template <>
+__device__ inline float round_bf16::op<float>(const float& v) {
+    using kittens::base_types::convertor;
+    return convertor<float, kittens::bf16>::convert(convertor<kittens::bf16, float>::convert(v));
+}
+template <>
+__device__ inline float2 round_bf16::op<float2>(const float2& v) {
+    return float2{round_bf16::op<float>(v.x), round_bf16::op<float>(v.y)};
+}
+
 // TK-GAP(rv_fma) begin
 // A register-vector map over three vectors, `dst[i][j] = op(a[i][j], b[i][j], c[i][j])`: TK's own
 // vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or two
