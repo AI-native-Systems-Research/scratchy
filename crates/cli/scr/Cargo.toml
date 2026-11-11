@@ -96,6 +96,13 @@ spyre-hw = [
   "scratchy-target-spyre/spyre-hw",
 ]
 spyre-emu = ["scratchy-serving-api/spyre-emu"]
+# The FFI link route is a property of the LINKED ARCHIVES, not a feature
+# of this crate: flex-rs's build script links libflex_shim.a and
+# libsenlib_oco.a statically from SENLIB_STATIC_LIB_DIR at build (both
+# built on card hosts from the IBM-internal trees), so a spyre-hw binary
+# embeds them — the executable itself is the record of what ran, and an
+# internal artifact. The former `--features spyre-hw,oco-so` chain is
+# gone with the path dependency that forwarded it.
 # Server-side modifiers: no-op without `serve` (`?/` only forwards when
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to

@@ -37,6 +37,15 @@ spyre = []
 #                  image (`superdsc_bake::global()` is `None`). What a card bake lowers is decided here;
 #                  `spyre-hw` adds only the compiler that turns it into images, and the SDK.
 spyre-lower = ["spyre"]
+# The card surface's flex-rs edge: the in-tree crate carries the C-ABI
+# DECLARATIONS only — the implementation is linked statically, as two
+# archives built on card hosts from the IBM-internal trees
+# (libflex_shim.a, an extern "C" seam over the native Rust port, then
+# libsenlib_oco.a), from the directory SENLIB_STATIC_LIB_DIR names.
+# A public clone compiles with no IBM artifact present; a spyre-hw
+# BUILD without the archives refuses loudly at the build script,
+# naming what is missing. No feature of the real crate needs naming
+# here; the declarations are generation-free.
 spyre-hw = ["spyre-lower", "dep:flex-rs"]
 spyre-emu = ["spyre", "dep:ktir-emulator"]
 # ⭐ THE TRITON SPLICE IS THE ONLY PRODUCER — UNCONDITIONAL. `lower_one_node` routes
@@ -75,11 +84,12 @@ half = { workspace = true }
 # holds the `Arc<Mmap>` the bytes are viewed through). Same workspace version
 # `scratchy-tensors` already exposes through `DeviceAllocator::register_mmap`.
 memmap2 = { workspace = true }
-# Native Rust port of flex. In-tree crate; the card surface's only
-# backing (see runtime.rs) — pure Rust so it compiles on any host regardless
-# of `spyre-hw`; its own cxx-shim only compiles/links when built on a real
-# Spyre host (its C++ compile is skipped only by the SCRATCHY_SKIP_SENDNN_CXX
-# check-only escape hatch, never by a Cargo feature).
+# In-tree crate: the senlib flex port's PUBLIC face — the C-ABI
+# declarations and the pure-Rust type layer (addressing, control-block
+# words, scheduler) the card surface compiles against. The implementing
+# archives are linked statically at build (see flex-rs/build.rs), so
+# this builds on any host and links the real implementation only where
+# the archives exist.
 flex-rs = { path = "flex-rs", optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

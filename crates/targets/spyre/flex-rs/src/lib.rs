@@ -30,8 +30,8 @@
 //! - `shared_host_pool`     — pinned, index-addressed host slots behind one
 //!   IOMMU mapping (#606; the stable-IOVA half of #603 PR3b's per-step DMA)
 //! - `flex_config`          — FlexConfig, RuntimeConfig
-//! - `hal_sbf`              — R5/RDMA wire-door builders over the cxx-shim
-//!   `hal_sbf.cpp` doors (the r5-wire port): the R5 section, Rdma12 unicast
+//! - `hal_sbf`              — R5/RDMA wire-door builders over the FFI
+//!   hal doors (the r5-wire port): the R5 section, Rdma12 unicast
 //!   send, Rdma10 wdone wait, R5 appdata decode
 //! - `util`                 — sendnn::Status, generic numeric/env helpers
 //! - `telemetry`            — FlexLogExtra, FlexConfig subset, Profiler/GlobalProfiler,
