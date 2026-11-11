@@ -9427,12 +9427,12 @@ mod elementwise_tests {
     /// ⭐⭐⭐ THE LEAD'S OWN FIXTURE — the Mulf the moved refusal named: one operand the
     /// converted 42-row PIECE (a whole `[42, 2048]` value), the other the whole 64-row VALUE's
     /// load of the same window `[0, 42)`. One window, two frames, TWO VALUES — the door places
-    /// each: the piece whole (a reconstructing walk), the load a row band whose walk is PINNED
-    /// to the parent's `[64, 2048]` extents. And the tail block's Mulf — the piece `[0, 22)`
+    /// each: the piece whole (a reconstructing walk), the load a row band that states the
+    /// parent's `[64, 2048]` pitch as its back gap. And the tail block's Mulf — the piece `[0, 22)`
     /// beside the load `[42, 64)` — places its load at the band's own corner, 2688 elements in.
-    /// `cols = 2048` is the ADMITTED geometry — 32 fp16 sticks, one stick a core, the batch-2
-    /// decode band shape. At 4096 (64 sticks over 32 cores) the door REFUSES by name; that
-    /// refusal has its own fixture below (`a_window_wider_than_one_stick_a_core_is_refused`).
+    /// `cols = 2048` is the one-stick-a-core geometry — the batch-2 decode band shape. At 4096
+    /// (64 sticks, multi-stick cores) the same door states the same pitch and the band lowers
+    /// through it (`a_band_wider_than_one_stick_a_core_lowers_through_its_back_gap` below).
     #[test]
     fn a_split_piece_beside_its_parent_load_states_one_window_two_frames() {
         let cols = 2048u32;
@@ -10084,13 +10084,13 @@ mod elementwise_tests {
     // whole row sweep is refused by name.
 
     /// ⭐ THE HEAD BAND — a split piece's head block, `[0,42)` of a `[64, ·]` value, under a
-    /// whole `[42, ·]` output: the input DECLARES the parent (its walk pinned to `[64, cols]`,
-    /// the extents the door reconstructs and sizes against) and sits at corner
-    /// 0. This is the frame the `v_rows == rows` clause exists for: a row-0 window of a TALLER
-    /// parent must never take the column-window form, whose corner math strides the planes at
-    /// the OP's own rows — the head-block mis-stride, unreachable here. `cols = 2048` is the
-    /// admitted geometry (32 sticks, one stick a core); the stride safety past the walk is the
-    /// windowed-stick law's, not the walk's.
+    /// whole `[42, ·]` output: the input DECLARES the parent — its pitch the door states as the
+    /// back gap past the swept walk (the extents the door reconstructs and sizes against) — and
+    /// sits at corner 0. This is the frame the `v_rows == rows` clause exists for: a row-0
+    /// window of a TALLER parent must never take the column-window form, whose corner math
+    /// strides the planes at the OP's own rows — the head-block mis-stride, unreachable here.
+    /// `cols = 2048` is the one-stick-a-core geometry; the stride safety past the walk is the
+    /// back gap's, not the walk's.
     #[test]
     fn a_head_band_scalarmul_declares_the_parent() {
         let cols = 2048u32;
@@ -10119,7 +10119,7 @@ mod elementwise_tests {
     /// ⭐ THE TAIL BAND — `[42,64)` of the same `[64, ·]` value under a whole `[22, ·]` output:
     /// the same parent declaration, and the corner at the parent's OWN nest — `rc_of(64, ·, 42,
     /// 0)` = 42·64 — never the op-rows pitch, which would read the head's rows as the tail's.
-    /// `cols = 2048` is the admitted geometry (32 sticks, one stick a core).
+    /// `cols = 2048` is the one-stick-a-core geometry.
     #[test]
     fn a_tail_band_scalarmul_sits_at_the_parent_s_own_corner() {
         let cols = 2048u32;
@@ -10144,36 +10144,34 @@ mod elementwise_tests {
         );
     }
 
-    /// ⛔ THE TOO-WIDE WINDOW IS REFUSED, NEVER EMITTED MIS-STRIDED. A `[42, ·]` band of a
-    /// `[64, 4096]` parent sweeps 64 fp16 sticks over 32 cores, so the windowed-stick law
-    /// refuses it by name: a core holding two sticks of the window would have to walk the
-    /// parent's inter-plane stride, and NOTHING states that stride. The walk's parent
-    /// declaration is NOT a fix — card-measured 2026-11-08, `maxDimSizes_` is inert as a
-    /// stride (a size cap only: `init_binary` is byte-identical with or without the pinned
-    /// walk, for pointwise bands and bmm alike), and without `backGapCore_` a multi-stick
-    /// operand's second stick lands at the op's own row count instead of the parent's —
-    /// 0% correct on the card's bmm legs. So a 64-stick window over 32 cores is REFUSED at
-    /// the budget, not baked and masked.
+    /// ⭐ A BAND WIDER THAN ONE STICK A CORE LOWERS THROUGH ITS BACK GAP — the case the
+    /// windowed-stick law used to refuse. A `[42, ·]` band of a `[64, 4096]` parent sweeps 64
+    /// fp16 sticks and spends the cores its bytes pay for (multi-stick cores), so its safety is
+    /// the parent's PITCH, which the door states on the banded operand: `backGapCore_[mb] =
+    /// 64 − 42` strides every core's sticks past the first at the parent's column planes
+    /// (card-measured 2026-11-08, bit-exact), and the walk itself stays the swept one — never
+    /// pinned to the parent (`maxDimSizes_` is a size cap, inert as a stride). The whole
+    /// output reconstructs, as every whole value's does.
     #[test]
-    fn a_window_wider_than_one_stick_a_core_is_refused() {
+    fn a_band_wider_than_one_stick_a_core_lowers_through_its_back_gap() {
         let cols = 4096u32;
         let r = vec![split(5, 64, 0, 42, cols), reg(7, 42, cols, true)];
         let mut sym = 0i64;
-        let Err(e) = scalarmul_scaled::<crate::collective::TpWorld<1>>(
+        let ops = scalarmul_scaled::<crate::collective::TpWorld<1>>(
             "scalarmul_s5",
             &ScaleSource::Bound { tid: 99 },
             None,
             &r,
             &mut sym,
             None,
-        ) else {
-            panic!("a 64-stick window over 32 cores is refused, never emitted mis-strided")
-        };
-        assert!(
-            e.message
-                .contains("a windowed operand too wide for one stick a core"),
-            "refused by name, got: {}",
-            e.message
+        )
+        .unwrap_or_else(|e| panic!("a 64-stick band lowers through its back gap: {}", e.message));
+        assert_eq!(ops.len(), 1, "one descriptor, not a decomposition");
+        assert_band_pitch(&ops[0], 0, 64, "the banded input");
+        assert_eq!(
+            walk_of(&ops[0], 1),
+            serde_json::json!([-1, -1]),
+            "the whole output reconstructs"
         );
     }
 

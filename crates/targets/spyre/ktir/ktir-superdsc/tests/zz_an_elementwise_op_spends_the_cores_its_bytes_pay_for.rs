@@ -9,9 +9,10 @@
 //! A `[1, 2048]` add costs 0.51 µs on 4–8 cores against 0.80 µs on 32; 32 cores start to win at 24–32 KiB
 //! of output (96 KiB moved by a binary op). Gen1's `BYTES_PER_CORE` = 3 KiB is that crossover.
 //!
-//! The WINDOWED law (a windowed operand's per-core stick count is 1) is proven in `work.rs`'s own
-//! unit tests — its mint (`TileOp::with_windowed`) is crate-private, one writer at the broadcast
-//! door.
+//! The law holds of a BANDED operand no less than a whole one: a row band's stride safety is the
+//! door's pitch statement (the back-gap law,
+//! `zz_a_row_band_states_its_parent_pitch_as_a_back_gap`), never the budget's, so nothing about a
+//! band moves this spend.
 
 use ktir_superdsc::device_gen::{DeviceGen, Gen1};
 use ktir_superdsc::ir::island::tile_op::{TileOp, TileOpKind};

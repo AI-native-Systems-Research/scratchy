@@ -1026,19 +1026,10 @@ pub fn pointwise_untiled_slice_bytes_divided(
         Df::Fp16,
     );
     // The pin is sized under the budget its ops spend ([`crate::work::EwDivision::budget`]), or the
-    // slice it reserves and the slice each op's core walks are two different divisions.
-    //
-    // ⚠ THIS MINT IS UNWINDOWED BY CONSTRUCTION, and that is a LAW OF ITS SIGNATURE, not an
-    // oversight: the sizer takes `(rows, cols, n_inputs)` — no operand presentation — and the
-    // windowed fact is minted from the operand presentation at the ONE door that holds it
-    // (`pointwise_broadcast_opspec_from_tile`, via `TileOp::with_windowed`); this lookalike
-    // cannot state it. So the budget below is the byte law's (`for_bytes`), and it is only the
-    // right budget for an op whose operands are its own extents. A caller sizing a WINDOWED op
-    // through this function — a row band of a taller parent — would reserve the pin under a
-    // different division than the op's cores walk (the windowed-stick law's `of_cores(sticks)`),
-    // and the windowed refusal cannot fire here to catch it. No such caller exists in this tree
-    // today (the function has none at all); one that appears must thread the door-minted
-    // `TileOp` through instead of re-deriving the shape.
+    // slice it reserves and the slice each op's core walks are two different divisions. The budget
+    // is the byte law's for every elementwise op — a banded operand's stride safety is the door's
+    // pitch statement, never the budget's — so the sizer's `(rows, cols, n_inputs)` signature
+    // states everything the budget reads.
     let division = division.resolve(true, true);
     tile_op
         .tile(division.budget(&tile_op).ok()?, division.splitter(), "out")

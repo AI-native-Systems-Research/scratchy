@@ -578,49 +578,27 @@ pub fn row_groups(dims: &[ItDim], max_cores: u32, n: u32) -> BTreeMap<&'static s
 }
 
 impl EwDivision {
-    /// ⭐ THE BUDGET THIS DIVISION SPENDS — the one place the byte law and the windowed-stick law
-    /// are applied, over the op's own [`TileOp`] declaration.
+    /// ⭐ THE BUDGET THIS DIVISION SPENDS — the one place the byte law is applied, over the op's
+    /// own [`TileOp`] declaration.
     ///
     /// **The byte law.** The two divisions the elementwise law chooses between
     /// ([`Self::RowsFirst`], [`Self::SticksFirst`]) are free choices of how to spread the op, so
     /// they spend the cores its bytes pay for ([`CoreBudget::for_bytes`] on
     /// [`TileOp::operand_bytes`]): a decode-sized op runs on the few cores whose fixed cost it
-    /// needs, not on all of them.
-    ///
-    /// **The windowed-stick law.** A WINDOWED operand — one whose declared `mb` device extent
-    /// exceeds the op's swept rows, the row-band/batched-decode form
-    /// ([`crate::addr::RowWindow::parent_rows`], declared at
-    /// [`TensorArg::with_device_extent`]) — is only safe because a core holding ONE stick never
-    /// crosses a column plane: its own stick-major layout coincides with the parent's inside that
-    /// plane. A MULTI-STICK core must walk the parent's inter-plane stride (`parent_rows·lanes`
-    /// between column planes), and nothing states that stride without `backGapCore_` — so a
-    /// windowed operand's per-core stick count is 1, and the budget is the op's swept
-    /// whole-stick count, clamped to at least one core. A windowed op whose swept stick count
-    /// exceeds the generation's cores is REFUSED by name — a windowed operand too wide for one
-    /// stick a core — never silently clamped past the law. [`Self::Groups`] is a correctness law
-    /// of its own — one row group a core, so each core's LX holds the intermediates its group
-    /// reads — and keeps every core ([`CoreBudget::whole`]). [`Self::Law`] is not a division
-    /// until it is resolved, and spends what its resolution spends.
-    ///
-    /// [`TensorArg::with_device_extent`]: crate::superdsc_opspec::TensorArg::with_device_extent
+    /// needs, not on all of them. A WINDOWED operand — a row band of a taller parent, the
+    /// batched-decode form — spends by the same law: its stride safety is not the budget's to
+    /// give but the door's, which states the parent's pitch on every multi-stick banded operand
+    /// it builds ([`crate::superdsc_opspec::LayoutAxis::pitch`] — `backGapCore_` on HBM, the
+    /// pinned walk on LX, card-measured 2026-11-08), so a multi-stick core strides the parent's
+    /// column planes correctly and the swept bytes are the bytes. [`Self::Groups`] is a
+    /// correctness law of its own — one row group a core, so each core's LX holds the
+    /// intermediates its group reads — and keeps every core ([`CoreBudget::whole`]).
+    /// [`Self::Law`] is not a division until it is resolved, and spends what its resolution
+    /// spends.
     pub fn budget(self, op: &crate::ir::island::tile_op::TileOp) -> Result<CoreBudget, String> {
         match self {
             EwDivision::Law | EwDivision::RowsFirst | EwDivision::SticksFirst => {
-                if op.windowed() {
-                    let sticks = op.swept_sticks();
-                    let cores = crate::device_gen::BUILD_CORES;
-                    if sticks > cores {
-                        return Err(format!(
-                            "a windowed operand too wide for one stick a core: the op sweeps \
-                             {sticks} sticks over {cores} cores — a multi-stick core would have \
-                             to walk the parent's inter-plane stride, which nothing states \
-                             without `backGapCore_`"
-                        ));
-                    }
-                    Ok(CoreBudget::of_cores(sticks.max(1)))
-                } else {
-                    Ok(CoreBudget::for_bytes(op.operand_bytes()))
-                }
+                Ok(CoreBudget::for_bytes(op.operand_bytes()))
             }
             EwDivision::Groups(_) => Ok(CoreBudget::whole()),
         }
@@ -1704,7 +1682,7 @@ mod layout_first_tests {
 }
 
 #[cfg(test)]
-mod windowed_stick_law_tests {
+mod byte_law_tests {
     use super::EwDivision;
     use crate::ir::island::tile_op::{TileOp, TileOpKind};
     use crate::superdsc_opspec::{CoreBudget, Df, ItDim};
@@ -1730,67 +1708,28 @@ mod windowed_stick_law_tests {
         )
     }
 
-    /// ⭐⭐⭐ THE WINDOWED-STICK LAW: a windowed operand's per-core stick count is 1, so the budget
-    /// is the op's swept whole-stick count — one stick a core, never a multi-stick core that would
-    /// have to walk the parent's inter-plane stride. `[1, 512]` fp16 sweeps 8 whole sticks
-    /// (64 elems a stick): 8 cores.
+    /// ⭐ EVERY ELEMENTWISE OP SPENDS THE CORES ITS BYTES PAY FOR — a banded shape no less than a
+    /// whole one: a band's stride safety is the door's pitch statement, never the budget's, so
+    /// nothing about a row band moves this spend. `[1, 512]` fp16 × 3 operands = 3 KiB: 1 core;
+    /// `[1, 2048]` = 12 KiB: 4 cores; a `[512, 512]` whole sweep: every core.
     #[test]
-    fn a_windowed_op_spends_one_stick_a_core() {
-        let windowed = op(1, 512).with_windowed(true);
-        assert_eq!(
-            EwDivision::Law.budget(&windowed).unwrap().get(),
-            8,
-            "the swept whole-stick count, one stick a core"
-        );
-        assert_eq!(
-            EwDivision::RowsFirst.budget(&windowed).unwrap().get(),
-            8,
-            "the law holds whichever way the free division splits"
-        );
-        assert_eq!(EwDivision::SticksFirst.budget(&windowed).unwrap().get(), 8);
-    }
-
-    /// The same op, NOT windowed, spends the cores its bytes pay for — the windowed fact is the
-    /// only thing that moves the budget, and it is minted from the operand presentation, never
-    /// from the shape alone.
-    #[test]
-    fn the_same_op_unwindowed_spends_by_bytes() {
+    fn every_elementwise_op_spends_by_bytes_band_or_whole() {
         assert_eq!(EwDivision::Law.budget(&op(1, 512)).unwrap().get(), 1);
         assert_eq!(EwDivision::Law.budget(&op(1, 2048)).unwrap().get(), 4);
-    }
-
-    /// The near-miss: a row band whose declared extent EQUALS the op's swept rows (batch-1) is not
-    /// windowed — `RowWindow::declares_past` says false at the door, so the op mints `windowed:
-    /// false` and spends by bytes like any other op.
-    #[test]
-    fn a_batch_one_band_is_not_windowed() {
-        // declared == swept: the door's `declares_past(rows)` is false, the mint keeps `false`.
-        let batch_one = op(512, 512).with_windowed(false);
-        assert_eq!(EwDivision::Law.budget(&batch_one).unwrap().get(), 32);
-    }
-
-    /// A windowed op whose swept stick count exceeds the generation's cores is REFUSED by name —
-    /// never silently clamped past the law, never spread two sticks to a core.
-    #[test]
-    fn a_windowed_op_wider_than_one_stick_a_core_is_refused_by_name() {
-        let err = EwDivision::Law
-            .budget(&op(1, 4096).with_windowed(true))
-            .unwrap_err();
-        assert!(
-            err.contains("a windowed operand too wide for one stick a core"),
-            "refused by name, got: {err}"
-        );
-    }
-
-    /// A stated division (`Groups`) is a correctness law of the walk's LX plan, windowed or not —
-    /// it keeps every core.
-    #[test]
-    fn a_stated_division_keeps_every_core_windowed_or_not() {
+        assert_eq!(EwDivision::RowsFirst.budget(&op(1, 2048)).unwrap().get(), 4);
         assert_eq!(
-            EwDivision::Groups(8)
-                .budget(&op(1, 512).with_windowed(true))
-                .unwrap()
-                .get(),
+            EwDivision::SticksFirst.budget(&op(1, 2048)).unwrap().get(),
+            4
+        );
+        assert_eq!(EwDivision::Law.budget(&op(512, 512)).unwrap().get(), 32);
+    }
+
+    /// A stated division (`Groups`) is a correctness law of the walk's LX plan — it keeps every
+    /// core whatever the bytes.
+    #[test]
+    fn a_stated_division_keeps_every_core() {
+        assert_eq!(
+            EwDivision::Groups(8).budget(&op(1, 512)).unwrap().get(),
             CoreBudget::whole().get()
         );
     }

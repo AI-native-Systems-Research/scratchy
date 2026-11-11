@@ -816,9 +816,8 @@ impl serde::Serialize for SliceIndex {
 /// ([`Baked`](crate::device_gen::Baked)) cores one op may be divided over. SEALED: the field is
 /// private and the constructors are [`Self::whole`] (public — the budget of every division that
 /// is a correctness law of its own) and [`Self::for_bytes`] (crate-private;
-/// [`crate::work::EwDivision::budget`] is its only caller, where the byte law and the
-/// windowed-stick law are applied), so no caller can hand the splitter a count it computed
-/// itself.
+/// [`crate::work::EwDivision::budget`] is its only caller, where the byte law is applied), so no
+/// caller can hand the splitter a count it computed itself.
 ///
 ///   * [`Self::whole`] — every core the generation has. The budget of every division that is a
 ///     correctness law of its own (a gather's entries, a walk's row groups, a matmul's cost search,
@@ -862,7 +861,7 @@ impl CoreBudget {
 
     /// The cores `bytes` of operand traffic pay for: `ceil(bytes / BYTES_PER_CORE)`, clamped to
     /// `1..=CORES`. SEALED crate-private: [`crate::work::EwDivision::budget`] — where the byte
-    /// law and the windowed-stick law are stated — is its only caller.
+    /// law is stated — is its only caller.
     pub(crate) const fn for_bytes(bytes: u64) -> Self {
         let want = bytes
             .div_ceil(<crate::device_gen::Baked as crate::device_gen::DeviceGen>::BYTES_PER_CORE);
@@ -873,13 +872,6 @@ impl CoreBudget {
         } else {
             want as u32
         };
-        CoreBudget { cores }
-    }
-
-    /// A budget of exactly `cores` cores — the windowed-stick law's count ([`crate::work::
-    /// EwDivision::budget`]), which has already refused everything above the generation's cores
-    /// and floors at one. Crate-private for the same reason [`Self::for_bytes`] is.
-    pub(crate) const fn of_cores(cores: u32) -> Self {
         CoreBudget { cores }
     }
 

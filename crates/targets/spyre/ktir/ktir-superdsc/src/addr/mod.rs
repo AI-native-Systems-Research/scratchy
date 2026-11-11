@@ -483,17 +483,6 @@ impl RowWindow {
     pub fn spans_one_stick(self) -> bool {
         self.width <= self.df.elems_per_stick()
     }
-
-    /// ⭐ Whether this window DECLARES a device extent past the op's swept rows — the
-    /// windowed-stick law's fact ([`crate::work::EwDivision::budget`]). True only of a
-    /// MULTI-STICK window (a one-stick window declares nothing — it never crosses a plane) of a
-    /// TALLER parent (`parent_rows > rows`; a band whose parent is exactly the op's rows, the
-    /// batch-1 case, declares an extent equal to the sweep). Such an operand is safe only while
-    /// a core holds ONE stick: a multi-stick core would have to walk the parent's inter-plane
-    /// stride, which nothing states without `backGapCore_`.
-    pub fn declares_past(self, rows: u32) -> bool {
-        !self.spans_one_stick() && self.parent_rows > rows
-    }
 }
 
 /// The [`RowWindow`] at `(r, c)` of a stick-major `[parent_rows, full]` tensor, `width` elements

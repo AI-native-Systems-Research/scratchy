@@ -58,66 +58,21 @@ pub struct TileOp {
     /// The stick (device format) of the OUTPUT/tiled dim — drives the `time_tile_for_lx` stick-count
     /// search. Matches `StickLayout::df` of the tensor whose `out`/N dim this op tiles.
     pub df: Df,
-    /// ⭐ THE WINDOWED-STICK LAW'S CARRIER — whether any operand of this op declares an `mb` device
-    /// extent taller than the op's swept rows (a row band of a taller parent, the batched decode's
-    /// per-request pass). PRIVATE: it is minted from the operand presentation at the ONE door that
-    /// holds it ([`crate::ir::bridge::tiled_op_sdsc_op::pointwise`]'s broadcast builder, via
-    /// [`Self::with_windowed`]) — never stated, or re-derived, per call site. Every other mint
-    /// ([`Self::new`], [`Self::from_layout`]) states `false`: its operands are its own extents.
-    /// Read by [`crate::work::EwDivision::budget`], which applies the law: a windowed operand's
-    /// per-core stick count is 1.
-    windowed: bool,
 }
 
 impl TileOp {
     /// The plain mint — a `TileOp` whose operands are its own extents (every matmul, gather,
-    /// scatter, reduce and whole-tensor pointwise op). The windowed fact is minted from an
-    /// operand presentation at the broadcast door, never here.
+    /// scatter, reduce and whole-tensor pointwise op).
     pub fn new(kind: TileOpKind, dims: Vec<ItDim>, df: Df) -> Self {
-        TileOp {
-            kind,
-            dims,
-            df,
-            windowed: false,
-        }
+        TileOp { kind, dims, df }
     }
 
     /// Build a `TileOp` from an operand's [`StickLayout`] plus the extra dims a matmul/reduce needs
     /// beyond the layout's own `(rows, cols)` — e.g. a matmul's `in`(K)/`out`(N) or a batched
     /// attention's `y`(heads). `sl` supplies `df` (the stick basis) directly — one less place for the
-    /// stick width to be hand-copied and drift from the tensor's real device format. The operands
-    /// are their own extents; the windowed fact is not this mint's to state.
+    /// stick width to be hand-copied and drift from the tensor's real device format.
     pub fn from_layout(kind: TileOpKind, sl: &StickLayout, dims: Vec<ItDim>) -> Self {
         TileOp::new(kind, dims, sl.df)
-    }
-
-    /// Whether any operand of this op declares an `mb` device extent taller than the op's swept
-    /// rows — the windowed-stick law's fact, read by [`crate::work::EwDivision::budget`].
-    pub(crate) fn windowed(&self) -> bool {
-        self.windowed
-    }
-
-    /// THIS op's declaration with the windowed fact minted from the operand presentation the
-    /// broadcast door holds — the ONE writer of that fact. Crate-private: the door
-    /// (`crate::ir::bridge::tiled_op_sdsc_op::pointwise`) derives `windowed` from its operands'
-    /// row windows once, and no other site can state it.
-    pub(crate) fn with_windowed(&self, windowed: bool) -> TileOp {
-        TileOp {
-            kind: self.kind,
-            dims: self.dims.clone(),
-            df: self.df,
-            windowed,
-        }
-    }
-
-    /// The op's swept whole-stick count — its `out` extent in sticks of its own device format.
-    /// The windowed-stick law's budget: one stick a core, so the swept sticks are the cores.
-    pub(crate) fn swept_sticks(&self) -> u32 {
-        let lanes = self.df.elems_per_stick().max(1);
-        self.dims
-            .iter()
-            .find(|d| d.name == "out")
-            .map_or(1, |d| (d.size / lanes).max(1))
     }
 
     /// The bytes this op moves: every operand's tile at the op's own extents. A pointwise or reduce

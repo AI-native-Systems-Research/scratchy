@@ -1545,24 +1545,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
     );
-    // ⭐⭐⭐ THE WINDOWED-STICK LAW, MINTED ONCE AT THIS DOOR. An operand whose declared `mb`
-    // device extent exceeds the op's swept rows — a multi-stick row band of a taller parent
-    // ([`crate::addr::RowWindow`], the parent's row count declared at
-    // [`TensorArg::with_device_extent`]) — is only safe because a core holding ONE stick never
-    // crosses a column plane; a multi-stick core would have to walk the parent's inter-plane
-    // stride, which nothing states without `backGapCore_`. So the door states the fact ONCE,
-    // from the operand presentation it already holds (the `mk` below is the presentation's other
-    // reader — it declares the same windows' parent rows as device extents), and
-    // [`crate::work::EwDivision::budget`] holds the op's cores to one stick a core. A ONE-STICK
-    // band declares no device extent (it never crosses a plane) and is not windowed; a band whose
-    // parent is exactly the op's rows (the batch-1 case, declared == swept) is not windowed
-    // either. No call site derives this — the callers' `TileOp`s state shape only.
-    let tile_op = tile_op.with_windowed(
-        out_row_window.is_some_and(|w| w.declares_past(rows))
-            || inputs
-                .iter()
-                .any(|i| i.row_window().is_some_and(|w| w.declares_past(rows))),
-    );
     let df = tile_op.df;
     // ⭐ THE FAMILY MINT — every operand's swept window (the per-form broadcast law,
     // `EwOperand::swept_extents`) checked against its handle's declared shape and, when a layout
