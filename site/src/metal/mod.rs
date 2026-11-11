@@ -21,19 +21,19 @@ use std::fs;
 
 use dioxus::prelude::*;
 
-use crate::Site;
 use crate::carbon::{
     Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Heading,
-    Section, Stack, Table, TableCell, TableRow, TipHeading, Toggletip,
+    Stack, Table, TableCell, TableRow, TipHeading, Toggletip, headers, part,
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Bounds, BubblePoint, Bubbles, Chart, ChartOptions,
     ColorLegend, Colour, ComboLayer, Enabled, Gradient, HeatPoint, HeatmapOptions, Hover,
-    LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, ScaleFit, SparkAxes, SparkPoint, Step,
-    TableAxes, chart, colour, log2_ratio, mini_heatmap, ratio_ink, ratio_labels, ratio_scale,
-    ratio_step, sparkline,
+    LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, STRIPED, ScaleFit, SparkAxes, SparkPoint,
+    Step, TableAxes, chart, colour, grouped_bars, log2_ratio, mini_heatmap, ratio_ink,
+    ratio_labels, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
+use crate::{Site, slug};
 use data::{At, Cell, Model, RequestTiming, Run, Scenario};
 use numbers::{
     Engine, FAILED, Metric, NO_STREAM, SHORT, cfmt, failed_note, fmt, marks, marks_note, served,
@@ -510,15 +510,6 @@ pub(super) fn marks_key() -> Element {
     )
 }
 
-pub(super) fn slug(text: &str) -> String {
-    let lower = text.to_lowercase();
-    let parts: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit())
-        .filter(|p| !p.is_empty())
-        .collect();
-    parts.join("-")
-}
-
 // ------------------------------------------------------------------ indexing
 
 /// One model's result within one run.
@@ -777,23 +768,6 @@ fn opt(v: Option<u32>) -> String {
     v.map_or("?".to_string(), |v| v.to_string())
 }
 
-fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
-    names.map(String::from).to_vec()
-}
-
-/// A part of a model's tile: its heading, then what explains it, then it.
-fn part(heading: &str, intro: Element, body: Element) -> Element {
-    rsx! {
-        Section { level: 4,
-            Stack { gap: 3,
-                Heading { "{heading}" }
-                p { {intro} }
-                {body}
-            }
-        }
-    }
-}
-
 /// One line of a chart: its label, series colour, and (x, value) points; a
 /// point present but None was not measured.
 pub(super) struct Series {
@@ -848,61 +822,26 @@ pub(super) fn bar_chart(
     height: &str,
     label: &str,
 ) -> Element {
-    let spec = Chart::GroupedBar {
-        data: series
-            .iter()
-            .flat_map(|s| {
-                s.pts.iter().map(|&(x, v)| BarPoint {
-                    group: &s.label,
-                    key: x.to_string(),
-                    // Carbon prints values as given: round to what the tables show.
-                    value: v.map(|v| (v * 10.0).round() / 10.0),
-                })
+    let data = (series.iter())
+        .flat_map(|s| {
+            (s.pts.iter()).map(|&(x, value)| BarPoint {
+                group: &s.label,
+                key: x.to_string(),
+                value,
             })
-            .collect(),
-        options: ChartOptions {
-            title: title.to_string(),
-            axes: Axes {
-                // Each user count a category, in the order measured.
-                bottom: Axis {
-                    maps_to: "key",
-                    title: sweep.xlabel(),
-                    scale_type: Some("labels"),
-                    ticks: None,
-                    include_zero: None,
-                    visible: None,
-                    domain: Some(AxisDomain::Labels(xs.iter().map(u32::to_string).collect())),
-                },
-                left: Axis {
-                    maps_to: "value",
-                    title: ylabel,
-                    scale_type: None,
-                    ticks: None,
-                    include_zero: Some(true),
-                    visible: None,
-                    domain: None,
-                },
-            },
-            color: Some(Colour::Scale {
-                scale: series
-                    .iter()
-                    .map(|s| (s.label.as_str(), colour(s.class)))
-                    .collect(),
-            }),
-            heatmap: None,
-            height: height.to_string(),
-            width: None,
-            legend: None,
-            locale: None,
-            combo: None,
-            bounds: None,
-            bubble: None,
-            line: None,
-            hover: None,
-            toolbar: Enabled { enabled: false },
-        },
-    };
-    chart(&spec, label, "width: 100%", None)
+        })
+        .collect();
+    // Each user count a category, in the order measured.
+    let keys = xs.iter().map(u32::to_string).collect();
+    let colours = series.iter().map(|s| (s.label.as_str(), colour(s.class)));
+    grouped_bars(
+        data,
+        keys,
+        colours,
+        (title, sweep.xlabel(), ylabel),
+        height,
+        label,
+    )
 }
 
 /// A model's full grid as a heatmap. With a rival, values are how many times
@@ -921,8 +860,6 @@ fn grid_heatmap(
     let spec = Chart::Heatmap {
         data,
         options: ChartOptions {
-            title,
-            axes: grid.axes(None),
             color: ratio.then_some(Colour::Gradient {
                 gradient: Gradient {
                     colors: &RATIO_STEPS,
@@ -936,18 +873,16 @@ fn grid_heatmap(
                 },
                 color_domain: ratio.then_some(RATIO_RANGE),
             }),
-            // Room for the axes (and Carbon's legend when it shows), then
-            // about 64px a cell. Carbon sets its box to this width.
-            height: format!("{}px", if ratio { 100 } else { 160 } + 56 * rows),
             width: Some(format!("{}px", 140 + 72 * columns)),
             legend: ratio.then_some(Enabled { enabled: false }),
             locale: Locale::total(total_label),
-            combo: None,
-            bounds: None,
-            bubble: None,
-            line: None,
-            hover: None,
-            toolbar: Enabled { enabled: false },
+            // Room for the axes (and Carbon's legend when it shows), then
+            // about 64px a cell. Carbon sets its box to this width.
+            ..ChartOptions::new(
+                title,
+                grid.axes(None),
+                format!("{}px", if ratio { 100 } else { 160 } + 56 * rows),
+            )
         },
         ratio,
     };
@@ -1142,6 +1077,7 @@ pub(super) fn sweep_part<'a>(m: &'a Model, run: &Run, sweep: Sweep) -> Element {
     };
     let [(m1, t1, y1), (m2, t2, y2)] = sweep.metrics();
     part(
+        4,
         heading,
         intro,
         rsx! {
@@ -1602,6 +1538,7 @@ pub(super) fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         }
     };
     part(
+        4,
         "Users × prompt size",
         rsx! {
             "Users at once down the side, fewest first; prompt size across the bottom, shortest first. One grid \
@@ -1727,31 +1664,26 @@ impl<'a> Latency<'a> {
             data,
             unit_radius,
             options: ChartOptions {
-                title: String::new(),
-                axes: Axes {
-                    bottom: axis("key", "TPOT (ms)", None, tpot),
-                    left: axis("value", "TTFT (ms)", None, ttft),
-                },
                 color: Some(Colour::Scale {
                     scale: (self.engines.iter().zip(["s1", "s2"]))
                         .map(|(&e, class)| (e.label(), colour(class)))
                         .collect(),
                 }),
-                heatmap: None,
-                height: side.to_string(),
                 width: Some(side.to_string()),
                 legend: Some(Enabled { enabled: false }),
-                locale: None,
-                combo: None,
-                bounds: None,
                 bubble: Some(Bubbles {
                     radius_maps_to: "radius",
                     radius_label: "Requests",
                     fill_opacity: 0.6,
                 }),
-                line: None,
-                hover: None,
-                toolbar: Enabled { enabled: false },
+                ..ChartOptions::new(
+                    String::new(),
+                    Axes {
+                        bottom: axis("key", "TPOT (ms)", None, tpot),
+                        left: axis("value", "TTFT (ms)", None, ttft),
+                    },
+                    side.to_string(),
+                )
             },
         };
         // Its title inside its plot, top left, letting the pointer through to the dots under it.
@@ -1953,11 +1885,6 @@ pub(super) fn ecdf_chart(
         data,
         dashed,
         options: ChartOptions {
-            title: String::new(),
-            axes: Axes {
-                bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
-                left: axis("value", "share of requests", None, [0.0, 1.0]),
-            },
             color: Some(Colour::Scale {
                 scale: (engines.iter().zip(["s1", "s2"]))
                     .map(|(&e, class)| (e.label(), colour(class)))
@@ -1970,13 +1897,8 @@ pub(super) fn ecdf_chart(
                     ])
                     .collect(),
             }),
-            heatmap: None,
-            // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
-            // ECDF_ASPECT makes it.
-            height: "100%".to_string(),
             width: Some("100%".to_string()),
             legend: Some(Enabled { enabled: false }),
-            locale: None,
             // Carbon draws an area's bounds only when the layer holds one series.
             combo: Some(
                 (fills
@@ -1997,14 +1919,22 @@ pub(super) fn ecdf_chart(
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
-            bubble: None,
             line: Some(LineOptions {
                 curve: "curveStepAfter",
                 points: Enabled { enabled: false },
             }),
             // A step per request, each curve its own: no one step lists every series.
             hover: Some(Hover::NONE),
-            toolbar: Enabled { enabled: false },
+            // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
+            // ECDF_ASPECT makes it.
+            ..ChartOptions::new(
+                String::new(),
+                Axes {
+                    bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
+                    left: axis("value", "share of requests", None, [0.0, 1.0]),
+                },
+                "100%".to_string(),
+            )
         },
     };
     rsx! {
@@ -2234,6 +2164,7 @@ pub(super) fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
         }
     };
     part(
+        4,
         "Latency distributions",
         rsx! {
             "With 1 user, every request a dot: time to first token up, time per output token across, \
@@ -2887,13 +2818,7 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                         format!("×{r:.2} vs {}", rival.label()),
                     )
                 }
-                Err(why) => (
-                    "background: repeating-linear-gradient(135deg, transparent 0 4px, \
-                     light-dark(#c6c6c6, #525252) 4px 5px)"
-                        .to_string(),
-                    None,
-                    why.to_string(),
-                ),
+                Err(why) => (STRIPED.to_string(), None, why.to_string()),
             };
             rsx! {
                 // The grid's own cell, and a flex box: Carbon puts the trigger in an inline box in its
@@ -4789,7 +4714,8 @@ mod tests {
     /// cell counts every request failed, says why, and shows no number.
     #[test]
     fn the_published_cells_of_a_dead_server_and_only_those_are_marked() {
-        use super::numbers::{DASH, Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
+        use super::numbers::{Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
+        use crate::DASH;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut runs: Vec<Run> = Vec::new();
         for dir in [FIXTURES] {

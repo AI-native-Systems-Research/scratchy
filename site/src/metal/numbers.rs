@@ -3,7 +3,7 @@
 
 use super::data::{Cell, Model, Rep};
 use crate::charts::{Better, Side};
-use crate::thousands_f;
+use crate::{DASH, thousands_f};
 
 /// The engines a run compares, in page order. Every chart pairs scratchy
 /// (its own colour) with one other engine, so the colours never run out
@@ -297,7 +297,6 @@ pub fn median(mut vals: Vec<f64>) -> Option<f64> {
     })
 }
 
-pub const DASH: &str = "—";
 pub const NO_STREAM: &str = "no stream";
 /// Marks a timing taken from only some of a cell's requests.
 pub const PARTIAL: &str = "†";
