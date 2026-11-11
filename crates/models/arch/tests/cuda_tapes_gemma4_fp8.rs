@@ -2,13 +2,14 @@
 //! Gemma 4 26B-A4B's emitted CUDA tapes under `fp8-dynamic-per-channel` (FP8 S2), checked with no
 //! toolchain. The tests are `common/cuda_tapes_fp8_body.rs`; this binary gives them the model.
 //!
-//! The checkpoint (`RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic`) quantizes the attention
-//! projections, the dense MLP and every routed expert, and leaves the router (`router.proj`, its
-//! own bf16 entry beside the fp8 expert bank) and the lm_head bf16. So, per prefill bucket: 30 fp8
-//! q/k/v groups, 60 fp8 GEMMs (30 attention o projections, 30 MLP downs) and 30 fp8 MLP gate/up
-//! pairs, each after its own quant write, and the 90 routed-expert GEMMs over the fp8 bank, which
-//! read all their sorted or activation rows quantized, the up reusing its gate's write (180). The
-//! decode tape has the same projections as fp8 GEMVs and no quant write.
+//! The checkpoint (`RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic`) quantizes the attention projections,
+//! the dense MLP and every routed expert, and leaves the router (`router.proj`, its own bf16 entry
+//! beside the fp8 expert bank) and the lm_head bf16. So, per prefill bucket: 30 fp8 q/k/v groups,
+//! 60 fp8 GEMMs (30 attention o projections, 30 MLP downs) and 30 fp8 MLP gate/up pairs, each after
+//! its own quant write, and the 90 routed-expert GEMMs over the fp8 bank, which read all their
+//! sorted or activation rows quantized, the up reusing its gate's write (180). The decode tape has
+//! the same projections as fp8 GEMVs, and the decode tape's fp8 GEMVs the shape rule takes run on
+//! the tensor cores, each after a one-row quant write (or reading one a step before it wrote).
 
 #[path = "../../../targets/cuda/tests/common/chains.rs"]
 pub mod chains;
@@ -23,19 +24,20 @@ const STEM: &str = "gemma-4-26b-a4b-it";
 const FEATURE: &str = "GEMMA_4_26B_A4B_IT";
 const ARCH: &str = "gemma4-moe";
 
-const DECODE_STEPS: [(&str, usize); 19] = [
+const DECODE_STEPS: [(&str, usize); 20] = [
     ("AttnDecode", 30),
     ("Embed", 1),
     ("ExpertCombine", 30),
-    ("ExpertGateUpAct", 30),
-    ("ExpertGemv", 30),
-    ("GateUpAct", 30),
+    ("ExpertGateUpTcFp8", 30),
+    ("ExpertGemvTcFp8", 30),
+    ("GateUpTcFp8", 30),
     ("Gemv", 1),
-    ("GemvFp8", 60),
-    ("GemvGroupFp8", 30),
+    ("GemvGroupTcFp8", 30),
+    ("GemvTcFp8", 60),
     ("LayerScale", 30),
     ("MoeRoute", 30),
     ("NormAdd", 90),
+    ("QuantRowsFp8", 120),
     ("RmsNorm", 131),
     ("RmsNormUnit", 5),
     ("RopeAppend", 30),
@@ -44,6 +46,9 @@ const DECODE_STEPS: [(&str, usize); 19] = [
     ("Scale", 1),
     ("SoftCap", 1),
 ];
+/// The decode tape's quant writes and their readers (FP8 S8 T2).
+const DECODE_QUANTS: usize = 120;
+const DECODE_QUANT_READERS: usize = 180;
 const PREFILL_STEPS: [(&str, usize); 22] = [
     ("AttnPrefill", 30),
     ("Embed", 1),

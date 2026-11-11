@@ -3,10 +3,12 @@
 //! toolchain. The tests are `common/cuda_tapes_fp8_body.rs`; this binary gives them the model.
 //!
 //! The checkpoint (`axteam/Qwen3.8-27B-FP8-dynamic`) quantizes every decoder projection, the GDN
-//! ones included, and leaves the lm_head bf16. So, per prefill bucket: 64 fp8 groups (48 GDN
-//! qkv/z, 16 attention q/k/v), 48 fp8 narrow groups (GDN a + b, 48 + 48 columns), 128 fp8 GEMMs
-//! (48 GDN out, 16 attention o, 64 MLP downs) and 64 fp8 MLP gate/up pairs, each after its own
-//! quant write (304). The decode tape has the same projections as fp8 GEMVs and no quant write.
+//! ones included, and leaves the lm_head bf16. So, per prefill bucket: 64 fp8 groups (48 GDN qkv/z,
+//! 16 attention q/k/v), 48 fp8 narrow groups (GDN a + b, 48 + 48 columns), 128 fp8 GEMMs (48 GDN
+//! out, 16 attention o, 64 MLP downs) and 64 fp8 MLP gate/up pairs, each after its own quant write
+//! but the 48 GDN a/b groups, which read their qkvz group's (256). The decode tape has the same
+//! projections as fp8 GEMVs, and the decode tape's fp8 GEMVs the shape rule takes run on the tensor
+//! cores, each after a one-row quant write (or reading one a step before it wrote).
 //!
 //! The 27B builds as `qwen3.8-27b-text-only`, as the 9b does (`cuda_tapes_9b.rs`).
 
@@ -23,19 +25,24 @@ const STEM: &str = "qwen3.8-27b";
 const FEATURE: &str = "QWEN3.8_27B_TEXT_ONLY";
 const ARCH: &str = "qwen3-5";
 
-const DECODE_STEPS: [(&str, usize); 11] = [
+const DECODE_STEPS: [(&str, usize); 13] = [
     ("AttnDecode", 16),
     ("Embed", 1),
     ("GateApply", 16),
     ("GateSplit", 16),
-    ("GateUpAct", 64),
+    ("GateUpTcFp8", 64),
     ("GatedDeltaNet", 48),
     ("Gemv", 1),
-    ("GemvFp8", 128),
-    ("GemvGroupFp8", 112),
+    ("GemvGroupFp8", 48),
+    ("GemvGroupTcFp8", 64),
+    ("GemvTcFp8", 128),
+    ("QuantRowsFp8", 192),
     ("RmsNorm", 161),
     ("RopeAppend", 16),
 ];
+/// The decode tape's quant writes and their readers (FP8 S8 T2).
+const DECODE_QUANTS: usize = 192;
+const DECODE_QUANT_READERS: usize = 256;
 const PREFILL_STEPS: [(&str, usize); 15] = [
     ("AddRmsNorm", 128),
     ("AttnPrefill", 16),
@@ -48,13 +55,14 @@ const PREFILL_STEPS: [(&str, usize); 15] = [
     ("GemmFp8", 128),
     ("GemmGroupFp8", 64),
     ("GemmNarrowGroupFp8", 48),
-    ("QuantRowsFp8", 304),
+    ("QuantRowsFp8", 256),
     ("RmsNorm", 33),
     ("Rope", 16),
     ("RopeAppend", 16),
 ];
-const QUANTS: usize = 304;
-/// The quant writes' readers: one per write (no experts).
+const QUANTS: usize = 256;
+/// The quant writes' readers: one per fp8 consumer (no experts), the GDN a/b groups reading their
+/// qkvz group's write.
 const QUANT_READERS: usize = 304;
 /// The `k`s quantized: the hidden (5120), GDN's and attention's out (6144), the MLP's down
 /// (17408).

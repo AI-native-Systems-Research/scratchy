@@ -1736,10 +1736,10 @@ fn gemv_tc(s: CudaStep) -> CudaStep {
 /// writes, the second what a tensor-core gate/up's act + quantize writes (its `q_act`), each
 /// slot the largest such write's bytes. Before each reader (a grouped launch, a gate/up pair, an
 /// expert GEMM or GEMV over an fp8 bank, a tensor-core GEMV), a [`QuantRowsFp8`] of its bf16
-/// input into the first slot, unless the reader is no dense prefill GEMM and a slot already holds
-/// that input's rows with nothing written to them since (an expert up GEMM after its gate; the
-/// 35B's shared gate/up after its routed one off one normed row; a down after its gate/up's act +
-/// quantize); the reader then reads that slot in place of its input. The
+/// input into the first slot, unless a slot already holds that input's rows with nothing written
+/// to them since (an expert up GEMM after its gate; the 27B's GDN a/b group after its qkvz group;
+/// the 35B's shared gate/up after its routed one off one normed row; a down after its gate/up's
+/// act + quantize); the reader then reads that slot in place of its input. The
 /// liveness is checked ([`quant_chain`]). Returns the steps and the arena's new end; a tape with
 /// no such step is as it was. A CUDA-core one-row GEMV quantizes its row in its own prologue
 /// (S4), so it reads its bf16 row.
@@ -1782,19 +1782,7 @@ fn quantize_fp8_inputs(
             t.q_act = slots[1];
         }
         if let Some((x, rows, cols)) = s.quantized_input() {
-            // shortcut: prefill's dense fp8 GEMMs keep a write each (S2's tapes as they are); reusing
-            // a held one would drop the 27B's 48 GDN a/b writes per prefill, once approved.
-            let dense = matches!(
-                s,
-                CudaStep::GemmFp8(_)
-                    | CudaStep::GemmCol64Fp8(_)
-                    | CudaStep::GemmNarrowFp8(_)
-                    | CudaStep::GemmGroupFp8(_)
-                    | CudaStep::GemmNarrowGroupFp8(_)
-                    | CudaStep::GateUpAct(_)
-            );
-            let held = (live.iter().flatten())
-                .find(|l| !dense && (l.x, l.rows, l.cols) == (x, rows, cols));
+            let held = (live.iter().flatten()).find(|l| (l.x, l.rows, l.cols) == (x, rows, cols));
             let q = match held {
                 Some(l) => l.q,
                 None => {

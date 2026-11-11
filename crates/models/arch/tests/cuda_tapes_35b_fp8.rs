@@ -2,13 +2,15 @@
 //! Qwen3.6-35B-A3B's emitted CUDA tapes under `fp8-dynamic-per-channel` (FP8 S2), checked with no
 //! toolchain. The tests are `common/cuda_tapes_fp8_body.rs`; this binary gives them the model.
 //!
-//! The checkpoint (`RedHatAI/Qwen3.6-35B-A3B-FP8-dynamic`) quantizes the attention projections,
-//! the shared expert and every routed expert, and leaves the GDN projections, the routers, the
-//! shared expert's gate and the lm_head bf16. So, per prefill bucket: 10 fp8 q/k/v groups, 50 fp8
-//! GEMMs (10 attention o projections, 40 shared-expert downs) and 40 fp8 shared-expert gate/up
-//! pairs, each after its own quant write, and the 120 routed-expert GEMMs over the fp8 bundle,
-//! which read all their sorted or activation rows quantized, the up reusing its gate's write
-//! (180). The decode tape has the same projections as fp8 GEMVs and no quant write.
+//! The checkpoint (`RedHatAI/Qwen3.6-35B-A3B-FP8-dynamic`) quantizes the attention projections, the
+//! shared expert and every routed expert, and leaves the GDN projections, the routers, the shared
+//! expert's gate and the lm_head bf16. So, per prefill bucket: 10 fp8 q/k/v groups, 50 fp8 GEMMs
+//! (10 attention o projections, 40 shared-expert downs) and 40 fp8 shared-expert gate/up pairs,
+//! each after its own quant write, and the 120 routed-expert GEMMs over the fp8 bundle, which read
+//! all their sorted or activation rows quantized, the up reusing its gate's write (180). The decode
+//! tape has the same projections as fp8 GEMVs, and the decode tape's fp8 GEMVs the shape rule takes
+//! run on the tensor cores, each after a one-row quant write (or reading one a step before it
+//! wrote).
 
 #[path = "../../../targets/cuda/tests/common/chains.rs"]
 pub mod chains;
@@ -23,28 +25,32 @@ const STEM: &str = "qwen3.6-35b-a3b";
 const FEATURE: &str = "QWEN3.6_35B_A3B";
 const ARCH: &str = "qwen3-5-moe";
 
-const DECODE_STEPS: [(&str, usize); 20] = [
+const DECODE_STEPS: [(&str, usize); 21] = [
     ("AddRmsNorm", 40),
     ("AttnDecode", 10),
     ("Embed", 1),
     ("ExpertCombine", 40),
-    ("ExpertGateUpAct", 40),
-    ("ExpertGemv", 40),
+    ("ExpertGateUpTcFp8", 40),
+    ("ExpertGemvTcFp8", 40),
     ("GateApply", 10),
     ("GateScale", 40),
     ("GateSplit", 10),
-    ("GateUpAct", 40),
+    ("GateUpTcFp8", 40),
     ("GdnDecode", 30),
     ("GemmNarrow", 40),
     ("Gemv", 31),
-    ("GemvFp8", 50),
     ("GemvGroup", 60),
-    ("GemvGroupFp8", 10),
+    ("GemvGroupTcFp8", 10),
+    ("GemvTcFp8", 50),
     ("MoeRoute", 40),
+    ("QuantRowsFp8", 60),
     ("RmsNorm", 61),
     ("RopeAppend", 10),
     ("RouterLogits", 40),
 ];
+/// The decode tape's quant writes and their readers (FP8 S8 T2).
+const DECODE_QUANTS: usize = 60;
+const DECODE_QUANT_READERS: usize = 180;
 const PREFILL_STEPS: [(&str, usize); 24] = [
     ("AddRmsNorm", 80),
     ("AttnPrefill", 10),
