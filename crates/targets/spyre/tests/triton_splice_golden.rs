@@ -699,7 +699,7 @@ fn two_sessions_on_one_thread_read_their_own_resident_weights() {
             &[(&[spliced_matmul_group(m, k, n)], &[2u64])],
             vec![(
                 1,
-                bytes,
+                scratchy_target_spyre::HostBytes::Owned(bytes),
                 scratchy_tensors::DType::F16,
                 vec![n as usize, k as usize],
             )],
@@ -1779,7 +1779,7 @@ fn execute_fp8_program(
         vec![
             (
                 1,
-                w,
+                scratchy_target_spyre::HostBytes::Owned(w),
                 scratchy_tensors::DType::Fp8E4m3,
                 vec![n as usize, k as usize],
             ),
@@ -1790,7 +1790,9 @@ fn execute_fp8_program(
                     // `Arg::TensorBytes { F16 }` arm expects (typed, zero f32 hop).
                     use ktir_emulator::codec;
                     let f16s: Vec<u16> = ws.iter().map(|&v| codec::f32_to_f16_bits(v)).collect();
-                    f16s.iter().flat_map(|&b| b.to_le_bytes()).collect()
+                    scratchy_target_spyre::HostBytes::Owned(
+                        f16s.iter().flat_map(|&b| b.to_le_bytes()).collect(),
+                    )
                 },
                 scratchy_tensors::DType::F16,
                 vec![1, n as usize],
@@ -3062,10 +3064,22 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
     let vd = attn_stimulus(mq * kv_width, 5, 1.0);
     let src = |i: usize| u64::from(rope.inputs[i].tensor.index() as u32);
     let srcs = step_sources(&step, &blocks, &rows).unwrap_or_else(|e| panic!("{at}: {e}"));
-    let typed: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = srcs
+    let typed: Vec<(
+        usize,
+        scratchy_target_spyre::HostBytes,
+        scratchy_tensors::DType,
+        Vec<usize>,
+    )> = srcs
         .int32
         .into_iter()
-        .map(|(tid, bytes, shape)| (tid as usize, bytes, scratchy_tensors::DType::I32, shape))
+        .map(|(tid, bytes, shape)| {
+            (
+                tid as usize,
+                scratchy_target_spyre::HostBytes::Owned(bytes),
+                scratchy_tensors::DType::I32,
+                shape,
+            )
+        })
         .collect();
     let (mask_tid, mask, mask_shape) = srcs.mask;
     let mut sources = vec![
@@ -3381,10 +3395,22 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         .map(|(&c, bl)| BatchSeq { blocks: bl, pos: c })
         .collect();
     let srcs = batch_sources(&step, &seqs).unwrap_or_else(|e| panic!("{at}: {e}"));
-    let typed: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = srcs
+    let typed: Vec<(
+        usize,
+        scratchy_target_spyre::HostBytes,
+        scratchy_tensors::DType,
+        Vec<usize>,
+    )> = srcs
         .int32
         .into_iter()
-        .map(|(tid, bytes, shape)| (tid as usize, bytes, scratchy_tensors::DType::I32, shape))
+        .map(|(tid, bytes, shape)| {
+            (
+                tid as usize,
+                scratchy_target_spyre::HostBytes::Owned(bytes),
+                scratchy_tensors::DType::I32,
+                shape,
+            )
+        })
         .collect();
     let (mask_tid, mask, mask_shape) = srcs.mask;
     let src = |i: usize| u64::from(rope.inputs[i].tensor.index() as u32);

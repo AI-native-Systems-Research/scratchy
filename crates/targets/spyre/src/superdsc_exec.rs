@@ -27,6 +27,7 @@ use flex_rs::memory_region::MemoryType;
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
+use crate::allocator::HostBytes;
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::cb_plan;
 use crate::fold_plan::{self, OpKv};
@@ -1201,7 +1202,13 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     // ── Host binds ──
     /// Bound host inputs. Ids bound BEFORE prepare are resident WEIGHTS (uploaded once); ids
     /// bound per predict are ACTIVATIONS (uploaded each step).
-    bound: BTreeMap<bundle::PlaceId, Vec<u8>>,
+    ///
+    /// ⭐ BY PROVENANCE, NOT ALWAYS OWNED: a weight staged off the page cache holds a
+    /// [`HostBytes::View`] of its mmap (the load's zero-copy alias — see
+    /// [`crate::allocator::HostBytes`]); activations and built tables hold `Owned` buffers.
+    /// Staging is the weights' last reader and walks byte slices, so a view serves as directly
+    /// as a copy and drops its keepalive when the entry leaves this map.
+    bound: BTreeMap<bundle::PlaceId, HostBytes>,
     weight_ids: BTreeSet<bundle::PlaceId>,
     /// ⭐⭐⭐⭐⭐ IDS WHOSE BYTES ARE **NOT** IEEE-fp16 — copied into the shadow verbatim instead of
     /// going through [`sen_convert::ieee_to_sen_bytes`].
@@ -1952,9 +1959,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// reclaimed there.
     ///
     /// ⭐ MOVES, never copies. The C++ took a pointer to caller memory precisely to avoid
-    /// duplicating an 8.9 GB model across the FFI; owning the `Vec` gets the same zero copies with
-    /// no lifetime contract to violate.
-    pub fn bind_weight(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) {
+    /// duplicating an 8.9 GB model across the FFI; owning the bytes gets the same zero copies
+    /// with no lifetime contract to violate. A staged weight arrives as a [`HostBytes::View`]
+    /// of its mmap — the move is a keepalive handle, so the page cache the staging walk is
+    /// about to read stays alive in `bound` and no private copy of the checkpoint ever exists.
+    pub fn bind_weight(&mut self, id: bundle::PlaceId, bytes: HostBytes) {
         self.weight_ids.insert(id);
         self.bound.insert(id, bytes);
     }
@@ -1972,7 +1981,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // shadow a later plain one.
         self.keyed.remove(&id);
         self.staged.remove(&id);
-        self.bound.insert(id, bytes);
+        self.bound.insert(id, HostBytes::Owned(bytes));
     }
 
     /// ⭐ Bind an f32 ACTIVATION by converting it STRAIGHT INTO ITS SLOT OF THE SHADOW — f32 →
@@ -2064,7 +2073,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         self.raw_ids.remove(&id);
         self.staged.remove(&id);
         self.keyed.insert(id, Keyed { key, fresh: true });
-        self.bound.insert(id, bytes);
+        self.bound.insert(id, HostBytes::Owned(bytes));
         Ok(())
     }
 
@@ -2176,7 +2185,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         self.raw_ids.insert(b.id);
         self.staged.remove(&b.id);
-        self.bound.insert(b.id, b.bytes);
+        self.bound.insert(b.id, HostBytes::Owned(b.bytes));
         // ⭐ THE HOST TAKES THE STICK BACK. A bind is the opposite of [`Self::hand_to_card`]:
         // a churned seating re-seeds from the collected picks, so the id leaves the card-owned
         // set and counts as a `TapeStep` fill from here on.
@@ -2253,7 +2262,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         self.weight_ids.insert(id);
         self.const_fp32_ids.insert(id);
-        self.bound.insert(id, bytes);
+        self.bound.insert(id, HostBytes::Owned(bytes));
         Ok(())
     }
 
@@ -2325,7 +2334,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             ) {
                 self.bind_const_fp32(id, bytes)?;
             } else {
-                self.bind_weight(id, bytes);
+                self.bind_weight(id, HostBytes::Owned(bytes));
             }
         }
         Ok(())
@@ -2493,6 +2502,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             if !self.weight_ids.contains(nm) {
                 continue; // activation
             }
+            // The bytes themselves, whatever their provenance — the whole walk below reads
+            // this slice, so a `View` of the mmap and an `Owned` copy stage identically.
+            let src: &[u8] = src.as_slice();
             // ⛔ A RAW BIND CANNOT BE A WEIGHT. This loop's every destination goes through
             // `ieee_to_sen_bytes` or the retile walk, neither of which may touch int32 index entries
             // (see [`Self::raw_ids`]) — and a raw id lands here only by having been bound BEFORE
@@ -5150,6 +5162,9 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             if self.weight_ids.contains(nm) {
                 continue; // weight, resident
             }
+            // An activation is always an `Owned` bind, so this is its own buffer's slice —
+            // stated through the provenance type like every other bound read.
+            let src: &[u8] = src.as_slice();
             if !refill_sends(&self.keyed, nm) {
                 continue; // keyed, and the device already holds this key's bytes
             }
@@ -5187,7 +5202,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
                 _ => {}
             }
-            writes.push((seg.get(), p.offset, src.as_slice()));
+            writes.push((seg.get(), p.offset, src));
             seg_dirty[seg.get()] = true;
             seg_runs[seg.get()].push(h2d_run(p.offset, src.len() as u64));
             if d.phase_time {
@@ -5234,6 +5249,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             if self.weight_ids.contains(nm) {
                 continue;
             }
+            let src: &[u8] = src.as_slice();
             if !refill_sends(&self.keyed, nm) {
                 continue;
             }

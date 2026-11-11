@@ -8,6 +8,7 @@
 
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_layers::weights::GpuWeights;
+use scratchy_target_spyre::HostBytes;
 use scratchy_target_spyre::SpyreAllocator;
 use scratchy_target_spyre::manifest::bytes_to_f32;
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
@@ -28,7 +29,13 @@ use tracing::info;
 use tracing::{debug, warn};
 
 /// A weight staged for binding: its tensor id, bytes, dtype and shape.
-pub(crate) type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
+///
+/// ⭐ THE BYTES ARE BY PROVENANCE ([`HostBytes`]): a weight the load viewed off the page
+/// cache stays a `View` all the way into the executor's bound map — no private copy of the
+/// checkpoint exists between the store's mmap and the staging walk that reads it. A weight
+/// whose bytes are REWRITTEN before binding (a pad, a fold, a TP rank's cut) arrives
+/// `Owned`, the product of that rewrite.
+pub(crate) type StagedWeight = (usize, HostBytes, SDType, Vec<usize>);
 
 /// ⭐ THE RESIDENT SEGMENTS EVERY BORROWER ADOPTS, AS ONE LIST. Four sites alias these (the
 /// prefix-capable prefill, the prefill ladder rungs, the decode batch rungs, and the top prefill
@@ -352,6 +359,11 @@ fn apply_weight_scale_folds(
                      not stage — the wiring and the weight binding disagree about the sources"
                 ))
             })?;
+        // A byte-rewriting fold MATERIALIZES its operand — the mmap a `View` reads is a
+        // read-only mapping, so the product must be the weight's own buffer. On the card
+        // the narrowing pass has already materialized every float target; this copy is
+        // the emulator's alone.
+        let bytes = bytes.make_owned();
         // SAFETY-free elementwise scale: every branch below reinterprets the Vec's own bytes as
         // the dtype it already declares, so the length check is the whole of the guard.
         match *dt {
@@ -427,16 +439,27 @@ pub(crate) struct RankCut {
 
 #[cfg(feature = "spyre-hw")]
 impl RankCut {
-    fn cut(&self, id: u32, bytes: Vec<u8>, elem: usize, is_gemm: bool) -> ExecutorResult<Vec<u8>> {
+    fn cut(
+        &self,
+        id: u32,
+        bytes: HostBytes,
+        elem: usize,
+        is_gemm: bool,
+    ) -> ExecutorResult<HostBytes> {
         let &whole = self.whole.tensor_shapes.get(id as usize).ok_or_else(|| {
             werr(format!(
                 "source {id} has no one-rank shape to cut rank {}'s share from",
                 self.me.get()
             ))
         })?;
-        self.forward
-            .slice_source_bytes(self.me, id, bytes, elem, whole, is_gemm)
-            .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))
+        // The cut OWNS its product — the slicing laws build each rank's share as a fresh
+        // buffer — so a viewed source materializes here: ONE copy on a sharded leg (the
+        // load used to pay the alias's place twice — the take's copy and the cut's).
+        let cut = self
+            .forward
+            .slice_source_bytes(self.me, id, bytes.into_vec(), elem, whole, is_gemm)
+            .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))?;
+        Ok(HostBytes::Owned(cut))
     }
 }
 
@@ -543,10 +566,20 @@ pub(crate) fn stage_bound_weights(
                 Some(alloc) if last_binding.get(&ptr) == Some(&bi) => {
                     // SAFETY: this is the buffer's last binding and staging is its last reader
                     // in the load — nothing reads through `bw.tensor` (or any tensor viewing
-                    // the same buffer) after this point.
-                    unsafe { alloc.take(ptr, len) }.unwrap_or_else(|| src.to_vec())
+                    // the same buffer) after this point. A VIEW take keeps the mmap alive, so
+                    // the tensor's readers stay valid anyway; an OWNED take is the move.
+                    unsafe { alloc.take(ptr, len) }
+                        .unwrap_or_else(|| HostBytes::Owned(src.to_vec()))
                 }
-                _ => src.to_vec(),
+                Some(alloc) => {
+                    // A shared buffer's earlier binding: a VIEW clones its keepalive handle
+                    // (two bindings of one mmap range — free); an OWNED buffer has no handle,
+                    // so this binding copies, as shared owned buffers always have.
+                    alloc
+                        .share(ptr, len)
+                        .unwrap_or_else(|| HostBytes::Owned(src.to_vec()))
+                }
+                None => HostBytes::Owned(src.to_vec()),
             }
         };
         let dt = bw.tensor.dtype();
@@ -598,7 +631,9 @@ pub(crate) fn stage_bound_weights(
             // the re-tile reads it there, via `stride_map_disk_order`. That map resolves the same
             // logical element as the transposed one (proven in `sdsc_df_width`), so this deletes a
             // whole pass over the model -- 4.4s of the 6.94s `load_weights` on granite-3.1-8b, plus
-            // the full second copy it wrote.
+            // the full second copy it wrote. The bytes keep their provenance: a VIEW stays a view
+            // through every no-op below, and each pad — whose product is a fresh buffer —
+            // materializes only itself.
             let t = bytes;
             {
                 // DEVICE stick padding — the shared `bump_sticks_to_splittable` rule: round to a
@@ -629,9 +664,9 @@ pub(crate) fn stage_bound_weights(
                     // zero rows at the end -- `resize`, not a strided rebuild. (Transposed it was the
                     // inner axis and every row had to be copied to a wider stride.) Same padded bytes,
                     // and the only weight that needs any is lm_head.
-                    let mut padded = t;
+                    let mut padded = t.into_vec();
                     padded.resize(n_dev * rows * elem, 0);
-                    padded
+                    HostBytes::Owned(padded)
                 } else {
                     t
                 };
@@ -662,13 +697,14 @@ pub(crate) fn stage_bound_weights(
                         }
                         // Post-N-pad the buffer is `[n_dev, k]` row-major (k inner, `rows` = k).
                         let mut padded = vec![0u8; n_dev * k_pad as usize * elem];
+                        let n_padded = n_padded.as_slice();
                         for n_row in 0..n_dev {
                             let src_off = n_row * k * elem;
                             let dst_off = n_row * k_pad as usize * elem;
                             padded[dst_off..dst_off + k * elem]
                                 .copy_from_slice(&n_padded[src_off..src_off + k * elem]);
                         }
-                        (padded, vec![k_pad as usize, n_dev])
+                        (HostBytes::Owned(padded), vec![k_pad as usize, n_dev])
                     }
                     None => (n_padded, vec![rows, n_dev]),
                 }
@@ -695,12 +731,16 @@ pub(crate) fn stage_bound_weights(
     {
         use rayon::prelude::*;
         let _t_cvt = std::time::Instant::now();
-        // DIRECT bf16/f32 → f16, no intermediate f32 Vec (per /tmp/zoo). Cast the raw
-        // bytes to &[bf16]/&mut [f16] and convert with a SIMD-friendly parallel zip
-        // ACROSS ELEMENTS — so the two huge embed/lm_head tensors get all cores too,
-        // not one core each. Every `bytes` here is a freshly-allocated Vec<u8> (take_to
-        // _cpu_bytes / transpose output), hence ≥2-byte aligned; the host is LE, so the
-        // cast equals `from_le_bytes`. Byte-identical to half::f16::from_f32(x.to_f32()).
+        // DIRECT bf16/f32 → f16, no intermediate f32 Vec (per /tmp/zoo). The SOURCE is
+        // read byte-wise (`as_chunks` + `from_le_bytes`) and the DESTINATION is a fresh
+        // Vec, converted with a SIMD-friendly parallel zip ACROSS ELEMENTS — so the two
+        // huge embed/lm_head tensors get all cores too, not one core each. Byte-wise
+        // source reads are the law, not a nicety: a bf16 weight can be a VIEW of its
+        // mmap (the zero-copy load), whose tensor offsets carry no alignment guarantee;
+        // on LE the byte-wise read is the aligned cast, byte-identical. The rewrite
+        // MATERIALIZES (a transform's product is owned — a `View` cannot be written
+        // through), so every bf16 weight leaves this pass an `Owned` f16 buffer.
+        // Byte-identical to half::f16::from_f32(x.to_f32()).
         weights
             .par_iter_mut()
             .for_each(|(_, bytes, dt, _)| match *dt {
@@ -708,16 +748,16 @@ pub(crate) fn stage_bound_weights(
                 SDType::BF16 => {
                     let n = bytes.len() / 2;
                     let mut out = vec![0u8; n * 2];
-                    let src = unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr() as *const half::bf16, n)
-                    };
+                    let src = bytes.as_slice();
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut half::f16, n)
                     };
                     dst.par_iter_mut()
-                        .zip(src.par_iter())
-                        .for_each(|(o, &i)| *o = half::f16::from_f32(i.to_f32()));
-                    *bytes = out;
+                        .zip(src.as_chunks::<2>().0.par_iter())
+                        .for_each(|(o, c)| {
+                            *o = half::f16::from_f32(half::bf16::from_le_bytes(*c).to_f32());
+                        });
+                    *bytes = HostBytes::Owned(out);
                     *dt = SDType::F16;
                 }
                 // fp8 weight STAYS 1 byte — do NOT narrow to f16. The `other` arm's bytes_to_f32→f16
@@ -731,7 +771,7 @@ pub(crate) fn stage_bound_weights(
                     for &v in &f32v {
                         f16.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
                     }
-                    *bytes = f16;
+                    *bytes = HostBytes::Owned(f16);
                     *dt = SDType::F16;
                 }
             });
@@ -1078,7 +1118,7 @@ impl SpyreWorker {
                     Some(_) => {}
                     None => {
                         staged.insert(tid, bytes.clone());
-                        weights.push((tid as usize, bytes, dt, shape.to_vec()));
+                        weights.push((tid as usize, HostBytes::Owned(bytes), dt, shape.to_vec()));
                     }
                 }
             }
@@ -2776,7 +2816,7 @@ mod weight_scale_fold_tests {
             })
             .collect();
         let dims = vec![1, vals.len()];
-        (id, bytes, dt, dims)
+        (id, HostBytes::Owned(bytes), dt, dims)
     }
 
     /// Decode staged bytes back to f32 (the payload already narrowed; widen for comparison).
@@ -2832,11 +2872,15 @@ mod weight_scale_fold_tests {
                     _ => v * 0.22,
                 })
                 .collect();
-            assert_eq!(decoded(dt, bytes), want, "t{id} ({dt:?}) kept one rounding");
+            assert_eq!(
+                decoded(dt, bytes.as_slice()),
+                want,
+                "t{id} ({dt:?}) kept one rounding"
+            );
         }
         let (_, bytes, _, _) = &weights[0];
         assert_eq!(
-            decoded(SDType::F16, bytes),
+            decoded(SDType::F16, bytes.as_slice()),
             vec![7.0, 8.0],
             "a tensor no fold names keeps its staged bytes"
         );
@@ -2854,14 +2898,19 @@ mod weight_scale_fold_tests {
             "the refusal names the tid: {err}"
         );
         // The staged tensor is untouched — a refusal leaves the bytes alone.
-        assert_eq!(decoded(SDType::F16, &weights[0].1), vec![1.0]);
+        assert_eq!(decoded(SDType::F16, weights[0].1.as_slice()), vec![1.0]);
     }
 
     /// An fp8 payload is a requantize, not a scale — the recognition refuses fp8 fold targets
     /// at BUILD time, so an fp8 fold reaching the runtime half can only be a desync. Refused.
     #[test]
     fn refuses_an_fp8_fold_target_as_a_desync() {
-        let mut weights = vec![(1usize, vec![0u8; 4], SDType::Fp8E4m3, vec![1, 4])];
+        let mut weights = vec![(
+            1usize,
+            HostBytes::Owned(vec![0u8; 4]),
+            SDType::Fp8E4m3,
+            vec![1, 4],
+        )];
         let err =
             apply_weight_scale_folds(&mut weights, &[(1u32, 2.0)]).expect_err("fp8 fold target");
         assert!(

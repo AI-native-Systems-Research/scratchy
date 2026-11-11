@@ -100,7 +100,7 @@ pub mod superdsc_exec;
 /// The per-model launch wiring as spyre's OWN types, emitted by `#[forward]`
 /// as a `static` — the typed replacement for parsing `manifest.json` at load.
 pub mod wiring;
-pub use allocator::SpyreAllocator;
+pub use allocator::{HostBytes, SpyreAllocator};
 
 // ── `__gpu` facade for the `#[forward]` macro's spyre path ──
 //
