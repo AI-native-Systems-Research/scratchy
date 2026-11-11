@@ -9,13 +9,8 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-<<<<<<< HEAD
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpSpec, Role, Scale, StickExtent,
-    TensorArg, WorkPlan,
-=======
-    Allocation, AnyTensorArg, DataFormat, DeviceAxis, Df, Fp16, MAX_CORES, MaxCores, OpFunc,
-    OpInfo, OpSpec, Role, Scale, StickExtent, TensorArg, WorkPlan,
->>>>>>> f45048e198 (refactor(spyre): one axis states one device mechanism by type, through one setter)
+    Allocation, AnyTensorArg, DataFormat, DeviceAxis, Df, Fp16, OpFunc, OpSpec, Role, Scale,
+    StickExtent, TensorArg, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).

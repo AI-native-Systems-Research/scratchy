@@ -341,7 +341,9 @@ pub fn assemble_matmul_windowed<T: crate::collective::Tp>(
             .set_axis(super::walk::InAxis::NAME, |_| {
                 Ok(crate::superdsc_opspec::DeviceAxis::Window(w_in_phys))
             })
-            .map_err(|e| at(e.0))?;
+            .map_err(|e| {
+                crate::superdsc_error::SuperDscError(format!("assemble_matmul {op_name}: {e}"))
+            })?;
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
@@ -548,7 +550,9 @@ pub fn assemble_matmul_rows<T: crate::collective::Tp>(
     let plan = op.iter.clone();
     op.args_mut()[0]
         .set_axis("mb", |mb| mb.pitch(&plan, shape.a_rows))
-        .map_err(|e| format!("assemble_matmul_rows {op_name}: {e}"))?;
+        .map_err(|e| {
+            crate::superdsc_error::SuperDscError(format!("assemble_matmul_rows {op_name}: {e}"))
+        })?;
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 

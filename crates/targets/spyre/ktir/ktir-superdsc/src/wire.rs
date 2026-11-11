@@ -374,6 +374,76 @@ pub struct AllocNode {
     pub coordinates_: Coordinates, // {coordInfo:{…}, coreIdToWkSlice_:{}}
 }
 
+/// ⭐ `backGapCore_` — an HBM view's per-axis BACK GAP: the elements past an axis's swept extent the
+/// walk skips before the next iteration of the axis outside it
+/// ([`crate::superdsc_opspec::DeviceAxis::Pitch`]). Opaque: the only constructor is
+/// [`BackGap::of_hbm_view`], which reads the gaps off the view's own pitched axes, so a gap that
+/// disagrees with the view's stated pitch is unconstructable.
+///
+/// THE WIRE (`dsc2.cpp`'s parser, `coreGap[std::stoi(core)] = std::stoi(gap.string_value())`):
+/// `{"<axis>": {"-1": "<gap>"}}` — HBM is keyed core `-1` (`DT_CHECK(dimGap.count(-1))` for that
+/// component), and the gap is a JSON STRING (a number reads `""` and `stoi` throws, naming no
+/// field). The vendor inductor writes the same (`compute_ops.py`, `{"-1": str(gap)}`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackGap(BTreeMap<&'static str, u32>);
+
+/// The core key an HBM view's back gap is stated under: dxp keys the gap per core and reads HBM's at
+/// core `-1` (`dsc2.cpp`: `DT_CHECK(dimGap.count(-1))` for an HBM component), the key the vendor
+/// inductor writes too (`compute_ops.py`, `{"-1": str(gap)}`). A wire constant, named once.
+pub const HBM_GAP_CORE: &str = "-1";
+
+impl BackGap {
+    /// The back gap of a view: each [`Pitch::gap`](crate::superdsc_opspec::Pitch::gap) on an axis
+    /// whose pitch resolves to [`PitchForm::Hbm`](crate::superdsc_opspec::PitchForm) — the gap
+    /// `declared − swept` the pitch was built with, read, never re-derived. `None` when no axis does — the
+    /// descriptor then carries no `backGapCore_`, byte-identical to every view before the field
+    /// existed. An LX view's pitch is [`PitchForm::Lx`](crate::superdsc_opspec::PitchForm), which
+    /// the walk carries as its pinned extent and this never sees (`ArgView::window_extents`).
+    ///
+    /// ⛔ THE GAP IS PAST THE WHOLE SWEPT EXTENT, NOT ONE CORE'S. An HBM unit view's per-dim capacity INCLUDES the
+    /// core fold (`dsc2.cpp` `getBufferCapacityForNodePerDim`: `comp == HBM && foldPos ==
+    /// coreFoldPos` multiplies the cardinality in), so the repeat the gap is folded into is the
+    /// whole tensor's along the axis — the vendor's own `backGap = dev_dim_size − it_dim_size`.
+    /// MEASURED on the card (2026-11-08): a reduction over blocks a pitch apart, whose stick axis the
+    /// cores split, read the gap fill past block 0 with `pitch − per-core extent`, and every block
+    /// with `pitch − extent`; a row band whose `mb` the cores split ([16,384] of [64,384]) is
+    /// bit-identical to the whole-parent op with `parent − rows`.
+    pub fn of_hbm_view(v: &ArgView<'_>) -> Option<BackGap> {
+        let gaps: BTreeMap<&'static str, u32> = v
+            .layout
+            .iter()
+            .zip(v.device_extent)
+            .filter_map(|(&d, &axis)| {
+                use crate::superdsc_opspec::{DeviceAxis, PitchForm};
+                match axis {
+                    DeviceAxis::Swept | DeviceAxis::Window(_) => None,
+                    DeviceAxis::Pitch(p) => match v.pitch_form(p) {
+                        PitchForm::Hbm(p) => Some((d, p.gap())),
+                        // The pinned walk carries it (`window_extents`); no gap, exactly one form.
+                        PitchForm::Lx(_) => None,
+                    },
+                }
+            })
+            .collect();
+        (!gaps.is_empty()).then_some(BackGap(gaps))
+    }
+
+    /// The gap on `axis`, in elements of that axis.
+    pub fn gap(&self, axis: &str) -> Option<u32> {
+        self.0.get(axis).copied()
+    }
+}
+
+impl Serialize for BackGap {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(self.0.len()))?;
+        for (axis, gap) in &self.0 {
+            m.serialize_entry(axis, &BTreeMap::from([(HBM_GAP_CORE, gap.to_string())]))?;
+        }
+        m.end()
+    }
+}
 /// ⭐ A DESCRIPTOR's `scheduleTree_` — ONE allocate node per operand of the op it was built from,
 /// every node's start-address fold minted from this tree's own fold set.
 ///
@@ -585,82 +655,6 @@ impl Coordinates {
                 /*group_stride=*/ eps,
             ),
         );
-    }
-}
-
-
-    pub backGapCore_: Option<BackGap>,
-    pub coordinates_: serde_json::Value, // {coordInfo:{…}, coreIdToWkSlice_:{}}
-}
-
-/// ⭐ `backGapCore_` — an HBM view's per-axis BACK GAP: the elements past an axis's swept extent the
-/// walk skips before the next iteration of the axis outside it
-/// ([`crate::superdsc_opspec::DeviceAxis::Pitch`]). Opaque: the only constructor is
-/// [`BackGap::of_hbm_view`], which reads the gaps off the view's own pitched axes, so a gap that
-/// disagrees with the view's stated pitch is unconstructable.
-///
-/// THE WIRE (`dsc2.cpp`'s parser, `coreGap[std::stoi(core)] = std::stoi(gap.string_value())`):
-/// `{"<axis>": {"-1": "<gap>"}}` — HBM is keyed core `-1` (`DT_CHECK(dimGap.count(-1))` for that
-/// component), and the gap is a JSON STRING (a number reads `""` and `stoi` throws, naming no
-/// field). The vendor inductor writes the same (`compute_ops.py`, `{"-1": str(gap)}`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackGap(BTreeMap<&'static str, u32>);
-
-/// The core key an HBM view's back gap is stated under: dxp keys the gap per core and reads HBM's at
-/// core `-1` (`dsc2.cpp`: `DT_CHECK(dimGap.count(-1))` for an HBM component), the key the vendor
-/// inductor writes too (`compute_ops.py`, `{"-1": str(gap)}`). A wire constant, named once.
-pub const HBM_GAP_CORE: &str = "-1";
-
-impl BackGap {
-    /// The back gap of a view: each [`Pitch::gap`](crate::superdsc_opspec::Pitch::gap) on an axis
-    /// whose pitch resolves to [`PitchForm::Hbm`](crate::superdsc_opspec::PitchForm) — the gap
-    /// `declared − swept` the pitch was built with, read, never re-derived. `None` when no axis does — the
-    /// descriptor then carries no `backGapCore_`, byte-identical to every view before the field
-    /// existed. An LX view's pitch is [`PitchForm::Lx`](crate::superdsc_opspec::PitchForm), which
-    /// the walk carries as its pinned extent and this never sees (`ArgView::window_extents`).
-    ///
-    /// ⛔ THE GAP IS PAST THE WHOLE SWEPT EXTENT, NOT ONE CORE'S. An HBM unit view's per-dim capacity INCLUDES the
-    /// core fold (`dsc2.cpp` `getBufferCapacityForNodePerDim`: `comp == HBM && foldPos ==
-    /// coreFoldPos` multiplies the cardinality in), so the repeat the gap is folded into is the
-    /// whole tensor's along the axis — the vendor's own `backGap = dev_dim_size − it_dim_size`.
-    /// MEASURED on the card (2026-11-08): a reduction over blocks a pitch apart, whose stick axis the
-    /// cores split, read the gap fill past block 0 with `pitch − per-core extent`, and every block
-    /// with `pitch − extent`; a row band whose `mb` the cores split ([16,384] of [64,384]) is
-    /// bit-identical to the whole-parent op with `parent − rows`.
-    pub fn of_hbm_view(v: &ArgView<'_>) -> Option<BackGap> {
-        let gaps: BTreeMap<&'static str, u32> = v
-            .layout
-            .iter()
-            .zip(v.device_extent)
-            .filter_map(|(&d, &axis)| {
-                use crate::superdsc_opspec::{DeviceAxis, PitchForm};
-                match axis {
-                    DeviceAxis::Swept | DeviceAxis::Window(_) => None,
-                    DeviceAxis::Pitch(p) => match v.pitch_form(p) {
-                        PitchForm::Hbm(p) => Some((d, p.gap())),
-                        // The pinned walk carries it (`window_extents`); no gap, exactly one form.
-                        PitchForm::Lx(_) => None,
-                    },
-                }
-            })
-            .collect();
-        (!gaps.is_empty()).then_some(BackGap(gaps))
-    }
-
-    /// The gap on `axis`, in elements of that axis.
-    pub fn gap(&self, axis: &str) -> Option<u32> {
-        self.0.get(axis).copied()
-    }
-}
-
-impl Serialize for BackGap {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut m = s.serialize_map(Some(self.0.len()))?;
-        for (axis, gap) in &self.0 {
-            m.serialize_entry(axis, &BTreeMap::from([(HBM_GAP_CORE, gap.to_string())]))?;
-        }
-        m.end()
     }
 }
 /// The `startAddressCoreCorelet_` fold: `dim_prop_func` = `[Map, Const, Const]`
