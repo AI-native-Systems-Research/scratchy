@@ -279,7 +279,34 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         pool_statics: &[(u32, Vec<u8>)],
         spilled_tail: &[u32],
     ) -> Result<Self> {
-        Self::new_inner(
+        let mut sess = Self::build_borrowing_with_consts(
+            cards,
+            code,
+            dims,
+            borrowed,
+            load_consts,
+            pool_statics,
+            spilled_tail,
+        )?;
+        sess.prepare()?;
+        Ok(sess)
+    }
+
+    /// [`new_borrowing_with_consts`](Self::new_borrowing_with_consts) WITHOUT the device half —
+    /// the HOST build alone, for a ladder fan-out that calls [`prepare`](Self::prepare) later,
+    /// once the owner session has allocated. The split changes nothing the borrowing law demands
+    /// of the caller: the `alias_seg_from` adoption still runs after that prepare, on the thread
+    /// that owns the owner, in ladder order.
+    pub fn build_borrowing_with_consts(
+        cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
+        code: &'static crate::bundle_code::BundleCode<'static, T>,
+        dims: SessionDims,
+        borrowed: &[i64],
+        load_consts: &[(u32, crate::wiring::LoadConst)],
+        pool_statics: &[(u32, Vec<u8>)],
+        spilled_tail: &[u32],
+    ) -> Result<Self> {
+        Self::build_inner(
             cards,
             code,
             dims,
@@ -328,9 +355,32 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         )
     }
 
+    /// Every constructor, composed: the HOST half then the DEVICE half. The ladder fan-outs are
+    /// the one caller that splits them (see
+    /// [`build_borrowing_with_consts`](Self::build_borrowing_with_consts) and
+    /// [`prepare`](Self::prepare)); everyone else gets both halves in the order they always had.
     fn new_inner(
         cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
         code: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, T>,
+        dims: SessionDims,
+        staged: Staged<'_, T>,
+        borrowed: &[i64],
+        spilled_tail: &[u32],
+    ) -> Result<Self> {
+        let mut sess = Self::build_inner(cards, code, dims, staged, borrowed, spilled_tail)?;
+        sess.prepare()?;
+        Ok(sess)
+    }
+
+    /// ⭐ THE HOST HALF of every constructor — `Executor::load`, the source and borrow
+    /// declarations, the weight and constant binds, and the staging walk. It touches NO device
+    /// state: every allocation, program upload, H2D and sync lives in [`prepare`](Self::prepare),
+    /// so what this returns is a plan plus host bytes and nothing on the card. The ladder
+    /// fan-outs build their rungs through this half WHILE the owner session builds — the
+    /// owner-first laws order the ladder's DEVICE half, not this one.
+    fn build_inner(
+        cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
+        code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         staged: Staged<'_, T>,
         borrowed: &[i64],
@@ -357,11 +407,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
             Some(w) => w,
             None => PerRank::from_fn(|_| CardWeights::new()),
         };
-        // ⭐ EVERY RANK'S BUILD AT ONCE — [`each_rank_parallel`]: a rank's build (its executor
-        // load, its binds, its stage, its prepare) touches only its own card and its own weight
-        // set, so the ranks build concurrently instead of the last card starting a whole world
-        // minus one builds after the first (measured at tp/8: the dxp session alone was 3.1 s of
-        // sequential per-card builds). The per-card alloc order (anchor → owner → rungs) is PER
+        // ⭐ EVERY RANK'S BUILD AT ONCE — [`each_rank_parallel`]: a rank's HOST build (its
+        // executor load, its binds, its stage) touches only its own card and its own weight set,
+        // so the ranks build concurrently instead of the last card starting a whole world minus
+        // one builds after the first (measured at tp/8: the dxp session alone was 3.1 s of
+        // sequential per-card builds). The DEVICE half ([`prepare`](Self::prepare)) is a separate
+        // wave the ladder laws order. The per-card alloc order (anchor → owner → rungs) is PER
         // CARD and each rank's thread keeps its own card's order; cross-card order was never
         // constrained — device memory is per card.
         let ranks: PerRank<T, Executor<'c, T>> =
@@ -469,7 +520,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
                     );
                 }
 
-                exec.prepare()?;
                 Ok(exec)
             })?;
         let exec = ranks.first();
@@ -479,6 +529,15 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
             pmask_slots: exec.pmask_slots(),
             ranks,
         })
+    }
+
+    /// ⭐ THE DEVICE HALF — every rank's [`Executor::prepare`]: the stream, the program and
+    /// tensor-segment allocations, the sends and the sync. Idempotent, and composed into every
+    /// `new*` constructor; the ladder fan-outs call it as a separate wave so a rung's host build
+    /// hides inside the owner's while the rung's ALLOCATIONS still happen only after the owner's
+    /// — the tp-window and weight-region placement laws are laws about THIS half alone.
+    pub fn prepare(&mut self) -> Result<()> {
+        self.each(|e| e.prepare()).map(drop)
     }
 
     /// ⭐ RANK 0 — the card whose readback a step returns. In a sharded world every value the host
