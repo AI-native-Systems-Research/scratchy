@@ -2334,7 +2334,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             ) {
                 self.bind_const_fp32(id, bytes)?;
             } else {
-                self.bind_weight(id, bytes);
+                self.bind_weight(id, HostBytes::Owned(bytes));
             }
         }
         Ok(())
@@ -5202,7 +5202,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 }
                 _ => {}
             }
-            writes.push((seg.get(), p.offset, src.as_slice()));
+            writes.push((seg.get(), p.offset, src));
             seg_dirty[seg.get()] = true;
             seg_runs[seg.get()].push(h2d_run(p.offset, src.len() as u64));
             if d.phase_time {
