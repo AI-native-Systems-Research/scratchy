@@ -5424,50 +5424,30 @@ mod walk_on_the_card {
             .collect()
     }
 
-    /// The HBM views the matmul pitch changed on purpose: each per-batch decode
-    /// contraction whose flat-frame batch rows sit past their own (`mb` 4 of a taller frame, `n` or
-    /// `k` past one stick) now carries `backGapCore_[mb] = frame − 4` over a swept walk instead of a
-    /// pinned `maxDimSizes_` — the card-proven flat-frame form (the bmm cells, 2026-11-08: pinned
-    /// read 0 rows correct, the gap every row). `(geometry, op)`, exactly the descriptors that differ.
-    const PITCHED_HBM_BMMS: [(&str, &str); 14] = [
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o14"),
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o14"),
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm2_o14"),
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm3_o14"),
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o21"),
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o21"),
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm2_o21"),
-        ("4 kv heads, 1 sequences over 1 blocks at hd 64", "bmm3_o21"),
-        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o11"),
-        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o11"),
-        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o18"),
-        ("2 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o18"),
-        ("1 kv heads, 1 sequences over 1 blocks at hd 64", "bmm0_o11"),
-        ("1 kv heads, 1 sequences over 1 blocks at hd 64", "bmm1_o11"),
-    ];
-
-    /// ⭐ THE BATCHED DECODE'S LX VIEWS ARE THE BYTES THEY SHIPPED AS — a matmul `phys_mb` became a
-    /// pitch, and an LX-resident view's pitch is the pinned walk it always was
-    /// (`PitchForm::Lx`). Against the tree before the matmul pitch, over every descriptor of all 40
-    /// head-share geometries:
+    /// ⭐ THE BATCHED DECODE'S DESCRIPTORS, PINNED — every descriptor of all 40 head-share
+    /// geometries, each one's LX-resident views named in its own column: any change to the walk's
+    /// emission moves exactly the line it changed, and an LX view moves only by a deliberate
+    /// residency change. The LX column exists because a matmul `phys_mb` became a pitch and an
+    /// LX-resident view's pitch is the pinned walk it always was (`PitchForm::Lx`) — the pitch
+    /// conversion changed exactly the 14 HBM flat-frame contractions (`bmm0..3_o14`,
+    /// `bmm0..3_o21` at 4 kv heads hd 64; `bmm0/1_o11`, `bmm0/1_o18` at 2 kv heads; `bmm0/1_o11`
+    /// at 1 kv head) and no LX view, proven against the pre-pitch tree when it landed
+    /// (card-measured 2026-11-08: the pinned walk read 0 rows correct, the gap every row; the b2
+    /// bake replied byte-identical). That baseline no longer builds against the sealed
+    /// `DeviceAxis` API, so the record stands in the history and this golden pins the emission.
     ///
-    /// * every descriptor's LX views are byte-identical;
-    /// * every descriptor is byte-identical whole, except exactly [`PITCHED_HBM_BMMS`] — the HBM
-    ///   flat-frame contractions the pitch changed on purpose (and each of those does differ);
-    /// * the smallest LX-bearing geometry's 16 descriptors match whole, as JSON, so a failure there
-    ///   reads without regenerating anything.
-    ///
-    /// `fixtures/batched_decode_descriptors_pre_pitch.digest` is `<geometry>\t<op>\t<fnv64 of the
-    /// descriptor's JSON>\t<fnv64 of its LX views>` a line; `fixtures/batched_decode_kv8_s1_b1_hd64_
-    /// pre_pitch.json` the slice. REGENERATING THE FULL JSON: check out this tree, replace
-    /// `ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/matmul/{opspec,assemble}.rs` with main's
-    /// (6f6c580ee6, `git show 6f6c580ee6:<path>`), and serialize `decode_batch_descriptors()` (one `{at, op_name,
-    /// op}` object per descriptor) from a scratch test in this module; `cargo test --release -p
-    /// scratchy-triton-splice --lib <that test>`. Generated so on nickm5 (full JSON md5 03e13d16).
+    /// `fixtures/batched_decode_descriptors.digest` is `<geometry>\t<op>\t<fnv64 of the
+    /// descriptor's JSON>\t<fnv64 of its LX views>` a line; `fixtures/batched_decode_kv8_s1_b1_
+    /// hd64.json` the smallest LX-bearing geometry's 16 descriptors whole, as JSON, so a failure
+    /// there reads without regenerating anything. REGENERATING: from a scratch test in this
+    /// module, print `decode_batch_digest()` (a `<geometry>\t<op>\t{digest:x}\t{lx:x}` line a
+    /// descriptor) and the kv8 slice of `decode_batch_descriptors()`, and install the outputs —
+    /// `cargo test -p scratchy-triton-splice --lib <that test> -- --nocapture`. Generated so on
+    /// nickm4 (2026-11-11, at the join: the back gap states the stride).
     #[test]
     fn the_batched_decode_emits_what_it_shipped() {
         let golden: Vec<(String, String, u64, u64)> =
-            include_str!("../tests/fixtures/batched_decode_descriptors_pre_pitch.digest")
+            include_str!("../tests/fixtures/batched_decode_descriptors.digest")
                 .lines()
                 .map(|l| {
                     let f: Vec<&str> = l.split('\t').collect();
@@ -5477,32 +5457,17 @@ mod walk_on_the_card {
                 .collect();
         let got = decode_batch_digest();
         assert_eq!(got.len(), golden.len(), "the same descriptor count");
-        let mut changed = Vec::new();
         for (i, (g, w)) in got.iter().zip(&golden).enumerate() {
             assert_eq!(
                 (&g.0, &g.1),
                 (&w.0, &w.1),
                 "descriptor {i}: the same geometry and op"
             );
+            assert_eq!(g.2, w.2, "descriptor {i} ({} {}): the descriptor", w.0, w.1);
             assert_eq!(g.3, w.3, "descriptor {i} ({} {}): its LX views", w.0, w.1);
-            if g.2 != w.2 {
-                assert!(
-                    PITCHED_HBM_BMMS.contains(&(w.0.as_str(), w.1.as_str())),
-                    "descriptor {i} ({} {}) changed and is not a pitched HBM contraction",
-                    w.0,
-                    w.1
-                );
-                changed.push((w.0.clone(), w.1.clone()));
-            }
-        }
-        for (at, op) in PITCHED_HBM_BMMS {
-            assert!(
-                changed.iter().any(|(a, o)| a == at && o == op),
-                "{at} {op}: listed as pitched and emitted unchanged"
-            );
         }
         let slice: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../tests/fixtures/batched_decode_kv8_s1_b1_hd64_pre_pitch.json"
+            "../tests/fixtures/batched_decode_kv8_s1_b1_hd64.json"
         ))
         .expect("the slice parses");
         let at = "8 kv heads, 1 sequences over 1 blocks at hd 64";
