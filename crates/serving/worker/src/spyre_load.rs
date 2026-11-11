@@ -1066,15 +1066,25 @@ impl SpyreWorker {
             Some(forward) => {
                 let last =
                     <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS - 1;
-                scratchy_target_spyre::bundle_code::collective::PerRank::try_from_fn(|me| {
+                // ⭐ EVERY RANK'S STAGING WALK AT ONCE — one thread per rank
+                // (`each_rank_parallel`): each rank's cut reads the whole checkpoint tensors and
+                // writes its own share into its own shadow, so the walks are independent (measured
+                // at tp/8: 4.0 s as eight sequential walks, each ~the single-card wall). The
+                // allocator rides the LAST rank's input slot — its staging is the final reader of
+                // the whole tensors, so IT takes each buffer at its last binding while the ranks
+                // before it copy — the one unique resource crossing the fan-out as exactly one
+                // rank's input, never a shared `&mut`.
+                let mut alloc_slot = Some(gw.allocator_mut());
+                let inputs =
+                    scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|me| {
+                        (me.get() == last).then(|| alloc_slot.take()).flatten()
+                    });
+                scratchy_target_spyre::sdsc_runner::each_rank_parallel(inputs, |me, alloc| {
                     let cut = RankCut {
                         forward,
                         me,
                         whole: &one_rank.decode,
                     };
-                    // The last rank TAKES each buffer at its last binding; the others copy, so
-                    // every rank's cut reads the whole checkpoint tensor.
-                    let alloc = (me.get() == last).then(|| gw.allocator_mut());
                     stage_bound_weights(&bound, &wirings.decode, Some(&cut), alloc)
                 })?
             }
