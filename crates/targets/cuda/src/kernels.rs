@@ -48,6 +48,14 @@ unsafe extern "C" {
     ) -> i32;
     // FP8 S3: the per-token quantization and the prefill fp8 GEMM family.
     fn scratchy_cuda_quant_rows_fp8_prepare() -> i32;
+    fn scratchy_cuda_quant_row_fp8_one_prepare() -> i32;
+    fn scratchy_cuda_quant_row_fp8_one(
+        x: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_quant_rows_fp8(
         x: *const c_void,
         q: *mut c_void,
@@ -1272,6 +1280,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gate_up_gemm_bf16", scratchy_cuda_gate_up_gemm_bf16_prepare),
     // FP8 S3: the attribute on every instance of each file, which loads each.
     ("quant_rows_fp8", scratchy_cuda_quant_rows_fp8_prepare),
+    ("quant_row_fp8_one", scratchy_cuda_quant_row_fp8_one_prepare),
     ("gemm_fp8", scratchy_cuda_gemm_fp8_prepare),
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
@@ -3624,6 +3633,27 @@ pub unsafe fn quant_rows_fp8(
     check(code, KernelError::RowShape { rows, cols })
 }
 
+/// Test support for `tests/gemv_fp8_tc.rs` only (FP8 S8's Q1, no tape launches it yet):
+/// [`quant_rows_fp8`] of one row, `x [1, cols]` bf16 into `q [1, cols]` e4m3 and `scale [1]` f32,
+/// the bits of [`quant_rows_fp8`]'s row 0 for the same row, one CTA per 256 columns. Refused with
+/// [`KernelError::RowShape`] (`rows` 1) unless `cols` is a non-zero multiple of 64 at most 17,408.
+/// Asynchronous.
+///
+/// # Safety
+///
+/// As [`quant_rows_fp8`]'s at one row.
+#[doc(hidden)]
+pub unsafe fn quant_row_fp8_one(
+    x: *const c_void,
+    (q, scale): (*mut c_void, *mut c_void),
+    cols: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe { scratchy_cuda_quant_row_fp8_one(x, q, scale, cols, stream) };
+    check(code, KernelError::RowShape { rows: 1, cols })
+}
+
 /// Launch the fp8 GEMM (`kernels/gemm_fp8.cu`): `c [m, n] = bf16((a · bᵀ) · b_scale[n] ·
 /// a_scale[m])`, accumulated in f32. At `col64` false on [`gemm_bf16_abt`]'s tile grid (`m`, `n`,
 /// `k` non-zero multiples of 128, 256 and 64), at `col64` true on [`gemm_col64_bf16_abt`]'s (128,
@@ -3985,9 +4015,10 @@ pub unsafe fn gemv_fp8_tc(
 
 /// Test support for `tests/gemv_fp8_tc.rs` only (the ceiling probe, /tmp/d-cap.md §3 P-B):
 /// [`gemv_fp8_tc`] at instance `variant` (0 B1, [`gemv_fp8_tc`]'s own; 1 B2 `wait1`, the same
-/// bits; 2 B3 `k128`, `k` a multiple of 128; 3 B4 `2cta`), and with `main_only` (B5 `noreduce`) the
+/// bits; 2 B3 `k128`, `k` a multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, `k` a multiple of 256), and
+/// with `main_only` (B5 `noreduce`) the
 /// stream-K kernel alone, `c` left unwritten. Refused with [`KernelError::GroupShape`] as
-/// [`gemv_fp8_tc`], or for `variant` above 3. Asynchronous.
+/// [`gemv_fp8_tc`], or for `variant` above 4. Asynchronous.
 ///
 /// # Safety
 ///

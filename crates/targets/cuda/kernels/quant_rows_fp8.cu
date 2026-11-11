@@ -208,3 +208,156 @@ extern "C" int scratchy_cuda_quant_rows_fp8(const void* x, void* q, void* scale,
         return SCRATCHY_CUDA_ERR_HOST;
     }
 }
+
+// ── Q1: the one-row form (FP8 S8's ceiling follow-up, test-only: no tape launches it yet) ──
+//
+// `rows == 1` in `quant_rows_fp8_ker` is one warp walking every tile of the row twice through a
+// 2-stage ring (454 µs at 5,120 columns, 1,529 at 17,408 on the H100). The one-row form is the
+// one-row RMSNorm's shape (`rms_norm_bf16.cu`): `col_tiles` CTAs of 8 warps, CTA `t` owning
+// column tile `t`.
+//   1. Every CTA computes the whole row's `amax`, as the fp8 GEMV's prologue does (`gemv_fp8.cu`'s
+//      `quantize_row`): warp `w` TMA-loads its 256-column chunks `w, w + 8, …` as `sv_bf<256>` in
+//      one burst, `warp::load` into a naive `rv_fl<256>` (exact), `warp::abs`, `warp::max`, then
+//      `warp::max` to one value, written twice into an `sv_fl<16>`, and every warp reduces the 16.
+//      A max of absolute values is exact in any order, so it is `quant_rows_fp8`'s `amax`.
+//   2. `scale = fp8_scale(amax)`; CTA 0 stores it. Warp 0 TMA-loads tile `t` as `quant_rows_fp8`'s
+//      plain `st_bf<16, 256>` from the `[1, cols]` map (rows 1..15 zero), and runs that kernel's
+//      pass 2 on it: `row_map<fp8_quant_pre>` by a column vector of `scale`, `warp::copy` to
+//      `rt_fp8e4m3`, stored and TMA-stored (rows past 1 and columns past `cols` dropped).
+// The same ops on the same values, so row 0's bytes and scale are `quant_rows_fp8`'s.
+
+namespace {
+
+constexpr int ONE_WARPS = 8;
+constexpr int ONE_THREADS = ONE_WARPS * kittens::WARP_THREADS;
+// The longest row's chunks (17,408 / 256), and a warp's share of them, `⌈68 / 8⌉`.
+constexpr int ONE_ROW_CHUNKS = 68;
+constexpr int ONE_CHUNKS = (ONE_ROW_CHUNKS + 8 - 1) / 8;
+
+using chunk_sv = sv_bf<COLS>;
+using chunk_rv = rv_fl<COLS>;
+using amax_rv = rv_fl<16>;
+using one_x_gl = gl<bf16, 1, 1, -1, -1, x_tile, chunk_sv>;
+
+struct one_row_globals {
+    one_x_gl x;
+    q_gl q;
+    scale_gl scale;
+    int col_tiles;
+};
+
+constexpr size_t ONE_SMEM_USED =
+    size_t(ONE_WARPS) * ONE_CHUNKS * sizeof(chunk_sv) + sizeof(x_tile) + sizeof(q_tile);
+constexpr int ONE_SMEM_BYTES = int(ONE_SMEM_USED) + 1024;
+static_assert(ONE_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
+
+__global__ __launch_bounds__(ONE_THREADS, 1) void quant_row_fp8_one_ker(
+    const __grid_constant__ one_row_globals g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    chunk_sv(&row)[ONE_WARPS][ONE_CHUNKS] = al.allocate<chunk_sv, ONE_WARPS, ONE_CHUNKS>();
+    x_tile& x_s = al.allocate<x_tile>();
+    q_tile& q_s = al.allocate<q_tile>();
+    __shared__ kittens::semaphore chunks_arrived[ONE_WARPS];
+    __shared__ kittens::semaphore owned;
+    __shared__ sv_fl<16> amax_s;
+    const int w = kittens::warpid();
+    const int t_own = blockIdx.x;
+    const int mine = (g.col_tiles - w + ONE_WARPS - 1) / ONE_WARPS;
+    if (warp::laneid() == 0) {
+        init_semaphore(chunks_arrived[w], 0, 1);
+        if (w == 0) {
+            init_semaphore(owned, 0, 1);
+        }
+    }
+    __syncwarp();
+    // Pass 1: this warp's chunks in one burst, their max of absolute values.
+    warp::tma::expect_bytes(chunks_arrived[w], uint32_t(mine * sizeof(chunk_sv)));
+    for (int i = 0; i < mine; i++) {
+        warp::tma::load_async(row[w][i], g.x, {0, 0, 0, w + i * ONE_WARPS}, chunks_arrived[w]);
+    }
+    // Warp 0 also loads its owned tile now, for pass 2.
+    if (w == 0) {
+        warp::tma::expect_bytes(owned, sizeof(x_tile));
+        warp::tma::load_async(x_s, g.x, {0, 0, 0, t_own}, owned);
+    }
+    chunk_rv x, m;
+    warp::zero(m);
+    if (mine > 0) {
+        wait(chunks_arrived[w], 0);
+    }
+    for (int i = 0; i < mine; i++) {
+        warp::load(x, row[w][i]);
+        warp::abs(x, x);
+        warp::max(m, m, x);
+    }
+    const float part = warp::max(m);
+    if (warp::laneid() == 0) {
+        amax_s[w] = part;
+        amax_s[w + ONE_WARPS] = part;
+    }
+    __syncthreads();
+    amax_rv all;
+    warp::load(all, amax_s);
+    const float scale = scratchy::ops::fp8_scale::op<float>(warp::max(all));
+    if (w == 0) {
+        if (t_own == 0 && warp::laneid() == 0) {
+            g.scale[{0, 0, 0, 0}] = scale;
+        }
+        // Pass 2: `quant_rows_fp8_ker`'s, on the owned tile.
+        row_values sc;
+        warp::zero(sc);
+        warp::add(sc, sc, scale);
+        wait(owned, 0);
+        acc_tile v;
+        warp::load(v, x_s);
+        warp::row_map<scratchy::ops::fp8_quant_pre>(v, v, sc);
+        fp8_tile q;
+        warp::copy(q, v);
+        warp::store(q_s, q);
+        __syncwarp();
+        coord<q_tile> at = {0, 0, 0, t_own};
+        warp::tma::store_async(g.q, q_s, at);
+        warp::tma::store_async_wait();
+    }
+}
+
+}  // namespace
+
+// The one-row form's one-time setup (in `PREPARE`, `kernels::prepare_all`).
+// 0 = done; any other value = the cudaError_t.
+extern "C" int scratchy_cuda_quant_row_fp8_one_prepare(void) {
+    return static_cast<int>(cudaFuncSetAttribute(
+        quant_row_fp8_one_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, ONE_SMEM_BYTES));
+}
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// C++ exception was caught; any other value = the cudaError_t of the launch.
+//
+// `quant_rows_fp8` of one row: `x [1, cols]` bf16 into `q [1, cols]` e4m3 and `scale [1]` f32, the
+// bits of `scratchy_cuda_quant_rows_fp8`'s row 0 for the same row. `cols` a non-zero multiple of 64
+// at most 17,408 (the shared chunks hold 68 256-column chunks), checked first. Pointers as
+// `scratchy_cuda_quant_rows_fp8`'s. `scratchy_cuda_quant_row_fp8_one_prepare` must have succeeded on
+// the current device. Asynchronous on `stream`.
+extern "C" int scratchy_cuda_quant_row_fp8_one(const void* x, void* q, void* scale, uint32_t cols,
+                                               void* stream /* cudaStream_t; null = default */) {
+    if (cols == 0 || cols % COL_MULTIPLE != 0 || cols > uint32_t(ONE_ROW_CHUNKS) * uint32_t(COLS)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+        one_row_globals G{
+            one_x_gl{static_cast<bf16*>(const_cast<void*>(x)), nullptr, nullptr, size_t(1),
+                     size_t(cols)},
+            q_gl{static_cast<fp8e4m3*>(q), nullptr, nullptr, size_t(1), size_t(cols)},
+            scale_gl{static_cast<float*>(scale), nullptr, nullptr, nullptr, size_t(1)},
+            col_tiles};
+        void* args[] = {&G};
+        return static_cast<int>(cudaLaunchKernel(quant_row_fp8_one_ker, dim3(col_tiles),
+                                                 dim3(ONE_THREADS), args, ONE_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}

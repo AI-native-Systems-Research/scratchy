@@ -726,3 +726,256 @@ fn quant_rows_fp8_one_row_times_are_recorded() {
         }
     }
 }
+
+// ── The ceiling follow-up (cap2): B6 `k256`, Gemma's shapes, and Q1, the one-row quantize ──────
+
+/// The K step of a variant (`gemv_fp8_tc_variant`'s numbering): a variant runs only where it
+/// divides `k`.
+fn k_step(variant: u32) -> u32 {
+    match variant {
+        2 => 128,
+        4 => 256,
+        _ => 64,
+    }
+}
+
+/// The cap2 shapes: the 27B's gate+up (as one), down and GDN qkv+z group, and Gemma's one-row
+/// dense gate+up (the gate and the up as a group) and down.
+const CAP2_SHAPES: &[(&[u32], u32, &str)] = &[
+    (&[34816], 5120, "27B_gate+up"),
+    (&[5120], 17408, "27B_down"),
+    (&[10240, 6144], 5120, "27B_gdn_qkv+z"),
+    (&[2112, 2112], 2816, "Gemma_gate+up"),
+    (&[2816], 2112, "Gemma_down"),
+];
+
+/// The cap2 bound: B3 (`k128`) and B6 (`k256`) inside S3's f64 bound at every cap2 shape whose
+/// `k` their K step divides (Gemma's down, `k` 2,112, takes neither), and B1 at Gemma's two;
+/// every worst ratio printed as `CAP2_BOUND`, a refused shape as `CAP2_SKIP`.
+#[test]
+fn the_cap2_tc_variants_are_inside_s3_s_bound() {
+    let device = h100();
+    let mut pass = true;
+    for &(ns, k, what) in CAP2_SHAPES {
+        let ku = k as usize;
+        let x = bf16_inputs(ku, 0x7F0 ^ u64::from(k));
+        let act = Act::new(&device, &x);
+        act.quantize();
+        let host: Vec<(Vec<u8>, Vec<f32>)> = (ns.iter().enumerate())
+            .map(|(i, &n)| {
+                let n = n as usize;
+                (
+                    e4m3_weights(n * ku, 0x7F1 ^ i as u64),
+                    weight_scales(n, 0x7F2 ^ i as u64),
+                )
+            })
+            .collect();
+        let ws: Vec<Fp8Buf> = host
+            .iter()
+            .map(|(q, s)| Fp8Buf::new(&device, q, s))
+            .collect();
+        let wr: Vec<&Fp8Buf> = ws.iter().collect();
+        let refs: Vec<Vec<(f64, f64)>> = (ns.iter().zip(&host))
+            .map(|(&n, (b, s))| gemv_reference(&x, (b, s), n as usize, ku))
+            .collect();
+        let p = filled(
+            &device,
+            gemv_fp8_tc_partial_bytes(ns, k).expect("bytes") as usize,
+            0,
+        );
+        let gemma = what.starts_with("Gemma");
+        for (variant, name) in [(0u32, "B1"), (2, "B3_k128"), (4, "B6_k256")] {
+            if (variant == 0 && !gemma) || k % k_step(variant) != 0 {
+                if variant != 0 {
+                    eprintln!(
+                        "CAP2_SKIP {name} {what}: k={k} is not a multiple of {}",
+                        k_step(variant)
+                    );
+                }
+                continue;
+            }
+            let outs: Vec<DeviceBuffer> = (ns.iter())
+                .map(|&n| DeviceBuffer::upload(&device, &vec![SENTINEL; n as usize]).expect("c"))
+                .collect();
+            let op: Vec<*mut c_void> = outs.iter().map(|c| c.ptr()).collect();
+            launch_variant(&act, (&wr, &op, ns), &p, (variant, false));
+            for (i, (c, r)) in outs.iter().zip(&refs).enumerate() {
+                let (bad, worst) = compare_fp8(&c.download().expect("c"), r);
+                let ok = bad == 0;
+                eprintln!(
+                    "CAP2_BOUND {name} {what} member {i} n={} k={k}: out_of_bound={bad} \
+                     worst_ratio={worst:.4} {}",
+                    ns[i],
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "a cap2 TC instance is out of S3's bound");
+}
+
+/// The cap2 timing: B1, B3 (`k128`) and B6 (`k256`) at every cap2 shape their K step divides,
+/// read-flush cold and hot, two rounds (each instance in turn, so A, B, A, B), as `TC_TIME` lines.
+#[test]
+fn the_cap2_tc_variants_bandwidth_is_recorded() {
+    let device = h100();
+    let flush = Flush::new(&device);
+    for &(ns, k, shape) in CAP2_SHAPES {
+        let ku = k as usize;
+        let bytes = ns.iter().sum::<u32>() as usize * ku;
+        let act = Act::new(&device, &vec![0x3F80u16; ku]);
+        act.quantize();
+        let ws: Vec<Fp8Buf> = ns
+            .iter()
+            .map(|&n| Fp8Buf::ones(&device, n as usize, ku))
+            .collect();
+        let wr: Vec<&Fp8Buf> = ws.iter().collect();
+        let outs: Vec<DeviceBuffer> = ns
+            .iter()
+            .map(|&n| filled(&device, n as usize * 2, 0))
+            .collect();
+        let op: Vec<*mut c_void> = outs.iter().map(|c| c.ptr()).collect();
+        let p = filled(
+            &device,
+            gemv_fp8_tc_partial_bytes(ns, k).expect("bytes") as usize,
+            0,
+        );
+        for round in 1..=2 {
+            for (variant, name) in [(0u32, "B1"), (2, "B3_k128"), (4, "B6_k256")] {
+                if k % k_step(variant) == 0 {
+                    record(&flush, shape, name, round, bytes, || {
+                        launch_variant(&act, (&wr, &op, ns), &p, (variant, false))
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Q1 on `x` (`[1, k]` bf16): its e4m3 bytes and its scale's bits.
+fn quant_one(device: &CudaDevice, x: &[u16]) -> (Vec<u8>, u32) {
+    use scratchy_target_cuda::kernels::quant_row_fp8_one;
+    let k = x.len();
+    let xb = DeviceBuffer::upload(device, x).expect("x");
+    let q = filled(device, k, 0xEE);
+    let s = filled(device, 4, 0xEE);
+    // SAFETY: `xb` holds k bf16, `q` k bytes and `s` one f32, three allocations; null is the
+    // default stream, which the downloads wait for.
+    unsafe {
+        quant_row_fp8_one(
+            xb.ptr().cast_const(),
+            (q.ptr(), s.ptr()),
+            k as u32,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("quant_row_fp8_one launch");
+    let qb: Vec<u8> = q
+        .download()
+        .expect("q")
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .take(k)
+        .collect();
+    let sb: Vec<u8> = s
+        .download()
+        .expect("s")
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    (qb, u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]))
+}
+
+/// Q1 is `quant_rows_fp8`'s row 0 bit for bit (the bytes and the scale), at the 27B's 5,120 and
+/// 17,408 columns, Gemma's 2,816 and 2,112 (a partial last 256-column tile), 64 and 1,088, on
+/// random rows, a zero row (the minimum scale) and a row of one large value (the clamp).
+#[test]
+fn the_one_row_quantize_is_quant_rows_fp8_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for k in [5120usize, 17408, 2816, 2112, 64, 1088] {
+        let mut rows = vec![
+            ("random", bf16_inputs(k, 0x7A0 ^ k as u64)),
+            ("zero", vec![0u16; k]),
+        ];
+        let mut big = bf16_inputs(k, 0x7A1);
+        big[k / 2] = 0x7F00; // bf16 1.7e38
+        rows.push(("one_large", big));
+        for (what, x) in rows {
+            let act = Act::new(&device, &x);
+            act.quantize();
+            let want_q: Vec<u8> = act
+                .q
+                .download()
+                .expect("q")
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .take(k)
+                .collect();
+            let sb: Vec<u8> = act
+                .s
+                .download()
+                .expect("s")
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .collect();
+            let want_s = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+            let (got_q, got_s) = quant_one(&device, &x);
+            let bad = got_q.iter().zip(&want_q).filter(|(a, b)| a != b).count();
+            let ok = bad == 0 && got_s == want_s;
+            eprintln!(
+                "Q1_BITS k={k} {what}: mismatched_bytes={bad} scale={:#010x} want={want_s:#010x} {}",
+                got_s,
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "Q1 is not quant_rows_fp8's row 0");
+}
+
+/// Q1's time at the 27B's 5,120 and 17,408 columns, one launch and ten back to back, read-flush
+/// cold and hot, two rounds, as `TC_TIME` lines (the TB/s is of the bf16 row).
+#[test]
+fn the_one_row_quantize_times_are_recorded() {
+    use scratchy_target_cuda::kernels::quant_row_fp8_one;
+    let device = h100();
+    let flush = Flush::new(&device);
+    for k in [5120u32, 17408] {
+        let ku = k as usize;
+        let x = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x7B0)).expect("x");
+        let q = filled(&device, ku, 0);
+        let s = filled(&device, 4, 0);
+        let one = || {
+            // SAFETY: `x` holds k bf16, `q` k bytes and `s` one f32; null is the default stream.
+            unsafe {
+                quant_row_fp8_one(
+                    x.ptr().cast_const(),
+                    (q.ptr(), s.ptr()),
+                    k,
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("quant_row_fp8_one launch");
+        };
+        for round in 1..=2 {
+            record(
+                &flush,
+                &format!("q1_1x{k}"),
+                "quant_row_fp8_one",
+                round,
+                ku * 2,
+                one,
+            );
+            record(
+                &flush,
+                &format!("q1_1x{k}"),
+                "quant_row_fp8_one_x10",
+                round,
+                10 * ku * 2,
+                || (0..10).for_each(|_| one()),
+            );
+        }
+    }
+}
