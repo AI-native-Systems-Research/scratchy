@@ -1670,7 +1670,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 (d, _) => d.resolve(stickmajor, core_local),
             };
             tile_op
-                .tile(d.budget(&tile_op)?, d.splitter(), "out")
+                .tile(d.budget(tile_op)?, d.splitter(), "out")
                 .map_err(|e| e.0)?
         }
         (stated, Some(_)) => {
