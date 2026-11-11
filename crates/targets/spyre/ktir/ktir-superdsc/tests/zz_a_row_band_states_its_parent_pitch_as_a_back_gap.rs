@@ -171,7 +171,7 @@ fn a_one_stick_band_states_no_gap() {
 #[test]
 fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
     use ktir_superdsc::superdsc_opspec::{
-        Allocation, DeviceAxis, Df, ItDim, MaxCores, PastExtent, Pitch, Role, Scale, TensorArg,
+        Allocation, CoreBudget, DeviceAxis, Df, ItDim, PastExtent, Pitch, Role, Scale, TensorArg,
         Window, WorkPlan,
     };
     // The pitch a view states is the one value `Pitch::past` builds — read back whole.
@@ -192,7 +192,7 @@ fn a_pitch_is_one_mechanism_per_axis_and_its_near_misses_refuse_by_name() {
             dim("mb", 4, false),
             dim("out", 128, true),
         ],
-        MaxCores::<32>,
+        CoreBudget::whole(),
         |_, _| Default::default(),
     )
     .unwrap();
