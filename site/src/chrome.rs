@@ -136,6 +136,9 @@ pub struct Head<'a> {
     pub og: Option<OpenGraph>,
     pub root: Root,
     pub libraries: &'a [Library],
+    /// The side file holding the page's chart specs, where it keeps them apart from its HTML
+    /// (charts.rs `keep_apart`): named in a meta tag charts.js reads.
+    pub chart_data: Option<&'a str>,
 }
 
 fn head(h: &Head, modules: &[Module]) -> Element {
@@ -151,6 +154,9 @@ fn head(h: &Head, modules: &[Module]) -> Element {
             meta { "property": "og:title", content: og.title }
             meta { "property": "og:description", content: og.description }
             meta { "property": "og:type", content: "website" }
+        }
+        if let Some(file) = h.chart_data {
+            meta { name: "chart-data", content: "{root}{file}" }
         }
         link { rel: "icon", r#type: "image/png", href: "{root}{h.assets.favicon}" }
         link { rel: "stylesheet", href: CARBON_STYLES }
@@ -173,7 +179,12 @@ fn head(h: &Head, modules: &[Module]) -> Element {
 /// so the document shell around the two is fixed text.
 /// The head loads the Carbon modules for exactly the tags `body` renders.
 pub fn document(h: Head, body: Element) -> Result<String, String> {
-    let body = dioxus_ssr::render_element(body);
+    document_html(h, dioxus_ssr::render_element(body))
+}
+
+/// [`document`], for a body already rendered: a page that renders its body first, to collect
+/// what it drew (its charts' specs, charts.rs `keep_apart`) before its head is written.
+pub fn document_html(h: Head, body: String) -> Result<String, String> {
     let modules = Module::used_by(&body).map_err(|e| format!("{}: {e}", h.title))?;
     Ok(format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{body}\n</body>\n</html>\n",

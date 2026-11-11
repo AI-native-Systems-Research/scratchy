@@ -1076,14 +1076,15 @@ pub(super) fn sweep_part<'a>(m: &'a Model, run: &Run, sweep: Sweep) -> Element {
             }
         }
         rsx! {
-            // One of a row's measures, side by side, as the dataset sections' users charts are.
-            div { style: "flex: 1 1 16rem; min-width: 16rem; max-width: 24rem",
+            // One of a row's measures, two a row across the panel, as the dataset sections' users
+            // charts are.
+            div { style: "min-width: 0",
               Stack { gap: 2,
                 strong { "{title}" }
                 div { style: "display: flex; flex-direction: column; gap: 1rem",
                     for (t, ss) in &charts {
                         div {
-                            {bar_chart(ss, &xs, (t.as_str(), ylabel), sweep, "200px", &format!("{title}, scratchy {t}"))}
+                            {bar_chart(ss, &xs, (t.as_str(), ylabel), sweep, "280px", &format!("{title}, scratchy {t}"))}
                         }
                     }
                 }
@@ -1153,7 +1154,7 @@ pub(super) fn sweep_part<'a>(m: &'a Model, run: &Run, sweep: Sweep) -> Element {
         heading,
         intro,
         rsx! {
-            div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: flex-start",
+            div { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: 1rem 1.5rem; align-items: start",
                 {row(m1, t1, y1)}
                 {row(m2, t2, y2)}
             }
@@ -2021,8 +2022,15 @@ impl Latency<'_> {
         prompts.sort_unstable();
         prompts.dedup();
         let beside = users == UsersNamed::Beside;
+        // A fixed-size chart's column grows with the panel, the chart centred in it, so a few
+        // charts fill the row rather than its left side; a flexible column is used as given.
+        let column = if column.ends_with("px") {
+            format!("minmax({column}, 1fr)")
+        } else {
+            column.to_string()
+        };
         let columns = format!(
-            "display: grid; grid-template-columns: {}repeat({}, {column}); gap: 0.5rem; align-items: center",
+            "display: grid; grid-template-columns: {}repeat({}, {column}); gap: 0.5rem; align-items: center; justify-items: center",
             if beside { "max-content " } else { "" },
             prompts.len()
         );
@@ -3049,6 +3057,17 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element
                 .collect::<Vec<_>>()
                 .join("/")
         };
+        // Where a column names two sizes, which set each is: "Prompt tokens a column, under 64 GB
+        // / 64 GB and up: 128, 512/1k, 1k/4k, 4k/8k".
+        let two_sizes = (0..most).any(|p| header(p).contains('/'));
+        let legend = two_sizes.then(|| {
+            let gb = lineup.large_from_gb;
+            let columns: Vec<String> = (0..most).map(header).collect();
+            format!(
+                "Prompt tokens a column, under {gb} GB / {gb} GB and up: {}.",
+                columns.join(", ")
+            )
+        });
         // A row's slowest and fastest ratio, over every model and prompt size in it, printed at
         // its right.
         let range = |chip: &str, gm: GridMetric, u: u32| -> Option<(f64, f64)> {
@@ -3195,6 +3214,9 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element
                         {ratio_scale(ScaleFit::Fill, "scale-one-map")}
                     }
                 }
+            }
+            if let Some(legend) = legend {
+                p { style: "font-size: 0.75rem", "{legend}" }
             }
         }
     };
@@ -3953,6 +3975,9 @@ fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
 
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     crate::charts::new_page();
+    // The page's chart specs go to a side file, not its HTML: they are most of its bytes, and a
+    // chart is drawn only once it nears the screen ([`crate::charts::keep_apart`]).
+    crate::charts::keep_apart();
     let runs = load(site)?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
@@ -4005,7 +4030,14 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let description = format!(
         "{against} on Apple silicon: startup, single-user speed, and scaling, per machine."
     );
-    let html = chrome::document(
+    // The body first, so every chart has given its spec before the side file is written.
+    let body = dioxus_ssr::render_element(page);
+    let specs = crate::charts::kept();
+    let side = format!("[{}]", specs.join(","));
+    let side_name = crate::hashed_name("metal.charts.json", side.as_bytes());
+    let side_path = site.out.join(&side_name);
+    fs::write(&side_path, &side).map_err(|e| format!("{}: {e}", side_path.display()))?;
+    let html = chrome::document_html(
         Head {
             assets,
             title: "Metal performance — scratchy",
@@ -4013,8 +4045,9 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
             og: None,
             root: Root(0),
             libraries: &[Library::CarbonCharts],
+            chart_data: Some(&side_name),
         },
-        page,
+        body,
     )?;
     let out = site.out.join("metal.html");
     fs::write(&out, html).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -4221,6 +4254,119 @@ mod tests {
         );
         assert!(map.contains(">gpt-oss-20b<"), "the small model, named");
         assert!(!map.contains(">gpt-oss-120b-3bit<"), "not the large one");
+    }
+
+    /// A page that keeps its charts' data apart carries only each chart's id in its HTML; the
+    /// data is the side file's, one spec an id, in the order the ids were given.
+    #[test]
+    fn a_pages_chart_data_is_kept_apart() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        crate::charts::keep_apart();
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        let specs = crate::charts::kept();
+        assert!(!specs.is_empty(), "charts drawn");
+        assert!(!html.contains("data-chart=\"{"), "no spec inline");
+        assert_eq!(html.matches("data-chart-id=\"").count(), specs.len());
+        let first: serde_json::Value = serde_json::from_str(&specs[0]).unwrap();
+        assert!(first.get("options").is_some(), "a spec");
+        // A page that does not keep them apart still carries them inline, as before.
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("data-chart=\"{"));
+    }
+
+    /// A grid column that names two prompt sizes, one each set's, says which is which.
+    #[test]
+    fn a_grid_column_of_two_sizes_says_which_set_is_which() {
+        let mut runs = fixtures(&[
+            "apple-m3-pro-2026-10-27T031941Z-f9739363.json",
+            "apple-m4-max-2026-10-28T041936Z-dbe48cd2.json",
+        ]);
+        // The 36 GB Mac's grid at the small set's sizes, as the matrix runs it now.
+        let sc = runs[0].config.scaling.as_mut().expect("a grid run");
+        sc.grid_input = Some(vec![128, 512, 1024, 4096]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
+        assert!(html.contains(">512/1k<"), "a column of two sizes");
+        assert!(html.contains(
+            "Prompt tokens a column, under 64 GB / 64 GB and up: 128, 512/1k, 1k/4k, 4k/8k."
+        ));
+    }
+
+    /// A fold's title is the accordion's title slot, not an HTML title attribute, which the
+    /// browser shows as a tooltip over everything inside the fold.
+    #[test]
+    fn a_fold_has_no_title_tooltip() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("This machine and its runs"));
+        assert!(
+            !html.contains("<cds-accordion-item title="),
+            "no title attribute"
+        );
+        assert!(html.contains("<span slot=\"title\">This machine and its runs"));
+    }
+
+    /// The latency plots and users charts fill their panel: columns that grow with it, not ones
+    /// leaving its right side empty, and users charts two a row at a readable height.
+    #[test]
+    fn latency_and_users_charts_fill_their_panel() {
+        let runs = fixtures(&[REQUESTS_FIXTURE]);
+        let machines = super::index(&runs);
+        let rag = render(super::datasets::section("rag", &machines, &machines));
+        assert!(
+            rag.contains("repeat(auto-fit, minmax(16rem, 1fr))"),
+            "ECDFs fill the row"
+        );
+        assert!(
+            rag.contains("minmax(min(100%, 20rem), 1fr)"),
+            "users charts two a row"
+        );
+        assert!(!rag.contains("max-width: 24rem"));
+    }
+
+    /// MuSiQue's accuracy is its own table under the summary, a row a model and engine, the
+    /// rival's beside scratchy's, held-back ones saying why; the timing tables carry no
+    /// accuracy, so a timed row has no column it can never fill.
+    #[test]
+    fn musique_accuracy_is_a_table_of_its_own() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let m = &mut runs[0].models[0];
+        let cell = |acc: f64, capped: u32| -> super::data::TaskCell {
+            serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+                "completed": 400, "num_tasks": 400, "accuracy": acc, "thinking_answers": 0,
+                "capped_answers": capped, "median_ttft_ms": 4000.0,
+                "accuracy_by_group": {"2": 0.3, "3": 0.2, "4": 0.1}}))
+            .unwrap()
+        };
+        m.tasks.as_mut().unwrap().push(cell(0.25, 10));
+        m.tasks_omlx.as_mut().unwrap().push(cell(0.1, 331));
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        let at = |t: &str| html.find(t).unwrap_or_else(|| panic!("no {t}"));
+        assert!(
+            at("<strong>MuSiQue accuracy</strong>") < at("rag-latency-machine"),
+            "in the summary"
+        );
+        assert!(html.contains("25% ±4.2"), "scratchy's, with its range");
+        assert!(html.contains("2-hop 30%, 3-hop 20%, 4-hop 10%"));
+        assert!(
+            html.contains("ran to its cap: 331 of 400"),
+            "oMLX's, held back"
+        );
+        assert!(
+            !html.contains("timed, not scored"),
+            "no accuracy column on timed rows"
+        );
+        assert!(
+            !html.contains(">J/right answer<")
+                || at(">J/right answer<") < at("rag-latency-machine")
+        );
     }
 
     #[test]
@@ -4543,8 +4689,19 @@ mod tests {
         // Squares of the grid's size: 4 rows by 4 buckets for its one model.
         let squares = html.matches("width: 2.25rem; height: 2.25rem").count();
         assert_eq!(squares, 4 * 4);
-        assert!(html.contains("vs oMLX</strong>"), "a ratio against its rival");
-        assert!(html.contains("2.85k+ prompt tokens"), "its bucket in its tooltip");
+        assert!(
+            html.contains("vs oMLX</strong>"),
+            "a ratio against its rival"
+        );
+        assert!(
+            html.contains("2.85k+ prompt tokens"),
+            "its bucket in its tooltip"
+        );
+        // And how many requests each side's median is over, so a thin square says it is thin.
+        assert!(
+            html.contains("over 2 and 2 requests"),
+            "the 2.55k+ bucket's two a side"
+        );
     }
 
     /// A run from before cells kept prompt counts has no buckets to draw: its summary says so,
@@ -4581,12 +4738,22 @@ mod tests {
             !html.contains("Accuracy, 400 tasks at 4 users"),
             "no accuracy line under the map"
         );
-        assert!(html.contains(">MuSiQue, scored<"), "its row in the table");
-        assert!(html.contains("48% of 400"));
+        assert!(
+            html.contains(">MuSiQue, scored<"),
+            "its row in the timing table"
+        );
+        assert!(
+            html.contains("<strong>MuSiQue accuracy</strong>"),
+            "its own table"
+        );
+        assert!(
+            html.contains("48% ±4.9") && html.contains("45% ±4.9"),
+            "both engines' rows"
+        );
     }
 
-    /// MuSiQue's detail table has its accuracy cell as a row of its own, beside the cells at each
-    /// users count: its accuracy over its tasks, by hop count, as every other row's.
+    /// MuSiQue's accuracy cell keeps its timings as a row of the detail table, beside the cells
+    /// at each users count, and its accuracy, by hop count, in the accuracy table.
     #[test]
     fn musiques_accuracy_cell_is_a_row_of_its_table() {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
@@ -4600,14 +4767,13 @@ mod tests {
         runs[0].models[0].tasks.as_mut().unwrap().push(cell);
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains(">MuSiQue, scored<"), "its own row");
-        assert!(html.contains("48% of 400 (2-hop 53%, 3-hop 46%, 4-hop 38%)"));
-        // The timed rows say why they have no accuracy, rather than a bare dash.
+        assert!(html.contains(">MuSiQue, scored<"), "its timings' own row");
         assert!(
             html.contains(">MuSiQue, timed<"),
             "a timed row named for what it is"
         );
-        assert!(html.contains(">not scored<"), "a timed row is not scored");
+        assert!(html.contains("48% ±4.9"), "its accuracy and range");
+        assert!(html.contains("2-hop 53%, 3-hop 46%, 4-hop 38%"));
         // Its columns say what they are: accuracy, and energy a right answer.
         assert!(html.contains(">accuracy<"), "the accuracy column");
         assert!(html.contains(">J/right answer<"), "energy a right answer");

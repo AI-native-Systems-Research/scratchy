@@ -479,11 +479,45 @@ pub fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Ele
         .map(|w| format!("; width: {w}"))
         .unwrap_or_default();
     let height = &options.height;
-    rsx! {
-        div { role: "img", "aria-label": label, style: "{mount}{width}; height: {height}", "data-scale": scale,
-            "data-chart": serde_json::to_string(spec).unwrap_or_default(),
-        }
+    let json = serde_json::to_string(spec).unwrap_or_default();
+    // A page keeping its charts apart ([`keep_apart`]) carries only the spec's place in its
+    // side file; any other, the spec itself.
+    let id = KEPT.with(|k| {
+        k.borrow_mut().as_mut().map(|specs| {
+            specs.push(json.clone());
+            specs.len() - 1
+        })
+    });
+    match id {
+        Some(id) => rsx! {
+            div { role: "img", "aria-label": label, style: "{mount}{width}; height: {height}", "data-scale": scale,
+                "data-chart-id": "{id}",
+            }
+        },
+        None => rsx! {
+            div { role: "img", "aria-label": label, style: "{mount}{width}; height: {height}", "data-scale": scale,
+                "data-chart": json,
+            }
+        },
     }
+}
+
+thread_local! {
+    /// The specs of the page being built, where it keeps them apart from its HTML ([`keep_apart`]).
+    static KEPT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Starts keeping each chart's spec apart from the page's HTML: [`chart`] then writes only the
+/// spec's id, and [`kept`] gives the specs for the page's side file. Per thread: a page is built
+/// on one.
+pub fn keep_apart() {
+    KEPT.with(|k| *k.borrow_mut() = Some(Vec::new()));
+}
+
+/// The specs kept since [`keep_apart`], in id order, as JSON; and stops keeping them, so the
+/// next page carries its own inline unless it keeps them apart too.
+pub fn kept() -> Vec<String> {
+    KEPT.with(|k| k.borrow_mut().take()).unwrap_or_default()
 }
 
 /// The overview's ratio scale.

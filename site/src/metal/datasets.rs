@@ -164,6 +164,12 @@ pub(super) fn section(
     // The summary's columns: the lineup's classes, where the runs record one; else every model
     // shown, a column each.
     let summary_columns = summary_grid(&ran, machines);
+    // Each machine's models as the section reads them, for the accuracy table: in page order.
+    let scored_pairs: Vec<(&str, &Model)> = (ran.iter())
+        .flat_map(|(chip, stems)| {
+            (stems.iter()).filter_map(move |stem| Some((*chip, machines[chip].latest(stem)?.m)))
+        })
+        .collect();
     let timelines: Vec<(&str, Vec<(String, Element)>)> = (chips.iter())
         .map(|&chip| (chip, dataset_timelines(dataset, all, chip, &ran)))
         .filter(|(_, cs)| !cs.is_empty())
@@ -180,6 +186,7 @@ pub(super) fn section(
                  ratio, the engine, and a borrowed rival's run."
             }
             {summary_map(dataset, &id, &ran, machines, &summary_columns)}
+            {tasks::accuracy_table(dataset, &scored_pairs)}
         }
     };
     rsx! {
@@ -778,6 +785,14 @@ fn summary_map(
             Err(why) => (STRIPED.to_string(), None, why.to_string()),
         };
         let bucket = buckets::BUCKETS[b].0;
+        // How many requests each side's median is over: a cell sends few, so a square of one or two
+        // can turn on a single answer, and says so.
+        let over = pair(chip, column).and_then(|p| {
+            let n =
+                |c: Option<&&TaskCell>| c.map_or(0, |c| buckets::in_bucket(c, row.timing, b).len());
+            let (a, t) = (n(p.ours.get(&row.users)), n(p.theirs.get(&row.users)));
+            (a + t > 0).then(|| format!("over {a} and {t} requests"))
+        });
         rsx! {
             cds-tooltip { "align": align(grid.columns.iter().position(|c| *c == column).unwrap_or(0), b),
                 style: "{place}; display: flex",
@@ -788,6 +803,7 @@ fn summary_map(
                     TipHeading { heading: verdict }
                     div { "{stem} on {chip}" }
                     div { "{row.name} · {bucket} prompt tokens · {users_at(row.users)}" }
+                    if let Some(over) = &over { div { "{over}" } }
                 }
             }
         }
@@ -917,7 +933,7 @@ fn pair_latency(dataset: &str, mr: &MachineRuns, stem: &str, chip: &str) -> Elem
                  (across), end to end. Time runs on a log axis, centred on the two medians; further \
                  left is faster, a steeper rise steadier."
             }
-            div { style: "display: grid; gap: var(--cds-spacing-05); grid-template-columns: repeat(auto-fill, {ECDF_COLUMN})",
+            div { style: "display: grid; gap: var(--cds-spacing-05); grid-template-columns: repeat(auto-fit, {ECDF_COLUMN})",
                 for &u in &users {
                     {ecdf_chart(&curves(u), &engines, &["E2EL", &users_at(u)],
                         &format!("end-to-end time of every request, {} at once, {stem} on {chip}", users_at(u)))}
@@ -1027,14 +1043,15 @@ fn users_curves(
     rsx! {
         Stack { gap: 2,
             strong { "Users" }
-            div { style: "display: flex; flex-wrap: wrap; gap: 1rem 1.5rem",
+            // Two a row across the panel, so four bars each read at a glance.
+            div { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: 1rem 1.5rem",
                 for (title, unit, pick) in metrics {
                     {
                         let ss = series(pick);
                         rsx! {
                             if !ss.is_empty() {
-                                div { style: "flex: 1 1 16rem; min-width: 16rem; max-width: 24rem",
-                                    {bar_chart(&ss, users, (title, unit), Sweep::Users, "200px",
+                                div { style: "min-width: 0",
+                                    {bar_chart(&ss, users, (title, unit), Sweep::Users, "280px",
                                         &format!("{title}, {stem} on {chip}"))}
                                 }
                             }
