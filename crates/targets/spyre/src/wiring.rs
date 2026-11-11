@@ -881,27 +881,31 @@ impl PagedStep {
     /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
     /// `None` when `swept` is no walk of this pool.
     ///
-    /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, by the launch's own kind — never a comparison
-    /// against the wiring's stated pair. The wiring states ONE representative of a tape the
-    /// ladders bake at several widths (the prefill ladder's rungs all bind the same tensor ids,
-    /// so one wiring serves them; `rows` here is the rung actually launching), and the runtime
-    /// truth is what the launch itself is: a `Sequence` launch is ONE request of `rows` rows —
-    /// `(rows, 1)` — and a `Batch` launch is one row per request — `(1, rows)`. Both are the
-    /// same law the bake's codegen minted each rung's own pair by, so a launch on the
+    /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, stated BY the launch — never a comparison against
+    /// the wiring's stated pair. The wiring states ONE representative of a tape the ladders bake
+    /// at several widths (the prefill ladder's rungs all bind the same tensor ids, so one wiring
+    /// serves them), and the runtime truth is what the launch itself is: a `Sequence` launch of
+    /// `requests` chunks of `per_request` rows each — `(per_request, requests)`, the packed
+    /// launch's S included — and a `Batch` launch one row per request — `(1, rows)`. Both are
+    /// the same law the bake's codegen minted each rung's own pair by, so a launch on the
     /// representative's own width re-derives the wiring's pair exactly.
     pub fn on_body(
         self,
-        rows: u32,
+        per_request: u32,
+        requests: u32,
         paged_rows: crate::paged_step::PagedRows,
         swept: u32,
     ) -> Option<PagedStep> {
         let walk = swept / self.page_slots;
+        // The graph's rows: the pair's product — the extent the whole graph lowers at, and the
+        // row count every whole-graph table (the KV write index above all) is sized by.
+        let rows = per_request.checked_mul(requests)?;
         let extent = match paged_rows {
             crate::paged_step::PagedRows::Sequence => {
-                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
+                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(per_request)?, RungCap::of_baked_seqs(requests)?)?
             }
             crate::paged_step::PagedRows::Batch => {
-                QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
+                QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(requests)?)?
             }
         };
         (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)

@@ -94,7 +94,15 @@ pub fn prove_ladder_walks(
                  reach it"
             ));
         }
-        if step.on_body(step.rows, step.paged_rows, swept).is_none() {
+        if step
+            .on_body(
+                step.extent.per_request().get(),
+                step.extent.requests().get(),
+                step.paged_rows,
+                swept,
+            )
+            .is_none()
+        {
             return Err(format!(
                 "a step reaching {p} position(s) selects rung {at}, whose {swept}-slot sweep is no \
                  walk of the {}-page pool ({} slots a page) — the worker has no walk to stage",
@@ -1015,7 +1023,12 @@ mod tests {
             for p in 1..=u64::from(top) {
                 let (_, rung) = ladder.rung_for(p);
                 if !rung.active_cap.covers(p)
-                    || s.on_body(s.rows, s.paged_rows, rung.active_cap.get())
+                    || s.on_body(
+                        s.extent.per_request().get(),
+                        s.extent.requests().get(),
+                        s.paged_rows,
+                        rung.active_cap.get(),
+                    )
                         .is_none()
                 {
                     return Err(format!("{p}"));
@@ -1569,7 +1582,7 @@ mod tests {
             };
             for walk in [1, 2, 4] {
                 let body = full
-                    .on_body(rows, PagedRows::Sequence, walk * full.page_slots)
+                    .on_body(rows, 1, PagedRows::Sequence, walk * full.page_slots)
                     .unwrap();
                 let st = StepRows {
                     start: 0,
@@ -1593,7 +1606,7 @@ mod tests {
         };
         for walk in [1, 2, 3, 8, 16] {
             let body = full
-                .on_body(4, PagedRows::Batch, walk * full.page_slots)
+                .on_body(1, 4, PagedRows::Batch, walk * full.page_slots)
                 .unwrap();
             let blocks: Vec<u32> = (0..walk).collect();
             let seqs = [BatchSeq {
@@ -1911,7 +1924,7 @@ mod tests {
     #[test]
     fn a_body_steps_at_its_own_walk() {
         let s = step();
-        let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
+        let body = s.on_body(3, 1, PagedRows::Sequence, 8).unwrap();
         assert_eq!((body.rows, body.walk, body.reach()), (3, 2, 8));
         assert_eq!(
             (
@@ -1929,7 +1942,7 @@ mod tests {
             extent: pair(3, 2),
             ..step()
         };
-        let body = wide.on_body(4, PagedRows::Sequence, 8).unwrap();
+        let body = wide.on_body(4, 1, PagedRows::Sequence, 8).unwrap();
         assert_eq!(
             (
                 body.extent.per_request().get(),
@@ -1943,7 +1956,7 @@ mod tests {
             extent: pair(1, 1),
             ..step()
         };
-        let body = decode.on_body(4, PagedRows::Batch, 8).unwrap();
+        let body = decode.on_body(1, 4, PagedRows::Batch, 8).unwrap();
         assert_eq!(
             (
                 body.extent.per_request().get(),
@@ -1952,7 +1965,7 @@ mod tests {
             (1, 4),
             "a batch launch is one row per request"
         );
-        let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
+        let body = s.on_body(3, 1, PagedRows::Sequence, 8).unwrap();
         assert_eq!(
             (
                 body.extent.per_request().get(),
@@ -1962,15 +1975,15 @@ mod tests {
             "a launch on the wiring's own width re-derives its pair"
         );
         assert!(
-            s.on_body(3, PagedRows::Sequence, 6).is_none(),
+            s.on_body(3, 1, PagedRows::Sequence, 6).is_none(),
             "not whole pages"
         );
-        assert!(s.on_body(3, PagedRows::Sequence, 0).is_none());
+        assert!(s.on_body(3, 1, PagedRows::Sequence, 0).is_none());
         assert!(
-            s.on_body(3, PagedRows::Sequence, 20).is_none(),
+            s.on_body(3, 1, PagedRows::Sequence, 20).is_none(),
             "past the pool"
         );
-        assert!(s.on_body(0, PagedRows::Sequence, 8).is_none());
+        assert!(s.on_body(0, 1, PagedRows::Sequence, 8).is_none());
     }
 
     #[test]
