@@ -12,7 +12,7 @@ use crate::charts::{
     RATIO_STEPS, STRIPED, ScaleFit, ratio_ink, ratio_labels, ratio_scale, ratio_step,
 };
 
-use super::buckets;
+use super::buckets::{self, Buckets};
 use super::data::{At, Model, RequestTiming, Run, TaskCell};
 use super::numbers::{Engine, served};
 use super::{
@@ -24,11 +24,128 @@ use super::{
 /// A summary square's side: the grid's, so one dataset's map is as small as the grid's are.
 const SQUARE: &str = "2.25rem";
 
-/// The accuracy cell's workload: MuSiQue again, over more tasks, for its accuracy alone.
-const ACCURACY: &str = "rag-accuracy";
-
 /// The random-token grid, read as one more dataset: its rows are the grid's prompt lengths.
 pub(super) const RANDOM: &str = "random";
+
+/// What the page knows of a dataset, one row each in [`DATASETS`].
+pub(super) struct Dataset {
+    /// Its key: its workload in the run file (`--dataset-name`), or [`RANDOM`].
+    pub key: &'static str,
+    /// Its name on the page.
+    pub label: &'static str,
+    /// What it measures.
+    pub about: &'static str,
+    /// The workload of its scored cell, a row of its table and not a section of its own:
+    /// MuSiQue's, over more tasks for its accuracy alone.
+    pub scored: Option<&'static str>,
+    /// Whether its tasks are MuSiQue's, drawn as the run's `task_sample` says: a change of
+    /// sampling is a change of its questions, and of no other dataset's.
+    pub sampled: bool,
+    /// The turns of each of its tasks: a conversation's, 1 for a single question.
+    pub turns: u32,
+    /// Its summary map's prompt-length columns.
+    pub buckets: Buckets,
+}
+
+/// A dataset of nothing but its name: one question a task, its prompts in one bucket.
+const fn plain(key: &'static str, label: &'static str, about: &'static str) -> Dataset {
+    Dataset {
+        key,
+        label,
+        about,
+        scored: None,
+        sampled: false,
+        turns: 1,
+        buckets: buckets::WHOLE,
+    }
+}
+
+/// Every dataset the page knows, in its order: the quick run's workloads first, the random-token
+/// grid last.
+const DATASETS: [Dataset; 9] = [
+    plain(
+        "sharegpt",
+        "ShareGPT chat",
+        "real chat prompts, one turn each",
+    ),
+    Dataset {
+        scored: Some("rag-accuracy"),
+        sampled: true,
+        buckets: buckets::MUSIQUE,
+        ..plain(
+            "rag",
+            "MuSiQue, timed",
+            "multi-document QA, MuSiQue: a question over its passages",
+        )
+    },
+    Dataset {
+        sampled: true,
+        buckets: buckets::MUSIQUE,
+        ..plain(
+            "rag-spans",
+            "RAG, passage reuse",
+            "the RAG tasks through scratchy's span cache",
+        )
+    },
+    Dataset {
+        turns: 4,
+        ..plain(
+            "sharegpt-multi-turn",
+            "ShareGPT conversations",
+            "each turn with the turns before it",
+        )
+    },
+    plain(
+        "longbench",
+        "LongBench",
+        "LongBench v2 short: long documents",
+    ),
+    plain(
+        "shared-prefix",
+        "Shared prompt",
+        "short questions sharing one long system prompt",
+    ),
+    plain(
+        "shared-prefix-control",
+        "Shared prompt, no reuse",
+        "the same, every prompt its own",
+    ),
+    Dataset {
+        sampled: true,
+        buckets: buckets::MUSIQUE,
+        ..plain(
+            "rag-accuracy",
+            "MuSiQue, scored",
+            "RAG over more tasks, for its accuracy alone: 100 on a quick run, 400 or the whole dev \
+             set on a full one",
+        )
+    },
+    plain(
+        RANDOM,
+        "Random tokens",
+        "random-token prompts at fixed lengths, the matrix's diagnostic grid (--random)",
+    ),
+];
+
+/// A dataset's row; None for one the page does not know yet.
+pub(super) fn of(key: &str) -> Option<&'static Dataset> {
+    DATASETS.iter().find(|d| d.key == key)
+}
+
+/// A dataset's place in the page's order; one the page does not know goes last.
+pub(super) fn order(key: &str) -> usize {
+    (DATASETS.iter().position(|d| d.key == key)).unwrap_or(DATASETS.len())
+}
+
+/// Whether `workload` is another dataset's scored cell ([`Dataset::scored`]).
+pub(super) fn is_scored(workload: &str) -> bool {
+    DATASETS.iter().any(|d| d.scored == Some(workload))
+}
+
+/// Whether `workload`'s tasks are drawn as the run's `task_sample` says ([`Dataset::sampled`]).
+pub(super) fn sampled(workload: &str) -> bool {
+    of(workload).is_some_and(|d| d.sampled)
+}
 
 /// Every dataset a shown model measured, in the page's order, then [`RANDOM`] if any shown model
 /// measured the random-token grid. A model counts by every run of it on each machine, in `all`,
@@ -48,31 +165,24 @@ pub(super) fn shown<'a>(
     };
     let mut shown: Vec<&'a str> = Vec::new();
     for e in every() {
-        // The accuracy cell is MuSiQue's, a row of its detail table, not a section of its own.
-        for w in tasks::workloads(e.m).into_iter().filter(|&w| w != ACCURACY) {
+        // A scored cell is its dataset's, a row of its detail table, not a section of its own.
+        for w in tasks::workloads(e.m).into_iter().filter(|&w| !is_scored(w)) {
             if !shown.contains(&w) {
                 shown.push(w);
             }
         }
     }
-    shown.sort_by_key(|w| tasks::order(w));
-    let grid = every().any(|e| ran_grid(e.m));
-    if grid {
+    if every().any(|e| ran_grid(e.m)) {
         shown.push(RANDOM);
     }
+    shown.sort_by_key(|w| order(w));
     shown
 }
 
 /// A dataset's name on the page: its label, or for a workload the page does not know yet its own
 /// name, so it keeps a link and section of its own.
 pub(super) fn title(dataset: &str) -> String {
-    match dataset {
-        RANDOM => "Random tokens".to_string(),
-        w => match tasks::workload_label(w).0 {
-            "dataset" => w.to_string(),
-            label => label.to_string(),
-        },
-    }
+    of(dataset).map_or(dataset, |d| d.label).to_string()
 }
 
 /// Whether a model's run measured the random-token grid.
@@ -161,7 +271,7 @@ pub(super) fn section(
         return random(&id, &ran, machines, all);
     }
     let name = title(dataset);
-    let about = tasks::workload_label(dataset).1;
+    let about = of(dataset).map_or("", |d| d.about);
     let chips: Vec<&str> = ran.iter().map(|&(c, _)| c).collect();
     // The summary's columns: the lineup's classes, where the runs record one; else every model
     // shown, a column each.
@@ -519,12 +629,13 @@ fn random(
         .map(|&(chip, _)| (chip, over_time_charts(all, chip)))
         .filter(|(_, cs)| !cs.is_empty())
         .collect();
+    let about = of(RANDOM).map_or("", |d| d.about);
     rsx! {
         Section { id: "{id}", level: 2,
             Stack { gap: 5,
                 Stack { gap: 2,
                     Heading { "{title(RANDOM)}" }
-                    p { "random-token prompts at fixed lengths, the matrix's diagnostic grid (--random)" }
+                    p { "{about}" }
                 }
                 {tabbed(id, &Pairs::of(ran, machines),
                     grid_glance(machines),
@@ -666,7 +777,7 @@ fn grid_latency(id: &str, mr: &MachineRuns, stem: &str, chip: &str) -> Element {
 /// A dataset's summary as one map, the random-token map's look: per machine its rows (P and D,
 /// prefill and decode at 1 user, then end-to-end time at each users count above it, 2u, 4u), per
 /// summary column (a class, or a model) a column each for its prompt-length buckets
-/// ([`buckets::BUCKETS`]), each square scratchy's median against the pair's rival's over the
+/// ([`Dataset::buckets`]), each square scratchy's median against the pair's rival's over the
 /// requests of that bucket. Runs from before cells kept each request's prompt count have none to
 /// draw, and say so.
 fn summary_map(
@@ -732,7 +843,8 @@ fn summary_map(
         }
         rows
     };
-    let n = buckets::BUCKETS.len();
+    let bs = of(dataset).map_or(buckets::WHOLE, |d| d.buckets);
+    let n = bs.len();
     let col = |k: usize, b: usize| 3 + k * n + b;
     // The grid's lines: three header lines (class, models, buckets), then each machine's rows.
     let mut lines: Vec<Option<(&str, Row)>> = vec![None, None, None];
@@ -756,8 +868,8 @@ fn summary_map(
             if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
                 return Err("most requests failed");
             }
-            let a = buckets::median_in(ours, row.timing, b);
-            let t = buckets::median_in(theirs, row.timing, b);
+            let a = buckets::median_in(ours, bs, row.timing, b);
+            let t = buckets::median_in(theirs, bs, row.timing, b);
             let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
             let from = theirs
                 .borrowed_from
@@ -811,12 +923,13 @@ fn summary_map(
             }
             Err(why) => (STRIPED.to_string(), None, why.to_string()),
         };
-        let bucket = buckets::BUCKETS[b].0;
+        let bucket = bs[b].0;
         // How many requests each side's median is over: a cell sends few, so a square of one or two
         // can turn on a single answer, and says so.
         let over = pair(chip, column).and_then(|p| {
-            let n =
-                |c: Option<&&TaskCell>| c.map_or(0, |c| buckets::in_bucket(c, row.timing, b).len());
+            let n = |c: Option<&&TaskCell>| {
+                c.map_or(0, |c| buckets::in_bucket(c, bs, row.timing, b).len())
+            };
             let (a, t) = (n(p.ours.get(&row.users)), n(p.theirs.get(&row.users)));
             (a + t > 0).then(|| format!("over {a} and {t} requests"))
         });
@@ -853,7 +966,7 @@ fn summary_map(
                             div { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap", title: "{name}", "{name}" }
                         }
                     }
-                    for (b, (label, _)) in buckets::BUCKETS.iter().enumerate() {
+                    for (b, (label, _)) in bs.iter().enumerate() {
                         div { style: "grid-row: 3; grid-column: {col(k, b)}; text-align: center; font-size: 0.5625rem; white-space: nowrap",
                             "{label}"
                         }

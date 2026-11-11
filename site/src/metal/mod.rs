@@ -263,9 +263,9 @@ fn borrow_earlier(runs: &mut [Run]) {
                         // apart from the rounds: as many tasks as this run's asked, by the count
                         // the lent cell recorded.
                         let same_tasks = |c: &data::TaskCell| {
-                            (!sampled_from_musique(&c.workload) || *lent_drawn == drawn)
+                            (!datasets::sampled(&c.workload) || *lent_drawn == drawn)
                                 && match (sizing, *theirs) {
-                                    _ if c.workload == "rag-accuracy" => {
+                                    _ if datasets::is_scored(&c.workload) => {
                                         c.num_tasks.is_some() && c.num_tasks == accuracy_tasks
                                     }
                                     (Some(a), Some(b)) => {
@@ -307,12 +307,6 @@ fn run_task_cap(config: &data::Config) -> Option<u32> {
 /// it was recorded, which drew from MuSiQue's first 200.
 fn task_sample(config: &data::Config) -> Option<String> {
     config.scaling.as_ref().and_then(|s| s.task_sample.clone())
-}
-
-/// Whether a workload's tasks are MuSiQue's, the only ones [`task_sample`] says how were drawn:
-/// a change of sampling is a change of their questions, and of no other workload's.
-fn sampled_from_musique(workload: &str) -> bool {
-    matches!(workload, "rag" | "rag-spans" | "rag-accuracy")
 }
 
 /// The comparison engines' releases as the runner recorded them: every engine
@@ -2332,7 +2326,7 @@ pub(super) fn task_timeline(entries: &[Entry], dataset: &str) -> Option<Element>
     let kept: Vec<&Entry> = entries
         .iter()
         .filter(|e| own(e, Engine::Scratchy).is_some())
-        .filter(|e| !sampled_from_musique(dataset) || Some(task_sample(&e.run.config)) == newest)
+        .filter(|e| !datasets::sampled(dataset) || Some(task_sample(&e.run.config)) == newest)
         .collect();
     if kept.len() < 2 {
         return None;
@@ -3736,7 +3730,7 @@ mod tests {
         );
         assert!(html.contains(">gpt-oss-20b<"), "the model under its class");
         // A column a bucket under its model, the random-token map's four.
-        for b in super::buckets::BUCKETS {
+        for b in super::buckets::MUSIQUE {
             let label = b.0.replace('<', "&#60;");
             assert!(html.contains(&format!(">{label}<")), "no {} column", b.0);
         }
@@ -4194,7 +4188,7 @@ mod tests {
         );
         let changed = lent(Some("musique-dev-by-hops"));
         assert!(
-            !changed.iter().any(|w| super::sampled_from_musique(w)),
+            !changed.iter().any(|w| super::datasets::sampled(w)),
             "no 2-hop RAG cell as the rival's: {changed:?}"
         );
         assert!(
