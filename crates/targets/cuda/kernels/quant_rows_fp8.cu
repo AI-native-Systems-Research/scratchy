@@ -225,6 +225,13 @@ extern "C" int scratchy_cuda_quant_rows_fp8(const void* x, void* q, void* scale,
 //      pass 2 on it: `row_map<fp8_quant_pre>` by a column vector of `scale`, `warp::copy` to
 //      `rt_fp8e4m3`, stored and TMA-stored (rows past 1 and columns past `cols` dropped).
 // The same ops on the same values, so row 0's bytes and scale are `quant_rows_fp8`'s.
+//
+// Q1 as first built (variant 0) took ~24 µs at any `cols` on the H100: pass 2 divided the tile's
+// 15 TMA-zero-filled rows too, and `__fdiv_rn` of a zero takes its slow path (SASS `FCHK` then a
+// `CALL` per element: 120 of a lane's 128). Variant 1, the launcher's, divides row 0 only:
+// `row_map<fp8_quant_pre_row>` by the column vector `[scale, 0, …, 0]` (an `sv_fl<16>` written by
+// lane 0..15 and `warp::load`ed), the same `fp8_quant_pre` call on row 0's values. A test-only
+// `TRACE` instance records each CTA's phases (`clock64`, cycles from its start) into `trace`.
 
 namespace {
 
@@ -239,10 +246,14 @@ using chunk_rv = rv_fl<COLS>;
 using amax_rv = rv_fl<16>;
 using one_x_gl = gl<bf16, 1, 1, -1, -1, x_tile, chunk_sv>;
 
+// `[ctas, 8]` f32 phase cycles (the `TRACE` instances'); no tensor map.
+using trace_gl = gl<float, 1, 1, -1, -1>;
+
 struct one_row_globals {
     one_x_gl x;
     q_gl q;
     scale_gl scale;
+    trace_gl trace;
     int col_tiles;
 };
 
@@ -251,8 +262,19 @@ constexpr size_t ONE_SMEM_USED =
 constexpr int ONE_SMEM_BYTES = int(ONE_SMEM_USED) + 1024;
 static_assert(ONE_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+// The trace's phases: 0 entry, 1 chunks arrived, 2 amax shared, 3 tile arrived, 4 tile divided,
+// 5 stored.
+template <bool ROW_ONLY, bool TRACE>
 __global__ __launch_bounds__(ONE_THREADS, 1) void quant_row_fp8_one_ker(
     const __grid_constant__ one_row_globals g) {
+    const long long t0 = TRACE ? clock64() : 0;
+    const auto mark = [&](int phase) {
+        if constexpr (TRACE) {
+            if (threadIdx.x == 0) {
+                g.trace[{0, 0, int(blockIdx.x), phase}] = float(clock64() - t0);
+            }
+        }
+    };
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
     chunk_sv(&row)[ONE_WARPS][ONE_CHUNKS] = al.allocate<chunk_sv, ONE_WARPS, ONE_CHUNKS>();
@@ -261,6 +283,7 @@ __global__ __launch_bounds__(ONE_THREADS, 1) void quant_row_fp8_one_ker(
     __shared__ kittens::semaphore chunks_arrived[ONE_WARPS];
     __shared__ kittens::semaphore owned;
     __shared__ sv_fl<16> amax_s;
+    __shared__ sv_fl<16> row_scale_s;
     const int w = kittens::warpid();
     const int t_own = blockIdx.x;
     const int mine = (g.col_tiles - w + ONE_WARPS - 1) / ONE_WARPS;
@@ -286,6 +309,7 @@ __global__ __launch_bounds__(ONE_THREADS, 1) void quant_row_fp8_one_ker(
     if (mine > 0) {
         wait(chunks_arrived[w], 0);
     }
+    mark(1);
     for (int i = 0; i < mine; i++) {
         warp::load(x, row[w][i]);
         warp::abs(x, x);
@@ -297,6 +321,7 @@ __global__ __launch_bounds__(ONE_THREADS, 1) void quant_row_fp8_one_ker(
         amax_s[w + ONE_WARPS] = part;
     }
     __syncthreads();
+    mark(2);
     amax_rv all;
     warp::load(all, amax_s);
     const float scale = scratchy::ops::fp8_scale::op<float>(warp::max(all));
@@ -306,12 +331,27 @@ __global__ __launch_bounds__(ONE_THREADS, 1) void quant_row_fp8_one_ker(
         }
         // Pass 2: `quant_rows_fp8_ker`'s, on the owned tile.
         row_values sc;
-        warp::zero(sc);
-        warp::add(sc, sc, scale);
+        if constexpr (ROW_ONLY) {
+            // `[scale, 0, …, 0]`: row 0's scale, and 0 for the 15 zero-fill rows.
+            if (warp::laneid() < 16) {
+                row_scale_s[warp::laneid()] = warp::laneid() == 0 ? scale : 0.0f;
+            }
+            __syncwarp();
+            warp::load(sc, row_scale_s);
+        } else {
+            warp::zero(sc);
+            warp::add(sc, sc, scale);
+        }
         wait(owned, 0);
+        mark(3);
         acc_tile v;
         warp::load(v, x_s);
-        warp::row_map<scratchy::ops::fp8_quant_pre>(v, v, sc);
+        if constexpr (ROW_ONLY) {
+            warp::row_map<scratchy::ops::fp8_quant_pre_row>(v, v, sc);
+        } else {
+            warp::row_map<scratchy::ops::fp8_quant_pre>(v, v, sc);
+        }
+        mark(4);
         fp8_tile q;
         warp::copy(q, v);
         warp::store(q_s, q);
@@ -319,16 +359,66 @@ __global__ __launch_bounds__(ONE_THREADS, 1) void quant_row_fp8_one_ker(
         coord<q_tile> at = {0, 0, 0, t_own};
         warp::tma::store_async(g.q, q_s, at);
         warp::tma::store_async_wait();
+        mark(5);
     }
+}
+
+template <bool ROW_ONLY, bool TRACE>
+cudaError_t allow_one() {
+    return cudaFuncSetAttribute(quant_row_fp8_one_ker<ROW_ONLY, TRACE>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, ONE_SMEM_BYTES);
 }
 
 }  // namespace
 
-// The one-row form's one-time setup (in `PREPARE`, `kernels::prepare_all`).
-// 0 = done; any other value = the cudaError_t.
+// The one-row form's one-time setup, every instance (in `PREPARE`, `kernels::prepare_all`).
+// 0 = done; any other value = the first failing cudaError_t.
 extern "C" int scratchy_cuda_quant_row_fp8_one_prepare(void) {
-    return static_cast<int>(cudaFuncSetAttribute(
-        quant_row_fp8_one_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, ONE_SMEM_BYTES));
+    cudaError_t e = cudaSuccess;
+    for (const cudaError_t r : {allow_one<true, false>(), allow_one<false, false>(),
+                                allow_one<true, true>(), allow_one<false, true>()}) {
+        if (e == cudaSuccess) {
+            e = r;
+        }
+    }
+    return static_cast<int>(e);
+}
+
+// Test support: Q1 at `variant` (0 the first form, dividing the zero rows; 1 the launcher's), its
+// phase trace into `trace` (`[col_tiles, 8]` f32 cycles) when `trace` is not null. Otherwise as
+// `scratchy_cuda_quant_row_fp8_one`.
+extern "C" int scratchy_cuda_quant_row_fp8_one_variant(const void* x, void* q, void* scale,
+                                                       uint32_t cols, uint32_t variant,
+                                                       void* trace,
+                                                       void* stream /* cudaStream_t */) {
+    if (cols == 0 || cols % COL_MULTIPLE != 0 || cols > uint32_t(ONE_ROW_CHUNKS) * uint32_t(COLS) ||
+        variant > 1) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+        one_row_globals G{
+            one_x_gl{static_cast<bf16*>(const_cast<void*>(x)), nullptr, nullptr, size_t(1),
+                     size_t(cols)},
+            q_gl{static_cast<fp8e4m3*>(q), nullptr, nullptr, size_t(1), size_t(cols)},
+            scale_gl{static_cast<float*>(scale), nullptr, nullptr, nullptr, size_t(1)},
+            // With no trace the view is never read; `scale` is a valid address for it.
+            trace_gl{static_cast<float*>(trace != nullptr ? trace : scale), nullptr, nullptr,
+                     size_t(trace != nullptr ? col_tiles : 1), size_t(trace != nullptr ? 8 : 1)},
+            col_tiles};
+        void* args[] = {&G};
+        const bool traced = trace != nullptr;
+        const auto ker = variant == 1 ? (traced ? quant_row_fp8_one_ker<true, true>
+                                                : quant_row_fp8_one_ker<true, false>)
+                                      : (traced ? quant_row_fp8_one_ker<false, true>
+                                                : quant_row_fp8_one_ker<false, false>);
+        return static_cast<int>(cudaLaunchKernel(ker, dim3(col_tiles), dim3(ONE_THREADS), args,
+                                                 ONE_SMEM_BYTES,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
@@ -341,23 +431,5 @@ extern "C" int scratchy_cuda_quant_row_fp8_one_prepare(void) {
 // the current device. Asynchronous on `stream`.
 extern "C" int scratchy_cuda_quant_row_fp8_one(const void* x, void* q, void* scale, uint32_t cols,
                                                void* stream /* cudaStream_t; null = default */) {
-    if (cols == 0 || cols % COL_MULTIPLE != 0 || cols > uint32_t(ONE_ROW_CHUNKS) * uint32_t(COLS)) {
-        return SCRATCHY_CUDA_ERR_SHAPE;
-    }
-    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
-    try {
-        const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
-        one_row_globals G{
-            one_x_gl{static_cast<bf16*>(const_cast<void*>(x)), nullptr, nullptr, size_t(1),
-                     size_t(cols)},
-            q_gl{static_cast<fp8e4m3*>(q), nullptr, nullptr, size_t(1), size_t(cols)},
-            scale_gl{static_cast<float*>(scale), nullptr, nullptr, nullptr, size_t(1)},
-            col_tiles};
-        void* args[] = {&G};
-        return static_cast<int>(cudaLaunchKernel(quant_row_fp8_one_ker, dim3(col_tiles),
-                                                 dim3(ONE_THREADS), args, ONE_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
-    } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
-    }
+    return scratchy_cuda_quant_row_fp8_one_variant(x, q, scale, cols, 1, nullptr, stream);
 }
