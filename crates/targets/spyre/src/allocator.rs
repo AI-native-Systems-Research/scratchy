@@ -67,12 +67,19 @@ impl DeviceAllocator for SpyreAllocator {
     fn stream(&self) {}
 
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
+        // `SCRATCHY_LOAD_TIME`: the zero-fill and the copy are counted apart —
+        // the copy is the pass's contract, the zero is `vec!`'s price for a
+        // buffer the very next statement overwrites whole.
+        let zero_timer = std::time::Instant::now();
         let mut buf = vec![0u8; bytes].into_boxed_slice();
+        scratchy_layers::load_time::record_alloc_zero(bytes, zero_timer);
         if bytes > 0 {
+            let copy_timer = std::time::Instant::now();
             // SAFETY: the caller guarantees `src_host` is valid for `bytes`
             // bytes; `buf` is exactly `bytes` long and freshly allocated, so the
             // ranges cannot overlap.
             unsafe { std::ptr::copy_nonoverlapping(src_host, buf.as_mut_ptr(), bytes) };
+            scratchy_layers::load_time::record_alloc_copy(bytes, copy_timer);
         }
         let ptr = buf.as_mut_ptr();
         self.allocs.push(buf);
