@@ -222,15 +222,11 @@ fn run(c: &Case, how: Run) -> Option<Left> {
 
     let bits = c.bits.unwrap_or(4);
     let quant = PolarQuantizer::new(hd, bits, SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
+    let encode_table = quant.encode_table();
     let (signs, centroids, bounds) = (
         shared(&device, quant.signs()),
         shared(&device, quant.centroids()),
-        shared(&device, &boundaries),
+        shared(&device, &encode_table),
     );
     let n_rows = N_BLOCKS * BLOCK_SIZE * nkv;
     let pdim = packed_dim(hd, bits);

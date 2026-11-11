@@ -1112,7 +1112,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // `None` for a dense model → no-op.
             if let Some(t) = tq {
                 pin(&t.signs);
-                pin(&t.boundaries);
+                pin(&t.encode_table);
                 pin(&t.centroids);
                 pin(&t.scratch.k_table);
                 pin(&t.scratch.v_table);
