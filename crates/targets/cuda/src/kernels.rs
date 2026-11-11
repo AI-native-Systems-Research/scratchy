@@ -3664,10 +3664,11 @@ pub unsafe fn quant_row_fp8_one(
 }
 
 /// Test support for `tests/gemv_fp8_tc.rs` only: [`quant_row_fp8_one`] at `variant` (0 its first
-/// form, which divides the tile's 15 zero-fill rows too; 1 [`quant_row_fp8_one`]'s own), and, when
+/// form, which divides the tile's 15 zero-fill rows too; 1 the tile dividing row 0 only; 2
+/// [`quant_row_fp8_one`]'s own, one element a thread), and, when
 /// `trace` is not null, each CTA's phase cycles into `trace` (`[⌈cols / 256⌉, 8]` f32: entry,
 /// chunks arrived, amax shared, tile arrived, tile divided, stored). Refused as
-/// [`quant_row_fp8_one`], or for `variant` above 1. Asynchronous.
+/// [`quant_row_fp8_one`], or for `variant` above 2. Asynchronous.
 ///
 /// # Safety
 ///

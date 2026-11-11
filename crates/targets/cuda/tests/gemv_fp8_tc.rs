@@ -1031,7 +1031,8 @@ fn quant_one_variant(
     (qb, u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]))
 }
 
-/// Both Q1 forms are `quant_rows_fp8`'s row 0 bit for bit (bytes and scale), at the 27B's 5,120 and
+/// Every Q1 form (0 the first, 1 the tile dividing row 0 only, 2 one element a thread, the
+/// launcher's) is `quant_rows_fp8`'s row 0 bit for bit (bytes and scale), at the 27B's 5,120 and
 /// 17,408 columns, Gemma's 2,816 and 2,112, 64 and 1,088, on random rows, a zero row, a row of one
 /// large value, and a row of signed zeros and bf16 subnormals among random values (the fixed form
 /// divides only row 0, so its zeros' signs must survive).
@@ -1069,7 +1070,7 @@ fn both_one_row_quantize_forms_are_quant_rows_fp8_bit_for_bit() {
                 .flat_map(|h| h.to_le_bytes())
                 .collect();
             let want_s = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
-            for variant in [0u32, 1] {
+            for variant in [0u32, 1, 2] {
                 let (got_q, got_s) = quant_one_variant(&device, &x, variant, None);
                 let bad = got_q.iter().zip(&want_q).filter(|(a, b)| a != b).count();
                 let ok = bad == 0 && got_s == want_s;
@@ -1085,7 +1086,7 @@ fn both_one_row_quantize_forms_are_quant_rows_fp8_bit_for_bit() {
     assert!(pass, "a Q1 form is not quant_rows_fp8's row 0");
 }
 
-/// Both Q1 forms timed at the 27B's 5,120 and 17,408 columns, one launch and ten back to back,
+/// Every Q1 form timed at the 27B's 5,120 and 17,408 columns, one launch and ten back to back,
 /// read-flush cold and hot, two rounds (A, B, A, B), as `TC_TIME` lines; then one traced launch of
 /// each, as `Q1_TRACE` lines: each phase's median over the CTAs and CTA 0's, in cycles from the
 /// CTA's start (entry, chunks arrived, amax shared, tile arrived, tile divided, stored).
@@ -1101,7 +1102,11 @@ fn both_one_row_quantize_forms_are_timed_and_traced() {
         let q = filled(&device, ku, 0);
         let s = filled(&device, 4, 0);
         for round in 1..=2 {
-            for (variant, name) in [(0u32, "q1_v0_zero_rows_divided"), (1, "q1_v1_row0_only")] {
+            for (variant, name) in [
+                (0u32, "q1_v0_zero_rows_divided"),
+                (1, "q1_v1_row0_only"),
+                (2, "q1_v2_thread_per_element"),
+            ] {
                 let one = || {
                     // SAFETY: `xb` holds k bf16, `q` k bytes and `s` one f32; no trace; null is
                     // the default stream.
@@ -1128,7 +1133,7 @@ fn both_one_row_quantize_forms_are_timed_and_traced() {
             }
         }
         let ctas = ku.div_ceil(256);
-        for variant in [0u32, 1] {
+        for variant in [0u32, 1, 2] {
             let trace = filled(&device, ctas * 8 * 4, 0);
             let _ = quant_one_variant(&device, &x, variant, Some(&trace));
             let tb: Vec<u8> = (trace.download().expect("trace").iter())
