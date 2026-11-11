@@ -4015,10 +4015,10 @@ pub unsafe fn gemv_fp8_tc(
 
 /// Test support for `tests/gemv_fp8_tc.rs` only (the ceiling probe, /tmp/d-cap.md §3 P-B):
 /// [`gemv_fp8_tc`] at instance `variant` (0 B1, [`gemv_fp8_tc`]'s own; 1 B2 `wait1`, the same
-/// bits; 2 B3 `k128`, `k` a multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, `k` a multiple of 256), and
-/// with `main_only` (B5 `noreduce`) the
+/// bits; 2 B3 `k128`, `k` a multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, 5 B8 `swapab32` and 6 B9
+/// `swapab32sk`, `k` a multiple of 256), and with `main_only` (B5 `noreduce`) the
 /// stream-K kernel alone, `c` left unwritten. Refused with [`KernelError::GroupShape`] as
-/// [`gemv_fp8_tc`], or for `variant` above 4. Asynchronous.
+/// [`gemv_fp8_tc`], or for `variant` above 6. Asynchronous.
 ///
 /// # Safety
 ///

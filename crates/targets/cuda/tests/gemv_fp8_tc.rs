@@ -734,7 +734,7 @@ fn quant_rows_fp8_one_row_times_are_recorded() {
 fn k_step(variant: u32) -> u32 {
     match variant {
         2 => 128,
-        4 => 256,
+        4..=6 => 256,
         _ => 64,
     }
 }
@@ -749,8 +749,9 @@ const CAP2_SHAPES: &[(&[u32], u32, &str)] = &[
     (&[2816], 2112, "Gemma_down"),
 ];
 
-/// The cap2 bound: B3 (`k128`) and B6 (`k256`) inside S3's f64 bound at every cap2 shape whose
-/// `k` their K step divides (Gemma's down, `k` 2,112, takes neither), and B1 at Gemma's two;
+/// The cap2 bound: B3 (`k128`), B6 (`k256`) and cap3's B8 (`swapab32`) and B9 (`swapab32sk`) inside
+/// S3's f64 bound at every cap2 shape whose `k` their K step divides (Gemma's down, `k` 2,112, takes
+/// none of them), and B1 at Gemma's two;
 /// every worst ratio printed as `CAP2_BOUND`, a refused shape as `CAP2_SKIP`.
 #[test]
 fn the_cap2_tc_variants_are_inside_s3_s_bound() {
@@ -784,7 +785,13 @@ fn the_cap2_tc_variants_are_inside_s3_s_bound() {
             0,
         );
         let gemma = what.starts_with("Gemma");
-        for (variant, name) in [(0u32, "B1"), (2, "B3_k128"), (4, "B6_k256")] {
+        for (variant, name) in [
+            (0u32, "B1"),
+            (2, "B3_k128"),
+            (4, "B6_k256"),
+            (5, "B8_swapab32"),
+            (6, "B9_swapab32sk"),
+        ] {
             if (variant == 0 && !gemma) || k % k_step(variant) != 0 {
                 if variant != 0 {
                     eprintln!(
@@ -815,7 +822,8 @@ fn the_cap2_tc_variants_are_inside_s3_s_bound() {
     assert!(pass, "a cap2 TC instance is out of S3's bound");
 }
 
-/// The cap2 timing: B1, B3 (`k128`) and B6 (`k256`) at every cap2 shape their K step divides,
+/// The cap2 timing: B1, B3 (`k128`), B6 (`k256`) and cap3's B8 (`swapab32`) and B9 (`swapab32sk`)
+/// at every cap2 shape their K step divides,
 /// read-flush cold and hot, two rounds (each instance in turn, so A, B, A, B), as `TC_TIME` lines.
 #[test]
 fn the_cap2_tc_variants_bandwidth_is_recorded() {
@@ -842,7 +850,13 @@ fn the_cap2_tc_variants_bandwidth_is_recorded() {
             0,
         );
         for round in 1..=2 {
-            for (variant, name) in [(0u32, "B1"), (2, "B3_k128"), (4, "B6_k256")] {
+            for (variant, name) in [
+                (0u32, "B1"),
+                (2, "B3_k128"),
+                (4, "B6_k256"),
+                (5, "B8_swapab32"),
+                (6, "B9_swapab32sk"),
+            ] {
                 if k % k_step(variant) == 0 {
                     record(&flush, shape, name, round, bytes, || {
                         launch_variant(&act, (&wr, &op, ns), &p, (variant, false))
