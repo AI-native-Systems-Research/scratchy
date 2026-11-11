@@ -70,7 +70,19 @@ fn main() {
     // The FFI archive's own undefined OCO symbols resolve against the OCO
     // archive at this link: dependent first, provider after (static-archive
     // resolution is left-to-right).
+    //
+    // `-bundle`: rustc's default for a named static lib is to EMBED it in
+    // every rlib it compiles against — and these archives are staticlibs,
+    // each carrying its own copy of std, so the embedded copy collides with
+    // the toolchain's std wherever a downstream link pulls it (a
+    // build-script link under rust-lld dies on the duplicate
+    // `rust_eh_personality`). The `-bundle` modifier (RFC 2951) records the
+    // dependency and passes the archives to the FINAL link only: the link
+    // line keeps both, in order, from the search path above, and no rlib
+    // ever carries a second std. Lazy archive-member extraction at the
+    // final link leaves the archives' std members unpulled — std symbols
+    // are already resolved.
     println!("cargo:rustc-link-search=native={}", dir.display());
-    println!("cargo:rustc-link-lib=static=flex_shim");
-    println!("cargo:rustc-link-lib=static=senlib_oco");
+    println!("cargo:rustc-link-lib=static:-bundle=flex_shim");
+    println!("cargo:rustc-link-lib=static:-bundle=senlib_oco");
 }
