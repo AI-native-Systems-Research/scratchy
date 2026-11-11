@@ -5080,3 +5080,135 @@ fn the_one_row_folds_play_bit_for_bit() {
         "a one-row tape with its folds differs from the same tape without them"
     );
 }
+
+// ── FP8 S8 F1: a prefill copies back one row ─────────────────────────────────────
+
+/// The case's forward on a fresh worker, copying back only row `row` ([`CudaWorker::forward_row`]).
+fn played_row(device: &CudaDevice, c: &Case<'_>, row: u32) -> Vec<u16> {
+    let (kv_pool, gdn_pool) = c.pools;
+    let mut worker = CudaWorker::new(device, c.tapes, c.table, kv_pool, gdn_pool).expect("worker");
+    let tape = &c.tapes[c.bucket];
+    let mut y = vec![0u16; (tape.result.bytes / u64::from(tape.bucket_m)) as usize / 2];
+    (worker.forward_row(
+        c.bucket,
+        Input::Hidden(&c.x),
+        &c.positions,
+        c.kv.as_ref(),
+        c.gdn.as_ref(),
+        (row, &mut y),
+    ))
+    .expect("the row forward");
+    y
+}
+
+/// F1: a row forward's result is that row of the whole forward's, bit for bit (rows 0, m/2 and
+/// m − 1 of the MLP block, the attention layer and its KV cache, and the GDN layer at m = 256),
+/// and it refuses a row past the bucket and an output of another size before running.
+#[test]
+fn a_row_forward_is_that_row_of_the_whole_forward_bit_for_bit() {
+    use scratchy_target_cuda::runtime::ForwardError;
+    let device = h100();
+    let mlp_w = mlp_table(&device, &mlp_weights());
+    let layer_w = layer_table(&device, &layer_weights());
+    let gdn_w = gdn_table(&device, &gdn_weights());
+    let block_table = [11u32, 3, 14, 0];
+    let m_layer = LAYER_BUCKETS[1].bucket_m as usize;
+    let m_gdn = GDN_BUCKETS[1].bucket_m as usize;
+    let cases = [
+        (
+            "the MLP block, m=256",
+            Case {
+                tapes: &MLP_BUCKETS,
+                table: &mlp_w,
+                pools: (None, None),
+                bucket: 1,
+                x: mlp_input(256),
+                positions: Vec::new(),
+                kv: None,
+                gdn: None,
+            },
+        ),
+        (
+            "the attention layer and its KV cache, m=256",
+            Case {
+                tapes: &LAYER_BUCKETS,
+                table: &layer_w,
+                pools: (POOL, None),
+                bucket: 1,
+                x: layer_input(m_layer, 0xF1),
+                positions: seq_positions(m_layer, 0),
+                kv: Some(KvSequence {
+                    block_table: &block_table[..m_layer / 64],
+                    prefix_len: 0,
+                    q_len: m_layer as u32,
+                }),
+                gdn: None,
+            },
+        ),
+        (
+            "the GDN layer and its state, m=256",
+            Case {
+                tapes: &GDN_BUCKETS,
+                table: &gdn_w,
+                pools: (None, GDN_POOL),
+                bucket: 1,
+                x: gdn_input(m_gdn, 0xF1),
+                positions: Vec::new(),
+                kv: None,
+                gdn: Some(GdnSequence {
+                    slot: 1,
+                    q_len: m_gdn as u32,
+                    fresh: true,
+                }),
+            },
+        ),
+    ];
+    let mut pass = true;
+    for (what, case) in &cases {
+        let whole = played(&device, case, false).0;
+        let tape = &case.tapes[case.bucket];
+        let m = tape.bucket_m;
+        let width = whole.len() / m as usize;
+        for row in [0, m / 2, m - 1] {
+            let got = played_row(&device, case, row);
+            let want = &whole[row as usize * width..][..width];
+            let bad = mismatched_bits(&got, want);
+            let ok = bad == 0 && got.len() == width;
+            eprintln!(
+                "row forward against the whole forward, {what}, row {row}: mismatched_bits={bad} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    // The refusals, before anything runs.
+    let case = &cases[0].1;
+    let tape = &case.tapes[case.bucket];
+    let width = (tape.result.bytes / u64::from(tape.bucket_m)) as usize / 2;
+    let mut worker = CudaWorker::new(&device, case.tapes, case.table, None, None).expect("worker");
+    let mut y = vec![0u16; width];
+    let past = worker.forward_row(
+        case.bucket,
+        Input::Hidden(&case.x),
+        &[],
+        None,
+        None,
+        (tape.bucket_m, &mut y),
+    );
+    let mut short = vec![0u16; width - 1];
+    let size = worker.forward_row(
+        case.bucket,
+        Input::Hidden(&case.x),
+        &[],
+        None,
+        None,
+        (0, &mut short),
+    );
+    eprintln!("row forward refusals: past the bucket {past:?}; a short row {size:?}");
+    pass &= matches!(past, Err(ForwardError::ResultRow { .. }))
+        && matches!(size, Err(ForwardError::ResultSize { .. }));
+    assert!(
+        pass,
+        "a row forward differs from its row of the whole forward, or a refusal is wrong"
+    );
+}

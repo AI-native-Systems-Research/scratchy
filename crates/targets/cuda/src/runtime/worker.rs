@@ -333,6 +333,13 @@ pub enum ForwardError {
     /// ([`CudaTape::greedy`]): not one row, or not a bf16 row of a multiple of `ARGMAX_CHUNK`
     /// logits. Nothing was enqueued.
     NoGreedy { bucket_m: u32, result_bytes: u64 },
+    /// A row forward ([`CudaWorker::forward_row`]) of row `row`, past the bucket's `bucket_m` rows
+    /// or of a result span that is not `bucket_m` equal rows. Nothing was enqueued.
+    ResultRow {
+        row: u32,
+        bucket_m: u32,
+        result_bytes: u64,
+    },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
 }
@@ -472,6 +479,14 @@ impl fmt::Display for ForwardError {
                 f,
                 "the greedy argmax takes a one-row tape's logits row, a multiple of \
                  {ARGMAX_CHUNK} bf16; this tape has {bucket_m} rows and a {result_bytes}-byte result"
+            ),
+            Self::ResultRow {
+                row,
+                bucket_m,
+                result_bytes,
+            } => write!(
+                f,
+                "row {row} of a {result_bytes}-byte result in {bucket_m} rows: no such row"
             ),
             Self::Cuda(e) => write!(f, "the forward failed: {e}"),
         }
@@ -723,6 +738,8 @@ struct Greedy {
 enum Out<'r> {
     Result(&'r mut [u16]),
     Token(&'r mut i32),
+    /// Row `.0` of the result span, split into the bucket's `bucket_m` rows (F1).
+    Row(u32, &'r mut [u16]),
 }
 
 /// A prefill attention launcher over the e4m3 cache: [`kernels::attn_prefill_windowed_fp8kv`]'s
@@ -1106,6 +1123,28 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         Ok(token)
     }
 
+    /// [`Self::forward`] copying back only row `row` of the result span (FP8 S8 F1): a prefill's
+    /// logits row `n − 1`, `vocab` bf16, instead of all `bucket_m` rows (1 GB at 2,048 × 262,144).
+    /// `out` holds one row, the result span's bytes over `bucket_m`. Refused before anything is
+    /// enqueued: [`ForwardError::ResultRow`] for a row past the bucket's (or a span that is not
+    /// `bucket_m` equal rows), [`ForwardError::ResultSize`] for an `out` of another size.
+    pub fn forward_row(
+        &mut self,
+        bucket: usize,
+        input: Input<'_>,
+        positions: &[u32],
+        kv: Option<&KvSequence<'_>>,
+        gdn: Option<&GdnSequence>,
+        (row, out): (u32, &mut [u16]),
+    ) -> Result<(), ForwardError> {
+        self.forward_as(
+            None,
+            (bucket, input, positions),
+            (kv, gdn),
+            Out::Row(row, out),
+        )
+    }
+
     /// [`Self::forward`] with each step launched one by one, the launches the graph recorded,
     /// instead of replaying it: the same kernels with the same arguments in the same order, and the
     /// same checks and copies, for the tests that check the two give the same bits.
@@ -1188,6 +1227,23 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     return Err(ForwardError::NoGreedy {
                         bucket_m: tape.bucket_m,
                         result_bytes: tape.result.bytes,
+                    });
+                }
+            }
+            Out::Row(row, buf) => {
+                let rows = u64::from(tape.bucket_m);
+                if u64::from(*row) >= rows || !tape.result.bytes.is_multiple_of(rows) {
+                    return Err(ForwardError::ResultRow {
+                        row: *row,
+                        bucket_m: tape.bucket_m,
+                        result_bytes: tape.result.bytes,
+                    });
+                }
+                let got = std::mem::size_of_val(*buf) as u64;
+                if got != tape.result.bytes / rows {
+                    return Err(ForwardError::ResultSize {
+                        expected: tape.result.bytes / rows,
+                        got,
                     });
                 }
             }
@@ -2541,6 +2597,19 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     std::ptr::from_mut(token).cast(),
                     g.token.ptr().cast_const(),
                     4,
+                )
+            }
+            // `forward_as` checked the row is inside the span and `buf` one row long.
+            Out::Row(row, buf) => {
+                let bytes = std::mem::size_of_val(buf);
+                (
+                    buf.as_mut_ptr().cast(),
+                    slot(tape.result.offset)
+                        .cast::<u8>()
+                        .wrapping_add(row as usize * bytes)
+                        .cast_const()
+                        .cast(),
+                    bytes,
                 )
             }
         };

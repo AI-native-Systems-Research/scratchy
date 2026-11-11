@@ -160,8 +160,9 @@ struct Loaded {
     weights: Option<Vec<DeviceBuffer>>,
     /// The first KV tape's geometry, which every KV tape shares (`CudaWorker::new` checks).
     kv: Option<KvTape>,
-    /// The host result buffer, sized once for the largest tape's result.
-    result: Vec<u16>,
+    /// The host row a prefill copies back (F1: its logits row `n − 1`, not the whole
+    /// `[bucket_m, vocab]` result), sized once for the widest tape's row.
+    row: Vec<u16>,
 }
 
 /// What `initialize_cache` built.
@@ -337,22 +338,20 @@ impl CudaServingWorker {
                 .map_err(exec)?;
             emits.then(|| greedy_code(code)).transpose().map_err(exec)?
         } else {
-            let result = &mut model.result[..tape.result.bytes as usize / 2];
+            // Only row `n − 1` comes back (F1): the one the greedy token is picked from.
+            let row = &mut model.row[..(tape.result.bytes / u64::from(bucket_m)) as usize / 2];
             (running.tapes)
-                .forward(
+                .forward_row(
                     bucket,
                     Input::TokenIds(&self.ids),
                     positions,
                     kv.as_ref(),
                     gdn.as_ref(),
-                    result,
+                    ((n as u32).saturating_sub(1), row),
                 )
                 .map_err(exec)?;
             match emits {
-                true => {
-                    let row = logits_row(result, bucket_m, n - 1).map_err(exec)?;
-                    Some(greedy_token(row).map_err(exec)?)
-                }
+                true => Some(greedy_token(row).map_err(exec)?),
                 false => None,
             }
         };
@@ -444,8 +443,8 @@ impl Worker for CudaServingWorker {
             entry.stem,
         );
         let kv = entry.tapes.iter().find_map(|t| t.kv);
-        let result_elems = (entry.tapes.iter())
-            .map(|t| t.result.bytes as usize / 2)
+        let row_elems = (entry.tapes.iter())
+            .map(|t| (t.result.bytes / u64::from(t.bucket_m.max(1))) as usize / 2)
             .max()
             .unwrap_or(0);
         let rows = (entry.tapes.iter()).map(|t| t.bucket_m as usize).max();
@@ -461,7 +460,7 @@ impl Worker for CudaServingWorker {
             hf_config,
             weights: Some(weights),
             kv,
-            result: vec![0; result_elems],
+            row: vec![0; row_elems],
         });
         Ok(())
     }
