@@ -70,16 +70,27 @@ constexpr uint32_t N_MULTIPLE = 64;
 //   B4 `2cta`: 264 CTAs, two per SM, 6 stages each;
 //   B6 `k256`: B3 at 256-wide K steps (`st_fp8e4m3<128, 256>` B, `<64, 256>` A: P-A's 256-byte
 //     rows), eight `m64n128k32` a stage, 4 stages (193 KB).
-// B3 and B4 change the K grouping and the stream-K split: the approved kind, under S3's bound.
-template <int K_STEP_, int STAGES_, int CTAS_, bool WAIT1_>
+//   B8 `swapab32`: vLLM's geometry (its `cutlass_3x_gemm_sm90_fp8` at TileShape 64x16x256) at the
+//     smallest fp8 N TK has at the pin (32): the weight's 64-row, 256-wide tile is the WGMMA's M
+//     side and the activation's `st_fp8e4m3<32, 256>` (1 real row, 31 TMA zero fill) its N side,
+//     so `D` is 64 × 32 and its column 0 the GEMV (`warp::row_sum`: the other columns are exact
+//     zeros). One CTA per 64 weight rows over the whole K, no stream-K, its epilogue stored
+//     directly; two CTAs per SM, 4 stages each (2 × 97 KB);
+//   B9 `swapab32sk`: B8's tile under stream-K (264 CTAs), its pieces through the reduce.
+// B3 to B9 change the K grouping and the split: the approved kind, under S3's bound.
+// `KIND` 0 is the activation as the M side (B1 to B6), 1 B8, 2 B9.
+template <int K_STEP_, int STAGES_, int CTAS_, bool WAIT1_, int TILE_ = TILE_N, int KIND_ = 0>
 struct tc_variant {
     static constexpr int k_step = K_STEP_;
     static constexpr int stages = STAGES_;
     static constexpr int ctas = CTAS_;
     static constexpr bool wait1 = WAIT1_;
+    static constexpr int tile = TILE_;
+    static constexpr int kind = KIND_;
     static constexpr int min_blocks = CTAS_ / CTAS;
-    using a_tile = st_fp8e4m3<64, K_STEP_>;
-    using b_tile = st_fp8e4m3<TILE_N, K_STEP_>;
+    // The activation's box (the M side's 64 rows, or B8's N side's 32) and the weight's.
+    using a_tile = st_fp8e4m3<KIND_ == 0 ? 64 : 32, K_STEP_>;
+    using b_tile = st_fp8e4m3<TILE_, K_STEP_>;
     static constexpr size_t smem = STAGES_ * (sizeof(a_tile) + sizeof(b_tile)) + 1024;
     static_assert(min_blocks * smem <= kittens::MAX_SHARED_MEMORY, "the CTAs per SM fit");
 };
@@ -88,12 +99,14 @@ using tc_b2 = tc_variant<K_STEP, 12, CTAS, true>;
 using tc_b3 = tc_variant<128, 8, CTAS, false>;
 using tc_b4 = tc_variant<K_STEP, 6, MAX_CTAS, false>;
 using tc_b6 = tc_variant<256, 4, CTAS, false>;
+using tc_b8 = tc_variant<256, 4, MAX_CTAS, false, 64, 1>;
+using tc_b9 = tc_variant<256, 4, MAX_CTAS, false, 64, 2>;
 
 using acc_tile = rt_fl<16, TILE_N>;
 using piece_rv = acc_tile::row_vec;
 using reduce_rv = rv_fl<REDUCE_ROWS>;
-using a_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::a_tile, tc_b3::a_tile, tc_b6::a_tile>;
-using b_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::b_tile, tc_b3::b_tile, tc_b6::b_tile>;
+using a_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::a_tile, tc_b3::a_tile, tc_b6::a_tile, tc_b8::a_tile>;
+using b_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::b_tile, tc_b3::b_tile, tc_b6::b_tile, tc_b8::b_tile>;
 // `[CTAS + tiles, 128]` f32 pieces, `[1, n]` scales and outputs: no tensor map.
 using partial_gl = gl<float, 1, 1, -1, -1>;
 using scale_gl = gl<float, 1, 1, -1, -1>;
@@ -223,12 +236,91 @@ __global__ __launch_bounds__(NUM_THREADS, V::min_blocks) void gemv_fp8_tc_ker(
     }
 }
 
+// B8 and B9: the weight tile as the WGMMA's M side, the activation's 32-row box as its N side.
+template <typename V>
+__global__ __launch_bounds__(NUM_THREADS, V::min_blocks) void gemv_fp8_swapab_ker(
+    const __grid_constant__ tc_globals g) {
+    using x_tile = typename V::a_tile;
+    using w_tile = typename V::b_tile;
+    using acc32 = rt_fl<16, 32>;
+    constexpr int STAGES = V::stages;
+    constexpr bool SK = V::kind == 2;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    w_tile(&w_s)[STAGES] = al.allocate<w_tile, STAGES>();
+    x_tile(&x_s)[STAGES] = al.allocate<x_tile, STAGES>();
+    __shared__ semaphore arrived[STAGES], done[STAGES];
+    const long long units = (long long)g.tiles * g.k_steps;
+    const int c = blockIdx.x;
+    // B9's stream-K run, or B8's whole tile `c`.
+    const long long u0 = SK ? run_start(c, units, g.ctas) : (long long)c * g.k_steps;
+    const int len = SK ? int(run_start(c + 1, units, g.ctas) - u0) : g.k_steps;
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < STAGES; s++) {
+            init_semaphore(arrived[s], 0, 1);
+            init_semaphore(done[s], 1, 0);
+        }
+    }
+    __syncthreads();
+    if (warpgroup::groupid() == 1) {
+        if (warpgroup::warpid() == 0) {
+            for (int i = 0; i < len; i++) {
+                const long long u = u0 + i;
+                const int t = int(u / g.k_steps), j = int(u % g.k_steps), s = i % STAGES;
+                if (i >= STAGES) {
+                    wait(done[s], ((i - STAGES) / STAGES) % 2);
+                }
+                const b_gl& b = t >= g.start2 ? g.b2 : t >= g.start1 ? g.b1 : g.b0;
+                const int local = t >= g.start2 ? t - g.start2 : t >= g.start1 ? t - g.start1 : t;
+                warp::tma::expect_bytes(arrived[s], sizeof(x_tile) + sizeof(w_tile));
+                warp::tma::load_async(x_s[s], g.a, {0, 0, 0, j}, arrived[s]);
+                warp::tma::load_async(w_s[s], b, {0, 0, local, j}, arrived[s]);
+            }
+        }
+    } else {
+        acc32 acc;
+        warp::zero(acc);
+        for (int i = 0; i < len; i++) {
+            const long long u = u0 + i;
+            const int t = int(u / g.k_steps), j = int(u % g.k_steps), s = i % STAGES;
+            wait(arrived[s], (i / STAGES) % 2);
+            warpgroup::mma_ABt(acc, w_s[s], x_s[s]);
+            warpgroup::mma_async_wait();
+            if (warpgroup::laneid() == 0) {
+                arrive(done[s], 1);
+            }
+            if (j == g.k_steps - 1 || i == len - 1) {
+                // Warp `w` holds weight rows `16w .. 16w + 16` of the tile; column 0 is theirs.
+                const int w = warpgroup::warpid();
+                typename acc32::col_vec v;
+                warp::row_sum(v, acc);
+                if constexpr (SK) {
+                    warp::store(g.partials, v, {0, 0, c + t, w});
+                } else {
+                    const int m = t >= g.start2 ? 2 : t >= g.start1 ? 1 : 0;
+                    const int local = t - (m == 2 ? g.start2 : m == 1 ? g.start1 : 0);
+                    const int row = local * V::tile + 16 * w;
+                    const scale_gl& sc = m == 2 ? g.s2 : m == 1 ? g.s1 : g.s0;
+                    const out_gl& out = m == 2 ? g.c2 : m == 1 ? g.c1 : g.c0;
+                    typename acc32::col_vec ws;
+                    warp::load(ws, sc, {0, 0, 0, row / 16});
+                    warp::mul(v, v, ws);
+                    warp::mul(v, v, g.a_scale[{0, 0, 0, 0}]);
+                    warp::store(out, v, {0, 0, 0, row / 16});
+                }
+                warp::zero(acc);
+            }
+        }
+    }
+}
+
 // Rows `32v .. 32v + 32` of the concatenated members: their tile's pieces added in ascending K
-// order, then `· b_scale`, `· a_scale`, rounded once.
+// order, then `· b_scale`, `· a_scale`, rounded once. `TILE` is the kernel's tile rows (128, or B9's 64).
+template <int TILE>
 __global__ __launch_bounds__(REDUCE_THREADS) void gemv_fp8_tc_reduce_ker(
     const __grid_constant__ tc_globals g) {
     const int v = blockIdx.x * REDUCE_WARPS + kittens::warpid();
-    const int t = v * REDUCE_ROWS / TILE_N;
+    const int t = v * REDUCE_ROWS / TILE;
     if (t >= g.tiles) {
         return;
     }
@@ -236,14 +328,14 @@ __global__ __launch_bounds__(REDUCE_THREADS) void gemv_fp8_tc_reduce_ker(
     const int start = m == 2 ? g.start2 : m == 1 ? g.start1 : 0;
     const int n = m == 2 ? g.n2 : m == 1 ? g.n1 : g.n0;
     // The vector's first row inside its member, and inside its tile.
-    const int row = (t - start) * TILE_N + (v * REDUCE_ROWS) % TILE_N;
+    const int row = (t - start) * TILE + (v * REDUCE_ROWS) % TILE;
     if (row >= n) {
         return;
     }
     const long long units = (long long)g.tiles * g.k_steps;
     const int first = cta_of((long long)t * g.k_steps, units, g.ctas);
     const int last = cta_of((long long)(t + 1) * g.k_steps - 1, units, g.ctas);
-    const int col = (v * REDUCE_ROWS) % TILE_N / REDUCE_ROWS;
+    const int col = (v * REDUCE_ROWS) % TILE / REDUCE_ROWS;
     reduce_rv acc, part, ws;
     warp::zero(acc);
     for (int cta = first; cta <= last; cta++) {
@@ -258,13 +350,23 @@ __global__ __launch_bounds__(REDUCE_THREADS) void gemv_fp8_tc_reduce_ker(
     warp::store(out, acc, {0, 0, 0, row / REDUCE_ROWS});
 }
 
-int tiles_of(uint32_t n) {
-    return int((n + uint32_t(TILE_N) - 1) / uint32_t(TILE_N));
+int tiles_of(uint32_t n, int tile = TILE_N) {
+    return int((n + uint32_t(tile) - 1) / uint32_t(tile));
+}
+
+// Instance `V`'s main kernel.
+template <typename V>
+constexpr auto main_ker() {
+    if constexpr (V::kind == 0) {
+        return gemv_fp8_tc_ker<V>;
+    } else {
+        return gemv_fp8_swapab_ker<V>;
+    }
 }
 
 template <typename V>
 cudaError_t allow() {
-    return cudaFuncSetAttribute(gemv_fp8_tc_ker<V>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    return cudaFuncSetAttribute(main_ker<V>(), cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 int(V::smem));
 }
 
@@ -285,9 +387,9 @@ tc_globals views(const void* q, const void* a_scale, const void* const* b,
     const auto cv = [&](uint32_t i) {
         return out_gl{static_cast<bf16*>(c[i]), nullptr, nullptr, size_t(1), size_t(n[i])};
     };
-    const int t0 = tiles_of(n[0]);
-    const int t1 = count > 1 ? tiles_of(n[1]) : 0;
-    const int t2 = count > 2 ? tiles_of(n[2]) : 0;
+    const int t0 = tiles_of(n[0], V::tile);
+    const int t1 = count > 1 ? tiles_of(n[1], V::tile) : 0;
+    const int t2 = count > 2 ? tiles_of(n[2], V::tile) : 0;
     const int tiles = t0 + t1 + t2;
     const int k_steps = int(k / uint32_t(V::k_step));
     const long long units = (long long)tiles * k_steps;
@@ -296,7 +398,7 @@ tc_globals views(const void* q, const void* a_scale, const void* const* b,
         a_gl{static_cast<fp8e4m3*>(const_cast<void*>(q)), nullptr, nullptr, size_t(1), size_t(k)},
         bv(0), bv(count > 1 ? 1 : last), bv(last),
         partial_gl{static_cast<float*>(partials), nullptr, nullptr, size_t(ctas + tiles),
-                   size_t(TILE_N)},
+                   size_t(V::tile)},
         sv(0), sv(count > 1 ? 1 : last), sv(last),
         cv(0), cv(count > 1 ? 1 : last), cv(last),
         scale_gl{static_cast<float*>(const_cast<void*>(a_scale)), nullptr, nullptr, size_t(1),
@@ -317,13 +419,15 @@ int launch(const void* q, const void* a_scale, const void* const* b, const void*
     tc_globals G = views<V>(q, a_scale, b, b_scale, c, n, count, k, partials);
     void* args[] = {&G};
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
-    cudaError_t e = cudaLaunchKernel(gemv_fp8_tc_ker<V>, dim3(G.ctas), dim3(NUM_THREADS), args,
-                                     V::smem, st);
-    if (e != cudaSuccess || main_only) {
+    // B8 runs one CTA per tile, every other instance its stream-K CTAs.
+    const int grid = V::kind == 1 ? G.tiles : G.ctas;
+    cudaError_t e = cudaLaunchKernel(main_ker<V>(), dim3(grid), dim3(NUM_THREADS), args, V::smem, st);
+    // B8 stores its rows itself: it has no reduce.
+    if (e != cudaSuccess || main_only || V::kind == 1) {
         return static_cast<int>(e);
     }
-    const int vectors = G.tiles * (TILE_N / REDUCE_ROWS);
-    return static_cast<int>(cudaLaunchKernel(gemv_fp8_tc_reduce_ker,
+    const int vectors = G.tiles * (V::tile / REDUCE_ROWS);
+    return static_cast<int>(cudaLaunchKernel(gemv_fp8_tc_reduce_ker<V::tile>,
                                              dim3((vectors + REDUCE_WARPS - 1) / REDUCE_WARPS),
                                              dim3(REDUCE_THREADS), args, 0, st));
 }
@@ -336,7 +440,7 @@ int launch(const void* q, const void* a_scale, const void* const* b, const void*
 extern "C" int scratchy_cuda_gemv_fp8_tc_prepare(void) {
     cudaError_t e = cudaSuccess;
     for (const cudaError_t r : {allow<tc_b1>(), allow<tc_b2>(), allow<tc_b3>(), allow<tc_b4>(),
-                               allow<tc_b6>()}) {
+                               allow<tc_b6>(), allow<tc_b8>(), allow<tc_b9>()}) {
         if (e == cudaSuccess) {
             e = r;
         }
@@ -366,7 +470,8 @@ extern "C" uint64_t scratchy_cuda_gemv_fp8_tc_partial_bytes(const uint32_t* n, u
 
 // The ceiling probe's test-only form (/tmp/d-cap.md §3 P-B): as `scratchy_cuda_gemv_fp8_tc` at
 // instance `variant` (0 B1, the launcher's; 1 B2 `wait1`; 2 B3 `k128`, which also needs `k` a
-// multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, `k` a multiple of 256), and with `main_only` (B5
+// multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, `k` a multiple of 256; 5 B8 `swapab32` and 6 B9
+// `swapab32sk`, `k` a multiple of 256), and with `main_only` (B5
 // `noreduce`) the stream-K kernel alone,
 // leaving `c` unwritten. No tape launches it.
 extern "C" int scratchy_cuda_gemv_fp8_tc_variant(const void* q, const void* a_scale,
@@ -375,7 +480,7 @@ extern "C" int scratchy_cuda_gemv_fp8_tc_variant(const void* q, const void* a_sc
                                                  uint32_t count, uint32_t k, void* partials,
                                                  uint32_t variant, uint32_t main_only,
                                                  void* stream /* cudaStream_t */) {
-    if (scratchy_cuda_gemv_fp8_tc_partial_bytes(n, count, k) == 0 || variant > 4) {
+    if (scratchy_cuda_gemv_fp8_tc_partial_bytes(n, count, k) == 0 || variant > 6) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -386,7 +491,9 @@ extern "C" int scratchy_cuda_gemv_fp8_tc_variant(const void* q, const void* a_sc
             case 1: return launch<tc_b2>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
             case 2: return launch<tc_b3>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
             case 3: return launch<tc_b4>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
-            default: return launch<tc_b6>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            case 4: return launch<tc_b6>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            case 5: return launch<tc_b8>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            default: return launch<tc_b9>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
         }
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
