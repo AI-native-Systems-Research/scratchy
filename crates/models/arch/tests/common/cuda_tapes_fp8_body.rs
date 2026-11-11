@@ -4,7 +4,7 @@
 // binary's root, so every test keeps its name. The including binary
 // supplies the model: its `CUDA_TAPES`, `CUDA_UNLOWERED` and `CUDA_WEIGHTS`, the `chains` module
 // (`targets/cuda/tests/common/chains.rs`), and the constants these tests read: `STEM`, `FEATURE`,
-// `ARCH`, `DECODE_STEPS`, `PREFILL_STEPS`, `QUANTS`, `QUANT_READERS`, `QUANT_COLS`,
+// `ARCH`, `GREEDY_WIDTH`, `DECODE_STEPS`, `PREFILL_STEPS`, `QUANTS`, `QUANT_READERS`, `QUANT_COLS`,
 // `QUANT_SCRATCH`, `EXPERT_WEIGHT`, `WEIGHT_KINDS`, `TABLE_LEN` and `HEADERS`.
 //
 // No toolchain and no GPU: the tapes are checked as emitted, and the weight table against the
@@ -429,4 +429,17 @@ fn the_model_is_registered_under_its_fp8_stem() {
     assert_eq!(stems, [variant().as_str()], "the registry");
     assert!(std::ptr::eq(entries[0].tapes, CUDA_TAPES), "the tapes");
     assert!(std::ptr::eq(entries[0].weights, CUDA_WEIGHTS), "the table");
+}
+
+/// W7: the greedy argmax is a compile-time fact of the decode tape alone. The one-row bucket runs
+/// it over its whole logits row (`GREEDY_WIDTH`, the model's vocab); no prefill bucket does.
+#[test]
+fn only_the_decode_tape_runs_the_greedy_argmax() {
+    let got: Vec<(u32, Option<u32>)> = (CUDA_TAPES.iter())
+        .map(|t| (t.bucket_m, t.greedy.map(|g| g.width)))
+        .collect();
+    let want: Vec<(u32, Option<u32>)> = (TAPE_BUCKETS.iter())
+        .map(|&m| (m, (m == 1).then_some(GREEDY_WIDTH)))
+        .collect();
+    assert_eq!(got, want, "{STEM}: the buckets with a greedy argmax");
 }

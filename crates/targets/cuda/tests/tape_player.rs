@@ -2995,6 +2995,7 @@ fn whole_arena_tape(bytes: u64) -> CudaTape {
         moe: None,
         rotary_local: None,
         gemv_scratch: None,
+        greedy: None,
     }
 }
 

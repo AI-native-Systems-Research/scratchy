@@ -22,6 +22,8 @@ include!("common/cuda_tapes_fp8_body.rs");
 const STEM: &str = "gemma-4-26b-a4b-it";
 const FEATURE: &str = "GEMMA_4_26B_A4B_IT";
 const ARCH: &str = "gemma4-moe";
+/// The decode tape's greedy argmax width (W7): the model's vocab, its whole logits row.
+const GREEDY_WIDTH: u32 = 262_144;
 
 const DECODE_STEPS: [(&str, usize); 19] = [
     ("AttnDecode", 30),

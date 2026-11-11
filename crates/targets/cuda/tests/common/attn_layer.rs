@@ -409,6 +409,7 @@ pub static ATTN_LAYER_M128: CudaTape = CudaTape {
     moe: None,
     rotary_local: None,
     gemv_scratch: None,
+    greedy: None,
 };
 
 /// [`attn_layer`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `k` (then `kr`) 3145728, `v`
@@ -451,4 +452,5 @@ pub static ATTN_LAYER_M256: CudaTape = CudaTape {
     moe: None,
     rotary_local: None,
     gemv_scratch: None,
+    greedy: None,
 };

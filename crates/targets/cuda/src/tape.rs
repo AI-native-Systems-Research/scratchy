@@ -13,8 +13,8 @@ use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep,
-    EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
+    ARGMAX_CHUNK, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE,
+    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
     GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
     GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, QuantChainError, RmsNormBf16, RopeAppendBf16,
     RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain,
@@ -422,6 +422,35 @@ impl TapeInput {
 /// Bytes of one token id.
 const TOKEN_ID_BYTES: u64 = 4;
 
+/// The greedy argmax a one-row tape runs over its logits row after its last step (FP8 S8 W7,
+/// `kernels/argmax_bf16.cu`): `width` bf16 logits, the token the worker copies back in place of
+/// the row (`runtime::CudaWorker::forward_greedy`). A compile-time fact of the tape, set at
+/// expansion by [`GreedyArgmax::of`]; the worker only plays it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GreedyArgmax {
+    pub width: u32,
+}
+
+impl GreedyArgmax {
+    /// The argmax kernel's rule: a one-row bucket whose result is a bf16 row of a non-zero
+    /// multiple of [`ARGMAX_CHUNK`] logits, at most 2^24 (its ids exact f32s); `None` for every
+    /// other tape.
+    pub const fn of(bucket_m: u32, result: ArenaSpan) -> Option<Self> {
+        let width = result.bytes / 2;
+        let takes = bucket_m == 1
+            && result.bytes.is_multiple_of(2)
+            && width > 0
+            && width.is_multiple_of(ARGMAX_CHUNK as u64)
+            && width <= 1 << 24;
+        match takes {
+            true => Some(Self {
+                width: width as u32,
+            }),
+            false => None,
+        }
+    }
+}
+
 /// One bucket's forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct CudaTape {
@@ -454,6 +483,9 @@ pub struct CudaTape {
     /// The MoE scratch, exactly when a step is a MoE step (a router, a routing, a sort, an expert
     /// projection or a combine); `None` for a tape with no mixture of experts.
     pub moe: Option<MoeTape>,
+    /// The greedy argmax after the last step, exactly [`GreedyArgmax::of`] the tape's `bucket_m`
+    /// and `result` (`validate` checks it); `None` for every tape it does not take.
+    pub greedy: Option<GreedyArgmax>,
     /// The decode's split scratch: the f32 partials of the one split step running at a time,
     /// `CudaStep::gemv_scratch` of the largest. That is a decode GEMV's split-K partials (#1031:
     /// a `Gemv`, a GEMV `RouterLogits` or an `ExpertGemv` above one K split), or a decode
@@ -557,6 +589,11 @@ pub enum TapeError {
     EmbedOutput { step: usize },
     /// The result span reaches past the arena.
     ResultOutside { span: ArenaSpan, total: u64 },
+    /// The tape's greedy argmax is not [`GreedyArgmax::of`] its `bucket_m` and result.
+    Greedy {
+        got: Option<GreedyArgmax>,
+        want: Option<GreedyArgmax>,
+    },
     /// A byte count of the `step`-th step overflows `u64`.
     StepOverflow { step: usize },
     /// A span the `step`-th step reads or writes is not at a multiple of [`CUDA_ARENA_ALIGN`].
@@ -818,6 +855,10 @@ impl std::fmt::Display for TapeError {
                     "the result ({bytes} bytes at {offset}) reaches past the {total}-byte arena"
                 )
             }
+            Self::Greedy { got, want } => write!(
+                f,
+                "the tape's greedy argmax is {got:?}; its bucket and result give {want:?}"
+            ),
             Self::StepOverflow { step } => write!(f, "step {step}'s byte counts overflow u64"),
             Self::StepMisaligned { step, offset } => write!(
                 f,
@@ -1201,6 +1242,14 @@ impl CudaTape {
                 self.check_step(step, s, (total, &regions), (scratch, moe, gemv))?;
                 self.check_quant_scratch(step, s, quant)?;
             }
+        }
+        // Last, so a tape refused for any other fact names that one first.
+        let want = GreedyArgmax::of(self.bucket_m, self.result);
+        if self.greedy != want {
+            return Err(TapeError::Greedy {
+                got: self.greedy,
+                want,
+            });
         }
         Ok(())
     }
@@ -2290,6 +2339,7 @@ mod tests {
         moe: None,
         rotary_local: None,
         gemv_scratch: None,
+        greedy: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -3270,6 +3320,7 @@ mod tests {
             moe: None,
             rotary_local: None,
             gemv_scratch: None,
+            greedy: None,
         }
     }
 
@@ -3606,6 +3657,10 @@ mod tests {
             TapeError::EmbedInput { step: 0 },
             TapeError::EmbedOutput { step: 0 },
             TapeError::ResultOutside { span: s, total: 8 },
+            TapeError::Greedy {
+                got: None,
+                want: Some(GreedyArgmax { width: 1024 }),
+            },
             TapeError::StepOverflow { step: 1 },
             TapeError::StepMisaligned { step: 1, offset: 4 },
             TapeError::StepOutside {
@@ -3764,6 +3819,7 @@ mod tests {
                 | TapeError::EmbedInput { .. }
                 | TapeError::EmbedOutput { .. }
                 | TapeError::ResultOutside { .. }
+                | TapeError::Greedy { .. }
                 | TapeError::StepOverflow { .. }
                 | TapeError::StepMisaligned { .. }
                 | TapeError::StepOutside { .. }
@@ -3893,6 +3949,7 @@ mod tests {
         moe: None,
         rotary_local: None,
         gemv_scratch: None,
+        greedy: Some(GreedyArgmax { width: 1024 }),
     };
 
     /// A GEMV whose `k` is off the launcher's 8-wide vector (`k` = 4) validates: `validate` checks
@@ -3926,6 +3983,7 @@ mod tests {
             moe: None,
             rotary_local: None,
             gemv_scratch: None,
+            greedy: None,
         };
         assert_eq!(t.validate(), Ok(()));
     }
@@ -4057,6 +4115,7 @@ mod tests {
             moe,
             rotary_local: None,
             gemv_scratch: None,
+            greedy: None,
         }
     }
 

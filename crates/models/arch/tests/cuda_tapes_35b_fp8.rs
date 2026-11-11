@@ -22,6 +22,8 @@ include!("common/cuda_tapes_fp8_body.rs");
 const STEM: &str = "qwen3.6-35b-a3b";
 const FEATURE: &str = "QWEN3.6_35B_A3B";
 const ARCH: &str = "qwen3-5-moe";
+/// The decode tape's greedy argmax width (W7): the model's vocab, its whole logits row.
+const GREEDY_WIDTH: u32 = 248_320;
 
 const DECODE_STEPS: [(&str, usize); 20] = [
     ("AddRmsNorm", 40),

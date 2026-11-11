@@ -244,6 +244,7 @@ pub static ATTN_GATE_M128: CudaTape = CudaTape {
     moe: None,
     rotary_local: None,
     gemv_scratch: None,
+    greedy: None,
 };
 
 /// [`attn_gate`]`(256)`: `x` 0, `n` (then `o`) 524288, `qg` 1048576, `q` 3145728, `qn` 4194304,
@@ -278,4 +279,5 @@ pub static ATTN_GATE_M256: CudaTape = CudaTape {
     moe: None,
     rotary_local: None,
     gemv_scratch: None,
+    greedy: None,
 };

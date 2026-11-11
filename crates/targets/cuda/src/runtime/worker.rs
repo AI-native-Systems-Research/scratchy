@@ -47,8 +47,8 @@ use crate::step::{
     attn_decode_scratch_bytes, attn_decode_split, fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KV_ELEM_BYTES,
-    KvTape, RotaryTable, TapeError, TapeInput, WeightIx,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
+    KV_ELEM_BYTES, KvTape, RotaryTable, TapeError, TapeInput, WeightIx,
 };
 
 /// A forward's input, of the kind its tape takes ([`TapeInput`]).
@@ -329,9 +329,9 @@ pub enum ForwardError {
     /// [`MOE_ROUTE_EXPERTS`], the Qwen program's one instance (#921). Checked over the whole tape
     /// before anything is uploaded or enqueued.
     NotLaunched { step: usize, op: &'static str },
-    /// A greedy forward ([`CudaWorker::forward_greedy`]) of a tape whose result the argmax does
-    /// not take ([`greedy_width`]): not one row, or not a bf16 row of a multiple of
-    /// `ARGMAX_CHUNK` logits. Nothing was enqueued.
+    /// A greedy forward ([`CudaWorker::forward_greedy`]) of a tape with no greedy argmax
+    /// ([`CudaTape::greedy`]): not one row, or not a bf16 row of a multiple of `ARGMAX_CHUNK`
+    /// logits. Nothing was enqueued.
     NoGreedy { bucket_m: u32, result_bytes: u64 },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
@@ -706,8 +706,7 @@ pub struct CudaWorker<'a, W: AsRef<[DeviceBuffer]> = &'a [DeviceBuffer]> {
     kv: Option<KvPool>,
     /// The GDN state pool, when a tape has GDN layers.
     gdn: Option<GdnPool>,
-    /// The greedy argmax's buffers, when a tape is one-row with a logits row it takes
-    /// ([`greedy_width`]).
+    /// The greedy argmax's buffers, when a tape runs it ([`CudaTape::greedy`]).
     greedy: Option<Greedy>,
 }
 
@@ -719,20 +718,8 @@ struct Greedy {
     token: DeviceBuffer,
 }
 
-/// The logits width of a tape whose result the greedy argmax takes, captured after its last step:
-/// a one-row tape whose result is a bf16 row of a non-zero multiple of [`ARGMAX_CHUNK`] at most
-/// 2^24 entries (its ids exact f32s); `None` for every other tape.
-fn greedy_width(tape: &CudaTape) -> Option<u32> {
-    let width = tape.result.bytes / 2;
-    let takes = tape.bucket_m == 1
-        && width > 0
-        && width.is_multiple_of(u64::from(ARGMAX_CHUNK))
-        && width <= 1 << 24;
-    takes.then_some(width as u32)
-}
-
-/// What a forward copies back to the host: its result span, or (a tape [`greedy_width`] takes)
-/// the greedy argmax's one i32.
+/// What a forward copies back to the host: its result span, or (a tape with a
+/// [`CudaTape::greedy`]) the greedy argmax's one i32.
 enum Out<'r> {
     Result(&'r mut [u16]),
     Token(&'r mut i32),
@@ -925,7 +912,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             }),
             None => None,
         };
-        let greedy = match tapes.iter().any(|t| greedy_width(t).is_some()) {
+        let greedy = match tapes.iter().any(|t| t.greedy.is_some()) {
             true => {
                 let iota: Vec<u8> = (0..ARGMAX_CHUNK)
                     .flat_map(|i| (i as f32).to_le_bytes())
@@ -1091,13 +1078,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     }
 
     /// Whether bucket `bucket`'s graph runs the greedy argmax after its last step, so a
-    /// [`Self::forward_greedy`] takes it ([`greedy_width`]).
+    /// [`Self::forward_greedy`] takes it: its tape's [`CudaTape::greedy`].
     pub fn has_greedy(&self, bucket: usize) -> bool {
-        self.greedy.is_some()
-            && self
-                .tapes
-                .get(bucket)
-                .is_some_and(|t| greedy_width(t).is_some())
+        self.tapes.get(bucket).is_some_and(|t| t.greedy.is_some())
     }
 
     /// [`Self::forward`] of a one-row tape, copying back only its greedy token (W7): the argmax
@@ -1201,7 +1184,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 }
             }
             Out::Token(_) => {
-                if greedy_width(tape).is_none() || self.greedy.is_none() {
+                if tape.greedy.is_none() {
                     return Err(ForwardError::NoGreedy {
                         bucket_m: tape.bucket_m,
                         result_bytes: tape.result.bytes,
@@ -1443,7 +1426,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         instantiated
     }
 
-    /// [`Self::play`], then, for a tape [`greedy_width`] takes, the greedy argmax over its result
+    /// [`Self::play`], then, for a tape with a [`CudaTape::greedy`], the greedy argmax over its result
     /// row into the worker's token buffer (W7): the same launches in the graph and launched one by
     /// one. An argmax refusal is reported at step `steps.len()`, one past the tape's last.
     fn play_greedy(
@@ -1455,7 +1438,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         greedy: Option<&Greedy>,
     ) -> Result<(), (usize, KernelError)> {
         Self::play(stream, arena, weights, pools, tape)?;
-        let (Some(vocab), Some(g)) = (greedy_width(tape), greedy) else {
+        let (Some(GreedyArgmax { width: vocab }), Some(g)) = (tape.greedy, greedy) else {
             return Ok(());
         };
         // SAFETY: the result span lies inside the tape's arena (`new` validated it) and holds
@@ -2553,7 +2536,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 std::mem::size_of_val(result),
             ),
             Out::Token(token) => {
-                let g = greedy.expect("`forward_as` checked the worker has the argmax's buffers");
+                let g = greedy.expect("`new` made the argmax's buffers for a tape with a greedy");
                 (
                     std::ptr::from_mut(token).cast(),
                     g.token.ptr().cast_const(),

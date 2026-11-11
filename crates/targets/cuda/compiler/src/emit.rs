@@ -77,6 +77,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "ArenaOffset",
                 "WeightIx",
                 "RotaryTable",
+                "GreedyArgmax",
                 "KvTape",
                 "KvClass",
                 "GdnTape",
@@ -977,6 +978,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         gdn,
         moe,
         gemv_scratch,
+        greedy,
     } = c;
     CudaTape {
         bucket_m: *bucket_m,
@@ -1039,6 +1041,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         ),
         moe: *moe,
         gemv_scratch: *gemv_scratch,
+        greedy: *greedy,
     }
 }
 

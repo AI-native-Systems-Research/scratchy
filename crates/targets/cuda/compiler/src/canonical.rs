@@ -38,8 +38,8 @@ use scratchy_target_cuda::step::{
     QuantRowsFp8, gdn_scratch, quant_chain,
 };
 use scratchy_target_cuda::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, KvClass, MoeSortTape, MoeTape,
-    RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
+    MoeTape, RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles,
 };
 
 use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_driver, lower_step};
@@ -225,6 +225,9 @@ pub struct CudaCanonical {
     /// The decode GEMVs' split-K scratch, after every other region, the token ids included:
     /// `Some` exactly when a step takes more than one K split (`CudaStep::gemv_scratch`).
     pub gemv_scratch: Option<ArenaSpan>,
+    /// The greedy argmax after the last step (W7): `GreedyArgmax::of` the bucket and the
+    /// result, decided here, at expansion.
+    pub greedy: Option<GreedyArgmax>,
 }
 
 /// One canonical's Gated-DeltaNet layers: the fields of a `scratchy_target_cuda::tape::GdnTape`,
@@ -1671,6 +1674,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         gdn,
         moe,
         gemv_scratch,
+        greedy: GreedyArgmax::of(arena.bucket_m, result),
     })
 }
 
