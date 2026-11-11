@@ -460,8 +460,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # 2026-11-11: a Canonical/Azure DNS outage (actions/runner-images#15297)
+      # left every *.ubuntu.com mirror unresolvable for ~3h — including the
+      # archive/security fallbacks the runner image already lists in
+      # /etc/apt/apt-mirrors.txt. The list's failover works, but not inside one
+      # DNS zone: append a mirror outside ubuntu.com (kernel.org) as the last
+      # resort.
       - name: Install OpenBLAS
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas-dev
+        run: |
+          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' \
+            | sudo tee -a /etc/apt/apt-mirrors.txt >/dev/null
+          APT_OPTS="-o Acquire::Retries=2 -o Acquire::http::Timeout=20"
+          sudo apt-get $APT_OPTS update -qq
+          sudo apt-get $APT_OPTS install -y -qq --no-install-recommends libopenblas-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -500,8 +511,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Same mirror hardening as linux-spyre-emu (the BLAS job's comment).
       - name: Install OpenBLAS
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas-dev
+        run: |
+          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:4\n' \
+            | sudo tee -a /etc/apt/apt-mirrors.txt >/dev/null
+          APT_OPTS="-o Acquire::Retries=2 -o Acquire::http::Timeout=20"
+          sudo apt-get $APT_OPTS update -qq
+          sudo apt-get $APT_OPTS install -y -qq --no-install-recommends libopenblas-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
