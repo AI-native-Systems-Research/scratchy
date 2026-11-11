@@ -235,12 +235,30 @@ impl DeviceAllocator for SpyreAllocator {
     /// Hold the shard for the alias path. The store also keeps its own
     /// `Arc`s; this one is what makes an alias valid after `take` removes the
     /// store's last reference to a tensor's `CpuTensorRef`.
-    fn register_mmap(&self, _path: &std::path::Path, mmap: Arc<memmap2::Mmap>) -> Result<()> {
+    ///
+    /// ⭐ AND DISPATCH THE PREFETCH THAT RIDES THE BRING-UP (metal's own
+    /// `register_mmap` shape: background `pread`s). The view load's first
+    /// reader of the shard pages is staging, after the card join — on a
+    /// page-cache-cold boot that puts the whole checkpoint read on the boot
+    /// critical path. A sequential reader started here fills the page cache
+    /// while the bring-up runs, which is the overlap the load's old host copy
+    /// provided for free; see [`prefetch_shard`] for why the `madvise` hint
+    /// alone does not carry it on the card's network filesystem.
+    fn register_mmap(&self, path: &std::path::Path, mmap: Arc<memmap2::Mmap>) -> Result<()> {
         self.backings
             .lock()
             .expect("SpyreAllocator backings Mutex")
             .push(mmap);
+        prefetch_shard(path);
         Ok(())
+    }
+
+    /// The `madvise(MADV_WILLNEED)` half of the readahead — the hint every
+    /// kernel that honors it turns into readahead over the mapping. On the
+    /// card's network filesystem it is inert (measured: the mapping's pages
+    /// stay cold), which is why [`register_mmap`] dispatches the real reader.
+    fn prefault_mmap(&self, mmap: &memmap2::Mmap) {
+        will_need(mmap.as_ptr() as *mut std::ffi::c_void, mmap.len());
     }
 
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
@@ -278,6 +296,61 @@ impl DeviceAllocator for SpyreAllocator {
         self.allocs.push(HostBytes::Owned(buf));
         Ok(ptr)
     }
+}
+
+/// `MADV_WILLNEED` over a mapping the store just opened — best-effort BY
+/// NATURE (it is an advice): a kernel that refuses it leaves the pages to
+/// fault on first read, exactly the behavior without the hint, which the
+/// refusal line names when it happens.
+#[cfg(target_os = "linux")]
+fn will_need(ptr: *mut std::ffi::c_void, mapped: usize) {
+    // SAFETY: `ptr`/`mapped` are the caller's live mapping (every caller
+    // passes a shard the store holds), and `madvise` reads only the VMA
+    // metadata.
+    unsafe {
+        if libc::madvise(ptr, mapped, libc::MADV_WILLNEED) != 0 {
+            let errno = std::io::Error::last_os_error();
+            tracing::debug!(
+                "MADV_WILLNEED refused ({errno}) — the shard's pages fault on first read"
+            );
+        }
+    }
+}
+
+/// Only Linux drives a card — elsewhere the store's pages fault on first read.
+#[cfg(not(target_os = "linux"))]
+fn will_need(_ptr: *mut std::ffi::c_void, _mapped: usize) {}
+
+/// Read a registered shard sequentially, once, on a detached thread — the
+/// readahead the card's NFS owes the view load. `madvise`/`fadvise(WILLNEED)`
+/// are inert there (measured: pages stay cold behind the hint), and the view
+/// load's own first reader is staging, after the card join — so without this
+/// reader a client-cache-cold boot pays the checkpoint's network reads on the
+/// critical path, where the load's old host copy paid them under the bring-up.
+/// The thread is bounded by construction (it reads the file's own length once,
+/// then exits) and best-effort by nature: a failed or refused read leaves the
+/// pages to fault on demand in staging, exactly the behavior without it.
+fn prefetch_shard(path: &std::path::Path) {
+    let path = path.to_path_buf();
+    // A spawn refusal (thread exhaustion) is the same non-event as a refused
+    // read: the pages fault on demand.
+    let _ = std::thread::Builder::new()
+        .name("shard-prefetch".to_string())
+        .spawn(move || {
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                return;
+            };
+            use std::io::Read;
+            // 8 MiB reads: whole RPCs on a network filesystem, not per-page
+            // round trips.
+            let mut buf = vec![0u8; 8 << 20];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
 }
 
 #[cfg(test)]
