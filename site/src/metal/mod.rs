@@ -2009,18 +2009,25 @@ impl Latency<'_> {
         ecdf_chart(&curves, &self.engines, tag, label)
     }
 
-    /// Every cell at answer length `o` as a small multiple, users at once down and prompt size
-    /// across, each column `column` wide (a grid track), under `title`: `cell` draws each, and
-    /// names its own users count where `users` says the rows don't.
+    /// Every cell at answer length `o` whose users count `keep` keeps as a small multiple, users at
+    /// once down and prompt size across, each column `column` wide (a grid track), under `title`:
+    /// `cell` draws each, and names its own users count where `users` says the rows don't. Nothing
+    /// where no cell is kept.
     fn multiple(
         &self,
         o: u32,
         column: &str,
         title: &str,
         users: UsersNamed,
+        keep: impl Fn(u32) -> bool,
         cell: impl Fn(CellKey) -> Element,
     ) -> Element {
-        let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
+        let ks: Vec<CellKey> = (self.keys.iter().copied())
+            .filter(|k| k.1 == o && keep(k.0))
+            .collect();
+        if ks.is_empty() {
+            return rsx! {};
+        }
         let mut rows: Vec<u32> = ks.iter().map(|k| k.0).collect();
         let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
         rows.dedup();
@@ -2087,10 +2094,12 @@ pub(super) fn ecdf_chart(
     let (start, end) = (centre / half, centre * half);
     // Plotted as log10(ms) on a linear axis: Carbon rounds a log axis out to whole decades,
     // which would undo the common span.
+    // Four decimals, far finer than a chart can draw: the JSON carries no float tails.
+    let r4 = |v: f64| (v * 1e4).round() / 1e4;
     let point = |group, key: f64, value: f64| SparkPoint {
         group,
-        key: key.clamp(start, end).log10(),
-        value: Some(value),
+        key: r4(key.clamp(start, end).log10()),
+        value: Some(r4(value)),
         upper: None,
         lower: None,
         factor: None,
@@ -2120,8 +2129,8 @@ pub(super) fn ecdf_chart(
             for (group, shown) in [(ECDF_AHEAD, a > b), (ECDF_BEHIND, a < b)] {
                 let (low, high) = if shown { (a.min(b), a.max(b)) } else { (a, a) };
                 data.push(SparkPoint {
-                    upper: Some(high),
-                    lower: Some(low),
+                    upper: Some(r4(high)),
+                    lower: Some(r4(low)),
                     ..point(group, x, high)
                 });
             }
@@ -2400,12 +2409,17 @@ pub(super) fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     answers.dedup();
     // A 1-user cell's bubble chart, on its own axes or on every cell's across every answer length;
     // a cell under load its end-to-end time's distribution ([`Load`]).
-    let multiple = |o: u32, axes: Axes2| {
+    let multiple = |o: u32, axes: Axes2, load: Load| {
+        let title = match load {
+            Load::Alone => format!("{o}-token answers, 1 user"),
+            Load::Shared => format!("{o}-token answers, more users"),
+        };
         l.multiple(
             o,
             &PANEL_SIDE.to_string(),
-            &format!("{o}-token answers"),
+            &title,
             UsersNamed::Beside,
+            |u| Load::of(u) == load,
             |(u, o, i)| match Load::of(u) {
                 Load::Alone => {
                     let about = format!(
@@ -2473,15 +2487,18 @@ pub(super) fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
                         ContentSwitcherItem { target: format!("{mid}-axes-{}", slug(axes.title())), selected: axes == Axes2::Own, "{axes.title()}" }
                     }
                 }
+                // The switch sets the bubble charts' ranges only, the 1-user rows; the curves under
+                // load are drawn once, below it, the same either way.
                 div {
                     for axes in Axes2::ALL {
                         ContentPanel { id: format!("{mid}-axes-{}", slug(axes.title())), shown: axes == Axes2::Own,
                             Stack { gap: 6,
-                                for &o in &answers { {multiple(o, axes)} }
+                                for &o in &answers { {multiple(o, axes, Load::Alone)} }
                             }
                         }
                     }
                 }
+                for &o in &answers { {multiple(o, Axes2::Own, Load::Shared)} }
                 Fold { title: "Table view, every request",
                     Stack { gap: 4,
                         for t in RequestTiming::ALL { {table(t)} }
@@ -3490,6 +3507,7 @@ fn latency_panel<'l>(
             ECDF_COLUMN,
             &format!("{stem} · {o}-token answers"),
             UsersNamed::InCells,
+            |_| true,
             |(u, o, i)| {
                 let label = |t: RequestTiming| {
                     format!(
@@ -4391,6 +4409,35 @@ mod tests {
             !html.contains(">J/right answer<")
                 || at(">J/right answer<") < at("rag-latency-machine")
         );
+    }
+
+    /// The latency switch sets the 1-user bubble charts' axes only: each curve under load is
+    /// drawn once, not once a switch panel, the two being the same either way.
+    #[test]
+    fn each_latency_curve_is_drawn_once() {
+        let runs = fixtures(&["apple-m4-max-2026-10-29T013115Z-8385aba7.json"]);
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
+        let labels: Vec<&str> = (html.split("aria-label=\"").skip(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        let curves: Vec<&&str> = (labels.iter())
+            .filter(|l| l.contains(" of every request, "))
+            .collect();
+        assert!(!curves.is_empty(), "curves under load drawn");
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &curves {
+            assert!(seen.insert(**c), "drawn twice: {c}");
+        }
+        // The bubble charts, a set a switch panel: each twice, on its own axes and on the same.
+        let bubbles = (labels.iter())
+            .filter(|l| l.starts_with("TTFT against TPOT"))
+            .count();
+        assert!(bubbles > 0 && bubbles % 2 == 0, "{bubbles} bubble charts");
     }
 
     #[test]
