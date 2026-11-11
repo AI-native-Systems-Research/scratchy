@@ -328,22 +328,25 @@ impl Worker for SpyreWorker {
         let mut sampled: Vec<Option<u32>> = Vec::new();
 
         // New requests = (chunked) prefill: register the prompt + empty KV cache.
+        // ⭐ ALL REGISTERED FIRST, THEN RUN — registration is a per-request fact (the draw, the
+        // token store, the block table), identical whether this step's prompts run one at a time
+        // or packed into one launch; the packing split below only chooses the launch. A request
+        // runs SOLO unless the wave takes it: its chunk starts past position 0 (a prefix-cache
+        // hit, whose keys only the solo PREFIX ladder's walk reaches), or its scheduled chunk is
+        // wider than the top prefill rung (the solo chunk loop cuts it), or it is the only new
+        // request this step (nothing to pack — the solo rung, byte-identical to the no-packing
+        // build).
         for nr in &scheduler_output.scheduled_new_reqs {
-            let n = scheduler_output
-                .num_scheduled_tokens
-                .get(&nr.req_id)
-                .copied()
-                .unwrap_or(0);
-            let start = nr.num_computed_tokens as usize;
             let prompt = nr.prompt_token_ids.clone().unwrap_or_default();
             requests.insert(
                 nr.req_id.clone(),
                 ReqState {
                     // ⭐ THE DRAW, DECIDED ONCE AT ADMISSION and staged per step by every seat the
                     // request's rows run through — the prompt-final chunk's, the solo decode loop's,
-                    // the batch's. Cached steps never see sampling params again, so this is the one
-                    // door. A request this path cannot serve honestly (a knob with no card leg) is
-                    // refused here, naming the knob — on both tiers, which mint the same draw.
+                    // the batch's, the packed wave's. Cached steps never see sampling params again,
+                    // so this is the one door. A request this path cannot serve honestly (a knob
+                    // with no card leg) is refused here, naming the knob — on both tiers, which
+                    // mint the same draw.
                     draw: SampledDraw::of(&nr.req_id, nr.sampling_params.as_ref()).map_err(werr)?,
                 },
             );
@@ -361,10 +364,89 @@ impl Worker for SpyreWorker {
                 nr.block_ids.first().cloned().unwrap_or_default(),
                 nr.num_computed_tokens,
             );
+        }
+        // ⭐⭐⭐ THE CONCURRENT-PREFILL WAVE — every new request whose whole scheduled chunk runs
+        // from position 0 and fits the top prefill rung, packed into ONE launch on the narrowest
+        // `(width, seqs)` rung holding the widest chunk and the live count. Two or more only: a
+        // lone prompt is the solo path's own case.
+        #[cfg(feature = "spyre-hw")]
+        let wave: Vec<usize> = {
+            let top_m = {
+                let SendnnSession::SuperDsc(sb) = &model.session;
+                sb.prefill_rungs.last().map(|(m, _, _)| *m).unwrap_or(0)
+            };
+            let w: Vec<usize> = scheduler_output
+                .scheduled_new_reqs
+                .iter()
+                .enumerate()
+                .filter(|(_, nr)| {
+                    let n = scheduler_output
+                        .num_scheduled_tokens
+                        .get(&nr.req_id)
+                        .copied()
+                        .unwrap_or(0);
+                    nr.num_computed_tokens == 0 && n > 1 && n <= top_m
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if w.len() >= 2 {
+                w
+            } else {
+                Vec::new()
+            }
+        };
+        let mut results: Vec<Option<u32>> =
+            vec![None; scheduler_output.scheduled_new_reqs.len()];
+        #[cfg(feature = "spyre-hw")]
+        if !wave.is_empty() {
+            let ids: Vec<&str> = wave
+                .iter()
+                .map(|&i| scheduler_output.scheduled_new_reqs[i].req_id.as_str())
+                .collect();
+            let ns: Vec<usize> = wave
+                .iter()
+                .map(|&i| {
+                    scheduler_output
+                        .num_scheduled_tokens
+                        .get(&scheduler_output.scheduled_new_reqs[i].req_id)
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .collect();
+            // The wave's draws, one per request in window order — immutable borrows of the
+            // request states, disjoint from the mutable model the launch runs through.
+            let draws: Vec<Option<&SampledDraw>> = ids
+                .iter()
+                .map(|id| {
+                    requests
+                        .get(*id)
+                        .map(|r| r.draw.as_ref())
+                        .ok_or_else(|| werr(format!("unknown new req {id}")))
+                })
+                .collect::<ExecutorResult<Vec<_>>>()?;
+            let picks = run_packed_request_step(model, &ids, &draws, input_batch, &ns)?;
+            for (q, &i) in wave.iter().enumerate() {
+                results[i] = picks[q];
+            }
+        }
+        for (i, nr) in scheduler_output.scheduled_new_reqs.iter().enumerate() {
+            #[cfg(feature = "spyre-hw")]
+            if wave.contains(&i) {
+                continue;
+            }
+            let n = scheduler_output
+                .num_scheduled_tokens
+                .get(&nr.req_id)
+                .copied()
+                .unwrap_or(0);
+            let start = nr.num_computed_tokens as usize;
             let req = requests.get_mut(&nr.req_id).expect("just inserted");
             let s = run_request_step(model, req, &nr.req_id, input_batch, start, n)?;
+            results[i] = s;
+        }
+        for (i, nr) in scheduler_output.scheduled_new_reqs.iter().enumerate() {
             order.push(nr.req_id.clone());
-            sampled.push(s);
+            sampled.push(results[i]);
         }
 
         // Cached requests = decode (n=1) or a prefill-continuation chunk.
@@ -611,6 +693,8 @@ impl Worker for SpyreWorker {
                     // binding the same tensor ids.
                     model.decode.last().expect("at least one decode bucket"),
                     seqs,
+                    // A decode rung's request capacity is its own rows — one row per request.
+                    seqs.count() as u32,
                     SamplerLaws {
                         seeds: if churned {
                             scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks)

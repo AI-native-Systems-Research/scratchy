@@ -126,15 +126,6 @@ impl LaunchRows<'_> {
         }
     }
 
-    /// The launch's request count — the pair's second half, what `PagedStep::on_body` mints the
-    /// extent's capacity from.
-    fn requests(&self) -> usize {
-        match self {
-            LaunchRows::Sequence { reqs } => reqs.len(),
-            LaunchRows::Batch { .. } => 1,
-        }
-    }
-
     /// The rung's graph rows this launch binds: the launch's own pair's product.
     fn graph_rows(&self, width: usize) -> usize {
         match self {
@@ -143,9 +134,21 @@ impl LaunchRows<'_> {
         }
     }
 
-    /// Bound row `r`'s position. A pad row's is a live row's: a sequence's pad row repeats its last
-    /// real token (`StepRows::pos`), a batch's repeats live 0 (its write lands at the null slot, so
-    /// what it computes is never read).
+    /// ⭐ THE LAUNCH'S OWN EXTENT PAIR — the rung's `(per-request width, request
+    /// capacity)` as this launch states it, the same law the bake minted each
+    /// rung's pair by: a sequence launch's per-request width is the rung's `w`
+    /// and its capacity the rung's BAKED request count (never the live one —
+    /// the stager seats live windows and leaves the rest empty, so the extent
+    /// must name every window the bundle placed); a batch launch's is one row
+    /// per request, its capacity the rung's own rows. `PagedStep::on_body`
+    /// mints the step's extent from exactly this pair.
+    fn extent_pair(&self, w: u32, baked_reqs: u32) -> (u32, u32) {
+        match self {
+            LaunchRows::Sequence { .. } => (w, baked_reqs),
+            LaunchRows::Batch { .. } => (1, baked_reqs),
+        }
+    }
+
     /// Bound row `r`'s position, `w` the rung's per-request width: the rows are window-major,
     /// row `r` is window `r/w`'s row `r%w`. A pad row repeats its request's last real token
     /// (`StepRows::pos`); a pad WINDOW past the live requests is staged fully masked, so nothing
@@ -160,7 +163,6 @@ impl LaunchRows<'_> {
         }
     }
 
-    /// The live row a bound row `r` takes its token from.
     /// The live row — an index into the launch's concatenated per-request seed tokens — that
     /// bound row `r` takes its token from, `w` the rung's per-request width.
     fn live_of(&self, r: usize, w: usize) -> usize {
@@ -197,14 +199,21 @@ pub(crate) struct SeatWidth(usize);
 #[cfg(feature = "spyre-hw")]
 impl SeatWidth {
     /// The ONE mint — the launch's own row count over the seat.
+    ///
+    /// ⭐ A SEQUENCE LAUNCH'S SEAT IS THE FOLDED DRAW'S — one row per request
+    /// the RUNG packs (the bake's own S), never the launch's live count: the
+    /// representative wiring every rung runs through states the SOLO rung's
+    /// one row, and a packed rung's bundle placed its own seat at its own S.
+    /// `baked_reqs` is that count — the rung's own pair, the same value the
+    /// launch's extent states.
     fn of_launch(
-        seat: &scratchy_target_spyre::wiring::SampleSeat,
         rows_in: &LaunchRows<'_>,
+        baked_reqs: u32,
         mq: usize,
     ) -> Self {
         Self(match rows_in {
             LaunchRows::Batch { .. } => mq,
-            _ => seat.rows as usize,
+            LaunchRows::Sequence { .. } => baked_reqs as usize,
         })
     }
 
@@ -250,6 +259,11 @@ pub(crate) fn run_card_launch(
     pf: &mut SuperDscSession,
     b: &BundleMeta,
     width: scratchy_subtile::sdsc_abstract::RungWidth,
+    // ⭐ THE RUNG'S BAKED REQUEST CAPACITY — the pair's second half, read off
+    // the ladder entry the caller picked (a solo rung's 1, a packed rung's S, a
+    // decode rung's own rows). The extent, the seat width and the row capacity
+    // below are all sized by it; the launch's LIVE count never is.
+    baked_reqs: u32,
     sampler: SamplerLaws<'_>,
 ) -> ExecutorResult<BatchOut> {
     let SamplerLaws {
@@ -261,7 +275,7 @@ pub(crate) fn run_card_launch(
     // ⭐ THE LAUNCH'S OWN PAIR — the rung's per-request width times its request count, the graph
     // rows every whole-graph fact below is sized by. A solo launch's pair is (w, 1): `mq` is the
     // width, exactly as before the S axis existed.
-    let w = width.get();
+    let w = width.count();
     let mq = rows_in.graph_rows(w);
     let live = rows_in.live();
     if live == 0 || live > mq {
@@ -286,11 +300,12 @@ pub(crate) fn run_card_launch(
             ))
         })?
         .get();
+    let (pair_w, pair_reqs) = rows_in.extent_pair(w as u32, baked_reqs);
     let step = b
         .wiring
         .paged
         .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?
-        .on_body(w as u32, rows_in.requests() as u32, rows_in.paged_rows(), swept)
+        .on_body(pair_w, pair_reqs, rows_in.paged_rows(), swept)
         .ok_or_else(|| {
             werr(format!(
                 "card launch: the body sweeps {swept} slot(s), which is no walk of this bundle's pool"
@@ -368,7 +383,13 @@ pub(crate) fn run_card_launch(
         launch_rows,
     ));
     let shape = b.wiring.forward_shape_within(
-        scratchy_target_spyre::wiring::RowCapacity::of_baked_rung(width),
+        // ⭐ THE CAPACITY IS THE PAIR'S OWN PRODUCT — the rows the bake lowered
+        // this rung's graph at (`width · requests`, the extent's held
+        // `graph_rows`), never the wiring representative's row count: a packed
+        // rung runs `w · S` rows through a wiring that states the solo shape.
+        scratchy_target_spyre::wiring::RowCapacity::of_baked_rung(
+            step.extent.graph_rows(),
+        ),
         launch_rows,
         Some(step),
         consts.len(),
@@ -435,24 +456,25 @@ pub(crate) fn run_card_launch(
         .wiring
         .sample_seat
         .as_ref()
-        .map(|seat| (seat, SeatWidth::of_launch(seat, &rows_in, mq)));
+        .map(|seat| (seat, SeatWidth::of_launch(&rows_in, baked_reqs, mq)));
     // (the pair is `Copy` — a reference and a `Copy` width — so this binding
     // copies it and the pick match below binds its own copy of the same one)
     if let Some((seat, seat_width)) = seat_launch {
         let laws: Vec<RowLaw<'_>> = match seat_laws {
-            // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
-            // last real one (the consumed pick is the last baked row's, so the pad row carries the
-            // draw the last real row would).
-            SeatLaws::Prompt { draw } => (0..seat_width.get())
-                .map(|r| RowLaw {
-                    draw,
-                    step: rows_in.pos(r, w) as u32,
-                })
-                .collect(),
+            // A PROMPT CHUNK: seat row `s` is request `s`'s folded answer row —
+            // the law runs that request's draw at its LAST REAL position
+            // (window `s`'s last row, `pos`'s pad clamp), and a pad seat row
+            // runs live 0's.
+            SeatLaws::Prompt { draws } => {
+                let live_pos: Vec<u32> = (0..draws.len())
+                    .map(|s| rows_in.pos(s * w + w - 1, w) as u32)
+                    .collect();
+                batch_seat_laws(draws, &live_pos, seat_width.get())?
+            }
             // A DECODE: live row `s` runs its own request's draw at its own position, and a pad row
             // runs live 0's ([`pad_law_of`]).
             SeatLaws::Batch { draws } => {
-                let live_pos: Vec<u32> = (0..live).map(|s| rows_in.pos(s) as u32).collect();
+                let live_pos: Vec<u32> = (0..live).map(|s| rows_in.pos(s, w) as u32).collect();
                 batch_seat_laws(draws, &live_pos, seat_width.get())?
             }
         };
@@ -941,13 +963,16 @@ fn batch_seat_laws<'a>(
 /// never silently resolved.
 #[cfg(feature = "spyre-hw")]
 pub(crate) enum SeatLaws<'a> {
-    /// A prompt-final chunk: every baked row runs `draw` — real row `i` at its
-    /// own position `start + i`, and a pad row at the last real position it
-    /// clamps to (the pad row replicates the last real token's entire forward,
-    /// and the CONSUMED pick is the last baked row's, so the pad row must carry
-    /// the same draw the last real row would, or an unfilled rung would pick
-    /// greedy for a sampled request).
-    Prompt { draw: Option<&'a SampledDraw> },
+    /// A prompt-final chunk: one draw per LIVE request, in window order — seat
+    /// row `s` is the folded tail's ANSWER ROW for request `s`, so it runs that
+    /// request's draw at its LAST REAL position (the row the lm-head fold
+    /// reads, the pad clamp's own law), and a pad seat row runs live 0's
+    /// ([`pad_law_of`]; an empty window's pick is never read). At one live
+    /// request this is the solo prompt's own law: one row, its request's draw,
+    /// its last real position.
+    Prompt {
+        draws: &'a [Option<&'a SampledDraw>],
+    },
     /// A decode: one law per LIVE row, in slot order — that row's request's
     /// draw at that request's own position. A padding slot runs LIVE 0'S LAW
     /// ([`pad_law_of`], the pad clamp); its pick is never read.
@@ -1503,6 +1528,8 @@ pub(crate) fn superdsc_forward_chunk(
             sess,
             pmeta,
             rung,
+            // A solo chunk's rung packs one request.
+            1,
             SamplerLaws {
                 seeds: scratchy_subtile::sdsc_abstract::SeedSource::Host(&chunk_toks),
                 want_logits: if finishes {
@@ -1511,7 +1538,7 @@ pub(crate) fn superdsc_forward_chunk(
                     LogitsWanted::None
                 },
                 laws: SeatLaws::Prompt {
-                    draw: req.draw.as_ref(),
+                    draws: &[req.draw.as_ref()],
                 },
             },
         )?;
@@ -1535,6 +1562,191 @@ pub(crate) fn superdsc_forward_chunk(
         Some(ts) => ChunkOut::Tokens(ts),
         None => ChunkOut::Prompt,
     })
+}
+
+/// ⭐⭐⭐ A CONCURRENT PREFILL WAVE — the scheduled new requests that each run their whole
+/// scheduled chunk from position 0, packed into ONE launch on the narrowest prefill rung whose
+/// `(width, seqs)` pair holds the widest chunk and the live count ([`prefill_rung_for`] — the
+/// same first-fit law the solo chunk loop selects the solo rungs by, with the live count as the
+/// pair's second half). Every request's chunk is its own window of the rung: its own pages, its
+/// own rows, its own draw at its own last real position; the windows past the live requests are
+/// staged fully masked, page-0, by the stager's own empty-slot law. A request that FINISHES takes
+/// its pick off the rung's minted idx stick — seat row `s`, its window's answer row, exactly the
+/// solo prompt's readback one window over.
+///
+/// ⛔ ONE LAUNCH, ONE CHUNK PER REQUEST: a wave request's whole scheduled chunk must fit the
+/// rung's width (`n ≤ top_m`) and run from position 0 — a chunk past position 0 needs the PREFIX
+/// ladder's walk, which is the solo ladder's, and a prompt the scheduler cut wider than the top
+/// rung chunks on the solo path. The caller states membership; this fn refuses a request that
+/// does not fit rather than silently dropping its tail.
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn run_packed_request_step(
+    model: &mut Loaded,
+    // The wave's request ids, in window order — seat row `s` serves `ids[s]`.
+    ids: &[&str],
+    // Each request's own draw, in the same order.
+    draws: &[Option<&SampledDraw>],
+    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
+    // Each request's scheduled token count, its whole chunk from position 0.
+    ns: &[usize],
+) -> ExecutorResult<Vec<Option<u32>>> {
+    if ids.is_empty() || ids.len() != draws.len() || ids.len() != ns.len() {
+        return Err(werr(format!(
+            "superdsc packed prefill: {} id(s), {} draw(s), {} chunk(s) — one of each per wave \
+             request",
+            ids.len(),
+            draws.len(),
+            ns.len()
+        )));
+    }
+    let sh = Shared {
+        embed_tokens: &model.embed_tokens,
+        hidden: model.hidden,
+        vocab: model.vocab,
+    };
+    let SendnnSession::SuperDsc(sb) = &mut model.session;
+    let SuperDscBundle { prefill_rungs, .. } = sb;
+    let pmeta = model.batched_prefill.as_ref().ok_or_else(|| {
+        werr("superdsc packed prefill: this bundle bakes no prompt chunk — a prompt has nothing to run on")
+    })?;
+    let top_m = prefill_rungs.last().map(|(m, _, _)| *m).unwrap_or(0);
+    let real = ns.iter().copied().max().unwrap_or(0);
+    if real == 0 {
+        return Err(werr(
+            "superdsc packed prefill: the wave schedules no token — the caller staged an empty \
+             chunk"
+                .to_string(),
+        ));
+    }
+    if real > top_m {
+        return Err(werr(format!(
+            "superdsc packed prefill: a {real}-token chunk in a wave over the widest baked rung \
+             ({top_m}) — the caller must keep such a chunk on the solo path"
+        )));
+    }
+    // ⭐ THE RUNG: the smallest (width, seqs) holding the widest chunk and the live count.
+    let ri = prefill_rung_for(prefill_rungs.as_mut_slice(), real, ids.len())
+        .ok_or_else(|| werr("superdsc packed prefill: no prompt chunk rung baked".to_string()))?;
+    let (m, rs, sess) = &mut prefill_rungs[ri];
+    let w = *m;
+    // ⭐ EACH REQUEST'S OWN WINDOW — its pages and its rows, cut at its own scheduled count
+    // (a pad row repeats its request's last real token, `StepRows::pos`'s clamp). The blocks
+    // are read into an owned list first: a chunk borrows its request's slice.
+    let blocks: Vec<Vec<u32>> = ids
+        .iter()
+        .map(|id| {
+            tokens
+                .block_table(id)
+                .map(|t| {
+                    t.iter()
+                        .map(|&b| scratchy_target_spyre::paged_step::page_of_block(b as u32))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut chunk_toks: Vec<usize> = Vec::with_capacity(ns.iter().sum::<usize>());
+    for (q, (&id, &n)) in ids.iter().zip(ns).enumerate() {
+        if n == 0 || n > w {
+            return Err(werr(format!(
+                "superdsc packed prefill: request {q} schedules {n} token(s) on a {w}-width rung — \
+                 the caller must keep a chunk that does not fit on the solo path"
+            )));
+        }
+        let toks: Vec<usize> = (0..n)
+            .map(|p| {
+                tokens.token_at(id, p).map(|t| t as usize).ok_or_else(|| {
+                    werr(format!(
+                        "superdsc packed prefill: request {q} wants token {p} but has {}",
+                        tokens.token_count(id),
+                    ))
+                })
+            })
+            .collect::<ExecutorResult<Vec<usize>>>()?;
+        chunk_toks.extend(toks);
+    }
+    let reqs: Vec<SeqChunk<'_>> = blocks
+        .iter()
+        .zip(ns)
+        .map(|(b, &n)| {
+            let rows = StepRows::new(0, n).ok_or_else(|| {
+                werr(
+                    "superdsc packed prefill: a chunk of zero real rows — the caller staged no \
+                     chunk"
+                        .to_string(),
+                )
+            })?;
+            Ok(SeqChunk {
+                blocks: b,
+                rows,
+            })
+        })
+        .collect::<ExecutorResult<Vec<_>>>()?;
+    // ⭐ THE WAVE'S OWN PICK LAW: the suffix runs iff any request finishes — a non-finishing
+    // request's answer row is computed and never read, the same inert suffix a middle chunk's
+    // launch skips whole.
+    let finishes: Vec<bool> = ids
+        .iter()
+        .zip(ns)
+        .map(|(&id, &n)| n >= tokens.prompt_len(id))
+        .collect();
+    let want = if finishes.iter().any(|&f| f) {
+        LogitsWanted::LastRow
+    } else {
+        LogitsWanted::None
+    };
+    let rung = scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(w as u32)
+        .ok_or_else(|| werr("superdsc packed prefill: the selected rung has zero rows".to_string()))?;
+    let out = run_card_launch(
+        LaunchRows::Sequence { reqs: &reqs },
+        &sh,
+        sess,
+        pmeta,
+        rung,
+        // The rung's own baked request count — the wave's extent and seat width.
+        *rs as u32,
+        SamplerLaws {
+            seeds: scratchy_subtile::sdsc_abstract::SeedSource::Host(&chunk_toks),
+            want_logits: want,
+            laws: SeatLaws::Prompt { draws },
+        },
+    )?;
+    // ⭐ ONE PICK PER FINISHING REQUEST — seat row `s` is request `s`'s answer row
+    // (`AnswerRows`' own law: the readback maps pick `s` to slot `s` by order).
+    let picks = match out {
+        BatchOut::Done(p) => p,
+        BatchOut::Deferred(_) => {
+            return Err(werr(
+                "a packed prompt chunk deferred its read — only a decode can",
+            ));
+        }
+    };
+    let mut out_picks: Vec<Option<u32>> = Vec::with_capacity(ids.len());
+    for (q, (&id, &n)) in ids.iter().zip(ns).enumerate() {
+        tokens.set_tokens_in_pool(id, n);
+        if finishes[q] {
+            let tok = picks
+                .as_deref()
+                .and_then(|p| p.get(q))
+                .copied()
+                .ok_or_else(|| {
+                    werr(format!(
+                        "superdsc packed prefill: the wave's launch picked no token for request \
+                         {q} — its minted draw never ran"
+                    ))
+                })?;
+            tokens.push_generated(id, tok);
+            out_picks.push(Some(tok));
+        } else {
+            out_picks.push(None);
+        }
+    }
+    tracing::debug!(
+        "PREFILL_PATH=packed rung={w}x{rs} live={} rows={real} finishes={}",
+        ids.len(),
+        finishes.iter().filter(|f| **f).count()
+    );
+    Ok(out_picks)
 }
 
 /// What a [`forward_chunk`] runs: one request's chunk, the tokens `toks` at absolute positions

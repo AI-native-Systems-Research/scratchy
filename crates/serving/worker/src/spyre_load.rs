@@ -1431,7 +1431,7 @@ impl SpyreWorker {
                     .filter(|&&(rm, seqs, _)| rm > 1 && seqs == 1)
                     .min_by_key(|&&(rm, _, _)| rm);
                 let prefill_code = match (top_prefill, narrowest_rung) {
-                    (Some(_tp), Some((rm, sent))) => Some(sent
+                    (Some(_tp), Some((rm, _, sent))) => Some(sent
                         .strip_prefix(SUPERDSC_SENTINEL)
                         .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .ok_or_else(|| {
@@ -1960,10 +1960,12 @@ impl SpyreWorker {
                 // lands in the ladder at its own pair (the worker selects on the pair). The
                 // anchor's own entry — the narrowest SOLO rung, `(prefill_m, 1)` — is skipped:
                 // its session is `prefill_ss` itself, built and aliased above.
-                let ladder: Vec<(
+                /// One ladder job: the rung's `(width, seqs)` pair and its bundle.
+                type LadderJob = (
                     (usize, usize),
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
-                )> = g0
+                );
+                let ladder: Vec<LadderJob> = g0
                     .prefill_rungs
                     .iter()
                     .filter_map(|&(rung_m, rung_s, sentinel)| {
@@ -2060,12 +2062,7 @@ impl SpyreWorker {
                         .unwrap_or(4)
                         .min(ladder.len().max(1));
                     let chunk = ladder.len().div_ceil(nthreads.max(1));
-                    let chunks: Vec<
-                        Vec<(
-                            usize,
-                            &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
-                        )>,
-                    > = if chunk == 0 {
+                    let chunks: Vec<Vec<LadderJob>> = if chunk == 0 {
                         Vec::new()
                     } else {
                         ladder.chunks(chunk).map(|c| c.to_vec()).collect()
