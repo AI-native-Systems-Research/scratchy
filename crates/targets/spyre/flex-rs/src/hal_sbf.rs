@@ -5,7 +5,7 @@
 //! trade-secret source; their field maps, bit ranges, enum bit values, and
 //! packing logic live ONLY on the implementation side of the FFI boundary
 //! (historically the C++ shim TU cited throughout this crate; today the
-//! `libflex_shim.a` archive built from the IBM-internal tree). This module
+//! `libflex_shim.a` archive built from the internal tree). This module
 //! carries OUR vocabulary — modes by meaning, byte offsets, sids, masks —
 //! and hands those scalars to the C-ABI doors, which return finished
 //! section words. No type, function, or test in this file knows where any

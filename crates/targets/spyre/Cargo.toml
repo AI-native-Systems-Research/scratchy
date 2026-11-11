@@ -39,10 +39,10 @@ spyre = []
 spyre-lower = ["spyre"]
 # The card surface's flex-rs edge: the in-tree crate carries the C-ABI
 # DECLARATIONS only — the implementation is linked statically, as two
-# archives built on card hosts from the IBM-internal trees
+# archives built on card hosts from the internal trees
 # (libflex_shim.a, an extern "C" seam over the native Rust port, then
 # libsenlib_oco.a), from the directory SENLIB_STATIC_LIB_DIR names.
-# A public clone compiles with no IBM artifact present; a spyre-hw
+# A public clone compiles with no internal artifact present; a spyre-hw
 # BUILD without the archives refuses loudly at the build script,
 # naming what is missing. No feature of the real crate needs naming
 # here; the declarations are generation-free.

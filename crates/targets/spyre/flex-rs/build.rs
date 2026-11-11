@@ -3,7 +3,7 @@
 //!
 //! The declarations live in `src/senlib_ffi.rs` (names, signatures, and the
 //! per-door contract prose). Their implementation is built on card hosts
-//! from the IBM-internal trees and staged as archives:
+//! from the internal trees and staged as archives:
 //!
 //!   - `libflex_shim.a`  — the FFI export layer over the native port of the
 //!     senlib doors (the mirror of this crate's declarations);
@@ -42,9 +42,7 @@ fn main() {
         format!(
             "flex-rs links its C-ABI implementation from STATIC archives, and the build \
              cannot proceed without them. Set SENLIB_STATIC_LIB_DIR to the directory \
-             holding libflex_shim.a and libsenlib_oco.a (both built on card hosts from \
-             the IBM-internal trees; the archives embed into the binary, so the \
-             resulting executable is a card-host artifact). {dir_name}"
+             holding libflex_shim.a and libsenlib_oco.a. {dir_name}"
         )
     };
 

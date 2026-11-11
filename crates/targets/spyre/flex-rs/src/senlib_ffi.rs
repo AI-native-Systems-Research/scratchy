@@ -131,7 +131,7 @@
 //!
 //! The resolution: every one of these names is a plain `extern "C"` symbol
 //! exported by `libflex_shim.a`, the FFI implementation archive built on
-//! card hosts from the IBM-internal tree — each a one-line marshal onto the
+//! card hosts from the internal tree — each a one-line marshal onto the
 //! real, PUBLIC `flex::DeviceHandle` /
 //! `senlib::ControlBlockInterface` / `senlib::ResponseBlockInterface`
 //! methods cited in each declaration's doc comment (the `cxx-shim/*.cpp`
