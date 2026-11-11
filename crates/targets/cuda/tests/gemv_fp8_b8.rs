@@ -159,6 +159,10 @@ struct Shape {
 /// The routed experts' 8 picks a token; the tests' banks hold 8 experts, all picked.
 const PAIRS: u32 = 8;
 const BANK: u32 = 8;
+/// The expert count today's expert GEMVs are launched with: as the tape launches them, a model's
+/// (they take 128 or 256), over the `BANK`-expert bank. Every pick is below `BANK`, so only the
+/// bank's experts are read.
+const TODAY_EXPERTS: u32 = 128;
 
 const SILU: GatedOp = GatedOp::Silu;
 const GELU: GatedOp = GatedOp::Gelu;
@@ -1115,33 +1119,19 @@ fn today(c: &Case, out: &[DeviceBuffer], p: &DeviceBuffer) {
                 op.code(),
                 null,
             ),
-            (
-                Kind::GateUp(op),
-                Form::Expert {
-                    experts,
-                    expert_rows,
-                    ..
-                },
-            ) => expert_gate_up_gemv_fp8(
+            (Kind::GateUp(op), Form::Expert { expert_rows, .. }) => expert_gate_up_gemv_fp8(
                 (x, c.weight(0), c.weight(1), c.topk.ptr().cast_const()),
                 (out[0].ptr(), p.ptr()),
                 (1, PAIRS, n0, s.k),
-                (experts, expert_rows, gemv_splits(n0, s.k, PAIRS)),
+                (TODAY_EXPERTS, expert_rows, gemv_splits(n0, s.k, PAIRS)),
                 op.code(),
                 null,
             ),
-            (
-                _,
-                Form::Expert {
-                    experts,
-                    expert_rows,
-                    ..
-                },
-            ) => expert_gemv_fp8(
+            (_, Form::Expert { expert_rows, .. }) => expert_gemv_fp8(
                 (x, c.weight(0), c.topk.ptr().cast_const()),
                 (out[0].ptr(), p.ptr()),
                 (1, PAIRS, n0, s.k),
-                (experts, expert_rows),
+                (TODAY_EXPERTS, expert_rows),
                 (true, gemv_splits(n0, s.k, PAIRS)),
                 null,
             ),

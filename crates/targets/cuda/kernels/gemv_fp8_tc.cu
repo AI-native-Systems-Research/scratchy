@@ -446,8 +446,13 @@ int launch(const void* q, const void* a_scale, const void* const* b, const void*
 //   - **The activation as `[rows, 1, k]`**: each row its own depth, so every box's rows past 0 are
 //     TMA's zero fill even when the activation holds several rows (the expert pairs' 8). Without
 //     it a box would read the next rows into `D`'s other columns, which the row sum adds.
-//   - **The K tail**: `⌈k / 256⌉` steps; both tensor maps' K extent is `k`, so TMA zero-fills both
-//     boxes past it (`tests/gemv_fp8_b8.rs`'s swizzled-box probe), and a zero adds 0 exactly.
+//   - **The K tail**: `⌈k / 256⌉` steps. Both boxes are 128-byte swizzled, and TK's tensor map for
+//     a swizzled tile bounds K in whole 128-byte atoms (TK-1's R1 rule): past `k`, a whole atom is
+//     TMA's zero fill, but the rest of a partial one is read from memory past the row (the next
+//     row's bytes). So when `k % 128 ≠ 0` the consumer zeroes those columns, `[tail_from, tail_to)`
+//     of the last step's two tiles (64 a row: `k` is a multiple of 64), through the tile accessor,
+//     before its WGMMAs (`b8_zero_tail`); a zero adds 0 exactly (`tests/gemv_fp8_b8.rs`'s
+//     swizzled-box probe, which applies the same zeroing).
 //   - **The residual epilogue** (`add`): `round_bf16`, the residual row widened, one f32 add, the
 //     store's one rounding: `scratchy::ops::with_residual`'s bits (W4a's `MatvecEpilogue`).
 //   - **The f32 store** (`F32`): the scaled f32 sums, unrounded, for the gate/up members, so the
@@ -483,7 +488,35 @@ struct b8_globals {
     // The first tile of members 1 and 2 (the tile count for an absent one), the K steps, the
     // activation row of pair `p` (`p / row_div`), and the residual epilogue's switch.
     int start1, start2, k_steps, row_div, add;
+    // The last step's columns read past `k` inside its last 128-byte atom (`tail_from` =
+    // `tail_to` when there are none).
+    int tail_from, tail_to;
 };
+
+// The K tail's columns `[from, to)` of a stage's two tiles zeroed by the `threads` threads of a
+// group, thread `tid` of it: every row (rows past the arrays are TMA's zero fill already).
+__device__ inline void b8_zero_tail(b8_w_tile& w, b8_x_tile& x, int from, int to, int tid,
+                                    int threads) {
+    const fp8e4m3 zero = base_types::convertor<fp8e4m3, float>::convert(0.0f);
+    const int width = to - from;
+    constexpr int ROWS = b8_w_tile::rows + b8_x_tile::rows;
+    for (int i = tid; i < ROWS * width; i += threads) {
+        const int r = i / width, c = from + i % width;
+        if (r < b8_w_tile::rows) {
+            w[{r, c}] = zero;
+        } else {
+            x[{r - b8_w_tile::rows, c}] = zero;
+        }
+    }
+}
+
+// The K tail of a `k`-wide row at B8's 256-wide steps: `[from, to)` of the last step's columns, empty
+// when `k` is a multiple of 128 (a whole atom past `k` is TMA's zero fill).
+inline void b8_tail(uint32_t k, int& from, int& to) {
+    const int rem = int(k - (k - 1) / uint32_t(tc_b8::k_step) * uint32_t(tc_b8::k_step));
+    from = rem;
+    to = (rem + 127) / 128 * 128;
+}
 
 template <bool EXPERT, bool F32>
 __global__ __launch_bounds__(NUM_THREADS, tc_b8::min_blocks) void gemv_fp8_b8_ker(
@@ -530,6 +563,14 @@ __global__ __launch_bounds__(NUM_THREADS, tc_b8::min_blocks) void gemv_fp8_b8_ke
         for (int j = 0; j < g.k_steps; j++) {
             const int s = j % STAGES;
             wait(arrived[s], (j / STAGES) % 2);
+            if (j == g.k_steps - 1 && g.tail_from < g.tail_to) {
+                // The K tail read past `k`: zeroed by the warpgroup before its WGMMAs read it;
+                // each writer's async-proxy fence (`mma_fence`) precedes the barrier.
+                b8_zero_tail(w_s[s], x_s[s], g.tail_from, g.tail_to, warpgroup::laneid(),
+                             kittens::WARPGROUP_THREADS);
+                warpgroup::mma_fence(acc);
+                warpgroup::sync(1);
+            }
             warpgroup::mma_ABt(acc, w_s[s], x_s[s]);
             warpgroup::mma_async_wait();
             if (warpgroup::laneid() == 0) {
@@ -567,6 +608,9 @@ struct b8_probe_globals {
     b8_dump_x_gl poison_x, dump_x;
     b8_dump_w_gl poison_w, dump_w;
     int row, tile, j;
+    // B8's K tail zeroing at step `j` (`tail_from` = `tail_to` but at the last step of a `k` with a
+    // partial last atom).
+    int tail_from, tail_to;
 };
 
 __global__ void gemv_fp8_b8_box_probe_ker(const __grid_constant__ b8_probe_globals g) {
@@ -588,6 +632,11 @@ __global__ void gemv_fp8_b8_box_probe_ker(const __grid_constant__ b8_probe_globa
     warp::tma::load_async(xs, g.x, {0, g.row, 0, g.j}, loaded);
     warp::tma::load_async(ws, g.w, {0, 0, g.tile, g.j}, loaded);
     wait(loaded, 0);
+    // The boxes as B8 reads them: its K tail zeroing, by this one warp.
+    if (g.tail_from < g.tail_to) {
+        b8_zero_tail(ws, xs, g.tail_from, g.tail_to, warp::laneid(), kittens::WARP_THREADS);
+        __syncwarp();
+    }
     warp::tma::store_async(g.dump_x, xs, {0, 0, 0, 0});
     warp::tma::store_async(g.dump_w, ws, {0, 0, 0, 0});
     warp::tma::store_async_wait();
@@ -668,7 +717,10 @@ int launch_b8(const b8_args& a, void* stream) {
         a.count > 2 ? tiles[0] + tiles[1] : all,
         int((a.k + uint32_t(tc_b8::k_step) - 1) / uint32_t(tc_b8::k_step)),
         int(a.row_div),
-        a.residual != nullptr ? 1 : 0};
+        a.residual != nullptr ? 1 : 0,
+        0,
+        0};
+    b8_tail(a.k, G.tail_from, G.tail_to);
     void* args[] = {&G};
     const dim3 grid{uint32_t(all), a.pairs}, block{uint32_t(NUM_THREADS)};
     return static_cast<int>(cudaLaunchKernel(gemv_fp8_b8_ker<EXPERT, F32>, grid, block, args,
@@ -857,7 +909,10 @@ extern "C" int scratchy_cuda_gemv_fp8_b8_box_probe(const void* x, uint32_t rows,
             b8_dump_x_gl{e4(dump_x), nullptr, nullptr, size_t(32), size_t(256)},
             b8_dump_w_gl{e4(poison_w), nullptr, nullptr, size_t(64), size_t(256)},
             b8_dump_w_gl{e4(dump_w), nullptr, nullptr, size_t(64), size_t(256)},
-            int(row), int(tile), int(j)};
+            int(row), int(tile), int(j), 0, 0};
+        if (uint64_t(j + 1) * 256 >= k) {
+            b8_tail(k, G.tail_from, G.tail_to);
+        }
         void* args[] = {&G};
         const dim3 grid{1u}, block{uint32_t(kittens::WARP_THREADS)};
         return static_cast<int>(cudaLaunchKernel(gemv_fp8_b8_box_probe_ker, grid, block, args,
