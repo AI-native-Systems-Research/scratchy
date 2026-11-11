@@ -588,3 +588,187 @@ extern "C" int scratchy_cuda_tma_probe_occupancy(uint32_t variant, uint32_t cons
             return occupancy_ring<page16k>(blocks);
     }
 }
+
+// ── The ceiling probe's pure stream in the tensor-core GEMV's geometry (/tmp/d-cap.md §3 P-A) ──
+//
+// `gemv_fp8_tc.cu`'s grid and stream-K runs (`CTAS` CTAs; CTA `c` takes units
+// `[⌊c · units / CTAS⌋, ⌊(c + 1) · units / CTAS⌋)` of `tiles × k_steps`), one producer warp (warp
+// 0 of the second warpgroup) and one consumer warpgroup that only waits each stage, reads one byte
+// per lane (TK's `st` accessor, then TK's element convertor and `base_ops::sum`) and releases it.
+// The variants differ in the box and its stage:
+//   0 A1 `b64`: B `st_fp8e4m3<128, 64>` (8 KB, 64-byte rows), 12 stages: the TC kernel's B box;
+//   1 A2 `b64+a`: A1 plus an `st_fp8e4m3<64, 64>` A box from a `[1, k]` map per stage (63 of its
+//     64 rows TMA's zero fill): the TC kernel's stage as it runs;
+//   2 A3 `b128`: B `st_fp8e4m3<128, 128>` (16 KB, 128-byte rows), 8 stages;
+//   3 A4 `b128+a`: A3 plus an `st_fp8e4m3<64, 128>` A box, 8 stages;
+//   4 A5 `b256`: B `st_fp8e4m3<64, 256>` (16 KB, 256-byte rows), 8 stages;
+//   5 A6 `b64x2cta`: A1 at 264 CTAs, 2 per SM, 6 stages each.
+// With every weight byte 1.0 each consumer thread folds one 1.0 per unit, so the folds add up to
+// exactly `128 · units`.
+
+namespace {
+
+template <int ROWS, int K_STEP, bool A, int STAGES_, int CTAS, int MIN_BLOCKS>
+struct stream_variant {
+    using b_box = st_fp8e4m3<ROWS, K_STEP>;
+    using a_box = st_fp8e4m3<64, K_STEP>;
+    static constexpr int rows = ROWS;
+    static constexpr int k_step = K_STEP;
+    static constexpr bool a = A;
+    static constexpr int stages = STAGES_;
+    static constexpr int ctas = CTAS;
+    static constexpr int min_blocks = MIN_BLOCKS;
+    static constexpr int smem =
+        STAGES_ * int(sizeof(b_box) + (A ? sizeof(a_box) : 0)) + 1024;
+    static_assert(MIN_BLOCKS * smem <= kittens::MAX_SHARED_MEMORY, "the CTAs per SM fit");
+};
+
+using a1_b64 = stream_variant<128, 64, false, 12, 132, 1>;
+using a2_b64a = stream_variant<128, 64, true, 12, 132, 1>;
+using a3_b128 = stream_variant<128, 128, false, 8, 132, 1>;
+using a4_b128a = stream_variant<128, 128, true, 8, 132, 1>;
+using a5_b256 = stream_variant<64, 256, false, 8, 132, 1>;
+using a6_b64x2 = stream_variant<128, 64, false, 6, 264, 2>;
+
+using stream_b_gl = gl<fp8e4m3, 1, 1, -1, -1, typename a1_b64::b_box, typename a3_b128::b_box,
+                       typename a5_b256::b_box>;
+using stream_a_gl = gl<fp8e4m3, 1, 1, -1, -1, typename a1_b64::a_box, typename a3_b128::a_box>;
+
+struct stream_globals {
+    stream_b_gl b;
+    stream_a_gl a;
+    out_gl out;
+    int tiles;
+    int k_steps;
+    int ctas;
+};
+
+constexpr int STREAM_THREADS = 2 * kittens::WARPGROUP_THREADS;
+
+__device__ inline long long stream_run_start(int c, long long units, int ctas) {
+    return units * c / ctas;
+}
+
+template <typename V>
+__global__ __launch_bounds__(STREAM_THREADS, V::min_blocks) void tc_stream_probe_ker(
+    const __grid_constant__ stream_globals g) {
+    using b_box = typename V::b_box;
+    using a_box = typename V::a_box;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    b_box(&b_s)[V::stages] = al.allocate<b_box, V::stages>();
+    __shared__ kittens::semaphore arrived[V::stages], done[V::stages];
+    const long long units = (long long)g.tiles * g.k_steps;
+    const int c = blockIdx.x;
+    const long long u0 = stream_run_start(c, units, g.ctas);
+    const int len = int(stream_run_start(c + 1, units, g.ctas) - u0);
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < V::stages; s++) {
+            init_semaphore(arrived[s], 0, 1);
+            init_semaphore(done[s], 1, 0);
+        }
+    }
+    __syncthreads();
+    float acc = 0.0f;
+    if (warpgroup::groupid() == 1) {
+        if (warpgroup::warpid() == 0) {
+            if constexpr (V::a) {
+                a_box(&a_s)[V::stages] = al.allocate<a_box, V::stages>();
+                for (int i = 0; i < len; i++) {
+                    const long long u = u0 + i;
+                    const int t = int(u / g.k_steps), j = int(u % g.k_steps), s = i % V::stages;
+                    if (i >= V::stages) {
+                        wait(done[s], ((i - V::stages) / V::stages) % 2);
+                    }
+                    warp::tma::expect_bytes(arrived[s], sizeof(a_box) + sizeof(b_box));
+                    warp::tma::load_async(a_s[s], g.a, {0, 0, 0, j}, arrived[s]);
+                    warp::tma::load_async(b_s[s], g.b, {0, 0, t, j}, arrived[s]);
+                }
+            } else {
+                for (int i = 0; i < len; i++) {
+                    const long long u = u0 + i;
+                    const int t = int(u / g.k_steps), j = int(u % g.k_steps), s = i % V::stages;
+                    if (i >= V::stages) {
+                        wait(done[s], ((i - V::stages) / V::stages) % 2);
+                    }
+                    warp::tma::expect_bytes(arrived[s], sizeof(b_box));
+                    warp::tma::load_async(b_s[s], g.b, {0, 0, t, j}, arrived[s]);
+                }
+            }
+        }
+    } else {
+        // Thread `x` of the consumer warpgroup reads byte `(x % rows, x / rows)` of each stage.
+        const int x = int(threadIdx.x);
+        for (int i = 0; i < len; i++) {
+            const int s = i % V::stages;
+            wait(arrived[s], (i / V::stages) % 2);
+            const fp8e4m3 v = b_s[s][{x % V::rows, x / V::rows}];
+            acc = base_ops::sum::op<float>(acc, base_types::convertor<float, fp8e4m3>::convert(v));
+            // Every thread has read the stage before it is released.
+            warpgroup::sync(1);
+            if (warpgroup::laneid() == 0) {
+                arrive(done[s], 1);
+            }
+        }
+    }
+    g.out[{0, 0, c, int(threadIdx.x)}] = acc;
+}
+
+template <typename V>
+int launch_stream(stream_globals G, uint32_t n, uint32_t k, void* stream) {
+    if (n % uint32_t(V::rows) != 0 || k % uint32_t(V::k_step) != 0) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    const cudaError_t set = cudaFuncSetAttribute(
+        tc_stream_probe_ker<V>, cudaFuncAttributeMaxDynamicSharedMemorySize, V::smem);
+    if (set != cudaSuccess) {
+        return static_cast<int>(set);
+    }
+    G.tiles = int(n / uint32_t(V::rows));
+    G.k_steps = int(k / uint32_t(V::k_step));
+    const long long units = (long long)G.tiles * G.k_steps;
+    G.ctas = units < V::ctas ? int(units) : V::ctas;
+    void* args[] = {&G};
+    return static_cast<int>(cudaLaunchKernel(tc_stream_probe_ker<V>, dim3(G.ctas),
+                                             dim3(STREAM_THREADS), args, V::smem,
+                                             static_cast<cudaStream_t>(stream)));
+}
+
+}  // namespace
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a C++
+// exception was caught; any other value = the cudaError_t of the attribute call or the launch.
+//
+// The ceiling probe's pure stream, variant `variant` (0 to 5: A1 to A6 above) over `b [n, k]`
+// e4m3, its A box (A2, A4) from `a [1, k]` e4m3; `out [264, 256]` f32 receives every thread's fold.
+// `n` a non-zero multiple of the variant's box rows (128, or 64 for A5) and `k` of its K step (64,
+// 128 or 256), both at most INT_MAX / 2. It sets its instance's shared-memory attribute on every
+// call (no worker launches it); asynchronous on `stream`.
+extern "C" int scratchy_cuda_tc_stream_probe(const void* b, const void* a, void* out, uint32_t n,
+                                             uint32_t k, uint32_t variant,
+                                             void* stream /* cudaStream_t; null = default */) {
+    if (n == 0 || k == 0 || n > uint32_t(INT_MAX / 2) || k > uint32_t(INT_MAX / 2) || variant > 5) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        stream_globals G{
+            stream_b_gl{static_cast<fp8e4m3*>(const_cast<void*>(b)), nullptr, nullptr, size_t(n),
+                        size_t(k)},
+            stream_a_gl{static_cast<fp8e4m3*>(const_cast<void*>(a)), nullptr, nullptr, size_t(1),
+                        size_t(k)},
+            out_gl{static_cast<float*>(out), nullptr, nullptr, size_t(264),
+                   size_t(STREAM_THREADS)},
+            0, 0, 0};
+        switch (variant) {
+            case 0: return launch_stream<a1_b64>(G, n, k, stream);
+            case 1: return launch_stream<a2_b64a>(G, n, k, stream);
+            case 2: return launch_stream<a3_b128>(G, n, k, stream);
+            case 3: return launch_stream<a4_b128a>(G, n, k, stream);
+            case 4: return launch_stream<a5_b256>(G, n, k, stream);
+            default: return launch_stream<a6_b64x2>(G, n, k, stream);
+        }
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}

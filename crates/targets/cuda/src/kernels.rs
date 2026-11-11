@@ -720,6 +720,15 @@ unsafe extern "C" {
         ctas: u32,
         blocks: *mut i32,
     ) -> i32;
+    fn scratchy_cuda_tc_stream_probe(
+        b: *const c_void,
+        a: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        k: u32,
+        variant: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_attn_decode_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_bf16(
         q: *const c_void,
@@ -2435,6 +2444,32 @@ pub unsafe fn tma_ring_probe(
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
     // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_tma_ring_probe(b, out, n, k, variant, stream) };
+    check(code, KernelError::RowShape { rows: n, cols: k })
+}
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only (the ceiling probe, /tmp/d-cap.md §3
+/// P-A). Stream `b` (`[n, k]` e4m3) in the tensor-core GEMV's geometry (132 CTAs, stream-K runs,
+/// one producer warp, one consumer warpgroup reading one byte per lane) as variant `variant`: 0
+/// A1 `b64` (`st<128, 64>` boxes), 1 A2 `b64+a` (plus a `[1, k]` A box from `a`), 2 A3 `b128`, 3
+/// A4 `b128+a`, 4 A5 `b256` (`st<64, 256>`), 5 A6 `b64x2cta` (A1 at 264 CTAs); each thread's fold
+/// into `out`. Refused with [`KernelError::RowShape`] (`rows` `n`, `cols` `k`) unless `n` is a
+/// non-zero multiple of the variant's box rows, `k` of its K step, both at most `i32::MAX / 2`,
+/// and `variant` at most 5. Asynchronous.
+///
+/// # Safety
+///
+/// `b` must be a 16-byte-aligned device pointer to `n · k` bytes, `a` to `k` bytes and `out` to
+/// `264 · 256` f32, valid for the whole kernel, `out` overlapping neither. `stream` as
+/// [`tma_ring_probe`]'s.
+#[doc(hidden)]
+pub unsafe fn tc_stream_probe(
+    (b, a, out): (*const c_void, *const c_void, *mut c_void),
+    (n, k): (u32, u32),
+    variant: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe { scratchy_cuda_tc_stream_probe(b, a, out, n, k, variant, stream) };
     check(code, KernelError::RowShape { rows: n, cols: k })
 }
 

@@ -436,3 +436,86 @@ fn the_tma_consume_probe_bandwidth_is_recorded() {
         "a consume probe variant did not read every byte of its weight"
     );
 }
+
+// ── The ceiling probe, P-A: the pure stream in the tensor-core GEMV's geometry ──────────
+
+/// The P-A variants, by the launcher's number (/tmp/d-cap.md §3).
+const STREAM: &[(u32, &str)] = &[
+    (0, "A1_b64"),
+    (1, "A2_b64+a"),
+    (2, "A3_b128"),
+    (3, "A4_b128+a"),
+    (4, "A5_b256"),
+    (5, "A6_b64x2cta"),
+];
+
+/// The ceiling probe's P-A (/tmp/d-cap.md §3): the weight stream alone in the tensor-core GEMV's
+/// geometry, at the TMA box widths and with or without its zero-filled A box, at the 27B's
+/// gate+up, down and GDN qkv+z bytes; cold, read-flush cold and hot, two rounds (each variant in
+/// turn, so A, B, A, B), as `CAP_PA <variant> <shape> <temp> <TB/s>`. Recorded, not asserted, but
+/// for the folds: with every weight byte 1.0 each consumer thread folds one 1.0 per unit, so a
+/// variant's folds add up to exactly `128 · units`.
+#[test]
+fn the_tc_stream_probe_bandwidth_is_recorded() {
+    use scratchy_target_cuda::kernels::tc_stream_probe;
+    let device = h100();
+    let scrub = filled(&device, SCRUB_BYTES, 0);
+    let flush_n = FLUSH_N as usize;
+    let flush = (
+        filled(&device, flush_n * FLUSH_K as usize, 0x38),
+        filled(&device, (16 * flush_n + 256) * 4, 0),
+    );
+    let mut pass = true;
+    for (n, k, shape) in [
+        (34816u32, 5120u32, "gate+up_34816x5120"),
+        (5120, 17408, "down_5120x17408"),
+        (16384, 5120, "gdn_group_16384x5120"),
+    ] {
+        let (nu, ku) = (n as usize, k as usize);
+        let b = filled(&device, nu * ku, 0x38);
+        let a = filled(&device, ku, 0x38);
+        for round in 1..=2 {
+            for &(v, name) in STREAM {
+                let out = filled(&device, 264 * 256 * 4, 0);
+                let launch = || {
+                    // SAFETY: `b` holds n·k bytes, `a` k bytes and `out` 264·256 f32, three
+                    // allocations; null is the default stream.
+                    unsafe {
+                        tc_stream_probe(
+                            (b.ptr().cast_const(), a.ptr().cast_const(), out.ptr()),
+                            (n, k),
+                            v,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("tc_stream_probe launch");
+                };
+                for (temp, (med, lo, hi)) in temps(&scrub, &flush, launch) {
+                    eprintln!(
+                        "CAP_PA {name} {shape} {temp} {:.2} (round {round}: median={med:.1}us \
+                         min={lo:.1}us max={hi:.1}us)",
+                        (nu * ku) as f64 / med / 1e6
+                    );
+                }
+                // One fold of 1.0 per consumer thread per unit; each launch overwrites `out`.
+                let (rows, step) = match v {
+                    2 | 3 => (128, 128),
+                    4 => (64, 256),
+                    _ => (128, 64),
+                };
+                let units = (nu / rows * (ku / step)) as f64;
+                let want = 128.0 * units;
+                let got = fold_sum(&out);
+                if got != want {
+                    eprintln!("CAP_PA_FOLDS {name} {shape}: want={want} got={got} FAIL");
+                    pass = false;
+                }
+            }
+        }
+        eprintln!(
+            "CAP_PA_FOLDS {shape}: {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+    assert!(pass, "a P-A variant did not read every unit");
+}
