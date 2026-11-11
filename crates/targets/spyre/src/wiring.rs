@@ -832,20 +832,30 @@ impl PagedStep {
                     PAGED_WINDOW_MASK, PAGED_WINDOW_PAGE_TABLE, PAGED_WINDOW_QUERY_ROWS,
                     paged_window_tid,
                 };
-                for r in 1..self.extent.requests().get() {
-                    v.extend([
-                        (
-                            paged_window_tid(r, PAGED_WINDOW_PAGE_TABLE),
-                            CardSeat::Step,
-                            u64::from(self.pages) * self.card_walk_step(),
-                        ),
-                        (
-                            paged_window_tid(r, PAGED_WINDOW_MASK),
-                            CardSeat::Step,
-                            u64::from(self.pages) * w * slots * 2,
-                        ),
-                        (paged_window_tid(r, PAGED_WINDOW_QUERY_ROWS), CardSeat::Step, sticks(w)),
-                    ]);
+                // ⛔ THE WINDOWS ARE A PROMPT CHUNK'S — a multi-row sequence step (`per_request > 1`).
+                // A single-row decode step is also a Sequence step, but its pair is
+                // `(1 row, seqs)`: one launch over its own tables, no window unroll, exactly as
+                // every decode rung placed them before the S axis existed.
+                if self.extent.per_request().get() > 1 {
+                    for r in 1..self.extent.requests().get() {
+                        v.extend([
+                            (
+                                paged_window_tid(r, PAGED_WINDOW_PAGE_TABLE),
+                                CardSeat::Step,
+                                u64::from(self.pages) * self.card_walk_step(),
+                            ),
+                            (
+                                paged_window_tid(r, PAGED_WINDOW_MASK),
+                                CardSeat::Step,
+                                u64::from(self.pages) * w * slots * 2,
+                            ),
+                            (
+                                paged_window_tid(r, PAGED_WINDOW_QUERY_ROWS),
+                                CardSeat::Step,
+                                sticks(w),
+                            ),
+                        ]);
+                    }
                 }
             }
         }
@@ -1988,7 +1998,7 @@ pub struct TpForward<T: crate::bundle_code::collective::World> {
     /// rungs and the prefix-capable prefill rungs — every rung the one-rank world serves, baked for
     /// this world, so a sharded session serves every prompt length and live request count on its
     /// own world's bundles.
-    pub prefill_rungs: &'static [(u32, &'static str)],
+    pub prefill_rungs: &'static [(u32, u32, &'static str)],
     pub decode_rungs: &'static [(
         crate::manifest::RungSeqs,
         crate::manifest::SweptCols,

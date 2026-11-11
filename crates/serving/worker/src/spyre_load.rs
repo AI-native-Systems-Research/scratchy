@@ -1422,11 +1422,14 @@ impl SpyreWorker {
                 // `top_prefill` remains exactly what it was gated to be: the anchor ONLY when the
                 // ladder has no multi-token rung at all, so its width is the prefill wiring's own
                 // `m_cap` in that case and never disagrees with the bundle it runs.
+                // The narrowest SOLO rung: the anchor's chunk is one request's, and the
+                // (width, seqs)-ascending list puts the solo rung of a width before its packed
+                // twin, so the min is the solo entry even where a packed rung shares its width.
                 let narrowest_rung = g0
                     .prefill_rungs
                     .iter()
-                    .filter(|(rm, _)| *rm > 1)
-                    .min_by_key(|(rm, _)| *rm);
+                    .filter(|&&(rm, seqs, _)| rm > 1 && seqs == 1)
+                    .min_by_key(|&&(rm, _, _)| rm);
                 let prefill_code = match (top_prefill, narrowest_rung) {
                     (Some(_tp), Some((rm, sent))) => Some(sent
                         .strip_prefix(SUPERDSC_SENTINEL)
@@ -1611,14 +1614,14 @@ impl SpyreWorker {
                 let anchor_rung_m = g0
                     .prefill_rungs
                     .iter()
-                    .filter(|(rm, _)| *rm > 1)
-                    .min_by_key(|(rm, _)| *rm)
-                    .map(|(rm, _)| *rm);
+                    .filter(|&&(rm, seqs, _)| rm > 1 && seqs == 1)
+                    .min_by_key(|&&(rm, _, _)| rm)
+                    .map(|&(rm, _, _)| rm);
                 let ladder_rung_bytes: u64 = g0
                     .prefill_rungs
                     .iter()
-                    .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
-                    .filter_map(|(_, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
+                    .filter(|&&(rm, seqs, _)| rm > 1 && (seqs > 1 || Some(rm) != anchor_rung_m))
+                    .filter_map(|&(_, _, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
                     .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                     .map(|rc| non_resident(&rc.layout))
                     .sum::<u64>()
@@ -1827,15 +1830,17 @@ impl SpyreWorker {
                         let prefill_m = g0
                             .prefill_rungs
                             .iter()
-                            .filter(|(rm, _)| *rm > 1)
-                            .min_by_key(|(rm, _)| *rm)
+                            // The anchor is the narrowest SOLO rung — the (width, seqs)-ascending
+                            // list puts it before any packed twin of the same width.
+                            .filter(|&&(rm, seqs, _)| rm > 1 && seqs == 1)
+                            .min_by_key(|&&(rm, _, _)| rm)
                             .map_or_else(
                                 || {
                                     wirings.prefill.as_ref().map_or(0, |p| {
                                         p.tensor_shapes[p.embed_src as usize].0 as usize
                                     })
                                 },
-                                |(rm, _)| *rm as usize,
+                                |&(rm, _, _)| rm as usize,
                             );
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
@@ -1951,21 +1956,26 @@ impl SpyreWorker {
                 // The thread only CREATES sessions (`SuperDscSession` is `Send`); the `alias_seg_from`
                 // calls stay on this thread after the join, because they need `&ss` and are a pointer
                 // swap, not work.
+                // ⭐ THE RUNG IS A `(width, seqs)` PAIR — the job carries both, so the session
+                // lands in the ladder at its own pair (the worker selects on the pair). The
+                // anchor's own entry — the narrowest SOLO rung, `(prefill_m, 1)` — is skipped:
+                // its session is `prefill_ss` itself, built and aliased above.
                 let ladder: Vec<(
-                    usize,
+                    (usize, usize),
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                 )> = g0
                     .prefill_rungs
                     .iter()
-                    .filter_map(|(rung_m, sentinel)| {
-                        let rm = *rung_m as usize;
-                        if rm == prefill_m || rm <= 1 {
+                    .filter_map(|&(rung_m, rung_s, sentinel)| {
+                        let rm = rung_m as usize;
+                        let rs = rung_s as usize;
+                        if (rm, rs) == (prefill_m, 1) || rm <= 1 {
                             return None;
                         }
                         sentinel
                             .strip_prefix(SUPERDSC_SENTINEL)
                             .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .map(|c| (rm, c))
+                            .map(|c| ((rm, rs), c))
                     })
                     .collect();
                 let _t_sess = std::time::Instant::now();
@@ -2077,7 +2087,7 @@ impl SpyreWorker {
                                 let rung_pool = ladder_pool.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
-                                        .map(|(rm, rcode)| {
+                                        .map(|(rung, rcode)| {
                                             let r = SuperDscSession::new_borrowing_with_consts(
                                                 cards,
                                                 rcode,
@@ -2091,7 +2101,7 @@ impl SpyreWorker {
                                                 &rung_pool,
                                                 &rung_spill,
                                             );
-                                            (rm, r)
+                                            (rung, r)
                                         })
                                         .collect::<Vec<_>>()
                                 })
@@ -2512,34 +2522,34 @@ impl SpyreWorker {
                 // the ladder block they are out of scope by the time it runs.
                 // Every rung that ends up serving, ascending by width. The top rung is appended
                 // after the join; the narrow ones arrive from the background thread.
-                let mut prefill_ladder: Vec<(usize, SuperDscSession)> = Vec::new();
+                let mut prefill_ladder: Vec<(usize, usize, SuperDscSession)> = Vec::new();
                 let mut _n_ladder = 0usize;
                 // JOIN: the background creates are done (or finishing); alias each onto the decode
                 // session's regions here, on the thread that owns `ss`.
-                for (rm, built) in ladder_join.join().unwrap_or_default() {
+                for ((rm, rs_seqs), built) in ladder_join.join().unwrap_or_default() {
                     match built {
-                        Ok(mut rs) => {
-                            if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
+                        Ok(mut sess) => {
+                            if let Err(e) = adopt_from_owner(&mut sess, &ss, &spill_images) {
                                 panic!(
-                                    "prefill ladder rung m={rm}: {e} — every rung the bake \
-                                     shipped must load"
+                                    "prefill ladder rung (m={rm}, seqs={rs_seqs}): {e} — every \
+                                     rung the bake shipped must load"
                                 );
                             }
                             _n_ladder += 1;
-                            prefill_ladder.push((rm, rs));
+                            prefill_ladder.push((rm, rs_seqs, sess));
                         }
                         Err(e) => panic!(
-                            "prefill ladder rung m={rm}: create failed: {e} — every rung the \
-                             bake shipped must load"
+                            "prefill ladder rung (m={rm}, seqs={rs_seqs}): create failed: {e} — \
+                             every rung the bake shipped must load"
                         ),
                     }
                 }
                 // The TOP rung is `prefill_ss` itself — built and aliased above, never on the
                 // background thread, because its allocation is what places decode's weight region.
                 if let Some(top) = prefill_ss {
-                    prefill_ladder.push((prefill_m, top));
+                    prefill_ladder.push((prefill_m, 1, top));
                 }
-                prefill_ladder.sort_by_key(|(m, _)| *m);
+                prefill_ladder.sort_by_key(|&(m, seqs, _)| (m, seqs));
                 debug!(
                     "[timing] prefill ladder: {} rung(s) ready in {:.2}s wall — built in parallel on \
                      background threads while the decode session staged",
@@ -2549,8 +2559,11 @@ impl SpyreWorker {
                 info!(
                     "[spyre-worker] sendnn: PREFILL ladder = {:?} (chunk runs on the smallest rung \
                      that holds it; ceiling {} rows/chunk)",
-                    prefill_ladder.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
-                    prefill_ladder.last().map(|(m, _)| *m).unwrap_or(0),
+                    prefill_ladder
+                        .iter()
+                        .map(|(m, seqs, _)| (*m, *seqs))
+                        .collect::<Vec<_>>(),
+                    prefill_ladder.last().map(|(m, _, _)| *m).unwrap_or(0),
                 );
                 // ── PREFIX-CAPABLE PREFILL LADDER ── the join. The jobs and their fan-out were
                 // spawned with the prefill ladder's, right after the owner allocated (see
@@ -2647,7 +2660,7 @@ impl SpyreWorker {
                             })?;
                             Ok(())
                         };
-                    for (rows, sess) in prefill_ladder.iter_mut() {
+                    for (rows, _, sess) in prefill_ladder.iter_mut() {
                         fault(sess, *rows)?;
                     }
                     for (rows, sess) in prefill_prefix.rungs_mut() {

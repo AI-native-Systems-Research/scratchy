@@ -1800,7 +1800,15 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .collect()
     };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
-    let mut mask: Option<(u32, u32)> = None;
+    // ⭐ THE MASKS ARE THE WINDOW FAMILY'S, one entry per window — never one flat pair. The
+    // splice unrolls a packed rung's attention into one program per window, each binding its
+    // own mask at `paged_window_tid(r, MASK)`; window 0's is the paged step's own sentinel.
+    // The law this merge guards is unchanged — ONE shared prefix capacity, and the SAME
+    // windows in every layer — stated over the family: every window's rows equal, and the
+    // tids collected are exactly the family's first n (a layer binding a tid its peers did
+    // not, or skipping a window, still refuses). The merged answer the wiring reads is
+    // window 0's, the step's own.
+    let mut masks: std::collections::BTreeMap<u32, u32> = Default::default();
     // ⭐ THE MERGED ARRANGEMENT FACTS — every parameter any program's propagation marked, in
     // node order, merged BEFORE the load-const list and the seat are derived so those two
     // derivations state the arrangement the bake actually emits (the one-derivation law).
@@ -1810,15 +1818,19 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     > = Default::default();
     for lowered in per_node {
         for (args, m, marks) in lowered? {
-            if let Some(m) = m {
-                if mask.is_some_and(|prev| prev != m) {
-                    return Err(SuperDscError(format!(
-                        "the attention mask must be uniform across layers (one shared prefix \
-                         capacity), but {:?} and {m:?} were both emitted",
-                        mask.unwrap()
-                    )));
+            if let Some((mid, cap)) = m {
+                match masks.get(&mid) {
+                    Some(&prev) if prev == cap => {}
+                    Some(&prev) => {
+                        return Err(SuperDscError(format!(
+                            "the attention mask t{mid} is bound at two capacities — {prev} and \
+                             {cap}; one pool, one capacity"
+                        )));
+                    }
+                    None => {
+                        masks.insert(mid, cap);
+                    }
                 }
-                mask = Some(m);
             }
             staggered.extend(marks);
             nodes.push(args);
@@ -1829,30 +1841,52 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
     let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows)?;
-    let attn_mask = match (mask, paged) {
-        (Some((mid, cap)), Some(p)) => {
+    // ⛔ THE FAMILY CHECK — the collected masks must BE the window family's first n, nothing
+    // else: every window r in 0..n present (a skipped window is a layer that did not unroll),
+    // no tid outside the family (a layer binding its own mask), all at the step's capacity.
+    // Window 0's tid IS the paged step's `p.mask` (the sentinel), so a solo rung — one mask,
+    // the sentinel — passes exactly as it did before the S axis existed.
+    if !masks.is_empty() {
+        let n = masks.len();
+        for r in 0..n as u32 {
+            let want = paged_window_tid(r, PAGED_WINDOW_MASK);
+            if !masks.contains_key(&want) {
+                return Err(SuperDscError(format!(
+                    "the attention masks bound are not the prefill window family's first {n} — \
+                     t{want} (window {r}'s mask) is missing; the family is the one set of masks \
+                     the window unroll mints, so a mask outside it is a layer that did not unroll \
+                     with its peers. Bound: {masks:?}"
+                )));
+            }
+        }
+    }
+    use ktir_superdsc::reserved_tids::{PAGED_WINDOW_MASK, paged_window_tid};
+    let attn_mask = match (&masks, paged) {
+        (m, Some(p)) if !m.is_empty() => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own
             // statement, not entries of this tid-indexed list).
-            if mid != p.mask {
-                return Err(SuperDscError(format!(
-                    "the attention binds its mask at t{mid} but the paged step names t{} — the \
-                     step's sources have one set of ids",
-                    p.mask
-                )));
+            if paged_window_tid(0, PAGED_WINDOW_MASK) != p.mask {
+                return Err(SuperDscError(
+                    "window 0's mask is not the paged step's own sentinel — the family's first \
+                     window IS the step (the `paged_window_tid(0, ·)` law)"
+                        .to_string(),
+                ));
             }
-            if cap as usize != p.capacity() {
-                return Err(SuperDscError(format!(
-                    "the attention's K pool holds {cap} slots but the paged step states {} — one \
-                     pool, two capacities",
-                    p.capacity()
-                )));
+            for &cap in masks.values() {
+                if cap as usize != p.capacity() {
+                    return Err(SuperDscError(format!(
+                        "the attention's K pool holds {cap} slots but the paged step states {} — \
+                         one pool, two capacities",
+                        p.capacity()
+                    )));
+                }
             }
-            Some(mid)
+            Some(p.mask)
         }
-        (None, None) => None,
-        (mask, paged) => {
+        (m, None) if m.is_empty() => None,
+        (m, paged) => {
             return Err(SuperDscError(format!(
-                "the attention programs bind a mask {mask:?} while the graph's paged step is \
+                "the attention programs bind masks {m:?} while the graph's paged step is \
                  {paged:?} — the two are one statement of one attention"
             )));
         }

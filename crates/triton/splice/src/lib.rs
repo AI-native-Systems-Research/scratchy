@@ -2321,7 +2321,17 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // per-step state shared by every window (decode is one row, so its unroll is one window by
     // construction). A new activation-segment operand added here is a new table the host must
     // stage per window — it does not ride the unroll for free.
-    let windows = query_rows.requests().get();
+    // ⛔ THE UNROLL IS THE PREFILL ARM'S ALONE. A decode row and a decode batch are ONE launch by
+    // construction — the batched kernel takes every request's row in one program over its own
+    // stacked tables, and the single-row decode kernel is one row — so their window count is ONE
+    // whatever the mint's request count says (a decode rung's pair is `(1 row, seqs)`: its rows
+    // ARE the requests). The window unroll spends a MULTI-ROW sequence step's pair: a prompt
+    // chunk of `per_request > 1` rows per request, S requests in one graph.
+    let windows = if batch || query_rows.per_request().get() == 1 {
+        1u32
+    } else {
+        query_rows.requests().get()
+    };
     let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(windows as usize);
     for r in 0..windows {
         let mut bindings = vec![

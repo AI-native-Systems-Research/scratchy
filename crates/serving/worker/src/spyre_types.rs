@@ -313,7 +313,14 @@ pub(crate) struct SuperDscBundle {
     /// SAME tensor ids (verified: identical 1467-key placement set across widths 15/31/47/63 — only
     /// the 611 activation SIZES scale with `mq`), so ONE prefill `BundleMeta` binds any of them, and
     /// `run_card_launch` rebinds every const on each call — so switching rungs between chunks is free.
-    pub(crate) prefill_rungs: Vec<(usize, SuperDscSession)>,
+    ///
+    /// ⭐ THE RUNG IS A `(width, seqs)` PAIR. A solo rung `(w, 1)` is baked for exactly its `w`
+    /// query rows — one request's chunk. A PACKED rung `(w, S)` is baked for `w·S` rows: S
+    /// requests' chunks in ONE launch, the whole graph over all of them at once, the attention
+    /// splice unrolling the packed node into S one-sequence programs of one kernel. Ascending by
+    /// `(width, seqs)`, so a first-fit holds one live request on the solo rung of its width and
+    /// the packed rung only when the launch carries more requests.
+    pub(crate) prefill_rungs: Vec<(usize, usize, SuperDscSession)>,
     /// DECODE BATCH LADDER `(seqs, session)`, ascending — one session per baked request count.
     ///
     /// A decode step runs one token of each RUNNING request. Without this the worker runs one

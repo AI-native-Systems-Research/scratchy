@@ -1349,8 +1349,9 @@ fn log_seat_readback(
 /// session is run in place.
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct PrefillLadders<'a> {
-    /// Ascending by baked width. A chunk at position 0 runs on the smallest rung holding it.
-    pub(crate) rungs: &'a mut [(usize, SuperDscSession)],
+    /// Ascending by `(width, seqs)`. A chunk at position 0 runs on the smallest rung holding it
+    /// and the live request count.
+    pub(crate) rungs: &'a mut [(usize, usize, SuperDscSession)],
     /// The rungs a chunk past position 0 runs on — its walk reaches every key before it.
     pub(crate) prefix: &'a mut PrefixLadder,
 }
@@ -1395,16 +1396,18 @@ pub(crate) fn superdsc_forward_chunk(
                 .collect()
         })
         .unwrap_or_default();
-    let top_m = rungs.last().map(|(m, _)| *m).unwrap_or(0);
+    // The ladder's widest PER-REQUEST width: a packed rung's rows are wider but its chunks are
+    // cut at the same per-request widths the solo ladder cuts at.
+    let top_m = rungs.last().map(|(m, _, _)| *m).unwrap_or(0);
     let end = start + n;
     let mut pos = start;
     let mut pick: Option<Vec<u32>> = None;
     while pos < end {
         let left = end - pos;
         let (width, sess) = if pos == 0 {
-            let ri = prefill_rung_for(rungs, left.min(top_m))
+            let ri = prefill_rung_for(rungs, left.min(top_m), 1)
                 .ok_or_else(|| werr("superdsc prefill: no prompt chunk rung baked".to_string()))?;
-            let (m, sess) = &mut rungs[ri];
+            let (m, _, sess) = &mut rungs[ri];
             (*m, sess)
         } else {
             let r = prefix.rung_for(left).ok_or_else(|| {

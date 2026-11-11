@@ -35,13 +35,21 @@ pub(crate) fn flags() -> &'static Flags {
     })
 }
 
-/// Index of the SMALLEST prefill rung that can hold `real` query rows. `rungs` is ascending, and the
-/// caller caps its chunk at the top rung, so this only returns `None` for an EMPTY ladder.
+/// Index of the SMALLEST prefill rung that can hold `real` query rows per request and `live`
+/// requests. `rungs` is ascending by `(width, seqs)`, and the caller caps its chunk at the top
+/// rung's width, so this only returns `None` for an EMPTY ladder. A packed rung holds any live
+/// count at or below its `seqs` (an empty window is staged fully masked, page-0), so the first
+/// fit over the ascending list is the narrowest width and — at a tie — the SOLO rung, keeping a
+/// one-request launch byte-identical to the no-packing build.
 #[cfg(feature = "spyre-hw")]
-pub(crate) fn prefill_rung_for(rungs: &[(usize, SuperDscSession)], real: usize) -> Option<usize> {
+pub(crate) fn prefill_rung_for(
+    rungs: &[(usize, usize, SuperDscSession)],
+    real: usize,
+    live: usize,
+) -> Option<usize> {
     rungs
         .iter()
-        .position(|(m, _)| *m >= real)
+        .position(|(w, seqs, _)| *w >= real && *seqs >= live)
         .or_else(|| rungs.len().checked_sub(1))
 }
 

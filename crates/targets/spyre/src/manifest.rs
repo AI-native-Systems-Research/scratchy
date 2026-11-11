@@ -229,7 +229,17 @@ pub struct SengraphBundleGroup {
     /// property that licenses the prefill↔decode seg2 alias).
     ///
     /// EMPTY ⇒ no ladder; the worker uses [`prefill`](Self::prefill) at its baked width.
-    pub prefill_rungs: &'static [(u32, &'static str)],
+    ///
+    /// ⭐ THE RUNG IS A `(width, seqs)` PAIR. Every solo rung is `(w, 1)` — a prompt chunk is one
+    /// request however many positions it spans. A PACKED rung `(w, S)` is the same width baked at
+    /// w·S rows: the whole graph runs over all S requests' rows at once (the batched compute
+    /// concurrent prefill exists for), while the attention splice unrolls the packed node into S
+    /// one-sequence programs of ONE kernel, each window binding its own host-staged tables at its
+    /// own reserved tids. Ascending by `(width, seqs)`, so the solo rung of a width precedes its
+    /// packed twin and a first-fit over the list holds one live request on the solo rung. The
+    /// worker picks the SMALLEST rung holding both the chunk's real token count and the live
+    /// request count.
+    pub prefill_rungs: &'static [(u32, u32, &'static str)],
     /// DECODE BATCH LADDER `[(seqs, sentinel)]`, ascending — the request counts the decode bundle is
     /// baked at.
     ///
