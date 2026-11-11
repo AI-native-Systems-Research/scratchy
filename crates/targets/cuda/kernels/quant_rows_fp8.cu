@@ -169,6 +169,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void quant_rows_fp8_ker(
 // `amax`); then `fp8_scale` and the same pass 2 on its tiles, with `fp8_quant_pre_nz`, which skips
 // the division of a ±0 (the value is the same; the padding rows of a prefill bucket stop taking
 // `__fdiv_rn`'s slow path). So the bytes and the scales are `quant_rows_fp8_ker`'s.
+// A narrow row leaves most of 8 warps idle (512 columns: 2 tiles, ~3× slower than the one-warp
+// form at 16,384 rows), so the kernel is generic over `BW`, the warps of a block: a CTA of 8 warps
+// holds `8 / BW` blocks, and the launcher takes the smallest of 1, 2, 4, 8 that is at least the
+// row's tiles (8 past that, `wide_warps`).
 // Shared memory: 8 warps × 2 stages × (an 8 KiB bf16 tile and a 4 KiB e4m3 tile), plus slack.
 
 constexpr int WIDE_WARPS = 8;
@@ -177,8 +181,15 @@ constexpr size_t WIDE_SMEM_USED = WIDE_WARPS * STAGES * (sizeof(x_tile) + sizeof
 constexpr int WIDE_SMEM_BYTES = int(WIDE_SMEM_USED) + 1024;
 static_assert(WIDE_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+// The warps of a block for a row of `col_tiles` tiles.
+int wide_warps(int col_tiles) {
+    return col_tiles <= 1 ? 1 : col_tiles <= 2 ? 2 : col_tiles <= 4 ? 4 : WIDE_WARPS;
+}
+
+template <int BW>
 __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
     const __grid_constant__ quant_globals g) {
+    static_assert(WIDE_WARPS % BW == 0, "whole blocks a CTA");
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
     x_tile(&x_smem)[WIDE_WARPS][STAGES] = al.allocate<x_tile, WIDE_WARPS, STAGES>();
@@ -187,9 +198,13 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
     __shared__ sv_fl<ROWS> amax_s[WIDE_WARPS];
 
     const int w = kittens::warpid();
-    const int row_block = blockIdx.x;
-    // This warp's tiles of the row: `w + 8 i` for `i < mine` (none when the row has fewer).
-    const int mine = (g.col_tiles - w + WIDE_WARPS - 1) / WIDE_WARPS;
+    // This warp's block of the CTA's `8 / BW`, its index `wb` in the block's warps.
+    const int first = w / BW * BW, wb = w - first;
+    const int row_block = blockIdx.x * (WIDE_WARPS / BW) + w / BW;
+    // A block past the last one (the last CTA's) has no tiles, but its warps meet the barrier.
+    const bool live = row_block < g.row_blocks;
+    // This warp's tiles of the row: `wb + BW i` for `i < mine` (none when the row has fewer).
+    const int mine = live ? (g.col_tiles - wb + BW - 1) / BW : 0;
     if (warp::laneid() == 0) {
         for (int s = 0; s < STAGES; s++) {
             init_semaphore(arrived[w][s], 0, 1);
@@ -200,7 +215,7 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
     // phase `(i / 2) % 2`.
     auto issue = [&](int i) {
         const int stage = i % STAGES;
-        coord<x_tile> at = {0, 0, row_block, w + (i % mine) * WIDE_WARPS};
+        coord<x_tile> at = {0, 0, row_block, wb + (i % mine) * BW};
         warp::tma::expect_bytes(arrived[w][stage], sizeof(x_tile));
         warp::tma::load_async(x_smem[w][stage], g.x, at, arrived[w][stage]);
     };
@@ -221,18 +236,18 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
         warp::abs(x, x);
         warp::row_max(amax, x, amax);
     }
-    // The 8 warps' maxima, then their max in every warp.
+    // The block's `BW` warps' maxima, then their max in each of them.
     warp::store(amax_s[w], amax);
     __syncthreads();
     row_values all, other;
-    warp::load(all, amax_s[0]);
-    for (int v = 1; v < WIDE_WARPS; v++) {
-        warp::load(other, amax_s[v]);
+    warp::load(all, amax_s[first]);
+    for (int v = 1; v < BW; v++) {
+        warp::load(other, amax_s[first + v]);
         warp::max(all, all, other);
     }
     row_values scale;
     warp::unary_op<scratchy::ops::fp8_scale>(scale, all);
-    if (w == 0) {
+    if (live && wb == 0) {
         warp::store(g.scale, scale, {0, 0, 0, row_block});
     }
 
@@ -254,7 +269,7 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
         warp::copy(q, x);
         warp::store(q_smem[w][stage], q);
         __syncwarp();
-        coord<q_tile> at = {0, 0, row_block, w + (i - mine) * WIDE_WARPS};
+        coord<q_tile> at = {0, 0, row_block, wb + (i - mine) * BW};
         warp::tma::store_async(g.q, q_smem[w][stage], at);
     }
     warp::tma::store_async_wait();
@@ -262,23 +277,29 @@ __global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
 
 }  // namespace
 
-// The kernels' one-time setup: allow `quant_rows_fp8_ker` `QUANT_SMEM_BYTES` and
-// `quant_rows_fp8_wide_ker` `WIDE_SMEM_BYTES` of dynamic shared memory on the current device (the default limit is 48 KB). Run once per device before any launch
+// The kernels' one-time setup: allow `quant_rows_fp8_ker` `QUANT_SMEM_BYTES` and each
+// `quant_rows_fp8_wide_ker` instance `WIDE_SMEM_BYTES` of dynamic shared memory on the current
+// device (the default limit is 48 KB). Run once per device before any launch
 // (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
 //
-// 0 = done; any other value = the cudaError_t of setting the attribute.
+// 0 = done; any other value = the cudaError_t of the first attribute that failed.
 extern "C" int scratchy_cuda_quant_rows_fp8_prepare(void) {
-    const cudaError_t e = cudaFuncSetAttribute(
-        quant_rows_fp8_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, QUANT_SMEM_BYTES);
-    return static_cast<int>(
-        e != cudaSuccess ? e
-                         : cudaFuncSetAttribute(quant_rows_fp8_wide_ker,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                WIDE_SMEM_BYTES));
+    cudaError_t e = cudaFuncSetAttribute(quant_rows_fp8_ker,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         QUANT_SMEM_BYTES);
+    for (const auto ker : {quant_rows_fp8_wide_ker<1>, quant_rows_fp8_wide_ker<2>,
+                           quant_rows_fp8_wide_ker<4>, quant_rows_fp8_wide_ker<WIDE_WARPS>}) {
+        if (e == cudaSuccess) {
+            e = cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     WIDE_SMEM_BYTES);
+        }
+    }
+    return static_cast<int>(e);
 }
 
 // Test support: `scratchy_cuda_quant_rows_fp8` at `variant` (0 `quant_rows_fp8_ker`, one warp a
-// 16-row block, FP8 S3's form; 1 `quant_rows_fp8_wide_ker`, the launcher's), the same bits.
+// 16-row block, FP8 S3's form; 1 `quant_rows_fp8_wide_ker` at `wide_warps`, the launcher's), the
+// same bits.
 extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void* scale,
                                                     uint32_t rows, uint32_t cols, uint32_t variant,
                                                     void* stream /* cudaStream_t */) {
@@ -300,8 +321,15 @@ extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void
         void* args[] = {&G};
         const cudaStream_t st = static_cast<cudaStream_t>(stream);
         if (variant == 1) {
-            return static_cast<int>(cudaLaunchKernel(quant_rows_fp8_wide_ker, dim3(row_blocks),
-                                                     dim3(WIDE_THREADS), args, WIDE_SMEM_BYTES, st));
+            const int bw = wide_warps(col_tiles);
+            const auto ker = bw == 1   ? quant_rows_fp8_wide_ker<1>
+                             : bw == 2 ? quant_rows_fp8_wide_ker<2>
+                             : bw == 4 ? quant_rows_fp8_wide_ker<4>
+                                       : quant_rows_fp8_wide_ker<WIDE_WARPS>;
+            const uint32_t per_cta = uint32_t(WIDE_WARPS / bw);
+            const dim3 grid((row_blocks + per_cta - 1) / per_cta);
+            return static_cast<int>(
+                cudaLaunchKernel(ker, grid, dim3(WIDE_THREADS), args, WIDE_SMEM_BYTES, st));
         }
         const dim3 grid((row_blocks + uint32_t(WARPS) - 1) / uint32_t(WARPS)), block(NUM_THREADS);
         return static_cast<int>(

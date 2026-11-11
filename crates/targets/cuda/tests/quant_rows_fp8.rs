@@ -308,6 +308,24 @@ fn the_wide_quantize_is_the_s3_quantize_bit_for_bit() {
     assert!(pass, "the wide quantize is not the S3 quantize's bits");
 }
 
+/// The wide quantize at one tile a row (one warp a block, eight blocks a CTA), with a partial last
+/// CTA, is the S3 quantize's bits.
+#[test]
+fn the_wide_quantize_at_one_tile_a_row_is_the_s3_quantize_bit_for_bit() {
+    let device = h100();
+    for &(rows, cols) in &[(16, 64), (48, 192), (4096, 256)] {
+        for kind in ["random", "padded", "edge"] {
+            let x = DeviceBuffer::upload(&device, &f3_input(kind, rows, cols)).expect("x");
+            let s3 = variant_quant(&device, &x, (rows, cols), 0);
+            let wide = variant_quant(&device, &x, (rows, cols), 1);
+            assert!(
+                s3 == wide,
+                "rows={rows} cols={cols} {kind}: not the S3 quantize's bits"
+            );
+        }
+    }
+}
+
 type CudaEvent = *mut std::ffi::c_void;
 
 unsafe extern "C" {
