@@ -56,6 +56,15 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_quant_row_fp8_one_variant(
+        x: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        cols: u32,
+        variant: u32,
+        trace: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_quant_rows_fp8(
         x: *const c_void,
         q: *mut c_void,
@@ -3651,6 +3660,30 @@ pub unsafe fn quant_row_fp8_one(
 ) -> Result<(), KernelError> {
     // SAFETY: as above; the launcher checks the shape before it touches a pointer.
     let code = unsafe { scratchy_cuda_quant_row_fp8_one(x, q, scale, cols, stream) };
+    check(code, KernelError::RowShape { rows: 1, cols })
+}
+
+/// Test support for `tests/gemv_fp8_tc.rs` only: [`quant_row_fp8_one`] at `variant` (0 its first
+/// form, which divides the tile's 15 zero-fill rows too; 1 [`quant_row_fp8_one`]'s own), and, when
+/// `trace` is not null, each CTA's phase cycles into `trace` (`[⌈cols / 256⌉, 8]` f32: entry,
+/// chunks arrived, amax shared, tile arrived, tile divided, stored). Refused as
+/// [`quant_row_fp8_one`], or for `variant` above 1. Asynchronous.
+///
+/// # Safety
+///
+/// As [`quant_row_fp8_one`]'s; `trace`, when not null, `⌈cols / 256⌉ · 8` f32 of device memory.
+#[doc(hidden)]
+pub unsafe fn quant_row_fp8_one_variant(
+    x: *const c_void,
+    (q, scale): (*mut c_void, *mut c_void),
+    cols: u32,
+    (variant, trace): (u32, *mut c_void),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_quant_row_fp8_one_variant(x, q, scale, cols, variant, trace, stream)
+    };
     check(code, KernelError::RowShape { rows: 1, cols })
 }
 
