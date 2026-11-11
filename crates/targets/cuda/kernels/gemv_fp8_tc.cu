@@ -29,8 +29,9 @@
 // not `gemv_fp8.cu`'s, and a member of a group is not its own launch's (the pieces fall elsewhere):
 // the approved kind of change (WGMMA accumulation, K order), against S3's f64 bound.
 //
-// Shared memory: `STAGES` × (a 4 KB A tile and an 8 KB B tile) plus 1,024 bytes of alignment slack,
-// set by `scratchy_cuda_gemv_fp8_tc_prepare`.
+// Shared memory: 12 stages × (a 4 KB A tile and an 8 KB B tile) plus 1,024 bytes of alignment
+// slack (B1; the ceiling probe's instances below differ), set by
+// `scratchy_cuda_gemv_fp8_tc_prepare`.
 
 #include "kittens.cuh"
 #include "scratchy_ops.cuh"
@@ -50,7 +51,8 @@ namespace {
 constexpr int CTAS = 132;
 constexpr int TILE_N = 128;
 constexpr int K_STEP = 64;
-constexpr int STAGES = 12;
+// The ceiling probe's B4 (`2cta`): two CTAs per SM. Every `partials` is sized for it.
+constexpr int MAX_CTAS = 264;
 constexpr int NUM_THREADS = 2 * kittens::WARPGROUP_THREADS;
 constexpr int REDUCE_ROWS = 32;
 constexpr int REDUCE_WARPS = 8;
@@ -58,20 +60,42 @@ constexpr int REDUCE_THREADS = REDUCE_WARPS * kittens::WARP_THREADS;
 // `n` a multiple of it: the reduce's 32-row vectors and the scales' reads stay inside the arrays.
 constexpr uint32_t N_MULTIPLE = 64;
 
-using a_tile = st_fp8e4m3<64, K_STEP>;
-using b_tile = st_fp8e4m3<TILE_N, K_STEP>;
+// The kernel's instance: its K step, ring, CTAs per SM and WGMMA release. `tc_b1` is the one this
+// file's launcher runs; the others are the ceiling probe's test-only knobs (/tmp/d-cap.md §3 P-B),
+// launched only by `scratchy_cuda_gemv_fp8_tc_variant`:
+//   B2 `wait1`: the stage before is released after `mma_async_wait<1>()`, so one WGMMA group stays
+//     in flight (the same WGMMAs in the same order: the same bits);
+//   B3 `k128`: 128-wide K steps (`st_fp8e4m3<128, 128>` B and `<64, 128>` A boxes, 128-byte
+//     swizzle), four `m64n128k32` a stage, 8 stages;
+//   B4 `2cta`: 264 CTAs, two per SM, 6 stages each.
+// B3 and B4 change the K grouping and the stream-K split: the approved kind, under S3's bound.
+template <int K_STEP_, int STAGES_, int CTAS_, bool WAIT1_>
+struct tc_variant {
+    static constexpr int k_step = K_STEP_;
+    static constexpr int stages = STAGES_;
+    static constexpr int ctas = CTAS_;
+    static constexpr bool wait1 = WAIT1_;
+    static constexpr int min_blocks = CTAS_ / CTAS;
+    using a_tile = st_fp8e4m3<64, K_STEP_>;
+    using b_tile = st_fp8e4m3<TILE_N, K_STEP_>;
+    static constexpr size_t smem = STAGES_ * (sizeof(a_tile) + sizeof(b_tile)) + 1024;
+    static_assert(min_blocks * smem <= kittens::MAX_SHARED_MEMORY, "the CTAs per SM fit");
+};
+using tc_b1 = tc_variant<K_STEP, 12, CTAS, false>;
+using tc_b2 = tc_variant<K_STEP, 12, CTAS, true>;
+using tc_b3 = tc_variant<128, 8, CTAS, false>;
+using tc_b4 = tc_variant<K_STEP, 6, MAX_CTAS, false>;
+
 using acc_tile = rt_fl<16, TILE_N>;
 using piece_rv = acc_tile::row_vec;
 using reduce_rv = rv_fl<REDUCE_ROWS>;
-using a_gl = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
-using b_gl = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
+using a_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::a_tile, tc_b3::a_tile>;
+using b_gl = gl<fp8e4m3, 1, 1, -1, -1, tc_b1::b_tile, tc_b3::b_tile>;
 // `[CTAS + tiles, 128]` f32 pieces, `[1, n]` scales and outputs: no tensor map.
 using partial_gl = gl<float, 1, 1, -1, -1>;
 using scale_gl = gl<float, 1, 1, -1, -1>;
 using out_gl = gl<bf16, 1, 1, -1, -1>;
 
-constexpr size_t TC_SMEM_BYTES = STAGES * (sizeof(a_tile) + sizeof(b_tile)) + 1024;
-static_assert(TC_SMEM_BYTES <= 227 * 1024, "one CTA per SM");
 
 struct tc_globals {
     a_gl a;
@@ -103,8 +127,12 @@ __device__ inline int cta_of(long long u, long long units, int ctas) {
     return c;
 }
 
-__global__ __launch_bounds__(NUM_THREADS, 1) void gemv_fp8_tc_ker(
+template <typename V>
+__global__ __launch_bounds__(NUM_THREADS, V::min_blocks) void gemv_fp8_tc_ker(
     const __grid_constant__ tc_globals g) {
+    using a_tile = typename V::a_tile;
+    using b_tile = typename V::b_tile;
+    constexpr int STAGES = V::stages;
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
     a_tile(&a_s)[STAGES] = al.allocate<a_tile, STAGES>();
@@ -122,6 +150,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemv_fp8_tc_ker(
     }
     __syncthreads();
     if (warpgroup::groupid() == 1) {
+        if constexpr (V::min_blocks == 2) {
+            // B4: two CTAs fit an SM's registers only with the producer's handed to the consumer
+            // (128 · 24 + 128 · 232 = 32,768, half the SM's file).
+            warpgroup::decrease_registers<24>();
+        }
         // The producer: warp 0 of the second warpgroup.
         if (warpgroup::warpid() == 0) {
             for (int i = 0; i < len; i++) {
@@ -138,20 +171,43 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemv_fp8_tc_ker(
             }
         }
     } else {
+        if constexpr (V::min_blocks == 2) {
+            warpgroup::increase_registers<232>();
+        }
         acc_tile acc;
         warp::zero(acc);
+        // B2: the stage whose WGMMA group may still be in flight, or -1.
+        int pending = -1;
+        const auto release = [&](int stage) {
+            if (warpgroup::laneid() == 0) {
+                arrive(done[stage], 1);
+            }
+        };
         for (int i = 0; i < len; i++) {
             const long long u = u0 + i;
             const int t = int(u / g.k_steps), j = int(u % g.k_steps), s = i % STAGES;
             wait(arrived[s], (i / STAGES) % 2);
             warpgroup::mma_ABt(acc, a_s[s], b_s[s]);
-            // The WGMMA reads the stage and writes `acc` asynchronously: wait before releasing the
-            // stage and before anything reads `acc`.
-            warpgroup::mma_async_wait();
-            if (warpgroup::laneid() == 0) {
-                arrive(done[s], 1);
+            const bool end = j == g.k_steps - 1 || i == len - 1;
+            if constexpr (V::wait1) {
+                // Every group but this stage's is done: release the one before.
+                warpgroup::mma_async_wait<1>();
+                if (pending >= 0) {
+                    release(pending);
+                }
+                pending = s;
+                if (end) {
+                    warpgroup::mma_async_wait();
+                    release(s);
+                    pending = -1;
+                }
+            } else {
+                // The WGMMA reads the stage and writes `acc` asynchronously: wait before releasing
+                // the stage and before anything reads `acc`.
+                warpgroup::mma_async_wait();
+                release(s);
             }
-            if (j == g.k_steps - 1 || i == len - 1) {
+            if (end) {
                 // The piece's end: warp 0 holds rows 0..15, row 0 the GEMV's.
                 if (warpgroup::warpid() == 0) {
                     piece_rv v;
@@ -203,16 +259,89 @@ int tiles_of(uint32_t n) {
     return int((n + uint32_t(TILE_N) - 1) / uint32_t(TILE_N));
 }
 
-}  // namespace
-
-// The main kernel's one-time setup: allow it `TC_SMEM_BYTES` of dynamic shared memory on the current
-// device. 0 = done; any other value = the cudaError_t.
-extern "C" int scratchy_cuda_gemv_fp8_tc_prepare(void) {
-    return static_cast<int>(cudaFuncSetAttribute(
-        gemv_fp8_tc_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, TC_SMEM_BYTES));
+template <typename V>
+cudaError_t allow() {
+    return cudaFuncSetAttribute(gemv_fp8_tc_ker<V>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                int(V::smem));
 }
 
-// The `partials` bytes a launch of these members needs: `(min(CTAS, units) + tiles) · 128` f32.
+// The views of one launch at instance `V`'s K step and CTA count. Can throw (TK's host code).
+template <typename V>
+tc_globals views(const void* q, const void* a_scale, const void* const* b,
+                 const void* const* b_scale, void* const* c, const uint32_t* n, uint32_t count,
+                 uint32_t k, void* partials) {
+    const uint32_t last = count - 1;
+    const auto bv = [&](uint32_t i) {
+        return b_gl{static_cast<fp8e4m3*>(const_cast<void*>(b[i])), nullptr, nullptr,
+                    size_t(n[i]), size_t(k)};
+    };
+    const auto sv = [&](uint32_t i) {
+        return scale_gl{static_cast<float*>(const_cast<void*>(b_scale[i])), nullptr, nullptr,
+                        size_t(1), size_t(n[i])};
+    };
+    const auto cv = [&](uint32_t i) {
+        return out_gl{static_cast<bf16*>(c[i]), nullptr, nullptr, size_t(1), size_t(n[i])};
+    };
+    const int t0 = tiles_of(n[0]);
+    const int t1 = count > 1 ? tiles_of(n[1]) : 0;
+    const int t2 = count > 2 ? tiles_of(n[2]) : 0;
+    const int tiles = t0 + t1 + t2;
+    const int k_steps = int(k / uint32_t(V::k_step));
+    const long long units = (long long)tiles * k_steps;
+    const int ctas = units < V::ctas ? int(units) : V::ctas;
+    return tc_globals{
+        a_gl{static_cast<fp8e4m3*>(const_cast<void*>(q)), nullptr, nullptr, size_t(1), size_t(k)},
+        bv(0), bv(count > 1 ? 1 : last), bv(last),
+        partial_gl{static_cast<float*>(partials), nullptr, nullptr, size_t(ctas + tiles),
+                   size_t(TILE_N)},
+        sv(0), sv(count > 1 ? 1 : last), sv(last),
+        cv(0), cv(count > 1 ? 1 : last), cv(last),
+        scale_gl{static_cast<float*>(const_cast<void*>(a_scale)), nullptr, nullptr, size_t(1),
+                 size_t(1)},
+        int(n[0]), int(n[count > 1 ? 1 : last]), int(n[last]),
+        // An absent member starts at `tiles`: no tile is its.
+        count > 1 ? t0 : tiles, count > 2 ? t0 + t1 : tiles, tiles, k_steps, ctas};
+}
+
+// The stream-K kernel at instance `V`, then (unless `main_only`) its reduce, on `stream`.
+template <typename V>
+int launch(const void* q, const void* a_scale, const void* const* b, const void* const* b_scale,
+           void* const* c, const uint32_t* n, uint32_t count, uint32_t k, void* partials,
+           bool main_only, void* stream) {
+    if (k % uint32_t(V::k_step) != 0) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    tc_globals G = views<V>(q, a_scale, b, b_scale, c, n, count, k, partials);
+    void* args[] = {&G};
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    cudaError_t e = cudaLaunchKernel(gemv_fp8_tc_ker<V>, dim3(G.ctas), dim3(NUM_THREADS), args,
+                                     V::smem, st);
+    if (e != cudaSuccess || main_only) {
+        return static_cast<int>(e);
+    }
+    const int vectors = G.tiles * (TILE_N / REDUCE_ROWS);
+    return static_cast<int>(cudaLaunchKernel(gemv_fp8_tc_reduce_ker,
+                                             dim3((vectors + REDUCE_WARPS - 1) / REDUCE_WARPS),
+                                             dim3(REDUCE_THREADS), args, 0, st));
+}
+
+}  // namespace
+
+// The kernels' one-time setup: allow every instance its dynamic shared memory on the current
+// device (B1, the launcher's, and the ceiling probe's B2 to B4, so no probe launch sets an
+// attribute inside a timed region). 0 = done; any other value = the first failing cudaError_t.
+extern "C" int scratchy_cuda_gemv_fp8_tc_prepare(void) {
+    cudaError_t e = cudaSuccess;
+    for (const cudaError_t r : {allow<tc_b1>(), allow<tc_b2>(), allow<tc_b3>(), allow<tc_b4>()}) {
+        if (e == cudaSuccess) {
+            e = r;
+        }
+    }
+    return static_cast<int>(e);
+}
+
+// The `partials` bytes a launch of these members needs at any instance:
+// `(min(264, units) + tiles) · 128` f32 (264 is B4's CTAs; B1 uses at most 132 of those rows).
 // 0 = the shape is refused.
 extern "C" uint64_t scratchy_cuda_gemv_fp8_tc_partial_bytes(const uint32_t* n, uint32_t count,
                                                            uint32_t k) {
@@ -227,8 +356,35 @@ extern "C" uint64_t scratchy_cuda_gemv_fp8_tc_partial_bytes(const uint32_t* n, u
         tiles += uint64_t(tiles_of(n[i]));
     }
     const uint64_t units = tiles * (k / K_STEP);
-    const uint64_t ctas = units < uint64_t(CTAS) ? units : uint64_t(CTAS);
+    const uint64_t ctas = units < uint64_t(MAX_CTAS) ? units : uint64_t(MAX_CTAS);
     return (ctas + tiles) * TILE_N * sizeof(float);
+}
+
+// The ceiling probe's test-only form (/tmp/d-cap.md §3 P-B): as `scratchy_cuda_gemv_fp8_tc` at
+// instance `variant` (0 B1, the launcher's; 1 B2 `wait1`; 2 B3 `k128`, which also needs `k` a
+// multiple of 128; 3 B4 `2cta`), and with `main_only` (B5 `noreduce`) the stream-K kernel alone,
+// leaving `c` unwritten. No tape launches it.
+extern "C" int scratchy_cuda_gemv_fp8_tc_variant(const void* q, const void* a_scale,
+                                                 const void* const* b, const void* const* b_scale,
+                                                 void* const* c, const uint32_t* n,
+                                                 uint32_t count, uint32_t k, void* partials,
+                                                 uint32_t variant, uint32_t main_only,
+                                                 void* stream /* cudaStream_t */) {
+    if (scratchy_cuda_gemv_fp8_tc_partial_bytes(n, count, k) == 0 || variant > 3) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const bool m = main_only != 0;
+        switch (variant) {
+            case 0: return launch<tc_b1>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            case 1: return launch<tc_b2>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            case 2: return launch<tc_b3>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+            default: return launch<tc_b4>(q, a_scale, b, b_scale, c, n, count, k, partials, m, stream);
+        }
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -246,55 +402,6 @@ extern "C" int scratchy_cuda_gemv_fp8_tc(const void* q, const void* a_scale,
                                          void* const* c, const uint32_t* n, uint32_t count,
                                          uint32_t k, void* partials,
                                          void* stream /* cudaStream_t; null = default */) {
-    if (scratchy_cuda_gemv_fp8_tc_partial_bytes(n, count, k) == 0) {
-        return SCRATCHY_CUDA_ERR_SHAPE;
-    }
-    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
-    try {
-        const uint32_t last = count - 1;
-        const auto bv = [&](uint32_t i) {
-            return b_gl{static_cast<fp8e4m3*>(const_cast<void*>(b[i])), nullptr, nullptr,
-                        size_t(n[i]), size_t(k)};
-        };
-        const auto sv = [&](uint32_t i) {
-            return scale_gl{static_cast<float*>(const_cast<void*>(b_scale[i])), nullptr, nullptr,
-                            size_t(1), size_t(n[i])};
-        };
-        const auto cv = [&](uint32_t i) {
-            return out_gl{static_cast<bf16*>(c[i]), nullptr, nullptr, size_t(1), size_t(n[i])};
-        };
-        const int t0 = tiles_of(n[0]);
-        const int t1 = count > 1 ? tiles_of(n[1]) : 0;
-        const int t2 = count > 2 ? tiles_of(n[2]) : 0;
-        const int tiles = t0 + t1 + t2;
-        const int k_steps = int(k / K_STEP);
-        const long long units = (long long)tiles * k_steps;
-        const int ctas = units < CTAS ? int(units) : CTAS;
-        tc_globals G{
-            a_gl{static_cast<fp8e4m3*>(const_cast<void*>(q)), nullptr, nullptr, size_t(1),
-                 size_t(k)},
-            bv(0), bv(count > 1 ? 1 : last), bv(last),
-            partial_gl{static_cast<float*>(partials), nullptr, nullptr, size_t(ctas + tiles),
-                       size_t(TILE_N)},
-            sv(0), sv(count > 1 ? 1 : last), sv(last),
-            cv(0), cv(count > 1 ? 1 : last), cv(last),
-            scale_gl{static_cast<float*>(const_cast<void*>(a_scale)), nullptr, nullptr, size_t(1),
-                     size_t(1)},
-            int(n[0]), int(n[count > 1 ? 1 : last]), int(n[last]),
-            // An absent member starts at `tiles`: no tile is its.
-            count > 1 ? t0 : tiles, count > 2 ? t0 + t1 : tiles, tiles, k_steps, ctas};
-        void* args[] = {&G};
-        const cudaStream_t st = static_cast<cudaStream_t>(stream);
-        cudaError_t e = cudaLaunchKernel(gemv_fp8_tc_ker, dim3(ctas), dim3(NUM_THREADS), args,
-                                         TC_SMEM_BYTES, st);
-        if (e != cudaSuccess) {
-            return static_cast<int>(e);
-        }
-        const int vectors = tiles * (TILE_N / REDUCE_ROWS);
-        return static_cast<int>(cudaLaunchKernel(gemv_fp8_tc_reduce_ker,
-                                                 dim3((vectors + REDUCE_WARPS - 1) / REDUCE_WARPS),
-                                                 dim3(REDUCE_THREADS), args, 0, st));
-    } catch (...) {
-        return SCRATCHY_CUDA_ERR_HOST;
-    }
+    return scratchy_cuda_gemv_fp8_tc_variant(q, a_scale, b, b_scale, c, n, count, k, partials, 0, 0,
+                                             stream);
 }

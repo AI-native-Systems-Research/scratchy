@@ -177,6 +177,20 @@ unsafe extern "C" {
         partials: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemv_fp8_tc_variant(
+        q: *const c_void,
+        a_scale: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        count: u32,
+        k: u32,
+        partials: *mut c_void,
+        variant: u32,
+        main_only: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_fp8_abt(
         a: *const c_void,
         b: *const c_void,
@@ -3963,6 +3977,49 @@ pub unsafe fn gemv_fp8_tc(
             members.len() as u32,
             k,
             partials,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// Test support for `tests/gemv_fp8_tc.rs` only (the ceiling probe, /tmp/d-cap.md §3 P-B):
+/// [`gemv_fp8_tc`] at instance `variant` (0 B1, [`gemv_fp8_tc`]'s own; 1 B2 `wait1`, the same
+/// bits; 2 B3 `k128`, `k` a multiple of 128; 3 B4 `2cta`), and with `main_only` (B5 `noreduce`) the
+/// stream-K kernel alone, `c` left unwritten. Refused with [`KernelError::GroupShape`] as
+/// [`gemv_fp8_tc`], or for `variant` above 3. Asynchronous.
+///
+/// # Safety
+///
+/// As [`gemv_fp8_tc`]'s.
+#[doc(hidden)]
+pub unsafe fn gemv_fp8_tc_variant(
+    (q, a_scale): Fp8Operand,
+    members: Fp8GroupOperands<'_>,
+    partials: *mut c_void,
+    k: u32,
+    (variant, main_only): (u32, bool),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemv_fp8_tc_variant", members, (1, k));
+    if members.is_empty() || members.len() > 3 {
+        return Err(refused);
+    }
+    // SAFETY: as above; the arrays are three long and the launcher checks the count, the variant
+    // and every member's shape before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemv_fp8_tc_variant(
+            q,
+            a_scale,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            members.len() as u32,
+            k,
+            partials,
+            variant,
+            u32::from(main_only),
             stream,
         )
     };

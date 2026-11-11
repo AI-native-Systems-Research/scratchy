@@ -546,3 +546,183 @@ fn the_tc_fp8_gemv_bandwidth_is_recorded() {
         }
     }
 }
+
+// ── The ceiling probe (/tmp/d-cap.md §3): P-B, the TC kernel's knobs, and P-D ──────────
+
+/// The P-B instances, by the variant launcher's number and `main_only` (B5 is B1's main kernel).
+const VARIANTS: &[(u32, bool, &str)] = &[
+    (0, false, "B1"),
+    (1, false, "B2_wait1"),
+    (2, false, "B3_k128"),
+    (3, false, "B4_2cta"),
+    (0, true, "B5_noreduce"),
+];
+
+/// [`launch_tc`] at instance `variant`, the main kernel alone when `main_only`.
+fn launch_variant(
+    act: &Act,
+    (ws, outs, ns): (&[&Fp8Buf], &[*mut c_void], &[u32]),
+    p: &DeviceBuffer,
+    (variant, main_only): (u32, bool),
+) {
+    use scratchy_target_cuda::kernels::gemv_fp8_tc_variant;
+    let members: Vec<(Fp8Operand, *mut c_void, u32)> = (ws.iter().zip(outs).zip(ns))
+        .map(|((w, &c), &n)| (w.op(), c, n))
+        .collect();
+    // SAFETY: as `launch_tc`'s; `p` holds `gemv_fp8_tc_partial_bytes`, which covers every instance.
+    unsafe {
+        gemv_fp8_tc_variant(
+            act.row(),
+            &members,
+            p.ptr(),
+            act.k,
+            (variant, main_only),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("gemv_fp8_tc_variant launch");
+}
+
+/// The ceiling probe's P-B bound: B2 (`wait1`) is B1's bits, and B3 (`k128`) and B4 (`2cta`),
+/// which move the K grouping and the stream-K split, are inside S3's f64 bound at the 27B's
+/// gate+up (as one), down and GDN qkv+z group; every worst ratio printed as `CAP_PB_BOUND`.
+#[test]
+fn the_tc_variants_are_inside_s3_s_bound() {
+    let device = h100();
+    let mut pass = true;
+    for (ns, k, what) in [
+        (vec![34816u32], 5120u32, "gate+up"),
+        (vec![5120], 17408, "down"),
+        (vec![10240, 6144], 5120, "gdn_qkv+z"),
+    ] {
+        let ku = k as usize;
+        let x = bf16_inputs(ku, 0x7D0 ^ u64::from(k));
+        let act = Act::new(&device, &x);
+        act.quantize();
+        let host: Vec<(Vec<u8>, Vec<f32>)> = (ns.iter().enumerate())
+            .map(|(i, &n)| {
+                let n = n as usize;
+                (
+                    e4m3_weights(n * ku, 0x7D1 ^ i as u64),
+                    weight_scales(n, 0x7D2 ^ i as u64),
+                )
+            })
+            .collect();
+        let ws: Vec<Fp8Buf> = host
+            .iter()
+            .map(|(q, s)| Fp8Buf::new(&device, q, s))
+            .collect();
+        let wr: Vec<&Fp8Buf> = ws.iter().collect();
+        let refs: Vec<Vec<(f64, f64)>> = (ns.iter().zip(&host))
+            .map(|(&n, (b, s))| gemv_reference(&x, (b, s), n as usize, ku))
+            .collect();
+        let p = filled(
+            &device,
+            gemv_fp8_tc_partial_bytes(&ns, k).expect("bytes") as usize,
+            0,
+        );
+        let run = |variant: u32| -> Vec<Vec<u16>> {
+            let outs: Vec<DeviceBuffer> = (ns.iter())
+                .map(|&n| DeviceBuffer::upload(&device, &vec![SENTINEL; n as usize]).expect("c"))
+                .collect();
+            let op: Vec<*mut c_void> = outs.iter().map(|c| c.ptr()).collect();
+            launch_variant(&act, (&wr, &op, &ns), &p, (variant, false));
+            outs.iter().map(|c| c.download().expect("c")).collect()
+        };
+        let b1 = run(0);
+        for (variant, name) in [(1u32, "B2_wait1"), (2, "B3_k128"), (3, "B4_2cta")] {
+            let got = run(variant);
+            for (i, (g, r)) in got.iter().zip(&refs).enumerate() {
+                let (bad, worst) = compare_fp8(g, r);
+                let same = mismatched_bits(g, &b1[i]);
+                let ok = bad == 0 && (variant != 1 || same == 0);
+                eprintln!(
+                    "CAP_PB_BOUND {name} {what} member {i} n={} k={k}: out_of_bound={bad} \
+                     worst_ratio={worst:.4} mismatched_bits_vs_B1={same} {}",
+                    ns[i],
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "a ceiling-probe TC instance is out of S3's bound, or B2 is not B1's bits"
+    );
+}
+
+/// The ceiling probe's P-B timing: B1 to B5 at the 27B's gate+up (as one), down and GDN qkv+z
+/// group, read-flush cold and hot, two rounds (each instance in turn, so A, B, A, B), as `TC_TIME`
+/// lines (`record`'s) with the instance as the implementation. B5 times the main kernel only.
+#[test]
+fn the_tc_variants_bandwidth_is_recorded() {
+    let device = h100();
+    let flush = Flush::new(&device);
+    for (ns, k, shape) in [
+        (vec![34816u32], 5120u32, "27B_gate+up"),
+        (vec![5120], 17408, "27B_down"),
+        (vec![10240, 6144], 5120, "27B_gdn_qkv+z"),
+    ] {
+        let ku = k as usize;
+        let bytes = ns.iter().sum::<u32>() as usize * ku;
+        let act = Act::new(&device, &vec![0x3F80u16; ku]);
+        act.quantize();
+        let ws: Vec<Fp8Buf> = ns
+            .iter()
+            .map(|&n| Fp8Buf::ones(&device, n as usize, ku))
+            .collect();
+        let wr: Vec<&Fp8Buf> = ws.iter().collect();
+        let outs: Vec<DeviceBuffer> = ns
+            .iter()
+            .map(|&n| filled(&device, n as usize * 2, 0))
+            .collect();
+        let op: Vec<*mut c_void> = outs.iter().map(|c| c.ptr()).collect();
+        let p = filled(
+            &device,
+            gemv_fp8_tc_partial_bytes(&ns, k).expect("bytes") as usize,
+            0,
+        );
+        for round in 1..=2 {
+            for &(variant, main_only, name) in VARIANTS {
+                record(&flush, shape, name, round, bytes, || {
+                    launch_variant(&act, (&wr, &op, &ns), &p, (variant, main_only))
+                });
+            }
+        }
+    }
+}
+
+/// The ceiling probe's P-D: `quant_rows_fp8` alone on its 16-row input (row 0 the activation) at
+/// the 27B's 5,120 and 17,408 columns, CUDA events around its launch only, read-flush cold and
+/// hot, two rounds, as `TC_TIME` lines (the TB/s is of the 16-row bf16 input).
+#[test]
+fn quant_rows_fp8_one_row_times_are_recorded() {
+    let device = h100();
+    let flush = Flush::new(&device);
+    for k in [5120u32, 17408] {
+        let ku = k as usize;
+        let act = Act::new(&device, &bf16_inputs(ku, 0x7E0 ^ u64::from(k)));
+        for round in 1..=2 {
+            record(
+                &flush,
+                &format!("quant_16x{k}"),
+                "quant_rows_fp8",
+                round,
+                QROWS * ku * 2,
+                || act.quantize(),
+            );
+            // Ten launches back to back between the events: each launch's host work (its tensor
+            // maps) overlaps the one before on the GPU, so a gap from the single line is the
+            // harness's, not the kernel's.
+            record(
+                &flush,
+                &format!("quant_16x{k}"),
+                "quant_rows_fp8_x10",
+                round,
+                10 * QROWS * ku * 2,
+                || (0..10).for_each(|_| act.quantize()),
+            );
+        }
+    }
+}
