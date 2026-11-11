@@ -158,34 +158,132 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void quant_rows_fp8_ker(
     warp::tma::store_async_wait();
 }
 
+// ── F3: eight warps a 16-row block (FP8 S8's TTFT plan) ──
+//
+// `quant_rows_fp8_ker` gives each 16-row block one warp, which walks every tile of the row twice:
+// ~165 µs a launch at 5,120 columns on the H100 (W4's prefill traces), whatever the rows, and its
+// grid is `rows / 64` CTAs. `quant_rows_fp8_wide_ker` gives each block a CTA of 8 warps: warp `w`
+// takes the block's tiles `w, w + 8, …` through the same 2-stage ring and the same pass-1 ops,
+// building its rows' `row_max` over its tiles; the 8 warps' maxima meet in shared memory and every
+// warp takes their max (a max of absolute values is exact in any order, so it is the one warp's
+// `amax`); then `fp8_scale` and the same pass 2 on its tiles, with `fp8_quant_pre_nz`, which skips
+// the division of a ±0 (the value is the same; the padding rows of a prefill bucket stop taking
+// `__fdiv_rn`'s slow path). So the bytes and the scales are `quant_rows_fp8_ker`'s.
+// Shared memory: 8 warps × 2 stages × (an 8 KiB bf16 tile and a 4 KiB e4m3 tile), plus slack.
+
+constexpr int WIDE_WARPS = 8;
+constexpr int WIDE_THREADS = WIDE_WARPS * kittens::WARP_THREADS;
+constexpr size_t WIDE_SMEM_USED = WIDE_WARPS * STAGES * (sizeof(x_tile) + sizeof(q_tile));
+constexpr int WIDE_SMEM_BYTES = int(WIDE_SMEM_USED) + 1024;
+static_assert(WIDE_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
+
+__global__ __launch_bounds__(WIDE_THREADS, 1) void quant_rows_fp8_wide_ker(
+    const __grid_constant__ quant_globals g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    x_tile(&x_smem)[WIDE_WARPS][STAGES] = al.allocate<x_tile, WIDE_WARPS, STAGES>();
+    q_tile(&q_smem)[WIDE_WARPS][STAGES] = al.allocate<q_tile, WIDE_WARPS, STAGES>();
+    __shared__ kittens::semaphore arrived[WIDE_WARPS][STAGES];
+    __shared__ sv_fl<ROWS> amax_s[WIDE_WARPS];
+
+    const int w = kittens::warpid();
+    const int row_block = blockIdx.x;
+    // This warp's tiles of the row: `w + 8 i` for `i < mine` (none when the row has fewer).
+    const int mine = (g.col_tiles - w + WIDE_WARPS - 1) / WIDE_WARPS;
+    if (warp::laneid() == 0) {
+        for (int s = 0; s < STAGES; s++) {
+            init_semaphore(arrived[w][s], 0, 1);
+        }
+    }
+    __syncwarp();
+    // Load `i` of `2 · mine` (pass 1's, then pass 2's): this warp's tile `i % mine`, stage `i % 2`,
+    // phase `(i / 2) % 2`.
+    auto issue = [&](int i) {
+        const int stage = i % STAGES;
+        coord<x_tile> at = {0, 0, row_block, w + (i % mine) * WIDE_WARPS};
+        warp::tma::expect_bytes(arrived[w][stage], sizeof(x_tile));
+        warp::tma::load_async(x_smem[w][stage], g.x, at, arrived[w][stage]);
+    };
+
+    // Pass 1: this warp's tiles' max of absolute values, `quant_rows_fp8_ker`'s ops.
+    row_values amax;
+    warp::zero(amax);
+    if (mine > 0) {
+        issue(0);
+    }
+    for (int i = 0; i < mine; i++) {
+        const int stage = i % STAGES;
+        __syncwarp();
+        issue(i + 1);  // pass 1's next tile, or pass 2's first (`i + 1 == mine`)
+        wait(arrived[w][stage], (i / STAGES) % 2);
+        acc_tile x;
+        warp::load(x, x_smem[w][stage]);
+        warp::abs(x, x);
+        warp::row_max(amax, x, amax);
+    }
+    // The 8 warps' maxima, then their max in every warp.
+    warp::store(amax_s[w], amax);
+    __syncthreads();
+    row_values all, other;
+    warp::load(all, amax_s[0]);
+    for (int v = 1; v < WIDE_WARPS; v++) {
+        warp::load(other, amax_s[v]);
+        warp::max(all, all, other);
+    }
+    row_values scale;
+    warp::unary_op<scratchy::ops::fp8_scale>(scale, all);
+    if (w == 0) {
+        warp::store(g.scale, scale, {0, 0, 0, row_block});
+    }
+
+    // Pass 2: each of this warp's tiles divided by its rows' scales, cast to e4m3 and stored.
+    for (int i = mine; i < 2 * mine; i++) {
+        const int stage = i % STAGES;
+        // The store from this stage's e4m3 tile two iterations ago must have read it before this
+        // one overwrites it; the other stage's bf16 tile was read last iteration.
+        warp::tma::store_async_read_wait<1>();
+        __syncwarp();
+        if (i + 1 < 2 * mine) {
+            issue(i + 1);
+        }
+        wait(arrived[w][stage], (i / STAGES) % 2);
+        acc_tile x;
+        warp::load(x, x_smem[w][stage]);
+        warp::row_map<scratchy::ops::fp8_quant_pre_nz>(x, x, scale);
+        fp8_tile q;
+        warp::copy(q, x);
+        warp::store(q_smem[w][stage], q);
+        __syncwarp();
+        coord<q_tile> at = {0, 0, row_block, w + (i - mine) * WIDE_WARPS};
+        warp::tma::store_async(g.q, q_smem[w][stage], at);
+    }
+    warp::tma::store_async_wait();
+}
+
 }  // namespace
 
-// The kernel's one-time setup: allow it `QUANT_SMEM_BYTES` of dynamic shared memory on the current
-// device (the default limit is 48 KB). Run once per device before any launch
+// The kernels' one-time setup: allow `quant_rows_fp8_ker` `QUANT_SMEM_BYTES` and
+// `quant_rows_fp8_wide_ker` `WIDE_SMEM_BYTES` of dynamic shared memory on the current device (the default limit is 48 KB). Run once per device before any launch
 // (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
 //
 // 0 = done; any other value = the cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_quant_rows_fp8_prepare(void) {
-    return static_cast<int>(cudaFuncSetAttribute(
-        quant_rows_fp8_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, QUANT_SMEM_BYTES));
+    const cudaError_t e = cudaFuncSetAttribute(
+        quant_rows_fp8_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, QUANT_SMEM_BYTES);
+    return static_cast<int>(
+        e != cudaSuccess ? e
+                         : cudaFuncSetAttribute(quant_rows_fp8_wide_ker,
+                                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                WIDE_SMEM_BYTES));
 }
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
-// = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
-// runtime's last-error state.
-//
-// `rows` must be a non-zero multiple of 16 and `cols` of 64 (`step::GEMM_FP8_K_MULTIPLE`), and
-// `rows · cols` at most INT_MAX; all are checked before any pointer is touched. `x` must be a
-// 16-byte-aligned device pointer to `rows·cols` bf16, `q` to `rows·cols` e4m3 bytes and `scale`
-// to `rows` f32 (4-byte aligned), neither overlapping `x` nor each other.
-// `scratchy_cuda_quant_rows_fp8_prepare` must have succeeded on the current device. The launch is
-// asynchronous on `stream`; the caller owns it and synchronizes.
-extern "C" int scratchy_cuda_quant_rows_fp8(const void* x, void* q, void* scale, uint32_t rows,
-                                            uint32_t cols,
-                                            void* stream /* cudaStream_t; null = default */) {
+// Test support: `scratchy_cuda_quant_rows_fp8` at `variant` (0 `quant_rows_fp8_ker`, one warp a
+// 16-row block, FP8 S3's form; 1 `quant_rows_fp8_wide_ker`, the launcher's), the same bits.
+extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void* scale,
+                                                    uint32_t rows, uint32_t cols, uint32_t variant,
+                                                    void* stream /* cudaStream_t */) {
     if (rows == 0 || rows % uint32_t(ROWS) != 0 || cols == 0 || cols % COL_MULTIPLE != 0 ||
-        uint64_t(rows) * uint64_t(cols) > uint64_t(INT_MAX)) {
+        uint64_t(rows) * uint64_t(cols) > uint64_t(INT_MAX) || variant > 1) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -200,11 +298,33 @@ extern "C" int scratchy_cuda_quant_rows_fp8(const void* x, void* q, void* scale,
         const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
         quant_globals G{xg, qg, sg, int(row_blocks), col_tiles};
         void* args[] = {&G};
+        const cudaStream_t st = static_cast<cudaStream_t>(stream);
+        if (variant == 1) {
+            return static_cast<int>(cudaLaunchKernel(quant_rows_fp8_wide_ker, dim3(row_blocks),
+                                                     dim3(WIDE_THREADS), args, WIDE_SMEM_BYTES, st));
+        }
         const dim3 grid((row_blocks + uint32_t(WARPS) - 1) / uint32_t(WARPS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(quant_rows_fp8_ker, grid, block, args,
-                                                 QUANT_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
+        return static_cast<int>(
+            cudaLaunchKernel(quant_rows_fp8_ker, grid, block, args, QUANT_SMEM_BYTES, st));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
+}
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
+// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value
+// = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
+// runtime's last-error state.
+//
+// `rows` must be a non-zero multiple of 16 and `cols` of 64 (`step::GEMM_FP8_K_MULTIPLE`), and
+// `rows · cols` at most INT_MAX; all are checked before any pointer is touched. `x` must be a
+// 16-byte-aligned device pointer to `rows·cols` bf16, `q` to `rows·cols` e4m3 bytes and `scale`
+// to `rows` f32 (4-byte aligned), neither overlapping `x` nor each other.
+// `scratchy_cuda_quant_rows_fp8_prepare` must have succeeded on the current device. The launch is
+// asynchronous on `stream`; the caller owns it and synchronizes. It runs
+// `quant_rows_fp8_wide_ker` (F3), whose bits are `quant_rows_fp8_ker`'s.
+extern "C" int scratchy_cuda_quant_rows_fp8(const void* x, void* q, void* scale, uint32_t rows,
+                                            uint32_t cols,
+                                            void* stream /* cudaStream_t; null = default */) {
+    return scratchy_cuda_quant_rows_fp8_variant(x, q, scale, rows, cols, 1, stream);
 }

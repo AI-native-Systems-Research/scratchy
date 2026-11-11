@@ -400,6 +400,21 @@ __device__ inline float2 fp8_quant_pre::op<float2>(const float2& x, const float2
     return float2{fp8_quant_pre::op<float>(x.x, scale.x), fp8_quant_pre::op<float>(x.y, scale.y)};
 }
 
+// `fp8_quant_pre` that leaves a ±0 undivided (FP8 S8 F3, `quant_rows_fp8.cu`): `±0 / scale` is
+// ±0 and the clamp keeps it, so the value is `fp8_quant_pre`'s, but `__fdiv_rn` of a zero takes its
+// slow path (SASS `FCHK` then a `CALL`), which a prefill bucket's padding rows hit on every element.
+struct fp8_quant_pre_nz {
+    template <typename T>
+    static __device__ inline T op(const T& x, const T& scale) {
+        return x == T(0) ? x : fp8_quant_pre::op<T>(x, scale);
+    }
+};
+template <>
+__device__ inline float2 fp8_quant_pre_nz::op<float2>(const float2& x, const float2& scale) {
+    return float2{fp8_quant_pre_nz::op<float>(x.x, scale.x),
+                  fp8_quant_pre_nz::op<float>(x.y, scale.y)};
+}
+
 // One quantized element as the fp8 GEMV computes with it (FP8 S4, `gemv_fp8.cu`): `x` rounded to
 // e4m3 and widened back, `float(e4m3_satfinite(x))`. The cast is TK's scalar convertor
 // (`__nv_fp8_e4m3(float)`: round to nearest even, saturating to finite), the one byte S3's

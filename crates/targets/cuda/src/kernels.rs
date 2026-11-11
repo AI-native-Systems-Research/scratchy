@@ -56,6 +56,15 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_quant_rows_fp8_variant(
+        x: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        rows: u32,
+        cols: u32,
+        variant: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemm_fp8_prepare() -> i32;
     fn scratchy_cuda_gemm_fp8_abt(
         a: *const c_void,
@@ -3639,6 +3648,27 @@ pub unsafe fn quant_rows_fp8(
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
     // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_quant_rows_fp8(x, q, scale, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Test support for `tests/quant_rows_fp8.rs` only (FP8 S8 F3): [`quant_rows_fp8`] at `variant`, 0
+/// the FP8 S3 kernel (one warp a 16-row block) and 1 [`quant_rows_fp8`]'s own (eight warps a block),
+/// the same bits. Refused as [`quant_rows_fp8`], or for `variant` above 1. Asynchronous.
+///
+/// # Safety
+///
+/// As [`quant_rows_fp8`]'s.
+#[doc(hidden)]
+pub unsafe fn quant_rows_fp8_variant(
+    x: *const c_void,
+    (q, scale): (*mut c_void, *mut c_void),
+    (rows, cols): (u32, u32),
+    variant: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code =
+        unsafe { scratchy_cuda_quant_rows_fp8_variant(x, q, scale, rows, cols, variant, stream) };
     check(code, KernelError::RowShape { rows, cols })
 }
 

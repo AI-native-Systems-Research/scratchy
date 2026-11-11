@@ -211,3 +211,213 @@ fn the_host_e4m3_is_cudas_satfinite_conversion() {
         assert_eq!(e4m3_satfinite(v as f32), b, "round trip of {b:#04x}");
     }
 }
+
+// ── FP8 S8 F3: eight warps a 16-row block ────────────────────────────────────────
+
+/// `quant_rows_fp8_variant` on `x [rows, cols]`: `(q, scale)` as bytes.
+fn variant_quant(
+    device: &CudaDevice,
+    x: &DeviceBuffer,
+    (rows, cols): (usize, usize),
+    variant: u32,
+) -> (Vec<u8>, Vec<u8>) {
+    use scratchy_target_cuda::kernels::quant_rows_fp8_variant;
+    let q = DeviceBuffer::upload_bytes(device, &vec![0xA5; rows * cols + 256]).expect("q");
+    let s = DeviceBuffer::upload_bytes(device, &vec![0xA5; rows * 4 + 256]).expect("scale");
+    // SAFETY: `x` holds rows·cols bf16, `q` rows·cols bytes and `s` rows f32, all their own
+    // allocations; the downloads wait for the default stream.
+    unsafe {
+        quant_rows_fp8_variant(
+            x.ptr(),
+            (q.ptr(), s.ptr()),
+            (rows as u32, cols as u32),
+            variant,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("quant_rows_fp8_variant launch");
+    (down_bytes(&q), down_bytes(&s))
+}
+
+/// The prefill shapes: 512 and 2048 rows × the three models' fp8 `k`s (2,048, 2,816, 5,120,
+/// 17,408), and the expert inputs' pair rows (512 or 2,048 tokens × 8 picks) × 512 and 704.
+const F3_SHAPES: &[(usize, usize)] = &[
+    (512, 2048),
+    (512, 2816),
+    (512, 5120),
+    (512, 17408),
+    (2048, 2048),
+    (2048, 2816),
+    (2048, 5120),
+    (2048, 17408),
+    (4096, 512),
+    (4096, 704),
+    (16384, 512),
+    (16384, 704),
+];
+
+/// `rows · cols` bf16 of one kind: `random`; `padded` (the first quarter of the rows random, the
+/// rest zero, as a 128-token prompt in a 512-row bucket); `edge` (random, with signed zeros, bf16
+/// subnormals and one large value a row).
+fn f3_input(kind: &str, rows: usize, cols: usize) -> Vec<u16> {
+    let mut x = bf16_inputs(rows * cols, 0xF30 ^ (rows * cols) as u64);
+    match kind {
+        "padded" => x[(rows / 4) * cols..].fill(0),
+        "edge" => {
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = match i % 11 {
+                    0 => 0x8000,
+                    1 => 0x0000,
+                    2 => 0x0001,
+                    3 => 0x8001,
+                    4 if i % cols == 4 => 0x7F00,
+                    _ => *v,
+                };
+            }
+        }
+        _ => {}
+    }
+    x
+}
+
+/// F3's kernel (variant 1, the launcher's) is the FP8 S3 kernel's (variant 0) bit for bit, bytes
+/// and scales, at every prefill shape, on random, padded and edge rows, as `F3_BITS` lines.
+#[test]
+fn the_wide_quantize_is_the_s3_quantize_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for &(rows, cols) in F3_SHAPES {
+        for kind in ["random", "padded", "edge"] {
+            let x = DeviceBuffer::upload(&device, &f3_input(kind, rows, cols)).expect("x");
+            let (q0, s0) = variant_quant(&device, &x, (rows, cols), 0);
+            let (q1, s1) = variant_quant(&device, &x, (rows, cols), 1);
+            let q_bad = q0.iter().zip(&q1).filter(|(a, b)| a != b).count();
+            let s_bad = s0
+                .chunks(4)
+                .zip(s1.chunks(4))
+                .filter(|(a, b)| a != b)
+                .count();
+            let ok = q_bad == 0 && s_bad == 0;
+            eprintln!(
+                "F3_BITS rows={rows} cols={cols} {kind}: mismatched_bytes={q_bad} mismatched_scales={s_bad} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "the wide quantize is not the S3 quantize's bits");
+}
+
+type CudaEvent = *mut std::ffi::c_void;
+
+unsafe extern "C" {
+    fn cudaEventCreate(event: *mut CudaEvent) -> i32;
+    fn cudaEventRecord(event: CudaEvent, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: CudaEvent) -> i32;
+    fn cudaEventElapsedTime(ms: *mut f32, start: CudaEvent, end: CudaEvent) -> i32;
+    fn cudaEventDestroy(event: CudaEvent) -> i32;
+}
+
+/// `(median, min, max)` µs of 20 launches of `launch` after 3 warm-ups between two CUDA events on
+/// the default stream, `before` run untimed on the same stream before each.
+fn timed(mut before: impl FnMut(), mut launch: impl FnMut()) -> (f64, f64, f64) {
+    let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event is
+    // destroyed below.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut start), 0, "cudaEventCreate");
+        assert_eq!(cudaEventCreate(&mut end), 0, "cudaEventCreate");
+    }
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let mut ms = 0.0f32;
+        before();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(cudaEventRecord(start, std::ptr::null_mut()), 0, "record");
+            launch();
+            assert_eq!(cudaEventRecord(end, std::ptr::null_mut()), 0, "record");
+            assert_eq!(cudaEventSynchronize(end), 0, "synchronize");
+            assert_eq!(cudaEventElapsedTime(&mut ms, start, end), 0, "elapsed");
+        }
+        if i >= 3 {
+            times.push(f64::from(ms) * 1e3);
+        }
+    }
+    // SAFETY: both events were created above and are no longer used.
+    unsafe {
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    times.sort_by(f64::total_cmp);
+    (times[times.len() / 2], times[0], times[times.len() - 1])
+}
+
+/// The two kernels' time at every prefill shape (random rows) and at the 512-row bucket's padded
+/// rows, read-flush cold (a 100 MiB quantize of other data before each launch, so L2 holds clean
+/// lines of it) and hot, two rounds (A, B, A, B), as `TC_TIME` lines; the gate is ≤ 25 µs at
+/// 2048 × 5,120.
+#[test]
+fn the_wide_quantize_times_are_recorded() {
+    use scratchy_target_cuda::kernels::quant_rows_fp8_variant;
+    let device = h100();
+    // The flush: 2,048 × 25,600 bf16 (100 MiB) through the S3 kernel.
+    let (fr, fc) = (2048usize, 25600usize);
+    let fx = DeviceBuffer::upload_bytes(&device, &vec![0u8; fr * fc * 2]).expect("flush x");
+    let fq = DeviceBuffer::upload_bytes(&device, &vec![0u8; fr * fc]).expect("flush q");
+    let fs = DeviceBuffer::upload_bytes(&device, &vec![0u8; fr * 4]).expect("flush s");
+    let flush = || {
+        // SAFETY: the flush buffers hold their shape; null is the default stream.
+        unsafe {
+            quant_rows_fp8_variant(
+                fx.ptr(),
+                (fq.ptr(), fs.ptr()),
+                (fr as u32, fc as u32),
+                1,
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("flush");
+    };
+    let mut cases: Vec<(usize, usize, &str)> =
+        F3_SHAPES.iter().map(|&(r, c)| (r, c, "random")).collect();
+    cases.extend([
+        (512, 2048, "padded"),
+        (512, 2816, "padded"),
+        (512, 5120, "padded"),
+        (512, 17408, "padded"),
+    ]);
+    for (rows, cols, kind) in cases {
+        let x = DeviceBuffer::upload(&device, &f3_input(kind, rows, cols)).expect("x");
+        let q = DeviceBuffer::upload_bytes(&device, &vec![0u8; rows * cols]).expect("q");
+        let s = DeviceBuffer::upload_bytes(&device, &vec![0u8; rows * 4]).expect("s");
+        let shape = format!("qr_{rows}x{cols}_{kind}");
+        for round in 1..=2 {
+            for (variant, name) in [(0u32, "v0_s3_one_warp"), (1, "v1_f3_eight_warps")] {
+                let launch = || {
+                    // SAFETY: `x` holds rows·cols bf16, `q` rows·cols bytes and `s` rows f32; null
+                    // is the default stream.
+                    unsafe {
+                        quant_rows_fp8_variant(
+                            x.ptr(),
+                            (q.ptr(), s.ptr()),
+                            (rows as u32, cols as u32),
+                            variant,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("quant_rows_fp8_variant launch");
+                };
+                let cold = timed(flush, launch);
+                let hot = timed(|| {}, launch);
+                for (temp, (med, lo, hi)) in [("readcold", cold), ("hot", hot)] {
+                    eprintln!(
+                        "TC_TIME {temp} {shape} {name}: median={med:.1}us min={lo:.1}us max={hi:.1}us \
+                         {:.2} TB/s (round {round})",
+                        (rows * cols * 3) as f64 / med / 1e6
+                    );
+                }
+            }
+        }
+    }
+}
