@@ -239,7 +239,14 @@ pub struct SengraphBundleGroup {
     /// packed twin and a first-fit over the list holds one live request on the solo rung. The
     /// worker picks the SMALLEST rung holding both the chunk's real token count and the live
     /// request count.
-    pub prefill_rungs: &'static [(u32, u32, &'static str)],
+    ///
+    /// ⭐ EACH RUNG CARRIES ITS OWN `load_consts` — the same law as the decode
+    /// ladder's: the kinds staged into THAT rung's session at the rung's own
+    /// row count, never the representative wiring's rows=1 list. A packed
+    /// rung's placement holds `seqs` rows per uniform `[rows, 1]` table, so the
+    /// representative's list stages a fraction of the placement's bytes and the
+    /// load refuses (Finding 1).
+    pub prefill_rungs: &'static [(u32, u32, &'static str, RungLoadConsts)],
     /// DECODE BATCH LADDER `[(seqs, sentinel)]`, ascending — the request counts the decode bundle is
     /// baked at.
     ///

@@ -2002,7 +2002,7 @@ pub struct TpForward<T: crate::bundle_code::collective::World> {
     /// rungs and the prefix-capable prefill rungs — every rung the one-rank world serves, baked for
     /// this world, so a sharded session serves every prompt length and live request count on its
     /// own world's bundles.
-    pub prefill_rungs: &'static [(u32, u32, &'static str)],
+    pub prefill_rungs: &'static [(u32, u32, &'static str, crate::manifest::RungLoadConsts)],
     pub decode_rungs: &'static [(
         crate::manifest::RungSeqs,
         crate::manifest::SweptCols,

@@ -126,14 +126,6 @@ impl LaunchRows<'_> {
         }
     }
 
-    /// The rung's graph rows this launch binds: the launch's own pair's product.
-    fn graph_rows(&self, width: usize) -> usize {
-        match self {
-            LaunchRows::Sequence { reqs } => width * reqs.len(),
-            LaunchRows::Batch { .. } => width,
-        }
-    }
-
     /// ⭐ THE LAUNCH'S OWN EXTENT PAIR — the rung's `(per-request width, request
     /// capacity)` as this launch states it, the same law the bake minted each
     /// rung's pair by: a sequence launch's per-request width is the rung's `w`
@@ -272,11 +264,18 @@ pub(crate) fn run_card_launch(
         laws: seat_laws,
     } = sampler;
     let (h, vocab) = (sh.hidden, sh.vocab);
-    // ⭐ THE LAUNCH'S OWN PAIR — the rung's per-request width times its request count, the graph
-    // rows every whole-graph fact below is sized by. A solo launch's pair is (w, 1): `mq` is the
-    // width, exactly as before the S axis existed.
+    // ⭐ THE LAUNCH'S OWN PAIR — the rung's per-request width times its baked request count,
+    // the graph rows every whole-graph fact below is sized by. A solo launch's pair is (w, 1):
+    // `mq` is the width, exactly as before the S axis existed. ⭐ THE LAUNCH STAGES THE RUNG'S
+    // WHOLE BAKED ROWS, never its live shape — the pad laws carry what the live requests do not
+    // (a pad row its request's last real token, an empty WINDOW the last live request's rows,
+    // its KV write the null slot), because the whole-graph readers — the KV write index, the
+    // folded lm-head tail's S answer rows — address every row the rung baked, and a row nobody
+    // staged is a row the fold reads unwritten. The decode batch has always launched this way
+    // (its `mq` IS the rung's rows); the packed sequence launch states the same law.
     let w = width.count();
-    let mq = rows_in.graph_rows(w);
+    let (pair_w, pair_reqs) = rows_in.extent_pair(w as u32, baked_reqs);
+    let mq = (pair_w * pair_reqs) as usize;
     let live = rows_in.live();
     if live == 0 || live > mq {
         return Err(werr(format!(
@@ -300,7 +299,6 @@ pub(crate) fn run_card_launch(
             ))
         })?
         .get();
-    let (pair_w, pair_reqs) = rows_in.extent_pair(w as u32, baked_reqs);
     let step = b
         .wiring
         .paged
@@ -599,6 +597,11 @@ pub(crate) fn run_card_launch(
                 seat,
                 b.wiring.load_consts,
                 &picked,
+                // ⭐ THE LAUNCH'S OWN SEAT WIDTH, never the wiring's static seat
+                // meta: a packed rung's seat is S rows while the representative
+                // wiring states the solo rung's 1, and reading the placement at
+                // [1, pad_v] strides the wrong bytes.
+                seat_width.get(),
                 &format!("prefill-final mq={mq} at={seq_pos}"),
             );
             Some(picked)
@@ -1228,6 +1231,7 @@ fn log_seat_readback(
     seat: &scratchy_target_spyre::wiring::SampleSeat,
     consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
     picked: &[u32],
+    rows: usize,
     ctx: &str,
 ) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
@@ -1262,7 +1266,6 @@ fn log_seat_readback(
             _ => None,
         })
     }
-    let rows = seat.rows as usize;
     // The four word tables + inv_t — the full reservation, each row's word at
     // its stick head (`sample_binds`' own law, read back through the same
     // stride it staged).
@@ -1361,6 +1364,13 @@ fn log_seat_readback(
     let stk = <scratchy_subtile::superdsc_opspec::Fp16 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
         as usize;
     let mut argmax: Vec<(usize, u32)> = Vec::with_capacity(report.len());
+    // ⭐ TOP-2 + MARGIN per report row — the near-tie instrument: a text that
+    // flips between two launches of the same request is a flip exactly when
+    // the top two logits sit within rounding of each other, and a gross
+    // margin with a flipped pick names a miscompute instead. `(row, top-2
+    // lanes, their values, the margin)` — one fact per row, read off the same
+    // bytes the argmax loop already walks.
+    let mut top2: Vec<(usize, u32, u32, f32, f32)> = Vec::with_capacity(report.len());
     match session.read_tensor_raw(
         scratchy_target_spyre::bundle_code::PlaceId::Act(seat.row),
         rows * pad_v * 2,
@@ -1368,6 +1378,7 @@ fn log_seat_readback(
         Ok(b) => {
             for &r in &report {
                 let mut best = (0usize, f32::NEG_INFINITY);
+                let mut second = (0usize, f32::NEG_INFINITY);
                 for j in 0..vocab {
                     let e = scratchy_subtile::sdsc_abstract::dev_off_stk(
                         &[rows, pad_v],
@@ -1379,11 +1390,21 @@ fn log_seat_readback(
                     if let Some(v) = b.get(o..o + 2) {
                         let x = half::f16::from_le_bytes([v[0], v[1]]).to_f32();
                         if x > best.1 {
+                            second = best;
                             best = (j, x);
+                        } else if x > second.1 {
+                            second = (j, x);
                         }
                     }
                 }
                 argmax.push((r, best.0 as u32));
+                top2.push((
+                    r,
+                    best.0 as u32,
+                    second.0 as u32,
+                    best.1,
+                    best.1 - second.1,
+                ));
             }
         }
         Err(e) => {
@@ -1403,12 +1424,18 @@ fn log_seat_readback(
                 .find(|(ar, _)| *ar == r)
                 .map(|(_, a)| a);
             format!(
-                "r{r}:words={:?}:invt={}:pick={:?}:argmax={:?}:eq={}",
+                "r{r}:words={:?}:invt={}:pick={:?}:argmax={:?}:eq={}:top2={}",
                 words[r],
                 invt[r],
                 pick,
                 am,
-                pick == am
+                pick == am,
+                // `#?` on a plain tuple: the two lanes, their values, the margin.
+                top2
+                    .iter()
+                    .find(|(tr, _, _, _, _)| *tr == r)
+                    .map(|(_, a, b, va, m)| format!("({a},{b},{va:.4},m={m:.4})"))
+                    .unwrap_or_else(|| "-".to_string())
             )
         })
         .collect();
@@ -1551,8 +1578,8 @@ pub(crate) fn superdsc_forward_chunk(
             }
         };
         tracing::debug!(
-            "PREFILL_PATH=batched rung={width} rows={real} pos={pos} end={end} top_m={top_m} \
-             prefix={}",
+            "PREFILL_PATH=batched id={id} rung={width} rows={real} pos={pos} end={end} \
+             top_m={top_m} prefix={}",
             pos > 0
         );
         pos += real;
@@ -1742,7 +1769,7 @@ pub(crate) fn run_packed_request_step(
         }
     }
     tracing::debug!(
-        "PREFILL_PATH=packed rung={w}x{rs} live={} rows={real} finishes={}",
+        "PREFILL_PATH=packed ids={ids:?} rung={w}x{rs} live={} rows={real} finishes={}",
         ids.len(),
         finishes.iter().filter(|f| **f).count()
     );

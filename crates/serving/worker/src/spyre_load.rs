@@ -1428,10 +1428,10 @@ impl SpyreWorker {
                 let narrowest_rung = g0
                     .prefill_rungs
                     .iter()
-                    .filter(|&&(rm, seqs, _)| rm > 1 && seqs == 1)
-                    .min_by_key(|&&(rm, _, _)| rm);
+                    .filter(|&&(rm, seqs, _, _)| rm > 1 && seqs == 1)
+                    .min_by_key(|&&(rm, _, _, _)| rm);
                 let prefill_code = match (top_prefill, narrowest_rung) {
-                    (Some(_tp), Some((rm, _, sent))) => Some(sent
+                    (Some(_tp), Some((rm, _, sent, _))) => Some(sent
                         .strip_prefix(SUPERDSC_SENTINEL)
                         .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
                         .ok_or_else(|| {
@@ -1614,14 +1614,14 @@ impl SpyreWorker {
                 let anchor_rung_m = g0
                     .prefill_rungs
                     .iter()
-                    .filter(|&&(rm, seqs, _)| rm > 1 && seqs == 1)
-                    .min_by_key(|&&(rm, _, _)| rm)
-                    .map(|&(rm, _, _)| rm);
+                    .filter(|&&(rm, seqs, _, _)| rm > 1 && seqs == 1)
+                    .min_by_key(|&&(rm, _, _, _)| rm)
+                    .map(|&(rm, _, _, _)| rm);
                 let ladder_rung_bytes: u64 = g0
                     .prefill_rungs
                     .iter()
-                    .filter(|&&(rm, seqs, _)| rm > 1 && (seqs > 1 || Some(rm) != anchor_rung_m))
-                    .filter_map(|&(_, _, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
+                    .filter(|&&(rm, seqs, _, _)| rm > 1 && (seqs > 1 || Some(rm) != anchor_rung_m))
+                    .filter_map(|&(_, _, sent, _)| sent.strip_prefix(SUPERDSC_SENTINEL))
                     .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                     .map(|rc| non_resident(&rc.layout))
                     .sum::<u64>()
@@ -1832,15 +1832,15 @@ impl SpyreWorker {
                             .iter()
                             // The anchor is the narrowest SOLO rung — the (width, seqs)-ascending
                             // list puts it before any packed twin of the same width.
-                            .filter(|&&(rm, seqs, _)| rm > 1 && seqs == 1)
-                            .min_by_key(|&&(rm, _, _)| rm)
+                            .filter(|&&(rm, seqs, _, _)| rm > 1 && seqs == 1)
+                            .min_by_key(|&&(rm, _, _, _)| rm)
                             .map_or_else(
                                 || {
                                     wirings.prefill.as_ref().map_or(0, |p| {
                                         p.tensor_shapes[p.embed_src as usize].0 as usize
                                     })
                                 },
-                                |&(rm, _, _)| rm as usize,
+                                |&(rm, _, _, _)| rm as usize,
                             );
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
@@ -1885,15 +1885,22 @@ impl SpyreWorker {
                         // the BORROWING form — identical to every ladder rung: placeholders here,
                         // `adopt_from_owner` onto decode's regions after the owner is built — when
                         // it does not. What that costs is the placement effect, never the run.
-                        // ⭐ THE PREFILL WIRING'S OWN STAGED CONSTANTS — the general mint puts
-                        // the sampler's nine tables in every prefill rung, and they sit in each
-                        // session's own seg3 (never aliased), so every prefill session stages
-                        // its own copy through the same load-time channel the decode rungs use.
-                        let prefill_consts = wirings
-                            .prefill
-                            .as_ref()
-                            .unwrap_or(&wirings.decode)
-                            .load_consts;
+                        // ⭐ THE ANCHOR RUNG'S OWN STAGED CONSTANTS — the same law the decode
+                        // ladder's rungs carry: the anchor IS the narrowest solo rung of the
+                        // manifest's list, so its uniform `[rows, 1]` tables stage at ITS OWN
+                        // rows, read straight off the entry `prefill_code` came from — never
+                        // the representative wiring's list, which agrees only while every solo
+                        // rung mints rows=1. The no-ladder fallback stays the wiring's own
+                        // consts (there is no rung entry to read).
+                        let prefill_consts = narrowest_rung
+                            .map(|&(_, _, _, consts)| consts)
+                            .unwrap_or_else(|| {
+                                wirings
+                                    .prefill
+                                    .as_ref()
+                                    .unwrap_or(&wirings.decode)
+                                    .load_consts
+                            });
                         // The pool's own tables, staged per prefill session — see
                         // [`prefill_pool_statics`] for why they cannot be aliased.
                         let anchor_pool = prefill_pool_statics(wirings)?;
@@ -1960,15 +1967,20 @@ impl SpyreWorker {
                 // lands in the ladder at its own pair (the worker selects on the pair). The
                 // anchor's own entry — the narrowest SOLO rung, `(prefill_m, 1)` — is skipped:
                 // its session is `prefill_ss` itself, built and aliased above.
-                /// One ladder job: the rung's `(width, seqs)` pair and its bundle.
+                /// One ladder job: the rung's `(width, seqs)` pair, its bundle and its OWN
+                /// staged constants — the decode ladder's law, carried by the prefill rungs
+                /// too: a PACKED rung's placement holds `seqs` rows per uniform `[rows, 1]`
+                /// table, so each session stages the entry's own kinds, never the
+                /// representative wiring's rows=1 list (Finding 1).
                 type LadderJob = (
                     (usize, usize),
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
+                    scratchy_target_spyre::manifest::RungLoadConsts,
                 );
                 let ladder: Vec<LadderJob> = g0
                     .prefill_rungs
                     .iter()
-                    .filter_map(|&(rung_m, rung_s, sentinel)| {
+                    .filter_map(|&(rung_m, rung_s, sentinel, consts)| {
                         let rm = rung_m as usize;
                         let rs = rung_s as usize;
                         if (rm, rs) == (prefill_m, 1) || rm <= 1 {
@@ -1977,7 +1989,7 @@ impl SpyreWorker {
                         sentinel
                             .strip_prefix(SUPERDSC_SENTINEL)
                             .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .map(|c| ((rm, rs), c))
+                            .map(|c| ((rm, rs), c, consts))
                     })
                     .collect();
                 let _t_sess = std::time::Instant::now();
@@ -2050,13 +2062,6 @@ impl SpyreWorker {
                 // ⛔ THE LADDER STILL BUILDS IN PARALLEL. This reorders WHO ALLOCATES FIRST; it does not
                 // serialize startup, and the aliasing after the join is unchanged.
                 let ladder_join = {
-                    // The prefill wiring's staged constants, staged by every rung through its own
-                    // seg3 (the general mint's nine tables — see the anchor's own `prefill_consts`).
-                    let prefill_consts = wirings
-                        .prefill
-                        .as_ref()
-                        .unwrap_or(&wirings.decode)
-                        .load_consts;
                     let nthreads = std::thread::available_parallelism()
                         .map(|n| n.get())
                         .unwrap_or(4)
@@ -2070,8 +2075,9 @@ impl SpyreWorker {
                     // Owned copy for the background build: the spilled tail's ids are declared
                     // resident by every session, and these rungs are built off this thread.
                     let ladder_spill = spill_tids.clone();
-                    // These are PREFILL rungs (`rung_consts = prefill_consts`), so each stages the
-                    // pool's tables for itself ([`prefill_pool_statics`]).
+                    // These are PREFILL rungs, so each stages the pool's tables for itself
+                    // ([`prefill_pool_statics`]); their staged CONSTANTS are each rung's own,
+                    // carried by the job (see `LadderJob`).
                     let ladder_pool = prefill_pool_statics(wirings)?;
                     // The cards are the loader's `&'static` borrow, so the background build takes
                     // the reference itself — nothing to clone, nothing kept alive by the build.
@@ -2080,11 +2086,10 @@ impl SpyreWorker {
                             .into_iter()
                             .map(|part| {
                                 let rung_spill = ladder_spill.clone();
-                                let rung_consts = prefill_consts;
                                 let rung_pool = ladder_pool.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
-                                        .map(|(rung, rcode)| {
+                                        .map(|(rung, rcode, rung_consts)| {
                                             let r = SuperDscSession::new_borrowing_with_consts(
                                                 cards,
                                                 rcode,

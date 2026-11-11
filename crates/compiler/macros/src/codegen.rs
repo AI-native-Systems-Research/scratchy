@@ -9201,6 +9201,13 @@ type DecodeRungEntry = (
     Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
 );
 
+/// One prefill rung as a bake commits it: its per-request width, its baked request count, its
+/// body fingerprint and its own staged constants — the SAME law as a decode rung's entry: the
+/// rung's uniform `[rows, 1]` tables are minted at the rung's OWN row count, never the
+/// representative wiring's (Finding 1).
+#[cfg(feature = "spyre")]
+type PrefillRungEntry = DecodeRungEntry;
+
 /// ⭐ ONE WORLD'S THREE LADDERS, AS TOKENS — `(prefill_rungs, decode_rungs, prefill_prefix)` for a
 /// [`SengraphBundleGroup`](scratchy_target_spyre::manifest::SengraphBundleGroup) or a
 /// [`TpForward`](scratchy_target_spyre::wiring::TpForward), from that world's committed rung cells.
@@ -9214,7 +9221,7 @@ type DecodeRungEntry = (
 /// included: no other slot carries it.
 #[cfg(feature = "spyre")]
 fn ladder_lits(
-    prefill_rungs: &[(u32, u32, String)],
+    prefill_rungs: &[PrefillRungEntry],
     decode_rungs: &[DecodeRungEntry],
     prefill_prefix_rungs: &[(u32, String)],
 ) -> (
@@ -9241,14 +9248,23 @@ fn ladder_lits(
     // the solo rung for one live request and the packed one only when it holds more.
     let prefill = if prefill_rungs.len() > 1 {
         let mut rungs = prefill_rungs.to_vec();
-        rungs.sort_by_key(|(w, s, _)| (*w, *s));
+        rungs.sort_by_key(|(w, s, _, _)| (*w, *s));
         rungs
             .iter()
-            .map(|(w, s, fp)| {
+            .map(|(w, s, fp, consts)| {
                 let wq = proc_macro2::Literal::u32_unsuffixed(*w);
                 let sq = proc_macro2::Literal::u32_unsuffixed(*s);
                 let f = sentinel(fp);
-                quote! { (#wq, #sq, #f) }
+                // ⭐ THE RUNG'S OWN KINDS — the same law as a decode rung's entry: a packed
+                // rung's placement holds `seqs` rows per table, and the representative wiring's
+                // `rows=1` list would stage 1 row's bytes against it (the bind_load_consts
+                // refusal). Rendered by the ONE load-const renderer, so the spellings cannot
+                // drift.
+                let consts = consts
+                    .iter()
+                    .map(load_const_entry_tokens)
+                    .collect::<Vec<_>>();
+                quote! { (#wq, #sq, #f, &[#(#consts),*]) }
             })
             .collect()
     } else {
@@ -11672,14 +11688,17 @@ fn dump_wavefront_mega(
         // SengraphBundle's PREFILL graph slot (C4) so the worker resolves a DISTINCT prefill dxp
         // bundle (prefill:Some) and runs the prompt in one m=N forward, then decodes the last token.
         let superdsc_prefill_fp: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
-        // PREFILL WIDTH LADDER `[(width, seqs, body_fp)]` — every prefill reroll that bakes stamps
-        // its own rung here, so the ladder is whatever actually LOWERED, never an assumed list. The
-        // top rung is `prefill_m` at ONE request (also stamped into `superdsc_prefill_fp`, keeping
-        // the single-bundle path and every downstream guard unchanged); interior rungs are extra
-        // bakes over the SAME resident weights+KV, and a PACKED rung (seqs = S) is the same bake at
-        // w·S rows — the tape the splice unrolls into S one-sequence attention programs. See
+        // PREFILL WIDTH LADDER `[(width, seqs, body_fp, OWN load_consts)]` — every prefill reroll
+        // that bakes stamps its own rung here, so the ladder is whatever actually LOWERED, never an
+        // assumed list. The top rung is `prefill_m` at ONE request (also stamped into
+        // `superdsc_prefill_fp`, keeping the single-bundle path and every downstream guard
+        // unchanged); interior rungs are extra bakes over the SAME resident weights+KV, and a
+        // PACKED rung (seqs = S) is the same bake at w·S rows — the tape the splice unrolls into S
+        // one-sequence attention programs. The consts are the decode ladder's law: the rung's OWN
+        // kinds at ITS OWN rows, never the representative wiring's rows=1 list (a packed rung
+        // stages `seqs` rows per uniform table). See
         // `manifest::SengraphBundleGroup::prefill_rungs`.
-        let superdsc_prefill_rungs: std::cell::RefCell<Vec<(u32, u32, String)>> =
+        let superdsc_prefill_rungs: std::cell::RefCell<Vec<PrefillRungEntry>> =
             std::cell::RefCell::new(Vec::new());
         // DECODE BATCH LADDER `[(seqs, body_fp)]` — one entry per width that actually LOWERED, never
         // an assumed list. The one-request rung is the bundle already stamped into `superdsc_fp`, so
@@ -11729,7 +11748,7 @@ fn dump_wavefront_mega(
         struct WorldBake<'w> {
             fp: &'w std::cell::RefCell<Option<String>>,
             prefill_fp: &'w std::cell::RefCell<Option<String>>,
-            prefill_rungs: &'w std::cell::RefCell<Vec<(u32, u32, String)>>,
+            prefill_rungs: &'w std::cell::RefCell<Vec<PrefillRungEntry>>,
             prefill_prefix_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
             decode_rungs: &'w std::cell::RefCell<Vec<DecodeRungEntry>>,
             wiring: &'w std::cell::RefCell<WiringPair>,
@@ -11782,6 +11801,12 @@ fn dump_wavefront_mega(
                 width: u32,
                 seqs: u32,
                 fp: String,
+                // ⭐ the prefill rung's OWN kinds, the same law as a decode
+                // rung's: a PACKED rung's placement holds `seqs` rows per
+                // uniform `[rows, 1]` table, and the representative wiring's
+                // rows=1 list stages one row against it (the bind_load_consts
+                // refusal). From THIS bake's wiring (`gk`).
+                consts: Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
             },
             PrefillFp(String),
             // ⭐ THE RUNG'S OWN KINDS ride the effect: the decode batch rung's
@@ -13165,6 +13190,14 @@ fn dump_wavefront_mega(
                                                 width: mq,
                                                 seqs: prefill_seqs,
                                                 fp: bfp.clone(),
+                                                // THIS rung's own kinds — the wiring `gk`
+                                                // derived from THIS bake, whose mint ran at
+                                                // this rung's row count. Same law as a
+                                                // decode rung's entry: a packed rung's
+                                                // uniform `[rows, 1]` tables stage at the
+                                                // rung's own rows, never the representative
+                                                // wiring's rows=1.
+                                                consts: gk.load_consts.clone(),
                                             });
                                             // Rungs bake ASCENDING, so the LAST write is the widest
                                             // -- the ceiling the worker treats as its single prefill
@@ -13373,10 +13406,15 @@ fn dump_wavefront_mega(
                     }
                     // Ladder rung (deduped on the (width, seqs) pair: a rebake of the same rung
                     // must not double-enter).
-                    BakeEffect::PrefillRung { width, seqs, fp } => {
+                    BakeEffect::PrefillRung {
+                        width,
+                        seqs,
+                        fp,
+                        consts,
+                    } => {
                         let mut r = world.prefill_rungs.borrow_mut();
-                        if !r.iter().any(|&(w, s, _)| (w, s) == (width, seqs)) {
-                            r.push((width, seqs, fp));
+                        if !r.iter().any(|&(w, s, _, _)| (w, s) == (width, seqs)) {
+                            r.push((width, seqs, fp, consts));
                         }
                     }
                     BakeEffect::PrefillFp(fp) => *world.prefill_fp.borrow_mut() = Some(fp),
@@ -14153,7 +14191,7 @@ fn dump_wavefront_mega(
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
-                .map(|&(w, _, _)| w)
+                .map(|&(w, _, _, _)| w)
                 .collect();
             let window = scratchy_subtile::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
             if let Err(e) =
@@ -14190,7 +14228,7 @@ fn dump_wavefront_mega(
             let baked: Vec<u32> = superdsc_prefill_rungs
                 .borrow()
                 .iter()
-                .map(|&(w, _, _)| w)
+                .map(|&(w, _, _, _)| w)
                 .collect();
             let asked = scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
             for &m in &asked {
