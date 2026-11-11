@@ -1490,7 +1490,9 @@ pub trait HardwareSubmit: Send + Sync {
     /// — `ResponseWorker::FetchResponseBlocks` (`response_worker.cpp:913`).
     /// Drains up to `out.len()` responses (the WHOLE backlog, sized
     /// `max_pending_requests_`), blocking only until `min_count` have
-    /// arrived — the real call passes `0`, i.e. it never blocks. Returns the
+    /// arrived — the real call passes `1` while requests are pending (the
+    /// door's completion-eventfd wait, bounded by the arrival wall budget)
+    /// and `0` when nothing is pending. Returns the
     /// number actually received.
     /// Returns the number of responses written into `out`, together with the
     /// [`ResponseCredit`] for those slots — which the caller MUST discharge via
@@ -2729,13 +2731,34 @@ impl ResponseWorker {
     }
 
     /// Port of `ResponseWorker::FetchResponseBlocks` (`response_worker.cpp:904-956`).
+    ///
+    /// One deliberate divergence from the reference: the C++ polls with
+    /// `min_count = 0` in a hot loop (`ReceiveResponsesSBF(rbs_.data(),
+    /// max_pending_requests_, 0)`), which burns a full core per response
+    /// worker for the whole drain — measured on card: nine response workers
+    /// at ~40% CPU each during a tp/8 decode. Here the receive blocks while
+    /// work is outstanding: `min_count = 1` makes the door wait on the
+    /// completion eventfd, BOUNDED by the arrival module's wall budget (a
+    /// receive waits at most that budget in either mode; expiry with nothing
+    /// arrived is a 0-count answer, not an error), so every check below
+    /// still runs at least once per budget and on every completion. The
+    /// idle exit keeps `min_count = 0` — nothing pending is probed, never
+    /// waited on.
     fn fetch_response_blocks(&self, scratch: &mut DrainScratch) -> (u64, ResponseCredit) {
         let start = Instant::now();
         let mut last_report = Duration::ZERO;
         loop {
-            // The whole backlog, non-blocking: `ReceiveResponsesSBF(rbs_.data(),
-            // max_pending_requests_, 0)`.
-            let (num_received, credit) = self.hw.receive_responses(&mut scratch.rbs, 0);
+            // Read the pending count BEFORE the receive: the min_count the
+            // receive takes is decided by the work that exists at entry, so
+            // a batch that completes while this thread was between the load
+            // and the receive is picked up by the blocked wait's own return,
+            // never lost to a stale 0.
+            let min_count = if self.num_pending_requests.load(Ordering::Acquire) > 0 {
+                1
+            } else {
+                0
+            };
+            let (num_received, credit) = self.hw.receive_responses(&mut scratch.rbs, min_count);
             if num_received > 0 {
                 return (num_received, credit);
             }
