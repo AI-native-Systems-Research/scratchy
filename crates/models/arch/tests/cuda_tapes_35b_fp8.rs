@@ -96,3 +96,30 @@ const WEIGHT_KINDS: [(&str, usize); 4] = [
     ("GdnBundle", 30),
 ];
 const HEADERS: &str = "fp8_headers_qwen3.6-35b-a3b.json";
+
+/// The shared expert's gate/up reads the routed experts' quantization of the same normed row
+/// (FP8 S8 T2): no quant write between the two, so the one write serves both, in every MoE layer.
+#[test]
+fn the_shared_gate_up_reuses_the_routed_quant_write() {
+    let steps = tape_of(1).steps;
+    let mut layers = 0;
+    for (i, s) in steps.iter().enumerate() {
+        let CudaStep::ExpertGateUpTcFp8(_) = s else {
+            continue;
+        };
+        let j = (i + 1..steps.len())
+            .find(|&j| matches!(steps[j], CudaStep::GateUpTcFp8(_)))
+            .unwrap_or_else(|| panic!("m=1 step {i}: no shared gate/up after it"));
+        assert_eq!(
+            steps[j].quantized_input(),
+            s.quantized_input(),
+            "m=1 step {j}: the routed experts' row"
+        );
+        assert!(
+            !(steps[i..j].iter()).any(|s| matches!(s, CudaStep::QuantRowsFp8(_))),
+            "m=1 steps {i}..{j}: no quant write between"
+        );
+        layers += 1;
+    }
+    assert_eq!(layers, 40, "m=1: every MoE layer");
+}

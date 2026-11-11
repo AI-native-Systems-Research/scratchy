@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
     CudaStep, ExpertGateUpActBf16, ExpertGemmBf16, ExpertGemvBf16, GateUpActBf16, GateUpKernel,
-    MoeWeight, QuantChainError, QuantRowsFp8, quant_chain,
+    MoeWeight, QuantChainError, QuantRowsFp8, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{CUDA_ARENA_ALIGN, CudaTape, TapeError};
 use scratchy_target_cuda::weights::{CudaWeight, check, open_checkpoint};
@@ -120,6 +120,11 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::GemmGroupFp8(_) => "GemmGroupFp8",
             CudaStep::GemmNarrowGroupFp8(_) => "GemmNarrowGroupFp8",
             CudaStep::GemvGroupFp8(_) => "GemvGroupFp8",
+            CudaStep::GemvTcFp8(_) => "GemvTcFp8",
+            CudaStep::GemvGroupTcFp8(_) => "GemvGroupTcFp8",
+            CudaStep::GateUpTcFp8(_) => "GateUpTcFp8",
+            CudaStep::ExpertGemvTcFp8(_) => "ExpertGemvTcFp8",
+            CudaStep::ExpertGateUpTcFp8(_) => "ExpertGateUpTcFp8",
         };
         *h.entry(kind).or_default() += 1;
     }
@@ -297,6 +302,37 @@ fn the_quant_scratch_liveness_check_holds_and_bites() {
                 Err(TapeError::QuantChain { error }),
                 "m={m}: validate, write {i} {what}"
             );
+        }
+    }
+}
+
+/// The decode tape's fp8 GEMVs on the tensor cores (FP8 S8 T2, /tmp/a-tc-plan.md §1, §2): every
+/// CUDA-core fp8 GEMV left is one `gemv_tc_takes` refuses; every quant write quantizes the one
+/// token row; every tensor-core gate/up's down, the step right after it, reads its act + quantize's
+/// write; and the quant scratch's liveness check holds.
+#[test]
+fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
+    let tape = tape_of(1);
+    assert_eq!(quant_chain(tape.steps), Ok(()), "m=1");
+    for (i, s) in tape.steps.iter().enumerate() {
+        match *s {
+            CudaStep::QuantRowsFp8(q) => assert_eq!(q.rows, 1, "m=1 step {i}: one row"),
+            CudaStep::GemvFp8(g) => {
+                assert!(!gemv_tc_takes([g.n, 0, 0], g.k, 1), "m=1 step {i}: {g:?}")
+            }
+            CudaStep::GemvGroupFp8(g) => {
+                let ns = [g.first.n, g.second.n, g.third.map_or(0, |t| t.n)];
+                assert!(!gemv_tc_takes(ns, g.k, 1), "m=1 step {i}: {ns:?}");
+            }
+            CudaStep::GateUpAct(g) => panic!("m=1 step {i}: a CUDA-core gate/up {:?}", g.kernel),
+            CudaStep::ExpertGateUpAct(_) | CudaStep::ExpertGemv(_) => {
+                panic!("m=1 step {i}: a CUDA-core expert GEMV")
+            }
+            _ => {}
+        }
+        if let (false, Some(w)) = (matches!(s, CudaStep::QuantRowsFp8(_)), s.quant_write()) {
+            let down = tape.steps.get(i + 1).and_then(CudaStep::quantized_input);
+            assert_eq!(down, Some((w.q, w.rows, w.cols)), "m=1 step {i}: its down reads it");
         }
     }
 }

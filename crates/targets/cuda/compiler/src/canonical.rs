@@ -34,12 +34,13 @@ use scratchy_target_cuda::op_abi::{
     CUDA_RESULT_ROWS, CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
 };
 use scratchy_target_cuda::step::{
-    CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, QuantChainError,
-    QuantRowsFp8, gdn_scratch, quant_chain,
+    ACT_QUANT_MAX_COLS, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, ExpertGateUpTcFp8,
+    GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, MoeWeight, QuantChainError, QuantRowsFp8,
+    gdn_scratch, gemv_tc_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, KvClass, MoeSortTape, MoeTape,
-    RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles,
+    RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles, overlap,
 };
 
 use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_driver, lower_step};
@@ -1554,7 +1555,11 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             | CudaStep::GemmFp8(_)
             | CudaStep::GemmCol64Fp8(_)
             | CudaStep::GemmNarrowFp8(_)
-            | CudaStep::GemvFp8(_) => {
+            | CudaStep::GemvFp8(_)
+            | CudaStep::GemvTcFp8(_)
+            | CudaStep::GateUpTcFp8(_)
+            | CudaStep::ExpertGemvTcFp8(_)
+            | CudaStep::ExpertGateUpTcFp8(_) => {
                 let w = s.extents()?.weight?;
                 Some((w.ix.0, w.bytes))
             }
@@ -1608,6 +1613,8 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             _ => None,
         })
     });
+    // The tensor-core decode GEMVs first: a gate/up's f32 rows are GEMV scratch.
+    let steps: Vec<CudaStep> = steps.into_iter().map(gemv_tc).collect();
     // The GEMV scratch, sized by the lowered steps, at the arena's end: the largest split step's
     // partials (one GEMV runs at a time), `None` when no step splits.
     let scratch = (steps.iter())
@@ -1674,55 +1681,179 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     })
 }
 
-/// The fp8 GEMMs of more than one row, each reading its quantized input (FP8 S2, §1c): before each
-/// one (a grouped launch, a gate/up pair once, or an expert GEMM over an fp8 bank, all its sorted
-/// or activation rows), a [`QuantRowsFp8`] of its bf16 input into the
-/// quant scratch, which the GEMM then reads in place of that input. The scratch is one region at
-/// the arena's end (`total`), the largest quant write's bytes; its liveness is checked
-/// ([`quant_chain`]). Returns the steps and the arena's new end; a tape with no such GEMM is as
-/// it was. A one-row GEMV quantizes its row in its own prologue (S4), so it reads its bf16 row.
+/// The decode fp8 GEMV `s` on the tensor cores when [`gemv_tc_takes`] takes its shape at one
+/// token row (FP8 S8 T2, /tmp/a-tc-plan.md §1): a GEMV, a GEMV group, a gate/up of one row (its
+/// activation at most [`ACT_QUANT_MAX_COLS`] columns), an expert GEMV or expert gate/up over an
+/// fp8 bank. Every other step is as it was; a gate/up's `q_act` is [`quantize_fp8_inputs`]'s to
+/// place.
+fn gemv_tc(s: CudaStep) -> CudaStep {
+    let fp8 = |w: MoeWeight| matches!(w, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
+    match s {
+        CudaStep::GemvFp8(g) if g.m == 1 && gemv_tc_takes([g.n, 0, 0], g.k, 1) => {
+            CudaStep::GemvTcFp8(g)
+        }
+        CudaStep::GemvGroupFp8(g) => {
+            let third = g.third.map_or(0, |t| t.n);
+            match g.m == 1 && gemv_tc_takes([g.first.n, g.second.n, third], g.k, 1) {
+                true => CudaStep::GemvGroupTcFp8(g),
+                false => s,
+            }
+        }
+        CudaStep::GateUpAct(fold)
+            if fold.kernel == GateUpKernel::GemvFp8
+                && fold.gate.m == 1
+                && fold.gate.n <= ACT_QUANT_MAX_COLS
+                && gemv_tc_takes([fold.gate.n, fold.up.n, 0], fold.gate.k, 1) =>
+        {
+            CudaStep::GateUpTcFp8(GateUpTcFp8 {
+                fold,
+                q_act: fold.out,
+            })
+        }
+        CudaStep::ExpertGemv(g) if g.m == 1 && fp8(g.weight) => {
+            let (n, k) = g.n_k();
+            match gemv_tc_takes([n, 0, 0], k, g.top_k) {
+                true => CudaStep::ExpertGemvTcFp8(g),
+                false => s,
+            }
+        }
+        CudaStep::ExpertGateUpAct(fold) if fold.gate.m == 1 && fp8(fold.gate.weight) => {
+            let (n, k) = fold.gate.n_k();
+            match n <= ACT_QUANT_MAX_COLS && gemv_tc_takes([n, n, 0], k, fold.gate.top_k) {
+                true => CudaStep::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
+                    fold,
+                    q_act: fold.out,
+                }),
+                false => s,
+            }
+        }
+        _ => s,
+    }
+}
+
+/// The fp8 steps reading a quantized input (FP8 S2, §1c; S8 T2), each served from the quant
+/// scratch at the arena's end (`total`), in two slots: the first holds what a [`QuantRowsFp8`]
+/// writes, the second what a tensor-core gate/up's act + quantize writes (its `q_act`), each
+/// slot the largest such write's bytes. Before each reader (a grouped launch, a gate/up pair, an
+/// expert GEMM or GEMV over an fp8 bank, a tensor-core GEMV), a [`QuantRowsFp8`] of its bf16
+/// input into the first slot, unless the reader is no dense prefill GEMM and a slot already holds
+/// that input's rows with nothing written to them since (an expert up GEMM after its gate; the
+/// 35B's shared gate/up after its routed one off one normed row; a down after its gate/up's act +
+/// quantize); the reader then reads that slot in place of its input. The
+/// liveness is checked ([`quant_chain`]). Returns the steps and the arena's new end; a tape with
+/// no such step is as it was. A CUDA-core one-row GEMV quantizes its row in its own prologue
+/// (S4), so it reads its bf16 row.
 fn quantize_fp8_inputs(
     steps: Vec<CudaStep>,
     total: u64,
 ) -> Result<(Vec<CudaStep>, u64), CanonicalRefusal> {
-    let q = ArenaOffset(total);
     let too_large = || CanonicalRefusal::Arena(ArenaRefusal::TooLarge);
-    let mut out = Vec::with_capacity(steps.len());
-    let mut most = 0u64;
-    let mut last: Option<QuantRowsFp8> = None;
-    for mut s in steps {
+    let align = |b: u64| {
+        b.checked_next_multiple_of(CUDA_ARENA_ALIGN)
+            .ok_or_else(too_large)
+    };
+    let mut most = [0u64; 2];
+    for s in &steps {
         if let Some((x, rows, cols)) = s.quantized_input() {
-            let quant = QuantRowsFp8 { x, q, rows, cols };
-            most = most.max(quant.bytes().ok_or_else(too_large)?);
-            // An expert up GEMM reads the rows its gate GEMM, the step before, read quantized: the
-            // gate writes neither those rows nor the scratch, so one quant write serves both.
-            let shared = matches!(
-                (out.last(), last),
-                (Some(p @ CudaStep::ExpertGemm(_)), Some(l))
-                    if l == quant && p.quantized_input() == Some((q, rows, cols))
+            let q = QuantRowsFp8 {
+                x,
+                q: x,
+                rows,
+                cols,
+            };
+            most[0] = most[0].max(q.bytes().ok_or_else(too_large)?);
+        }
+        if let Some(q) = s.quant_write() {
+            most[1] = most[1].max(q.bytes().ok_or_else(too_large)?);
+        }
+    }
+    let slots = [
+        ArenaOffset(total),
+        ArenaOffset(total.checked_add(align(most[0])?).ok_or_else(too_large)?),
+    ];
+    // Per slot, the input rows it holds the quantization of.
+    let mut live: [Option<QuantRowsFp8>; 2] = [None, None];
+    let mut out = Vec::with_capacity(steps.len());
+    for mut s in steps {
+        if let CudaStep::GateUpTcFp8(t) = &mut s {
+            t.q_act = slots[1];
+        }
+        if let CudaStep::ExpertGateUpTcFp8(t) = &mut s {
+            t.q_act = slots[1];
+        }
+        if let Some((x, rows, cols)) = s.quantized_input() {
+            // shortcut: prefill's dense fp8 GEMMs keep a write each (S2's tapes as they are); reusing
+            // a held one would drop the 27B's 48 GDN a/b writes per prefill, once approved.
+            let dense = matches!(
+                s,
+                CudaStep::GemmFp8(_)
+                    | CudaStep::GemmCol64Fp8(_)
+                    | CudaStep::GemmNarrowFp8(_)
+                    | CudaStep::GemmGroupFp8(_)
+                    | CudaStep::GemmNarrowGroupFp8(_)
+                    | CudaStep::GateUpAct(_)
             );
-            if !shared {
-                out.push(CudaStep::QuantRowsFp8(quant));
-            }
-            last = Some(quant);
-            match &mut s {
-                CudaStep::GemmFp8(g) | CudaStep::GemmCol64Fp8(g) | CudaStep::GemmNarrowFp8(g) => {
-                    g.a = q
+            let held = (live.iter().flatten())
+                .find(|l| !dense && (l.x, l.rows, l.cols) == (x, rows, cols));
+            let q = match held {
+                Some(l) => l.q,
+                None => {
+                    let quant = QuantRowsFp8 {
+                        x,
+                        q: slots[0],
+                        rows,
+                        cols,
+                    };
+                    out.push(CudaStep::QuantRowsFp8(quant));
+                    live[0] = Some(quant);
+                    slots[0]
                 }
-                CudaStep::GemmGroupFp8(g) | CudaStep::GemmNarrowGroupFp8(g) => g.a = q,
+            };
+            match &mut s {
+                CudaStep::GemmFp8(g)
+                | CudaStep::GemmCol64Fp8(g)
+                | CudaStep::GemmNarrowFp8(g)
+                | CudaStep::GemvTcFp8(g) => g.a = q,
+                CudaStep::GemmGroupFp8(g)
+                | CudaStep::GemmNarrowGroupFp8(g)
+                | CudaStep::GemvGroupTcFp8(g) => g.a = q,
                 CudaStep::GateUpAct(g) => (g.gate.a, g.up.a) = (q, q),
+                CudaStep::GateUpTcFp8(t) => (t.fold.gate.a, t.fold.up.a) = (q, q),
                 CudaStep::ExpertGemm(g) => g.a = q,
-                _ => unreachable!("`quantized_input` names only the fp8 GEMMs it reads"),
+                CudaStep::ExpertGemvTcFp8(g) => g.a = q,
+                CudaStep::ExpertGateUpTcFp8(t) => (t.fold.gate.a, t.fold.up.a) = (q, q),
+                _ => unreachable!("`quantized_input` names only the fp8 steps it reads"),
             }
+        }
+        // A slot no longer holds its input's quantization once the step writes those rows; a step
+        // with no extents may write anything.
+        let writes: Option<Vec<ArenaSpan>> = (s.parts().into_iter().flatten())
+            .map(|p| p.extents().map(|e| [Some(e.writes), e.second_write]))
+            .collect::<Option<Vec<_>>>()
+            .map(|w| w.into_iter().flatten().flatten().collect());
+        for l in &mut live {
+            let rows = l.and_then(|q| {
+                Some(ArenaSpan {
+                    offset: q.x,
+                    bytes: u64::from(q.rows.checked_mul(q.cols)?) * CUDA_ACT_BYTES,
+                })
+            });
+            if let (Some(rows), Some(writes)) = (rows, &writes)
+                && !writes.iter().any(|&w| overlap(w, rows))
+            {
+                continue;
+            }
+            *l = None;
+        }
+        if let Some(q) = s.quant_write() {
+            live[1] = Some(q);
         }
         out.push(s);
     }
     quant_chain(&out).map_err(CanonicalRefusal::QuantChain)?;
     let end = match most {
-        0 => total,
-        bytes => (bytes.checked_next_multiple_of(CUDA_ARENA_ALIGN))
-            .and_then(|b| total.checked_add(b))
-            .ok_or_else(too_large)?,
+        [0, 0] => total,
+        [_, b] => (slots[1].0.checked_add(align(b)?)).ok_or_else(too_large)?,
     };
     Ok((out, end))
 }
