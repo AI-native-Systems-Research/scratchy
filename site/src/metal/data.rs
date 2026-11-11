@@ -378,15 +378,14 @@ pub struct TaskSizing {
 }
 
 impl TaskSizing {
-    /// How many tasks (conversations, for `sharegpt-multi-turn`) a cell of this workload at
-    /// `users` sent: `users` × the rounds, at least the fewest; a quarter of that in conversations
-    /// of four turns, at least 2.
+    /// How many tasks (conversations, for a workload of several turns a task) a cell of this
+    /// workload at `users` sent: `users` × the rounds, at least the fewest; in conversations, that
+    /// over their turns, at least 2.
     pub fn count(self, workload: &str, users: u32) -> u32 {
         let n = (users * self.rounds).max(self.min_tasks);
-        if workload == "sharegpt-multi-turn" {
-            (n / 4).max(2)
-        } else {
-            n
+        match super::datasets::of(workload).map_or(1, |d| d.turns) {
+            1 => n,
+            turns => (n / turns).max(2),
         }
     }
 }
