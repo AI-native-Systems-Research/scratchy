@@ -621,10 +621,6 @@ fn table(m: &Model, only: Option<&str>) -> Element {
     }
 }
 
-/// One dataset overview square: the users count, the workload, and how many times faster
-/// scratchy is to its first token (None where either side has no number).
-pub type GlanceSquare = (u32, String, Option<f64>);
-
 /// The workloads a model's dataset cells cover, in the page's order: the overview's columns.
 pub fn workloads(m: &Model) -> Vec<&str> {
     let mut ws: Vec<&str> = Engine::Scratchy
@@ -647,63 +643,6 @@ pub fn load_label(c: &TaskCell) -> String {
         _ if c.conc == 1 => "1 user".to_string(),
         _ => format!("{} users", c.conc),
     }
-}
-
-/// The label of a load key on the overview: the load of scratchy's own cell at that key.
-pub fn key_label(m: &Model, key: u32) -> String {
-    (Engine::Scratchy.tasks(m).iter())
-        .find(|c| c.conc == key && compared(c))
-        .map_or_else(|| key.to_string(), load_label)
-}
-
-/// Whether a cell's numbers are set against a rival's: every open-loop or closed-loop users
-/// cell, not the base, which only scratchy runs.
-fn compared(c: &TaskCell) -> bool {
-    c.load.as_deref() != Some("base")
-}
-
-/// One model's dataset overview map: a square a (load, workload), how many times faster
-/// scratchy is to its first token than the rival, None where either side has no number, and the
-/// rival it is set against (the first that ran any of these cells). The map is shown only with a
-/// rival: scratchy alone has nothing to be faster than.
-pub fn glance_squares(m: &Model) -> Option<(Engine, Vec<GlanceSquare>)> {
-    squares(m, None)
-}
-
-fn squares(m: &Model, only: Option<&str>) -> Option<(Engine, Vec<GlanceSquare>)> {
-    let ours = Engine::Scratchy.tasks(m);
-    let ws: Vec<&str> = (workloads(m).into_iter())
-        .filter(|w| only.is_none_or(|o| o == *w))
-        .collect();
-    let mut users: Vec<u32> = (ours.iter())
-        .filter(|c| compared(c) && only.is_none_or(|o| c.workload == o))
-        .map(|c| c.conc)
-        .collect();
-    users.sort_unstable();
-    users.dedup();
-    // One dataset's squares are set against its own rival, as its pair is ([`rival_of`]); the
-    // whole map against the first that measured any.
-    let rival = match only {
-        Some(dataset) => rival_of(m, dataset)?,
-        None => Engine::RIVALS
-            .into_iter()
-            .find(|&e| e.tasks(m).iter().any(TaskCell::measured))?,
-    };
-    let squares = (users.iter())
-        .flat_map(|&u| ws.iter().map(move |&w| (u, w)))
-        .map(|(u, w)| {
-            let mine = ours
-                .iter()
-                .find(|c| c.workload == w && c.conc == u && c.measured());
-            let theirs =
-                (rival.tasks(m).iter()).find(|c| c.workload == w && c.conc == u && c.measured());
-            let r = mine
-                .zip(theirs)
-                .and_then(|(a, b)| ttft_times(a, b));
-            (u, w.to_string(), r)
-        })
-        .collect();
-    Some((rival, squares))
 }
 
 #[cfg(test)]
@@ -849,11 +788,9 @@ mod tests {
         assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");
     }
 
-    /// The overview's map of a run that timed scratchy and oMLX TurboQuant on the same tasks: a
-    /// square a users count and workload, how many times faster scratchy is to its first token;
-    /// rag-spans, scratchy's own, has no rival and so no ratio.
+    /// A run's workloads, in the order it ran them.
     #[test]
-    fn the_overview_sets_scratchy_against_the_rival_on_each_workload() {
+    fn a_runs_workloads_are_read_in_its_order() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/metal/apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"
@@ -865,19 +802,6 @@ mod tests {
             workloads(m),
             ["sharegpt", "rag", "rag-spans", "sharegpt-multi-turn"]
         );
-        let (rival, squares) = glance_squares(m).expect("a rival ran");
-        assert_eq!(rival.key(), "omlx_tq");
-        let at = |u: u32, w: &str| {
-            squares
-                .iter()
-                .find(|(su, sw, _)| *su == u && sw == w)
-                .unwrap()
-                .2
-        };
-        // ShareGPT at 1 user: 167 ms against 280 ms.
-        assert!((at(1, "sharegpt").unwrap() - 280.0 / 167.0).abs() < 0.05);
-        assert!(at(1, "rag-spans").is_none(), "scratchy's own: no rival");
-        assert_eq!(squares.len(), 2 * 4, "two users counts by four workloads");
     }
 
     /// A cell is named by its load: the closed-loop base, an open-loop rate, or (older runs, and
@@ -894,8 +818,6 @@ mod tests {
         assert_eq!(load_label(&cell(Some("rate"), 2, Some(0.4152))), "0.42/s");
         assert_eq!(load_label(&cell(None, 4, None)), "4 users", "a run from before rates");
         assert_eq!(load_label(&cell(None, 1, None)), "1 user");
-        assert!(!compared(&cell(Some("base"), 0, None)), "the base is scratchy's only");
-        assert!(compared(&cell(Some("rate"), 1, Some(0.2))));
     }
 
     /// An accuracy's 95% range: the binomial interval over its tasks, in points.
