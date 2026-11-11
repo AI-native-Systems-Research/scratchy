@@ -962,6 +962,8 @@ pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
 /// stacked as the rows of one query tile, and only the 16 rows of each consumer warpgroup's warp 0
 /// are merged and stored (`kernels/attn_decode_bf16.cu`). The target models' groups are 2 to 12.
 pub const ATTN_DECODE_BF16_MAX_GROUP: u32 = 16;
+/// The most splits over keys a split decode takes (FP8 S8 W6b, `kernels/attn_decode_merge.cu`).
+pub const ATTN_DECODE_MAX_SPLITS: u32 = 64;
 /// The head dims the KV append is instantiated for (`kernels/kv_append_bf16.cu`): a head's row is
 /// one `sv_bf<256>`, one 512-byte box of the cache's vector tensor map, or one `sv_bf<512>`, two
 /// such boxes (Gemma 4's global layers). The lowering already refuses any other head dim for a

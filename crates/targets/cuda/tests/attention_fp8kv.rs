@@ -23,11 +23,15 @@ pub mod common {
 use std::ffi::c_void;
 
 use common::fp8::{e4m3_satfinite, e4m3_to_bf16_bits};
-use common::numerics::{bf16_inputs, bits, centred_gains, mismatched_bits, slot_of};
+use common::numerics::{
+    ATTN_SCORE_MAX, AttnCase, attention_reference, bf16_inputs, bits, centred_gains,
+    compare_attention, gather_paged, mismatched_bits, slot_of,
+};
 use half::bf16;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use scratchy_target_cuda::kernels::{
-    KernelError, attn_decode_d512_bf16, attn_decode_d512_fp8kv, attn_decode_windowed_bf16,
+    DecodeSplit, KernelError, attn_decode_d512_bf16, attn_decode_d512_fp8kv,
+    attn_decode_fp8kv_split, attn_decode_merge, attn_decode_windowed_bf16,
     attn_decode_windowed_fp8kv, attn_prefill_d512_bf16, attn_prefill_d512_fp8kv,
     attn_prefill_windowed_bf16, attn_prefill_windowed_fp8kv, kv_append_fp8,
 };
@@ -980,4 +984,382 @@ fn the_fp8kv_decode_time_is_recorded() {
             );
         }
     }
+}
+
+// ── FP8 S8 W6b: the split decode (flash-decoding) ──────────────────
+
+/// The split the decode tapes take at both head dims (W6b): 16 splits of at least 2 tiles of 64
+/// keys, so a sequence of 2 tiles or fewer is one split (the unsplit kernel's bits) and 8,192 keys
+/// are 16 splits of 8 tiles.
+const SPLITS: u32 = 16;
+const MIN_TILES: u32 = 2;
+/// The `(splits, min_tiles)` the timing sweeps beside [`SPLITS`] × [`MIN_TILES`].
+const SPLIT_SWEEP: [(u32, u32); 7] = [(4, 2), (8, 2), (16, 1), (16, 2), (16, 4), (32, 1), (32, 2)];
+/// The split decode's lengths: one split (1 to 128 keys at 2 tiles), the first two-split length,
+/// tiles off the split size, the window's, and the longest.
+const SPLIT_KV_LENS: [usize; 11] = [1, 64, 128, 129, 300, 1000, 1025, 2049, 4096, 6000, 8192];
+
+/// A split decode's partials, sized for `splits` of `c`'s shape.
+struct Partials {
+    o: DeviceBuffer,
+    ml: DeviceBuffer,
+}
+
+impl Partials {
+    fn new(device: &CudaDevice, c: &Case, splits: u32) -> Self {
+        let (kvh, hd) = (c.heads.1, c.kernel.head_dim());
+        let zeros = |floats: usize| up_bytes(device, &vec![0u8; 4 * floats]);
+        Self {
+            o: zeros(splits as usize * kvh * 16 * hd),
+            ml: zeros(splits as usize * kvh * 2 * 16),
+        }
+    }
+
+    fn split(&self, splits: u32, min_tiles: u32) -> DecodeSplit {
+        DecodeSplit {
+            splits,
+            min_tiles,
+            o_split: self.o.ptr(),
+            ml_split: self.ml.ptr(),
+        }
+    }
+}
+
+impl Launch {
+    /// Enqueue `c`'s split decode over the e4m3 `caches` at `split`, then its merge.
+    fn fire_split(
+        &self,
+        c: &Case,
+        (kc, vc): (&DeviceBuffer, &DeviceBuffer),
+        split: DecodeSplit,
+    ) -> Result<(), KernelError> {
+        let ((qh, kvh), hd) = (c.heads, c.kernel.head_dim() as u32);
+        let null = std::ptr::null_mut();
+        // SAFETY: as `fire`'s; the partials hold `split.splits` of this shape's f32 rows, each
+        // its own allocation.
+        unsafe {
+            attn_decode_fp8kv_split(
+                (self.q.ptr().cast_const(), self.out.ptr()),
+                (kc.ptr().cast_const(), vc.ptr().cast_const()),
+                (
+                    self.table.ptr().cast_const(),
+                    self.sequence.ptr().cast_const(),
+                ),
+                (qh as u32, kvh as u32, hd),
+                (BS as u32, DEC_BLOCKS as u32),
+                (c.scale, c.window, split),
+                null,
+            )?;
+            attn_decode_merge(
+                (self.sequence.ptr().cast_const(), self.out.ptr()),
+                (qh as u32, kvh as u32, hd),
+                (c.scale, c.window),
+                split,
+                null,
+            )
+        }
+    }
+}
+
+/// `c`'s split decode at `(splits, min_tiles)` over the e4m3 `caches`; the output, downloaded.
+fn launch_split(
+    device: &CudaDevice,
+    c: &Case,
+    q: &[u16],
+    caches: (&DeviceBuffer, &DeviceBuffer),
+    table: &[u32],
+    (splits, min_tiles): (u32, u32),
+) -> Vec<u16> {
+    let l = Launch::new(device, c, q, table);
+    let p = Partials::new(device, c, splits);
+    l.fire_split(c, caches, p.split(splits, min_tiles))
+        .expect("the split decode");
+    l.out.download().expect("download the output")
+}
+
+/// A split decode's shape: its name, kernel, `(q_heads, kv_heads)`, window and scale.
+type SplitShape = (&'static str, Kernel, (usize, usize), u32, f32);
+
+/// The split decodes' shapes: Gemma 4's sliding layers (d256, 16 over 8, window 1024) and global
+/// layers (d512, 16 over 2), Qwen3.6-35B's (d256, 16 over 2) and Qwen3.8-27B's (d256, 24 over 4).
+fn split_shapes() -> [SplitShape; 4] {
+    [
+        (
+            "gemma-sliding d256 16/8 w1024",
+            Kernel::Decode,
+            (16, 8),
+            WINDOW,
+            1.0,
+        ),
+        (
+            "gemma-global d512 16/2",
+            Kernel::DecodeD512,
+            (16, 2),
+            0,
+            1.0,
+        ),
+        ("35b d256 16/2", Kernel::Decode, (16, 2), 0, SCALE),
+        ("27b d256 24/4", Kernel::Decode, (24, 4), 0, SCALE),
+    ]
+}
+
+/// W6b's first step, recorded (the gate is read off the lines): today's fp8kv decode against the
+/// split decode, its merge launch included, at each `SPLIT_SWEEP` point, kv_len 192 to 8192, 50
+/// launches after a warm-up each. `W6B GATE` per shape and kv_len ≥ 1024: PASS when the tapes'
+/// split ([`SPLITS`] × [`MIN_TILES`]) is faster than today.
+#[test]
+fn the_split_decode_time_is_recorded() {
+    const LAUNCHES: u32 = 50;
+    let device = h100();
+    let time = |f: &mut dyn FnMut(), l: &Launch| {
+        f();
+        l.out.download().expect("wait for the warm-up");
+        let start = std::time::Instant::now();
+        for _ in 0..LAUNCHES {
+            f();
+        }
+        l.out.download().expect("wait for the launches");
+        start.elapsed().as_secs_f64() * 1e6 / f64::from(LAUNCHES)
+    };
+    for (name, kernel, heads, window, scale) in split_shapes() {
+        for kv_len in [192usize, 1024, 2048, 4096, 8192] {
+            let c = Case::decode(kernel, heads, kv_len, window, scale);
+            let seed = 0x0F8C_7000 ^ kv_len as u64;
+            let [q, k, v] = inputs(&c, seed);
+            let table = shuffled_blocks(seed);
+            let (k8, v8) = fp8_pool(&device, &c, (&k, &v), &table, POISON);
+            let l = Launch::new(&device, &c, &q, &table[..kv_len.div_ceil(BS)]);
+            let p = Partials::new(&device, &c, 32);
+            let today = time(
+                &mut || l.fire(&c, true, (&k8, &v8)).expect("today's decode"),
+                &l,
+            );
+            let mut cells = Vec::new();
+            let mut tapes = f64::NAN;
+            for (splits, min_tiles) in SPLIT_SWEEP {
+                let us = time(
+                    &mut || {
+                        l.fire_split(&c, (&k8, &v8), p.split(splits, min_tiles))
+                            .expect("the split decode")
+                    },
+                    &l,
+                );
+                if (splits, min_tiles) == (SPLITS, MIN_TILES) {
+                    tapes = us;
+                }
+                cells.push(format!("S{splits}/min{min_tiles} {us:.1}"));
+            }
+            eprintln!(
+                "W6B time {name} kv_len={kv_len}: today {today:.1} us | {} (us, merge included)",
+                cells.join(" | ")
+            );
+            if kv_len >= 1024 {
+                eprintln!(
+                    "W6B GATE {name} kv_len={kv_len}: split S{SPLITS}/min{MIN_TILES} {tapes:.1} us \
+                     vs today {today:.1} us ({:.2}x) {}",
+                    today / tapes,
+                    verdict(tapes < today)
+                );
+            }
+        }
+    }
+}
+
+/// W6b's T2 (the user's decision D6): the split decode at [`SPLITS`] × [`MIN_TILES`] and at 4 × 1,
+/// at every shape and `SPLIT_KV_LENS` (window 1024 for Gemma's sliding layers), within the f64
+/// bound on the cache as the kernel read it (the e4m3 bytes widened, exact), every output finite,
+/// the score maximum at most 64. The pool is poisoned and the table shuffled.
+#[test]
+fn the_split_decode_is_within_the_f64_bound() {
+    let device = h100();
+    let mut pass = true;
+    for (name, kernel, heads, window, scale) in split_shapes() {
+        let (qh, kvh) = heads;
+        let hd = kernel.head_dim();
+        for (case, &kv_len) in SPLIT_KV_LENS.iter().enumerate() {
+            let c = Case::decode(kernel, heads, kv_len, window, scale);
+            let seed = 0x0F8C_8000 ^ ((case as u64) << 20) ^ kv_len as u64;
+            let [q, k, v] = inputs(&c, seed);
+            let table = shuffled_blocks(seed);
+            let (k8, v8) = fp8_pool(&device, &c, (&k, &v), &table, POISON);
+            let widen = |b: &DeviceBuffer| {
+                let bits = e4m3_to_bf16_bits(&down_bytes(b));
+                gather_paged(&bits, &table, kv_len, (kvh, BS, hd))
+            };
+            let (kr, vr) = (widen(&k8), widen(&v8));
+            let (refs, score_max) = attention_reference(&AttnCase {
+                q: &q,
+                k: &kr,
+                v: &vr,
+                q_heads: qh,
+                kv_heads: kvh,
+                head_dim: hd,
+                prefix_len: kv_len - 1,
+                q_len: 1,
+                scale: f64::from(scale),
+                window: (window > 0).then_some(window as usize),
+            });
+            let need = &table[..kv_len.div_ceil(BS)];
+            for split in [(SPLITS, MIN_TILES), (4, 1)] {
+                let out = launch_split(&device, &c, &q, (&k8, &v8), need, split);
+                let cmp = compare_attention(&out, &refs, qh * hd);
+                let nonfinite = (out.iter())
+                    .filter(|&&b| !bf16::from_bits(b).to_f32().is_finite())
+                    .count();
+                let ok = cmp.pass() && nonfinite == 0 && score_max <= ATTN_SCORE_MAX;
+                eprintln!(
+                    "W6B bound {name} kv_len={kv_len} S{}/min{}: {} nonfinite={nonfinite} \
+                     score_max={score_max:.4} (≤ {ATTN_SCORE_MAX}) {}",
+                    split.0,
+                    split.1,
+                    cmp.line(),
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "a split decode case is out of the f64 bound: see the lines above"
+    );
+}
+
+/// W6b's S = 1 (D6): the split decode at one split is today's fp8kv decode bit for bit, and so,
+/// through T2, the bf16 decode's on the widened cache; and at 16 splits of at least 2 tiles a
+/// sequence of 2 tiles or fewer is one split, the same bits. Every shape, `SPLIT_KV_LENS` (one
+/// split) and `[1, 64, 128]` (16 × 2), against both.
+#[test]
+fn the_split_decode_at_one_split_is_the_unsplit_decode_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for (name, kernel, heads, window, scale) in split_shapes() {
+        let points = (SPLIT_KV_LENS.iter().map(|&n| (n, (1, 1))))
+            .chain([1usize, 64, 128].map(|n| (n, (SPLITS, MIN_TILES))));
+        for (case, (kv_len, split)) in points.enumerate() {
+            let c = Case::decode(kernel, heads, kv_len, window, scale);
+            let seed = 0x0F8C_9000 ^ ((case as u64) << 20) ^ kv_len as u64;
+            let [q, k, v] = inputs(&c, seed);
+            let table = shuffled_blocks(seed);
+            let need = &table[..kv_len.div_ceil(BS)];
+            let (k8, v8) = fp8_pool(&device, &c, (&k, &v), &table, POISON);
+            let (kb, vb) = (widened(&device, &k8), widened(&device, &v8));
+            let got = launch_split(&device, &c, &q, (&k8, &v8), need, split);
+            let today = launch(&device, &c, true, &q, (&k8, &v8), need).expect("today's decode");
+            let bf = launch(&device, &c, false, &q, (&kb, &vb), need).expect("the bf16 decode");
+            let (t, b) = (mismatched_bits(&got, &today), mismatched_bits(&got, &bf));
+            eprintln!(
+                "W6B one-split {name} kv_len={kv_len} S{}/min{}: vs today's fp8kv \
+                 mismatched_bits={t}, vs bf16 on the widened cache mismatched_bits={b} {}",
+                split.0,
+                split.1,
+                verdict(t == 0 && b == 0)
+            );
+            pass &= t == 0 && b == 0;
+        }
+    }
+    assert!(pass, "a one-split decode differs from the unsplit decode");
+}
+
+/// W6b's T4: the split decode at [`SPLITS`] × [`MIN_TILES`], three times over one pool and once
+/// over a second pool through another shuffled table, all four outputs bit-identical: the merge's
+/// order is the split order, with no atomics. Every shape at kv_len 1000, 4096 and 8192.
+#[test]
+fn the_split_decode_is_deterministic() {
+    let device = h100();
+    let mut pass = true;
+    for (name, kernel, heads, window, scale) in split_shapes() {
+        for kv_len in [1000usize, 4096, 8192] {
+            let c = Case::decode(kernel, heads, kv_len, window, scale);
+            let seed = 0x0F8C_A000 ^ kv_len as u64;
+            let [q, k, v] = inputs(&c, seed);
+            let need = kv_len.div_ceil(BS);
+            let mut outs = Vec::new();
+            for (table_seed, repeats) in [(seed, 3), (seed ^ 1, 1)] {
+                let table = shuffled_blocks(table_seed);
+                let (kc, vc) = fp8_pool(&device, &c, (&k, &v), &table, POISON);
+                for _ in 0..repeats {
+                    let split = (SPLITS, MIN_TILES);
+                    outs.push(launch_split(
+                        &device,
+                        &c,
+                        &q,
+                        (&kc, &vc),
+                        &table[..need],
+                        split,
+                    ));
+                }
+            }
+            let mismatched: usize = (outs[1..].iter())
+                .map(|o| mismatched_bits(o, &outs[0]))
+                .sum();
+            eprintln!(
+                "W6B determinism {name} kv_len={kv_len}: 2 repeats and a second table \
+                 mismatched_bits={mismatched} {}",
+                verdict(mismatched == 0)
+            );
+            pass &= mismatched == 0;
+        }
+    }
+    assert!(pass, "a split decode is not deterministic");
+}
+
+/// W6b's refusals: the split decode at 0 or 65 splits, 0 or 129 tiles a split, or a null partial
+/// at 16 splits; the merge at head dim 128 and at 0 splits. Each returns its shape code and leaves
+/// `out` untouched.
+#[test]
+fn the_split_decode_refuses_each_bad_split() {
+    let device = h100();
+    let c = Case::decode(Kernel::Decode, (16, 2), 1000, 0, SCALE);
+    let [q, k, v] = inputs(&c, 7);
+    let table = shuffled_blocks(7);
+    let (k8, v8) = fp8_pool(&device, &c, (&k, &v), &table, POISON);
+    let l = Launch::new(&device, &c, &q, &table[..c.tokens().div_ceil(BS)]);
+    let p = Partials::new(&device, &c, 64);
+    let null = std::ptr::null_mut();
+    let bad = [
+        ("0 splits", p.split(0, 2)),
+        ("65 splits", p.split(65, 2)),
+        ("0 tiles a split", p.split(16, 0)),
+        ("129 tiles a split", p.split(16, 129)),
+        (
+            "a null partial",
+            DecodeSplit {
+                o_split: null,
+                ..p.split(16, 2)
+            },
+        ),
+    ];
+    let mut pass = true;
+    for (what, split) in bad {
+        let r = l.fire_split(&c, (&k8, &v8), split);
+        let untouched = (l.out.download().expect("download"))
+            .iter()
+            .all(|&b| b == SENTINEL);
+        let ok = matches!(r, Err(KernelError::AttnDecodeShape { .. })) && untouched;
+        eprintln!(
+            "W6B refusal {what}: {r:?} out_untouched={untouched} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    for (what, hd, split) in [
+        ("head dim 128", 128, p.split(16, 2)),
+        ("0 splits", 256, p.split(0, 2)),
+    ] {
+        // SAFETY: refused before any pointer is touched.
+        let r = unsafe {
+            attn_decode_merge(
+                (l.sequence.ptr().cast_const(), l.out.ptr()),
+                (16, 2, hd),
+                (SCALE, 0),
+                split,
+                null,
+            )
+        };
+        let ok = matches!(r, Err(KernelError::AttnDecodeShape { .. }));
+        eprintln!("W6B refusal merge {what}: {r:?} {}", verdict(ok));
+        pass &= ok;
+    }
+    assert!(pass, "a bad split was not refused");
 }
