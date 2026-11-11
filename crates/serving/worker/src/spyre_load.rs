@@ -1151,6 +1151,21 @@ impl SpyreWorker {
             );
             weights
         };
+        // ⭐ THE CHECKPOINT'S HOST TEARDOWN LEAVES THE BOOT PATH HERE. `gw`'s last read is the
+        // staging above; its drop unmaps the store's safetensors mappings and frees the
+        // allocator's buffers — a `munmap` pass measured as the WHOLE silent window between this
+        // load's last log and the engine's "Model:" line (SIGSTOP mid-gap on the frozen load
+        // thread, caught in `Arc<Mmap>::drop_slow` → `__munmap`; 2b fp8, nickm3, 2026-11-11:
+        // 105–160 ms). Nothing downstream observes the drop: every byte the sessions read is a
+        // view whose keepalive `Arc<Mmap>` outlives `gw` by the zero-copy load's law, so the
+        // teardown may run concurrently with the session and ladder work below. Detached — if
+        // the process exits first, the mapping dies with the address space; no order to keep.
+        // A spawn failure drops the closure (and `gw`) right here on this thread: the
+        // pre-change behavior, never a leak.
+        std::thread::Builder::new()
+            .name("checkpoint-drop".into())
+            .spawn(move || drop(gw))
+            .ok();
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
         // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
