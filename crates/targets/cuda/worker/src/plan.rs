@@ -298,6 +298,18 @@ pub fn greedy_token(row: &[u16]) -> Result<u32, PlanError> {
     Ok(id as u32)
 }
 
+/// The greedy token the device's argmax wrote (`CudaWorker::forward_greedy`, W7): [`greedy_token`]
+/// of the same row, the token id, or its `−1 − i` for a row holding a NaN, `i` its lowest NaN id,
+/// refused as [`greedy_token`] refuses it.
+pub fn greedy_code(code: i32) -> Result<u32, PlanError> {
+    match u32::try_from(code) {
+        Ok(id) => Ok(id),
+        Err(_) => Err(PlanError::NanLogit {
+            id: (-1 - i64::from(code)) as usize,
+        }),
+    }
+}
+
 /// The bytes one KV block of `block_size` tokens costs in a pool of `kv`'s geometry: per KV
 /// layer a K and a V block of its own class's `kv_heads · block_size · head_dim` e4m3, one byte
 /// each (Gemma's sliding and global layers differ), from the pool's own layout

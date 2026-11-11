@@ -962,6 +962,9 @@ pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
 /// stacked as the rows of one query tile, and only the 16 rows of each consumer warpgroup's warp 0
 /// are merged and stored (`kernels/attn_decode_bf16.cu`). The target models' groups are 2 to 12.
 pub const ATTN_DECODE_BF16_MAX_GROUP: u32 = 16;
+/// The logits the greedy argmax reads at a time, and the length of the f32 iota it takes
+/// (`kernels/argmax_bf16.cu`): a one-row tape's logits width is a multiple of it.
+pub const ARGMAX_CHUNK: u32 = 256;
 /// The most splits over keys a split decode takes (FP8 S8 W6b, `kernels/attn_decode_merge.cu`).
 pub const ATTN_DECODE_MAX_SPLITS: u32 = 64;
 /// The decode attention's split over keys per head dim (FP8 S8 W6b): `(head_dim, splits,

@@ -39,8 +39,8 @@ use tracing::info;
 
 use crate::plan::{
     block_table_u32, check_kv_cache_dtype, check_quantization_config, check_sampling,
-    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_token, kv_block_bytes, logits_row,
-    scheduled_request,
+    choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes,
+    logits_row, scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
@@ -322,22 +322,39 @@ impl CudaServingWorker {
             Some(_) => &self.positions[..],
             None => &[],
         };
-        let result = &mut model.result[..tape.result.bytes as usize / 2];
-        (running.tapes)
-            .forward(
-                bucket,
-                Input::TokenIds(&self.ids),
-                positions,
-                kv.as_ref(),
-                gdn.as_ref(),
-                result,
-            )
-            .map_err(exec)?;
-        let token = if emits_token(start as usize, n, history) {
-            let row = logits_row(result, bucket_m, n - 1).map_err(exec)?;
-            Some(greedy_token(row).map_err(exec)?)
+        let emits = emits_token(start as usize, n, history);
+        // A one-row bucket's graph picks the greedy token itself (W7): 4 bytes come back, not the
+        // logits row, and the host ranks nothing.
+        let token = if running.tapes.has_greedy(bucket) {
+            let code = (running.tapes)
+                .forward_greedy(
+                    bucket,
+                    Input::TokenIds(&self.ids),
+                    positions,
+                    kv.as_ref(),
+                    gdn.as_ref(),
+                )
+                .map_err(exec)?;
+            emits.then(|| greedy_code(code)).transpose().map_err(exec)?
         } else {
-            None
+            let result = &mut model.result[..tape.result.bytes as usize / 2];
+            (running.tapes)
+                .forward(
+                    bucket,
+                    Input::TokenIds(&self.ids),
+                    positions,
+                    kv.as_ref(),
+                    gdn.as_ref(),
+                    result,
+                )
+                .map_err(exec)?;
+            match emits {
+                true => {
+                    let row = logits_row(result, bucket_m, n - 1).map_err(exec)?;
+                    Some(greedy_token(row).map_err(exec)?)
+                }
+                false => None,
+            }
         };
         if let Some(t) = token {
             self.input_batch.push_generated(req_id, t);

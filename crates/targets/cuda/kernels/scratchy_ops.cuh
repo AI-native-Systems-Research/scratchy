@@ -290,6 +290,30 @@ __device__ inline float2 nan_to_neg_inf::op<float2>(const float2& x) {
     return float2{nan_to_neg_inf::op<float>(x.x), nan_to_neg_inf::op<float>(x.y)};
 }
 
+// The greedy argmax's maps (`kernels/argmax_bf16.cu`), over naive f32 vectors. `nan_flag`: 1 for
+// a NaN logit, else 0 (a `max` reduce says whether a row holds one). `equals_key`: 1 for a logit
+// equal to the row's max `key`, else 0 (−0 equals +0, as the host's comparison has it).
+// `index_if`: index `idx` (an exact f32 below 2^24) where `flag` is set, else +inf, so a `min`
+// reduce gives the lowest index of the flagged set.
+struct nan_flag {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x != x ? T(1) : T(0);
+    }
+};
+struct equals_key {
+    template <typename T>
+    static __device__ inline T op(const T& x, const T& key) {
+        return x == key ? T(1) : T(0);
+    }
+};
+struct index_if {
+    template <typename T>
+    static __device__ inline T op(const T& flag, const T& idx) {
+        return flag != T(0) ? idx : kittens::base_types::constants<T>::pos_infty();
+    }
+};
+
 // The windowed online softmax's running max, before it is scaled: −inf as +0, every other value as
 // it is. With a window, a warp's first KV tile can lie wholly below every one of its rows'
 // windows, so its row max is −inf and `sub_row` would form `−inf − (−inf) = NaN`. Through this op

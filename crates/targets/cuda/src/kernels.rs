@@ -696,6 +696,13 @@ unsafe extern "C" {
         window: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_argmax_bf16(
+        row: *const c_void,
+        vocab: u32,
+        iota: *const c_void,
+        out: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_attn_decode_fp8kv_prepare() -> i32;
     fn scratchy_cuda_attn_decode_fp8kv(
         q: *const c_void,
@@ -958,8 +965,9 @@ pub enum KernelError {
     EmbedShape { rows: u32, hidden: u32, vocab: u32 },
     /// The GEMM does not take this shape; nothing was launched.
     Shape { m: u32, n: u32, k: u32 },
-    /// A row kernel (RMSNorm, add, SiluMul, GateApply, and Gemma's unit RMSNorm, GeluMul, scale,
-    /// layer scale and soft-cap) does not take this shape; nothing was launched.
+    /// A row kernel (RMSNorm, add, SiluMul, GateApply, Gemma's unit RMSNorm, GeluMul, scale,
+    /// layer scale and soft-cap, and the greedy argmax) does not take this shape; nothing was
+    /// launched.
     RowShape { rows: u32, cols: u32 },
     /// The rope does not take this shape; nothing was launched.
     RopeShape {
@@ -3632,6 +3640,37 @@ pub unsafe fn quant_rows_fp8(
     // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_quant_rows_fp8(x, q, scale, rows, cols, stream) };
     check(code, KernelError::RowShape { rows, cols })
+}
+
+/// The greedy token of `row` (`vocab` bf16 logits, `kernels/argmax_bf16.cu`) into `out` (one
+/// i32): its argmax, the lowest id on a tie, as the CUDA worker's host `greedy_token`; `−1 − i`
+/// when the row holds a NaN, `i` its lowest NaN id. `iota` holds the f32s `0 .. ARGMAX_CHUNK`
+/// ([`crate::step::ARGMAX_CHUNK`]). One CTA; asynchronous.
+///
+/// Refused with [`KernelError::RowShape`] (`rows` 1, `cols` `vocab`) when `vocab` is zero, not a
+/// multiple of [`crate::step::ARGMAX_CHUNK`] or above 2^24 (its ids exact f32s), or a pointer is
+/// null.
+///
+/// # Safety
+///
+/// Every pointer a device pointer to its elements, valid for the kernel; `out` overlapping no
+/// input. `stream` a live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn argmax_bf16(
+    (row, vocab): (*const c_void, u32),
+    iota: *const c_void,
+    out: *mut c_void,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape and the pointers before it touches one and catches every C++ exception.
+    let code = unsafe { scratchy_cuda_argmax_bf16(row, vocab, iota, out, stream) };
+    check(
+        code,
+        KernelError::RowShape {
+            rows: 1,
+            cols: vocab,
+        },
+    )
 }
 
 /// Launch the fp8 GEMM (`kernels/gemm_fp8.cu`): `c [m, n] = bf16((a · bᵀ) · b_scale[n] ·

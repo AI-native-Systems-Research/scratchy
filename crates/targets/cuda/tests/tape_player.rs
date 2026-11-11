@@ -2620,6 +2620,94 @@ fn decode_layer_buckets() -> &'static [CudaTape] {
     Box::leak(Box::new([static_tape(&one), ATTN_LAYER_M128]))
 }
 
+/// W7: a one-row tape whose result is a row the greedy argmax takes (the attention layer's 1,024
+/// bf16) runs it in its graph, and `forward_greedy` copies back its token: after the same 128-row
+/// prefill, each of 8 decodes forwarded twice over the same inputs (the second rewrites the same
+/// cache slot with the same bits), once for the row and once for the token, the token the host's
+/// argmax of the row (the lowest id on a tie, `−1 − i` for a NaN at `i`).
+#[test]
+fn a_greedy_decode_copies_back_the_argmax_of_its_row() {
+    let device = h100();
+    let w = layer_weights();
+    let table = layer_table(&device, &w);
+    let buckets = decode_layer_buckets();
+    let mut worker = CudaWorker::new(&device, buckets, &table, POOL, None).expect("worker");
+    assert!(
+        worker.has_greedy(0) && !worker.has_greedy(1),
+        "the one-row tape alone"
+    );
+    let block_table = [11u32, 3, 14];
+    let p0 = 100u32;
+    let mut y = vec![0u16; 128 * AL_H];
+    let prefill = KvSequence {
+        block_table: &block_table[..2],
+        prefix_len: 0,
+        q_len: p0,
+    };
+    worker
+        .forward(
+            1,
+            Input::Hidden(&layer_input(128, 0xDEC0)),
+            &seq_positions(128, 0),
+            Some(&prefill),
+            None,
+            &mut y,
+        )
+        .expect("the prefill");
+    // The host's greedy rule over a bf16 row, as the device code states it.
+    let host = |row: &[u16]| -> i32 {
+        let mut best: Option<(usize, f32)> = None;
+        for (id, &bits) in row.iter().enumerate() {
+            let v = f32::from_bits(u32::from(bits) << 16);
+            if v.is_nan() {
+                return -1 - id as i32;
+            }
+            if best.is_none_or(|(_, b)| v > b) {
+                best = Some((id, v));
+            }
+        }
+        best.map_or(i32::MIN, |(id, _)| id as i32)
+    };
+    let mut pass = true;
+    for step in 0..8u32 {
+        let p = p0 + step;
+        let seq = KvSequence {
+            block_table: &block_table[..(p as usize + 1).div_ceil(64)],
+            prefix_len: p,
+            q_len: 1,
+        };
+        let x = layer_input(1, 0xDEC1 + u64::from(step));
+        let mut y1 = vec![0u16; AL_H];
+        worker
+            .forward(0, Input::Hidden(&x), &[p], Some(&seq), None, &mut y1)
+            .expect("a decode");
+        let token = (worker.forward_greedy(0, Input::Hidden(&x), &[p], Some(&seq), None))
+            .expect("a greedy decode");
+        let want = host(&y1);
+        eprintln!(
+            "W7 greedy decode at {p}: device {token} host {want} {}",
+            verdict(token == want)
+        );
+        pass &= token == want;
+    }
+    let refused = worker.forward_greedy(
+        1,
+        Input::Hidden(&y),
+        &seq_positions(128, 0),
+        Some(&prefill),
+        None,
+    );
+    let refused_ok = matches!(refused, Err(ForwardError::NoGreedy { bucket_m: 128, .. }));
+    eprintln!(
+        "W7 greedy refused at 128 rows: {refused:?} {}",
+        verdict(refused_ok)
+    );
+    assert!(
+        pass && refused_ok,
+        "a greedy decode differs from the argmax of its row"
+    );
+}
+
 /// A 128-row prefill of `P = 100` tokens over `[11, 3, 14]`, then decodes at positions 100..107
 /// one token at a time through the one-row tape: each decode's attention against the f64
 /// reference over the `P + 1` keys read back from the cache (the query its GEMV-projected,

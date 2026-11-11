@@ -44,3 +44,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 # The checkpoint's `quantization_config`, read as the raw JSON `HfModelConfig` keeps (`plan`).
 serde_json = { workspace = true }
+
+# The device argmax against `plan::greedy_token`, bit for bit (W7): an H100 test.
+[[test]]
+name = "argmax"
+required-features = ["nvcc"]

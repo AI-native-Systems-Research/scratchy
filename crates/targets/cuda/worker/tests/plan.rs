@@ -11,7 +11,7 @@ use scratchy_serving_engine::worker_factory::WorkerFactory;
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, KvClass, KvTape};
 use scratchy_target_cuda_worker::plan::{
     PlanError, QuantRefusal, block_table_u32, check_kv_cache_dtype, check_quantization_config,
-    check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_token,
+    check_sampling, choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token,
     kv_block_bytes, logits_row, scheduled_request,
 };
 use scratchy_target_cuda_worker::{CudaWorkerFactory, NO_NVCC};
@@ -138,6 +138,18 @@ fn the_greedy_token_is_the_argmax_with_ties_to_the_lowest_id() {
     assert_eq!(greedy_token(&negative), Ok(1));
     let nan = [bf16(1.0), bf16(f32::NAN)];
     assert_eq!(greedy_token(&nan), Err(PlanError::NanLogit { id: 1 }));
+}
+
+/// The device argmax's code (W7, `CudaWorker::forward_greedy`) is the token id, or `−1 − i` for a
+/// row whose lowest NaN id is `i`: the same `Ok` and the same `NanLogit` as `greedy_token`.
+#[test]
+fn the_device_greedy_code_is_the_greedy_token() {
+    assert_eq!(greedy_code(0), Ok(0));
+    assert_eq!(greedy_code(262_143), Ok(262_143));
+    assert_eq!(greedy_code(-1), Err(PlanError::NanLogit { id: 0 }));
+    assert_eq!(greedy_code(-2), Err(PlanError::NanLogit { id: 1 }));
+    let nan = [bf16(1.0), bf16(f32::NAN)];
+    assert_eq!(greedy_code(-2), greedy_token(&nan));
 }
 
 #[test]
