@@ -30,6 +30,7 @@ fn identical_matmuls(
                 &emit::rb("rep_o", 64, 64),
                 None,
             )
+            .expect("assemble_matmul builds")
         })
         .collect()
 }

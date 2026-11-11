@@ -5,7 +5,7 @@
 //! Every source is declared in the IR as `[K, N]`; the weight's bytes on the device are `[N, K]`.
 //! Source 0 is the activation, rebound to the embedded hidden: colour 0, the forward's input.
 
-use scratchy_subtile::fixtures::front_end_lowered;
+use scratchy_subtile::fixtures::{front_end_lowered, rebind};
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
@@ -211,7 +211,7 @@ pub fn chain_input(m: u32, k0: u32, ns: &[u32]) -> LoweringInput {
 /// `input` as the shared front end binds it, with source 0 rebound to the embedded hidden.
 pub fn with_hidden(input: LoweringInput) -> LoweredDecode {
     let mut l = front_end_lowered(input);
-    l.bindings[0] = SourceBinding::EmbeddedHidden;
+    rebind(&mut l, |b| b[0] = SourceBinding::EmbeddedHidden);
     l
 }
 

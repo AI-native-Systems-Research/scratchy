@@ -676,9 +676,9 @@ all = [
 # two names, which is exactly why quant scope needed its own crate).
 # `scratchy-forwards.rs` (this crate's build script) calls
 # `scratchy_quantizations::enabled_presets()` — via the [build-dependencies]
-# edge below — to compute SCRATCHY_QUANTS, intersected per-arch against that
-# arch's own quantizations.json (an arch that doesn't declare a preset just
-# ignores it).
+# edge below — to compute the quant scope (the union of enabled presets),
+# intersected per-arch against that arch's own quantizations.json (an arch
+# that doesn't declare a preset just ignores it).
 
 # Speculative-decoding drafters. `mtp-heads`: every selected model whose
 # checkpoint carries a multi-token-prediction head compiles that head too
@@ -719,7 +719,14 @@ cuda = [
 # nvcc from CUDA 12.8+ on PATH to build, and an sm_90 GPU (H100) to run the tests that use it.
 nvcc = ["cuda", "scratchy-target-cuda/nvcc"]
 # A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
-spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
+# THE CARD'S LOWERING, no device compile (see the macro crate's `spyre-lower`): the step CI runs to
+# see a card-only lowering defect without a card.
+spyre-lower = ["spyre", "scratchy-forward-compiler-macro/spyre-lower"]
+spyre-hw = ["spyre-lower", "scratchy-forward-compiler-macro/spyre-hw"]
+# WRITE EACH BAKED BUNDLE'S dxp INPUT under this crate's OUT_DIR (`superdsc-dump/<fp>/`), for diffing
+# against a known-good dump. Read by the build script, which passes its own OUT_DIR into the bake
+# (`compile_carrier`'s `dump_dir`); off by default, and it changes nothing the bake lowers.
+superdsc-dump = ["spyre"]
 # THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
 # an emu build refuses to compile a bundle whose emulator run diverges from the
 # reference semantics at the probe.
@@ -823,6 +830,7 @@ half = { workspace = true }
 # ForwardDeviceHandle in the universal carrier parity gate
 # (tests/carrier_parity.rs). compute_hybrid_kv_layout (shared with the
 # worker) builds gemma4-style hybrid KV pools in the same gate.
+scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 serde_json = { workspace = true }
 # tests/metal_o2_logits.rs (the runtime logits oracle): local Hub-cache lookup, the tokenizer,

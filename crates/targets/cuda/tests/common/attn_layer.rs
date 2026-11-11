@@ -35,7 +35,7 @@
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
-use scratchy_subtile::fixtures::attention_at;
+use scratchy_subtile::fixtures::{attention_at, rebind};
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::RopeClass;
@@ -193,7 +193,7 @@ pub fn attn_layer(m: u32) -> LoweredDecode {
             },
         ),
     ] {
-        l.bindings[ix] = binding;
+        rebind(&mut l, |b| b[ix] = binding);
     }
     l
 }

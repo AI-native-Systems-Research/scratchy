@@ -14,7 +14,7 @@
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
 use scratchy_forward_compiler_macro::{
-    CarrierError, compile_carrier, parse_python_file, render_tokens,
+    CarrierError, Scope, compile_carrier, parse_python_file, render_tokens,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -66,19 +66,6 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
         }
     }
     out.into_iter().collect()
-}
-
-/// Lossy FORWARD-only feature/env name mangle: non-alphanumeric → `_`, upper.
-fn envify(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// The quant presets enabled for one arch: its `quantizations.json`
@@ -148,12 +135,19 @@ fn write_hf_registry_file(out_dir: &Path, ids: &[String]) {
 
 /// Emit one arch: parse its DSL carrier (`dsl/<arch>.py`), run the pipeline
 /// against its configs (`configs/<arch>/`), write `$OUT_DIR/<mod>.rs`. Called
-/// concurrently across arches — must not mutate global state (e.g. env). The
-/// quant scoping (SCRATCHY_QUANTS) is set once in `main` before the fan-out.
+/// concurrently across arches — must not mutate global state (e.g. env); the
+/// scope (models, heads, quant presets) is the one `&Scope`
+/// value `main` stated before the fan-out, borrowed by every arch.
 ///
 /// Returns the path (`<mod>::<model>`) of every model module the emit gives a
 /// `METAL_BUCKETS` ([`metal_tape_models`]).
-fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str) -> Vec<String> {
+fn emit_arch(
+    dsl_path: &Path,
+    configs_dir: &Path,
+    out_dir: &Path,
+    mod_name: &str,
+    scope: &Scope,
+) -> Vec<String> {
     println!("cargo:rerun-if-changed={}", dsl_path.display());
     // Watch the dir itself (its mtime bumps on add/remove) plus each file.
     println!("cargo:rerun-if-changed={}", configs_dir.display());
@@ -169,12 +163,17 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
         parse_python_file(&dsl).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
     // The stem arrives as a FIELD of the typed error (compile_carrier is called once per
     // arch, so the per-config stem can only enter there) — printed, never parsed.
-    let tokens = compile_carrier(carrier, configs_dir).unwrap_or_else(|e| match e {
-        CarrierError::Config { stem, source } => {
-            panic!("forward pipeline ({mod_name}/{stem}): {source}")
-        }
-        CarrierError::Arch(source) => panic!("forward pipeline ({mod_name}): {source}"),
-    });
+    // A `superdsc-dump` build hands the bake THIS build script's output directory — the one place
+    // that knows it — so each baked bundle's dxp input lands beside the device images; any other
+    // build writes no dump.
+    let dump_dir = cfg!(feature = "superdsc-dump").then_some(out_dir);
+    let tokens =
+        compile_carrier(carrier, configs_dir, dump_dir, scope).unwrap_or_else(|e| match e {
+            CarrierError::Config { stem, source } => {
+                panic!("forward pipeline ({mod_name}/{stem}): {source}")
+            }
+            CarrierError::Arch(source) => panic!("forward pipeline ({mod_name}): {source}"),
+        });
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
     let models = (metal_tape_models(&tokens).into_iter())
@@ -255,22 +254,6 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
-/// Arches whose emit only compiles under metal. Kept in sync with src/lib.rs
-/// gates.
-const METAL_ONLY: &[&str] = &[
-    "dflash2",
-    "gemma4-assistant",
-    "glm4-moe",
-    "gpt-oss",
-    "nemotron-h",
-    "nemotron-h-latent",
-    "nemotron-h-mtp",
-];
-/// Arches that additionally support the spyre (KTIR) backend.
-///
-/// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
-/// is dropped by the `supported` gate below before its configs are read.
-const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
 /// Arches the cuda backend lowers: every op of their prefill canonicals has a CUDA kernel. Each
 /// model of one emits its per-bucket `static` CUDA tapes (`CUDA_TAPES`).
 ///
@@ -402,13 +385,6 @@ fn main() {
         // bundle). Without this, cargo keeps the stale OUT_DIR codegen.
         "KTIR_M",
         "KTIR_PREFILL_LEN",
-        // Version + base/instruct precision filter (see config.rs) — a
-        // hand-set env var, not Cargo-feature-derived, so it needs explicit
-        // tracking or changing it silently reuses the stale config set.
-        "SCRATCHY_BUILD_FILTER",
-        // Toggling `hf-completions` changes what the registry contains, and a
-        // feature flip alone doesn't otherwise invalidate this script.
-        "CARGO_FEATURE_HF_COMPLETIONS",
         // Load-bearing for the registry: gated repos (`meta-llama/*`) 401 and
         // get dropped when no token is set, so the SAME model scope resolves to
         // a different candidate list with and without it. Untracked, two
@@ -417,10 +393,7 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
-    let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
-    let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
-    // Every arch whose `arch-<name>` feature is on, whether or not a selected backend emits it.
+    // Under `cuda`, every arch whose `arch-<name>` feature is on, whether or not cuda lowers it.
     let mut selected: Vec<String> = Vec::new();
 
     // The backend law, stated once: `src/lib.rs`'s arch gates read `scratchy_backend`,
@@ -428,10 +401,7 @@ fn main() {
     // under a backend iff its `arch-<name>` feature and that backend are on, with no
     // per-arch spelling left to drift.
     println!("cargo::rustc-check-cfg=cfg(scratchy_backend)");
-    if std::env::var_os("CARGO_FEATURE_METAL").is_some()
-        || std::env::var_os("CARGO_FEATURE_SPYRE").is_some()
-        || std::env::var_os("CARGO_FEATURE_CUDA").is_some()
-    {
+    if cfg!(feature = "metal") || cfg!(feature = "spyre") || cfg!(feature = "cuda") {
         println!("cargo::rustc-cfg=scratchy_backend");
     }
 
@@ -467,6 +437,27 @@ fn main() {
         .collect();
     dsl_files.sort();
 
+    // The scope's stem set: cargo's delivery of THIS crate's `model/*` feature
+    // flags. THE LAW: model and quant selection IS the feature flags — no env
+    // var of our invention, no second channel around them. This is the one
+    // dynamic read (`cfg!` cannot loop over the stem list, and a hand-restated
+    // probe table would be a second copy of Cargo.toml): the `CARGO_FEATURE_*`
+    // names cargo itself sets for the enabled features of the crate whose
+    // build script this is — the same fact `cfg!` states one name at a time.
+    // The head flags ride the same statement as `cfg!` booleans, valid here in
+    // the crate that owns them.
+    let enabled_features: Vec<String> = std::env::vars()
+        .filter_map(|(k, _)| k.strip_prefix("CARGO_FEATURE_").map(str::to_string))
+        .collect();
+    // The build's one statement of what it selects — stated once here, before
+    // the fan-out; every arch borrows the SAME &Scope, no re-derivation per
+    // thread, no second read.
+    let scope = Scope::from_feature_flags(
+        enabled_features,
+        cfg!(feature = "mtp"),
+        cfg!(feature = "mtp-heads"),
+    );
+
     // (dsl_path, mod_name, configs_dir) for each arch that passes the feature +
     // backend gates.
     let targets: Vec<(PathBuf, String, PathBuf)> = dsl_files
@@ -477,22 +468,18 @@ fn main() {
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".py"))?
                 .to_string();
-            // Feature gate: `arch-<name>` → CARGO_FEATURE_ARCH_<ENVIFY(name)>.
-            if std::env::var(format!("CARGO_FEATURE_ARCH_{}", envify(&arch))).is_err() {
+            // Its `arch-<name>` feature and a backend it compiles for, as the `pub mod <name>`
+            // cfg in src/lib.rs has it: never the pipeline of an arch whose mod won't compile.
+            if !scope.arch_compiled(&arch) {
                 return None;
             }
-            selected.push(arch.clone());
-            // Backend gate: mirror the `pub mod <name>` cfg in src/lib.rs, so we
-            // never run the pipeline for an arch whose mod won't be compiled.
-            let supported = (if METAL_ONLY.contains(&arch.as_str()) {
-                metal
-            } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
-                metal || spyre
-            } else {
-                metal
-            }) || (cuda && CUDA_CAPABLE.contains(&arch.as_str()));
-            if !supported {
-                return None;
+            // Under `cuda`, only the arches the cuda backend lowers (#978); the others are
+            // refused by name below when none of the selected arches is one.
+            if cfg!(feature = "cuda") {
+                selected.push(arch.clone());
+                if !CUDA_CAPABLE.contains(&arch.as_str()) {
+                    return None;
+                }
             }
             let mod_name = arch.replace('-', "_");
             let configs_dir = manifest.join("configs").join(&arch);
@@ -500,10 +487,13 @@ fn main() {
         })
         .collect();
 
-    // Set SCRATCHY_QUANTS ONCE to the global union of enabled presets. config.rs
-    // intersects it with each arch's own quantizations.json, so the per-arch
-    // result is identical to setting it per arch — but doing it once lets us emit
-    // arches in parallel below without a set_var data race.
+    // The global union of enabled presets, computed once and stated IN the scope —
+    // config.rs intersects it with each arch's own quantizations.json, so the
+    // per-arch result is identical to setting it per arch. A value, not an env
+    // var: the scope is threaded through the rayon fan-out below, so nothing is
+    // restated through the environment to survive the parallelism. The presets
+    // come from `scratchy_quantizations::enabled_presets()` — the `quant/*`
+    // feature flags read by `cfg!` in the crate that owns them, the pure form.
     let enabled_presets: std::collections::HashSet<&'static str> =
         scratchy_quantizations::enabled_presets()
             .into_iter()
@@ -512,11 +502,10 @@ fn main() {
         .iter()
         .flat_map(|(_, _, cfg)| enabled_quants(&cfg.join("quantizations.json"), &enabled_presets))
         .collect();
-    let quants = quant_union.iter().cloned().collect::<Vec<_>>().join(",");
     // CUDA builds FP8 models only (#978): every selected CUDA arch compiles under exactly
     // `CUDA_PRESETS`, never dense (no preset) and never under a preset with no CUDA kernels.
     // Refused here, before any expansion.
-    if cuda {
+    if cfg!(feature = "cuda") {
         for (_, mod_name, cfg) in &targets {
             let q = enabled_quants(&cfg.join("quantizations.json"), &enabled_presets);
             if q.is_empty() || q.iter().any(|p| !CUDA_PRESETS.contains(&p.as_str())) {
@@ -527,11 +516,7 @@ fn main() {
             }
         }
     }
-    // SAFETY: set once here, before the rayon fan-out reads it; no other thread
-    // mutates the environment. `set_var` is unsafe on 2024.
-    unsafe {
-        std::env::set_var("SCRATCHY_QUANTS", &quants);
-    }
+    let scope = scope.with_quants(quant_union.iter().cloned());
 
     // Emit arches in parallel. compile_carrier is itself rayon-parallel over
     // models, so this is nested (arch × model) work-stealing across all cores —
@@ -540,7 +525,7 @@ fn main() {
     let mut metal_models: Vec<String> = targets
         .par_iter()
         .flat_map(|(dsl_path, mod_name, configs_dir)| {
-            emit_arch(dsl_path, configs_dir, &out_dir, mod_name)
+            emit_arch(dsl_path, configs_dir, &out_dir, mod_name, &scope)
         })
         .collect();
     metal_models.sort();
@@ -579,19 +564,11 @@ fn main() {
     let hf_ids = Vec::<String>::new();
     write_hf_registry_file(&out_dir, &hf_ids);
 
-    // Every arch's configs/ dir has now been walked, so every
-    // SCRATCHY_BUILD_FILTER tag that could ever match has had its chance.
-    // A tag that matched nothing anywhere is almost certainly a typo, not
-    // an intentional "compile zero models" request — fail loudly instead
-    // of silently producing a binary with no models baked in.
-    let unmatched = scratchy_forward_compiler_macro::unmatched_build_filter_tags();
-    if !unmatched.is_empty() {
-        panic!("SCRATCHY_BUILD_FILTER tag(s) matched no config in any arch: {unmatched:?}");
-    }
-
     // Under `cuda`, a build that named models none of which the cuda backend lowers would
     // otherwise reach the "no models selected" panic below, which blames the wrong thing.
-    if cuda && !selected.is_empty() && !selected.iter().any(|a| CUDA_CAPABLE.contains(&a.as_str()))
+    if cfg!(feature = "cuda")
+        && !selected.is_empty()
+        && !selected.iter().any(|a| CUDA_CAPABLE.contains(&a.as_str()))
     {
         panic!(
             "the cuda backend lowers none of the selected architectures \

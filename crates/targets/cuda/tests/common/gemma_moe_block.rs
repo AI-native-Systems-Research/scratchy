@@ -42,6 +42,7 @@
 //! The reference and the emulation also play [`super::gemma_moe`]'s small block ([`SMALL`]: H 256,
 //! I 128, the experts on `x` itself, the result the combine).
 
+use scratchy_subtile::fixtures::rebind;
 use scratchy_subtile::handoff::{
     BundleTensor, Expansion, ExpansionId, LoweredDecode, SourceBinding, UnrollIndex,
 };
@@ -232,11 +233,13 @@ pub const TENSORS: [(usize, u32, BundleTensor); 6] = [
 pub fn gemma_moe_block(m: u32) -> LoweredDecode {
     let mut l = with_hidden(gemma_moe_block_input(m));
     for (ix, id, tensor) in TENSORS {
-        l.bindings[ix] = SourceBinding::BundleTensor {
-            id,
-            index: Some(UnrollIndex(LAYER)),
-            tensor,
-        };
+        rebind(&mut l, |b| {
+            b[ix] = SourceBinding::BundleTensor {
+                id,
+                index: Some(UnrollIndex(LAYER)),
+                tensor,
+            }
+        });
     }
     for (i, e) in l.op_expansion.iter_mut().enumerate() {
         if (7..=21).contains(&i) {

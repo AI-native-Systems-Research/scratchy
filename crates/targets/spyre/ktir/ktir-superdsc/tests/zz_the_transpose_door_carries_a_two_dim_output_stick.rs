@@ -261,7 +261,8 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
         DevOff::ZERO,
         &mut sid,
         None,
-    );
+    )
+    .expect("the restickify builds");
     let dsc = op
         .op
         .as_ref()

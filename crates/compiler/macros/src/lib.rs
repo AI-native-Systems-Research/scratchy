@@ -42,9 +42,7 @@ mod config;
 /// The baked program, as const tokens — see its own header.
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
-pub use config::{
-    arch_compiled, selected_config_paths, total_models_emitted, unmatched_build_filter_tags,
-};
+pub use config::{Scope, selected_config_paths, total_models_emitted};
 mod emit;
 mod fuf;
 mod interpreter_codegen;
@@ -526,6 +524,7 @@ pub(crate) fn record_target_input(input: &scratchy_subtile::handoff::TargetModel
 pub fn target_model_inputs(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
+    scope: &Scope,
 ) -> Result<Vec<scratchy_subtile::handoff::TargetModelInput>, CarrierError> {
     let collecting = |on: bool| {
         let mut inputs = TARGET_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -537,7 +536,7 @@ pub fn target_model_inputs(
         }
     };
     collecting(true);
-    let compiled = compile_carrier(carrier, models_dir);
+    let compiled = compile_carrier(carrier, models_dir, None, scope);
     let inputs = collecting(false);
     compiled.map(|_| inputs)
 }
@@ -566,9 +565,15 @@ impl std::fmt::Display for CarrierError {
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
+///
+/// `dump_dir`: where a spyre bake writes each bundle's dxp input — the build script's own output
+/// directory when its build asked for the dump (`superdsc-dump`), else `None` (no dump). The caller
+/// is the one place that knows the directory, so the bake never reads the environment for it.
 pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
+    dump_dir: Option<&std::path::Path>,
+    scope: &Scope,
 ) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
@@ -615,8 +620,8 @@ pub fn compile_carrier(
         // bound set from the nested `vision_config` block via the
         // declared `Params` schema instead of the decoder's flat
         // top-level harvest.
-        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec),
-        _ => config::load_dir(models_dir, &spec),
+        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec, scope),
+        _ => config::load_dir(models_dir, &spec, scope),
     }
     .map_err(|e| {
         // A refusal that belongs to ONE config rides the per-stem arm —
@@ -1140,6 +1145,7 @@ pub fn compile_carrier(
             sm.tp_world_size,
             mode.emit_arch_dispatch,
             canonical_affine_rows,
+            dump_dir,
         );
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);

@@ -62,6 +62,8 @@ pub enum SynthRole {
     Sq16,
     Mean,
     Meps,
+    /// The GAINLESS rmsnorm's `1/√(mean+eps)` — an HBM synthetic (`assemble_rmsnorm_unit`). The
+    /// gained form's reciprocal root is an op-local LX pin, [`OpLocalRole`], not this.
     Rinv,
     Xn,
     /// ⭐ THE `(1 + w)` GAIN ROW — `gamma + GAIN_OFFSET`, the OnePlusScale
@@ -167,7 +169,7 @@ pub enum SynthRole {
     /// prepare (the synthetic-constants law), so the lane-64 sentinel pick (`l_tab`'s
     /// past-`pad_vocab` mapping) reads a ZERO ROW, never past the placement. The one-row
     /// cost per request — `hidden · 2 B` — is the price of keeping an already-broken chat
-    /// off the device bus (the loud `idx > vocab` refusal at the readback still fires;
+    /// off the device bus (the loud `idx >= vocab` refusal at the readback still fires;
     /// this row only keeps the bus quiet while it does).
     ChainSlabT,
     /// ⭐⭐ THE REQUEST-MAJOR ROWS, `[width·row_entries, 64]` — `EmbedRowGather`'s leg-3
@@ -284,13 +286,55 @@ pub enum PlaceId {
     Act(u32),
     /// An intermediate the lowering invented, derived from `of`. Device-internal.
     Synth { of: u32, role: SynthRole },
+    /// An OP-LOCAL LX pin, derived from `of` — scratch written by one op and read by the next inside
+    /// one program, sharing its class's slot. Declared, slotted and spelled ONLY by its pair
+    /// ([`crate::emit::lx_op_local_pair`]): every layout constructor takes a [`SynthId`], which has
+    /// no variant for it.
+    OpLocal { of: u32, role: OpLocalRole },
+}
+
+/// The role of an op-local LX pin ([`PlaceId::OpLocal`]) — one named constant per pin kind, with no
+/// public constructor beside them:
+///
+/// ```compile_fail,E0603
+/// let _ = ktir_superdsc::place::OpLocalRole(ktir_superdsc::place::OpLocalKind::Rinv);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpLocalRole(OpLocalKind);
+
+/// Which op-local pin an [`OpLocalRole`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OpLocalKind {
+    /// The gained rmsnorm's `1/√(E[x²]+eps)`, read back at its E[x²] lane by the normalising
+    /// multiply.
+    Rinv,
+}
+
+impl OpLocalRole {
+    /// The gained rmsnorm's reciprocal root. Public so generated code can NAME a baked op-local
+    /// identity; an op-local [`PlaceId`] still reaches a layout only through its pair, because no
+    /// layout constructor takes a [`PlaceId`] ([`SynthId`] has no op-local variant).
+    pub const RINV: OpLocalRole = OpLocalRole(OpLocalKind::Rinv);
+
+    /// Which pin this is.
+    pub fn kind(self) -> OpLocalKind {
+        self.0
+    }
+}
+
+impl fmt::Display for OpLocalRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            OpLocalKind::Rinv => f.write_str("rinv"),
+        }
+    }
 }
 
 impl PlaceId {
     /// The caller-numbered buffer this names, or that it derives from.
     pub fn tid(self) -> u32 {
         match self {
-            Self::Act(t) | Self::Synth { of: t, .. } => t,
+            Self::Act(t) | Self::Synth { of: t, .. } | Self::OpLocal { of: t, .. } => t,
         }
     }
     /// Is this a tensor the host may bind? False for a device-internal synthetic.
@@ -301,15 +345,78 @@ impl PlaceId {
     pub fn bindable(self) -> Option<u32> {
         match self {
             Self::Act(t) => Some(t),
-            Self::Synth { .. } => None,
+            Self::Synth { .. } | Self::OpLocal { .. } => None,
         }
     }
-    /// Derive a synthetic from this tensor.
-    pub fn synth(self, role: SynthRole) -> Self {
-        Self::Synth {
+    /// Derive the op-local pin of `role` from this tensor — reached only by the pair that builds the
+    /// pin's writer and reader.
+    pub(crate) fn op_local(self, role: OpLocalRole) -> Self {
+        Self::OpLocal {
             of: self.tid(),
             role,
         }
+    }
+
+    /// Derive a synthetic from this tensor — as the [`SynthId`] a layout constructor takes.
+    pub fn synth(self, role: SynthRole) -> SynthId {
+        SynthId::Synth {
+            of: self.tid(),
+            role,
+        }
+    }
+}
+
+/// A placed id a LAYOUT CONSTRUCTOR takes ([`crate::placement::BundleLayout::synth`] and its
+/// siblings, [`crate::placement::syn`]) — a caller-numbered buffer or a synthetic. It has no op-local
+/// variant, so an op-local pin cannot be declared, slotted or spelled through any of them: its one
+/// door is [`crate::emit::lx_op_local_pair`]. Every way INTO it ([`SynthId::Act`], `From<u32>`,
+/// [`PlaceId::synth`], [`SynthId::synth`]) produces one of these two variants by its type; there is
+/// no conversion from a [`PlaceId`].
+///
+/// ```compile_fail,E0599
+/// let _ = ktir_superdsc::place::SynthId::OpLocal { of: 7, role: todo!() };
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SynthId {
+    /// [`PlaceId::Act`].
+    Act(u32),
+    /// [`PlaceId::Synth`].
+    Synth { of: u32, role: SynthRole },
+}
+
+impl SynthId {
+    /// The [`PlaceId`] it names — never [`PlaceId::OpLocal`].
+    pub fn place(self) -> PlaceId {
+        match self {
+            Self::Act(t) => PlaceId::Act(t),
+            Self::Synth { of, role } => PlaceId::Synth { of, role },
+        }
+    }
+
+    /// The caller-numbered buffer this names, or that it derives from.
+    pub fn tid(self) -> u32 {
+        self.place().tid()
+    }
+
+    /// Derive a synthetic from this tensor ([`PlaceId::synth`]).
+    pub fn synth(self, role: SynthRole) -> SynthId {
+        SynthId::Synth {
+            of: self.tid(),
+            role,
+        }
+    }
+}
+
+impl From<u32> for SynthId {
+    /// A caller-numbered buffer, `t{tid}`.
+    fn from(tid: u32) -> SynthId {
+        SynthId::Act(tid)
+    }
+}
+
+impl fmt::Display for SynthId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.place().fmt(f)
     }
 }
 
@@ -320,6 +427,7 @@ impl fmt::Display for PlaceId {
         match self {
             Self::Act(t) => write!(f, "t{t}"),
             Self::Synth { of, role } => write!(f, "t{of}_{role}"),
+            Self::OpLocal { of, role } => write!(f, "t{of}_{role}"),
         }
     }
 }

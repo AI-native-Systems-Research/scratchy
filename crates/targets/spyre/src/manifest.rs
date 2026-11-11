@@ -172,13 +172,11 @@ pub struct KtirBundle {
 }
 
 /// One emitted **sendnn** bundle (the `--target sendnn` silicon path), baked
-/// `&'static` by the `#[forward]` macro: the same [`Manifest`] IO contract the
-/// KTIR path uses (`manifest_json`) plus the op-graph as a single JSON string
-/// (`graph_json`) the DeepTools toolchain compiles. The PrimaryInputs are named
-/// `t{id}` matching the manifest tensor ids, so the worker binds weights /
-/// dynamic sources by id exactly as for KTIR.
+/// `&'static` by the `#[forward]` macro: the op-graph as a single JSON string
+/// (`graph_json`, the SuperDSC sentinel naming the baked bundle). Its IO contract
+/// is the generated `wiring::Wiring` — one walk of the bindings, never a parsed
+/// manifest.
 pub struct SengraphBundleData {
-    pub manifest_json: &'static str,
     pub graph_json: &'static str,
     /// Fingerprint of `graph_json` (lowercase hex of a stable content hash),
     /// keying the AHEAD-OF-TIME-compiled g2 blob baked by `scratchy-builder-spyre`

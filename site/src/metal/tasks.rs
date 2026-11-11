@@ -112,17 +112,29 @@ fn mostly_capped(c: &TaskCell) -> bool {
         .is_some_and(|n| n > 0 && 2 * c.capped_answers.unwrap_or(0) > n)
 }
 
-/// Accuracy, where it is like for like: none for a cell whose answers opened as reasoning, or one
-/// most of whose answers ran to their cap, which read as wrong without being answers.
+/// Whether most of a cell's requests failed: its times are the few that answered, its accuracy
+/// counts the failures wrong, and its energy spreads the time it ran over requests never served.
+pub fn mostly_failed(c: &TaskCell) -> bool {
+    c.failed.unwrap_or(0) > c.completed.unwrap_or(0)
+}
+
+/// Whether a cell's answers stand for the engine's: neither mostly capped nor mostly failed.
+fn usable(c: &TaskCell) -> bool {
+    !mostly_capped(c) && !mostly_failed(c)
+}
+
+/// Accuracy, where it is like for like: none for a cell whose answers opened as reasoning, one
+/// most of whose answers ran to their cap, which read as wrong without being answers, or one most
+/// of whose requests failed.
 fn accuracy(c: &TaskCell) -> Option<f64> {
     c.accuracy
-        .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && !mostly_capped(c))
+        .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && usable(c))
 }
 
 /// How many times faster scratchy is to its first token than the rival: none where either mostly
-/// ran its answers to their cap, whose requests were not the tasks' answers.
+/// ran its answers to their cap, whose requests were not the tasks' answers, or mostly failed.
 fn ttft_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
-    (!mostly_capped(c) && !mostly_capped(r))
+    (usable(c) && usable(r))
         .then(|| times(c.median_ttft_ms, r.median_ttft_ms, true))
         .flatten()
 }
@@ -138,7 +150,7 @@ const SAME_LENGTH: f64 = 0.10;
 fn total_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
     let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
     let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
-    (close && !mostly_capped(c) && !mostly_capped(r))
+    (close && usable(c) && usable(r))
         .then(|| times(c.median_e2el_ms, r.median_e2el_ms, true))
         .flatten()
 }
@@ -150,13 +162,15 @@ pub const ENERGY_NOTE: &str = "J/request and J/token: the energy of the cell's r
      20 s is coarse.";
 
 /// A cell's joules a request, an output token, and a right answer where it is scored and shows
-/// its accuracy; None where its run kept no energy.
+/// its accuracy; None where its run kept no energy, or most of its requests failed.
 fn per_request(c: &TaskCell) -> Option<f64> {
-    c.energy.as_ref().and_then(|e| e.j_per_request)
+    let e = c.energy.as_ref().filter(|_| !mostly_failed(c))?;
+    e.j_per_request
 }
 
 fn per_token(c: &TaskCell) -> Option<f64> {
-    c.energy.as_ref().and_then(|e| e.j_per_output_token)
+    let e = c.energy.as_ref().filter(|_| !mostly_failed(c))?;
+    e.j_per_output_token
 }
 
 fn per_right(c: &TaskCell) -> Option<f64> {
@@ -182,7 +196,7 @@ fn joules(v: Option<f64>) -> String {
 fn energy_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
     let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
     let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
-    (close && !mostly_capped(c) && !mostly_capped(r))
+    (close && usable(c) && usable(r))
         .then(|| times(per_request(c), per_request(r), true))
         .flatten()
 }
@@ -201,8 +215,18 @@ fn pct(v: Option<f64>) -> String {
 }
 
 /// A cell's accuracy as the table shows it: with its task count, and marked `~` where too few
-/// tasks make it indicative ([`FIRM_ACCURACY_TASKS`]).
+/// tasks make it indicative ([`FIRM_ACCURACY_TASKS`]); for a cell most of whose requests failed,
+/// how many answered instead.
 fn right(c: &TaskCell) -> String {
+    if mostly_failed(c) {
+        let done = c.completed.unwrap_or(0) as usize;
+        let sent = done + c.failed.unwrap_or(0) as usize;
+        return format!(
+            "{} of {} answered",
+            crate::thousands(done),
+            crate::thousands(sent)
+        );
+    }
     let Some(a) = accuracy(c) else {
         return "—".to_string();
     };
@@ -320,7 +344,8 @@ fn table(m: &Model, only: Option<&str>) -> Element {
         p { style: "font-size: 0.875rem",
             "Accuracy: the share of tasks answered right, a failed request or an answer that ran to \
              its cap counted wrong; none on a cell whose answers are forced to one length, so its \
-             times compare across engines, as every cell at a users count is; left out where most answers ran to their cap. ~ marks one over fewer \
+             times compare across engines, as every cell at a users count is; left out where most answers ran to their cap. A cell most of whose requests failed shows \
+             how many answered, and no accuracy, energy or ratio on either side. ~ marks one over fewer \
              than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
              indicative only. The second total ratio is shown only where both engines' answers were \
              about one length."
@@ -479,6 +504,38 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(joules(per_request(&old)), "—");
+    }
+
+    /// A cell most of whose requests failed shows no accuracy, energy or ratio, on either side of
+    /// a pair, and says how many of its requests answered.
+    #[test]
+    fn a_mostly_failed_cell_shows_no_accuracy_energy_or_ratio() {
+        let cell = |completed: u32, failed: u32| -> TaskCell {
+            serde_json::from_value(serde_json::json!({
+                "workload": "rag-accuracy", "conc": 4, "completed": completed, "failed": failed,
+                "num_tasks": completed + failed, "accuracy": 0.06, "thinking_answers": 0,
+                "capped_answers": 0, "mean_output_tokens": 30.0,
+                "median_ttft_ms": 100.0, "median_e2el_ms": 1000.0,
+                "energy": {"soc_j": 6500.0, "window_s": 144.0, "j_per_request": 2.7,
+                    "j_per_output_token": 0.09, "j_per_right_answer": 48.4},
+            }))
+            .unwrap()
+        };
+        let broken = cell(268, 2147);
+        let whole = cell(2415, 0);
+        assert_eq!(right(&broken), "268 of 2,415 answered");
+        assert_eq!(joules(per_request(&broken)), "—");
+        assert_eq!(joules(per_token(&broken)), "—");
+        assert_eq!(joules(per_right(&broken)), "—");
+        for (a, b) in [(&broken, &whole), (&whole, &broken)] {
+            assert_eq!(ttft_times(a, b), None);
+            assert_eq!(total_times(a, b), None);
+            assert_eq!(energy_times(a, b), None);
+        }
+        // A few failures leave the rest standing.
+        let few = cell(2400, 15);
+        assert_eq!(right(&few), "6% of 2415");
+        assert_eq!(ttft_times(&few, &whole), Some(1.0));
     }
 
     /// A MuSiQue cell that recorded its accuracy by hop count shows each beside the whole, in hop

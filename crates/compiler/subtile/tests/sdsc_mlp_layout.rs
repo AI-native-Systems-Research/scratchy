@@ -97,8 +97,8 @@ fn run_mlp() -> (Vec<f64>, Vec<f64>) {
     // rmsnorm is validated on-card (cos 1.0); seed its OUTPUT from the reference (this bridge is the
     // MLP, not the norm).
     let nrm = rmsnorm_reference(&xf, &gam, HIDDEN, EPS);
-    for c in 0..HIDDEN {
-        mem.set(nt.addr(&[0, c]), nrm[c]);
+    for (c, &v) in nrm.iter().enumerate().take(HIDDEN) {
+        mem.set(nt.addr(&[0, c]), v);
     }
     for d in 0..HIDDEN {
         for i in 0..INTER {

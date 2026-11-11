@@ -35,13 +35,30 @@ const PASS: &str = "PlanCorelets";
 // 1p0 hardware constants -- owned by the planning pass.
 //===----------------------------------------------------------------------===//
 
-/// 1p0 has exactly two corelets per compute tile.
-const NUM_CORELETS: i64 = 2;
-/// A stick is 64 elements wide.
-const STICK_WIDTH: i64 = 64;
+/// 1p0 has exactly two corelets per compute tile — READ from the baked
+/// generation's table (`<Baked as DeviceGen>::CORELETS`; the vendor's own
+/// default, `sysdef.h:169 corelets = 2`, under its citation).
+const NUM_CORELETS: i64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::CORELETS as i64;
+/// A stick is 64 elements wide — the f16 stick width, derived by the
+/// device's own stick law (elems per stick = the generation's `FLIT_BYTES` /
+/// the format's word size; see `superdsc_opspec`'s `DataFormat` doc for the
+/// vendor citation).
+const STICK_WIDTH: i64 =
+    (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES / 2) as i64;
 /// Each corelet has its OWN 8 PT rows -- the same inclusive [0, 7] range while
 /// they compute different `output_partition`s.
+///
+/// NOT a generation constant: no readable gen1 statement of the PT-row count
+/// exists (deeptools' `sysdef.h` declares `xrfCapacity` as a field but states
+/// no value for it, and no DDL template or header pins the 8 rows), and we
+/// hold no card measurement of our own — so it stays HERE, a corelet-internal
+/// fact of the pass, rather than a table row whose citation would be a guess.
 const MATMUL_PT_ROWS_HI: i64 = 7;
+/// NOT a generation constant, for the same reason as
+/// [`MATMUL_PT_ROWS_HI`]: `sysdef.h:105` declares `xrfCapacity` ("B per pt
+/// array (corelet)") but no gen1 value is stated anywhere we can read, and we
+/// hold no measurement — it stays here as the pass's own fact.
 const MATMUL_XRF_CAPACITY_KB: i64 = 64;
 /// CL0 reduces its partition and SENDS its partial; CL1 reduces, RECEIVES, and
 /// combines -- so CL1 produces the final result. `ccw` is the 1p0 SFPRING

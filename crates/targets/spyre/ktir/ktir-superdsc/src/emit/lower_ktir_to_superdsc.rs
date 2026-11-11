@@ -63,6 +63,7 @@ use crate::superdsc_opspec::{
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
+use ktir_core::ddl_binds::DeviceOp;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
@@ -1204,7 +1205,10 @@ pub fn load_scatters<T: crate::collective::Tp>(
                 value,
                 crate::ktir_node::Scratch::RelayoutMid,
             );
-            layout.synth(PlaceId::Act(tid), &[src.v_rows * groups, width]);
+            layout.synth(
+                crate::place::SynthId::Act(tid),
+                &[src.v_rows * groups, width],
+            );
             let scratch = crate::place::act_name(tid);
             // Each head's group of columns, stick-major `[sticks][rows]` in the source, to row-major
             // `[rows][sticks]` at the same base in the scratch.
@@ -1944,14 +1948,14 @@ pub(crate) fn pointwise_tile_op_df(
 ///
 /// ⛔ ENUMERATED, NEVER `_`: a producer that gains a new elementwise kind is an E0004 here, which is
 /// the whole reason the kind is not a `&str` any more.
-pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static str, usize), Error> {
+pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(DeviceOp, usize), Error> {
     Ok(match kind {
-        Elementwise::Silu => ("silu", 1),
+        Elementwise::Silu => (DeviceOp::Silu, 1),
         // A REAL DDL primitive (`OpFunc::Gelu`), not a decomposition: the SFP
         // constant table ships gelu's polynomial, so this is one pointwise op.
-        Elementwise::Gelu => ("gelu", 1),
-        Elementwise::Mul => ("multiply", 2),
-        Elementwise::Add => ("add", 2),
+        Elementwise::Gelu => (DeviceOp::Gelu, 1),
+        Elementwise::Mul => (DeviceOp::Multiply, 2),
+        Elementwise::Add => (DeviceOp::Add, 2),
         // ⛔ `Sub` WAS REFUSED HERE, AND THE STATED REASON WAS FALSE IN EVERY CLAUSE. It read "Sub
         // takes a [m, 1] broadcast operand that pw2 cannot express (see the two-operand arity
         // law)". There is no arity law on `pw2`; `In::col` expresses precisely the `[m, 1]` operand
@@ -1964,30 +1968,30 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
         //
         // The hazard the old refusal gestured at is real but general, and it is now guarded where it
         // belongs — [`pointwise_extents_agree`], for EVERY binary kind.
-        Elementwise::Sub => ("sub", 2),
+        Elementwise::Sub => (DeviceOp::Sub, 2),
         // ── The rest of the `OpFunc` pointwise set. Each already had an `OpFunc` variant AND an
         // `op_func_from_str` arm before this table named it, and most are already emitted on card by
         // the attention / rmsnorm / fp8-quantiser bodies; what was missing was only the door.
-        Elementwise::Exp => ("exp", 1),
-        Elementwise::Log => ("log", 1),
-        Elementwise::Neg => ("neg", 1),
-        Elementwise::Rsqrt => ("rsqrt", 1),
-        Elementwise::Sqrt => ("sqrt", 1),
-        Elementwise::Abs => ("abs", 1),
-        Elementwise::Reciprocal => ("reciprocal", 1),
-        Elementwise::Sigmoid => ("sigmoid", 1),
-        Elementwise::Tanh => ("tanh", 1),
-        Elementwise::Mish => ("mish", 1),
-        Elementwise::RealDiv => ("realdiv", 2),
-        Elementwise::Maximum => ("maximum", 2),
-        Elementwise::Minimum => ("minimum", 2),
+        Elementwise::Exp => (DeviceOp::Exp, 1),
+        Elementwise::Log => (DeviceOp::Log, 1),
+        Elementwise::Neg => (DeviceOp::Neg, 1),
+        Elementwise::Rsqrt => (DeviceOp::Rsqrt, 1),
+        Elementwise::Sqrt => (DeviceOp::Sqrt, 1),
+        Elementwise::Abs => (DeviceOp::Abs, 1),
+        Elementwise::Reciprocal => (DeviceOp::Reciprocal, 1),
+        Elementwise::Sigmoid => (DeviceOp::Sigmoid, 1),
+        Elementwise::Tanh => (DeviceOp::Tanh, 1),
+        Elementwise::Mish => (DeviceOp::Mish, 1),
+        Elementwise::RealDiv => (DeviceOp::RealDiv, 2),
+        Elementwise::Maximum => (DeviceOp::Maximum, 2),
+        Elementwise::Minimum => (DeviceOp::Minimum, 2),
         // The equality mask. `OpFunc::Equal` realizes as `EQUAL` into a BOOL state reg then
         // `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the wire-level result IS an fp16
         // 0.0/1.0 tensor — the same shape every pointwise here already emits, NOT a bool tile
         // needing a dtype lane of its own. NaN compares FALSE on the SFP unit, which is the
         // emulator's ordered `cmpf oeq` verbatim, so the numeric rung and the card compute the
         // same predicate. Used by the first-max sampler's one-hot selectors.
-        Elementwise::Equal => ("equal", 2),
+        Elementwise::Equal => (DeviceOp::Equal, 2),
         // ⛔ THE DDL HAS NO PRIMITIVE FOR THESE TWO, AND SUBSTITUTING THE NEAREST ONE IS THE BUG.
         // `QuickGelu` is x·σ(1.702x) and `GeluErf` is the exact-erf gelu — neither is
         // `OpFunc::Gelu`'s tanh polynomial, so emitting "gelu" for them would run a DIFFERENT
@@ -2223,7 +2227,8 @@ pub fn elementwise_df<T: crate::collective::Tp>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
-    let (op_func, arity) = elementwise_op_func(name, kind)?;
+    let (op, arity) = elementwise_op_func(name, kind)?;
+    let op_func = op.op_func();
     // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD: the dense arm below places row corners
     // per-operand (the windowed emission), so which operands are inputs is a fact about the
     // parameter list, not about how one arm addresses them. The arms that CANNOT carry a corner
@@ -2352,7 +2357,7 @@ pub fn elementwise_df<T: crate::collective::Tp>(
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
-        )]);
+        )?]);
     }
     if bcast.iter().any(Option::is_some) {
         // `df` is `Fp16` here (the non-fp16 gate above returned or routed already), so this is
@@ -2448,7 +2453,7 @@ pub fn elementwise_df<T: crate::collective::Tp>(
             &out.name(),
             sym_id_base,
             layout,
-        );
+        )?;
         return Ok(vec![op]);
     }
     // ⛔⛔⛔ THE CORNERS ARE PER-OPERAND, AND THE PAIRING IS THE PROGRAM'S OWN — the rotate-half
@@ -2517,7 +2522,7 @@ pub fn elementwise_df<T: crate::collective::Tp>(
         out_off,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// ⛔⛔⛔ EVERY OPERAND A COLUMN-BLOCKED PIECE NAMES IS ADDRESSED AT THAT PIECE's WINDOW — the class law,
@@ -2684,7 +2689,8 @@ fn elementwise_per_row<T: crate::collective::Tp>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
-    let (op_func, arity) = elementwise_op_func(name, kind)?;
+    let (op, arity) = elementwise_op_func(name, kind)?;
+    let op_func = op.op_func();
     // EVERY operand must be the same per-row shape — this is the dense path's law ([`pointwise_extents_agree`])
     // restated for the one-stick emission: the op computes lane 0 of every row of every operand.
     for (i, x) in ins.iter().enumerate() {
@@ -2711,7 +2717,7 @@ fn elementwise_per_row<T: crate::collective::Tp>(
         &out.name(),
         sym_id_base,
         layout,
-    );
+    )?;
     Ok(vec![op])
 }
 
@@ -2939,7 +2945,7 @@ pub fn int_binary<T: crate::collective::Tp>(
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// ⭐⭐⭐ [`elementwise`] WITH A BROADCAST OPERAND — the arm [`pointwise_extents_agree`] names in its
@@ -3265,7 +3271,7 @@ fn elementwise_broadcast<T: crate::collective::Tp>(
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// [`elementwise_broadcast`]'s row-split spray at an `out` wider than one stick: ONE descriptor per
@@ -3359,7 +3365,7 @@ fn elementwise_y_by_column<T: crate::collective::Tp>(
             at(out, j),
             sym_id_base,
             layout,
-        ));
+        )?);
     }
     Ok(ops)
 }
@@ -3481,7 +3487,7 @@ fn elementwise_by_inner_spray<T: crate::collective::Tp>(
                 at(out, c),
                 sym_id_base,
                 layout,
-            ))
+            )?)
         })
         .collect()
 }
@@ -3621,7 +3627,7 @@ fn elementwise_by_outer_spray<T: crate::collective::Tp>(
                 at(out, c, 0),
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         return Ok(ops);
     }
@@ -3654,7 +3660,7 @@ fn elementwise_by_outer_spray<T: crate::collective::Tp>(
                 at(out, c, j * mb),
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
     }
     Ok(ops)
@@ -3706,6 +3712,19 @@ impl ConvertKind {
             ConvertKind::Fp32ToInt32 => "fp32toint32",
             ConvertKind::Int32ToFp32 => "int32tofp32",
             ConvertKind::Fp32ToDl16 => "fp32todl16",
+        }
+    }
+
+    /// The TYPED device op this convert is — the ONE key into the device-facts
+    /// table (`ktir_core::ddl_binds::DEVICE_OPS`), so the arrangement
+    /// propagation reads its row and never a string. A pure vocabulary
+    /// mapping: the convert's identity, restated in the table's key type.
+    pub fn device_op(self) -> ktir_core::ddl_binds::DeviceOp {
+        match self {
+            ConvertKind::Dl16ToFp32 => ktir_core::ddl_binds::DeviceOp::Dl16ToFp32,
+            ConvertKind::Fp32ToInt32 => ktir_core::ddl_binds::DeviceOp::Fp32ToInt32,
+            ConvertKind::Int32ToFp32 => ktir_core::ddl_binds::DeviceOp::Int32ToFp32,
+            ConvertKind::Fp32ToDl16 => ktir_core::ddl_binds::DeviceOp::Fp32ToDl16,
         }
     }
 
@@ -3835,7 +3854,7 @@ pub fn convert<T: crate::collective::Tp>(
             },
             sym_id_base,
             layout,
-        )]);
+        )?]);
     }
     if cols != dev_cols {
         let whole_view = |x: &Region| x.c_start == 0 && x.c_len == x.v_cols;
@@ -3864,7 +3883,7 @@ pub fn convert<T: crate::collective::Tp>(
         &out_h,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// main's `lower_silumul_node` (main 8466-8604): `out = silu(gate) · up` DECOMPOSED into two
@@ -3955,7 +3974,7 @@ pub fn silumul<T: crate::collective::Tp>(
             out_w,
             sym_id_base,
             layout,
-        ),
+        )?,
         assemble_pointwise_broadcast_off(
             &mul_name,
             "multiply",
@@ -3969,7 +3988,7 @@ pub fn silumul<T: crate::collective::Tp>(
             out_w,
             sym_id_base,
             layout,
-        ),
+        )?,
     ])
 }
 
@@ -4064,13 +4083,14 @@ pub fn rmsnorm<T: crate::collective::Tp>(
         cols,
         &x,
         &gamma,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
         layout,
+        &mut crate::placement::LxScope::program(),
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// THE POINTWISE DEVICE-WIDTH PAD, CAPPED AT THE WIDTH THE OUTPUT'S PLACEMENT ACTUALLY HOLDS.
@@ -4173,9 +4193,9 @@ fn pointwise_width_the_output_holds(
                 .placements
                 .get(&tid)
                 .map(|p| p.size)
-                .or_else(|| l.synth.borrow().sizes.get(name).copied())
+                .or_else(|| l.synth.borrow().size(name))
                 .or_else(|| l.lx_full_size(name)),
-            _ => l.synth.borrow().sizes.get(name).copied(),
+            _ => l.synth.borrow().size(name),
         }?;
         // A footprint is `synth_footprint_bytes`: the INNER (column) axis stick-rounded, the outer
         // multiplied. So one row costs a stick-rounded column count, and the width the buffer holds is
@@ -4332,16 +4352,16 @@ mod pointwise_width_caps {
     }
 
     /// ⭐ CASE (d) — THE NARROWEST OPERAND WINS, AND THE SYNTH ALLOCATOR IS READ. The output `t1` is
-    /// adequately sized; the INPUT is a synthetic intermediate declared only in `SynthAlloc::sizes`
-    /// and holding one stick. `cols` sizes both views, so the pad is only real if BOTH hold it.
+    /// adequately sized; the INPUT is a synthetic intermediate declared only to the synth allocator
+    /// (`BundleLayout::synth`) and holding one stick. `cols` sizes both views, so the pad is only
+    /// real if BOTH hold it.
     #[test]
     fn the_narrowest_operand_wins_including_one_only_the_synth_allocator_knows() {
         let l = placed(u64::from(ROWS) * 512 * 2);
-        let narrow = "t32_synth";
-        l.synth
-            .borrow_mut()
-            .sizes
-            .insert(narrow.to_string(), 64 * 64 * 2);
+        let narrow_id = PlaceId::Act(32).synth(crate::place::SynthRole::Silu);
+        l.synth(narrow_id, &[64, 64]);
+        let narrow = narrow_id.to_string();
+        let narrow = narrow.as_str();
         let out = act_name(1);
         assert_eq!(
             pointwise_width_the_output_holds(Some(&l), &[&out, narrow], ROWS, 64, 512)
@@ -5098,7 +5118,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
-        ));
+        )?);
         let hh = |name: &str| fl(name, rows, hd);
         // One row of angles shared by every head at mq==1; per-row above that.
         let (cos_h, sin_h) = (hh(&cos), hh(&sin));
@@ -5126,7 +5146,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &hh(&xc),
             sym_id_base,
             layout,
-        ));
+        )?);
         ops.push(pw2(
             &format!("rope_rs_o{t}"),
             "multiply",
@@ -5137,7 +5157,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &hh(&rs),
             sym_id_base,
             layout,
-        ));
+        )?);
         ops.push(pw2(
             &format!("rope_add_o{t}"),
             "add",
@@ -5148,7 +5168,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &hh(&out),
             sym_id_base,
             layout,
-        ));
+        )?);
         return Ok(ops);
     }
     // ── PREFILL (mq>1) hd>stick: SLAB rope ──────────────────────────────────────────────────────────
@@ -5321,7 +5341,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
                 o_place,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         // PREFILL KEEPS THE PER-HEAD P MATMUL — the form measured coherent on granite-8b (`7d27d734`),
         // one `[mq,hd]` window per head with the whole head dim contracted. `heads` ops instead of
@@ -5347,7 +5367,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
                 off_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         // The three elementwise legs, each over the WHOLE tensor: same bytes the per-block ops covered,
         // one op instead of `heads * n_slabs`. cos/sin are the worker's head-TILED table at this site's
@@ -5367,7 +5387,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &rb(&xc, mq, total),
             sym_id_base,
             layout,
-        ));
+        )?);
         ops.push(pw2(
             &format!("rope_rs_o{t}"),
             "multiply",
@@ -5378,7 +5398,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &rb(&rs, mq, total),
             sym_id_base,
             layout,
-        ));
+        )?);
         // ADD, unconditionally: P already carries the rotate's sign, so there is no first-half/
         // second-half split left to make this op two ops (which the stick planes' interleaving would
         // have forced — first-half slabs are every OTHER plane, not a contiguous run).
@@ -5392,7 +5412,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             &rb(&out, mq, total),
             sym_id_base,
             layout,
-        ));
+        )?);
         return Ok(ops);
     }
     // ── PREFILL (mq>1) hd==stick: PER-HEAD ROW-BATCHED rope (2026-07-28, TTFT) ──────────────────
@@ -5513,7 +5533,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
-        ));
+        )?);
         // ── The three POINTWISE legs collapse to ONE op EACH, across all heads. ──────────────────
         // These were `heads` ops apiece (160 of the 402 trips in a granite prefill layer body — the
         // single largest family, 40%) purely because they inherited the per-head loop. They do not
@@ -5603,7 +5623,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
                 off,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             ew_ph(
                 &mut ops,
                 format!("rope_xc_r{r}_h{h}_o{t}"),
@@ -5712,10 +5732,23 @@ pub fn lmlast<T: crate::collective::Tp>(
             out.tid
         ));
     }
-    // `mq` and the row come from the SOURCE's own view + window: the buffer is `[mq, hidden]` and the
-    // program takes ONE row of it, at `r_start`.
+    // ⭐ THE ROWS COME FROM THE NODE'S OWN STATEMENT — `KtirNode::answer_rows`, minted by the
+    // producer from the rung's extent pair. Neither view states the row LAW (which row of each
+    // request's window is the answer row), and re-deriving `r·w + (w−1)` here would divide `mq`
+    // back apart — the one derivation the extent pair exists to make unnecessary. So the door
+    // refuses by name when the producer stated none, and takes each request's row from the ONE
+    // statement.
+    let answers = k.answer_rows.ok_or_else(|| Error {
+        message: format!(
+            "{name}: states no `answer_rows`. The extraction takes one answer row per request \
+             window — the rung's own `r·w + (w−1)` law — which neither the `[mq, hidden]` source \
+             view nor the `[S, hidden]` staging view states. The producer that built the tail must \
+             state it, the same way it states `node_out_tid`."
+        ),
+    })?;
+    // `mq` and `hidden` come from the SOURCE's own view: the buffer is `[mq, hidden]` and the
+    // program takes one row of it per request window.
     let (mq, hidden) = (src.v_rows, src.v_cols);
-    let row = src.r_start;
     let stk = Fp16::ELEMS_PER_STICK;
     if hidden % stk != 0 {
         return err(format!(
@@ -5723,9 +5756,27 @@ pub fn lmlast<T: crate::collective::Tp>(
              a run of whole stick-groups — the per-stick extraction cannot address it"
         ));
     }
+    // ⭐ THE STATEMENT MEETS THE VIEWS HERE — the rows' extent pair must describe THIS program's
+    // source (`w·S == mq`) and THIS program's staging (`S` rows), or the producer stated the rows
+    // of a different rung than the one the door is emitting. A disagreement is a REFUSAL by name,
+    // the same agreement check the splice runs before minting.
+    let extent = answers.extent();
+    if extent.graph_rows().get() != mq || answers.count() as u32 != out.v_rows {
+        return err(format!(
+            "{name}: the stated answer rows are {} row(s) of a {}-row source (per-request {} × {} \
+             request(s)), but the program takes `[{mq}, {hidden}]` into a `[{}, {}]` staging — the \
+             rows do not describe the program they lower",
+            answers.count(),
+            extent.graph_rows().get(),
+            extent.per_request().get(),
+            extent.requests().get(),
+            out.v_rows,
+            out.v_cols,
+        ));
+    }
     // The WINDOW is one SINGLE STICK — `regions` reports the first access tile, and the extraction's
     // tiles are `[1, stk]` by construction (that is the whole point: one stick-group per op). What must
-    // be whole-row is the DESTINATION BUFFER, `[1, hidden]`.
+    // be whole-row is the DESTINATION BUFFER, `[S, hidden]`.
     if src.r_len != 1 || src.c_len != stk || out.r_len != 1 || out.c_len != stk {
         return err(format!(
             "{name}: takes `[{}, {}]` into `[{}, {}]` — each copy is one `[1, {stk}]` stick-group, \
@@ -5733,52 +5784,69 @@ pub fn lmlast<T: crate::collective::Tp>(
             src.r_len, src.c_len, out.r_len, out.c_len,
         ));
     }
-    if out.v_rows != 1 || out.v_cols != hidden {
+    if out.v_cols != hidden {
         return err(format!(
-            "{name}: destination buffer is `[{}, {}]` — the last-row staging is `[1, hidden]` for the \
-             `[{mq}, {hidden}]` source it is extracted from",
+            "{name}: destination buffer is `[{}, {}]` — the last-row staging is `[S, hidden]` for \
+             the `[{mq}, {hidden}]` source it is extracted from",
             out.v_rows, out.v_cols,
         ));
     }
-    if row >= mq {
-        return err(format!(
-            "{name}: row {row} is outside the `[{mq}, {hidden}]` source — the row is \
-             `selector_lastrow_col(mq)`, which is `mq - 1`"
-        ));
+    for (req, row) in answers.rows() {
+        if row as u32 >= mq {
+            return err(format!(
+                "{name}: request {}'s answer row {row} is outside the `[{mq}, {hidden}]` source — \
+                 the row is its window's last baked row, `r·w + (w−1)`",
+                req.get()
+            ));
+        }
     }
+    let s = out.v_rows;
     if let Some(l) = layout {
-        l.synth(PlaceId::Act(out.tid), &[1, hidden]);
+        l.synth(crate::place::SynthId::Act(out.tid), &[s, hidden]);
     }
     // ⭐ TRUE EXTENTS, not the `[1, stk]`/`rbo` staging annotations: the source IS the `[mq, hidden]`
-    // prompt buffer and the destination IS the `[1, hidden]` staging the synth above reserves, so the
+    // prompt buffer and the destination IS the `[S, hidden]` staging the synth above reserves, so the
     // handles state the buffers the corners below address — the mint's bound. The stick walk's last
-    // window ends exactly at `mq*hidden` / `hidden` elements respectively.
+    // window ends exactly at `mq*hidden` / `S*hidden` elements respectively.
     let src_name = rb(&src.name(), mq, hidden);
-    let dst = rb(&out.name(), 1, hidden);
-    Ok((0..hidden / stk)
-        .map(|j| {
+    let dst = rb(&out.name(), s, hidden);
+    Ok(answers
+        .rows()
+        .flat_map(|(req, row)| (0..hidden / stk).map(move |j| (req, row, j)))
+        .map(|(req, row, j)| {
             assemble_pointwise_broadcast_off(
-                &format!("lmlast{j}_o{owner}"),
+                // ⛔ NAMED AFTER THE STICK-PLANE ROW THE COPY WRITES — `j·S + r` of the destination's
+                // `[.., stk]` staging, the same row the corner below addresses. At `S = 1` that is
+                // `j` alone, so every name is byte-identical to the single-row law's
+                // `lmlast{j}_o{owner}`; at `S > 1` the plane row is a bijection over `(j, r)`, so
+                // every copy keeps its own name.
+                &format!("lmlast{}_o{owner}", (j * s) as usize + req.get()),
                 "identity",
                 crate::sdsc_abstract::RowCount::of_token_rows(1),
                 crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
                 &[In::sliced(
                     &src_name,
                     // row `j*mq + row` of a `[.., stk]` staging — a corner, not a product.
-                    crate::addr::rc_of((j + 1) * mq + row + 1, stk, j * mq + row, 0, Df::Fp16),
+                    crate::addr::rc_of(
+                        (j + 1) * mq + row as u32 + 1,
+                        stk,
+                        j * mq + row as u32,
+                        0,
+                        Df::Fp16,
+                    ),
                 )
                 .ew()],
                 &dst,
-                // Column `j*stk` of the single-row `[1, hidden]` last-hidden staging — a corner on
-                // that tensor, not a product. At one row the stick plane term is 0, so this is the
-                // same address either way; saying it as a coordinate keeps the last hand-built offset
-                // in this file from being the one nobody notices.
-                crate::addr::rc_of(1, hidden, 0, j * stk, Df::Fp16),
+                // Row `r`, column `j*stk` of the `[S, hidden]` last-hidden staging — a corner on
+                // that tensor, not a product. At one request the row term is 0, so this is the
+                // same address the single-row law stated; saying it as a coordinate keeps the last
+                // hand-built offset in this file from being the one nobody notices.
+                crate::addr::rc_of(s, hidden, req.get() as u32, j * stk, Df::Fp16),
                 sym_id_base,
                 layout,
             )
         })
-        .collect())
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 /// A BLOCK COPY — `dst[:, off .. off + C_SRC] = src` for a whole `[R, C_SRC]` source and an
@@ -5811,9 +5879,7 @@ pub fn block_copy<T: crate::collective::Tp>(
             ins.len()
         ));
     };
-    let stk = Fp16::ELEMS_PER_STICK;
-    let (rows, c_src) = (src.v_rows, src.v_cols);
-    let (c_dst, off) = (out.v_cols, out.c_start);
+    let rows = src.v_rows;
     // The source is read WHOLE from its corner, the destination at row 0 and a stick-aligned column:
     // anything else is not a run of whole stick columns at either end, and no single row range of a
     // tall-narrow view names it.
@@ -5830,19 +5896,34 @@ pub fn block_copy<T: crate::collective::Tp>(
             out.v_rows
         ));
     }
-    if !c_src.is_multiple_of(stk) || !c_dst.is_multiple_of(stk) || !off.is_multiple_of(stk) {
-        return err(format!(
-            "{name}: source width {c_src}, destination width {c_dst} and column {off} must all be \
-             whole {stk}-fp16 sticks — a partial stick column is not a contiguous run"
-        ));
-    }
+    // ⭐ THE WHOLE-STICK LAW IS THE TYPES' — the same `StickExtent` and `ColWindow` constructors the
+    // splice states the kernel's constexprs through. The door reads the extents off the PROGRAM, not
+    // off the splice, so it states them through those constructors rather than restating the law: a
+    // partial stick column is not a contiguous run, and has no spelling here.
+    let whole = |what: &str, r: Result<u32, String>| {
+        r.map_err(|e| Error {
+            message: format!("{name}: the block copy's {what}: {e}"),
+        })
+    };
+    let c_src = whole(
+        "source width",
+        StickExtent::<Fp16>::new(src.v_cols).map(|s| s.elems()),
+    )?;
+    let c_dst = whole(
+        "destination width",
+        StickExtent::<Fp16>::new(out.v_cols).map(|s| s.elems()),
+    )?;
+    let off = whole(
+        "destination column",
+        crate::addr::col_window_of(rows, c_dst, out.c_start, Df::Fp16).map(|w| w.column()),
+    )?;
     if off + c_src > c_dst {
         return err(format!(
             "{name}: the block [{off}, {}) runs past the destination's {c_dst} columns",
             off + c_src
         ));
     }
-    let sticks = c_src / stk;
+    let sticks = c_src / Fp16::ELEMS_PER_STICK;
     let src_name = rb(&src.name(), rows, c_src);
     let dst = rb(&out.name(), rows, c_dst);
     Ok(vec![assemble_pointwise_broadcast_off(
@@ -5855,7 +5936,7 @@ pub fn block_copy<T: crate::collective::Tp>(
         crate::addr::rc_of(rows, c_dst, 0, off, Df::Fp16),
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// main's `lower_matmul_node` (main 7752-8362).
@@ -6237,7 +6318,7 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
             &rb(&out.name(), m, n_dev),
             sym_id_base,
             layout,
-        )
+        )?
     } else {
         // ⛔ A PARTIAL WINDOW MAY NOT TAKE THE UTIL-FLOOR PAD. `n_dev > n` invents output columns
         // the program never stated; on a whole-tensor program their write lands in the placement's
@@ -6277,7 +6358,7 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
             o_off,
             sym_id_base,
             layout,
-        )
+        )?
     };
     // Default path: one f16 matmul.
     Ok(vec![op])
@@ -6356,7 +6437,8 @@ pub fn scalar_binary<T: crate::collective::Tp>(
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
-    let (op_func, _) = elementwise_op_func(name, e)?;
+    let (op, _) = elementwise_op_func(name, e)?;
+    let op_func = op.op_func();
     let x = ins[0];
     if x.c_start != 0 || out.c_start != 0 || x.r_start != 0 || out.r_start != 0 {
         return err(format!(
@@ -6399,7 +6481,7 @@ pub fn scalar_binary<T: crate::collective::Tp>(
         crate::addr::OutCorner::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// A buffer SEEDED with one value — a walk's carried state at the value the program initialises it
@@ -6436,7 +6518,7 @@ pub fn fill<T: crate::collective::Tp>(
         crate::addr::OutCorner::ZERO,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// `linalg.batch_matmul` `[b, m, k] × [b, k, n] → [b, m, n]` — ONE 2-D contraction per batch.
@@ -6614,8 +6696,8 @@ pub fn batch_matmul<T: crate::collective::Tp>(
                 sym_id_base,
                 layout,
             )
-            .map_err(|message| Error {
-                message: format!("{name}: {message}"),
+            .map_err(|e| Error {
+                message: format!("{name}: {}", e.0),
             })?,
         );
     }
@@ -7476,7 +7558,7 @@ pub fn embed_row_gather<T: crate::collective::Tp>(
             &rb(&out.name(), width, hidden),
             sym_id_base,
             layout,
-        ))
+        )?)
     };
     // ── THE EMISSION, in chain order: per request the slab gather then the transpose
     // (the transpose reads what the gather wrote), then the row gather's ops (request
@@ -8334,7 +8416,7 @@ mod elementwise_tests {
             "out is the ONE stick the frame law allows"
         );
         assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
-        for a in &op.args {
+        for a in op.args() {
             assert_eq!(
                 a.view().layout,
                 &["y", "mb", "out"] as &[&'static str],
@@ -8343,7 +8425,7 @@ mod elementwise_tests {
             );
         }
         let merged_view = op
-            .args
+            .args()
             .iter()
             .find(|a| a.view().name == "t6")
             .expect("the merged source's arg")
@@ -8434,7 +8516,7 @@ mod elementwise_tests {
         .expect("the inner row-spray op emits");
         assert_eq!(op.iter.extent("mb"), 64, "mb is the source's rows");
         assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
-        for a in &op.args {
+        for a in op.args() {
             assert_eq!(
                 a.view().layout,
                 &["mb", "y", "out"] as &[&'static str],
@@ -8443,7 +8525,7 @@ mod elementwise_tests {
             );
         }
         let mask_view = op
-            .args
+            .args()
             .iter()
             .find(|a| a.view().name == "t6")
             .expect("the sprayed source's arg")
@@ -8979,7 +9061,10 @@ mod elementwise_tests {
         for k in Elementwise::ALL {
             match elementwise_op_func("probe", *k) {
                 Ok((key, arity)) => {
-                    assert!(!key.is_empty(), "{k:?} mapped to an empty op-func key");
+                    assert!(
+                        !key.op_func().is_empty(),
+                        "{k:?} mapped to an empty op-func key"
+                    );
                     assert!(
                         arity == 1 || arity == 2,
                         "{k:?} has arity {arity}; this emitter builds unary and binary pointwise \
@@ -9020,20 +9105,25 @@ mod elementwise_tests {
     fn the_four_original_kinds_keep_their_op_func_keys() {
         assert_eq!(
             elementwise_op_func("p", Elementwise::Silu).unwrap(),
-            ("silu", 1)
+            (DeviceOp::Silu, 1)
         );
         assert_eq!(
             elementwise_op_func("p", Elementwise::Gelu).unwrap(),
-            ("gelu", 1)
+            (DeviceOp::Gelu, 1)
         );
         assert_eq!(
             elementwise_op_func("p", Elementwise::Mul).unwrap(),
-            ("multiply", 2)
+            (DeviceOp::Multiply, 2)
         );
         assert_eq!(
             elementwise_op_func("p", Elementwise::Add).unwrap(),
-            ("add", 2)
+            (DeviceOp::Add, 2)
         );
+        // And the STRINGS those ops spell — the fingerprint's own bytes.
+        assert_eq!(DeviceOp::Silu.op_func(), "silu");
+        assert_eq!(DeviceOp::Gelu.op_func(), "gelu");
+        assert_eq!(DeviceOp::Multiply.op_func(), "multiply");
+        assert_eq!(DeviceOp::Add.op_func(), "add");
     }
 
     /// Every key in the table is a key `op_func_from_str` ACCEPTS — it panics on an unknown name, so
@@ -9044,7 +9134,7 @@ mod elementwise_tests {
         for k in Elementwise::ALL {
             if let Ok((key, _)) = elementwise_op_func("probe", *k) {
                 // Panics on an unrecognized key; reaching the assert means the key is in the table.
-                let f = crate::emit::op_func_from_str(key);
+                let f = crate::emit::op_func_from_str(key.op_func());
                 assert!(
                     !f.name().is_empty(),
                     "{k:?} → {key:?} has no dxp opFuncName"
@@ -10258,6 +10348,7 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
+    lx_scope: &mut crate::placement::LxScope,
 ) -> Result<Vec<EmittedOp<T>>, Error> {
     // x, gamma and the output — the parameters the rmsnorm program mints. Its constants are
     // immediates, so none of them is a parameter.
@@ -10314,13 +10405,14 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
         cols,
         &x,
         &gamma,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
         layout,
+        lx_scope,
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::RmsNormUnit`] —
@@ -10381,12 +10473,12 @@ pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
         rows,
         cols,
         &x,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &eps_const,
         sym_id_base,
         layout,
     )
-    .map_err(|e| Error { message: e })
+    .map_err(Error::from)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::WindowedRmsNorm`] — the
@@ -10504,7 +10596,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
     let x = tensors[0].name();
     let t = out.tid;
-    let out_id = PlaceId::Act(t);
+    let out_id = crate::place::SynthId::Act(t);
     use crate::place::SynthRole as R;
     let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
     // ── THE SYNTHETICS ──
@@ -10570,7 +10662,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             gw,
             sym_id_base,
             layout,
-        )); // gw = γ + 1, shared by every head
+        )?); // gw = γ + 1, shared by every head
     }
     for h in 0..heads {
         // The head window's base offset in the `[m, H·D]` buffers — a whole-block shift of
@@ -10593,7 +10685,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             win,
             sym_id_base,
             layout,
-        ));
+        )?);
         // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
         //    its own head's buffer at ZERO (the fp8 amax-partial shape). THE ONE PROBE-AND-SPLIT
         //    BODY owns the long form: a head window too wide for one LX pass splits into
@@ -10619,7 +10711,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             sym_id_base,
             layout,
         )
-        .map_err(|e| Error { message: e })?;
+        .map_err(Error::from)?;
         if let Some(split) = split {
             ops.extend(split);
         } else {
@@ -10652,7 +10744,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 crate::superdsc_opspec::Df::Fp16,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
         // 3. mean + eps.
         ops.push(pw2(
@@ -10665,7 +10757,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             &meps_h,
             sym_id_base,
             layout,
-        ));
+        )?);
         // 4. rinv = rsqrt(mean+eps).
         ops.push(pw1(
             &format!("rmrsqrt_{prefix}"),
@@ -10676,7 +10768,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             &rinv_h,
             sym_id_base,
             layout,
-        ));
+        )?);
         // 5. xn = x·rinv (r per-row of the head's block, out-broadcast over D) — the
         //    unit form's TERMINAL multiply writes `out` directly here instead.
         // 6. out = xn·gamma (the `[1, D]` row, mb-broadcast) — the Gw row (γ+1)
@@ -10692,7 +10784,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 win,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             let gain = gw_h.as_ref().unwrap_or(g);
             ops.push(assemble_pointwise_broadcast_off(
                 &format!("rmg_{prefix}"),
@@ -10704,7 +10796,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 win,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         } else {
             ops.push(assemble_pointwise_broadcast_off(
                 &format!("rmxn_{prefix}"),
@@ -10716,7 +10808,7 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
                 win,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         }
     }
     Ok(ops)
@@ -10766,11 +10858,11 @@ pub fn tanhsoftcap<T: crate::collective::Tp>(
         rows,
         cols,
         &x,
-        PlaceId::Act(t),
+        crate::place::SynthId::Act(t),
         &cap_const,
         sym_id_base,
         layout,
-    ))
+    )?)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
@@ -10819,7 +10911,7 @@ pub fn scalarweightmul<T: crate::collective::Tp>(
         &out_h,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::Reshape`] — a RE-LAYING COPY that
@@ -10961,7 +11053,7 @@ pub fn reshape<T: crate::collective::Tp>(
             ),
             sym_id_base,
             layout,
-        ));
+        )?);
     }
     Ok(ops)
 }
@@ -11332,7 +11424,7 @@ fn scalarmul_scaled<T: crate::collective::Tp>(
         corner,
         sym_id_base,
         layout,
-    )])
+    )?])
 }
 
 /// A BARE ROW REDUCTION — `[rows, cols]` → `[rows, 1]`, one `sfp` op along the stick axis.
@@ -11474,7 +11566,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     })?,
                     ReduceDataLeg::whole(&data_h),
                     ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-                    PlaceId::Act(out.tid),
+                    crate::place::SynthId::Act(out.tid),
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -11483,7 +11575,7 @@ pub fn reduce<T: crate::collective::Tp>(
                 layout,
             )
             .map_err(|e| Error {
-                message: format!("{name}: {e}"),
+                message: format!("{name}: {}", e.0),
             })?;
             if let Some(ops) = split {
                 return Ok(ops);
@@ -11498,7 +11590,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     &rb(&out.name(), rows, 1),
                     sym_id_base,
                     layout,
-                ),
+                )?,
             ])
         }
         Df::Fp32 => {
@@ -11541,7 +11633,7 @@ pub fn reduce<T: crate::collective::Tp>(
                     })?,
                     ReduceDataLeg::whole(&data_h),
                     ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-                    PlaceId::Act(out.tid),
+                    crate::place::SynthId::Act(out.tid),
                 )
                 .map_err(|e| Error {
                     message: format!("{name}: {e}"),
@@ -11550,7 +11642,7 @@ pub fn reduce<T: crate::collective::Tp>(
                 layout,
             )
             .map_err(|e| Error {
-                message: format!("{name}: {e}"),
+                message: format!("{name}: {}", e.0),
             })?;
             if let Some(ops) = split {
                 return Ok(ops);
@@ -11654,7 +11746,7 @@ pub fn reduce_df<T: crate::collective::Tp>(
             })?,
             ReduceDataLeg::whole(&data_h),
             ReduceAccumLeg::new(&accum_h, crate::addr::DevOff::ZERO),
-            PlaceId::Act(out.tid),
+            crate::place::SynthId::Act(out.tid),
         )
         .map_err(|e| Error {
             message: format!("{name}: {e}"),
@@ -11663,7 +11755,7 @@ pub fn reduce_df<T: crate::collective::Tp>(
         layout,
     )
     .map_err(|e| Error {
-        message: format!("{name}: {e}"),
+        message: format!("{name}: {}", e.0),
     })?;
     if let Some(ops) = split {
         return Ok(ops);
@@ -11679,6 +11771,55 @@ pub fn reduce_df<T: crate::collective::Tp>(
             df,
             sym_id_base,
             layout,
-        ),
+        )?,
     ])
+}
+
+#[cfg(test)]
+mod block_copy_tests {
+    use super::elementwise_tests::reg;
+    use super::*;
+
+    /// ⛔ THE DOOR STATES THE PROGRAM'S EXTENTS THROUGH THE SPLICE'S OWN CONSTRUCTORS. A program
+    /// whose source width, destination width or destination column is not whole sticks is refused by
+    /// `StickExtent` / `ColWindow`, naming which, and a whole-stick block still lowers to one op.
+    #[test]
+    fn a_sub_stick_extent_is_refused_by_its_constructor_naming_which() {
+        let lower = |src: Region, out: Region| {
+            let mut sym = 0i64;
+            block_copy::<crate::collective::TpWorld<1>>("bc", &[src, out], &mut sym, None)
+        };
+        // The destination's window at column `c`: its corner moves, its extent is the source's.
+        let at = |r: Region, c: u32| Region {
+            c_start: c,
+            c_len: 128,
+            c_cover: (c, c + 128),
+            ..r
+        };
+        let ok = lower(reg(1, 4, 128, false), at(reg(2, 4, 512, true), 256))
+            .expect("a whole-stick column block lowers");
+        assert_eq!(ok.len(), 1, "one identity");
+        for (src, out, what) in [
+            (reg(1, 4, 96, false), reg(2, 4, 512, true), "source width"),
+            (
+                reg(1, 4, 128, false),
+                reg(2, 4, 520, true),
+                "destination width",
+            ),
+            (
+                reg(1, 4, 128, false),
+                at(reg(2, 4, 512, true), 32),
+                "destination column",
+            ),
+        ] {
+            let Err(e) = lower(src, out) else {
+                panic!("{what}: a sub-stick block copy lowered");
+            };
+            assert!(
+                e.message.contains(&format!("the block copy's {what}")),
+                "names its {what}: {}",
+                e.message
+            );
+        }
+    }
 }

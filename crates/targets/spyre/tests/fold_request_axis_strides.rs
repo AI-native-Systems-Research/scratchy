@@ -51,10 +51,11 @@
 //! pitch and the request→slots mapping stays where it is known — the host's page map, delivered as
 //! index entries. That is why the gather is not an optimisation of the collapse but its precondition.
 //!
-//! ⛔ WHICH ALSO MEANS THE TWO CANNOT LAND SEPARATELY. `fold_plan::fold_delta` returns
-//! `kv = page_base_bytes(s, rp)` — an ABSOLUTE per-pass KV base applied as a segment shift — while a
-//! gathered read computes `addr = idx * skip_addr + base` from that already-shifted base. Wiring the
-//! gather in without dropping the shift composes two bases and lands inside neither. One atomic change.
+//! ⛔ WHICH ALSO MEANS THE TWO CANNOT LAND SEPARATELY. A gathered read computes
+//! `addr = idx * skip_addr + base` from an ABSOLUTE entry, while a page base applied as a KV segment
+//! shift is a second base: wiring the gather in without dropping the shift composes the two and lands
+//! inside neither. That is the live law `fold_plan::OpKv::gathered` states (a gathered group takes NO
+//! KV segment shift) — one atomic change, not an optimisation layered on the fold.
 
 use ktir_superdsc::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
 

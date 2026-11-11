@@ -82,6 +82,7 @@ pub fn make_ttir(m: &mut Module) -> Result<()> {
         changed |= fold_identity_casts(m);
         changed |= fold_constant_arith(m);
         changed |= fold_int_identities(m);
+        changed |= fold_float_identities(m);
         changed |= fold_constant_int_casts(m);
         changed |= fold_constant_int_to_float(m);
         changed |= fold_splat_of_constant(m);
@@ -712,6 +713,18 @@ fn fold_arith_ops(ops: &mut [Op], consts: &HashMap<ValueId, (f64, bool)>, tys: &
             // other one, which `f64::max`/`min` also do.
             ("arith.maxnumf", 2) => Some(args[0].max(args[1])),
             ("arith.minnumf", 2) => Some(args[0].min(args[1])),
+            // `maximumf`/`minimumf` are IEEE-754-2019 maximum/minimum: a NaN operand yields
+            // NaN, and -0 orders below +0 (`llvm::maximum`, which `MaximumFOp::fold` calls).
+            ("arith.maximumf", 2) => Some(ieee_extremum(args[0], args[1], true)),
+            ("arith.minimumf", 2) => Some(ieee_extremum(args[0], args[1], false)),
+            // A widening is exact -- every value of the narrower type is one of the wider -- so
+            // the constant is the operand's, re-typed (`ExtFOp::fold`'s `constFoldCastOp`).
+            ("arith.extf", 1) => Some(args[0]),
+            // ONLY WHERE THE RESULT IS EXACT. `exp(c)` for a general `c` is a rounded
+            // transcendental whose last bit the device's implementation decides, so folding it
+            // here would be a different program. The points where the function's value is
+            // representable exactly -- and so every implementation must return it -- are folded.
+            ("math.exp", 1) | ("math.exp2", 1) => exact_exp(args[0]),
             _ => None,
         };
         let Some(v) = folded else { continue };
@@ -731,6 +744,456 @@ fn fold_arith_ops(ops: &mut [Op], consts: &HashMap<ValueId, (f64, bool)>, tys: &
         op.attrs.clear();
         op.attrs.insert("value".to_string(), attr);
         changed = true;
+    }
+    changed
+}
+
+/// `exp(c)` / `exp2(c)` where the value is exact: `-inf -> +0`, `±0 -> 1`, `+inf -> +inf`,
+/// `NaN -> NaN`. Any other `c` is refused (`None`): its result is a rounding.
+fn exact_exp(c: f64) -> Option<f64> {
+    if c.is_nan() {
+        Some(f64::NAN)
+    } else if c == f64::NEG_INFINITY {
+        Some(0.0)
+    } else if c == 0.0 {
+        Some(1.0)
+    } else if c == f64::INFINITY {
+        Some(f64::INFINITY)
+    } else {
+        None
+    }
+}
+
+/// IEEE-754-2019 `maximum` (`max = true`) / `minimum`: NaN if either operand is, and a zero
+/// pair ordered `-0 < +0`.
+fn ieee_extremum(a: f64, b: f64, max: bool) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        // Equal as numbers, so the answer is decided by the signs alone.
+        let negative = if max {
+            a.is_sign_negative() && b.is_sign_negative()
+        } else {
+            a.is_sign_negative() || b.is_sign_negative()
+        };
+        return if negative { -0.0 } else { 0.0 };
+    }
+    if max { a.max(b) } else { a.min(b) }
+}
+
+//===----------------------------------------------------------------------===//
+// 3e. Float identities, over what is known of each value
+//===----------------------------------------------------------------------===//
+
+/// What is known of EVERY element a float value can hold: each non-NaN element lies in
+/// `[lo, hi]` (a zero of either sign counts as 0 there), `nan` says one may be NaN and
+/// `neg_zero` that one may be -0. An empty interval (`lo > hi`) holds only NaNs.
+///
+/// A FORWARD ANALYSIS OVER OP KINDS, and only the kinds whose result is bounded by IEEE
+/// semantics alone ([`float_facts`]). Every other op -- and every block argument, so every
+/// loop-carried value -- is [`FloatFacts::UNKNOWN`]. Every bound is a constant of the program,
+/// a selection or negation of bounds, or a landmark no rounding can cross (0, 2, f16's largest
+/// finite value, an infinity), so no bound depends on how the device rounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FloatFacts {
+    lo: f64,
+    hi: f64,
+    nan: bool,
+    neg_zero: bool,
+}
+
+impl FloatFacts {
+    const UNKNOWN: FloatFacts = FloatFacts {
+        lo: f64::NEG_INFINITY,
+        hi: f64::INFINITY,
+        nan: true,
+        neg_zero: true,
+    };
+
+    fn of_constant(c: f64) -> FloatFacts {
+        if c.is_nan() {
+            FloatFacts {
+                lo: f64::INFINITY,
+                hi: f64::NEG_INFINITY,
+                nan: true,
+                neg_zero: false,
+            }
+        } else {
+            FloatFacts {
+                lo: c,
+                hi: c,
+                nan: false,
+                neg_zero: c == 0.0 && c.is_sign_negative(),
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lo > self.hi
+    }
+
+    /// No element is NaN or infinite.
+    fn finite(&self) -> bool {
+        !self.nan && (self.is_empty() || (self.lo.is_finite() && self.hi.is_finite()))
+    }
+
+    /// Every element's sign bit is clear: `+0` or above, and never NaN.
+    fn sign_clear(&self) -> bool {
+        !self.nan && !self.neg_zero && (self.is_empty() || self.lo >= 0.0)
+    }
+
+    /// Some element may be `+0` or above zero -- the elements `negf` turns into `-0` or below.
+    fn may_hold_zero(&self) -> bool {
+        !self.is_empty() && self.lo <= 0.0 && self.hi >= 0.0
+    }
+}
+
+/// The smallest interval holding every non-empty `[lo, hi]` in `parts`.
+fn hull(parts: &[(f64, f64)]) -> (f64, f64) {
+    parts
+        .iter()
+        .filter(|(l, h)| l <= h)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l0, h0), (l, h)| {
+            (l0.min(*l), h0.max(*h))
+        })
+}
+
+/// `maxnumf` (`max = true`) / `minnumf`: IEEE maxNum/minNum, so a NaN operand yields the OTHER
+/// operand and the result is NaN only where both are. The result is the extremum of two
+/// elements, or one operand's element where the other is NaN.
+fn num_extremum(a: FloatFacts, b: FloatFacts, max: bool) -> FloatFacts {
+    let pick = |x: f64, y: f64| if max { x.max(y) } else { x.min(y) };
+    let mut parts = Vec::with_capacity(3);
+    if !a.is_empty() && !b.is_empty() {
+        parts.push((pick(a.lo, b.lo), pick(a.hi, b.hi)));
+    }
+    if a.nan {
+        parts.push((b.lo, b.hi));
+    }
+    if b.nan {
+        parts.push((a.lo, a.hi));
+    }
+    let (lo, hi) = hull(&parts);
+    FloatFacts {
+        lo,
+        hi,
+        nan: a.nan && b.nan,
+        // Equal zeros may yield either one.
+        neg_zero: a.neg_zero || b.neg_zero,
+    }
+}
+
+/// A `tt.reduce` whose body is ONE binary op of its two block arguments, returned: that op's
+/// name. Anything else (several operands, a longer body) is `None`, so its result is unknown.
+fn reduce_combiner(op: &Op) -> Option<&str> {
+    let [region] = op.regions.as_slice() else {
+        return None;
+    };
+    let [block] = region.blocks.as_slice() else {
+        return None;
+    };
+    let ([a, b], [combine, ret]) = (block.args.as_slice(), block.ops.as_slice()) else {
+        return None;
+    };
+    let args_ok =
+        combine.operands.as_slice() == [*a, *b] || combine.operands.as_slice() == [*b, *a];
+    let returns = ret.name == "tt.reduce.return" && ret.operands == combine.results;
+    (args_ok && returns && combine.results.len() == 1).then_some(combine.name.as_str())
+}
+
+/// The result facts of one op, from its operands'. [`FloatFacts::UNKNOWN`] for every op kind
+/// not named here.
+fn transfer(
+    op: &Op,
+    facts: &HashMap<ValueId, FloatFacts>,
+    consts: &HashMap<ValueId, (f64, bool)>,
+    tys: &[Type],
+) -> FloatFacts {
+    let arg = |i: usize| {
+        facts
+            .get(&op.operands[i])
+            .copied()
+            .unwrap_or(FloatFacts::UNKNOWN)
+    };
+    match (op.name.as_str(), op.operands.len()) {
+        ("arith.constant", 0) => consts
+            .get(&op.results[0])
+            .map(|(c, _)| FloatFacts::of_constant(*c))
+            .unwrap_or(FloatFacts::UNKNOWN),
+        // Exact (a widening), or a rearrangement of the same elements.
+        ("arith.extf", 1)
+        | ("tt.splat", 1)
+        | ("tt.broadcast", 1)
+        | ("tt.expand_dims", 1)
+        | ("tt.reshape", 1)
+        | ("tt.trans", 1) => arg(0),
+        // A narrowing to f16, in WHATEVER rounding mode the device's is: every mode is monotone
+        // and keeps the sign (a negative element may land on -0), and none takes a value within
+        // f16's range past its largest finite one. So the bounds widen to those landmarks --
+        // 0 and ±65504 -- rather than to a rounding of their own, which would be one mode's.
+        ("arith.truncf", 1) => {
+            const F16_MAX: f64 = 65504.0;
+            let a = arg(0);
+            if *tys[op.results[0].0 as usize].scalar() != Type::f16() {
+                return FloatFacts::UNKNOWN;
+            }
+            let widen = |v: f64| {
+                if v == 0.0 {
+                    0.0
+                } else if v.abs() <= F16_MAX {
+                    F16_MAX.copysign(v)
+                } else {
+                    f64::INFINITY.copysign(v)
+                }
+            };
+            if a.is_empty() {
+                return a;
+            }
+            FloatFacts {
+                lo: if a.lo >= 0.0 { 0.0 } else { widen(a.lo) },
+                hi: if a.hi <= 0.0 { 0.0 } else { widen(a.hi) },
+                nan: a.nan,
+                neg_zero: a.neg_zero || a.lo < 0.0,
+            }
+        }
+        ("arith.negf", 1) => {
+            let a = arg(0);
+            FloatFacts {
+                lo: -a.hi,
+                hi: -a.lo,
+                nan: a.nan,
+                neg_zero: a.may_hold_zero(),
+            }
+        }
+        // `e^x` and `2^x` are positive, so the result is `+0` or above (it underflows to
+        // `+0`, never to `-0`). On `x <= 0` the true value is at most 1, so any implementation
+        // whose error is under 100% returns below 2: the bound is stated as 2, not 1, because
+        // what the folds read is that the result is FINITE, and that must not rest on the
+        // implementation's last bit. NaN stays NaN.
+        ("math.exp", 1) | ("math.exp2", 1) => {
+            let a = arg(0);
+            FloatFacts {
+                lo: 0.0,
+                hi: if a.is_empty() || a.hi <= 0.0 {
+                    2.0
+                } else {
+                    f64::INFINITY
+                },
+                nan: a.nan,
+                neg_zero: false,
+            }
+        }
+        ("arith.maxnumf", 2) => num_extremum(arg(0), arg(1), true),
+        ("arith.minnumf", 2) => num_extremum(arg(0), arg(1), false),
+        // `tt.dot` is NOT here, deliberately: its accumulation order and width are the
+        // implementation's, and a fused multiply-add (or a wide sum narrowed at the end) turns
+        // a tiny negative product into -0 even over a +0 accumulator.
+        ("tt.reduce", 1) => {
+            let a = arg(0);
+            match reduce_combiner(op) {
+                // Each result is one element of its row, or NaN only where one is.
+                Some("arith.maxnumf" | "arith.minnumf" | "arith.maximumf" | "arith.minimumf") => a,
+                // A sum of one or more elements, in an order and at a width that are the
+                // implementation's: at least the least of them when none is negative, at most
+                // the greatest when none is positive. NaN from a NaN element, or from
+                // `+inf + -inf` once elements of both signs can overflow. A sum of elements none
+                // of which is negative or -0 is never -0; any other sum is allowed to be.
+                Some("arith.addf") => FloatFacts {
+                    lo: if a.lo >= 0.0 { a.lo } else { f64::NEG_INFINITY },
+                    hi: if a.hi <= 0.0 { a.hi } else { f64::INFINITY },
+                    nan: a.nan || (a.lo < 0.0 && a.hi > 0.0),
+                    neg_zero: a.neg_zero || (!a.is_empty() && a.lo < 0.0),
+                },
+                _ => FloatFacts::UNKNOWN,
+            }
+        }
+        _ => FloatFacts::UNKNOWN,
+    }
+}
+
+/// Every float value's [`FloatFacts`], where they are narrower than unknown.
+fn float_facts(
+    m: &Module,
+    consts: &HashMap<ValueId, (f64, bool)>,
+    tys: &[Type],
+) -> HashMap<ValueId, FloatFacts> {
+    // Program order is def-before-use, and a region's ops are walked before the op that owns
+    // it -- whose result is defined after its body.
+    fn walk(
+        ops: &[Op],
+        consts: &HashMap<ValueId, (f64, bool)>,
+        tys: &[Type],
+        out: &mut HashMap<ValueId, FloatFacts>,
+    ) {
+        for op in ops {
+            for r in &op.regions {
+                for b in &r.blocks {
+                    walk(&b.ops, consts, tys, out);
+                }
+            }
+            let [res] = op.results.as_slice() else {
+                continue;
+            };
+            if !tys[res.0 as usize].is_floating() {
+                continue;
+            }
+            let f = transfer(op, out, consts, tys);
+            if f != FloatFacts::UNKNOWN {
+                out.insert(*res, f);
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for f in &m.funcs {
+        for b in &f.body.blocks {
+            walk(&b.ops, consts, tys, &mut out);
+        }
+    }
+    out
+}
+
+/// What a float identity turns its op into.
+enum FloatFold {
+    /// The op's result IS this operand.
+    Operand(ValueId),
+    /// The op's result is a zero of this sign (`true`: `-0`).
+    Zero(bool),
+}
+
+/// The identity `op(x, c)` satisfies, where `c` is a constant and `c_right` says it is the
+/// right operand -- only where it holds for EVERY element `x`'s facts admit.
+///
+/// Each law is IEEE-754's, for every `x` (NaN and both zeros included) -- `x * 1`, `x / 1`,
+/// `x + -0`, `x - +0`, `maxnum(x, NaN)`, `maximum(x, -inf)` -- or holds only on the values
+/// the facts admit: `x + +0` changes a `-0` to `+0`, so it needs `x` never `-0`; `x * 0` is
+/// the zero itself only for a finite `x` whose sign bit is clear; `maxnum(x, -inf)` is `-inf`
+/// at a NaN `x`, so it needs `x` never NaN.
+fn float_identity(
+    name: &str,
+    x: ValueId,
+    fx: FloatFacts,
+    c: f64,
+    c_right: bool,
+) -> Option<FloatFold> {
+    let zero = c == 0.0;
+    let negative = c.is_sign_negative();
+    let keep = Some(FloatFold::Operand(x));
+    match name {
+        // `x + -0 = x` always; `x + +0 = x` except at `x = -0`.
+        "arith.addf" if zero && (negative || !fx.neg_zero) => keep,
+        // `x - +0 = x` always; `x - -0 = x + +0`.
+        "arith.subf" if c_right && zero && (!negative || !fx.neg_zero) => keep,
+        "arith.mulf" if c == 1.0 => keep,
+        // `x * ±0` is a zero of `0`'s sign for a finite `x` whose sign bit is clear. (A NaN or
+        // infinite `x` makes NaN; a `-0` or negative one flips the sign.)
+        "arith.mulf" if zero && fx.finite() && fx.sign_clear() => Some(FloatFold::Zero(negative)),
+        "arith.divf" if c_right && c == 1.0 => keep,
+        // maxNum/minNum drop a NaN operand.
+        "arith.maxnumf" | "arith.minnumf" if c.is_nan() => keep,
+        "arith.maxnumf" if c == f64::NEG_INFINITY && !fx.nan => keep,
+        "arith.minnumf" if c == f64::INFINITY && !fx.nan => keep,
+        // maximum/minimum propagate a NaN `x`, and order every other `x` (both zeros too)
+        // at or above `-inf` / at or below `+inf`.
+        "arith.maximumf" if c == f64::NEG_INFINITY => keep,
+        "arith.minimumf" if c == f64::INFINITY => keep,
+        _ => None,
+    }
+}
+
+/// Float identities with one constant operand: `x * 1`, `x / 1`, `x + -0`, `x - +0`,
+/// `maximum(x, -inf)` -> `x` always, and -- where [`FloatFacts`] proves IEEE makes them
+/// exact -- `x + +0` -> `x`, `x * ±0` -> a zero, `maxnum(x, -inf)` -> `x`.
+///
+/// A fold whose law does not hold for every value the operand can take is LEFT UNFOLDED, the
+/// op lowering as written. The integer forms are [`fold_int_identities`].
+///
+/// MEASURED: a loop that [`promote_single_trip_loops`] promotes hands its body the carried
+/// values' INITIAL constants -- an online softmax's running sum `0` and running maximum `-inf`
+/// -- and the carried update `sum * rescale + s` becomes `rescale * 0 + s`: with `rescale` the
+/// `exp` of a value at most 0 (so finite and `+0` or above), that is `+0 + s`, and `s` a sum of
+/// `exp`s (never -0) is the result. The whole rescale chain is then dead.
+pub fn fold_float_identities(m: &mut Module) -> bool {
+    let consts = float_constants(m);
+    let tys: Vec<Type> = m.values.iter().map(|v| v.ty.clone()).collect();
+    let facts = float_facts(m, &consts, &tys);
+    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut changed = false;
+    for f in &mut m.funcs {
+        for b in &mut f.body.blocks {
+            changed |= fold_float_ops(&mut b.ops, &consts, &facts, &tys, &mut subst);
+        }
+    }
+    if !subst.is_empty() {
+        substitute(m, &subst);
+        changed = true;
+    }
+    changed
+}
+
+fn fold_float_ops(
+    ops: &mut [Op],
+    consts: &HashMap<ValueId, (f64, bool)>,
+    facts: &HashMap<ValueId, FloatFacts>,
+    tys: &[Type],
+    subst: &mut HashMap<ValueId, ValueId>,
+) -> bool {
+    let mut changed = false;
+    for op in ops.iter_mut() {
+        for r in &mut op.regions {
+            for b in &mut r.blocks {
+                changed |= fold_float_ops(&mut b.ops, consts, facts, tys, subst);
+            }
+        }
+        let ([a, b], [res]) = (op.operands.as_slice(), op.results.as_slice()) else {
+            continue;
+        };
+        let (a, b, res) = (*a, *b, *res);
+        let res_ty = &tys[res.0 as usize];
+        if !res_ty.is_floating() {
+            continue;
+        }
+        let facts_of = |v: ValueId| facts.get(&v).copied().unwrap_or(FloatFacts::UNKNOWN);
+        // The constant on the right first (where `sort_commutative_operands` puts it), then --
+        // for the ops whose operands commute -- on the left.
+        let commutes = matches!(
+            op.name.as_str(),
+            "arith.addf"
+                | "arith.mulf"
+                | "arith.maxnumf"
+                | "arith.minnumf"
+                | "arith.maximumf"
+                | "arith.minimumf"
+        );
+        let mut fold = consts
+            .get(&b)
+            .and_then(|(c, _)| float_identity(&op.name, a, facts_of(a), *c, true));
+        if fold.is_none() && commutes {
+            fold = consts
+                .get(&a)
+                .and_then(|(c, _)| float_identity(&op.name, b, facts_of(b), *c, false));
+        }
+        match fold {
+            Some(FloatFold::Operand(x)) if tys[x.0 as usize] == *res_ty => {
+                subst.insert(res, x);
+            }
+            Some(FloatFold::Zero(negative)) => {
+                let elem = res_ty.scalar().clone();
+                let z = if negative { -0.0 } else { 0.0 };
+                let inner = Attr::Float(crate::ttir::F64Bits::new(z), elem);
+                let attr = if res_ty.is_tensor() {
+                    Attr::DenseSplat(Box::new(inner), res_ty.clone())
+                } else {
+                    inner
+                };
+                op.name = "arith.constant".to_string();
+                op.operands.clear();
+                op.attrs.clear();
+                op.attrs.insert("value".to_string(), attr);
+                changed = true;
+            }
+            _ => {}
+        }
     }
     changed
 }

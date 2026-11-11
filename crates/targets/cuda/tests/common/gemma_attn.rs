@@ -33,7 +33,7 @@
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::{AttnScale, HeadDim, KvRope, Rope};
-use scratchy_subtile::fixtures::fixture_head_geometry;
+use scratchy_subtile::fixtures::{fixture_head_geometry, rebind};
 use scratchy_subtile::handoff::{LoweredDecode, RopePairing, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::RopeClass;
@@ -231,7 +231,7 @@ pub fn gemma_attn(m: u32) -> LoweredDecode {
         ),
         (14, SourceBinding::Cos { local: false }),
     ] {
-        l.bindings[ix] = binding;
+        rebind(&mut l, |b| b[ix] = binding);
     }
     l
 }
@@ -343,7 +343,7 @@ fn bind_global(l: &mut LoweredDecode, src: usize) {
         (9, SourceBinding::PrefixK { layer }),
         (10, SourceBinding::PrefixV { layer }),
     ] {
-        l.bindings[src + i] = binding;
+        rebind(l, |b| b[src + i] = binding);
     }
 }
 
@@ -372,7 +372,9 @@ pub fn gemma_attn_two_classes(m: u32) -> LoweredDecode {
     input.result = op0 + GLOBAL_OPS - 1;
     let sliding = gemma_attn(m);
     let mut l = with_hidden(input);
-    l.bindings[..sliding.bindings.len()].clone_from_slice(&sliding.bindings);
+    rebind(&mut l, |b| {
+        b[..sliding.bindings().len()].clone_from_slice(sliding.bindings())
+    });
     bind_global(&mut l, src);
     l
 }

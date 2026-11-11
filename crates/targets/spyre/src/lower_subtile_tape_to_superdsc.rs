@@ -238,8 +238,8 @@ use ktir_superdsc::emit::EmittedOp;
 ///    length field describes. IBM's own validator for this is commented out in `qg.h`.
 ///  * **Inside its segment.** A placement running past `segment_bytes[seg]` addresses memory the
 ///    segment does not own — I1's inner half, which the device checks only on one path.
-///  * **No overlap.** Two placements sharing bytes means one tensor's producer overwrites the
-///    other's, which is silent: wrong output, or a fault when the second is a kernel.
+///  * **No overlap** is not checked here: synthetics are disjoint by construction
+///    (`SynthAlloc::take`), and colored activations share slots by design.
 ///  * **Non-empty.** A zero-length field is read by the device as `1 << 27` flits = 16 GiB, in both
 ///    `handleHostDMA` and `handleXLATentry`. Zero does not mean nothing.
 ///  * **Allocatable.** A segment is ONE `FlexAllocator` allocation, served from ONE region, so it
@@ -344,42 +344,11 @@ fn audit_layout_addresses(
         }
     }
 
-    // ── overlap, per segment — SYNTHETICS ONLY ──
+    // ── overlap: not checked here ──
     //
-    // ⛔ COLORED ACTIVATIONS OVERLAP ON PURPOSE. The slot-coloring pass gives two tensors whose
-    // LIFETIMES are disjoint the same address; that is the optimisation, not a defect, and
-    // granite's `t447`/`t464`/`t1127` legitimately share one 4096 B slot. Liveness is not a fact
-    // this function has, so it does not get to judge them.
-    //
-    // Synthetics are different: they come from a BUMP allocator, so disjointness IS their
-    // invariant and an overlap means the allocator handed the same address out twice — which is
-    // exactly what it did, by never advancing `next` for an undeclared name.
-    for seg in 0..segment_bytes.len() {
-        let mut in_seg: Vec<&bundle::Placement> = places
-            .iter()
-            .filter(|p| {
-                p.segment as usize == seg
-                    && p.size > 0
-                    && matches!(p.id, bundle::PlaceId::Synth { .. })
-            })
-            .collect();
-        in_seg.sort_by_key(|p| p.offset);
-        for w in in_seg.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if a.offset + a.size > b.offset {
-                fail.push(format!(
-                    "{} spans [{}, {}) and {} starts at {} in seg{seg} — they SHARE {} B, so one \
-                     tensor's producer writes over the other's",
-                    a.id,
-                    a.offset,
-                    a.offset + a.size,
-                    b.id,
-                    b.offset,
-                    a.offset + a.size - b.offset
-                ));
-            }
-        }
-    }
+    // Colored activations overlap ON PURPOSE (two tensors whose lifetimes are disjoint share a slot:
+    // the slot-coloring pass's optimisation, a fact this function does not have). Synthetics cannot:
+    // `SynthAlloc::take` is their one writer and hands out disjoint ranges by construction.
 
     if !fail.is_empty() {
         let shown = fail.len().min(12);
@@ -626,13 +595,17 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     paged_rows: scratchy_triton_splice::PagedRows,
+    // The graph's query extents, minted by the bake — threaded, never re-derived here:
+    // a registry walk that minted its own pair from graph rows would agree with the
+    // graph yet state the wrong per-request width the day a packed prefill arrives.
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<Vec<f32>, SuperDscError> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
     let mut registry = scalar_registry(ir);
     let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
     for node in &ir.nodes {
         let NodeLowering::Ops(ops) =
-            lower_one_node::<T, F>(node, ir, ActiveCap::FULL, rows_are_requests)
+            lower_one_node::<T, F>(node, ir, ActiveCap::FULL, rows_are_requests, query_rows)
         else {
             continue;
         };
@@ -732,6 +705,18 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
 /// THE KV POOLS — every attention's K and V cache tensors, each once, in layer order: what a card
 /// bake places in the KV segment ([`compute_bundle_layout`]) and an emulator bake leaves to the
 /// emulator, which holds them as the KTIR's own buffers.
+/// ⭐ THE EMITTER'S ROW PAD — `mq` rows padded up to whole fp16 sticks. THE one
+/// home of the pad every row-count statement takes: the emitter's own placement
+/// of the attention zero tensor (`compute_bundle_layout`, `mq_pad` off the
+/// widest `AttnDecode`), and the worker's launch (`spyre_forward`'s
+/// stick-padded row count for the constants' tables, `spyre_load`'s load-time
+/// tape check). The stick is [`Fp16`]'s own — a row count that is not whole
+/// fp16 sticks is not a shape this ladder places, and the launch's whole-stick
+/// refusal on `hidden` checks the same fact.
+pub fn mq_pad(mq: usize) -> usize {
+    mq.div_ceil(Fp16::ELEMS_PER_STICK as usize) * Fp16::ELEMS_PER_STICK as usize
+}
+
 pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
     let mut pools: Vec<u32> = Vec::new();
     for n in &ir.nodes {
@@ -759,6 +744,9 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // ⭐ WHAT THE ROWS ARE — one sequence's, or a decode batch's: the paged step's sources differ.
     paged_rows: scratchy_triton_splice::PagedRows,
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
+    // The graph's query extents, minted by the bake — threaded to the registry walk below,
+    // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<BundleLayout, SuperDscError> {
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
@@ -988,7 +976,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    emulator runs the paged step as KTIR over the cache tensors bound by tid, and a model whose
     //    pools outgrow one device region (`max_position_embeddings` pages of every layer) is refused
     //    by the address audit on the card it cannot fit, not on an emulator that never places them.
-    let pools = if cfg!(feature = "spyre-hw") {
+    let pools = if cfg!(feature = "spyre-lower") {
         kv_pool_tids(ir)
     } else {
         Vec::new()
@@ -1301,19 +1289,19 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         // own bind restores. Recorded because that false story invites a "fix" that merely reorders
         // binds, which would leave the over-bind in place.
         //
-        // Derive the extent from the WIDEST AttnDecode in the tape. `div_ceil` keeps it at exactly one
+        // Derive the extent from the WIDEST AttnDecode in the tape, through the emitter's own
+        // ONE pad home ([`mq_pad`]). `div_ceil` keeps it at exactly one
         // stick for every mq<=64 (decode's mq=1 included), so previously-baked bundles are unchanged.
         let mqp_z = ir
             .nodes
             .iter()
             .filter_map(|n| match &n.op {
-                SubOp::AttnDecode { .. } => Some(n.output.region.rows.len as u64),
+                SubOp::AttnDecode { .. } => Some(n.output.region.rows.len as usize),
                 _ => None,
             })
             .max()
-            .unwrap_or(1)
-            .div_ceil(Fp16::ELEMS_PER_STICK as u64)
-            * Fp16::ELEMS_PER_STICK as u64;
+            .unwrap_or(1);
+        let mqp_z = mq_pad(mqp_z) as u64;
         let off = seg_bytes[seg];
         let sz = mqp_z * hd * 2;
         placements.insert(
@@ -1536,7 +1524,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
     //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
-    let scalarmul_scales = bundle_registry::<T, F>(ir, paged_rows)?;
+    let scalarmul_scales = bundle_registry::<T, F>(ir, paged_rows, query_rows)?;
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -1562,9 +1550,12 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    in the intermediate segment, which neither a layer's launch nor a walk's relaunch shifts
     //    (the KV segment moves with every layer). `PagedStep::card_placements` is
     //    the one statement of what they are and how big — the card stagers stage within it.
-    if let Some(step) =
-        crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL, paged_rows)?
-    {
+    if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+        ir,
+        ActiveCap::FULL,
+        paged_rows,
+        query_rows,
+    )? {
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {
                 crate::wiring::CardSeat::Step => SegRole::Activation,
@@ -1589,11 +1580,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
     // colored intermediates in seg3, so they never overlap a real intermediate.
-    let synth = std::cell::RefCell::new(SynthAlloc {
-        next: seg_bytes[SegRole::Intermediate.segment()],
-        map: std::collections::BTreeMap::new(),
-        sizes: std::collections::BTreeMap::new(),
-    });
+    let synth =
+        std::cell::RefCell::new(SynthAlloc::new(seg_bytes[SegRole::Intermediate.segment()]));
     // Every placed tensor's spelling, registered at the one site that knows the whole set.
     let ids = std::cell::RefCell::new(
         placements
@@ -2462,9 +2450,14 @@ pub(crate) struct StagedWeightView<'a> {
     /// graph OUTPUT stages that output's INITIAL bytes — the ops overwrite
     /// them wherever they compute — so the reference legs take them through
     /// [`Self::stage_load_consts`] at buffer init instead, never through the
-    /// read-time channel.
-    pub load_consts: &'a [(u32, crate::wiring::LoadConst)],
+    /// read-time channel. Each entry is already BUILT (`LoadConst::build`) for
+    /// the rank the probe stages — a chained head's tables are its rank's
+    /// vocabulary block — so the view carries no rank of its own.
+    pub load_consts: &'a [BuiltConst],
 }
+
+/// One load-time constant, built for its staging rank: `(tid, bytes, dtype)`.
+pub(crate) type BuiltConst = (u32, Vec<u8>, scratchy_tensors::DType);
 
 impl StagedWeightView<'_> {
     /// The f32 image of staged weight `tid` in the LOGICAL `[rows, cols]`
@@ -2527,12 +2520,12 @@ impl StagedWeightView<'_> {
     /// covering slice left unallocated is skipped with it — nothing bound
     /// reads it.
     pub(crate) fn stage_load_consts(&self, bufs: &mut [Vec<f32>], floor: usize) {
-        for &(tid, kind) in self.load_consts {
+        for (tid, bytes, dt) in self.load_consts {
+            let (tid, dt) = (*tid, *dt);
             let i = tid as usize;
             if i < floor || i >= bufs.len() || bufs[i].is_empty() {
                 continue;
             }
-            let (bytes, dt, _shape) = kind.build();
             let vals: Vec<f32> = match dt {
                 scratchy_tensors::DType::F16 => bytes
                     .as_chunks::<2>()
@@ -3533,15 +3526,17 @@ fn teacher_forced_walk<F: RopeForm>(
                     shape,
                 );
                 // ⭐ A FOLDED tail tid states the FOLD'S OWN LAW here too: the
-                // program's product is ONE row (row 0 of the readback — the
-                // stick above it is sized by the IR and never written), so the
-                // row compares the emulator's row 0 against this walk's LAST
+                // program's product is S rows (rows 0..S of the readback —
+                // the stick above them is sized by the IR and never written;
+                // every golden today is one request, so S = 1 and the product
+                // is row 0 alone), so the row compares the emulator's row 0
+                // against this walk's LAST
                 // row (the `selector_lastrow_col` extraction the lowering
                 // pins). The teacher still pins — the fold's own pin: the
-                // program wrote ONE row, row 0, the row the fold's consumers
-                // read (the Sample's `SampleRows::Folded` region is rows
-                // 0..1), so the emulator's row 0 is pinned there and rows 1..
-                // stay as the walk computed them (the program never wrote
+                // program wrote S rows starting at row 0, the rows the fold's
+                // consumers read (the Sample's `SampleRows::Folded` region is
+                // rows 0..S), so the emulator's row 0 is pinned there and rows
+                // 1.. stay as the walk computed them (the program never wrote
                 // them, and the fold law of every downstream folded tid reads
                 // the walk's LAST row). Without this pin the walk's Sample
                 // re-drew from the WALK's row 0 — the FIRST prompt
@@ -3727,7 +3722,7 @@ struct GateProbe {
     view_bytes: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)>,
     gemm: std::collections::HashSet<u32>,
     scale_rows: std::collections::HashSet<u32>,
-    load_consts: Vec<(u32, crate::wiring::LoadConst)>,
+    load_consts: Vec<BuiltConst>,
     staged_rope: std::collections::HashMap<u32, Vec<f32>>,
     sources: Vec<(u64, Vec<f32>, Vec<usize>)>,
 }
@@ -3738,8 +3733,14 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     covering: Option<&std::collections::HashSet<u64>>,
     prefill: Option<&PrefillGate>,
-    active_cap: ActiveCap,
+    // The rung under test, whole — its sweep AND its query extents, one fact (clippy's
+    // argument budget is the forcing function, but the rung was already the unit every
+    // gate message names; the probe reads `rung.active_cap` / `rung.query_rows`).
+    rung: &GateRung<'_>,
     seed: &dyn Fn(u32) -> usize,
+    // The rank this probe stages — `None` for the one-rank gate. A chained head's decompose
+    // tables are this rank's vocabulary block (`LoadConst::build`).
+    seat: Option<crate::bundle_code::collective::Rank<T>>,
 ) -> Result<GateProbe, String> {
     // ── The fold list the scales manifest's skip set states ──
     let sm_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
@@ -3775,17 +3776,20 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // merged map (see `staggered_of_ir`'s doc for why lowering the Sample node alone states
     // it), so the bytes this gate stages into the emulator are the worker's bytes: a table the
     // propagation marked is staged ALREADY PERMUTED by the same builder both legs call.
-    let staggered =
-        crate::lower_subtile_tape_to_ktir::staggered_of_ir::<T, F>(ir).map_err(|e| e.0)?;
+    let staggered = crate::lower_subtile_tape_to_ktir::staggered_of_ir::<T, F>(ir, rung.query_rows)
+        .map_err(|e| e.0)?;
     let load_consts =
         crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir, &staggered).map_err(|e| e.0)?;
     let load_const_tids: std::collections::HashSet<u32> =
         load_consts.iter().map(|&(tid, _)| tid).collect();
     let weights_ref = emu_weights.clone();
+    let mut built: Vec<BuiltConst> = Vec::with_capacity(load_consts.len());
     for &(tid, kind) in &load_consts {
-        let (bytes, dt, shape) = kind.build();
+        let (bytes, dt, shape) = kind.build(seat);
+        built.push((tid, bytes.clone(), dt));
         emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
     }
+    let load_consts = built;
     // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
     // states (`eval_golden_buffers`' seat block), staged into the session at
     // the operands' TRUE dtypes so neither rides `run_step`'s f16-only
@@ -3852,8 +3856,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // chunk's rows are one sequence's (the bake's `rows_are_requests`).
     let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
-        active_cap,
+        rung.active_cap,
         scratchy_triton_splice::PagedRows::of_requests(prefill.is_none()),
+        rung.query_rows,
     )
     .map_err(|e| e.0)?;
     let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
@@ -3875,10 +3880,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .flatten()
         .collect();
     let step_rows = match (prefill, paged) {
-        (Some(pg), _) => crate::paged_step::StepRows {
-            start: 0,
-            real: pg.mq as usize,
-        },
+        (Some(pg), _) => crate::paged_step::StepRows::new(0, pg.mq as usize).expect(
+            "the prefill wiring's rung holds no query rows — the bake cannot stage its step",
+        ),
         (None, Some(p)) => {
             let cached = ir
                 .nodes
@@ -3891,12 +3895,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 })
                 .max()
                 .unwrap_or(0);
-            crate::paged_step::StepRows {
-                start: cached.min(p.capacity().saturating_sub(1)),
-                real: 1,
-            }
+            crate::paged_step::StepRows::one_at(cached.min(p.capacity().saturating_sub(1)))
         }
-        (None, None) => crate::paged_step::StepRows { start: 0, real: 1 },
+        (None, None) => crate::paged_step::StepRows::one_at(0),
     };
     // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
     // every page through the table rather than at its block's own index, and the pages the step
@@ -4037,7 +4038,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// (ActiveCap::NONE, the first-chunk programs): the gate stages the run-time
 /// forward's OWN first-chunk law — the `[mq, mq]` clamped causal triangle and
 /// the per-position rotary rows — and compares against the golden with the
-/// rope tables read row-aligned and the lm-head tail's m=1 fold stated as the
+/// rope tables read row-aligned and the lm-head tail's m=S fold stated as the
 /// last-row law. A PREFIX-CAPABLE prefill bundle (ActiveCap::FULL — the
 /// continuation chunks) is still refused by the CALLER with a loud skip line:
 /// its resident-prefix mask law is the next rung. Graphs containing ops
@@ -4083,6 +4084,10 @@ pub struct GateRung<'a> {
     /// The rung's sweep — its paged walk ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]),
     /// so the gate stages the step against the reach the bundle was baked with.
     pub active_cap: ActiveCap,
+    /// The rung's query extents — the pair the bake minted for the graph under test
+    /// ([`scratchy_subtile::sdsc_abstract::QueryExtent`]), so the gate lowers the
+    /// graph's nodes under the SAME extents the bundle was baked with.
+    pub query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
     /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
     /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
     /// ranks at once ([`numeric_gate_sharded`]).
@@ -4343,6 +4348,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             fp,
             cap,
             active_cap: rung.active_cap,
+            query_rows: rung.query_rows,
             shards,
             scope,
         });
@@ -4357,9 +4363,15 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         load_consts,
         staged_rope,
         sources,
-    } = stage_gate_probe::<T, F>(ir, weight_ids, covering, prefill, rung.active_cap, &|tid| {
-        tid as usize
-    })?;
+    } = stage_gate_probe::<T, F>(
+        ir,
+        weight_ids,
+        covering,
+        prefill,
+        rung,
+        &|tid| tid as usize,
+        None,
+    )?;
     let view = StagedWeightView {
         bytes: &view_bytes,
         gemm: &gemm,
@@ -4688,11 +4700,13 @@ fn judge_gate_run<F: RopeForm>(
             }
         };
         // The fold is a documented transform, not a defect: the splice lowers
-        // the result-width tail to m=1 (the last-row extraction feeding the
-        // re-lowered ops), so those tids' program product is ONE row — row 0
-        // of a readback whose STICK the IR still sizes at [mq, cols] (the
-        // program never writes past row 0; measured: t302's stick read back
-        // 19 rows with rows 1-18 all zero). The compare states the fold's own
+        // the result-width tail to m=S over the requests' answer rows (the
+        // last-row extraction feeding the re-lowered ops; this golden's rung
+        // is one request, so S = 1), so those tids' program product is S
+        // rows — rows 0..S of a readback whose STICK the IR still sizes at
+        // [mq, cols] (the program never writes past row S; measured: t302's
+        // stick read back 19 rows with rows 1-18 all zero). The compare
+        // states the fold's own
         // law — the golden's LAST row against the emu's row 0 (the
         // `selector_lastrow_col` extraction the lowering pins) — so a fold
         // that grabs the WRONG row still diverges. A tid that comes back
@@ -4967,9 +4981,14 @@ struct ShardedGate<'a, T: ktir_superdsc::collective::Tp, F: RopeForm> {
     covering: Option<&'a std::collections::HashSet<u64>>,
     tainted: &'a std::collections::HashSet<u32>,
     prefill: Option<&'a PrefillGate>,
+    // The rung's own facts, carried loose — fp, cap, the sweep, the query extents — plus
+    // the shard law as its OWN typed field: `shards: &[SourceShard]`, not an Option to
+    // recover from the rung. The sharded gate cannot be BUILT without its shards, so
+    // nothing on this path unwraps.
     fp: &'a str,
     cap: u32,
     active_cap: ActiveCap,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
     shards: &'a [scratchy_subtile::tensor_parallel::SourceShard],
     scope: String,
 }
@@ -5007,6 +5026,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         fp,
         cap,
         active_cap,
+        query_rows,
         shards,
         scope,
     } = gate;
@@ -5021,6 +5041,16 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             Some(_) => tid as usize + r * RANK_STREAM,
         }
     };
+    // The probe lowers under the rung's sweep and query extents — the same GateRung
+    // shape the one-rank gate hands it, wrapped (never unwrapped) with this gate's own
+    // typed shard slice.
+    let probe_rung = GateRung {
+        fp,
+        cap,
+        active_cap,
+        query_rows,
+        shards: Some(shards),
+    };
     let mut probes: Vec<GateProbe> = Vec::with_capacity(ranks.len());
     for me in &ranks {
         probes.push(stage_gate_probe::<T, F>(
@@ -5028,8 +5058,9 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             weight_ids,
             covering,
             prefill,
-            active_cap,
+            &probe_rung,
             &seed(me.get() as usize),
+            Some(*me),
         )?);
     }
     let golden_index = GoldenIndex::of(ir);
@@ -5464,28 +5495,6 @@ fn write_refusal_dump(
 pub enum GroupKind<T: ktir_superdsc::collective::Tp> {
     /// Fusable on-card trip (no per-entry shim handling).
     Pure,
-    /// `host_kv_write`: the shim host-scatters KV then does `oi += skip` to skip
-    /// the on-card cachewr copies it replaced. This entry AND those `skip`
-    /// entries MUST be singletons so `oi += skip` skips exactly them.
-    HostKv { skip: usize },
-    /// `slot_write` DECODE cachewr: every fused copy writes the SAME slot (baked at slot 0,
-    /// shim shifts the group base by `slot_pos·stride` ONCE). Consecutive `Slot` trips FUSE
-    /// ≤ g (the launch reduction). MUST all share one slot — enforce via [`GroupKind::SlotSolo`]
-    /// for the distinct-slot case, so a fused `Slot` group is uniform-slot by construction.
-    ///
-    /// CARRIES ITS REQUEST, and a run BREAKS where the request changes. A group is one launch and a
-    /// launch resolves ONE request's page table and write cursor, so two requests cannot share a
-    /// group — but a request's own kv-head copies still can, and they must: a batched decode step's
-    /// cache writes are `nkvh · requests · 2` per layer, and making each its own singleton (which is
-    /// what treating them as distinct-slot did) cost ~5,300 extra launches per forward and ran a
-    /// batch of 8 twenty times slower than one request. 0 for an unbatched bundle, so its grouping
-    /// is exactly what it was.
-    Slot { req: u32 },
-    /// `slot_write` PREFILL cachewr: writes a DISTINCT per-entry slot (baked at `s·hd`). The
-    /// shim's single per-group slot-shift CANNOT express distinct slots, so each is its OWN
-    /// singleton group (launched with its baked slot doff; prefill `slot_pos==0` ⇒ no shift).
-    /// This makes "distinct-slot copy fused into a uniform-shift group" UNCONSTRUCTABLE.
-    SlotSolo,
     /// PAGE FOLD (`kv_page_fold`): folds one page of resident prefix. Consecutive fold trips FUSE
     /// (they share a page base) but must never fuse with anything else — the shim re-launches this
     /// group per page, and a stray op swept in would re-run per page too, re-seeding the new-token
@@ -5496,13 +5505,6 @@ pub enum GroupKind<T: ktir_superdsc::collective::Tp> {
     /// property of the kind and must stay in ONE place; a gathered fold's passes communicate through a
     /// scratch they rewrite, an ungathered fold's do not, and that is the whole difference.
     PageFold { gathered: bool },
-    /// `slab_write` DECODE incremental Kᵀ restickify (kill-restickify Stage 2, hd==64): re-transposes
-    /// ONLY the current 64-slot slab; the shim shifts the group's seg2 base by
-    /// `(slot_pos/64)·slab_stride_bytes` ONCE (each op baked at slab 0). Consecutive `Slab` trips FUSE
-    /// ≤ g (the nkvh per-kv-head restickifies, all one `slab_stride_bytes`). DISTINCT kind from `Slot`:
-    /// its stride (STICK_BYTES·stick = 8192) ≠ the cachewr's `slot_stride_bytes` (128), so fusing the two
-    /// would trip the per-group uniform-stride assert (mixed-stride group → wrong base shift).
-    Slab,
     /// A GATHERED read outside any fold — the split-KV chunk's copies (`attn.rs`'s
     /// `assemble_attn_chunk`), which pull every resident page through the index ONCE per launch.
     /// Consecutive `Gathered` trips FUSE, but never with anything else: the group's `KvShifts::gathered`
@@ -5519,61 +5521,28 @@ pub enum GroupKind<T: ktir_superdsc::collective::Tp> {
     TpConsume(ktir_superdsc::collective::TpConsume<T>),
 }
 
-/// WHICH REQUEST A TRIP'S ADDRESSING BELONGS TO.
-///
-/// Wraps the op's `kv_request` so the group walk cannot silently compare it against something else
-/// (a slot index, a page, a `rep`) — every one of those is also a small integer, and this file's
-/// history is a list of exactly that mistake. `0` is both "request 0" and "untagged", deliberately:
-/// an unbatched bundle must stay byte-identical, so the two are the same value. That conflation is
-/// SAFE HERE and nowhere else — for a group BOUNDARY, treating an untagged trip as request 0 can
-/// only break a run that would otherwise have fused, and over-breaking costs launches while
-/// under-breaking costs correctness. (Where the conflation is NOT safe is the page base and write
-/// cursor; those live behind `fold_plan::RequestSlot`.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TripRequest(pub u32);
-
-/// A body trip: WHAT it is plus WHOSE it is. The pair travels together so the fusion walk cannot
-/// consult one without the other.
-///
-/// Before this type the walk saw only `GroupKind`, and only the `Slot` variant happened to carry a
-/// request. So every OTHER kind fused across requests — and a group is ONE launch, which resolves
-/// ONE request's page table, so a `Pure` run spanning two requests gave both of them the FIRST
-/// request's KV page. That is the same class of bug as the six before it: correctness depended on
-/// each variant separately remembering to check the request, and a new variant (or an op newly
-/// tagged with a request, like the per-page Kᵀ re-transpose) got it wrong by default.
-/// Now the request is checked ONCE, for all kinds, in [`Trip::fusable_with`].
+/// One body trip: the launch-group KIND its op takes. A group is one launch, so the kind decides
+/// which trips may share one ([`GroupKind::fusable_kind_with`]) and how long a run may grow
+/// ([`GroupKind::run_may_be_chunked`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Trip<T: ktir_superdsc::collective::Tp> {
     pub kind: GroupKind<T>,
-    pub req: TripRequest,
-    /// ⭐ THE OP'S [`EmittedOp::kv_slot_offset`] — which PAGE PART of a multi-page prefill window it
-    /// addresses. Checked beside the request, for every kind, and for the same reason: a launch resolves
-    /// ONE page per group, so a cache-write part (a `Slot`) and a Kᵀ re-transpose part (a `Pure`) of the
-    /// window's second page cannot share a group with anything aimed at its first.
-    pub slot_offset: u32,
 }
 
 impl<T: ktir_superdsc::collective::Tp> GroupKind<T> {
-    /// Whether two trips of these kinds may share one concrete bundle, IGNORING the request.
-    ///
-    /// Note `SlotSolo` and `HostKv` are not fusable even with THEMSELVES — that is how "this trip is
-    /// a singleton by construction" is expressed, and it is what makes the walk's advance-by-one
-    /// fallback unnecessary: a run is `[start, start+1)` unless the kind opts in.
+    /// Whether two trips of these kinds may share one concrete bundle. A run is `[start, start+1)`
+    /// unless the kind opts in.
     fn fusable_kind_with(self, other: GroupKind<T>) -> bool {
         match (self, other) {
             (GroupKind::Pure, GroupKind::Pure) => true,
-            (GroupKind::Slab, GroupKind::Slab) => true,
             (GroupKind::Gathered, GroupKind::Gathered) => true,
             // AND THE SAME GATHER STATE. They move together in today's emitter (one `gather` decision
             // serves a whole attention block), so this arm is `true` in practice — but a group takes
             // its SIZE CAP from its first trip's kind, so a run mixing the two would silently give one
             // half the other's cap. Breaking at that boundary can only cost a launch.
             (GroupKind::PageFold { gathered: a }, GroupKind::PageFold { gathered: b }) => a == b,
-            (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
             // One consume's descriptor ops are one launch; two consumes never share one.
             (GroupKind::TpConsume(a), GroupKind::TpConsume(b)) => a == b,
-            // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
-            // HostKv: the shim's `oi += skip` must land on this exact entry.
             _ => false,
         }
     }
@@ -5582,7 +5551,8 @@ impl<T: ktir_superdsc::collective::Tp> GroupKind<T> {
     /// `PageFold { gathered: true }` ALONE, and that is a CORRECTNESS law, not a tuning choice.
     ///
     /// ⛔⛔⛔ A GROUP IS THE UNIT OF THE `reps` RELAUNCH, AND THE LOOP IS GROUP-MAJOR.
-    /// `superdsc_exec::launch_ops_inner` is `for op in ops { for rep in 0..reps(op) { … } }`, so a fold
+    /// `superdsc_exec::launch_ops_inner` enumerates `fold_plan::launches` — at one request exactly
+    /// `for op in ops { for rep in 0..reps(op) { … } }` — so a fold
     /// cut into groups A then B runs **A(pass 0..n), then B(pass 0..n)** — never A(0),B(0),A(1),B(1).
     /// Every op inside one pass therefore has to be inside one group.
     ///
@@ -5652,30 +5622,13 @@ impl<T: ktir_superdsc::collective::Tp> GroupKind<T> {
 }
 
 impl<T: ktir_superdsc::collective::Tp> Trip<T> {
-    /// A trip addressing its request's page at the write cursor — every trip but a page part's.
-    pub fn new(kind: GroupKind<T>, req: TripRequest) -> Trip<T> {
-        Trip::at_slot_offset(kind, req, 0)
+    pub fn new(kind: GroupKind<T>) -> Trip<T> {
+        Trip { kind }
     }
 
-    /// A trip addressing the page `slot_offset` slots past the write cursor (see [`Trip::slot_offset`]).
-    pub fn at_slot_offset(kind: GroupKind<T>, req: TripRequest, slot_offset: u32) -> Trip<T> {
-        Trip {
-            kind,
-            req,
-            slot_offset,
-        }
-    }
-
-    /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: same request, same page part, and kinds that fuse.
-    ///
-    /// A group is one launch; a launch resolves one request's page table and one write cursor and
-    /// shifts the segment base ONCE. Two requests therefore cannot share a group whatever their
-    /// kinds — so the request test lives HERE, above the kind test, and applies to kinds that do not
-    /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page.
+    /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: kinds that fuse.
     fn fusable_with(&self, other: &Trip<T>) -> bool {
-        self.req == other.req
-            && self.slot_offset == other.slot_offset
-            && self.kind.fusable_kind_with(other.kind)
+        self.kind.fusable_kind_with(other.kind)
     }
 }
 
@@ -5683,8 +5636,7 @@ impl<T: ktir_superdsc::collective::Tp> Trip<T> {
 /// fusion. Contiguous ⇒ emission (dataflow) order preserved ⇒ every producer
 /// precedes its consumer, so cross-group edges thread through the shared global
 /// HBM placement (addresses are grouping-invariant — baked at lowering, not here).
-/// A run of `Pure` trips is chunked ≤ `g`; each `HostKv` (with the `skip` entries
-/// it replaces) and each `Slot` is its OWN singleton. `g==1` reproduces the per-op
+/// A run of fusable trips is chunked ≤ its kind's cap. `g==1` reproduces the per-op
 /// partition EXACTLY. PURE (no env/IO) so Kani verifies the covering-partition
 /// invariant (no trip dropped or double-emitted → no dropped/duplicated compute).
 pub fn group_ranges<T: ktir_superdsc::collective::Tp>(
@@ -5696,21 +5648,8 @@ pub fn group_ranges<T: ktir_superdsc::collective::Tp>(
     let mut groups: Vec<core::ops::Range<usize>> = Vec::new();
     let mut i = 0usize;
     while i < n {
-        if let GroupKind::HostKv { skip } = trips[i].kind {
-            // this entry + the `skip` on-card copies it replaced: each its own singleton, so the
-            // shim's per-entry `oi += skip` advances over exactly them.
-            let end = i.saturating_add(1).saturating_add(skip).min(n);
-            let mut k = i;
-            while k < end {
-                groups.push(k..k + 1);
-                k += 1;
-            }
-            i = end;
-            continue;
-        }
-        // EVERY other kind takes the same walk. `end` starts one past `start`, so the walk always
-        // advances (termination is structural, not a special case) and a kind that fuses with
-        // nothing — SlotSolo — comes out a singleton without an arm of its own.
+        // Every kind takes the same walk. `end` starts one past `start`, so the walk always advances
+        // (termination is structural, not a special case).
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
@@ -5737,8 +5676,7 @@ pub fn group_ranges<T: ktir_superdsc::collective::Tp>(
 /// CBMC-tractable SCALAR twin of [`group_ranges`]'s partition walk (a `Vec<Range>`
 /// is CBMC-hostile — dynamic alloc over symbolic control flow blows up). Runs the
 /// IDENTICAL i-advancing control flow but tracks only scalars: the covered-prefix
-/// end and whether every emitted group is contiguous + correctly sized (Pure ≤ g,
-/// any non-Pure group == singleton). Returns `(covered_end, ok)`. Because it shares
+/// end and whether every emitted group is contiguous + within its kind's cap. Returns `(covered_end, ok)`. Because it shares
 /// [`group_ranges`]'s exact walk, proving `(covered_end==n && ok)` proves the Vec
 /// version is an EXACT covering partition (no trip dropped/double-emitted) with the
 /// size/singleton invariant. Keep byte-identical to `group_ranges`'s match arms.
@@ -5752,17 +5690,6 @@ pub fn group_ranges_cover_ok<T: ktir_superdsc::collective::Tp>(
     let mut expect = 0usize; // start of the next group must equal the covered-prefix end
     let mut ok = true;
     while i < n {
-        if let GroupKind::HostKv { skip } = trips[i].kind {
-            let end = i.saturating_add(1).saturating_add(skip).min(n);
-            let mut k = i;
-            while k < end {
-                ok &= k == expect; // contiguous; each is a [k,k+1) singleton (len 1 ≤ g)
-                expect = k + 1;
-                k += 1;
-            }
-            i = end;
-            continue;
-        }
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
@@ -5786,50 +5713,6 @@ pub fn group_ranges_cover_ok<T: ktir_superdsc::collective::Tp>(
         i = end;
     }
     (expect, ok)
-}
-
-/// Whether ANY group of this partition spans two requests — the bug-#7 predicate.
-///
-/// A group is one launch, and a launch shifts the KV base by ONE request's page/cursor. So a group
-/// holding trips of two requests gives the second request the first's KV, silently: fluent output,
-/// wrong tokens. Scalar (Vec-free) so CBMC can prove it never happens for ANY trip sequence.
-pub fn group_spans_two_requests<T: ktir_superdsc::collective::Tp>(
-    trips: &[Trip<T>],
-    g: usize,
-) -> bool {
-    let g = if g == 0 { 1 } else { g };
-    let n = trips.len();
-    let mut i = 0usize;
-    while i < n {
-        if let GroupKind::HostKv { skip } = trips[i].kind {
-            i = i.saturating_add(1).saturating_add(skip).min(n);
-            continue;
-        }
-        let start = i;
-        let mut end = start + 1;
-        let mut cnt = 1usize;
-        // THE SAME PER-KIND CAP AS THE WALK. It cannot change this predicate's answer — the run only
-        // extends while `fusable_with` holds, and that requires an equal request — but a third copy of
-        // the walk that drifts from the other two is how the cap came to be missing from one of them.
-        let cap = if trips[start].kind.run_may_be_chunked() {
-            g
-        } else {
-            usize::MAX
-        };
-        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
-            end += 1;
-            cnt += 1;
-        }
-        let mut k = start;
-        while k < end {
-            if trips[k].req != trips[start].req {
-                return true;
-            }
-            k += 1;
-        }
-        i = end;
-    }
-    false
 }
 
 /// ⭐⭐⭐⭐⭐ TRIPS PER CONCRETE dxp BUNDLE, AS A COMPILE-TIME CONSTANT — and the reason it stopped
@@ -5975,14 +5858,14 @@ pub fn concrete_trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec
             let mut op = e.dsc().clone();
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for node in dsc.scheduleTree_.iter_mut() {
-                        let ti = node.ldsIdx_ as usize;
+                    for mut node in dsc.scheduleTree_.edit() {
+                        let ti = node.operand();
                         let Some(stride) = e.affine_strides.get(ti).and_then(|m| m.get("out"))
                         else {
                             continue; // non-tiled tensor — base address unchanged.
                         };
                         let bump = t as i64 * *stride;
-                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                        for v in node.start_addrs().values_mut() {
                             let base: i64 = v.parse().unwrap_or(0);
                             *v = (base + bump).to_string();
                         }
@@ -6022,11 +5905,8 @@ pub fn emit_bundle_mlir<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>]) 
 /// silently dropped when the `sdsc_*.json` device ops are byte-identical (the cache reuses the old
 /// dir, so the old manifest survives). Pure: no file IO; mirrors `write_bundle`'s trip iteration.
 /// Per-trip [`GroupKind`] + owning-op index for the body's flat trip sequence.
-/// `write_bundle` and `build_manifest_ops` BOTH call this so their grouping is
-/// IDENTICAL (same partition, same subdir names). `host_kv_write`'s first trip
-/// carries `HostKv{skip=kv_n_skip}` (kv_n_skip counts the on-card cachewr TRIPS
-/// it replaces — the same unit the shim's `oi += kv_n_skip` advances over);
-/// `slot_stride_bytes>0` → `Slot`; everything else `Pure` (fusable).
+/// `write_bundle` and `launch_index` BOTH call this so their grouping is IDENTICAL (same partition,
+/// same subdir names).
 fn trip_kinds_and_owner<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
 ) -> (Vec<Trip<T>>, Vec<usize>) {
@@ -6034,13 +5914,9 @@ fn trip_kinds_and_owner<T: ktir_superdsc::collective::Tp>(
     let mut owner = Vec::new();
     for (oi, e) in ops.iter().enumerate() {
         let nt = (e.time.max(1)) as usize; // == concrete_trips(e).len()
-        for ti in 0..nt {
+        for _ in 0..nt {
             let k = if let Some(consume) = e.tp_consume {
                 GroupKind::TpConsume(consume)
-            } else if e.host_kv_write && ti == 0 {
-                GroupKind::HostKv {
-                    skip: e.kv_n_skip as usize,
-                }
             } else if e.kv_page_fold {
                 // ⛔ THE GATHER STATE TRAVELS IN THE KIND, TAKEN FROM THE OP THAT DECLARED IT — the same
                 // field `launch_index` puts on the group's `KvShifts`, so the size cap and the runtime's
@@ -6050,28 +5926,10 @@ fn trip_kinds_and_owner<T: ktir_superdsc::collective::Tp>(
                 }
             } else if e.kv_gathered {
                 GroupKind::Gathered
-            } else if e.slab_write {
-                // Incremental Kᵀ restickify (kill-restickify Stage 2) → Slab (fusable, one
-                // `slab_stride_bytes`). A DISTINCT kind from Slot: its 8192-byte slab stride ≠ the
-                // cachewr's 128, so fusing them would trip the per-group uniform-stride assert.
-                GroupKind::Slab
-            } else if e.slot_stride_bytes > 0 {
-                // Distinct per-slot cachewr (mq>1 prefill) → SlotSolo (singleton); uniform-slot
-                // cachewr (decode) → Slot (fusable). A distinct-slot copy MUST NOT be fused into
-                // a uniform-shift Slot group (would collapse the per-slot writes).
-                if e.slot_no_fuse {
-                    GroupKind::SlotSolo
-                } else {
-                    GroupKind::Slot { req: e.kv_request }
-                }
             } else {
                 GroupKind::Pure
             };
-            kinds.push(Trip::at_slot_offset(
-                k,
-                TripRequest(e.kv_request),
-                e.kv_slot_offset,
-            ));
+            kinds.push(Trip::new(k));
             owner.push(oi);
         }
     }
@@ -6245,12 +6103,8 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
     fold: FoldGrouping,
 ) -> Vec<bundle::KvShifts<T>> {
-    // MEDIUM-GRAIN: one manifest entry per fusion GROUP (a contiguous run of ≤ g Pure
-    // trips = one concrete dxp bundle; every host_kv_write/slot trip a singleton). g==1
-    // reproduces the historical per-trip manifest exactly. The shim reads one entry →
-    // one program; a pure group needs no per-entry handling, a host_kv/slot singleton
-    // carries its metadata (the shim's `oi += kv_n_skip` then skips exactly the singleton
-    // groups that hold the replaced copies).
+    // MEDIUM-GRAIN: one launch group per fusion GROUP (a contiguous run of fusable trips = one
+    // concrete dxp bundle). g==1 reproduces the per-trip partition exactly.
     let (kinds, owner) = trip_kinds_for(ops, fold);
     let groups = group_ranges(&kinds, group_size());
     // LAUNCHES, not ops. A group IS a launch, and fusion means the two numbers are far apart — the
@@ -6358,9 +6212,8 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
         for (gi, r) in groups.iter().enumerate() {
             let e = &ops[owner[r.start]];
             eprintln!(
-                "[sdsc-groups]   op {gi:<3} {:3} trip(s)  req {}  {:?}  {}",
+                "[sdsc-groups]   op {gi:<3} {:3} trip(s)  {:?}  {}",
                 r.end - r.start,
-                kinds[r.start].req.0,
                 kinds[r.start].kind,
                 e.op_name,
             );
@@ -6368,84 +6221,8 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
     }
     let mut shifts: Vec<bundle::KvShifts<T>> = Vec::new();
     for (gi, r) in groups.iter().enumerate() {
-        // The group's first trip's owning op supplies name + any per-entry metadata.
+        // The group's first trip's owning op supplies any per-group metadata.
         let e = &ops[owner[r.start]];
-        // SLOT-group stride: the owner (first trip) carries it; a Slot group's shim slot-shift is
-        // applied ONCE to the whole group, so EVERY op in the group MUST share one stride (else some
-        // head lands at the wrong row). Guard it at build (an un-catchable `cargo build` panic — the
-        // re-roll path swallows Err). Pure groups have stride 0 (their owner is a Pure op). HostKv
-        // singleton stride is 0 (it carries kv_* metadata instead).
-        let slot = if matches!(
-            kinds[r.start].kind,
-            GroupKind::Slot { .. } | GroupKind::SlotSolo
-        ) {
-            let stride = e.slot_stride_bytes;
-            // A SlotSolo group is a singleton (r.len()==1) by construction, so the uniform-stride
-            // check is trivially true; a fused Slot group must share one stride (uniform shift).
-            for t in r.clone() {
-                let o = &ops[owner[t]];
-                assert!(
-                    o.slot_stride_bytes == stride,
-                    "fused Slot group {gi}: op '{}' stride {} != group stride {stride} — a fused \
-                     Slot group's shim slot-shift is uniform, so all cachewr copies must share one \
-                     stride (else a head writes the wrong cache row)",
-                    o.op_name,
-                    o.slot_stride_bytes
-                );
-                // AND one REQUEST. The shim resolves a group's page table and write cursor ONCE,
-                // from the owner's `kv_request`, so two requests in one group would put one
-                // request's token into the other's history — the one cache-write error no later
-                // step can detect. `group_ranges` breaks a Slot run where the request changes, so
-                // this cannot fire; it is here because the consequence is undetectable downstream.
-                assert!(
-                    o.kv_request == e.kv_request,
-                    "fused Slot group {gi}: op '{}' names request {} but the group resolves request \
-                     {} — a group is ONE launch and one page table, so a fused cachewr group must \
-                     be single-request (else a request's token is written into another's history)",
-                    o.op_name,
-                    o.kv_request,
-                    e.kv_request
-                );
-            }
-            stride
-        } else {
-            0
-        };
-        // SLAB-group stride (kill-restickify Stage 2): mirror the Slot guard — the shim shifts the fused
-        // Slab group's seg2 base by `(slot_pos/64)·slab_stride` ONCE, so every op in the group MUST share
-        // one slab_stride (else a kv-head restickifies the wrong slab). Non-Slab groups: 0.
-        let slab = if matches!(kinds[r.start].kind, GroupKind::Slab) {
-            let stride = e.slab_stride_bytes;
-            for t in r.clone() {
-                let o = &ops[owner[t]];
-                assert!(
-                    o.slab_stride_bytes == stride,
-                    "fused Slab group {gi}: op '{}' slab_stride {} != group stride {stride} — a fused \
-                     Slab group's shim shift is uniform, so all restickifies must share one slab_stride \
-                     (else a kv-head re-transposes the wrong slab)",
-                    o.op_name,
-                    o.slab_stride_bytes
-                );
-            }
-            stride
-        } else {
-            0
-        };
-        // ONE PAGE PART per group, of ANY kind — the runtime resolves the group's page once, at the
-        // owner's offset, so an op of another part would land on the wrong page. `group_ranges` breaks a
-        // run where the offset changes (`Trip::fusable_with`), so this cannot fire; it is here because a
-        // part on the wrong page is a cache write nothing downstream can detect.
-        for t in r.clone() {
-            let o = &ops[owner[t]];
-            assert!(
-                o.kv_slot_offset == e.kv_slot_offset,
-                "group {gi}: op '{}' addresses slot offset {} but the group resolves {} — one group is \
-                 one page shift, so a page part must not share a group with another part",
-                o.op_name,
-                o.kv_slot_offset,
-                e.kv_slot_offset
-            );
-        }
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
         // ⭐ A WALK'S BODY GROUP relaunches as its walk says — ONE walk per group, since the group is
@@ -6463,32 +6240,13 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
             );
         }
         shifts.push(bundle::KvShifts {
-            slot_stride_bytes: slot,
-            slab_stride_bytes: slab,
-            // PAGED: `page_slots` is the write-slot modulus AND the declaration that this bundle is
-            // paged — a runtime that does not know the key must refuse rather than apply an
-            // absolute-position shift and land past the page.
-            page_slots: e.kv_page_slots,
-            request: e.kv_request,
-            slot_offset: e.kv_slot_offset,
-            // `page_fold` marks the group the runtime re-launches once per page.
+            // `page_fold` marks the group the runtime re-launches: a walk's body.
             page_fold: fold_group,
-            // ONE PASS PER PAGE INSTEAD OF PER (REQUEST, PAGE) — only when the fold's kernels actually
-            // carry the request axis.
-            batched_requests: fold_group && e.kv_batched_requests,
-            // ⭐ AND WHETHER THAT AXIS IS OVER A GATHERED SCRATCH — the other half of `fold_plan::collapsed`,
-            // and what sends the fold's KV shift to zero. A non-fold group gathers only as a `Gathered`
-            // run (the split-KV chunk's copies), which takes the same zero shift and the same staged index.
+            // ⭐ WHETHER THE GROUP READS THROUGH A GATHERED SCRATCH — what sends its KV shift to zero.
+            // A non-fold group gathers only as a `Gathered` run (the split-KV chunk's copies), which
+            // takes the same zero shift and the same staged index.
             gathered: (fold_group && e.kv_gathered)
                 || matches!(kinds[r.start].kind, GroupKind::Gathered),
-            fold_rows: match e.kv_fold_rows {
-                scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest => {
-                    bundle::FoldRows::PerRequest
-                }
-                scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch => {
-                    bundle::FoldRows::WholeBatch
-                }
-            },
             walk: walk.map(|w| bundle::Walk {
                 trips: w.trips,
                 step_bytes: w.step_bytes,
@@ -6504,10 +6262,10 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-//  The op-local LX slot alternation walk — #645 fix (a)'s guard on sharing
+//  The op-local LX pin ledger — #645's report on sharing (the sharing is sound by construction)
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One op-local pin's row in the alternation walk's ledger — what the dump's `bundle_id.json`
+/// One op-local pin's row in the pin ledger — what the dump's `bundle_id.json`
 /// carries beside the descriptors, and what a same-class pair hunt reads to name a bundle's
 /// independent norms.
 #[derive(Clone, Debug)]
@@ -6523,226 +6281,58 @@ pub struct LxSlotRow {
     pub touched_by: Vec<(String, bool)>,
 }
 
-/// ⭐⭐⭐ THE OP-LOCAL SLOT ALTERNATION WALK — the build-time guard that same-class LX pins
-/// SHARE a slot only where execution order makes the sharing sound (#645's fix (a), step 3 of 3).
+/// ⭐ THE OP-LOCAL PIN LEDGER — which programs touch each op-local LX pin, in walk order: the row the
+/// dump's `bundle_id.json` carries beside the descriptors, read by the #645 same-class pair hunts.
 ///
-/// Every op-local pin of one footprint class resolves to ONE slot address
-/// (`BundleLayout::synth_lx_op_local`), so a name's bytes survive exactly until the next
-/// same-class name's program runs. Sharing is therefore sound iff, per class, the touching
-/// names form CONTIGUOUS RUNS over the bundle's execution order — `x…x y…y` alternates the
-/// slot cleanly, `x…y…x` reads `y`'s bytes as `x`'s. This walk proves that, at build, per
-/// launch group over its programs in order:
+/// A REPORT, NOT A GUARD. The three facts the alternation walk used to check after lowering are the
+/// shape of the code now: [`ktir_superdsc::emit::lx_op_local_pair`] is the only door to an op-local pin, and
+/// it takes the pin's writer and reader as ONE construction (a pin with no reader cannot be built),
+/// keeps the pin's handle inside that construction (no touch after its scope), and takes the
+/// program's `&mut LxScope` (a nested pair is a borrow error; a second same-class pin in one program
+/// is refused at the pair, by name). So this walks the emitted order only to WRITE DOWN what those
+/// constructions produced.
 ///
-///   * **one program, one name per class** — a program touching two same-class pins is
-///     refused outright. One program's descriptors are ONE SDSC phase, and the citation
-///     pack schedules per node, one phase each — so two same-class pins in one program
-///     live in the SAME phase, with no phase boundary between their touches for a shared
-///     slot to alternate across. (Impossible in every emission today — each rmsnorm's
-///     `rinv` is touched only by its own program — guarded generically so a future op
-///     that reads two norms' pins in one program refuses here, not on card.)
-///   * **per-name contiguity** — once a name's run has been closed by a same-class sibling,
-///     touching it again is a refusal naming both names and the class. The run state carries
-///     ACROSS the bundle's launch groups: the groups launch in order on one stream, so a
-///     sibling in an earlier group poisons a later group's re-read exactly as an intra-group
-///     one does.
-///   * **both directions, by name** — every pin this bundle TOUCHES is written by ≥1 program
-///     and read by ≥1 program, both through named `arg_bindings`. A read with no named write
-///     is a producer the emission lost, or one that addresses the pin through a RAW OFFSET no
-///     walk over `arg_bindings` can see; a write with no read is dead scratch against the
-///     window. Scoped to touched pins — the layout is rung-shared, so other bundles' pins sit
-///     untouched in this bundle's table and are not this walk's to judge.
-///
-/// The ORDER this walk guards is the EMITTED order — the order of `sdsc_ops` as lowered, cut
-/// into programs by `per_prog` and into launch groups by the SAME partition [`launch_index`]
-/// and [`render_dxp_input`] use (`trip_kinds_for` + `group_ranges`; `group_ranges` is
-/// Kani-proven an exact covering partition, and contiguous, so emission order is group order).
-/// ⛔ IT DOES NOT GUARD DEVICE ORDER, AND CANNOT: whether the device really executes programs
-/// complete-before-start in declaration order rests on the #645 citation pack (dxp compiles a
-/// group's programs one at a time, `SchedulerStages.cpp:29-38`; program order = declaration
-/// order = combined-packet order, `ProgramLayout.cpp:126-127`, `PlacePrograms.cpp:78-79`; the
-/// vendor stream contract is complete-before-start, `runtime_stream_mode.hpp:25-33`) — and the
-/// CARD LEG is the measurement of that premise, not this walk.
-///
-/// Touches are derived PURELY from each op's `arg_bindings` — the same name-keyed consult
-/// `mark_lx_residency` resolves allocations with — so the walk adds no emission state, keeps
-/// every emitted byte identical, and has no log for the declare pass to drain. A bundle with
-/// no op-local pins (the overwhelmingly common case) returns an empty ledger unchanged.
-///
-/// On a refusal the fallback is to SPLIT THE CONFLICTING CLASS — give the returning name its
-/// own slot — never to un-share globally; the walk itself only refuses.
-pub fn walk_lx_slot_alternation<T: ktir_superdsc::collective::Tp>(
-    sdsc_ops: &[EmittedOp<T>],
-    per_prog: &[(String, usize)],
-    fold: FoldGrouping,
+/// ⛔ ONE PREMISE NO TYPE CARRIES: that the device runs a launch group's programs complete-before-start
+/// in declaration order (the #645 citation pack). The card leg measures it.
+pub fn lx_slot_ledger<T: ktir_superdsc::collective::Tp>(
+    // Every lowered program in walk order, WITH its own descriptors — one list, so an op's program
+    // is the pair it sits in, never an index into a parallel table.
+    programs: &[(&str, &[EmittedOp<T>])],
     layout: Option<&BundleLayout>,
-) -> Result<Vec<LxSlotRow>, String> {
-    // The pin table: name → (class bytes, slot address). Empty ⇒ nothing shares ⇒ Ok, no cost.
-    // Bound to a local so the borrowed keys outlive the collect — the accessor hands back owned
-    // rows (`Vec<(String, u64, u64)>`), and the walk reads them by reference from here on.
-    let table = layout.map(|l| l.lx_op_local_pins()).unwrap_or_default();
-    let pins: std::collections::BTreeMap<&str, (u64, u64)> = table
-        .iter()
-        .map(|(name, fp, slot)| (name.as_str(), (*fp, *slot)))
-        .collect();
-    if pins.is_empty() {
-        return Ok(Vec::new());
-    }
-    // The op-local names each op touches, straight off its arg bindings.
-    let touches: Vec<std::collections::BTreeSet<&str>> = sdsc_ops
-        .iter()
-        .map(|e| {
-            e.arg_bindings
-                .iter()
-                .map(|b| b.buffer.as_str())
-                .filter(|n| pins.contains_key(n))
-                .collect()
-        })
-        .collect();
-    // Program index per op, off the SAME per-program table the dump writes (`per_prog` is
-    // (program name, descriptor count) in lowering order, and `sdsc_ops` is exactly its
-    // concatenation — see `ktir_groups_via_superdsc`'s loop).
-    let mut prog_of: Vec<usize> = Vec::with_capacity(sdsc_ops.len());
-    for (pi, (_, n)) in per_prog.iter().enumerate() {
-        prog_of.extend(std::iter::repeat_n(pi, *n));
-    }
-    debug_assert_eq!(
-        prog_of.len(),
-        sdsc_ops.len(),
-        "per_prog's descriptor counts must sum to sdsc_ops"
-    );
-    // THE partition launch_index and render_dxp_input both use — same kinds, same group walk.
-    let (kinds, owner) = trip_kinds_for(sdsc_ops, fold);
-    let groups = group_ranges(&kinds, group_size());
-    // Run state per class: the name currently holding the slot, and the names whose runs have
-    // been closed by a sibling. Carried ACROSS groups: the bundle's launches are ordered.
-    let mut run: std::collections::BTreeMap<u64, &str> = std::collections::BTreeMap::new();
-    let mut closed: std::collections::BTreeMap<u64, std::collections::BTreeSet<&str>> =
-        std::collections::BTreeMap::new();
-    // The ledger, accumulated in walk order.
-    let mut touched_by: std::collections::BTreeMap<&str, Vec<(String, bool)>> =
-        std::collections::BTreeMap::new();
-    for r in &groups {
-        // This group's programs, in order: maximal runs of one program over the group's trips.
-        // A program cut across a group boundary is two programs — one per compile unit — which
-        // is exactly how dxp sees it (a group is one directory, one compile invocation).
-        let mut seq: Vec<(usize, std::collections::BTreeSet<&str>)> = Vec::new();
-        for ti in r.clone() {
-            let o = owner[ti];
-            let p = prog_of[o];
-            if !seq.last().is_some_and(|(q, _)| *q == p) {
-                seq.push((p, Default::default()));
-            }
-            for &n in &touches[o] {
-                let is_input = sdsc_ops[o]
-                    .arg_bindings
-                    .iter()
-                    .any(|b| b.buffer.as_str() == n && b.is_input);
-                // Ledger row, deduplicated: one entry per (program, direction) per pin.
-                let v = touched_by.entry(n).or_default();
-                if !v
-                    .last()
-                    .is_some_and(|(s, i)| s == &per_prog[p].0 && *i == is_input)
-                {
-                    v.push((per_prog[p].0.clone(), is_input));
-                }
-                seq.last_mut().expect("pushed above").1.insert(n);
-            }
-        }
-        for (p, names) in &seq {
-            let prog = &per_prog[*p].0;
-            // ONE PROGRAM, ONE NAME PER CLASS: two same-class pins in one program have no
-            // phase boundary between them that any citation covers.
-            let mut by_class: std::collections::BTreeMap<u64, Vec<&str>> = Default::default();
-            for &n in names {
-                by_class.entry(pins[n].0).or_default().push(n);
-            }
-            for (fp, same) in &by_class {
-                if same.len() > 1 {
-                    return Err(format!(
-                        "program '{prog}' touches {} same-class op-local LX pins — {} — of the \
-                         {fp}-byte class at slot {}: within one program there is no program-order \
-                         boundary for the shared slot, so the later name would read the earlier's \
-                         bytes. Split the conflicting class (own slot per name) or keep each \
-                         class's names in separate programs; never un-share globally.",
-                        same.len(),
-                        same.iter()
-                            .map(|n| format!("'{n}' (slot {})", pins[n].1))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        pins[same[0]].1,
-                    ));
-                }
-            }
-            // PER-NAME CONTIGUITY: a name re-touched after a sibling closed its run reads the
-            // sibling's bytes — refuse, naming both.
-            for &n in names {
-                let (fp, slot) = pins[n];
-                let closed_names = closed.entry(fp).or_default();
-                if closed_names.contains(n) {
-                    let sibling = run.get(&fp).copied().unwrap_or("<closed>");
-                    return Err(format!(
-                        "op-local LX pin '{n}' of the {fp}-byte class (slot {slot}) is touched \
-                         again by program '{prog}' after '{sibling}' of the same class took the \
-                         slot — the touches of one class must form contiguous runs over the \
-                         bundle's launch groups, or the returning name reads the sibling's bytes. \
-                         Split the conflicting class (own slot per name) or fold '{n}'s uses into \
-                         its own run; never un-share globally."
-                    ));
-                }
-                match run.get(&fp) {
-                    // The name's own run continues — nothing to close.
-                    Some(&m) if m == n => {}
-                    // A sibling's run opens: close the old name's, start this one's.
-                    Some(&m) => {
-                        closed_names.insert(m);
-                        run.insert(fp, n);
-                    }
-                    None => {
-                        run.insert(fp, n);
-                    }
-                }
-            }
-        }
-    }
-    // ⭐ THE DIRECTION GUARD — every op-local pin THIS BUNDLE touches is touched in BOTH
-    // directions: at least one program WRITES it and at least one READS it, both through named
-    // arg bindings (the only consult this walk has). A pin read but never written is a producer
-    // the emission lost — or one that addresses the pin through a RAW OFFSET instead of a named
-    // binding, which no walk over `arg_bindings` can see; this refusal turns both into a build
-    // failure instead of a card-time read of stale slot bytes. A pin written but never read is
-    // dead scratch minted against the window budget. Scoped to the pins this bundle TOUCHES,
-    // not every pin in the table: the layout is RUNG-shared (the declare pass pre-declares
-    // prefix, bodies and suffix alike), so other bundles' pins sit untouched in this bundle's
-    // table and are not this walk's to judge.
-    for (&name, touches) in &touched_by {
-        let (fp, slot) = pins[name];
-        if !touches.iter().any(|(_, is_input)| !is_input) {
-            return Err(format!(
-                "op-local LX pin '{name}' of the {fp}-byte class (slot {slot}) is READ by this \
-                 bundle but no program WRITES it: its producer is missing, or it addresses the pin \
-                 through a raw offset instead of a named arg binding this walk can see. Every pin \
-                 this bundle touches must have one producer and one consumer, both by name."
-            ));
-        }
-        if !touches.iter().any(|(_, is_input)| *is_input) {
-            return Err(format!(
-                "op-local LX pin '{name}' of the {fp}-byte class (slot {slot}) is WRITTEN by this \
-                 bundle but no program READS it: its consumer is missing, or it addresses the pin \
-                 through a raw offset instead of a named arg binding this walk can see — dead \
-                 scratch minted against the LX window. Every pin this bundle touches must have one \
-                 producer and one consumer, both by name."
-            ));
-        }
-    }
-    Ok(pins
+) -> Vec<LxSlotRow> {
+    let Some(layout) = layout else {
+        return Vec::new();
+    };
+    // One row per pin in the table, its touches filled in below; a pin this bundle never touches
+    // keeps its empty run list.
+    let mut rows: std::collections::BTreeMap<String, LxSlotRow> = layout
+        .lx_op_local_pins()
         .into_iter()
-        .map(|(name, (fp, slot))| LxSlotRow {
-            name: name.to_string(),
-            class_bytes: fp,
-            slot,
-            touched_by: touched_by.remove(name).unwrap_or_default(),
+        .map(|(name, class_bytes, slot)| {
+            let row = LxSlotRow {
+                name: name.clone(),
+                class_bytes,
+                slot,
+                touched_by: Vec::new(),
+            };
+            (name, row)
         })
-        .collect())
+        .collect();
+    for &(prog, ops) in programs {
+        for e in ops {
+            for b in &e.arg_bindings {
+                let Some(row) = rows.get_mut(b.buffer.as_str()) else {
+                    continue; // not an op-local pin — the ledger records only those
+                };
+                // One entry per (program, direction) run, as the dump has always written it.
+                let v = &mut row.touched_by;
+                if !v.last().is_some_and(|(q, i)| q == prog && *i == b.is_input) {
+                    v.push((prog.to_string(), b.is_input));
+                }
+            }
+        }
+    }
+    rows.into_values().collect()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -6966,7 +6556,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     // SYNTHETIC intermediates are not SubtileIR tensors, so they have no `t{id}` — they are named
     // directly and always live in the Intermediate segment.
     let synth = synth.borrow();
-    places.extend(synth.map.iter().map(|(name, off)| {
+    places.extend(synth.iter().map(|(name, off, size)| {
         bundle::Placement {
             // ⛔ REFUSES rather than defaulting. Every synthetic is minted through `PlaceId::synth`,
             // which records the id; a name in `map` with no id means something allocated an
@@ -6979,15 +6569,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
             segment: SegRole::Intermediate as u32,
             // Synthetics are intermediates; only the WEIGHT segment is ever banked.
             bank: 0,
-            offset: *off,
-            // ⛔ NO `unwrap_or(0)`. A zero-length field is read by the device as `1 << 27` flits —
-            // 16 GiB — in both `handleHostDMA` and `handleXLATentry`. Every synthetic now has a size,
-            // declared or reserved at first reference, so a missing one is a bug in the allocator and
-            // says so.
-            size: *synth
-                .sizes
-                .get(name)
-                .unwrap_or_else(|| panic!("synthetic '{name}' has an offset but no reserved size")),
+            offset: off,
+            // The allocator reserves a name's size with its offset (`SynthAlloc::take`), and never
+            // zero: a zero-length field is read by the device as `1 << 27` flits — 16 GiB.
+            size,
             is_logits: false,
         }
     }));
@@ -7033,8 +6618,8 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     // caller can forget. A no-op for the SubtileIR path, which already grew it.
     let mut segment_bytes = *segment_bytes;
     let seg_i = SegRole::Intermediate.segment();
-    if synth.next > segment_bytes[seg_i] {
-        segment_bytes[seg_i] = synth.next;
+    if synth.high_water() > segment_bytes[seg_i] {
+        segment_bytes[seg_i] = synth.high_water();
     }
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
@@ -7057,12 +6642,37 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         kernel_weights: std::borrow::Cow::Owned(
             kernel_weights
                 .iter()
-                .map(|(tid, k)| bundle::KernelWeight {
-                    id: bundle::PlaceId::Act(*tid),
-                    device_size: std::borrow::Cow::Owned(k.device_size.clone()),
-                    stride_map: std::borrow::Cow::Owned(k.stride_map.clone()),
-                    stick_size: k.stick_size,
-                    word_length: k.word_length,
+                .map(|(tid, k)| {
+                    // ⭐ ONE (EXTENT, STRIDE) SLICE, PAIRED HERE — a device axis's extent and
+                    // its stride are ONE fact, and two separate lists could disagree in length.
+                    // The bake refuses a descriptor that does, or one that states no axes at
+                    // all, instead of letting the boot find out one walk later. The arm
+                    // verdict is the walk's own law ([`crate::stage_weight::RetileWalk::arm`]),
+                    // stated once here so the boot dispatches on it and does no analysis.
+                    assert_eq!(
+                        k.device_size.len(),
+                        k.stride_map.len(),
+                        "a retile's device_size and stride_map disagree in length"
+                    );
+                    assert!(
+                        !k.device_size.is_empty(),
+                        "a rank-0 retile has no axes to stage"
+                    );
+                    let axes: Vec<(u64, u64)> = k
+                        .device_size
+                        .iter()
+                        .copied()
+                        .zip(k.stride_map.iter().copied())
+                        .collect();
+                    let walk = crate::stage_weight::RetileWalk { axes: &axes };
+                    let arm = walk.arm();
+                    bundle::KernelWeight {
+                        id: bundle::PlaceId::Act(*tid),
+                        axes: std::borrow::Cow::Owned(axes),
+                        arm,
+                        stick_size: k.stick_size,
+                        word_length: k.word_length,
+                    }
                 })
                 .collect(),
         ),
@@ -7204,7 +6814,7 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
         // emulator has no such ceiling: it runs the tile grid the func declares, which is how a
         // prefill of more than 32 tokens gets one core per token, so this is checked where the
         // limit exists and nowhere else.
-        #[cfg(feature = "spyre-hw")]
+        #[cfg(feature = "spyre-lower")]
         if cores > MAX_CORES {
             fail.push(format!(
                 "{name}: its grid names {cores} cores but the card has {MAX_CORES}"
@@ -7272,6 +6882,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
     {
@@ -7299,7 +6910,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     }
     let b = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params)?
+        emit_bundle_inner(ops, layout, fold, attn_params, dump)?
     };
     debug_assert_eq!(
         b.fp, fp,
@@ -7575,6 +7186,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> std::io::Result<EmittedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
@@ -7603,13 +7215,14 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     };
 
     // ⭐ ONE SHARED KTIR, TWO CONSUMERS. `-Fspyre-emu` runs the group's own programs directly, so
-    // the group IS the result — nothing is staged and nothing is submitted. `-Fspyre-hw` lowers
-    // that SAME KTIR to a real SuperDSC directory and stages + submits it to the device compiler:
+    // the group IS the result — nothing is staged and nothing is submitted. `-Fspyre-lower` (and so
+    // `-Fspyre-hw`) lowers that SAME KTIR to a real SuperDSC directory, and a card build stages +
+    // submits it to the device compiler:
     // this is the write-files/reserve-disk/pair-with-an-id step `emit_bundle_inner` used to do
     // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
-    let groups = if cfg!(feature = "spyre-hw") {
+    let groups = if cfg!(feature = "spyre-lower") {
         PendingGroups::Staged(
-            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params)
+            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params, dump)
                 .map_err(|e| std::io::Error::other(e.0))?,
         )
     } else {
@@ -7642,11 +7255,10 @@ impl<T: ktir_superdsc::collective::Tp> EmittedBundle<T> {
                 let bake = crate::superdsc_bake::global();
                 let mut out = Vec::with_capacity(staged.len());
                 for (kv, id) in &staged {
-                    // `bake` is `None` on a cardless build with `SCRATCHY_PLAN_ONLY_BAKE=1` (the
-                    // one case `global()` doesn't panic for having no device compiler) —
-                    // `ktir_groups_via_superdsc` staged/submitted nothing FOR that same reason,
-                    // so there is nothing to have lost here either. Empty `init_binary` matches
-                    // `ktir_groups`'s own plan-only default.
+                    // `bake` is `None` on a `spyre-lower` build without `spyre-hw` (no device image
+                    // is compiled) — `ktir_groups_via_superdsc` staged/submitted nothing FOR that
+                    // same reason, so there is nothing to have lost here either. Empty
+                    // `init_binary` matches `ktir_groups`'s own plan-only default.
                     let (init_binary, job_bin_ptr, correction) = match bake {
                         None => (Vec::new(), 0, Vec::new()),
                         Some(b) => {
@@ -8246,8 +7858,31 @@ pub fn ktir_groups<T: ktir_superdsc::collective::Tp>(
     Ok(out)
 }
 
-/// `-Fspyre-hw`'s counterpart to [`ktir_groups`]: the SAME per-op KTIR, lowered to real SuperDSC
-/// descriptors and handed to the bake queue.
+/// Where a bake writes each bundle's dxp input, when the build asks it to — the directory the BUILD
+/// passes in (the build script's own `OUT_DIR`, the one place that knows it: `compile_carrier`'s
+/// caller), never a path this crate reads from the environment. `None`: write nothing (every caller
+/// outside a build script, and every build without the `superdsc-dump` feature).
+#[derive(Clone, Copy, Debug)]
+pub struct DumpRoot<'a>(Option<&'a std::path::Path>);
+
+impl<'a> DumpRoot<'a> {
+    /// No dump.
+    pub const NONE: DumpRoot<'static> = DumpRoot(None);
+
+    /// Dump under `<dir>/superdsc-dump/<fp>/` — `dir` is the build's own output directory.
+    pub fn under(dir: &'a std::path::Path) -> Self {
+        DumpRoot(Some(dir))
+    }
+
+    fn bundle_dir(self, fp: &str) -> Option<std::path::PathBuf> {
+        self.0.map(|d| d.join("superdsc-dump").join(fp))
+    }
+}
+
+/// The card's counterpart to [`ktir_groups`] (`-Fspyre-lower`, and so `-Fspyre-hw`): the SAME per-op
+/// KTIR, lowered to real SuperDSC descriptors and handed to the bake queue — which a `spyre-lower`
+/// build without `spyre-hw` does not have, so every group is lowered, guarded and rendered and none
+/// is compiled.
 ///
 /// ⛔⛔⛔ THIS RENDERS NOTHING AND WRITES NOTHING OF ITS OWN. `lower_ktir_to_superdsc::lower` returns
 /// [`EmittedOp`]s carrying in-memory [`SdscOp`]s — built by `pw1`/`pw2`/`assemble_matmul`, the SAME
@@ -8272,6 +7907,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    dump: DumpRoot<'_>,
 ) -> Result<Vec<(bundle::KvShifts<T>, crate::superdsc_bake::GroupId)>, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
@@ -8283,7 +7919,9 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     let mut fp8_quantized = ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default();
     // (program name, descriptors) — written into the dump's `bundle_id.json`, since the eprintln below
     // is invisible on a successful build.
-    let mut per_prog: Vec<(String, usize)> = Vec::new();
+    // Each program and its descriptors' place in `sdsc_ops` — recorded by the push that places
+    // them, so a reader takes a program's ops as its own range, never by re-cutting the list.
+    let mut per_prog: Vec<(String, std::ops::Range<usize>)> = Vec::new();
     let _pc_mint = crate::pc::Pc::start("mint");
     for e in ops {
         // ⛔ ONE PATH, AND IT IS CHECKED HERE. An op arriving with a descriptor ALREADY BUILT means
@@ -8346,8 +7984,9 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                 lowered.len()
             );
         }
-        per_prog.push((e.op_name.clone(), lowered.len()));
+        let at = sdsc_ops.len();
         sdsc_ops.extend(lowered);
+        per_prog.push((e.op_name.clone(), at..sdsc_ops.len()));
     }
 
     // ⛔⛔⛔ A WALK'S BODY READS THE SHIFTED SEGMENT ONLY THROUGH THE STEP'S SOURCES. The relaunch moves
@@ -8386,9 +8025,10 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         }
     }
 
-    // ⛔⛔⛔ main's FOUR POST-LOWERING GUARDS, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
+    // ⛔⛔⛔ main's POST-LOWERING ALIASING GUARD, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
     //
-    // All four are `lower_graph_to_superdsc`/`emit_bundle_inner`'s own text, and all four went SILENT
+    // It is `lower_graph_to_superdsc`/`emit_bundle_inner`'s own text, and it (with three dxp-shape
+    // guards since made unwritable by the wire types) went SILENT
     // when the lowering moved here: they read `EmittedOp::op` and `EmittedOp::time`, which main's walk
     // had already filled by the time they ran. On this path the ops reaching `emit_bundle_inner` carry
     // a KTIR program and NOTHING ELSE — `EmittedOp::bare` sets `op: None` and `time: 1` — so the
@@ -8406,79 +8046,23 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                 e.op_name, e.time
             )));
         }
-        // GUARD (priority-1, from OBSERVED on-card failure 2026-06-25): dxp_standalone
-        // throws `DtException: allocNode (dsc2.cpp:3999)` when a dsc has an empty
-        // scheduleTree_ — the per-tensor HBM allocate nodes are REQUIRED. Refuse to
-        // bake a scheduleTree_-less op at BUILD time rather than dxp-crash on-card.
-        for e in &sdsc_ops {
-            let name = &e.op_name;
-            let op = e.dsc();
-            for dsc_map in &op.dscs_ {
-                for (dname, dsc) in dsc_map {
-                    if dsc.scheduleTree_.is_empty() {
-                        return Err(SuperDscError(format!(
-                            "op {name} (dsc {dname}): empty scheduleTree_ — dxp_standalone \
-                         DtException's at allocNode (dsc2.cpp:3999) without the per-tensor HBM \
-                         allocate nodes. Emit them via the page_coalesce HBM coloring (task #50) \
-                         before baking."
-                        )));
-                    }
-                    // GUARD (priority-1, OBSERVED on-card 2026-06-25): an AllocNode with
-                    // an empty `coordinates_.coordInfo` makes the scheduler throw
-                    // `DtException: "There must be at least one valid candidate."`
-                    // (L3DlOpsScheduler.cpp:1195) — the per-dim tile-folds are required.
-                    for an in &dsc.scheduleTree_ {
-                        let empty_coord = an
-                            .coordinates_
-                            .get("coordInfo")
-                            .and_then(|c| c.as_object())
-                            .map(|o| o.is_empty())
-                            .unwrap_or(true);
-                        if empty_coord {
-                            return Err(SuperDscError(format!(
-                                "op {name} (dsc {dname}, alloc {}): empty coordinates_.coordInfo — \
-                             dxp's scheduler DtException's ('at least one valid candidate', \
-                             L3DlOpsScheduler.cpp:1195) without the per-dim tile-folds. Emit the \
-                             coordInfo (core_fold/corelet_fold/elem_arr from the work-division) \
-                             before baking.",
-                                an.name_
-                            )));
-                        }
-                        // GUARD (priority-1, from OBSERVED on-card crash 2026-06-25):
-                        // the startAddressCoreCorelet_ fold's [core,corelet] factors
-                        // MUST equal the SDSC's declared coreFoldProp_/coreletFoldProp_
-                        // sizes, else the FoldManager import throws "Different
-                        // cardinality between json and caller" (foldInfrastructure.h:2775).
-                        let attrs = &an.startAddressCoreCorelet_.dim_prop_attr;
-                        let core_ok =
-                            attrs.first().map(|f| f.factor_) == Some(op.coreFoldProp_.factor_);
-                        let corelet_ok =
-                            attrs.get(1).map(|f| f.factor_) == Some(op.coreletFoldProp_.factor_);
-                        if !core_ok || !corelet_ok {
-                            return Err(SuperDscError(format!(
-                                "op {name} (alloc {}): startAddressCoreCorelet_ fold factors \
-                             [{:?}] disagree with coreFoldProp_={} / coreletFoldProp_={} — dxp \
-                             FoldManager throws 'Different cardinality' (foldInfrastructure.h:2775).",
-                                an.name_,
-                                attrs.iter().map(|f| f.factor_).collect::<Vec<_>>(),
-                                op.coreFoldProp_.factor_,
-                                op.coreletFoldProp_.factor_
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+        // The three dxp-shape guards that followed (an empty `scheduleTree_`, an empty `coordInfo`,
+        // and start-fold factors that disagree with `coreFoldProp_`/`coreletFoldProp_`) are now
+        // unwritable: `wire::ScheduleTree` is built one node per operand of an op that always has an
+        // output, `wire::Coordinates` only by `build_coordinates` over an operand, and both the nodes'
+        // start folds and the op's fold props come from the tree's one fold set.
     } // pc:guards
 
-    // ⭐ THE OP-LOCAL SLOT ALTERNATION WALK — #645 fix (a)'s guard on same-class sharing, at the
-    //    grain where programs and their descriptors now exist. Refuses a bundle whose same-class
-    //    op-local pins would interleave over one shared slot (the walk's own doc states the two
-    //    rules and the exact premise split: emitted order here, device order on the citations,
-    //    the card leg as the measurement). Also THE LEDGER's one computation — the dump below
-    //    writes it beside the descriptors, and the same-class pair hunts read it from there.
-    let lx_ledger =
-        walk_lx_slot_alternation(&sdsc_ops, &per_prog, fold, layout).map_err(SuperDscError)?;
+    // ⭐ THE OP-LOCAL PIN LEDGER — written into the dump beside the descriptors for the #645
+    //    same-class pair hunts. A report: the sharing it records is sound by construction
+    //    (`emit::lx_op_local_pair`), see `lx_slot_ledger`.
+    let lx_ledger = {
+        let programs: Vec<(&str, &[EmittedOp<T>])> = per_prog
+            .iter()
+            .map(|(name, range)| (name.as_str(), &sdsc_ops[range.clone()]))
+            .collect();
+        lx_slot_ledger(&programs, layout)
+    };
 
     // ── THE BAKE BUDGET, PER BUNDLE (`BakeBudget::bundle_verdict`) ─────────────────────────
     //    A bundle is the unit the emitter fans out, so its counts bound BOTH the wave's critical
@@ -8536,16 +8120,18 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // which run on this same card. Byte-equality against a known-good dump is what localised a layout
     // defect in this repo before; reasoning about paged addressing is what has not.
     //
-    // ⚠️ DIAGNOSTIC, AND UNCONDITIONAL BY CHOICE — there is no env gate to hide it behind (this repo
-    // forbids behaviour toggles), so it either belongs here or it does not. Remove it deliberately once
-    // the prefill fence is closed, or keep it and say so.
+    // ⭐ AN OUTPUT A BUILD ASKS FOR BY NAME — `dump` ([`DumpRoot`]), passed in by the build: the
+    // `superdsc-dump` feature makes the build script hand its own `OUT_DIR` here (never `/tmp`,
+    // never an environment read). It is not a behaviour toggle: what the bake lowers and refuses is
+    // the same with it on or off; it only decides whether the descriptors the bake already rendered
+    // are also written where a person can diff them. A CI lowering check (`spyre-lower`) writes
+    // nothing.
     // ⛔ `fold`, NOT A HARDCODED `Split`. This read `FoldGrouping::Split` unconditionally, so a FUSED
     // twin's dump directory was its split's partition under the twin's name — the one thing about a
     // twin that differs (where the group boundaries fall) was the one thing the dump could not show,
     // and a diff of the two dirs came back "identical" no matter what the bake actually did.
-    {
+    if let Some(dump) = dump.bundle_dir(fp) {
         let _pc = crate::pc::Pc::start("dump");
-        let dump = std::path::Path::new("/tmp/superdsc-dump").join(fp);
         if let Err(e) = write_rendered_dxp_input(&dump, &rendered) {
             eprintln!(
                 "  [superdsc-dump] {fp}: could not write {}: {e}",
@@ -8563,8 +8149,8 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         // program's q view is built first and is `[mq, nqh·hd]`, so its row count is `mq` — the same fact
         // `recognize_attn` recovers, not a new one threaded in.
         let mut progs: Vec<(String, usize)> = Vec::new();
-        for (name, n) in &per_prog {
-            progs.push((name.clone(), *n));
+        for (name, range) in &per_prog {
+            progs.push((name.clone(), range.len()));
         }
         let mq = ops
             .iter()
@@ -8599,7 +8185,7 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         // a green build prints nothing, and the #645 same-class pair hunts (which bundle holds two
         // independent same-class norms, and which programs touch them) have nowhere else to read
         // the walk's view from. One row per op-local pin — name, class bytes, slot address, and
-        // the programs touching it with their direction — straight off the alternation walk's
+        // the programs touching it with their direction — straight off the pin ledger's
         // ledger, so the dump cannot disagree with the guard that ran.
         let lx_pins = lx_ledger
             .iter()
@@ -8633,12 +8219,12 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
         if let Err(e) = std::fs::write(dump.join("bundle_id.json"), &id_json) {
             eprintln!("  [superdsc-dump] {fp}: could not write bundle_id.json: {e}");
         }
-        eprintln!(
-            "[ktir->sdsc] BUNDLE {fp}: {} KTIR program(s) -> {} descriptor(s)",
-            ops.len(),
-            sdsc_ops.len(),
-        );
     } // pc:dump
+    eprintln!(
+        "[ktir->sdsc] BUNDLE {fp}: {} KTIR program(s) -> {} descriptor(s)",
+        ops.len(),
+        sdsc_ops.len(),
+    );
 
     // ── from here down this is main's block, verbatim ──
     let shifts = {
@@ -8718,6 +8304,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -8725,6 +8312,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
         weight_ids,
         active_cap,
         rows_are_requests,
+        query_rows,
     )
 }
 
@@ -8744,6 +8332,19 @@ mod tests {
     // after the retarget those assemblers are reached from tests alone, so the import belongs here
     // rather than in the lowering's own prelude.
     use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+
+    /// The extent pair the lowering calls below state for their graphs: one request of
+    /// the graph's own row count — the S=1 prefill pair. None of these fixtures carries
+    /// an `AttnDecode`; the pair still must describe the graph it is handed, and it does.
+    fn one_request_of(rows: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
+        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rows)
+                .expect("the fixture's row count is nonzero"),
+            scratchy_subtile::sdsc_abstract::RungCap::ONE,
+        )
+        .expect("one request's rows fit a u32")
+    }
+
     // ⭐ SAME REASON, WIDER: the whole SuperDSC EMITTER is now `ktir_superdsc::emit`, so every name
     // below is reached from these tests alone and none of them belongs in the lowering's prelude.
     // The tests stayed here deliberately — they pin laws of the emitter as this crate CALLS it (the
@@ -8982,7 +8583,7 @@ mod tests {
         let f32_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp32)
             .expect("fp32 mean reduce opspec");
         assert_eq!(
-            f32_spec.op_info,
+            f32_spec.op_info(),
             OpInfo::ReduceScalingFp32((1.0f32 / 576.0).to_bits()),
             "fp32 reduce const must be raw IEEE f32 bits of 1/N"
         );
@@ -9010,7 +8611,7 @@ mod tests {
         let f16_spec = reduce_opspec_df(OpFunc::Mean, 64, 576, "r_x", "r_acc", true, Df::Fp16)
             .expect("fp16 mean reduce opspec");
         assert_eq!(
-            f16_spec.op_info,
+            f16_spec.op_info(),
             OpInfo::ReduceScaling(sen169_bits(1.0f32 / 576.0) as u32),
             "fp16 reduce const must stay SEN169_FP16"
         );
@@ -9107,6 +8708,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(4),
         )
         .expect("a layout for a plain matmul bundle");
 
@@ -9224,6 +8826,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("plain lays out");
         let l_minted = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
@@ -9231,6 +8834,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("the minted graph lays out");
 
@@ -9327,6 +8931,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(4),
         )
         .expect("the minted graph lays out");
 
@@ -9441,7 +9046,7 @@ mod tests {
         // The epilogue operand is the one inserted BEFORE the real output (see
         // `attach_fused_epilogue`'s own doc) — for this 3-arg-input matmul (a,w,o) that is index 2.
         let epi_idx = 2;
-        let view = op.args[epi_idx].view();
+        let view = op.args()[epi_idx].view();
         // ⭐ ASSERTED BY DIM NAME, NOT BY POSITION. This test asserted `layout == ["mb","out","y"]` and
         // a scale array indexed against it; the emitter's order is `["mb","y","out"]` (the
         // on-hardware-proven batch-inner walk `batched_decode_walk_order.rs` pins), so the positional
@@ -9511,7 +9116,7 @@ mod tests {
             },
         });
         let epi_idx = 2;
-        let view = op.args[epi_idx].view();
+        let view = op.args()[epi_idx].view();
         assert_eq!(
             view.layout,
             ["mb", "out"],
@@ -9587,14 +9192,15 @@ mod tests {
 
     #[test]
     fn prefill_m_gt_1_lm_head_folds_to_m1_decode_unchanged() {
-        // The mq>1 (prefill) bundle CANNOT run the vocab-wide lm_head at m>1 (it time-tiles, and
-        // per-row time-tiling is design-risk-4). It runs it at m=1 over the LAST prompt row instead,
-        // which is what lets prefill produce the first generated token's logits itself.
+        // The mq>1 (prefill) bundle CANNOT run the vocab-wide lm_head at m=mq (it time-tiles, and
+        // per-row time-tiling is design-risk-4). It runs it at m=S over the requests' answer rows
+        // instead, which is what lets prefill produce every request's first generated token's
+        // logits itself.
         //
         // ⭐ THE PRODUCER HALF IS THE SPLICE'S, AND IT HAS LANDED: `lower_all` routes an m>1
-        // vocab-wide MatmulTile through the Triton `lmlast.py` extraction + the re-lowered m=1
+        // vocab-wide MatmulTile through the Triton `lmlast.py` extraction + the re-lowered m=S
         // matmul. This test pins three things: (1) the m>1 tail LOWERS to the fold's two programs
-        // (an extraction named `lmlast_s{id}` and the m=1 matmul after it — never a silent m>1
+        // (an extraction named `lmlast_s{id}` and the m=S matmul after it — never a silent m=mq
         // lowering of a vocab-wide matmul); (2) the m=1 DECODE bundle stays a single bare matmul —
         // the fold never fires at m=1; (3) the CONSUMER half of the fold
         // (`lower_ktir_to_superdsc::lmlast`, main's copy loop verbatim) still refuses a nameless
@@ -9641,7 +9247,8 @@ mod tests {
             };
             (node, ir)
         };
-        let lower = |m: u32| {
+        let lower_at = |extent: scratchy_subtile::sdsc_abstract::QueryExtent| {
+            let m = extent.graph_rows().get();
             let (_, ir) = build(m);
             // t1 is the lm_head weight; t0 is the activation source.
             let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
@@ -9650,20 +9257,31 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
+                extent,
             )
             .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
+        let lower = |m: u32| lower_at(one_request_of(m));
+        let packed_rung_of = |w: u32, s: u32| {
+            scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+                scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(w)
+                    .expect("the fixture's width is nonzero"),
+                scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(s)
+                    .expect("the fixture's request count fits a u32"),
+            )
+            .expect("the pair's product fits a u32")
+        };
         // m>1 (prefill): the tail FOLDS — the splice's `lmlast.py` extraction (its own program,
-        // over the reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul, never a
-        // silent m>1 lowering of a vocab-wide matmul (the wrong-token defect the fold exists to
+        // over the reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=S matmul, never a
+        // silent m=mq lowering of a vocab-wide matmul (the wrong-token defect the fold exists to
         // prevent). Through the door the extraction is `hidden/64` per-stick copies named after
-        // the tail's own output tid (`lmlast{j}_o2`), then the m=1 matmul `matmul_o2`.
+        // the tail's own output tid (`lmlast{j}_o2`), then the m=S matmul `matmul_o2`.
         let mq = 8u32;
-        let names = lower(mq).expect("the m>1 lm-head tail folds to m=1");
+        let names = lower(mq).expect("the m>1 lm-head tail folds to m=S");
         assert_eq!(
             names.len() as u32,
             h / 64 + 1,
-            "the fold is the per-stick copies plus the m=1 matmul: {names:?}"
+            "the fold is the per-stick copies plus the m=S matmul: {names:?}"
         );
         for (j, name) in names.iter().take(h as usize / 64).enumerate() {
             assert_eq!(
@@ -9675,8 +9293,37 @@ mod tests {
         assert_eq!(
             names.last().map(String::as_str),
             Some("matmul_o2"),
-            "the fold's last program is the m=1 matmul"
+            "the fold's last program is the m=S matmul"
         );
+        // ⭐ AND THE PACKED RUNG'S FOLD IS THE SAME LAW PER REQUEST — k = 2 and 3 (3 is
+        // not a power of two), each at w = 4: `S · hidden/64` copies named after the
+        // stick-plane row they write (`j·S + r` of the `[S, hidden]` staging), then the
+        // m=S matmul. No count is special-cased: the S=1 block above is this same
+        // assertion at `S = 1`, where `j·S + r` is `j` alone.
+        for s in [2u32, 3] {
+            let names = lower_at(packed_rung_of(4, s))
+                .unwrap_or_else(|e| panic!("the packed lm-head tail folds at S = {s}: {e}"));
+            let sticks = h as usize / 64;
+            assert_eq!(
+                names.len(),
+                s as usize * sticks + 1,
+                "the fold is S · hidden/64 per-stick copies plus the m=S matmul at S = {s}: {names:?}"
+            );
+            for (r, name) in names.iter().take(s as usize * sticks).enumerate() {
+                let req = r / sticks;
+                let j = r % sticks;
+                assert_eq!(
+                    name,
+                    &format!("lmlast{}_o2", j * s as usize + req),
+                    "request {req}'s copy {j} is named after the stick-plane row it writes"
+                );
+            }
+            assert_eq!(
+                names.last().map(String::as_str),
+                Some("matmul_o2"),
+                "the packed fold's last program is still the m=S matmul at S = {s}"
+            );
+        }
         // m==1 (decode): the SAME node lowers to exactly one bare matmul — the fold never fires, so
         // the decode bundle is byte-identical to the pre-fold emitter.
         assert_eq!(
@@ -9696,12 +9343,13 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(mq),
         )
         .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(&node, &ir, false)
+        >(&node, &ir, false, one_request_of(mq))
         .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
@@ -9722,6 +9370,37 @@ mod tests {
         };
         assert!(
             why.contains("node_out_tid"),
+            "the refusal must name the missing fact, got {why:?}"
+        );
+
+        // ⛔ NEGATIVE CONTROL FOR THE ROWS' OWN FACT, the same shape: the door takes each
+        // request's answer row from `KtirNode::answer_rows` — the ONE statement — and a
+        // MISSING one must REFUSE rather than re-derive `r·w + (w−1)` from the view
+        // extents by dividing `mq` back apart.
+        let mut programs = scratchy_triton_splice::lower_all::<
+            ktir_superdsc::collective::TpWorld<1>,
+            _,
+        >(&node, &ir, false, one_request_of(mq))
+        .expect("the splice's fold mints the tail");
+        let extract = programs
+            .iter_mut()
+            .find(|e| e.op_name.starts_with("lmlast"))
+            .expect("the tail emits an extraction program");
+        extract.ktir.as_mut().expect("its KTIR").answer_rows = None;
+        let mut sym = 0i64;
+        let stripped = crate::ktir_superdsc_door::lower::<ktir_superdsc::collective::TpWorld<1>>(
+            extract.ktir.as_ref().unwrap(),
+            &mut sym,
+            Some(&layout),
+            None,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        );
+        let why = match stripped {
+            Err(e) => e.message,
+            Ok(_) => panic!("a rowless extraction must refuse"),
+        };
+        assert!(
+            why.contains("answer_rows"),
             "the refusal must name the missing fact, got {why:?}"
         );
     }
@@ -9783,6 +9462,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
@@ -9797,6 +9477,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect("the fp16 layout mints");
         let p = layout
@@ -9878,6 +9559,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            one_request_of(1),
         )
         .expect("two-fp8-matmul lowering");
         let quantizes = ops
@@ -9966,6 +9648,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            one_request_of(1),
         )
         .expect("the folded residual shape lowers");
 
@@ -10041,6 +9724,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
+            one_request_of(1),
         )
         .expect("the refused residual shape still lowers");
 
@@ -10184,7 +9868,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
         let op = emitted.dsc();
         // numWkSlices product = 32 cores.
@@ -10228,7 +9913,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let via_emitted = emit_bundle_mlir(&[emitted]);
         assert_eq!(
             via_emitted,
@@ -10257,7 +9943,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         assert_eq!(whole.time, 1, "an unbatched fp16 matmul is staged by dxp");
         // The shape this test drove before the refusal, 64×16384×2048 at two kernel batches: a
         // 32-stick contraction under a `y` batch, the form measured incoherent on granite-3.1-8b.
@@ -10294,7 +9981,8 @@ mod tests {
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
             None,
-        );
+        )
+        .expect("assemble_matmul builds");
         let n = emitted.time;
         assert!(n > 1, "this matmul must time-tile, got time={n}");
         // (ii) the divided per-time `out` shows up in N_ / ss_ (per-core out_per_time).
@@ -10520,6 +10208,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            one_request_of(1),
         )
         .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
@@ -10536,6 +10225,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
+            one_request_of(1),
         )
         .expect("the wiring is a registry and never runs the budget pass");
         assert_eq!(
@@ -10685,6 +10375,7 @@ mod tests {
             bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
             mask: None,
             node_out_tid: None,
+            answer_rows: None,
             minted: Default::default(),
             lx_plan: Default::default(),
         }
@@ -10776,7 +10467,7 @@ mod tests {
         // THE DECLARE PASS, then the real one — the same two lowerings every rung runs over
         // the ONE shared plan.
         pass(&layout);
-        let synth_before = layout.synth.borrow().map.len();
+        let synth_before = layout.synth.borrow().len();
         assert!(
             synth_before >= 2,
             "each node minted at least one intermediate — the fixture no longer exercises \
@@ -10790,7 +10481,7 @@ mod tests {
         // pass's buffers instead of on them.
         pass(&layout);
         assert_eq!(
-            layout.synth.borrow().map.len(),
+            layout.synth.borrow().len(),
             synth_before,
             "the second lowering minted fresh synthetics — the declare/real name agreement broke"
         );
@@ -10829,8 +10520,14 @@ mod tests {
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let weight_ids: std::collections::HashSet<u32> = [2u32, 3, 4].into_iter().collect();
-            let (ops, layout) =
-                lower_graph_to_superdsc::<T, _>(&ir, &weight_ids, ActiveCap::FULL, false).unwrap();
+            let (ops, layout) = lower_graph_to_superdsc::<T, _>(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                false,
+                one_request_of(1),
+            )
+            .unwrap();
             // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
             let groups: Vec<bundle::LaunchGroup<'static, T>> =
                 launch_index(&ops, FoldGrouping::Split)
@@ -10905,7 +10602,7 @@ mod tests {
             layout.placements.contains_key(&victim),
             "t{victim} must be a real placement for the collision to be the card's shape"
         );
-        layout.synth(ktir_superdsc::place::PlaceId::Act(victim), &[1, 64]);
+        layout.synth(ktir_superdsc::place::SynthId::Act(victim), &[1, 64]);
         let _ = bake_layout(&layout);
     }
 }
@@ -10933,6 +10630,7 @@ mod fingerprint_tests {
                 &rb("out", m, 384),
                 None,
             )
+            .expect("assemble_matmul builds")
         };
         let (a, b) = (at(384), at(192));
         assert_eq!((&a.op_name, a.time), (&b.op_name, b.time));

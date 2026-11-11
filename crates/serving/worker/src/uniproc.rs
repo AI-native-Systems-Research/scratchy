@@ -227,6 +227,13 @@ impl Executor for UniProcExecutor {
     fn drain_until(&mut self, cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>) {
         self.worker.drain_until(cell);
     }
+
+    /// Straight through to the worker: it owns the devices the thread drives.
+    fn pin_driving_thread(&self) -> scratchy_serving_engine::error::EngineResult<()> {
+        self.worker
+            .pin_driving_thread()
+            .map_err(|e| scratchy_serving_engine::error::EngineError::Executor(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +406,7 @@ mod tests {
             },
             max_model_len: 4096,
             num_gpu_blocks: 1024,
-            block_size: 16,
+            block_size: scratchy_core_common::KvBlockTokens::new(16).expect("16 > 0"),
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,

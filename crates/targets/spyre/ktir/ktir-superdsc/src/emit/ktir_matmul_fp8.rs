@@ -318,7 +318,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                     &ascale_h,
                     sym_id_base,
                     layout,
-                ));
+                )?);
             } else {
                 // PARTIALS: `time` single-shot fused reduces, each over a `[m, k/time]` column slice
                 // of the RowBlocked activation. Slice j starts at column `j·k/time` — a stick
@@ -391,7 +391,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                         Df::Fp16,
                         sym_id_base,
                         layout,
-                    ));
+                    )?);
                 }
                 // COMBINE: ascale = maximum(ascale, partial_j) — running, in place on `ascale` (the
                 // old amax chain's own law). Lands in the SAME `ascale` name every downstream op
@@ -408,7 +408,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                         &ascale_h,
                         sym_id_base,
                         layout,
-                    ));
+                    )?);
                 }
             }
             // The three tensors the two fused ops subsume, plus the `1/448` and ±448 they used to take as
@@ -437,7 +437,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 &invs_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             // scaled = act·invs; clamp to [-448,448] (torch-spyre's `quantize_fp8_with_scale` ALWAYS clamps).
             let sc_h = rb(&sc, m, k);
             ops.push(pw2(
@@ -450,7 +450,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 &sc_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             // ⭐⭐⭐⭐⭐ THE CLAMP IS THE DEVICE'S OWN `clip` OP — ONE input, computing
             // `FMIN(FMAX(x, clipMin), clipMax)` (`unary_pipeline.ddl:370-377` PE stage, `:472-479` SFP
             // stage) — the same min/max pair the two ops it replaces encoded, so the swap is
@@ -477,7 +477,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 &cl_h,
                 sym_id_base,
                 layout,
-            ));
+            )?);
             // ⭐ THE PAD WINDOW'S ZERO FILL. `cl`'s logical `[m, k]` window is written by the
             // clamp above; the `[k, cl_reach)` window — the LAST pair's convert overhang,
             // `inn_pad − inn` lanes — is written HERE, unconditionally, every step — a `sub`
@@ -512,7 +512,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                     crate::addr::col_of(m, cl_reach, k, Df::Fp16),
                     sym_id_base,
                     layout,
-                ));
+                )?);
             }
             // qfp8ch: f16 clamped act → SEN143_FP8. A dtype CONVERT (input 64-stick, output 128-stick), so it
             // goes through `assemble_convert` (two `primaryDsInfo_`), NOT a same-stick pointwise. The output's
@@ -533,7 +533,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                     &rb_df(&afp8, m, k_pad, Df::Fp8),
                     sym_id_base,
                     layout,
-                ));
+                )?);
             } else {
                 // PER SLOT — the half-stick `inn` case (the 26b DOWN door's 704): slot `s`'s
                 // convert reads `cl` at column `s·inn` (an fp16 stick boundary — `inn` is a
@@ -580,7 +580,7 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                         crate::addr::col_of(m, k_pad, s * inn_pad, Df::Fp8),
                         sym_id_base,
                         layout,
-                    ));
+                    )?);
                 }
             }
         } // end `if !already_quantized` — the shared activation-quantize chain (per distinct activation).
@@ -665,7 +665,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
             Df::Fp8,
         )
         .map_err(SuperDscError)?;
-        for arg in &mut spec.args {
+        for arg in spec.args_mut() {
             if !matches!(arg.view().role, Role::Output) {
                 arg.set_df(Df::Fp8);
             }
@@ -691,7 +691,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         &dqa_h,
         sym_id_base,
         layout,
-    ));
+    )?);
     let out_h = rb(&out, m, n);
     let ws_h = rb(&ws_name, 1, n);
     let w_scale_in = if m > 1 {
@@ -709,7 +709,7 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         &out_h,
         sym_id_base,
         layout,
-    ));
+    )?);
     Ok(ops)
 }
 
@@ -917,8 +917,7 @@ mod tests {
         assert!(
             l.synth
                 .borrow()
-                .map
-                .contains_key(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
+                .contains(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
             "the first partial synth is declared"
         );
     }
@@ -961,8 +960,7 @@ mod tests {
         assert!(
             !l.synth
                 .borrow()
-                .map
-                .contains_key(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
+                .contains(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
             "no partial synth may be declared at a fitting geometry"
         );
     }
@@ -1009,29 +1007,26 @@ mod tests {
         // [m, k_pad] fp8 (1 byte/elem — the ½-fp16 residency).
         let s = l.synth.borrow();
         let cl_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * k_pad as u64 * 2,
             "cl owns [m, k_pad] fp16"
         );
         let afp8_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqAfp8).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqAfp8).to_string())
             .expect("afp8 is placed");
         assert_eq!(
-            *afp8_sz,
+            afp8_sz,
             m as u64 * k_pad as u64,
             "afp8 owns [m, k_pad] fp8 (1 B/elem)"
         );
         // The amax family is untouched by the pad: `absx` stays at the LOGICAL [m, k].
         let absx_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqAbsX).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqAbsX).to_string())
             .expect("absx is placed");
-        assert_eq!(*absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
+        assert_eq!(absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
     }
 
     /// ⭐ THE ALIGNED CASE IS BYTE-IDENTICAL: at a 128-aligned k (every earlier fp8 model), no
@@ -1058,11 +1053,10 @@ mod tests {
         );
         let s = l.synth.borrow();
         let cl_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * k as u64 * 2,
             "cl owns [m, k] fp16 — no widening"
         );
@@ -1222,28 +1216,25 @@ mod tests {
         let s = l.synth.borrow();
         let a7 = PlaceId::Act(7);
         let cl_sz = s
-            .sizes
-            .get(&a7.synth(SynthRole::FqCl).to_string())
+            .size(&a7.synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * cl_reach as u64 * 2,
             "cl owns [m, cl_reach] = [1, {cl_reach}] fp16"
         );
         let afp8_sz = s
-            .sizes
-            .get(&a7.synth(SynthRole::FqAfp8).to_string())
+            .size(&a7.synth(SynthRole::FqAfp8).to_string())
             .expect("afp8 is placed");
         assert_eq!(
-            *afp8_sz,
+            afp8_sz,
             m as u64 * k_pad as u64,
             "afp8 owns [m, k_pad] = [1, {k_pad}] fp8 (1 B/elem)"
         );
         let absx_sz = s
-            .sizes
-            .get(&a7.synth(SynthRole::FqAbsX).to_string())
+            .size(&a7.synth(SynthRole::FqAbsX).to_string())
             .expect("absx is placed");
-        assert_eq!(*absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
+        assert_eq!(absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
     }
 
     /// ⭐ THE ALIGNED-`inn` CONTROL: at the expert door's gate/up geometry (inn=2816, itself a
@@ -1283,11 +1274,10 @@ mod tests {
         );
         let s = l.synth.borrow();
         let cl_sz = s
-            .sizes
-            .get(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
+            .size(&PlaceId::Act(7).synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * k as u64 * 2,
             "cl owns [m, k] fp16 — no widening"
         );
@@ -1407,28 +1397,25 @@ mod tests {
         let s2 = l2.synth.borrow();
         let a7 = PlaceId::Act(7);
         let cl_sz = s2
-            .sizes
-            .get(&a7.synth(SynthRole::FqCl).to_string())
+            .size(&a7.synth(SynthRole::FqCl).to_string())
             .expect("cl is placed");
         assert_eq!(
-            *cl_sz,
+            cl_sz,
             m as u64 * cl_reach as u64 * 2,
             "cl owns [m, cl_reach] = [{m}, {cl_reach}] fp16"
         );
         let afp8_sz = s2
-            .sizes
-            .get(&a7.synth(SynthRole::FqAfp8).to_string())
+            .size(&a7.synth(SynthRole::FqAfp8).to_string())
             .expect("afp8 is placed");
         assert_eq!(
-            *afp8_sz,
+            afp8_sz,
             m as u64 * k_pad as u64,
             "afp8 owns [m, k_pad] = [{m}, {k_pad}] fp8 (1 B/elem)"
         );
         let absx_sz = s2
-            .sizes
-            .get(&a7.synth(SynthRole::FqAbsX).to_string())
+            .size(&a7.synth(SynthRole::FqAbsX).to_string())
             .expect("absx is placed");
-        assert_eq!(*absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
+        assert_eq!(absx_sz, m as u64 * k as u64 * 2, "absx owns [m, k] fp16");
         // And the positive control: the same m=2 at an ALIGNED inn (1024, a whole fp8 stick)
         // EMITS — one whole-tensor convert, the m-generic form the prefill door consumes.
         let l3 = fp8_layout(2, 2048, 128);

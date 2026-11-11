@@ -187,7 +187,8 @@ fn print_what_the_shipped_fold_score_op_addresses() {
         DevOff::ZERO,
         &mut s,
         None,
-    );
+    )
+    .expect("assemble_matmul_off builds");
     for (name, arg) in [("input qs", 0usize), ("kernel kct", 1), ("output sc", 2)] {
         let pc = PerCore::of(&e, "sc_shipped", arg, GQA, MQ);
         println!(

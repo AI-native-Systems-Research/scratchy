@@ -307,7 +307,12 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 sliding_window: (e == max_e).then_some(1),
             })
             .collect();
-        compute_hybrid_kv_layout(&geom, BLOCK_SIZE, usize::MAX / 2, elem_bytes)
+        compute_hybrid_kv_layout(
+            &geom,
+            scratchy_core_common::KvBlockTokens::new(BLOCK_SIZE).expect("16 > 0"),
+            usize::MAX / 2,
+            elem_bytes,
+        )
     });
     // The worker's tensors (`kv_pool_tensors`): the hybrid's group-shared positions, else a
     // tensor per layer that holds KV (a recurrent hybrid's attention layers), else per layer.

@@ -124,21 +124,44 @@ pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::No
 /// [`PagedStep::rows`] wide. A row past the real ones repeats the last real token
 /// ([`scratchy_subtile::sdsc_abstract::ChunkRows::row_logical_pos`]'s law), so its forward, its
 /// mask and its KV write are the last real token's.
+///
+/// ⭐ `real` IS A COUNT, ONE OR MORE — a step of zero real rows is no step, and every reader that
+/// clamped it (`pos`'s own `.max(1)`, the worker's `live_of`) was defending against a value that
+/// names a broken staging, not tolerating a real one. The mint refuses it, so the count the type
+/// carries is the count the staging meant.
 #[derive(Clone, Copy, Debug)]
 pub struct StepRows {
     pub start: usize,
-    pub real: usize,
+    pub real: std::num::NonZeroUsize,
 }
 
 impl StepRows {
+    /// Declare `real` rows from `start`. `None` for zero real rows — a staging that asks for a
+    /// step of nothing, which the caller names at its own door.
+    pub fn new(start: usize, real: usize) -> Option<StepRows> {
+        Some(StepRows {
+            start,
+            real: std::num::NonZeroUsize::new(real)?,
+        })
+    }
+
+    /// One row at `start` — the literal-row mint, `const` so no `expect` stands where the value
+    /// is a literal. `NonZeroUsize::MIN` is 1, the count one row is.
+    pub const fn one_at(start: usize) -> StepRows {
+        StepRows {
+            start,
+            real: std::num::NonZeroUsize::MIN,
+        }
+    }
+
     /// The sequence position row `r` carries.
     pub fn pos(&self, r: usize) -> usize {
-        self.start + r.min(self.real.max(1) - 1)
+        self.start + r.min(self.real.get() - 1)
     }
 
     /// One past the last position this step reaches — the KV length after its write.
     pub fn end(&self) -> usize {
-        self.start + self.real
+        self.start + self.real.get()
     }
 }
 
@@ -153,14 +176,21 @@ impl std::fmt::Display for PagedStepError {
 }
 
 /// The blocks a step reads and writes must exist: every position below `rows.end()` has a block,
-/// and every block is a page of the pool.
-fn check(step: &PagedStep, blocks: &[u32], rows: &StepRows) -> Result<(), PagedStepError> {
+/// and every block is a page of the pool. `bound` is the row count the rows are checked against —
+/// the graph's rows for one sequence's whole forward, the extent's per-request width for one
+/// request of a packed rung's (the two are the same number at one request).
+fn check(
+    step: &PagedStep,
+    bound: usize,
+    blocks: &[u32],
+    rows: &StepRows,
+) -> Result<(), PagedStepError> {
     let slots = step.page_slots as usize;
     let need = rows.end().div_ceil(slots);
-    if rows.real == 0 || rows.real > step.rows as usize {
+    if rows.real.get() > bound {
         return Err(PagedStepError(format!(
-            "a step of {} real row(s) in a {}-row bundle",
-            rows.real, step.rows
+            "a step of {} real row(s) in a {bound}-row window",
+            rows.real
         )));
     }
     if blocks.len() < need {
@@ -198,7 +228,9 @@ fn check(step: &PagedStep, blocks: &[u32], rows: &StepRows) -> Result<(), PagedS
 }
 
 /// `INT32_ELEMS_PER_STICK` — a page index table row's width.
-pub const INT32_ELEMS_PER_STICK: usize = 32;
+pub const INT32_ELEMS_PER_STICK: usize =
+    <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
 
 /// The page index table: `[walk, INT32_ELEMS_PER_STICK]` int32, row `i` holding block `i`'s page at
 /// column 0 — `table[:, 0] = block_table[s, :walk]`, the block table's own zeros past the request's
@@ -208,7 +240,7 @@ pub fn page_table(
     blocks: &[u32],
     rows: &StepRows,
 ) -> Result<Vec<i32>, PagedStepError> {
-    check(step, blocks, rows)?;
+    check(step, step.rows as usize, blocks, rows)?;
     let mut t = vec![0i32; step.walk as usize * INT32_ELEMS_PER_STICK];
     for (i, &page) in blocks.iter().take(step.walk as usize).enumerate() {
         t[i * INT32_ELEMS_PER_STICK] = page as i32;
@@ -216,10 +248,17 @@ pub fn page_table(
     Ok(t)
 }
 
-/// The mask stack: `[walk, rows, page_slots]`, tile `i` column `c` keyed by position
-/// `i · page_slots + c` — 0 at or before query row `m`'s position, [`MASKED`] after it.
+/// The mask stack: `[walk, q, page_slots]`, tile `i` column `c` keyed by position
+/// `i · page_slots + c` — 0 at or before query row `m`'s position, [`MASKED`] after it. `q` is
+/// the row count one request's stack serves — the graph's rows for one sequence's whole forward
+/// ([`step_sources`]'s spelling), the extent's per-request width for one request of a packed
+/// rung's ([`card_step_sources`]'s); the two are the same number at one request.
 pub fn mask_stack(step: &PagedStep, rows: &StepRows) -> Vec<f32> {
-    let (slots, q) = (step.page_slots as usize, step.rows as usize);
+    mask_stack_of(step, step.rows as usize, rows)
+}
+
+fn mask_stack_of(step: &PagedStep, q: usize, rows: &StepRows) -> Vec<f32> {
+    let slots = step.page_slots as usize;
     let mut m = vec![MASKED; step.walk as usize * q * slots];
     for i in 0..step.walk as usize {
         for r in 0..q {
@@ -242,7 +281,7 @@ pub fn write_rows(
     blocks: &[u32],
     rows: &StepRows,
 ) -> Result<Vec<i32>, PagedStepError> {
-    check(step, blocks, rows)?;
+    check(step, step.rows as usize, blocks, rows)?;
     let (slots, nkvh, q) = (
         step.page_slots as usize,
         step.nkvh as usize,
@@ -262,23 +301,44 @@ pub fn write_rows(
 /// ⭐ A QUERY ROW INDEX THAT IS CONSECUTIVE BY CONSTRUCTION. The prefill kernel under Triton's
 /// 8-row scatter floor reads and writes its rows as the one tile at `query_row_index[0]`
 /// (`page_attn_head_major_prefill.py`, `out_tile.store([first, 0], attn)`), which is the rows the
-/// index names only when they are consecutive. The only way to make one is [`Self::of`], the
-/// forward's rows in order from 0, so the kernel's assumption is a property of the type, not a
-/// comment (#1038).
+/// index names only when they are consecutive. The only ways to make one are [`Self::of`] — the
+/// forward's rows in order from 0 — and [`Self::of_request`] — one request's window of a packed
+/// rung, in order from its first row — so the kernel's assumption is a property of the type, not
+/// a comment (#1038).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueryRowIndex {
+    first: u32,
     rows: u32,
 }
 
 impl QueryRowIndex {
     /// The forward's `rows` query rows, `0..rows`, in order.
     pub const fn of(step: &PagedStep) -> Self {
-        Self { rows: step.rows }
+        Self {
+            first: 0,
+            rows: step.rows,
+        }
     }
 
-    /// The staged words: `0, 1, …, rows - 1`.
+    /// ⭐ REQUEST `r`'s WINDOW of a packed rung — `r·w .. r·w + w` in order, `w` the extent's
+    /// per-request width: the rung's graph rows ARE its requests' windows in order (request `r`
+    /// owns rows `r·w..r·w+w`, the row its answer comes back from), so the kernel's one-tile
+    /// scatter serves each request's rows exactly as it served one sequence's. `r` comes from the
+    /// stager's own `0..requests` walk over the capacity's slots, so the window is in range by
+    /// construction; at one request (`r = 0`, `w = rows`) this is [`Self::of`].
+    pub const fn of_request(step: &PagedStep, r: u32) -> Self {
+        let w = step.extent.per_request().get();
+        Self {
+            first: r * w,
+            rows: w,
+        }
+    }
+
+    /// The staged words: `first, first + 1, …, first + rows - 1`.
     pub fn words(self) -> Vec<i32> {
-        (0..self.rows as i32).collect()
+        (self.first..self.first + self.rows)
+            .map(|v| v as i32)
+            .collect()
     }
 }
 
@@ -536,11 +596,31 @@ fn le_words(w: Vec<i32>) -> Vec<u8> {
     w.into_iter().flat_map(i32::to_le_bytes).collect()
 }
 
-/// [`step_sources`] on the card: one sequence's step, its page table one block per trip.
+/// ⭐ ONE REQUEST'S STEP — its KV blocks (as pool pages) and its rows of the forward. The card
+/// stager ([`card_step_sources`]) takes the launch's requests as this list, dense from slot 0:
+/// request `r`'s tables stage at `r · `[`PagedStep::card_request_pitch`] within their
+/// placements, and the slots past the live ones (the rung's capacity is the count, the launch's
+/// live requests the fill) stage the empty-slot laws — an empty slot's writes reach no request's
+/// cache.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestStep<'a> {
+    pub blocks: &'a [u32],
+    pub rows: StepRows,
+}
+
+/// [`step_sources`] on the card: the launch's requests' step, each request's page table one block
+/// per trip, its block at its own offset ([`PagedStep::card_request_pitch`]).
+///
+/// ⭐ THE EMPTY-SLOT LAW — a launch with fewer live requests than the rung's capacity stages the
+/// slots past them as NO request's: page table rows name page 0 (the null page,
+/// [`page_of_block`]'s own reserve), the mask stack is fully [`MASKED`] (a finite all-masked tile
+/// whose weights vanish under the running maximum), and the KV write index lands on
+/// [`NULL_SLOT`] — the empty slot's forward runs, but nothing it writes reaches a request's cache
+/// and nothing it answers is read back. At one request nothing moves: the buffers are exactly
+/// one sequence's own ([`step_sources`]'s laws), byte for byte.
 pub fn card_step_sources(
     step: &PagedStep,
-    blocks: &[u32],
-    rows: &StepRows,
+    reqs: &[RequestStep<'_>],
 ) -> Result<CardSources, PagedStepError> {
     if step.batch().is_some() {
         return Err(PagedStepError(
@@ -548,23 +628,84 @@ pub fn card_step_sources(
                 .into(),
         ));
     }
-    let table = le_words(page_table(step, blocks, rows)?);
+    let (w, cap) = (
+        step.extent.per_request().get() as usize,
+        step.extent.requests().get() as usize,
+    );
+    if reqs.is_empty() || reqs.len() > cap {
+        return Err(PagedStepError(format!(
+            "a step of {} live request(s) in a rung that packs {cap}",
+            reqs.len()
+        )));
+    }
+    for (r, req) in reqs.iter().enumerate() {
+        check(step, w, req.blocks, &req.rows)
+            .map_err(|e| PagedStepError(format!("request {r}: {}", e.0)))?;
+    }
+    let (walk, slots, nkvh) = (
+        step.walk as usize,
+        step.page_slots as usize,
+        step.nkvh as usize,
+    );
+    let (pitch, trip) = (
+        step.card_request_pitch() as usize,
+        step.card_walk_step() as usize,
+    );
+    // ⭐ THE PAGE INDEX TABLE — request `r`'s `[walk, INT32_ELEMS_PER_STICK]` rows at
+    // `r·P + i·trip`: the walk's own trip pitch within the block, the request's block pitch
+    // between blocks. An empty slot's rows stay zero — page 0, the null page.
+    let mut table = vec![0u8; (cap - 1) * pitch + walk * trip];
+    for (r, req) in reqs.iter().enumerate() {
+        for (i, &page) in req.blocks.iter().take(walk).enumerate() {
+            let at = r * pitch + i * trip;
+            table[at..at + 4].copy_from_slice(&(page as i32).to_le_bytes());
+        }
+    }
+    // ⭐ THE MASK STACK — request `r`'s `[walk·w, page_slots]` stack, stick-major ([`card_mask`],
+    // the planes the walk's per-trip shift reads), at value offset `r·P/2`. An empty slot's stack
+    // stays fully [`MASKED`] — the zero of its own fill.
+    let mut mask = vec![MASKED; (cap - 1) * pitch / 2 + walk * w * slots];
+    for (r, req) in reqs.iter().enumerate() {
+        let scattered = card_mask(&mask_stack_of(step, w, &req.rows), &[walk * w, slots]);
+        let at = r * pitch / 2;
+        mask[at..at + scattered.len()].copy_from_slice(&scattered);
+    }
+    // ⭐ THE KV WRITE INDEX — packed over the graph's rows, head-major: row `r·w + j` (request
+    // `r`'s row `j`) names its OWN request's cache slot at its own position, a pad row clamped to
+    // its request's last real one (the host law, an idempotent rewrite); an EMPTY slot's rows name
+    // [`NULL_SLOT`], the null page's own slot. Not pitched: the KV writers run once per step over
+    // the whole graph — they are not the walk the per-request shift serves.
+    let mut write: Vec<i32> = Vec::with_capacity(nkvh * cap * w);
+    for h in 0..nkvh {
+        for r in 0..cap {
+            match reqs.get(r) {
+                Some(req) => {
+                    for j in 0..w {
+                        let pos = req.rows.pos(j);
+                        let page = req.blocks[pos / slots] as usize;
+                        write.push(((page * nkvh + h) * slots + pos % slots) as i32);
+                    }
+                }
+                None => {
+                    let null = ((NULL_SLOT / slots) * nkvh + h) * slots + NULL_SLOT % slots;
+                    write.extend(std::iter::repeat_n(null as i32, w));
+                }
+            }
+        }
+    }
+    // ⭐ THE QUERY ROW INDEX — request `r`'s consecutive window `r·w .. r·w+w`
+    // ([`QueryRowIndex::of_request`]) at word offset `r·P/4`.
+    let mut query = vec![0i32; (cap - 1) * pitch / 4 + w];
+    for r in 0..cap {
+        let at = r * pitch / 4;
+        query[at..at + w].copy_from_slice(&QueryRowIndex::of_request(step, r as u32).words());
+    }
     Ok(CardSources {
-        mask: (
-            step.mask,
-            card_mask(&mask_stack(step, rows), &mask_shape(step)),
-        ),
+        mask: (step.mask, mask),
         int32: vec![
-            (
-                step.page_table,
-                pitched(
-                    &table,
-                    INT32_ELEMS_PER_STICK * 4,
-                    step.card_walk_step() as usize,
-                ),
-            ),
-            (step.write_rows, le_words(write_rows(step, blocks, rows)?)),
-            (step.query_rows, le_words(query_rows(step))),
+            (step.page_table, table),
+            (step.write_rows, le_words(write)),
+            (step.query_rows, le_words(query)),
         ],
     })
 }
@@ -612,7 +753,7 @@ pub fn request_sources(
 ) -> Result<StepSources, PagedStepError> {
     match step.paged_rows {
         PagedRows::Sequence => step_sources(step, blocks, rows),
-        PagedRows::Batch if rows.real == 1 => batch_sources(
+        PagedRows::Batch if rows.real.get() == 1 => batch_sources(
             step,
             &[BatchSeq {
                 blocks,
@@ -712,6 +853,23 @@ pub fn pool_of_rows(
 mod tests {
     use super::*;
 
+    fn nz(n: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(n).unwrap()
+    }
+
+    /// The extent pair a fixture's rows state — the mint's own spelling, `fn` so `expect` reads.
+    /// The pair's held product must equal the fixture's `rows` (the mint's agreement, which
+    /// [`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`] checks on every real step).
+    fn pair(per_request: u32, requests: u32) -> crate::wiring::QueryExtent {
+        crate::wiring::QueryExtent::of_baked_rung(
+            crate::wiring::RungWidth::of_baked_rows(per_request)
+                .expect("the fixture's row count is nonzero"),
+            crate::wiring::RungCap::of_baked_seqs(requests)
+                .expect("the fixture's request count is nonzero"),
+        )
+        .expect("the fixture's rows fit a u32")
+    }
+
     fn step() -> PagedStep {
         PagedStep {
             mask: 10,
@@ -733,6 +891,7 @@ mod tests {
             head_size: 64,
             walk: 4,
             paged_rows: PagedRows::Sequence,
+            extent: pair(3, 1),
         }
     }
 
@@ -744,6 +903,7 @@ mod tests {
             rows: 4,
             walk: 2,
             paged_rows: PagedRows::Batch,
+            extent: pair(1, 4),
             ..step()
         }
     }
@@ -960,6 +1120,7 @@ mod tests {
         let s = PagedStep {
             rows: 2,
             walk: 1,
+            extent: pair(1, 2),
             ..batch()
         };
         let c = s.batch().unwrap();
@@ -1010,10 +1171,19 @@ mod tests {
         let decode = PagedStep {
             rows: 1,
             paged_rows: PagedRows::Batch,
+            extent: pair(1, 1),
             ..step()
         };
         let blocks = [2u32, 3];
-        let got = request_sources(&decode, &blocks, &StepRows { start: 5, real: 1 }).unwrap();
+        let got = request_sources(
+            &decode,
+            &blocks,
+            &StepRows {
+                start: 5,
+                real: nz(1),
+            },
+        )
+        .unwrap();
         let want = batch_sources(
             &decode,
             &[BatchSeq {
@@ -1028,7 +1198,10 @@ mod tests {
         assert!(tids.contains(&decode.rep_rows) && tids.contains(&decode.chunk_pages));
         assert!(!tids.contains(&decode.page_table) && !tids.contains(&decode.kv_row_pool));
         let prompt = step();
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         assert_eq!(
             request_sources(&prompt, &blocks, &rows).unwrap().int32,
             step_sources(&prompt, &blocks, &rows).unwrap().int32
@@ -1048,7 +1221,10 @@ mod tests {
     #[test]
     fn the_tables_follow_spyre_inference_s_laws() {
         let s = step();
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         let blocks = [2u32, 0];
         let pt = page_table(&s, &blocks, &rows).unwrap();
         assert_eq!(
@@ -1101,10 +1277,28 @@ mod tests {
                 .collect()
         };
         let chunk = step();
-        let staged = tids(&chunk, StepRows { start: 5, real: 2 });
+        let staged = tids(
+            &chunk,
+            StepRows {
+                start: 5,
+                real: nz(2),
+            },
+        );
         assert!(!staged.contains(&chunk.kv_row_pool) && !staged.contains(&chunk.int32_zero));
-        let decode = PagedStep { rows: 1, ..step() };
-        let srcs = step_sources(&decode, &blocks, &StepRows { start: 5, real: 1 }).unwrap();
+        let decode = PagedStep {
+            rows: 1,
+            extent: pair(1, 1),
+            ..step()
+        };
+        let srcs = step_sources(
+            &decode,
+            &blocks,
+            &StepRows {
+                start: 5,
+                real: nz(1),
+            },
+        )
+        .unwrap();
         assert!(srcs.int32.iter().any(|(t, ..)| *t == decode.kv_row_pool));
         let (_, zero, _) = srcs
             .int32
@@ -1127,9 +1321,19 @@ mod tests {
     #[test]
     fn the_card_holds_the_page_table_one_block_per_trip() {
         let s = step();
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         let blocks = [2u32, 3];
-        let card = card_step_sources(&s, &blocks, &rows).unwrap();
+        let card = card_step_sources(
+            &s,
+            &[RequestStep {
+                blocks: &blocks,
+                rows,
+            }],
+        )
+        .unwrap();
         let pitch = s.card_walk_step() as usize;
         assert_eq!(pitch, 3 * 128, "one fp16 stick per score row, three rows");
         let table = ints(card.words(s.page_table).unwrap());
@@ -1164,10 +1368,20 @@ mod tests {
             page_slots: 128,
             ..step()
         };
-        let rows = StepRows { start: 5, real: 2 };
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
         let blocks = [2u32, 3];
         let logical = mask_stack(&s, &rows);
-        let card = card_step_sources(&s, &blocks, &rows).unwrap();
+        let card = card_step_sources(
+            &s,
+            &[RequestStep {
+                blocks: &blocks,
+                rows,
+            }],
+        )
+        .unwrap();
         let (n, w) = ((s.walk * s.rows) as usize, s.page_slots as usize);
         assert_eq!(card.mask.1.len(), logical.len());
         for r in 0..n {
@@ -1250,7 +1464,11 @@ mod tests {
     #[test]
     fn the_pool_statics_hold_each_pages_rows_at_the_run_pitch() {
         let run = ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as usize;
-        let decode = PagedStep { rows: 1, ..step() };
+        let decode = PagedStep {
+            rows: 1,
+            extent: pair(1, 1),
+            ..step()
+        };
         let statics = card_statics(&decode).unwrap();
         let pool = ints(
             &statics
@@ -1313,13 +1531,28 @@ mod tests {
             }
         };
         for (rows, real) in [(1u32, 1usize), (3, 2)] {
-            let full = PagedStep { rows, ..step() };
+            let full = PagedStep {
+                rows,
+                extent: pair(rows, 1),
+                ..step()
+            };
             for walk in [1, 2, 4] {
                 let body = full
                     .on_body(rows, PagedRows::Sequence, walk * full.page_slots)
                     .unwrap();
-                let st = StepRows { start: 0, real };
-                let card = card_step_sources(&body, &[3, 2, 1, 0], &st).unwrap();
+                let st = StepRows {
+                    start: 0,
+                    real: nz(real),
+                };
+                let blocks = [3u32, 2, 1, 0];
+                let card = card_step_sources(
+                    &body,
+                    &[RequestStep {
+                        blocks: &blocks,
+                        rows: st,
+                    }],
+                )
+                .unwrap();
                 fits(full, &card, &card_statics(&body).unwrap());
             }
         }
@@ -1340,20 +1573,330 @@ mod tests {
         }
     }
 
+    /// ⭐ A PACKED STEP STAGES EACH REQUEST AT ITS OWN PITCH — the S=2 shape the packed prefill rung
+    /// bakes: request `r`'s page table, mask stack and query rows at `r · card_request_pitch()`
+    /// within their own regions, each request's block by the ONE-REQUEST laws (its own blocks, its
+    /// own positions, its own consecutive window `r·w..r·w+w`), and the write rows PACKED over the
+    /// graph's rows — every row naming its OWN request's cache slot.
+    #[test]
+    fn a_packed_step_stages_each_request_at_its_own_pitch() {
+        // Two requests of 3 rows over a 6-row graph, the pool and walk of `step()`.
+        let s = PagedStep {
+            rows: 6,
+            extent: pair(3, 2),
+            ..step()
+        };
+        // The pitch: the largest of the three per-request blocks, 128-aligned — the page table
+        // (4 pages · 3 rows · 128 B) dwarfs the mask (96 B) and the query rows (one stick).
+        let pitch = s.card_request_pitch() as usize;
+        assert_eq!(pitch, 4 * 3 * 128, "the page table is the largest block");
+        let (trip, slots, nkvh) = (s.card_walk_step() as usize, 4, 2);
+        assert_eq!(trip, 3 * 128);
+        let a = [2u32, 3];
+        let b = [1u32, 0, 3];
+        let ra = StepRows {
+            start: 5,
+            real: nz(2),
+        };
+        let rb = StepRows {
+            start: 1,
+            real: nz(3),
+        };
+        let card = card_step_sources(
+            &s,
+            &[
+                RequestStep {
+                    blocks: &a,
+                    rows: ra,
+                },
+                RequestStep {
+                    blocks: &b,
+                    rows: rb,
+                },
+            ],
+        )
+        .unwrap();
+        // THE PAGE TABLE — request `r`'s block `i` at `r·P + i·trip`, zero past its own blocks.
+        let table = ints(card.words(s.page_table).unwrap());
+        assert_eq!(table.len(), (pitch + 4 * trip) / 4);
+        for (r, blocks) in [(0usize, &a[..]), (1, &b[..])] {
+            for i in 0..4 {
+                let want = blocks.get(i).copied().unwrap_or(0) as i32;
+                assert_eq!(
+                    table[(r * pitch + i * trip) / 4],
+                    want,
+                    "request {r} block {i}"
+                );
+            }
+        }
+        // THE MASK — request `r`'s stack is the one-request law over its own rows (4-slot pages:
+        // the stick-major form is the logical one), at value offset `r·P/2`.
+        let mask = &card.mask.1;
+        assert_eq!(mask.len(), pitch / 2 + 4 * 3 * slots);
+        for (r, rows) in [(0, ra), (1, rb)] {
+            let want = mask_stack_of(&s, 3, &rows);
+            let at = r * pitch / 2;
+            assert_eq!(&mask[at..at + want.len()], &want[..], "request {r}");
+        }
+        // THE WRITE ROWS — packed `[nkvh · 6]`, head-major: request `r`'s row `j` from its own
+        // blocks at its own position (a pad row repeats its request's last real one).
+        let write = ints(card.words(s.write_rows).unwrap());
+        assert_eq!(write.len(), nkvh * 6);
+        // Request A: positions 5, 6 and a pad row repeating 6, over blocks `[2, 3]`.
+        // Request B: positions 1, 2, 3, over blocks `[1, 0, 3]`.
+        let slot_of =
+            |page: usize, h: usize, pos: usize| ((page * nkvh + h) * slots + pos % slots) as i32;
+        let want_a = [slot_of(3, 0, 1), slot_of(3, 0, 2), slot_of(3, 0, 2)];
+        let want_b = [slot_of(1, 0, 1), slot_of(1, 0, 2), slot_of(1, 0, 3)];
+        for h in 0..nkvh {
+            let at = h * 6;
+            assert_eq!(
+                &write[at..at + 3],
+                &want_a.map(|v| v + (h * slots) as i32)[..],
+                "request A, head {h}"
+            );
+            assert_eq!(
+                &write[at + 3..at + 6],
+                &want_b.map(|v| v + (h * slots) as i32)[..],
+                "request B, head {h}"
+            );
+        }
+        // THE QUERY ROWS — request `r`'s consecutive window at word offset `r·P/4`.
+        let query = ints(card.words(s.query_rows).unwrap());
+        assert_eq!(query.len(), pitch / 4 + 3);
+        assert_eq!(&query[..3], &[0, 1, 2], "request 0's window");
+        assert_eq!(&query[pitch / 4..][..3], &[3, 4, 5], "request 1's window");
+        // ⭐ AND EVERY SOURCE FITS ITS PLACEMENT — each table's region grew by the capacity's
+        // `(S - 1) · P` spare over its per-request size.
+        let size = |tid: u32| {
+            s.card_placements()
+                .iter()
+                .find(|(t, ..)| *t == tid)
+                .map(|&(.., b)| b)
+                .unwrap()
+        };
+        assert_eq!(size(s.page_table), 4 * 3 * 128 + pitch as u64);
+        assert_eq!(size(s.mask), (4 * 3 * 4 * 2) as u64 + pitch as u64);
+        assert_eq!(size(s.query_rows), 128 + pitch as u64);
+        assert_eq!(
+            size(s.write_rows),
+            128,
+            "the write rows stay the graph's own rows, unpitched"
+        );
+        for (tid, words) in &card.int32 {
+            assert!(words.len() as u64 <= size(*tid), "t{tid}");
+        }
+        assert!(card.mask.1.len() as u64 * 2 <= size(s.mask));
+    }
+
+    /// ⭐ AN EMPTY SLOT IS NO REQUEST'S — a launch seating fewer requests than the rung's capacity
+    /// stages the slots past its live ones to the null page, a fully-`MASKED` stack and
+    /// [`NULL_SLOT`] writes: the empty slot's forward runs, but nothing it writes reaches a
+    /// request's cache and nothing it answers is read back. The live slot's own tables are exactly
+    /// the one-request laws' — nothing moves at the front.
+    #[test]
+    fn an_empty_slot_is_no_request_s() {
+        let s = PagedStep {
+            rows: 6,
+            extent: pair(3, 2),
+            ..step()
+        };
+        let pitch = s.card_request_pitch() as usize;
+        let trip = s.card_walk_step() as usize;
+        let a = [2u32, 3];
+        let ra = StepRows {
+            start: 5,
+            real: nz(2),
+        };
+        let card = card_step_sources(
+            &s,
+            &[RequestStep {
+                blocks: &a,
+                rows: ra,
+            }],
+        )
+        .unwrap();
+        // The empty slot's page table rows are zero — page 0, the null page.
+        let table = ints(card.words(s.page_table).unwrap());
+        for i in 0..4 {
+            assert_eq!(table[(pitch + i * trip) / 4], 0, "empty slot block {i}");
+        }
+        // Its mask stack is fully `MASKED` — the finite all-masked tile.
+        assert!(
+            card.mask.1[pitch / 2..].iter().all(|&v| v == MASKED),
+            "the empty slot's stack is fully masked"
+        );
+        // Its write rows name the null slot — page 0, slot 0, head-major.
+        let write = ints(card.words(s.write_rows).unwrap());
+        for h in 0..2 {
+            let at = h * 6 + 3;
+            assert_eq!(&write[at..at + 3], &[h as i32 * 4; 3], "head {h}");
+        }
+        // And the live slot's tables are the one-request staging's own bytes.
+        let one = PagedStep {
+            rows: 3,
+            extent: pair(3, 1),
+            ..step()
+        };
+        let solo = card_step_sources(
+            &one,
+            &[RequestStep {
+                blocks: &a,
+                rows: ra,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            &card.words(s.page_table).unwrap()[..4 * trip],
+            solo.words(s.page_table).unwrap(),
+            "the live slot's page table is the one-request law's"
+        );
+        assert_eq!(
+            &card.mask.1[..4 * 3 * 4],
+            &solo.mask.1[..],
+            "the live slot's mask is the one-request law's"
+        );
+        assert_eq!(
+            &card.words(s.query_rows).unwrap()[..3 * 4],
+            solo.words(s.query_rows).unwrap(),
+            "the live slot's query rows are the one-request law's"
+        );
+        // A launch wider than the capacity refuses; so does an empty one. (Two requests in a
+        // two-request rung is the FULL launch, not a wide one.)
+        let three: Vec<RequestStep<'_>> = (0..3)
+            .map(|_| RequestStep {
+                blocks: &a,
+                rows: ra,
+            })
+            .collect();
+        assert!(card_step_sources(&s, &three).is_err());
+        assert!(card_step_sources(&s, &[]).is_err());
+        // A request wider than the per-request window refuses by name.
+        assert!(
+            card_step_sources(
+                &one,
+                &[RequestStep {
+                    blocks: &[0, 1, 2, 3],
+                    rows: StepRows {
+                        start: 0,
+                        real: nz(4),
+                    },
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    /// ⭐ AT ONE REQUEST NOTHING MOVES — the capacity's spare is zero, every placement size is the
+    /// per-request one, and the three tables stay contiguous and LAST in the activation segment
+    /// (write rows first) — the layout every rung today bakes, which is why the gate's bundle
+    /// pairing against main must come back identical.
+    #[test]
+    fn at_one_request_nothing_moves() {
+        let one = step();
+        let seats: Vec<(u32, crate::wiring::CardSeat)> = one
+            .card_placements()
+            .iter()
+            .map(|&(t, s, _)| (t, s))
+            .collect();
+        assert_eq!(
+            seats,
+            vec![
+                (one.write_rows, crate::wiring::CardSeat::Step),
+                (one.page_table, crate::wiring::CardSeat::Step),
+                (one.mask, crate::wiring::CardSeat::Step),
+                (one.query_rows, crate::wiring::CardSeat::Step),
+            ],
+            "write rows first, then the three tables contiguous"
+        );
+        let packed = PagedStep {
+            rows: 6,
+            extent: pair(3, 2),
+            ..step()
+        };
+        let spare = packed.card_request_pitch();
+        let own = |s: &PagedStep, tid: u32| {
+            s.card_placements()
+                .iter()
+                .find(|(t, ..)| *t == tid)
+                .map(|&(.., b)| b)
+                .unwrap()
+        };
+        for t in [packed.page_table, packed.mask, packed.query_rows] {
+            assert_eq!(own(&packed, t), own(&one, t) + spare, "t{t}'s region");
+        }
+        assert_eq!(own(&packed, packed.write_rows), own(&one, one.write_rows));
+    }
+
     /// A body's step walks the whole pages its sweep covers, and a sweep that is no walk of the pool
-    /// names no step.
+    /// names no step. ⭐ AND THE BODY'S EXTENT — a body's step states the LAUNCH's own extent
+    /// pair, by the launch's kind: a `Sequence`
+    /// launch is one request of `rows` rows — `(rows, 1)` — whatever width the wiring's own
+    /// pair names (the ladders bake one tape at several widths under one wiring, and `rows` is
+    /// the rung actually launching — the worker's chunk ladder stages a narrow chunk under the
+    /// shared wiring every prompt), and a `Batch` launch is one row per request — `(1, rows)`.
+    /// Both are the same law the bake's codegen minted each rung's own pair by, so a launch on
+    /// the wiring's own width re-derives the wiring's pair exactly.
     #[test]
     fn a_body_steps_at_its_own_walk() {
         let s = step();
-        let body = s.on_body(1, PagedRows::Sequence, 8).unwrap();
-        assert_eq!((body.rows, body.walk, body.reach()), (1, 2, 8));
+        let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
+        assert_eq!((body.rows, body.walk, body.reach()), (3, 2, 8));
+        assert_eq!(
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
+            (3, 1),
+            "a sequence launch is one request of its own rows"
+        );
+        // ⭐ THE WORKER'S REAL SHAPE: a chunk narrower than the wiring's representative width —
+        // the prefill ladder stages a 4-row chunk under a 3-per-request wiring (one tape, one
+        // wiring, several baked widths). The launch's own pair, never a refusal.
+        let wide = PagedStep {
+            rows: 6,
+            extent: pair(3, 2),
+            ..step()
+        };
+        let body = wide.on_body(4, PagedRows::Sequence, 8).unwrap();
+        assert_eq!(
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
+            (4, 1),
+            "a chunk narrower than the wiring's width still states its own rows"
+        );
+        let decode = PagedStep {
+            rows: 1,
+            extent: pair(1, 1),
+            ..step()
+        };
+        let body = decode.on_body(4, PagedRows::Batch, 8).unwrap();
+        assert_eq!(
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
+            (1, 4),
+            "a batch launch is one row per request"
+        );
+        let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
+        assert_eq!(
+            (
+                body.extent.per_request().get(),
+                body.extent.requests().get()
+            ),
+            (3, 1),
+            "a launch on the wiring's own width re-derives its pair"
+        );
         assert!(
-            s.on_body(1, PagedRows::Sequence, 6).is_none(),
+            s.on_body(3, PagedRows::Sequence, 6).is_none(),
             "not whole pages"
         );
-        assert!(s.on_body(1, PagedRows::Sequence, 0).is_none());
+        assert!(s.on_body(3, PagedRows::Sequence, 0).is_none());
         assert!(
-            s.on_body(1, PagedRows::Sequence, 20).is_none(),
+            s.on_body(3, PagedRows::Sequence, 20).is_none(),
             "past the pool"
         );
         assert!(s.on_body(0, PagedRows::Sequence, 8).is_none());
@@ -1362,8 +1905,28 @@ mod tests {
     #[test]
     fn a_step_past_the_request_s_blocks_is_refused() {
         let s = step();
-        assert!(page_table(&s, &[2], &StepRows { start: 3, real: 2 }).is_err());
-        assert!(write_rows(&s, &[2, 9], &StepRows { start: 0, real: 1 }).is_err());
+        assert!(
+            page_table(
+                &s,
+                &[2],
+                &StepRows {
+                    start: 3,
+                    real: nz(2)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            write_rows(
+                &s,
+                &[2, 9],
+                &StepRows {
+                    start: 0,
+                    real: nz(1)
+                }
+            )
+            .is_err()
+        );
     }
 
     /// A bundle whose attention walks two of the pool's four blocks serves a chunk over a cached
@@ -1373,8 +1936,21 @@ mod tests {
         let s = PagedStep { walk: 2, ..step() };
         assert_eq!(s.reach(), 8);
         let blocks = [3u32, 1, 0];
-        assert!(page_table(&s, &blocks, &StepRows { start: 5, real: 3 }).is_ok());
-        let past = StepRows { start: 6, real: 3 };
+        assert!(
+            page_table(
+                &s,
+                &blocks,
+                &StepRows {
+                    start: 5,
+                    real: nz(3)
+                }
+            )
+            .is_ok()
+        );
+        let past = StepRows {
+            start: 6,
+            real: nz(3),
+        };
         assert!(page_table(&s, &blocks, &past).is_err());
         assert!(write_rows(&s, &blocks, &past).is_err());
     }

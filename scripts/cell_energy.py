@@ -16,9 +16,11 @@ import csv
 import json
 import sys
 
-# How much of a window the log may miss, in seconds, and still be read: a sample's own interval
-# runs a little over a second.
+# How much of a window the log may miss and still be read: the larger of a fixed slack, a
+# sample's own interval running a little over a second, and a share of the window, so a cell of
+# hours keeps its energy over a gap of seconds in the log.
 SLACK_S = 1.5
+SLACK_SHARE = 0.001
 
 
 def read(power_csv):
@@ -37,7 +39,9 @@ def read(power_csv):
 
 def window(rows, start, end):
     """The CPU, GPU and ANE joules over start to end (Unix seconds), each sample by the share of
-    its interval inside the window; None where the log does not cover the window."""
+    its interval inside the window; None where the log misses more of it than the slack allows
+    (SLACK_S, SLACK_SHARE). Seconds it misses within that count at the window's mean power, and
+    the result says how many (uncovered_s)."""
     if end <= start:
         return None
     cpu = gpu = ane = covered = 0.0
@@ -52,11 +56,14 @@ def window(rows, start, end):
         cpu, gpu, ane = cpu + c * share, gpu + g * share, ane + a * share
         covered += hi - lo
         n += 1
-    if covered < (end - start) - SLACK_S:
+    length = end - start
+    uncovered = max(length - covered, 0.0)
+    if covered <= 0 or uncovered > max(SLACK_S, SLACK_SHARE * length):
         return None
-    r = lambda x: round(x, 2)  # noqa: E731
+    scale = length / covered if uncovered > SLACK_S else 1.0
+    r = lambda x: round(x * scale, 2)  # noqa: E731
     return {"cpu_j": r(cpu), "gpu_j": r(gpu), "ane_j": r(ane), "soc_j": r(cpu + gpu + ane),
-            "window_s": round(end - start, 3), "samples": n}
+            "window_s": round(length, 3), "samples": n, "uncovered_s": round(uncovered, 3)}
 
 
 def per(cell, e):

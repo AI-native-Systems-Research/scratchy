@@ -35,27 +35,23 @@ fn variant() -> String {
 }
 
 /// The model's canonicals, as `#[forward]` handed them to the seam: selected, as the build script
-/// that expanded `CUDA_TAPES` did, by `CARGO_FEATURE_<STEM>` and `SCRATCHY_QUANTS` naming the one
-/// preset, set once here, before the pipeline reads them; no other test in this binary reads the
-/// environment.
+/// that expanded `CUDA_TAPES` did, by a scope of the stem's feature (`FEATURE`, cargo's env name
+/// for it without the `CARGO_FEATURE_` prefix) and the one preset.
 fn input() -> TargetModelInput {
     static INPUT: std::sync::OnceLock<TargetModelInput> = std::sync::OnceLock::new();
     INPUT.get_or_init(capture).clone()
 }
 
 fn capture() -> TargetModelInput {
-    // SAFETY: set before the pipeline's own threads start, and no other thread of this binary
-    // reads or writes the environment.
-    unsafe {
-        std::env::set_var(FEATURE, "1");
-        std::env::set_var("SCRATCHY_QUANTS", PRESET);
-    }
+    let scope = scratchy_forward_compiler_macro::Scope::from_feature_flags([FEATURE], false, false)
+        .with_quants([PRESET]);
     let models = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dsl = std::fs::read_to_string(models.join(format!("dsl/{ARCH}.py"))).expect("the DSL");
     let carrier = scratchy_forward_compiler_macro::parse_python_file(&dsl).expect("parse the DSL");
     let inputs = scratchy_forward_compiler_macro::target_model_inputs(
         carrier,
         &models.join(format!("configs/{ARCH}")),
+        &scope,
     )
     .expect("the forward pipeline");
     let stem = variant();

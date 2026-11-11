@@ -434,7 +434,7 @@ pub fn reduce_opspec_df_divided(
         )
     };
 
-    let args = vec![data, accum];
+    let args = [&data, &accum];
     // BUILD-TIME GUARD (guard-every-crash-at-build-time): DATA and ACCUM are both `Role::Output`, so they
     // SHARE one `primaryDsInfo` LayoutInfo of rank N. dxp interprets EACH operand's AllocNode dims against
     // that single rank-N layout — a mismatched-rank operand makes dxp search for a dim that isn't there,
@@ -451,19 +451,12 @@ pub fn reduce_opspec_df_divided(
             ranks[0]
         ));
     }
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     let op_info = reduce_op_info(op, cols, df, accum_name)?;
-    Ok(OpSpec {
-        op,
-        is_reduction: true,
-        iter: plan,
-        args,
-        op_info,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask,
-    })
+    Ok(OpSpec::new(op, plan, vec![data], accum)
+        .map_err(|e| e.0)?
+        .with_op_info(op_info)
+        .with_time_tile(time_tile)
+        .with_coordinate_mask(coordinate_mask))
 }
 
 /// fp32 REDUCE (the torch-spyre RMSNorm `mean(x²)`): native fp32 SFP reduce over `cols`, keeping all
@@ -479,7 +472,7 @@ pub fn assemble_reduce_df<T: crate::collective::Tp>(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // head_major=TRUE ⇒ rank-3 flat, matching the flat fp32 island (see assemble_pointwise_broadcast_df).
     let op = reduce_opspec_df(
         op_func_from_str(op_func),
@@ -490,10 +483,13 @@ pub fn assemble_reduce_df<T: crate::collective::Tp>(
         true,
         df,
     )
-    .unwrap_or_else(|e| panic!("assemble_reduce_df {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_df {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce_df {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_df {op_name}: {e}"))
+    })
 }
 
 /// Assemble a complete SuperDSC for ONE REDUCTION over `[rows, cols]` reducing
@@ -507,7 +503,7 @@ pub fn assemble_reduce<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     data: &Stk<D>,
     accum: &Stk<A>,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let mut sym_id_base: i64 = 0;
     assemble_reduce_seeded(
         op_name,
@@ -532,7 +528,7 @@ pub fn assemble_reduce_seeded<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     accum: &Stk<A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // DATA's kind now DRIVES head_major (was hardcoded `false`, forcing every caller's data operand
     // through the RowBlocked/stickmajor-eligible path regardless of what actually consumes it next).
     // The stick-major optimization exists ONLY so a whole-tensor pointwise producer's output agrees
@@ -560,10 +556,11 @@ pub fn assemble_reduce_seeded<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         Df::Fp16,
         division,
     )
-    .unwrap_or_else(|e| panic!("assemble_reduce {op_name}: {e}"));
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("assemble_reduce {op_name}: {e}")))?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce {op_name}: {e}"))
+    })
 }
 
 /// [`reduce_opspec`] with per-operand ELEMENT offsets — for per-head/offset reduce slices.
@@ -888,7 +885,7 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             .with_offset(accum_off),
         )
     };
-    let args = vec![data, accum];
+    let args = [&data, &accum];
     // Mirror reduce_opspec_df's build-time guard: a mixed-rank data/accum pair is unconditionally
     // wrong (dxp abort), so catch it here too rather than let a future edit reintroduce it silently.
     let ranks: Vec<usize> = args.iter().map(|a| a.view().layout.len()).collect();
@@ -900,21 +897,14 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
             ranks[0]
         ));
     }
-    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     // The scaling const divides by the reduce's LOGICAL extent (`ScalingExtent`), never by
     // this emission's slice geometry — see `ReduceOffSpec::scaling`.
     let op_info = reduce_op_info(op, scaling.get(), df, accum_name)?;
-    Ok(OpSpec {
-        op,
-        is_reduction: true,
-        iter: plan,
-        args,
-        op_info,
-        tiled_symbols,
-        time_tile,
-        indirect: None,
-        coordinate_mask,
-    })
+    Ok(OpSpec::new(op, plan, vec![data], accum)
+        .map_err(|e| e.0)?
+        .with_op_info(op_info)
+        .with_time_tile(time_tile)
+        .with_coordinate_mask(coordinate_mask))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -934,7 +924,7 @@ pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let op = reduce_opspec_off(
         op_func_from_str(op_func),
         rows.get(),
@@ -943,10 +933,13 @@ pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         accum,
         df,
     )
-    .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off {op_name}: {e}"))
+    })
 }
 
 /// The parameter list of [`assemble_reduce_off_divided`], carried as a struct (the `PointwiseDivided`
@@ -969,7 +962,7 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
     r: ReduceDivided<'_, D, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> EmittedOp<T> {
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let ReduceDivided {
         op_name,
         op_func,
@@ -990,10 +983,13 @@ pub fn assemble_reduce_off_divided<T: crate::collective::Tp, D: KindTag, A: Kind
         division,
         scaling: ScalingExtent::whole(cols.get()),
     })
-    .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));
+    .map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off_divided {op_name}: {e}"))
+    })?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+        crate::superdsc_error::SuperDscError(format!("assemble_reduce_off_divided {op_name}: {e}"))
+    })
 }
 
 /// ⭐⭐⭐⭐⭐ THE LONG-REDUCE SPLIT — the ONE law for a seeded row reduce too long for one
@@ -1067,7 +1063,7 @@ pub struct ReduceSplit<'a, D: KindTag, A: KindTag> {
     accum_off: DevOff,
     /// The place the partial synthetics mint under — the reduce's own place, whatever the
     /// caller holds for it.
-    parent: crate::place::PlaceId,
+    parent: crate::place::SynthId,
     /// The caller's OWN core division — the probe must ask the tiler the question the caller's
     /// single-shot emission asks.
     division: ReduceDivision,
@@ -1150,7 +1146,7 @@ impl<'a, D: KindTag, A: KindTag> ReduceSplit<'a, D, A> {
         geometry: ReduceGeometry,
         data: ReduceDataLeg<'a, D>,
         accum: ReduceAccumLeg<'a, A>,
-        parent: crate::place::PlaceId,
+        parent: crate::place::SynthId,
     ) -> Result<Self, String> {
         let parent_cols = u32::try_from(data.stk.layout().cols).map_err(|_| {
             format!(
@@ -1255,7 +1251,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     s: ReduceSplit<'_, D, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<Option<Vec<EmittedOp<T>>>, String> {
+) -> Result<Option<Vec<EmittedOp<T>>>, crate::superdsc_error::SuperDscError> {
     let rows = s.rows.get();
     let rows_t = crate::sdsc_abstract::RowCount::of_token_rows(rows);
     // The parent's full column extent, read off the handle — the nest every slice corner is
@@ -1268,7 +1264,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         crate::sdsc_abstract::BlockCols::of_feature_cols(s.cols),
         s.df,
         &format!("{}: the long-reduce probe's data window", s.op_name),
-    )?;
+    )
+    .map_err(crate::superdsc_error::SuperDscError)?;
     let probe_accum = win_reduce_accum(
         layout,
         s.accum,
@@ -1276,7 +1273,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         rows_t,
         s.df,
         &format!("{}: the long-reduce probe's accum window", s.op_name),
-    )?;
+    )
+    .map_err(crate::superdsc_error::SuperDscError)?;
     let probe = reduce_opspec_off_divided(ReduceOffSpec {
         op: s.op,
         rows,
@@ -1287,7 +1285,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         division: s.division,
         scaling: ScalingExtent::whole(s.cols),
     })
-    .map_err(|e| format!("{}: {e}", s.op_name))?;
+    .map_err(|e| crate::superdsc_error::SuperDscError(format!("{}: {e}", s.op_name)))?;
     if probe.iter.split_of("out") > 1 {
         return Ok(None);
     }
@@ -1302,7 +1300,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     // The partials: `time - 1` synthetics under the reduce's own place, one stick per row each,
     // so no two slice reduces share an output byte. Slice 0 seeds the CALLER's accum.
     use crate::place::SynthRole as R;
-    let partial_ids: Vec<crate::place::PlaceId> = (1..time)
+    let partial_ids: Vec<crate::place::SynthId> = (1..time)
         .map(|j| s.parent.synth(R::ReducePartial(j)))
         .collect();
     let partial_names: Vec<String> = partial_ids
@@ -1317,7 +1315,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
     let partials: Vec<Stk<A>> = partial_names
         .iter()
         .map(|n| partial_accum_handle(n, rows, stick, s.df))
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>()
+        .map_err(crate::superdsc_error::SuperDscError)?;
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
     for j in 0..time {
         let slice_cols = slices.cols_of(j);
@@ -1336,7 +1335,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
             crate::sdsc_abstract::BlockCols::of_feature_cols(slice_cols),
             s.df,
             &format!("{op_name}: the slice's data window"),
-        )?;
+        )
+        .map_err(crate::superdsc_error::SuperDscError)?;
         let accum_win = if j == 0 {
             win_reduce_accum(
                 layout,
@@ -1345,7 +1345,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 rows_t,
                 s.df,
                 &format!("{op_name}: the slice's accum window (the caller's own)"),
-            )?
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?
         } else {
             let p = &partials[(j - 1) as usize];
             win_reduce_accum(
@@ -1355,7 +1356,8 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 rows_t,
                 s.df,
                 &format!("{op_name}: the slice's accum window (its own partial)"),
-            )?
+            )
+            .map_err(crate::superdsc_error::SuperDscError)?
         };
         // The slice's own geometry (`cols` = the slice's width, its pad lanes masked) with the
         // WHOLE reduce's scaling extent — the partials must add to the single-shot result.
@@ -1368,12 +1370,16 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
             df: s.df,
             division: ReduceDivision::Rows,
             scaling: slices.scaling_of(j),
-        })?;
+        })
+        .map_err(crate::superdsc_error::SuperDscError)?;
         let folds = SdscFoldSet::new(spec.iter.cores_used());
-        ops.push(
-            crate::emit::emit_sdsc_tiled(&op_name, &spec, &folds, sym_id_base, layout)
-                .map_err(|e| e.0)?,
-        );
+        ops.push(crate::emit::emit_sdsc_tiled(
+            &op_name,
+            &spec,
+            &folds,
+            sym_id_base,
+            layout,
+        )?);
     }
     // THE COMBINE, one per reduce kind: accum = accum ∘ partial_j, running, in place on the
     // caller's accum, through the same pointwise door every other combine takes. The width is
@@ -1402,7 +1408,7 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 s.accum_off,
                 sym_id_base,
                 layout,
-            ));
+            )?);
         } else {
             let mut op = crate::emit::pointwise_broadcast_opspec_df(
                 op_func_from_str(combine),
@@ -1419,13 +1425,16 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
                 layout,
                 crate::work::EwDivision::Law,
             )
-            .map_err(|e| format!("{op_name}: {e}"))?;
+            .map_err(|e| crate::superdsc_error::SuperDscError(format!("{op_name}: {e}")))?;
             crate::emit::apply_lx_residency(&mut op, layout);
             let folds = SdscFoldSet::new(op.iter.cores_used());
-            ops.push(
-                crate::emit::emit_sdsc_tiled(&op_name, &op, &folds, sym_id_base, layout)
-                    .map_err(|e| e.0)?,
-            );
+            ops.push(crate::emit::emit_sdsc_tiled(
+                &op_name,
+                &op,
+                &folds,
+                sym_id_base,
+                layout,
+            )?);
         }
     }
     Ok(Some(ops))
@@ -1566,7 +1575,7 @@ mod long_reduce_split {
                     .expect("the split's geometry mints"),
                 ReduceDataLeg::whole(&data),
                 ReduceAccumLeg::new(&accum, DevOff::ZERO),
-                crate::place::PlaceId::Act(1),
+                crate::place::SynthId::Act(1),
             )
             .expect("the split request mints"),
             &mut 0i64,
@@ -1591,7 +1600,7 @@ mod long_reduce_split {
                     .expect("the split's geometry mints"),
                 ReduceDataLeg::whole(&data),
                 ReduceAccumLeg::new(&accum, DevOff::ZERO),
-                crate::place::PlaceId::Act(1),
+                crate::place::SynthId::Act(1),
             )
             .expect("the split request mints"),
             &mut 0i64,
@@ -1647,7 +1656,7 @@ mod long_reduce_split {
                     .expect("the split's geometry mints"),
                 ReduceDataLeg::whole(&data),
                 ReduceAccumLeg::new(&accum, DevOff::ZERO),
-                crate::place::PlaceId::Act(1),
+                crate::place::SynthId::Act(1),
             )
             .expect("the split request mints"),
             &mut 0i64,
@@ -1716,5 +1725,201 @@ mod long_reduce_split {
             c["computeOp_"][0]["opFuncName"], "add",
             "the mean's combine"
         );
+    }
+}
+
+/// ⭐ THE DDL ARITY IS A CONSTRUCTION FACT: `OpSpec::new` refuses an operand list its op function's
+/// template cannot bind, and every descriptor that reaches `emit_sdsc` lists the count the template
+/// binds — so there is no emit-time arity arm left to reach.
+#[cfg(test)]
+mod the_arity_is_checked_where_the_op_is_built {
+    use crate::superdsc_opspec::{
+        Allocation, AnyTensorArg, ItDim, MAX_CORES, MaxCores, OpFunc, OpSpec, Role, Scale,
+        SdscFoldSet, TensorArg, WorkPlan,
+    };
+
+    fn plan() -> WorkPlan {
+        let dims = [
+            ItDim {
+                name: "mb",
+                size: 4,
+                is_reduction: false,
+                is_stick: false,
+                df: crate::superdsc_opspec::Df::Fp16,
+            },
+            ItDim {
+                name: "out",
+                size: 64,
+                is_reduction: true,
+                is_stick: true,
+                df: crate::superdsc_opspec::Df::Fp16,
+            },
+        ];
+        WorkPlan::divide(&dims, MaxCores::<{ MAX_CORES }>, |_, _| {
+            std::collections::BTreeMap::new()
+        })
+        .expect("a two-dim plan divides")
+    }
+
+    fn arg(p: &WorkPlan, is_input: bool, name: &str, out: Scale) -> AnyTensorArg {
+        AnyTensorArg::R2(
+            TensorArg::<2>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active, out],
+                p.iter_syms(["mb", "out"]),
+                ["mb", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .expect("a [mb, out] arg"),
+        )
+    }
+
+    fn build(op: OpFunc, inputs: usize) -> Result<OpSpec, crate::superdsc_error::SuperDscError> {
+        let p = plan();
+        let ins = (0..inputs)
+            .map(|i| arg(&p, true, &format!("in{i}"), Scale::Active))
+            .collect();
+        let out = arg(&p, false, "acc", Scale::RedStick);
+        OpSpec::new(op, p, ins, out)
+    }
+
+    fn input_refs(op: &OpSpec) -> usize {
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let e = crate::emit::emit_sdsc("arity_o1", op, &folds, None).expect("emits");
+        let j = serde_json::to_value(&e).expect("serializes");
+        j["dscs_"][0]["arity_o1"]["computeOp_"][0]["inputLabeledDs"]
+            .as_array()
+            .expect("an input list")
+            .len()
+    }
+
+    /// The match, on both rows of the table that bind a fixed arity through a reduce: the fused
+    /// per-token scale binds ONE (its accumulator is template-internal), and the descriptor lists one.
+    #[test]
+    fn a_one_input_fused_reduce_builds_and_lists_one_input() {
+        let op = build(OpFunc::QuantScalePerTokenFp8, 1).expect("one operand is the bind");
+        assert!(!op.accum_is_input(), "the accumulator is template-internal");
+        assert_eq!(input_refs(&op), 1);
+    }
+
+    /// The neighbour with NO fixed row: a seeded `sum` lists its accumulator as its second input,
+    /// the `summeanmaxexx2.ddl` bind — unchanged by the move.
+    #[test]
+    fn a_seeded_reduce_lists_its_accumulator_as_an_input() {
+        let op = build(OpFunc::Sum, 1).expect("a seeded sum builds");
+        assert!(op.accum_is_input());
+        assert_eq!(input_refs(&op), 2);
+    }
+
+    /// Near-miss: one operand too many for the one-input bind is refused AT CONSTRUCTION, naming the
+    /// template's count — before any descriptor exists.
+    #[test]
+    fn one_operand_too_many_refuses_at_construction() {
+        let e =
+            build(OpFunc::QuantScalePerTokenFp8, 2).expect_err("two operands, a one-input bind");
+        assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
+    }
+
+    /// Near-miss: the same table row refuses an operand list with no input at all.
+    #[test]
+    fn no_operand_refuses_at_construction() {
+        let e = build(OpFunc::QuantScalePerTokenFp8, 0).expect_err("no input, a one-input bind");
+        assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
+    }
+
+    /// Near-miss: a seeded `sum` with a SECOND data operand — the count rule this replaced decided
+    /// "accumulator is an input" from `inputs.len() == 1`, so two operands silently made it not one.
+    /// The row decides it now, and two data operands plus the accumulator are three, not the
+    /// template's two.
+    #[test]
+    fn a_seeded_reduce_with_two_data_operands_refuses_at_construction() {
+        let e = build(OpFunc::Sum, 2).expect_err("two data operands, a two-input bind");
+        assert!(e.0.contains("binds exactly 2"), "names the bind: {}", e.0);
+        assert!(
+            e.0.contains("+ the accumulator"),
+            "counts the accumulator: {}",
+            e.0
+        );
+    }
+
+    /// The table, row by row: every seeded reduce lists its accumulator, every internal-state
+    /// reduction does not, and a non-reduction is not a reduction.
+    #[test]
+    fn each_op_func_states_how_its_template_binds_the_accumulator() {
+        use crate::superdsc_opspec::ReductionBinding as B;
+        for op in [OpFunc::Sum, OpFunc::Max, OpFunc::Mean, OpFunc::Exx2] {
+            assert_eq!(op.reduction_binding(), B::Seeded, "{op:?}");
+            assert_eq!(op.ddl_input_arity(), Some(2), "{op:?}: data + accumulator");
+        }
+        for op in [
+            OpFunc::Matmul,
+            OpFunc::BatchMatmul,
+            OpFunc::QuantScalePerTokenFp8,
+            OpFunc::TopKIndex,
+            OpFunc::TopKValue,
+        ] {
+            assert_eq!(op.reduction_binding(), B::Internal, "{op:?}");
+            assert!(!op.reduction_binding().accum_is_input(), "{op:?}");
+        }
+        assert!(!OpFunc::Add.reduction_binding().is_reduction());
+    }
+
+    /// An attached operand is a tensor, never a bound input: a fused epilogue's addend sits past the
+    /// inputs `OpSpec::new` checked, so the descriptor's `inputLabeledDs` is the same list before
+    /// and after, and the addend appears only in the SECOND computeOp_ entry.
+    #[test]
+    fn an_attached_epilogue_moves_no_bound_input() {
+        use crate::superdsc_opspec::{EpilogueOpFunc, EpilogueSpec, EpilogueSpecs};
+        let ins = |op: &OpSpec| -> serde_json::Value {
+            let folds = SdscFoldSet::new(op.iter.cores_used());
+            let e = crate::emit::emit_sdsc("epi_o1", op, &folds, None).expect("emits");
+            serde_json::to_value(&e).expect("serializes")["dscs_"][0]["epi_o1"]["computeOp_"]
+                .clone()
+        };
+        let mut op =
+            crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec(1, 64, 64, 1, "a", "w", "o")
+                .expect("a legal matmul");
+        let before = ins(&op)[0]["inputLabeledDs"].clone();
+        let bound = op.bound_inputs();
+        op.attach_fused_epilogue(EpilogueSpecs {
+            one: EpilogueSpec {
+                operand_name: "bias".to_string(),
+                offset_elems: 0,
+                op_func: EpilogueOpFunc::StridedAdd,
+                broadcast_dims: &[],
+                broadcast_batch: false,
+            },
+        });
+        let after = ins(&op);
+        assert_eq!(
+            op.bound_inputs(),
+            bound,
+            "the bound inputs are fixed at construction"
+        );
+        assert_eq!(
+            after[0]["inputLabeledDs"], before,
+            "the matmul's own inputs do not move"
+        );
+        assert_eq!(
+            after[1]["inputLabeledDs"],
+            serde_json::json!(["Tensor3-idx3", "Tensor2-idx2"]),
+            "the addend is the epilogue's, read with the slid output"
+        );
+    }
+
+    /// Near-miss on a non-reduction row: `clip` binds one input; two refuse.
+    #[test]
+    fn a_two_input_clip_refuses_at_construction() {
+        let p = plan();
+        let ins = vec![
+            arg(&p, true, "a", Scale::Active),
+            arg(&p, true, "b", Scale::Active),
+        ];
+        let out = arg(&p, false, "o", Scale::Active);
+        let e = OpSpec::new(OpFunc::Clip, p, ins, out).expect_err("clip binds one");
+        assert!(e.0.contains("binds exactly 1"), "names the bind: {}", e.0);
     }
 }

@@ -65,7 +65,7 @@ pub struct DraftSeedInputs {
     pub tokens_before: Vec<usize>,
     pub q_lens: Vec<usize>,
     pub was_spec_decode: Vec<bool>,
-    pub block_size: usize,
+    pub block_size: scratchy_core_common::KvBlockTokens,
 
     /// Phase 8 signal: when `true`, the worker has already submitted
     /// the lockstep prefill on its dedicated draft queue (in parallel
@@ -383,11 +383,11 @@ impl DraftModelProposer {
             let mut max_k: usize = 0;
             for (i, &pos) in current_positions.iter().enumerate().take(num_reqs) {
                 positions.push(pos as u32);
-                let block_idx = pos / seed.block_size;
-                let offset = pos % seed.block_size;
+                let block_idx = pos / seed.block_size.get();
+                let offset = pos % seed.block_size.get();
                 let blocks = &seed.block_ids[i];
                 let slot = if block_idx < blocks.len() {
-                    (blocks[block_idx] as usize * seed.block_size + offset) as u32
+                    (blocks[block_idx] as usize * seed.block_size.get() + offset) as u32
                 } else {
                     u32::MAX
                 };
@@ -673,7 +673,7 @@ mod tests {
             tokens_before: vec![10, 0, 20],
             q_lens: vec![1, 4, 1],
             was_spec_decode: vec![false; 3],
-            block_size: 16,
+            block_size: scratchy_core_common::KvBlockTokens::new(16).expect("16 > 0"),
             async_lockstep_done: false,
             speculative_seeds: Vec::new(),
             speculative_chain_drafts: Vec::new(),

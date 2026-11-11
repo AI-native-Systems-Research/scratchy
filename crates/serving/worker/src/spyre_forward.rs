@@ -34,8 +34,11 @@ use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct SubmittedDecode {
     pub(crate) read: scratchy_target_spyre::superdsc_exec::DeferredRead,
-    /// The launch's row count — the seat's `rows` the submit half set.
-    pub(crate) rows: u32,
+    /// The launch's own typed width ([`SeatWidth`]) the submit half minted.
+    pub(crate) rows: SeatWidth,
+    /// The idx stick's own row size in i32 words — the seat's typed readback
+    /// fact, so the collect half decodes at the placement's own width.
+    pub(crate) idx_row_words: u32,
     pub(crate) result_id: u32,
     pub(crate) vocab: usize,
 }
@@ -102,7 +105,7 @@ impl LaunchRows<'_> {
     /// The live rows — a sequence's real tokens, or a batch's sequences.
     fn live(&self) -> usize {
         match self {
-            LaunchRows::Sequence { rows, .. } => rows.real,
+            LaunchRows::Sequence { rows, .. } => rows.real.get(),
             LaunchRows::Batch { seqs } => seqs.len(),
         }
     }
@@ -120,7 +123,7 @@ impl LaunchRows<'_> {
     /// The live row a bound row `r` takes its token from.
     fn live_of(&self, r: usize) -> usize {
         match self {
-            LaunchRows::Sequence { rows, .. } => r.min(rows.real.max(1) - 1),
+            LaunchRows::Sequence { rows, .. } => r.min(rows.real.get() - 1),
             LaunchRows::Batch { seqs } => {
                 if r < seqs.len() {
                     r
@@ -129,6 +132,38 @@ impl LaunchRows<'_> {
                 }
             }
         }
+    }
+}
+
+/// ⭐ THE SEAT'S LAUNCH WIDTH — the typed row count a launch binds and reads
+/// the per-step seat at. `b` is the one-request decode's meta borrowed for
+/// its tensor ids, so its seat states `rows = 1`; a batched launch at `mq`
+/// rows binds and reads `mq` rows of the per-step seat, and a prompt keeps
+/// the prefill rung's own row count verbatim (its draw is the FOLDED single
+/// row). Minted by ONE fn ([`SeatWidth::of_launch`]) from the seat and the
+/// launch's own rows, so no call site spells a number — the width a
+/// batching launch takes is this type's value, never a field overwritten on
+/// a copy of the seat.
+#[cfg(feature = "spyre-hw")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SeatWidth(usize);
+
+#[cfg(feature = "spyre-hw")]
+impl SeatWidth {
+    /// The ONE mint — the launch's own row count over the seat.
+    fn of_launch(
+        seat: &scratchy_target_spyre::wiring::SampleSeat,
+        rows_in: &LaunchRows<'_>,
+        mq: usize,
+    ) -> Self {
+        Self(match rows_in {
+            LaunchRows::Batch { .. } => mq,
+            _ => seat.rows as usize,
+        })
+    }
+
+    fn get(self) -> usize {
+        self.0
     }
 }
 
@@ -213,7 +248,15 @@ pub(crate) fn run_card_launch(
         })?;
     let card = match &rows_in {
         LaunchRows::Sequence { blocks, rows } => {
-            scratchy_target_spyre::paged_step::card_step_sources(&step, blocks, rows)
+            // One request's list: a sequence launch is one request today — the packing that
+            // widens this list is the concurrent-prefill rung's own step, not this front's.
+            scratchy_target_spyre::paged_step::card_step_sources(
+                &step,
+                &[scratchy_target_spyre::paged_step::RequestStep {
+                    blocks,
+                    rows: *rows,
+                }],
+            )
         }
         LaunchRows::Batch { seqs } => {
             scratchy_target_spyre::paged_step::card_batch_sources(&step, seqs)
@@ -252,12 +295,14 @@ pub(crate) fn run_card_launch(
         }
     }
     let positions: Vec<u32> = (0..mq).map(|r| rows_in.pos(r) as u32).collect();
-    // The stick-padded row count the constants' tables are laid at (`mq.div_ceil(64)*64`, the
-    // emitter's own pad).
-    let mq_pad = mq.div_ceil(64) * 64;
-    if h % 64 != 0 {
+    // The stick-padded row count the constants' tables are laid at — whole
+    // fp16 sticks, the pool's own `POOL_STICK` (the emitter's own pad law),
+    // never a literal 64.
+    let stick = scratchy_subtile::sdsc_abstract::POOL_STICK as usize;
+    let mq_pad = mq.div_ceil(stick) * stick;
+    if h % stick != 0 {
         return Err(werr(format!(
-            "card launch: hidden={h} is not a whole number of 64-element sticks"
+            "card launch: hidden={h} is not a whole number of {stick}-element sticks"
         )));
     }
     let launch_rows = scratchy_target_spyre::wiring::StagedRows::of_launch(mq)
@@ -301,6 +346,7 @@ pub(crate) fn run_card_launch(
         staged: None,
         acts: Vec::with_capacity(fsteps.len()),
         acts_i32: Vec::new(),
+        seeds: Vec::new(),
         card_owned_sticks: Vec::new(),
         launched: false,
     };
@@ -320,35 +366,31 @@ pub(crate) fn run_card_launch(
     }
     let acts = launcher.acts;
     let mut acts_i32 = launcher.acts_i32;
+    let seeds = launcher.seeds;
     // ⭐ EVERY LAUNCH OF A BUNDLE THAT MINTS THE DRAW BINDS ITS SAMPLER SEAT, every row of it,
     // before anything runs — a MIDDLE prompt chunk included. Its suffix is skipped, but the
     // seat's five sources are placed in this bundle all the same, and the launch's completeness
     // check (`require_sources_filled`) refuses a placed source nobody wrote. The laws a middle
     // chunk stages are this request's own, so nothing is invented.
-    let decodes = matches!(want_logits, LogitsWanted::PerRequestDeferred);
-    let suffix_runs = decodes || matches!(want_logits, LogitsWanted::LastRow);
-    if suffix_runs && b.wiring.sample_seat.is_none() {
-        return Err(werr(format!(
-            "bundle has no sampler seat (result t{}) — a launch whose suffix runs cannot \
-             pick without the minted draw",
-            b.result_id
-        )));
-    }
-    if let Some(seat) = b.wiring.sample_seat.as_ref() {
-        // ⭐ A DECODE BATCH'S SEAT IS THE RUNG'S OWN WIDTH. `b` is the one-request decode's meta
-        // borrowed for its tensor ids, so its seat states `rows = 1` — a launch at `mq` rows binds
-        // and reads `mq` rows of the per-step seat. A prompt-final chunk keeps the prefill rung's
-        // own seat verbatim: its draw is the FOLDED single row.
-        let mut seat = *seat;
-        if matches!(rows_in, LaunchRows::Batch { .. }) {
-            seat.rows = mq as u32;
-        }
-        let seat_rows = seat.rows as usize;
+    //
+    // ⭐ THE LAUNCH'S SEAT AND WIDTH, BOUND ONCE: the width is [`SeatWidth`]'s
+    // ONE mint for the whole launch — the staging block and both pick arms
+    // below read this one value, never a second mint — and the seat rides
+    // beside it so the pick match binds the pair as its own, never a second
+    // Option walk of the wiring.
+    let seat_launch = b
+        .wiring
+        .sample_seat
+        .as_ref()
+        .map(|seat| (seat, SeatWidth::of_launch(seat, &rows_in, mq)));
+    // (the pair is `Copy` — a reference and a `Copy` width — so this binding
+    // copies it and the pick match below binds its own copy of the same one)
+    if let Some((seat, seat_width)) = seat_launch {
         let laws: Vec<RowLaw<'_>> = match seat_laws {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
             // draw the last real row would).
-            SeatLaws::Prompt { draw } => (0..seat_rows)
+            SeatLaws::Prompt { draw } => (0..seat_width.get())
                 .map(|r| RowLaw {
                     draw,
                     step: rows_in.pos(r) as u32,
@@ -358,10 +400,10 @@ pub(crate) fn run_card_launch(
             // runs live 0's ([`pad_law_of`]).
             SeatLaws::Batch { draws } => {
                 let live_pos: Vec<u32> = (0..live).map(|s| rows_in.pos(s) as u32).collect();
-                batch_seat_laws(draws, &live_pos, seat_rows)?
+                batch_seat_laws(draws, &live_pos, seat_width.get())?
             }
         };
-        acts_i32.extend(sample_binds(&seat, &laws)?);
+        acts_i32.extend(sample_binds(seat, seat_width, &laws)?);
     }
     if flags().phase_time {
         let elems: usize = acts.iter().map(|(_, v)| v.len()).sum();
@@ -374,12 +416,17 @@ pub(crate) fn run_card_launch(
         );
     }
     log_binds(&format!("launch mq={mq} at={seq_pos}"), b.wiring, &acts);
-    let picked = match want_logits {
+    // ⭐ THE SEAT IS THE PICK'S OWN MATCH — every suffix arm takes the
+    // launch's own (seat, width) pair as the match's binding, never a second
+    // Option and never an unwrap over a guard established lines earlier: a
+    // launch whose suffix runs and whose bundle mints no draw is refused AT
+    // THE ARM, before anything stages.
+    let picked = match (want_logits, seat_launch) {
         // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read, return. The
         // minted sampler consumes the `[rows, vocab]` result on the card and leaves the idx stick in
         // its place; this arm defers the ONE raw D2H of that stick — never a logits read, never a
         // host argmax — and the caller collects it through `collect_decode_tokens`.
-        LogitsWanted::PerRequestDeferred => {
+        (LogitsWanted::PerRequestDeferred, Some((seat, seat_width))) => {
             // ⭐ #32 (E) — THE OVERLAP PROBE'S ASK: had the PREVIOUS step's stick read already
             // landed? NOT-yet-landed is "card busy at submit".
             let card_busy_at_submit = PRIOR_READ
@@ -388,11 +435,12 @@ pub(crate) fn run_card_launch(
                 .as_ref()
                 .is_some_and(|s| !s.fired());
             let t_bind = std::time::Instant::now();
-            pf.stage_step_acts(&acts, &[], &acts_i32).map_err(|e| {
-                werr(format!(
-                    "superdsc decode stage (mq={mq}, at={seq_pos}): {e}"
-                ))
-            })?;
+            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc decode stage (mq={mq}, at={seq_pos}): {e}"
+                    ))
+                })?;
             let t_submit = std::time::Instant::now();
             pf.submit_step(mq, seq_pos).map_err(|e| {
                 werr(format!(
@@ -401,10 +449,13 @@ pub(crate) fn run_card_launch(
             })?;
             let depth = OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let t_defer = std::time::Instant::now();
+            // The readback's own byte size — the seat's typed fact (the idx
+            // stick's placed row, minted once at the bake), never a
+            // recomputed `mq · 64 · 4`, at the launch's one typed width.
             let read = pf
                 .defer_read_tensor_ring(
                     scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
-                    mq * 64 * 4,
+                    seat_width.get() * seat.idx_row_words as usize * 4,
                 )
                 .map_err(|e| {
                     werr(format!(
@@ -424,14 +475,28 @@ pub(crate) fn run_card_launch(
             });
             return Ok(BatchOut::Deferred(SubmittedDecode {
                 read,
-                rows: mq as u32,
+                rows: seat_width,
+                // The collect half's own typed readback fact — the idx
+                // stick's row size, carried beside the launch's typed width
+                // so the decode law never re-derives it.
+                idx_row_words: seat.idx_row_words,
                 result_id: b.result_id as u32,
                 vocab,
             }));
         }
+        // A deferred decode whose bundle mints no draw — refused at the arm,
+        // before anything stages (the match's own binding, no second Option).
+        (LogitsWanted::PerRequestDeferred, None) => {
+            return Err(werr(format!(
+                "bundle has no sampler seat (result t{}) — a deferred decode cannot pick \
+                 without the minted draw",
+                b.result_id
+            )));
+        }
         // A middle prompt chunk: no suffix runs and nothing is read back.
-        LogitsWanted::None => {
-            pf.run_step_i32(mq, seq_pos, &acts, &[], &acts_i32, StepLogits::Discarded)
+        (LogitsWanted::None, _) => {
+            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
@@ -442,19 +507,18 @@ pub(crate) fn run_card_launch(
         // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
         // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
         // stick comes back raw, exactly like a decode's.
-        LogitsWanted::LastRow => {
-            pf.run_step_i32(mq, seq_pos, &acts, &[], &acts_i32, StepLogits::LeftOnDevice)
+        (LogitsWanted::LastRow, Some((seat, seat_width))) => {
+            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
                     ))
                 })?;
-            let seat = b
-                .wiring
-                .sample_seat
-                .as_ref()
-                .ok_or_else(|| werr("prefill bundle has no sampler seat".to_string()))?;
-            let picked = read_sampled_tokens(pf, seat, b.result_id as u32, vocab)?;
+            // The prompt-final width is the launch's one typed width — the
+            // mint's verbatim prompt case, the same value the staging block
+            // bound the seat's rows at.
+            let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
             log_seat_readback(
                 pf,
                 seat,
@@ -463,6 +527,14 @@ pub(crate) fn run_card_launch(
                 &format!("prefill-final mq={mq} at={seq_pos}"),
             );
             Some(picked)
+        }
+        // A prompt-final pick whose bundle mints no draw — refused at the arm.
+        (LogitsWanted::LastRow, None) => {
+            return Err(werr(format!(
+                "bundle has no sampler seat (result t{}) — a prompt-final pick cannot run \
+                 without the minted draw",
+                b.result_id
+            )));
         }
     };
     Ok(BatchOut::Done(picked))
@@ -527,6 +599,12 @@ pub(crate) struct ForwardLauncher<'a> {
     /// from [`Self::acts`] because they need a DIFFERENT shadow write: a value is re-encoded to the
     /// card's fp16 (`ieee_to_sen_bytes`), an index must be copied verbatim.
     pub(crate) acts_i32: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>,
+    /// ⭐ THE CHAIN'S SEEDS — per rank, so not in [`Self::acts_i32`]: every card of a sharded world
+    /// binds its own vocabulary block's words (`SuperDscSession::stage_step_acts_seeded`).
+    pub(crate) seeds: Vec<(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        scratchy_target_spyre::forward_tape::ChainSeed,
+    )>,
     /// ⭐⭐⭐ THE STICKS THIS LAUNCH HANDS TO THE CARD — filled by the ChainSeed skip below.
     /// An `OnCard` launch's sticks are the CARD'S: the previous step's ChainStage writes them,
     /// and the executor's persistent bind maps must let them go, or every later submit's
@@ -635,16 +713,11 @@ impl scratchy_subtile::host_tape::Launcher for ForwardLauncher<'_> {
             scratchy_target_spyre::forward_tape::Staged::I32(bytes) => {
                 self.acts_i32.push((tensor, bytes));
             }
-            // ⭐ THE CHAIN'S SEED — raw u32 lane values, LE words verbatim through
-            // the same raw-integer bind the index table rides (the staging door's
-            // law: LE bytes are the device encoding for raw integer words), never
-            // the IEEE→SEN convert an f16 arm would run.
-            scratchy_target_spyre::forward_tape::Staged::U32(v) => {
-                let mut bytes = Vec::with_capacity(v.len() * 4);
-                for w in v.iter() {
-                    bytes.extend_from_slice(&w.to_le_bytes());
-                }
-                self.acts_i32.push((tensor, bytes));
+            // ⭐ THE CHAIN'S SEED — per rank: the session builds each card's words from its own
+            // vocabulary block at the bind, raw u32 LE through the same raw-integer channel the
+            // index table rides, never the IEEE→SEN convert an f16 arm would run.
+            scratchy_target_spyre::forward_tape::Staged::ChainSeed(seed) => {
+                self.seeds.push((tensor, seed));
             }
         }
         Ok(())
@@ -743,9 +816,14 @@ fn token_of_idx_word(r: usize, w: i32, vocab: usize) -> ExecutorResult<u32> {
         ))
     })?;
     if t as usize >= vocab {
+        let why = if t == scratchy_subtile::subtile_ir::sample_sentinel(vocab as u32) {
+            "the sampler's all-NaN sentinel: the logits row was NaN in every lane"
+        } else {
+            "not the all-NaN sentinel either, so no answer the sampler gives"
+        };
         return Err(werr(format!(
-            "the token draw for row {r} is {t} >= vocab {vocab} — the sampler's sentinel, never \
-             a token"
+            "the token draw for row {r} is {t} >= vocab {vocab} — {why}. \
+             Refusing rather than serving a token that does not exist."
         )));
     }
     Ok(t)
@@ -855,9 +933,10 @@ pub(crate) enum SeatLaws<'a> {
 #[cfg(feature = "spyre-hw")]
 fn sample_binds(
     seat: &scratchy_target_spyre::wiring::SampleSeat,
+    width: SeatWidth,
     laws: &[RowLaw<'_>],
 ) -> ExecutorResult<Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>> {
-    let rows = seat.rows as usize;
+    let rows = width.get();
     if laws.len() != rows {
         return Err(werr(format!(
             "the sampler seat holds {rows} baked row(s) but {} law(s) were staged — one law per \
@@ -893,36 +972,18 @@ fn sample_binds(
     // ⭐ THE SEAT STAGES THROUGH THE ONE COL LAW — `stage_col_stick_heads`,
     // the same fn the bake's ten UNIFORM tables spread through
     // (`LoadConst::card_bytes`), so the seat's words and the uniform tables
-    // can never disagree about where a row's word lives. The stride is the
-    // placement's own reservation; `seed_row_words` is its word form, and a
-    // seat that disagrees with the derivation refuses here rather than stage
-    // a word at a stride nobody placed.
-    let stride_bytes =
-        scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
-    if seat.seed_row_words as usize * 4 != stride_bytes {
-        return Err(werr(format!(
-            "the sampler seat's seed_row_words is {} but the `[rows, 1]` reservation derives {} \
-             — the seat and the placement's own law disagree, refusing to stage the seed words",
-            seat.seed_row_words,
-            stride_bytes / 4
-        )));
-    }
+    // can never disagree about where a row's word lives. The strides are the
+    // SEAT'S OWN typed facts — `seed_row_words` and `gate_row_words`, minted
+    // once at the bake from the placement's own reservation laws — so the
+    // staging and the placement cannot drift by construction, never by a
+    // runtime comparison.
+    let stride_bytes = seat.seed_row_words as usize * 4;
     // ⭐⭐⭐ THE GATE ALONE STAGES THE β RESERVATION (front-b-noise, auditor
     // ruling 2026-10-27): its chain crosses the i32→f32 convert, so its table
     // reserves the convert's 64-element device sweep — `stage_gate_sweep`
     // writes the gate at row r's stick HEAD (the same byte the one-stick law
-    // ever stated) and zero-fills the sweep's second sticks. The same
-    // refusal-on-disagreement contract as `seed_row_words` above.
-    let gate_stride_bytes = scratchy_target_spyre::wiring::gate_row_stride_bytes();
-    if seat.gate_row_words as usize * 4 != gate_stride_bytes {
-        return Err(werr(format!(
-            "the sampler seat's gate_row_words is {} but the gate table's `[rows, 1]` device-sweep \
-             reservation derives {} — the seat and the placement's own law disagree, refusing to \
-             stage the gate",
-            seat.gate_row_words,
-            gate_stride_bytes / 4
-        )));
-    }
+    // ever stated) and zero-fills the sweep's second sticks.
+    let gate_stride_bytes = seat.gate_row_words as usize * 4;
     let mut binds = Vec::with_capacity(1 + seat.seed_words.len());
     for (k, &tid) in seat.seed_words.iter().enumerate() {
         let table = if k == 3 {
@@ -957,10 +1018,11 @@ fn sample_binds(
 /// lane 0 of a 64-lane padded row. Any word at or past `vocab` is the sampler's
 /// sentinel — refuse it, never sample it.
 ///
-/// ⭐ THE STICK IS SCATTERED, NOT ROW-MAJOR. A `[rows, 64]` SENUINT32 placement
-/// stores rows INTERLEAVED at the format's own 32-element stick — `dev_off_stk`
+/// ⭐ THE STICK IS SCATTERED, NOT ROW-MAJOR. A `[rows, W]` SENUINT32 placement
+/// (W the seat's minted `idx_row_words`) stores rows INTERLEAVED at the
+/// format's own 32-element stick — `dev_off_stk`
 /// with `SenUint32::ELEMS_PER_STICK` — so row r's lane 0 is word `r·32`, NOT
-/// `r·64`: measured on the card (probe, 2-row rung: each 64-word physical block
+/// `r·W`: measured on the card (probe, 2-row rung: each 64-word physical block
 /// held `32×row0's idx` then `32×row1's idx`, both blocks identical), where the
 /// row-major stride handed EVERY row row 0's pick. At `rows = 1` the scattered
 /// offset is 0 and the solo readback is byte-identical.
@@ -968,17 +1030,17 @@ fn sample_binds(
 fn read_sampled_tokens(
     session: &mut SuperDscSession,
     seat: &scratchy_target_spyre::wiring::SampleSeat,
+    width: SeatWidth,
     result_id: u32,
     vocab: usize,
 ) -> ExecutorResult<Vec<u32>> {
-    let rows = seat.rows as usize;
     let bytes = session
         .read_tensor_raw(
             scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
-            rows * 64 * 4,
+            width.get() * seat.idx_row_words as usize * 4,
         )
         .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
-    decode_idx_stick(&bytes, rows, vocab)
+    decode_idx_stick(&bytes, width.get(), seat.idx_row_words as usize, vocab)
 }
 
 /// ⭐ #32 (c3) — THE COLLECT HALF of a submitted decode step: park on the idx
@@ -1002,7 +1064,12 @@ pub(crate) fn collect_decode_tokens(
         .finish_deferred_read_raw(&sub.read)
         .map_err(|e| werr(format!("sampler idx readback (t{}): {e}", sub.result_id)))?;
     let t_pick = std::time::Instant::now();
-    let toks = decode_idx_stick(&bytes, sub.rows as usize, sub.vocab);
+    let toks = decode_idx_stick(
+        &bytes,
+        sub.rows.get(),
+        sub.idx_row_words as usize,
+        sub.vocab,
+    );
     OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     let toks = toks?;
     crate::step_segs::record_collect(crate::step_segs::CollectSegs {
@@ -1013,9 +1080,21 @@ pub(crate) fn collect_decode_tokens(
 }
 
 /// The idx stick's own decode law, shared by the sync readback and the deferred
-/// collect so the two cannot drift.
-#[cfg(feature = "spyre-hw")]
-fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<Vec<u32>> {
+/// collect so the two cannot drift. `idx_row_words` is the seat's own typed fact
+/// — the stick's placed row size — so both the addressing width and (at the
+/// caller) the readback byte size are the placement's own law, never a literal.
+/// A word at or past the vocab is refused: the sampler answers an all-NaN logits
+/// row with `sample_sentinel` (#666), and the card's draw is the only pick, so
+/// every path refuses that row alike.
+// The `test` arm makes the fn exist under `spyre-emu`, which has no `spyre-hw`;
+// CI runs `idx_stick_tests` in that shape (the spyre-triton job).
+#[cfg(any(test, feature = "spyre-hw"))]
+fn decode_idx_stick(
+    bytes: &[u8],
+    rows: usize,
+    idx_row_words: usize,
+    vocab: usize,
+) -> ExecutorResult<Vec<u32>> {
     let words: Vec<i32> = bytes
         .as_chunks::<4>()
         .0
@@ -1028,7 +1107,12 @@ fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<V
         as usize;
     (0..rows)
         .map(|r| {
-            let off = scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, 64], 1, &[r, 0], stk);
+            let off = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                &[rows, idx_row_words],
+                1,
+                &[r, 0],
+                stk,
+            );
             token_of_idx_word(r, words.get(off).copied().unwrap_or(-1), vocab)
         })
         .collect()
@@ -1121,9 +1205,15 @@ fn log_seat_readback(
             }
         }
     }
-    let invt: Vec<f32> = match le_words(session, seat.invt, rows * 32) {
+    // The f32 stick width — the launch's readback stride for the seat's f32 word
+    // tables (inv_t): each row's word at its stick head. Derived from the
+    // format's own stick (the ladder's one derivation), never spelled here.
+    const FP32_ELEMS_PER_STICK: usize =
+        <scratchy_subtile::superdsc_opspec::Fp32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
+    let invt: Vec<f32> = match le_words(session, seat.invt, rows * FP32_ELEMS_PER_STICK) {
         Ok(ws) => (0..rows)
-            .map(|r| ws.get(r * 32).copied().unwrap_or(0))
+            .map(|r| ws.get(r * FP32_ELEMS_PER_STICK).copied().unwrap_or(0))
             .map(|w| f32::from_bits(w as u32))
             .collect(),
         Err(e) => {
@@ -1132,6 +1222,14 @@ fn log_seat_readback(
         }
     };
     // The hash chain's uniform tables at row 0's and row 1's stick heads.
+    // The u32 stick width is the same readback stride for the seat's I32 word
+    // tables. The u32 and f32 sticks are both 32 lanes today, but they are TWO
+    // laws (one per format), each read from its own format — a stick widening
+    // that moved one and not the other must move its own reader, not both by
+    // accident of a shared literal.
+    const U32_ELEMS_PER_STICK: usize =
+        <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
     let mut hash = String::new();
     for (name, operand) in [("hc1", 10u8), ("hc2", 11), ("hc3", 12), ("c256", 13)] {
         match uniform(consts, operand) {
@@ -1144,11 +1242,14 @@ fn log_seat_readback(
                 // launch addresses actually holds the constant (a staged
                 // one-word stream leaves rows past 0 reading ZERO).
                 let trows = trows.max(rows);
-                match le_words(session, tid, trows * 32) {
+                match le_words(session, tid, trows * U32_ELEMS_PER_STICK) {
                     Ok(ws) => {
                         let w0 = ws.first().copied().unwrap_or(-1);
                         let r1 = if trows > 1 {
-                            format!("/r1=0x{:08X}", ws.get(32).copied().unwrap_or(-1))
+                            format!(
+                                "/r1=0x{:08X}",
+                                ws.get(U32_ELEMS_PER_STICK).copied().unwrap_or(-1)
+                            )
                         } else {
                             String::new()
                         };
@@ -1332,7 +1433,12 @@ pub(crate) fn superdsc_forward_chunk(
         let out = run_card_launch(
             LaunchRows::Sequence {
                 blocks: &blocks,
-                rows: StepRows { start: pos, real },
+                rows: StepRows::new(pos, real).ok_or_else(|| {
+                    werr(
+                        "superdsc prefill: a chunk of zero real rows — the chunker staged no chunk"
+                            .to_string(),
+                    )
+                })?,
             },
             sh,
             sess,
@@ -1582,9 +1688,12 @@ pub(crate) fn forward_chunk(
                 let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
                 let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
                 let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
-                let s_words = scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows);
+                // The emulator plays a world of one: the whole table.
+                let block = scratchy_subtile::subtile_ir::ChainBlock::whole(chain.block);
+                let s_words =
+                    scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows, block);
                 let l_words =
-                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows);
+                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows, block);
                 dynamic.push((
                     chain.s_src as u64,
                     s_words.iter().map(|&w| w as f32).collect(),
@@ -1639,7 +1748,11 @@ pub(crate) fn forward_chunk(
         let step = b
             .paged
             .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
-        let rows = scratchy_target_spyre::paged_step::StepRows { start, real: n };
+        let rows = scratchy_target_spyre::paged_step::StepRows::new(start, n).ok_or_else(|| {
+            werr(format!(
+                "request {id}: a decode step of zero rows — no token to run"
+            ))
+        })?;
         let srcs = scratchy_target_spyre::paged_step::request_sources(&step, &blocks, &rows)
             .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
         session
@@ -1658,7 +1771,7 @@ pub(crate) fn forward_chunk(
         // share one session, so every tensor is resident at the WIDEST program's row count: a
         // one-row decode step had its outputs decoded at the prefill's `m`. The result is the one
         // readback — `vocab` of the logits row, or, for a rung that draws (its result re-pointed at
-        // the idx stick, `[rows, 64]`), the whole stick (`0`).
+        // the idx stick, `[rows, W]` at the seat's minted width), the whole stick (`0`).
         let result_elems = if b.sample_seat.is_some() { 0 } else { vocab };
         let wanted: std::collections::HashMap<u64, usize> =
             std::iter::once((b.result_id as u64, result_elems)).collect();
@@ -1963,22 +2076,37 @@ pub(crate) fn run_request_step(
 mod pad_clamp_tests {
     use super::*;
 
-    /// A seat at `rows` baked rows whose strides agree with the placement's own
-    /// derivations (the staging's own refusal contract), so `sample_binds`
-    /// stages for real.
+    /// The seat the BAKE'S OWN MINT mints at `rows` baked rows — built the way
+    /// the expansion builds it (`mint_sample` over a one-request lm-head graph,
+    /// read back by `sample_seat_of_ir`), never spelled field by field, so the
+    /// staging this module pins runs against the real seat's own strides: the
+    /// seat cannot drift from the law because it IS the law's own output.
     fn seat_of(rows: u32) -> scratchy_target_spyre::wiring::SampleSeat {
-        scratchy_target_spyre::wiring::SampleSeat {
-            seed_words: [901, 902, 903, 904],
-            invt: 905,
-            rows,
-            row: 0,
-            vocab: 100,
-            pad_vocab: 128,
-            seed_row_words: (scratchy_target_spyre::wiring::col_row_stride_bytes(
-                scratchy_tensors::DType::I32,
-            ) / 4) as u32,
-            gate_row_words: (scratchy_target_spyre::wiring::gate_row_stride_bytes() / 4) as u32,
-        }
+        use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
+        use scratchy_subtile::subtile_ir::{
+            SampleRows, SourceShape, SubOp, lower_region, mint_sample,
+        };
+        // K=1, vocab 5 — the one-request lm-head shape the mint admits, the
+        // same fixture the spyre crate's own mint tests pin.
+        let input = LoweringInput {
+            exported: None,
+            sources: vec![SourceShape { rows, cols: 1 }, SourceShape { rows, cols: 5 }],
+            ops: vec![OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 5,
+                    weight: GemmWeight::Dense,
+                },
+                m: rows,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+            result: 0,
+        };
+        let nz = std::num::NonZeroU32::new(64).expect("64 is a whole stick");
+        let mut minted = lower_region(&input, nz);
+        mint_sample(&mut minted, SampleRows::All);
+        scratchy_target_spyre::lower_subtile_tape_to_ktir::sample_seat_of_ir(&minted)
+            .expect("the minted graph's seat derives")
+            .expect("the mint appends exactly one Sample node")
     }
 
     /// Two live rows in a 4-row rung — slots 2 and 3 are padding — at positions 10 and 11.
@@ -1986,7 +2114,7 @@ mod pad_clamp_tests {
 
     /// Every staged bind's pad-row words equal row 0's — the four seed tables
     /// and inv_t alike. EVERY word sits at its row's STICK HEAD
-    /// (`col_row_stride_bytes`): the gate table's reservation is wider (the
+    /// (the seat's own `seed_row_words` stride): the gate table's reservation is wider (the
     /// i32→f32 convert's device sweep, two sticks per row) but the sweep's
     /// second sticks are the reservation's own zero tail — the word the
     /// kernel reads is still the head, at the same stride as every other
@@ -1996,9 +2124,21 @@ mod pad_clamp_tests {
         laws: &[RowLaw<'_>],
         ctx: &str,
     ) {
-        let binds = sample_binds(seat, laws).expect("the seat stages");
-        let head_stride =
-            scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
+        // The width comes through the REAL DOOR — `of_launch` over a real
+        // `LaunchRows` (a sequence of four real rows at positions 10..13, the
+        // TWO_OF_FOUR rung's own shape), never a spelled number: the staging
+        // this pin checks is the same mint every launch reads.
+        let rows_in = LaunchRows::Sequence {
+            blocks: &[],
+            rows: scratchy_target_spyre::paged_step::StepRows { start: 10, real: 4 },
+        };
+        let binds = sample_binds(
+            seat,
+            SeatWidth::of_launch(seat, &rows_in, seat.rows as usize),
+            laws,
+        )
+        .expect("the seat stages");
+        let head_stride = seat.seed_row_words as usize * 4;
         assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
         for (tid, bytes) in &binds {
             for r in [2usize, 3] {
@@ -2100,6 +2240,7 @@ mod pad_clamp_tests {
             k: 3,
             hidden: 2048,
             replaces: 7,
+            block: 65536,
         };
         let shape = ForwardShape {
             rows: 1,
@@ -2133,12 +2274,13 @@ mod pad_clamp_tests {
                 staged: None,
                 acts: Vec::new(),
                 acts_i32: Vec::new(),
+                seeds: Vec::new(),
                 card_owned_sticks: Vec::new(),
                 launched: false,
             };
             play(&HostTape { steps: &ftape }, &mut launcher).expect("the decode tape plays");
             assert!(launcher.launched, "the tape must reach its device step");
-            (launcher.card_owned_sticks, launcher.acts_i32)
+            (launcher.card_owned_sticks, launcher.seeds)
         };
 
         // OnCard: the two ChainSeed steps stage nothing and the skip names EXACTLY the
@@ -2168,6 +2310,82 @@ mod pad_clamp_tests {
             host_i32.len(),
             2,
             "the s and the l seed both stage through the raw channel"
+        );
+        // ⭐ EACH RANK'S SEED IS ITS OWN BLOCK'S. With the table cut into two 32768-column blocks,
+        // token 1318 is rank 0's: rank 0 seeds its slab and lane, rank 1 the sentinel's zero row.
+        type W2 = scratchy_target_spyre::bundle_code::collective::TpWorld<2>;
+        let (r0, r1) = (
+            scratchy_target_spyre::bundle_code::collective::Rank::<W2>::of::<0>(),
+            scratchy_target_spyre::bundle_code::collective::Rank::<W2>::of::<1>(),
+        );
+        let mut split = host_i32[1].1.clone();
+        split.chain.block = 32768;
+        let alone = host_i32[1].1.words::<W2>(None);
+        assert_eq!(
+            split.words(Some(r0)),
+            alone,
+            "the owner seeds the token's own ramp"
+        );
+        assert_eq!(
+            split.words(Some(r1)),
+            scratchy_subtile::subtile_ir::chain_l_sentinel_ramp(chain.hidden),
+            "a rank that does not hold the token seeds the zero row"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idx_stick_tests {
+    use super::decode_idx_stick;
+    use scratchy_subtile::subtile_ir::sample_sentinel;
+
+    /// The idx stick's placed row width in these fixtures.
+    const ROW_WORDS: usize = 64;
+
+    /// An idx stick as the card writes it: row r's pick in every one of its `ROW_WORDS`
+    /// lanes, each lane at its SenUint32 stick address (`dev_off_stk`), the layout the
+    /// readback reads.
+    fn stick(picks: &[u32]) -> Vec<u8> {
+        let rows = picks.len();
+        let stk = <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
+        let mut words = vec![0i32; rows * ROW_WORDS];
+        for (r, &p) in picks.iter().enumerate() {
+            for c in 0..ROW_WORDS {
+                let off = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                    &[rows, ROW_WORDS],
+                    1,
+                    &[r, c],
+                    stk,
+                );
+                words[off] = p as i32;
+            }
+        }
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// The readback passes real picks and refuses the sampler's all-NaN sentinel (#666), at
+    /// granite's vocab, solo and on a batched row; any other word past the vocab refuses too.
+    #[test]
+    fn the_readback_refuses_the_all_nan_sentinel_and_passes_a_real_pick() {
+        let vocab = 49155u32;
+        let v = vocab as usize;
+        assert_eq!(
+            decode_idx_stick(&stick(&[12358, 0]), 2, ROW_WORDS, v).expect("two real picks"),
+            vec![12358, 0]
+        );
+        for picks in [
+            vec![sample_sentinel(vocab)],
+            vec![12358, sample_sentinel(vocab)],
+        ] {
+            let err = decode_idx_stick(&stick(&picks), picks.len(), ROW_WORDS, v)
+                .expect_err("the sentinel is never a token");
+            assert!(err.to_string().contains("all-NaN sentinel:"), "{err}");
+        }
+        let err = decode_idx_stick(&stick(&[vocab]), 1, ROW_WORDS, v).expect_err("past the vocab");
+        assert!(
+            err.to_string().contains("not the all-NaN sentinel"),
+            "{err}"
         );
     }
 }

@@ -14,10 +14,7 @@
 use crate::superdsc_exec::{
     DeferredRead, Executor, KvDim, Logits, LogitsRead, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
 };
-use anyhow::{Result, anyhow, bail};
-use scratchy_subtile::sdsc_abstract::{
-    FoldPages, FoldRowRegime, FoldWalker, MaskBlocks, PrefixMaskShape,
-};
+use anyhow::{Result, anyhow};
 use scratchy_tensors::DType as SDType;
 use tracing::debug;
 
@@ -60,69 +57,11 @@ fn f16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// ⛔ GUARD (env precondition): the deeptools host functions the executor calls open their hardware
-/// arch config at `${DEEPTOOLS_PATH}/perfdsc/HardwareArchMapping/…`. When `DEEPTOOLS_PATH` is unset
-/// the SDK composes a broken relative `..` path and aborts deep inside with
-/// `DtException: Unable to open arch config` (observed on dd2 when the var was not exported).
-/// Convert that cryptic abort into an early, actionable error.
-///
-/// This is an *environment* precondition, so it cannot be a build-time guard — the runtime env is
-/// unknown at `cargo build`. Validate only (no env mutation): the SDK env block is supplied
-/// externally, exactly like `LD_LIBRARY_PATH` / `FLEX_COMPUTE`.
-fn ensure_deeptools_arch_config() -> Result<()> {
-    let root = std::env::var_os("DEEPTOOLS_PATH").filter(|v| !v.is_empty());
-    let Some(root) = root else {
-        bail!(
-            "DEEPTOOLS_PATH is not set — the deeptools host functions need it to locate the arch \
-             config (${{DEEPTOOLS_PATH}}/perfdsc/HardwareArchMapping/…). Set it to the SDK 'share' \
-             dir, e.g. DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share."
-        );
-    };
-    let arch_dir = std::path::Path::new(&root)
-        .join("perfdsc")
-        .join("HardwareArchMapping");
-    if !arch_dir.is_dir() {
-        bail!(
-            "DEEPTOOLS_PATH={} but the arch config dir {} does not exist — point DEEPTOOLS_PATH at \
-             the SDK 'share' dir (e.g. /opt/ibm/spyre/deeptools/share).",
-            std::path::Path::new(&root).display(),
-            arch_dir.display()
-        );
-    }
-    Ok(())
-}
-
-/// The prefix mask's per-fold-pass BYTE stride, minted only from the mask's own declared shape —
-/// never a loose integer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MaskRepStride(u64);
-
-impl MaskRepStride {
-    /// One block of `shape`, in f16 bytes — the only constructor.
-    pub const fn of<const STICK: u32, const COLS: u32>(
-        shape: PrefixMaskShape<STICK, COLS>,
-    ) -> MaskRepStride {
-        MaskRepStride(shape.rep_stride_bytes())
-    }
-}
-
-/// The per-request row-block stride in the INTERMEDIATE segment, minted only from the bundle's own
-/// declared [`FoldRowRegime`] — a whole-batch bundle's 0 arrives by derivation, not by choice.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct IntRepStride(u64);
-
-impl IntRepStride {
-    /// The regime's stride across one request's `nqh` head rows — the only constructor.
-    pub const fn of(regime: FoldRowRegime, nqh: u32) -> IntRepStride {
-        IntRepStride(regime.int_rep_stride_bytes(nqh))
-    }
-}
-
 /// A resident SUPERDSC session: the dxp-compiled bundle loaded from its AoT cache directory and run
 /// through the flex runtime. Weights pack into resident device segments and the KV grows in a
 /// resident pool; `run_step` appends `n_new` NEW positions at `[seq_pos..seq_pos+n_new)` and returns
 /// the last new position's logits.
-pub struct SuperDscSession<T: ktir_superdsc::collective::Tp> {
+pub struct SuperDscSession<'c, T: ktir_superdsc::collective::Tp> {
     /// ⭐ ONE EXECUTOR PER CARD THE FORWARD SPANS, in rank order — one for a world of one, `W` for a
     /// sharded world's ranks, all driven by THIS session in one process. Every step is submitted on
     /// every card before any card is waited on (a rank's collective waits on its peers' sends, so a
@@ -130,14 +69,12 @@ pub struct SuperDscSession<T: ktir_superdsc::collective::Tp> {
     /// host-staged input is staged on every card (the forward is SPMD: each rank stages the same
     /// activations, its weights are its own shard). The token comes back from rank 0's suffix — the
     /// ranks' replicated values are bit-identical, the canonical reduction order's promise.
-    ranks: PerRank<T, Executor<T>>,
+    ///
+    /// Rank `r`'s executor BORROWS card `r` for `'c`: the cards are opened once, by their owner,
+    /// and the compiler checks that no session outlives them.
+    ranks: PerRank<T, Executor<'c, T>>,
     /// Logits column count.
     pub vocab: usize,
-    /// Resident capacity in slots (= the longest context THIS request can hold).
-    pub cap: usize,
-    /// PAGED: pages in the SHARED pool, and positions per page (0 ⇒ not paged).
-    pub pool_pages: usize,
-    pub page_slots: usize,
     /// One resident K/V row width (= kv_heads·head_dim).
     pub kv_dim: usize,
     /// ⛔ THE BROADCAST PREFIX MASK'S EXTENT, from the bundle's own placement — see
@@ -145,10 +82,6 @@ pub struct SuperDscSession<T: ktir_superdsc::collective::Tp> {
     /// read back at), and using it for the mask is what over-bound the mask by 4x on every prompt.
     /// `None` ⇒ the bundle placed no broadcast mask, and staging one must be REFUSED, not guessed.
     pub pmask_slots: Option<usize>,
-    /// Whether this bundle's ops read KV through the PAGED pool — see [`Executor::is_paged`]. Load-time
-    /// callers pair it with [`Self::pmask_slots`]: unpaged, the attention sweeps the whole `cap`, so a
-    /// `cap` past the mask's placement is unservable and must be refused rather than staged either way.
-    pub paged: bool,
 }
 
 /// One card's resident weights, `(source id, device bytes, dtype, shape)` each.
@@ -172,7 +105,7 @@ struct Staged<'a, T: ktir_superdsc::collective::Tp> {
     pool_statics: &'a [(u32, Vec<u8>)],
 }
 
-impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
+impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
     /// weights and KV pool).
     ///
@@ -196,7 +129,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// ([`crate::paged_step::card_statics`]) — staged VERBATIM once here by the session whose
     /// bundles read them (the one-request decode's).
     pub fn new(
-        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
         code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         weights: RankWeights<T>,
@@ -228,7 +161,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// The CB parity gate also waits for that alias: it cannot render through a placeholder,
     /// so it runs at the [`alias_seg_from`](Self::alias_seg_from) that completes the borrowed set.
     pub fn new_borrowing(
-        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
         code: &'static crate::bundle_code::BundleCode<'static, T>,
         vocab: usize,
         kv_dim: usize,
@@ -259,7 +192,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// tables sit. Each rung stages its own copy — a few MB against the rung's programs, once
     /// at load — through the same load-time channel the owner uses.
     pub fn new_borrowing_with_consts(
-        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
         code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         borrowed: &[i64],
@@ -301,7 +234,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// sampler's nine tables in EVERY prefill rung too, and they sit in the session's own seg3
     /// (never aliased), so the anchor stages its own copy exactly as a borrowing rung does.
     pub fn new_reserving(
-        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
         code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         load_consts: &[(u32, crate::wiring::LoadConst)],
@@ -324,7 +257,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     }
 
     fn new_inner(
-        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        cards: &'c PerRank<T, crate::runtime::CardRuntime<T>>,
         code: &'static crate::bundle_code::BundleCode<'static, T>,
         dims: SessionDims,
         staged: Staged<'_, T>,
@@ -347,17 +280,16 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
             load_consts,
             pool_statics,
         } = staged;
-        ensure_deeptools_arch_config()?;
         // The owner binds rank r's weight set on card r; a borrower binds none on any.
         let mut weights: PerRank<T, CardWeights> = match weights {
             Some(w) => w,
             None => PerRank::from_fn(|_| CardWeights::new()),
         };
-        let ranks: PerRank<T, Executor<T>> = PerRank::try_from_fn(|r| -> Result<Executor<T>> {
+        let ranks: PerRank<T, Executor<'c, T>> = PerRank::try_from_fn(|r| -> Result<_> {
             let card = cards.get(r);
             let card_weights: CardWeights = std::mem::take(weights.get_mut(r));
             let mut exec = Executor::load(
-                card.clone(),
+                card,
                 code,
                 Vocab(vocab),
                 KvDim(kv_dim),
@@ -445,12 +377,8 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         let exec = ranks.first();
         Ok(Self {
             vocab: exec.vocab.0,
-            cap: exec.cap() as usize,
-            pool_pages: exec.pool_pages().0 as usize,
-            page_slots: exec.page_slots().0 as usize,
             kv_dim: exec.kv_dim.0,
             pmask_slots: exec.pmask_slots(),
-            paged: exec.is_paged(),
             ranks,
         })
     }
@@ -459,13 +387,13 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// reads (the picked token, the logits row) is replicated across the ranks — the forward ends in
     /// the whole hidden state on every rank, so each rank's suffix computes the same row — so one
     /// rank answers for all.
-    fn lead(&mut self) -> &mut Executor<T> {
+    fn lead(&mut self) -> &mut Executor<'c, T> {
         self.ranks.first_mut()
     }
 
     /// Apply `f` on EVERY card, rank order, stopping at the first refusal (named by its rank in a
     /// sharded world).
-    fn each<R>(&mut self, mut f: impl FnMut(&mut Executor<T>) -> Result<R>) -> Result<Vec<R>> {
+    fn each<R>(&mut self, mut f: impl FnMut(&mut Executor<'c, T>) -> Result<R>) -> Result<Vec<R>> {
         use ktir_superdsc::collective::World;
         self.ranks
             .iter_mut()
@@ -486,9 +414,12 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     /// independent, and run serially the last card starts a whole `W - 1` submits after the first,
     /// stalling every collective that waits on it (measured at tp/8: ~2.2 ms a rank, the eighth
     /// card's doorbell 18 ms into the step). A world of one runs on the caller's thread.
+    ///
+    /// Each rank's thread runs on its card's NUMA node (`CardRuntime::cpus`) before it touches the
+    /// card: its doorbell and its host writes stay on the card's socket.
     fn each_parallel<R: Send>(
         &mut self,
-        f: impl Fn(&mut Executor<T>) -> Result<R> + Sync,
+        f: impl Fn(&mut Executor<'c, T>) -> Result<R> + Sync,
     ) -> Result<Vec<R>> {
         use ktir_superdsc::collective::World;
         if !<T as World>::SHARDED {
@@ -496,114 +427,31 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         }
         let f = &f;
         std::thread::scope(|scope| {
-            let handles: Vec<_> = self
+            let handles = self
                 .ranks
                 .iter_mut()
                 .map(|(r, e)| {
-                    scope
-                        .spawn(move || f(e).map_err(|err| err.context(format!("rank {}", r.get()))))
+                    // Named `SubmitR<rank>`, so the thread's placement can be read per rank.
+                    std::thread::Builder::new()
+                        .name(format!("SubmitR{}", r.get()))
+                        .spawn_scoped(scope, move || {
+                            let pinned = e
+                                .card_cpus()
+                                .pin_current_thread()
+                                .map_err(anyhow::Error::from);
+                            pinned
+                                .and_then(|()| f(e))
+                                .map_err(|err| err.context(format!("rank {}", r.get())))
+                        })
+                        .map_err(|err| anyhow!("rank {}: spawn its submit thread: {err}", r.get()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             handles
                 .into_iter()
                 .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         })
     }
-
-    /// Whether this bundle's resident cache is PAGED.
-    pub fn is_paged(&self) -> bool {
-        self.page_slots > 0
-    }
-
-    /// Positions a request can hold given the `pages` it was assigned.
-    pub fn context_for_pages(&self, pages: usize) -> usize {
-        pages * self.page_slots
-    }
-
-    /// Declare how many BLOCKS the staged prefix mask has, so the fold can refuse a pass that would
-    /// read past it. Takes [`MaskBlocks`], whose only mint is `MaskBlocks::of(MaskPassGrid)` — the
-    /// count the fold will walk, never a loose integer.
-    ///
-    /// PRIVATE, with [`FoldWalker::declare_fold`] as the public door: this number and the page count
-    /// below are one decision, and a caller able to send half of it can block the mask by a geometry
-    /// the fold does not walk.
-    fn set_mask_blocks(&mut self, blocks: MaskBlocks) -> Result<()> {
-        let b = blocks.get() as u64;
-        for e in self.ranks.values_mut() {
-            e.set_mask_blocks(b);
-        }
-        Ok(())
-    }
-
-    /// Declare the host's [`FoldPages`] — the page count the fold must walk, derived ONCE from the
-    /// batch's `BatchSlot`. The executor derives the same number itself; declaring it makes a
-    /// divergence a refusal rather than a silently wrong fold.
-    ///
-    /// PRIVATE for the same reason as [`Self::set_mask_blocks`]: see [`FoldWalker::declare_fold`].
-    fn set_fold_pages(&mut self, pages: FoldPages) -> Result<()> {
-        let p = pages.get().get() as u64;
-        for e in self.ranks.values_mut() {
-            e.set_fold_pages(p);
-        }
-        Ok(())
-    }
-
-    /// Declare the prefix mask's per-fold-pass stride. A batched decode's mask is one
-    /// `[nqh*mq, page]` block per (request, page) pass; only the worker, which stages it, knows how
-    /// deep a block is.
-    pub fn set_mask_stride(&mut self, stride: MaskRepStride) -> Result<()> {
-        for e in self.ranks.values_mut() {
-            e.set_mask_stride(stride.0);
-        }
-        Ok(())
-    }
-
-    /// Declare the per-request row-block stride in the intermediate segment.
-    pub fn set_int_stride(&mut self, stride: IntRepStride) -> Result<()> {
-        for e in self.ranks.values_mut() {
-            e.set_int_stride(stride.0);
-        }
-        Ok(())
-    }
-
-    /// ⭐⭐⭐⭐⭐ THE GATHER'S ENTRY UNIT — how many index entries one PHYSICAL PAGE spans, i.e. the factor
-    /// that turns a block-table page number into the index value the card reads.
-    ///
-    /// ⛔ NOT A CONSTANT, AND NOT `4096`. An index entry advances one `skip_addr`, which the emitter
-    /// declares as ONE STICK BLOCK of the value operand (`PageExtent::of_one_stick()` on the slot axis)
-    /// — `hd * ELEMS_PER_STICK` elements, so 4096 at head_dim 64 and **8192 at head_dim 128**. A page
-    /// spans every LAYER (`page_stride_bytes = iters * kv_stride`), so the factor carries `iters` too and
-    /// is a property of this BUNDLE, not of the pool alone. Every doc comment in this tree that says
-    /// "global 4096-element block" is implicitly hd=64.
-    ///
-    /// ⛔ DERIVED FROM THE SESSION'S OWN `page_stride_bytes`, WHICH IS THE NUMBER `page_base_bytes`
-    /// MULTIPLIES. That is the whole point: the host's page address is `phys * page_stride_bytes` and the
-    /// card's is `idx * skip_addr + base`, so `idx = phys * (page_stride_bytes / skip_addr_bytes)` is an
-    /// identity between two quantities read off the same session — not two derivations that must be kept
-    /// in agreement. `zz_the_gather_index_reproduces_the_host_page_address` pins it.
-    ///
-    /// `None` when the bundle is unpaged, or when a page is not a whole number of entries — in which case
-    /// no integer index can name a page boundary and the caller must refuse rather than round.
-    ///
-    /// The arithmetic itself is [`gather_entries_per_page`]; this hands it the ONE number only the
-    /// session knows.
-    ///
-    /// [`gather_entries_per_page`]: scratchy_subtile::sdsc_abstract::gather_entries_per_page
-    pub fn gather_entries_per_page(
-        &self,
-        pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-    ) -> Option<scratchy_subtile::sdsc_abstract::EntriesPerPage> {
-        scratchy_subtile::sdsc_abstract::gather_entries_per_page(
-            self.ranks.first().kv_page_stride_bytes(),
-            pool,
-        )
-    }
-
-    // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE
-    // count for the pin that the card refuses (`PagePlaneExtent::entry_elems`); the page-granular gather
-    // pins one stick block like every other gather and reads the accessor above. Two accessors over one
-    // `kv_page_stride_bytes` is the "same number, two derivations" shape the identity exists to remove.
 
     /// ⭐⭐⭐⭐⭐ WHICH BODY THE NEXT LAUNCH AT `start` WILL RUN, and what it declares — see
     /// [`superdsc_exec::StepBody`]. The host asks this BEFORE it stages anything, because both the
@@ -627,43 +475,6 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         // Every rank runs the same bundle at the same position, so every rank selects the same body.
         self.lead()
             .step_body(crate::superdsc_exec::SeqPos(start as i64))
-    }
-
-    /// Install a request's page map under the SLOT it occupies in this forward, with its write cursor.
-    ///
-    /// ⛔ A SLOT, AND NOTHING ELSE. This took a second argument — the KV ROW the request holds for life —
-    /// and threaded it down to `SessionKv::kv_rows`, where NOTHING READ IT: every address builder below
-    /// says "NO REQUEST TERM", so the row never reached an address. It is deleted rather than kept "for
-    /// reporting": a device-layer field named after a forbidden concept is read as evidence the concept
-    /// is still load-bearing, and it cost one investigation already.
-    ///
-    /// What distinguishes two requests down here is their PAGES, installed under the slot they occupy.
-    pub fn set_block_table(
-        &mut self,
-        slot: crate::fold_plan::LaunchSlotIdx,
-        pos: i64,
-        pages: &[i64],
-    ) -> Result<()> {
-        if pages.is_empty() {
-            bail!("set_block_table: empty page map — a request needs at least one page");
-        }
-        let pool_pages = self.pool_pages;
-        self.each(|e| {
-            e.set_block_table(
-                crate::fold_plan::RowIdx::from_launch_row(slot.get() as u64),
-                SeqPos(pos),
-                pages,
-            )
-        })
-        .map(|_| ())
-        .map_err(|e| {
-            anyhow!(
-                "{e} (request slot {} at {pos} with {} page(s); pool has {})",
-                slot.get(),
-                pages.len(),
-                pool_pages
-            )
-        })
     }
 
     /// Run ONE INCREMENTAL forward over `n_new` NEW positions at `[seq_pos..seq_pos+n_new)`.
@@ -912,6 +723,21 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
+        self.stage_step_acts_seeded(activations, activations_f16, activations_i32, &[])
+    }
+
+    /// [`Self::stage_step_acts`] plus the chained head's seeds — the one host input that is NOT
+    /// the same on every card: rank `r` binds the words of ITS OWN vocabulary block
+    /// ([`crate::forward_tape::ChainSeed::words`]), the block its staged tables were built for,
+    /// by the rank its executor plays as. Raw LE u32 words, through the same verbatim channel
+    /// the index tables ride.
+    pub fn stage_step_acts_seeded(
+        &mut self,
+        activations: &[crate::wiring::Bind],
+        activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        seeds: &[(crate::bundle_code::PlaceId, crate::forward_tape::ChainSeed)],
+    ) -> Result<()> {
         // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
         // breakdown): this loop runs BEFORE predict, so it is invisible to the
         // preamble_h2d/compute/logits_d2h split. For batched prefill it converts ~300k f32
@@ -957,6 +783,23 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
                 e.bind_input_raw(bind);
             }
         }
+        for (id, seed) in seeds {
+            for e in self.ranks.values_mut() {
+                let bytes: Vec<u8> = seed
+                    .words(e.tp_identity())
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                let n = bytes.len();
+                let bind = e.place_raw(*id, bytes).ok_or_else(|| {
+                    anyhow!(
+                        "bind: the chain seed '{id}' ({n} B) has no placement in this bundle or \
+                         does not fit the one it has — an unstaged stick gathers the wrong row"
+                    )
+                })?;
+                e.bind_input_raw(bind);
+            }
+        }
         if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
             eprintln!(
                 "[sdsc-host] bind_loop={:.2} ms  ({} acts, {bind_elems} f32->sen, {} f16 acts, \
@@ -982,6 +825,17 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
         self.stage_step_acts(activations, activations_f16, activations_i32)?;
+        self.run_staged_step(n_new, seq_pos, logits)
+    }
+
+    /// Run the step whatever the shadow holds — every input already staged
+    /// ([`Self::stage_step_acts`] / [`Self::stage_step_acts_seeded`]).
+    pub fn run_staged_step(
+        &mut self,
+        n_new: usize,
+        seq_pos: usize,
+        logits: StepLogits,
+    ) -> Result<Option<Vec<f32>>> {
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         let want = match logits {
             StepLogits::ReadBack => LogitsRead::ReadBack,
@@ -1101,7 +955,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
     #[cfg(feature = "spyre-hw")]
     pub fn point_landing_slots(
         &mut self,
-        cards: &PerRank<T, std::sync::Arc<crate::runtime::CardRuntime<T>>>,
+        cards: &PerRank<T, crate::runtime::CardRuntime<T>>,
     ) -> Result<()> {
         use ktir_superdsc::collective::World;
         if !<T as World>::SHARDED {
@@ -1113,7 +967,7 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
         Ok(())
     }
 
-    pub fn alias_seg_from(&mut self, owner: &SuperDscSession<T>, seg: i64) -> Result<()> {
+    pub fn alias_seg_from(&mut self, owner: &SuperDscSession<'_, T>, seg: i64) -> Result<()> {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("alias_seg: segment {seg} out of range"))?;
         // Rank r aliases the owner's rank r: both sessions are one executor per rank of `T`.
@@ -1121,18 +975,5 @@ impl<T: ktir_superdsc::collective::Tp> SuperDscSession<T> {
             e.alias_seg_from(owner.ranks.get(r), s)?;
         }
         Ok(())
-    }
-}
-
-/// THE SESSION IS THE THING THAT WALKS THE FOLD, so it is the thing a launch declares its pass geometry
-/// to — and the [`DeclaredFold`](scratchy_subtile::sdsc_abstract::DeclaredFold) it hands back is what the
-/// prefix-mask staging is blocked by. One call, both numbers, so the count the shim's `fold_plan::reps`
-/// checks itself against and the count the mask is sized by are the same declaration.
-impl<T: ktir_superdsc::collective::Tp> FoldWalker for SuperDscSession<T> {
-    type Error = anyhow::Error;
-
-    fn declare_fold(&mut self, pages: FoldPages, blocks: MaskBlocks) -> Result<()> {
-        self.set_mask_blocks(blocks)?;
-        self.set_fold_pages(pages)
     }
 }

@@ -172,7 +172,7 @@ fn weight_exts(lowered: &LoweredDecode, op_idx: usize) -> Vec<usize> {
         .filter_map(|r| match r {
             InputRef::Ext(e)
                 if matches!(
-                    lowered.bindings[*e],
+                    lowered.bindings()[*e],
                     SourceBinding::Weight { .. }
                         | SourceBinding::WeightScale { .. }
                         | SourceBinding::BundleTensor { .. }
@@ -187,7 +187,7 @@ fn weight_exts(lowered: &LoweredDecode, op_idx: usize) -> Vec<usize> {
 
 /// `(WeightId, layer)` of a weight-carrying binding.
 fn weight_of(lowered: &LoweredDecode, ext: usize) -> Option<(WeightId, Option<UnrollIndex>)> {
-    match &lowered.bindings[ext] {
+    match &lowered.bindings()[ext] {
         SourceBinding::Weight { id, index }
         | SourceBinding::WeightScale { id, index }
         | SourceBinding::BundleTensor { id, index, .. } => Some((WeightId(*id), *index)),
@@ -331,7 +331,7 @@ pub(crate) fn emit_weight_bindings(
         .collect();
 
     let mut arms: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (i, b) in lowered.bindings.iter().enumerate() {
+    for (i, b) in lowered.bindings().iter().enumerate() {
         // Which tensor inside the field the source binds — `None` for the field's own
         // primary tensor, `Some(..)` for a tensor of a MULTI-TENSOR bundle.
         let mut bundle_tensor = None;
@@ -815,19 +815,20 @@ mod tests {
 
     fn decode(bindings: Vec<SourceBinding>, ops: Vec<OpDesc>) -> LoweredDecode {
         let n_ops = ops.len();
-        LoweredDecode {
-            input: LoweringInput {
+        LoweredDecode::new(
+            LoweringInput {
                 exported: None,
                 sources: vec![SourceShape { rows: 1, cols: 8 }; bindings.len()],
                 ops,
                 result: n_ops.saturating_sub(1),
             },
             bindings,
-            op_tiles: vec![None; n_ops],
-            norm_gain_add_tiles: Default::default(),
-            op_expansion: vec![None; n_ops],
-            unnamed_reads: Vec::new(),
-        }
+            vec![None; n_ops],
+            Default::default(),
+            vec![None; n_ops],
+            Vec::new(),
+        )
+        .expect("a binding fixture names at most one embed row")
     }
 
     /// ⭐ THE PROPERTY THE WHOLE GENERATED LOADER RESTS ON: one field per

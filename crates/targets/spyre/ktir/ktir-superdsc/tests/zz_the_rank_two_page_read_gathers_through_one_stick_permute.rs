@@ -222,6 +222,7 @@ fn program(entries: i64, w: i64, m: i64) -> KtirNode {
         ],
         mask: None,
         node_out_tid: None,
+        answer_rows: None,
         minted: Default::default(),
         lx_plan: Default::default(),
     }

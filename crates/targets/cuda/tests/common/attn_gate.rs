@@ -21,6 +21,7 @@
 use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
+use scratchy_subtile::fixtures::rebind;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, RowScale, SourceShape, SubOp};
@@ -118,8 +119,8 @@ pub fn attn_gate_input(m: u32) -> LoweringInput {
 /// `cos`, `sin` to the global rotary table.
 pub fn attn_gate(m: u32) -> LoweredDecode {
     let mut l = with_hidden(attn_gate_input(m));
-    l.bindings[4] = SourceBinding::Cos { local: false };
-    l.bindings[5] = SourceBinding::Sin { local: false };
+    rebind(&mut l, |b| b[4] = SourceBinding::Cos { local: false });
+    rebind(&mut l, |b| b[5] = SourceBinding::Sin { local: false });
     l
 }
 

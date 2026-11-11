@@ -302,12 +302,9 @@ cargo build -p scratchy-cli --features metal,model/smollm2-135m
 **Never build `model/<arch>` or `model/all` just to test one thing** — the
 `#[forward]` macro is the bulk of per-arch compile time, and forward-expanding
 every config in scope (rather than the one you actually need) costs
-minutes-to-hours and risks OOM on a laptop. `SCRATCHY_BUILD_FILTER=<tag>,...`
-(comma-separated substrings, OR'd, matched against the stem) still exists as
-an orthogonal cross-cutting filter on top of whichever `model/*` features are
-enabled — useful for narrowing a wide `model/<arch>` build without listing
-every excluded model individually — but for picking one specific model it's
-no longer necessary; just name that model's feature directly.
+minutes-to-hours and risks OOM on a laptop. Model and quant selection is the
+feature flags, full stop: to pick one specific model, name that model's
+feature directly.
 
 ## Direct crate builds
 

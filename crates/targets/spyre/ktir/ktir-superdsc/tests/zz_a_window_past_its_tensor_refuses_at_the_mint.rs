@@ -175,7 +175,7 @@ fn an_undeclared_name_refuses_rather_than_panics() {
 #[test]
 fn a_declared_synth_window_is_bounded_by_its_declaration() {
     let layout = BundleLayout::default();
-    let id = PlaceId::Synth {
+    let id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::Silu,
     };
@@ -191,7 +191,7 @@ fn a_declared_synth_window_is_bounded_by_its_declaration() {
         .unwrap();
     // A declaration SMALLER than the handle's shape: a whole-tensor sweep exceeds the
     // declaration's footprint —
-    let short = PlaceId::Synth {
+    let short = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::Xc,
     };
@@ -223,7 +223,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     // CORE-LOCAL: every core's slice starts AT the pin. The one view into it is a whole stick plane
     // of its rows, which sits at that plane of every core's slice; any other offset — here one row of
     // two — has no place in a core's slice.
-    let core_id = PlaceId::Synth {
+    let core_id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::Qs,
     };
@@ -254,18 +254,24 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     assert!(err.contains("test: core-local row offset"), "{err}");
     assert!(err.contains("only a whole stick plane"), "{err}");
     // OP-LOCAL: a pin that does not cover the handle's declared shape is the disagreement.
-    let op_id = PlaceId::Synth {
+    let op_id = ktir_superdsc::place::SynthId::Synth {
         of: 7,
         role: SynthRole::KRep,
     };
-    layout.synth_lx_op_local(op_id, &[1, 128]);
-    let op_stk =
-        Stk::<RowBlockedTag>::new(op_id.to_string(), StickLayout::row_blocked(1, 128)).unwrap();
-    layout
-        .win(&op_stk, DevOff::ZERO, 1, 128, "test: op-local fits")
+    // Claimed the way the pair claims it, in its own program's scope (the windows below are the
+    // test's own reads of the pinned name; a pin is one stick wide by its shape's type).
+    let name = layout
+        .claim_op_local_for_test(
+            &mut ktir_superdsc::placement::LxScope::for_test(),
+            op_id,
+            ktir_superdsc::placement::OpLocalShape::rows_of_one_stick(std::num::NonZeroU32::MIN),
+        )
         .unwrap();
-    let big =
-        Stk::<RowBlockedTag>::new(op_id.to_string(), StickLayout::row_blocked(1, 1024)).unwrap();
+    let op_stk = Stk::<RowBlockedTag>::new(name.clone(), StickLayout::row_blocked(1, 64)).unwrap();
+    layout
+        .win(&op_stk, DevOff::ZERO, 1, 64, "test: op-local fits")
+        .unwrap();
+    let big = Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(1, 1024)).unwrap();
     let err = layout
         .win(&big, DevOff::ZERO, 1, 1024, "test: op-local past pin")
         .unwrap_err();

@@ -20,7 +20,7 @@
 //! as the ONE implementation rather than something each consumer re-derives.
 
 use crate::addr::{DevOff, Win};
-use crate::place::PlaceId;
+use crate::place::{PlaceId, SynthId};
 use crate::sdsc_abstract::{KindTag, StickKind, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::Df;
@@ -368,22 +368,90 @@ pub struct BundleLayout {
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate
-/// segment (task #55). `next` starts at the colored-intermediate high-water; each
-/// distinct synthetic name gets one 128B-aligned offset, reused on later sight.
+/// segment (task #55). The cursor starts at the colored-intermediate high-water; each
+/// distinct synthetic name gets one 128B-aligned range, reused on later sight.
+///
+/// ⭐ DISJOINT BY CONSTRUCTION. The fields are private and [`Self::take`] is the one writer: it
+/// hands out `[align128(cursor), +align128(bytes))` and advances the cursor past it, recording the
+/// offset and the size together. No two names can share a byte, and no name can have an offset
+/// without a size — the facts an after-the-fact overlap audit used to re-check.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct SynthAlloc {
-    pub next: u64,
-    pub map: std::collections::BTreeMap<String, u64>,
-    /// Declared FULL footprint (bytes) per synth name — set by [`BundleLayout::synth`].
-    /// Present ⇒ the tensor OWNS its shape: `resolve_seg_base` reserves this whole size up
-    /// front (so a per-head write at offset h·stride can't land on the next tensor) and GUARDS
-    /// that no access exceeds it — an out-of-footprint access is a shape mismatch and a
-    /// `cargo build` Err, not silent on-card aliasing.
-    pub sizes: std::collections::BTreeMap<String, u64>,
+    next: u64,
+    map: std::collections::BTreeMap<String, u64>,
+    /// The FULL footprint (bytes) of each name, reserved with its offset.
+    sizes: std::collections::BTreeMap<String, u64>,
 }
 
-/// LX scratchpad size per core: 2 MiB (`sysdef.cpp:587`, `lxSize = 2L*1024*1024`).
-pub const LX_SIZE: u64 = 2 * 1024 * 1024;
+impl SynthAlloc {
+    /// An allocator whose first range starts at `base` (128-aligned at the first take).
+    pub fn new(base: u64) -> Self {
+        Self {
+            next: base,
+            ..Self::default()
+        }
+    }
+
+    /// Reserve `bytes` for `name` once: its offset, the first time; the same offset after. A
+    /// synthetic of no bytes is a tensor with a zero extent, which no op can read or write — so the
+    /// door takes a [`std::num::NonZeroU64`] and there is no zero case to round up.
+    fn take(&mut self, name: String, bytes: std::num::NonZeroU64) -> u64 {
+        if let Some(&o) = self.map.get(&name) {
+            return o;
+        }
+        let o = align128(self.next);
+        let fp = align128(bytes.get());
+        self.next = o + fp;
+        self.map.insert(name.clone(), o);
+        self.sizes.insert(name, fp);
+        o
+    }
+
+    /// `name`'s offset in the Intermediate segment, when it was reserved.
+    pub fn offset(&self, name: &str) -> Option<u64> {
+        self.map.get(name).copied()
+    }
+
+    /// `name`'s reserved footprint in bytes, when it was reserved.
+    pub fn size(&self, name: &str) -> Option<u64> {
+        self.sizes.get(name).copied()
+    }
+
+    /// Whether `name` was reserved.
+    pub fn contains(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+
+    /// How many names are reserved.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether nothing is reserved.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The end of the last range: the Intermediate segment's extent must cover it.
+    pub fn high_water(&self) -> u64 {
+        self.next
+    }
+
+    /// Every reservation as `(name, offset, size)`, in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, u64, u64)> + '_ {
+        self.map
+            .iter()
+            .map(|(name, &o)| (name.as_str(), o, self.sizes[name]))
+    }
+}
+
+/// LX scratchpad size per core — the SAME fact `superdsc_opspec`'s
+/// `LX_CAPACITY_BYTES` states, READ from the baked generation's table
+/// (the vendor's own `sysdef.h:169 lxCap` default and torch-spyre's
+/// confirmation under its citation; `sysdef.cpp:587`'s `lxSize =
+/// 2L*1024*1024` restates the same 2 MiB). One fact, one spelling.
+pub const LX_SIZE: u64 =
+    <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::LX_CAPACITY_BYTES;
 
 /// ⭐ THE CEILING EVERY PINNED LX ADDRESS + FOOTPRINT MUST FIT UNDER — the frontend's end of the LX
 /// split, [`crate::superdsc_opspec::FRONTEND_LX_END`] (1,625,344 B), not the 2 MiB scratchpad. dxp
@@ -440,7 +508,7 @@ pub struct LxAlloc {
     pub op_local_slots: std::collections::BTreeMap<u64, u64>,
     /// The names declared OP-LOCAL ([`BundleLayout::synth_lx_op_local`]): short-lived scratch
     /// whose def and use both live inside one assembly call, so same-class names share a slot
-    /// under the per-group alternation walk's proof.
+    /// under [`crate::emit::lx_op_local_pair`]'s construction.
     pub op_local: std::collections::BTreeSet<String>,
     /// Pinned byte address per synth name.
     pub map: std::collections::BTreeMap<String, u64>,
@@ -473,6 +541,87 @@ impl Default for LxAlloc {
             divisions: std::collections::BTreeMap::new(),
             full_sizes: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+/// ⭐ ONE PROGRAM's op-local LX scope — created ONCE per program by the lowering door that lowers it,
+/// and handed `&mut` to every op-local pin ([`crate::emit::lx_op_local_pair`]) the program states. It
+/// records the footprint classes the program has already pinned, so a second same-class pin in one
+/// program is refused at the pair. Its one constructor is crate-private, called by the door that
+/// lowers one program (`whole_function::lower_function_folded`, the per-op rmsnorm door), so a scope
+/// is never carried across two programs and no caller outside the crate can mint one:
+/// ```compile_fail,E0624
+/// let _ = ktir_superdsc::placement::LxScope::program(); // E0624: private associated function
+/// ```
+///
+/// ⚖️ WHY THE SECOND-PIN REFUSAL IS A MAP AND NOT A MOVED VALUE. A class is a pin's 128-aligned
+/// footprint in bytes, derived from the pin's dims, so the class SET is known only when the bake
+/// lowers the program (31-33 classes on the shipped granites) — it cannot be one `ClassSlot` field
+/// per class for the compiler to move. The refusal is therefore a NAMED BUILD ERROR at the pair
+/// (`#[forward]` expansion), never a card fault.
+#[derive(Debug)]
+pub struct LxScope {
+    classes: std::collections::BTreeMap<OpLocalClass, String>,
+}
+
+/// An op-local pin's FOOTPRINT CLASS: its fp16 footprint, 128-aligned, in bytes. Every pin of one
+/// class shares one slot, and a program holds at most one pin of a class. Computed once per pin, by
+/// [`OpLocalClass::of`], so the slot ([`BundleLayout::synth_lx_op_local`]) and the program's rule
+/// ([`LxScope`]) cannot key on different footprints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpLocalClass(u64);
+
+/// An op-local pin's SHAPE: `rows` one-stick fp16 rows — the per-row scalar an op chain writes and
+/// reads back (the rmsnorm `rinv`). `rows` is non-zero by type, so the footprint is at least one
+/// stick and its class is positive by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpLocalShape {
+    rows: std::num::NonZeroU32,
+}
+
+impl OpLocalShape {
+    /// `rows` one-stick rows.
+    pub const fn rows_of_one_stick(rows: std::num::NonZeroU32) -> OpLocalShape {
+        OpLocalShape { rows }
+    }
+
+    /// The pin's row count.
+    pub const fn rows(self) -> u32 {
+        self.rows.get()
+    }
+
+    /// The pin's width, one fp16 stick.
+    pub const fn cols(self) -> u32 {
+        crate::sdsc_abstract::POOL_STICK
+    }
+}
+
+impl OpLocalClass {
+    /// The class of a pin of shape `shape`: its fp16 footprint, 128-aligned — `rows` one-stick
+    /// rows of `Df::Fp16`, so at least one 128-byte stick, with no floor: `rows` is non-zero by type.
+    fn of(shape: OpLocalShape) -> OpLocalClass {
+        let stick_bytes = u64::from(shape.cols()) * u64::from(Df::Fp16.word_length());
+        OpLocalClass(align128(u64::from(shape.rows.get()) * stick_bytes))
+    }
+
+    /// The class's footprint in bytes — the slot every pin of it shares.
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+impl LxScope {
+    /// The scope of one program's lowering — minted only by the door that lowers that program.
+    pub(crate) fn program() -> LxScope {
+        LxScope {
+            classes: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A program's scope for a fixture that lowers a body without its door. Test builds only.
+    #[cfg(feature = "test-support")]
+    pub fn for_test() -> LxScope {
+        LxScope::program()
     }
 }
 
@@ -569,13 +718,14 @@ pub fn synth_footprint_bytes(dims: &[u32], df: Df) -> u64 {
     let word_length = df.word_length();
     let inner = dims.last().copied().unwrap_or(stick_elems);
     let inner_stick = inner.div_ceil(stick_elems) * stick_elems;
+    // The product of the outer dims (1 for a rank-1 tensor). A zero outer dim is a zero-byte
+    // tensor, which the allocator's door refuses — never rounded up to one row.
     let outer: u64 = dims
         .iter()
         .rev()
         .skip(1)
         .map(|&d| d as u64)
-        .product::<u64>()
-        .max(1);
+        .product::<u64>();
     outer * inner_stick as u64 * word_length as u64
 }
 
@@ -592,10 +742,11 @@ pub fn align128(n: u64) -> u64 {
 /// Every `{tensor}_{role}` name goes through here, so `resolve_seg_base` can recover the identity
 /// by LOOKUP. Minting and registering are one call because a name minted without being registered
 /// is exactly the case the parse used to paper over.
-pub fn syn(layout: Option<&BundleLayout>, id: PlaceId) -> String {
+pub fn syn(layout: Option<&BundleLayout>, id: impl Into<SynthId>) -> String {
+    let id: SynthId = id.into();
     let n = id.to_string();
     if let Some(l) = layout {
-        l.ids.borrow_mut().insert(n.clone(), id);
+        l.ids.borrow_mut().insert(n.clone(), id.place());
     }
     n
 }
@@ -780,7 +931,7 @@ impl BundleLayout {
         }
         // A SYNTHETIC intermediate — declared or refused; the mint never allocates.
         let s = self.synth.borrow();
-        match s.sizes.get(name).copied() {
+        match s.size(name) {
             None => Err(format!(
                 "{what}: '{name}' is windowed but was never declared to the layout. Every \
                  intermediate is known at bake — declare it with `BundleLayout::synth(id, dims)` \
@@ -859,7 +1010,7 @@ impl BundleLayout {
     /// This is the principled replacement for the old bump allocator that sized each synthetic
     /// from its FIRST op's per-op view (ONE head) — which aliased sp/spprod/mxp on-card and
     /// produced the garbage attention. The shape is now part of the tensor, not guessed per-op.
-    pub fn synth(&self, id: PlaceId, dims: &[u32]) {
+    pub fn synth(&self, id: impl Into<SynthId>, dims: &[u32]) {
         self.synth_df(id, dims, Df::Fp16);
     }
 
@@ -870,8 +1021,9 @@ impl BundleLayout {
     ///
     /// ⭐ A PLANNED id ([`Self::lx_planned`]) is declared core-local in LX instead, at its planned
     /// pin: the scratchpad plan's one point of effect on the lowering.
-    pub fn synth_df(&self, id: PlaceId, dims: &[u32], df: Df) {
-        let planned = self.lx_planned.borrow().get(&id).copied();
+    pub fn synth_df(&self, id: impl Into<SynthId>, dims: &[u32], df: Df) {
+        let id: SynthId = id.into();
+        let planned = self.lx_planned.borrow().get(&id.place()).copied();
         match planned {
             Some(pin) => {
                 self.synth_lx_planned(id, pin);
@@ -937,11 +1089,9 @@ impl BundleLayout {
     /// the group, so a bundle's pin demand is the number of CLASSES, not of norms (#645: a
     /// rung's ~23 stacked `[rows,64]` rinvs refused the window; as ~3 classes they fit with
     /// room for the chunk forms). This is sound because each name's live range is confined to
-    /// its own assembly call: the per-group alternation walk
-    /// (`lower_subtile_tape_to_superdsc::walk_lx_slot_alternation`) proves at build, per launch
-    /// group over its programs in order, that no same-class def lands inside another's live
-    /// range — so sharing is checked, never assumed, and the fallback on a refusal is to split
-    /// the conflicting class, never to un-share globally.
+    /// its own assembly call — which is the shape of the code, not a check: the only door is
+    /// [`crate::emit::lx_op_local_pair`], which builds the pin's writer and reader as one construction
+    /// inside one program's [`LxScope`] (see its doc for the three facts it makes structural).
     ///
     /// Slots bump DOWN from [`LX_PIN_END`] so the two pin families are independent by
     /// construction: a chunk core-local pin declared later in walk order (bumping up from
@@ -952,14 +1102,13 @@ impl BundleLayout {
     /// one-function budget the `lx_form` admission witness reads — so this runs at
     /// `#[forward]` expansion AS the cargo-build guard: a bundle whose pins do not fit the
     /// frontend's LX window is unbuildable, not silently overlapping dxp's own LX allocations.
-    pub fn synth_lx_op_local(&self, id: PlaceId, dims: &[u32]) {
+    fn synth_lx_op_local(&self, id: PlaceId, class: OpLocalClass) {
         let name = id.to_string();
-        self.ids.borrow_mut().insert(name.clone(), id);
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
         }
-        let fp = align128(synth_footprint_bytes(dims, Df::Fp16).max(1));
+        let fp = class.bytes();
         let (slot, added) = match a.op_local_slots.get(&fp) {
             Some(&s) => (s, 0),
             None => (a.next_down - fp, fp),
@@ -986,6 +1135,61 @@ impl BundleLayout {
         a.op_local.insert(name);
     }
 
+    /// Claim one op-local pin for one program: its class is checked against the program's
+    /// [`LxScope`] (one pin per class per program, with or without a layout), and on a layout the
+    /// pin is slotted ([`Self::synth_lx_op_local`]). Returns the pin's operand spelling. Reached
+    /// only from [`crate::emit::lx_op_local_pair`], which builds the pin's writer and reader from it
+    /// and lets the spelling go no further.
+    pub(crate) fn claim_op_local(
+        layout: Option<&BundleLayout>,
+        scope: &mut LxScope,
+        of: SynthId,
+        role: crate::place::OpLocalRole,
+        shape: OpLocalShape,
+    ) -> Result<String, String> {
+        let id = of.place().op_local(role);
+        let name = id.to_string();
+        if let Some(l) = layout {
+            l.ids.borrow_mut().insert(name.clone(), id);
+        }
+        // The pin's class, stated once: the slot it shares and the program's one-per-class rule
+        // both key on it.
+        let class = OpLocalClass::of(shape);
+        if let Some(first) = scope.classes.get(&class) {
+            return Err(format!(
+                "op-local LX pins '{first}' and '{name}' are both of the {}-byte class in ONE \
+                 program: the class's one shared slot alternates only across programs, and \
+                 within one program (one SDSC phase) dxp may order the two chains' descriptors \
+                 either way, so the second writer could land on the first pin before its \
+                 reader runs. Give one of them its own program, or its own class.",
+                class.bytes()
+            ));
+        }
+        scope.classes.insert(class, name.clone());
+        if let Some(l) = layout {
+            l.synth_lx_op_local(id, class);
+        }
+        Ok(name)
+    }
+
+    /// [`Self::claim_op_local`] for a fixture that reads an op-local pin's windows without a
+    /// writer or reader of its own (the window mint's bounds). Test builds only.
+    #[cfg(feature = "test-support")]
+    pub fn claim_op_local_for_test(
+        &self,
+        scope: &mut LxScope,
+        of: SynthId,
+        shape: OpLocalShape,
+    ) -> Result<String, String> {
+        Self::claim_op_local(
+            Some(self),
+            scope,
+            of,
+            crate::place::OpLocalRole::RINV,
+            shape,
+        )
+    }
+
     /// Declare a synthetic intermediate LX-resident CORE-LOCALLY: every core holds only ITS OWN work
     /// slice, `per_core_bytes` of it, at one pinned address shared by all cores — the reference's form
     /// for every softmax intermediate (`allocate … component_ lx`, one `startAddressCoreCorelet_` value
@@ -997,9 +1201,10 @@ impl BundleLayout {
     /// every op that differs, at build ([`Self::record_lx_division`]).
     ///
     /// ⛔ PANICS past [`LX_PIN_END`], the same `cargo build` guard as [`Self::synth_lx_op_local`].
-    pub fn synth_lx_core_local(&self, id: PlaceId, per_core_bytes: u64) {
+    pub fn synth_lx_core_local(&self, id: impl Into<SynthId>, per_core_bytes: u64) {
+        let id: SynthId = id.into();
         let name = id.to_string();
-        self.ids.borrow_mut().insert(name.clone(), id);
+        self.ids.borrow_mut().insert(name.clone(), id.place());
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
@@ -1045,9 +1250,9 @@ impl BundleLayout {
     /// plan reserved ([`Self::reserve_lx_plan`]) — the same declaration as
     /// [`Self::synth_lx_core_local`], at the plan's address instead of the next free one. Idempotent
     /// per name.
-    pub fn synth_lx_planned(&self, id: PlaceId, pin: LxPin) {
+    pub fn synth_lx_planned(&self, id: SynthId, pin: LxPin) {
         let name = id.to_string();
-        self.ids.borrow_mut().insert(name.clone(), id);
+        self.ids.borrow_mut().insert(name.clone(), id.place());
         let mut a = self.lx.borrow_mut();
         if a.map.contains_key(&name) {
             return;
@@ -1124,7 +1329,7 @@ impl BundleLayout {
     }
 
     /// ⭐ THE OP-LOCAL PIN TABLE — one row per shared-slot pin, `(name, class bytes, slot address)`,
-    /// name-sorted. THE alternation walk's and the dump ledger's whole view of the op-local family:
+    /// name-sorted. THE dump ledger's whole view of the op-local family:
     /// the class is the row's `bytes` (the footprint IS the class key, [`LxAlloc::op_local_slots`]),
     /// and every name of one class carries the same slot address. Empty for a bundle that declares
     /// no op-local pins — the walk's own no-op case.
@@ -1190,7 +1395,8 @@ impl BundleLayout {
     ///
     /// Falls back to `dims` when the tensor has no placement (a synth OF a synth, and every unit test
     /// that lowers without a layout) — the old behaviour, correct whenever the op is not chunked.
-    pub fn synth_like(&self, id: PlaceId, shadows: u32, dims: &[u32], df: Df) {
+    pub fn synth_like(&self, id: impl Into<SynthId>, shadows: u32, dims: &[u32], df: Df) {
+        let id: SynthId = id.into();
         match self.placements.get(&shadows) {
             Some(p) => self.synth_bytes(id, p.size),
             None => self.synth_bytes(id, synth_footprint_bytes(dims, df)),
@@ -1198,24 +1404,18 @@ impl BundleLayout {
     }
 
     /// The byte-exact core of [`Self::synth_df`]: bump-allocate `bytes` for `id`, once.
-    fn synth_bytes(&self, id: PlaceId, bytes: u64) {
+    fn synth_bytes(&self, id: SynthId, bytes: u64) {
         let name = id.to_string();
-        let a = self.synth.borrow_mut();
-        // The IDENTITY is recorded even when the OFFSET already exists. `resolve_seg_base` bump-
-        // allocates an intermediate the first time an op references it, which can happen BEFORE the
-        // declaring `synth()` call; the early return below then skipped the id and the placement had
-        // no identity to be built from. Declaration order decides the offset, never the identity.
-        drop(a);
-        self.ids.borrow_mut().insert(name.clone(), id);
-        let mut a = self.synth.borrow_mut();
-        if a.map.contains_key(&name) {
-            return;
-        }
-        let o = align128(a.next);
-        let fp = align128(bytes.max(1));
-        a.next = o + fp;
-        a.map.insert(name.clone(), o);
-        a.sizes.insert(name, fp);
+        let bytes = std::num::NonZeroU64::new(bytes).unwrap_or_else(|| {
+            panic!(
+                "synthetic '{name}' declared at 0 bytes — a tensor with a zero extent is not a \
+                 tensor; the declaring site's dims (or the placement it shadows) are wrong"
+            )
+        });
+        // The IDENTITY is recorded even when the OFFSET already exists: declaration order decides
+        // the offset, never the identity.
+        self.ids.borrow_mut().insert(name.clone(), id.place());
+        self.synth.borrow_mut().take(name, bytes);
     }
 
     /// THE arrangement authority. Record that tensor `name` is addressed through `want`; a later op that

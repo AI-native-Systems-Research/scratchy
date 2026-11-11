@@ -34,13 +34,47 @@ pub enum Staged {
     /// lose precision visibly — it would gather and scatter a DIFFERENT ROW'S KEYS and read as fluent
     /// text.
     I32(Vec<u8>),
-    /// ⭐ RAW u32 LANE VALUES — the chained head's stick seeds and nothing
-    /// else. The sticks carry the decompose's own words (`k·s + (i mod k)`
-    /// lane patterns, stick ramps), which an f32 arm would round and an
-    /// i32-arm would mistype; they are VALUE words the device's own
-    /// ChainStage rewrites every step, never addresses-in-waiting, so they
-    /// get their own variant rather than borrowing the index words'.
-    U32(std::borrow::Cow<'static, [u32]>),
+    /// ⭐ THE CHAINED HEAD'S SEED, PER RANK — the tokens and the stick it seeds, not yet its
+    /// words. They are RAW u32 lane values (`k·s + (i mod k)` lane patterns, stick ramps), which
+    /// an f32 arm would round and an i32 arm would mistype: VALUE words the device's own
+    /// ChainStage rewrites every step, bound through the raw channel verbatim. Every other
+    /// staged value is the same on every card of a sharded world (the forward is SPMD); a seed is
+    /// not, because each rank decomposes a token through ITS OWN vocabulary block
+    /// ([`crate::wiring::chain_block`]) — the block its staged tables were built for. The session
+    /// builds each rank's words at the bind ([`ChainSeed::words`]), by the rank's type.
+    ChainSeed(ChainSeed),
+}
+
+/// One stick's seed, before a rank is named — see [`Staged::ChainSeed`].
+#[derive(Clone, Debug)]
+pub struct ChainSeed {
+    pub chain: crate::wiring::ChainWiring,
+    /// The s stick (`true`) or the l stick.
+    pub is_s: bool,
+    /// One token per real row.
+    pub toks: Vec<u32>,
+    /// The launch's own row count; pad rows repeat the last real token.
+    pub rows: usize,
+}
+
+impl ChainSeed {
+    /// Rank `me`'s seed words — `None` for a session that plays no rank of a sharded world.
+    pub fn words<T: crate::bundle_code::collective::World>(
+        &self,
+        me: Option<crate::bundle_code::collective::Rank<T>>,
+    ) -> Vec<u32> {
+        let block = crate::wiring::chain_block(self.chain.block, me);
+        if self.is_s {
+            scratchy_subtile::subtile_ir::chain_s_seed(self.chain.k, &self.toks, self.rows, block)
+        } else {
+            scratchy_subtile::subtile_ir::chain_l_seed(
+                &self.toks,
+                self.chain.hidden,
+                self.rows,
+                block,
+            )
+        }
+    }
 }
 
 /// A forward's ARGUMENTS — the data its kernels compute FROM.
@@ -173,13 +207,12 @@ pub fn kernel_values(
         // index reads whatever was there, a fluent wrong row). At `rows == 1`
         // the per-row spelling IS the solo one byte-for-byte, so the W=1
         // byte-identity rides the same construction rather than a width branch.
-        let toks: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
-        let words = if is_s {
-            scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks, rows)
-        } else {
-            scratchy_subtile::subtile_ir::chain_l_seed(&toks, chain.hidden, rows)
-        };
-        return Ok(Staged::U32(std::borrow::Cow::Owned(words)));
+        return Ok(Staged::ChainSeed(ChainSeed {
+            chain,
+            is_s,
+            toks: toks.iter().map(|&t| t as u32).collect(),
+            rows,
+        }));
     }
     // ⭐ SERVED BEFORE THE OWNED TAIL, because a constant is not COMPUTED here — it is a table
     // the macro put in the binary, and the arms below all build their rows. Routing it through
@@ -549,6 +582,23 @@ mod tests {
         head_size: 64,
         walk: 4,
         paged_rows: crate::paged_step::PagedRows::Sequence,
+        // One request of the graph's 3 rows — the mint's own spelling, const: the pair's held
+        // product IS the `rows` above, and each `None` arm is a fixture bug the const panic
+        // names (const panic takes a literal, so the messages are).
+        extent: match crate::wiring::QueryExtent::of_baked_rung(
+            match crate::wiring::RungWidth::of_baked_rows(3) {
+                ::core::option::Option::Some(w) => w,
+                ::core::option::Option::None => {
+                    ::core::panic!("the fixture's three rows are a baked width")
+                }
+            },
+            crate::wiring::RungCap::ONE,
+        ) {
+            ::core::option::Option::Some(e) => e,
+            ::core::option::Option::None => {
+                ::core::panic!("the fixture's three rows by one request name a rung")
+            }
+        },
     };
 
     fn shape() -> ForwardShape {
@@ -591,8 +641,15 @@ mod tests {
     /// card's placements hold. The index tables arrive as INTEGER words, the mask as values.
     #[test]
     fn the_paged_steps_are_the_card_steps_tables() {
-        let rows = crate::paged_step::StepRows { start: 9, real: 3 };
-        let card = crate::paged_step::card_step_sources(&STEP, &[3, 1, 0], &rows).expect("staged");
+        let rows = crate::paged_step::StepRows::new(9, 3).expect("three rows is three rows");
+        let card = crate::paged_step::card_step_sources(
+            &STEP,
+            &[crate::paged_step::RequestStep {
+                blocks: &[3, 1, 0],
+                rows,
+            }],
+        )
+        .expect("staged");
         let inp = inputs(Some(&card));
         for t in [STEP.page_table, STEP.write_rows, STEP.query_rows] {
             match staged(ForwardKernel::Paged, t, &inp).expect("a table") {

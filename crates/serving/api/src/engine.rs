@@ -3924,6 +3924,13 @@ fn executor_thread_loop(
     mut rx: tokio::sync::mpsc::Receiver<ExecutorWork>,
     tx: tokio::sync::mpsc::Sender<ExecutorResult>,
 ) {
+    // First act: run where the executor's devices want their driver (a spyre worker: its cards'
+    // NUMA node). A refusal ends the thread by name, through the same teardown as every exit.
+    if let Err(e) = executor.pin_driving_thread() {
+        error!("executor thread: {e}");
+        executor.shutdown();
+        return;
+    }
     while let Some(work) = rx.blocking_recv() {
         match work {
             ExecutorWork::Execute(sched) => {
@@ -4546,7 +4553,7 @@ mod tests {
             },
             max_model_len: 4096,
             num_gpu_blocks: 1024,
-            block_size: 16,
+            block_size: scratchy_core_common::KvBlockTokens::new(16).expect("16 > 0"),
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,

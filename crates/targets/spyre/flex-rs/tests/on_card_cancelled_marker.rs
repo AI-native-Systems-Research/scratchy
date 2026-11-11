@@ -27,6 +27,7 @@ use flex_rs::control_block_wire::{ControlBlockWire, RB_NUM_BYTES, ResponseBlockW
 use flex_rs::device_memory_allocator::DeviceMemoryAllocator;
 use flex_rs::flex_config::DeviceKind;
 use flex_rs::iommu::PfIommuMapper;
+use flex_rs::numa::CardCpus;
 use flex_rs::runtime::RuntimeContext;
 use flex_rs::scheduler::{
     FlexAllocatorAddressResolver, HardwareSubmit, PipelineId, SchedulerBackendConfig,
@@ -106,7 +107,9 @@ fn cancelled_marker_on_card() {
     ));
     let addr_resolver: Arc<dyn flex_rs::scheduler::DeviceAddressResolver> =
         Arc::new(FlexAllocatorAddressResolver::new(allocator.clone()));
-    let hw = Arc::new(SenlibHardwareSubmit::new(card.clone()));
+    let cpus = CardCpus::read(&pci)
+        .unwrap_or_else(|e| panic!("REFUSED: card {pci}'s NUMA placement is unreadable — {e}"));
+    let hw = Arc::new(SenlibHardwareSubmit::new(card.clone(), cpus));
     let capacity = Arc::new(SenlibQueueCapacity::new(card.clone()));
     let iommu_mapper = PfIommuMapper::new(card.clone());
     let scheduler = create_scheduler(

@@ -19,7 +19,7 @@
 //! slots (`52551252`). At a 256-token block that is 2 pages of tokens and 3 pages of slots.
 
 use scratchy_core_common::kv::{CacheableTokens, KvExtent, KvSlotSpan};
-use scratchy_core_common::{Request, SamplingParams};
+use scratchy_core_common::{KvBlockTokens, Request, SamplingParams};
 use scratchy_serving_scheduler::scheduler::core::{KVCacheManagerOps, SimpleBlockTracker};
 
 const BLOCK: usize = 256;
@@ -27,7 +27,8 @@ const BLOCK: usize = 256;
 /// The tracker as the spyre pool declares it, with a step reach already set — the state every batched
 /// decode step allocates in.
 fn batched_tracker(step_reach: u32) -> SimpleBlockTracker {
-    let mut t = SimpleBlockTracker::with_caching(64, BLOCK).sharing_one_write_slot();
+    let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"))
+        .sharing_one_write_slot();
     t.set_step_reach(KvSlotSpan::new(step_reach));
     t
 }
@@ -53,7 +54,7 @@ fn request_of(id: &str, tokens: usize, extent: Option<KvExtent>) -> Request {
 /// the TOKEN-ADDRESSED PREFIX ONLY. Both from one `KvExtent`.
 #[test]
 fn a_hole_bearing_request_is_allocated_by_slots_and_cached_by_its_contiguous_prefix() {
-    let mut t = SimpleBlockTracker::with_caching(64, BLOCK);
+    let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
 
     // 450 tokens, but the batch's shared write slot pushed its history to 514 slots. Its first
     // contiguous run — the part where token `n` is at slot `n` — is the 450-token prompt.
@@ -90,7 +91,7 @@ fn a_hole_bearing_request_is_allocated_by_slots_and_cached_by_its_contiguous_pre
 /// exactly the arithmetic they always were. A regression here is a change to metal behaviour.
 #[test]
 fn a_backend_that_reports_nothing_is_allocated_and_cached_by_its_token_count() {
-    let mut t = SimpleBlockTracker::with_caching(64, BLOCK);
+    let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
     let req = request_of("plain", 450, None);
 
     let blocks = t.allocate_slots(&req, 450, 0, &[]).expect("plenty");
@@ -109,7 +110,7 @@ fn a_backend_that_reports_nothing_is_allocated_and_cached_by_its_token_count() {
 /// prefix may ever become a cache hit, however many slots the request occupies.
 #[test]
 fn no_block_past_the_cacheable_prefix_can_ever_be_hit() {
-    let mut t = SimpleBlockTracker::with_caching(64, BLOCK);
+    let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
 
     // 600 tokens; the hole starts at 300, so only ONE full block (0..256) is token-addressed even
     // though the request holds 3 pages of keys.
@@ -148,7 +149,8 @@ fn a_shallow_request_under_a_deep_step_reach_holds_blocks_for_the_reach() {
     // ⛔ `sharing_one_write_slot()` IS THE POINT: the tracker used to infer this from `set_kv_pool_reach`
     // having been called, and this very test reproduced the card's failure on the host when that inference
     // was removed — `[step-reach] asked=798 applied=0`. The capability is DECLARED now.
-    let mut t = SimpleBlockTracker::with_caching(64, BLOCK).sharing_one_write_slot();
+    let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"))
+        .sharing_one_write_slot();
     t.set_kv_pool_reach(KvSlotSpan::new(697));
     t.set_step_reach(KvSlotSpan::new(798));
 
@@ -180,7 +182,8 @@ fn a_shallow_request_under_a_deep_step_reach_holds_blocks_for_the_reach() {
 
     // ⛔ THE CONTROL, IN THE SAME TEST: a tracker that did NOT declare the capability must be untouched by
     // any reach. This is metal, and a regression here is a change to its allocation.
-    let mut plain = SimpleBlockTracker::with_caching(64, BLOCK);
+    let mut plain =
+        SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
     plain.set_kv_pool_reach(KvSlotSpan::new(697));
     plain.set_step_reach(KvSlotSpan::new(798));
     let same = request_of("shallow", 441, Some(extent));
@@ -279,7 +282,8 @@ fn an_extent_one_step_in_flight_is_allocated_for_the_slot_the_launch_will_write(
 
     // ⛔ AND THE TOKEN-ADDRESSED CONTROL: metal reports no extent at all, so nothing here can reach
     // them. A regression on this line is a change to their allocation.
-    let mut plain = SimpleBlockTracker::with_caching(64, BLOCK);
+    let mut plain =
+        SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
     plain.set_step_reach(KvSlotSpan::new((current_end + 1) as u32));
     let mut fresh = request_of("plain-async", 300, None);
     fresh.num_output_placeholders = 1;
@@ -305,7 +309,8 @@ fn an_extent_one_step_in_flight_is_allocated_for_the_slot_the_launch_will_write(
 /// `2 == ceil(441/256)` — the token-count answer, from the arm that had no reach in it.
 #[test]
 fn a_new_request_is_allocated_for_the_step_reach_before_any_pool_reach_exists() {
-    let mut t = SimpleBlockTracker::with_caching(64, BLOCK).sharing_one_write_slot();
+    let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"))
+        .sharing_one_write_slot();
     // NO `set_kv_pool_reach` — this is the state on every step up to the worker's first report.
     t.set_step_reach(KvSlotSpan::new(698));
 
@@ -322,7 +327,8 @@ fn a_new_request_is_allocated_for_the_step_reach_before_any_pool_reach_exists() 
     );
 
     // The control again: undeclared, so the reach is inert and this is the metal answer.
-    let mut plain = SimpleBlockTracker::with_caching(64, BLOCK);
+    let mut plain =
+        SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"));
     plain.set_step_reach(KvSlotSpan::new(698));
     let same = request_of("fresh", 441, None);
     assert_eq!(

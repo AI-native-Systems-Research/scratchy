@@ -14,6 +14,7 @@ pub mod arena;
 pub mod attrkey;
 pub mod codec;
 pub mod consttest;
+pub mod ddl_binds;
 pub mod dtypes;
 pub mod fxhash;
 pub mod ir;

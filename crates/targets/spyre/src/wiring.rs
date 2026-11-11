@@ -21,12 +21,18 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
-use crate::lower_subtile_tape_to_superdsc::{DeviceWidth, row_footprint_bytes};
+use crate::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, row_footprint_bytes};
 pub use ktir_superdsc::element_arrangement::{
     DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
 use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_tensors::GpuTensor;
+
+// The query's extent pair and its two halves, re-exported for the wiring's own emission: the
+// models crate (where `#[forward]` expands) names every wiring type through this crate's root,
+// and `PagedStep` carries the pair ([`PagedStep::extent`]) — so its literal needs the types in
+// reach through the same prefix every other wiring type uses.
+pub use scratchy_subtile::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
 
 // ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
 // whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
@@ -147,8 +153,9 @@ pub struct BakeFacts {
     pub uses_ones_reduce: bool,
     /// Length in f32 elements of that placement (`size / 2`). The fp8-prefill L2 amax enlarges
     /// ONES to `[max(hidden, max fp8-K), stick]`, so binding only `hidden * 64` would leave
-    /// down_proj's tail rows reading adjacent seg0 consts. 0 when unplaced.
-    pub ones_reduce_len: usize,
+    /// down_proj's tail rows reading adjacent seg0 consts. `None` when unplaced — a placed
+    /// `ONES_REDUCE` is at least a full stick of pairs, so `None` is exactly "unplaced".
+    pub ones_reduce_len: Option<std::num::NonZeroUsize>,
     /// The bundle placed `IDENTITY_TID` — the KV cachewr / GQA-replicate matmul-by-identity.
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
@@ -160,7 +167,7 @@ impl BakeFacts {
     /// ask. ⛔ NOT A DEFAULT FOR THE CARD PATH: `require_identity` refuses this on decode.
     pub const NONE: BakeFacts = BakeFacts {
         uses_ones_reduce: false,
-        ones_reduce_len: 0,
+        ones_reduce_len: None,
         uses_identity: false,
         scalarmul_scales: &[],
     };
@@ -171,7 +178,7 @@ impl BakeFacts {
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
-            ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
+            ones_reduce_len: ones.and_then(|p| std::num::NonZeroUsize::new((p.size / 2) as usize)),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
@@ -676,6 +683,15 @@ pub struct PagedStep {
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
     pub paged_rows: crate::paged_step::PagedRows,
+    /// ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(per-request width, capacity)`, minted once
+    /// at the bake from the rung (never a division of [`Self::rows`]) and threaded here so the
+    /// card stager and the layout state the per-request laws off the ONE pair the splice already
+    /// checks against the graph ([`QueryExtent`]'s own doc). The pair's held product IS
+    /// `rows` — the two are one fact in two spellings, pinned at the one mint
+    /// ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]'s agreement check) and maintained
+    /// by [`Self::on_body`]'s own re-mint, so a `PagedStep` can never carry a pair its rows
+    /// disagree with.
+    pub extent: QueryExtent,
 }
 
 impl PagedStep {
@@ -725,17 +741,42 @@ impl PagedStep {
     /// card holds the trip's page ids at: the relaunch shifts every step source in the activation
     /// segment by that one step (`loop_fold`'s pitched index table). The stack is stick-major
     /// (`paged_step::card_mask`), so one trip's tile is its rows' sticks in every plane of it, 128 B
-    /// a row: `rows` of them for one sequence (`[rows, page_slots]`),
-    /// so page table row `i` sits at `i · rows · 128` B (one int32 stick at decode), and
-    /// `entries` of them for a decode batch (`[J, B, 1, 1, page_slots]`: one row per block slot and
+    /// a row: one request's `per_request` rows for a sequence's step (`[w, page_slots]` — at one
+    /// request the extent's width IS the graph's rows, so the pitch is unchanged there), so page
+    /// table row `i` sits at `i · w · 128` B (one int32 stick at decode), and `entries` of them for
+    /// a decode batch (`[J, B, 1, 1, page_slots]`: one row per block slot and
     /// sequence, every kv head reading it through the kernel's broadcast), so chunk `c`'s ids sit at
     /// `c · entries · 128` B.
     pub const fn card_walk_step(self) -> u64 {
         let rows = match self.batch() {
             Some(c) => c.entries(),
-            None => self.rows,
+            None => self.extent.per_request().get(),
         };
         rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
+    }
+
+    /// ⭐ THE REQUEST BLOCK'S PITCH — the stride the step's three tables (page table, mask stack,
+    /// query rows) repeat each request's block at within their placements: request `r`'s copy of
+    /// every one of them sits `r · P` bytes past its placement's start, so ONE shift of the
+    /// activation segment — `r · P` plus the walk's own `t · card_walk_step` — selects request
+    /// `r`'s block in all three at once (the card's seven bound addresses hold one base per
+    /// segment, so the tables cannot take an address each; the pitch is how one base serves them
+    /// all).
+    ///
+    /// `P` is the largest of the three PER-REQUEST sizes — each table's placement is its own
+    /// region, so the pitch only has to keep one request's block clear of the next's within a
+    /// region — aligned up to a whole 128-byte stick, so every request's block starts where both
+    /// the int32 sticks and the mask's fp16 sticks tile. At one request (`S = 1`, every rung
+    /// today) the pitch is never added and nothing moves.
+    pub fn card_request_pitch(self) -> u64 {
+        let int32_stick = u64::from(scratchy_triton_splice::INT32_STICK);
+        let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
+        let w = u64::from(self.extent.per_request().get());
+        let slots = u64::from(self.page_slots);
+        let page_table = u64::from(self.pages) * self.card_walk_step();
+        let mask = u64::from(self.pages) * w * slots * 2;
+        let query_rows = sticks(w);
+        page_table.max(mask).max(query_rows).div_ceil(128) * 128
     }
 
     /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at
@@ -788,23 +829,32 @@ impl PagedStep {
                     ),
                 ]);
             }
-            None => v.extend([
-                (
-                    self.page_table,
-                    CardSeat::Step,
-                    u64::from(self.pages) * self.card_walk_step(),
-                ),
-                (
-                    self.mask,
-                    CardSeat::Step,
-                    u64::from(self.pages) * u64::from(self.rows) * slots * 2,
-                ),
-                (
-                    self.query_rows,
-                    CardSeat::Step,
-                    sticks(u64::from(self.rows)),
-                ),
-            ]),
+            None => {
+                // ⭐ THE SEQUENCE TABLES' OWN REGION EACH, SIZED FOR THE RUNG'S WHOLE CAPACITY:
+                // one request's block (the per-request size — the pool's whole walk, as ever) plus
+                // `(S - 1) · card_request_pitch()` for the requests behind it, so request `r`'s
+                // copy sits `r · P` past the region's start ([`Self::card_request_pitch`]) and the
+                // regions stay disjoint by their own packing order (write rows, page table, mask,
+                // query rows — the three tables contiguous and last in the segment). At one
+                // request the spare is zero and every size is the per-request one — the layout
+                // every rung today bakes, byte for byte.
+                let w = u64::from(self.extent.per_request().get());
+                let spare =
+                    (u64::from(self.extent.requests().get()) - 1) * self.card_request_pitch();
+                v.extend([
+                    (
+                        self.page_table,
+                        CardSeat::Step,
+                        u64::from(self.pages) * self.card_walk_step() + spare,
+                    ),
+                    (
+                        self.mask,
+                        CardSeat::Step,
+                        u64::from(self.pages) * w * slots * 2 + spare,
+                    ),
+                    (self.query_rows, CardSeat::Step, sticks(w) + spare),
+                ]);
+            }
         }
         if self.reads_kv_row_pool() {
             v.extend([
@@ -827,6 +877,15 @@ impl PagedStep {
     /// prompt-width rung is the same tape baked at `rows` rows), walking the blocks the body sweeps:
     /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
     /// `None` when `swept` is no walk of this pool.
+    ///
+    /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, by the launch's own kind — never a comparison
+    /// against the wiring's stated pair. The wiring states ONE representative of a tape the
+    /// ladders bake at several widths (the prefill ladder's rungs all bind the same tensor ids,
+    /// so one wiring serves them; `rows` here is the rung actually launching), and the runtime
+    /// truth is what the launch itself is: a `Sequence` launch is ONE request of `rows` rows —
+    /// `(rows, 1)` — and a `Batch` launch is one row per request — `(1, rows)`. Both are the
+    /// same law the bake's codegen minted each rung's own pair by, so a launch on the
+    /// representative's own width re-derives the wiring's pair exactly.
     pub fn on_body(
         self,
         rows: u32,
@@ -834,11 +893,20 @@ impl PagedStep {
         swept: u32,
     ) -> Option<PagedStep> {
         let walk = swept / self.page_slots;
+        let extent = match paged_rows {
+            crate::paged_step::PagedRows::Sequence => {
+                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
+            }
+            crate::paged_step::PagedRows::Batch => {
+                QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
+            }
+        };
         (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
             .then_some(PagedStep {
                 rows,
                 paged_rows,
                 walk,
+                extent,
                 ..self
             })
     }
@@ -1026,6 +1094,13 @@ pub struct Wiring {
 /// (the tape's ChainSeed steps replaced the EmbedRow push), stated once at
 /// the mint and read by the layout stamp's resident excuse and the bake's
 /// binding-check arm; the worker never names it.
+///
+/// `block` is the table columns one rank's gather reads (the mint's own `block`): the widened
+/// table's pad at a world of one, a rank's vocabulary block when the projection is split. With the
+/// rank a session plays as, it is the rank's [`ChainBlock`] ([`chain_block`]) — the one fact the
+/// tables and the seeds both decompose a pick through.
+///
+/// [`ChainBlock`]: scratchy_subtile::subtile_ir::ChainBlock
 #[derive(Clone, Copy, Debug)]
 pub struct ChainWiring {
     pub s_src: u32,
@@ -1033,6 +1108,25 @@ pub struct ChainWiring {
     pub k: u32,
     pub hidden: u32,
     pub replaces: u32,
+    pub block: u32,
+}
+
+/// ⭐ THE BLOCK A SESSION'S CHAINED HEAD GATHERS — `width` columns at the origin of the rank `me`
+/// plays as; the whole table for a session that plays no rank of a sharded world (`None`, the
+/// executor's own [`RankSeat`] alone). Bound at load from the session's own seat, never baked: one
+/// bake serves every rank, and the rank lives only in the bytes each rank stages (its tables, its
+/// seeds).
+///
+/// [`RankSeat`]: crate::superdsc_exec::RankSeat
+pub fn chain_block<T: crate::bundle_code::collective::World>(
+    width: u32,
+    me: Option<crate::bundle_code::collective::Rank<T>>,
+) -> scratchy_subtile::subtile_ir::ChainBlock {
+    use scratchy_subtile::subtile_ir::ChainBlock;
+    me.map_or_else(
+        || ChainBlock::whole(width),
+        |r| ChainBlock::of_rank(width, r),
+    )
 }
 
 /// ⭐ THE GRAPH'S OWN CHAIN FACT — read once off the mint by `chain_of_ir`
@@ -1096,10 +1190,14 @@ pub enum LoadConst {
     /// at the mint beside it — the l-tab's LANE RAMP
     /// `64·(i mod (hidden/64)) + (t&63)` reads its entry count from it), so
     /// the staging is self-contained: the fill never re-derives either.
+    ///
+    /// `block` is the mint's own block width ([`ChainWiring::block`]); the rank's origin is bound
+    /// when the session stages the table ([`Self::build`]'s `me`).
     ChainStageTable {
         pad_vocab: u32,
         k: u32,
         hidden: u32,
+        block: u32,
         operand: u8,
     },
 }
@@ -1111,7 +1209,13 @@ impl LoadConst {
     /// on one leg only). PURE IN THE ARRANGEMENT: a `Dl16ToFp32` entry's bytes
     /// come out already permuted into the stagger the consuming island reads,
     /// so every leg that calls here stages identical bytes by construction.
-    pub fn build(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+    ///
+    /// `me` is the rank the staging session plays as (`None` alone): the chain's tables are its
+    /// rank's [`chain_block`]; every other kind is the same on every rank.
+    pub fn build<T: crate::bundle_code::collective::World>(
+        &self,
+        me: Option<crate::bundle_code::collective::Rank<T>>,
+    ) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
         match *self {
             LoadConst::SampleTable {
                 vocab,
@@ -1147,12 +1251,14 @@ impl LoadConst {
                 pad_vocab,
                 k,
                 hidden,
+                block,
                 operand,
             } => {
-                let (bytes, dt, shape) = chain_staged_tables(pad_vocab, k, hidden)
-                    .into_iter()
-                    .nth((operand - 1) as usize)
-                    .expect("the mint emits operand 1..=2 — the registry's own row");
+                let (bytes, dt, shape) =
+                    chain_staged_tables(pad_vocab, k, hidden, chain_block(block, me))
+                        .into_iter()
+                        .nth((operand - 1) as usize)
+                        .expect("the mint emits operand 1..=2 — the registry's own row");
                 (bytes, dt, shape)
             }
         }
@@ -1189,8 +1295,11 @@ impl LoadConst {
     /// pointwise island reads; a one-word-per-row table has no lane stream to
     /// permute, and a mark on one is a mint/propagation disagreement — refuse
     /// it, never permute the rows' words.
-    pub fn card_bytes(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
-        let (bytes, dt, shape) = self.build();
+    pub fn card_bytes<T: crate::bundle_code::collective::World>(
+        &self,
+        me: Option<crate::bundle_code::collective::Rank<T>>,
+    ) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        let (bytes, dt, shape) = self.build(me);
         // Only the sampler's own tables carry the uniform-col class; every
         // other kind — the chain's decompose ramps — falls through VERBATIM,
         // and a second such kind arrives here by this match failing to
@@ -1322,17 +1431,28 @@ pub fn stage_col_stick_heads<const N: usize>(
 /// pattern. Tables are functions of `pad_vocab`, `k`, and `hidden`, constant
 /// across decode steps, staged ONCE.
 ///
-/// The SENTINEL (all-NaN row, #666): the device answers `PAD_V + 4160`, so
-/// the tables run to `pad_vocab + SAMPLE_SENTINEL_OFFSET + 1` rows to keep
-/// that pick's gather IN EXTENT. Past `pad_vocab` every row stages the
-/// sentinel's own values — `stab` = the s=0 LANE PATTERN (every lane names a
-/// quarter of slab 0, the clamp's bus safety: no special-cased row class),
-/// `ltab` = the SENTINEL RAMP (`chain_l_sentinel_ramp` — lanes naming the
-/// transposed placement's unwritten zero tail, word 0 = `hidden` the mark: a
-/// real pick's word 0 is a lane `≤ 63 < 64 ≤ hidden`, so the mark never
-/// collides): the readback refusal (`checked_picked_token`) errors the step
-/// BEFORE any consumer of the sentinel rows runs, so those rows are bus
-/// safety, never a value the forward reads.
+/// The SENTINEL (all-NaN row, #666): the device answers `G·4096 + 4160`
+/// (`sample_sentinel` — `PAD_V + 4160` at every pad of whole 4096-lane
+/// groups, and below it otherwise), so the tables run to `pad_vocab +
+/// SAMPLE_SENTINEL_OFFSET + 1` rows to keep that pick's gather IN EXTENT.
+/// Past `pad_vocab` every row stages the sentinel's own values — `stab` =
+/// the s=0 LANE PATTERN (every lane names a quarter of slab 0, the clamp's
+/// bus safety: no special-cased row class), `ltab` = the SENTINEL RAMP
+/// (`chain_l_sentinel_ramp` — lanes naming the transposed placement's
+/// unwritten zero tail, word 0 = `hidden` the mark: a real pick's word 0 is
+/// a lane `≤ 63 < 64 ≤ hidden`, so the mark never collides). The worker's
+/// idx-stick readback refuses the sentinel and fails the step that drew it,
+/// but under the pipelined decode the next step can already be on the card
+/// by then, gathering through these rows — so they are read, and what they
+/// buy is bus safety: the gather stages a zero row, never a read past the
+/// matrix.
+///
+/// ⭐ A RANK'S TABLES ARE ITS BLOCK'S (`block`, the session's [`chain_block`]).
+/// At a world of one the block is the whole widened table and the rows above
+/// are exact. When the vocabulary projection is split, a row whose pick another
+/// rank holds stages the sentinel's values too — this rank's ZERO addend,
+/// which the analysis's all-reduce sums with the owner's row — and an owned
+/// pick decomposes at its column within the block.
 ///
 /// ⛔ THE WORDS ARE THE DEVICE ENCODING — SENUINT32 lane values as u32 LE
 /// words, `DType::I32`. The staging door for I32 consts is the VERBATIM
@@ -1342,6 +1462,7 @@ pub fn chain_staged_tables(
     pad_vocab: u32,
     k: u32,
     hidden: u32,
+    block: scratchy_subtile::subtile_ir::ChainBlock,
 ) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     // The mint stated k; the fill TRUSTS it — and a k outside the law's
     // window would not mis-fill, it would UNNAME (k = 0 dies a divide-by-
@@ -1360,14 +1481,16 @@ pub fn chain_staged_tables(
         pad_vocab as usize + scratchy_subtile::subtile_ir::SAMPLE_SENTINEL_OFFSET as usize + 1;
     let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
     // The stab row is the LANE PATTERN, not a splat: lane i names entry
-    // k·(t>>6) + (i mod k) of the weight's slab-major staging. Past
-    // pad_vocab the base clamps to s = 0, so every lane stays a quarter of
-    // slab 0 — the clamp's bus safety under the entry-word encoding.
+    // k·s + (i mod k) of the weight's slab-major staging, `s` the pick's slab
+    // within the rank's block (`chain_s_row`, the one spelling the seeds
+    // share). A pick the block does not hold — past the pad at a world of
+    // one, outside the rank's columns when the table is split — clamps to
+    // s = 0, so every lane stays a quarter of slab 0: the clamp's bus safety
+    // under the entry-word encoding.
     let mut stab = Vec::with_capacity(rows * lanes * 4);
     for t in 0..rows as u32 {
-        let base = if t < pad_vocab { k * (t >> 6) } else { 0 };
-        for i in 0..lanes as u32 {
-            stab.extend_from_slice(&(base + i % k).to_le_bytes());
+        for w in scratchy_subtile::subtile_ir::chain_s_row(k, t, block) {
+            stab.extend_from_slice(&w.to_le_bytes());
         }
     }
     // The ltab row is the pick's WHOLE LANE RAMP, not a splat: word `i` names
@@ -1382,11 +1505,7 @@ pub fn chain_staged_tables(
     let l_words = l_sticks * lanes;
     let mut ltab = Vec::with_capacity(rows * l_words * 4);
     for t in 0..rows as u32 {
-        let row = if t < pad_vocab {
-            scratchy_subtile::subtile_ir::chain_l_stick_ramp(t & 63, hidden)
-        } else {
-            scratchy_subtile::subtile_ir::chain_l_sentinel_ramp(hidden)
-        };
+        let row = scratchy_subtile::subtile_ir::chain_l_row(t, hidden, block);
         // The fill and the shape are ONE law: the ramp is self-sized at the
         // stick count, so a row's length IS the placement's word count —
         // asserted here, never trusted, so the two cannot drift by a silent
@@ -1426,11 +1545,24 @@ const _: () = assert!(
     "the entry cap: CHAIN_IDX_BLOCK (the u32 index stick's width) must equal \
      CopyDims::ENTRIES_PER_OP (the IBR ceiling) — one stick, two spellings"
 );
+// ⭐ AND THE PIN AGAINST THE LADDER'S OWN DERIVATION: CHAIN_IDX_BLOCK is the leaf
+// crate's one honest copy of the SENUINT32 stick width (the leaf cannot depend on
+// ktir-superdsc, where the DataFormat table derives it). Both sides compile in this
+// one build, so a drift in either spelling fails it here — never at a device read.
+const _: () = assert!(
+    scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as u64
+        == <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as u64,
+    "the u32 index stick: the leaf crate's CHAIN_IDX_BLOCK must equal the ladder's \
+     SenUint32 ELEMS_PER_STICK — one stick, one copy each side of the crate edge, \
+     pinned here"
+);
 
 /// ⭐⭐⭐ THE GATE TABLE'S β IMAGE — the ONE `[rows, 1]` table whose chain crosses the
 /// i32→f32 convert, staged at the convert's own device sweep (front-b-noise, auditor
-/// ruling 2026-10-27). The table's reservation is [`gate_row_stride_bytes`] (two u32
-/// sticks per row), and the convert's `[rows, 64]` addressing over it is STICK-BLOCKED —
+/// ruling 2026-10-27). The table's reservation is the convert's own device width —
+/// `DeviceWidth::for_convert(1)` bytes, two u32 sticks per row — and the convert's
+/// `[rows, 64]` addressing over it is STICK-BLOCKED —
 /// row r's first stick is flat stick `r`, its second flat stick `rows + r` — so the image
 /// is the one-stick head staging (row r's gate at byte `r · 128`, the SAME head
 /// [`stage_col_stick_heads`] ever wrote, the Col operand mode's own address) followed by
@@ -1438,7 +1570,7 @@ const _: () = assert!(
 /// zero-filled reservation is deterministic — no uninitialized tail for the sweep to
 /// consume. `head_stride` is the seed words' own one-stick stride
 /// ([`col_row_stride_bytes`]); `sweep_stride` is the gate's own reservation
-/// ([`gate_row_stride_bytes`]) — both passed in so this fn stages LAWS, never
+/// (the seat's `gate_row_words`) — both passed in so this fn stages LAWS, never
 /// recomputations.
 pub fn stage_gate_sweep<const N: usize>(
     rows: usize,
@@ -1454,15 +1586,6 @@ pub fn stage_gate_sweep<const N: usize>(
     let mut out = stage_col_stick_heads::<N>(rows, head_stride, elem);
     out.resize(rows * sweep_stride, 0);
     out
-}
-
-/// ⭐ THE GATE TABLE'S OWN ROW RESERVATION — `DeviceWidth::for_convert(1)` in i32 words
-/// (64 = two u32 sticks, 256 B), the SAME one decision the convert door sweeps, the
-/// whole-function mint reserves, and the layout's `nbytes` places — stated here so the
-/// worker's per-row write and the placement's reservation cannot drift, exactly
-/// [`col_row_stride_bytes`]'s own contract for the one-stick tables.
-pub fn gate_row_stride_bytes() -> usize {
-    DeviceWidth::for_convert(1).get() as usize * 4
 }
 
 /// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
@@ -1518,6 +1641,17 @@ pub struct SampleSeat {
     pub vocab: u32,
     /// `sample_pad_vocab(vocab)` — the width the f32 tables share.
     pub pad_vocab: u32,
+    /// ⭐ THE IDX STICK'S OWN ROW SIZE in i32 words — the readback's typed
+    /// byte law. The mint re-points the rung's result at the draw's idx
+    /// stick, a `[rows, SAMPLE_BLOCK]` SenUint32 placement, and this is that
+    /// stick's own PLACED WIDTH in words (one u32 word per element — not the
+    /// `row_footprint_bytes` reservation, whose occupancy pad is a
+    /// weight-streaming fact the readback never reads): the worker's
+    /// readback reads `rows · idx_row_words · 4` bytes of it and addresses
+    /// row r's lane 0 at the stick's own placed width — never a recomputed
+    /// `64 · 4`. Minted once at the bake ([`sample_seat_of_ir`]), exactly
+    /// `seed_row_words`'s own contract.
+    pub idx_row_words: u32,
     /// Every seed word table's ROW STRIDE in i32 words on the CARD — the
     /// placement's own reservation law for a `[rows, 1]` SenUint32 table
     /// (`row_footprint_bytes(1, SenUint32) / 4`, a whole 32-element u32
@@ -1536,9 +1670,8 @@ pub struct SampleSeat {
     /// law ever stated, because the convert's `[rows, 64]` addressing is
     /// stick-blocked (row r's first stick is flat stick `r`) — and the
     /// widened words past the head are the sweep's own padding: converted,
-    /// never read. Staged by [`stage_gate_sweep`]; the worker checks it
-    /// against [`gate_row_stride_bytes`] the same way `seed_row_words` is
-    /// checked against [`col_row_stride_bytes`].
+    /// never read. Staged by [`stage_gate_sweep`] — the worker stages at
+    /// this stride directly, the seat's own fact.
     pub gate_row_words: u32,
 }
 
@@ -1631,8 +1764,8 @@ pub struct SampleSeat {
 ///
 /// The SENTINEL (all-NaN row, #666): the one-hot falls on the pad lanes,
 /// where the tables stage `ginc = G`, `binc = GROUP_BLOCKS`, `linc = BLOCK`,
-/// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK = PAD_V + 4160`, past the last
-/// real lane.
+/// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK` =
+/// [`scratchy_subtile::subtile_ir::sample_sentinel`], past the last real lane.
 ///
 /// Every selection value is a small exact integer (`G ≤ 2048` by the admission
 /// gate; `padoff` stages only 0.0 and −inf); every noise value is either an
@@ -1987,7 +2120,10 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
     }
     let w = T::RANKS;
     let divides = match shard {
-        SourceShard::Whole => true,
+        SourceShard::Whole
+        | SourceShard::Partial
+        | SourceShard::ColBlocks { .. }
+        | SourceShard::RowBlocks { .. } => true,
         SourceShard::Rows => rows.is_multiple_of(w),
         SourceShard::Cols => cols.is_multiple_of(w),
         SourceShard::HeadRows { heads } => {
@@ -2011,7 +2147,10 @@ fn cut_source_bytes<T: crate::bundle_code::collective::World>(
         match shard {
             SourceShard::Rows => (disk, SourceShard::Cols),
             SourceShard::Cols => (disk, SourceShard::Rows),
-            SourceShard::Whole => (disk, SourceShard::Whole),
+            SourceShard::ColBlocks { block } => (disk, SourceShard::RowBlocks { block }),
+            SourceShard::RowBlocks { block } => (disk, SourceShard::ColBlocks { block }),
+            // Rank 0 holds the value and every other rank zeros, in either byte order.
+            SourceShard::Whole | SourceShard::Partial => (disk, shard),
             SourceShard::HeadRows { .. } => return Err(SliceRefusal::HeadSplitGemm { id }),
         }
     } else {
@@ -2062,9 +2201,9 @@ pub struct ConstantEnv {
     pub mq_pad: usize,
     /// From the bundle's own placements, not a runtime flag.
     pub uses_ones_reduce: bool,
-    /// Baked `ONES_REDUCE` placement length in f32 elements; 0 ⇒ fall back to
-    /// `hidden * 64`.
-    pub ones_reduce_len: usize,
+    /// Baked `ONES_REDUCE` placement length in f32 elements; `None` ⇒ fall back to
+    /// `hidden` × the fp16 stick (one stick per hidden column).
+    pub ones_reduce_len: Option<std::num::NonZeroUsize>,
     /// From the bundle's own placements.
     pub uses_identity: bool,
     /// ⭐ THE KERNEL-TABLE CLASS SETS (see [`Wiring::rope_class_hds`]). The tables themselves are
@@ -2102,11 +2241,12 @@ pub struct ConstantEnv {
 // [`ConstValues`] is what lets the list hold them beside the computed ones.
 
 /// RMSNorm Newton-rsqrt bound: 0.5, exact in fp16.
-static RMS_HALF: [f32; 64] = [0.5; 64];
+static RMS_HALF: [f32; FP16_ELEMS_PER_STICK as usize] = [0.5; FP16_ELEMS_PER_STICK as usize];
 /// fp8 E4M3 clamp bounds and the `qfp8ch` amax reciprocal.
-static FP8_POS448: [f32; 64] = [448.0; 64];
-static FP8_NEG448: [f32; 64] = [-448.0; 64];
-static FP8_INV448: [f32; 64] = [1.0 / 448.0; 64];
+static FP8_POS448: [f32; FP16_ELEMS_PER_STICK as usize] = [448.0; FP16_ELEMS_PER_STICK as usize];
+static FP8_NEG448: [f32; FP16_ELEMS_PER_STICK as usize] = [-448.0; FP16_ELEMS_PER_STICK as usize];
+static FP8_INV448: [f32; FP16_ELEMS_PER_STICK as usize] =
+    [1.0 / 448.0; FP16_ELEMS_PER_STICK as usize];
 
 /// A constant's values: BORROWED from the binary when the value is known ahead
 /// of the run, OWNED while it is still computed at load.
@@ -2243,11 +2383,12 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     if reductions && env.uses_ones_reduce {
         // Bind the FULL baked placement length: the fp8-prefill L2 amax enlarges
         // ONES to cover down_proj (K = intermediate > hidden), and binding only
-        // `hidden*64` leaves the tail rows reading adjacent seg0 consts.
-        let len = if env.ones_reduce_len > 0 {
-            env.ones_reduce_len
-        } else {
-            h * 64
+        // one stick per hidden column leaves the tail rows reading adjacent
+        // seg0 consts. The stick is Fp16's own (the ladder's derivation), never
+        // a spelled 64.
+        let len = match env.ones_reduce_len {
+            Some(len) => len.get(),
+            None => h * FP16_ELEMS_PER_STICK as usize,
         };
         out.push((sd::ONES_REDUCE_TID, ConstValues::Fill { value: 1.0, len }));
     }
@@ -2506,7 +2647,7 @@ mod constant_tape_tests {
             head_dim: 64,
             mq_pad: 64,
             uses_ones_reduce: true,
-            ones_reduce_len: 0,
+            ones_reduce_len: None,
             uses_identity: true,
             rows,
             scalarmul_scales: &[1.5, 2.5],
@@ -2749,6 +2890,40 @@ mod constant_tape_tests {
             ..Default::default()
         }
     }
+
+    /// The staged pad lanes spell the sampler's all-NaN answer (#666): an all-NaN row's one-hot
+    /// falls on a pad lane, whose `ginc`, `binc` and `linc` read back idx = `ginc·4096 + binc·64 +
+    /// linc` — `sample_sentinel`, the host reference's answer, past the vocab (the readback's
+    /// refusal) and inside the chain tables' extent (the next step's gather stays in bounds).
+    /// At a small vocab, granite's, and gemma-4's power of two, which pads to the next one.
+    #[test]
+    fn the_staged_pad_lanes_spell_the_all_nan_sentinel() {
+        use scratchy_subtile::subtile_ir::{
+            SAMPLE_BLOCK, SAMPLE_GROUP_BLOCKS, SAMPLE_SENTINEL_OFFSET, sample_pad_vocab,
+            sample_sentinel,
+        };
+        for vocab in [5u32, 49155, 262144] {
+            let tables = sample_staged_tables(vocab, 1);
+            // The last lane of a `[1, pad_v]` f32 table is a pad lane at every vocab.
+            let pad = |t: usize| {
+                let (bytes, dt, _) = &tables[t];
+                assert_eq!(*dt, scratchy_tensors::DType::F32);
+                let last = bytes.len() - 4;
+                f32::from_le_bytes(bytes[last..].try_into().unwrap()) as u32
+            };
+            let (binc, linc, ginc) = (pad(2), pad(3), pad(8));
+            let idx = ginc * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS) + binc * SAMPLE_BLOCK + linc;
+            assert_eq!(idx, sample_sentinel(vocab), "vocab {vocab}");
+            assert!(
+                idx >= vocab,
+                "vocab {vocab}: the sentinel is past the vocab"
+            );
+            assert!(
+                idx < sample_pad_vocab(vocab) + SAMPLE_SENTINEL_OFFSET + 1,
+                "vocab {vocab}: the chain's tables reach the sentinel's row"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2780,6 +2955,24 @@ mod tp_slice_tests {
             cut_source_bytes::<W2>(SourceShard::Cols, r1, 3, row, 2, (1, 4), false),
             Ok(vec![4, 5, 6, 7])
         );
+    }
+
+    /// An uneven vocabulary's padded N-split (`ColBlocks`) is a row block of the disk bytes like
+    /// the even one, the last rank's rows past the vocabulary staged zero — the columns its local
+    /// projection computes and the all-gather crops.
+    #[test]
+    fn a_padded_block_stages_zeros_past_the_source() {
+        let (r0, r1) = (Rank::<W2>::of::<0>(), Rank::<W2>::of::<1>());
+        // Logical [k=2, n=3]; on disk [n=3, k=2], element (n, k) = 10·n + k.
+        let disk: Vec<u8> = (0..3u8)
+            .flat_map(|n| (0..2u8).map(move |k| 10 * n + k))
+            .collect();
+        let block = SourceShard::ColBlocks {
+            block: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let cut = |me| cut_source_bytes::<W2>(block, me, 7, disk.clone(), 1, (2, 3), true);
+        assert_eq!(cut(r0), Ok(vec![0, 1, 10, 11]));
+        assert_eq!(cut(r1), Ok(vec![20, 21, 0, 0]));
     }
 
     /// Every cut it cannot make byte-exactly is refused by name.

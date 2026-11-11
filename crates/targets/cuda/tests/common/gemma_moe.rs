@@ -12,6 +12,7 @@
 //! embedded hidden), 1 the router scale `[1, H]`, 2 the router projection `[H, E]`, 3 the
 //! per-expert scale `[1, E]`, 4 the gate `[E·I, H]`, 5 the up `[E·I, H]`, 6 the down `[E·H, I]`.
 
+use scratchy_subtile::fixtures::rebind;
 use scratchy_subtile::handoff::{
     BundleTensor, Expansion, ExpansionId, LoweredDecode, SourceBinding, UnrollIndex,
 };
@@ -156,11 +157,13 @@ pub const TENSORS: [(usize, u32, BundleTensor); 6] = [
 pub fn gemma_moe(m: u32) -> LoweredDecode {
     let mut l = with_hidden(gemma_moe_input(m));
     for (ix, id, tensor) in TENSORS {
-        l.bindings[ix] = SourceBinding::BundleTensor {
-            id,
-            index: Some(UnrollIndex(LAYER)),
-            tensor,
-        };
+        rebind(&mut l, |b| {
+            b[ix] = SourceBinding::BundleTensor {
+                id,
+                index: Some(UnrollIndex(LAYER)),
+                tensor,
+            }
+        });
     }
     for e in l.op_expansion.iter_mut() {
         *e = Some(Expansion {

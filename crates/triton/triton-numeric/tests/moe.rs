@@ -105,7 +105,8 @@ fn f16(v: f64) -> f64 {
     ktir_core::codec::decode(&b, 1, ktir_core::dtypes::DType::F16)[0] as f64
 }
 
-/// Round to e4m3 (RTNE, saturating at ±448) — the card's `qfp8ch`.
+/// Round to e4m3 (RTNE; NaN past the finite range, as on the card) — the card's `qfp8ch`. The
+/// kernel clamps to ±448 first, so its codes never reach the NaN band.
 fn e4m3(v: f64) -> f64 {
     ktir_core::codec::e4m3_to_f32(ktir_core::codec::f32_to_e4m3(v as f32)) as f64
 }

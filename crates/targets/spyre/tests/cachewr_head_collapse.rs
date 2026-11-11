@@ -83,6 +83,7 @@ fn cachewr_op(
         &mut sym,
         None,
     )
+    .expect("assemble_matmul_placed builds")
 }
 
 fn layout_dim_order(
@@ -254,9 +255,9 @@ fn a_prompt_chunk_writes_all_its_rows_in_one_op() {
 }
 
 /// THE REQUEST MOVES THE SOURCE ROW AND NOTHING ELSE: the cache side never moves, because the page
-/// and the slot are the LAUNCH's (`kv_request` → the host's block table). A per-request term in the
-/// cache ADDRESS would be double-counting the row — which is what the address carried before, and
-/// what the pool's page-per-row map replaced.
+/// and the slot are the LAUNCH's (the host's block table). A per-request term in the cache ADDRESS
+/// would be double-counting the row — which is what the address carried before, and what the pool's
+/// page-per-row map replaced.
 #[test]
 fn the_request_moves_the_source_row_and_nothing_else() {
     for hd in [64u32, 128, 512] {

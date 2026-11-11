@@ -6,6 +6,8 @@
 
 use std::borrow::Cow;
 
+use scratchy_core_common::KvBlockTokens;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -284,8 +286,9 @@ fn default_mamba_type() -> Cow<'static, str> {
 /// Ported from `vllm.v1.kv_cache_interface.KVCacheSpec` and its subclasses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KVCacheSpec {
-    /// Number of tokens in a single cache block.
-    pub block_size: usize,
+    /// Number of tokens in a single cache block — typed, because every reader of it (the
+    /// scheduler's hybrid groups, the worker's full-group page) divides or hashes by it.
+    pub block_size: KvBlockTokens,
 
     /// The specific attention type and associated parameters.
     #[serde(flatten)]
@@ -377,7 +380,7 @@ pub struct HybridKvLayout {
     pub layer_to_group: Vec<usize>,
     /// Per-layer (layer order) effective `block_size` (sliding layers keep the
     /// base block_size; full layers may be scaled up by page unification).
-    pub layer_block_size: Vec<usize>,
+    pub layer_block_size: Vec<KvBlockTokens>,
 }
 
 impl HybridKvLayout {
@@ -391,7 +394,7 @@ impl HybridKvLayout {
     /// (group 0 = full) — the form the scheduler's hybrid allocator
     /// (`SimpleBlockTracker::enable_hybrid`) and `EngineCoreConfig::hybrid_kv`
     /// consume.
-    pub fn engine_groups(&self) -> Vec<(bool, usize, usize)> {
+    pub fn engine_groups(&self) -> Vec<(bool, usize, KvBlockTokens)> {
         self.config
             .kv_cache_groups
             .iter()
@@ -422,7 +425,7 @@ impl HybridKvLayout {
         self.config
             .kv_cache_groups
             .first()
-            .map(|g| g.kv_cache_spec.block_size)
+            .map(|g| g.kv_cache_spec.block_size.get())
             .unwrap_or(0)
     }
 }
@@ -443,7 +446,7 @@ const fn cdiv(a: usize, b: usize) -> usize {
 /// is NOT a full+sliding hybrid (caller should fall back to the uniform pool).
 pub fn compute_hybrid_kv_layout(
     layers: &[LayerKvGeometry],
-    base_block_size: usize,
+    base_block_size: KvBlockTokens,
     available_bytes: usize,
     elem_bytes: usize,
 ) -> Option<HybridKvLayout> {
@@ -464,7 +467,7 @@ pub fn compute_hybrid_kv_layout(
         let hv = l.head_size_v.unwrap_or(l.head_size);
         bs * l.num_kv_heads * (l.head_size + hv) * elem_bytes
     };
-    let base_page = |l: &LayerKvGeometry| page_of(l, base_block_size);
+    let base_page = |l: &LayerKvGeometry| page_of(l, base_block_size.get());
 
     // 1. Page-size unification: scale each layer's block_size up so every
     //    layer's page == max_page (vLLM `unify_kv_cache_spec_page_size`).
@@ -480,7 +483,11 @@ pub fn compute_hybrid_kv_layout(
             return None;
         }
         let ratio = max_page / p;
-        layer_block_size.push(base_block_size * ratio);
+        // The scale is the type's one multiplicative construction (`KvBlockTokens::times`):
+        // `ratio` is the max over the pages divided by one of them, so it is ≥ 1 by this
+        // loop's own construction, and the product of a nonzero token count and it is
+        // nonzero — `?` names a violated domain, never a fact checked at runtime.
+        layer_block_size.push(base_block_size.times(ratio)?);
     }
     let page_size_bytes = max_page;
 
@@ -649,15 +656,17 @@ mod hybrid_layout_tests {
     fn test_gemma4_grouping_matches_vllm() {
         let layers = gemma4_layers();
         // 5 GiB budget, bf16.
-        let layout = compute_hybrid_kv_layout(&layers, 16, 5 << 30, 2).expect("hybrid");
+        let layout =
+            compute_hybrid_kv_layout(&layers, KvBlockTokens::new(16).expect("16 > 0"), 5 << 30, 2)
+                .expect("hybrid");
         // full page = 2*16*2*512*2 = 65536; sliding = 2*16*8*256*2 = 131072.
         // Unified page = 131072; full block_size scaled x2 -> 32, sliding 16.
         assert_eq!(layout.page_size_bytes, 131072);
         for (i, &bs) in layout.layer_block_size.iter().enumerate() {
             if i % 6 == 5 {
-                assert_eq!(bs, 32, "full layer {i} block_size scaled x2");
+                assert_eq!(bs.get(), 32, "full layer {i} block_size scaled x2");
             } else {
-                assert_eq!(bs, 16, "sliding layer {i} block_size unchanged");
+                assert_eq!(bs.get(), 16, "sliding layer {i} block_size unchanged");
             }
         }
         // 5 full + 25 sliding -> group_size = min(5,25) = 5; 1 full + 5 sliding
@@ -699,7 +708,10 @@ mod hybrid_layout_tests {
                 sliding_window: None,
             })
             .collect();
-        assert!(compute_hybrid_kv_layout(&layers, 16, 5 << 30, 2).is_none());
+        assert!(
+            compute_hybrid_kv_layout(&layers, KvBlockTokens::new(16).expect("16 > 0"), 5 << 30, 2,)
+                .is_none()
+        );
     }
 }
 
@@ -732,7 +744,7 @@ mod tests {
     #[test]
     fn test_kv_cache_spec_full_attention_roundtrip() {
         let spec = KVCacheSpec {
-            block_size: 16,
+            block_size: KvBlockTokens::new(16).expect("16 > 0"),
             spec_type: KVCacheSpecType::FullAttention {
                 num_kv_heads: 8,
                 head_size: 128,
@@ -757,7 +769,7 @@ mod tests {
             kv_cache_groups: vec![KVCacheGroupSpec {
                 layer_names: vec!["layer0".to_string(), "layer1".to_string()],
                 kv_cache_spec: KVCacheSpec {
-                    block_size: 16,
+                    block_size: KvBlockTokens::new(16).expect("16 > 0"),
                     spec_type: KVCacheSpecType::FullAttention {
                         num_kv_heads: 8,
                         head_size: 128,

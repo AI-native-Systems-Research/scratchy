@@ -11,6 +11,7 @@
 //! MEASURED on granite-3.1-8b fp8 at `live=1` (no batch at all), 2026-08-12:
 //!   * 450-token prompt: two step-backs of 32 ⇒ history ended at 514, position at 450.
 //!   * 731-token prompt: three step-backs of 32 ⇒ history ended at 827, position at 731.
+//!
 //! The extra slots are marked valid and hold whatever the pool held before, so a softmax attends
 //! real-looking keys the request never said — fluent output that drifts, worse the longer the prompt,
 //! and non-monotone in length because whether a chunk straddles a page depends on `total % POOL_PAGE_SLOTS`.

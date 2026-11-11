@@ -116,7 +116,7 @@ fn fp8_operands_are_fp8_resident() {
     )
     .unwrap();
     let mut non_output = 0;
-    for arg in &f8.args {
+    for arg in f8.args() {
         let v = arg.view();
         if !matches!(v.role, Role::Output) {
             assert_eq!(
@@ -149,7 +149,7 @@ fn fp8_operands_are_fp8_resident() {
         0,
     )
     .unwrap();
-    for arg in &f16.args {
+    for arg in f16.args() {
         assert_eq!(arg.view().df, Df::Fp16, "fp16 matmul operands stay Fp16");
     }
 }
@@ -212,7 +212,7 @@ fn fp8_large_matmul_time_tile_never_substick() {
             .unwrap_or_else(|e| panic!("{tag} N={n} K={k} fp8 must emit, got Err: {e}"));
         let split = f.iter.split_of("out").max(1);
         let per_core = f.iter.per_core_extent("out");
-        let time = f.time_tile.as_ref().map(|t| t.count()).unwrap_or(1).max(1);
+        let time = f.time_tile().map(|t| t.count()).unwrap_or(1).max(1);
         let per_core_per_trip = per_core / time;
         assert_eq!(
             per_core_per_trip % 128,
@@ -240,7 +240,8 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
             &rb("afp8", 1, cols),
             &mut sym,
             None,
-        );
+        )
+        .expect("assemble_convert builds");
         let split = e
             .dsc()
             .numWkSlicesPerDim_

@@ -383,7 +383,7 @@ mod imp {
                     .collect();
                 scratchy_core_config::compute_hybrid_kv_layout(
                     &geom,
-                    BLOCK_SIZE,
+                    scratchy_core_common::KvBlockTokens::new(BLOCK_SIZE).expect("16 > 0"),
                     usize::MAX / 2,
                     2, // bf16 elem bytes — only the (ignored) num_blocks read
                 )

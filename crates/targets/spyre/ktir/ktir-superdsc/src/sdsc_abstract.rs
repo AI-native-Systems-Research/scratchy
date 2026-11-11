@@ -1276,15 +1276,17 @@ impl DeviceWalk {
     }
 
     /// The same walk with its dims in another order: entry `i` of the result is entry `from[i]` of
-    /// this one (a paged pin follows its dim). `None` unless `from` is a permutation of `0..rank`.
-    pub(crate) fn reordered(&self, from: &[usize]) -> Option<Self> {
-        let rank = self.rank();
-        let mut seen = vec![false; rank];
-        if from.len() != rank
-            || from
-                .iter()
-                .any(|&j| j >= rank || std::mem::replace(&mut seen[j], true))
-        {
+    /// this one (a paged pin follows its dim). `from` is a [`DeviceOrder`]'s positions — a permutation
+    /// of `0..n`, proven where the order was stated — so the one thing left to hold is that it orders
+    /// THIS walk's dims: `None` when the walk's rank is not `n`.
+    ///
+    /// [`DeviceOrder`]: crate::superdsc_opspec::DeviceOrder
+    pub(crate) fn reordered(
+        &self,
+        from: crate::superdsc_opspec::DeviceOrderView<'_>,
+    ) -> Option<Self> {
+        let from = from.positions;
+        if from.len() != self.rank() {
             return None;
         }
         Some(DeviceWalk(match &self.0 {
@@ -3491,6 +3493,187 @@ impl RungWidth {
     pub const fn count(self) -> usize {
         self.0.get() as usize
     }
+
+    /// ONE row — a decode batch's per-request width: every row of a batch's graph is a
+    /// request's one token ([`QueryExtent`]'s decode law), the width a body's pair takes
+    /// wherever the rows are a batch's. The `S = 1` counterpart of [`RungCap::ONE`].
+    pub const ONE: RungWidth = RungWidth(NonZeroU32::MIN);
+}
+
+/// SEQUENCES A PREFILL RUNG HOLDS — the S axis of the prefill ladder.
+///
+/// A prefill rung is keyed by TWO quantities that both fit a bare `u32`: its chunk WIDTH
+/// ([`RungWidth`] — rows of one sequence's chunk) and how many SEQUENCES it packs. The packed
+/// rung's non-attention tape runs at `width · cap` rows (the decode rungs' own device — the
+/// same tape at a wider row count), so a width handed where a capacity is read bakes a rung
+/// at 2·w rows for one sequence and silently doubles every chunk. Typed apart, as the decode
+/// ladder's own keyed-by-type lesson demands (its `RungSeqs`): three lists once shared a bare
+/// `u32` and two quantities were mixed type-safely by mistake.
+///
+/// ONE is today's every rung — one sequence per chunk, the only shape the bake emits until
+/// the packed prefill rung (M2) lands. Selection reads (per-request width, live sequence
+/// count) against the (width, cap) pairs: the smallest rung holding both.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct RungCap(NonZeroU32);
+
+impl RungCap {
+    /// A BAKED sequence count, read from the bake's own artifacts — a ladder entry. The
+    /// worker-side source. The bake's codegen is the one caller: a ladder literal states its
+    /// rung's capacity as this type (today always `RungCap::ONE`), and nothing on the host
+    /// mints a capacity a bake never stated.
+    pub const fn of_baked_seqs(seqs: u32) -> Option<RungCap> {
+        match NonZeroU32::new(seqs) {
+            Some(n) => Some(RungCap(n)),
+            None => None,
+        }
+    }
+
+    /// ONE sequence — today's every rung, and the value the S = 1 axis bakes at.
+    pub const ONE: RungCap = RungCap(NonZeroU32::MIN);
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The sequence count as a host-side extent — the arithmetic exit.
+    pub const fn count(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+/// THE ATTENTION QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, never a division of the
+/// graph's rows.
+///
+/// A packed prefill rung's graph runs `width · capacity` rows, but its attention kernel serves ONE
+/// request's `width` rows per request (the reference's own law: the varlen batch is one query
+/// buffer, attention is called once per sequence with `PADDED_QUERY_LEN = aligned_s` —
+/// `spyre_attn.py`'s `_run_page_attn`/`_build_query_row_tables`). The two counts were one `mq`
+/// until S > 1, and the splice spent it as BOTH extents; this type is the pair that separates them.
+///
+/// ⛔ MINTED ONCE, FROM THE RUNG — [`Self::of_baked_rung`] is the only mint, and the graph's row
+/// count is the product HELD by the type, not a division any reader performs: nothing may recover
+/// the per-request width by dividing graph rows back (a width a later reader re-derived could
+/// disagree with the one the bake minted). The splice CHECKS the held product against the graph it
+/// lowers and refuses by name on disagreement, so a mint that does not describe the graph is a
+/// bake refusal, never a silently-wrong extent.
+///
+/// The decode mints state their own true pair — every row a request's one token: per-request one
+/// row, requests the baked row count — which the decode and batch kernel arms read exactly as they
+/// read the graph's rows today (one row per request means the two agree by construction).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QueryExtent {
+    /// One request's query rows — the prefill chunk width the rung bakes.
+    per_request: RungWidth,
+    /// How many requests the rung packs — the S axis.
+    requests: RungCap,
+    /// `per_request · requests`, minted once and held: the graph's own row count. The mint checks
+    /// the product, so this is a read, never a recompute.
+    rows: RungWidth,
+}
+
+impl QueryExtent {
+    /// THE MINT — the rung's own pair. `None` only when the product does not fit a `u32` (a rung
+    /// wider than four billion rows is a bake bug, named by the caller that holds the rung).
+    pub const fn of_baked_rung(per_request: RungWidth, requests: RungCap) -> Option<Self> {
+        match per_request.get().checked_mul(requests.get()) {
+            Some(rows) => match RungWidth::of_baked_rows(rows) {
+                Some(w) => Some(Self {
+                    per_request,
+                    requests,
+                    rows: w,
+                }),
+                // `rows` is nonzero whenever `checked_mul` returned `Some` over nonzero factors,
+                // so this arm is unreachable; it exists because `of_baked_rows` states the
+                // nonzero law and the const context cannot `debug_assert` it away.
+                None => None,
+            },
+            None => None,
+        }
+    }
+
+    /// One request's query rows — the prefill kernel's `PADDED_QUERY_LEN` and its walk's extent.
+    pub const fn per_request(self) -> RungWidth {
+        self.per_request
+    }
+
+    /// How many requests the rung packs.
+    pub const fn requests(self) -> RungCap {
+        self.requests
+    }
+
+    /// The graph's row count — `per_request · requests`, held since the mint. The whole-batch
+    /// query buffer's `NUM_TOKENS`.
+    pub const fn graph_rows(self) -> RungWidth {
+        self.rows
+    }
+}
+
+/// ⭐ THE PREFILL TAIL'S ANSWER ROWS — one per request window of a packed prefill rung: request
+/// `r`'s answer row is `r·w + selector_lastrow_col(w)`, its window's last BAKED row — the row
+/// whose hidden the lm-head fold extracts, [`selector_lastrow_col`]'s own law stated per
+/// request. Minted ONCE, from the graph's [`QueryExtent`] at the bake; every tail site reads
+/// it, none re-derives a row. The host's window law ([`crate::paged_step`]'s `RowSpan::last`)
+/// states the SAME law at the slot — the two are one statement in two spellings, pinned equal
+/// by fixture, never two laws that agree by accident.
+///
+/// At one request (`S = 1`, every rung today) the first of `rows()` is `selector_lastrow_col(w)`
+/// with `w = mq` — exactly today's single-row law, so every tail site is byte-identical there.
+///
+/// ⛔ THE COUNT IS THE RUNG'S CAPACITY, NOT THE LAUNCH'S LIVE REQUESTS — this is the bake's
+/// own statement of the rung's windows. A launch that seats fewer requests than the rung
+/// packs leaves EMPTY WINDOWS (no request's), which produce NO answer rows: the readback reads
+/// the LIVE request count off the launch's own slot list and maps pick `r` to slot `r` by
+/// order. The bake names the rows; the launch names how many are read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AnswerRows {
+    extent: QueryExtent,
+}
+
+impl AnswerRows {
+    /// ⭐ THE ONE MINT — the graph's QueryExtent, the same pair the attention's extents read:
+    /// one `(w, S)` statement per rung, three readers, one bake fact.
+    pub const fn of_extent(extent: QueryExtent) -> Self {
+        Self { extent }
+    }
+
+    /// The rung's answer rows, one per packed window, in request order — the ONLY mint of a
+    /// [`RequestIndex`], so a request past the capacity is UNSPELLABLE: no reader passes a bare
+    /// request index, and the readback takes `rows().take(live)` with the live count off the
+    /// launch's own slot list (an empty window's row is never read).
+    pub fn rows(self) -> impl ExactSizeIterator<Item = (RequestIndex, usize)> {
+        (0..self.count()).map(move |r| {
+            (
+                RequestIndex(r),
+                r * self.extent.per_request().get() as usize
+                    + selector_lastrow_col(self.extent.per_request().get() as usize),
+            )
+        })
+    }
+
+    /// How many answer rows the rung bakes — the request count `S` (the capacity, not the
+    /// launch's live requests; see the type's doc).
+    pub const fn count(self) -> usize {
+        self.extent.requests().count()
+    }
+
+    /// The extent the rows were minted from — the tail's agreement check against the graph it
+    /// lowers, the same check the attention's extents take.
+    pub const fn extent(self) -> QueryExtent {
+        self.extent
+    }
+}
+
+/// A request of a packed rung's windows — minted only by [`AnswerRows::rows`], never spelled
+/// by a caller, so an index past the rung's capacity cannot reach a row law.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestIndex(usize);
+
+impl RequestIndex {
+    /// The request's slot in the rung's window order — the readback's pick order, by which the
+    /// launch's slot list seats its requests.
+    pub const fn get(self) -> usize {
+        self.0
+    }
 }
 
 /// REQUESTS ACTUALLY LIVE THIS STEP — what the scheduler admitted, BEFORE padding to a rung.
@@ -4443,7 +4626,7 @@ impl CausalKey {
 /// ROW is the same fact, and this is its SINGLE SOURCE OF TRUTH — shared by the emitter's copy offsets
 /// and the Kani proof (`selector_lastrow_picks_last_row`). A wrong row feeds the WRONG token's hidden to
 /// the lm_head → a wrong first generated token, with everything downstream still perfectly fluent.
-pub fn selector_lastrow_col(m: usize) -> usize {
+pub const fn selector_lastrow_col(m: usize) -> usize {
     m - 1
 }
 
@@ -6617,6 +6800,12 @@ impl ChunkScratch {
     /// reaches the same depth with a chunk of 32 smaller pages walked over several in-program trips.
     pub const PAGES_MAX: u32 = 64;
 
+    /// NOT a generation constant: 64 pages is the SERVED CONTEXT DEPTH (64
+    /// pages × 256 slots = 16384 tokens, the shipped `--max-model-len`), a
+    /// serving choice — not a derivation from the core count. The gather's
+    /// `ENTRIES_PER_OP == MAX_CORES` law (see `lx_form`) is about the copy's
+    /// index stick, a different fact that does not fix the page count.
+    ///
     /// ⭐ THE ONE-REQUEST DECODE LADDER — one baked body per chunk width, in pages, ascending. The
     /// runtime picks the smallest rung covering the live context (`select_body`'s own law over each
     /// rung's swept `pages * POOL_PAGE_SLOTS`), and the chunk's tail pages repeat the last real page under a
@@ -9503,6 +9692,54 @@ mod tests {
             Some(STK),
             "the layouts agree only within the first stick; element {STK} is the first to move"
         );
+    }
+
+    /// ⭐ THE PREFILL TAIL'S ANSWER ROWS — one per request window: request `r`'s is its window's
+    /// last BAKED row, `r·w + selector_lastrow_col(w)`. At one request (every rung today) that
+    /// is exactly today's single-row law `selector_lastrow_col(mq)` — the S = 1 identity every
+    /// tail site is byte-identical by. The count is the rung's CAPACITY, never a launch's live
+    /// requests: an empty window produces no answer row.
+    #[test]
+    fn answer_rows_are_the_windows_last_baked_rows() {
+        // S = 1 — today's law, unchanged: one window of the rung's whole width.
+        let one = AnswerRows::of_extent(
+            QueryExtent::of_baked_rung(RungWidth::of_baked_rows(8).unwrap(), RungCap::ONE).unwrap(),
+        );
+        assert_eq!(one.count(), 1);
+        assert_eq!(
+            one.rows().map(|(_, row)| row).collect::<Vec<_>>(),
+            vec![selector_lastrow_col(8)]
+        );
+        assert_eq!(
+            one.rows().map(|(_, row)| row).collect::<Vec<_>>(),
+            vec![selector_lastrow_col(
+                one.extent().graph_rows().get() as usize
+            )],
+            "at S = 1 the answer row is today's selector_lastrow_col(mq)"
+        );
+        // A PACKED RUNG — (w, S) = (4, 3): each request's window's last baked row.
+        let packed = AnswerRows::of_extent(
+            QueryExtent::of_baked_rung(
+                RungWidth::of_baked_rows(4).unwrap(),
+                RungCap::of_baked_seqs(3).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(packed.count(), 3);
+        assert_eq!(
+            packed.rows().map(|(_, row)| row).collect::<Vec<_>>(),
+            vec![3, 7, 11]
+        );
+        for (req, row) in packed.rows() {
+            let w = packed.extent().per_request().get() as usize;
+            let r = req.get();
+            assert!(
+                row >= r * w && row < (r + 1) * w,
+                "request {r}'s answer row is inside its own window"
+            );
+        }
+        // The readback shape: only the LIVE requests' rows are read.
+        assert_eq!(packed.rows().take(1).count(), 1);
     }
 
     #[test]

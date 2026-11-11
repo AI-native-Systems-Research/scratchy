@@ -310,19 +310,20 @@ mod tests {
 
     fn decode(ops: Vec<OpDesc>) -> LoweredDecode {
         let n = ops.len();
-        LoweredDecode {
-            input: LoweringInput {
+        LoweredDecode::new(
+            LoweringInput {
                 sources: vec![],
                 result: n - 1,
                 exported: None,
                 ops,
             },
-            bindings: vec![],
-            op_tiles: (0..n as u32).map(|t| Some((t, 0))).collect(),
-            norm_gain_add_tiles: Default::default(),
-            op_expansion: vec![None; n],
-            unnamed_reads: Vec::new(),
-        }
+            vec![],
+            (0..n as u32).map(|t| Some((t, 0))).collect(),
+            Default::default(),
+            vec![None; n],
+            Vec::new(),
+        )
+        .expect("a sourceless tape names no embed row")
     }
 
     fn mul(inputs: Vec<InputRef>) -> OpDesc {
