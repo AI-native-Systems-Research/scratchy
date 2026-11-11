@@ -105,6 +105,7 @@ use scratchy_subtile::subtile_ir::{
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
+use triton_ktir_superdsc::CompiledKernel;
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -2233,9 +2234,8 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             file: file.to_string(),
         };
         let module = compile_kernel(src, &spec, &[1])?;
-        let positional =
-            triton_ktir_superdsc::node_for_keyed(&module, module.key.as_deref(), program)
-                .map_err(|e| format!("triton splice: node_for: {e}"))?;
+        let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
+            .map_err(|e| format!("triton splice: node_for: {e}"))?;
         let k = rebind(
             positional,
             format!("attn_s{}", node.id.index()),
@@ -2300,7 +2300,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_keyed(&module, module.key.as_deref(), program)
+    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⭐ THE BINDINGS ARE THE REQUEST SHIFT'S WHOLE REACH. A launch serving several requests
     // relaunches this program's whole group span once per request (`fold_plan`'s request law),
@@ -2432,7 +2432,7 @@ pub fn lower_kv_write<
         file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_keyed(&module, module.key.as_deref(), program)
+    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
@@ -3413,32 +3413,20 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// READ it (`node_for` takes `&Module`), and everything a node re-states (name,
 /// bindings, mask, `node_out_tid`) is a field of the MINTED NODE, not of the module.
 ///
-/// ⭐ THE KEY RIDES ALONG ([`CompiledKernel::key`]): the mint hands it to
-/// `triton_ktir_superdsc::node_for_keyed`, so the KTIR handoff lowers each kernel ONCE,
-/// not once per node that splices it (the same layers-times-rungs law that motivated
-/// this memo).
+/// ⭐ THE KEY RIDES ALONG, INSIDE THE VALUE ([`CompiledKernel`]): the memo's own mint
+/// pairs the module with the key that produced it, and the mint hands the pair to
+/// `triton_ktir_superdsc::node_for_compiled`, so the KTIR handoff lowers each kernel
+/// ONCE, not once per node that splices it (the same layers-times-rungs law that
+/// motivated this memo).
 fn compile_kernel(src: &str, spec: &KernelSpec, grid: &[i64]) -> Result<CompiledKernel, String> {
-    /// The memo. The key is [`memo_key`]'s canonical `String`, so it needs no `Hash`/`Ord` on
-    /// `ArgSpec`/`Val` and is deterministic in construction.
-    static CACHE: Memo<triton_ktir::ir::Module> = Memo::new();
-    let key = memo_key(src, spec, grid);
-    let module = CACHE.get_or_compute(key.clone(), || compile_kernel_uncached(src, spec, grid))?;
-    Ok(CompiledKernel { module, key })
-}
-
-/// One memoized compile's result: the module every caller of the same key SHARES, and
-/// the key itself. `Deref` to the module, so a `&CompiledKernel` reads as the `&Module`
-/// every door takes.
-struct CompiledKernel {
-    module: std::sync::Arc<triton_ktir::ir::Module>,
-    key: Option<String>,
-}
-
-impl std::ops::Deref for CompiledKernel {
-    type Target = triton_ktir::ir::Module;
-    fn deref(&self) -> &Self::Target {
-        &self.module
-    }
+    /// The module memo: one compile per key, and the ONLY mint of the paired
+    /// [`CompiledKernel`] the doors take. The key is [`memo_key`]'s canonical `String`,
+    /// so it needs no `Hash`/`Ord` on `ArgSpec`/`Val` and is deterministic in
+    /// construction.
+    static CACHE: triton_ktir_superdsc::ModuleMemo = triton_ktir_superdsc::ModuleMemo::new();
+    CACHE.compile_under(memo_key(src, spec, grid), || {
+        compile_kernel_uncached(src, spec, grid)
+    })
 }
 
 /// ⭐ A PROCESS-WIDE MEMO, SHARED BY EVERY THREAD OF THE EMIT — one compile per key, ever.
@@ -3794,11 +3782,11 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     bindings: Vec<BufferId>,
 ) -> Result<KtirNode, String> {
     // The adapter's mint: `to_ktir_emit::lower` over the module, positional buffer ids —
-    // KEYED by the compile's own memo key, so a kernel spliced once per layer per rung
-    // lowers its handoff ONCE, not once per node.
-    let positional =
-        triton_ktir_superdsc::node_for_keyed(&compiled.module, compiled.key.as_deref(), *program)
-            .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    // KEYED by the compile's own memo key (riding inside the `CompiledKernel` the memo
+    // minted), so a kernel spliced once per layer per rung lowers its handoff ONCE, not
+    // once per node.
+    let positional = triton_ktir_superdsc::node_for_compiled(compiled, *program)
+        .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key
     // follow the same law the builder path established — what the golden pins.
     let name = Arena::global().str(format!(
