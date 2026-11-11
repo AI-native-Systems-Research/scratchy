@@ -1030,7 +1030,7 @@ fn lower_sandwich_node<
         output: *out_r,
     };
     let program = Program::WindowedRmsNorm { unit: !*gained };
-    let k = mint(&synth, module, &program, default_bindings(&synth))?;
+    let k = mint(&synth, &module, &program, default_bindings(&synth))?;
     // `mint` already named the node `rmsnorm_s{split.id}` (the program stem + the
     // split's id, main's own naming law for the fused form).
     let name = k.func.name.to_string();
@@ -1350,7 +1350,7 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
     }
     let spec = kernel_spec(node, ir, file, entry)?;
     let m = compile_kernel(src, &spec, &grid(node, ir)?)?;
-    let k = mint(node, m, program, default_bindings(node))?;
+    let k = mint(node, &m, program, default_bindings(node))?;
     let name = format!("{}_s{}", program_stem(node, program), node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
@@ -1503,7 +1503,7 @@ fn lower_prefill_lm_head_fold<
     };
     let mut k = mint(
         &extraction_node,
-        module,
+        &module,
         &lmlast_program,
         default_bindings(&extraction_node),
     )?;
@@ -1636,7 +1636,7 @@ pub fn lower_block_copy<
         inputs: vec![src],
         output: dst,
     };
-    let mut k = mint(&copy, module, &Program::BlockCopy, default_bindings(&copy))?;
+    let mut k = mint(&copy, &module, &Program::BlockCopy, default_bindings(&copy))?;
     k.func.name = Arena::global().str(name.to_string());
     let mut e = EmittedOp::bare(name.to_string());
     e.ktir = Some(k);
@@ -2233,8 +2233,9 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             file: file.to_string(),
         };
         let module = compile_kernel(src, &spec, &[1])?;
-        let positional = triton_ktir_superdsc::node_for(&module, program)
-            .map_err(|e| format!("triton splice: node_for: {e}"))?;
+        let positional =
+            triton_ktir_superdsc::node_for_keyed(&module, module.key.as_deref(), program)
+                .map_err(|e| format!("triton splice: node_for: {e}"))?;
         let k = rebind(
             positional,
             format!("attn_s{}", node.id.index()),
@@ -2299,7 +2300,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for(&module, program)
+    let positional = triton_ktir_superdsc::node_for_keyed(&module, module.key.as_deref(), program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⭐ THE BINDINGS ARE THE REQUEST SHIFT'S WHOLE REACH. A launch serving several requests
     // relaunches this program's whole group span once per request (`fold_plan`'s request law),
@@ -2431,7 +2432,7 @@ pub fn lower_kv_write<
         file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for(&module, program)
+    let positional = triton_ktir_superdsc::node_for_keyed(&module, module.key.as_deref(), program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
@@ -3406,21 +3407,38 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// script, ~17 s per attention program alone (~26 programs in the golden's 442 s run),
 /// where main's direct-emission builder paid none of it. The compile is a pure function
 /// of (source, spec, grid) — the ladder is deterministic — so the second and later
-/// callers get a CLONE of the first result. Every consumer mutates only its own copy
-/// (`mint`/`mint_attn` re-state names and bindings; `inject_dead_cache_views` and
-/// `truncate_unused_mask_param` edit their own copy), so a cached pristine `Module` is
-/// safe to hand out again.
-fn compile_kernel(
-    src: &str,
-    spec: &KernelSpec,
-    grid: &[i64],
-) -> Result<triton_ktir::ir::Module, String> {
+/// callers SHARE the first result (one `Arc`, no per-caller deep copy of the module
+/// tree: MEASURED on the tp/8 fp8 bake, 2026-11-11, the clone-on-hit was the memo's own
+/// second cost). No consumer mutates the module — `mint` and the attention doors only
+/// READ it (`node_for` takes `&Module`), and everything a node re-states (name,
+/// bindings, mask, `node_out_tid`) is a field of the MINTED NODE, not of the module.
+///
+/// ⭐ THE KEY RIDES ALONG ([`CompiledKernel::key`]): the mint hands it to
+/// `triton_ktir_superdsc::node_for_keyed`, so the KTIR handoff lowers each kernel ONCE,
+/// not once per node that splices it (the same layers-times-rungs law that motivated
+/// this memo).
+fn compile_kernel(src: &str, spec: &KernelSpec, grid: &[i64]) -> Result<CompiledKernel, String> {
     /// The memo. The key is [`memo_key`]'s canonical `String`, so it needs no `Hash`/`Ord` on
     /// `ArgSpec`/`Val` and is deterministic in construction.
     static CACHE: Memo<triton_ktir::ir::Module> = Memo::new();
-    CACHE.get_or_compute(memo_key(src, spec, grid), || {
-        compile_kernel_uncached(src, spec, grid)
-    })
+    let key = memo_key(src, spec, grid);
+    let module = CACHE.get_or_compute(key.clone(), || compile_kernel_uncached(src, spec, grid))?;
+    Ok(CompiledKernel { module, key })
+}
+
+/// One memoized compile's result: the module every caller of the same key SHARES, and
+/// the key itself. `Deref` to the module, so a `&CompiledKernel` reads as the `&Module`
+/// every door takes.
+struct CompiledKernel {
+    module: std::sync::Arc<triton_ktir::ir::Module>,
+    key: Option<String>,
+}
+
+impl std::ops::Deref for CompiledKernel {
+    type Target = triton_ktir::ir::Module;
+    fn deref(&self) -> &Self::Target {
+        &self.module
+    }
 }
 
 /// ⭐ A PROCESS-WIDE MEMO, SHARED BY EVERY THREAD OF THE EMIT — one compile per key, ever.
@@ -3435,31 +3453,38 @@ struct Memo<T> {
     cells: std::sync::Mutex<std::collections::BTreeMap<String, MemoCell<T>>>,
 }
 
-/// One key's result: computed at most once, by whichever caller gets there first.
-type MemoCell<T> = std::sync::Arc<std::sync::OnceLock<Result<T, String>>>;
+/// One key's result: computed at most once, by whichever caller gets there first. The value is
+/// behind an `Arc` — every caller is handed the SAME result, never a deep copy of it (the module
+/// tree is megabytes at bake scale; cloning it per caller was the memo's own second cost, measured
+/// on the tp/8 fp8 bake, 2026-11-11).
+type MemoCell<T> = std::sync::Arc<std::sync::OnceLock<Result<std::sync::Arc<T>, String>>>;
 
-impl<T: Clone> Memo<T> {
+impl<T> Memo<T> {
     const fn new() -> Memo<T> {
         Memo {
             cells: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
-    /// `f()` once per `key`, cloned out to every caller. A `None` key (a spec [`memo_key`] cannot
-    /// spell injectively) is never memoized: it computes every time.
+    /// `f()` once per `key`, the same `Arc` handed to every caller. A `None` key (a spec
+    /// [`memo_key`] cannot spell injectively) is never memoized: it computes every time, and the
+    /// fresh result is still wrapped so the caller's type is one shape.
     fn get_or_compute(
         &self,
         key: Option<String>,
         f: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
+    ) -> Result<std::sync::Arc<T>, String> {
         let Some(key) = key else {
-            return f();
+            return f().map(std::sync::Arc::new);
         };
         let cell = {
             let mut cells = self.cells.lock().unwrap_or_else(|p| p.into_inner());
             std::sync::Arc::clone(cells.entry(key).or_default())
         };
-        cell.get_or_init(f).clone()
+        match cell.get_or_init(|| f().map(std::sync::Arc::new)) {
+            Ok(value) => Ok(std::sync::Arc::clone(value)),
+            Err(e) => Err(e.clone()),
+        }
     }
 }
 
@@ -3574,6 +3599,24 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
     bindings
 }
 
+/// ⭐ THE PYTHON PARSE, MEMOIZED BY SOURCE TEXT — the parse (a `Lexer`/`Parser` walk over
+/// the WHOLE `.py` source) is a pure function of the source alone, and the placement
+/// census calls [`operand_dfs`] once per NODE per rung per world
+/// (`compute_bundle_layout`'s width walk), so the same kernel source was re-parsed
+/// thousands of times in one expansion (MEASURED on the tp/8 fp8 bake, 2026-11-11: the
+/// build script spent ~666% CPU / 40+ CPU-min / 17-25 GB RSS, with the parser at the
+/// top of the profile). The key is the source text itself — the same law
+/// [`memo_key`]'s source clause states — and the memo hands every caller the SAME
+/// `Arc<PyModule>`, never a copy. The error is the parse's own display, memoized with
+/// the success (the parse is pure, so a retry could only say the same thing); the
+/// caller frames it with its own file name.
+fn parse_py(src: &str) -> Result<std::sync::Arc<triton_frontend::py::ast::PyModule>, String> {
+    static CACHE: Memo<triton_frontend::py::ast::PyModule> = Memo::new();
+    CACHE.get_or_compute(Some(src.to_string()), || {
+        triton_frontend::py::parser::parse(src).map_err(|e| e.to_string())
+    })
+}
+
 /// ⭐⭐⭐ THE OPERAND FORMATS A SPLICED KERNEL STATES — every buffer parameter's
 /// element format, as `(tensor id, format)` pairs in the node's OPERAND ORDER
 /// ([`default_bindings`]' law: the node's inputs, the output LAST). This is the
@@ -3671,8 +3714,7 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
         return Ok(None);
     };
     let spec = kernel_spec(node, ir, file, entry)?;
-    let module = triton_frontend::py::parser::parse(src)
-        .map_err(|e| format!("triton splice: {file}: {e}"))?;
+    let module = parse_py(src).map_err(|e| format!("triton splice: {file}: {e}"))?;
     let f = module
         .function(entry)
         .ok_or_else(|| format!("triton splice: {file} declares no function {entry}"))?;
@@ -3747,13 +3789,16 @@ fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df,
 /// only the splice knows which graph tensor each kernel parameter addresses.
 fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
-    module: triton_ktir::ir::Module,
+    compiled: &CompiledKernel,
     program: &Program,
     bindings: Vec<BufferId>,
 ) -> Result<KtirNode, String> {
-    // The adapter's mint: `to_ktir_emit::lower` over the module, positional buffer ids.
-    let positional = triton_ktir_superdsc::node_for(&module, *program)
-        .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    // The adapter's mint: `to_ktir_emit::lower` over the module, positional buffer ids —
+    // KEYED by the compile's own memo key, so a kernel spliced once per layer per rung
+    // lowers its handoff ONCE, not once per node.
+    let positional =
+        triton_ktir_superdsc::node_for_keyed(&compiled.module, compiled.key.as_deref(), *program)
+            .map_err(|e| format!("triton splice: node_for: {e}"))?;
     // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key
     // follow the same law the builder path established — what the golden pins.
     let name = Arena::global().str(format!(
