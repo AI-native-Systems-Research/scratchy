@@ -69,7 +69,7 @@ impl SharedMemory {
     }
 
     pub(crate) fn granule_of(&self, block: usize) -> usize {
-        block / self.budget.kv_granule_blocks.get()
+        block / self.budget.kv_granule_blocks
     }
 
     /// Granule `g`'s blocks: the last granule's run ends with the pool.
@@ -100,7 +100,7 @@ impl SharedMemory {
     }
 
     pub(crate) fn slot_mapped(&self, slot: usize) -> bool {
-        self.units[slot / self.budget.unit_slots.get()]
+        self.units[slot / self.budget.unit_slots]
     }
 
     /// The granules not mapped, lowest first: the order KV maps them in.
@@ -180,14 +180,14 @@ impl SharedMemory {
 
     /// A request took `block` (fresh, or a cached block it hits) at step `now`.
     pub(crate) fn take(&mut self, block: usize, now: u64) {
-        let g = &mut self.granules[block / self.budget.kv_granule_blocks.get()];
+        let g = &mut self.granules[block / self.budget.kv_granule_blocks];
         g.held += 1;
         g.age = g.age.max(now);
     }
 
     /// The last request holding `block` let it go at step `now`.
     pub(crate) fn give_back(&mut self, block: usize, now: u64) {
-        let g = &mut self.granules[block / self.budget.kv_granule_blocks.get()];
+        let g = &mut self.granules[block / self.budget.kv_granule_blocks];
         g.held -= 1;
         g.age = g.age.max(now);
     }

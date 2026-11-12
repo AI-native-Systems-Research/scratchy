@@ -3671,13 +3671,13 @@ pub fn write_eval_golden<F: RopeForm>(
     order.push(']');
     std::fs::write(dbg.join("order.json"), order)?;
     let mut shapes = String::from("[");
-    for id in 0..nsrc {
+    for (id, t) in ir.tensors[..nsrc].iter().enumerate() {
         if id > 0 {
             shapes.push(',');
         }
         shapes.push_str(&format!(
             "{{\"tid\":{id},\"rows\":{},\"cols\":{}}}",
-            ir.tensors[id].rows, ir.tensors[id].cols
+            t.rows, t.cols
         ));
     }
     shapes.push(']');

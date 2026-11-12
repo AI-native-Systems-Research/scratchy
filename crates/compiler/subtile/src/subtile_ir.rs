@@ -4367,7 +4367,7 @@ pub fn head_blocks(
     // `nb.get() / hd` may be zero (when nb < hd); fall back to one
     // head — `NonZeroU32::new(...).unwrap_or(NonZeroU32::MIN)` is the
     // canonical "floor at 1" idiom on a NonZeroU32-output path.
-    let heads_per_block = NonZeroU32::new(nb.get() / head_dim.get()).unwrap_or(NonZeroU32::MIN);
+    let heads_per_block = NonZeroU32::new(nb.get() / head_dim).unwrap_or(NonZeroU32::MIN);
     let block = heads_per_block.saturating_mul(head_dim);
     n_blocks(total, block)
 }
@@ -5640,8 +5640,8 @@ mod tests {
             "post-decompose: 1 reduce + 3 apply + 3 mul tiles"
         );
         assert!(matches!(g.nodes[0].op, SubOp::RmsNormReduce { .. }));
-        for i in 1..4 {
-            assert!(matches!(g.nodes[i].op, SubOp::RmsNormApply { .. }));
+        for node in &g.nodes[1..4] {
+            assert!(matches!(node.op, SubOp::RmsNormApply { .. }));
         }
         // Reduce reads only sources (x).
         assert!(preds[0].is_empty(), "RmsNormReduce reads only sources");

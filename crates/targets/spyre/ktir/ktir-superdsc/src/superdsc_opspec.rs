@@ -665,7 +665,7 @@ impl PackedInt8Scale {
     /// in `[0, groups)` for every `k < k_elems` (the covering map — no code is unscaled),
     /// locked by `senint8_dequant_scale_index_is_covering_partition`.
     pub fn scale_index_for(&self, k: u32) -> u32 {
-        k / self.group_size.get()
+        k / self.group_size
     }
 
     /// Codes per group (the ctor's `group_size`).

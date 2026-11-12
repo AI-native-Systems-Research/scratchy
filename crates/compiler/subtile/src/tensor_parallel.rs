@@ -1001,17 +1001,17 @@ pub fn shard<T: World>(
             gathered.push(g);
         }
     }
-    for i in 0..n {
+    for (i, input_op) in input.ops.iter().enumerate() {
         let d = if !T::SHARDED {
             // ⭐ THE IDENTITY AT W = 1, by construction rather than by every rule happening to
             // agree: a one-rank world has nothing to split and nothing to collect.
-            if input.ops[i].op.tp_rule() == TpRule::Collective {
+            if input_op.op.tp_rule() == TpRule::Collective {
                 return Err(ShardRefusal::StatedCollective { op: i });
             }
             Decision {
-                op: input.ops[i].op,
+                op: input_op.op,
                 out: Placement::Whole,
-                inputs: input.ops[i].inputs.clone(),
+                inputs: input_op.inputs.clone(),
                 adopt: vec![],
             }
         } else {
@@ -1028,13 +1028,13 @@ pub fn shard<T: World>(
         // Padded: a contraction whose local width is not an even share of its own, or an op
         // carrying a padded operand's split on.
         let split_cols = d.out == Placement::Split(Axis::Cols);
-        let pads = match (d.op, input.ops[i].op) {
+        let pads = match (d.op, input_op.op) {
             (SubOp::MatmulTile { n: local, .. }, SubOp::MatmulTile { n, .. }) => {
                 local * T::RANKS != n
             }
             _ => false,
         };
-        let inherits = input.ops[i]
+        let inherits = input_op
             .inputs
             .iter()
             .any(|r| matches!(r, InputRef::Op(j) if wv.padded[*j]));
@@ -1042,7 +1042,7 @@ pub fn shard<T: World>(
         wv.op_map.push(wv.ops.len());
         wv.ops.push(OpDesc {
             op: d.op,
-            m: input.ops[i].m,
+            m: input_op.m,
             inputs: d.inputs,
         });
         wv.place.push(d.out);
