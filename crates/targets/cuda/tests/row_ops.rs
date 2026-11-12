@@ -1871,3 +1871,494 @@ fn the_row_norm_graph_times_are_recorded() {
         }
     }
 }
+
+// ── FP8 S8 N3: the decode norm in one CTA a row, with the next GEMM's quant ─────
+
+/// N3's bound's relative term: the output's one RNE rounding to bf16 (an 8-bit significand,
+/// `2⁻⁸·|y|`) plus `2⁻¹⁶` for the f32 arithmetic before it. That arithmetic is about `2⁻²⁰`: the sum
+/// of squares is at most 18 dependent f32 roundings deep (8 a lane, 5 shuffles, 1 chunk add, 4 warp
+/// levels: `≤ 18·2⁻²⁴`), `rsqrt` halves it and adds its own `~2⁻²³`, the two products `3·2⁻²⁴`;
+/// `2⁻¹⁶` is 16× that.
+const N3_REL: f64 = 1.0 / 256.0 + 1.0 / 65_536.0;
+/// N3's absolute floor: the smallest normal f32, below which fast math flushes a result to zero.
+const N3_ABS: f64 = 1.0 / (1u128 << 126) as f64;
+/// N3's widths: one chunk, the three models' (35B, Gemma, 27B) and the widest.
+const N3_COLS: [usize; 5] = [256, 2048, 2816, 5120, 8192];
+
+/// N3's forms, the launcher's codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum N3Form {
+    Norm = 0,
+    AddNorm = 1,
+    NormAdd = 2,
+}
+
+/// One N3 case's device buffers: the inputs, the outputs (sentinels), the quant row and scales.
+struct N3 {
+    x: DeviceBuffer,
+    other: DeviceBuffer,
+    g: DeviceBuffer,
+    y: DeviceBuffer,
+    sum: DeviceBuffer,
+    q: DeviceBuffer,
+    scale: DeviceBuffer,
+    rows: usize,
+    cols: usize,
+}
+
+impl N3 {
+    fn new(device: &CudaDevice, (x, other, g): (&[u16], &[u16], &[u16]), rows: usize) -> Self {
+        let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+        let cols = g.len();
+        Self {
+            x: up(x),
+            other: up(other),
+            g: up(g),
+            y: up(&vec![SENTINEL; rows * cols]),
+            sum: up(&vec![SENTINEL; rows * cols]),
+            q: DeviceBuffer::upload_bytes(device, &vec![0xA5u8; rows * cols]).expect("q"),
+            scale: DeviceBuffer::upload_bytes(device, &vec![0xA5u8; 4 * rows]).expect("scale"),
+            rows,
+            cols,
+        }
+    }
+
+    /// N3 at `form` (with its quant when `quant`), on `stream`.
+    fn launch(&self, form: N3Form, quant: bool, offset: f32, stream: *mut std::ffi::c_void) {
+        use scratchy_target_cuda::kernels::rms_norm_quant_row;
+        // SAFETY: every buffer is its own cudaMalloc allocation holding the elements the launcher
+        // names for `rows · cols`; the outputs are distinct; `stream` null or live.
+        unsafe {
+            rms_norm_quant_row(
+                (
+                    self.x.ptr().cast_const(),
+                    self.other.ptr().cast_const(),
+                    self.g.ptr().cast_const(),
+                ),
+                (self.y.ptr(), self.sum.ptr()),
+                quant.then(|| (self.q.ptr(), self.scale.ptr())),
+                (self.rows as u32, self.cols as u32),
+                (form as u32, EPS, offset),
+                stream,
+            )
+        }
+        .expect("an N3 launch");
+    }
+}
+
+/// The N3 input rows of `cols`: two random rows, all zeros, ±65,504 alternating, and tiny normals
+/// (`±2⁻¹⁰⁰`, whose squares flush to zero in f32 while `eps` dominates the f64 mean too).
+fn n3_rows(cols: usize, seed: u64) -> Vec<(&'static str, Vec<u16>)> {
+    let alternate = |v: f32| -> Vec<u16> {
+        (0..cols)
+            .map(|c| bits(if c % 2 == 0 { v } else { -v }))
+            .collect()
+    };
+    vec![
+        ("random0", bf16_inputs(cols, seed)),
+        ("random1", bf16_inputs(cols, seed ^ 0x77)),
+        ("zeros", vec![0; cols]),
+        ("max", alternate(65504.0)),
+        ("tiny", alternate(2f32.powi(-100))),
+    ]
+}
+
+/// FP8 S8 N3, the bound and the quant: every form at every width of [`N3_COLS`], gain offsets 0
+/// and 1, one row and three rows (one CTA a row), on [`n3_rows`]' kinds:
+/// - the normed row within `N3_REL · |ref| + N3_ABS` of the f64 norm (`rms_norm_reference`); under
+///   `NormAdd`, `y` within `N3_REL · |n| + 2⁻⁸ · |n + r| + N3_ABS` of `n + r` (the second rounding);
+/// - `AddNorm`'s sum the add's bits (`add_reference`), and the norm's reference taken on that sum;
+/// - with the quant (`Norm`, `AddNorm`): the e4m3 bytes and the scale of each row
+///   `quant_row_fp8_one` (`quant_rows_fp8`'s row, bit for bit) of N3's own bf16 row, bit for bit.
+///
+/// `N3_BOUND` and `N3_QUANT` lines.
+#[test]
+fn n3_is_inside_its_f64_bound_and_quantizes_as_quant_rows_fp8() {
+    use scratchy_target_cuda::kernels::quant_row_fp8_one;
+    let device = h100();
+    let mut pass = true;
+    for cols in N3_COLS {
+        for (kind, row) in n3_rows(cols, 0x0E30_0000 ^ cols as u64) {
+            for offset in [SCALE, ONE_PLUS_SCALE] {
+                let g = match offset {
+                    SCALE => bf16_inputs(cols, 0x0E31_0000 ^ cols as u64),
+                    _ => centred_gains(cols, 0x0E32_0000 ^ cols as u64),
+                };
+                for rows in [1usize, 3] {
+                    // Row 0 the kind; the others random.
+                    let mut x = row.clone();
+                    for r in 1..rows {
+                        x.extend(bf16_inputs(cols, 0x0E33_0000 ^ (r * cols) as u64));
+                    }
+                    let other = bf16_inputs(rows * cols, 0x0E34_0000 ^ cols as u64);
+                    for form in [N3Form::Norm, N3Form::AddNorm, N3Form::NormAdd] {
+                        let quant = form != N3Form::NormAdd;
+                        let c = N3::new(&device, (&x, &other, &g), rows);
+                        c.launch(form, quant, offset, std::ptr::null_mut());
+                        let y = c.y.download().expect("y");
+                        let sum = c.sum.download().expect("sum");
+                        let normed_in = match form {
+                            N3Form::AddNorm => add_reference(&x, &other),
+                            _ => x.clone(),
+                        };
+                        let sum_bad = match form {
+                            N3Form::AddNorm => mismatched_bits(&sum, &normed_in),
+                            _ => 0,
+                        };
+                        let n = rms_norm_reference(
+                            &normed_in,
+                            &g,
+                            (rows, cols),
+                            f64::from(EPS),
+                            f64::from(offset),
+                        );
+                        let r = widen(&other);
+                        let cmp = match form {
+                            N3Form::NormAdd => {
+                                let want: Vec<f64> = n.iter().zip(&r).map(|(a, b)| a + b).collect();
+                                compare_rows_with(&y, &want, cols, |i, w| {
+                                    N3_REL * n[i].abs() + w.abs() / 256.0 + N3_ABS
+                                })
+                            }
+                            _ => compare_rows_with(&y, &n, cols, |_, w| N3_REL * w.abs() + N3_ABS),
+                        };
+                        let ok = cmp.out_of_bound == 0 && sum_bad == 0;
+                        eprintln!(
+                            "N3_BOUND {form:?} cols={cols} offset={offset} rows={rows} {kind}: \
+                             out_of_bound={} worst={:?} sum_mismatched={sum_bad} {}",
+                            cmp.out_of_bound,
+                            cmp.worst,
+                            verdict(ok)
+                        );
+                        pass &= ok;
+                        if !quant {
+                            continue;
+                        }
+                        // Q1 on each of N3's own rows.
+                        let (q1, s1) = (
+                            DeviceBuffer::upload_bytes(&device, &vec![0x5Au8; rows * cols])
+                                .expect("q1"),
+                            DeviceBuffer::upload_bytes(&device, &vec![0x5Au8; 4 * rows])
+                                .expect("s1"),
+                        );
+                        for r in 0..rows {
+                            // SAFETY: row `r` of each buffer is inside its allocation; Q1 reads
+                            // `cols` bf16 and writes `cols` bytes and one f32.
+                            unsafe {
+                                quant_row_fp8_one(
+                                    c.y.ptr().wrapping_byte_add(r * cols * 2).cast_const(),
+                                    (
+                                        q1.ptr().wrapping_byte_add(r * cols),
+                                        s1.ptr().wrapping_byte_add(r * 4),
+                                    ),
+                                    cols as u32,
+                                    std::ptr::null_mut(),
+                                )
+                            }
+                            .expect("Q1");
+                        }
+                        let bytes = |b: &DeviceBuffer| -> Vec<u8> {
+                            (b.download().expect("download").iter())
+                                .flat_map(|h| h.to_le_bytes())
+                                .collect()
+                        };
+                        let differ =
+                            |a: &[u8], b: &[u8]| (a.iter().zip(b)).filter(|(p, q)| p != q).count();
+                        let (qb, sb) = (
+                            differ(&bytes(&c.q), &bytes(&q1)),
+                            differ(&bytes(&c.scale), &bytes(&s1)),
+                        );
+                        let ok = qb == 0 && sb == 0;
+                        eprintln!(
+                            "N3_QUANT {form:?} cols={cols} offset={offset} rows={rows} {kind}: \
+                             q_differing_bytes={qb} scale_differing_bytes={sb} {}",
+                            verdict(ok)
+                        );
+                        pass &= ok;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        pass,
+        "N3 left its bound, or its quant is not quant_rows_fp8 of its row"
+    );
+}
+
+/// N3 twice on the same inputs, every form with its quant where it has one, at the three models'
+/// widths and three rows: 0 differing bytes in `y`, `AddNorm`'s sum, the e4m3 rows and the scales.
+#[test]
+fn n3_repeats_bit_identically() {
+    let device = h100();
+    let mut pass = true;
+    for cols in [2048usize, 2816, 5120] {
+        let x = bf16_inputs(3 * cols, 0x0E35_0000 ^ cols as u64);
+        let other = bf16_inputs(3 * cols, 0x0E36_0000 ^ cols as u64);
+        let g = centred_gains(cols, 0x0E37_0000 ^ cols as u64);
+        for form in [N3Form::Norm, N3Form::AddNorm, N3Form::NormAdd] {
+            let quant = form != N3Form::NormAdd;
+            let run = || {
+                let c = N3::new(&device, (&x, &other, &g), 3);
+                c.launch(form, quant, ONE_PLUS_SCALE, std::ptr::null_mut());
+                [&c.y, &c.sum, &c.q, &c.scale].map(|b| b.download().expect("download"))
+            };
+            let (a, b) = (run(), run());
+            let differ: usize = (a.iter().zip(&b))
+                .map(|(p, q)| p.iter().zip(q).filter(|(x, y)| x != y).count())
+                .sum();
+            eprintln!(
+                "N3_REPEAT {form:?} cols={cols}: differing_halves={differ} {}",
+                verdict(differ == 0)
+            );
+            pass &= differ == 0;
+        }
+    }
+    assert!(pass, "two N3 runs differ");
+}
+
+/// N3 refuses, before it touches a pointer and with its outputs unchanged: rows 0 and 65,536; cols
+/// 0, 255, 320 and 8,448; form 3; eps 0, NaN; gain offset Inf; a null `x`, `gain` and `y`; a null
+/// `other` at forms 1 and 2; a null `sum` at form 1; `q` without `scale` and `scale` without `q`;
+/// the quant at form 2.
+#[test]
+fn n3_refuses_what_it_does_not_take() {
+    use scratchy_target_cuda::kernels::rms_norm_quant_row;
+    let device = h100();
+    let c = N3::new(
+        &device,
+        (
+            &bf16_inputs(4 * 8192, 1),
+            &bf16_inputs(4 * 8192, 2),
+            &bf16_inputs(8192, 3),
+        ),
+        4,
+    );
+    let null = std::ptr::null_mut::<std::ffi::c_void>();
+    let (x, o, g) = (
+        c.x.ptr().cast_const(),
+        c.other.ptr().cast_const(),
+        c.g.ptr().cast_const(),
+    );
+    let (y, s, q, sc) = (c.y.ptr(), c.sum.ptr(), c.q.ptr(), c.scale.ptr());
+    type Case = (
+        &'static str,
+        (
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+        ),
+        (*mut std::ffi::c_void, *mut std::ffi::c_void),
+        Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)>,
+        (u32, u32),
+        (u32, f32, f32),
+    );
+    let ok_in = (x, o, g);
+    let cases: [Case; 18] = [
+        ("rows 0", ok_in, (y, s), None, (0, 2048), (0, EPS, 1.0)),
+        (
+            "rows 65536",
+            ok_in,
+            (y, s),
+            None,
+            (65536, 2048),
+            (0, EPS, 1.0),
+        ),
+        ("cols 0", ok_in, (y, s), None, (1, 0), (0, EPS, 1.0)),
+        ("cols 255", ok_in, (y, s), None, (1, 255), (0, EPS, 1.0)),
+        ("cols 320", ok_in, (y, s), None, (1, 320), (0, EPS, 1.0)),
+        ("cols 8448", ok_in, (y, s), None, (1, 8448), (0, EPS, 1.0)),
+        ("form 3", ok_in, (y, s), None, (1, 2048), (3, EPS, 1.0)),
+        ("eps 0", ok_in, (y, s), None, (1, 2048), (0, 0.0, 1.0)),
+        (
+            "eps NaN",
+            ok_in,
+            (y, s),
+            None,
+            (1, 2048),
+            (0, f32::NAN, 1.0),
+        ),
+        (
+            "offset Inf",
+            ok_in,
+            (y, s),
+            None,
+            (1, 2048),
+            (0, EPS, f32::INFINITY),
+        ),
+        (
+            "null x",
+            (std::ptr::null(), o, g),
+            (y, s),
+            None,
+            (1, 2048),
+            (0, EPS, 1.0),
+        ),
+        (
+            "null gain",
+            (x, o, std::ptr::null()),
+            (y, s),
+            None,
+            (1, 2048),
+            (0, EPS, 1.0),
+        ),
+        ("null y", ok_in, (null, s), None, (1, 2048), (0, EPS, 1.0)),
+        (
+            "null other, form 1",
+            (x, std::ptr::null(), g),
+            (y, s),
+            None,
+            (1, 2048),
+            (1, EPS, 1.0),
+        ),
+        (
+            "null other, form 2",
+            (x, std::ptr::null(), g),
+            (y, s),
+            None,
+            (1, 2048),
+            (2, EPS, 1.0),
+        ),
+        (
+            "null sum, form 1",
+            ok_in,
+            (y, null),
+            None,
+            (1, 2048),
+            (1, EPS, 1.0),
+        ),
+        (
+            "q without scale",
+            ok_in,
+            (y, s),
+            Some((q, null)),
+            (1, 2048),
+            (0, EPS, 1.0),
+        ),
+        (
+            "quant at form 2",
+            ok_in,
+            (y, s),
+            Some((q, sc)),
+            (1, 2048),
+            (2, EPS, 1.0),
+        ),
+    ];
+    let before = [&c.y, &c.sum, &c.q, &c.scale].map(|b| b.download().expect("download"));
+    let mut pass = true;
+    for (what, ins, outs, quant, dims, (form, eps, offset)) in cases {
+        // SAFETY: refused before any pointer is touched; every non-null pointer is a live buffer.
+        let got = unsafe { rms_norm_quant_row(ins, outs, quant, dims, (form, eps, offset), null) };
+        let want = KernelError::RowShape {
+            rows: dims.0,
+            cols: dims.1,
+        };
+        let ok = got == Err(want);
+        eprintln!("N3 refused {what}: {got:?} {}", verdict(ok));
+        pass &= ok;
+    }
+    // `scale` without `q`, through the launcher's own null `q`: refused the same way.
+    // SAFETY: as above.
+    let got = unsafe {
+        rms_norm_quant_row(
+            ok_in,
+            (y, s),
+            Some((null, sc)),
+            (1, 2048),
+            (0, EPS, 1.0),
+            null,
+        )
+    };
+    let ok = got
+        == Err(KernelError::RowShape {
+            rows: 1,
+            cols: 2048,
+        });
+    eprintln!("N3 refused scale without q: {got:?} {}", verdict(ok));
+    pass &= ok;
+    let after = [&c.y, &c.sum, &c.q, &c.scale].map(|b| b.download().expect("download"));
+    let unchanged = before == after;
+    eprintln!(
+        "N3 refusals left every output unchanged: {unchanged} {}",
+        verdict(unchanged)
+    );
+    assert!(
+        pass && unchanged,
+        "N3 took what it must refuse, or wrote an output"
+    );
+}
+
+/// Recorded, not asserted (N3's gate: bring it to the tape only if it saves ≥ ~0.5 ms a Gemma
+/// token): inside a captured graph of 10 back-to-back nodes, a node one pair, today's pair (N1's
+/// row norm, `rms_norm_bf16` / `add_rms_norm_bf16` / `norm_add_bf16` at one row, then Q1 on its
+/// output where the GEMM after it is a T2 one) against N3 (one launch, with its quant), at the
+/// three models' widths and forms, read-cold and hot, two rounds (A, B, A, B): `TC_TIME …
+/// n1_q1_graph_per_node` and `… n3_graph_per_node` lines.
+#[test]
+fn n3_graph_times_are_recorded() {
+    use scratchy_target_cuda::kernels::quant_row_fp8_one;
+    let device = h100();
+    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
+    let shapes = [
+        ("27B", 5120usize, N3Form::Norm, ONE_PLUS_SCALE),
+        ("27B", 5120, N3Form::AddNorm, ONE_PLUS_SCALE),
+        ("35B", 2048, N3Form::Norm, ONE_PLUS_SCALE),
+        ("35B", 2048, N3Form::AddNorm, ONE_PLUS_SCALE),
+        ("Gemma", 2816, N3Form::Norm, SCALE),
+        ("Gemma", 2816, N3Form::NormAdd, SCALE),
+    ];
+    for (model, cols, form, offset) in shapes {
+        let quant = form != N3Form::NormAdd;
+        let x = bf16_inputs(cols, 0x0E38_0000 ^ cols as u64);
+        let other = bf16_inputs(cols, 0x0E39_0000 ^ cols as u64);
+        let g = centred_gains(cols, 0x0E3A_0000 ^ cols as u64);
+        let c = N3::new(&device, (&x, &other, &g), 1);
+        let shape = format!(
+            "{model}_{form:?}_{cols}{}",
+            if quant { "_quant" } else { "" }
+        );
+        let today = |s: *mut std::ffi::c_void| {
+            let dims = (1u32, cols as u32);
+            // SAFETY: as `N3::launch`'s, one row.
+            unsafe {
+                match form {
+                    N3Form::Norm => {
+                        rms_norm_bf16(c.x.ptr(), c.g.ptr(), c.y.ptr(), dims, EPS, offset, s)
+                    }
+                    N3Form::AddNorm => add_rms_norm_bf16(
+                        (c.x.ptr(), c.other.ptr()),
+                        c.g.ptr(),
+                        (c.sum.ptr(), c.y.ptr()),
+                        dims,
+                        (EPS, offset),
+                        s,
+                    ),
+                    N3Form::NormAdd => norm_add_bf16(
+                        (c.x.ptr(), c.other.ptr()),
+                        c.g.ptr(),
+                        c.y.ptr(),
+                        dims,
+                        (EPS, offset),
+                        s,
+                    ),
+                }
+                .expect("N1");
+                if quant {
+                    quant_row_fp8_one(
+                        c.y.ptr().cast_const(),
+                        (c.q.ptr(), c.scale.ptr()),
+                        cols as u32,
+                        s,
+                    )
+                    .expect("Q1");
+                }
+            }
+        };
+        for round in 1..=2 {
+            graph_record(&scrub, (&shape, "n1_q1", round), today);
+            graph_record(&scrub, (&shape, "n3", round), |s| {
+                c.launch(form, quant, offset, s)
+            });
+        }
+    }
+}

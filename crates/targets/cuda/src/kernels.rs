@@ -422,6 +422,22 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_quant_row_prepare() -> i32;
+    fn scratchy_cuda_rms_norm_quant_row(
+        x: *const c_void,
+        other: *const c_void,
+        gain: *const c_void,
+        y: *mut c_void,
+        sum: *mut c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        rows: u32,
+        cols: u32,
+        form: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rms_norm_one_row_variant(
         x: *const c_void,
         gain: *const c_void,
@@ -1424,6 +1440,11 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
+    // FP8 S8 N3: a load of every instance of the one-CTA-a-row norm (no tape launches it yet).
+    (
+        "rms_norm_quant_row",
+        scratchy_cuda_rms_norm_quant_row_prepare,
+    ),
     ("gemv_fp8_tc", scratchy_cuda_gemv_fp8_tc_prepare),
     ("act_quant_fp8", scratchy_cuda_act_quant_fp8_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
@@ -1712,6 +1733,56 @@ pub unsafe fn rms_norm_unit_bf16(
 ) -> Result<(), KernelError> {
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_rms_norm_unit_bf16(x, y, rows, cols, eps, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// The decode RMSNorm in one CTA a row, fused with the next GEMM's FP8 quantization (FP8 S8 N3,
+/// `kernels/rms_norm_quant_row.cu`; no `CudaStep` launches it yet). Per row of `x [rows, cols]`
+/// bf16: `form` 0 `y = norm(x)`, 1 `sum = bf16(x + other)` and `y = norm(sum)`, 2 `y =
+/// bf16(bf16(norm(x)) + other)`, with `norm(v) = v · rsqrt(mean(v²) + eps) · (gain_offset + gain)`
+/// rounded once to bf16, its sum of squares in its own order (a warp tree, not the 16-row
+/// kernel's: the bits of [`rms_norm_bf16`] within an f64 bound, not equal). With `quant` (`(q,
+/// scale)`, forms 0 and 1), also `q [rows, cols]` e4m3 and `scale [rows]` f32, [`quant_rows_fp8`]
+/// of `y` bit for bit. Asynchronous.
+///
+/// Refused with [`KernelError::RowShape`], before any pointer is touched, unless `rows` is 1 to
+/// 65,535, `cols` a non-zero multiple of 256 at most 8,192, `form` at most 2, `eps` finite and
+/// positive, `gain_offset` finite, `x`, `gain` and `y` not null, `other` not null at forms 1 and 2,
+/// `sum` not null at form 1, and `quant` both pointers or none, at forms 0 and 1 only.
+///
+/// # Safety
+///
+/// `x`, `other`, `y`, `sum` 16-byte-aligned device pointers to `rows · cols` bf16, `gain` to
+/// `cols`, `q` to `rows · cols` bytes and `scale` to `rows` f32; the outputs overlap no input.
+/// [`prepare_all`] must have succeeded on the current device; `stream` a live `cudaStream_t` of
+/// the current device, or null for the default stream.
+pub unsafe fn rms_norm_quant_row(
+    (x, other, gain): (*const c_void, *const c_void, *const c_void),
+    (y, sum): (*mut c_void, *mut c_void),
+    quant: Option<(*mut c_void, *mut c_void)>,
+    (rows, cols): (u32, u32),
+    (form, eps, gain_offset): (u32, f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (q, scale) = quant.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+    // SAFETY: the caller upholds the contract above; the launcher checks every rule first.
+    let code = unsafe {
+        scratchy_cuda_rms_norm_quant_row(
+            x,
+            other,
+            gain,
+            y,
+            sum,
+            q,
+            scale,
+            rows,
+            cols,
+            form,
+            eps,
+            gain_offset,
+            stream,
+        )
+    };
     check(code, KernelError::RowShape { rows, cols })
 }
 
