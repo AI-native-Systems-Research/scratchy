@@ -65,8 +65,8 @@ __device__ inline float2 rms_inv::op<float2>(const float2& m, const float2& eps)
     return float2{rms_inv::op<float>(m.x, eps.x), rms_inv::op<float>(m.y, eps.y)};
 }
 
-// The one-row RMSNorm's `inv` (`kernels/rms_norm_bf16.cu`'s `rms_norm_one_row_ker`), written out
-// as the 16-row kernel's SASS computes `rms_inv(total / cols, eps)` in all four forms on the H100:
+// The one-row RMSNorm's `inv` (`kernels/rms_norm_bf16.cu`'s `rms_norm_row_ker`), written out as
+// the 16-row kernel's SASS computes `rms_inv(total / cols, eps)` in all four forms on the H100:
 // `rcp(cols)` (one MUFU.RCP: `warp::div` by a scalar under `--use_fast_math`), then `total · rcp +
 // eps` contracted into one FFMA, then MUFU.RSQ. Left to ptxas in the one-row `ADD_NORM` instance,
 // the bottom packed row's product and `+ eps` stayed apart (an FMUL, then an FADD past the warps'

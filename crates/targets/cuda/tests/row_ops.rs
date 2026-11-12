@@ -21,7 +21,7 @@ use common::numerics::{
     soft_cap_bound, soft_cap_reference, widen,
 };
 use scratchy_target_cuda::kernels::{KernelError, add_bf16, rms_norm_bf16, silu_mul_bf16};
-use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16, rms_norm_one_row_variant};
+use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16};
 use scratchy_target_cuda::kernels::{
     gelu_mul_bf16, layer_scale_bf16, rms_norm_unit_bf16, scale_bf16, soft_cap_bf16,
 };
@@ -395,6 +395,51 @@ fn every_row_launcher_refuses_a_shape_it_cannot_run() {
             );
             pass &= ok;
         }
+    }
+    // A one-row norm past the row form's 68 tiles (17,408 columns), every norm launcher.
+    let (rows, cols) = (1u32, 17_664u32);
+    let len = cols as usize;
+    let input = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload an input");
+    let gain = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload a gain");
+    for kernel in [
+        "rms_norm_bf16",
+        "rms_norm_unit_bf16",
+        "add_rms_norm_bf16",
+        "norm_add_bf16",
+    ] {
+        let (out, sum) = (
+            DeviceBuffer::upload(&device, &vec![SENTINEL; len]).expect("upload out"),
+            DeviceBuffer::upload(&device, &vec![SENTINEL; len]).expect("upload sum"),
+        );
+        let null = std::ptr::null_mut();
+        let (x, g, y) = (input.ptr(), gain.ptr(), out.ptr());
+        // SAFETY: each launcher refuses this shape before it touches any pointer.
+        let got = unsafe {
+            match kernel {
+                "rms_norm_bf16" => rms_norm_bf16(x, g, y, (rows, cols), EPS, ONE_PLUS_SCALE, null),
+                "rms_norm_unit_bf16" => rms_norm_unit_bf16(x, y, (rows, cols), EPS, null),
+                "add_rms_norm_bf16" => add_rms_norm_bf16(
+                    (x, g),
+                    g,
+                    (sum.ptr(), y),
+                    (rows, cols),
+                    (EPS, ONE_PLUS_SCALE),
+                    null,
+                ),
+                _ => norm_add_bf16((x, g), g, y, (rows, cols), (EPS, ONE_PLUS_SCALE), null),
+            }
+        };
+        let unchanged = [&out, &sum].iter().all(|b| {
+            (b.download().expect("download"))
+                .iter()
+                .all(|&v| v == SENTINEL)
+        });
+        let ok = got == Err(KernelError::RowShape { rows, cols }) && unchanged;
+        eprintln!(
+            "{kernel} rows={rows} cols={cols}: {got:?} out_unchanged={unchanged} {}",
+            verdict(ok)
+        );
+        pass &= ok;
     }
     assert!(pass, "a row launcher did not refuse a shape it cannot run");
 }
@@ -1189,8 +1234,8 @@ const ONE_ROW_COLS: [usize; 12] = [
 /// sum, `NORM_ADD`) takes the one-row kernel (`col_tiles` CTAs), and its output is the 16-row
 /// kernel's bits for the same row: the row as row 0 of a 16-row launch, and of a 2-row launch,
 /// both today's kernel. At every width in [`ONE_ROW_COLS`], gain offsets 0 and 1, 3 seeds, plus an
-/// all-zero row and a row of ±65,504 (whose squares overflow to inf, as today). Every output's
-/// tail is intact.
+/// all-zero row, a row of ±65,504 (whose squares overflow to inf, as today) and a row of
+/// subnormals beside the largest finite bf16. Every output's tail is intact.
 #[test]
 fn the_one_row_norms_are_the_16_row_norms_bit_for_bit() {
     let device = h100();
@@ -1217,6 +1262,10 @@ fn the_one_row_norms_are_the_16_row_norms_bit_for_bit() {
             .map(|c| bits(if c % 2 == 0 { 65504.0 } else { -65504.0 }))
             .collect();
         rows_in.push(("max".into(), big.clone(), big));
+        let tiny: Vec<u16> = (0..cols)
+            .map(|c| [0x0001, 0x8001, 0x7F7F, 0x0080][c % 4])
+            .collect();
+        rows_in.push(("subnormal".into(), tiny.clone(), tiny));
         for (what, x, b) in &rows_in {
             for offset in [SCALE, ONE_PLUS_SCALE] {
                 let g = match offset {
@@ -1357,7 +1406,7 @@ fn event_median(scrub: Option<&DeviceBuffer>, mut launch: impl FnMut()) -> f64 {
 }
 
 /// Recorded, not asserted (W1's prototype gate reads it): µs per launch of each norm form at
-/// `rows == 1` (the one-row kernel) and at `rows == 2` (today's 16-row kernel on one CTA, the
+/// `rows == 1` (the row kernel, N1) and at `rows == 2` (today's 16-row kernel on one CTA, the
 /// time W0 measured in the tape), hot and with L2 cleared, at the three models' widths.
 #[test]
 fn the_one_row_norm_times_are_recorded() {
@@ -1637,129 +1686,6 @@ fn the_one_row_map_times_are_recorded() {
     }
 }
 
-// ── FP8 S8 N1: the row norm against today's one-row norm ─────────────────────
-
-/// One row's buffers for [`rms_norm_one_row_variant`]: `x`, `b` (the addend or the residual), the
-/// gain, and both variants' `y` and `sum`.
-struct N1Row {
-    x: DeviceBuffer,
-    b: DeviceBuffer,
-    g: DeviceBuffer,
-    out: [(DeviceBuffer, DeviceBuffer); 2],
-    cols: usize,
-}
-
-impl N1Row {
-    fn new(device: &CudaDevice, (x, b, g): (&[u16], &[u16], &[u16])) -> Self {
-        let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
-        let cols = x.len();
-        let pair = || (output(device, cols), output(device, cols));
-        Self {
-            x: up(x),
-            b: up(b),
-            g: up(g),
-            out: [pair(), pair()],
-            cols,
-        }
-    }
-
-    /// Form `form` (the launcher's code) at `variant` into its own outputs, on `stream`.
-    fn launch(&self, form: NormForm, offset: f32, variant: u32, stream: *mut std::ffi::c_void) {
-        let (y, sum) = &self.out[variant as usize];
-        // SAFETY: every buffer is its own cudaMalloc allocation (256-byte aligned) of at least
-        // `cols` bf16 (`output`'s are longer), the outputs distinct; `stream` is null or a live
-        // stream of this device.
-        unsafe {
-            rms_norm_one_row_variant(
-                (self.x.ptr().cast_const(), self.g.ptr().cast_const()),
-                (y.ptr(), self.b.ptr().cast_const(), sum.ptr()),
-                self.cols as u32,
-                (EPS, offset),
-                (form as u32, variant),
-                stream,
-            )
-        }
-        .expect("a one-row norm variant launch");
-    }
-
-    /// `variant`'s `y` (and `sum` under `ADD_NORM`) and whether every tail held.
-    fn outputs(&self, form: NormForm, variant: u32) -> (Vec<u16>, bool) {
-        let (y, sum) = &self.out[variant as usize];
-        let (mut v, mut tails) = result(y, self.cols);
-        if form == NormForm::AddNorm {
-            let (s, st) = result(sum, self.cols);
-            v.extend(s);
-            tails &= st;
-        }
-        (v, tails)
-    }
-}
-
-/// FP8 S8 N1: the row kernel (variant 1, the launchers' at `rows == 1`) is today's one-row kernel
-/// (variant 0) byte for byte, `y` and `ADD_NORM`'s sum, every form at the three models' widths
-/// (2,048, 2,816, 5,120), gain offsets 0 and 1, on 3 random rows and 3 edge rows (all zeros, ±65,504
-/// whose squares overflow, and subnormals beside the largest finite bf16), as `N1_BITS` lines.
-#[test]
-fn the_row_norm_is_the_one_row_norm_bit_for_bit() {
-    let device = h100();
-    let mut pass = true;
-    for cols in [2048usize, 2816, 5120] {
-        let mut rows_in: Vec<(String, Vec<u16>, Vec<u16>)> = (0..3u64)
-            .map(|s| {
-                let seed = 0x0E11_0000 ^ (cols as u64) << 8 ^ s;
-                (
-                    format!("random{s}"),
-                    bf16_inputs(cols, seed),
-                    bf16_inputs(cols, seed ^ 0x55),
-                )
-            })
-            .collect();
-        rows_in.push(("zeros".into(), vec![0; cols], vec![0; cols]));
-        let big: Vec<u16> = (0..cols)
-            .map(|c| bits(if c % 2 == 0 { 65504.0 } else { -65504.0 }))
-            .collect();
-        rows_in.push(("max".into(), big.clone(), big));
-        let tiny: Vec<u16> = (0..cols)
-            .map(|c| [0x0001, 0x8001, 0x7F7F, 0x0080][c % 4])
-            .collect();
-        rows_in.push(("subnormal".into(), tiny.clone(), tiny));
-        for (what, x, b) in &rows_in {
-            for offset in [SCALE, ONE_PLUS_SCALE] {
-                let g = match offset {
-                    SCALE => bf16_inputs(cols, 0x0E12_0000 ^ cols as u64),
-                    _ => centred_gains(cols, 0x0E13_0000 ^ cols as u64),
-                };
-                let r = N1Row::new(&device, (x, b, &g));
-                for form in [
-                    NormForm::Norm,
-                    NormForm::Unit,
-                    NormForm::AddNorm,
-                    NormForm::NormAdd,
-                ] {
-                    if form == NormForm::Unit && offset != SCALE {
-                        continue;
-                    }
-                    let null = std::ptr::null_mut();
-                    r.launch(form, offset, 0, null);
-                    r.launch(form, offset, 1, null);
-                    let (want, wt) = r.outputs(form, 0);
-                    let (got, gt) = r.outputs(form, 1);
-                    let m = mismatched_bits(&got, &want);
-                    let ok = m == 0 && wt && gt;
-                    eprintln!(
-                        "N1_BITS {form:?} cols={cols} offset={offset} {what}: mismatched_bits={m} \
-                         tails_intact={} {}",
-                        wt && gt,
-                        verdict(ok)
-                    );
-                    pass &= ok;
-                }
-            }
-        }
-    }
-    assert!(pass, "the row norm is not today's one-row norm's bits");
-}
-
 const STREAM_BLOCKING: u32 = 0;
 const CAPTURE_THREAD_LOCAL: i32 = 1;
 
@@ -1835,40 +1761,6 @@ fn graph_record(
         cudaGraphExecDestroy(exec);
         cudaGraphDestroy(graph);
         cudaStreamDestroy(stream);
-    }
-}
-
-/// The decode norms of the three FP8 models: (model, width, form, gain offset).
-const N1_SHAPES: &[(&str, usize, NormForm, f32)] = &[
-    ("27B", 5120, NormForm::Norm, ONE_PLUS_SCALE),
-    ("27B", 5120, NormForm::AddNorm, ONE_PLUS_SCALE),
-    ("35B", 2048, NormForm::Norm, ONE_PLUS_SCALE),
-    ("35B", 2048, NormForm::AddNorm, ONE_PLUS_SCALE),
-    ("Gemma", 2816, NormForm::Norm, SCALE),
-    ("Gemma", 2816, NormForm::NormAdd, SCALE),
-];
-
-/// Recorded, not asserted (N1's gate reads it): inside a captured graph of 10 back-to-back nodes,
-/// today's one-row norm (`w1_norm`) against the row norm (`n1_norm`), read-cold and hot, two rounds
-/// (A, B, A, B), as `TC_TIME … _graph_per_node` lines.
-#[test]
-fn the_row_norm_graph_times_are_recorded() {
-    let device = h100();
-    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
-    for &(model, cols, form, offset) in N1_SHAPES {
-        let x = bf16_inputs(cols, 0x0E14_0000 ^ cols as u64);
-        let b = bf16_inputs(cols, 0x0E15_0000 ^ cols as u64);
-        let g = centred_gains(cols, 0x0E16_0000 ^ cols as u64);
-        let r = N1Row::new(&device, (&x, &b, &g));
-        let shape = format!("{model}_{form:?}_{cols}");
-        for round in 1..=2 {
-            graph_record(&scrub, (&shape, "w1_norm", round), |s| {
-                r.launch(form, offset, 0, s)
-            });
-            graph_record(&scrub, (&shape, "n1_norm", round), |s| {
-                r.launch(form, offset, 1, s)
-            });
-        }
     }
 }
 
