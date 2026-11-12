@@ -5439,18 +5439,23 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // nothing, and the queue's own FIFO orders the preamble CB ahead of the step's
             // compute CBs — the whole step submits with no host-side waits.
             if runs.is_empty() {
+                // The whole-segment fallback sends the shadow itself — the segment's own
+                // bytes, never the region's alignment pad past it (that pad is device-side
+                // zeros `prepare` filled once and no step ever writes; the shadow stops at
+                // the segment's declared extent).
+                let shadow = self.seg_host[i]
+                    .host()
+                    .ok_or_else(|| anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY"))?;
+                let take = shadow.len().min(tot as usize);
+                let src = shadow.get(..take).ok_or_else(|| {
+                    anyhow!(
+                        "preamble: seg{i} shadow of {} B cannot cover a {take} B send",
+                        shadow.len()
+                    )
+                })?;
                 last_h2d = Some(
                     stream
-                        .h2d_on_compute_signaled(
-                            whole_shadow(
-                                self.seg_host[i].host().ok_or_else(|| {
-                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
-                                })?,
-                                addr,
-                                i,
-                            )?,
-                            addr,
-                        )
+                        .h2d_on_compute_signaled(src, addr)
                         .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?,
                 );
             } else {
