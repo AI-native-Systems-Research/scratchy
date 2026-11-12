@@ -1978,15 +1978,16 @@ fn the_gating_refuses_a_width_off_16() {
 }
 
 /// #1049's one-launch GDN decode is the four launches bit for bit at one row: the bf16 output, the
-/// conv ring and the state of the slot, for both geometries (one value head per key head, and two),
-/// fresh (the pool NaN-poisoned, so a read of the slot would show) and continued from a slot the
-/// four launches filled with 300 tokens; every other slot bit-unchanged.
+/// conv ring and the state of the slot, for the three geometries (one, two and three value heads
+/// per key head: the 0.8B, the 35B, the 27B), fresh (the pool NaN-poisoned, so a read of the slot
+/// would show) and continued from a slot the four launches filled with 300 tokens; every other
+/// slot bit-unchanged.
 #[test]
 fn the_gdn_decode_fold_is_its_four_launches_bit_for_bit() {
     use scratchy_target_cuda::kernels::{GdnDecodeOperands, gdn_decode};
     let device = h100();
     let mut pass = true;
-    for d in [G08, G9] {
+    for d in [G08, G9, G27] {
         let bu = bundle(d, 0xDEC5);
         let bb = upload_bundle(&device, &bu);
         for prior in [0usize, 300] {

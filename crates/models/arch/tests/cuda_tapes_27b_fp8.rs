@@ -33,7 +33,7 @@ const DECODE_STEPS: [(&str, usize); 13] = [
     ("GateApply", 16),
     ("GateSplit", 16),
     ("GateUpTcFp8", 64),
-    ("GatedDeltaNet", 48),
+    ("GdnDecode", 48),
     ("Gemv", 1),
     ("GemvGroupFp8", 48),
     ("GemvGroupTcFp8", 64),
