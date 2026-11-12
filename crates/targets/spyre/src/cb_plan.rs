@@ -480,10 +480,7 @@ pub(crate) fn build_cb_plan<T: ktir_superdsc::collective::Tp>(
             bases.push(if i == SEG_WEIGHT.get() {
                 (wbase.clone(), weight_shift)
             } else {
-                (
-                    segment_base(seg, banks, weight_bank, i)?.clone(),
-                    *byte_off,
-                )
+                (segment_base(seg, banks, weight_bank, i)?.clone(), *byte_off)
             });
         }
         entries.push(CbPlanEntry {
