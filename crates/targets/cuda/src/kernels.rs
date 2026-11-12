@@ -330,6 +330,19 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_one_row_variant(
+        x: *const c_void,
+        gain: *const c_void,
+        y: *mut c_void,
+        other: *const c_void,
+        sum: *mut c_void,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        form: u32,
+        variant: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rms_norm_unit_bf16(
         x: *const c_void,
         y: *mut c_void,
@@ -1570,6 +1583,44 @@ pub unsafe fn rms_norm_unit_bf16(
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_rms_norm_unit_bf16(x, y, rows, cols, eps, stream) };
     check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Test support for `tests/row_ops.rs` only (FP8 S8 N1): one row of norm form `form` (0
+/// [`rms_norm_bf16`], 1 [`rms_norm_unit_bf16`], 2 [`add_rms_norm_bf16`], 3 [`norm_add_bf16`]) at
+/// `variant` 0, today's one-row kernel, or 1, the row kernel the launchers take, the same bits.
+/// No `CudaStep` uses it. Refused with [`KernelError::RowShape`] (`rows` 1) unless `cols` meets
+/// the row kernels' rule and is at most 17,408, and `form` and `variant` are codes. Asynchronous.
+///
+/// # Safety
+///
+/// Every pointer a 16-byte-aligned device pointer to `cols` bf16, valid for the whole kernel, the
+/// outputs `y` and `sum` overlapping no input nor each other. `stream` as [`rms_norm_bf16`]'s.
+#[doc(hidden)]
+pub unsafe fn rms_norm_one_row_variant(
+    (x, gain): (*const c_void, *const c_void),
+    (y, other, sum): (*mut c_void, *const c_void, *mut c_void),
+    cols: u32,
+    (eps, gain_offset): (f32, f32),
+    (form, variant): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape and the codes before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_rms_norm_one_row_variant(
+            x,
+            gain,
+            y,
+            other,
+            sum,
+            cols,
+            eps,
+            gain_offset,
+            form,
+            variant,
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows: 1, cols })
 }
 
 /// Launch the bf16 `out = 0.5 · gate · (1 + tanh(√(2/π) · (gate + 0.044715 · gate³))) · up` (GeGLU,

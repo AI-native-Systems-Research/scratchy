@@ -21,7 +21,7 @@ use common::numerics::{
     soft_cap_bound, soft_cap_reference, widen,
 };
 use scratchy_target_cuda::kernels::{KernelError, add_bf16, rms_norm_bf16, silu_mul_bf16};
-use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16};
+use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16, rms_norm_one_row_variant};
 use scratchy_target_cuda::kernels::{
     gelu_mul_bf16, layer_scale_bf16, rms_norm_unit_bf16, scale_bf16, soft_cap_bf16,
 };
@@ -1634,5 +1634,240 @@ fn the_one_row_map_times_are_recorded() {
             line += &format!(" rows={rows} ({kernel}) {us:.2} us;");
         }
         eprintln!("{line}");
+    }
+}
+
+// ── FP8 S8 N1: the row norm against today's one-row norm ─────────────────────
+
+/// One row's buffers for [`rms_norm_one_row_variant`]: `x`, `b` (the addend or the residual), the
+/// gain, and both variants' `y` and `sum`.
+struct N1Row {
+    x: DeviceBuffer,
+    b: DeviceBuffer,
+    g: DeviceBuffer,
+    out: [(DeviceBuffer, DeviceBuffer); 2],
+    cols: usize,
+}
+
+impl N1Row {
+    fn new(device: &CudaDevice, (x, b, g): (&[u16], &[u16], &[u16])) -> Self {
+        let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+        let cols = x.len();
+        let pair = || (output(device, cols), output(device, cols));
+        Self {
+            x: up(x),
+            b: up(b),
+            g: up(g),
+            out: [pair(), pair()],
+            cols,
+        }
+    }
+
+    /// Form `form` (the launcher's code) at `variant` into its own outputs, on `stream`.
+    fn launch(&self, form: NormForm, offset: f32, variant: u32, stream: *mut std::ffi::c_void) {
+        let (y, sum) = &self.out[variant as usize];
+        // SAFETY: every buffer is its own cudaMalloc allocation (256-byte aligned) of at least
+        // `cols` bf16 (`output`'s are longer), the outputs distinct; `stream` is null or a live
+        // stream of this device.
+        unsafe {
+            rms_norm_one_row_variant(
+                (self.x.ptr().cast_const(), self.g.ptr().cast_const()),
+                (y.ptr(), self.b.ptr().cast_const(), sum.ptr()),
+                self.cols as u32,
+                (EPS, offset),
+                (form as u32, variant),
+                stream,
+            )
+        }
+        .expect("a one-row norm variant launch");
+    }
+
+    /// `variant`'s `y` (and `sum` under `ADD_NORM`) and whether every tail held.
+    fn outputs(&self, form: NormForm, variant: u32) -> (Vec<u16>, bool) {
+        let (y, sum) = &self.out[variant as usize];
+        let (mut v, mut tails) = result(y, self.cols);
+        if form == NormForm::AddNorm {
+            let (s, st) = result(sum, self.cols);
+            v.extend(s);
+            tails &= st;
+        }
+        (v, tails)
+    }
+}
+
+/// FP8 S8 N1: the row kernel (variant 1, the launchers' at `rows == 1`) is today's one-row kernel
+/// (variant 0) byte for byte, `y` and `ADD_NORM`'s sum, every form at the three models' widths
+/// (2,048, 2,816, 5,120), gain offsets 0 and 1, on 3 random rows and 3 edge rows (all zeros, ±65,504
+/// whose squares overflow, and subnormals beside the largest finite bf16), as `N1_BITS` lines.
+#[test]
+fn the_row_norm_is_the_one_row_norm_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for cols in [2048usize, 2816, 5120] {
+        let mut rows_in: Vec<(String, Vec<u16>, Vec<u16>)> = (0..3u64)
+            .map(|s| {
+                let seed = 0x0E11_0000 ^ (cols as u64) << 8 ^ s;
+                (
+                    format!("random{s}"),
+                    bf16_inputs(cols, seed),
+                    bf16_inputs(cols, seed ^ 0x55),
+                )
+            })
+            .collect();
+        rows_in.push(("zeros".into(), vec![0; cols], vec![0; cols]));
+        let big: Vec<u16> = (0..cols)
+            .map(|c| bits(if c % 2 == 0 { 65504.0 } else { -65504.0 }))
+            .collect();
+        rows_in.push(("max".into(), big.clone(), big));
+        let tiny: Vec<u16> = (0..cols)
+            .map(|c| [0x0001, 0x8001, 0x7F7F, 0x0080][c % 4])
+            .collect();
+        rows_in.push(("subnormal".into(), tiny.clone(), tiny));
+        for (what, x, b) in &rows_in {
+            for offset in [SCALE, ONE_PLUS_SCALE] {
+                let g = match offset {
+                    SCALE => bf16_inputs(cols, 0x0E12_0000 ^ cols as u64),
+                    _ => centred_gains(cols, 0x0E13_0000 ^ cols as u64),
+                };
+                let r = N1Row::new(&device, (x, b, &g));
+                for form in [
+                    NormForm::Norm,
+                    NormForm::Unit,
+                    NormForm::AddNorm,
+                    NormForm::NormAdd,
+                ] {
+                    if form == NormForm::Unit && offset != SCALE {
+                        continue;
+                    }
+                    let null = std::ptr::null_mut();
+                    r.launch(form, offset, 0, null);
+                    r.launch(form, offset, 1, null);
+                    let (want, wt) = r.outputs(form, 0);
+                    let (got, gt) = r.outputs(form, 1);
+                    let m = mismatched_bits(&got, &want);
+                    let ok = m == 0 && wt && gt;
+                    eprintln!(
+                        "N1_BITS {form:?} cols={cols} offset={offset} {what}: mismatched_bits={m} \
+                         tails_intact={} {}",
+                        wt && gt,
+                        verdict(ok)
+                    );
+                    pass &= ok;
+                }
+            }
+        }
+    }
+    assert!(pass, "the row norm is not today's one-row norm's bits");
+}
+
+const STREAM_BLOCKING: u32 = 0;
+const CAPTURE_THREAD_LOCAL: i32 = 1;
+
+unsafe extern "C" {
+    fn cudaStreamCreateWithFlags(stream: *mut *mut std::ffi::c_void, flags: u32) -> i32;
+    fn cudaStreamDestroy(stream: *mut std::ffi::c_void) -> i32;
+    fn cudaStreamBeginCapture(stream: *mut std::ffi::c_void, mode: i32) -> i32;
+    fn cudaStreamEndCapture(
+        stream: *mut std::ffi::c_void,
+        graph: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn cudaGraphInstantiateWithFlags(
+        exec: *mut *mut std::ffi::c_void,
+        graph: *mut std::ffi::c_void,
+        flags: u64,
+    ) -> i32;
+    fn cudaGraphLaunch(exec: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaGraphExecDestroy(exec: *mut std::ffi::c_void) -> i32;
+    fn cudaGraphDestroy(graph: *mut std::ffi::c_void) -> i32;
+}
+
+/// `launch(stream)` ten times captured into one graph on a blocking stream, replayed between
+/// [`event_median`]'s events (the legacy default stream orders them), with L2 cleared before each
+/// (`readcold`) and not (`hot`): one `TC_TIME` line each, the replay's median per node.
+fn graph_record(
+    scrub: &DeviceBuffer,
+    (shape, imp, round): (&str, &str, u32),
+    launch: impl Fn(*mut std::ffi::c_void),
+) {
+    let (mut stream, mut graph, mut exec) = (
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    // SAFETY: out-pointers to locals; nothing else is captured on this thread; every handle is
+    // destroyed below.
+    unsafe {
+        assert_eq!(
+            cudaStreamCreateWithFlags(&mut stream, STREAM_BLOCKING),
+            0,
+            "stream"
+        );
+        assert_eq!(
+            cudaStreamBeginCapture(stream, CAPTURE_THREAD_LOCAL),
+            0,
+            "begin capture"
+        );
+        for _ in 0..10 {
+            launch(stream);
+        }
+        assert_eq!(cudaStreamEndCapture(stream, &mut graph), 0, "end capture");
+        assert_eq!(
+            cudaGraphInstantiateWithFlags(&mut exec, graph, 0),
+            0,
+            "instantiate"
+        );
+    }
+    let replay = || {
+        // SAFETY: `exec` is the instantiated graph and `stream` live.
+        assert_eq!(unsafe { cudaGraphLaunch(exec, stream) }, 0, "graph launch");
+    };
+    let cold = event_median(Some(scrub), replay);
+    let hot = event_median(None, replay);
+    for (temp, us) in [("readcold", cold), ("hot", hot)] {
+        eprintln!(
+            "TC_TIME {temp} {shape} {imp}_graph_per_node: median={:.2}us per node, 0.00 TB/s \
+             (round {round})",
+            us / 10.0
+        );
+    }
+    // SAFETY: the handles were created above and are no longer used.
+    unsafe {
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    }
+}
+
+/// The decode norms of the three FP8 models: (model, width, form, gain offset).
+const N1_SHAPES: &[(&str, usize, NormForm, f32)] = &[
+    ("27B", 5120, NormForm::Norm, ONE_PLUS_SCALE),
+    ("27B", 5120, NormForm::AddNorm, ONE_PLUS_SCALE),
+    ("35B", 2048, NormForm::Norm, ONE_PLUS_SCALE),
+    ("35B", 2048, NormForm::AddNorm, ONE_PLUS_SCALE),
+    ("Gemma", 2816, NormForm::Norm, SCALE),
+    ("Gemma", 2816, NormForm::NormAdd, SCALE),
+];
+
+/// Recorded, not asserted (N1's gate reads it): inside a captured graph of 10 back-to-back nodes,
+/// today's one-row norm (`w1_norm`) against the row norm (`n1_norm`), read-cold and hot, two rounds
+/// (A, B, A, B), as `TC_TIME … _graph_per_node` lines.
+#[test]
+fn the_row_norm_graph_times_are_recorded() {
+    let device = h100();
+    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
+    for &(model, cols, form, offset) in N1_SHAPES {
+        let x = bf16_inputs(cols, 0x0E14_0000 ^ cols as u64);
+        let b = bf16_inputs(cols, 0x0E15_0000 ^ cols as u64);
+        let g = centred_gains(cols, 0x0E16_0000 ^ cols as u64);
+        let r = N1Row::new(&device, (&x, &b, &g));
+        let shape = format!("{model}_{form:?}_{cols}");
+        for round in 1..=2 {
+            graph_record(&scrub, (&shape, "w1_norm", round), |s| {
+                r.launch(form, offset, 0, s)
+            });
+            graph_record(&scrub, (&shape, "n1_norm", round), |s| {
+                r.launch(form, offset, 1, s)
+            });
+        }
     }
 }
