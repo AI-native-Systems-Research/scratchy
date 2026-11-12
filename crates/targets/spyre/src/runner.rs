@@ -194,7 +194,7 @@ impl SpyreSession {
     #[allow(clippy::type_complexity)]
     pub fn new_multi<T: ktir_superdsc::collective::Tp>(
         programs: &[(&[bundle::LaunchGroup<'static, T>], &[u64])],
-        weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        weights: Vec<(usize, crate::allocator::HostBytes, SDType, Vec<usize>)>,
     ) -> Result<Self> {
         // An empty floor matches no tid, so every stick keeps its view-derived
         // size — today's behavior, stated once instead of duplicated.
@@ -213,7 +213,7 @@ impl SpyreSession {
     /// allocation, never shrink one the views already sized.
     pub fn new_multi_floored<T: ktir_superdsc::collective::Tp>(
         programs: &[(&[bundle::LaunchGroup<'static, T>], &[u64])],
-        weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        weights: Vec<(usize, crate::allocator::HostBytes, SDType, Vec<usize>)>,
         shape_floor: &std::collections::HashMap<u64, usize>,
     ) -> Result<Self> {
         let mut funcs: Vec<Vec<ktir_core::ir::IRFunction<'static>>> =
@@ -251,10 +251,13 @@ impl SpyreSession {
             specs.push(build_spec(&progs, results));
         }
         // Weights moved in once (no clone); shared across all programs by tensor id, and
-        // moved AGAIN into the session so they reach HBM without a copy.
+        // moved AGAIN into the session so they reach HBM without a copy. The emulator's
+        // runtime OWNS its resident buffers (`Arg::Tensor`), so a viewed weight — the
+        // zero-copy load's product — materializes HERE, at the boundary that needs the
+        // ownership; the one copy this leg pays is the one its session's lifetime demands.
         let args: Vec<(u64, Arg)> = weights
             .into_iter()
-            .map(|(id, data, dt, shape)| (id as u64, weight_arg(data, dt, shape)))
+            .map(|(id, data, dt, shape)| (id as u64, weight_arg(data.into_vec(), dt, shape)))
             .collect();
         let prog_refs: Vec<(&[ktir_core::ir::IRFunction<'static>], &ProgramSpec)> = funcs
             .iter()

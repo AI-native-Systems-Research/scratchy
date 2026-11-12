@@ -1532,8 +1532,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
         // us where in the chain values transition from real to zero.
         if std::env::var_os("VLLM_DUMP_ARENA").is_some() {
-            for slot in 0..guard.worker.arena.len() {
-                let buf = &guard.worker.arena[slot];
+            for (slot, buf) in guard.worker.arena.iter().enumerate() {
                 let len_bytes = buf.length();
                 let ptr = crate::sparse_arena::host_ptr(buf);
                 if ptr.is_null() {
@@ -1559,8 +1558,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             fn bf16_bits_to_f32(bits: u16) -> f32 {
                 f32::from_bits((bits as u32) << 16)
             }
-            for slot in 0..guard.worker.arena.len() {
-                let buf = &guard.worker.arena[slot];
+            for (slot, buf) in guard.worker.arena.iter().enumerate() {
                 let len_bytes = buf.length();
                 let ptr = crate::sparse_arena::host_ptr(buf);
                 if len_bytes < 32 || ptr.is_null() {

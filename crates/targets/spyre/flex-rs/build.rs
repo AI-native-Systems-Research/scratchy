@@ -1,99 +1,76 @@
-//! Compiles and links the crate's C++ shim: `cxx-shim/senlib_ffi.cpp` (the
-//! real senlib FFI binding) and `cxx-shim/hal_sbf.cpp` (the hal SBF wire
-//! doors — see each file's own header). Unconditional by default — flex-rs
-//! is the only senlib path in the workspace, so its shim must build whenever
-//! anything actually links against real senlib, with no separate opt-in.
+//! Links the crate's C-ABI implementation: two STATIC archives, never a
+//! shared object and never a runtime loader.
+//!
+//! The declarations live in `src/senlib_ffi.rs` (names, signatures, and the
+//! per-door contract prose). Their implementation is built on card hosts
+//! from the internal trees and staged as archives:
+//!
+//!   - `libflex_shim.a`  — the FFI export layer over the native port of the
+//!     senlib doors (the mirror of this crate's declarations);
+//!   - `libsenlib_oco.a` — the export-controlled OCO crate the FFI layer's
+//!     own undefined symbols resolve against.
+//!
+//! Both are found in the one directory named by `SENLIB_STATIC_LIB_DIR` at
+//! build time; there is no search, no fallback directory, and no default —
+//! a build that names no directory, or whose directory is missing either
+//! archive, REFUSES here, naming exactly what is missing. What executes on
+//! a card host is provable from the linked binary itself: the archives are
+//! embedded, not loaded.
+//!
+//! `SCRATCHY_SKIP_SENDNN_CXX=1` skips emitting the link directives — the
+//! check/clippy escape hatch (cargo check and clippy run build scripts but
+//! perform no final link). A real link under the escape hatch fails loudly
+//! at `ld`. This is the same contract the escape hatch always carried.
+//!
 //! This is the only build script in the spyre tree.
-//!
-//! This links ONLY against `senlib` (+ its own transitive deps: flightlog,
-//! boost). It does NOT link `libflex.so` or any `sendnn_*` library — this
-//! crate has no `flex::` dependency at all, by design. The hal SBF headers
-//! install inside senlib's own include root (`senlib/include/hal/`), so
-//! hal_sbf.cpp needs no include path beyond senlib's.
-//!
-//! `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile (cargo check/clippy only —
-//! a link will fail): the escape hatch that keeps a laptop with no Spyre SDK
-//! headers/libs checkable.
 
 use std::env;
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SCRATCHY_SKIP_SENDNN_CXX");
-    println!("cargo:rerun-if-env-changed=FLEX_RS_SPYRE_ROOT");
-    println!("cargo:rerun-if-changed=cxx-shim/senlib_ffi.cpp");
-    println!("cargo:rerun-if-changed=cxx-shim/hal_sbf.cpp");
+    println!("cargo:rerun-if-env-changed=SENLIB_STATIC_LIB_DIR");
 
-    let spyre_root: PathBuf = env::var("FLEX_RS_SPYRE_ROOT")
-        .unwrap_or_else(|_| "/opt/ibm/spyre".to_string())
-        .into();
-    let senlib_lib = spyre_root.join("senlib/lib");
-    println!("cargo:rustc-link-search=native={}", senlib_lib.display());
-    let boost_lib = env::var("BOOST_LIB").unwrap_or_else(|_| "/usr/lib64".to_string());
-    println!("cargo:rustc-link-search=native={boost_lib}");
-    // Link only senlib itself + its own real transitive deps (verified via
-    // `ldd libsenlib.so` on the pod: flightlog + this boost set). No `flex`,
-    // no `sendnn_*` — this crate has zero dependence on libflex.so. Emitted
-    // whether or not we compile below, so a real build with the shim skipped
-    // fails loudly at link time instead of silently missing symbols.
-    for l in [
-        "senlib",
-        "flightlog",
-        "boost_log",
-        "boost_log_setup",
-        "boost_thread",
-        "boost_filesystem",
-        "boost_atomic",
-        "boost_regex",
-        "boost_json",
-        "boost_container",
-        "boost_locale",
-        "boost_chrono",
-    ] {
-        println!("cargo:rustc-link-lib=dylib={l}");
-    }
-
-    if env::var_os("SCRATCHY_SKIP_SENDNN_CXX").is_some() {
-        println!(
-            "cargo:warning=SCRATCHY_SKIP_SENDNN_CXX set — senlib_ffi.cpp NOT compiled (cargo check \
-             only; a link will fail)"
-        );
+    if env::var_os("SCRATCHY_SKIP_SENDNN_CXX").is_some_and(|v| v == "1") {
+        // Check/clippy only: no link directives are emitted, so no archives
+        // are needed. A link will fail at `ld` with undefined references to
+        // every door — loud, by design.
         return;
     }
 
-    let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        // senlib headers (parse_init_buffer.hpp) use std::span (C++20).
-        .std("c++20")
-        .file("cxx-shim/senlib_ffi.cpp")
-        .file("cxx-shim/hal_sbf.cpp")
-        .warnings(true);
-    // senlib's own include root. This crate's own .cpp code never includes
-    // anything under `flex/`, and only senlib itself is linked above — no
-    // libflex.so, no sendnn_*.
-    for sub in ["senlib/include", "senlib/flightlog/include"] {
-        build.include(spyre_root.join(sub));
-    }
-    // senlib's public headers (vfio_target.hpp, device_identity.hpp) include
-    // `common/self_doc_enum.hpp`, a header senlib does not install itself.
-    // Older images installed it under `runtime/include`; the current `:dev`
-    // images install no `common/` there and ship it only in the flex source
-    // tree at `/project_src/flex`. Take the first root that holds it.
-    let common_roots = [
-        spyre_root.join("runtime/include"),
-        PathBuf::from("/project_src/flex"),
-    ];
-    let common_root = common_roots
-        .iter()
-        .find(|root| root.join("common/self_doc_enum.hpp").is_file())
+    let missing_dir_reason = |dir_name: &str| -> String {
+        format!(
+            "flex-rs links its C-ABI implementation from STATIC archives, and the build \
+             cannot proceed without them. Set SENLIB_STATIC_LIB_DIR to the directory \
+             holding libflex_shim.a and libsenlib_oco.a. {dir_name}"
+        )
+    };
+
+    let dir: PathBuf = env::var_os("SENLIB_STATIC_LIB_DIR")
+        .map(PathBuf::from)
         .unwrap_or_else(|| {
             panic!(
-                "flex-rs: no `common/self_doc_enum.hpp` (senlib's public headers include it) \
-                 under any of {common_roots:?}"
+                "{}",
+                missing_dir_reason("SENLIB_STATIC_LIB_DIR is not set at all.")
             )
         });
-    build.include(common_root);
-    build.include(spyre_root.join("runtime/include"));
-    build.compile("senlib_ffi");
+
+    for archive in ["libflex_shim.a", "libsenlib_oco.a"] {
+        if !dir.join(archive).is_file() {
+            panic!(
+                "{}",
+                missing_dir_reason(&format!(
+                    "The named directory ({}) does not contain {archive}.",
+                    dir.display()
+                ))
+            );
+        }
+    }
+
+    // The FFI archive's own undefined OCO symbols resolve against the OCO
+    // archive at this link: dependent first, provider after (static-archive
+    // resolution is left-to-right).
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    println!("cargo:rustc-link-lib=static=flex_shim");
+    println!("cargo:rustc-link-lib=static=senlib_oco");
 }

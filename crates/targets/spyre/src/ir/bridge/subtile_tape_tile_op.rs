@@ -158,11 +158,11 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
                 crate::op_abi::Operands::FromInputs => n.inputs.len() as u32 + 1,
                 crate::op_abi::Operands::Fixed(k) => k,
             };
-            Ok(vec![TileOp {
-                kind: TileOpKind::PointwiseOrReduce { n_operands },
-                dims: vec![mb, out_active, y],
-                df: Df::Fp16,
-            }])
+            Ok(vec![TileOp::new(
+                TileOpKind::PointwiseOrReduce { n_operands },
+                vec![mb, out_active, y],
+                Df::Fp16,
+            )])
         }
         // ⛔ NOT A POINTWISE TILE. A reshape re-lays the buffer out (the device
         // layout is a function of the ROW COUNT), so it is a restickify, not an
@@ -201,11 +201,11 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
                 is_stick: true,
                 df: Df::Fp16,
             };
-            Ok(vec![TileOp {
-                kind: TileOpKind::PointwiseOrReduce { n_operands: 2 },
-                dims: vec![mb, out_dev, y],
-                df: Df::Fp16,
-            }])
+            Ok(vec![TileOp::new(
+                TileOpKind::PointwiseOrReduce { n_operands: 2 },
+                vec![mb, out_dev, y],
+                Df::Fp16,
+            )])
         }
         // RmsNormReduce is the reduce phase (mean(x²) over the WHOLE row) — a genuine stick reduce,
         // `is_reduction: true` on `out`, output region is `[m,1]` (the per-row scalar), so `cols` here
@@ -223,11 +223,12 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
                 is_stick: true,
                 df: Df::Fp16,
             };
-            Ok(vec![TileOp {
-                kind: TileOpKind::PointwiseOrReduce { n_operands: 2 }, // data + accum
-                dims: vec![mb, reduce_out, y],
-                df: Df::Fp16,
-            }])
+            Ok(vec![TileOp::new(
+                // data + accum
+                TileOpKind::PointwiseOrReduce { n_operands: 2 },
+                vec![mb, reduce_out, y],
+                Df::Fp16,
+            )])
         } // RmsNormApply (x * inv_rms * gamma) and the whole-form RmsNorm are both shape-preserving
           // elementwise over the OUTPUT's [rows,cols] — 3 tensor inputs (x, inv_rms/mean+rinv, gamma) + output.
           // RoPE (RopeRotate/RopeAppend): PURE SYNTAX — the node's OWN declared shape and input count,
@@ -271,11 +272,7 @@ fn matmul_tile_dims(
         out_active,
         y,
     ];
-    Ok(vec![TileOp {
-        kind: TileOpKind::Matmul,
-        dims,
-        df: Df::Fp16,
-    }])
+    Ok(vec![TileOp::new(TileOpKind::Matmul, dims, Df::Fp16)])
 }
 
 #[cfg(test)]

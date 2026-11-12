@@ -3,7 +3,8 @@
 
 use dioxus::prelude::*;
 
-use crate::carbon::{Table, TableCell, TableRow};
+use crate::carbon::{Fold, Stack, Table, TableCell, TableRow};
+use crate::charts::{RangeGroup, RangeMark, range_dots};
 
 use super::data::{Model, RequestTiming, TaskCell};
 use super::numbers::Engine;
@@ -13,7 +14,7 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
     match w {
         "sharegpt" => ("ShareGPT chat", "real chat prompts, one turn each"),
         "rag" => (
-            "MuSiQue",
+            "MuSiQue, timed",
             "multi-document QA, MuSiQue: a question over its passages",
         ),
         "rag-spans" => (
@@ -31,7 +32,7 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
         ),
         "shared-prefix-control" => ("Shared prompt, no reuse", "the same, every prompt its own"),
         "rag-accuracy" => (
-            "MuSiQue accuracy",
+            "MuSiQue, scored",
             "RAG over more tasks, for its accuracy alone: 100 on a quick run, 400 or the whole dev set on a full one",
         ),
         _ => ("dataset", ""),
@@ -123,12 +124,41 @@ fn usable(c: &TaskCell) -> bool {
     !mostly_capped(c) && !mostly_failed(c)
 }
 
-/// Accuracy, where it is like for like: none for a cell whose answers opened as reasoning, one
-/// most of whose answers ran to their cap, which read as wrong without being answers, or one most
-/// of whose requests failed.
+/// Whether most of a cell's answers opened as reasoning: their accuracy and tokens count it too.
+fn mostly_thought(c: &TaskCell) -> bool {
+    c.completed
+        .is_some_and(|n| n > 0 && 2 * c.thinking_answers.unwrap_or(0) > n)
+}
+
+/// Accuracy, where it is like for like: none for a cell most of whose answers opened as
+/// reasoning, ran to their cap (which read as wrong without being answers), or failed.
 fn accuracy(c: &TaskCell) -> Option<f64> {
-    c.accuracy
-        .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && usable(c))
+    c.accuracy.filter(|_| !mostly_thought(c) && usable(c))
+}
+
+/// Why a cell shows no accuracy, in its cell: "not scored" for a timed cell, its answers forced
+/// to one length; else what held it back, with how many.
+fn no_accuracy(c: &TaskCell) -> String {
+    let done = c.completed.unwrap_or(0) as usize;
+    let of = |k: Option<u32>| {
+        format!(
+            "{} of {}",
+            crate::thousands(k.unwrap_or(0) as usize),
+            crate::thousands(done)
+        )
+    };
+    if c.accuracy.is_none() {
+        "not scored".to_string()
+    } else if mostly_capped(c) {
+        format!(
+            "cut off: {} answers hit the length limit",
+            of(c.capped_answers)
+        )
+    } else if mostly_thought(c) {
+        format!("answered in reasoning: {}", of(c.thinking_answers))
+    } else {
+        "—".to_string()
+    }
 }
 
 /// How many times faster scratchy is to its first token than the rival: none where either mostly
@@ -155,11 +185,67 @@ fn total_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
         .flatten()
 }
 
-/// What a cell's energy figures cover, said wherever they are shown.
-pub const ENERGY_NOTE: &str = "J/request and J/token: the energy of the cell's requests, over \
-     every request sent and every output token, from the CPU, GPU and ANE counters, not DRAM, \
-     the Mac's idle floor of about 1.6 W in it; read once a second, so a cell of under about \
-     20 s is coarse.";
+/// What the energy columns cover: the counters, the idle floor, and the sampling.
+const ENERGY_COVERS: &str = "From the CPU, GPU and ANE energy counters, not DRAM, with the Mac's \
+     idle floor of about 1.6 W in it; read once a second, so a cell under about 20 s is coarse.";
+
+/// Each column's header and what it means, shown where it is read ([`Table`]'s definitions).
+fn columns() -> (Vec<String>, Vec<String>) {
+    let cols = [
+        (
+            "workload",
+            "Timed: every answer forced to one length, so times compare across engines. Scored: \
+            the full run's larger sample, answers ending on their own; its accuracy is the \
+            accuracy table's.",
+        ),
+        (
+            "load",
+            "Users sending at once, each its next request when its last answer returns.",
+        ),
+        (
+            "TTFT",
+            "Time to first token, the median: how long before the answer starts.",
+        ),
+        (
+            "total",
+            "From sending a request to its last token, the median.",
+        ),
+        ("answer tok", "Output tokens an answer took, on average."),
+        (
+            "cached tok",
+            "Prompt tokens the engine's cache served, on average.",
+        ),
+        (
+            "J/request",
+            &format!("Energy a request, over every request sent. {ENERGY_COVERS}"),
+        ),
+        (
+            "J/token",
+            &format!("Energy an output token. {ENERGY_COVERS}"),
+        ),
+        (
+            "vs",
+            "The engine scratchy is set against on these same tasks.",
+        ),
+        (
+            "TTFT",
+            "How many times faster scratchy is to its first token.",
+        ),
+        (
+            "total",
+            "How many times faster scratchy is end to end; shown only where both \
+            engines' answers were about one length.",
+        ),
+        (
+            "J/request",
+            "How many times less energy scratchy spent a request; shown only where \
+            both engines' answers were about one length.",
+        ),
+    ];
+    cols.iter()
+        .map(|(h, a)| (h.to_string(), a.to_string()))
+        .unzip()
+}
 
 /// A cell's joules a request, an output token, and a right answer where it is scored and shows
 /// its accuracy; None where its run kept no energy, or most of its requests failed.
@@ -228,7 +314,7 @@ fn right(c: &TaskCell) -> String {
         );
     }
     let Some(a) = accuracy(c) else {
-        return "—".to_string();
+        return no_accuracy(c);
     };
     let whole = match c.num_tasks {
         Some(n) if n >= FIRM_ACCURACY_TASKS => format!("{} of {n}", pct(Some(a))),
@@ -267,6 +353,188 @@ fn x(v: Option<f64>) -> String {
     v.map_or_else(String::new, |v| format!("×{v:.2}"))
 }
 
+/// Why a pair's cells have no ratio, where it is the rival's doing: most of its requests failed.
+fn no_ratio(theirs: &TaskCell) -> Option<String> {
+    mostly_failed(theirs).then(|| {
+        let done = theirs.completed.unwrap_or(0) as usize;
+        let sent = done + theirs.failed.unwrap_or(0) as usize;
+        format!(
+            "rival: {} of {} answered",
+            crate::thousands(done),
+            crate::thousands(sent)
+        )
+    })
+}
+
+/// An accuracy's 95% range, in points: the binomial interval over its tasks,
+/// ±1.96·√(p(1−p)/n), to one decimal. None where it shows no accuracy or kept no task count.
+fn range(c: &TaskCell) -> Option<f64> {
+    let (p, n) = (accuracy(c)?, f64::from(c.num_tasks.filter(|&n| n > 0)?));
+    Some((1960.0 * (p * (1.0 - p) / n).sqrt()).round() / 10.0)
+}
+
+/// A cell's accuracy with its range, "25% ±4.2", as the accuracy table shows it; or why it has
+/// none, or how many requests answered where most failed ([`right`]).
+fn scored(c: &TaskCell) -> String {
+    match (accuracy(c), range(c)) {
+        (Some(a), Some(r)) => format!("{} ±{r:.1}", pct(Some(a))),
+        (Some(a), None) => format!("~{}", pct(Some(a))),
+        _ => right(c),
+    }
+}
+
+/// A dataset's scored cells, a row each a machine, model and engine: scratchy's and its rival's
+/// side by side, each accuracy with its range, by hops, and joules a right answer; a held-back
+/// one says why. `pairs` is each machine and its models as the section reads them. Nothing where
+/// none of them was scored.
+pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
+    let rows: Vec<(String, &str, &TaskCell)> = (pairs.iter())
+        .flat_map(|&(chip, m)| {
+            let mut engines = vec![Engine::Scratchy];
+            engines.extend(rival_of(m, dataset));
+            engines.into_iter().flat_map(move |e| {
+                (e.tasks(m).iter())
+                    .filter(|c| of_dataset(c, dataset) && !c.timed_answers && c.accuracy.is_some())
+                    .map(move |c| (format!("{} on {chip}", m.stem), e.label(), c))
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        return rsx! {};
+    }
+    let cols = [
+        ("model", "The model and the Mac it ran on."),
+        (
+            "engine",
+            "scratchy, or the engine it is set against on these same tasks.",
+        ),
+        ("load", "Users sending at once."),
+        (
+            "tasks",
+            "Tasks asked: the full run's sample, every engine the same ones.",
+        ),
+        (
+            "accuracy",
+            "The share of tasks answered right, a failed or cut-off answer counted \
+            wrong, ± its 95% range over the tasks. Not shown where most answers were cut off at the length limit, \
+            opened in reasoning, or failed: the cell says which.",
+        ),
+        (
+            "by hops",
+            "Accuracy over each hop count's questions: 2-hop, 3-hop and 4-hop.",
+        ),
+        (
+            "cut off",
+            "Answers cut off at the length limit before they ended on their own.",
+        ),
+        ("J/right answer", "Energy over the right answers alone."),
+    ];
+    let (headers, abouts): (Vec<String>, Vec<String>) = cols
+        .iter()
+        .map(|(h, a)| (h.to_string(), a.to_string()))
+        .unzip();
+    let groups = accuracy_dots(dataset, pairs);
+    rsx! {
+        Stack { gap: 2,
+            // The dataset's own name, "MuSiQue accuracy": its scored cell's name is "MuSiQue, scored".
+            strong { "{workload_label(dataset).0.split(',').next().unwrap_or_default()} accuracy" }
+            p { style: "font-size: 0.875rem",
+                "Each dot is an engine's accuracy on the same tasks, its bar the 95% range. Where two \
+                 engines' bars overlap they are within noise of each other; where they do not, the gap \
+                 is real. Hover a dot for its numbers; the table view has every one."
+            }
+            {range_dots(&groups)}
+            Fold { title: "Table view",
+            Table { headers, abouts,
+                for (model, engine, c) in rows {
+                    TableRow {
+                        TableCell { "{model}" }
+                        TableCell { "{engine}" }
+                        TableCell { "{load_label(c)}" }
+                        TableCell { {c.num_tasks.map_or("—".to_string(), |n| crate::thousands(n as usize))} }
+                        TableCell { "{scored(c)}" }
+                        TableCell { "{by_hops(c).filter(|_| accuracy(c).is_some()).unwrap_or_default()}" }
+                        TableCell { {c.capped_answers.map_or("—".to_string(), |k| crate::thousands(k as usize))} }
+                        TableCell { "{joules(per_right(c))}" }
+                    }
+                }
+            }
+            }
+        }
+    }
+}
+
+/// Why a cell has no accuracy, short enough for its line on the plot: "331 of 400 cut off",
+/// "268 of 2,415 answered"; the table view words it in full ([`right`]).
+fn short_reason(c: &TaskCell) -> String {
+    let done = c.completed.unwrap_or(0) as usize;
+    let of = |k: Option<u32>| {
+        format!(
+            "{} of {}",
+            crate::thousands(k.unwrap_or(0) as usize),
+            crate::thousands(done)
+        )
+    };
+    if mostly_failed(c) {
+        let sent = done + c.failed.unwrap_or(0) as usize;
+        format!(
+            "{} of {} answered",
+            crate::thousands(done),
+            crate::thousands(sent)
+        )
+    } else if mostly_capped(c) {
+        format!("{} cut off", of(c.capped_answers))
+    } else if mostly_thought(c) {
+        format!("reasoning {}", of(c.thinking_answers))
+    } else {
+        right(c)
+    }
+}
+
+/// [`accuracy_table`]'s plot: a group a model, in the order the section reads them, a row a Mac
+/// it ran on, a mark an engine, scratchy first: its accuracy and 95% range, or why it has none.
+fn accuracy_dots(dataset: &str, pairs: &[(&str, &Model)]) -> Vec<RangeGroup> {
+    let mut groups: Vec<RangeGroup> = Vec::new();
+    for &(chip, m) in pairs {
+        let mut engines = vec![Engine::Scratchy];
+        engines.extend(rival_of(m, dataset));
+        let marks: Vec<RangeMark> = (engines.iter().zip(["s1", "s2"]))
+            .filter_map(|(&e, class)| {
+                let c = (e.tasks(m).iter())
+                    .find(|c| of_dataset(c, dataset) && !c.timed_answers && c.accuracy.is_some())?;
+                let at = match (accuracy(c), range(c)) {
+                    (Some(a), Some(r)) => Ok((a, a - r / 100.0, a + r / 100.0)),
+                    (Some(a), None) => Ok((a, a, a)),
+                    _ => Err(short_reason(c)),
+                };
+                let mut tip = vec![
+                    format!("{} on {chip}", m.stem),
+                    format!("accuracy {}", scored(c)),
+                ];
+                tip.extend(by_hops(c).filter(|_| accuracy(c).is_some()));
+                if let Some(n) = c.num_tasks {
+                    tip.push(format!("over {} tasks", crate::thousands(n as usize)));
+                }
+                Some(RangeMark {
+                    class,
+                    name: e.label().to_string(),
+                    at,
+                    tip,
+                })
+            })
+            .collect();
+        if marks.is_empty() {
+            continue;
+        }
+        let row = (chip.to_string(), marks);
+        match groups.iter_mut().find(|(stem, _)| stem == &m.stem) {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((m.stem.clone(), vec![row])),
+        }
+    }
+    groups
+}
+
 /// [`tasks_table`]'s rows of one workload: its detail in a dataset's section. Nothing for a model
 /// that did not run it.
 pub fn detail_table(m: &Model, dataset: &str) -> Element {
@@ -291,14 +559,11 @@ fn table(m: &Model, only: Option<&str>) -> Element {
     cells.sort_by_key(|c| (rank(&c.workload), c.conc));
     // The open-loop note, only where the run timed its cells open loop (`--open-loop`).
     let open_loop = cells.iter().any(|c| c.load.as_deref() == Some("rate"));
+    let (headers, abouts) = columns();
     rsx! {
         Table {
-            headers: [
-                "workload", "load", "TTFT", "total", "answer tok", "cached tok", "accuracy",
-                "J/request", "J/token", "J/right answer", "vs", "TTFT", "total", "J/request",
-            ]
-            .map(String::from)
-            .to_vec(),
+            headers,
+            abouts,
             for c in cells {
                 {
                     let (name, _) = workload_label(&c.workload);
@@ -325,35 +590,24 @@ fn table(m: &Model, only: Option<&str>) -> Element {
                                 TableCell { "{ms(c.median_e2el_ms)}" }
                                 TableCell { "{n(c.answer_tokens())}" }
                                 TableCell { "{n(c.mean_cached_tokens)}" }
-                                TableCell { "{right(c)}" }
                                 TableCell { "{joules(per_request(c))}" }
                                 TableCell { "{joules(per_token(c))}" }
-                                TableCell { "{joules(per_right(c))}" }
                             } else {
-                                TableCell { colspan: 8, "no answers" }
+                                TableCell { colspan: 6, "no answers" }
                             }
                             TableCell { "{vs}" }
-                            TableCell { "{x(ttft)}" }
-                            TableCell { "{x(total)}" }
-                            TableCell { "{x(spent)}" }
+                            // A rival that mostly failed says so, rather than leave its ratios blank.
+                            if let Some(why) = them.and_then(|(_, r)| no_ratio(r)) {
+                                TableCell { colspan: 3, "{why}" }
+                            } else {
+                                TableCell { "{x(ttft)}" }
+                                TableCell { "{x(total)}" }
+                                TableCell { "{x(spent)}" }
+                            }
                         }
                     }
                 }
             }
-        }
-        p { style: "font-size: 0.875rem",
-            "Accuracy: the share of tasks answered right, a failed request or an answer that ran to \
-             its cap counted wrong; none on a cell whose answers are forced to one length, so its \
-             times compare across engines, as every cell at a users count is; left out where most answers ran to their cap. A cell most of whose requests failed shows \
-             how many answered, and no accuracy, energy or ratio on either side. ~ marks one over fewer \
-             than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
-             indicative only. The second total ratio is shown only where both engines' answers were \
-             about one length."
-        }
-        p { style: "font-size: 0.875rem", {ENERGY_NOTE} " J/right answer: over the right answers, \
-             where the cell is scored. Its ratio is how many times less energy scratchy spent a request, \
-             shown only where both engines' answers were about one length, an engine that stops \
-             early spending less for answering less."
         }
         if open_loop {
             p { style: "font-size: 0.875rem",
@@ -366,10 +620,6 @@ fn table(m: &Model, only: Option<&str>) -> Element {
         }
     }
 }
-
-/// One dataset overview square: the users count, the workload, and how many times faster
-/// scratchy is to its first token (None where either side has no number).
-pub type GlanceSquare = (u32, String, Option<f64>);
 
 /// The workloads a model's dataset cells cover, in the page's order: the overview's columns.
 pub fn workloads(m: &Model) -> Vec<&str> {
@@ -393,63 +643,6 @@ pub fn load_label(c: &TaskCell) -> String {
         _ if c.conc == 1 => "1 user".to_string(),
         _ => format!("{} users", c.conc),
     }
-}
-
-/// The label of a load key on the overview: the load of scratchy's own cell at that key.
-pub fn key_label(m: &Model, key: u32) -> String {
-    (Engine::Scratchy.tasks(m).iter())
-        .find(|c| c.conc == key && compared(c))
-        .map_or_else(|| key.to_string(), load_label)
-}
-
-/// Whether a cell's numbers are set against a rival's: every open-loop or closed-loop users
-/// cell, not the base, which only scratchy runs.
-fn compared(c: &TaskCell) -> bool {
-    c.load.as_deref() != Some("base")
-}
-
-/// One model's dataset overview map: a square a (load, workload), how many times faster
-/// scratchy is to its first token than the rival, None where either side has no number, and the
-/// rival it is set against (the first that ran any of these cells). The map is shown only with a
-/// rival: scratchy alone has nothing to be faster than.
-pub fn glance_squares(m: &Model) -> Option<(Engine, Vec<GlanceSquare>)> {
-    squares(m, None)
-}
-
-fn squares(m: &Model, only: Option<&str>) -> Option<(Engine, Vec<GlanceSquare>)> {
-    let ours = Engine::Scratchy.tasks(m);
-    let ws: Vec<&str> = (workloads(m).into_iter())
-        .filter(|w| only.is_none_or(|o| o == *w))
-        .collect();
-    let mut users: Vec<u32> = (ours.iter())
-        .filter(|c| compared(c) && only.is_none_or(|o| c.workload == o))
-        .map(|c| c.conc)
-        .collect();
-    users.sort_unstable();
-    users.dedup();
-    // One dataset's squares are set against its own rival, as its pair is ([`rival_of`]); the
-    // whole map against the first that measured any.
-    let rival = match only {
-        Some(dataset) => rival_of(m, dataset)?,
-        None => Engine::RIVALS
-            .into_iter()
-            .find(|&e| e.tasks(m).iter().any(TaskCell::measured))?,
-    };
-    let squares = (users.iter())
-        .flat_map(|&u| ws.iter().map(move |&w| (u, w)))
-        .map(|(u, w)| {
-            let mine = ours
-                .iter()
-                .find(|c| c.workload == w && c.conc == u && c.measured());
-            let theirs =
-                (rival.tasks(m).iter()).find(|c| c.workload == w && c.conc == u && c.measured());
-            let r = mine
-                .zip(theirs)
-                .and_then(|(a, b)| ttft_times(a, b));
-            (u, w.to_string(), r)
-        })
-        .collect();
-    Some((rival, squares))
 }
 
 #[cfg(test)]
@@ -573,6 +766,7 @@ mod tests {
             num_tasks: Some(8),
             load: None,
             request_rate: None,
+            timed_answers: false,
             timed_out: false,
             median_tpot_ms: None,
             output_throughput: None,
@@ -594,11 +788,9 @@ mod tests {
         assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");
     }
 
-    /// The overview's map of a run that timed scratchy and oMLX TurboQuant on the same tasks: a
-    /// square a users count and workload, how many times faster scratchy is to its first token;
-    /// rag-spans, scratchy's own, has no rival and so no ratio.
+    /// A run's workloads, in the order it ran them.
     #[test]
-    fn the_overview_sets_scratchy_against_the_rival_on_each_workload() {
+    fn a_runs_workloads_are_read_in_its_order() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/metal/apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"
@@ -610,19 +802,6 @@ mod tests {
             workloads(m),
             ["sharegpt", "rag", "rag-spans", "sharegpt-multi-turn"]
         );
-        let (rival, squares) = glance_squares(m).expect("a rival ran");
-        assert_eq!(rival.key(), "omlx_tq");
-        let at = |u: u32, w: &str| {
-            squares
-                .iter()
-                .find(|(su, sw, _)| *su == u && sw == w)
-                .unwrap()
-                .2
-        };
-        // ShareGPT at 1 user: 167 ms against 280 ms.
-        assert!((at(1, "sharegpt").unwrap() - 280.0 / 167.0).abs() < 0.05);
-        assert!(at(1, "rag-spans").is_none(), "scratchy's own: no rival");
-        assert_eq!(squares.len(), 2 * 4, "two users counts by four workloads");
     }
 
     /// A cell is named by its load: the closed-loop base, an open-loop rate, or (older runs, and
@@ -639,8 +818,51 @@ mod tests {
         assert_eq!(load_label(&cell(Some("rate"), 2, Some(0.4152))), "0.42/s");
         assert_eq!(load_label(&cell(None, 4, None)), "4 users", "a run from before rates");
         assert_eq!(load_label(&cell(None, 1, None)), "1 user");
-        assert!(!compared(&cell(Some("base"), 0, None)), "the base is scratchy's only");
-        assert!(compared(&cell(Some("rate"), 1, Some(0.2))));
+    }
+
+    /// An accuracy's 95% range: the binomial interval over its tasks, in points.
+    #[test]
+    fn an_accuracy_carries_its_range() {
+        let cell = |acc: f64, n: u32| -> TaskCell {
+            serde_json::from_value(serde_json::json!({"workload": "rag-accuracy", "conc": 4,
+                "completed": n, "num_tasks": n, "accuracy": acc, "thinking_answers": 0,
+                "capped_answers": 0}))
+            .unwrap()
+        };
+        // 1.96 * sqrt(0.25 * 0.75 / 400) = 4.2 points; over 2,415 tasks, 1.7.
+        assert_eq!(range(&cell(0.25, 400)), Some(4.2));
+        assert_eq!(range(&cell(0.25, 2415)), Some(1.7));
+        assert_eq!(scored(&cell(0.25, 400)), "25% ±4.2");
+        // One decimal always: 1.96 * sqrt(0.5 * 0.5 / 2401) = 2.0 points.
+        assert_eq!(scored(&cell(0.5, 2401)), "50% ±2.0");
+    }
+
+    /// A held-back accuracy says why in its cell, and one reasoning answer among many does not
+    /// hide a score: only most of them do, as for capped answers.
+    #[test]
+    fn a_held_back_accuracy_says_why() {
+        let cell = |capped: u32, thinking: u32| -> TaskCell {
+            serde_json::from_value(serde_json::json!({
+                "workload": "rag-accuracy", "conc": 4, "completed": 400, "num_tasks": 400,
+                "accuracy": 0.47, "capped_answers": capped, "thinking_answers": thinking,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            right(&cell(331, 0)),
+            "cut off: 331 of 400 answers hit the length limit"
+        );
+        assert_eq!(right(&cell(0, 378)), "answered in reasoning: 378 of 400");
+        assert_eq!(
+            right(&cell(0, 1)),
+            "47% of 400",
+            "one reasoning answer in 400"
+        );
+        let timed: TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag", "conc": 1, "completed": 8,
+        }))
+        .unwrap();
+        assert_eq!(right(&timed), "not scored");
     }
 
     #[test]
@@ -679,6 +901,7 @@ mod tests {
             num_tasks: Some(4),
             load: None,
             request_rate: None,
+            timed_answers: false,
             timed_out: false,
             median_tpot_ms: None,
             output_throughput: None,

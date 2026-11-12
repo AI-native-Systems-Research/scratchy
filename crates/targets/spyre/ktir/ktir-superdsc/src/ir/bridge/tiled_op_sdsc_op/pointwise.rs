@@ -9,8 +9,8 @@ use crate::ir::island::tile_op::TileOp;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
-    Role, Scale, SdscFoldSet, TensorArg,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpInfo, OpSpec, Role, Scale,
+    SdscFoldSet, TensorArg,
 };
 use crate::work::{CoreDivision, EwDivision};
 
@@ -172,7 +172,7 @@ pub fn gather_copy_opspec(
         // CORE BASE by `W·lanes` while intra-core positions stay contiguous, so the law is exact
         // exactly while no core owns two entries. The cap law above bounds one op to
         // `ENTRIES_PER_OP` (32) entries and `gather_copy_cores` splits `mb` by whole entries over
-        // `MAX_CORES` (32) cores — so a core owning two entries is not a shape this arm can be
+        // every core (32 on gen1) — so a core owning two entries is not a shape this arm can be
         // handed, and the bound below is the whole of the address law.
         crate::sdsc_abstract::GatherDest::Scatter {
             rows: interleave, ..
@@ -214,18 +214,18 @@ pub fn gather_copy_opspec(
         is_stick,
         df,
     };
-    let tile_op = TileOp {
-        // Two operands: the gathered source and the contiguous destination. The index is APPENDED by
-        // `attach_gather_index`, which is also what declares it — one call, so an operand cannot be
-        // pushed without the declaration that makes it an index.
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: vec![
+    // Two operands: the gathered source and the contiguous destination. The index is APPENDED by
+    // `attach_gather_index`, which is also what declares it — one call, so an operand cannot be
+    // pushed without the declaration that makes it an index.
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        vec![
             dim("mb", rows, false),
             dim("out", cols, true),
             dim("y", 1, false),
         ],
         df,
-    };
+    );
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
         OpFunc::Identity,
@@ -263,8 +263,13 @@ pub fn gather_copy_opspec(
         //
         // It costs no parallelism worth having: the entries are `nkvh * nb * mq` — at least `nkvh` (8), and
         // 64 at bs=8 — so the copy still spreads over 8-32 cores.
-        |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
-            gather_copy_cores(dims, max_cores, page)
+
+        // The gather's entry split is a correctness law: every core is its budget.
+        Division {
+            budget: crate::superdsc_opspec::CoreBudget::whole(),
+            splitter: |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
+                gather_copy_cores(dims, max_cores, page)
+            },
         },
         // ⭐⭐⭐ THE DESTINATION'S BASE IS **DERIVED**, NOT PASSED. This op serves the run of scratch rows
         // starting at the index's own `first_entry`, so there is exactly one legal destination base and
@@ -546,12 +551,13 @@ pub fn scatter_copy_opspec(
         ));
     }
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if crate::work::index_core_split(rows / page, MAX_CORES, cap).is_none() {
+    if crate::work::index_core_split(rows / page, crate::device_gen::BUILD_CORES, cap).is_none() {
         return Err(format!(
-            "scatter_copy_opspec('{src}' -> '{dst}'): {} index entries divide over no {MAX_CORES} \
+            "scatter_copy_opspec('{src}' -> '{dst}'): {} index entries divide over no {cores} \
              cores into runs each core reads from ONE {cap}-entry stick — entries past a core's \
              stick wrap and write another core's rows",
-            rows / page
+            rows / page,
+            cores = crate::device_gen::BUILD_CORES,
         ));
     }
     let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
@@ -561,15 +567,15 @@ pub fn scatter_copy_opspec(
         is_stick,
         df,
     };
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: vec![
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        vec![
             dim("mb", rows, false),
             dim("out", cols, true),
             dim("y", 1, false),
         ],
         df,
-    };
+    );
     // Rank-3 and `mb`-only core splits: the gather copy's two card-measured laws (see its call).
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
@@ -577,8 +583,12 @@ pub fn scatter_copy_opspec(
         &[src],
         dst,
         true,
-        |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
-            gather_copy_cores(dims, max_cores, page)
+        // The gather's entry split is a correctness law: every core is its budget.
+        Division {
+            budget: crate::superdsc_opspec::CoreBudget::whole(),
+            splitter: |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
+                gather_copy_cores(dims, max_cores, page)
+            },
         },
         // The destination is addressed THROUGH the index from the pool's own base.
         OutView::at(0),
@@ -655,12 +665,13 @@ pub fn page_gather_copy_opspec(
         ));
     }
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if crate::work::index_core_split(rows / page, MAX_CORES, cap).is_none() {
+    if crate::work::index_core_split(rows / page, crate::device_gen::BUILD_CORES, cap).is_none() {
         return Err(format!(
             "page_gather_copy_opspec('{src}' -> '{dst}'): {} index entries divide over no \
-             {MAX_CORES} cores into runs each core reads from ONE {cap}-entry stick — entries past \
+             {cores} cores into runs each core reads from ONE {cap}-entry stick — entries past \
              a core's stick wrap and gather another core's pages",
-            rows / page
+            rows / page,
+            cores = crate::device_gen::BUILD_CORES,
         ));
     }
     let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
@@ -674,25 +685,29 @@ pub fn page_gather_copy_opspec(
         GatheredWords::Fp16 => (OpFunc::Identity, vec![src]),
         GatheredWords::SenUint32 { zero } => (OpFunc::AddI32ToI32, vec![zero, src]),
     };
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
             n_operands: ins.len() as u32 + 1,
         },
-        dims: vec![
+        vec![
             dim("mb", rows, false),
             dim("out", cols, true),
             dim("y", 1, false),
         ],
         df,
-    };
+    );
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
         op_func,
         &ins,
         dst,
         true,
-        |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
-            gather_copy_cores(dims, max_cores, page)
+        // The gather's entry split is a correctness law: every core is its budget.
+        Division {
+            budget: crate::superdsc_opspec::CoreBudget::whole(),
+            splitter: |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
+                gather_copy_cores(dims, max_cores, page)
+            },
         },
         OutView::at(0),
     )?;
@@ -862,9 +877,10 @@ pub fn index_select_opspec(
         dim("x", rows.get(), false),
         dim("out", cols.elems(), true),
     ];
-    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |d, max| {
-        gather_copy_cores(d, max, 1)
-    })?;
+    let plan =
+        crate::superdsc_opspec::WorkPlan::divide(&dims, crate::device_gen::whole(), |d, max| {
+            gather_copy_cores(d, max, 1)
+        })?;
     let layout = ["mb", "y", "x", "out"];
     let arg = |is_input: bool,
                name: &str,
@@ -1000,12 +1016,16 @@ pub fn expand_blocks_opspec(
         dim("out", cols, true),
     ];
     let (mb_cores, x_cores) = {
-        let mb = crate::work::core_split(batch, MAX_CORES);
-        (mb, crate::work::core_split(group, MAX_CORES / mb))
+        let mb = crate::work::core_split(batch, crate::device_gen::BUILD_CORES);
+        (
+            mb,
+            crate::work::core_split(group, crate::device_gen::BUILD_CORES / mb),
+        )
     };
-    let plan = crate::superdsc_opspec::WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
-        std::collections::BTreeMap::from([("mb", mb_cores), ("x", x_cores)])
-    })?;
+    let plan =
+        crate::superdsc_opspec::WorkPlan::divide(&dims, crate::device_gen::whole(), |_, _| {
+            std::collections::BTreeMap::from([("mb", mb_cores), ("x", x_cores)])
+        })?;
     let layout = ["mb", "x", "y", "out"];
     let arg = |is_input: bool, name: &str, scale: [Scale; 4]| -> Result<_, String> {
         Ok(AnyTensorArg::R4(
@@ -1095,7 +1115,7 @@ pub fn stick_permute_opspec(
         crate::emit::lower_ktir_to_superdsc::pointwise_tile_op_df(rows, stick, sticks, 2, df);
     let tiled = tile_op
         .tile(
-            MaxCores::<MAX_CORES>,
+            crate::device_gen::whole(),
             EwDivision::Law.resolve(false, false).splitter(),
             "out",
         )
@@ -1210,7 +1230,7 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
         crate::emit::lower_ktir_to_superdsc::pointwise_tile_op_df(n, stick, run_sticks, 2, df);
     let tiled = tile_op
         .tile(
-            MaxCores::<MAX_CORES>,
+            crate::device_gen::whole(),
             EwDivision::Law.resolve(false, false).splitter(),
             "out",
         )
@@ -1321,7 +1341,10 @@ pub fn pointwise_opspec_from_tile(
         in_names,
         o_name,
         head_major,
-        division.splitter(),
+        Division {
+            budget: division.budget(tile_op)?,
+            splitter: division.splitter(),
+        },
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
         OutView::whole(),
     )
@@ -1363,23 +1386,32 @@ impl OutView {
     }
 }
 
+/// ONE WORK DIVISION: the cores it may spend and how it spends them. The two travel together because
+/// they are one decision — the byte law's budget for the elementwise law ([`EwDivision::budget`]), every
+/// core for a division that is a law of its own (a gather's entries) — so no caller can pair a budget
+/// with a splitter it was not chosen for.
+struct Division<S> {
+    budget: crate::superdsc_opspec::CoreBudget,
+    splitter: S,
+}
+
 /// [`pointwise_opspec_from_tile`] with the WORK DIVISION as a parameter — for the one op whose entry
 /// unit is a function of which dims got split (see [`gather_copy_cores`]). Every other caller takes
 /// the [`EwDivision`] law through the wrapper above.
-fn pointwise_opspec_from_tile_split(
+fn pointwise_opspec_from_tile_split<S>(
     tile_op: &TileOp,
     op: OpFunc,
     in_names: &[&str],
     o_name: &str,
     head_major: bool,
-    cores: impl Fn(
-        &[crate::superdsc_opspec::ItDim],
-        u32,
-    ) -> std::collections::BTreeMap<&'static str, u32>,
+    division: Division<S>,
     // The OUTPUT's own view — its base in elements and, for the gather's scatter destination,
     // the scatter's width. See [`gather_copy_opspec`]'s `dst_off` and `OutView`.
     out_view: OutView,
-) -> Result<OpSpec, String> {
+) -> Result<OpSpec, String>
+where
+    S: Fn(&[crate::superdsc_opspec::ItDim], u32) -> std::collections::BTreeMap<&'static str, u32>,
+{
     let rows = tile_op
         .dims
         .iter()
@@ -1387,7 +1419,7 @@ fn pointwise_opspec_from_tile_split(
         .map(|d| d.size)
         .unwrap_or(1);
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, cores, "out")
+        .tile(division.budget, division.splitter, "out")
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
@@ -1502,6 +1534,24 @@ pub fn pointwise_broadcast_opspec_from_tile(
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
     );
+    // ⭐⭐⭐ THE WINDOWED-STICK LAW, MINTED ONCE AT THIS DOOR. An operand whose declared `mb`
+    // device extent exceeds the op's swept rows — a multi-stick row band of a taller parent
+    // ([`crate::addr::RowWindow`], the parent's row count declared at
+    // [`TensorArg::with_device_extent`]) — is only safe because a core holding ONE stick never
+    // crosses a column plane; a multi-stick core would have to walk the parent's inter-plane
+    // stride, which nothing states without `backGapCore_`. So the door states the fact ONCE,
+    // from the operand presentation it already holds (the `mk` below is the presentation's other
+    // reader — it declares the same windows' parent rows as device extents), and
+    // [`crate::work::EwDivision::budget`] holds the op's cores to one stick a core. A ONE-STICK
+    // band declares no device extent (it never crosses a plane) and is not windowed; a band whose
+    // parent is exactly the op's rows (the batch-1 case, declared == swept) is not windowed
+    // either. No call site derives this — the callers' `TileOp`s state shape only.
+    let tile_op = tile_op.with_windowed(
+        out_row_window.is_some_and(|w| w.declares_past(rows))
+            || inputs
+                .iter()
+                .any(|i| i.row_window().is_some_and(|w| w.declares_past(rows))),
+    );
     let df = tile_op.df;
     // ⭐ THE FAMILY MINT — every operand's swept window (the per-form broadcast law,
     // `EwOperand::swept_extents`) checked against its handle's declared shape and, when a layout
@@ -1612,11 +1662,11 @@ pub fn pointwise_broadcast_opspec_from_tile(
     });
     let tiled = match (&division, spray_rows) {
         (CoreDivision::Gathered(g), None) => tile_op
-            .tile(MaxCores::<MAX_CORES>, |_, _| g.splits().clone(), "out")
+            .tile(crate::device_gen::whole(), |_, _| g.splits().clone(), "out")
             .map_err(|e| e.0)?,
         (CoreDivision::Ew(EwDivision::Law), Some(rows)) => tile_op
             .tile(
-                MaxCores::<MAX_CORES>,
+                crate::device_gen::whole(),
                 crate::work::distribute_cores_layout_first(rows),
                 "out",
             )
@@ -1627,7 +1677,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 (d, _) => d.resolve(stickmajor, core_local),
             };
             tile_op
-                .tile(MaxCores::<MAX_CORES>, d.splitter(), "out")
+                .tile(d.budget(&tile_op)?, d.splitter(), "out")
                 .map_err(|e| e.0)?
         }
         (stated, Some(_)) => {
