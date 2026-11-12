@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
+// TEST SUPPORT: the decode kernel's bit reference; no `CudaStep` launches it. Since FP8 S8 F6-2 a
+// `GatedDeltaNet` step's scan is `gdn_chunk_scan.cu`; this per-token scan stays as the arithmetic
+// `gdn_decode.cu`'s scan stage is, bit for bit (`tests/gdn.rs`'s
+// `the_gdn_decode_fold_is_its_four_launches_bit_for_bit`), and the four-launch step tests' scan.
+//
 // Gated-DeltaNet recurrent gated delta-rule scan for the H100, one prefill chunk of one sequence:
-// launch 3 of the four a `GatedDeltaNet` step makes (`src/step.rs`). Per value head `h`, the state
-// `S [head_v, head_k]` (f32) starts from the slot's (or zero on a fresh start), and per real token
-// `t < q_len`, in order (metal's `gdn_scan_varlen.metal:155-245`, `cpu_golden::gdn_recurrent`):
+// the third of the four launches a `GatedDeltaNet` step made before F6-2. Per value head `h`, the
+// state `S [head_v, head_k]` (f32) starts from the slot's (or zero on a fresh start), and per real
+// token `t < q_len`, in order (metal's `gdn_scan_varlen.metal:155-245`,
+// `cpu_golden::gdn_recurrent`):
 //
 //     q̂ = q · scale / sqrt(‖q‖² + 1e-6),  k̂ = k / sqrt(‖k‖² + 1e-6)    (key head h / (nv/nk))
 //     S ← S · exp(g)                       the decay, applied first

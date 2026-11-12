@@ -1474,6 +1474,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         "gdn_rms_norm_gated",
         scratchy_cuda_gdn_rms_norm_gated_prepare,
     ),
+    // Test support: the decode kernel's bit reference; no `CudaStep` launches it.
     ("gdn_scan", scratchy_cuda_gdn_scan_prepare),
     ("kv_append_bf16", scratchy_cuda_kv_append_bf16_prepare),
     ("kv_append_fp8", scratchy_cuda_kv_append_fp8_prepare),
@@ -3349,6 +3350,9 @@ pub unsafe fn gdn_gating(
     check(code, KernelError::GdnGatingShape { rows, nv })
 }
 
+/// Test support: the decode kernel's bit reference; no `CudaStep` launches it (since FP8 S8 F6-2 a
+/// `GatedDeltaNet` step's scan is [`gdn_chunk_scan`]).
+///
 /// Launch the GDN recurrent gated delta-rule scan: per value head, the slot's f32 state (zero,
 /// never read, on a fresh start) through the real tokens of `conv_out` (`q | k | v`), `g` and
 /// `beta`, each token's output into `o [rows, nv·head_v]` (f32); the state written back once.
