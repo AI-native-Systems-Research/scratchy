@@ -20,12 +20,10 @@
 //! stage an activation, so the boundaries the architecture claims are boundaries
 //! the compiler now enforces.
 
-// Force the linker to keep every compiled arch crate (and thus its
-// `SpyreArchRegistration` `inventory::submit!`) — otherwise the model crates,
-// referenced only via the inventory registry, get dead-stripped and `try_load`
-// finds an empty registry. (The metal path does the same in `gpu_worker`,
-// which isn't compiled under spyre.)
-extern crate scratchy_models as _;
+// Force the linker to keep the compiled models (and thus their `SpyreArchRegistration`
+// `inventory::submit!`s) — otherwise, referenced only via the inventory registry, they get
+// dead-stripped and `try_load` finds an empty registry.
+extern crate scratchy_target_spyre_models as _;
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -26,12 +26,12 @@
 //! both asserted, so a recognition that silently widened or narrowed is a failure either
 //! way.
 
-#![cfg(all(feature = "spyre", feature = "granite-3.1-2b-instruct"))]
+#![cfg(model = "granite-3.1-2b-instruct")]
 
 /// The phases a granite bake carries, with the wiring each one lowered — decode always, the
 /// batched-prefill program when the bake made one.
 fn phases() -> Vec<(&'static str, &'static scratchy_target_spyre::wiring::Wiring)> {
-    let w = &scratchy_models::granite::granite_3_1_2b_instruct::SUPERDSC_WIRINGS;
+    let w = &scratchy_target_spyre_models::granite::granite_3_1_2b_instruct::SUPERDSC_WIRINGS;
     match &w.prefill {
         Some(p) => vec![("decode", &w.decode), ("prefill", p)],
         None => panic!("granite bakes a batched-prefill program; the wiring has none"),

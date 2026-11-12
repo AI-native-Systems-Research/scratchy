@@ -2007,7 +2007,7 @@ fn emit_arch_dispatcher(
             let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
             let metal_row = arch_row(&tp_lit, quote! { ::scratchy_target_metal::MetalWeights });
             quote! {
-                #[cfg(feature = "metal")]
+                #[cfg(scratchy_target = "metal")]
                 ::scratchy_forward_compiler::inventory::submit! {
                     ::scratchy_target_metal::MetalArchRegistration(#metal_row)
                 }
@@ -2093,7 +2093,7 @@ fn emit_arch_dispatcher(
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
         /// must be the live backend device.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
             w: &Weights,
@@ -2111,7 +2111,7 @@ fn emit_arch_dispatcher(
         ///
         /// # Safety
         /// Same as [`forward`].
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_with_metal_followup(
             w: &Weights,
@@ -2130,7 +2130,7 @@ fn emit_arch_dispatcher(
         ///
         /// # Safety
         /// Same as [`forward`].
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub unsafe fn forward_onto<'w>(
             w: &'w Weights,
             ctx: &crate::__gpu::ForwardCtx,
@@ -2156,7 +2156,7 @@ fn emit_arch_dispatcher(
         /// # Safety
         /// Same as [`forward`]; additionally, `body` must not retain
         /// any references to the encoder past its return.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_chain_with_encoder(
             w: &Weights,
@@ -2188,7 +2188,7 @@ fn emit_arch_dispatcher(
             fn num_key_value_heads(&self) -> u64 { self.num_key_value_heads() }
             fn head_dim(&self) -> u64 { self.head_dim() }
             fn vocab_size(&self) -> u64 { self.vocab_size() }
-            #[cfg(feature = "metal")]
+            #[cfg(scratchy_target = "metal")]
             fn kv_cache_layers(&self) -> ::core::option::Option<&'static [u32]> {
                 match self {
                     #(#kv_cache_layers_arms)*
@@ -2198,7 +2198,7 @@ fn emit_arch_dispatcher(
             #gdn_runtime_config_tokens
         }
 
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         impl ::scratchy_target_metal::MetalWeights for Weights {
             fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
                 match self {
@@ -2338,7 +2338,7 @@ fn emit_arch_dispatcher(
         // info` walks this registry separately, with no runtime GPU
         // or weight loading. Gated on either backend feature so the
         // metal CLI sees compiled-in metal arches too.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         ::scratchy_forward_compiler::inventory::submit! {
             ::scratchy_forward_compiler::BackboneDumpRegistration {
                 arch_name: #arch_name_lit,

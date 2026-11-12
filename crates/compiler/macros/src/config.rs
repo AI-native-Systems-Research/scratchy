@@ -641,7 +641,7 @@ fn feature_candidates(arch_name: &str, stem: &str) -> [String; 2] {
 
 /// Cargo's own feature-name → env-var transform: uppercase, `-` → `_`, every other byte
 /// verbatim — including `.`.
-fn feature_env_name(feature: &str) -> String {
+pub fn feature_env_name(feature: &str) -> String {
     feature.to_uppercase().replace('-', "_")
 }
 
@@ -737,13 +737,11 @@ impl Scope {
         }
     }
 
-    /// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a
-    /// backend — probed against the scope's stated feature names, never the environment.
-    /// `scratchy-models`' build script runs an arch's pipeline only then (its `src/lib.rs`
-    /// gates each arch's `pub mod` the same way), and a target bakes in the facts of the
-    /// heads that compile beside it alone. Whether an arch ACTUALLY lowers is each
-    /// lowering's verdict — an op with no spyre lowering is a build error naming it, not a
-    /// silent skip here.
+    /// Whether `arch` compiles in this build: its `arch-<name>` feature is on — probed against
+    /// the scope's stated feature names, never the environment. A target's models build runs
+    /// an arch's pipeline only then, and a target bakes in the facts of the heads that compile
+    /// beside it alone. Whether an arch ACTUALLY lowers is the target's lowering's verdict — an
+    /// op with no lowering is a build error naming it, not a silent skip here.
     pub fn arch_compiled(&self, arch: &str) -> bool {
         match &self.stems {
             StemSelection::All => true,
@@ -1180,7 +1178,7 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 
 /// [`Scope::arch_compiled`] under the features `on` reports.
 fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
-    on(&format!("arch-{arch}")) && (on("metal") || on("spyre"))
+    on(&format!("arch-{arch}"))
 }
 
 /// Every arch dir under `configs/`.
@@ -3620,11 +3618,12 @@ mod tests {
         );
     }
 
-    /// An arch compiles under its `arch-<name>` feature and a backend — the ONE law, no
-    /// capability list. The arch name comes from `configs/` (the tree is the list), never
-    /// a literal, so the test cannot shadow it.
+    /// An arch compiles exactly when its `arch-<name>` feature is on — the ONE law, no
+    /// capability list. (Which target compiles it is the build's: only a target's models crate
+    /// runs the pipeline, with its own emitter.) The arch name comes from `configs/` (the tree
+    /// is the list), never a literal, so the test cannot shadow it.
     #[test]
-    fn an_arch_compiles_with_its_feature_and_a_backend_of_its_own() {
+    fn an_arch_compiles_exactly_when_its_feature_is_on() {
         let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
         let arch = arch_dirs(&configs)
             .expect("walk configs/")
@@ -3638,40 +3637,27 @@ mod tests {
             .next()
             .expect("at least one arch dir");
         let feature = format!("arch-{arch}");
-        let with = |backend: &'static str| {
-            let f = feature.clone();
-            move |feat: &str| feat == backend || feat == f
-        };
-        assert!(arch_compiled_with(&arch, with("metal")));
-        assert!(arch_compiled_with(&arch, with("spyre")));
-        // Both backends off: not compiled, whatever the arch feature.
-        let neither = {
-            let f = feature.clone();
-            move |feat: &str| feat == f
-        };
-        assert!(!arch_compiled_with(&arch, neither));
-        // Its arch feature off: not compiled, whatever the backend.
-        let no_arch_feature = |feat: &str| feat == "metal";
+        assert!(arch_compiled_with(&arch, |feat: &str| feat == feature));
+        // Its arch feature off: not compiled, whatever else is on.
+        let other_features = |feat: &str| feat != feature;
         assert!(
-            !arch_compiled_with(&arch, no_arch_feature),
+            !arch_compiled_with(&arch, other_features),
             "its arch feature is off"
         );
     }
 
-    /// The tree law: EVERY arch dir under `configs/` compiles under `spyre` when its
-    /// `arch-<name>` feature is on — the build script's target filter admits it, and what
-    /// happens next (lowering or a named refusal) is the lowering's verdict. No name is
-    /// written here; the tree is the list.
+    /// The tree law: EVERY arch dir under `configs/` compiles when its `arch-<name>` feature is
+    /// on — the build script's filter admits it, and what happens next (lowering or a named
+    /// refusal) is the target's lowering's verdict. No name is written here; the tree is the list.
     #[test]
-    fn every_arch_in_the_tree_compiles_under_spyre_with_its_feature_on() {
+    fn every_arch_in_the_tree_compiles_with_its_feature_on() {
         let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
         for dir in arch_dirs(&configs).expect("walk configs/") {
             let arch = dir.file_name().and_then(|s| s.to_str()).expect("dir name");
             let feature = format!("arch-{arch}");
-            let spyre = move |feat: &str| feat == "spyre" || feat == feature;
             assert!(
-                arch_compiled_with(arch, spyre),
-                "{arch} compiles under spyre with its feature on"
+                arch_compiled_with(arch, move |feat: &str| feat == feature),
+                "{arch} compiles with its feature on"
             );
         }
     }

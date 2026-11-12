@@ -82,7 +82,7 @@ metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
 # get something that can actually run a model.
-spyre = ["dep:scratchy-serving-api", "dep:scratchy-forward-compiler", "model?/spyre"]
+spyre = ["dep:scratchy-serving-api", "dep:scratchy-forward-compiler"]
 # ANY CARD — the ONE card tier, the same name the api, worker and target crates use. This crate
 # REFERENCES it: `main.rs`'s `libc::_exit` (senlib's atexit resets the device, so the process must
 # not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never

@@ -18,6 +18,10 @@ use scratchy_forward_compiler_macro::target::{
 pub struct Spyre;
 
 impl TargetEmitter for Spyre {
+    fn name(&self) -> &'static str {
+        "spyre"
+    }
+
     fn facade(&self) -> TokenStream {
         // The host target re-exports the neutral surface (`weights` defaulted to
         // `SpyreAllocator`, `LoadStream`, `BackendAllocator`) the emitted load/fingerprint code

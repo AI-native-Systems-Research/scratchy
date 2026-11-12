@@ -24,6 +24,7 @@ members = [
     "crates/targets/spyre/builder",
     "crates/targets/spyre/worker",
     "crates/targets/spyre/compiler",
+    "crates/targets/spyre/models",
     # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE from
     # the lowering rather than reached through a text round trip.
     "crates/targets/spyre/ktir/ktir-core",
@@ -44,6 +45,7 @@ members = [
     # hooks it in without a second copy of the lowering.
     "crates/targets/spyre/triton/splice",
     "crates/models/arch",
+    "crates/models/build",
     "crates/models/vision",
     "crates/models/quantization",
     "crates/models/spec",
@@ -258,6 +260,9 @@ debug = "line-tables-only"
 [profile.dev.package.scratchy-models]
 debug = 0
 
+[profile.dev.package.scratchy-target-spyre-models]
+debug = 0
+
 # Proc-macros (and their dependencies) execute AT COMPILE TIME. The wavefront
 # codegen pipeline (solver, region tiling, per-model×variant emit) runs on
 # EVERY build. At the default dev opt-level that pipeline is the DOMINANT
@@ -286,6 +291,11 @@ debug = 0
 # overrides back to -O3 + fat LTO for the shipping build.
 opt-level = 1
 
+# Spyre's compiled models: the same emitted dispatch glue, the same reasoning.
+[profile.release.package.scratchy-target-spyre-models]
+debug = 0
+opt-level = 1
+
 [profile.release-dist]
 inherits = "release"
 strip = true
@@ -295,4 +305,7 @@ codegen-units = 1
 # Keep the model code fully optimized in the shipping build (release inherits
 # opt-level = 1 above; undo it here).
 [profile.release-dist.package.scratchy-models]
+opt-level = 3
+
+[profile.release-dist.package.scratchy-target-spyre-models]
 opt-level = 3

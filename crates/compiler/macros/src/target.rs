@@ -89,6 +89,10 @@ pub struct LoadCx<'a> {
 
 /// A target's emission, called by the shared pipeline.
 pub trait TargetEmitter: Sync {
+    /// The target's name: the value of the `scratchy_target` cfg its models crate compiles
+    /// under, which emitted code gates its target's own items on.
+    fn name(&self) -> &'static str;
+
     /// A model's weights struct, for a target that derives it itself; `None` takes the shared
     /// emission.
     fn weights_struct(&self, cx: &StructCx<'_>) -> Option<WeightsStruct> {
@@ -134,6 +138,10 @@ pub trait TargetEmitter: Sync {
 pub struct Metal;
 
 impl TargetEmitter for Metal {
+    fn name(&self) -> &'static str {
+        "metal"
+    }
+
     fn facade(&self) -> TokenStream {
         quote::quote! { ::scratchy_target_metal }
     }

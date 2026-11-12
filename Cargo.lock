@@ -3472,16 +3472,27 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
+ "scratchy-models-build",
  "scratchy-quantizations",
  "scratchy-target-metal",
- "scratchy-target-spyre",
- "scratchy-target-spyre-compiler",
  "scratchy-tensors",
  "scratchy-vision",
  "serde_json",
  "sha2 0.11.1",
  "tokenizers 0.23.2",
  "ureq 3.5.1",
+]
+
+[[package]]
+name = "scratchy-models-build"
+version = "0.1.0"
+dependencies = [
+ "hf-hub-downloader",
+ "proc-macro2",
+ "rayon",
+ "scratchy-core-model",
+ "scratchy-forward-compiler-macro",
+ "serde_json",
 ]
 
 [[package]]
@@ -3775,6 +3786,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-target-spyre-models"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "scratchy-core-model",
+ "scratchy-forward-compiler",
+ "scratchy-layers",
+ "scratchy-models",
+ "scratchy-models-build",
+ "scratchy-quantizations",
+ "scratchy-subtile",
+ "scratchy-target-spyre",
+ "scratchy-target-spyre-compiler",
+ "scratchy-tensors",
+]
+
+[[package]]
 name = "scratchy-target-spyre-worker"
 version = "0.1.0"
 dependencies = [
@@ -3788,12 +3816,12 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-layers",
- "scratchy-models",
  "scratchy-serving-engine",
  "scratchy-serving-scheduler",
  "scratchy-serving-worker",
  "scratchy-subtile",
  "scratchy-target-spyre",
+ "scratchy-target-spyre-models",
  "scratchy-tensors",
  "serde_json",
  "tracing",
@@ -3812,7 +3840,6 @@ dependencies = [
 name = "scratchy-tp"
 version = "0.1.0"
 dependencies = [
- "scratchy-models",
  "scratchy-target-spyre-worker",
 ]
 

@@ -4029,7 +4029,7 @@ fn emit_weights_struct(
         };
         quote! {
             impl Weights {
-                #[cfg(feature = "metal")]
+                #[cfg(scratchy_target = "metal")]
                 pub fn build_rope_tables(
                     &self,
                     ctx: &crate::__gpu::ForwardCtx,
@@ -7310,7 +7310,7 @@ fn emit_weight_accessors_impl(
             .unwrap_or_else(|| "    (none recorded for this method)".to_string());
         let aqe_summary_lit = proc_macro2::Literal::string(&aqe_summary);
         quote! {
-            #[cfg(feature = "metal")]
+            #[cfg(scratchy_target = "metal")]
             fn affine_quant_embedding_at(
                 &self,
                 tape_index: u32,
@@ -7608,7 +7608,7 @@ fn metal_off_tape_tokens(
     );
     quote! {
         /// This model's off-tape kernels, baked for its logits.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub static METAL_OFF_TAPE: ::scratchy_target_metal::off_tape::OffTapeKernels = {
             ::scratchy_target_metal::off_tape::OffTape {
                 vocab: ::scratchy_target_metal::tape::ids::LogitsWidth(#vocab),
@@ -7710,7 +7710,7 @@ fn metal_tq_codebook_tokens(mc: &scratchy_ir::model_facts::ModelFacts) -> TokenS
     };
     quote! {
         /// This model's TurboQuant codebook (`None`: dense KV cache).
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub static METAL_TQ_CODEBOOK: ::core::option::Option<
             ::scratchy_target_metal::turboquant::TqCodebook,
         > = #codebook;
@@ -9498,7 +9498,7 @@ pub fn emit_model(
         let resolver = &resolver.tokens;
         quote! {
             #weight_accessors_impl
-            #[cfg(feature = "metal")]
+            #[cfg(scratchy_target = "metal")]
             #resolver
         }
     };
@@ -9612,7 +9612,7 @@ pub fn emit_model(
     // `dump()` walks it; metal's pool uses `METAL_BUCKETS` for the
     // forward and ignores the runtime fields here.
     let forward_table = quote! {
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         static FORWARD_TABLE: &[::scratchy_forward_compiler::BucketEntry<__I>] = {
             use ::scratchy_forward_compiler::BucketEntry as __B;
             &[
@@ -9948,7 +9948,7 @@ pub fn emit_model(
             };
             let ident = bucket_static_ident("METAL_TAPES_M", wp);
             metal_arena_bytes_statics.push(quote! {
-                #[cfg(feature = "metal")]
+                #[cfg(scratchy_target = "metal")]
                 static #ident:
                     &[::scratchy_target_metal::tape::lowered::ClassedTape] = #tapes_expr;
             });
@@ -10040,7 +10040,7 @@ pub fn emit_model(
     metal_arena_bytes_statics.push(quote! {
         /// The model's arena: the colours and arenas its buckets' colourings make, and its slots
         /// ranked by their bytes.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         mod __arena {
             use super::__dims;
             use ::scratchy_tensors::typed::Act;
@@ -10053,14 +10053,14 @@ pub fn emit_model(
 
         /// The model's buckets: each row of [`METAL_BUCKETS`] as a type, and the enum a forward's
         /// bucket is, chosen at the door (`scratchy_target_metal::interpreter::metal::bucket`).
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         mod __buckets {
             ::scratchy_target_metal::baked_buckets! {
                 pub enum Bucket { #(#metal_bucket_types),* }
             }
         }
 
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         impl ::scratchy_target_metal::interpreter::metal::BakedBuckets for Weights {
             type Bucket = __buckets::Bucket;
         }
@@ -10236,7 +10236,7 @@ pub fn emit_model(
                 /// The rotary cos/sin rows a forward of `n` tokens at `positions` (`[n]`, or MRoPE's
                 /// `[3, n]`) reads in place of the position-indexed cache — its positions then each
                 /// row's own index.
-                #[cfg(feature = "metal")]
+                #[cfg(scratchy_target = "metal")]
                 pub fn metal_rope_rows(
                     positions: &[u32],
                     n: usize,
@@ -10256,7 +10256,7 @@ pub fn emit_model(
         }
         None => quote! {
             /// None: this model's rope reads the positions.
-            #[cfg(feature = "metal")]
+            #[cfg(scratchy_target = "metal")]
             pub fn metal_rope_rows(
                 _positions: &[u32],
                 _n: usize,
@@ -10322,7 +10322,7 @@ pub fn emit_model(
         /// bucket's band rows adjacent. A pool keeps one band's rows (`pick_rung`), so its
         /// bucket index is no index into this table: a forward's slots come from its bucket's row
         /// (`Buckets::row`), the one the door chose.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub static METAL_BUCKETS:
             &[::scratchy_target_metal::interpreter::metal::MetalBucketSpec]
             = &[
@@ -10331,7 +10331,7 @@ pub fn emit_model(
 
         /// [`METAL_BUCKETS`]' baked rungs, which the worker picks the rung a pool runs on from
         /// before the pool exists: the KV pool's block-table width, the memory budget.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub static METAL_RUNGS: ::scratchy_target_metal::interpreter::metal::MetalRungs =
             ::scratchy_target_metal::interpreter::metal::MetalRungs {
                 buckets: METAL_BUCKETS,
@@ -10348,53 +10348,53 @@ pub fn emit_model(
         /// metal forward body's `RuntimeFactory` allocates per-worker
         /// runtime buffers (input_ids/positions/slot_mapping/...) at
         /// `METAL_MAX_BUCKET_M * sizeof(u32)`.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_MAX_BUCKET_M: u32 = #max_bucket_m_lit;
 
         /// Byte size of the vision 2D-RoPE `freqs` runtime buffer
         /// (f32 `[max_bucket_m, vision_head_dim/2]`). 0 on non-vision
         /// arches (`alloc` floors to 16 bytes).
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_VISION_FREQS_BYTES: u64 = #vision_freqs_bytes_lit;
 
         /// Byte size of the vision `pixels` runtime buffer (model dtype
         /// `[max_bucket_m, vision_in_features]`). 0 on non-vision arches.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_VISION_PIXELS_BYTES: u64 = #vision_pixels_bytes_lit;
 
         /// Byte size of the vision `pos_embeds` runtime buffer (model
         /// dtype `[max_bucket_m, vision_embed_dim]`). 0 on non-vision
         /// arches and on towers without a learned positional embedding.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_VISION_POSEMB_BYTES: u64 = #vision_posemb_bytes_lit;
 
         /// Byte size of the `target_hidden` runtime buffer (model dtype
         /// `[max_bucket_m, hidden]`). 0 on every arch but an MTP head.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_TARGET_HIDDEN_BYTES: u64 = #target_hidden_bytes_lit;
 
         /// Byte size of the rows a target captures for its DFlash2 drafter (model dtype
         /// `[max_bucket_m, slots · hidden]`). 0 on a model no drafter reads.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_DRAFT_CAPTURE_BYTES: u64 = #draft_capture_bytes_lit;
 
         /// A DFlash2 drafter's block: its drafts and their anchor.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_DRAFT_ROWS: u64 = #draft_rows_lit;
 
         /// Byte size of the `mm_embeds` splice buffer (bf16
         /// `[max_bucket_m, hidden]`) and the `mm_dst_rows` buffer (u32
         /// `[max_bucket_m]`). 0 on arches without the multimodal splice.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_MM_EMBEDS_BYTES: u64 = #mm_embeds_bytes_lit;
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_MM_DST_ROWS_BYTES: u64 = #mm_dst_rows_bytes_lit;
 
         /// Byte size of the MRoPE cos/sin override buffer (model dtype
         /// `[max_bucket_m, rot_dim]`). 0 on 1D-rope arches (the rope
         /// kernel keeps the static cos/sin cache; `alloc` floors to 16
         /// bytes and the buffer is never bound).
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_MROPE_COS_SIN_BYTES: u64 = #mrope_cos_sin_bytes_lit;
 
         /// Width of one row of the terminal arena slot: `vocab_size`
@@ -10402,7 +10402,7 @@ pub fn emit_model(
         /// `hidden_size` on encoder layouts (no lm_head — the terminal
         /// IS the hidden state). The metal forward shapes its returned
         /// `OwnedTensor` as `[num_tokens, METAL_VOCAB_SIZE]` f16.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub const METAL_VOCAB_SIZE: u64 = #vocab_size_lit;
 
         /// Build a [`MetalWorkerPool`] for this canonical. Thin
@@ -10420,7 +10420,7 @@ pub fn emit_model(
         ///
         /// [`MetalWorkerPool`]: ::scratchy_target_metal::interpreter::metal::MetalWorkerPool
         /// [`MetalWorkerPool::for_buckets`]: ::scratchy_target_metal::interpreter::metal::MetalWorkerPool::for_buckets
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub fn metal_pool(
             device: ::std::sync::Arc<
                 ::scratchy_target_metal::interpreter::metal::__re::Device,
@@ -10470,7 +10470,7 @@ pub fn emit_model(
         /// the first forward triggers the only factory invocation
         /// in single-worker configs. Every forward entry point
         /// reaches the pool through here, whichever runs first.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         fn resident_metal_pool<'w>(
             wm: &'w Weights,
             ctx: &crate::__gpu::ForwardCtx,
@@ -10854,7 +10854,7 @@ pub fn emit_model(
         /// `MetalWorkerPool::forward`, and copies the tape_index's
         /// terminal arena slot out as a fresh `OwnedTensor` of
         /// `[num_tokens, vocab_size]` f16 logits.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
             wm: &Weights,
@@ -10872,7 +10872,7 @@ pub fn emit_model(
         ///
         /// # Safety
         /// Every non-null view in `ctx` points at host-visible memory of its numel.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         unsafe fn with_forward_inputs<R>(
             ctx: &crate::__gpu::ForwardCtx,
             num_tokens: u64,
@@ -11140,7 +11140,7 @@ pub fn emit_model(
         /// `endEncoding`. Lets the caller (the executor's argmax
         /// dispatch, today) append its own dispatches onto the same
         /// CB so forward + tail share one commit and one host wait.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_with_metal_followup(
             wm: &Weights,
@@ -11274,7 +11274,7 @@ pub fn emit_model(
         ///
         /// # Safety
         /// Same as [`forward`].
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub unsafe fn forward_onto<'w>(
             wm: &'w Weights,
             ctx: &crate::__gpu::ForwardCtx,
@@ -11361,7 +11361,7 @@ pub fn emit_model(
         /// across iters because the K-step decode shape is fixed).
         ///
         /// [`ChainStepHandle`]: ::scratchy_target_metal::model::ChainStepHandle
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_chain_with_encoder(
             wm: &Weights,
@@ -11512,7 +11512,7 @@ pub fn emit_model(
         /// `scr model info` via the inventory registry. Available
         /// under either backend so the CLI subcommand can dump
         /// metal-compiled arches too.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub fn dump() -> ::std::vec::Vec<::scratchy_forward_compiler::BucketDump> {
             FORWARD_TABLE
                 .iter()
@@ -11608,10 +11608,10 @@ fn emit_shim_model(
         // `dump` is the per-variant `scr model info` accessor —
         // available under either backend so shim variants register
         // under metal too.
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub use super::#canonical::dump;
 
-        #[cfg(feature = "metal")]
+        #[cfg(scratchy_target = "metal")]
         pub use super::#canonical::{
             forward, forward_chain_with_encoder, forward_onto, forward_with_metal_followup,
             metal_rope_rows,

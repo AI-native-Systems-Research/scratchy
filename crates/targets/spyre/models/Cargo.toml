@@ -1,0 +1,56 @@
+[package]
+name = "scratchy-target-spyre-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The selected models, compiled for spyre: the model scope `scratchy-models` states, through the shared pipeline with spyre's emitter"
+
+[features]
+default = []
+# THE CARD'S LOWERING, no device compile (see scratchy-target-spyre-compiler's `spyre-lower`): the
+# step CI runs to see a card-only lowering defect without a card.
+spyre-lower = ["scratchy-target-spyre-compiler/spyre-lower"]
+spyre-hw = ["spyre-lower", "scratchy-target-spyre-compiler/spyre-hw"]
+# THE EMULATOR + the bake-time numeric gate (see scratchy-target-spyre-compiler's `spyre-emu`): an
+# emu build refuses to compile a bundle whose emulator run diverges from the reference semantics
+# at the probe.
+spyre-emu = ["scratchy-target-spyre-compiler/spyre-emu"]
+# WRITE EACH BAKED BUNDLE'S dxp INPUT under this crate's OUT_DIR (`superdsc-dump/<fp>/`), for
+# diffing against a known-good dump. Read by the build script, which passes its own OUT_DIR into
+# the bake; off by default, and it changes nothing the bake lowers.
+superdsc-dump = []
+# A W-RANK TENSOR-PARALLEL WORLD baked beside every selected model's one-rank forward (see
+# scratchy-target-spyre-compiler's `tp-<W>`). Reached from the CLI as `tp/<W>` through scratchy-tp.
+# ⛔ BOTH COPIES OF THE WORLD CRATE: the bake is a build dependency, compiled for the HOST, and
+# cargo does not unify its dependencies' features with the binary's — so the runtime's
+# `scratchy-target-spyre` is named here too, or its `Build` stays a world of one while the bake
+# shards for `N`. The baked code asserts the two agree (`SUPERDSC_TP`).
+tp-2 = ["scratchy-target-spyre-compiler/tp-2", "scratchy-target-spyre/tp-2"]
+tp-4 = ["scratchy-target-spyre-compiler/tp-4", "scratchy-target-spyre/tp-4"]
+tp-8 = ["scratchy-target-spyre-compiler/tp-8", "scratchy-target-spyre/tp-8"]
+
+[dependencies]
+# THE MODEL SCOPE: which models, heads and quant presets — `scratchy-models`' own features,
+# published as its build metadata (`DEP_SCRATCHY_MODELS_*`), which this crate's build script reads.
+scratchy-models = { path = "../../../models/arch", default-features = false }
+# What the emitted code names.
+scratchy-target-spyre = { path = ".." }
+scratchy-forward-compiler = { path = "../../../compiler" }
+scratchy-layers = { path = "../../../layers" }
+scratchy-tensors = { path = "../../../tensors" }
+scratchy-quantizations = { path = "../../../models/quantization" }
+# The `BakedTokenizer`s the build bakes register against.
+scratchy-core-model = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]
+# The shared models build driver, and the emitter it runs spyre's models through.
+scratchy-models-build = { path = "../../../models/build" }
+scratchy-target-spyre-compiler = { path = "../compiler" }
+# Purely for feature reachability: `-p <this crate> --features scratchy-quantizations/<preset>`
+# reaches the HOST build of scratchy-quantizations through this edge, the build `scratchy-models`'
+# build script reads the enabled presets from (host builds share one feature set).
+scratchy-quantizations = { path = "../../../models/quantization" }
+
+[dev-dependencies]
+scratchy-subtile = { path = "../../../compiler/subtile", features = ["spyre"] }
