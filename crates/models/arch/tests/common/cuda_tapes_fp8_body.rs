@@ -17,10 +17,13 @@ use std::path::{Path, PathBuf};
 
 use scratchy_subtile::handoff::TargetModelInput;
 use scratchy_target_cuda::step::{
-    CudaStep, ExpertGateUpActBf16, ExpertGemmBf16, ExpertGemvBf16, GateUpActBf16, GateUpKernel,
-    MoeWeight, QuantChainError, QuantRowsFp8, quant_chain,
+    CudaStep, ExpertGateUpActBf16, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertGemvBf16,
+    GateUpActBf16, GateUpKernel, GateUpTcFp8, MoeWeight, QuantChainError, QuantRowsFp8,
+    gemv_tc_takes, quant_chain,
 };
-use scratchy_target_cuda::tape::{CUDA_ARENA_ALIGN, CudaTape, TapeError};
+use scratchy_target_cuda::tape::{
+    ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, TapeError, overlap,
+};
 use scratchy_target_cuda::weights::{CudaWeight, check, open_checkpoint};
 use scratchy_target_cuda_compiler::emit::lower_model;
 
@@ -116,6 +119,11 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::GemmGroupFp8(_) => "GemmGroupFp8",
             CudaStep::GemmNarrowGroupFp8(_) => "GemmNarrowGroupFp8",
             CudaStep::GemvGroupFp8(_) => "GemvGroupFp8",
+            CudaStep::GemvTcFp8(_) => "GemvTcFp8",
+            CudaStep::GemvGroupTcFp8(_) => "GemvGroupTcFp8",
+            CudaStep::GateUpTcFp8(_) => "GateUpTcFp8",
+            CudaStep::ExpertGemvTcFp8(_) => "ExpertGemvTcFp8",
+            CudaStep::ExpertGateUpTcFp8(_) => "ExpertGateUpTcFp8",
         };
         *h.entry(kind).or_default() += 1;
     }
@@ -156,10 +164,12 @@ fn the_tapes_are_the_decode_and_prefill_buckets_and_validate() {
     assert_eq!(left, [2, 4, 8, 16, 32, 64], "CUDA_UNLOWERED's buckets");
 }
 
-/// The step histogram of every bucket: the decode tape's projections are fp8 GEMVs and it has no
-/// quant write (the GEMV quantizes its one row in its prologue); every prefill tape's are fp8
-/// GEMMs, each (a group or a gate/up pair once) after its own quant write. What stays bf16 is
-/// what the checkpoint leaves unquantized (the lm_head, the routers, Qwen3.6's GDN projections).
+/// The step histogram of every bucket: the decode tape's fp8 GEMVs the shape rule takes run on the
+/// tensor cores, each after a one-row quant write (or reading one a step before it wrote); every
+/// prefill tape's are fp8 GEMMs, each (a group or a gate/up pair once) after a quant write of its
+/// rows (its own, or one still live: `every_quant_write_sits_before_its_fp8_gemm`). What stays
+/// bf16 is what the checkpoint leaves unquantized (the lm_head, the routers, Qwen3.6's GDN
+/// projections).
 #[test]
 fn every_tape_has_the_fp8_steps() {
     for tape in CUDA_TAPES {
@@ -172,10 +182,16 @@ fn every_tape_has_the_fp8_steps() {
         let quantized = (tape.steps.iter())
             .filter(|s| s.quantized_input().is_some())
             .count();
-        assert_eq!(quantized, if m == 1 { 0 } else { QUANT_READERS }, "m={m}");
+        assert_eq!(quantized, if m == 1 { DECODE_QUANT_READERS } else { QUANT_READERS }, "m={m}");
         for (i, s) in tape.steps.iter().enumerate() {
-            // Every gate/up pair of these checkpoints is quantized.
-            if let CudaStep::GateUpAct(GateUpActBf16 { kernel, .. }) = *s {
+            // Every gate/up pair of these checkpoints is quantized; a tensor-core one folds the
+            // CUDA-core one-row gate/up's kernel.
+            if let CudaStep::GateUpAct(GateUpActBf16 { kernel, .. })
+            | CudaStep::GateUpTcFp8(GateUpTcFp8 {
+                fold: GateUpActBf16 { kernel, .. },
+                ..
+            }) = *s
+            {
                 let want: &[GateUpKernel] = match m {
                     1 => &[GateUpKernel::GemvFp8],
                     _ => &[GateUpKernel::GemmFp8, GateUpKernel::GemmCol64Fp8],
@@ -185,8 +201,17 @@ fn every_tape_has_the_fp8_steps() {
             let expert = match *s {
                 CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
                 | CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
+                | CudaStep::ExpertGemvTcFp8(ExpertGemvBf16 { weight, .. })
                 | CudaStep::ExpertGateUpAct(ExpertGateUpActBf16 {
                     gate: ExpertGemvBf16 { weight, .. },
+                    ..
+                })
+                | CudaStep::ExpertGateUpTcFp8(ExpertGateUpTcFp8 {
+                    fold:
+                        ExpertGateUpActBf16 {
+                            gate: ExpertGemvBf16 { weight, .. },
+                            ..
+                        },
                     ..
                 }) => Some(weight),
                 _ => None,
@@ -202,10 +227,12 @@ fn every_tape_has_the_fp8_steps() {
 /// quantizes all `m` rows of that GEMM's `k` columns (an expert GEMM's: all `max_tiles·128`) from a
 /// bf16 colour or the MoE scratch's rows, and writes the one quant scratch, the arena's last
 /// region: every write starts at its offset, the largest is its size, and it ends the arena. A
-/// reader with no write right before it is an fp8 expert GEMM after one reading the same rows.
+/// reader with no write right before it reads the quantization still live in the scratch: the last
+/// write's, its bf16 rows unwritten since (an expert up GEMM after its gate; the 27B's GDN a/b
+/// group after its qkvz group).
 #[test]
 fn every_quant_write_sits_before_its_fp8_gemm() {
-    assert!(quants(tape_of(1)).is_empty(), "m=1: no quant write");
+    assert_eq!(quants(tape_of(1)).len(), DECODE_QUANTS, "m=1: quant writes");
     for &(m, at, bytes) in &QUANT_SCRATCH {
         let tape = tape_of(m);
         let qs = quants(tape);
@@ -233,21 +260,30 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
             cols.insert(q.cols);
             most = most.max(q.bytes().expect("fits"));
         }
-        for (i, s) in tape.steps.iter().enumerate().skip(1) {
-            let prev = &tape.steps[i - 1];
-            let Some(read) = s.quantized_input() else {
-                continue;
-            };
-            if matches!(prev, CudaStep::QuantRowsFp8(_)) {
+        // The last write, and whether a step wrote its bf16 rows since (a step reads, then writes).
+        let mut live: Option<(QuantRowsFp8, bool)> = None;
+        for (i, s) in tape.steps.iter().enumerate() {
+            if let CudaStep::QuantRowsFp8(q) = *s {
+                live = Some((q, false));
                 continue;
             }
-            assert!(
-                matches!(s, CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
-                    if Some(*weight) == EXPERT_WEIGHT)
-                    && matches!(prev, CudaStep::ExpertGemm(_))
-                    && prev.quantized_input() == Some(read),
-                "m={m} step {i}: a reader with no write before it"
-            );
+            if let Some(read) = s.quantized_input() {
+                assert!(
+                    matches!(live, Some((q, false)) if (q.q, q.rows, q.cols) == read),
+                    "m={m} step {i}: a reader with no write before it reads the live quantization"
+                );
+            }
+            if let Some((q, stale)) = &mut live {
+                let rows = ArenaSpan {
+                    offset: q.x,
+                    bytes: u64::from(q.rows) * u64::from(q.cols) * CUDA_ACT_BYTES,
+                };
+                *stale |= (s.parts().into_iter().flatten()).any(|p| {
+                    p.extents().is_none_or(|e| {
+                        overlap(e.writes, rows) || e.second_write.is_some_and(|w| overlap(w, rows))
+                    })
+                });
+            }
         }
         assert_eq!(cols.into_iter().collect::<Vec<_>>(), QUANT_COLS, "m={m}");
         assert_eq!(most, bytes, "m={m}: the scratch is the largest write");
@@ -293,6 +329,37 @@ fn the_quant_scratch_liveness_check_holds_and_bites() {
                 Err(TapeError::QuantChain { error }),
                 "m={m}: validate, write {i} {what}"
             );
+        }
+    }
+}
+
+/// The decode tape's fp8 GEMVs on the tensor cores (FP8 S8 T2, /tmp/a-tc-plan.md §1, §2): every
+/// CUDA-core fp8 GEMV left is one `gemv_tc_takes` refuses; every quant write quantizes the one
+/// token row; every tensor-core gate/up's down, the step right after it, reads its act + quantize's
+/// write; and the quant scratch's liveness check holds.
+#[test]
+fn the_decode_tape_runs_its_fp8_gemvs_on_the_tensor_cores() {
+    let tape = tape_of(1);
+    assert_eq!(quant_chain(tape.steps), Ok(()), "m=1");
+    for (i, s) in tape.steps.iter().enumerate() {
+        match *s {
+            CudaStep::QuantRowsFp8(q) => assert_eq!(q.rows, 1, "m=1 step {i}: one row"),
+            CudaStep::GemvFp8(g) => {
+                assert!(!gemv_tc_takes([g.n, 0, 0], g.k, 1), "m=1 step {i}: {g:?}")
+            }
+            CudaStep::GemvGroupFp8(g) => {
+                let ns = [g.first.n, g.second.n, g.third.map_or(0, |t| t.n)];
+                assert!(!gemv_tc_takes(ns, g.k, 1), "m=1 step {i}: {ns:?}");
+            }
+            CudaStep::GateUpAct(g) => panic!("m=1 step {i}: a CUDA-core gate/up {:?}", g.kernel),
+            CudaStep::ExpertGateUpAct(_) | CudaStep::ExpertGemv(_) => {
+                panic!("m=1 step {i}: a CUDA-core expert GEMV")
+            }
+            _ => {}
+        }
+        if let (false, Some(w)) = (matches!(s, CudaStep::QuantRowsFp8(_)), s.quant_write()) {
+            let down = tape.steps.get(i + 1).and_then(CudaStep::quantized_input);
+            assert_eq!(down, Some((w.q, w.rows, w.cols)), "m=1 step {i}: its down reads it");
         }
     }
 }

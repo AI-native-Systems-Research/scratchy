@@ -1745,7 +1745,9 @@ impl CudaTape {
                 }
                 Ok(())
             }
-            CudaStep::Gemv(_) | CudaStep::GemvFp8(_) => self.one_row(step, s),
+            CudaStep::Gemv(_) | CudaStep::GemvFp8(_) | CudaStep::GemvTcFp8(_) => {
+                self.one_row(step, s)
+            }
             // Gemma's router norm writes the scratch's router-norm region, whole.
             CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
                 Some(moe)
@@ -1770,6 +1772,8 @@ impl CudaTape {
             | CudaStep::ExpertSort(_)
             | CudaStep::ExpertGemm(_)
             | CudaStep::ExpertGemv(_)
+            | CudaStep::ExpertGemvTcFp8(_)
+            | CudaStep::ExpertGateUpTcFp8(_)
             | CudaStep::ExpertCombine(_) => self.check_moe_step(step, s),
             CudaStep::Embed(_)
             | CudaStep::Gemm(_)
@@ -1797,12 +1801,14 @@ impl CudaTape {
             | CudaStep::GemvGroup(_)
             | CudaStep::GemmGroupFp8(_)
             | CudaStep::GemmNarrowGroupFp8(_)
-            | CudaStep::GemvGroupFp8(_) => Ok(()),
+            | CudaStep::GemvGroupFp8(_)
+            | CudaStep::GemvGroupTcFp8(_) => Ok(()),
             // The quant scratch's writer and readers: `quant_region` checks them.
             CudaStep::QuantRowsFp8(_)
             | CudaStep::GemmFp8(_)
             | CudaStep::GemmCol64Fp8(_)
-            | CudaStep::GemmNarrowFp8(_) => Ok(()),
+            | CudaStep::GemmNarrowFp8(_)
+            | CudaStep::GateUpTcFp8(_) => Ok(()),
         }
     }
 
@@ -1905,23 +1911,47 @@ impl CudaTape {
         scratches: [Option<ArenaSpan>; 2],
     ) -> Result<Option<ArenaSpan>, TapeError> {
         quant_chain(self.steps).map_err(|error| TapeError::QuantChain { error })?;
-        let mut span: Option<ArenaSpan> = None;
+        // Its two slots (`quant_chain`): every write's span at its slot's `q`, the second slot
+        // after the first; the scratch is both.
+        let mut slots: [Option<ArenaSpan>; 2] = [None, None];
         for (step, s) in self.steps.iter().enumerate() {
-            let CudaStep::QuantRowsFp8(q) = *s else {
+            let Some(q) = s.quant_write() else {
                 continue;
             };
             let bytes = q.bytes().ok_or(TapeError::StepOverflow { step })?;
-            span = match span {
-                None => Some(ArenaSpan { offset: q.q, bytes }),
-                Some(sp) if sp.offset == q.q => Some(ArenaSpan {
-                    bytes: sp.bytes.max(bytes),
-                    ..sp
-                }),
-                Some(sp) => return Err(TapeError::QuantScratch { step, span: sp }),
-            };
+            let at = slots
+                .iter()
+                .position(|sl| sl.is_some_and(|sp| sp.offset == q.q));
+            match at.or_else(|| slots.iter().position(Option::is_none)) {
+                Some(at) => {
+                    slots[at] = Some(ArenaSpan {
+                        offset: q.q,
+                        bytes: slots[at].map_or(bytes, |sp| sp.bytes.max(bytes)),
+                    })
+                }
+                None => {
+                    let sp = slots[0].expect("both slots are taken");
+                    return Err(TapeError::QuantScratch { step, span: sp });
+                }
+            }
         }
-        let Some(sp) = span else {
-            return Ok(None);
+        let sp = match slots {
+            [None, _] => return Ok(None),
+            [Some(a), None] => a,
+            [Some(a), Some(b)] => {
+                let (lo, hi) = if a.offset.0 <= b.offset.0 {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                if lo.offset.0 + lo.bytes > hi.offset.0 {
+                    return Err(TapeError::QuantScratch { step: 0, span: hi });
+                }
+                ArenaSpan {
+                    offset: lo.offset,
+                    bytes: hi.offset.0 + hi.bytes - lo.offset.0,
+                }
+            }
         };
         let clear = (regions.iter().map(|&(_, r)| r))
             .chain(scratches.into_iter().flatten())
@@ -1957,7 +1987,7 @@ impl CudaTape {
         let writes = [Some(e.writes), e.second_write];
         let writes_it = writes.iter().flatten().any(|&w| overlap(w, scratch));
         let reads_it = e.reads.iter().flatten().any(|&r| overlap(r, scratch));
-        let writer = matches!(s, CudaStep::QuantRowsFp8(_));
+        let writer = s.quant_write().is_some();
         let reader = s.quantized_input().is_some();
         if (writes_it && !writer) || (reads_it && !reader) {
             return Err(TapeError::QuantScratch {
@@ -2008,6 +2038,8 @@ impl CudaTape {
                 | CudaStep::ExpertSort(_)
                 | CudaStep::ExpertGemm(_)
                 | CudaStep::ExpertGemv(_)
+                | CudaStep::ExpertGemvTcFp8(_)
+                | CudaStep::ExpertGateUpTcFp8(_)
                 | CudaStep::ExpertCombine(_)
         );
         if moe_step {
@@ -2208,6 +2240,45 @@ impl CudaTape {
                 }
                 want(output.0, c, output.1)
             }
+            // The tensor-core expert GEMV (FP8 S8 T2): the GEMV's geometry and picks; its input is the
+            // quant scratch (`quant_chain` checks it), and its output the projection's region.
+            CudaStep::ExpertGemvTcFp8(
+                g @ ExpertGemvBf16 {
+                    topk_idx,
+                    c,
+                    m,
+                    top_k,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                },
+            ) => {
+                if moe.sort.is_some()
+                    || (m, top_k) != (self.bucket_m, moe.top_k)
+                    || !same(experts, hidden, inter)
+                {
+                    return Err(geometry);
+                }
+                want(Region::MoeTopKIdx, topk_idx, moe.topk_idx)?;
+                let (_, output) = moe.projection_regions(g.proj, None);
+                want(output.0, c, output.1)
+            }
+            // The tensor-core expert gate/up: its gate's geometry and picks, and its activation the
+            // down's input rows (the act + quantize writes them and their quantization).
+            CudaStep::ExpertGateUpTcFp8(t) => {
+                let g = t.fold.gate;
+                if moe.sort.is_some()
+                    || (g.m, g.top_k) != (self.bucket_m, moe.top_k)
+                    || !same(g.experts, g.hidden, g.inter)
+                {
+                    return Err(geometry);
+                }
+                want(Region::MoeTopKIdx, g.topk_idx, moe.topk_idx)?;
+                let (down_input, _) =
+                    moe.projection_regions(crate::step::ExpertProjection::Down, None);
+                want(down_input.0, t.fold.out, down_input.1)
+            }
             CudaStep::ExpertCombine(ExpertCombineBf16 {
                 down,
                 pos,
@@ -2237,7 +2308,9 @@ impl CudaTape {
     /// those kernels index no row past the first. Any other step passes.
     fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rows = match *s {
-            CudaStep::Gemv(GemmBf16 { m, .. }) | CudaStep::GemvFp8(GemmBf16 { m, .. }) => m,
+            CudaStep::Gemv(GemmBf16 { m, .. })
+            | CudaStep::GemvFp8(GemmBf16 { m, .. })
+            | CudaStep::GemvTcFp8(GemmBf16 { m, .. }) => m,
             CudaStep::AttnDecode(AttnPrefillBf16 { rows, .. }) => rows,
             _ => return Ok(()),
         };
@@ -2274,7 +2347,8 @@ fn write_clash(e: &crate::step::StepExtents) -> Option<(ArenaSpan, ArenaSpan)> {
     None
 }
 
-fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
+/// Whether two non-empty arena spans share a byte.
+pub fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
     let (a0, b0) = (a.offset.0, b.offset.0);
     a.bytes > 0 && b.bytes > 0 && a0 < b0 + b.bytes && b0 < a0 + a.bytes
 }
