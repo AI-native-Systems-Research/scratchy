@@ -719,6 +719,32 @@ unsafe extern "C" {
         eps: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gdn_decode_variant(
+        qkv: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        z: *const c_void,
+        w: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        norm: *const c_void,
+        conv_state: *mut c_void,
+        conv_slot_elems: u64,
+        ssm_state: *mut c_void,
+        ssm_slot_elems: u64,
+        sequence: *const c_void,
+        out: *mut c_void,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        kernel: u32,
+        scale: f32,
+        eps: f32,
+        variant: u32,
+        trace: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gate_up_gemv_bf16_prepare() -> i32;
     fn scratchy_cuda_gate_up_gemv_bf16(
         a: *const c_void,
@@ -3455,6 +3481,66 @@ pub unsafe fn gdn_decode(
             kernel,
             scale,
             eps,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnDecodeShape {
+            nk,
+            nv,
+            head_v,
+            kernel,
+        },
+    )
+}
+
+/// Test support for `tests/gdn.rs` only (FP8 S8 D1): [`gdn_decode`] at `variant` 0 (the one-key-head
+/// form, #1049's: one CTA a key head) or 1 (the one-value-head form [`gdn_decode`] runs: one CTA a
+/// value head, a key head's CTAs one cluster), the same bits; with `trace` (not null, `kernel` 4
+/// only), the traced instance's phase cycles into `[CTAs, 8]` f32 (`nk` CTAs at variant 0, `nv` at
+/// 1; `kernels/gdn_decode.cu`'s `PHASES`). Refused as [`gdn_decode`], for `variant` above 1, and for
+/// a `trace` at another `kernel`.
+///
+/// # Safety
+///
+/// As [`gdn_decode`]'s; `trace`, when not null, a device pointer to `CTAs · 8` f32.
+#[doc(hidden)]
+pub unsafe fn gdn_decode_variant(
+    o: &GdnDecodeOperands,
+    (conv_state, conv_slot_elems): (*mut c_void, u64),
+    (ssm_state, ssm_slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    (nk, nv, head_k, head_v, kernel): (u32, u32, u32, u32, u32),
+    (scale, eps): (f32, f32),
+    (variant, trace, stream): (u32, *mut c_void, *mut c_void),
+) -> Result<(), KernelError> {
+    // SAFETY: as `gdn_decode`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_decode_variant(
+            o.qkv,
+            o.a,
+            o.b,
+            o.z,
+            o.w,
+            o.a_log,
+            o.dt_bias,
+            o.norm,
+            conv_state,
+            conv_slot_elems,
+            ssm_state,
+            ssm_slot_elems,
+            sequence,
+            o.out,
+            nk,
+            nv,
+            head_k,
+            head_v,
+            kernel,
+            scale,
+            eps,
+            variant,
+            trace,
             stream,
         )
     };
