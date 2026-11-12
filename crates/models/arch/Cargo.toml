@@ -702,7 +702,6 @@ mtp = ["mtp-heads"]
 # ride the backend.
 metal = [
     "scratchy-forward-compiler-macro/metal",
-    "scratchy-forward-compiler/metal",
     "dep:scratchy-target-metal",
     "scratchy-vision?/metal",
 ]
@@ -735,7 +734,6 @@ tp-4 = ["scratchy-forward-compiler-macro/tp-4", "scratchy-target-spyre?/tp-4"]
 tp-8 = ["scratchy-forward-compiler-macro/tp-8", "scratchy-target-spyre?/tp-8"]
 spyre = [
     "scratchy-forward-compiler-macro/spyre",
-    "scratchy-forward-compiler/spyre",
     "dep:scratchy-target-spyre",
 ]
 # Shell tab-completion over REAL HuggingFace model ids. Off by default, and

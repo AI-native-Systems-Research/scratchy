@@ -173,13 +173,6 @@ pub use scratchy_tensors::{layer_weight_path_with_root, vision_block_weight_path
 // `try_load_mm` closures name it as `::scratchy_forward_compiler::GpuWeightsHandle`
 // — the arch crates dep this compiler crate but not `scratchy-tensors` directly.
 pub use scratchy_tensors::GpuWeightsHandle;
-// Allocator-erased handle for the Metal worker's per-forward `RuntimeBindings`,
-// threaded through `MetalChainBody` so this crate's chain-body type names no
-// metal-target type. Re-exported so the `#[forward]` macro's emitted
-// `forward_chain_with_encoder` wraps the concrete `&RuntimeBindings` as
-// `::scratchy_forward_compiler::MetalRuntimeHandle` without a direct
-// `scratchy-tensors` dep on the arch crate.
-pub use scratchy_tensors::MetalRuntimeHandle;
 
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
 /// content discrimination. Canonicalizes object key order and
@@ -237,89 +230,44 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-// `ForwardCtx` (ambient-args bundle the emitted forward fn takes) names the
-// backend-coupled `KvCachePool` / `GdnStatePool`, so it lives in the target
-// crate (`scratchy_target_metal::ForwardCtx`). The `ScratchyWeights` trait
-// below takes the neutral `ForwardCtxHandle` instead of `&ForwardCtx`.
-
 // ── Cross-arch dispatcher ────────────────────────────────────────
 //
-// Every `#[forward] fn <arch>()` macro invocation auto-emits an
-// `impl ScratchyWeights for Weights` + an `inventory::submit!`
-// registration, so `try_load` discovers every compiled arch
-// without a hand-written central list. Adding a new arch touches
-// only its source file plus a single `pub mod <arch>;` in the
-// calling crate's lib.rs (Rust module system requirement).
-//
-// Same trait + registration + walk under every backend: the trait methods
-// take neutral handles, so a single signature serves them all. Metal's
-// per-arch bodies go through `MetalWorkerPool::forward`.
+// Every compiled arch emits an `impl ScratchyWeights for Weights`, its target's extension of it,
+// and an `inventory::submit!` of its target's registration row, so `try_load` discovers every
+// compiled arch without a hand-written central list.
 
 mod dispatcher;
 
-#[cfg(feature = "metal")]
-pub use dispatcher::{
-    ChainStepHandle, DraftSelection, FollowupOutputs, GpuExecutionFailed, MetalChainBody,
-    MetalForwardFollowup, MetalForwardOnto, SampledRowCount,
-};
-// Backend-neutral contracts — the `ScratchyWeights` trait (its device-runtime
-// forward methods take the neutral `ForwardCtxHandle` / `ForwardDeviceHandle`)
-// and the pure-config `HfFingerprint` carry no backend coupling, so they're
-// re-exported unconditionally; a third target (Spyre) names them without a
-// backend feature.
-pub use dispatcher::{BoundWeight, HfFingerprint, LentWeight, ScratchyWeights};
+// The target-neutral contracts: the model facts every loaded model answers, and the pure-config
+// `HfFingerprint` the per-variant sniff reads.
+pub use dispatcher::{HfFingerprint, LentWeight, ScratchyWeights};
 
 // Device-runtime multimodal forward surface (`PixelInput` / `EmbedPatch` /
 // `MultimodalForward`). The trait takes the neutral `ForwardDeviceHandle`
-// (the per-arch `VisionWrapper` impl recovers the concrete `&mut GpuDevice`),
+// (the per-arch `VisionWrapper` impl recovers the concrete device),
 // so it carries no backend coupling and lives here next to the MM registry.
 pub mod mm;
 #[cfg(feature = "vision")]
 pub use mm::MultimodalForward;
 pub use mm::{EmbedPatch, PixelInput};
 
-// Cross-arch load registry: `ScratchyArchRegistration` / `try_load` (text-side)
-// + the MM sibling `ScratchyMmRegistration` / `try_load_mm` /
-// `resolve_mm_metadata`, plus the `inventory::collect!` for both. The
-// fn-pointers name the allocator-erased `scratchy_tensors::GpuWeightsHandle`
-// (the `try_load` wrapper is generic over the concrete `GpuWeights<A>` and
-// builds the handle), so the registry holds no backend allocator and lives
-// here — the `#[forward]` macro emits `::scratchy_forward_compiler::Scratchy*`
-// directly, which keeps resolving after the `__gpu` alias flips to metal (a
-// crate that cannot depend on this one).
-#[cfg(any(feature = "metal", feature = "spyre", feature = "vision"))]
+// Cross-arch load registry: the shared `ArchRegistration` row each target wraps and collects, the
+// `try_load` walk over a target's registry, the `ArchFacts` every compiled arch states, and the
+// MM sibling `ScratchyMmRegistration` / `try_load_mm` / `resolve_mm_metadata`. The fn-pointers
+// name the allocator-erased `scratchy_tensors::GpuWeightsHandle` (`try_load` is generic over the
+// concrete `GpuWeights<A>` and builds the handle), so the registry holds no backend allocator.
 pub mod arch_registry;
-/// SuperDSC device code as `&'static` bytes in the binary, submitted by the `#[forward]` emit after
-/// `dxp_standalone` compiles it. Replaces the fingerprint→directory table and the bundle cache it
-/// pointed at — nothing is cached; see the module docs.
-// Text-side registry (`ScratchyArchRegistration` / `try_load`) is allocator-
-// generic and names no device-runtime or vision types, so it compiles + is
-// reachable under spyre too — the spyre worker fingerprint-loads through this
-// SAME registry (with `GpuWeights<SpyreAllocator>`).
-#[cfg(any(feature = "metal", feature = "spyre"))]
-pub use arch_registry::{ArchLoad, ArchTryLoadFn, ScratchyArchRegistration, try_load};
+pub use arch_registry::{
+    ArchFacts, ArchLoad, ArchRegistration, ArchTryLoadFn, TargetRegistration, try_load,
+};
 pub mod heads;
 pub use heads::{
     DFLASH2_BLOCK_LANES, HeadDrafting, HeadRegistration, PublishedDrafter, TargetShape,
     compiles_any_head, draft_head, head_of, heads_of,
 };
-// Read-only KTIR bundle resolver — spyre fetches its forward bundle without
-// consuming `GpuWeights` (so the worker keeps the live tensors for the runner).
-#[cfg(feature = "spyre")]
-pub use arch_registry::{resolve_ktir_bundle, resolve_sengraph_bundle};
-// MM sibling names `scratchy-vision` (`MmMetadata`) + device-runtime types, so
-// it's gated on the `vision` CAPABILITY (not a target): metal enables it
-// today; spyre opts in the same way when it grows a vision path.
+// MM sibling names `scratchy-vision` (`MmMetadata`), so it's gated on the `vision` CAPABILITY.
 #[cfg(feature = "vision")]
 pub use arch_registry::{MmTryLoadFn, ScratchyMmRegistration, resolve_mm_metadata, try_load_mm};
-/// Re-exports of the objc2/objc2_metal types referenced by macro-emitted
-/// `forward_with_metal_followup` / trait `MetalForwardFollowup` so consuming
-/// crates don't need direct `objc2`/`objc2_metal` deps.
-#[cfg(feature = "metal")]
-pub mod metal_followup_reexports {
-    pub use objc2::runtime::ProtocolObject;
-    pub use objc2_metal::{MTL4ComputeCommandEncoder, MTLBuffer};
-}
 
 /// Re-export `inventory` so the macro-emitted
 /// `::scratchy_forward_compiler::inventory::submit!` block for

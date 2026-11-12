@@ -68,7 +68,7 @@ pub struct ModelParams {
     /// `config.json`. The macro unions these across every compiled
     /// model in an arch directory to produce the `hf_arches` list
     /// baked into the arch's
-    /// `scratchy_forward_compiler::ScratchyArchRegistration` registration,
+    /// `scratchy_forward_compiler::ArchRegistration` row,
     /// driving the runtime `try_load(..., arch_hint)` dispatch.
     pub architectures: Vec<String>,
     /// The checkpoint architectures of the model this arch is a part of — its config's own
@@ -1472,7 +1472,7 @@ pub struct GgufSpec {
     /// (e.g. Mistral for `"llama"`, deepseek-v3-flat for `"deepseek2"`)
     /// so a single deterministic spec covers each gguf_arch. The arch
     /// still gets a `-ggml` overlay variant + `gguf_archs` entry in
-    /// its `ScratchyArchRegistration` so the dispatcher tries it.
+    /// its `ArchRegistration` row so the dispatcher tries it.
     pub register_spec: bool,
 }
 

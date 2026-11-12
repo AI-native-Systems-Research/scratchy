@@ -499,7 +499,7 @@ fn sharded_bundle(
 }
 
 pub(crate) fn stage_bound_weights(
-    bound: &[scratchy_forward_compiler::BoundWeight],
+    bound: &[scratchy_target_spyre::BoundWeight],
     // ⛔ FOR PLACEMENT EXISTENCE ONLY — never for names. The K-split branches
     // below must ask whether the BAKED bundle actually placed its block tids
     // (on a quantized model the emitter returns before the split, leaving the
@@ -877,16 +877,9 @@ impl SpyreWorker {
         // `SCRATCHY_LOAD_TIME`: arm before the load records, print after it —
         // the whole instrument lives inside the pass this times.
         scratchy_layers::load_time::arm();
-        let model = scratchy_forward_compiler::try_load(
-            &mut gw,
-            (),
-            arch.as_str(),
-            1,
-            0,
-            max_model_len,
-            hf_fp,
-        )
-        .map_err(|e| werr(format!("try_load {arch:?}: {e}")))?;
+        let model =
+            scratchy_target_spyre::try_load(&mut gw, (), arch.as_str(), 1, 0, max_model_len, hf_fp)
+                .map_err(|e| werr(format!("try_load {arch:?}: {e}")))?;
         let model = match model {
             scratchy_forward_compiler::ArchLoad::Loaded(m) => m,
             // The arch is compiled; the checkpoint just doesn't match any of its

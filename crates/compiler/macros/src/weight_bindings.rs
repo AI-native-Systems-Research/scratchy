@@ -440,7 +440,7 @@ pub(crate) fn emit_weight_bindings(
         };
         let i = proc_macro2::Literal::u32_unsuffixed(i as u32);
         arms.push(quote! {
-            out.push(::scratchy_forward_compiler::BoundWeight {
+            out.push(::scratchy_target_spyre::BoundWeight {
                 id: #i,
                 tensor: #tensor,
                 is_gemm: #is_gemm,
@@ -489,7 +489,7 @@ pub(crate) fn emit_weight_bindings(
         #[allow(clippy::vec_init_then_push)]
         pub fn superdsc_weights(
             w: &Weights,
-        ) -> ::anyhow::Result<::std::vec::Vec<::scratchy_forward_compiler::BoundWeight>> {
+        ) -> ::anyhow::Result<::std::vec::Vec<::scratchy_target_spyre::BoundWeight>> {
             let mut out = ::std::vec::Vec::new();
             #(#arms)*
             Ok(out)

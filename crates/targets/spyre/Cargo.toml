@@ -123,6 +123,11 @@ ktir-emulator = { path = "ktir/ktir-emulator", optional = true }
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 # The model facts (`scratchy_ir::model_facts`) the bake threads through the lowering.
 scratchy-ir = { path = "../../compiler/ir" }
+# The target-neutral model surface `model::SpyreWeights` extends (`ScratchyWeights`), and the
+# shared registry row and walk `model::SpyreArchRegistration` wraps.
+scratchy-forward-compiler = { path = "../../compiler" }
+# The spyre arch registry (`model::SpyreArchRegistration`) every compiled arch submits to.
+inventory = { workspace = true }
 
 # The tests mint the pool's law-governed quantities (head widths, slot and
 # page counts, gather scratches) through the same `sdsc_abstract` doors

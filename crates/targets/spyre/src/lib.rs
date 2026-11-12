@@ -101,6 +101,9 @@ pub mod superdsc_exec;
 /// as a `static` — the typed replacement for parsing `manifest.json` at load.
 pub mod wiring;
 pub use allocator::{HostBytes, SpyreAllocator};
+/// A loaded model as spyre runs it (`SpyreWeights`), and the registry its loaders live in.
+pub mod model;
+pub use model::{BoundWeight, SpyreArchRegistration, SpyreWeights, try_load};
 
 // ── `__gpu` facade for the `#[forward]` macro's spyre path ──
 //

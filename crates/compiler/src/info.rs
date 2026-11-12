@@ -1409,7 +1409,7 @@ pub struct VariantDump {
 /// walks every variant in this arch's compiled set and returns a
 /// flat list. One [`BackboneDumpRegistration`] per `#[forward]` —
 /// inventory-collected, mirroring the existing
-/// `ScratchyArchRegistration` pattern.
+/// `ArchRegistration` pattern.
 pub struct BackboneDumpRegistration {
     pub arch_name: &'static str,
     pub dump_all: fn() -> Vec<VariantDump>,

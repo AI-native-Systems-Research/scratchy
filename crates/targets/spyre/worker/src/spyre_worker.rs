@@ -3,7 +3,7 @@
 //! engine resolves a `--device spyre` worker through. Nothing else.
 //!
 //! ⛔ THE WORKER IS NOT WHERE A MODEL LIVES. It looks the model up in
-//! `inventory` (the `#[forward]` macro's `ScratchyArchRegistration`) and invokes
+//! `inventory` (the emitted `SpyreArchRegistration`) and invokes
 //! it; every model fact reaches it as GENERATED data. The jobs that used to sit
 //! in this one file are now the things they are:
 //!
@@ -21,7 +21,7 @@
 //! the compiler now enforces.
 
 // Force the linker to keep every compiled arch crate (and thus its
-// `ScratchyArchRegistration` `inventory::submit!`) — otherwise the model crates,
+// `SpyreArchRegistration` `inventory::submit!`) — otherwise the model crates,
 // referenced only via the inventory registry, get dead-stripped and `try_load`
 // finds an empty registry. (The metal path does the same in `gpu_worker`,
 // which isn't compiled under spyre.)

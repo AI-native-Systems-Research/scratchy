@@ -29,7 +29,7 @@ scratchy-serving-engine = { workspace = true }
 scratchy-serving-scheduler = { workspace = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-model = { workspace = true }
-scratchy-forward-compiler = { path = "../../../compiler", features = ["spyre"] }
+scratchy-forward-compiler = { path = "../../../compiler" }
 scratchy-models = { path = "../../../models/arch", default-features = false, features = ["spyre"] }
 # Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
 # staged weight width == the emitted device width by construction.

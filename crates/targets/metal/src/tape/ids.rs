@@ -185,9 +185,9 @@ pub use crate::tape::constants::ConstSlot;
 // reordering of two interchangeable `u32`s.
 
 /// The rows one step samples (its `SampleIndices`' length): the count the chain step's trait
-/// carries ([`scratchy_forward_compiler::ChainStepHandle`]), read by a runtime gate and a
+/// carries ([`crate::model::ChainStepHandle`]), read by a runtime gate and a
 /// [`crate::tape::lowered::SetAxis`].
-pub use scratchy_forward_compiler::SampledRowCount;
+pub use crate::model::SampledRowCount;
 
 macro_rules! u32_newtype {
     ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(

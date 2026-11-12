@@ -6,7 +6,7 @@
 
 // Force the linker to keep `scratchy_models` — its `#[forward]`
 // modules register with `inventory::submit!` for auto-discovery by
-// `scratchy_forward_compiler::try_load`. Without this, the linker gc's the
+// `scratchy_target_metal::try_load`. Without this, the linker gc's the
 // crate (no direct symbol references after the Phase B collapse)
 // and the inventory comes up empty.
 extern crate scratchy_models as _;
@@ -217,11 +217,11 @@ pub struct MetalWorker {
     /// exactly this many — one process, one number. `None` until
     /// `load_model` resolves it.
     resolved_max_num_seqs: Option<usize>,
-    /// Loaded scratchy-forward-compiler weights — `Box<dyn ScratchyWeights>`
+    /// Loaded scratchy-forward-compiler weights — `Box<dyn MetalWeights>`
     /// dispatched through `try_load`. The trait `forward` body
     /// collapses to the per-canonical metal `forward` fn; the worker
     /// calls it through the trait vtable.
-    model: Option<Box<dyn scratchy_forward_compiler::ScratchyWeights>>,
+    model: Option<Box<dyn scratchy_target_metal::MetalWeights>>,
     /// Vision tower for multimodal arches (Qwen3.5-VL). Loaded by
     /// `load_model` via `try_load_mm` alongside the text weights; `None`
     /// for text-only models / checkpoints without `visual.*` tensors.
@@ -238,7 +238,7 @@ pub struct MetalWorker {
     /// Draft model for speculative decoding (loaded onto the same
     /// device + allocator + command queue as the target). Idle until
     /// the proposer is wired.
-    draft_model: Option<Box<dyn scratchy_forward_compiler::ScratchyWeights>>,
+    draft_model: Option<Box<dyn scratchy_target_metal::MetalWeights>>,
     /// Compiled greedy-sampling pipeline. Cached once at load_model
     /// to avoid recompiling the MSL kernel each step.
     argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
@@ -678,10 +678,7 @@ fn gdn_draft_lanes(
 
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
 /// × [`METAL_KV_ELEM_BYTES`].
-fn kv_per_block_bytes(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
-    block_size: usize,
-) -> usize {
+fn kv_per_block_bytes(model: &dyn scratchy_target_metal::MetalWeights, block_size: usize) -> usize {
     let elt_bytes = METAL_KV_ELEM_BYTES;
     // Hybrid-attention-geometry arches (Gemma4) size each layer by its
     // own kv_heads*head_dim; uniform arches use the single product.
@@ -704,7 +701,7 @@ fn kv_per_block_bytes(
 /// ([`kv_pool_tensors`]), its KV heads and head_dim, `dense_elem_bytes` wide when
 /// `codec` is dense.
 fn pool_bytes_per_token(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &dyn scratchy_target_metal::MetalWeights,
     codec: scratchy_forward_compiler::KvCodec,
     dense_elem_bytes: usize,
 ) -> usize {
@@ -724,7 +721,7 @@ fn pool_bytes_per_token(
 /// attention layers (`kv_cache_layers`), mapped by
 /// `compact_kv_layer_to_tensor` — else one per layer (`None` map).
 fn kv_pool_tensors(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &dyn scratchy_target_metal::MetalWeights,
     hybrid: Option<&scratchy_core_config::HybridKvLayout>,
 ) -> (usize, Option<Vec<usize>>) {
     let layers = model.num_hidden_layers() as usize;
@@ -745,7 +742,7 @@ fn kv_pool_tensors(
 /// in `init`, so the two never disagree on group count. `None` → one physical
 /// tensor per layer (the uniform pool).
 fn hybrid_kv_layout(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &dyn scratchy_target_metal::MetalWeights,
     block_size: scratchy_core_common::KvBlockTokens,
     elem_bytes: usize,
 ) -> Option<scratchy_core_config::HybridKvLayout> {
@@ -773,7 +770,7 @@ fn hybrid_kv_layout(
 /// TurboQuant global layers keep their codes BESIDE its fp16 pool, which the
 /// sliding layers read ([`target_block_bytes`] charges both).
 fn uniform_turboquant(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &dyn scratchy_target_metal::MetalWeights,
     block_size: scratchy_core_common::KvBlockTokens,
 ) -> bool {
     model.kv_codec().is_turboquant()
@@ -785,7 +782,7 @@ fn uniform_turboquant(
 /// codes, norms and scratch; a uniform TurboQuant model's codes, norms and
 /// scratch; every other model's dense rows.
 fn target_block_bytes(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &dyn scratchy_target_metal::MetalWeights,
     block_size: scratchy_core_common::KvBlockTokens,
 ) -> usize {
     if let Some(layout) = hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES) {
@@ -827,7 +824,7 @@ fn target_block_bytes(
 /// its fp16 scratch — none of the scratch when it stages through its target's
 /// ([`DraftScratch::Target`]).
 fn draft_block_bytes(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &dyn scratchy_target_metal::MetalWeights,
     block_size: usize,
     scratch: DraftScratch,
 ) -> usize {
@@ -848,7 +845,7 @@ fn draft_block_bytes(
 
 /// One block's bytes in each store of a dense draft pool: one layer's K or V rows.
 fn draft_store_block_bytes(
-    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &dyn scratchy_target_metal::MetalWeights,
     block_size: usize,
 ) -> usize {
     model.num_key_value_heads() as usize
@@ -1167,7 +1164,7 @@ impl MetalWorker {
     /// default this method substituted.)
     fn resolve_max_num_seqs(
         &mut self,
-        model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        model: &dyn scratchy_target_metal::MetalWeights,
         arch: &str,
         gpu_device: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<()> {
@@ -1298,7 +1295,7 @@ impl MetalWorker {
         // the loaded target (width consumers sit between the two), so the
         // caller hands the just-loaded pair in — `determine_available_memory`
         // (after field assignment) passes `None` and the fields serve.
-        model: Option<&dyn scratchy_forward_compiler::ScratchyWeights>,
+        model: Option<&dyn scratchy_target_metal::MetalWeights>,
         gpu_device: Option<&scratchy_target_metal::GpuDevice>,
         // The budget the bucket selection prunes against. `None` = the raw
         // `working_set × utilization` figure past what is allocated now —
@@ -1346,7 +1343,7 @@ impl MetalWorker {
     /// a model with no buckets.
     fn metal_select_bucket(
         &self,
-        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        target: &dyn scratchy_target_metal::MetalWeights,
         dev: &scratchy_target_metal::GpuDevice,
         budget: u64,
         resident: u64,
@@ -1364,7 +1361,7 @@ impl MetalWorker {
     /// pool pruned to the bucket allocates beside its KV cache whatever the cache holds.
     fn metal_bucket_prices(
         &self,
-        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        target: &dyn scratchy_target_metal::MetalWeights,
         dev: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<Vec<MetalBucketPrice>> {
         let full_cap = self.kv_block_cap(usize::MAX);
@@ -1389,10 +1386,10 @@ impl MetalWorker {
     /// it (`ArenaShare::Hosts`), so it adds what the target's arena grows by.
     fn metal_bucket_costs(
         &self,
-        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        target: &dyn scratchy_target_metal::MetalWeights,
         dev: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<Vec<(u32, u64)>> {
-        type Model<'m> = &'m dyn scratchy_forward_compiler::ScratchyWeights;
+        type Model<'m> = &'m dyn scratchy_target_metal::MetalWeights;
         let layout = |m: Model<'_>, bucket_m: u32, rows| {
             ExecutorResult::Ok(Self::metal_pick(m, dev, Some(bucket_m), 1)?.arena_layout(rows))
         };
@@ -1435,12 +1432,12 @@ impl MetalWorker {
     /// head's only what the target's scratch grows by to hold it, as its arena.
     fn metal_rung_scratch(
         &self,
-        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        target: &dyn scratchy_target_metal::MetalWeights,
         dev: &scratchy_target_metal::GpuDevice,
         max_m: Option<u32>,
         block_cap: usize,
     ) -> ExecutorResult<u64> {
-        let pick = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+        let pick = |m: &dyn scratchy_target_metal::MetalWeights| {
             Self::metal_pick(m, dev, max_m, block_cap)
         };
         let target_rung = pick(target)?;
@@ -1460,7 +1457,7 @@ impl MetalWorker {
     /// What the target's pool holds for its MTP head (`ArenaShare::Hosts`): the head's arena and
     /// scratch at the bucket cap and KV cap rung its own pool runs on — its KV pool's, or its
     /// target's for a head reading its target's KV. `None` without a head. Handed to the target
-    /// model (`ScratchyWeights::metal_host`) before its pool is built, at its first forward.
+    /// model (`MetalWeights::metal_host`) before its pool is built, at its first forward.
     fn metal_head_guest(&self) -> ExecutorResult<Option<GuestArena>> {
         let (Some(head), Some(dev)) = (
             self.draft_model.as_deref().filter(|_| self.draft_is_head()),
@@ -1501,7 +1498,7 @@ impl MetalWorker {
     /// is the KV pool's block-table width; the scratch counts in the memory budget.
     fn metal_rung(
         &self,
-        model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        model: &dyn scratchy_target_metal::MetalWeights,
         block_cap: usize,
         dev: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<(usize, u64)> {
@@ -1514,7 +1511,7 @@ impl MetalWorker {
 
     /// [`Self::metal_rung`]'s pick on `dev`, its buckets those up to `max_m`.
     fn metal_pick(
-        model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        model: &dyn scratchy_target_metal::MetalWeights,
         dev: &scratchy_target_metal::GpuDevice,
         max_m: Option<u32>,
         block_cap: usize,
@@ -1556,7 +1553,7 @@ impl MetalWorker {
     /// window of positions, a slot for each sequence the worker holds — sized from its `config`.
     fn load_dflash2(
         &self,
-        (budget, model): (DraftBudget, &dyn scratchy_forward_compiler::ScratchyWeights),
+        (budget, model): (DraftBudget, &dyn scratchy_target_metal::MetalWeights),
         kernels: &scratchy_target_metal::off_tape::OffTapeKernels,
         config: &HfModelConfig,
     ) -> ExecutorResult<Dflash2> {
@@ -1565,7 +1562,7 @@ impl MetalWorker {
         let target = (self.model.as_deref()).ok_or_else(|| init("its target must load first"))?;
         // The weight bytes of a model's forward at the bucket that holds a cycle's verify rows.
         let rows = budget.verify_rows as u32;
-        let weight_bytes = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+        let weight_bytes = |m: &dyn scratchy_target_metal::MetalWeights| {
             let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(m.metal_rungs())
                 .map_err(|e| init(&format!("its buckets: {e}")))?;
             (rungs.bucket_row(rows))
@@ -1900,7 +1897,7 @@ impl MetalWorker {
     /// argmax kernel compile (per-device, not per-model — `self.argmax_*`
     /// stays target-aligned for batch sizing), and the worker-pool /
     /// SpecializedPipelineCache for the draft is created lazily inside
-    /// `scratchy_forward_compiler::try_load`. Two ScratchyWeights instances on the
+    /// `scratchy_target_metal::try_load`. Two MetalWeights instances on the
     /// same device → two pipeline caches; that's fine because cache
     /// keys include the library name and each model's synthesized
     /// libraries are derived from its own per-arch macro expansion.
@@ -1977,7 +1974,7 @@ impl MetalWorker {
             .unwrap_or(4096);
 
         let t_try_load = std::time::Instant::now();
-        let draft_model = scratchy_forward_compiler::try_load(
+        let draft_model = scratchy_target_metal::try_load(
             &mut draft_weights,
             (),
             draft_arch.as_str(),
@@ -2993,7 +2990,7 @@ impl MetalWorker {
             .snapshot_slot()
             .ok_or_else(|| err("no snapshot slot"))?;
         let bs = self.config.block_size;
-        let turboquant_stores = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+        let turboquant_stores = |m: &dyn scratchy_target_metal::MetalWeights| {
             let bits = match m.kv_codec() {
                 scratchy_forward_compiler::KvCodec::TurboQuant(bits) => bits.get(),
                 scratchy_forward_compiler::KvCodec::Dense => return Vec::new(),
@@ -3292,7 +3289,7 @@ impl MetalWorker {
 /// the K argmax buffers and returns iter-major `[k][num_reqs]`
 /// argmax IDs.
 fn metal_chain_dispatch(
-    model_ref: &dyn scratchy_forward_compiler::ScratchyWeights,
+    model_ref: &dyn scratchy_target_metal::MetalWeights,
     kv_cache_ref: &KvCachePool,
     device_mut: &mut GpuDevice,
     argmax_kernels: &scratchy_target_metal::argmax::ArgmaxKernels,
@@ -3476,7 +3473,7 @@ fn metal_chain_dispatch(
     let num_reqs_u32 = num_reqs as u32;
     let k_usize = k;
 
-    let body: scratchy_forward_compiler::MetalChainBody<'_> = Box::new(
+    let body: scratchy_target_metal::model::MetalChainBody<'_> = Box::new(
         move |handle, runtime, enc| -> Result<(), String> {
             // `MetalChainBody` hands the per-forward bindings through the
             // neutral `MetalRuntimeHandle` (the compiler's chain-body type
@@ -3511,7 +3508,7 @@ fn metal_chain_dispatch(
 
             for iter in 0..k_usize {
                 // A K-step decode samples each sequence's one row.
-                let sampled = ::scratchy_forward_compiler::SampledRowCount(num_reqs_u32);
+                let sampled = ::scratchy_target_metal::model::SampledRowCount(num_reqs_u32);
                 handle.run_forward_step(enc, num_reqs_u32, sampled)?;
 
                 let table = &argmax_arg_tables_for_closure[iter];
@@ -3613,7 +3610,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         }
 
         // Resolve target model + KV pool (handle 1 = draft, 0 = target).
-        let model_ref: &dyn scratchy_forward_compiler::ScratchyWeights = match model {
+        let model_ref: &dyn scratchy_target_metal::MetalWeights = match model {
             ModelHandle::TARGET => self
                 .model
                 .as_deref()
@@ -3734,7 +3731,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         &self,
         model: ::scratchy_serving_engine::spec_decode::ModelHandle,
     ) -> Result<usize, ::scratchy_serving_engine::spec_decode::BackendError> {
-        let model_ref: &dyn scratchy_forward_compiler::ScratchyWeights = match model {
+        let model_ref: &dyn scratchy_target_metal::MetalWeights = match model {
             ::scratchy_serving_engine::spec_decode::ModelHandle::TARGET => {
                 self.model.as_deref().ok_or_else(|| {
                     ::scratchy_serving_engine::spec_decode::BackendError::Backend(
@@ -3778,7 +3775,7 @@ impl MetalWorker {
 
         // Resolve handles. 0 → target, 1 → draft; everything else is
         // an unknown handle.
-        let model_ref: &dyn scratchy_forward_compiler::ScratchyWeights = match model {
+        let model_ref: &dyn scratchy_target_metal::MetalWeights = match model {
             ModelHandle::TARGET => self
                 .model
                 .as_deref()
@@ -4191,7 +4188,7 @@ impl MetalWorker {
         };
         let head = std::cell::RefCell::new(head);
         let head_onto: std::cell::RefCell<
-            Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + '_>>,
+            Option<Box<dyn scratchy_target_metal::model::MetalForwardOnto + '_>>,
         > = std::cell::RefCell::new(None);
         let arg_table = {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
@@ -4311,9 +4308,9 @@ impl MetalWorker {
             pass => pass,
         };
         let logprobs_device = mtl_device.clone();
-        let followup: scratchy_forward_compiler::MetalForwardFollowup<'_> = Box::new(
+        let followup: scratchy_target_metal::model::MetalForwardFollowup<'_> = Box::new(
             move |enc, outputs| -> Result<(), String> {
-                let scratchy_forward_compiler::FollowupOutputs {
+                let scratchy_target_metal::model::FollowupOutputs {
                     logits: logits_buf,
                     rows: total_n_actual,
                     vocab: vocab_actual,
@@ -4695,7 +4692,7 @@ impl ChainLayout {
 /// What `target`'s pool shares with its MTP head, which runs in it: nothing until the target's
 /// first forward builds that pool.
 fn hosted_by(
-    target: &dyn scratchy_forward_compiler::ScratchyWeights,
+    target: &dyn scratchy_target_metal::MetalWeights,
 ) -> Result<HostArena, ::scratchy_serving_engine::spec_decode::BackendError> {
     let hosted = (target.metal_hosted())
         .map(|h| h.downcast::<HostArena>())
@@ -4714,7 +4711,7 @@ fn hosted_by(
 /// bound where the target binds them, its codes read the way the target's binding stores them.
 fn vocab_suffix_draft(
     gpu_device: &GpuDevice,
-    target: &dyn scratchy_forward_compiler::ScratchyWeights,
+    target: &dyn scratchy_target_metal::MetalWeights,
     refs: &scratchy_target_metal::weights::TensorRefs,
     weights: &mut GpuWeights,
     kernels: &scratchy_target_metal::off_tape::SuffixKernels<
@@ -4801,9 +4798,9 @@ fn vocab_suffix_draft(
 /// chained pass behind the device's pick of its inputs.
 struct HeadPassesEncoder<'a> {
     passes: &'a ::scratchy_serving_engine::spec_decode::HeadPasses,
-    model: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &'a dyn scratchy_target_metal::MetalWeights,
     /// The target whose command buffer the passes ride, whose buffers the head's pool is built in.
-    target: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    target: &'a dyn scratchy_target_metal::MetalWeights,
     kv_cache: &'a KvCachePool,
     /// The step's sliding KV groups' tables, when the head reads its target's KV.
     sliding: StepTables,
@@ -4832,7 +4829,7 @@ impl<'a> HeadPassesEncoder<'a> {
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
         hidden: &scratchy_target_metal::mtl4_dispatch::Buffer,
-    ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
+    ) -> Result<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>, String> {
         use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
         let passes = self.passes;
         // Pass 1 over the rows no draft reads, for their KV alone; then over the rows a draft can
@@ -4965,12 +4962,12 @@ impl<'a> HeadPassesEncoder<'a> {
     fn encode_pass(
         &mut self,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-        onto: Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>>,
+        onto: Option<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>>,
         pass: &::scratchy_serving_engine::spec_decode::PassOne,
         reads: Reads,
         tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
         hidden: &scratchy_target_metal::mtl4_dispatch::Buffer,
-    ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
+    ) -> Result<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>, String> {
         use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
         let row_bytes = self.layout.hidden_bytes;
         // The target's token at a sampled row: `tokens` holds one a sampled row, in order.
@@ -5213,9 +5210,9 @@ impl Dflash2 {
 /// acceptance, the commit, then the block draft.
 struct BlockPassesEncoder<'a> {
     step: &'a BlockStep,
-    model: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    model: &'a dyn scratchy_target_metal::MetalWeights,
     /// The target whose command buffer the passes ride, whose arena the drafter's pool is built in.
-    target: &'a dyn scratchy_forward_compiler::ScratchyWeights,
+    target: &'a dyn scratchy_target_metal::MetalWeights,
     /// The target's KV cache: the drafter's forwards read none (its rings are its KV).
     kv_cache: &'a KvCachePool,
     dflash2: &'a Dflash2,
@@ -5244,8 +5241,8 @@ impl<'a> BlockPassesEncoder<'a> {
         &mut self,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
-        outputs: scratchy_forward_compiler::FollowupOutputs<'_>,
-    ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
+        outputs: scratchy_target_metal::model::FollowupOutputs<'_>,
+    ) -> Result<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>, String> {
         use ::objc2_metal::MTLBuffer as _;
         use scratchy_target_metal::interpreter::metal::{DeviceInputInto as Into, DraftInputs};
         let step = self.step;
@@ -5294,7 +5291,7 @@ impl<'a> BlockPassesEncoder<'a> {
             let table = argument_table(&self.device, &layout.accept(base, tokens.gpuAddress()))?;
             self.dflash2.accept.encode(enc, &table, lanes as u32);
         }
-        let mut onto: Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>> = None;
+        let mut onto: Option<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>> = None;
         // 2. The rings a restore gives back: each window from its snapshot, then the rings rebuilt
         // from it (Splash `addDraftRebuild`, Runtime.cpp:1556-1564, ahead of the command's rows).
         let window = self.dflash2.window;
@@ -5441,10 +5438,10 @@ impl<'a> BlockPassesEncoder<'a> {
     /// the drafter's pool in its target's arena; the rest follow it on the same worker.
     ///
     /// # Safety
-    /// Same as [`scratchy_forward_compiler::ScratchyWeights::metal_forward_onto`].
+    /// Same as [`scratchy_target_metal::MetalWeights::metal_forward_onto`].
     unsafe fn play(
         &mut self,
-        onto: &mut Option<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>>,
+        onto: &mut Option<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>>,
         ctx: &scratchy_target_metal::ForwardCtx<'_>,
         num_tokens: u64,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
@@ -5499,7 +5496,7 @@ impl<'a> BlockPassesEncoder<'a> {
     /// the command buffer it ran in is done.
     fn selection(
         &self,
-        onto: &dyn scratchy_forward_compiler::MetalForwardOnto,
+        onto: &dyn scratchy_target_metal::model::MetalForwardOnto,
     ) -> Option<Selection> {
         use ::objc2_metal::MTLBuffer as _;
         let block = (self.step.passes.block.as_ref()).filter(|b| b.drafts)?;
@@ -5570,8 +5567,8 @@ impl<'a> HeadEncoder<'a> {
         &mut self,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
-        outputs: scratchy_forward_compiler::FollowupOutputs<'_>,
-    ) -> Result<Box<dyn scratchy_forward_compiler::MetalForwardOnto + 'a>, String> {
+        outputs: scratchy_target_metal::model::FollowupOutputs<'_>,
+    ) -> Result<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>, String> {
         match self {
             Self::Mtp(h) => h.encode(enc, tokens, &retained(outputs.hidden)),
             Self::Block(b) => b.encode(enc, tokens, outputs),
@@ -5582,7 +5579,7 @@ impl<'a> HeadEncoder<'a> {
     /// from its chain buffer, a block drafter's from `onto`'s outputs and its cycle buffer.
     fn outcome(
         &self,
-        onto: Option<&dyn scratchy_forward_compiler::MetalForwardOnto>,
+        onto: Option<&dyn scratchy_target_metal::model::MetalForwardOnto>,
     ) -> HeadOutcome {
         match self {
             Self::Mtp(h) => HeadOutcome {
@@ -6332,7 +6329,7 @@ impl Worker for MetalWorker {
         // `Weights::load` body ignores the stream parameter (uploads go
         // through the allocator inside `GpuWeights`).
         let t_try_load = std::time::Instant::now();
-        let model = scratchy_forward_compiler::try_load(
+        let model = scratchy_target_metal::try_load(
             &mut weights,
             (),
             arch.as_str(),
@@ -8494,16 +8491,16 @@ impl Worker for MetalWorker {
                 // thread (target verify uses self.model + self.kv_cache,
                 // disjoint fields) and the thread can't outlive the
                 // scope (scoped threads are joined before scope exit).
-                // Decompose the fat pointer to `dyn ScratchyWeights`
+                // Decompose the fat pointer to `dyn MetalWeights`
                 // into two `usize` so the closure stays `Send`.
                 // `*const dyn T` is `[data, vtable]` on the supported
                 // targets; transmute to extract both.
                 let dm_pair: [usize; 2] = {
-                    let fat: *const dyn scratchy_forward_compiler::ScratchyWeights =
+                    let fat: *const dyn scratchy_target_metal::MetalWeights =
                         self.draft_model.as_deref().expect("checked above");
                     unsafe {
                         std::mem::transmute::<
-                            *const dyn scratchy_forward_compiler::ScratchyWeights,
+                            *const dyn scratchy_target_metal::MetalWeights,
                             [usize; 2],
                         >(fat)
                     }
@@ -8606,11 +8603,11 @@ impl Worker for MetalWorker {
 
                         // Reassemble fat pointer from (data, vtable)
                         // pair, then immutable-borrow.
-                        let dm_fat_reassembled: *const dyn scratchy_forward_compiler::ScratchyWeights =
+                        let dm_fat_reassembled: *const dyn scratchy_target_metal::MetalWeights =
                             unsafe {
                                 std::mem::transmute::<
                                     [usize; 2],
-                                    *const dyn scratchy_forward_compiler::ScratchyWeights,
+                                    *const dyn scratchy_target_metal::MetalWeights,
                                 >(dm_pair)
                             };
                         let dm = unsafe { &*dm_fat_reassembled };
@@ -9346,8 +9343,7 @@ impl Worker for MetalWorker {
     /// head reading its target's KV is not TurboQuant itself, and so reads the target's global layer
     /// from the shared pool at group 0's blocks (a coded one binds its target's stores).
     fn hybrid_kv_stores(&self) -> scratchy_core_common::HybridKvStores {
-        let coded =
-            |m: &dyn scratchy_forward_compiler::ScratchyWeights| m.kv_codec().is_turboquant();
+        let coded = |m: &dyn scratchy_target_metal::MetalWeights| m.kv_codec().is_turboquant();
         let target_coded = self.model.as_deref().is_some_and(coded);
         let head_coded =
             !self.head_reads_target_kv() || self.draft_model.as_deref().is_some_and(coded);

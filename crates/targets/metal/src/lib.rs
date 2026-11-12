@@ -260,6 +260,9 @@ pub mod weights_metal;
 pub use weights_metal::MetalWeightsExt;
 pub mod metal_allocator;
 pub mod metal_mem;
+// A loaded model as metal runs it (`MetalWeights`), and the registry its loaders live in.
+pub mod model;
+pub use model::{MetalArchRegistration, MetalWeights, try_load};
 pub mod mtl4_dispatch;
 pub mod off_tape;
 pub mod owned_metal;

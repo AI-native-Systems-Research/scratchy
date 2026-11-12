@@ -48,9 +48,10 @@ mod imp {
 
     use half::bf16;
     use objc2_metal::MTLCreateSystemDefaultDevice;
-    use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value, try_load};
+    use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value};
     use scratchy_target_metal::device::Device;
     use scratchy_target_metal::kv_cache::KvCachePool;
+    use scratchy_target_metal::try_load;
     use scratchy_target_metal::{
         DType, ForwardCtx, GpuDevice, GpuTensor, GpuWeights, MetalAllocator, MetalMem, TensorView,
     };

@@ -17,22 +17,21 @@ license.workspace = true
 # and the macro's `compile_error!` rejected having both at once.
 default = []
 # Backend selection: exactly one must be enabled
-# Forwards into `scratchy-forward-compiler/metal` so the metal-only
+# Turns on `scratchy-ir/metal` so the metal-only
 # `Instruction` variants (`SynthGateUpSiluMul`, `AffineEmbed`) are
 # visible to the macro's match arms — they're gated
-# `#[cfg(feature = "metal")]` in `scratchy-forward-compiler::instr`.
+# `#[cfg(feature = "metal")]` in `scratchy-ir`.
 metal = ["scratchy-ir/metal",
     "scratchy-forward-compiler-frontend/metal",
     "dep:scratchy-target-metal",
     "dep:scratchy-target-metal-compiler",
-    "scratchy-forward-compiler/metal",
 ]
 # Spyre (IBM AIU / KTIR): no GPU dispatch codegen — under this feature the
 # macro emits the real model's KTIR (via scratchy-subtile, a non-optional dep)
 # at build time and the spyre worker runs it. Forwards into the compiler's
 # `spyre` gate (registry + IR); NEVER target-cuda — spyre rides the
 # compiler-owned registry, not the cuda crate.
-spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scratchy-target-spyre", "dep:ktir-core", "dep:scratchy-triton-splice"]
+spyre = ["scratchy-subtile/spyre", "dep:scratchy-target-spyre", "dep:ktir-core", "dep:scratchy-triton-splice"]
 
 # A CARD. The device image is compiled from the KTIR at bake time, so this build has a device
 # compiler to drain; the emulator build has nothing to compile and nothing to wait for.

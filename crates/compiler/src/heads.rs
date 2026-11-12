@@ -143,14 +143,11 @@ pub fn heads_of(target_arch: &str) -> impl Iterator<Item = HeadRegistration> + '
         .filter(move |head| head.drafts_for.contains(&target_arch))
 }
 
-/// Every compiled head, with its arch's checkpoint architectures. A build without a target
-/// compiles no model (the registry is a target's, `arch_registry`), so no head.
+/// Every compiled head, with its arch's checkpoint architectures, from the facts every compiled
+/// arch registers ([`crate::ArchFacts`]). A build that compiled no model has none.
 fn registered() -> impl Iterator<Item = (&'static [&'static str], HeadRegistration)> {
-    #[cfg(any(feature = "metal", feature = "spyre", feature = "vision"))]
-    return inventory::iter::<crate::arch_registry::ScratchyArchRegistration>()
-        .filter_map(|reg| Some((reg.hf_arches, reg.head?)));
-    #[cfg(not(any(feature = "metal", feature = "spyre", feature = "vision")))]
-    std::iter::empty()
+    inventory::iter::<crate::arch_registry::ArchFacts>()
+        .filter_map(|facts| Some((facts.hf_arches, facts.head?)))
 }
 
 impl HeadRegistration {

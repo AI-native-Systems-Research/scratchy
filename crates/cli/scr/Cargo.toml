@@ -50,10 +50,10 @@ bench = ["scratchy-bench"]
 # The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `scr bench
 # serve --dataset-name rag --rag-source two-wiki|hotpotqa`.
 bench-datasets = ["bench", "scratchy-bench/datasets"]
-# `dep:scratchy-forward-compiler` + `scratchy-forward-compiler/metal` surface
+# `dep:scratchy-forward-compiler` surfaces
 # `BackboneDumpRegistration` + `Instruction::normalize` so
-# `scr model info` works on metal builds. Backends enable the ENGINE (via scratchy-serving-api/
-# <backend>), not the HTTP server — a backend is only meaningful with local
+# `scr model info` works on metal builds. Backends enable the ENGINE and their target's worker,
+# not the HTTP server — a backend is only meaningful with local
 # inference.
 #
 # `metal` is `metal-base` with two scratchy-models features on, both off for
@@ -76,13 +76,13 @@ bench-datasets = ["bench", "scratchy-bench/datasets"]
 #
 # `metal-base` alone builds the same engine with a dense KV cache and no MTP
 # heads; add `model/mtp-heads` back for drafting over a dense cache.
-metal-base = ["dep:scratchy-serving-api", "dep:scratchy-target-metal-worker", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
+metal-base = ["dep:scratchy-serving-api", "dep:scratchy-target-metal-worker", "dep:scratchy-forward-compiler"]
 metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
 # get something that can actually run a model.
-spyre = ["dep:scratchy-serving-api", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/spyre", "model?/spyre"]
+spyre = ["dep:scratchy-serving-api", "dep:scratchy-forward-compiler", "model?/spyre"]
 # ANY CARD — the ONE card tier, the same name the api, worker and target crates use. This crate
 # REFERENCES it: `main.rs`'s `libc::_exit` (senlib's atexit resets the device, so the process must
 # not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never

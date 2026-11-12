@@ -14936,7 +14936,7 @@ pub fn emit_model(
                 quote! {
                     pub fn superdsc_weights(
                         _w: &Weights,
-                    ) -> ::anyhow::Result<::std::vec::Vec<::scratchy_forward_compiler::BoundWeight>> {
+                    ) -> ::anyhow::Result<::std::vec::Vec<::scratchy_target_spyre::BoundWeight>> {
                         ::anyhow::bail!(
                             "{}: no weight binding was generated — the decode point did not lower, \
                              so this model cannot be launched on spyre",
@@ -17077,8 +17077,8 @@ pub fn emit_model(
             ctx: &crate::__gpu::ForwardCtx,
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
-            followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_forward_compiler::GpuExecutionFailed> {
+            followup: ::core::option::Option<::scratchy_target_metal::model::MetalForwardFollowup<'_>>,
+        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_target_metal::model::GpuExecutionFailed> {
             let pool = resident_metal_pool(wm, ctx, device);
             // A guest's slots are its host's, which may be sparse: the host reads none of them.
             assert!(
@@ -17110,8 +17110,8 @@ pub fn emit_model(
                 // Resolve the outputs from the worker's arena, its runtime bindings and the
                 // canonical's compile-time vocab; map error variants.
                 let tail_adapter = followup.map(|f| {
-                    move |enc: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                              dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                    move |enc: &::scratchy_target_metal::model::ProtocolObject<
+                              dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
                           >,
                           worker: &::scratchy_target_metal::interpreter::metal::MetalWorker<Weights>,
                           #captured_runtime: &::scratchy_target_metal::interpreter::metal::RuntimeBindings,
@@ -17121,7 +17121,7 @@ pub fn emit_model(
                         ::scratchy_target_metal::interpreter::metal::ForwardError,
                     > {
                         let spec = ::scratchy_target_metal::interpreter::metal::Buckets::row(bucket);
-                        let outputs = ::scratchy_forward_compiler::FollowupOutputs {
+                        let outputs = ::scratchy_target_metal::model::FollowupOutputs {
                             logits: &worker.arena[spec.terminal_slot as usize],
                             hidden: &worker.arena[spec.backbone_slot as usize],
                             // A DFlash2 head's target's captured rows.
@@ -17191,7 +17191,7 @@ pub fn emit_model(
             // KV not mapped), which still stops the server.
             .map_err(|e| match e {
                 ::scratchy_target_metal::interpreter::metal::ForwardError::ExecutionFailed(_) => {
-                    ::scratchy_forward_compiler::GpuExecutionFailed(e.to_string())
+                    ::scratchy_target_metal::model::GpuExecutionFailed(e.to_string())
                 }
                 // Its `Display` names `MetalWorkerPool::forward` already.
                 other => ::core::panic!("{other}"),
@@ -17211,21 +17211,21 @@ pub fn emit_model(
             ctx: &crate::__gpu::ForwardCtx,
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
-            encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+            encoder: &::scratchy_target_metal::model::ProtocolObject<
+                dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
             >,
         ) -> ::core::result::Result<
-            ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>,
+            ::std::boxed::Box<dyn ::scratchy_target_metal::model::MetalForwardOnto + 'w>,
             ::std::string::String,
         > {
             struct Onto<'p>(::scratchy_target_metal::interpreter::metal::Onto<'p, Weights>);
-            impl ::scratchy_forward_compiler::MetalForwardOnto for Onto<'_> {
+            impl ::scratchy_target_metal::model::MetalForwardOnto for Onto<'_> {
                 unsafe fn then(
                     &mut self,
                     ctx: crate::__gpu::ForwardCtxHandle<'_>,
                     num_tokens: u64,
-                    encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                        dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                    encoder: &::scratchy_target_metal::model::ProtocolObject<
+                        dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
                     >,
                 ) -> ::core::result::Result<(), ::std::string::String> {
                     let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
@@ -17236,8 +17236,8 @@ pub fn emit_model(
 
                 fn hidden(
                     &self,
-                ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
+                ) -> &::scratchy_target_metal::model::ProtocolObject<
+                    dyn ::scratchy_target_metal::model::MTLBuffer,
                 > {
                     let row = ::scratchy_target_metal::interpreter::metal::Buckets::row(self.0.bucket());
                     &self.0.worker().arena[row.backbone_slot as usize]
@@ -17245,8 +17245,8 @@ pub fn emit_model(
 
                 fn logits(
                     &self,
-                ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
+                ) -> &::scratchy_target_metal::model::ProtocolObject<
+                    dyn ::scratchy_target_metal::model::MTLBuffer,
                 > {
                     let row = ::scratchy_target_metal::interpreter::metal::Buckets::row(self.0.bucket());
                     &self.0.worker().arena[row.terminal_slot as usize]
@@ -17254,10 +17254,10 @@ pub fn emit_model(
 
                 fn draft_selection(
                     &self,
-                ) -> ::core::option::Option<::scratchy_forward_compiler::DraftSelection<'_>> {
+                ) -> ::core::option::Option<::scratchy_target_metal::model::DraftSelection<'_>> {
                     use ::scratchy_target_metal::dflash2::DraftOutput as O;
                     (self.0.runtime().draft.as_ref()).map(|d| {
-                        ::scratchy_forward_compiler::DraftSelection {
+                        ::scratchy_target_metal::model::DraftSelection {
                             tokens: d.output(O::Tokens),
                             candidates: d.output(O::Candidates),
                             q_probs: d.output(O::QProbs),
@@ -17275,7 +17275,7 @@ pub fn emit_model(
             with_forward_inputs(ctx, num_tokens, |inputs| pool.forward_onto(inputs, encoder))
                 .and_then(::core::convert::identity)
                 .map(|onto| ::std::boxed::Box::new(Onto(onto))
-                    as ::std::boxed::Box<dyn ::scratchy_forward_compiler::MetalForwardOnto + 'w>)
+                    as ::std::boxed::Box<dyn ::scratchy_target_metal::model::MetalForwardOnto + 'w>)
                 .map_err(|e| format!("MetalWorkerPool::forward_onto: {e}"))
         }
 
@@ -17291,7 +17291,7 @@ pub fn emit_model(
         /// `num_tokens` is the shape of EACH forward iter (constant
         /// across iters because the K-step decode shape is fixed).
         ///
-        /// [`ChainStepHandle`]: ::scratchy_forward_compiler::ChainStepHandle
+        /// [`ChainStepHandle`]: ::scratchy_target_metal::model::ChainStepHandle
         #[cfg(feature = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_chain_with_encoder(
@@ -17299,7 +17299,7 @@ pub fn emit_model(
             ctx: &crate::__gpu::ForwardCtx,
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
-            body: ::scratchy_forward_compiler::MetalChainBody<'_>,
+            body: ::scratchy_target_metal::model::MetalChainBody<'_>,
         ) -> ::core::result::Result<(), ::std::string::String> {
             let pool = resident_metal_pool(wm, ctx, device);
             with_forward_inputs(ctx, num_tokens, |inputs| {
@@ -17331,15 +17331,15 @@ pub fn emit_model(
                         }
                         impl<W: ::scratchy_forward_compiler::CanonicalParams
                             + ::scratchy_target_metal::interpreter::metal::BakedBuckets>
-                            ::scratchy_forward_compiler::ChainStepHandle for Adapter<'_, W>
+                            ::scratchy_target_metal::model::ChainStepHandle for Adapter<'_, W>
                         {
                             fn run_forward_step(
                                 &self,
-                                encoder: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                                    dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                                encoder: &::scratchy_target_metal::model::ProtocolObject<
+                                    dyn ::scratchy_target_metal::model::MTL4ComputeCommandEncoder,
                                 >,
                                 num_seqs: u32,
-                                sampled_rows: ::scratchy_forward_compiler::SampledRowCount,
+                                sampled_rows: ::scratchy_target_metal::model::SampledRowCount,
                             ) -> ::core::result::Result<(), ::std::string::String> {
                                 self.worker
                                     .run_bucket_mtl4(
@@ -17354,8 +17354,8 @@ pub fn emit_model(
 
                             fn logits_buf(
                                 &self,
-                            ) -> &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
-                                dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
+                            ) -> &::scratchy_target_metal::model::ProtocolObject<
+                                dyn ::scratchy_target_metal::model::MTLBuffer,
                             > {
                                 &self.worker.arena[self.terminal_slot]
                             }
@@ -17374,7 +17374,7 @@ pub fn emit_model(
                         // worker's body closure recovers `&RuntimeBindings`.
                         body(
                             &adapter,
-                            ::scratchy_forward_compiler::MetalRuntimeHandle::new(runtime),
+                            ::scratchy_target_metal::model::MetalRuntimeHandle::new(runtime),
                             enc,
                         )
                         .map_err(
