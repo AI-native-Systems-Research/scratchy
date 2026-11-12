@@ -411,6 +411,15 @@ pub fn quant_chain(steps: &[CudaStep]) -> Result<(), QuantChainError> {
     }
 }
 
+/// Whether a `GatedDeltaNet` step of `rows` rows scans with the recurrent kernel
+/// (`kernels/gdn_scan.cu`) rather than the chunked one (`kernels/gdn_chunk_scan.cu`, FP8 S8 F6a): at
+/// a one-row bucket, a decode the one-launch `GdnDecode` does not take (the 27B's three value heads
+/// a key head), where the chunked scan would pay a 64-token chunk for one token; every prefill
+/// bucket's is the chunked scan. A constant of each step (its `rows`), chosen at expansion.
+pub const fn gdn_scan_is_recurrent(rows: u32) -> bool {
+    rows == 1
+}
+
 /// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`): one CTA
 /// per key head owns its value heads, `nv / nk` of them; qwen3.5's are 1 (0.8B) and 2 (9B, 35B).
 pub const GDN_DECODE_MAX_HEADS: u32 = 4;

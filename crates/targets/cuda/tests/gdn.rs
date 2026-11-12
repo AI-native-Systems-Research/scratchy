@@ -2988,15 +2988,28 @@ const PHASES: [&str; 12] = [
     "state_store",
 ];
 
+/// Whether the one-launch decode (`gdn_decode`) takes geometry `d`: the decode tapes' rule
+/// (`steps_from_tape`'s `gdn_decode_takes`), else a one-row bucket's GDN step is the four launches
+/// with the recurrent scan (`step::gdn_scan_is_recurrent`): the 27B's three value heads a key head.
+fn gdn_decode_takes(d: GdnDims) -> bool {
+    let heads = d.nv / d.nk;
+    (d.head_v == 128 || d.head_v == 256)
+        && d.nv.is_multiple_of(d.nk)
+        && (1..=4).contains(&heads)
+        && 16usize.is_multiple_of(heads)
+        && 2 + heads * d.head_v / 128 <= 8
+}
+
 /// FP8 S8 F6-2, decode after a chunked prefill at the real tapes' shapes: the 35B's and 27B's GDN
 /// geometries, a prefill bucket of 512 and of 2,048 rows holding `rows − 37` real tokens (the
-/// rest padding) by the chunked scan, then 8 decodes by the one-launch decode kernel the decode
-/// tapes run (`gdn_decode`), each from the slot the last left. The slot's state after the decodes
-/// within the chunked state bound of the f64 recurrence over the whole sequence (the prefill's own
-/// conv_out, g and β, then the decode tokens' from the CPU conv and gating, from the ring the
-/// prefill left), and every decode's output finite.
+/// rest padding) by the chunked scan, then 8 decodes as the decode tapes run them, each from the
+/// slot the last left: the one-launch decode (`gdn_decode`) where it takes the geometry (the
+/// 35B), else the four launches at one row with the recurrent scan (the 27B). The slot's state
+/// after the decodes within the chunked state bound of the f64 recurrence over the whole sequence
+/// (the prefill's own conv_out, g and β, then the decode tokens' from the CPU conv and gating, from
+/// the ring the prefill left), and every decode's output finite.
 #[test]
-fn a_one_launch_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
+fn a_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
     use scratchy_target_cuda::kernels::{GdnDecodeOperands, gdn_decode};
     const DECODES: usize = 8;
     let device = h100();
@@ -3028,8 +3041,14 @@ fn a_one_launch_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
                 d.conv_kernel as u32,
             );
             let mut finite = true;
+            let one_launch = gdn_decode_takes(d);
             for t in q_len..q_len + DECODES {
                 let tok = chunk(&x, d, t, 1, 1);
+                if !one_launch {
+                    let s = run_step(&device, &pool, &bb, d, &tok, (1, false)).expect("a decode");
+                    finite &= s.out.iter().all(|&h| (h & 0x7F80) != 0x7F80);
+                    continue;
+                }
                 let seq = up_u32(&device, &[1, 1, 0, 0]);
                 let (qkv, a, b, z) = (
                     up(&device, &tok.qkv),
@@ -3112,9 +3131,14 @@ fn a_one_launch_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
                 |_| true,
             );
             let ok = st.pass() && finite;
+            let by = if one_launch {
+                "gdn_decode"
+            } else {
+                "the four launches (recurrent scan)"
+            };
             eprintln!(
-                "decode by gdn_decode after a chunked prefill bucket {} rows={rows} q_len={q_len} \
-                 + {DECODES}: state {} outputs_finite={finite} {}",
+                "decode by {by} after a chunked prefill bucket {} rows={rows} q_len={q_len} + \
+                 {DECODES}: state {} outputs_finite={finite} {}",
                 model(d),
                 st.line(),
                 verdict(ok)
@@ -3124,6 +3148,6 @@ fn a_one_launch_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
     }
     assert!(
         pass,
-        "a one-launch decode after a chunked prefill bucket left the recurrence's bound"
+        "a decode after a chunked prefill bucket left the recurrence's bound"
     );
 }
