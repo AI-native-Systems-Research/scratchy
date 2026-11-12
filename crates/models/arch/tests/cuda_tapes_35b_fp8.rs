@@ -53,7 +53,7 @@ const DECODE_STEPS: [(&str, usize); 21] = [
 /// The decode tape's quant writes and their readers (FP8 S8 T2).
 const DECODE_QUANTS: usize = 60;
 const DECODE_QUANT_READERS: usize = 180;
-const PREFILL_STEPS: [(&str, usize); 24] = [
+const PREFILL_STEPS: [(&str, usize); 25] = [
     ("AddRmsNorm", 80),
     ("AttnPrefill", 10),
     ("Embed", 1),
@@ -65,6 +65,7 @@ const PREFILL_STEPS: [(&str, usize); 24] = [
     ("GateSplit", 10),
     ("GateUpAct", 40),
     ("GatedDeltaNet", 30),
+    ("GatherLastRow", 1),
     ("Gemm", 31),
     ("GemmFp8", 50),
     ("GemmGroup", 30),

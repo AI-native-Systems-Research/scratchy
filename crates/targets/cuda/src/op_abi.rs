@@ -540,7 +540,7 @@ mod tests {
     /// (stage 1) and Gemma's per-expert scale (stage 2), nothing at stage 3. The one-row table is
     /// the every-bucket sweep, then the experts' `ExpertActivation`.
     #[test]
-    fn cuda_declares_its_folds_per_bucket_and_no_sampled_rows() {
+    fn cuda_declares_its_folds_per_bucket_and_samples_the_dense_lm_head() {
         for table in [&CUDA_FUSIONS, &CUDA_FUSIONS_ONE_ROW] {
             assert!(table.rows.is_none());
         }
@@ -555,7 +555,7 @@ mod tests {
         else {
             panic!("the one-row table's counted operands");
         };
-        assert!(CUDA_SAMPLE_ROWS.weights.is_empty());
+        assert_eq!(CUDA_SAMPLE_ROWS.weights, [GemmWeightKind::Dense]);
         // The one-row table has the residual epilogues' sweep, the rope sweep (FP8 S8 W4a, W4c) and
         // the experts' sweep; every other bucket's has the one sweep.
         assert_eq!(cuda_fusions(1).sweeps.len(), 4);
