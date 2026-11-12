@@ -13,6 +13,7 @@ pub mod common {
     pub mod attn_gate;
     pub mod attn_layer;
     pub mod chains;
+    pub mod decoder;
     pub mod fp8;
     pub mod gdn_layer;
     pub mod gemma_attn;
@@ -2614,6 +2615,7 @@ fn decode_layer_buckets() -> &'static [CudaTape] {
         CanonicalAt {
             stem: "attn_layer(1)",
             m: 1,
+            rows: scratchy_subtile::sample_rows::ResultRows::Every,
         },
     )
     .expect("the attention layer lowers at one row");
@@ -2851,6 +2853,7 @@ fn moe_buckets() -> &'static [CudaTape] {
                     CanonicalAt {
                         stem: "moe_block",
                         m: u64::from(m),
+                        rows: scratchy_subtile::sample_rows::ResultRows::Every,
                     },
                 )
                 .unwrap_or_else(|e| panic!("the MoE block lowers at m={m}: {e:?}"));
@@ -3097,6 +3100,7 @@ fn gemma_moe_buckets() -> &'static [CudaTape] {
         let at = CanonicalAt {
             stem: "gemma_moe",
             m: 512,
+            rows: scratchy_subtile::sample_rows::ResultRows::Every,
         };
         let c = lower_canonical(&gemma_moe(512), GEMMA_MOE_FACTS, at)
             .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m=512: {e}"));
@@ -3126,6 +3130,7 @@ fn gemma_moe_block_buckets() -> &'static [CudaTape] {
                 let at = CanonicalAt {
                     stem: "gemma_moe_block",
                     m: u64::from(m),
+                    rows: scratchy_subtile::sample_rows::ResultRows::Every,
                 };
                 let c = lower_canonical(&gemma_moe_block(m), GEMMA_MOE_BLOCK_FACTS, at)
                     .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m={m}: {e}"));
@@ -3142,6 +3147,7 @@ fn gemma_moe_small_buckets() -> &'static [CudaTape] {
         let at = CanonicalAt {
             stem: "gemma_moe",
             m: 1,
+            rows: scratchy_subtile::sample_rows::ResultRows::Every,
         };
         let c = lower_canonical(&gemma_moe(1), GEMMA_MOE_FACTS, at)
             .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m=1: {e}"));
@@ -3392,6 +3398,7 @@ fn gemma_rows_buckets() -> &'static [CudaTape] {
                 let at = CanonicalAt {
                     stem: "gemma_rows",
                     m: u64::from(m),
+                    rows: scratchy_subtile::sample_rows::ResultRows::Every,
                 };
                 let c = lower_canonical(&gemma_rows(m), GEMMA_ROWS_FACTS, at)
                     .unwrap_or_else(|e| panic!("the Gemma row chain lowers at m={m}: {e}"));
@@ -3539,6 +3546,7 @@ fn gemma_mlp_buckets() -> &'static [CudaTape] {
         let at = CanonicalAt {
             stem: "gemma_mlp",
             m: 1,
+            rows: scratchy_subtile::sample_rows::ResultRows::Every,
         };
         let c = lower_canonical(&gemma_mlp(1), GEMMA_MLP_FACTS, at)
             .unwrap_or_else(|e| panic!("the Gemma MLP lowers at m=1: {e}"));
@@ -3678,6 +3686,7 @@ fn qwen_route_at_128() -> &'static [CudaTape] {
         let at = CanonicalAt {
             stem: "gemma_moe",
             m: 1,
+            rows: scratchy_subtile::sample_rows::ResultRows::Every,
         };
         let c = lower_canonical(&gemma_moe(1), GEMMA_MOE_FACTS, at)
             .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m=1: {e}"));
@@ -3806,6 +3815,7 @@ fn gemma_attn_buckets() -> &'static [CudaTape] {
                 let at = CanonicalAt {
                     stem: "gemma_attn",
                     m: u64::from(m),
+                    rows: scratchy_subtile::sample_rows::ResultRows::Every,
                 };
                 let c = lower_canonical(&gemma_attn(m), GEMMA_ATTN_FACTS, at)
                     .unwrap_or_else(|e| panic!("the Gemma sliding layer lowers at m={m}: {e}"));
@@ -4251,6 +4261,7 @@ fn gg_buckets(
             let at = CanonicalAt {
                 stem: "gemma_attn_global",
                 m: u64::from(m),
+                rows: scratchy_subtile::sample_rows::ResultRows::Every,
             };
             let c = lower_canonical(&lower(m), GEMMA_ATTN_FACTS, at)
                 .unwrap_or_else(|e| panic!("the Gemma {name} lowers at m={m}: {e}"));
@@ -4942,7 +4953,11 @@ fn w4_tapes(
     use scratchy_target_cuda_compiler::canonical::{
         cuda_fold_facts, lower_plan, plan_canonical_folding,
     };
-    let at = CanonicalAt { stem: "w4", m: 1 };
+    let at = CanonicalAt {
+        stem: "w4",
+        m: 1,
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
+    };
     let on = lower_canonical(l, facts, at).expect("the one-row tape lowers with its folds");
     let off_facts = scratchy_subtile::tape_folding::ModelFoldFacts {
         matvec_ends: false,
@@ -5210,5 +5225,100 @@ fn a_row_forward_is_that_row_of_the_whole_forward_bit_for_bit() {
     assert!(
         pass,
         "a row forward differs from its row of the whole forward, or a refusal is wrong"
+    );
+}
+
+// ── F2: the sampled row's lm_head ──────────────────────────────────
+
+/// F2: a decoder's sampled row. The attention layer, its final norm and a bf16 lm_head (and Gemma's
+/// soft-cap), planned at m = 256 with every row read and with the sampled rows read, on one worker
+/// and one input: row `q_len − 1` of the every-row forward's logits against row 0 of the sampled
+/// forward's (the gather's row moved to the front, the lm_head over one 128-row tile), bit for bit,
+/// at `q_len` 1, 100 and 256 from an empty prefix and 128 after a 64-token prefix. The sampled tape
+/// has one gather, the every-row tape none.
+#[test]
+fn the_sampled_row_is_the_every_row_forwards_last_row_bit_for_bit() {
+    use common::decoder::{VOCAB, decoder};
+    use scratchy_subtile::sample_rows::ResultRows;
+    let device = h100();
+    let mut table = layer_table(&device, &layer_weights());
+    let up = |b: &[u16]| DeviceBuffer::upload(&device, b).expect("upload a weight");
+    table.push(up(&centred_gains(AL_H, 0x0F20_0001)));
+    table.push(up(&bf16_inputs(VOCAB as usize * AL_H, 0x0F20_0002)));
+    let m = 256u32;
+    let width = VOCAB as usize;
+    let mut pass = true;
+    for soft_cap in [false, true] {
+        let l = decoder(m, soft_cap);
+        let lowered = |rows| {
+            let at = CanonicalAt {
+                stem: "decoder",
+                m: u64::from(m),
+                rows,
+            };
+            static_tape(&lower_canonical(&l, QWEN3_5_FACTS, at).expect("the decoder lowers"))
+        };
+        let tapes: &'static [CudaTape; 2] = Box::leak(Box::new([
+            lowered(ResultRows::Every),
+            lowered(ResultRows::Sampled),
+        ]));
+        let gathers = |t: &CudaTape| {
+            (t.steps.iter())
+                .filter(|s| matches!(s, CudaStep::GatherLastRow(_)))
+                .count()
+        };
+        let shape = [gathers(&tapes[0]), gathers(&tapes[1])];
+        eprintln!(
+            "sampled row, soft_cap={soft_cap}: gathers every={} sampled={} {}",
+            shape[0],
+            shape[1],
+            verdict(shape == [0, 1])
+        );
+        pass &= shape == [0, 1];
+        let mut worker = CudaWorker::new(&device, tapes, &table, POOL, None).expect("worker");
+        let x = layer_input(m as usize, 0x0F20);
+        let block_table = [11u32, 3, 14, 0, 5];
+        for (prefix_len, q_len) in [(0u32, 1u32), (0, 100), (0, m), (64, 128)] {
+            let blocks = (prefix_len + q_len).div_ceil(64) as usize;
+            let seq = KvSequence {
+                block_table: &block_table[..blocks],
+                prefix_len,
+                q_len,
+            };
+            let positions = seq_positions(m as usize, prefix_len);
+            let mut every = vec![0u16; tapes[0].result.bytes as usize / 2];
+            (worker.forward(
+                0,
+                Input::Hidden(&x),
+                &positions,
+                Some(&seq),
+                None,
+                &mut every,
+            ))
+            .expect("the every-row forward");
+            let mut sampled = vec![0u16; width];
+            (worker.forward_row(
+                1,
+                Input::Hidden(&x),
+                &positions,
+                Some(&seq),
+                None,
+                (0, &mut sampled),
+            ))
+            .expect("the sampled forward");
+            let want = &every[(q_len as usize - 1) * width..][..width];
+            let bad = mismatched_bits(&sampled, want);
+            eprintln!(
+                "sampled row, soft_cap={soft_cap} prefix_len={prefix_len} q_len={q_len}: row 0 \
+                 against the every-row forward's row {}: mismatched_bits={bad} {}",
+                q_len - 1,
+                verdict(bad == 0)
+            );
+            pass &= bad == 0;
+        }
+    }
+    assert!(
+        pass,
+        "the sampled row is not the every-row forward's last row"
     );
 }

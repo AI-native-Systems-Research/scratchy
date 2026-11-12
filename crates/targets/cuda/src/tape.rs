@@ -16,9 +16,9 @@ use crate::step::{
     ARGMAX_CHUNK, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE,
     CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
     GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
-    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, QuantChainError, RmsNormBf16, RopeAppendBf16,
-    RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, quant_chain,
-    sort_index_regions,
+    GatedDeltaNetBf16, GatherLastRowBf16, GemmBf16, MoeRouteBf16, QuantChainError, RmsNormBf16,
+    RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch,
+    quant_chain, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -1775,6 +1775,14 @@ impl CudaTape {
             | CudaStep::ExpertGemvTcFp8(_)
             | CudaStep::ExpertGateUpTcFp8(_)
             | CudaStep::ExpertCombine(_) => self.check_moe_step(step, s),
+            // The gather reads `q_len` from the tape's KV sequence region.
+            CudaStep::GatherLastRow(GatherLastRowBf16 { sequence, .. }) => {
+                let seq = ArenaSpan {
+                    offset: sequence,
+                    bytes: 2 * KV_ENTRY_BYTES,
+                };
+                region(Region::Sequence, seq, self.kv.map(|k| k.sequence))
+            }
             CudaStep::Embed(_)
             | CudaStep::Gemm(_)
             | CudaStep::GemmNarrow(_)

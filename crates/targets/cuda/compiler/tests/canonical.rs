@@ -38,16 +38,19 @@ use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_fus
 const AT: CanonicalAt<'static> = CanonicalAt {
     stem: "fixture",
     m: 1,
+    rows: scratchy_subtile::sample_rows::ResultRows::Every,
 };
 
 const AT_128: CanonicalAt<'static> = CanonicalAt {
     stem: "fixture",
     m: 128,
+    rows: scratchy_subtile::sample_rows::ResultRows::Every,
 };
 
 const AT_256: CanonicalAt<'static> = CanonicalAt {
     stem: "fixture",
     m: 256,
+    rows: scratchy_subtile::sample_rows::ResultRows::Every,
 };
 
 /// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7. A fixture
@@ -1099,6 +1102,7 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
         ],
         embed_prefix: Some("model.embed_tokens".to_string()),
         bundle_tensor_names: Vec::new(),
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
     }
 }
 

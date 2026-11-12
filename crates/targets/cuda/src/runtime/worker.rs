@@ -41,11 +41,11 @@ use crate::step::{
     ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16,
     CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16,
-    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8,
-    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
-    ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_scratch_bytes, attn_decode_split,
-    fp8_moe_layout, fp8_weight, gemv_splits,
+    GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GatherLastRowBf16, GemmBf16, GroupMember,
+    LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16,
+    PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_scratch_bytes,
+    attn_decode_split, fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -1776,6 +1776,22 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 slot(out),
                                 (rows, cols),
                                 f32::from_bits(cap_bits),
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GatherLastRow(GatherLastRowBf16 {
+                        x,
+                        sequence,
+                        rows,
+                        cols,
+                    }) => {
+                        // SAFETY: as above, for `x` (`rows*cols`) and the sequence region (2 u32).
+                        unsafe {
+                            kernels::gather_last_row_bf16(
+                                slot(x),
+                                slot(sequence).cast_const(),
+                                (rows, cols),
                                 stream.0,
                             )
                         }

@@ -556,6 +556,9 @@ pub struct TargetModelInput {
     /// that [`BUNDLE_TENSOR_LEAVES`] names, and its full checkpoint tensor name: the bundle's
     /// prefix, rewritten by [`BUNDLE_PREFIX_REWRITES`], then the tensor's leaf.
     pub bundle_tensor_names: Vec<(u32, Option<UnrollIndex>, BundleTensor, String)>,
+    /// The rows of each canonical's result the forward's caller reads: a decoder's sampled logits
+    /// ([`crate::sample_rows::ResultRows::Sampled`]), an encoder's every row.
+    pub rows: crate::sample_rows::ResultRows,
 }
 
 /// One workload point: `m` token rows, `sk` the KV-length bucket.

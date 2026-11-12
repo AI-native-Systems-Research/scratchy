@@ -68,6 +68,7 @@ fn lower_with(
     let at = CanonicalAt {
         stem: "fixture",
         m: u64::from(l.input.ops[0].m),
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
     };
     lower_canonical(l, facts, at)
 }
@@ -1878,6 +1879,7 @@ fn a_gemm_with_an_extra_operand_is_refused() {
     let at = CanonicalAt {
         stem: "fixture",
         m: 256,
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
     };
     let mut p = plan_canonical(&l, QWEN3_5_FACTS, at).expect("the GEMMs plan");
     let gemm = (p.tape.instrs().iter())
@@ -2162,6 +2164,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
     let at = CanonicalAt {
         stem: "gdn_layer",
         m: 256,
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
     };
     let c = lower_canonical(&l, QWEN3_5_GDN_FACTS, at).expect("the GDN layer lowers");
     let gdn = c.gdn.expect("the GDN layer has GDN state");
@@ -2742,6 +2745,7 @@ fn gemma_moe_model(
         weight_prefixes: Vec::new(),
         embed_prefix: Some("m.embed_tokens".to_string()),
         bundle_tensor_names: names,
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
     }
 }
 
@@ -2870,6 +2874,7 @@ fn vnorm_shape(l: &LoweredDecode, facts: CudaModelFacts) -> (u32, u32) {
     let at = CanonicalAt {
         stem: "vnorm",
         m: 1,
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
     };
     let c = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("the v_norm lowers: {e}"));
     match static_tape(&c).steps {

@@ -101,6 +101,7 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::GeluMul(_) => "GeluMul",
             CudaStep::LayerScale(_) => "LayerScale",
             CudaStep::SoftCap(_) => "SoftCap",
+            CudaStep::GatherLastRow(_) => "GatherLastRow",
             CudaStep::RouterNorm(_) => "RouterNorm",
             CudaStep::GemmCol64(_) => "GemmCol64",
             CudaStep::GemmGroup(_) => "GemmGroup",

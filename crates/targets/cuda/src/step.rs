@@ -103,6 +103,11 @@ pub enum CudaStep {
     /// `cap · tanh(x / cap)` (Gemma's final logits), lowered from `SubOp::TanhSoftCap`
     /// (`kernels/pointwise_bf16.cu`, `scratchy_cuda_soft_cap_bf16`).
     SoftCap(SoftCapBf16),
+    /// The sequence's last row moved to the front of a decoder's result-matmul input, in place
+    /// (FP8 S8 F2), lowered from `SubOp::SampleRowsGather`: row `q_len − 1` of `x [rows, cols]`
+    /// copied over row 0, `q_len` read from the KV sequence region on the device
+    /// (`kernels/gather_last_row_bf16.cu`, `scratchy_cuda_gather_last_row_bf16`).
+    GatherLastRow(GatherLastRowBf16),
     /// Gemma's router pre-norm, `x̂ · router.scale` into the MoE scratch's router-norm region,
     /// lowered from `SubOp::RouterNorm`: the operands of [`Self::RmsNorm`], its gain the bundle's
     /// `router.scale` (`kernels/rms_norm_bf16.cu`, `scratchy_cuda_rms_norm_bf16`).
@@ -705,6 +710,22 @@ pub const SCALE_BF16_COLS: u32 = 8;
 /// The soft-cap's `cols` is a non-zero multiple of this (one 16-byte vector of 8 bf16), `rows`
 /// non-zero, and `rows · cols` at most `i32::MAX`.
 pub const SOFT_CAP_BF16_COLS: u32 = 8;
+
+/// The gather's `cols` is a non-zero multiple of this (one 16-byte unit of 8 bf16, so each row
+/// starts 16-byte aligned for the bulk copy), `rows` non-zero, and `rows · cols` at most
+/// `i32::MAX`.
+pub const GATHER_LAST_ROW_BF16_COLS: u32 = 8;
+
+/// Row `q_len − 1` of `x [rows, cols]` bf16 copied over its row 0, in place; `q_len` is entry 1
+/// of the KV sequence region (`[prefix_len, q_len]` u32), written by the forward. A `q_len` of 0,
+/// 1 or above `rows` copies nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GatherLastRowBf16 {
+    pub x: ArenaOffset,
+    pub sequence: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+}
 
 /// `out = x · scale` over `[rows, cols]`, bf16 in and out, computed in f32 and rounded once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1977,6 +1998,7 @@ impl CudaStep {
             | Self::GeluMul(_)
             | Self::LayerScale(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::RouterNorm(_)
             | Self::GemmCol64(_)
             // A grouped GEMV's members each take their own split, at their own place in the
@@ -2044,6 +2066,7 @@ impl CudaStep {
             | Self::GeluMul(_)
             | Self::LayerScale(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::RouterNorm(_)
             | Self::GemmCol64(_)
             | Self::GemmGroup(_)
@@ -2108,6 +2131,7 @@ impl CudaStep {
             | Self::GeluMul(_)
             | Self::LayerScale(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::RouterNorm(_)
             | Self::GemmCol64(_)
             | Self::AddRmsNorm(_)
@@ -3107,6 +3131,32 @@ impl CudaStep {
                     in_place: false,
                 })
             }
+            // The rows read (row `q_len − 1`, any of them) and the sequence region's two entries;
+            // the write is row 0 of the same rows, declared as the whole tensor it is in place over.
+            Self::GatherLastRow(GatherLastRowBf16 {
+                x,
+                sequence,
+                rows,
+                cols,
+            }) => {
+                let Some(bytes) = bf16_bytes(rows, cols) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(x, bytes)),
+                        Some(span(sequence, u32_bytes(2))),
+                        None,
+                        None,
+                    ],
+                    writes: span(x, bytes),
+                    second_write: None,
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                    in_place: true,
+                })
+            }
             // `pointwise_bf16.cu` reads each element before the same thread writes it, so the
             // soft-cap may write over its input.
             Self::SoftCap(SoftCapBf16 {
@@ -3310,6 +3360,7 @@ impl CudaStep {
             | Self::RmsNormUnit(_)
             | Self::GeluMul(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::QuantRowsFp8(_) => None,
         }
     }
