@@ -70,6 +70,7 @@ pub fn assert_tape_is_lowered_with(
     let at = CanonicalAt {
         stem: name,
         m: u64::from(tape.bucket_m),
+        rows: scratchy_subtile::sample_rows::ResultRows::Every,
     };
     let lowered =
         lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("{name}: lower_canonical: {e}"));

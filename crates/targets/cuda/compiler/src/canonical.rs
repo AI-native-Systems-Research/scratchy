@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use scratchy_subtile::handoff::{BundleTensor, LoweredDecode, RopePairing, SourceBinding};
 use scratchy_subtile::lower::GemmWeightKind;
-use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
+use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertProj;
 use scratchy_subtile::subtile_ir::{SubOp, SubtileIR, TensorShape, ValidatedGraph, lower_region};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
@@ -31,7 +31,7 @@ use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colou
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FOLD_PROJECTIONS,
-    CUDA_RESULT_ROWS, CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
+    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
 };
 use scratchy_target_cuda::step::{
     ACT_QUANT_MAX_COLS, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, ExpertGateUpTcFp8,
@@ -173,6 +173,9 @@ pub struct CanonicalAt<'a> {
     pub stem: &'a str,
     /// The canonical's rows.
     pub m: u64,
+    /// The rows of its result the forward's caller reads (Metal's `CanonicalAt::rows`): a
+    /// decoder's sampled logits, at the front; a test's fixture block, every row.
+    pub rows: ResultRows,
 }
 
 /// The shared passes' result for one canonical, before opcode lowering.
@@ -1423,11 +1426,10 @@ pub fn plan_canonical_folding(
     at: CanonicalAt<'_>,
     model: ModelFoldFacts,
 ) -> Result<CudaPlan, CanonicalRefusal> {
-    let CanonicalAt { stem, m } = at;
-    // CUDA's lm_head slice: none is declared, so this inserts nothing — but it runs, so a row
-    // added to the table takes effect without touching this function.
-    let lowered = expand_sample_rows(l, &CUDA_SAMPLE_ROWS, CUDA_RESULT_ROWS)
-        .map_err(CanonicalRefusal::SampleRows)?;
+    let CanonicalAt { stem, m, rows } = at;
+    // A decoder's sampled rows (FP8 S8 F2): its multi-row result matmul wrapped in the gather.
+    let lowered =
+        expand_sample_rows(l, &CUDA_SAMPLE_ROWS, rows).map_err(CanonicalRefusal::SampleRows)?;
     let graph = lower_region(&lowered.input, CUDA_COLUMN_BLOCK);
     let tape = {
         let valid = ValidatedGraph::new(&graph)

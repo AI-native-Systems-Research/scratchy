@@ -10,7 +10,7 @@
 //!
 //! ⭐ EVERY ENTRY IS THE CONSERVATIVE ONE. Each fact is the one that is correct for ANY kernel a
 //! later issue writes: every op writes a fresh buffer and reads its inputs across the step, no row
-//! is sampled, and the folds are the `SiluMul` and `MoeRoute` folds, whose kernels exist. That
+//! is sampled (but the dense `lm_head`'s, FP8 S8 F2), and the folds are the `SiluMul` and `MoeRoute` folds, whose kernels exist. That
 //! costs arena space and launches; an opcode issue wins them back one row at a time, by changing
 //! only its own op's row. The soft-cap has: its kernel writes over its input.
 
@@ -19,7 +19,7 @@ use std::num::NonZeroU32;
 use scratchy_subtile::handoff::SourceBinding;
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::ops::SubOpKind;
-use scratchy_subtile::sample_rows::{ResultRows, SampleRowsFacts};
+use scratchy_subtile::sample_rows::SampleRowsFacts;
 use scratchy_subtile::subtile_ir::{EwKind, ExpertBundle, ExpertProj, OpStage, RopeForm, SubOp};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
 use scratchy_subtile::tape_folding::{
@@ -105,10 +105,13 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         | L::KvEncode { .. }
         | L::KvStage { .. }
         | L::RotateRows { .. }
-        | L::AttnPackedKv
-        | L::SampleRowsGather
-        | L::SampleRowsScatter
-        | L::AllRowsMatmul => FRESH.reads_across(),
+        | L::AttnPackedKv => FRESH.reads_across(),
+        // The sampled rows move in place (FP8 S8 F2), Metal's rows: the gather over the result
+        // matmul's input, the scatter over its output, and the all-rows matmul writes the output
+        // it takes over.
+        L::SampleRowsGather => FRESH.output(A::Operand(OperandIx(0))).pinned_on(0),
+        L::SampleRowsScatter => FRESH.output(A::Operand(OperandIx(0))),
+        L::AllRowsMatmul => FRESH.output(A::Operand(OperandIx(1))),
         // Spyre's token draw and chained head (the spyre bake's mints; CUDA never lowers them):
         // each writes its own fresh buffer, metal's row.
         L::Sample { .. } | L::EmbedRowGather { .. } | L::ChainStage { .. } => FRESH,
@@ -145,14 +148,14 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
 
 // ── The sampled rows ────────────────────────────────────────────────
 
-/// CUDA's sampled rows: none. The `lm_head` computes every row (bf16 only, no sliced matmul yet),
-/// so `sample_rows::expand_sample_rows` inserts nothing.
-pub const CUDA_SAMPLE_ROWS: SampleRowsFacts = SampleRowsFacts { weights: &[] };
-
-/// The rows of a CUDA tape's result its caller reads: every row, in order. The worker downloads
-/// the whole result colour (no row is sampled to the front), so the shared sample-rows pass leaves
-/// the canonical as it is.
-pub const CUDA_RESULT_ROWS: ResultRows = ResultRows::Every;
+/// CUDA's sampled rows (FP8 S8 F2): a dense result matmul (the bf16 `lm_head`) of a multi-row
+/// decoder canonical runs over one 128-row tile, after the gather moved the sequence's last row
+/// (`q_len − 1`, read from the KV sequence region on the device) to the activation's front, so
+/// the sampled row's logits are its output's row 0. Whether a canonical's caller reads the
+/// sampled rows is the model's (`canonical::CanonicalAt::rows`).
+pub const CUDA_SAMPLE_ROWS: SampleRowsFacts = SampleRowsFacts {
+    weights: &[GemmWeightKind::Dense],
+};
 
 // ── The fusions ─────────────────────────────────────────────────────
 

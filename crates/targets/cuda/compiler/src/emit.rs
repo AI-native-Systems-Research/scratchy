@@ -122,6 +122,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RmsNormUnitBf16",
                 "LayerScaleBf16",
                 "SoftCapBf16",
+                "GatherLastRowBf16",
                 "GemmGroupBf16",
                 "GroupMember",
                 "AddRmsNormBf16",
@@ -390,6 +391,7 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
         let at = CanonicalAt {
             stem: &input.stem,
             m: u64::from(b.point.m),
+            rows: input.rows,
         };
         let lowered = lower_canonical(&b.lowered, facts, at);
         by_m.entry(b.point.m)
@@ -680,7 +682,8 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::Scale(_)
         | CudaStep::RmsNormUnit(_)
         | CudaStep::GeluMul(_)
-        | CudaStep::SoftCap(_) => None,
+        | CudaStep::SoftCap(_)
+        | CudaStep::GatherLastRow(_) => None,
         // Read through their members ([`CudaStep::parts`]), each a GEMM's `[n, k]`.
         CudaStep::GemmGroup(_)
         | CudaStep::GemmNarrowGroup(_)

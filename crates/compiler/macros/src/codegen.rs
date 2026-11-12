@@ -8167,6 +8167,10 @@ fn target_model_input(
         weight_prefixes,
         embed_prefix: lent_weight_prefix(program, fuf, model, LentWeight::EmbedTokens),
         bundle_tensor_names,
+        rows: match backbone_layout(fuf, program) {
+            BackboneLayout::Decoder => scratchy_subtile::sample_rows::ResultRows::Sampled,
+            BackboneLayout::Encoder => scratchy_subtile::sample_rows::ResultRows::Every,
+        },
         facts: TargetModelFacts {
             head_dim,
             rot_dim: rot_dim(model, head_dim),

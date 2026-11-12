@@ -23,6 +23,7 @@ fn lowered(lower: fn(u32) -> LoweredDecode) -> Vec<CudaTape> {
             let at = CanonicalAt {
                 stem: "kv_pool",
                 m: u64::from(m),
+                rows: scratchy_subtile::sample_rows::ResultRows::Every,
             };
             let c = lower_canonical(&lower(m), GEMMA_ATTN_FACTS, at)
                 .unwrap_or_else(|e| panic!("lowers at m={m}: {e}"));

@@ -468,6 +468,14 @@ unsafe extern "C" {
         cap: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gather_last_row_bf16_prepare() -> i32;
+    fn scratchy_cuda_gather_last_row_bf16(
+        x: *mut c_void,
+        sequence: *const c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_add_bf16_prepare() -> i32;
     fn scratchy_cuda_add_bf16(
         a: *const c_void,
@@ -1363,6 +1371,10 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
     ("pointwise_bf16", scratchy_cuda_pointwise_bf16_prepare),
+    (
+        "gather_last_row_bf16",
+        scratchy_cuda_gather_last_row_bf16_prepare,
+    ),
     ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
     ("gate_scale_bf16", scratchy_cuda_gate_scale_bf16_prepare),
     ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
@@ -1829,6 +1841,29 @@ pub unsafe fn soft_cap_bf16(
 ) -> Result<(), KernelError> {
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_soft_cap_bf16(x, out, rows, cols, cap, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the sampled row's gather (`kernels/gather_last_row_bf16.cu`, FP8 S8 F2): row `q_len −
+/// 1` of `x [rows, cols]` bf16 copied over row 0, in place, `q_len` entry 1 of `sequence`
+/// (`[prefix_len, q_len]` u32); a `q_len` of 0, 1 or above `rows` copies nothing. Asynchronous;
+/// refused with [`KernelError::RowShape`] unless `rows` and `cols` are non-zero, `cols` a multiple
+/// of [`crate::step::GATHER_LAST_ROW_BF16_COLS`] and `rows · cols` at most `i32::MAX`.
+///
+/// # Safety
+///
+/// `x` must be a 16-byte-aligned device pointer to `rows·cols` bf16 and `sequence` a 4-byte-aligned
+/// one to 2 u32, both valid for the whole kernel. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+pub unsafe fn gather_last_row_bf16(
+    x: *mut c_void,
+    sequence: *const c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe { scratchy_cuda_gather_last_row_bf16(x, sequence, rows, cols, stream) };
     check(code, KernelError::RowShape { rows, cols })
 }
 
