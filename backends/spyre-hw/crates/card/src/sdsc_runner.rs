@@ -536,8 +536,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     /// `new*` constructor; the ladder fan-outs call it as a separate wave so a rung's host build
     /// hides inside the owner's while the rung's ALLOCATIONS still happen only after the owner's
     /// — the tp-window and weight-region placement laws are laws about THIS half alone.
+    ///
+    /// ⭐ AND THE DEVICE HALF IS PER RANK AT ONCE — [`Self::each_parallel`], the host half's own
+    /// law. A rank's prepare touches only its own card, so the owner's ranks prepare together and
+    /// every wave session's ranks prepare together; run serially the half re-serializes what the
+    /// host fan-out parallelized (measured at tp/2: the ranks' prepares back-to-back cost 0.34 s
+    /// of boot).
     pub fn prepare(&mut self) -> Result<()> {
-        self.each(|e| e.prepare()).map(drop)
+        self.each_parallel("Prepare", |e| e.prepare()).map(drop)
     }
 
     /// ⭐ RANK 0 — the card whose readback a step returns. In a sharded world every value the host
@@ -574,8 +580,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     ///
     /// Each rank's thread runs on its card's NUMA node (`CardRuntime::cpus`) before it touches the
     /// card: its doorbell and its host writes stay on the card's socket.
+    ///
+    /// `name` prefixes the per-rank thread name, so the thread's phase (a step submit, a boot
+    /// prepare) and its placement can be read per rank.
     fn each_parallel<R: Send>(
         &mut self,
+        name: &str,
         f: impl Fn(&mut Executor<'c, T>) -> Result<R> + Sync,
     ) -> Result<Vec<R>> {
         use ktir_superdsc::collective::World;
@@ -588,9 +598,10 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
                 .ranks
                 .iter_mut()
                 .map(|(r, e)| {
-                    // Named `SubmitR<rank>`, so the thread's placement can be read per rank.
+                    // Named `<name>R<rank>`, so the thread's phase and placement can be read per
+                    // rank.
                     std::thread::Builder::new()
-                        .name(format!("SubmitR{}", r.get()))
+                        .name(format!("{name}R{}", r.get()))
                         .spawn_scoped(scope, move || {
                             let pinned = e
                                 .card_cpus()
@@ -765,7 +776,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
         let t0 = std::time::Instant::now();
-        let at = self.each_parallel(|e| {
+        let at = self.each_parallel("Submit", |e| {
             e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))?;
             Ok(t0.elapsed().as_secs_f64() * 1e3)
         })?;
@@ -1004,7 +1015,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         };
         // ⭐ EVERY CARD SUBMITS BEFORE ANY CARD IS WAITED ON — a rank's collective waits on its
         // peers' sends, so the forward is in flight on all of them before the host drains one.
-        let submitted = self.each_parallel(|e| e.predict_submit(n_new, seq_pos, want))?;
+        let submitted = self.each_parallel("Submit", |e| e.predict_submit(n_new, seq_pos, want))?;
         let mut row = vec![0u8; self.vocab * 2];
         for ((r, e), s) in self.ranks.iter_mut().zip(submitted) {
             // Rank 0 reads the row back; every other rank's forward is drained, its read the same
