@@ -92,6 +92,8 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::RouterLogits(_) => "RouterLogits",
             CudaStep::MoeRoute(_) => "MoeRoute",
             CudaStep::ExpertSort(_) => "ExpertSort",
+            CudaStep::ExpertSortFp8(_) => "ExpertSortFp8",
+            CudaStep::ExpertActQuant(_) => "ExpertActQuant",
             CudaStep::ExpertGemm(_) => "ExpertGemm",
             CudaStep::ExpertGemv(_) => "ExpertGemv",
             CudaStep::ExpertCombine(_) => "ExpertCombine",

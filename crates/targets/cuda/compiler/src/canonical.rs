@@ -34,9 +34,10 @@ use scratchy_target_cuda::op_abi::{
     CUDA_RESULT_ROWS, CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
 };
 use scratchy_target_cuda::step::{
-    ACT_QUANT_MAX_COLS, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, ExpertGateUpTcFp8,
-    GDN_SEQUENCE_BYTES, GateUpKernel, GateUpTcFp8, MoeWeight, QuantChainError, QuantRowsFp8,
-    gdn_scratch, gemv_tc_takes, quant_chain,
+    ACT_QUANT_MAX_COLS, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, ExpertActQuantFp8,
+    ExpertGateUpTcFp8, ExpertGemmBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel,
+    GateUpTcFp8, GatedOp, MoeWeight, QuantChainError, QuantRowsFp8, gdn_scratch, gemv_tc_takes,
+    quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -1751,6 +1752,7 @@ fn quantize_fp8_inputs(
     steps: Vec<CudaStep>,
     total: u64,
 ) -> Result<(Vec<CudaStep>, u64), CanonicalRefusal> {
+    let steps = fp8_moe_prefill(steps);
     let too_large = || CanonicalRefusal::Arena(ArenaRefusal::TooLarge);
     let align = |b: u64| {
         b.checked_next_multiple_of(CUDA_ARENA_ALIGN)
@@ -1785,6 +1787,9 @@ fn quantize_fp8_inputs(
         if let CudaStep::ExpertGateUpTcFp8(t) = &mut s {
             t.q_act = slots[1];
         }
+        if let CudaStep::ExpertActQuant(t) = &mut s {
+            t.q_act = slots[1];
+        }
         if let Some((x, rows, cols)) = s.quantized_input() {
             let held = (live.iter().flatten()).find(|l| (l.x, l.rows, l.cols) == (x, rows, cols));
             let q = match held {
@@ -1812,6 +1817,8 @@ fn quantize_fp8_inputs(
                 CudaStep::GateUpAct(g) => (g.gate.a, g.up.a) = (q, q),
                 CudaStep::GateUpTcFp8(t) => (t.fold.gate.a, t.fold.up.a) = (q, q),
                 CudaStep::ExpertGemm(g) => g.a = q,
+                // The e4m3 sort reads the token rows' quantization (FP8 S8 P1).
+                CudaStep::ExpertSortFp8(sort) => sort.x = q,
                 CudaStep::ExpertGemvTcFp8(g) => g.a = q,
                 CudaStep::ExpertGateUpTcFp8(t) => (t.fold.gate.a, t.fold.up.a) = (q, q),
                 _ => unreachable!("`quantized_input` names only the fp8 steps it reads"),
@@ -1848,6 +1855,57 @@ fn quantize_fp8_inputs(
         [_, b] => (slots[1].0.checked_add(align(b)?)).ok_or_else(too_large)?,
     };
     Ok((out, end))
+}
+
+/// FP8 S8 P1, an fp8 bank's MoE prefill: the sort its gate reads becomes the e4m3 sort (the token
+/// rows quantized once, before it: [`quantize_fp8_inputs`] inserts that quant write), and the act
+/// its down reads becomes the act + quantize over the live rows, which writes the down's quantized
+/// input (at the quant scratch's second slot, set by [`quantize_fp8_inputs`]). Every step's bits
+/// are the chain's it replaces; every other step is as it was.
+fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
+    let fp8 = |g: &ExpertGemmBf16| matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
+    for i in 0..steps.len() {
+        let later = &steps[i + 1..];
+        match steps[i] {
+            CudaStep::ExpertSort(sort) => {
+                let gate = later.iter().any(|s| {
+                    matches!(s, CudaStep::ExpertGemm(g)
+                        if fp8(g) && g.proj == ExpertProjection::Gate && g.a == sort.rows)
+                });
+                if gate {
+                    steps[i] = CudaStep::ExpertSortFp8(sort);
+                }
+            }
+            CudaStep::SiluMul(act) | CudaStep::GeluMul(act) => {
+                let op = match steps[i] {
+                    CudaStep::SiluMul(_) => GatedOp::Silu,
+                    _ => GatedOp::Gelu,
+                };
+                let down = later.iter().find_map(|s| match s {
+                    CudaStep::ExpertGemm(g)
+                        if fp8(g) && g.proj == ExpertProjection::Down && g.a == act.out =>
+                    {
+                        Some(*g)
+                    }
+                    _ => None,
+                });
+                let capacity = down.and_then(|d| d.max_tiles.checked_mul(CUDA_EXPERT_TILE_ROWS));
+                if let (Some(d), Some(rows)) = (down, capacity)
+                    && (act.rows, act.cols) == (rows, d.inter)
+                {
+                    steps[i] = CudaStep::ExpertActQuant(ExpertActQuantFp8 {
+                        act,
+                        op,
+                        offsets: d.offsets,
+                        experts: d.experts,
+                        q_act: ArenaOffset(0),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    steps
 }
 
 /// The KV pool of one canonical: its layers, ascending, its geometry (class 0's), and each
