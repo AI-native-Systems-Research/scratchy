@@ -22,10 +22,10 @@ pub mod common {
 }
 
 use common::numerics::{
-    F32Comparison, GDN_CHUNK_STEP, GDN_SCAN_STEP, GdnDims, ScanInputs, ScanReference, ScanVariant,
-    bf16_in, compare_f32, compare_rows, f32_from_halves, f32_inputs, f32_to_halves,
-    gdn_chunk_bound, gdn_conv_bound, gdn_conv_reference, gdn_gating_bound, gdn_gating_reference,
-    gdn_norm_reference, gdn_scan_bound, gdn_scan_reference, widen,
+    F32Comparison, GDN_CHUNK_REL, GDN_CHUNK_STEP, GDN_SCAN_STEP, GdnDims, ScanInputs,
+    ScanReference, ScanVariant, bf16_in, compare_f32, compare_rows, f32_from_halves, f32_inputs,
+    f32_to_halves, gdn_chunk_bound, gdn_conv_bound, gdn_conv_reference, gdn_gating_bound,
+    gdn_gating_reference, gdn_norm_reference, gdn_scan_bound, gdn_scan_reference, widen,
 };
 use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_target_cuda::kernels::{
@@ -2120,8 +2120,16 @@ fn compare_o_chunked(
     compare_f32(&s.o, &refs, |i| gdn_chunk_bound(r.o[i].0, r.o[i].1), keep)
 }
 
+/// The chunked scan's state check on element `i` of a reference's final state (`hk` key lanes a
+/// row): `2⁻⁷·|ref| + 2⁻¹⁰·(t_last+1)·Smax`, the output check's form (user decision 2026-11-12:
+/// the first rank-1 update's bf16 operands put up to ~2⁻⁷ of an element on it, past a term in
+/// Smax alone).
+fn chunk_state_bound(r: &ScanReference, i: usize, hk: usize) -> f64 {
+    GDN_CHUNK_REL * r.state[i].abs() + GDN_CHUNK_STEP * r.state_scale[i / hk]
+}
+
 /// [`check_scan`] under the chunked bound: `o` within it, its padding rows unwritten, the slot's
-/// state within `2⁻¹⁰·(t_last+1)·Smax`.
+/// state within [`chunk_state_bound`].
 fn check_chunk_scan(
     what: &str,
     d: GdnDims,
@@ -2135,12 +2143,7 @@ fn check_chunk_scan(
     let linear = GDN_CHUNK_STEP * r.o.get(cmp.worst).map_or(0.0, |p| p.1);
     let padding = written_past(&s.o, q_len * d.value_dim());
     let hk = d.head_k;
-    let st = compare_f32(
-        after,
-        &r.state,
-        |i| GDN_CHUNK_STEP * r.state_scale[i / hk],
-        |_| true,
-    );
+    let st = compare_f32(after, &r.state, |i| chunk_state_bound(&r, i, hk), |_| true);
     let ok = cmp.pass() && st.pass() && padding == 0;
     eprintln!(
         "{what} chunked scan L={q_len} t0={}: o {} linear_term_at_worst={linear:.4e} state {} \
@@ -2620,7 +2623,7 @@ fn chunk_aligned_pieces_are_bit_identical_to_one_forward() {
                 let st = compare_f32(
                     &after_two,
                     &r.state,
-                    |i| GDN_CHUNK_STEP * r.state_scale[i / hk],
+                    |i| chunk_state_bound(&r, i, hk),
                     |_| true,
                 );
                 let ok = cmp.pass() && st.pass();
@@ -2708,7 +2711,7 @@ fn a_decode_after_a_chunked_prefill_follows_the_recurrence() {
             let st = compare_f32(
                 &pool.ssm_slot(1),
                 &r.state,
-                |i| GDN_CHUNK_STEP * r.state_scale[i / hk],
+                |i| chunk_state_bound(&r, i, hk),
                 |_| true,
             );
             let ok = cmp.pass() && st.pass();

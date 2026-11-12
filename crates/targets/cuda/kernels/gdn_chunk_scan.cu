@@ -169,6 +169,22 @@ __device__ inline void set_diag_block(sq_rt& dst, const diag_rt& src, int w) {
     }
 }
 
+// `a`, `b`: a warp's 16 rows of a q or k head, its two 64-lane halves, each row scaled to unit norm
+// times `scale` (`l2_inv` of the row's sum of squares, the two halves' `row_sum`s added).
+__device__ inline void normalise_rows(sq_rt& a, sq_rt& b, float scale) {
+    sq_rt sq;
+    sq_rt::col_vec n, m;
+    warp::mul(sq, a, a);
+    warp::row_sum(n, sq);
+    warp::mul(sq, b, b);
+    warp::row_sum(m, sq);
+    warp::add(n, n, m);
+    warp::unary_op<scratchy::ops::l2_inv>(n, n);
+    warp::mul(n, n, scale);
+    warp::mul_row(a, a, n);
+    warp::mul_row(b, b, n);
+}
+
 // Every warp's operand stores visible to the next WGMMA: the async-proxy fence, then the barrier.
 __device__ inline void operands_ready() {
     warpgroup::mma_fence();
@@ -245,44 +261,65 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
 
     for (int c0 = 0; c0 < q_len; c0 += CHUNK) {
         const int nt = min(CHUNK, q_len - c0);
-        // 1. The chunk's rows: q̂, k̂ and v as bf16 operands, zero past `q_len`; g and β.
-        for (int r = 0; r < WARP_TOKENS; ++r) {
-            const int tt = i0 + r;
-            rv_fl<HALF> k0, k1, q0, q1, sq;
-            rv_fl<ROWS> v;
-            if (tt < nt) {
-                const int t = c0 + tt;
-                warp::load(q0, g.conv_out, {0, 0, t, kh * HEAD_K / HALF});
-                warp::load(q1, g.conv_out, {0, 0, t, kh * HEAD_K / HALF + 1});
-                warp::load(k0, g.conv_out, {0, 0, t, (key_dim + kh * HEAD_K) / HALF});
-                warp::load(k1, g.conv_out, {0, 0, t, (key_dim + kh * HEAD_K) / HALF + 1});
-                warp::load(v, g.conv_out, {0, 0, t, v_col / ROWS});
-                warp::mul(sq, k0, k0);
-                float kk = warp::sum(sq);
-                warp::mul(sq, k1, k1);
-                kk += warp::sum(sq);
-                warp::mul(sq, q0, q0);
-                float qq = warp::sum(sq);
-                warp::mul(sq, q1, q1);
-                qq += warp::sum(sq);
-                const float k_inv = scratchy::ops::l2_inv::op<float>(kk);
-                const float q_inv = scratchy::ops::l2_inv::op<float>(qq) * g.scale;
-                warp::mul(k0, k0, k_inv);
-                warp::mul(k1, k1, k_inv);
-                warp::mul(q0, q0, q_inv);
-                warp::mul(q1, q1, q_inv);
-            } else {
-                warp::zero(k0);
-                warp::zero(k1);
-                warp::zero(q0);
-                warp::zero(q1);
-                warp::zero(v);
+        // 1. The chunk's rows: q̂, k̂ and v as bf16 operands, zero past `q_len`; g and β. A warp whose
+        //    16 rows are all real loads them as whole register tiles, every load in flight at once
+        //    (one row at a time, each warp waited out five loads' latency a row: a third of a
+        //    chunk, F6 r2); the tail's warps load row by row, so no padding row is read.
+        if (i0 + WARP_TOKENS <= nt) {
+            const int tr = (c0 + i0) / WARP_TOKENS;
+            sq_rt k0, k1, q0, q1;
+            rows_rt vt;
+            warp::load(k0, g.conv_out, {0, 0, tr, (key_dim + kh * HEAD_K) / HALF});
+            warp::load(k1, g.conv_out, {0, 0, tr, (key_dim + kh * HEAD_K) / HALF + 1});
+            warp::load(q0, g.conv_out, {0, 0, tr, kh * HEAD_K / HALF});
+            warp::load(q1, g.conv_out, {0, 0, tr, kh * HEAD_K / HALF + 1});
+            warp::load(vt, g.conv_out, {0, 0, tr, v_col / ROWS});
+            normalise_rows(k0, k1, 1.0f);
+            warpgroup::store(kq[0][0], k0);
+            warpgroup::store(kq[0][1], k1);
+            normalise_rows(q0, q1, g.scale);
+            warpgroup::store(kq[1][0], q0);
+            warpgroup::store(kq[1][1], q1);
+            warpgroup::store(vb, vt);
+        } else {
+            for (int r = 0; r < WARP_TOKENS; ++r) {
+                const int tt = i0 + r;
+                rv_fl<HALF> k0, k1, q0, q1, sq;
+                rv_fl<ROWS> v;
+                if (tt < nt) {
+                    const int t = c0 + tt;
+                    warp::load(q0, g.conv_out, {0, 0, t, kh * HEAD_K / HALF});
+                    warp::load(q1, g.conv_out, {0, 0, t, kh * HEAD_K / HALF + 1});
+                    warp::load(k0, g.conv_out, {0, 0, t, (key_dim + kh * HEAD_K) / HALF});
+                    warp::load(k1, g.conv_out, {0, 0, t, (key_dim + kh * HEAD_K) / HALF + 1});
+                    warp::load(v, g.conv_out, {0, 0, t, v_col / ROWS});
+                    warp::mul(sq, k0, k0);
+                    float kk = warp::sum(sq);
+                    warp::mul(sq, k1, k1);
+                    kk += warp::sum(sq);
+                    warp::mul(sq, q0, q0);
+                    float qq = warp::sum(sq);
+                    warp::mul(sq, q1, q1);
+                    qq += warp::sum(sq);
+                    const float k_inv = scratchy::ops::l2_inv::op<float>(kk);
+                    const float q_inv = scratchy::ops::l2_inv::op<float>(qq) * g.scale;
+                    warp::mul(k0, k0, k_inv);
+                    warp::mul(k1, k1, k_inv);
+                    warp::mul(q0, q0, q_inv);
+                    warp::mul(q1, q1, q_inv);
+                } else {
+                    warp::zero(k0);
+                    warp::zero(k1);
+                    warp::zero(q0);
+                    warp::zero(q1);
+                    warp::zero(v);
+                }
+                warp::store(kq[0][0], k0, {tt, 0});
+                warp::store(kq[0][1], k1, {tt, 0});
+                warp::store(kq[1][0], q0, {tt, 0});
+                warp::store(kq[1][1], q1, {tt, 0});
+                warp::store(vb, v, {tt, 0});
             }
-            warp::store(kq[0][0], k0, {tt, 0});
-            warp::store(kq[0][1], k1, {tt, 0});
-            warp::store(kq[1][0], q0, {tt, 0});
-            warp::store(kq[1][1], q1, {tt, 0});
-            warp::store(vb, v, {tt, 0});
         }
         mark(1);
         if (threadIdx.x < CHUNK) {
