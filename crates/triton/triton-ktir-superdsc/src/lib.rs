@@ -198,10 +198,7 @@ impl ModuleMemo {
 /// operations — nothing downstream can mutate what it does not own. The node's own
 /// re-statements (name, bindings, mask, `node_out_tid`, `answer_rows`) are fields of
 /// the `KtirNode`, rebuilt per mint, never of the cached function.
-pub fn node_for_compiled(
-    compiled: &CompiledKernel,
-    program: Program,
-) -> Result<KtirNode, Error> {
+pub fn node_for_compiled(compiled: &CompiledKernel, program: Program) -> Result<KtirNode, Error> {
     let func = match &compiled.key {
         Some(key) => cached_handoff(&compiled.module, key)?,
         None => lower_handoff(&compiled.module)?,
