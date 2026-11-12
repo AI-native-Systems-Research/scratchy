@@ -4367,7 +4367,7 @@ pub fn head_blocks(
     // `nb.get() / hd` may be zero (when nb < hd); fall back to one
     // head — `NonZeroU32::new(...).unwrap_or(NonZeroU32::MIN)` is the
     // canonical "floor at 1" idiom on a NonZeroU32-output path.
-    let heads_per_block = NonZeroU32::new(nb.get() / head_dim.get()).unwrap_or(NonZeroU32::MIN);
+    let heads_per_block = NonZeroU32::new(nb.get() / head_dim).unwrap_or(NonZeroU32::MIN);
     let block = heads_per_block.saturating_mul(head_dim);
     n_blocks(total, block)
 }
