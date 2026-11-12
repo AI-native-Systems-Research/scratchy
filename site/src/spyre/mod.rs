@@ -14,17 +14,16 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
-use crate::Site;
 use crate::carbon::{
     ContentPanel, Fold, Heading, Layer, Section, Stack, TabItem, Table, TableCell, TableRow, Tabs,
-    TabsKind, Tile,
+    TabsKind, Tile, headers, part,
 };
 use crate::charts::{
-    Axes, Axis, AxisDomain, BarPoint, Chart, ChartOptions, Colour, Enabled, RatioSquare, Side,
-    SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, sparkline,
+    BarPoint, RatioSquare, Side, SparkAxes, Step, TableAxes, colour, glance_maps, glance_mini,
+    grouped_bars, highlight, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
-use crate::thousands_f;
+use crate::{DASH, Site, slug, thousands_f};
 use data::{Cell, Dtype, Metric, Notes, Progress, Provenance, Sweep};
 
 /// The sweep files, relative to site/; copied to the same place under
@@ -51,8 +50,6 @@ const TORCH: Side = Side {
 /// Two numbers this close together are the same number: the run-to-run
 /// spread the ratio scale's middle step holds.
 const NOISE: f64 = 0.04;
-
-const DASH: &str = "—";
 
 // --------------------------------------------------------------------- load
 
@@ -464,19 +461,6 @@ fn perfect(sweep: &Sweep, cells: &[&Cell], at: &Cell) -> Option<f64> {
     })
 }
 
-fn slug(text: &str) -> String {
-    let lower = text.to_lowercase();
-    let parts: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit())
-        .filter(|p| !p.is_empty())
-        .collect();
-    parts.join("-")
-}
-
-fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
-    names.map(String::from).to_vec()
-}
-
 /// What a section ends with: the notes on its cells, each once, then the
 /// sweep's own notes for it.
 fn closing_notes<'a>(
@@ -495,85 +479,29 @@ fn closing_notes<'a>(
     }
 }
 
-/// A part of a section: its heading, then what explains it, then it.
-fn part(heading: &str, intro: Element, body: Element) -> Element {
-    rsx! {
-        Section { level: 3,
-            Stack { gap: 3,
-                Heading { "{heading}" }
-                p { {intro} }
-                {body}
-            }
-        }
-    }
-}
-
 // ------------------------------------------------------------------ charts
 
 /// One bar chart: a bar per stack at each group, scratchy's blue first.
 fn bars(
     groups: &[(String, Option<f64>, Option<f64>)],
-    (title, xlabel, ylabel): (&str, &str, &str),
+    axes: (&str, &str, &str),
     height: &str,
     label: &str,
 ) -> Element {
-    // Carbon prints values as given: round to what the tables show.
-    let round = |v: Option<f64>| v.map(|v| (v * 10.0).round() / 10.0);
-    let pts = |name: &'static str, pick: usize| -> Vec<BarPoint> {
-        groups
-            .iter()
-            .map(|(k, torch, scratchy)| BarPoint {
-                group: name,
-                key: k.clone(),
-                value: round(if pick == 0 { *torch } else { *scratchy }),
-            })
-            .collect()
+    // scratchy's bars, then torch-spyre's, each a point a group.
+    let side = |name: &'static str, torch: bool| {
+        (groups.iter()).map(move |(k, t, s)| BarPoint {
+            group: name,
+            key: k.clone(),
+            value: if torch { *t } else { *s },
+        })
     };
-    let spec = Chart::GroupedBar {
-        data: [pts(SCRATCHY.line, 1), pts(TORCH.line, 0)].concat(),
-        options: ChartOptions {
-            title: title.to_string(),
-            axes: Axes {
-                bottom: Axis {
-                    maps_to: "key",
-                    title: xlabel,
-                    scale_type: Some("labels"),
-                    ticks: None,
-                    include_zero: None,
-                    visible: None,
-                    domain: Some(AxisDomain::Labels(
-                        groups.iter().map(|(k, _, _)| k.clone()).collect(),
-                    )),
-                },
-                left: Axis {
-                    maps_to: "value",
-                    title: ylabel,
-                    scale_type: None,
-                    ticks: None,
-                    include_zero: Some(true),
-                    visible: None,
-                    domain: None,
-                },
-            },
-            color: Some(Colour::Scale {
-                scale: [(SCRATCHY.line, colour("s1")), (TORCH.line, colour("s2"))]
-                    .into_iter()
-                    .collect(),
-            }),
-            heatmap: None,
-            height: height.to_string(),
-            width: None,
-            legend: None,
-            locale: None,
-            combo: None,
-            bounds: None,
-            bubble: None,
-            line: None,
-            hover: None,
-            toolbar: Enabled { enabled: false },
-        },
-    };
-    chart(&spec, label, "width: 100%", None)
+    let data = (side(SCRATCHY.line, false))
+        .chain(side(TORCH.line, true))
+        .collect();
+    let keys = groups.iter().map(|(k, _, _)| k.clone()).collect();
+    let colours = [(SCRATCHY.line, colour("s1")), (TORCH.line, colour("s2"))];
+    grouped_bars(data, keys, colours, axes, height, label)
 }
 
 /// One model's sparkline panel at one batch: its cells as steps along the
@@ -881,6 +809,7 @@ fn metric_section(
                 .collect();
             let lead = lead_text(&cs);
             Some(part(
+                3,
                 &format!("{}, {}, one request at a time", size_name(m), dtype.label()),
                 rsx! {
                     "{metric.label()} by context bucket (p50 where a median). {lead}. Lower is \
@@ -1013,6 +942,7 @@ fn conc_section(sweep: &Sweep) -> Element {
                 .collect();
             let lead = lead_text(&rows.iter().map(|r| r.3).collect::<Vec<_>>());
             Some(part(
+                3,
                 &format!("conc {conc}, fp16"),
                 rsx! {
                     "Decoded tokens per second with {conc} requests at once. {lead}. Higher is \
@@ -1514,6 +1444,7 @@ fn progress_section(progress: &[(PathBuf, Progress)], sweeps: &[(PathBuf, Sweep)
                 }
                 if !timelines.is_empty() {
                     {part(
+                        3,
                         "Each cell, over time",
                         rsx! {
                             "Every source that measured a moved cell, oldest first — a \
@@ -1541,6 +1472,7 @@ fn progress_section(progress: &[(PathBuf, Progress)], sweeps: &[(PathBuf, Sweep)
                     )}
                 }
                 {part(
+                    3,
                     "What each PR moved",
                     rsx! {
                         "Every progress entry's cells, the PR against the main it ran on, \

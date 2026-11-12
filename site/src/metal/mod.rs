@@ -21,20 +21,21 @@ use std::fs;
 
 use dioxus::prelude::*;
 
-use crate::Site;
 use crate::carbon::{
-    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Heading,
-    Section, Stack, Table, TableCell, TableRow, TipHeading, Toggletip,
+    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Stack, Table,
+    TableCell, TableRow, Toggletip, headers, part,
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Bounds, BubblePoint, Bubbles, Chart, ChartOptions,
     ColorLegend, Colour, ComboLayer, Enabled, Gradient, HeatPoint, HeatmapOptions, Hover,
     LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, ScaleFit, SparkAxes, SparkPoint, Step,
-    TableAxes, chart, colour, log2_ratio, mini_heatmap, ratio_ink, ratio_labels, ratio_scale,
+    TableAxes, chart, colour, grouped_bars, log2_ratio, mini_heatmap, ratio_labels, ratio_scale,
     ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
+use crate::{Site, slug};
 use data::{At, Cell, Model, RequestTiming, Run, Scenario};
+use datasets::{MapAt, MapRow, MapSquare, SummaryMap};
 use numbers::{
     Engine, FAILED, Metric, NO_STREAM, SHORT, cfmt, failed_note, fmt, marks, marks_note, served,
     timing,
@@ -263,9 +264,9 @@ fn borrow_earlier(runs: &mut [Run]) {
                         // apart from the rounds: as many tasks as this run's asked, by the count
                         // the lent cell recorded.
                         let same_tasks = |c: &data::TaskCell| {
-                            (!sampled_from_musique(&c.workload) || *lent_drawn == drawn)
+                            (!datasets::sampled(&c.workload) || *lent_drawn == drawn)
                                 && match (sizing, *theirs) {
-                                    _ if c.workload == "rag-accuracy" => {
+                                    _ if datasets::is_scored(&c.workload) => {
                                         c.num_tasks.is_some() && c.num_tasks == accuracy_tasks
                                     }
                                     (Some(a), Some(b)) => {
@@ -307,12 +308,6 @@ fn run_task_cap(config: &data::Config) -> Option<u32> {
 /// it was recorded, which drew from MuSiQue's first 200.
 fn task_sample(config: &data::Config) -> Option<String> {
     config.scaling.as_ref().and_then(|s| s.task_sample.clone())
-}
-
-/// Whether a workload's tasks are MuSiQue's, the only ones [`task_sample`] says how were drawn:
-/// a change of sampling is a change of their questions, and of no other workload's.
-fn sampled_from_musique(workload: &str) -> bool {
-    matches!(workload, "rag" | "rag-spans" | "rag-accuracy")
 }
 
 /// The comparison engines' releases as the runner recorded them: every engine
@@ -508,15 +503,6 @@ pub(super) fn marks_key() -> Element {
                        tok/s (the table views say what share)."
         },
     )
-}
-
-pub(super) fn slug(text: &str) -> String {
-    let lower = text.to_lowercase();
-    let parts: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit())
-        .filter(|p| !p.is_empty())
-        .collect();
-    parts.join("-")
 }
 
 // ------------------------------------------------------------------ indexing
@@ -777,23 +763,6 @@ fn opt(v: Option<u32>) -> String {
     v.map_or("?".to_string(), |v| v.to_string())
 }
 
-fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
-    names.map(String::from).to_vec()
-}
-
-/// A part of a model's tile: its heading, then what explains it, then it.
-fn part(heading: &str, intro: Element, body: Element) -> Element {
-    rsx! {
-        Section { level: 4,
-            Stack { gap: 3,
-                Heading { "{heading}" }
-                p { {intro} }
-                {body}
-            }
-        }
-    }
-}
-
 /// One line of a chart: its label, series colour, and (x, value) points; a
 /// point present but None was not measured.
 pub(super) struct Series {
@@ -848,61 +817,26 @@ pub(super) fn bar_chart(
     height: &str,
     label: &str,
 ) -> Element {
-    let spec = Chart::GroupedBar {
-        data: series
-            .iter()
-            .flat_map(|s| {
-                s.pts.iter().map(|&(x, v)| BarPoint {
-                    group: &s.label,
-                    key: x.to_string(),
-                    // Carbon prints values as given: round to what the tables show.
-                    value: v.map(|v| (v * 10.0).round() / 10.0),
-                })
+    let data = (series.iter())
+        .flat_map(|s| {
+            (s.pts.iter()).map(|&(x, value)| BarPoint {
+                group: &s.label,
+                key: x.to_string(),
+                value,
             })
-            .collect(),
-        options: ChartOptions {
-            title: title.to_string(),
-            axes: Axes {
-                // Each user count a category, in the order measured.
-                bottom: Axis {
-                    maps_to: "key",
-                    title: sweep.xlabel(),
-                    scale_type: Some("labels"),
-                    ticks: None,
-                    include_zero: None,
-                    visible: None,
-                    domain: Some(AxisDomain::Labels(xs.iter().map(u32::to_string).collect())),
-                },
-                left: Axis {
-                    maps_to: "value",
-                    title: ylabel,
-                    scale_type: None,
-                    ticks: None,
-                    include_zero: Some(true),
-                    visible: None,
-                    domain: None,
-                },
-            },
-            color: Some(Colour::Scale {
-                scale: series
-                    .iter()
-                    .map(|s| (s.label.as_str(), colour(s.class)))
-                    .collect(),
-            }),
-            heatmap: None,
-            height: height.to_string(),
-            width: None,
-            legend: None,
-            locale: None,
-            combo: None,
-            bounds: None,
-            bubble: None,
-            line: None,
-            hover: None,
-            toolbar: Enabled { enabled: false },
-        },
-    };
-    chart(&spec, label, "width: 100%", None)
+        })
+        .collect();
+    // Each user count a category, in the order measured.
+    let keys = xs.iter().map(u32::to_string).collect();
+    let colours = series.iter().map(|s| (s.label.as_str(), colour(s.class)));
+    grouped_bars(
+        data,
+        keys,
+        colours,
+        (title, sweep.xlabel(), ylabel),
+        height,
+        label,
+    )
 }
 
 /// A model's full grid as a heatmap. With a rival, values are how many times
@@ -921,8 +855,6 @@ fn grid_heatmap(
     let spec = Chart::Heatmap {
         data,
         options: ChartOptions {
-            title,
-            axes: grid.axes(None),
             color: ratio.then_some(Colour::Gradient {
                 gradient: Gradient {
                     colors: &RATIO_STEPS,
@@ -936,18 +868,16 @@ fn grid_heatmap(
                 },
                 color_domain: ratio.then_some(RATIO_RANGE),
             }),
-            // Room for the axes (and Carbon's legend when it shows), then
-            // about 64px a cell. Carbon sets its box to this width.
-            height: format!("{}px", if ratio { 100 } else { 160 } + 56 * rows),
             width: Some(format!("{}px", 140 + 72 * columns)),
             legend: ratio.then_some(Enabled { enabled: false }),
             locale: Locale::total(total_label),
-            combo: None,
-            bounds: None,
-            bubble: None,
-            line: None,
-            hover: None,
-            toolbar: Enabled { enabled: false },
+            // Room for the axes (and Carbon's legend when it shows), then
+            // about 64px a cell. Carbon sets its box to this width.
+            ..ChartOptions::new(
+                title,
+                grid.axes(None),
+                format!("{}px", if ratio { 100 } else { 160 } + 56 * rows),
+            )
         },
         ratio,
     };
@@ -1142,6 +1072,7 @@ pub(super) fn sweep_part<'a>(m: &'a Model, run: &Run, sweep: Sweep) -> Element {
     };
     let [(m1, t1, y1), (m2, t2, y2)] = sweep.metrics();
     part(
+        4,
         heading,
         intro,
         rsx! {
@@ -1606,6 +1537,7 @@ pub(super) fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         }
     };
     part(
+        4,
         "Users × prompt size",
         rsx! {
             "Users at once down the side, fewest first; prompt size across the bottom, shortest first. One grid \
@@ -1731,31 +1663,26 @@ impl<'a> Latency<'a> {
             data,
             unit_radius,
             options: ChartOptions {
-                title: String::new(),
-                axes: Axes {
-                    bottom: axis("key", "TPOT (ms)", None, tpot),
-                    left: axis("value", "TTFT (ms)", None, ttft),
-                },
                 color: Some(Colour::Scale {
                     scale: (self.engines.iter().zip(["s1", "s2"]))
                         .map(|(&e, class)| (e.label(), colour(class)))
                         .collect(),
                 }),
-                heatmap: None,
-                height: side.to_string(),
                 width: Some(side.to_string()),
                 legend: Some(Enabled { enabled: false }),
-                locale: None,
-                combo: None,
-                bounds: None,
                 bubble: Some(Bubbles {
                     radius_maps_to: "radius",
                     radius_label: "Requests",
                     fill_opacity: 0.6,
                 }),
-                line: None,
-                hover: None,
-                toolbar: Enabled { enabled: false },
+                ..ChartOptions::new(
+                    String::new(),
+                    Axes {
+                        bottom: axis("key", "TPOT (ms)", None, tpot),
+                        left: axis("value", "TTFT (ms)", None, ttft),
+                    },
+                    side.to_string(),
+                )
             },
         };
         // Its title inside its plot, top left, letting the pointer through to the dots under it.
@@ -1957,11 +1884,6 @@ pub(super) fn ecdf_chart(
         data,
         dashed,
         options: ChartOptions {
-            title: String::new(),
-            axes: Axes {
-                bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
-                left: axis("value", "share of requests", None, [0.0, 1.0]),
-            },
             color: Some(Colour::Scale {
                 scale: (engines.iter().zip(["s1", "s2"]))
                     .map(|(&e, class)| (e.label(), colour(class)))
@@ -1974,13 +1896,8 @@ pub(super) fn ecdf_chart(
                     ])
                     .collect(),
             }),
-            heatmap: None,
-            // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
-            // ECDF_ASPECT makes it.
-            height: "100%".to_string(),
             width: Some("100%".to_string()),
             legend: Some(Enabled { enabled: false }),
-            locale: None,
             // Carbon draws an area's bounds only when the layer holds one series.
             combo: Some(
                 (fills
@@ -2001,14 +1918,22 @@ pub(super) fn ecdf_chart(
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
-            bubble: None,
             line: Some(LineOptions {
                 curve: "curveStepAfter",
                 points: Enabled { enabled: false },
             }),
             // A step per request, each curve its own: no one step lists every series.
             hover: Some(Hover::NONE),
-            toolbar: Enabled { enabled: false },
+            // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
+            // ECDF_ASPECT makes it.
+            ..ChartOptions::new(
+                String::new(),
+                Axes {
+                    bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
+                    left: axis("value", "share of requests", None, [0.0, 1.0]),
+                },
+                "100%".to_string(),
+            )
         },
     };
     rsx! {
@@ -2238,6 +2163,7 @@ pub(super) fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
         }
     };
     part(
+        4,
         "Latency distributions",
         rsx! {
             "With 1 user, every request a dot: time to first token up, time per output token across, \
@@ -2401,7 +2327,7 @@ pub(super) fn task_timeline(entries: &[Entry], dataset: &str) -> Option<Element>
     let kept: Vec<&Entry> = entries
         .iter()
         .filter(|e| own(e, Engine::Scratchy).is_some())
-        .filter(|e| !sampled_from_musique(dataset) || Some(task_sample(&e.run.config)) == newest)
+        .filter(|e| !datasets::sampled(dataset) || Some(task_sample(&e.run.config)) == newest)
         .collect();
     if kept.len() < 2 {
         return None;
@@ -2465,17 +2391,6 @@ pub(super) fn over_time_charts(
 /// them: at most one per colour step, spread over the steps the squares use.
 /// A heat map left without one then gets one of its own.
 pub(super) const HEAT_LABELS: usize = 12;
-
-/// Where an overview heat map square is: machine, model, metric, and its
-/// users count and prompt length.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Square<'a> {
-    chip: &'a str,
-    stem: &'a str,
-    metric: &'a str,
-    users: u32,
-    prompt: u32,
-}
 
 /// One overview heat map's ratios, at its run's [`glance_answer`]: the rival, and each square's
 /// (users, prompt, how many times faster scratchy is).
@@ -2640,13 +2555,9 @@ pub(super) fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<L
     })
 }
 
-/// The random-token grid's summary map and latency distributions, the Random tokens section's top
-/// half: [`glance`]'s heat map and latency panel, without its section, tabs or dataset maps.
-pub(super) fn grid_glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
-    glance_of(machines)
-}
-
-fn glance_of(machines: &BTreeMap<&str, MachineRuns>) -> Element {
+/// The random-token grid's summary map, its intro over it: the Random tokens section's Summary
+/// tab, its ratio scale's id from the section's `id`.
+pub(super) fn grid_glance(id: &str, machines: &BTreeMap<&str, MachineRuns>) -> Element {
     // A column per architecture class ([`Lineup`]); each machine's row shows the class's model:
     // the small one on every Mac where the lineup's newest default run took the small set
     // everywhere, else the small set below the lineup's `large_from_gb` and the large one from it,
@@ -2706,37 +2617,136 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             );
         }
     }
-    let squares: BTreeMap<Square, f64> = grids
-        .iter()
-        .filter_map(|(&(chip, stem, name), g)| Some((chip, stem, name, g.as_ref().ok()?)))
-        .flat_map(|(chip, stem, name, g)| {
-            g.cells.iter().filter_map(move |&(u, i, r)| {
-                let at = Square {
-                    chip,
-                    stem,
-                    metric: name,
-                    users: u,
-                    prompt: i,
-                };
-                Some((at, r?))
-            })
+    let chips: Vec<&str> = in_order(machines);
+    // Every machine a row, the small set's first.
+    let rows: Vec<&str> = (Set::ALL.into_iter())
+        .flat_map(|set| {
+            let lineup = &lineup;
+            (chips.iter().copied()).filter(move |&chip| lineup.set(memory(chip)) == set)
         })
         .collect();
+    // The one map ([`datasets::SummaryMap`]): every machine, model, measure and users count in a
+    // single grid, a square a cell, on the one ratio scale, under one header. Under each model
+    // (its class) a column per prompt size, shortest first; where the sets of Macs ran different
+    // sizes there, its header names each set's, small set first. Under each machine its rows:
+    // prefill and decode with 1 user, then end-to-end time with each users count
+    // ([`GRID_METRICS`]).
+    let most = (lineup.shapes.values())
+        .map(|s| s.prompts.len())
+        .max()
+        .unwrap_or(0);
+    let mut squares: BTreeMap<MapAt, MapSquare> = BTreeMap::new();
+    // Each square's heat map: its machine, model and measure.
+    let mut heat_map: BTreeMap<MapAt, (&str, &str, &str)> = BTreeMap::new();
+    let mut map_machines: Vec<(&str, Vec<MapRow>)> = Vec::new();
+    for (m, &chip) in rows.iter().enumerate() {
+        let mut lines: Vec<MapRow> = Vec::new();
+        for &gm in &GRID_METRICS {
+            for u in gm.load.users(&shape(chip).users) {
+                let r = lines.len();
+                for (k, class) in classes.iter().enumerate() {
+                    let Some(stem) = model_of(chip, class) else {
+                        continue;
+                    };
+                    for (p, &i) in shape(chip).prompts.iter().enumerate() {
+                        let ratio = match &grids[&(chip, stem, gm.name)] {
+                            Ok(g) => {
+                                match g.cells.iter().find(|&&(cu, ci, _)| (cu, ci) == (u, i)) {
+                                    Some(&(_, _, Some(r))) => Ok((r, g.rival.label().to_string())),
+                                    // Where its cell says why, as a first token timed too soon.
+                                    _ => Err((g.why.iter())
+                                        .find(|(wu, wi, _)| (*wu, *wi) == (u, i))
+                                        .map_or("no ratio".to_string(), |(_, _, w)| w.clone())),
+                                }
+                            }
+                            Err(why) => Err(why.to_string()),
+                        };
+                        let tip = vec![
+                            format!("{stem} on {chip}"),
+                            format!("{} · {i} prompt tokens · {}", gm.name, users_at(u)),
+                        ];
+                        squares.insert((m, r, k, p), MapSquare { ratio, tip });
+                        heat_map.insert((m, r, k, p), (chip, stem, gm.name));
+                    }
+                }
+                let (label, about) = match gm.load {
+                    Load::Alone => (gm.letter.to_string(), gm.about.to_string()),
+                    Load::Shared => (
+                        format!("{u}{}", gm.letter),
+                        format!("With {u} users at once. {}", gm.about),
+                    ),
+                };
+                lines.push(MapRow {
+                    label,
+                    name: gm.name.to_string(),
+                    about,
+                });
+            }
+        }
+        map_machines.push((chip, lines));
+    }
+    // A model per class, or each model the Macs run there where sets differ.
+    let models = |class: &str| {
+        let mut names: Vec<String> = Vec::new();
+        for &chip in &rows {
+            if let Some(stem) = model_of(chip, class).filter(|s| !names.iter().any(|n| n == s)) {
+                names.push(stem.to_string());
+            }
+        }
+        names
+    };
+    let k_prompt = |i: u32| {
+        if i >= 1024 && i.is_multiple_of(1024) {
+            format!("{}k", i / 1024)
+        } else {
+            i.to_string()
+        }
+    };
+    // Each column's prompt size, or each set's where they differ: "512/1k".
+    let header = |p: usize| {
+        let mut sizes: Vec<u32> = Vec::new();
+        for set in Set::ALL {
+            if let Some(&i) = lineup.shapes.get(&set).and_then(|s| s.prompts.get(p))
+                && !sizes.contains(&i)
+                && rows.iter().any(|&chip| lineup.set(memory(chip)) == set)
+            {
+                sizes.push(i);
+            }
+        }
+        sizes
+            .into_iter()
+            .map(k_prompt)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let columns: Vec<String> = (0..most).map(header).collect();
+    // Where a column names two sizes, which set each is: "Prompt tokens a column, under 64 GB
+    // / 64 GB and up: 128, 512/1k, 1k/4k, 4k/8k".
+    let legend = columns.iter().any(|c| c.contains('/')).then(|| {
+        let gb = lineup.large_from_gb;
+        format!(
+            "Prompt tokens a column, under {gb} GB / {gb} GB and up: {}.",
+            columns.join(", ")
+        )
+    });
+    let mut map = SummaryMap {
+        groups: classes.iter().map(|&c| (c, models(c))).collect(),
+        columns,
+        machines: map_machines,
+        squares,
+        labelled: BTreeSet::new(),
+        legend,
+    };
+    let ratios = map.ratios();
     // Each colour step's square furthest from ×1, HEAT_LABELS of them ([`ratio_labels`]).
-    let mut highlights: BTreeSet<Square> = ratio_labels(&squares, HEAT_LABELS);
+    let mut highlights: BTreeSet<MapAt> = ratio_labels(&ratios, HEAT_LABELS);
     // Then each heat map still without a label gets one: its square furthest
     // from ×1 in a colour step not yet labelled, or, every step it has taken,
     // its square furthest from ×1.
-    let mut taken: BTreeSet<usize> = highlights
-        .iter()
-        .map(|at| ratio_step(squares[at]))
-        .collect();
-    for &(chip, stem, metric) in grids.keys() {
-        let mine = || {
-            squares
-                .iter()
-                .filter(move |(at, _)| (at.chip, at.stem, at.metric) == (chip, stem, metric))
-        };
+    let mut taken: BTreeSet<usize> = highlights.iter().map(|at| ratio_step(ratios[at])).collect();
+    for &key in grids.keys() {
+        let heat_map = &heat_map;
+        let mine = || (ratios.iter()).filter(move |(at, _)| heat_map[*at] == key);
         if mine().any(|(at, _)| highlights.contains(at)) {
             continue;
         }
@@ -2751,250 +2761,8 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             taken.insert(ratio_step(r));
         }
     }
-    let chips: Vec<&str> = in_order(machines);
-    // Every machine a row, the small set's first.
-    let rows: Vec<&str> = (Set::ALL.into_iter())
-        .flat_map(|set| {
-            let lineup = &lineup;
-            (chips.iter().copied()).filter(move |&chip| lineup.set(memory(chip)) == set)
-        })
-        .collect();
-    // The one map: every machine, model, measure and users count in a single grid, a square a
-    // cell, on the one ratio scale, under one header. Under each model (its class) a column per
-    // prompt size, shortest first; where the sets of Macs ran different sizes there, its header
-    // names each set's, small set first. Under each machine its rows: prefill and decode with 1
-    // user, then end-to-end time with each users count ([`GRID_METRICS`]).
-    let one_map = {
-        enum Line<'a> {
-            Classes,
-            Models,
-            Prompts,
-            Measure(&'a str, GridMetric, u32),
-        }
-        let most = (lineup.shapes.values())
-            .map(|s| s.prompts.len())
-            .max()
-            .unwrap_or(0);
-        let col = |k: usize, p: usize| 3 + k * most + p;
-        let mut lines: Vec<Line> = vec![Line::Classes, Line::Models, Line::Prompts];
-        // Each machine's label spans its rows: (machine, first line, last line).
-        let mut spans: Vec<(&str, usize, usize)> = Vec::new();
-        for &chip in &rows {
-            let start = lines.len();
-            let users = &shape(chip).users;
-            for &gm in &GRID_METRICS {
-                lines.extend(
-                    gm.load
-                        .users(users)
-                        .into_iter()
-                        .map(|u| Line::Measure(chip, gm, u)),
-                );
-            }
-            spans.push((chip, start, lines.len() - 1));
-        }
-        // A model per class, or each model the Macs run there where sets differ.
-        let models = |class: &str| {
-            let mut names: Vec<&str> = Vec::new();
-            for &chip in &rows {
-                if let Some(stem) = model_of(chip, class).filter(|s| !names.contains(s)) {
-                    names.push(stem);
-                }
-            }
-            names.join(" / ")
-        };
-        let template_columns = format!(
-            "max-content max-content repeat({}, 2.25rem)",
-            classes.len() * most
-        );
-        let k_prompt = |i: u32| {
-            if i >= 1024 && i.is_multiple_of(1024) {
-                format!("{}k", i / 1024)
-            } else {
-                i.to_string()
-            }
-        };
-        // Each column's prompt size, or each set's where they differ: "512/1k".
-        let header = |p: usize| {
-            let mut sizes: Vec<u32> = Vec::new();
-            for set in Set::ALL {
-                if let Some(&i) = lineup.shapes.get(&set).and_then(|s| s.prompts.get(p))
-                    && !sizes.contains(&i)
-                    && rows.iter().any(|&chip| lineup.set(memory(chip)) == set)
-                {
-                    sizes.push(i);
-                }
-            }
-            sizes
-                .into_iter()
-                .map(k_prompt)
-                .collect::<Vec<_>>()
-                .join("/")
-        };
-        // Where a column names two sizes, which set each is: "Prompt tokens a column, under 64 GB
-        // / 64 GB and up: 128, 512/1k, 1k/4k, 4k/8k".
-        let two_sizes = (0..most).any(|p| header(p).contains('/'));
-        let legend = two_sizes.then(|| {
-            let gb = lineup.large_from_gb;
-            let columns: Vec<String> = (0..most).map(header).collect();
-            format!(
-                "Prompt tokens a column, under {gb} GB / {gb} GB and up: {}.",
-                columns.join(", ")
-            )
-        });
-        // A row's slowest and fastest ratio, over every model and prompt size in it, printed at
-        // its right.
-        let range = |chip: &str, gm: GridMetric, u: u32| -> Option<(f64, f64)> {
-            (classes.iter())
-                .filter_map(|class| {
-                    grids[&(chip, model_of(chip, class)?, gm.name)]
-                        .as_ref()
-                        .ok()
-                })
-                .flat_map(|g| g.cells.iter().filter(|c| c.0 == u).filter_map(|c| c.2))
-                .fold(None, |acc, r| match acc {
-                    None => Some((r, r)),
-                    Some((lo, hi)) => Some((f64::min(lo, r), f64::max(hi, r))),
-                })
-        };
-        // Over the grid's first and last two columns the tooltip reaches inward, not off its edge.
-        let align = |k: usize, p: usize| match (k, p) {
-            (0, p) if p < 2 => "top-left",
-            (k, p) if k + 1 == classes.len() && p + 2 >= most => "top-right",
-            _ => "top",
-        };
-        // Each square with Carbon's tooltip: the square is its trigger, focusable so a keyboard
-        // opens it too; the tooltip gives the ratio (or why there is none), the model on its
-        // machine, and the measure, prompt size and users.
-        let square = |chip: &str,
-                      stem: &str,
-                      gm: GridMetric,
-                      u: u32,
-                      i: u32,
-                      align: &str,
-                      place: String|
-         -> Element {
-            let ratio = match &grids[&(chip, stem, gm.name)] {
-                Ok(g) => match g.cells.iter().find(|&&(cu, ci, _)| (cu, ci) == (u, i)) {
-                    Some(&(_, _, Some(r))) => Ok((r, g.rival)),
-                    _ => Err((g.why.iter())
-                        .find(|(wu, wi, _)| (*wu, *wi) == (u, i))
-                        .map_or("no ratio".to_string(), |(_, _, w)| w.clone())),
-                },
-                Err(why) => Err(why.to_string()),
-            };
-            let (fill, label, verdict) = match ratio {
-                Ok((r, rival)) => {
-                    let step = ratio_step(r);
-                    let shown = highlights.contains(&Square {
-                        chip,
-                        stem,
-                        metric: gm.name,
-                        users: u,
-                        prompt: i,
-                    });
-                    let ink = ratio_ink(step);
-                    (
-                        format!("background: {}; color: {ink}", RATIO_STEPS[step]),
-                        shown.then(|| format!("×{r:.1}")),
-                        format!("×{r:.2} vs {}", rival.label()),
-                    )
-                }
-                Err(why) => (
-                    "background: repeating-linear-gradient(135deg, transparent 0 4px, \
-                     light-dark(#c6c6c6, #525252) 4px 5px)"
-                        .to_string(),
-                    None,
-                    why.to_string(),
-                ),
-            };
-            rsx! {
-                // The grid's own cell, and a flex box: Carbon puts the trigger in an inline box in its
-                // shadow DOM, whose line would add room for text under every square.
-                cds-tooltip { "align": align, style: "{place}; display: flex",
-                    // Its own width: Carbon wraps the trigger in an inline box, so an empty square would
-                    // shrink to nothing.
-                    div { tabindex: "0",
-                        style: "width: 2.25rem; height: 2.25rem; {fill}; display: flex; align-items: center; justify-content: center; font-size: 0.625rem; font-weight: 600",
-                        if let Some(label) = label { "{label}" }
-                    }
-                    cds-tooltip-content { style: "text-align: left",
-                        TipHeading { heading: verdict }
-                        div { "{stem} on {chip}" }
-                        div { "{gm.name} · {i} prompt tokens · {users_at(u)}" }
-                    }
-                }
-            }
-        };
-        rsx! {
-            div { style: "display: grid; grid-template-columns: {template_columns} max-content max-content; column-gap: 2px; row-gap: 2px; align-items: center",
-                for (n, line) in lines.iter().enumerate() {
-                    match *line {
-                        Line::Classes => rsx! {
-                            for (k, class) in classes.iter().enumerate() {
-                                div { style: "grid-row: {n + 1}; grid-column: {col(k, 0)} / span {most}; text-align: center; font-weight: 600", "{class}" }
-                            }
-                        },
-                        Line::Models => rsx! {
-                            for (k, class) in classes.iter().enumerate() {
-                                div { style: "grid-row: {n + 1}; grid-column: {col(k, 0)} / span {most}; text-align: center; font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap",
-                                    {models(class)}
-                                }
-                            }
-                        },
-                        Line::Prompts => rsx! {
-                            for k in 0..classes.len() {
-                                for p in 0..most {
-                                    div { style: "grid-row: {n + 1}; grid-column: {col(k, p)}; text-align: center; font-size: 0.625rem; white-space: nowrap", {header(p)} }
-                                }
-                            }
-                        },
-                        Line::Measure(chip, gm, u) => {
-                            let (label, about) = match gm.load {
-                                Load::Alone => (gm.letter.to_string(), gm.about.to_string()),
-                                Load::Shared => (
-                                    format!("{u}{}", gm.letter),
-                                    format!("With {u} users at once. {}", gm.about),
-                                ),
-                            };
-                            rsx! {
-                                div { style: "grid-row: {n + 1}; grid-column: 2; font-size: 0.875rem; font-weight: 600; text-align: right; padding-right: 0.5rem; white-space: nowrap",
-                                    Definition { alignment: Alignment::BottomLeft, heading: gm.name.to_string(), definition: about, strong { "{label}" } }
-                                }
-                                for (k, class) in classes.iter().enumerate() {
-                                    if let Some(stem) = model_of(chip, class) {
-                                        for (p, &i) in shape(chip).prompts.iter().enumerate() {
-                                            {square(chip, stem, gm, u, i, align(k, p), format!("grid-row: {}; grid-column: {}", n + 1, col(k, p)))}
-                                        }
-                                    }
-                                }
-                                if let Some((lo, hi)) = range(chip, gm, u) {
-                                    div { style: "grid-row: {n + 1}; grid-column: {col(classes.len(), 0) + 1}; font-size: 0.75rem; white-space: nowrap; padding-left: 1.5rem",
-                                        "×{lo:.2}–×{hi:.2}"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                for &(chip, start, end) in &spans {
-                    // A margin, not padding: the rotation would turn padding onto the label's far side.
-                    div { style: "grid-row: {start + 1} / {end + 2}; grid-column: 1; writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; font-weight: 600; font-size: 0.875rem; margin-right: 1rem",
-                        "{chip}"
-                    }
-                }
-                // The ratio scale right beside the squares, as tall as their rows: one cell over
-                // all of them, so each row's range, a column further on, stays on its row.
-                if let (Some(&(_, first, _)), Some(&(_, _, last))) = (spans.first(), spans.last()) {
-                    div { style: "grid-row: {first + 1} / {last + 2}; grid-column: {col(classes.len(), 0)}; align-self: stretch; display: flex; padding-left: 0.5rem",
-                        {ratio_scale(ScaleFit::Fill, "scale-one-map")}
-                    }
-                }
-            }
-            if let Some(legend) = legend {
-                p { style: "font-size: 0.75rem", "{legend}" }
-            }
-        }
-    };
+    map.labelled = highlights;
+    let one_map = map.render(&format!("{id}-summary-scale"));
     rsx! {
             div { style: "width: fit-content; max-width: 100%",
                 Stack { gap: 4,
@@ -3011,10 +2779,6 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
     }
 }
-
-// The startup panel compares scratchy with the first of Engine::RIVALS a run
-// timed (StartupSpark::rival): oMLX TurboQuant where it has it, mlx-lm (which
-// loads the same MLX checkpoint) in runs from before oMLX.
 
 /// The engines the page compares scratchy with, in [`Engine::RIVALS`] order: those any machine's
 /// shown models measured (oMLX TurboQuant under oMLX), written as a list, or None for none.
@@ -3811,7 +3575,7 @@ mod tests {
         );
         assert!(html.contains(">gpt-oss-20b<"), "the model under its class");
         // A column a bucket under its model, the random-token map's four.
-        for b in super::buckets::BUCKETS {
+        for b in super::buckets::MUSIQUE {
             let label = b.0.replace('<', "&#60;");
             assert!(html.contains(&format!(">{label}<")), "no {} column", b.0);
         }
@@ -4269,7 +4033,7 @@ mod tests {
         );
         let changed = lent(Some("musique-dev-by-hops"));
         assert!(
-            !changed.iter().any(|w| super::sampled_from_musique(w)),
+            !changed.iter().any(|w| super::datasets::sampled(w)),
             "no 2-hop RAG cell as the rival's: {changed:?}"
         );
         assert!(
@@ -4857,7 +4621,8 @@ mod tests {
     /// cell counts every request failed, says why, and shows no number.
     #[test]
     fn the_published_cells_of_a_dead_server_and_only_those_are_marked() {
-        use super::numbers::{DASH, Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
+        use super::numbers::{Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
+        use crate::DASH;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut runs: Vec<Run> = Vec::new();
         for dir in [FIXTURES] {
