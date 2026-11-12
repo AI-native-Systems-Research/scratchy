@@ -383,15 +383,24 @@ struct gate_up_template {
 // `e` of `[E, expert_rows, k]`), its scale row `e` of `[E, expert_rows]` f32, and `a_scale` the
 // pair rows' (each pair row was quantized on its own). So every live tile's rows are the bits
 // `matmul_template` gives for the same 128 rows against the same expert's `[n, k]` and scales.
-template<int M_BLOCK, int N_BLOCK>
+//
+// FP8 S8 P3(a): `M_BLOCK` 1 makes a task one 64-row tile (one consumer warpgroup), so the sort's
+// padding is per 64 rows; `K_STEP` 128 makes a stage one `st_fp8e4m3<64, 128>` (128-byte rows,
+// 128-byte swizzle) of A and of each B block, four `k32` WGMMAs a stage in place of two. The K
+// loop is the same `k32` WGMMAs in the same order, and each output row is its own A row's K
+// sequence, so every row is the bits of `M_BLOCK` 2, `K_STEP` 64 (`tests/moe.rs`). `K_STEP` 128
+// needs `k` a multiple of 128: a 128-byte box past `k` reads the next row's bytes (TK-1's R1).
+template<int M_BLOCK, int N_BLOCK, int K_STEP = 64>
 struct expert_layout {
+    using k_tile = st_fp8e4m3<64, K_STEP>;
+    using a_gl = gl<fp8e4m3, 1, 1, -1, -1, k_tile>;
     // `[experts, expert_rows, k]`: expert `e`'s weights are depth `e`.
-    using expert_gl = gl<fp8e4m3, 1, -1, -1, -1, in_tile>;
+    using expert_gl = gl<fp8e4m3, 1, -1, -1, -1, k_tile>;
     // `[experts, expert_rows]` f32 per-channel scales, and the sort's `[1, len]` index regions.
     using expert_scale_gl = gl<float, 1, 1, -1, -1>;
     using idx_gl = gl<int, 1, 1, -1, -1>;
     struct globals {
-        in_gl A;
+        a_gl A;
         expert_gl B;
         out_gl C;
         scale_gl A_scale;
@@ -400,17 +409,18 @@ struct expert_layout {
         idx_gl offsets;
         idx_gl tile_expert;
     };
-    struct input_block    { in_tile a[M_BLOCK], b[N_BLOCK]; };
+    struct input_block    { k_tile a[M_BLOCK], b[N_BLOCK]; };
     struct finish_block   { out_tile c[M_BLOCK][N_BLOCK]; };
     struct common_state   { int2 coord; int expert; };
     struct consumer_state { rt_fl<16, N_BLOCK*64> accum; };
 };
-template<int _EXPERTS, int _N_BLOCK, int _M_BLOCK=2>
+template<int _EXPERTS, int _N_BLOCK, int _M_BLOCK=2, int _K_STEP=64>
 struct expert_template {
     static constexpr int EXPERTS = _EXPERTS, M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK;
-    using layout = expert_layout<M_BLOCK, N_BLOCK>;
+    static constexpr int K_STEP = _K_STEP;
+    using layout = expert_layout<M_BLOCK, N_BLOCK, K_STEP>;
     using wide_tile = st_bf<64, 64*N_BLOCK>;
-    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, 64>;
+    using b_stack_tile = st_fp8e4m3<64*N_BLOCK, K_STEP>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         const int max_tiles = args.globals.C.rows() / (M_BLOCK*64);
@@ -423,7 +433,7 @@ struct expert_template {
         }
         const int t = task_id % live;
         args.common.expert = args.globals.tile_expert[{0, 0, 0, t}];
-        args.num_iters = args.globals.A.cols()/64;
+        args.num_iters = args.globals.A.cols()/K_STEP;
         int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid(); // producer sets as 0
         args.common.coord = {t*M_BLOCK + id, (task_id / live)*N_BLOCK};
     }
@@ -491,6 +501,13 @@ constexpr uint32_t N_TILE_WIDE = 256;
 using expert_gemm_fp8_mmt = expert_template<EXPERTS_LARGE, 4>;
 using expert_gemm_e128_fp8_mmt = expert_template<EXPERTS_SMALL, 4>;
 using expert_gemm_e128_col64_fp8_mmt = expert_template<EXPERTS_SMALL, 1>;
+// FP8 S8 P3(a): the 64-row tiles at K step 64 and 128, each expert count and column tile.
+using expert_gemm_m64_k64_fp8_mmt = expert_template<EXPERTS_LARGE, 4, 1, 64>;
+using expert_gemm_m64_k128_fp8_mmt = expert_template<EXPERTS_LARGE, 4, 1, 128>;
+using expert_gemm_e128_m64_k64_fp8_mmt = expert_template<EXPERTS_SMALL, 4, 1, 64>;
+using expert_gemm_e128_m64_k128_fp8_mmt = expert_template<EXPERTS_SMALL, 4, 1, 128>;
+using expert_gemm_e128_col64_m64_k64_fp8_mmt = expert_template<EXPERTS_SMALL, 1, 1, 64>;
+using expert_gemm_e128_col64_m64_k128_fp8_mmt = expert_template<EXPERTS_SMALL, 1, 1, 128>;
 
 // `gemm_bf16.cu`'s: the whole H100 budget minus the 1024 bytes `lcf` reserves for alignment.
 constexpr int GEMM_FP8_SMEM_BYTES = kittens::MAX_SHARED_MEMORY - 1024;
@@ -588,7 +605,9 @@ int launch_expert(const void* a, const void* a_scale, const void* b, const void*
                                size_t(1), size_t(mmt::EXPERTS + 1)};
     typename layout::idx_gl Tg{static_cast<int*>(const_cast<void*>(tile_expert)), nullptr,
                                nullptr, size_t(1), size_t(max_tiles)};
-    typename layout::globals G{in_view(a, uint32_t(rows), k), Bg, out_view(c, uint32_t(rows), n),
+    typename layout::a_gl Ag{static_cast<fp8e4m3*>(const_cast<void*>(a)), nullptr, nullptr,
+                             size_t(rows), size_t(k)};
+    typename layout::globals G{Ag, Bg, out_view(c, uint32_t(rows), n),
                                scale_view(a_scale, uint32_t(rows)), Sg, Og, Tg};
     return launch<mmt>(G, stream);
 }
@@ -628,6 +647,24 @@ extern "C" int scratchy_cuda_gemm_fp8_prepare(void) {
     }
     if (e == cudaSuccess) {
         e = smem_attr<expert_gemm_e128_col64_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gemm_m64_k64_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gemm_m64_k128_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gemm_e128_m64_k64_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gemm_e128_m64_k128_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gemm_e128_col64_m64_k64_fp8_mmt>();
+    }
+    if (e == cudaSuccess) {
+        e = smem_attr<expert_gemm_e128_col64_m64_k128_fp8_mmt>();
     }
     return static_cast<int>(e);
 }
@@ -769,6 +806,52 @@ extern "C" int scratchy_cuda_expert_gemm_fp8(const void* a, const void* a_scale,
         return launch_expert<expert_gemm_e128_col64_fp8_mmt>(a, a_scale, b, b_scale, offsets,
                                                              tile_expert, c, rows, n, k,
                                                              max_tiles, expert_rows, stream);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// Test support (`tests/moe.rs`, FP8 S8 P3(a)): `scratchy_cuda_expert_gemm_fp8` at row tile `m_tile`
+// (128, today's instances, K step 64; or 64) and K step `k_step` (64; or 128, `k` a multiple of
+// 128). `max_tiles` counts `m_tile`-row tiles, and `tile_expert` names each one's expert: a
+// sort padded to `m_tile` rows. Each pair row is the same bits at every row tile and K step.
+// Return codes and rule otherwise as that launcher's.
+extern "C" int scratchy_cuda_expert_gemm_fp8_variant(
+    const void* a, const void* a_scale, const void* b, const void* b_scale, const void* offsets,
+    const void* tile_expert, void* c, uint32_t max_tiles, uint32_t n, uint32_t k, uint32_t experts,
+    uint32_t expert_rows, uint32_t n_tile, uint32_t m_tile, uint32_t k_step,
+    void* stream /* cudaStream_t; null = default */) {
+    if (m_tile == 128 && k_step == 64) {
+        return scratchy_cuda_expert_gemm_fp8(a, a_scale, b, b_scale, offsets, tile_expert, c,
+                                             max_tiles, n, k, experts, expert_rows, n_tile,
+                                             stream);
+    }
+    const bool wide_large = experts == uint32_t(EXPERTS_LARGE) && n_tile == N_TILE_WIDE;
+    const bool wide_small = experts == uint32_t(EXPERTS_SMALL) && n_tile == N_TILE_WIDE;
+    const bool narrow_small = experts == uint32_t(EXPERTS_SMALL) && n_tile == N_TILE_NARROW;
+    const uint64_t rows = uint64_t(max_tiles) * 64;
+    const uint64_t wide = n > k ? n : k;
+    if (m_tile != 64 || (k_step != 64 && k_step != 128) || max_tiles == 0 ||
+        !(wide_large || wide_small || narrow_small) || n == 0 || k == 0 || n % n_tile != 0 ||
+        k % k_step != 0 || expert_rows < n || rows * wide > uint64_t(INT_MAX) ||
+        uint64_t(experts) * uint64_t(expert_rows) * uint64_t(k) > uint64_t(INT_MAX)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const auto go = [&](auto mmt) {
+            return launch_expert<decltype(mmt)>(a, a_scale, b, b_scale, offsets, tile_expert, c,
+                                                rows, n, k, max_tiles, expert_rows, stream);
+        };
+        if (wide_large) {
+            return k_step == 128 ? go(expert_gemm_m64_k128_fp8_mmt{}) : go(expert_gemm_m64_k64_fp8_mmt{});
+        }
+        if (wide_small) {
+            return k_step == 128 ? go(expert_gemm_e128_m64_k128_fp8_mmt{})
+                                 : go(expert_gemm_e128_m64_k64_fp8_mmt{});
+        }
+        return k_step == 128 ? go(expert_gemm_e128_col64_m64_k128_fp8_mmt{})
+                             : go(expert_gemm_e128_col64_m64_k64_fp8_mmt{});
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
