@@ -1381,10 +1381,12 @@ run_task_cell() { # prefix workload load
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:tasks:$2:${key}" | cksum | cut -d' ' -f1)
     [[ -n "${rate}" ]] && pace=(--request-rate "${rate}")
     # A timed cell forces each answer to its task's length, the same on every engine. MuSiQue's
-    # answers end on their own, the accuracy cell's included (#1208): a real answer is about 6-12
+    # 1-user cell, the page's decode row, answers on its own (#1208): a real answer is about 6-12
     # tokens, so forced to 64 most of it was text past where the model stopped, which a drafting
     # engine guesses far worse than the answer (23% accepted against 76%), and its TPOT timed that.
-    [[ "${w}" == rag* ]] && timed=0
+    # Above 1 user the cells stay forced, so their end-to-end times compare equal work; the span
+    # and accuracy cells answer on their own as ever.
+    [[ "${w}" == rag-* || ( "${w}" == rag && "${conc}" == 1 ) ]] && timed=0
     (( timed )) && pace+=(--timed-answers)
     case "${w}" in
         sharegpt)              extra=(--dataset-name sharegpt --dataset-path "${SHAREGPT_PATH}" --sharegpt-max-output-len 256) ;;
