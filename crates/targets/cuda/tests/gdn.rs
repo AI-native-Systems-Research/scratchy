@@ -2261,108 +2261,149 @@ fn a_continued_chunked_scan_starts_from_its_slot() {
     assert!(pass, "a continued chunked step is out of its bound");
 }
 
-/// The chunked bound must still bite (/tmp/a-f6-plan.md §2): each mutated reference compared with
-/// the chunked scan's output at `q_len` 300 (five chunks) puts at least `need` of the elements it
-/// changes out of the chunked bound. The mutations: one chunk's decay missing (tokens 64..128,
-/// judged on tokens 65..128), the intra-chunk term dropped (each chunk's correction from the
-/// state at its start, judged on `t ≥ 1`), `β = b` (no sigmoid), no delta-rule correction, the
-/// decay after the update.
+/// The chunked self-checks' inputs (`tokens` rows of geometry `d`): q̂ = k̂, each key head's `q`
+/// columns the same values as its `k` columns and its `q` channels the `k` channels' conv taps,
+/// the same row at every token, so `o` is the state's own row and the bound's linear term small
+/// beside it; `b` drawn in `b_range`, `a_log` the same for every value head.
+fn aligned(
+    d: GdnDims,
+    tokens: usize,
+    seed: u64,
+    a_log: f32,
+    b_range: (f64, f64),
+) -> (Inputs, Bundle) {
+    let mut x = inputs(d, tokens, seed);
+    let (cd, kd, k) = (d.conv_dim(), d.key_dim(), d.conv_kernel);
+    for t in 0..tokens {
+        for c in 0..kd {
+            let v = x.qkv[kd + c];
+            x.qkv[t * cd + c] = v;
+            x.qkv[t * cd + kd + c] = v;
+        }
+    }
+    x.b = bf16_in(tokens * d.nv, seed ^ 0x04, b_range);
+    let mut bu = bundle(d, seed);
+    for c in 0..kd {
+        for j in 0..k {
+            bu.w[c * k + j] = bu.w[(kd + c) * k + j];
+        }
+    }
+    bu.a_log = vec![a_log; d.nv];
+    (x, bu)
+}
+
+/// The chunked bound must still bite (/tmp/a-f6-plan.md §2): a kernel computing a mutation would
+/// fail the real check. Each mutated f64 reference against the chunked scan's `o`, under the REAL
+/// reference's bound (the bound the real check applies; a mutation that grows the state would
+/// grow its own), puts at least half the judged elements out of it, at `q_len` 128 (two chunks),
+/// on [`aligned`] inputs where each mistake is large:
+/// - fast decay (`a_log` 1.5), small β (`b` in [-5, -3]): the decay after the update (judged on
+///   `t ≥ 1`), chunk 1's decay missing (tokens 64..128, judged on 65..128), `β = b` (`t ≥ 1`);
+/// - slow decay (`a_log` -5), β as drawn: no delta-rule correction, the intra-chunk term dropped
+///   (T = I; both `t ≥ 1`).
+///
+/// The kernel passes the real check on the same inputs.
 #[test]
 fn every_chunked_self_check_misses_by_its_margin() {
+    const NEED: f64 = 0.5;
     let device = h100();
     let mut pass = true;
-    let q_len = 300;
+    let q_len = 2 * CHUNK;
     for d in [G9, G27] {
-        let bu = bundle(d, 0xF620);
-        let bb = upload_bundle(&device, &bu);
-        let x = inputs(d, q_len, 0xF621);
-        let pool = Pool::new(&device, d, NAN_F32);
-        let c = chunk(&x, d, 0, q_len, q_len);
-        let s = run_step_with(&device, &pool, &bb, d, &c, (0, true), Scan::Chunked)
-            .expect("the step launches");
-        let vd = d.value_dim();
-        let (_, state) = zeros(d);
-        let tokens = |from: usize, to: usize| move |i: usize| (from * vd..to * vd).contains(&i);
-        for (what, variant, keep, need) in [
-            (
-                "chunk 1's decay missing",
-                ScanVariant::NoDecayOver {
-                    from: CHUNK,
-                    to: 2 * CHUNK,
-                },
-                tokens(CHUNK + 1, 2 * CHUNK),
-                0.5,
-            ),
-            (
-                "the intra-chunk term dropped (T = I)",
-                ScanVariant::StaleInChunks { len: CHUNK },
-                tokens(1, q_len),
-                0.5,
-            ),
-            (
-                "no delta-rule correction (u = beta*v)",
-                ScanVariant::NoCorrection,
-                tokens(1, q_len),
-                0.25,
-            ),
-            (
-                "decay after the update",
-                ScanVariant::DecayLast,
-                tokens(1, q_len),
-                0.5,
-            ),
+        for (regime, a_log, b_range) in [
+            ("fast decay, small beta", 1.5f32, (-5.0, -3.0)),
+            ("slow decay", -5.0, (-2.0, 2.0)),
         ] {
-            let r = scan_reference(d, &s, q_len, (&state, None, 0), variant);
-            let m = compare_o_chunked(&s, &r, keep);
-            let ok = m.fraction() >= need;
+            let (x, bu) = aligned(d, q_len, 0xF620, a_log, b_range);
+            let bb = upload_bundle(&device, &bu);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let c = chunk(&x, d, 0, q_len, q_len);
+            let s = run_step_with(&device, &pool, &bb, d, &c, (0, true), Scan::Chunked)
+                .expect("the step launches");
+            let (vd, nv) = (d.value_dim(), d.nv);
+            let (_, state) = zeros(d);
+            let real = scan_reference(d, &s, q_len, (&state, None, 0), ScanVariant::Real);
+            let rc = compare_o_chunked(&s, &real, |_| true);
             eprintln!(
-                "chunked self-check {} L={q_len} {what}: out_of_bound={}/{} ({:.4}, need >= \
-                 {need}) {}",
+                "chunked self-check {} L={q_len} {regime}: the real check o {} {}",
                 model(d),
-                m.out_of_bound,
-                m.n,
-                m.fraction(),
-                verdict(ok)
+                rc.line(),
+                verdict(rc.pass())
             );
-            pass &= ok;
+            pass &= rc.pass();
+            let mutated = |variant| scan_reference(d, &s, q_len, (&state, None, 0), variant);
+            let cases: Vec<(&str, ScanReference, usize)> = if a_log > 0.0 {
+                // β = b: the reference from the GPU's conv_out and g, with b itself as β.
+                let (_, b_raw) = gdn_gating_reference(
+                    &widen(&c.a[..q_len * nv]),
+                    &widen(&c.b[..q_len * nv]),
+                    &to_f64(&bu.a_log),
+                    &to_f64(&bu.dt_bias),
+                    nv,
+                    false,
+                );
+                let conv_out = to_f64(&s.conv_out[..q_len * d.conv_dim()]);
+                let gpu_g = to_f64(&s.g[..q_len * nv]);
+                let beta_b = gdn_scan_reference(
+                    &ScanInputs {
+                        conv_out: &conv_out,
+                        g: &gpu_g,
+                        beta: &b_raw,
+                        state: &state,
+                        smax: None,
+                        t0: 0,
+                        q_len,
+                    },
+                    d,
+                    ScanVariant::Real,
+                );
+                vec![
+                    ("decay after the update", mutated(ScanVariant::DecayLast), 1),
+                    (
+                        "chunk 1's decay missing",
+                        mutated(ScanVariant::NoDecayOver {
+                            from: CHUNK,
+                            to: 2 * CHUNK,
+                        }),
+                        CHUNK + 1,
+                    ),
+                    ("beta = b (no sigmoid)", beta_b, 1),
+                ]
+            } else {
+                vec![
+                    (
+                        "no delta-rule correction (u = beta*v)",
+                        mutated(ScanVariant::NoCorrection),
+                        1,
+                    ),
+                    (
+                        "the intra-chunk term dropped (T = I)",
+                        mutated(ScanVariant::StaleInChunks { len: CHUNK }),
+                        1,
+                    ),
+                ]
+            };
+            for (what, m, from) in cases {
+                let refs: Vec<f64> = m.o.iter().map(|p| p.0).collect();
+                let miss = compare_f32(
+                    &s.o,
+                    &refs,
+                    |i| gdn_chunk_bound(real.o[i].0, real.o[i].1),
+                    |i| (from * vd..q_len * vd).contains(&i),
+                );
+                let ok = miss.fraction() >= NEED;
+                eprintln!(
+                    "chunked self-check {} L={q_len} {regime}: {what}: out_of_bound={}/{} \
+                     ({:.4}, need >= {NEED}) {}",
+                    model(d),
+                    miss.out_of_bound,
+                    miss.n,
+                    miss.fraction(),
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
         }
-        // β = b: the reference from the GPU's conv_out and g, with b itself as β.
-        let nv = d.nv;
-        let (_, b_raw) = gdn_gating_reference(
-            &widen(&c.a[..q_len * nv]),
-            &widen(&c.b[..q_len * nv]),
-            &to_f64(&bu.a_log),
-            &to_f64(&bu.dt_bias),
-            nv,
-            false,
-        );
-        let conv_out = to_f64(&s.conv_out[..q_len * d.conv_dim()]);
-        let gpu_g = to_f64(&s.g[..q_len * nv]);
-        let r = gdn_scan_reference(
-            &ScanInputs {
-                conv_out: &conv_out,
-                g: &gpu_g,
-                beta: &b_raw,
-                state: &state,
-                smax: None,
-                t0: 0,
-                q_len,
-            },
-            d,
-            ScanVariant::Real,
-        );
-        let m = compare_o_chunked(&s, &r, |_| true);
-        let ok = m.fraction() >= 0.5;
-        eprintln!(
-            "chunked self-check {} L={q_len} beta = b (no sigmoid): out_of_bound={}/{} ({:.4}, \
-             need >= 0.5) {}",
-            model(d),
-            m.out_of_bound,
-            m.n,
-            m.fraction(),
-            verdict(ok)
-        );
-        pass &= ok;
     }
     assert!(pass, "a chunked self-check's mutated reference passed");
 }
@@ -2752,7 +2793,7 @@ fn the_chunked_scan_refuses_what_the_scan_refuses() {
                         out.ptr(),
                         (rows, nk, nv),
                         (hk, hv, sc),
-                        (p, null),
+                        (p, null, null),
                     ),
                 }
             };
@@ -2767,20 +2808,8 @@ fn the_chunked_scan_refuses_what_the_scan_refuses() {
             pass &= ok;
         }
     }
-    // A shape it takes, at a part it does not.
+    // A shape it takes, at a part it does not (4), and the traced part with no trace (3).
     let se = u64::from(nv9) * 128 * 128;
-    // SAFETY: as above.
-    let got = unsafe {
-        gdn_chunk_scan_part(
-            (x.ptr(), x.ptr(), x.ptr()),
-            (st.ptr(), se),
-            seq.ptr(),
-            out.ptr(),
-            (4, 16, nv9),
-            (128, 128, scale),
-            (3, null),
-        )
-    };
     let want = KernelError::GdnScanShape {
         rows: 4,
         nk: 16,
@@ -2788,9 +2817,26 @@ fn the_chunked_scan_refuses_what_the_scan_refuses() {
         head_k: 128,
         head_v: 128,
     };
-    let ok = got == Err(want) && unchanged(&out) && unchanged(&st);
-    eprintln!("chunked refused part=3: {got:?} {}", verdict(ok));
-    pass &= ok;
+    for part in [4u32, 3] {
+        // SAFETY: as above.
+        let got = unsafe {
+            gdn_chunk_scan_part(
+                (x.ptr(), x.ptr(), x.ptr()),
+                (st.ptr(), se),
+                seq.ptr(),
+                out.ptr(),
+                (4, 16, nv9),
+                (128, 128, scale),
+                (part, null, null),
+            )
+        };
+        let ok = got == Err(want) && unchanged(&out) && unchanged(&st);
+        eprintln!(
+            "chunked refused part={part} (no trace): {got:?} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
     assert!(
         pass,
         "the chunked scan took a shape the scan refuses, or wrote its output"
@@ -2802,7 +2848,9 @@ fn the_chunked_scan_refuses_what_the_scan_refuses() {
 /// step's own conv_out, g and β; and its split: the launch with the solve skipped (T = I) and the
 /// launch stopped after the precompute. Each 20 launches after a warm-up, timed to the download
 /// that waits for them, in the order A, B, A, B (A today's, B the chunked and its parts). Printed
-/// as `F6_TIME` lines; recorded, not asserted.
+/// as `F6_TIME` lines; then one traced launch's phase split (each CTA's thread 0's cycles per
+/// phase and chunk, averaged over the CTAs, and each phase's share) as an `F6_PHASE` line.
+/// Recorded, not asserted.
 #[test]
 fn the_chunked_scan_time_is_recorded() {
     const LAUNCHES: u32 = 20;
@@ -2849,7 +2897,7 @@ fn the_chunked_scan_time_is_recorded() {
                             o.ptr(),
                             rows,
                             heads,
-                            (p, null),
+                            (p, null, null),
                         ),
                     }
                 }
@@ -2882,6 +2930,57 @@ fn the_chunked_scan_time_is_recorded() {
                 (full - no_solve) / full,
                 (full - precompute) / full,
             );
+            // The phase split: one traced launch, each CTA's thread 0's cycles per phase.
+            let ctas = (d.head_v / 32) * d.nv;
+            let trace = up_f32_bits(&device, ctas * (PHASES.len() + 1), NAN_F32);
+            // SAFETY: as `launch`'s; `trace` holds `ctas · 13` f32.
+            unsafe {
+                gdn_chunk_scan_part(
+                    (cv.ptr(), g.ptr(), beta.ptr()),
+                    (pool.ssm.ptr(), pool.layout.ssm_elems_per_slot() as u64),
+                    seq.ptr(),
+                    o.ptr(),
+                    (q_len as u32, d.nk as u32, d.nv as u32),
+                    (d.head_k as u32, d.head_v as u32, gdn_scale(d.head_k as u32)),
+                    (3, trace.ptr(), std::ptr::null_mut()),
+                )
+            }
+            .expect("the traced scan launches");
+            let t = down_f32(&trace);
+            let cols = PHASES.len() + 1;
+            let chunks = f64::from(t[cols - 1]);
+            let mean =
+                |p: usize| (0..ctas).map(|c| f64::from(t[c * cols + p])).sum::<f64>() / ctas as f64;
+            let total: f64 = (0..PHASES.len()).map(mean).sum();
+            let split: Vec<String> = (PHASES.iter().enumerate())
+                .map(|(p, name)| {
+                    let m = mean(p);
+                    format!("{name}={:.0} ({:.3})", m / chunks, m / total)
+                })
+                .collect();
+            eprintln!(
+                "F6_PHASE {} L={q_len}: chunks={chunks} cycles_per_chunk={:.0} {}",
+                model(d),
+                total / chunks,
+                split.join(" ")
+            );
         }
     }
 }
+
+/// The chunked scan's traced phases (`kernels/gdn_chunk_scan.cu`'s `PHASES`), in order; its trace's
+/// last column is the chunk count.
+const PHASES: [&str; 12] = [
+    "state_load",
+    "rows",
+    "g_beta_G",
+    "kk_qk_qs",
+    "a_n_p",
+    "diag_solve",
+    "t_products",
+    "u_w",
+    "v_new",
+    "o",
+    "state_update",
+    "state_store",
+];
