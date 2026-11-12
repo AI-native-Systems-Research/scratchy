@@ -68,7 +68,7 @@
 // TEST SUPPORT: `PART` instantiates the timing split (`scratchy_cuda_gdn_chunk_scan_part`): 1 skips
 // the solve (T = I), 2 stops after the precompute (no `V_new`, `O` or state update). Neither is a
 // correct scan; `PART` 0 is the kernel, and 3 is the kernel recording its phases: thread 0's
-// `clock64` cycles in each phase, summed over the chunks, one row of `trace` per CTA.
+// `clock` cycles in each phase, summed over the chunks, one row of `trace` per CTA.
 
 #include "kittens.cuh"
 #include "scratchy_ops.cuh"
@@ -246,13 +246,23 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
     const int q_len = g.sequence[{0, 0, 0, 1}];
     const bool fresh = g.sequence[{0, 0, 0, 2}] == 1;
 
-    // `PART_TRACE`: thread 0 adds the cycles since the last mark to phase `p`.
-    long long ph[PHASES] = {};
-    long long last = PART == PART_TRACE ? clock64() : 0;
+    // `PART_TRACE`: thread 0 adds the cycles since the last mark to phase `p`, in shared memory
+    // (`clock`, differences modulo 2³²; a launch's phase sums stay far below it): register
+    // counters took the traced instance past 255 registers.
+    __shared__ sv<int, 16> ph;
+    if constexpr (PART == PART_TRACE) {
+        if (threadIdx.x < 16) {
+            ph[threadIdx.x] = 0;
+        }
+        __syncthreads();
+    }
+    uint32_t last = PART == PART_TRACE ? uint32_t(clock()) : 0;
     const auto mark = [&](int p) {
         if constexpr (PART == PART_TRACE) {
-            const long long now = clock64();
-            ph[p] += now - last;
+            const uint32_t now = uint32_t(clock());
+            if (threadIdx.x == 0) {
+                ph[p] = ph[p] + int(now - last);
+            }
             last = now;
         }
     };
@@ -407,31 +417,37 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
             warp::zero(d);
             warp::apply(d, d, [&](int r, int c, float) { return c == i0 + r ? 1.0f : 0.0f; });
         } else {
-            // D: warp w's diagonal block, in place, its rows `i0 ..` only. Row 0 is e_0 (A's row
-            // 0 block is zero); row r is e_r − Σ_{j<r} A_rj · D_j, whose entry r is 0 (D_j is lower)
-            // and becomes 1.
-            __syncwarp();
-            if (warp::laneid() == 0) {
-                ad[{i0, 0}] = 1.0f;
-            }
-            __syncwarp();
-            for (int r = 1; r < WARP_TOKENS; ++r) {
-                rv_fl<16> acc, dj;
-                warp::zero(acc);
+            // D: warp w's diagonal block, its rows `i0 ..` only, in registers (F6 r3: the shared-
+            // memory row steps were 66% of a chunk). With D_r = e_r − N_r, `B·D = I` row by row
+            // is N_r = A_r − Σ_{j<r} A_rj · N_j, A_r A's row (its entries from column r on are
+            // zero, A strictly lower): the loops fully unrolled, every N_j a register row, each
+            // row's A reads issued together ahead of its chain; then each row stored once, −N_r
+            // with its 1.
+            rv_fl<16> nr[WARP_TOKENS];
+#pragma unroll
+            for (int r = 0; r < WARP_TOKENS; ++r) {
+                // Row r's A reads stay in row r (a shared-memory fence): the 120 hoisted at once
+                // took ptxas past 255 registers.
+                __syncwarp();
+                warp::load(nr[r], ad, {i0 + r, 0});
+#pragma unroll
                 for (int j = 0; j < r; ++j) {
-                    warp::load(dj, ad, {i0 + j, 0});
-                    warp::mul(dj, dj, ad[{i0 + r, j}]);
-                    warp::add(acc, acc, dj);
+                    rv_fl<16> t;
+                    warp::mul(t, nr[j], ad[{i0 + r, j}]);
+                    warp::sub(nr[r], nr[r], t);
                 }
-                warp::mul(acc, acc, -1.0f);
-                __syncwarp();
-                warp::store(ad, acc, {i0 + r, 0});
-                __syncwarp();
-                if (warp::laneid() == 0) {
-                    ad[{i0 + r, r}] = 1.0f;
-                }
-                __syncwarp();
             }
+            __syncwarp();
+#pragma unroll
+            for (int r = 0; r < WARP_TOKENS; ++r) {
+                warp::mul(nr[r], nr[r], -1.0f);
+                warp::store(ad, nr[r], {i0 + r, 0});
+            }
+            __syncwarp();
+            if (warp::laneid() < WARP_TOKENS) {
+                ad[{i0 + warp::laneid(), warp::laneid()}] = 1.0f;
+            }
+            __syncwarp();
             warpgroup::load(dg, ad);
             warp::zero(d);
             set_diag_block(d, dg, w);
@@ -564,7 +580,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
     if constexpr (PART == PART_TRACE) {
         if (threadIdx.x == 0) {
             const int cta = blockIdx.y * gridDim.x + blockIdx.x;
-            ph[12] = (q_len + CHUNK - 1) / CHUNK;
+            ph[PHASES - 1] = (q_len + CHUNK - 1) / CHUNK;
 #pragma unroll
             for (int p = 0; p < PHASES; ++p) {
                 g.trace[{0, 0, cta, p}] = float(ph[p]);
