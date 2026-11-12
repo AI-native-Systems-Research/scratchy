@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The decode RMSNorm in one CTA a row, fused with the next GEMM's per-token FP8 quantization (FP8
-// S8 N3; no tape launches it yet). Per row `r` of `x [rows, cols]` bf16:
+// S8 N3; every one-row norm of a tape plays it, `step::norm_row_takes`). Per row `r` of `x [rows,
+// cols]` bf16:
 //
 //     y[r, c] = bf16(x[r, c] · inv · (offset + gain[c])),  inv = rsqrt(Σ_c x[r, c]² / cols + eps)
 //

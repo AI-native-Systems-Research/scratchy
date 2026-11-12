@@ -199,6 +199,62 @@ pub enum CudaStep {
     /// [`Self::ExpertGateUpAct`] over an fp8 bank on the tensor cores, as [`Self::GateUpTcFp8`]:
     /// B8's expert form for the gate and the up (f32), then the act + quantize of the pairs' rows.
     ExpertGateUpTcFp8(ExpertGateUpTcFp8),
+    /// A one-row [`Self::RmsNorm`] and the [`Self::QuantRowsFp8`] of its `y` right after it, in
+    /// one launch (FP8 S8 N3, `kernels/rms_norm_quant_row.cu`): `y` as N3's norm computes it, then
+    /// its e4m3 row and scale at `q`, the quant scratch's first slot, `quant_rows_fp8` of `y` bit
+    /// for bit.
+    RmsNormQuantFp8(RmsNormQuantFp8),
+    /// [`Self::AddRmsNorm`] of one row and the quantization of its `y`, as [`Self::RmsNormQuantFp8`].
+    AddRmsNormQuantFp8(AddRmsNormQuantFp8),
+}
+
+/// [`CudaStep::RmsNormQuantFp8`]: the norm, and where its quantization goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RmsNormQuantFp8 {
+    pub norm: RmsNormBf16,
+    pub q: ArenaOffset,
+}
+
+impl RmsNormQuantFp8 {
+    /// The quantization's write, as the [`QuantRowsFp8`] of `y` it equals.
+    pub const fn quant_write(&self) -> QuantRowsFp8 {
+        QuantRowsFp8 {
+            x: self.norm.y,
+            q: self.q,
+            rows: self.norm.rows,
+            cols: self.norm.cols,
+        }
+    }
+}
+
+/// [`CudaStep::AddRmsNormQuantFp8`]: the add-norm, and where its quantization goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AddRmsNormQuantFp8 {
+    pub fold: AddRmsNormBf16,
+    pub q: ArenaOffset,
+}
+
+impl AddRmsNormQuantFp8 {
+    /// As [`RmsNormQuantFp8::quant_write`].
+    pub const fn quant_write(&self) -> QuantRowsFp8 {
+        RmsNormQuantFp8 {
+            norm: self.fold.norm,
+            q: self.q,
+        }
+        .quant_write()
+    }
+}
+
+/// The one-row norm's column granule and widest row (FP8 S8 N3, `kernels/rms_norm_quant_row.cu`'s
+/// `CHUNK` and `MAX_COLS`).
+pub const NORM_ROW_COLS: u32 = 256;
+pub const NORM_ROW_MAX_COLS: u32 = 8192;
+
+/// Whether a norm, add-norm or norm-add of `rows` × `cols` plays the one-row norm (FP8 S8 N3):
+/// the decode bucket's one token row, at a width its kernel takes. Every other norm plays the
+/// row kernels (`kernels/rms_norm_bf16.cu`).
+pub const fn norm_row_takes(rows: u32, cols: u32) -> bool {
+    rows == 1 && cols.is_multiple_of(NORM_ROW_COLS) && cols <= NORM_ROW_MAX_COLS
 }
 
 /// [`CudaStep::GateUpTcFp8`]: the gate/up fold it computes (its `kernel` the CUDA-core one,
@@ -391,7 +447,12 @@ pub fn quant_chain(steps: &[CudaStep]) -> Result<(), QuantChainError> {
         let Some(w) = s.quant_write() else {
             continue;
         };
-        let required = matches!(s, CudaStep::QuantRowsFp8(_));
+        let required = matches!(
+            s,
+            CudaStep::QuantRowsFp8(_)
+                | CudaStep::RmsNormQuantFp8(_)
+                | CudaStep::AddRmsNormQuantFp8(_)
+        );
         let at = live
             .iter()
             .position(|l| l.is_some_and(|(_, q, _, _)| q.q == w.q));
@@ -2023,7 +2084,9 @@ impl CudaStep {
             | Self::GemvGroupTcFp8(_)
             | Self::GateUpTcFp8(_)
             | Self::ExpertGemvTcFp8(_)
-            | Self::ExpertGateUpTcFp8(_) => None,
+            | Self::ExpertGateUpTcFp8(_)
+            | Self::RmsNormQuantFp8(_)
+            | Self::AddRmsNormQuantFp8(_) => None,
         }
     }
 
@@ -2082,7 +2145,9 @@ impl CudaStep {
             | Self::GemvGroupTcFp8(_)
             | Self::GateUpTcFp8(_)
             | Self::ExpertGemvTcFp8(_)
-            | Self::ExpertGateUpTcFp8(_) => None,
+            | Self::ExpertGateUpTcFp8(_)
+            | Self::RmsNormQuantFp8(_)
+            | Self::AddRmsNormQuantFp8(_) => None,
         }
     }
 
@@ -2138,7 +2203,9 @@ impl CudaStep {
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
             | Self::ExpertGateUpAct(_)
-            | Self::GdnDecode(_) => None,
+            | Self::GdnDecode(_)
+            | Self::RmsNormQuantFp8(_)
+            | Self::AddRmsNormQuantFp8(_) => None,
         }
     }
 
@@ -2206,6 +2273,8 @@ impl CudaStep {
             Self::QuantRowsFp8(q) => Some(q),
             Self::GateUpTcFp8(t) => Some(t.quant_write()),
             Self::ExpertGateUpTcFp8(t) => t.quant_write(),
+            Self::RmsNormQuantFp8(t) => Some(t.quant_write()),
+            Self::AddRmsNormQuantFp8(t) => Some(t.quant_write()),
             _ => None,
         }
     }
@@ -2240,6 +2309,14 @@ impl CudaStep {
         }
         if let Self::ExpertGateUpTcFp8(t) = self {
             return [Some(*self), Some(Self::ExpertGemvTcFp8(t.fold.up)), None];
+        }
+        // A norm with its quantization (FP8 S8 N3): itself (the norm's operands), then the
+        // quantization as the quant write it equals.
+        if let Self::RmsNormQuantFp8(t) = self {
+            return [Some(*self), Some(Self::QuantRowsFp8(t.quant_write())), None];
+        }
+        if let Self::AddRmsNormQuantFp8(t) = self {
+            return [Some(*self), Some(Self::QuantRowsFp8(t.quant_write())), None];
         }
         // A rope append with its query rope folded in (FP8 S8 W4c): the append, then the query rope
         // as the step it is on its own, so `validate` checks its spans too.
@@ -2620,6 +2697,9 @@ impl CudaStep {
                     ..e
                 })
             }
+            // The norm's; its quantization is its second part's ([`Self::parts`]).
+            Self::RmsNormQuantFp8(t) => Self::RmsNorm(t.norm).extents(),
+            Self::AddRmsNormQuantFp8(t) => Self::AddRmsNorm(t.fold).extents(),
             // The norm's gain and both inputs; the sum, then the norm.
             Self::AddRmsNorm(f) => {
                 let RmsNormBf16 {
@@ -3302,6 +3382,18 @@ impl CudaStep {
             })
             | Self::NormAdd(NormAddBf16 {
                 norm: RmsNormBf16 { gain, .. },
+                ..
+            })
+            | Self::RmsNormQuantFp8(RmsNormQuantFp8 {
+                norm: RmsNormBf16 { gain, .. },
+                ..
+            })
+            | Self::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
+                fold:
+                    AddRmsNormBf16 {
+                        norm: RmsNormBf16 { gain, .. },
+                        ..
+                    },
                 ..
             }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),

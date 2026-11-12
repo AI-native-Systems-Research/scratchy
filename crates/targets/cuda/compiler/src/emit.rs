@@ -134,6 +134,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "QuantRowsFp8",
                 "GateUpTcFp8",
                 "ExpertGateUpTcFp8",
+                "RmsNormQuantFp8",
+                "AddRmsNormQuantFp8",
             ],
         },
         ModuleRow {
@@ -701,6 +703,9 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvFp8(t.fold.gate)),
         CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemv(g)),
         CudaStep::ExpertGateUpTcFp8(t) => role(&CudaStep::ExpertGemv(t.fold.gate)),
+        // A norm with its quantization (FP8 S8 N3) reads its norm's gain.
+        CudaStep::RmsNormQuantFp8(t) => role(&CudaStep::RmsNorm(t.norm)),
+        CudaStep::AddRmsNormQuantFp8(t) => role(&CudaStep::AddRmsNorm(t.fold)),
         CudaStep::GemvGroupTcFp8(_) => None,
     }
 }

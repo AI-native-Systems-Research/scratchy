@@ -1749,7 +1749,9 @@ pub unsafe fn rms_norm_unit_bf16(
 }
 
 /// The decode RMSNorm in one CTA a row, fused with the next GEMM's FP8 quantization (FP8 S8 N3,
-/// `kernels/rms_norm_quant_row.cu`; no `CudaStep` launches it yet). Per row of `x [rows, cols]`
+/// `kernels/rms_norm_quant_row.cu`; the one-row norms [`crate::step::norm_row_takes`] takes, and
+/// [`CudaStep::RmsNormQuantFp8`](crate::step::CudaStep::RmsNormQuantFp8) and its add-norm twin with
+/// their quantization). Per row of `x [rows, cols]`
 /// bf16: `form` 0 `y = norm(x)`, 1 `sum = bf16(x + other)` and `y = norm(sum)`, 2 `y =
 /// bf16(bf16(norm(x)) + other)`, with `norm(v) = v · rsqrt(mean(v²) + eps) · (gain_offset + gain)`
 /// rounded once to bf16, its sum of squares in its own order (a warp tree, not the 16-row
