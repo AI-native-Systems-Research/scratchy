@@ -444,16 +444,6 @@ struct fp8_round {
     }
 };
 
-// A 32-bit add modulo 2³² on `int` (FP8 S8 W2d's consume probe, `tma_ring_probe.cu`): TK's
-// `base_ops::sum` on `int` is a signed add, whose overflow is undefined. Exact, so a host can
-// check a fold of any words.
-struct wrap_add {
-    template <typename T>
-    static __device__ inline T op(const T& a, const T& b) {
-        return T(uint32_t(a) + uint32_t(b));
-    }
-};
-
 // The MoE sort's run length: an expert's pair count rounded up to whole 128-row tiles of the
 // grouped GEMM (`op_abi::CUDA_EXPERT_TILE_ROWS`), so a tile belongs to one expert. Integer, exact.
 struct tile_pad {

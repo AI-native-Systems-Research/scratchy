@@ -65,12 +65,6 @@ required-features = ["nvcc"]
 name = "tma_bounds"
 required-features = ["nvcc"]
 
-# FP8 S8 W2c: the fp8 GEMV's weight stream alone, at five sizes of TMA operation
-# (`kernels/tma_ring_probe.cu`), timed on the GPU. Not built without `nvcc`.
-[[test]]
-name = "gemv_fp8_ring_probe"
-required-features = ["nvcc"]
-
 # The row kernels (RMSNorm, add, SiluMul) against a CPU reference, on the GPU. Not built without
 # `nvcc`.
 [[test]]
