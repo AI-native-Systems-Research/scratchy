@@ -61,7 +61,8 @@ pub enum CudaStep {
     AttnDecode(AttnPrefillBf16),
     /// One prefill chunk of a Gated-DeltaNet linear-attention layer, lowered from
     /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
-    /// `kernels/gdn_gating.cu`, `kernels/gdn_scan.cu` then `kernels/gdn_rms_norm_gated.cu`.
+    /// `kernels/gdn_gating.cu`, `kernels/gdn_chunk_scan.cu` (FP8 S8 F6a: the scan 64 tokens at a
+    /// time) then `kernels/gdn_rms_norm_gated.cu`.
     GatedDeltaNet(GatedDeltaNetBf16),
     /// A MoE block's router, `[m, experts]` logits into the MoE scratch, lowered from
     /// `SubOp::RouterLogits`: the tiled GEMM or the GEMV (`kernels/gemm_bf16.cu`,
@@ -413,6 +414,15 @@ pub fn quant_chain(steps: &[CudaStep]) -> Result<(), QuantChainError> {
         Some((at, ..)) => Err(QuantChainError::Overwritten { step: *at }),
         None => Ok(()),
     }
+}
+
+/// Whether a `GatedDeltaNet` step of `rows` rows scans with the recurrent kernel
+/// (`kernels/gdn_scan.cu`) rather than the chunked one (`kernels/gdn_chunk_scan.cu`, FP8 S8 F6a): at
+/// a one-row bucket, a decode the one-launch `GdnDecode` does not take (the 27B's three value heads
+/// a key head), where the chunked scan would pay a 64-token chunk for one token; every prefill
+/// bucket's is the chunked scan. A constant of each step (its `rows`), chosen at expansion.
+pub const fn gdn_scan_is_recurrent(rows: u32) -> bool {
+    rows == 1
 }
 
 /// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`): one CTA

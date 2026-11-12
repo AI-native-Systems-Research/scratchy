@@ -45,7 +45,7 @@ use crate::step::{
     LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16,
     PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
     RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_scratch_bytes,
-    attn_decode_split, fp8_moe_layout, fp8_weight, gemv_splits,
+    attn_decode_split, fp8_moe_layout, fp8_weight, gdn_scan_is_recurrent, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -2818,7 +2818,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (g.rows, g.num_v_heads),
                 stream.0,
             )?;
-            kernels::gdn_scan(
+            // A prefill bucket's step scans 64 tokens a chunk (FP8 S8 F6a); a one-row bucket's (a
+            // decode `GdnDecode` does not take) by the recurrent scan (`gdn_scan_is_recurrent`).
+            // The two take the same contract.
+            let scan = match gdn_scan_is_recurrent(g.rows) {
+                true => kernels::gdn_scan,
+                false => kernels::gdn_chunk_scan,
+            };
+            scan(
                 (conv_out.cast_const(), gate.cast_const(), beta.cast_const()),
                 (ssm_state, layout.ssm_elems_per_slot() as u64),
                 seq,

@@ -43,9 +43,10 @@ use common::numerics::{
     silu_mul_reference,
 };
 use common::numerics::{
-    GDN_SCAN_STEP, GdnDims, ScanInputs, ScanReference, ScanVariant, compare_f32, f32_from_halves,
-    f32_inputs, f32_to_halves, gdn_conv_bound, gdn_conv_reference, gdn_gating_bound,
-    gdn_gating_reference, gdn_norm_reference, gdn_scan_bound, gdn_scan_reference, widen,
+    GDN_CHUNK_REL, GDN_CHUNK_STEP, GdnDims, ScanInputs, ScanReference, ScanVariant, compare_f32,
+    f32_from_halves, f32_inputs, f32_to_halves, gdn_chunk_bound, gdn_conv_bound,
+    gdn_conv_reference, gdn_gating_bound, gdn_gating_reference, gdn_norm_reference,
+    gdn_scan_reference, widen,
 };
 use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::subtile_ir::GainConvention;
@@ -2094,7 +2095,7 @@ fn check_gdn_forward(
     let oc = compare_f32(
         &s.o[..q_len * GL_VALUE],
         &o_ref,
-        |i| gdn_scan_bound(scan.o[i].0, scan.o[i].1),
+        |i| gdn_chunk_bound(scan.o[i].0, scan.o[i].1),
         |_| true,
     );
     eprintln!(
@@ -2179,7 +2180,7 @@ fn the_gdn_layer_matches_the_cpu_reference_in_each_bucket() {
 
 /// Bucket 256: chunk 1 (`q_len = 200`, fresh, slot 2), then chunk 2 (`q_len = 150`, continued).
 /// Chunk 2's stages within bound, its scan against the reference from the state chunk 1 left; the
-/// state after chunk 2 within the long-recurrence bound of a reference over all 350 tokens;
+/// state after chunk 2 within the chunked scan's bound of a reference over all 350 tokens;
 /// chunk 2's padding rows of `core` `+0.0`; slots 0, 1 and 3 bit-unchanged.
 #[test]
 fn the_gdn_layer_carries_its_state_across_two_chunks() {
@@ -2268,7 +2269,7 @@ fn the_gdn_layer_carries_its_state_across_two_chunks() {
     let sc = compare_f32(
         &state2,
         &whole.state,
-        |i| GDN_SCAN_STEP * whole.state_scale[i / 128],
+        |i| GDN_CHUNK_REL * whole.state[i].abs() + GDN_CHUNK_STEP * whole.state_scale[i / 128],
         |_| true,
     );
     let after = gdn_snapshot(&mut worker);

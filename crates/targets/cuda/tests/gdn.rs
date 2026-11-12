@@ -22,14 +22,15 @@ pub mod common {
 }
 
 use common::numerics::{
-    F32Comparison, GDN_SCAN_STEP, GdnDims, ScanInputs, ScanReference, ScanVariant, bf16_in,
-    compare_f32, compare_rows, f32_from_halves, f32_inputs, f32_to_halves, gdn_conv_bound,
-    gdn_conv_reference, gdn_gating_bound, gdn_gating_reference, gdn_norm_reference, gdn_scan_bound,
-    gdn_scan_reference, widen,
+    F32Comparison, GDN_CHUNK_REL, GDN_CHUNK_STEP, GDN_SCAN_STEP, GdnDims, ScanInputs,
+    ScanReference, ScanVariant, bf16_in, compare_f32, compare_rows, f32_from_halves, f32_inputs,
+    f32_to_halves, gdn_chunk_bound, gdn_conv_bound, gdn_conv_reference, gdn_gating_bound,
+    gdn_gating_reference, gdn_norm_reference, gdn_scan_bound, gdn_scan_reference, widen,
 };
 use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_target_cuda::kernels::{
-    KernelError, gdn_conv1d, gdn_gating, gdn_rms_norm_gated, gdn_scan,
+    KernelError, gdn_chunk_scan, gdn_chunk_scan_part, gdn_conv1d, gdn_gating, gdn_rms_norm_gated,
+    gdn_scan,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 use scratchy_target_cuda::step::gdn_scale;
@@ -275,7 +276,28 @@ fn run_step(
     bb: &BundleBufs,
     d: GdnDims,
     c: &Chunk,
+    slot: (u32, bool),
+) -> Result<StepOut, KernelError> {
+    run_step_with(device, pool, bb, d, c, slot, Scan::Recurrent)
+}
+
+/// Which scan a step's third launch is: today's recurrent `gdn_scan`, or the chunked
+/// `gdn_chunk_scan` (FP8 S8 F6a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scan {
+    Recurrent,
+    Chunked,
+}
+
+/// [`run_step`] with `scan` as its third launch.
+fn run_step_with(
+    device: &CudaDevice,
+    pool: &Pool,
+    bb: &BundleBufs,
+    d: GdnDims,
+    c: &Chunk,
     (slot, fresh): (u32, bool),
+    scan: Scan,
 ) -> Result<StepOut, KernelError> {
     let rows = c.rows;
     let seq = up_u32(device, &[slot, c.q_len as u32, u32::from(fresh), 0]);
@@ -319,7 +341,11 @@ fn run_step(
             (r, nv),
             null,
         )?;
-        gdn_scan(
+        let launch = match scan {
+            Scan::Recurrent => gdn_scan,
+            Scan::Chunked => gdn_chunk_scan,
+        };
+        launch(
             (conv_out.ptr(), g.ptr(), beta.ptr()),
             (pool.ssm.ptr(), l.ssm_elems_per_slot() as u64),
             seq.ptr(),
@@ -2074,5 +2100,1054 @@ fn the_gdn_decode_fold_is_its_four_launches_bit_for_bit() {
     assert!(
         pass,
         "the one-launch GDN decode differs from its four launches"
+    );
+}
+
+// ── FP8 S8 F6a: the chunked scan (`kernels/gdn_chunk_scan.cu`) ─────────────────
+
+/// The chunk the chunked scan works in.
+const CHUNK: usize = 64;
+/// The chunked scan's lengths (/tmp/a-f6-plan.md §5, F6-1).
+const CHUNK_LENGTHS: [usize; 8] = [1, 2, 63, 64, 65, 128, 2048, 4096];
+
+/// `o` against a scan reference under the chunked bound, over the elements `keep` admits.
+fn compare_o_chunked(
+    s: &StepOut,
+    r: &ScanReference,
+    keep: impl Fn(usize) -> bool,
+) -> F32Comparison {
+    let refs: Vec<f64> = r.o.iter().map(|p| p.0).collect();
+    compare_f32(&s.o, &refs, |i| gdn_chunk_bound(r.o[i].0, r.o[i].1), keep)
+}
+
+/// The chunked scan's state check on element `i` of a reference's final state (`hk` key lanes a
+/// row): `2⁻⁷·|ref| + 2⁻¹⁰·(t_last+1)·Smax`, the output check's form (user decision 2026-11-12:
+/// the first rank-1 update's bf16 operands put up to ~2⁻⁷ of an element on it, past a term in
+/// Smax alone).
+fn chunk_state_bound(r: &ScanReference, i: usize, hk: usize) -> f64 {
+    GDN_CHUNK_REL * r.state[i].abs() + GDN_CHUNK_STEP * r.state_scale[i / hk]
+}
+
+/// [`check_scan`] under the chunked bound: `o` within it, its padding rows unwritten, the slot's
+/// state within [`chunk_state_bound`].
+fn check_chunk_scan(
+    what: &str,
+    d: GdnDims,
+    s: &StepOut,
+    q_len: usize,
+    start: (&[f64], Option<&[f64]>, usize),
+    after: &[f32],
+) -> (bool, ScanReference) {
+    let r = scan_reference(d, s, q_len, start, ScanVariant::Real);
+    let cmp = compare_o_chunked(s, &r, |_| true);
+    let linear = GDN_CHUNK_STEP * r.o.get(cmp.worst).map_or(0.0, |p| p.1);
+    let padding = written_past(&s.o, q_len * d.value_dim());
+    let hk = d.head_k;
+    let st = compare_f32(after, &r.state, |i| chunk_state_bound(&r, i, hk), |_| true);
+    let ok = cmp.pass() && st.pass() && padding == 0;
+    eprintln!(
+        "{what} chunked scan L={q_len} t0={}: o {} linear_term_at_worst={linear:.4e} state {} \
+         padding_written={padding} {}",
+        start.2,
+        cmp.line(),
+        st.line(),
+        verdict(ok)
+    );
+    (ok, r)
+}
+
+/// [`check_step`] with the chunked scan's check.
+fn check_chunk_step(
+    what: &str,
+    (d, bu): (GdnDims, &Bundle),
+    (c, s): (&Chunk, &StepOut),
+    start: &Start<'_>,
+    (pool, slot): (&Pool, u32),
+) -> bool {
+    let mut ok = check_conv(what, d, c, &bu.w, start.ring, s, &pool.conv_slot(slot));
+    ok &= check_gating(what, d, c, bu, s);
+    let (scan_ok, _) = check_chunk_scan(what, d, s, c.q_len, start.scan(), &pool.ssm_slot(slot));
+    ok &= scan_ok;
+    ok & check_norm(what, d, c, bu, s)
+}
+
+/// The 35B's GDN geometry is the 9b's (16 key heads, 32 value heads, 128 × 128).
+fn model(d: GdnDims) -> &'static str {
+    match d.nv / d.nk {
+        2 => "35B",
+        3 => "27B",
+        _ => name(d),
+    }
+}
+
+/// How many bits of two f32 slices differ.
+fn differing_bits(a: &[f32], b: &[f32]) -> usize {
+    (bits_of(a).iter().zip(bits_of(b)))
+        .filter(|(x, y)| **x != *y)
+        .count()
+}
+
+/// Fresh in slot 1 of a pool NaN-poisoned everywhere, the chunked scan as the third launch, at the
+/// 35B's and the 27B's geometries: every stage within its bound (the scan within the chunked one)
+/// at every length of [`CHUNK_LENGTHS`], the padding rows unread and unwritten, the other slots
+/// bit-unchanged.
+#[test]
+fn the_chunked_scan_matches_its_reference_at_every_length() {
+    let device = h100();
+    let mut pass = true;
+    for d in [G9, G27] {
+        let bu = bundle(d, 0xF600);
+        let bb = upload_bundle(&device, &bu);
+        let x = inputs(d, CHUNK_LENGTHS[CHUNK_LENGTHS.len() - 1], 0xF601);
+        let (ring, state) = zeros(d);
+        for &l in &CHUNK_LENGTHS {
+            let pool = Pool::new(&device, d, NAN_F32);
+            let before = pool.snapshot();
+            let c = chunk(&x, d, 0, l, l + PAD);
+            let s = run_step_with(&device, &pool, &bb, d, &c, (1, true), Scan::Chunked)
+                .expect("the step launches");
+            let start = Start {
+                ring: &ring,
+                state: &state,
+                smax: None,
+                t0: 0,
+            };
+            let what = format!("{} fresh", model(d));
+            let ok = check_chunk_step(&what, (d, &bu), (&c, &s), &start, (&pool, 1));
+            let others = pool.others_changed(&before, 1);
+            eprintln!(
+                "{what} chunked L={l}: other_slots_mismatched_bits={others} {}",
+                verdict(others == 0)
+            );
+            pass &= ok && others == 0;
+        }
+    }
+    assert!(pass, "the chunked scan is out of its bound");
+}
+
+/// A known, finite start state in slot 2 (the others NaN): the chunked step within bound of the
+/// reference started from it, at `q_len` 1, 65 and 300; the other slots bit-unchanged.
+#[test]
+fn a_continued_chunked_scan_starts_from_its_slot() {
+    let device = h100();
+    let mut pass = true;
+    for d in [G9, G27] {
+        let bu = bundle(d, 0xF610);
+        let bb = upload_bundle(&device, &bu);
+        let x = inputs(d, 300, 0xF611);
+        let l = GdnStateLayout::new(4, 16, d.nv as u32, 128, 128, 4);
+        let ring = f32_inputs(l.conv_elems_per_slot(), 0xF612, (-1.0, 1.0));
+        let state = f32_inputs(l.ssm_elems_per_slot(), 0xF613, (-0.5, 0.5));
+        for q_len in [1, 65, 300] {
+            let mut pool = Pool::new(&device, d, NAN_F32);
+            pool.write_slot(&device, 2, &ring, &state);
+            let before = pool.snapshot();
+            let c = chunk(&x, d, 0, q_len, q_len + PAD);
+            let s = run_step_with(&device, &pool, &bb, d, &c, (2, false), Scan::Chunked)
+                .expect("the step launches");
+            let start = Start {
+                ring: &to_f64(&ring),
+                state: &to_f64(&state),
+                smax: None,
+                t0: 0,
+            };
+            let what = format!("{} continued", model(d));
+            let ok = check_chunk_step(&what, (d, &bu), (&c, &s), &start, (&pool, 2));
+            let others = pool.others_changed(&before, 2);
+            eprintln!(
+                "{what} chunked L={q_len}: other_slots_mismatched_bits={others} {}",
+                verdict(others == 0)
+            );
+            pass &= ok && others == 0;
+        }
+    }
+    assert!(pass, "a continued chunked step is out of its bound");
+}
+
+/// The chunked self-checks' inputs (`tokens` rows of geometry `d`): q̂ = k̂, each key head's `q`
+/// columns the same values as its `k` columns and its `q` channels the `k` channels' conv taps,
+/// the same row at every token, so `o` is the state's own row and the bound's linear term small
+/// beside it; `b` drawn in `b_range`, `a_log` the same for every value head.
+fn aligned(
+    d: GdnDims,
+    tokens: usize,
+    seed: u64,
+    a_log: f32,
+    b_range: (f64, f64),
+) -> (Inputs, Bundle) {
+    let mut x = inputs(d, tokens, seed);
+    let (cd, kd, k) = (d.conv_dim(), d.key_dim(), d.conv_kernel);
+    for t in 0..tokens {
+        for c in 0..kd {
+            let v = x.qkv[kd + c];
+            x.qkv[t * cd + c] = v;
+            x.qkv[t * cd + kd + c] = v;
+        }
+    }
+    x.b = bf16_in(tokens * d.nv, seed ^ 0x04, b_range);
+    let mut bu = bundle(d, seed);
+    for c in 0..kd {
+        for j in 0..k {
+            bu.w[c * k + j] = bu.w[(kd + c) * k + j];
+        }
+    }
+    bu.a_log = vec![a_log; d.nv];
+    (x, bu)
+}
+
+/// The chunked bound must still bite (/tmp/a-f6-plan.md §2): a kernel computing a mutation would
+/// fail the real check. Each mutated f64 reference against the chunked scan's `o`, under the REAL
+/// reference's bound (the bound the real check applies; a mutation that grows the state would
+/// grow its own), puts at least half the judged elements out of it, at `q_len` 128 (two chunks),
+/// on [`aligned`] inputs where each mistake is large:
+/// - fast decay (`a_log` 1.5), small β (`b` in [-5, -3]): the decay after the update (judged on
+///   `t ≥ 1`), chunk 1's decay missing (tokens 64..128, judged on 65..128), `β = b` (`t ≥ 1`);
+/// - slow decay (`a_log` -5), β as drawn: no delta-rule correction, the intra-chunk term dropped
+///   (T = I; both `t ≥ 1`).
+///
+/// The kernel passes the real check on the same inputs.
+#[test]
+fn every_chunked_self_check_misses_by_its_margin() {
+    const NEED: f64 = 0.5;
+    let device = h100();
+    let mut pass = true;
+    let q_len = 2 * CHUNK;
+    for d in [G9, G27] {
+        for (regime, a_log, b_range) in [
+            ("fast decay, small beta", 1.5f32, (-5.0, -3.0)),
+            ("slow decay", -5.0, (-2.0, 2.0)),
+        ] {
+            let (x, bu) = aligned(d, q_len, 0xF620, a_log, b_range);
+            let bb = upload_bundle(&device, &bu);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let c = chunk(&x, d, 0, q_len, q_len);
+            let s = run_step_with(&device, &pool, &bb, d, &c, (0, true), Scan::Chunked)
+                .expect("the step launches");
+            let (vd, nv) = (d.value_dim(), d.nv);
+            let (_, state) = zeros(d);
+            let real = scan_reference(d, &s, q_len, (&state, None, 0), ScanVariant::Real);
+            let rc = compare_o_chunked(&s, &real, |_| true);
+            eprintln!(
+                "chunked self-check {} L={q_len} {regime}: the real check o {} {}",
+                model(d),
+                rc.line(),
+                verdict(rc.pass())
+            );
+            pass &= rc.pass();
+            let mutated = |variant| scan_reference(d, &s, q_len, (&state, None, 0), variant);
+            let cases: Vec<(&str, ScanReference, usize)> = if a_log > 0.0 {
+                // β = b: the reference from the GPU's conv_out and g, with b itself as β.
+                let (_, b_raw) = gdn_gating_reference(
+                    &widen(&c.a[..q_len * nv]),
+                    &widen(&c.b[..q_len * nv]),
+                    &to_f64(&bu.a_log),
+                    &to_f64(&bu.dt_bias),
+                    nv,
+                    false,
+                );
+                let conv_out = to_f64(&s.conv_out[..q_len * d.conv_dim()]);
+                let gpu_g = to_f64(&s.g[..q_len * nv]);
+                let beta_b = gdn_scan_reference(
+                    &ScanInputs {
+                        conv_out: &conv_out,
+                        g: &gpu_g,
+                        beta: &b_raw,
+                        state: &state,
+                        smax: None,
+                        t0: 0,
+                        q_len,
+                    },
+                    d,
+                    ScanVariant::Real,
+                );
+                vec![
+                    ("decay after the update", mutated(ScanVariant::DecayLast), 1),
+                    (
+                        "chunk 1's decay missing",
+                        mutated(ScanVariant::NoDecayOver {
+                            from: CHUNK,
+                            to: 2 * CHUNK,
+                        }),
+                        CHUNK + 1,
+                    ),
+                    ("beta = b (no sigmoid)", beta_b, 1),
+                ]
+            } else {
+                vec![
+                    (
+                        "no delta-rule correction (u = beta*v)",
+                        mutated(ScanVariant::NoCorrection),
+                        1,
+                    ),
+                    (
+                        "the intra-chunk term dropped (T = I)",
+                        mutated(ScanVariant::StaleInChunks { len: CHUNK }),
+                        1,
+                    ),
+                ]
+            };
+            for (what, m, from) in cases {
+                let refs: Vec<f64> = m.o.iter().map(|p| p.0).collect();
+                let miss = compare_f32(
+                    &s.o,
+                    &refs,
+                    |i| gdn_chunk_bound(real.o[i].0, real.o[i].1),
+                    |i| (from * vd..q_len * vd).contains(&i),
+                );
+                let ok = miss.fraction() >= NEED;
+                eprintln!(
+                    "chunked self-check {} L={q_len} {regime}: {what}: out_of_bound={}/{} \
+                     ({:.4}, need >= {NEED}) {}",
+                    model(d),
+                    miss.out_of_bound,
+                    miss.n,
+                    miss.fraction(),
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "a chunked self-check's mutated reference passed");
+}
+
+/// The scan's exact properties, on the chunked scan: (a) 35B, NaN in key head `j`'s `q` and `k`
+/// reaches exactly value heads `2j` and `2j + 1`; (b) a zero value head's `o` and final state stay
+/// exactly zero; (c) padding rows (NaN in every input) reach nothing, the real rows and the state
+/// bit-identical to the same tokens with no padding; (d) a fresh start in a slot holding NaN, or
+/// a previous sequence's large state, gives the same bits, the other slots untouched; (e) two
+/// identical runs give identical bits.
+#[test]
+fn the_chunked_scan_keeps_the_scans_exact_properties() {
+    let device = h100();
+    let mut pass = true;
+    let run = |pool: &Pool, bb: &BundleBufs, d: GdnDims, c: &Chunk, slot: u32| {
+        run_step_with(&device, pool, bb, d, c, (slot, true), Scan::Chunked)
+            .expect("the step launches")
+    };
+    // (a)
+    {
+        let d = G9;
+        let bb = upload_bundle(&device, &bundle(d, 0xF630));
+        for j in [0usize, 5, 15] {
+            let mut x = inputs(d, 100, 0xF631);
+            let (cd, kd, hk) = (d.conv_dim(), d.key_dim(), d.head_k);
+            for t in 0..100 {
+                for c in 0..hk {
+                    x.qkv[t * cd + j * hk + c] = NAN_BF16;
+                    x.qkv[t * cd + kd + j * hk + c] = NAN_BF16;
+                }
+            }
+            let s = run(
+                &Pool::new(&device, d, 0),
+                &bb,
+                d,
+                &chunk(&x, d, 0, 100, 100),
+                0,
+            );
+            let (vd, hv) = (d.value_dim(), d.head_v);
+            let non_finite: Vec<usize> = (0..d.nv)
+                .filter(|&h| {
+                    (0..100).any(|t| (0..hv).any(|i| !s.o[t * vd + h * hv + i].is_finite()))
+                })
+                .collect();
+            let want = vec![2 * j, 2 * j + 1];
+            let ok = non_finite == want;
+            eprintln!(
+                "chunked key-head probe j={j}: value heads with non-finite o = {non_finite:?} \
+                 (want {want:?}) {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    for d in [G9, G27] {
+        let bb = upload_bundle(&device, &bundle(d, 0xF640));
+        let (cd, kd, hv, vd) = (d.conv_dim(), d.key_dim(), d.head_v, d.value_dim());
+        // (b)
+        let mut x = inputs(d, 300, 0xF641);
+        let live = 3usize;
+        for t in 0..300 {
+            for h in (0..d.nv).filter(|&h| h != live) {
+                for i in 0..hv {
+                    x.qkv[t * cd + 2 * kd + h * hv + i] = 0;
+                }
+            }
+        }
+        let pool = Pool::new(&device, d, NAN_F32);
+        let s = run(&pool, &bb, d, &chunk(&x, d, 0, 300, 300), 1);
+        let o_nonzero = (0..300 * vd)
+            .filter(|&i| (i % vd) / hv != live && s.o[i] != 0.0)
+            .count();
+        let per_head = hv * d.head_k;
+        let state = pool.ssm_slot(1);
+        let s_nonzero = (0..state.len())
+            .filter(|&i| i / per_head != live && state[i] != 0.0)
+            .count();
+        let live_nonzero = (0..300 * vd)
+            .filter(|&i| (i % vd) / hv == live && s.o[i] != 0.0)
+            .count();
+        let ok = o_nonzero == 0 && s_nonzero == 0 && live_nonzero > 0;
+        eprintln!(
+            "chunked value-isolation probe {}: other heads' o not zero = {o_nonzero}, state not \
+             zero = {s_nonzero}, live head's o non-zero = {live_nonzero} {}",
+            model(d),
+            verdict(ok)
+        );
+        pass &= ok;
+        // (c)
+        let x = inputs(d, 100, 0xF642);
+        let (pool_p, pool_e) = (
+            Pool::new(&device, d, NAN_F32),
+            Pool::new(&device, d, NAN_F32),
+        );
+        let sp = run(&pool_p, &bb, d, &chunk(&x, d, 0, 100, 128), 0);
+        let se = run(&pool_e, &bb, d, &chunk(&x, d, 0, 100, 100), 0);
+        let n = 100 * vd;
+        let zeros_ok = sp.out[n..].iter().all(|&b| b == 0);
+        let o_padding = written_past(&sp.o, n);
+        let same = differing_bits(&sp.o[..n], &se.o) + mismatched(&sp.out[..n], &se.out);
+        let state_bits = differing_bits(&pool_p.ssm_slot(0), &pool_e.ssm_slot(0));
+        let ok = zeros_ok && o_padding == 0 && same == 0 && state_bits == 0;
+        eprintln!(
+            "chunked padding {}: padding_rows_plus_zero={zeros_ok} o_padding_written={o_padding} \
+             real_rows_mismatched={same} state_mismatched_bits={state_bits} {}",
+            model(d),
+            verdict(ok)
+        );
+        pass &= ok;
+        // (d)
+        let c = chunk(&x, d, 0, 100, 100 + PAD);
+        let pool_a = Pool::new(&device, d, NAN_F32);
+        let before = pool_a.snapshot();
+        let sa = run(&pool_a, &bb, d, &c, 2);
+        let finite = pool_a.ssm_slot(2).iter().all(|v| v.is_finite());
+        let others = pool_a.others_changed(&before, 2);
+        let mut pool_b = Pool::new(&device, d, NAN_F32);
+        let l = pool_b.layout;
+        let big_ring = f32_inputs(l.conv_elems_per_slot(), 0xF643, (-1e4, 1e4));
+        let big_state = f32_inputs(l.ssm_elems_per_slot(), 0xF644, (-1e4, 1e4));
+        pool_b.write_slot(&device, 2, &big_ring, &big_state);
+        let sb = run(&pool_b, &bb, d, &c, 2);
+        let b_vs_a =
+            differing_bits(&sa.o, &sb.o) + differing_bits(&pool_a.ssm_slot(2), &pool_b.ssm_slot(2));
+        let ok = finite && others == 0 && b_vs_a == 0;
+        eprintln!(
+            "chunked stale state {}: slot_2_finite={finite} other_slots_mismatched_bits={others} \
+             stale_vs_nan_mismatched_bits={b_vs_a} {}",
+            model(d),
+            verdict(ok)
+        );
+        pass &= ok;
+        // (e)
+        let c = chunk(&inputs(d, 1024, 0xF645), d, 0, 1024, 1024 + PAD);
+        let twice = || {
+            let pool = Pool::new(&device, d, NAN_F32);
+            let s = run(&pool, &bb, d, &c, 0);
+            (bits_of(&s.o), pool.snapshot())
+        };
+        let (a, b) = (twice(), twice());
+        let differ = usize::from(a.0 != b.0) + usize::from(a.1 != b.1);
+        eprintln!(
+            "chunked repeats {} L=1024: differing_buffers={differ} {}",
+            model(d),
+            verdict(differ == 0)
+        );
+        pass &= differ == 0;
+    }
+    assert!(
+        pass,
+        "the chunked scan lost one of the scan's exact properties"
+    );
+}
+
+/// One forward of `L1 + L2` tokens against the same tokens as two steps, the second from the
+/// state the first left, both chunked. With `L1` a multiple of 64 the second step's chunks are the
+/// one forward's: its outputs and the final state bit-identical. Off a multiple of 64 the chunks
+/// differ: the second step's `o` and the final state within the chunked bound of the whole
+/// sequence's reference.
+#[test]
+fn chunk_aligned_pieces_are_bit_identical_to_one_forward() {
+    let device = h100();
+    let mut pass = true;
+    for d in [G9, G27] {
+        let bu = bundle(d, 0xF650);
+        let bb = upload_bundle(&device, &bu);
+        for (l1, l2) in [
+            (64, 64),
+            (64, 1),
+            (128, 300),
+            (64, 212),
+            (100, 200),
+            (3, 61),
+        ] {
+            let x = inputs(d, l1 + l2, 0xF651 ^ (l1 as u64) << 16 ^ l2 as u64);
+            let pool_one = Pool::new(&device, d, NAN_F32);
+            let one = chunk(&x, d, 0, l1 + l2, l1 + l2);
+            let so = run_step_with(&device, &pool_one, &bb, d, &one, (3, true), Scan::Chunked)
+                .expect("one forward");
+            let pool_two = Pool::new(&device, d, NAN_F32);
+            let c1 = chunk(&x, d, 0, l1, l1 + PAD);
+            run_step_with(&device, &pool_two, &bb, d, &c1, (3, true), Scan::Chunked)
+                .expect("piece 1");
+            let c2 = chunk(&x, d, l1, l2, l2 + PAD);
+            let s2 = run_step_with(&device, &pool_two, &bb, d, &c2, (3, false), Scan::Chunked)
+                .expect("piece 2");
+            let vd = d.value_dim();
+            let (after_one, after_two) = (pool_one.ssm_slot(3), pool_two.ssm_slot(3));
+            if l1 % CHUNK == 0 {
+                let o = differing_bits(&so.o[l1 * vd..][..l2 * vd], &s2.o[..l2 * vd]);
+                let out = mismatched(&so.out[l1 * vd..][..l2 * vd], &s2.out[..l2 * vd]);
+                let state = differing_bits(&after_one, &after_two);
+                let ok = o + out + state == 0;
+                eprintln!(
+                    "chunked continuity {} ({l1}, {l2}), aligned: o_mismatched={o} \
+                     out_mismatched={out} state_mismatched_bits={state} {}",
+                    model(d),
+                    verdict(ok)
+                );
+                pass &= ok;
+            } else {
+                // The whole sequence's reference, from the one forward's own conv_out, g and β
+                // (piece 2's equal them: the conv and gating are bit-continuous).
+                let (_, state) = zeros(d);
+                let r = scan_reference(d, &so, l1 + l2, (&state, None, 0), ScanVariant::Real);
+                let refs: Vec<f64> = r.o.iter().map(|p| p.0).collect();
+                let cmp = compare_f32(
+                    &s2.o[..l2 * vd],
+                    &refs[l1 * vd..],
+                    |i| gdn_chunk_bound(r.o[l1 * vd + i].0, r.o[l1 * vd + i].1),
+                    |_| true,
+                );
+                let hk = d.head_k;
+                let st = compare_f32(
+                    &after_two,
+                    &r.state,
+                    |i| chunk_state_bound(&r, i, hk),
+                    |_| true,
+                );
+                let ok = cmp.pass() && st.pass();
+                eprintln!(
+                    "chunked continuity {} ({l1}, {l2}), off the chunk: o {} state {} {}",
+                    model(d),
+                    cmp.line(),
+                    st.line(),
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "chunked pieces differ from one forward: stop and report"
+    );
+}
+
+/// Decode after a chunked prefill: a prefill of `L` tokens by the chunked scan, then 8 one-row
+/// decode steps (`rows = 1`, today's recurrent scan, the four launches the one-launch decode is
+/// bit for bit), each from the state the last left. Every decode token's `o` and the final state
+/// within the chunked bound of the f64 recurrence of the whole sequence (the state they start from
+/// carries the chunked prefill's error), at the 35B's and 27B's geometries, `L` 300 and 2048.
+#[test]
+fn a_decode_after_a_chunked_prefill_follows_the_recurrence() {
+    const DECODES: usize = 8;
+    let device = h100();
+    let mut pass = true;
+    for d in [G9, G27] {
+        let bu = bundle(d, 0xF660);
+        let bb = upload_bundle(&device, &bu);
+        for l in [300usize, 2048] {
+            let x = inputs(d, l + DECODES, 0xF661 ^ l as u64);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let pre = run_step_with(
+                &device,
+                &pool,
+                &bb,
+                d,
+                &chunk(&x, d, 0, l, l + PAD),
+                (1, true),
+                Scan::Chunked,
+            )
+            .expect("the prefill");
+            let (cd, nv, vd) = (d.conv_dim(), d.nv, d.value_dim());
+            let (mut conv_out, mut g, mut beta) = (
+                pre.conv_out[..l * cd].to_vec(),
+                pre.g[..l * nv].to_vec(),
+                pre.beta[..l * nv].to_vec(),
+            );
+            let mut o = Vec::with_capacity(DECODES * vd);
+            for t in l..l + DECODES {
+                let s = run_step(&device, &pool, &bb, d, &chunk(&x, d, t, 1, 1), (1, false))
+                    .expect("a decode step");
+                conv_out.extend_from_slice(&s.conv_out);
+                g.extend_from_slice(&s.g);
+                beta.extend_from_slice(&s.beta);
+                o.extend_from_slice(&s.o);
+            }
+            let (_, state) = zeros(d);
+            let (conv_out, g, beta) = (to_f64(&conv_out), to_f64(&g), to_f64(&beta));
+            let r = gdn_scan_reference(
+                &ScanInputs {
+                    conv_out: &conv_out,
+                    g: &g,
+                    beta: &beta,
+                    state: &state,
+                    smax: None,
+                    t0: 0,
+                    q_len: l + DECODES,
+                },
+                d,
+                ScanVariant::Real,
+            );
+            let refs: Vec<f64> = r.o.iter().map(|p| p.0).collect();
+            let cmp = compare_f32(
+                &o,
+                &refs[l * vd..],
+                |i| gdn_chunk_bound(r.o[l * vd + i].0, r.o[l * vd + i].1),
+                |_| true,
+            );
+            let hk = d.head_k;
+            let st = compare_f32(
+                &pool.ssm_slot(1),
+                &r.state,
+                |i| chunk_state_bound(&r, i, hk),
+                |_| true,
+            );
+            let ok = cmp.pass() && st.pass();
+            eprintln!(
+                "decode after a chunked prefill {} L={l} + {DECODES}: o {} state {} {}",
+                model(d),
+                cmp.line(),
+                st.line(),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "a decode after a chunked prefill left the recurrence's bound"
+    );
+}
+
+/// The chunked scan refuses exactly what the scan refuses (both refusal tests' scan cases), before
+/// it touches a pointer, its output and the state left as they were; its timing split refuses the
+/// same and a `part` above 2.
+#[test]
+fn the_chunked_scan_refuses_what_the_scan_refuses() {
+    let device = h100();
+    let small = |n: usize| up_f32_bits(&device, n, NAN_F32);
+    let (x, st, seq, out) = (small(1 << 12), small(1 << 12), small(4), small(1 << 12));
+    let unchanged = |b: &DeviceBuffer| down_f32(b).iter().all(|v| v.to_bits() == NAN_F32);
+    let null = std::ptr::null_mut();
+    let scale = gdn_scale(128);
+    let nv9 = G9.nv as u32;
+    let mut pass = true;
+    // `(rows, nk, nv, head_k, head_v, slot_elems, scale)`.
+    let cases: Vec<(u32, u32, u32, u32, u32, u64, f32)> = [
+        (4u32, 1u32, 1u32, 64u32, 32u32, 32u64 * 128, scale),
+        (4, 1, 1, 128, 40, 40 * 128, scale),
+        (4, 1, 1, 128, 512, 512 * 128, scale),
+        (4, 2, 3, 128, 32, 3 * 32 * 128, scale),
+        (4, 1, 1, 128, 32, 32 * 64, scale),
+        (4, 1, 1, 128, 32, 32 * 128, 0.0),
+    ]
+    .into_iter()
+    .chain(
+        [
+            (0u32, 16u32, nv9, 128u32),
+            (4, 0, nv9, 128),
+            (4, 16, 0, 128),
+            (4, 16, nv9, 0),
+            (1 << 18, 16, nv9, 128),
+        ]
+        .map(|(rows, nk, nv, hv)| {
+            let se = u64::from(nv) * u64::from(hv) * 128;
+            (rows, nk, nv, 128, hv, se, scale)
+        }),
+    )
+    .collect();
+    for (rows, nk, nv, hk, hv, se, sc) in cases {
+        let want = KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k: hk,
+            head_v: hv,
+        };
+        for part in [None, Some(0u32), Some(1), Some(2)] {
+            // SAFETY: refused before any pointer is touched; every buffer is a live allocation.
+            let got = unsafe {
+                match part {
+                    None => gdn_chunk_scan(
+                        (x.ptr(), x.ptr(), x.ptr()),
+                        (st.ptr(), se),
+                        seq.ptr(),
+                        out.ptr(),
+                        (rows, nk, nv),
+                        (hk, hv, sc),
+                        null,
+                    ),
+                    Some(p) => gdn_chunk_scan_part(
+                        (x.ptr(), x.ptr(), x.ptr()),
+                        (st.ptr(), se),
+                        seq.ptr(),
+                        out.ptr(),
+                        (rows, nk, nv),
+                        (hk, hv, sc),
+                        (p, null, null),
+                    ),
+                }
+            };
+            let (o, s) = (unchanged(&out), unchanged(&st));
+            let ok = got == Err(want) && o && s;
+            eprintln!(
+                "chunked refused part={part:?} rows={rows} nk={nk} nv={nv} head_k={hk} \
+                 head_v={hv} slot_elems={se} scale={sc}: {got:?} output_unchanged={o} \
+                 state_unchanged={s} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    // A shape it takes, at a part it does not (4), and the traced part with no trace (3).
+    let se = u64::from(nv9) * 128 * 128;
+    let want = KernelError::GdnScanShape {
+        rows: 4,
+        nk: 16,
+        nv: nv9,
+        head_k: 128,
+        head_v: 128,
+    };
+    for part in [4u32, 3] {
+        // SAFETY: as above.
+        let got = unsafe {
+            gdn_chunk_scan_part(
+                (x.ptr(), x.ptr(), x.ptr()),
+                (st.ptr(), se),
+                seq.ptr(),
+                out.ptr(),
+                (4, 16, nv9),
+                (128, 128, scale),
+                (part, null, null),
+            )
+        };
+        let ok = got == Err(want) && unchanged(&out) && unchanged(&st);
+        eprintln!(
+            "chunked refused part={part} (no trace): {got:?} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the chunked scan took a shape the scan refuses, or wrote its output"
+    );
+}
+
+/// The chunked scan's time per launch (one GDN layer's scan) beside today's recurrent scan, at the
+/// 27B's (nv 48) and the 35B's (nv 32) geometries and `q_len` 128, 2048 and 4096, fresh, over one
+/// step's own conv_out, g and β; and its split: the launch with the solve skipped (T = I) and the
+/// launch stopped after the precompute. Each 20 launches after a warm-up, timed to the download
+/// that waits for them, in the order A, B, A, B (A today's, B the chunked and its parts). Printed
+/// as `F6_TIME` lines; then one traced launch's phase split (each CTA's thread 0's cycles per
+/// phase and chunk, averaged over the CTAs, and each phase's share) as an `F6_PHASE` line.
+/// Recorded, not asserted.
+#[test]
+fn the_chunked_scan_time_is_recorded() {
+    const LAUNCHES: u32 = 20;
+    let device = h100();
+    for d in [G27, G9] {
+        let bu = bundle(d, 0xF670);
+        let bb = upload_bundle(&device, &bu);
+        for q_len in [128usize, 2048, 4096] {
+            let x = inputs(d, q_len, 0xF671 ^ q_len as u64);
+            let c = chunk(&x, d, 0, q_len, q_len);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let s = run_step(&device, &pool, &bb, d, &c, (0, true)).expect("the step launches");
+            let (cv, g, beta) = (
+                up_f32(&device, &s.conv_out),
+                up_f32(&device, &s.g),
+                up_f32(&device, &s.beta),
+            );
+            let o = up_f32_bits(&device, q_len * d.value_dim(), NAN_F32);
+            let seq = up_u32(&device, &[0, q_len as u32, 1, 0]);
+            // `None` today's scan, `Some(part)` the chunked scan's.
+            let launch = |part: Option<u32>| {
+                let (rows, slot) = (
+                    (q_len as u32, d.nk as u32, d.nv as u32),
+                    (pool.ssm.ptr(), pool.layout.ssm_elems_per_slot() as u64),
+                );
+                let heads = (d.head_k as u32, d.head_v as u32, gdn_scale(d.head_k as u32));
+                let null = std::ptr::null_mut();
+                // SAFETY: as `run_step`'s, for the scan alone over this step's own scratch.
+                unsafe {
+                    match part {
+                        None => gdn_scan(
+                            (cv.ptr(), g.ptr(), beta.ptr()),
+                            slot,
+                            seq.ptr(),
+                            o.ptr(),
+                            rows,
+                            heads,
+                            null,
+                        ),
+                        Some(p) => gdn_chunk_scan_part(
+                            (cv.ptr(), g.ptr(), beta.ptr()),
+                            slot,
+                            seq.ptr(),
+                            o.ptr(),
+                            rows,
+                            heads,
+                            (p, null, null),
+                        ),
+                    }
+                }
+                .expect("the scan launches");
+            };
+            let time = |part: Option<u32>| {
+                launch(part);
+                seq.download().expect("wait for the warm-up");
+                let start = std::time::Instant::now();
+                for _ in 0..LAUNCHES {
+                    launch(part);
+                }
+                seq.download().expect("wait for the launches");
+                start.elapsed().as_secs_f64() * 1e6 / f64::from(LAUNCHES)
+            };
+            let parts = [None, Some(0), Some(1), Some(2)];
+            let mut us = [0.0f64; 4];
+            for _ in 0..2 {
+                for (k, &p) in parts.iter().enumerate() {
+                    us[k] += time(p) / 2.0;
+                }
+            }
+            let [today, full, no_solve, precompute] = us;
+            eprintln!(
+                "F6_TIME {} L={q_len}: today={today:.1} us chunked={full:.1} us ({:.2}x) \
+                 no_solve={no_solve:.1} us precompute_only={precompute:.1} us solve_share={:.3} \
+                 sequential_share={:.3}",
+                model(d),
+                today / full,
+                (full - no_solve) / full,
+                (full - precompute) / full,
+            );
+            // The phase split: one traced launch, each CTA's thread 0's cycles per phase.
+            let ctas = (d.head_v / 32) * d.nv;
+            let trace = up_f32_bits(&device, ctas * (PHASES.len() + 1), NAN_F32);
+            // SAFETY: as `launch`'s; `trace` holds `ctas · 13` f32.
+            unsafe {
+                gdn_chunk_scan_part(
+                    (cv.ptr(), g.ptr(), beta.ptr()),
+                    (pool.ssm.ptr(), pool.layout.ssm_elems_per_slot() as u64),
+                    seq.ptr(),
+                    o.ptr(),
+                    (q_len as u32, d.nk as u32, d.nv as u32),
+                    (d.head_k as u32, d.head_v as u32, gdn_scale(d.head_k as u32)),
+                    (3, trace.ptr(), std::ptr::null_mut()),
+                )
+            }
+            .expect("the traced scan launches");
+            let t = down_f32(&trace);
+            let cols = PHASES.len() + 1;
+            let chunks = f64::from(t[cols - 1]);
+            let mean =
+                |p: usize| (0..ctas).map(|c| f64::from(t[c * cols + p])).sum::<f64>() / ctas as f64;
+            let total: f64 = (0..PHASES.len()).map(mean).sum();
+            let split: Vec<String> = (PHASES.iter().enumerate())
+                .map(|(p, name)| {
+                    let m = mean(p);
+                    format!("{name}={:.0} ({:.3})", m / chunks, m / total)
+                })
+                .collect();
+            eprintln!(
+                "F6_PHASE {} L={q_len}: chunks={chunks} cycles_per_chunk={:.0} {}",
+                model(d),
+                total / chunks,
+                split.join(" ")
+            );
+        }
+    }
+}
+
+/// The chunked scan's traced phases (`kernels/gdn_chunk_scan.cu`'s `PHASES`), in order; its trace's
+/// last column is the chunk count.
+const PHASES: [&str; 12] = [
+    "state_load",
+    "rows",
+    "g_beta_G",
+    "kk_qk_qs",
+    "a_n_p",
+    "diag_solve",
+    "t_products",
+    "u_w",
+    "v_new",
+    "o",
+    "state_update",
+    "state_store",
+];
+
+/// Whether the one-launch decode (`gdn_decode`) takes geometry `d`: the decode tapes' rule
+/// (`steps_from_tape`'s `gdn_decode_takes`), else a one-row bucket's GDN step is the four launches
+/// with the recurrent scan (`step::gdn_scan_is_recurrent`): the 27B's three value heads a key head.
+fn gdn_decode_takes(d: GdnDims) -> bool {
+    let heads = d.nv / d.nk;
+    (d.head_v == 128 || d.head_v == 256)
+        && d.nv.is_multiple_of(d.nk)
+        && (1..=4).contains(&heads)
+        && 16usize.is_multiple_of(heads)
+        && 2 + heads * d.head_v / 128 <= 8
+}
+
+/// FP8 S8 F6-2, decode after a chunked prefill at the real tapes' shapes: the 35B's and 27B's GDN
+/// geometries, a prefill bucket of 512 and of 2,048 rows holding `rows − 37` real tokens (the
+/// rest padding) by the chunked scan, then 8 decodes as the decode tapes run them, each from the
+/// slot the last left: the one-launch decode (`gdn_decode`) where it takes the geometry (the
+/// 35B), else the four launches at one row with the recurrent scan (the 27B). The slot's state
+/// after the decodes within the chunked state bound of the f64 recurrence over the whole sequence
+/// (the prefill's own conv_out, g and β, then the decode tokens' from the CPU conv and gating, from
+/// the ring the prefill left), and every decode's output finite.
+#[test]
+fn a_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
+    use scratchy_target_cuda::kernels::{GdnDecodeOperands, gdn_decode};
+    const DECODES: usize = 8;
+    let device = h100();
+    let mut pass = true;
+    for d in [G9, G27] {
+        let bu = bundle(d, 0xF680);
+        let bb = upload_bundle(&device, &bu);
+        for rows in [512usize, 2048] {
+            let q_len = rows - 37;
+            let x = inputs(d, q_len + DECODES, 0xF681 ^ rows as u64);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let pre = run_step_with(
+                &device,
+                &pool,
+                &bb,
+                d,
+                &chunk(&x, d, 0, q_len, rows),
+                (1, true),
+                Scan::Chunked,
+            )
+            .expect("the prefill");
+            let ring = to_f64(&pool.conv_slot(1));
+            let l = pool.layout;
+            let dims = (
+                d.nk as u32,
+                d.nv as u32,
+                d.head_k as u32,
+                d.head_v as u32,
+                d.conv_kernel as u32,
+            );
+            let mut finite = true;
+            let one_launch = gdn_decode_takes(d);
+            for t in q_len..q_len + DECODES {
+                let tok = chunk(&x, d, t, 1, 1);
+                if !one_launch {
+                    let s = run_step(&device, &pool, &bb, d, &tok, (1, false)).expect("a decode");
+                    finite &= s.out.iter().all(|&h| (h & 0x7F80) != 0x7F80);
+                    continue;
+                }
+                let seq = up_u32(&device, &[1, 1, 0, 0]);
+                let (qkv, a, b, z) = (
+                    up(&device, &tok.qkv),
+                    up(&device, &tok.a),
+                    up(&device, &tok.b),
+                    up(&device, &tok.z),
+                );
+                let out = up(&device, &vec![NAN_BF16; d.value_dim()]);
+                let operands = GdnDecodeOperands {
+                    qkv: qkv.ptr(),
+                    a: a.ptr(),
+                    b: b.ptr(),
+                    z: z.ptr(),
+                    w: bb.w.ptr(),
+                    a_log: bb.a_log.ptr(),
+                    dt_bias: bb.dt_bias.ptr(),
+                    norm: bb.norm.ptr(),
+                    out: out.ptr(),
+                };
+                // SAFETY: as `run_step`'s at one row: every buffer holds what the launcher's
+                // contract names, the pool `SLOTS` slots of its layout and slot 1 below it, `q_len`
+                // 1; null is the default stream, which the downloads below wait for.
+                unsafe {
+                    gdn_decode(
+                        &operands,
+                        (pool.conv.ptr(), l.conv_elems_per_slot() as u64),
+                        (pool.ssm.ptr(), l.ssm_elems_per_slot() as u64),
+                        seq.ptr(),
+                        dims,
+                        (gdn_scale(d.head_k as u32), EPS),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("a decode launches");
+                let got = out.download().expect("download out");
+                finite &= got.iter().all(|&h| (h & 0x7F80) != 0x7F80);
+            }
+            let (cd, nv) = (d.conv_dim(), d.nv);
+            let span = |v: &[u16], cols: usize| widen(&v[q_len * cols..(q_len + DECODES) * cols]);
+            let (conv_ref, _) = gdn_conv_reference(
+                &span(&x.qkv, cd),
+                &to_f64(&bu.w),
+                &ring,
+                (DECODES, cd, d.conv_kernel),
+                false,
+            );
+            let (g_ref, beta_ref) = gdn_gating_reference(
+                &span(&x.a, nv),
+                &span(&x.b, nv),
+                &to_f64(&bu.a_log),
+                &to_f64(&bu.dt_bias),
+                nv,
+                true,
+            );
+            let mut conv_out = to_f64(&pre.conv_out[..q_len * cd]);
+            conv_out.extend(conv_ref.iter().map(|p| p.0));
+            let mut g = to_f64(&pre.g[..q_len * nv]);
+            g.extend(g_ref);
+            let mut beta = to_f64(&pre.beta[..q_len * nv]);
+            beta.extend(beta_ref);
+            let (_, state) = zeros(d);
+            let r = gdn_scan_reference(
+                &ScanInputs {
+                    conv_out: &conv_out,
+                    g: &g,
+                    beta: &beta,
+                    state: &state,
+                    smax: None,
+                    t0: 0,
+                    q_len: q_len + DECODES,
+                },
+                d,
+                ScanVariant::Real,
+            );
+            let hk = d.head_k;
+            let st = compare_f32(
+                &pool.ssm_slot(1),
+                &r.state,
+                |i| chunk_state_bound(&r, i, hk),
+                |_| true,
+            );
+            let ok = st.pass() && finite;
+            let by = if one_launch {
+                "gdn_decode"
+            } else {
+                "the four launches (recurrent scan)"
+            };
+            eprintln!(
+                "decode by {by} after a chunked prefill bucket {} rows={rows} q_len={q_len} + \
+                 {DECODES}: state {} outputs_finite={finite} {}",
+                model(d),
+                st.line(),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "a decode after a chunked prefill bucket left the recurrence's bound"
     );
 }

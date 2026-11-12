@@ -30,6 +30,7 @@ unsafe extern "C" {
     fn scratchy_cuda_gdn_gating_prepare() -> i32;
     fn scratchy_cuda_gdn_rms_norm_gated_prepare() -> i32;
     fn scratchy_cuda_gdn_scan_prepare() -> i32;
+    fn scratchy_cuda_gdn_chunk_scan_prepare() -> i32;
     fn scratchy_cuda_kv_append_bf16_prepare() -> i32;
     fn scratchy_cuda_kv_append_fp8_prepare() -> i32;
     fn scratchy_cuda_moe_combine_bf16_prepare() -> i32;
@@ -1028,6 +1029,40 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gdn_chunk_scan(
+        conv_out: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        ssm_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        o: *mut c_void,
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_chunk_scan_part(
+        conv_out: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        ssm_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        o: *mut c_void,
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        scale: f32,
+        part: u32,
+        trace: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gdn_rank_one_probe(
         s: *const c_void,
         t: *const c_void,
@@ -1459,6 +1494,8 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
+    // FP8 S8 F6a: the attribute on every instance of the chunked scan.
+    ("gdn_chunk_scan", scratchy_cuda_gdn_chunk_scan_prepare),
     ("gemv_fp8_tc", scratchy_cuda_gemv_fp8_tc_prepare),
     ("act_quant_fp8", scratchy_cuda_act_quant_fp8_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
@@ -1472,6 +1509,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         "gdn_rms_norm_gated",
         scratchy_cuda_gdn_rms_norm_gated_prepare,
     ),
+    // A one-row bucket's `GatedDeltaNet` scan (`step::gdn_scan_is_recurrent`).
     ("gdn_scan", scratchy_cuda_gdn_scan_prepare),
     ("kv_append_bf16", scratchy_cuda_kv_append_bf16_prepare),
     ("kv_append_fp8", scratchy_cuda_kv_append_fp8_prepare),
@@ -3370,6 +3408,10 @@ pub unsafe fn gdn_gating(
     check(code, KernelError::GdnGatingShape { rows, nv })
 }
 
+/// A one-row bucket's `GatedDeltaNet` scan (a decode `GdnDecode` does not take); a prefill
+/// bucket's is [`gdn_chunk_scan`] (`step::gdn_scan_is_recurrent`). Also the decode kernel's bit
+/// reference.
+///
 /// Launch the GDN recurrent gated delta-rule scan: per value head, the slot's f32 state (zero,
 /// never read, on a fresh start) through the real tokens of `conv_out` (`q | k | v`), `g` and
 /// `beta`, each token's output into `o [rows, nv·head_v]` (f32); the state written back once.
@@ -3404,6 +3446,83 @@ pub unsafe fn gdn_scan(
         scratchy_cuda_gdn_scan(
             conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
             scale, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k,
+            head_v,
+        },
+    )
+}
+
+/// Launch the GDN chunked gated delta-rule scan (FP8 S8 F6a, `kernels/gdn_chunk_scan.cu`):
+/// [`gdn_scan`]'s recurrence, arguments, buffers and refusals, computed 64 tokens at a time with
+/// bf16 WGMMAs and f32 accumulation, the state f32 between chunks. No `CudaStep` launches it yet.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::GdnScanShape`] exactly where [`gdn_scan`] is, before any pointer is
+/// touched.
+///
+/// # Safety
+///
+/// As [`gdn_scan`]'s.
+pub unsafe fn gdn_chunk_scan(
+    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
+    (ssm_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    o: *mut c_void,
+    (rows, nk, nv): (u32, u32, u32),
+    (head_k, head_v, scale): (u32, u32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_chunk_scan(
+            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
+            scale, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k,
+            head_v,
+        },
+    )
+}
+
+/// Test support for `tests/gdn.rs`'s timing split only: [`gdn_chunk_scan`] with `part` 0 (the
+/// kernel), 1 (the solve skipped, T = I), 2 (stopped after the precompute) or 3 (the kernel, its
+/// phases into `trace`: `[(head_v / 32) · nv, 13]` f32, each CTA's cycles per phase summed over
+/// its chunks, then the chunk count; `kernels/gdn_chunk_scan.cu`'s `PHASES`). Parts 1 and 2 are not
+/// a scan. No `CudaStep` uses it. Refused as [`gdn_chunk_scan`] is, at any other `part`, and at
+/// part 3 with a null `trace`.
+///
+/// # Safety
+///
+/// As [`gdn_scan`]'s; `trace`, at part 3, a device pointer to `(head_v / 32) · nv · 13` f32.
+pub unsafe fn gdn_chunk_scan_part(
+    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
+    (ssm_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    o: *mut c_void,
+    (rows, nk, nv): (u32, u32, u32),
+    (head_k, head_v, scale): (u32, u32, f32),
+    (part, trace, stream): (u32, *mut c_void, *mut c_void),
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_chunk_scan_part(
+            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
+            scale, part, trace, stream,
         )
     };
     check(
