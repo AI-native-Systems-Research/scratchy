@@ -127,6 +127,8 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::GateUpTcFp8(_) => "GateUpTcFp8",
             CudaStep::ExpertGemvTcFp8(_) => "ExpertGemvTcFp8",
             CudaStep::ExpertGateUpTcFp8(_) => "ExpertGateUpTcFp8",
+            CudaStep::RmsNormQuantFp8(_) => "RmsNormQuantFp8",
+            CudaStep::AddRmsNormQuantFp8(_) => "AddRmsNormQuantFp8",
         };
         *h.entry(kind).or_default() += 1;
     }

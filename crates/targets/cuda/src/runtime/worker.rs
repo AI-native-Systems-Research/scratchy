@@ -46,6 +46,7 @@ use crate::step::{
     PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
     RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_scratch_bytes,
     attn_decode_split, fp8_moe_layout, fp8_weight, gdn_scan_is_recurrent, gemv_splits,
+    norm_row_takes,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -2183,6 +2184,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         let pool = gdn.expect("`new` made a pool for a GDN tape");
                         Self::gdn_decode(&g, pool, slot, weights, stream)
                     }
+                    CudaStep::RmsNorm(norm) | CudaStep::RouterNorm(norm)
+                        if norm_row_takes(norm.rows, norm.cols) =>
+                    {
+                        Self::norm_row(norm, (0, norm.x, None, None), None, slot, weights, stream)
+                    }
                     CudaStep::RmsNorm(
                         norm @ RmsNormBf16 {
                             x,
@@ -2219,6 +2225,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
+                    CudaStep::AddRmsNorm(f) if norm_row_takes(f.norm.rows, f.norm.cols) => {
+                        let add = (1, f.a, Some(f.b), Some(f.sum));
+                        Self::norm_row(f.norm, add, None, slot, weights, stream)
+                    }
                     CudaStep::AddRmsNorm(f) => {
                         let n = f.norm;
                         let gain = weights[n.gain.0 as usize].ptr();
@@ -2235,6 +2245,18 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             )
                         }
                     }
+                    CudaStep::NormAdd(NormAddBf16 { norm: n, residual })
+                        if norm_row_takes(n.rows, n.cols) =>
+                    {
+                        Self::norm_row(
+                            n,
+                            (2, n.x, Some(residual), None),
+                            None,
+                            slot,
+                            weights,
+                            stream,
+                        )
+                    }
                     CudaStep::NormAdd(NormAddBf16 { norm: n, residual }) => {
                         let gain = weights[n.gain.0 as usize].ptr();
                         // SAFETY: as above, for `x`, `residual` and `y` (`rows*cols` each) and `gain`
@@ -2249,6 +2271,21 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 stream.0,
                             )
                         }
+                    }
+                    CudaStep::RmsNormQuantFp8(t) => {
+                        let quant = Some(t.q);
+                        Self::norm_row(
+                            t.norm,
+                            (0, t.norm.x, None, None),
+                            quant,
+                            slot,
+                            weights,
+                            stream,
+                        )
+                    }
+                    CudaStep::AddRmsNormQuantFp8(t) => {
+                        let add = (1, t.fold.a, Some(t.fold.b), Some(t.fold.sum));
+                        Self::norm_row(t.fold.norm, add, Some(t.q), slot, weights, stream)
                     }
                     CudaStep::Add(AddBf16 {
                         a,
@@ -2721,6 +2758,48 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             "cudaMemcpyAsync(device to host)",
         )
         .map_err(ForwardError::Cuda)
+    }
+
+    /// A one-row norm on N3's kernel (FP8 S8 N3, [`norm_row_takes`]): `form` the launcher's code
+    /// (0 the norm of `x`, 1 the add-norm of `x` and `other` into `sum`, 2 the norm-add of `x` and
+    /// the residual `other`); with `quant`, also the e4m3 row and scale of `y` at that quant
+    /// scratch.
+    fn norm_row(
+        norm: RmsNormBf16,
+        (form, x, other, sum): (u32, ArenaOffset, Option<ArenaOffset>, Option<ArenaOffset>),
+        quant: Option<ArenaOffset>,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let RmsNormBf16 {
+            gain,
+            y,
+            rows,
+            cols,
+            convention,
+            ..
+        } = norm;
+        let gain = weights[gain.0 as usize].ptr().cast_const();
+        let other = other.map_or(std::ptr::null(), |o| slot(o).cast_const());
+        let sum = sum.map_or(std::ptr::null_mut(), &slot);
+        let quant = quant.map(|q| {
+            let (q, scale) = Self::fp8_rows(&slot, q, rows, cols);
+            (q.cast_mut(), scale.cast_mut())
+        });
+        // SAFETY: as the row kernels' arms, for `x`, `other`, `y` and `sum` (`rows*cols` each) and
+        // `gain` (`cols`), and the quant scratch (`rows*cols` bytes, then `rows` f32 at
+        // `scale_at`); the outputs overlap no input (`validate`).
+        unsafe {
+            kernels::rms_norm_quant_row(
+                (slot(x).cast_const(), other, gain),
+                (slot(y), sum),
+                quant,
+                (rows, cols),
+                (form, norm.eps(), convention.offset()),
+                stream.0,
+            )
+        }
     }
 
     /// A GDN step's four launches, in order on the stream: conv1d, gating, scan, gated norm. Each
