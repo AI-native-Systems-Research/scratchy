@@ -466,7 +466,10 @@ mod tests {
         assert_eq!(Metric::Energy.decimals(), 2);
         // scratchy at 0.5 J a token against 0.75: 1.5 times less.
         assert_eq!(Metric::Energy.faster(Some(0.5), Some(0.75)), Some(1.5));
-        assert_eq!(timing(Some(&cell(serde_json::Value::Null)), Metric::Energy), None);
+        assert_eq!(
+            timing(Some(&cell(serde_json::Value::Null)), Metric::Energy),
+            None
+        );
         let mut dead = c.clone();
         dead.dead = true;
         assert_eq!(timing(Some(&dead), Metric::Energy), None);

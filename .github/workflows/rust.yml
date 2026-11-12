@@ -691,6 +691,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      # site/ is its own workspace, so the root --all above never reaches it.
+      - run: cargo fmt --manifest-path site/Cargo.toml --all -- --check
 
   scripts:
     name: Python scripts
