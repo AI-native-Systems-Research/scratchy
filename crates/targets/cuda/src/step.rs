@@ -2325,9 +2325,10 @@ impl CudaStep {
             },
         ) = *self
         {
+            // An fp8 bank's row tile (FP8 S8 P3(a)).
             let rows = g
                 .max_tiles
-                .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS);
+                .checked_mul(crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS);
             return match rows {
                 Some(rows) => Some((g.a, rows, g.n_k().1)),
                 None => None,
@@ -3134,7 +3135,7 @@ impl CudaStep {
                 };
                 let Some(capacity) = s
                     .max_tiles
-                    .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS)
+                    .checked_mul(crate::op_abi::CUDA_FP8_EXPERT_TILE_ROWS)
                 else {
                     return None;
                 };
@@ -3191,7 +3192,8 @@ impl CudaStep {
                 })
             }
             Self::ExpertGemm(g) => {
-                let rows = g.max_tiles as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
+                let fp8 = matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own);
+                let rows = g.max_tiles as u64 * crate::op_abi::expert_tile_rows(fp8) as u64;
                 let (n, k) = g.n_k();
                 // An fp8 bank's rows are the quantized ones, e4m3 then their scales.
                 let ab = match self.fp8_expert_rows() {

@@ -856,3 +856,20 @@ extern "C" int scratchy_cuda_expert_gemm_fp8_variant(
         return SCRATCHY_CUDA_ERR_HOST;
     }
 }
+
+// FP8 S8 P3(a): the grouped expert GEMM over an fp8 bank at 64-row tiles (`max_tiles` and
+// `tile_expert` counting a sort's 64-row tiles, `scratchy_cuda_moe_sort_fp8_m64`), K step 128 when
+// `k` is a multiple of 128, else 64: each pair row the bits of `scratchy_cuda_expert_gemm_fp8` on
+// the same row. Return codes and rule as that launcher's, the rows `max_tiles · 64`.
+extern "C" int scratchy_cuda_expert_gemm_fp8_m64(const void* a, const void* a_scale,
+                                                 const void* b, const void* b_scale,
+                                                 const void* offsets, const void* tile_expert,
+                                                 void* c, uint32_t max_tiles, uint32_t n,
+                                                 uint32_t k, uint32_t experts,
+                                                 uint32_t expert_rows, uint32_t n_tile,
+                                                 void* stream /* cudaStream_t; null = default */) {
+    const uint32_t k_step = k % 128 == 0 ? 128 : 64;
+    return scratchy_cuda_expert_gemm_fp8_variant(a, a_scale, b, b_scale, offsets, tile_expert, c,
+                                                 max_tiles, n, k, experts, expert_rows, n_tile, 64,
+                                                 k_step, stream);
+}

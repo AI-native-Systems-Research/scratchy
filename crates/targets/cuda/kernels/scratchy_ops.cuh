@@ -454,15 +454,18 @@ struct wrap_add {
     }
 };
 
-// The MoE sort's run length: an expert's pair count rounded up to whole 128-row tiles of the
-// grouped GEMM (`op_abi::CUDA_EXPERT_TILE_ROWS`), so a tile belongs to one expert. Integer, exact.
-struct tile_pad {
-    static constexpr int ROWS = 128;
+// The MoE sort's run length: an expert's pair count rounded up to whole `ROWS_`-row tiles of the
+// grouped GEMM, so a tile belongs to one expert. Integer, exact. `tile_pad` is the 128-row tile
+// (`op_abi::CUDA_EXPERT_TILE_ROWS`); an fp8 bank's is 64 (`op_abi::CUDA_FP8_EXPERT_TILE_ROWS`).
+template <int ROWS_>
+struct tile_pad_at {
+    static constexpr int ROWS = ROWS_;
     template <typename T>
     static __device__ inline T op(const T& n) {
         return (n + (ROWS - 1)) / ROWS * ROWS;
     }
 };
+using tile_pad = tile_pad_at<128>;
 
 // TK-GAP(exclusive_scan_sv) begin
 // An exclusive prefix sum over a shared vector, in place, each element first mapped by `op`:
