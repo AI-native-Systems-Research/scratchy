@@ -40,7 +40,7 @@ use tracing::info;
 use crate::plan::{
     block_table_u32, check_kv_cache_dtype, check_quantization_config, check_sampling,
     choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes,
-    logits_row, scheduled_request,
+    scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
