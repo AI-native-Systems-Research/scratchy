@@ -2649,24 +2649,60 @@ impl SpyreWorker {
                     _t_joins.as_secs_f64() * 1e3,
                     (_t_all - _t_joins).as_secs_f64() * 1e3,
                 );
-                // ADOPTION: alias each onto the decode session's regions here, on the thread
-                // that owns `ss`.
-                for (rm, built) in ladder_prepared {
-                    match built {
-                        Ok(mut rs) => {
-                            if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
-                                panic!(
-                                    "prefill ladder rung m={rm}: {e} — every rung the bake \
-                                     shipped must load"
-                                );
-                            }
+                // ADOPTION: alias each onto the decode session's regions. The alias is
+                // host work on the BORROWER's own segment table (pointer swaps) plus, when
+                // the layout spilled a weight tail, that borrower's own device copy — the
+                // owner is only ever READ here — so the rungs adopt in parallel, one thread
+                // per session, the same width the prepare wave above already rode. The
+                // refusals are still reported in ladder order on this thread: every thread
+                // returns its failure as a value, and the walk below panics on the first
+                // one in rung order, byte-identical to the serial loop it replaces.
+                let ladder_adopted: Vec<(usize, Result<SuperDscSession, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = ladder_prepared
+                            .into_iter()
+                            .map(|(rm, built)| {
+                                let ss = &ss;
+                                let spill = &spill_images;
+                                scope.spawn(move || {
+                                    (
+                                        rm,
+                                        built
+                                            .map_err(|e| {
+                                                format!(
+                                                    "create failed: {e} — every rung the bake \
+                                                     shipped must load"
+                                                )
+                                            })
+                                            .and_then(|mut rs| {
+                                                adopt_from_owner(&mut rs, ss, spill)
+                                                    .map_err(|e| {
+                                                        format!(
+                                                            "{e} — every rung the bake \
+                                                             shipped must load"
+                                                        )
+                                                    })
+                                                    .map(|()| rs)
+                                            }),
+                                    )
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
+                    });
+                for (rm, adopted) in ladder_adopted {
+                    match adopted {
+                        Ok(rs) => {
                             _n_ladder += 1;
                             prefill_ladder.push((rm, rs));
                         }
-                        Err(e) => panic!(
-                            "prefill ladder rung m={rm}: create failed: {e} — every rung the \
-                             bake shipped must load"
-                        ),
+                        Err(msg) => panic!("prefill ladder rung m={rm}: {msg}"),
                     }
                 }
                 // The TOP rung is `prefill_ss` itself — built and aliased above, never on the
@@ -2690,23 +2726,53 @@ impl SpyreWorker {
                 );
                 // ── PREFIX-CAPABLE PREFILL LADDER ── the adoption. The fan-out was spawned with
                 // the prefill ladder's, before the owner (host halves only); its prepare ran in
-                // the wave above. The adoption runs here, on this thread, in ladder order.
-                let mut prefix_built: Vec<(usize, SuperDscSession)> = Vec::new();
-                for (job, built) in prefix_jobs.into_iter().zip(prefix_prepared) {
-                    let mut ps = built.unwrap_or_else(|(_, m)| panic!("{m}"));
-                    adopt_from_owner(&mut ps, &ss, &spill_images).unwrap_or_else(|e| {
-                        panic!(
-                            "prefix-capable prefill m={}: {e} — every rung the bake shipped \
-                             must load",
-                            job.pmq
-                        )
+                // the wave above. The adoption runs one thread per session, reading the owner
+                // only; refusals and "ready" logs land in ladder order on this thread.
+                let prefix_adopted: Vec<(u32, &'static str, Result<SuperDscSession, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = prefix_jobs
+                            .into_iter()
+                            .zip(prefix_prepared)
+                            .map(|(job, built)| {
+                                let ss = &ss;
+                                let spill = &spill_images;
+                                let pmq = job.pmq;
+                                let fp: &'static str = &job.rcode.fp;
+                                scope.spawn(move || {
+                                    (
+                                        pmq,
+                                        fp,
+                                        built.map_err(|(_, m)| m).and_then(|mut ps| {
+                                            adopt_from_owner(&mut ps, ss, spill)
+                                                .map_err(|e| {
+                                                    format!(
+                                                        "prefix-capable prefill m={pmq}: {e} — \
+                                                         every rung the bake shipped must load"
+                                                    )
+                                                })
+                                                .map(|()| ps)
+                                        }),
+                                    )
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
                     });
+                let mut prefix_built: Vec<(usize, SuperDscSession)> = Vec::new();
+                for (pmq, fp, adopted) in prefix_adopted {
+                    let ps = adopted.unwrap_or_else(|m| panic!("{m}"));
                     info!(
                         "[spyre-worker] sendnn: prefix-capable prefill session ready (m={}, \
                          bundle {}) — used for start>0 chunks",
-                        job.pmq, job.rcode.fp
+                        pmq, fp
                     );
-                    prefix_built.push((job.pmq as usize, ps));
+                    prefix_built.push((pmq as usize, ps));
                 }
                 let mut prefill_prefix = PrefixLadder::of_built(prefix_built);
                 if prefill_prefix.is_empty() {
@@ -2730,23 +2796,59 @@ impl SpyreWorker {
                 let mut decode_ladder: Vec<DecodeRung> = Vec::new();
                 // The jobs and their fan-out were spawned with the prefill ladder's, before the
                 // owner (see `decode_join` above); their prepare ran in the wave above, and the
-                // adoption below runs on this thread, in ladder order.
-                for (job, built) in decode_jobs.into_iter().zip(decode_prepared) {
-                    let mut rs = built.unwrap_or_else(|(_, m)| panic!("{m}"));
-                    adopt_from_owner(&mut rs, &ss, &spill_images).unwrap_or_else(|e| {
-                        panic!(
-                            "decode batch rung seqs={}: {e} — every rung the bake shipped must \
-                             load",
-                            job.rn
-                        )
-                    });
+                // adoption below runs one thread per session, reading the owner only —
+                // refusals and "ready" logs land in ladder order on this thread.
+                let decode_adopted: Vec<(
+                    usize,
+                    scratchy_subtile::sdsc_abstract::RungWidth,
+                    (usize, usize),
+                    Result<SuperDscSession, String>,
+                )> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = decode_jobs
+                        .into_iter()
+                        .zip(decode_prepared)
+                        .map(|(job, built)| {
+                            let ss = &ss;
+                            let spill = &spill_images;
+                            let rn = job.rn;
+                            let rung_width = job.rung_width;
+                            let logits = job.logits;
+                            scope.spawn(move || {
+                                (
+                                    rn,
+                                    rung_width,
+                                    (logits.rows, logits.width),
+                                    built.map_err(|(_, m)| m).and_then(|mut rs| {
+                                        adopt_from_owner(&mut rs, ss, spill)
+                                            .map_err(|e| {
+                                                format!(
+                                                    "decode batch rung seqs={rn}: {e} — \
+                                                         every rung the bake shipped must load"
+                                                )
+                                            })
+                                            .map(|()| rs)
+                                    }),
+                                )
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| match h.join() {
+                            Ok(r) => r,
+                            Err(p) => std::panic::resume_unwind(p),
+                        })
+                        .collect()
+                });
+                for (rn, rung_width, (lrows, lwidth), adopted) in decode_adopted {
+                    let rs = adopted.unwrap_or_else(|m| panic!("{m}"));
                     info!(
                         "[spyre-worker] sendnn: decode batch rung seqs={} ready \
                          (logits [{}, {}])",
-                        job.rn, job.logits.rows, job.logits.width
+                        rn, lrows, lwidth
                     );
                     decode_ladder.push(DecodeRung {
-                        seqs: job.rung_width,
+                        seqs: rung_width,
                         // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
                         // per-BODY and this is per-bundle; see `DecodeRung`. The launch
                         // asks `sess.step_body(start)`, which is the selector itself.
