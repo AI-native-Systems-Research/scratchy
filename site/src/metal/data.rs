@@ -630,6 +630,10 @@ pub struct TaskCell {
     /// from before it was recorded.
     #[serde(default)]
     pub num_tasks: Option<u32>,
+    /// Whether its answers were forced to one length for timing (`--timed-answers`), so it is
+    /// never scored; false for a scored cell and for cells from before it was recorded.
+    #[serde(default)]
+    pub timed_answers: bool,
     #[serde(default)]
     pub timed_out: bool,
     /// Each request's time to first token and end-to-end time, in the order they were sent; None
