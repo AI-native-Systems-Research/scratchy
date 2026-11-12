@@ -644,6 +644,11 @@ impl<A: DeviceAllocator> GpuWeights<A> {
 
         let numel = cpu_ref.size_bytes / cpu_ref.dtype.size_bytes();
         let cast_size = numel * target.size_bytes();
+        // `SCRATCHY_LOAD_TIME`: the cast pass, timed apart from the store read
+        // and the allocator copy that follow it. Started before the scratch
+        // grow so a realloc lands in the cast's own column, where the fix for
+        // a slow cast would have to look.
+        let cast_timer = std::time::Instant::now();
         // Vec::resize is grow-only-cheap when capacity already
         // satisfies; the slow path is rare, so an occasional realloc
         // is fine.
@@ -762,6 +767,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             numel,
         );
 
+        crate::load_time::record_cast(cast_size, cast_timer);
         (dst as *const u8, cast_size, target)
     }
 
@@ -1217,6 +1223,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             elem,
         );
 
+        let transpose_timer = std::time::Instant::now();
         let mut buf = vec![0u8; total_bytes];
         for i in 0..d0 {
             for j in 0..d1 {
@@ -1225,6 +1232,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                 buf[dst_off..dst_off + elem].copy_from_slice(&src[src_off..src_off + elem]);
             }
         }
+        crate::load_time::record_transpose(total_bytes, transpose_timer);
 
         cpu_ref.mmap = None;
         cpu_ref.data_offset = 0;
@@ -2274,7 +2282,9 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         // SAFETY: `ptr` points into either `cpu_ref.data()` (if no cast
         // happened) or `self.cast_scratch` (filled by `maybe_cast_cpu`).
         // We immediately copy out before either source is reused.
+        let to_vec_timer = std::time::Instant::now();
         let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
+        crate::load_time::record_to_vec(size_bytes, to_vec_timer);
         Ok((data, cpu_ref.shape, dtype))
     }
 
@@ -2286,7 +2296,9 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
         let (ptr, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
         // SAFETY: as `take_cpu`'s.
+        let to_vec_timer = std::time::Instant::now();
         let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
+        crate::load_time::record_to_vec(size_bytes, to_vec_timer);
         Ok((data, cpu_ref.shape, dtype))
     }
 }

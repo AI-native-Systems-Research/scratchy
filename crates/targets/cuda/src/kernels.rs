@@ -30,6 +30,7 @@ unsafe extern "C" {
     fn scratchy_cuda_gdn_gating_prepare() -> i32;
     fn scratchy_cuda_gdn_rms_norm_gated_prepare() -> i32;
     fn scratchy_cuda_gdn_scan_prepare() -> i32;
+    fn scratchy_cuda_gdn_chunk_scan_prepare() -> i32;
     fn scratchy_cuda_kv_append_bf16_prepare() -> i32;
     fn scratchy_cuda_kv_append_fp8_prepare() -> i32;
     fn scratchy_cuda_moe_combine_bf16_prepare() -> i32;
@@ -177,6 +178,29 @@ unsafe extern "C" {
         q_gain: *const c_void,
         k_gain: *const c_void,
         eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_rope_append_fp8_variant(
+        q: *const c_void,
+        q_out: *mut c_void,
+        k: *const c_void,
+        k_out: *mut c_void,
+        v: *const c_void,
+        table: *const c_void,
+        slot_mapping: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        rot_dim: u32,
+        pairing: u32,
+        block_size: u32,
+        num_blocks: u32,
+        q_gain: *const c_void,
+        k_gain: *const c_void,
+        eps: f32,
+        variant: u32,
         stream: *mut c_void,
     ) -> i32;
     // FP8 S8 W4a: the one-row GEMVs with the residual epilogue (`kernels/gemv_fp8.cu`,
@@ -440,6 +464,22 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_quant_row_prepare() -> i32;
+    fn scratchy_cuda_rms_norm_quant_row(
+        x: *const c_void,
+        other: *const c_void,
+        gain: *const c_void,
+        y: *mut c_void,
+        sum: *mut c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        rows: u32,
+        cols: u32,
+        form: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rms_norm_one_row_variant(
         x: *const c_void,
         gain: *const c_void,
@@ -484,6 +524,14 @@ unsafe extern "C" {
         rows: u32,
         cols: u32,
         cap: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gather_last_row_bf16_prepare() -> i32;
+    fn scratchy_cuda_gather_last_row_bf16(
+        x: *mut c_void,
+        sequence: *const c_void,
+        rows: u32,
+        cols: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_add_bf16_prepare() -> i32;
@@ -727,6 +775,32 @@ unsafe extern "C" {
         kernel: u32,
         scale: f32,
         eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_decode_variant(
+        qkv: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        z: *const c_void,
+        w: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        norm: *const c_void,
+        conv_state: *mut c_void,
+        conv_slot_elems: u64,
+        ssm_state: *mut c_void,
+        ssm_slot_elems: u64,
+        sequence: *const c_void,
+        out: *mut c_void,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        kernel: u32,
+        scale: f32,
+        eps: f32,
+        variant: u32,
+        trace: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gate_up_gemv_bf16_prepare() -> i32;
@@ -1013,6 +1087,40 @@ unsafe extern "C" {
         head_k: u32,
         head_v: u32,
         scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_chunk_scan(
+        conv_out: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        ssm_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        o: *mut c_void,
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_chunk_scan_part(
+        conv_out: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        ssm_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        o: *mut c_void,
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        scale: f32,
+        part: u32,
+        trace: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gdn_rank_one_probe(
@@ -1412,6 +1520,10 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
     ("pointwise_bf16", scratchy_cuda_pointwise_bf16_prepare),
+    (
+        "gather_last_row_bf16",
+        scratchy_cuda_gather_last_row_bf16_prepare,
+    ),
     ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
     ("gate_scale_bf16", scratchy_cuda_gate_scale_bf16_prepare),
     ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
@@ -1473,6 +1585,13 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
+    // FP8 S8 F6a: the attribute on every instance of the chunked scan.
+    ("gdn_chunk_scan", scratchy_cuda_gdn_chunk_scan_prepare),
+    // FP8 S8 N3: a load of every instance of the one-CTA-a-row norm (no tape launches it yet).
+    (
+        "rms_norm_quant_row",
+        scratchy_cuda_rms_norm_quant_row_prepare,
+    ),
     ("gemv_fp8_tc", scratchy_cuda_gemv_fp8_tc_prepare),
     ("act_quant_fp8", scratchy_cuda_act_quant_fp8_prepare),
     (
@@ -1490,6 +1609,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         "gdn_rms_norm_gated",
         scratchy_cuda_gdn_rms_norm_gated_prepare,
     ),
+    // A one-row bucket's `GatedDeltaNet` scan (`step::gdn_scan_is_recurrent`).
     ("gdn_scan", scratchy_cuda_gdn_scan_prepare),
     ("kv_append_bf16", scratchy_cuda_kv_append_bf16_prepare),
     ("kv_append_fp8", scratchy_cuda_kv_append_fp8_prepare),
@@ -1768,6 +1888,58 @@ pub unsafe fn rms_norm_unit_bf16(
     check(code, KernelError::RowShape { rows, cols })
 }
 
+/// The decode RMSNorm in one CTA a row, fused with the next GEMM's FP8 quantization (FP8 S8 N3,
+/// `kernels/rms_norm_quant_row.cu`; the one-row norms [`crate::step::norm_row_takes`] takes, and
+/// [`CudaStep::RmsNormQuantFp8`](crate::step::CudaStep::RmsNormQuantFp8) and its add-norm twin with
+/// their quantization). Per row of `x [rows, cols]`
+/// bf16: `form` 0 `y = norm(x)`, 1 `sum = bf16(x + other)` and `y = norm(sum)`, 2 `y =
+/// bf16(bf16(norm(x)) + other)`, with `norm(v) = v · rsqrt(mean(v²) + eps) · (gain_offset + gain)`
+/// rounded once to bf16, its sum of squares in its own order (a warp tree, not the 16-row
+/// kernel's: the bits of [`rms_norm_bf16`] within an f64 bound, not equal). With `quant` (`(q,
+/// scale)`, forms 0 and 1), also `q [rows, cols]` e4m3 and `scale [rows]` f32, [`quant_rows_fp8`]
+/// of `y` bit for bit. Asynchronous.
+///
+/// Refused with [`KernelError::RowShape`], before any pointer is touched, unless `rows` is 1 to
+/// 65,535, `cols` a non-zero multiple of 256 at most 8,192, `form` at most 2, `eps` finite and
+/// positive, `gain_offset` finite, `x`, `gain` and `y` not null, `other` not null at forms 1 and 2,
+/// `sum` not null at form 1, and `quant` both pointers or none, at forms 0 and 1 only.
+///
+/// # Safety
+///
+/// `x`, `other`, `y`, `sum` 16-byte-aligned device pointers to `rows · cols` bf16, `gain` to
+/// `cols`, `q` to `rows · cols` bytes and `scale` to `rows` f32; the outputs overlap no input.
+/// [`prepare_all`] must have succeeded on the current device; `stream` a live `cudaStream_t` of
+/// the current device, or null for the default stream.
+pub unsafe fn rms_norm_quant_row(
+    (x, other, gain): (*const c_void, *const c_void, *const c_void),
+    (y, sum): (*mut c_void, *mut c_void),
+    quant: Option<(*mut c_void, *mut c_void)>,
+    (rows, cols): (u32, u32),
+    (form, eps, gain_offset): (u32, f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let (q, scale) = quant.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+    // SAFETY: the caller upholds the contract above; the launcher checks every rule first.
+    let code = unsafe {
+        scratchy_cuda_rms_norm_quant_row(
+            x,
+            other,
+            gain,
+            y,
+            sum,
+            q,
+            scale,
+            rows,
+            cols,
+            form,
+            eps,
+            gain_offset,
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
 /// Test support for `tests/row_ops.rs` only (FP8 S8 N1): one row of norm form `form` (0
 /// [`rms_norm_bf16`], 1 [`rms_norm_unit_bf16`], 2 [`add_rms_norm_bf16`], 3 [`norm_add_bf16`]) at
 /// `variant` 0, today's one-row kernel, or 1, the row kernel the launchers take, the same bits.
@@ -1882,6 +2054,29 @@ pub unsafe fn soft_cap_bf16(
 ) -> Result<(), KernelError> {
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_soft_cap_bf16(x, out, rows, cols, cap, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the sampled row's gather (`kernels/gather_last_row_bf16.cu`, FP8 S8 F2): row `q_len −
+/// 1` of `x [rows, cols]` bf16 copied over row 0, in place, `q_len` entry 1 of `sequence`
+/// (`[prefix_len, q_len]` u32); a `q_len` of 0, 1 or above `rows` copies nothing. Asynchronous;
+/// refused with [`KernelError::RowShape`] unless `rows` and `cols` are non-zero, `cols` a multiple
+/// of [`crate::step::GATHER_LAST_ROW_BF16_COLS`] and `rows · cols` at most `i32::MAX`.
+///
+/// # Safety
+///
+/// `x` must be a 16-byte-aligned device pointer to `rows·cols` bf16 and `sequence` a 4-byte-aligned
+/// one to 2 u32, both valid for the whole kernel. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+pub unsafe fn gather_last_row_bf16(
+    x: *mut c_void,
+    sequence: *const c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe { scratchy_cuda_gather_last_row_bf16(x, sequence, rows, cols, stream) };
     check(code, KernelError::RowShape { rows, cols })
 }
 
@@ -3365,6 +3560,10 @@ pub unsafe fn gdn_gating(
     check(code, KernelError::GdnGatingShape { rows, nv })
 }
 
+/// A one-row bucket's `GatedDeltaNet` scan (a decode `GdnDecode` does not take); a prefill
+/// bucket's is [`gdn_chunk_scan`] (`step::gdn_scan_is_recurrent`). Also the decode kernel's bit
+/// reference.
+///
 /// Launch the GDN recurrent gated delta-rule scan: per value head, the slot's f32 state (zero,
 /// never read, on a fresh start) through the real tokens of `conv_out` (`q | k | v`), `g` and
 /// `beta`, each token's output into `o [rows, nv·head_v]` (f32); the state written back once.
@@ -3413,6 +3612,83 @@ pub unsafe fn gdn_scan(
     )
 }
 
+/// Launch the GDN chunked gated delta-rule scan (FP8 S8 F6a, `kernels/gdn_chunk_scan.cu`):
+/// [`gdn_scan`]'s recurrence, arguments, buffers and refusals, computed 64 tokens at a time with
+/// bf16 WGMMAs and f32 accumulation, the state f32 between chunks. No `CudaStep` launches it yet.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::GdnScanShape`] exactly where [`gdn_scan`] is, before any pointer is
+/// touched.
+///
+/// # Safety
+///
+/// As [`gdn_scan`]'s.
+pub unsafe fn gdn_chunk_scan(
+    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
+    (ssm_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    o: *mut c_void,
+    (rows, nk, nv): (u32, u32, u32),
+    (head_k, head_v, scale): (u32, u32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_chunk_scan(
+            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
+            scale, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k,
+            head_v,
+        },
+    )
+}
+
+/// Test support for `tests/gdn.rs`'s timing split only: [`gdn_chunk_scan`] with `part` 0 (the
+/// kernel), 1 (the solve skipped, T = I), 2 (stopped after the precompute) or 3 (the kernel, its
+/// phases into `trace`: `[(head_v / 32) · nv, 13]` f32, each CTA's cycles per phase summed over
+/// its chunks, then the chunk count; `kernels/gdn_chunk_scan.cu`'s `PHASES`). Parts 1 and 2 are not
+/// a scan. No `CudaStep` uses it. Refused as [`gdn_chunk_scan`] is, at any other `part`, and at
+/// part 3 with a null `trace`.
+///
+/// # Safety
+///
+/// As [`gdn_scan`]'s; `trace`, at part 3, a device pointer to `(head_v / 32) · nv · 13` f32.
+pub unsafe fn gdn_chunk_scan_part(
+    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
+    (ssm_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    o: *mut c_void,
+    (rows, nk, nv): (u32, u32, u32),
+    (head_k, head_v, scale): (u32, u32, f32),
+    (part, trace, stream): (u32, *mut c_void, *mut c_void),
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_chunk_scan_part(
+            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
+            scale, part, trace, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k,
+            head_v,
+        },
+    )
+}
+
 /// The operands of [`gdn_decode`]: the token's `qkv`, `a`, `b` and `z`, the bundle's conv taps,
 /// `a_log`, `dt_bias` and norm gain, and the output.
 pub struct GdnDecodeOperands {
@@ -3432,8 +3708,10 @@ pub struct GdnDecodeOperands {
 /// bits. `dims` is `(nk, nv, head_k, head_v, kernel)`. Asynchronous.
 ///
 /// Refused with [`KernelError::GdnDecodeShape`], before any pointer is touched, unless the four
-/// launchers take the geometry at one row, `head_v` is 128 or 256, `nv / nk` at most
-/// [`crate::step::GDN_DECODE_MAX_HEADS`] dividing 16, and `scale` and `eps` finite and positive.
+/// launchers take the geometry at one row, `head_v` is 128 or 256, `nv / nk` at most 8 (one CTA a
+/// value head, a key head's CTAs one cluster: FP8 S8 D1), and `scale` and `eps` finite and
+/// positive. The tapes choose it by `steps_from_tape`'s `gdn_decode_takes` (at most
+/// [`crate::step::GDN_DECODE_MAX_HEADS`] dividing 16, the one-key-head form's rule).
 ///
 /// # Safety
 ///
@@ -3473,6 +3751,66 @@ pub unsafe fn gdn_decode(
             kernel,
             scale,
             eps,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnDecodeShape {
+            nk,
+            nv,
+            head_v,
+            kernel,
+        },
+    )
+}
+
+/// Test support for `tests/gdn.rs` only (FP8 S8 D1): [`gdn_decode`] at `variant` 0 (the one-key-head
+/// form, #1049's: one CTA a key head) or 1 (the one-value-head form [`gdn_decode`] runs: one CTA a
+/// value head, a key head's CTAs one cluster), the same bits; with `trace` (not null, `kernel` 4
+/// only), the traced instance's phase cycles into `[CTAs, 8]` f32 (`nk` CTAs at variant 0, `nv` at
+/// 1; `kernels/gdn_decode.cu`'s `PHASES`). Refused as [`gdn_decode`], for `variant` above 1, and for
+/// a `trace` at another `kernel`.
+///
+/// # Safety
+///
+/// As [`gdn_decode`]'s; `trace`, when not null, a device pointer to `CTAs · 8` f32.
+#[doc(hidden)]
+pub unsafe fn gdn_decode_variant(
+    o: &GdnDecodeOperands,
+    (conv_state, conv_slot_elems): (*mut c_void, u64),
+    (ssm_state, ssm_slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    (nk, nv, head_k, head_v, kernel): (u32, u32, u32, u32, u32),
+    (scale, eps): (f32, f32),
+    (variant, trace, stream): (u32, *mut c_void, *mut c_void),
+) -> Result<(), KernelError> {
+    // SAFETY: as `gdn_decode`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_decode_variant(
+            o.qkv,
+            o.a,
+            o.b,
+            o.z,
+            o.w,
+            o.a_log,
+            o.dt_bias,
+            o.norm,
+            conv_state,
+            conv_slot_elems,
+            ssm_state,
+            ssm_slot_elems,
+            sequence,
+            o.out,
+            nk,
+            nv,
+            head_k,
+            head_v,
+            kernel,
+            scale,
+            eps,
+            variant,
+            trace,
             stream,
         )
     };
@@ -5018,6 +5356,71 @@ pub unsafe fn rope_append_fp8(
             q_gain,
             k_gain,
             eps,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::KvAppendShape {
+            rows: 1,
+            kv_heads,
+            head_dim,
+            block_size,
+        },
+    )
+}
+
+/// Test support for `tests/rope_gate.rs` only (FP8 S8 R1): [`rope_append_fp8`] at `variant`, 0 the
+/// one-warp kernel W4c built and 1 [`rope_append_fp8`]'s own four-warp kernel, the same bits.
+/// Refused as [`rope_append_fp8`], or for `variant` above 1. Asynchronous.
+///
+/// # Safety
+///
+/// As [`rope_append_fp8`]'s.
+#[doc(hidden)]
+pub unsafe fn rope_append_fp8_variant(
+    (q, q_out, k, k_out, v): (
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+    ),
+    (table, slot_mapping): (*const c_void, *const c_void),
+    (k_cache, v_cache): (*mut c_void, *mut c_void),
+    (q_heads, kv_heads, head_dim, rot_dim, pairing): (u32, u32, u32, u32, RopePairing),
+    (block_size, num_blocks): (u32, u32),
+    norms: Option<(*const c_void, *const c_void, f32)>,
+    (variant, stream): (u32, *mut c_void),
+) -> Result<(), KernelError> {
+    let pairing_code = match pairing {
+        RopePairing::HalfRotated => 0,
+        RopePairing::HalfHead => 1,
+    };
+    let (q_gain, k_gain, eps) = norms.unwrap_or((std::ptr::null(), std::ptr::null(), 0.0));
+    // SAFETY: the caller upholds the contract above; the launcher checks every rule first.
+    let code = unsafe {
+        scratchy_cuda_rope_append_fp8_variant(
+            q,
+            q_out,
+            k,
+            k_out,
+            v,
+            table,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            q_heads,
+            kv_heads,
+            head_dim,
+            rot_dim,
+            pairing_code,
+            block_size,
+            num_blocks,
+            q_gain,
+            k_gain,
+            eps,
+            variant,
             stream,
         )
     };

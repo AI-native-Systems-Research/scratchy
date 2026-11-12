@@ -9,8 +9,8 @@ use super::walk::{
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpSpec, Role,
-    Scale, StickExtent, TensorArg, WorkPlan,
+    Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpSpec, Role, Scale, StickExtent,
+    TensorArg, WorkPlan,
 };
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
@@ -265,7 +265,7 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
             // geometries the guard refused now get the probe's own shape instead.
             let mb_split = crate::work::core_split(
                 op.iter.extent(MbAxis::NAME),
-                crate::superdsc_opspec::MAX_CORES,
+                crate::device_gen::BUILD_CORES,
             );
             let mut mb_only = std::collections::BTreeMap::new();
             if mb_split > 1 {
@@ -275,7 +275,7 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
                 let dims = op.iter.dims().to_vec();
                 op.iter = crate::superdsc_opspec::WorkPlan::divide(
                     &dims,
-                    MaxCores::<{ MAX_CORES }>,
+                    crate::device_gen::whole(),
                     |_, _| mb_only,
                 )?;
             }
@@ -410,11 +410,11 @@ where
     // SubtileTape dispatch (every `SubOp::MatmulTile`), same pattern as `pointwise_opspec`/
     // `reduce_opspec_df`. `DF::DF` bridges the compile-time format marker to the runtime `Df`
     // `TileOp::resident_bytes` dispatches on (fp8 ⇒ its 1-byte operand path, unchanged).
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::Matmul,
-        dims: dims.clone(),
-        df: operand_df,
-    };
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::Matmul,
+        dims.clone(),
+        operand_df,
+    );
     // ── WHO STAGES THE OPERANDS THROUGH LX ──
     // An UNBATCHED dense matmul is handed to dxp WHOLE — torch-spyre's form: ONE descriptor over
     // the cost model's split, HBM operands, no frontend LX-fit time trips; dxp stages the slab
@@ -425,12 +425,12 @@ where
     // its forms are the card-proven ones (the rope-rotate and attention score doors route here).
     let (plan, time_tile) = if batch > 1 {
         let tiled = tile_op
-            .tile(MaxCores::<MAX_CORES>, splitter, OutAxis::NAME)
+            .tile(crate::device_gen::whole(), splitter, OutAxis::NAME)
             .map_err(|e| e.0)?;
         (tiled.plan, tiled.time_tile)
     } else {
         (
-            WorkPlan::divide(&tile_op.dims, MaxCores::<MAX_CORES>, &splitter)?,
+            WorkPlan::divide(&tile_op.dims, crate::device_gen::whole(), &splitter)?,
             None,
         )
     };
@@ -864,13 +864,13 @@ pub fn matmul_opspec_batched_off(
     // Attention bmm operands are fp16 (SEN169) — 64-lane sticks.
     let dims = matmul_dims::<Fp16>(m, &n_ext, &k_ext, batch);
     // LOWER to TileIR: same pattern as `matmul_opspec_split` — the batched-attention bmm's TileOp.
-    let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::Matmul,
-        dims: dims.clone(),
-        df: Df::Fp16,
-    };
+    let tile_op = TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::Matmul,
+        dims.clone(),
+        Df::Fp16,
+    );
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, matmul_split_map, OutAxis::NAME)
+        .tile(crate::device_gen::whole(), matmul_split_map, OutAxis::NAME)
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     // INPUT [y,mb,in] stick=in (batch-outermost; reduction = OMIT `in` from OUTPUT).
@@ -973,11 +973,12 @@ pub fn matmul_opspec_x_batched(
     let k_ext = StickExtent::<Fp16>::new(k)?;
     // One batch a core, or past the cores, as many consecutive batches a core as divide evenly
     // (a decode batch's `J · B · KV` blocks).
-    let cores = crate::work::core_split(batch, MAX_CORES);
+    let cores = crate::work::core_split(batch, crate::device_gen::BUILD_CORES);
     if batch <= 1 || cores <= 1 {
         return Err(format!(
             "matmul_opspec_x_batched('{o_name}'): a batch of {batch} divides over no cores of \
-             {MAX_CORES}"
+             {cores}",
+            cores = crate::device_gen::BUILD_CORES
         ));
     }
     let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
@@ -993,7 +994,7 @@ pub fn matmul_opspec_x_batched(
         dim(OutAxis::NAME, n_ext.elems(), false, true),
         dim(InAxis::NAME, k_ext.elems(), true, true),
     ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+    let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), |_, _| {
         std::collections::BTreeMap::from([("x", cores)])
     })?;
     let active = [Scale::Active, Scale::Active, Scale::Active];
@@ -1098,10 +1099,15 @@ pub fn matmul_opspec_rows_split(
     use crate::superdsc_opspec::{ItDim, ViewFrame};
     let n_ext = StickExtent::<Fp16>::new(n)?;
     let k_ext = StickExtent::<Fp16>::new(k)?;
-    if batch == 0 || chunks <= 1 || chunks > MAX_CORES || !m.is_multiple_of(chunks) {
+    if batch == 0
+        || chunks <= 1
+        || chunks > crate::device_gen::BUILD_CORES
+        || !m.is_multiple_of(chunks)
+    {
         return Err(format!(
             "matmul_opspec_rows_split('{o_name}'): {m} rows of {batch} batch(es) in {chunks} chunks \
-             — the rows split into 2 to {MAX_CORES} whole chunks"
+             — the rows split into 2 to {cores} whole chunks",
+            cores = crate::device_gen::BUILD_CORES
         ));
     }
     let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
@@ -1117,7 +1123,7 @@ pub fn matmul_opspec_rows_split(
         dim(OutAxis::NAME, n_ext.elems(), false, true),
         dim(InAxis::NAME, k_ext.elems(), true, true),
     ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+    let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), |_, _| {
         std::collections::BTreeMap::from([(MbAxis::NAME, chunks)])
     })?;
     let active = [Scale::Active, Scale::Active, Scale::Active];

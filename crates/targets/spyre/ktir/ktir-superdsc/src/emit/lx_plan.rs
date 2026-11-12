@@ -243,7 +243,7 @@ fn heads_inner(node: &KtirNode) -> Option<WalkDivision> {
         };
         let rows = u32::try_from(*rows).ok()?;
         (is_102 && rows > 1).then(|| WalkDivision::HeadsInner {
-            chunks: crate::work::core_split(rows, crate::superdsc_opspec::MAX_CORES),
+            chunks: crate::work::core_split(rows, crate::device_gen::BUILD_CORES),
         })
     })
 }

@@ -27,25 +27,26 @@ const ARCH: &str = "qwen3-5";
 /// The decode tape's greedy argmax width (W7): the model's vocab, its whole logits row.
 const GREEDY_WIDTH: u32 = 248_320;
 
-const DECODE_STEPS: [(&str, usize); 13] = [
+const DECODE_STEPS: [(&str, usize); 14] = [
     ("AttnDecode", 16),
     ("Embed", 1),
     ("GateApply", 16),
     ("GateSplit", 16),
     ("GateUpTcFp8", 64),
-    ("GatedDeltaNet", 48),
+    ("GdnDecode", 48),
     ("Gemv", 1),
     ("GemvGroupFp8", 48),
     ("GemvGroupTcFp8", 64),
     ("GemvTcFp8", 128),
-    ("QuantRowsFp8", 192),
-    ("RmsNorm", 161),
+    ("QuantRowsFp8", 64),
+    ("RmsNorm", 33),
+    ("RmsNormQuantFp8", 128),
     ("RopeAppend", 16),
 ];
 /// The decode tape's quant writes and their readers (FP8 S8 T2).
-const DECODE_QUANTS: usize = 192;
+const DECODE_QUANTS: usize = 64;
 const DECODE_QUANT_READERS: usize = 256;
-const PREFILL_STEPS: [(&str, usize); 15] = [
+const PREFILL_STEPS: [(&str, usize); 16] = [
     ("AddRmsNorm", 128),
     ("AttnPrefill", 16),
     ("Embed", 1),
@@ -53,6 +54,7 @@ const PREFILL_STEPS: [(&str, usize); 15] = [
     ("GateSplit", 16),
     ("GateUpAct", 64),
     ("GatedDeltaNet", 48),
+    ("GatherLastRow", 1),
     ("Gemm", 1),
     ("GemmFp8", 128),
     ("GemmGroupFp8", 64),

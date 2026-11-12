@@ -122,6 +122,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RmsNormUnitBf16",
                 "LayerScaleBf16",
                 "SoftCapBf16",
+                "GatherLastRowBf16",
                 "GemmGroupBf16",
                 "GroupMember",
                 "AddRmsNormBf16",
@@ -134,6 +135,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "GateUpTcFp8",
                 "ExpertGateUpTcFp8",
                 "ExpertActQuantFp8",
+                "RmsNormQuantFp8",
+                "AddRmsNormQuantFp8",
             ],
         },
         ModuleRow {
@@ -391,6 +394,7 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
         let at = CanonicalAt {
             stem: &input.stem,
             m: u64::from(b.point.m),
+            rows: input.rows,
         };
         let lowered = lower_canonical(&b.lowered, facts, at);
         by_m.entry(b.point.m)
@@ -683,7 +687,8 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::Scale(_)
         | CudaStep::RmsNormUnit(_)
         | CudaStep::GeluMul(_)
-        | CudaStep::SoftCap(_) => None,
+        | CudaStep::SoftCap(_)
+        | CudaStep::GatherLastRow(_) => None,
         // Read through their members ([`CudaStep::parts`]), each a GEMM's `[n, k]`.
         CudaStep::GemmGroup(_)
         | CudaStep::GemmNarrowGroup(_)
@@ -701,6 +706,9 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         CudaStep::GateUpTcFp8(t) => role(&CudaStep::GemvFp8(t.fold.gate)),
         CudaStep::ExpertGemvTcFp8(g) => role(&CudaStep::ExpertGemv(g)),
         CudaStep::ExpertGateUpTcFp8(t) => role(&CudaStep::ExpertGemv(t.fold.gate)),
+        // A norm with its quantization (FP8 S8 N3) reads its norm's gain.
+        CudaStep::RmsNormQuantFp8(t) => role(&CudaStep::RmsNorm(t.norm)),
+        CudaStep::AddRmsNormQuantFp8(t) => role(&CudaStep::AddRmsNorm(t.fold)),
         CudaStep::GemvGroupTcFp8(_) => None,
     }
 }

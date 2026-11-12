@@ -7,10 +7,11 @@
 //! split leaves the gemm on less than half the cores. These are granite's real widths, pinned through
 //! the public constructors the three consumers call.
 
-use ktir_superdsc::superdsc_opspec::MAX_CORES;
+use ktir_superdsc::device_gen::{DeviceGen, Gen1};
+const MAX_CORES: u32 = <Gen1 as DeviceGen>::CORES;
+const UTIL_FLOOR_CORES: u32 = <Gen1 as DeviceGen>::UTIL_FLOOR_CORES;
 use ktir_superdsc::work::{
-    DeviceWidth, FP16_ELEMS_PER_STICK, Fp16Sticks, UTIL_FLOOR_CORES, bump_sticks_to_splittable,
-    core_split,
+    DeviceWidth, FP16_ELEMS_PER_STICK, Fp16Sticks, bump_sticks_to_splittable, core_split,
 };
 
 const STICK: u32 = FP16_ELEMS_PER_STICK;

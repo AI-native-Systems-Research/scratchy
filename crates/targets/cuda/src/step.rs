@@ -61,7 +61,8 @@ pub enum CudaStep {
     AttnDecode(AttnPrefillBf16),
     /// One prefill chunk of a Gated-DeltaNet linear-attention layer, lowered from
     /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
-    /// `kernels/gdn_gating.cu`, `kernels/gdn_scan.cu` then `kernels/gdn_rms_norm_gated.cu`.
+    /// `kernels/gdn_gating.cu`, `kernels/gdn_chunk_scan.cu` (FP8 S8 F6a: the scan 64 tokens at a
+    /// time) then `kernels/gdn_rms_norm_gated.cu`.
     GatedDeltaNet(GatedDeltaNetBf16),
     /// A MoE block's router, `[m, experts]` logits into the MoE scratch, lowered from
     /// `SubOp::RouterLogits`: the tiled GEMM or the GEMV (`kernels/gemm_bf16.cu`,
@@ -113,6 +114,11 @@ pub enum CudaStep {
     /// `cap · tanh(x / cap)` (Gemma's final logits), lowered from `SubOp::TanhSoftCap`
     /// (`kernels/pointwise_bf16.cu`, `scratchy_cuda_soft_cap_bf16`).
     SoftCap(SoftCapBf16),
+    /// The sequence's last row moved to the front of a decoder's result-matmul input, in place
+    /// (FP8 S8 F2), lowered from `SubOp::SampleRowsGather`: row `q_len − 1` of `x [rows, cols]`
+    /// copied over row 0, `q_len` read from the KV sequence region on the device
+    /// (`kernels/gather_last_row_bf16.cu`, `scratchy_cuda_gather_last_row_bf16`).
+    GatherLastRow(GatherLastRowBf16),
     /// Gemma's router pre-norm, `x̂ · router.scale` into the MoE scratch's router-norm region,
     /// lowered from `SubOp::RouterNorm`: the operands of [`Self::RmsNorm`], its gain the bundle's
     /// `router.scale` (`kernels/rms_norm_bf16.cu`, `scratchy_cuda_rms_norm_bf16`).
@@ -204,6 +210,62 @@ pub enum CudaStep {
     /// [`Self::ExpertGateUpAct`] over an fp8 bank on the tensor cores, as [`Self::GateUpTcFp8`]:
     /// B8's expert form for the gate and the up (f32), then the act + quantize of the pairs' rows.
     ExpertGateUpTcFp8(ExpertGateUpTcFp8),
+    /// A one-row [`Self::RmsNorm`] and the [`Self::QuantRowsFp8`] of its `y` right after it, in
+    /// one launch (FP8 S8 N3, `kernels/rms_norm_quant_row.cu`): `y` as N3's norm computes it, then
+    /// its e4m3 row and scale at `q`, the quant scratch's first slot, `quant_rows_fp8` of `y` bit
+    /// for bit.
+    RmsNormQuantFp8(RmsNormQuantFp8),
+    /// [`Self::AddRmsNorm`] of one row and the quantization of its `y`, as [`Self::RmsNormQuantFp8`].
+    AddRmsNormQuantFp8(AddRmsNormQuantFp8),
+}
+
+/// [`CudaStep::RmsNormQuantFp8`]: the norm, and where its quantization goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RmsNormQuantFp8 {
+    pub norm: RmsNormBf16,
+    pub q: ArenaOffset,
+}
+
+impl RmsNormQuantFp8 {
+    /// The quantization's write, as the [`QuantRowsFp8`] of `y` it equals.
+    pub const fn quant_write(&self) -> QuantRowsFp8 {
+        QuantRowsFp8 {
+            x: self.norm.y,
+            q: self.q,
+            rows: self.norm.rows,
+            cols: self.norm.cols,
+        }
+    }
+}
+
+/// [`CudaStep::AddRmsNormQuantFp8`]: the add-norm, and where its quantization goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AddRmsNormQuantFp8 {
+    pub fold: AddRmsNormBf16,
+    pub q: ArenaOffset,
+}
+
+impl AddRmsNormQuantFp8 {
+    /// As [`RmsNormQuantFp8::quant_write`].
+    pub const fn quant_write(&self) -> QuantRowsFp8 {
+        RmsNormQuantFp8 {
+            norm: self.fold.norm,
+            q: self.q,
+        }
+        .quant_write()
+    }
+}
+
+/// The one-row norm's column granule and widest row (FP8 S8 N3, `kernels/rms_norm_quant_row.cu`'s
+/// `CHUNK` and `MAX_COLS`).
+pub const NORM_ROW_COLS: u32 = 256;
+pub const NORM_ROW_MAX_COLS: u32 = 8192;
+
+/// Whether a norm, add-norm or norm-add of `rows` × `cols` plays the one-row norm (FP8 S8 N3):
+/// the decode bucket's one token row, at a width its kernel takes. Every other norm plays the
+/// row kernels (`kernels/rms_norm_bf16.cu`).
+pub const fn norm_row_takes(rows: u32, cols: u32) -> bool {
+    rows == 1 && cols.is_multiple_of(NORM_ROW_COLS) && cols <= NORM_ROW_MAX_COLS
 }
 
 /// [`CudaStep::GateUpTcFp8`]: the gate/up fold it computes (its `kernel` the CUDA-core one,
@@ -396,7 +458,12 @@ pub fn quant_chain(steps: &[CudaStep]) -> Result<(), QuantChainError> {
         let Some(w) = s.quant_write() else {
             continue;
         };
-        let required = matches!(s, CudaStep::QuantRowsFp8(_));
+        let required = matches!(
+            s,
+            CudaStep::QuantRowsFp8(_)
+                | CudaStep::RmsNormQuantFp8(_)
+                | CudaStep::AddRmsNormQuantFp8(_)
+        );
         let at = live
             .iter()
             .position(|l| l.is_some_and(|(_, q, _, _)| q.q == w.q));
@@ -420,9 +487,19 @@ pub fn quant_chain(steps: &[CudaStep]) -> Result<(), QuantChainError> {
     }
 }
 
-/// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`): one CTA
-/// per key head owns its value heads, `nv / nk` of them; qwen3.5's are 1 (0.8B) and 2 (9B, 35B).
-pub const GDN_DECODE_MAX_HEADS: u32 = 4;
+/// Whether a `GatedDeltaNet` step of `rows` rows scans with the recurrent kernel
+/// (`kernels/gdn_scan.cu`) rather than the chunked one (`kernels/gdn_chunk_scan.cu`, FP8 S8 F6a): at
+/// a one-row bucket, a decode the one-launch `GdnDecode` does not take (the 27B's three value heads
+/// a key head), where the chunked scan would pay a 64-token chunk for one token; every prefill
+/// bucket's is the chunked scan. A constant of each step (its `rows`), chosen at expansion.
+pub const fn gdn_scan_is_recurrent(rows: u32) -> bool {
+    rows == 1
+}
+
+/// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`, FP8 S8
+/// D1): one CTA per value head, a key head's `nv / nk` CTAs one cluster, at most the portable
+/// cluster size; qwen3.5's are 1 (0.8B), 2 (9B, 35B) and 3 (27B).
+pub const GDN_DECODE_MAX_HEADS: u32 = 8;
 
 /// The activation a gate/up step applies (`kernels/scratchy_ops.cuh`'s op struct): SwiGLU's
 /// `silu_mul` or GeGLU's `gelu_tanh_mul`, the op of [`CudaStep::SiluMul`] or [`CudaStep::GeluMul`].
@@ -715,6 +792,22 @@ pub const SCALE_BF16_COLS: u32 = 8;
 /// The soft-cap's `cols` is a non-zero multiple of this (one 16-byte vector of 8 bf16), `rows`
 /// non-zero, and `rows · cols` at most `i32::MAX`.
 pub const SOFT_CAP_BF16_COLS: u32 = 8;
+
+/// The gather's `cols` is a non-zero multiple of this (one 16-byte unit of 8 bf16, so each row
+/// starts 16-byte aligned for the bulk copy), `rows` non-zero, and `rows · cols` at most
+/// `i32::MAX`.
+pub const GATHER_LAST_ROW_BF16_COLS: u32 = 8;
+
+/// Row `q_len − 1` of `x [rows, cols]` bf16 copied over its row 0, in place; `q_len` is entry 1
+/// of the KV sequence region (`[prefix_len, q_len]` u32), written by the forward. A `q_len` of 0,
+/// 1 or above `rows` copies nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GatherLastRowBf16 {
+    pub x: ArenaOffset,
+    pub sequence: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+}
 
 /// `out = x · scale` over `[rows, cols]`, bf16 in and out, computed in f32 and rounded once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -2014,6 +2107,7 @@ impl CudaStep {
             | Self::GeluMul(_)
             | Self::LayerScale(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::RouterNorm(_)
             | Self::GemmCol64(_)
             // A grouped GEMV's members each take their own split, at their own place in the
@@ -2038,7 +2132,9 @@ impl CudaStep {
             | Self::GemvGroupTcFp8(_)
             | Self::GateUpTcFp8(_)
             | Self::ExpertGemvTcFp8(_)
-            | Self::ExpertGateUpTcFp8(_) => None,
+            | Self::ExpertGateUpTcFp8(_)
+            | Self::RmsNormQuantFp8(_)
+            | Self::AddRmsNormQuantFp8(_) => None,
         }
     }
 
@@ -2083,6 +2179,7 @@ impl CudaStep {
             | Self::GeluMul(_)
             | Self::LayerScale(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::RouterNorm(_)
             | Self::GemmCol64(_)
             | Self::GemmGroup(_)
@@ -2098,7 +2195,9 @@ impl CudaStep {
             | Self::GemvGroupTcFp8(_)
             | Self::GateUpTcFp8(_)
             | Self::ExpertGemvTcFp8(_)
-            | Self::ExpertGateUpTcFp8(_) => None,
+            | Self::ExpertGateUpTcFp8(_)
+            | Self::RmsNormQuantFp8(_)
+            | Self::AddRmsNormQuantFp8(_) => None,
         }
     }
 
@@ -2149,13 +2248,16 @@ impl CudaStep {
             | Self::GeluMul(_)
             | Self::LayerScale(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::RouterNorm(_)
             | Self::GemmCol64(_)
             | Self::AddRmsNorm(_)
             | Self::NormAdd(_)
             | Self::GateUpAct(_)
             | Self::ExpertGateUpAct(_)
-            | Self::GdnDecode(_) => None,
+            | Self::GdnDecode(_)
+            | Self::RmsNormQuantFp8(_)
+            | Self::AddRmsNormQuantFp8(_) => None,
         }
     }
 
@@ -2243,6 +2345,8 @@ impl CudaStep {
             Self::ExpertActQuant(t) => Some(t.quant_write()),
             Self::GateUpTcFp8(t) => Some(t.quant_write()),
             Self::ExpertGateUpTcFp8(t) => t.quant_write(),
+            Self::RmsNormQuantFp8(t) => Some(t.quant_write()),
+            Self::AddRmsNormQuantFp8(t) => Some(t.quant_write()),
             _ => None,
         }
     }
@@ -2277,6 +2381,14 @@ impl CudaStep {
         }
         if let Self::ExpertGateUpTcFp8(t) = self {
             return [Some(*self), Some(Self::ExpertGemvTcFp8(t.fold.up)), None];
+        }
+        // A norm with its quantization (FP8 S8 N3): itself (the norm's operands), then the
+        // quantization as the quant write it equals.
+        if let Self::RmsNormQuantFp8(t) = self {
+            return [Some(*self), Some(Self::QuantRowsFp8(t.quant_write())), None];
+        }
+        if let Self::AddRmsNormQuantFp8(t) = self {
+            return [Some(*self), Some(Self::QuantRowsFp8(t.quant_write())), None];
         }
         // A rope append with its query rope folded in (FP8 S8 W4c): the append, then the query rope
         // as the step it is on its own, so `validate` checks its spans too.
@@ -2657,6 +2769,9 @@ impl CudaStep {
                     ..e
                 })
             }
+            // The norm's; its quantization is its second part's ([`Self::parts`]).
+            Self::RmsNormQuantFp8(t) => Self::RmsNorm(t.norm).extents(),
+            Self::AddRmsNormQuantFp8(t) => Self::AddRmsNorm(t.fold).extents(),
             // The norm's gain and both inputs; the sum, then the norm.
             Self::AddRmsNorm(f) => {
                 let RmsNormBf16 {
@@ -3232,6 +3347,32 @@ impl CudaStep {
                     in_place: false,
                 })
             }
+            // The rows read (row `q_len − 1`, any of them) and the sequence region's two entries;
+            // the write is row 0 of the same rows, declared as the whole tensor it is in place over.
+            Self::GatherLastRow(GatherLastRowBf16 {
+                x,
+                sequence,
+                rows,
+                cols,
+            }) => {
+                let Some(bytes) = bf16_bytes(rows, cols) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(x, bytes)),
+                        Some(span(sequence, u32_bytes(2))),
+                        None,
+                        None,
+                    ],
+                    writes: span(x, bytes),
+                    second_write: None,
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                    in_place: true,
+                })
+            }
             // `pointwise_bf16.cu` reads each element before the same thread writes it, so the
             // soft-cap may write over its input.
             Self::SoftCap(SoftCapBf16 {
@@ -3378,6 +3519,18 @@ impl CudaStep {
             | Self::NormAdd(NormAddBf16 {
                 norm: RmsNormBf16 { gain, .. },
                 ..
+            })
+            | Self::RmsNormQuantFp8(RmsNormQuantFp8 {
+                norm: RmsNormBf16 { gain, .. },
+                ..
+            })
+            | Self::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
+                fold:
+                    AddRmsNormBf16 {
+                        norm: RmsNormBf16 { gain, .. },
+                        ..
+                    },
+                ..
             }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),
             Self::MoeRoute(MoeRouteBf16 { expert_scale, .. }) => expert_scale.as_mut(),
@@ -3437,6 +3590,7 @@ impl CudaStep {
             | Self::RmsNormUnit(_)
             | Self::GeluMul(_)
             | Self::SoftCap(_)
+            | Self::GatherLastRow(_)
             | Self::QuantRowsFp8(_) => None,
         }
     }

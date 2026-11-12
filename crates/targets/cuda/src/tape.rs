@@ -13,12 +13,13 @@ use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    ARGMAX_CHUNK, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE,
-    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection,
-    ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
-    GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, MoeWeight, QuantChainError,
-    RmsNormBf16, RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim,
-    gdn_scratch, quant_chain, sort_index_regions,
+    ARGMAX_CHUNK, ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AddRmsNormBf16, AddRmsNormQuantFp8,
+    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GatherLastRowBf16,
+    GemmBf16, MoeRouteBf16, MoeWeight, QuantChainError, RmsNormBf16, RmsNormQuantFp8,
+    RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch,
+    quant_chain, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -1745,9 +1746,11 @@ impl CudaTape {
                 }
                 Ok(())
             }
-            CudaStep::Gemv(_) | CudaStep::GemvFp8(_) | CudaStep::GemvTcFp8(_) => {
-                self.one_row(step, s)
-            }
+            CudaStep::Gemv(_)
+            | CudaStep::GemvFp8(_)
+            | CudaStep::GemvTcFp8(_)
+            | CudaStep::RmsNormQuantFp8(_)
+            | CudaStep::AddRmsNormQuantFp8(_) => self.one_row(step, s),
             // Gemma's router norm writes the scratch's router-norm region, whole.
             CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
                 Some(moe)
@@ -1777,6 +1780,14 @@ impl CudaTape {
             | CudaStep::ExpertGemvTcFp8(_)
             | CudaStep::ExpertGateUpTcFp8(_)
             | CudaStep::ExpertCombine(_) => self.check_moe_step(step, s),
+            // The gather reads `q_len` from the tape's KV sequence region.
+            CudaStep::GatherLastRow(GatherLastRowBf16 { sequence, .. }) => {
+                let seq = ArenaSpan {
+                    offset: sequence,
+                    bytes: 2 * KV_ENTRY_BYTES,
+                };
+                region(Region::Sequence, seq, self.kv.map(|k| k.sequence))
+            }
             CudaStep::Embed(_)
             | CudaStep::Gemm(_)
             | CudaStep::GemmNarrow(_)
@@ -2348,14 +2359,20 @@ impl CudaTape {
         }
     }
 
-    /// A one-row kernel's step (the GEMV, the decode attention) is one row, in a one-row bucket:
-    /// those kernels index no row past the first. Any other step passes.
+    /// A one-row kernel's step (the GEMV, the decode attention, the norm with its quantization) is
+    /// one row, in a one-row bucket: those kernels index no row past the first. Any other step
+    /// passes.
     fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rows = match *s {
             CudaStep::Gemv(GemmBf16 { m, .. })
             | CudaStep::GemvFp8(GemmBf16 { m, .. })
             | CudaStep::GemvTcFp8(GemmBf16 { m, .. }) => m,
             CudaStep::AttnDecode(AttnPrefillBf16 { rows, .. }) => rows,
+            CudaStep::RmsNormQuantFp8(RmsNormQuantFp8 { norm, .. })
+            | CudaStep::AddRmsNormQuantFp8(AddRmsNormQuantFp8 {
+                fold: AddRmsNormBf16 { norm, .. },
+                ..
+            }) => norm.rows,
             _ => return Ok(()),
         };
         if rows == 1 && self.bucket_m == 1 {

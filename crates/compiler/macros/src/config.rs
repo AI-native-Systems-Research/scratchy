@@ -941,13 +941,9 @@ fn load_dir_mode(
         {
             return false;
         }
-        if cfg!(feature = "metal")
+        !(cfg!(feature = "metal")
             && !preset_name.starts_with("mlx-affine-")
-            && preset_name != "nvfp4"
-        {
-            return false;
-        }
-        true
+            && preset_name != "nvfp4")
     };
 
     // An in-checkpoint head's configs are the selected configs of its target arches that carry it.

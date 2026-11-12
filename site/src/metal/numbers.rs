@@ -1,7 +1,7 @@
 //! What the page computes from a run: per-engine accessors, medians, ratios,
 //! and how each number is written.
 
-use super::data::{Cell, Model, Rep, Scenario};
+use super::data::{Cell, Model, Rep};
 use crate::charts::{Better, Side};
 use crate::thousands_f;
 
@@ -217,27 +217,6 @@ impl Engine {
     }
 }
 
-/// A startup measurement of one launch.
-#[derive(Clone, Copy, PartialEq)]
-pub enum Startup {
-    /// Launch until the server reports ready.
-    Ready,
-    /// Request sent until its first token.
-    FirstToken,
-    /// Launch until the first token: Ready, then FirstToken.
-    Launch,
-}
-
-impl Startup {
-    fn of(self, r: &Rep) -> Option<f64> {
-        match self {
-            Startup::Ready => r.t_ready_s,
-            Startup::FirstToken => r.ttft_from_send_s,
-            Startup::Launch => r.ttft_exec_s,
-        }
-    }
-}
-
 /// A serving measurement of one cell.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Metric {
@@ -262,8 +241,8 @@ impl Metric {
 
     fn raw(self, c: &Cell) -> Option<f64> {
         match self {
-            Metric::Ttft => c.median_ttft_ms,
-            Metric::Tpot => c.median_tpot_ms,
+            Metric::Ttft => c.median_ttft_ms.filter(|_| !c.ttft_too_soon),
+            Metric::Tpot => c.median_tpot_ms.filter(|_| !c.ttft_too_soon),
             Metric::E2el => c.e2el_ms(),
             Metric::Throughput => c.output_throughput,
             Metric::PeakMem => c.server_mem_peak_mib.filter(|_| !c.mem_below_weights),
@@ -318,17 +297,6 @@ pub fn median(mut vals: Vec<f64>) -> Option<f64> {
     })
 }
 
-/// The median of one startup measurement over a ladder's launches of one scenario.
-pub fn med(ladder: &[Rep], scenario: Scenario, what: Startup) -> Option<f64> {
-    median(
-        ladder
-            .iter()
-            .filter(|r| r.scenario == scenario)
-            .filter_map(|r| what.of(r))
-            .collect(),
-    )
-}
-
 pub const DASH: &str = "—";
 pub const NO_STREAM: &str = "no stream";
 /// Marks a timing taken from only some of a cell's requests.
@@ -339,22 +307,6 @@ pub const FAILED: &str = "‡";
 pub const SHORT: &str = "§";
 pub fn fmt(v: Option<f64>, decimals: usize) -> String {
     v.map_or_else(|| DASH.to_string(), |v| thousands_f(v, decimals))
-}
-
-/// A startup median, or why there is none: launches that reached ready but
-/// never streamed a token say so instead of showing a dash.
-pub fn lfmt(
-    ladder: &[Rep],
-    scenario: Scenario,
-    what: Startup,
-    decimals: usize,
-    scale: f64,
-) -> String {
-    let v = med(ladder, scenario, what);
-    if v.is_none() && what != Startup::Ready && med(ladder, scenario, Startup::Ready).is_some() {
-        return "no first token".to_string();
-    }
-    fmt(v.map(|v| v * scale), decimals)
 }
 
 /// Whether `mib` reads below `m`'s weights for an engine that loads them.

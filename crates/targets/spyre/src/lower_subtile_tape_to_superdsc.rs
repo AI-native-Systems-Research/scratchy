@@ -76,7 +76,7 @@ use std::collections::BTreeMap;
 // Re-export the hardware constants from the typed core so the whole emitter
 // shares ONE source of truth (the typed witnesses live in `superdsc_opspec`).
 // (`DataFormat` itself is brought into scope by the main `use` block above.)
-pub use scratchy_subtile::superdsc_opspec::{ACTIVE_CORELETS, MAX_CORES};
+pub use scratchy_subtile::superdsc_opspec::ACTIVE_CORELETS;
 /// fp16 data format alias (the default). `Fp32` is used only by the fp32-SFP-merge split-K path;
 /// `SenInt8` only by the packed-int8 (SENINT8) quant weight path.
 pub use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Fp32, SenInt8};
@@ -3671,13 +3671,13 @@ pub fn write_eval_golden<F: RopeForm>(
     order.push(']');
     std::fs::write(dbg.join("order.json"), order)?;
     let mut shapes = String::from("[");
-    for id in 0..nsrc {
+    for (id, t) in ir.tensors[..nsrc].iter().enumerate() {
         if id > 0 {
             shapes.push(',');
         }
         shapes.push_str(&format!(
             "{{\"tid\":{id},\"rows\":{},\"cols\":{}}}",
-            ir.tensors[id].rows, ir.tensors[id].cols
+            t.rows, t.cols
         ));
     }
     shapes.push(']');
@@ -4439,6 +4439,13 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .enumerate()
         .map(|(i, t)| (i as u64, t.rows as usize * t.cols as usize))
         .collect();
+    // The gate's weights are SYNTHESIZED bytes (random draws, built tables, word rows) —
+    // built, so owned; stated by wrapping at the boundary the session's provenance type
+    // demands.
+    let emu_weights = emu_weights
+        .into_iter()
+        .map(|(id, b, dt, s)| (id, crate::allocator::HostBytes::Owned(b), dt, s))
+        .collect::<Vec<_>>();
     let mut session =
         crate::runner::SpyreSession::new_multi_floored(&refs, emu_weights, &shape_floor)
             .map_err(|e| format!("gate session: {e}"))?;
@@ -5119,7 +5126,10 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .collect();
         let session = crate::runner::SpyreSession::new_multi_floored(
             &refs,
-            std::mem::take(&mut probes[r].emu_weights),
+            std::mem::take(&mut probes[r].emu_weights)
+                .into_iter()
+                .map(|(id, b, dt, s)| (id, crate::allocator::HostBytes::Owned(b), dt, s))
+                .collect::<Vec<_>>(),
             &shape_floor,
         )
         .map_err(|e| format!("rank {r}'s gate session: {e}"))?;
@@ -6784,7 +6794,7 @@ fn loop_bounds(body: &[ktir_core::ir::Operation<'_>]) -> Vec<(String, i64, i64, 
 /// Checked per op:
 ///   * `time`, the trip count, is `> 0`
 ///   * the func's own grid names at least one core, and — on `spyre-hw` only, where the limit
-///     exists — no more than `MAX_CORES`
+///     exists — no more than the generation's `CORES`
 ///   * every `scf.for` in the program runs a non-empty range with a positive step
 fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &str) {
     let mut fail: Vec<String> = Vec::new();
@@ -6808,16 +6818,17 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
                 "{name}: its grid names 0 cores — no unit will ever run this op"
             ));
         }
-        // ⭐ `MAX_CORES` IS A CARD FACT — "Spyre dd2: 32 cores"
-        // (`scratchy_subtile::superdsc_opspec::MAX_CORES`). A grid wider than the card is a
+        // ⭐ THE CORE COUNT IS A CARD FACT — the build's generation's `DeviceGen::CORES`
+        // (`ktir_superdsc::device_gen::Baked`). A grid wider than the card is a
         // schedule no card can satisfy, so on hardware it is fatal here rather than at submit. The
         // emulator has no such ceiling: it runs the tile grid the func declares, which is how a
         // prefill of more than 32 tokens gets one core per token, so this is checked where the
         // limit exists and nowhere else.
         #[cfg(feature = "spyre-lower")]
-        if cores > MAX_CORES {
+        if cores > ktir_superdsc::device_gen::BUILD_CORES {
             fail.push(format!(
-                "{name}: its grid names {cores} cores but the card has {MAX_CORES}"
+                "{name}: its grid names {cores} cores but the card has {}",
+                ktir_superdsc::device_gen::BUILD_CORES
             ));
         }
         // ⭐ EVERY LOOP BOUND THE PROGRAM STATES. The sdsc/core/corelet fold factors were the
@@ -8352,7 +8363,7 @@ mod tests {
     // rosters at once.
     use ktir_superdsc::emit::{emit_sdsc, rb, scaling_factor_const_fp32, sen169_bits};
     use scratchy_subtile::superdsc_opspec::{
-        ItDim, MaxCores, OpFunc, OpInfo, Scale, SdscFoldSet, StickExtent, WorkPlan,
+        ItDim, OpFunc, OpInfo, Scale, SdscFoldSet, StickExtent, WorkPlan,
     };
 
     /// ⭐⭐⭐ THE PROBE'S WEIGHTS ARE FULL ROW RANK — the gate measures the EMULATOR's rounding
@@ -8492,7 +8503,8 @@ mod tests {
         assert_eq!(right, 51200, "the output axis pads to full occupancy");
         assert_eq!(right % 64, 0);
         assert_eq!(
-            right / 64 % MAX_CORES,
+            right / 64
+                % <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
             0,
             "800 sticks = 25 per core on 32 cores"
         );
@@ -8654,7 +8666,10 @@ mod tests {
                 df: Df::Fp16,
             },
         ];
-        let splits = distribute_cores(&dims, MAX_CORES);
+        let splits = distribute_cores(
+            &dims,
+            <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
+        );
         let cores: u32 = splits.values().product::<u32>().max(1);
         // Must use all 32 cores — the entire point (sengraph auto-split wastes 31).
         assert_eq!(
@@ -8662,7 +8677,12 @@ mod tests {
             "work-division must fill all 32 cores: {splits:?}"
         );
         // And the validated WorkPlan accepts it (≤32 by type).
-        let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores).unwrap();
+        let plan = WorkPlan::divide(
+            &dims,
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
+            distribute_cores,
+        )
+        .unwrap();
         assert_eq!(plan.cores_used().get(), 32);
     }
 
@@ -10066,8 +10086,14 @@ mod tests {
             &StickExtent::<Fp8>::new(256).unwrap(),
             1,
         );
-        let s_f16 = matmul_split_map(&dims_f16, MAX_CORES);
-        let s_f8 = matmul_split_map(&dims_f8, MAX_CORES);
+        let s_f16 = matmul_split_map(
+            &dims_f16,
+            <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
+        );
+        let s_f8 = matmul_split_map(
+            &dims_f8,
+            <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
+        );
         let out16 = s_f16.get("out").copied().unwrap_or(1);
         let out8 = s_f8.get("out").copied().unwrap_or(1);
         assert!(
@@ -10103,7 +10129,11 @@ mod tests {
             is_stick: true,
             df: Df::Fp8,
         }];
-        let err = WorkPlan::divide(&fp8_dim, MaxCores::<MAX_CORES>, |d, c| over(d[0].name, c));
+        let err = WorkPlan::divide(
+            &fp8_dim,
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
+            |d, c| over(d[0].name, c),
+        );
         assert!(
             err.is_err(),
             "fp8 256 (=2×128 sticks) split 4 ways must be Err (sub-stick), got {err:?}"
@@ -10116,7 +10146,11 @@ mod tests {
             is_stick: true,
             df: Df::Fp16,
         }];
-        let ok = WorkPlan::divide(&fp16_dim, MaxCores::<MAX_CORES>, |d, c| over(d[0].name, c));
+        let ok = WorkPlan::divide(
+            &fp16_dim,
+            ktir_superdsc::superdsc_opspec::CoreBudget::whole(),
+            |d, c| over(d[0].name, c),
+        );
         assert!(
             ok.is_ok(),
             "fp16 256 (=4×64 sticks) split 4 ways is 1 stick/core, must be Ok, got {ok:?}"
@@ -10135,11 +10169,17 @@ mod tests {
                 &StickExtent::<Fp16>::new(64).unwrap(),
                 1,
             );
-            let split = matmul_split_map(&dims, MAX_CORES)
-                .get("out")
-                .copied()
-                .unwrap_or(1);
-            let expected = core_split(stick_count(n), MAX_CORES);
+            let split = matmul_split_map(
+                &dims,
+                <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
+            )
+            .get("out")
+            .copied()
+            .unwrap_or(1);
+            let expected = core_split(
+                stick_count(n),
+                <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES,
+            );
             assert_eq!(
                 split, expected,
                 "fp16 out split for N={n} must match stick_count-based split"

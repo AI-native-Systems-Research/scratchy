@@ -84,8 +84,11 @@ pub struct SuperDscSession<'c, T: ktir_superdsc::collective::Tp> {
     pub pmask_slots: Option<usize>,
 }
 
-/// One card's resident weights, `(source id, device bytes, dtype, shape)` each.
-pub type CardWeights = Vec<(usize, Vec<u8>, SDType, Vec<usize>)>;
+/// One card's resident weights, `(source id, bytes, dtype, shape)` each. The bytes are by
+/// provenance ([`crate::allocator::HostBytes`]): a weight the load viewed off its mmap stays a
+/// `View` through the bind — the executor's staging walk reads the page cache directly and the
+/// keepalive lives as long as the bound entry does.
+pub type CardWeights = Vec<(usize, crate::allocator::HostBytes, SDType, Vec<usize>)>;
 
 /// The resident weights of every card a session spans — one set per rank, rank `r`'s its own shard.
 /// The OWNER session's only; a borrower binds none (`None`), so "one set per card" is a type, never a
@@ -103,6 +106,70 @@ struct Staged<'a, T: ktir_superdsc::collective::Tp> {
     load_consts: &'a [(u32, crate::wiring::LoadConst)],
     /// The KV pool's own tables — bound once, verbatim, by each session whose kernels read them.
     pool_statics: &'a [(u32, Vec<u8>)],
+}
+
+/// ⭐ EVERY RANK'S `f(r, its input)` AT ONCE — one scoped thread per rank, the results in rank
+/// order. A sharded world's BUILD work (its staging walks, its per-card session builds) is per
+/// rank and independent — each rank's thread touches only its own card and its own input — and
+/// run serially the last rank starts a whole world minus one builds after the first (measured at
+/// tp/8: staging 4.0 s as eight sequential walks, the dxp session 3.1 s as eight sequential
+/// per-card builds; each is ~the single-card wall on its own). A world of one runs on the
+/// caller's thread — the same law as [`SuperDscSession::each_parallel`].
+///
+/// Each rank's `input` is MOVED into its thread: the one way a unique resource (the allocator
+/// whose buffers exactly one rank's staging takes) crosses the fan-out without a shared `&mut`.
+/// Threads are spawned for EVERY rank first and joined in a second pass (the prefill ladder's
+/// own shape); a panicked rank re-panics on the caller with its own payload, and the first error
+/// in rank order is the one returned — the same rank the serial map would have stopped at.
+/// NUMA pinning is the caller's law (the session builds pin to their card's CPUs; staging runs
+/// where the loader ran, as it always has).
+pub fn each_rank_parallel<T, I, X, E>(
+    inputs: PerRank<T, I>,
+    f: impl Fn(ktir_superdsc::collective::Rank<T>, I) -> Result<X, E> + Sync,
+) -> Result<PerRank<T, X>, E>
+where
+    T: ktir_superdsc::collective::World,
+    I: Send,
+    X: Send,
+    E: Send,
+{
+    use ktir_superdsc::collective::{Rank, ranks};
+    let mut slots: Vec<Option<I>> = inputs.into_values().map(Some).collect();
+    let mut take_input = |r: Rank<T>| {
+        slots[r.get() as usize]
+            .take()
+            .expect("every rank's input is taken exactly once")
+    };
+    // A world of one runs on the caller's thread — nothing to fan out over.
+    if !T::SHARDED {
+        return PerRank::try_from_fn(|r| f(r, take_input(r)));
+    }
+    let f = &f;
+    std::thread::scope(|scope| {
+        // Spawn EVERY rank first, join in a second pass — a map that joins inside the spawn
+        // loop would run each rank's build to completion before the next thread exists.
+        let handles: Vec<_> = ranks::<T>()
+            .map(|r| {
+                let input = take_input(r);
+                std::thread::Builder::new()
+                    .name(format!("BuildR{}", r.get()))
+                    .spawn_scoped(scope, move || f(r, input))
+                    // A spawn refusal at boot is a resource-exhaustion event, not a load error
+                    // to route around — the ladder fan-outs' own shape (`scope::spawn` panics).
+                    .unwrap_or_else(|err| panic!("rank {}: spawn its build thread: {err}", r.get()))
+            })
+            .collect::<Vec<_>>();
+        // `handles` is in rank order (built over `ranks`), so the consuming iterator joins in
+        // rank order — the first error the serial map would have stopped at is the one returned.
+        let mut joins = handles.into_iter();
+        PerRank::try_from_fn(|_| {
+            joins
+                .next()
+                .expect("one handle per rank")
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+        })
+    })
 }
 
 impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
@@ -281,99 +348,120 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
             pool_statics,
         } = staged;
         // The owner binds rank r's weight set on card r; a borrower binds none on any.
-        let mut weights: PerRank<T, CardWeights> = match weights {
+        let weights: PerRank<T, CardWeights> = match weights {
             Some(w) => w,
             None => PerRank::from_fn(|_| CardWeights::new()),
         };
-        let ranks: PerRank<T, Executor<'c, T>> = PerRank::try_from_fn(|r| -> Result<_> {
-            let card = cards.get(r);
-            let card_weights: CardWeights = std::mem::take(weights.get_mut(r));
-            let mut exec = Executor::load(
-                card,
-                code,
-                Vocab(vocab),
-                KvDim(kv_dim),
-                PoolPages(num_blocks as i64),
-            )?;
-            // ⭐ THE GRAPH'S OWN SOURCE FACTS — the count and the resident ids are stamped on the
-            // layout this session's `code` carries, so the completeness walk covers exactly the
-            // source range of the graph being run: prefix-KV caches and load-const tables excused
-            // by the bundle's own list, the spilled tail by the caller's, and nothing else.
-            exec.declare_sources(
-                code.layout.num_sources,
-                code.layout
-                    .resident_source_tids
-                    .iter()
-                    .copied()
-                    .chain(spilled_tail.iter().copied()),
-            );
-            // BORROWED segments must be declared BEFORE prepare — afterwards the full region is already
-            // allocated and transferred, so the flag would be a silent no-op (the executor refuses).
-            for &seg in borrowed {
-                let s = SegIdx::checked(seg)
-                    .ok_or_else(|| anyhow!("mark_borrowed: segment {seg} out of range"))?;
-                exec.mark_borrowed(s)?;
-            }
+        // ⭐ EVERY RANK'S BUILD AT ONCE — [`each_rank_parallel`]: a rank's build (its executor
+        // load, its binds, its stage, its prepare) touches only its own card and its own weight
+        // set, so the ranks build concurrently instead of the last card starting a whole world
+        // minus one builds after the first (measured at tp/8: the dxp session alone was 3.1 s of
+        // sequential per-card builds). The per-card alloc order (anchor → owner → rungs) is PER
+        // CARD and each rank's thread keeps its own card's order; cross-card order was never
+        // constrained — device memory is per card.
+        let ranks: PerRank<T, Executor<'c, T>> =
+            each_rank_parallel(weights, |r, card_weights| -> Result<Executor<'c, T>> {
+                let card = cards.get(r);
+                // This rank's build thread runs on its card's NUMA node before it touches the card
+                // (its doorbell and its host writes stay on the card's socket) — the same law as
+                // [`SuperDscSession::each_parallel`]'s submits. A world of one runs this closure on
+                // the caller's thread, already where the world's shared work runs, and skips the pin.
+                if <T as ktir_superdsc::collective::World>::SHARDED {
+                    card.cpus()
+                        .pin_current_thread()
+                        .map_err(anyhow::Error::from)?;
+                }
+                let mut exec = Executor::load(
+                    card,
+                    code,
+                    Vocab(vocab),
+                    KvDim(kv_dim),
+                    PoolPages(num_blocks as i64),
+                )?;
+                // ⭐ THE GRAPH'S OWN SOURCE FACTS — the count and the resident ids are stamped on the
+                // layout this session's `code` carries, so the completeness walk covers exactly the
+                // source range of the graph being run: prefix-KV caches and load-const tables excused
+                // by the bundle's own list, the spilled tail by the caller's, and nothing else.
+                exec.declare_sources(
+                    code.layout.num_sources,
+                    code.layout
+                        .resident_source_tids
+                        .iter()
+                        .copied()
+                        .chain(spilled_tail.iter().copied()),
+                );
+                // BORROWED segments must be declared BEFORE prepare — afterwards the full region is already
+                // allocated and transferred, so the flag would be a silent no-op (the executor refuses).
+                for &seg in borrowed {
+                    let s = SegIdx::checked(seg)
+                        .ok_or_else(|| anyhow!("mark_borrowed: segment {seg} out of range"))?;
+                    exec.mark_borrowed(s)?;
+                }
 
-            // Bind every weight to its input `t{id}` as device-dtype bytes. Prepare packs them, so they
-            // must be bound before prepare. Ownership MOVES in — no copy anywhere on this path.
-            let t_bind = std::time::Instant::now();
-            let n_bound = card_weights.len();
-            for (id, data, dt, _shape) in card_weights {
-                let bytes = match dt {
-                    SDType::F16 => data,
-                    SDType::Fp8E4m3 => data, // fp8 binds VERBATIM (1-byte); do NOT dequant to f16
-                    other => f32_to_f16_le(&bytes_to_f32(&data, other)),
-                };
-                exec.bind_weight(crate::bundle_code::PlaceId::Act(id as u32), bytes);
-            }
-            // ⭐ THE STAGED CONSTANTS ride the same law: bound once, before
-            // prepare, into the same weight channel `stage_weights` converts and
-            // uploads — a table the owner never binds reads as ZEROS on card, and
-            // the kernel composes its answer from zeros (measured: the argmax
-            // mint's first card run answered token 0 — EOS — on every decode
-            // step, while the build's own numeric gate passed, because the gate's
-            // emulator binds its own sources and never crosses this seat).
-            exec.bind_load_consts(load_consts)?;
-            // The pool's int32 tables ride the same verbatim channel as an i32 load constant: their LE
-            // words ARE the device's.
-            for (tid, bytes) in pool_statics {
-                exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(*tid), bytes.clone())?;
-            }
-            let n_staged = n_bound + load_consts.len() + pool_statics.len();
-            debug!(
-                "[timing] bind weights loop took {:.2}s",
-                t_bind.elapsed().as_secs_f64()
-            );
-
-            // Convert + stage the bound weights into host staging NOW, on this thread, while the
-            // background device prewarm is still bringing the card up — this takes the ~1s parallel
-            // IEEE→SEN convert off the prepare critical path. Bytes reaching the device are identical;
-            // pure scheduling.
-            //
-            // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
-            // a host shadow of a segment that is about to be replaced by an alias. A BORROWER THAT
-            // BINDS STAGED CONSTANTS still stages: `stage_weights` gives every borrowed segment its
-            // 128 B placeholder, so the only shadow this writes is the ACTIVATION segment's — the one
-            // holding this session's own load-const tables, which no alias can deliver (the tables are
-            // per-session placements, and a rung's seg3 is its own region).
-            if n_staged == 0 {
+                // Bind every weight to its input `t{id}` as device-dtype bytes. Prepare packs them, so they
+                // must be bound before prepare. Ownership MOVES in — no copy anywhere on this path: a
+                // VIEW moves as its keepalive handle and the staging walk reads the mmap itself.
+                let t_bind = std::time::Instant::now();
+                let n_bound = card_weights.len();
+                for (id, data, dt, _shape) in card_weights {
+                    let bytes = match dt {
+                        // Already the device dtype (the narrowing pass's product, or fp8 verbatim —
+                        // do NOT dequant to f16): the bytes bind as they are, view or owned.
+                        SDType::F16 | SDType::Fp8E4m3 => data,
+                        other => crate::allocator::HostBytes::Owned(f32_to_f16_le(&bytes_to_f32(
+                            data.as_slice(),
+                            other,
+                        ))),
+                    };
+                    exec.bind_weight(crate::bundle_code::PlaceId::Act(id as u32), bytes);
+                }
+                // ⭐ THE STAGED CONSTANTS ride the same law: bound once, before
+                // prepare, into the same weight channel `stage_weights` converts and
+                // uploads — a table the owner never binds reads as ZEROS on card, and
+                // the kernel composes its answer from zeros (measured: the argmax
+                // mint's first card run answered token 0 — EOS — on every decode
+                // step, while the build's own numeric gate passed, because the gate's
+                // emulator binds its own sources and never crosses this seat).
+                exec.bind_load_consts(load_consts)?;
+                // The pool's int32 tables ride the same verbatim channel as an i32 load constant: their LE
+                // words ARE the device's.
+                for (tid, bytes) in pool_statics {
+                    exec.bind_const_fp32(crate::bundle_code::PlaceId::Act(*tid), bytes.clone())?;
+                }
+                let n_staged = n_bound + load_consts.len() + pool_statics.len();
                 debug!(
-                    "[timing] weight bind + stage SKIPPED (nothing bound — segments reserved, \
+                    "[timing] bind weights loop took {:.2}s",
+                    t_bind.elapsed().as_secs_f64()
+                );
+
+                // Convert + stage the bound weights into host staging NOW, on this thread, while the
+                // background device prewarm is still bringing the card up — this takes the ~1s parallel
+                // IEEE→SEN convert off the prepare critical path. Bytes reaching the device are identical;
+                // pure scheduling.
+                //
+                // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
+                // a host shadow of a segment that is about to be replaced by an alias. A BORROWER THAT
+                // BINDS STAGED CONSTANTS still stages: `stage_weights` gives every borrowed segment its
+                // 128 B placeholder, so the only shadow this writes is the ACTIVATION segment's — the one
+                // holding this session's own load-const tables, which no alias can deliver (the tables are
+                // per-session placements, and a rung's seg3 is its own region).
+                if n_staged == 0 {
+                    debug!(
+                        "[timing] weight bind + stage SKIPPED (nothing bound — segments reserved, \
                      populated by alias)"
-                );
-            } else {
-                let t_stage = std::time::Instant::now();
-                exec.stage_weights()?;
-                debug!(
-                    "[timing] weight stage took {:.2}s",
-                    t_stage.elapsed().as_secs_f64()
-                );
-            }
+                    );
+                } else {
+                    let t_stage = std::time::Instant::now();
+                    exec.stage_weights()?;
+                    debug!(
+                        "[timing] weight stage took {:.2}s",
+                        t_stage.elapsed().as_secs_f64()
+                    );
+                }
 
-            exec.prepare()?;
-            Ok(exec)
-        })?;
+                exec.prepare()?;
+                Ok(exec)
+            })?;
         let exec = ranks.first();
         Ok(Self {
             vocab: exec.vocab.0,

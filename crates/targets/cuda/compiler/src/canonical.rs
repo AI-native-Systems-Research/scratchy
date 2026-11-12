@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use scratchy_subtile::handoff::{BundleTensor, LoweredDecode, RopePairing, SourceBinding};
 use scratchy_subtile::lower::GemmWeightKind;
-use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
+use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertProj;
 use scratchy_subtile::subtile_ir::{SubOp, SubtileIR, TensorShape, ValidatedGraph, lower_region};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
@@ -31,13 +31,13 @@ use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colou
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
     CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FOLD_PROJECTIONS,
-    CUDA_RESULT_ROWS, CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
+    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion, cuda_fusions,
 };
 use scratchy_target_cuda::step::{
-    ACT_QUANT_MAX_COLS, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, ExpertActQuantFp8,
-    ExpertGateUpTcFp8, ExpertGemmBf16, ExpertProjection, GDN_SEQUENCE_BYTES, GateUpKernel,
-    GateUpTcFp8, GatedOp, MoeWeight, QuantChainError, QuantRowsFp8, gdn_scratch, gemv_tc_takes,
-    quant_chain,
+    ACT_QUANT_MAX_COLS, AddRmsNormQuantFp8, CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep,
+    ExpertActQuantFp8, ExpertGateUpTcFp8, ExpertGemmBf16, ExpertProjection, GDN_SEQUENCE_BYTES,
+    GateUpKernel, GateUpTcFp8, GatedOp, MoeWeight, QuantChainError, QuantRowsFp8, RmsNormBf16,
+    RmsNormQuantFp8, gdn_scratch, gemv_tc_takes, norm_row_takes, quant_chain,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
@@ -174,6 +174,9 @@ pub struct CanonicalAt<'a> {
     pub stem: &'a str,
     /// The canonical's rows.
     pub m: u64,
+    /// The rows of its result the forward's caller reads (Metal's `CanonicalAt::rows`): a
+    /// decoder's sampled logits, at the front; a test's fixture block, every row.
+    pub rows: ResultRows,
 }
 
 /// The shared passes' result for one canonical, before opcode lowering.
@@ -1424,11 +1427,10 @@ pub fn plan_canonical_folding(
     at: CanonicalAt<'_>,
     model: ModelFoldFacts,
 ) -> Result<CudaPlan, CanonicalRefusal> {
-    let CanonicalAt { stem, m } = at;
-    // CUDA's lm_head slice: none is declared, so this inserts nothing — but it runs, so a row
-    // added to the table takes effect without touching this function.
-    let lowered = expand_sample_rows(l, &CUDA_SAMPLE_ROWS, CUDA_RESULT_ROWS)
-        .map_err(CanonicalRefusal::SampleRows)?;
+    let CanonicalAt { stem, m, rows } = at;
+    // A decoder's sampled rows (FP8 S8 F2): its multi-row result matmul wrapped in the gather.
+    let lowered =
+        expand_sample_rows(l, &CUDA_SAMPLE_ROWS, rows).map_err(CanonicalRefusal::SampleRows)?;
     let graph = lower_region(&lowered.input, CUDA_COLUMN_BLOCK);
     let tape = {
         let valid = ValidatedGraph::new(&graph)
@@ -1849,6 +1851,7 @@ fn quantize_fp8_inputs(
         }
         out.push(s);
     }
+    let out = fold_norm_quants(out);
     quant_chain(&out).map_err(CanonicalRefusal::QuantChain)?;
     let end = match most {
         [0, 0] => total,
@@ -1906,6 +1909,34 @@ fn fp8_moe_prefill(mut steps: Vec<CudaStep>) -> Vec<CudaStep> {
         }
     }
     steps
+}
+
+/// A one-row norm or add-norm whose `y` the next step quantizes, with that quant write folded in
+/// (FP8 S8 N3, [`norm_row_takes`]): one launch writes the norm and its quantization, one step
+/// fewer. Every other step is as it was; the quant scratch holds what it held, at the same step.
+fn fold_norm_quants(steps: Vec<CudaStep>) -> Vec<CudaStep> {
+    let folds = |n: RmsNormBf16, q: QuantRowsFp8| {
+        (q.x, q.rows, q.cols) == (n.y, n.rows, n.cols) && norm_row_takes(n.rows, n.cols)
+    };
+    let mut out: Vec<CudaStep> = Vec::with_capacity(steps.len());
+    for s in steps {
+        let fused = match (out.last(), s) {
+            (Some(&CudaStep::RmsNorm(norm)), CudaStep::QuantRowsFp8(q)) if folds(norm, q) => {
+                CudaStep::RmsNormQuantFp8(RmsNormQuantFp8 { norm, q: q.q })
+            }
+            (Some(&CudaStep::AddRmsNorm(fold)), CudaStep::QuantRowsFp8(q))
+                if folds(fold.norm, q) =>
+            {
+                CudaStep::AddRmsNormQuantFp8(AddRmsNormQuantFp8 { fold, q: q.q })
+            }
+            _ => {
+                out.push(s);
+                continue;
+            }
+        };
+        *out.last_mut().expect("a fold follows its norm") = fused;
+    }
+    out
 }
 
 /// The KV pool of one canonical: its layers, ascending, its geometry (class 0's), and each

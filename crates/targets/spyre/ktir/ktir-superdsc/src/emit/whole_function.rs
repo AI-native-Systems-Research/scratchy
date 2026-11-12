@@ -1349,7 +1349,7 @@ impl<'a> HeadMajorCopies<'a> {
         // ⛔ AT MOST ONE RUN A CORE: a copy of more runs than cores hands a core several, which the
         // card steps by the run's device-extent pitch — a stride no copy here has run with. Past the
         // cores, the runs go out a core's worth an op, each op's runs one a core.
-        let per_op = crate::superdsc_opspec::MAX_CORES;
+        let per_op = crate::device_gen::BUILD_CORES;
         let chunks = a.div_ceil(per_op);
         let mut ops = Vec::with_capacity((n * chunks) as usize);
         for s in 0..n {

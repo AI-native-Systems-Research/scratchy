@@ -34,6 +34,21 @@
 // One warp per CTA, so no CTA barrier; each stage's output is in shared memory before the next
 // stage's `warp::load` of it (`__syncwarp`). Built with `--use_fast_math`, as each stage's kernel.
 //
+// THE FOUR-WARP FORM (FP8 S8 R1, `rope_append_wide_ker`, the launcher's): the same stages and the
+// same TK ops on the same tiles, so the same bits, scheduled across four warps of the head's CTA
+// instead of one warp's serial chain (25 × 10.4 µs a Gemma decode token):
+//   - every load at once, by warp 0: the table, q's or k's head (its view tiles and gains when
+//     normed), and, on k's heads that append, v's (its view tiles, or its row), each on its own
+//     semaphore, where the one-warp form loaded v only after the rope;
+//   - the norms' pass 1 in parallel: the q/k view's tile `t` by warp `t`, v's by warp `2 + t`, as
+//     the 16-row kernel's warp `t` owns tile `t`; each warp's row sums into a shared vector, added
+//     back in warp order (tile 0's, then tile 1's, then the exact zeros), then pass 2 by the same
+//     warps;
+//   - the rope's box pairs by warps `0 ..` (two at Gemma's sliding 256, one elsewhere), the head's
+//     boxes stored by warps `b % 4`, k's and v's e4m3 rows converted and stored by warps 0 and 1.
+// The one-warp form, `rope_append_ker`, stays as the bits the four-warp form is checked against
+// (`scratchy_cuda_rope_append_fp8_variant`, test support).
+//
 // Instances (`step::ROPE_BF16_KERNEL_SHAPES` by head dim, and `NORMS` on the one the fold takes):
 // `<64, false, 256>` (27B, 35B), `<256, false, 256>` and `<256, false, 256, true>` (Gemma sliding),
 // `<128, true, 512>` and `<128, true, 512, true>` (Gemma global). Shared memory: the head's boxes
@@ -340,6 +355,258 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_append_ker(
     warp::tma::store_async_wait();
 }
 
+// The four-warp form's warps.
+constexpr int WIDE_WARPS = 4;
+constexpr int WIDE_THREADS = WIDE_WARPS * kittens::WARP_THREADS;
+
+// `view_norm`'s loads: the view's tiles (and, but under `UNIT`, its gains) on `arrived`.
+template <bool UNIT, int TILES>
+__device__ inline void view_load(norm_tile (&x_s)[TILES], gain_vec (&g_s)[TILES], const norm_gl& x,
+                                 const gain_gl& gain, semaphore& arrived) {
+    warp::tma::expect_bytes(arrived, TILES * (sizeof(norm_tile) + (UNIT ? 0 : sizeof(gain_vec))));
+    for (int t = 0; t < TILES; t++) {
+        warp::tma::load_async(x_s[t], x, coord<norm_tile>{0, 0, 0, t}, arrived);
+        if constexpr (!UNIT) {
+            warp::tma::load_async(g_s[t], gain, coord<gain_vec>{0, 0, 0, t}, arrived);
+        }
+    }
+}
+
+// `view_norm`'s pass 1 on one tile: its rows' sums of squares (`part[t]` there) into `part_s`.
+__device__ inline void view_part(const norm_tile& x_t, sv_fl<ROWS>& part_s) {
+    norm_rows part;
+    warp::zero(part);
+    norm_rt v;
+    warp::load(v, x_t);
+    warp::mul(v, v, v);
+    warp::row_sum(part, v, part);
+    warp::store(part_s, part);
+}
+
+// `view_norm`'s total of the four warps' parts (the `TILES` tiles', then exact zeros, in warp order),
+// `inv`, and pass 2 on one tile.
+template <bool UNIT, int TILES>
+__device__ inline void view_scale(norm_tile& x_t, const gain_vec& g_t,
+                                  const sv_fl<ROWS> (&parts)[TILES], float eps, float cols) {
+    norm_rows part[4];
+    for (int w = 0; w < 4; w++) {
+        warp::zero(part[w]);
+    }
+    for (int t = 0; t < TILES; t++) {
+        warp::load(part[t], parts[t]);
+    }
+    for (int w = 1; w < 4; w++) {
+        warp::add(part[0], part[0], part[w]);
+    }
+    norm_rows rcp, inv;
+    warp::one(rcp);
+    warp::div(rcp, rcp, cols);
+    scratchy::ops::rv_ternary_map<scratchy::ops::rms_inv_fused>(inv, part[0], rcp, eps);
+    norm_rt v;
+    warp::load(v, x_t);
+    warp::mul_row(v, v, inv);
+    if constexpr (!UNIT) {
+        norm_cols g;
+        warp::load(g, g_t);
+        warp::add(g, g, 0.0f);
+        warp::mul_col(v, v, g);
+    }
+    warp::store(x_t, v);
+    __syncwarp();
+}
+
+template <int ROT, bool HALF_HEAD, int HEAD_DIM, bool NORMS>
+__global__ __launch_bounds__(WIDE_THREADS, 1) void rope_append_wide_ker(
+    const __grid_constant__ ra_globals<HEAD_DIM> g) {
+    constexpr int BOXES = rope_shape<ROT, HALF_HEAD>::BOXES;
+    constexpr int TABLE_BOXES = rope_shape<ROT, HALF_HEAD>::TABLE_BOXES;
+    constexpr int PAIR_OFF = rope_shape<ROT, HALF_HEAD>::PAIR_OFF;
+    constexpr int HEAD_BOXES = HEAD_DIM / BOX_COLS;
+    constexpr int NORM_TILES = norm_tiles<HEAD_DIM, NORMS>();
+    static_assert(!NORMS || HEAD_DIM % NORM_COLS == 0, "a normed head is whole 256-lane tiles");
+    static_assert(NORM_TILES <= 2, "the q/k view's tiles on warps 0, 1, v's on 2, 3");
+    // Only the head's first unit is rotated, as `rope_append_ker` runs it (`BOXES` its boxes).
+    static_assert(BOXES <= HEAD_BOXES, "a head is whole units");
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    box(&x_s)[HEAD_BOXES] = al.allocate<box, HEAD_BOXES>();
+    box(&t_s)[TABLE_BOXES] = al.allocate<box, TABLE_BOXES>();
+    norm_tile(&n_s)[NORM_TILES] = al.allocate<norm_tile, NORM_TILES>();
+    norm_tile(&nv_s)[NORM_TILES] = al.allocate<norm_tile, NORM_TILES>();
+    gain_vec(&g_s)[NORM_TILES] = al.allocate<gain_vec, NORM_TILES>();
+    __shared__ sv_bf<HEAD_DIM> k_buf;
+    __shared__ sv_bf<HEAD_DIM> v_buf;
+    __shared__ sv_fp8e4m3<HEAD_DIM> k_q;
+    __shared__ sv_fp8e4m3<HEAD_DIM> v_q;
+    // Per view (q/k's, then v's), each tile's row sums.
+    __shared__ sv_fl<ROWS> qk_parts[NORM_TILES];
+    __shared__ sv_fl<ROWS> v_parts[NORM_TILES];
+    __shared__ semaphore arrived, table_arrived, norm_arrived, v_arrived;
+
+    const int head = blockIdx.x;
+    const bool is_q = head < g.q_heads;
+    const int h = is_q ? head : head - g.q_heads;
+    const int w = kittens::warpid();
+    // The append's slot and checks first (k's heads only), so v's load starts with the others.
+    const uint32_t slot = is_q ? NO_SLOT : uint32_t(g.slot_mapping[{0, 0, 0, 0}]);
+    const uint32_t block = slot / BLOCK_SIZE, off = slot % BLOCK_SIZE;
+    const bool append = !is_q && slot != NO_SLOT && block < g.num_blocks;
+
+    if (threadIdx.x == 0) {
+        init_semaphore(arrived, 0, 1);
+        init_semaphore(table_arrived, 0, 1);
+        init_semaphore(norm_arrived, 0, 1);
+        init_semaphore(v_arrived, 0, 1);
+    }
+    __syncthreads();
+    // 1. Every load, at once.
+    if (w == 0) {
+        warp::tma::expect_bytes(table_arrived, TABLE_BOXES * sizeof(box));
+        for (int b = 0; b < TABLE_BOXES; b++) {
+            warp::tma::load_async(t_s[b], g.table, coord<box>{0, 0, 0, b}, table_arrived);
+        }
+        if constexpr (NORMS) {
+            view_load<false>(n_s, g_s, is_q ? g.qn : g.kn, is_q ? g.q_gain : g.k_gain,
+                             norm_arrived);
+            if (append) {
+                view_load<true>(nv_s, g_s, g.vn, g.k_gain, v_arrived);
+            }
+        } else {
+            const box_gl& src = is_q ? g.q : g.k;
+            warp::tma::expect_bytes(arrived, HEAD_BOXES * sizeof(box));
+            for (int b = 0; b < HEAD_BOXES; b++) {
+                warp::tma::load_async(x_s[b], src, coord<box>{0, 0, 0, h * HEAD_BOXES + b},
+                                      arrived);
+            }
+            if (append) {
+                // `kv_append_fp8_ker`'s bulk load of the head's row.
+                constexpr uint32_t bytes = HEAD_DIM * sizeof(bf16);
+                warp::tma::expect_bytes(v_arrived, bytes);
+                warp::tma::load_async(v_buf[0], g.v[{0, 0, 0, h * HEAD_DIM}], bytes, v_arrived);
+            }
+        }
+    }
+
+    // 2. The norms (normed only), the q/k view on warps 0 .., v's on warps 2 ..; then the head's
+    //    row into the boxes' row 0 (rows 1..15 zeros), v's into `v_buf`.
+    if constexpr (NORMS) {
+        const bool qk_warp = w < NORM_TILES;
+        const bool v_warp = append && w >= 2 && w - 2 < NORM_TILES;
+        if (qk_warp) {
+            wait(norm_arrived, 0);
+            view_part(n_s[w], qk_parts[w]);
+        } else if (v_warp) {
+            wait(v_arrived, 0);
+            view_part(nv_s[w - 2], v_parts[w - 2]);
+        }
+        __syncthreads();
+        if (qk_warp) {
+            view_scale<false>(n_s[w], g_s[w], qk_parts, g.eps, g.cols);
+        } else if (v_warp) {
+            view_scale<true>(nv_s[w - 2], g_s[w - 2], v_parts, g.eps, g.cols);
+        }
+        for (int b = w; b < HEAD_BOXES; b += WIDE_WARPS) {
+            warp::zero(x_s[b]);
+        }
+        __syncthreads();
+        for (int e = threadIdx.x; e < HEAD_DIM; e += WIDE_THREADS) {
+            x_s[e / BOX_COLS][{0, e % BOX_COLS}] = n_s[e / NORM_COLS][{h % ROWS, e % NORM_COLS}];
+            if (append) {
+                v_buf[e] = nv_s[e / NORM_COLS][{h % ROWS, e % NORM_COLS}];
+            }
+        }
+    } else {
+        wait(arrived, 0);
+    }
+    __syncthreads();
+
+    // 3. The rope: `rope_append_ker`'s code, its pairs on warps 0 ...
+    if constexpr (ROT == 64) {
+        if (w == 0) {
+            wait(table_arrived, 0);
+            box_rt t;
+            warp::load(t, t_s[0]);
+            half_rt c, s;
+            c.tiles[0][0] = t.tiles[0][0];
+            c.tiles[0][1] = t.tiles[0][1];
+            s.tiles[0][0] = t.tiles[0][2];
+            s.tiles[0][1] = t.tiles[0][3];
+            box_rt x;
+            warp::load(x, x_s[0]);
+            half_rt x0, x1, a, b;
+            x0.tiles[0][0] = x.tiles[0][0];
+            x0.tiles[0][1] = x.tiles[0][1];
+            x1.tiles[0][0] = x.tiles[0][2];
+            x1.tiles[0][1] = x.tiles[0][3];
+            // y0 = x0·c − x1·s, into `a`.
+            warp::mul(a, x0, c);
+            warp::mul(b, x1, s);
+            warp::sub(a, a, b);
+            // y1 = x1·c + x0·s, into `b`.
+            warp::mul(x1, x1, c);
+            warp::mul(x0, x0, s);
+            warp::add(b, x1, x0);
+            x.tiles[0][0] = a.tiles[0][0];
+            x.tiles[0][1] = a.tiles[0][1];
+            x.tiles[0][2] = b.tiles[0][0];
+            x.tiles[0][3] = b.tiles[0][1];
+            warp::store(x_s[0], x);
+        }
+    } else {
+        constexpr int PAIR = TABLE_BOXES / 2;
+        static_assert(PAIR <= WIDE_WARPS, "one pair a warp");
+        if (w < PAIR) {
+            wait(table_arrived, 0);
+            const int b = w;
+            box_rt x0, x1, t, y0, y1;
+            warp::load(x0, x_s[b]);
+            warp::load(x1, x_s[b + PAIR_OFF]);
+            warp::load(t, t_s[b]);
+            warp::mul(y0, x0, t);
+            warp::mul(y1, x1, t);
+            warp::load(t, t_s[b + PAIR]);
+            // y0 = x0·c − x1·s.
+            warp::mul(x1, x1, t);
+            warp::sub(y0, y0, x1);
+            // y1 = x1·c + x0·s.
+            warp::mul(x0, x0, t);
+            warp::add(y1, y1, x0);
+            warp::store(x_s[b], y0);
+            warp::store(x_s[b + PAIR_OFF], y1);
+        }
+    }
+    __syncthreads();
+
+    // 4. The roped head to its output, its boxes on warps `b % 4`.
+    const box_gl& dst = is_q ? g.q_out : g.k_out;
+    for (int b = w; b < HEAD_BOXES; b += WIDE_WARPS) {
+        warp::tma::store_async(dst, x_s[b], coord<box>{0, 0, 0, h * HEAD_BOXES + b});
+    }
+
+    // 5. The append: k's roped row (the boxes' row 0, `k_out`'s bytes) and v's, each to e4m3 and
+    //    its cache, on warps 0 and 1.
+    if (append) {
+        for (int e = threadIdx.x; e < HEAD_DIM; e += WIDE_THREADS) {
+            k_buf[e] = x_s[e / BOX_COLS][{0, e % BOX_COLS}];
+        }
+        __syncthreads();
+        const coord<cache_vec<HEAD_DIM>> at = {int(block), h, int(off), 0};
+        if (w == 0) {
+            warp::copy(k_q, k_buf);
+            __syncwarp();
+            warp::tma::store_async(g.k_cache, k_q, at);
+        } else if (w == 1) {
+            if constexpr (!NORMS) {
+                wait(v_arrived, 0);
+            }
+            warp::copy(v_q, v_buf);
+            __syncwarp();
+            warp::tma::store_async(g.v_cache, v_q, at);
+        }
+    }
+    warp::tma::store_async_wait();
+}
+
 // The instance's dynamic shared memory: the head's boxes, the table's, the two views' norm tiles
 // and the gain vectors, plus 1,024 bytes of alignment slack.
 template <int ROT, bool HALF_HEAD, int HEAD_DIM, bool NORMS>
@@ -373,7 +640,7 @@ struct ra_args {
 
 template <int ROT, bool HALF_HEAD, int HEAD_DIM, bool NORMS>
 int launch(const ra_args& a, uint32_t q_heads, uint32_t kv_heads, uint32_t num_blocks, float eps,
-           cudaStream_t s) {
+           bool wide, cudaStream_t s) {
     const auto bf = [](const void* p) { return static_cast<bf16*>(const_cast<void*>(p)); };
     const size_t qc = size_t(q_heads) * HEAD_DIM, kc = size_t(kv_heads) * HEAD_DIM;
     const size_t blocks = size_t(num_blocks < MAX_SLOT_BLOCKS ? num_blocks : MAX_SLOT_BLOCKS);
@@ -402,11 +669,14 @@ int launch(const ra_args& a, uint32_t q_heads, uint32_t kv_heads, uint32_t num_b
     ra_globals<HEAD_DIM> G{qg, qog, kg, kog, vg, tg, sg, kcg, vcg, qn, kn, vn, qgg, kgg,
                            eps, float(HEAD_DIM), int(q_heads), int(kv_heads), num_blocks};
     void* args[] = {&G};
-    const dim3 grid{q_heads + kv_heads}, block{uint32_t(NUM_THREADS)};
+    const dim3 grid{q_heads + kv_heads};
+    constexpr int smem = smem_bytes<ROT, HALF_HEAD, HEAD_DIM, NORMS>();
+    if (wide) {
+        return static_cast<int>(cudaLaunchKernel(rope_append_wide_ker<ROT, HALF_HEAD, HEAD_DIM, NORMS>,
+                                                 grid, dim3(WIDE_THREADS), args, smem, s));
+    }
     return static_cast<int>(cudaLaunchKernel(rope_append_ker<ROT, HALF_HEAD, HEAD_DIM, NORMS>, grid,
-                                             block, args,
-                                             smem_bytes<ROT, HALF_HEAD, HEAD_DIM, NORMS>(),
-                                             s));
+                                             dim3(NUM_THREADS), args, smem, s));
 }
 
 }  // namespace
@@ -429,6 +699,13 @@ extern "C" int scratchy_cuda_rope_append_fp8_prepare(void) {
              cudaFuncGetAttributes(&attr, rope_append_ker<128, true, 512, false>),
              cudaFuncGetAttributes(&attr, rope_append_ker<128, true, 512, true>),
              cudaFuncSetAttribute(rope_append_ker<128, true, 512, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, HALF_NORMED_SMEM),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<64, false, 256, false>),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<256, false, 256, false>),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<256, false, 256, true>),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<128, true, 512, false>),
+             cudaFuncGetAttributes(&attr, rope_append_wide_ker<128, true, 512, true>),
+             cudaFuncSetAttribute(rope_append_wide_ker<128, true, 512, true>,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize, HALF_NORMED_SMEM),
          }) {
         if (e != cudaSuccess) {
@@ -456,12 +733,12 @@ extern "C" int scratchy_cuda_rope_append_fp8_prepare(void) {
 // `v` `kv_heads · head_dim`, the table `rot_dim`, the gains `head_dim` bf16; the outputs overlap no
 // input; the caches as `scratchy_cuda_kv_append_fp8`'s. `num_blocks` 0 appends nothing. The launch
 // is asynchronous on `stream`.
-extern "C" int scratchy_cuda_rope_append_fp8(
-    const void* q, void* q_out, const void* k, void* k_out, const void* v, const void* table,
-    const void* slot_mapping, void* k_cache, void* v_cache, uint32_t q_heads, uint32_t kv_heads,
-    uint32_t head_dim, uint32_t rot_dim, uint32_t pairing, uint32_t block_size,
-    uint32_t num_blocks, const void* q_gain, const void* k_gain, float eps,
-    void* stream /* cudaStream_t; null = default */) {
+static int rope_append(const void* q, void* q_out, const void* k, void* k_out, const void* v,
+                       const void* table, const void* slot_mapping, void* k_cache, void* v_cache,
+                       uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim, uint32_t rot_dim,
+                       uint32_t pairing, uint32_t block_size, uint32_t num_blocks,
+                       const void* q_gain, const void* k_gain, float eps, bool wide,
+                       void* stream) {
     const bool narrow = pairing == PAIRING_HALF_ROTATED && rot_dim == 64 && head_dim == 256;
     const bool full = pairing == PAIRING_HALF_ROTATED && rot_dim == 256 && head_dim == 256;
     const bool half = pairing == PAIRING_HALF_HEAD && rot_dim == 128 && head_dim == 512;
@@ -477,15 +754,44 @@ extern "C" int scratchy_cuda_rope_append_fp8(
         const ra_args a{q, q_out, k, k_out, v, table, slot_mapping, k_cache, v_cache, q_gain, k_gain};
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
         if (half) {
-            return norms ? launch<128, true, 512, true>(a, q_heads, kv_heads, num_blocks, eps, s)
-                         : launch<128, true, 512, false>(a, q_heads, kv_heads, num_blocks, eps, s);
+            return norms ? launch<128, true, 512, true>(a, q_heads, kv_heads, num_blocks, eps, wide, s)
+                         : launch<128, true, 512, false>(a, q_heads, kv_heads, num_blocks, eps, wide, s);
         }
         if (narrow) {
-            return launch<64, false, 256, false>(a, q_heads, kv_heads, num_blocks, eps, s);
+            return launch<64, false, 256, false>(a, q_heads, kv_heads, num_blocks, eps, wide, s);
         }
-        return norms ? launch<256, false, 256, true>(a, q_heads, kv_heads, num_blocks, eps, s)
-                     : launch<256, false, 256, false>(a, q_heads, kv_heads, num_blocks, eps, s);
+        return norms ? launch<256, false, 256, true>(a, q_heads, kv_heads, num_blocks, eps, wide, s)
+                     : launch<256, false, 256, false>(a, q_heads, kv_heads, num_blocks, eps, wide, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
+}
+
+extern "C" int scratchy_cuda_rope_append_fp8(
+    const void* q, void* q_out, const void* k, void* k_out, const void* v, const void* table,
+    const void* slot_mapping, void* k_cache, void* v_cache, uint32_t q_heads, uint32_t kv_heads,
+    uint32_t head_dim, uint32_t rot_dim, uint32_t pairing, uint32_t block_size,
+    uint32_t num_blocks, const void* q_gain, const void* k_gain, float eps,
+    void* stream /* cudaStream_t; null = default */) {
+    return rope_append(q, q_out, k, k_out, v, table, slot_mapping, k_cache, v_cache, q_heads,
+                       kv_heads, head_dim, rot_dim, pairing, block_size, num_blocks, q_gain, k_gain,
+                       eps, true, stream);
+}
+
+// Test support for `tests/rope_gate.rs` only (FP8 S8 R1): `scratchy_cuda_rope_append_fp8` at
+// `variant` 0 (`rope_append_ker`, the one-warp form W4c built) or 1 (`rope_append_wide_ker`, the
+// launcher's own), the same bits. Refused as `scratchy_cuda_rope_append_fp8`, or for `variant`
+// above 1.
+extern "C" int scratchy_cuda_rope_append_fp8_variant(
+    const void* q, void* q_out, const void* k, void* k_out, const void* v, const void* table,
+    const void* slot_mapping, void* k_cache, void* v_cache, uint32_t q_heads, uint32_t kv_heads,
+    uint32_t head_dim, uint32_t rot_dim, uint32_t pairing, uint32_t block_size,
+    uint32_t num_blocks, const void* q_gain, const void* k_gain, float eps, uint32_t variant,
+    void* stream /* cudaStream_t; null = default */) {
+    if (variant > 1) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    return rope_append(q, q_out, k, k_out, v, table, slot_mapping, k_cache, v_cache, q_heads,
+                       kv_heads, head_dim, rot_dim, pairing, block_size, num_blocks, q_gain, k_gain,
+                       eps, variant == 1, stream);
 }

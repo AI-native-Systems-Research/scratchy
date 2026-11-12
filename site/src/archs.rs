@@ -263,6 +263,7 @@ fn page(
             og: None,
             root: Root(0),
             libraries: &[Library::DiffView],
+            chart_data: None,
         },
         body,
     )

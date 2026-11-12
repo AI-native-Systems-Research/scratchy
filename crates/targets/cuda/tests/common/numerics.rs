@@ -577,6 +577,12 @@ pub const GDN_GATING_ABS: f64 = 1.0 / 4_194_304.0;
 pub const GDN_SCAN_REL: f64 = 1.0 / 16_384.0;
 /// The scan's per-token term, `2⁻¹⁷`.
 pub const GDN_SCAN_STEP: f64 = 1.0 / 131_072.0;
+/// The chunked scan's (FP8 S8 F6a, `kernels/gdn_chunk_scan.cu`) relative term, `2⁻⁷`: the
+/// recurrent bound's form at 2⁷ × its coefficients, for the bf16 operands of its products
+/// (/tmp/a-f6-plan.md §2), to be fitted by its self-checks.
+pub const GDN_CHUNK_REL: f64 = 1.0 / 128.0;
+/// The chunked scan's per-token term, `2⁻¹⁰`.
+pub const GDN_CHUNK_STEP: f64 = 1.0 / 1_024.0;
 
 /// One GDN chunk's geometry.
 #[derive(Clone, Copy, Debug)]
@@ -679,6 +685,17 @@ pub enum ScanVariant {
     DecayLast,
     /// Key head `h % nk` instead of `h / (nv/nk)`.
     ModuloHeads,
+    /// No decay at tokens `from .. to` (a chunked scan missing one chunk's decay).
+    NoDecayOver {
+        from: usize,
+        to: usize,
+    },
+    /// Within each run of `len` tokens, the correction reads the state at the run's start,
+    /// decayed to the token, instead of the running state: the intra-chunk term of a chunked scan
+    /// dropped (its triangular solve's `T = I`).
+    StaleInChunks {
+        len: usize,
+    },
 }
 
 /// The scan's f64 reference over `q_len` tokens of `conv_out [q_len, conv_dim]` (the GPU's f32
@@ -732,21 +749,38 @@ pub fn gdn_scan_reference(x: &ScanInputs<'_>, d: GdnDims, variant: ScanVariant) 
             None => (0..hv).map(|i| l2(&s[i * hk..][..hk]).sqrt()).collect(),
         };
         let mut o = vec![(0.0, 0.0); q_len * hv];
+        // `StaleInChunks`: the state at the run's start, and the decay since.
+        let (mut s0, mut since) = (Vec::new(), 1.0);
         for t in 0..q_len {
             let row = &conv_out[t * cd..][..cd];
             let q = &row[kh * hk..][..hk];
             let k = &row[kd + kh * hk..][..hk];
             let qn = 1.0 / (l2(q) + 1e-6).sqrt() * scale;
             let kn = 1.0 / (l2(k) + 1e-6).sqrt();
-            let alpha = g[t * d.nv + h].exp();
+            let alpha = match variant {
+                ScanVariant::NoDecayOver { from, to } if (from..to).contains(&t) => 1.0,
+                _ => g[t * d.nv + h].exp(),
+            };
             let b = beta[t * d.nv + h];
+            if let ScanVariant::StaleInChunks { len } = variant {
+                if t % len == 0 {
+                    (s0, since) = (s.clone(), 1.0);
+                }
+                since *= alpha;
+            }
             for i in 0..hv {
                 let sr = &mut s[i * hk..][..hk];
                 let v = row[2 * kd + h * hv + i];
                 if variant != ScanVariant::DecayLast {
                     sr.iter_mut().for_each(|x| *x *= alpha);
                 }
-                let sk: f64 = sr.iter().zip(k).map(|(a, b)| a * b * kn).sum();
+                let sk: f64 = match variant {
+                    ScanVariant::StaleInChunks { .. } => {
+                        let r0 = &s0[i * hk..][..hk];
+                        since * r0.iter().zip(k).map(|(a, b)| a * b * kn).sum::<f64>()
+                    }
+                    _ => sr.iter().zip(k).map(|(a, b)| a * b * kn).sum(),
+                };
                 let u = match variant {
                     ScanVariant::NoCorrection => b * v,
                     _ => b * (v - sk),
@@ -791,6 +825,12 @@ pub fn gdn_scan_reference(x: &ScanInputs<'_>, d: GdnDims, variant: ScanVariant) 
 /// The scan's bound on an output element `(ref, linear)`.
 pub fn gdn_scan_bound(r: f64, linear: f64) -> f64 {
     GDN_SCAN_REL * r.abs() + GDN_SCAN_STEP * linear
+}
+
+/// The chunked scan's bound on an output element `(ref, linear)`: [`gdn_scan_bound`]'s form at
+/// [`GDN_CHUNK_REL`] and [`GDN_CHUNK_STEP`].
+pub fn gdn_chunk_bound(r: f64, linear: f64) -> f64 {
+    GDN_CHUNK_REL * r.abs() + GDN_CHUNK_STEP * linear
 }
 
 /// The gated norm's reference of `o [q_len, value_dim]` (the GPU's f32) under `z` (bf16 widened)

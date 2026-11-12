@@ -40,7 +40,7 @@ use tracing::info;
 use crate::plan::{
     block_table_u32, check_kv_cache_dtype, check_quantization_config, check_sampling,
     choose_bucket, emits_token, fill_inputs, gdn_fresh, greedy_code, greedy_token, kv_block_bytes,
-    logits_row, scheduled_request,
+    scheduled_request,
 };
 
 /// The GDN slots, and the sequences running at once: one.
@@ -338,7 +338,9 @@ impl CudaServingWorker {
                 .map_err(exec)?;
             emits.then(|| greedy_code(code)).transpose().map_err(exec)?
         } else {
-            // Only row `n − 1` comes back (F1): the one the greedy token is picked from.
+            // Only the last token's logits row comes back (F1): the one the greedy token is picked
+            // from. A decoder's tapes leave it at row 0 (F2): a prefill bucket's gather moves row
+            // `n − 1` to the lm_head's front, and a one-row bucket has no other row.
             let row = &mut model.row[..(tape.result.bytes / u64::from(bucket_m)) as usize / 2];
             (running.tapes)
                 .forward_row(
@@ -347,7 +349,7 @@ impl CudaServingWorker {
                     positions,
                     kv.as_ref(),
                     gdn.as_ref(),
-                    ((n as u32).saturating_sub(1), row),
+                    (0, row),
                 )
                 .map_err(exec)?;
             match emits {

@@ -28,16 +28,16 @@ use scratchy_target_cuda::step::{
     ATTN_WINDOW_MULTIPLE, AddBf16, AddRmsNormBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS,
     EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16, ExpertGemvBf16,
     ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
-    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE,
-    GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE,
-    GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
-    GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp, GemmBf16, GemmGroupBf16, GroupKind,
-    GroupMember, HeadNorms, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16,
-    MoeWeight, NormAddBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
-    ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ,
-    RouteProgram, RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS,
-    ScaleBf16, SiluMulBf16, SoftCapBf16,
+    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GATHER_LAST_ROW_BF16_COLS,
+    GDN_CONV_KERNEL_RANGE, GDN_DECODE_MAX_HEADS, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE,
+    GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_FP8_K_MULTIPLE, GEMM_NARROW_BF16_MAX_N,
+    GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
+    GateScaleBf16, GateSplitBf16, GateUpActBf16, GateUpKernel, GatedDeltaNetBf16, GatedOp,
+    GatherLastRowBf16, GemmBf16, GemmGroupBf16, GroupKind, GroupMember, HeadNorms, LayerScaleBf16,
+    MOE_ROUTE_MAX_TOP_K, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows,
+    RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE, ROPE_BF16_ROT_MULTIPLE, RmsNormBf16,
+    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RopeQ, RouteProgram, RouterLogitsBf16,
+    SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -165,10 +165,21 @@ pub fn lower_step(
                 .map(CudaStep::ExpertCombine)
         }
         L::GateScale => gate_scale(cx, s).map(CudaStep::GateScale),
-        L::ScalarMul { scale } => scalar_mul(cx, s, *scale).map(CudaStep::Scale),
+        L::ScalarMul { scale } => {
+            scalar_mul(cx, s, *scale, reads_sampled(s, computes)).map(CudaStep::Scale)
+        }
         L::RmsNormUnit { eps } => rms_norm_unit(cx, s, *eps).map(CudaStep::RmsNormUnit),
         L::ScalarWeightMul => layer_scale(cx, s).map(CudaStep::LayerScale),
-        L::TanhSoftCap { cap } => soft_cap(cx, s, *cap).map(CudaStep::SoftCap),
+        L::TanhSoftCap { cap } => {
+            soft_cap(cx, s, *cap, reads_sampled(s, computes)).map(CudaStep::SoftCap)
+        }
+        // A decoder's sampled row (FP8 S8 F2): the gather moves it to the front of the result
+        // matmul's input, the matmul runs over one tile of rows ([`reads_sampled`]), and its
+        // logits are its output's row 0, the row CUDA's caller reads. The scatter has nothing to
+        // put back, and no CUDA step samples every row, so neither it nor the all-rows matmul
+        // runs.
+        L::SampleRowsGather => gather_last_row(cx, s).map(CudaStep::GatherLastRow),
+        L::SampleRowsScatter | L::AllRowsMatmul => return Ok(None),
         // A routing runs only as the `MoeRoute` fold its top-k drives: one the fold left (a
         // softmax or argsort it did not absorb, a top-k driving none, a gather, scale, renorm or
         // per-expert scale no top-k took as its epilogue) has no kernel.
@@ -210,9 +221,6 @@ pub fn lower_step(
         | L::KvStage { .. }
         | L::RotateRows { .. }
         | L::AttnPackedKv
-        | L::SampleRowsGather
-        | L::SampleRowsScatter
-        | L::AllRowsMatmul
         | L::Sample { .. }
         | L::EmbedRowGather { .. }
         | L::ChainStage { .. }
@@ -770,7 +778,16 @@ fn gemm(
         (_, [_] | []) => return Err(operand(s, 1, OperandRefusal::Missing)),
         (_, [_, _, ..]) => return Err(operand(s, 2, OperandRefusal::Extra)),
     };
-    let m = cx.graph.shape(node.output.tensor).rows;
+    // The result matmul over the gathered row runs over one tile of rows: row 0 is the sampled
+    // row's, and each output row is its own input row's bits at any `m` (F2).
+    let m = match reads_sampled(s, computes) {
+        true => cx
+            .graph
+            .shape(node.output.tensor)
+            .rows
+            .min(GEMM_BF16_TILE.0),
+        false => cx.graph.shape(node.output.tensor).rows,
+    };
     let k = cx.graph.shape(wt.tensor).rows;
     let kernel = match weight {
         GemmWeight::Dense => gemm_kernel(m, n, k, cx.facts.gemm_col_tile),
@@ -1426,16 +1443,15 @@ pub fn gdn_bundle_layer(bindings: &[SourceBinding], s: &TapeStep<'_>) -> Option<
 }
 
 /// Whether the one-launch GDN decode takes `g`'s geometry (its launcher's rule, beyond the four
-/// launchers'): `head_v` 128 or 256, and one CTA per key head owning its `nv / nk` value heads,
-/// at most [`GDN_DECODE_MAX_HEADS`] of them, dividing a 16-head gating chunk, with the conv's
-/// `2 + heads · head_v / 128` channel warps at most 8.
+/// launchers'): `head_v` 128 or 256, and one CTA per value head, a key head's `nv / nk` CTAs one
+/// cluster, at most [`GDN_DECODE_MAX_HEADS`] of them, `nv` whole 16-head gating chunks (FP8 S8 D1:
+/// the 27B's three value heads a key head now take it).
 fn gdn_decode_takes(g: &GatedDeltaNetBf16) -> bool {
     let heads = g.num_v_heads / g.num_k_heads.max(1);
     (g.head_v == 128 || g.head_v == 256)
         && g.num_v_heads.is_multiple_of(g.num_k_heads.max(1))
         && (1..=GDN_DECODE_MAX_HEADS).contains(&heads)
-        && 16u32.is_multiple_of(heads)
-        && 2 + heads * g.head_v / 128 <= 8
+        && g.num_v_heads.is_multiple_of(16)
 }
 
 /// `GatedDeltaNet(qkv, z, a, b, bundle)` as one prefill chunk of the Gated-DeltaNet layer: four
@@ -1653,8 +1669,10 @@ fn scalar_mul(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     scale: f32,
+    sampled: bool,
 ) -> Result<ScaleBf16, CanonicalRefusal> {
     let (xc, rows, cols) = unary_row(cx, s, SCALE_BF16_COLS)?;
+    let rows = sampled_rows(rows, sampled);
     finite_scalar(s, scale, false)?;
     let at = arena(cx)?;
     Ok(ScaleBf16 {
@@ -1739,9 +1757,16 @@ fn layer_scale(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<LayerScaleBf16, Cano
 }
 
 /// `TanhSoftCap { cap }` as the bf16 soft-cap (Gemma's final logits): `x` (operand 0) a computed
-/// slot or the embedded hidden, `cap` finite and above 0.
-fn soft_cap(cx: &StepCx<'_>, s: &TapeStep<'_>, cap: f32) -> Result<SoftCapBf16, CanonicalRefusal> {
+/// slot or the embedded hidden, `cap` finite and above 0. Over the sampled rows' tile alone when
+/// `sampled` ([`reads_sampled`]).
+fn soft_cap(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    cap: f32,
+    sampled: bool,
+) -> Result<SoftCapBf16, CanonicalRefusal> {
     let (xc, rows, cols) = unary_row(cx, s, SOFT_CAP_BF16_COLS)?;
+    let rows = sampled_rows(rows, sampled);
     finite_scalar(s, cap, true)?;
     let at = arena(cx)?;
     Ok(SoftCapBf16 {
@@ -1751,6 +1776,54 @@ fn soft_cap(cx: &StepCx<'_>, s: &TapeStep<'_>, cap: f32) -> Result<SoftCapBf16, 
         cols,
         cap_bits: cap.to_bits(),
     })
+}
+
+/// `SampleRowsGather` as the sampled row's gather (FP8 S8 F2): `x` (operand 0, the result matmul's
+/// input, which the gather's output is in place) a computed slot, `q_len` read from the tape's KV
+/// sequence region. A canonical with no KV sequence has no row to gather: refused, as not lowered.
+fn gather_last_row(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+) -> Result<GatherLastRowBf16, CanonicalRefusal> {
+    let (xc, rows, cols) = unary_row(cx, s, GATHER_LAST_ROW_BF16_COLS)?;
+    let Some(kv) = cx.kv_regions else {
+        return Err(CanonicalRefusal::NotLowered {
+            step: s.step,
+            op: s.node.op.name(),
+        });
+    };
+    let at = arena(cx)?;
+    Ok(GatherLastRowBf16 {
+        x: at(xc),
+        sequence: kv.sequence.offset,
+        rows,
+        cols,
+    })
+}
+
+/// Whether `s` reads the sampled rows (FP8 S8 F2): its operand 0 is the gather's output (the
+/// result matmul), the all-rows matmul's (the logit tail's first op), or a sampled logit-tail op's.
+fn reads_sampled(s: &TapeStep<'_>, computes: &[TapeStep<'_>]) -> bool {
+    let Some(ComputeInput::Computed(slots)) = s.inputs.iter().next() else {
+        return false;
+    };
+    let [slot] = slots.as_slice() else {
+        return false;
+    };
+    (computes.iter().find(|c| c.writes == *slot)).is_some_and(|c| match c.node.op {
+        SubOp::SampleRowsGather | SubOp::AllRowsMatmul => true,
+        SubOp::TanhSoftCap { .. } | SubOp::ScalarMul { .. } => reads_sampled(c, computes),
+        _ => false,
+    })
+}
+
+/// A sampled logit-tail op's rows: the result matmul's tile of rows, which hold the sampled row's
+/// logits at row 0; every row otherwise.
+fn sampled_rows(rows: u32, sampled: bool) -> u32 {
+    match sampled {
+        true => rows.min(GEMM_BF16_TILE.0),
+        false => rows,
+    }
 }
 
 // ── The MoE block ───────────────────────────────────────────────────

@@ -940,12 +940,12 @@ impl SharedKv {
     }
 
     fn block_mapped(&self, block: usize) -> bool {
-        let g = block / self.budget.kv_granule_blocks.get();
+        let g = block / self.budget.kv_granule_blocks;
         self.granules.get(g).copied().unwrap_or(false)
     }
 
     fn slot_mapped(&self, slot: usize) -> bool {
-        let u = slot / self.budget.unit_slots.get();
+        let u = slot / self.budget.unit_slots;
         self.units.get(u).copied().unwrap_or(false)
     }
 }
@@ -3098,7 +3098,7 @@ impl MetalWorker {
             budget,
             num_blocks: num_gpu_blocks,
             granules: vec![false; num_gpu_blocks.div_ceil(granule.get())],
-            units: vec![false; self.gdn_snapshot_cap / unit.get()],
+            units: vec![false; self.gdn_snapshot_cap / unit],
             dense_target,
             dense_draft,
             turboquant: !dense_target || (draft.is_some() && !dense_draft),
@@ -7349,7 +7349,7 @@ impl Worker for MetalWorker {
         // scheduler hands memory between KV and the snapshots as each needs it. Nothing is carved
         // out of the budget for them. A snapshot is a slot like any other, without draft lanes.
         self.gdn_snapshot_cap = match self.snapshot_slot() {
-            Some((bytes, unit)) => (available / bytes) / unit.get() * unit.get(),
+            Some((bytes, unit)) => (available / bytes) / unit * unit.get(),
             None => 0,
         };
         if let Some((bytes, unit)) = self.snapshot_slot().filter(|_| self.gdn_snapshot_cap > 0) {

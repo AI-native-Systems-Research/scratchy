@@ -476,14 +476,11 @@ pub(crate) fn build_cb_plan<T: ktir_superdsc::collective::Tp>(
             .weight_slot(where_.byte_off[SEG_WEIGHT.get()], where_.weight_bank);
         let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
         let mut bases = Vec::with_capacity(NUM_SEGMENTS);
-        for i in 0..NUM_SEGMENTS {
+        for (i, byte_off) in where_.byte_off.iter().enumerate() {
             bases.push(if i == SEG_WEIGHT.get() {
                 (wbase.clone(), weight_shift)
             } else {
-                (
-                    segment_base(seg, banks, weight_bank, i)?.clone(),
-                    where_.byte_off[i],
-                )
+                (segment_base(seg, banks, weight_bank, i)?.clone(), *byte_off)
             });
         }
         entries.push(CbPlanEntry {
