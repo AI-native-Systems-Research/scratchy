@@ -571,10 +571,6 @@ pub enum Scenario {
 #[derive(Deserialize, Clone)]
 pub struct Rep {
     pub scenario: Scenario,
-    pub t_ready_s: Option<f64>,
-    pub ttft_from_send_s: Option<f64>,
-    /// Launch until the first token: ready, then the first request.
-    pub ttft_exec_s: Option<f64>,
 }
 
 /// One dataset workload at one users count, as `scr bench serve --dataset-name <workload>`
@@ -702,11 +698,6 @@ impl TaskCell {
 pub struct Bytes(pub u64);
 
 impl Bytes {
-    /// In GB (10⁹ bytes), as model cards give sizes.
-    pub fn gb(self) -> f64 {
-        self.0 as f64 / 1e9
-    }
-
     /// In MiB (2²⁰ bytes), as the runner records memory.
     pub fn mib(self) -> f64 {
         self.0 as f64 / (1u64 << 20) as f64
