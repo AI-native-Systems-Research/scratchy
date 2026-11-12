@@ -2574,9 +2574,12 @@ impl SpyreWorker {
                                 })
                                 .collect()
                         }
-                        // One thread per session, all three families at once — a rung's prepare is
-                        // device fills and small pre-mapped H2Ds (~25 ms measured), so the wave's
-                        // wall is the slowest single prepare, not the count.
+                        // One thread per session, all three families at once — the wave's
+                        // concurrency is its SESSION count, the width a one-card boot already
+                        // rides, and each session's ranks prepare in rank order on its own
+                        // thread (`prepare_in_rank_order`) so the thread count stays there:
+                        // fanned per rank, tp/8's wave was 264 prepare threads on one host
+                        // driver path and paid 3755 ms for ~a tenth of that in device work.
                         let hl: Vec<_> = ladder_built
                             .into_iter()
                             .map(|(rm, built)| {
@@ -2584,7 +2587,7 @@ impl SpyreWorker {
                                     (
                                         rm,
                                         built.and_then(|mut rs| {
-                                            rs.prepare()?;
+                                            rs.prepare_in_rank_order()?;
                                             Ok(rs)
                                         }),
                                     )
@@ -2597,7 +2600,7 @@ impl SpyreWorker {
                             .map(|(job, built)| {
                                 scope.spawn(move || {
                                     built.and_then(|mut ps| {
-                                        ps.prepare().map_err(|e| {
+                                        ps.prepare_in_rank_order().map_err(|e| {
                                         (job.pmq, format!(
                                             "prefix-capable prefill m={} session prepare failed: \
                                              {e} — every rung the bake shipped must load",
@@ -2615,7 +2618,7 @@ impl SpyreWorker {
                             .map(|(job, built)| {
                                 scope.spawn(move || {
                                     built.and_then(|mut ds| {
-                                        ds.prepare().map_err(|e| {
+                                        ds.prepare_in_rank_order().map_err(|e| {
                                         (job.rn, format!(
                                             "decode batch rung seqs={} FAILED to prepare ({e}) — \
                                              every rung the bake shipped must load",

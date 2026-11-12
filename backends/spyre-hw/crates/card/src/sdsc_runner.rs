@@ -533,17 +533,28 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
 
     /// ⭐ THE DEVICE HALF — every rank's [`Executor::prepare`]: the stream, the program and
     /// tensor-segment allocations, the sends and the sync. Idempotent, and composed into every
-    /// `new*` constructor; the ladder fan-outs call it as a separate wave so a rung's host build
-    /// hides inside the owner's while the rung's ALLOCATIONS still happen only after the owner's
-    /// — the tp-window and weight-region placement laws are laws about THIS half alone.
+    /// `new*` constructor; the ladder fan-outs call it as a separate wave (see
+    /// [`Self::prepare_in_rank_order`]) so a rung's host build hides inside the owner's while the
+    /// rung's ALLOCATIONS still happen only after the owner's — the tp-window and weight-region
+    /// placement laws are laws about THIS half alone.
     ///
-    /// ⭐ AND THE DEVICE HALF IS PER RANK AT ONCE — [`Self::each_parallel`], the host half's own
-    /// law. A rank's prepare touches only its own card, so the owner's ranks prepare together and
-    /// every wave session's ranks prepare together; run serially the half re-serializes what the
-    /// host fan-out parallelized (measured at tp/2: the ranks' prepares back-to-back cost 0.34 s
-    /// of boot).
+    /// ⭐ A LONE SESSION'S RANKS PREPARE TOGETHER ([`Self::each_parallel`], the host half's own
+    /// law): one thread per rank on its card's node. Run serially the half re-serializes what the
+    /// host fan-out parallelized (measured at tp/2: the owner's two prepares back-to-back cost
+    /// 0.34 s of boot).
     pub fn prepare(&mut self) -> Result<()> {
         self.each_parallel("Prepare", |e| e.prepare()).map(drop)
+    }
+
+    /// [`Self::prepare`] with the WAVE's rank schedule: ranks in rank order, on the caller's
+    /// thread. A wave's concurrency is its SESSION count — one thread per rung, the width a
+    /// one-card boot already rides (a k=1 wave is this exact shape and is the fastest measured) —
+    /// so a session preparing among many walks its ranks in order instead of fanning them:
+    /// fanned, tp/8's wave was 33 sessions × 8 ranks = 264 prepare threads on one host driver
+    /// path, measured 3755 ms for ~a tenth of that in per-card device work; in rank order the
+    /// thread count stays at the session count and the cards queue the same device work.
+    pub fn prepare_in_rank_order(&mut self) -> Result<()> {
+        self.each(|e| e.prepare()).map(drop)
     }
 
     /// ⭐ RANK 0 — the card whose readback a step returns. In a sharded world every value the host
