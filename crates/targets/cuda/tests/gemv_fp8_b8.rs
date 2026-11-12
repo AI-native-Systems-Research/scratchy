@@ -1019,7 +1019,7 @@ unsafe extern "C" {
 type CudaEvent = *mut c_void;
 
 /// The median µs of 20 launches of `launch` after 3 warm-ups, each between two CUDA events on the
-/// default stream, `before` run (untimed, on the same stream) before each (`tests/gemv_fp8_tc.rs`'s).
+/// default stream, `before` run (untimed, on the same stream) before each.
 fn timed(mut before: impl FnMut(), mut launch: impl FnMut()) -> f64 {
     let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
     // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event is

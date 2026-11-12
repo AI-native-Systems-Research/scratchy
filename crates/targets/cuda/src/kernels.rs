@@ -57,15 +57,6 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
-    fn scratchy_cuda_quant_row_fp8_one_variant(
-        x: *const c_void,
-        q: *mut c_void,
-        scale: *mut c_void,
-        cols: u32,
-        variant: u32,
-        trace: *mut c_void,
-        stream: *mut c_void,
-    ) -> i32;
     fn scratchy_cuda_quant_rows_fp8(
         x: *const c_void,
         q: *mut c_void,
@@ -212,7 +203,7 @@ unsafe extern "C" {
     ) -> i32;
     // FP8 S4: the decode fp8 GEMV family, one prepare for the file.
     fn scratchy_cuda_gemv_fp8_prepare() -> i32;
-    // FP8 S8: the tensor-core decode GEMV (`kernels/gemv_fp8_tc.cu`), no tape launches it yet.
+    // FP8 S8 T1, T2: B8, the tensor-core decode GEMV (`kernels/gemv_fp8_tc.cu`).
     fn scratchy_cuda_gemv_fp8_tc_prepare() -> i32;
     fn scratchy_cuda_gemv_fp8_b8(
         q: *const c_void,
@@ -258,33 +249,6 @@ unsafe extern "C" {
         rows: u32,
         n: u32,
         op: u32,
-        stream: *mut c_void,
-    ) -> i32;
-    fn scratchy_cuda_gemv_fp8_tc_partial_bytes(n: *const u32, count: u32, k: u32) -> u64;
-    fn scratchy_cuda_gemv_fp8_tc(
-        q: *const c_void,
-        a_scale: *const c_void,
-        b: *const *const c_void,
-        b_scale: *const *const c_void,
-        c: *const *mut c_void,
-        n: *const u32,
-        count: u32,
-        k: u32,
-        partials: *mut c_void,
-        stream: *mut c_void,
-    ) -> i32;
-    fn scratchy_cuda_gemv_fp8_tc_variant(
-        q: *const c_void,
-        a_scale: *const c_void,
-        b: *const *const c_void,
-        b_scale: *const *const c_void,
-        c: *const *mut c_void,
-        n: *const u32,
-        count: u32,
-        k: u32,
-        partials: *mut c_void,
-        variant: u32,
-        main_only: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gemv_fp8_abt(
@@ -4300,16 +4264,15 @@ pub unsafe fn argmax_bf16(
     )
 }
 
-/// Test support for `tests/gemv_fp8_tc.rs` only (FP8 S8's Q1, no tape launches it yet):
-/// [`quant_rows_fp8`] of one row, `x [1, cols]` bf16 into `q [1, cols]` e4m3 and `scale [1]` f32,
-/// the bits of [`quant_rows_fp8`]'s row 0 for the same row, one CTA per 256 columns. Refused with
+/// Q1, [`quant_rows_fp8`] of one row (FP8 S8: the decode bucket's `QuantRowsFp8`), `x [1, cols]`
+/// bf16 into `q [1, cols]` e4m3 and `scale [1]` f32, the bits of [`quant_rows_fp8`]'s row 0 for the
+/// same row (`tests/quant_rows_fp8.rs`), one CTA per 256 columns. Refused with
 /// [`KernelError::RowShape`] (`rows` 1) unless `cols` is a non-zero multiple of 64 at most 17,408.
 /// Asynchronous.
 ///
 /// # Safety
 ///
 /// As [`quant_rows_fp8`]'s at one row.
-#[doc(hidden)]
 pub unsafe fn quant_row_fp8_one(
     x: *const c_void,
     (q, scale): (*mut c_void, *mut c_void),
@@ -4318,31 +4281,6 @@ pub unsafe fn quant_row_fp8_one(
 ) -> Result<(), KernelError> {
     // SAFETY: as above; the launcher checks the shape before it touches a pointer.
     let code = unsafe { scratchy_cuda_quant_row_fp8_one(x, q, scale, cols, stream) };
-    check(code, KernelError::RowShape { rows: 1, cols })
-}
-
-/// Test support for `tests/gemv_fp8_tc.rs` only: [`quant_row_fp8_one`] at `variant` (0 its first
-/// form, which divides the tile's 15 zero-fill rows too; 1 the tile dividing row 0 only; 2
-/// [`quant_row_fp8_one`]'s own, one element a thread), and, when
-/// `trace` is not null, each CTA's phase cycles into `trace` (`[⌈cols / 256⌉, 8]` f32: entry,
-/// chunks arrived, amax shared, tile arrived, tile divided, stored). Refused as
-/// [`quant_row_fp8_one`], or for `variant` above 2. Asynchronous.
-///
-/// # Safety
-///
-/// As [`quant_row_fp8_one`]'s; `trace`, when not null, `⌈cols / 256⌉ · 8` f32 of device memory.
-#[doc(hidden)]
-pub unsafe fn quant_row_fp8_one_variant(
-    x: *const c_void,
-    (q, scale): (*mut c_void, *mut c_void),
-    cols: u32,
-    (variant, trace): (u32, *mut c_void),
-    stream: *mut c_void,
-) -> Result<(), KernelError> {
-    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
-    let code = unsafe {
-        scratchy_cuda_quant_row_fp8_one_variant(x, q, scale, cols, variant, trace, stream)
-    };
     check(code, KernelError::RowShape { rows: 1, cols })
 }
 
@@ -4656,55 +4594,6 @@ pub unsafe fn gemv_group_fp8_abt(
     check(code, refused)
 }
 
-/// The `partials` bytes [`gemv_fp8_tc`] needs for members of `n` rows each over `k`, or `None`
-/// when that launcher refuses the shape.
-pub fn gemv_fp8_tc_partial_bytes(n: &[u32], k: u32) -> Option<u64> {
-    let count = u32::try_from(n.len()).ok()?;
-    // SAFETY: `n` is `count` u32s; the function only reads them, after checking `count`.
-    let bytes = unsafe { scratchy_cuda_gemv_fp8_tc_partial_bytes(n.as_ptr(), count, k) };
-    (bytes != 0).then_some(bytes)
-}
-
-/// The tensor-core decode GEMV (`kernels/gemv_fp8_tc.cu`, FP8 S8, not yet in a tape): member `i`
-/// of `members` is `c [n] = bf16(((q · bᵀ) · b_scale) · a_scale)` off one quantized row `q [1, k]`
-/// e4m3 and its scale `a_scale` (one f32, `quant_rows_fp8`'s), 1 to 3 members, each `n` a non-zero
-/// multiple of 64 and `k` of 64. `partials` holds [`gemv_fp8_tc_partial_bytes`] bytes. Two launches,
-/// asynchronous; refused with [`KernelError::GroupShape`] before any pointer is touched.
-///
-/// # Safety
-///
-/// Every pointer is 16-byte-aligned device memory of its size; no output overlaps an input or
-/// another output; `stream` is a live stream or null.
-pub unsafe fn gemv_fp8_tc(
-    (q, a_scale): Fp8Operand,
-    members: Fp8GroupOperands<'_>,
-    partials: *mut c_void,
-    k: u32,
-    stream: *mut c_void,
-) -> Result<(), KernelError> {
-    let ([b, s], c, n, refused) = fp8_group_parts("gemv_fp8_tc", members, (1, k));
-    if members.is_empty() || members.len() > 3 {
-        return Err(refused);
-    }
-    // SAFETY: as above; the arrays are three long and the launcher checks the count and every
-    // member's shape before it reads a pointer.
-    let code = unsafe {
-        scratchy_cuda_gemv_fp8_tc(
-            q,
-            a_scale,
-            b.as_ptr(),
-            s.as_ptr(),
-            c.as_ptr(),
-            n.as_ptr(),
-            members.len() as u32,
-            k,
-            partials,
-            stream,
-        )
-    };
-    check(code, refused)
-}
-
 /// B8's expert form (FP8 S8 T1): every member reads its first `n` rows of expert `topk_idx[p]`'s
 /// block of the bank `[experts, expert_rows, k]` e4m3 (its scales `[experts, expert_rows]` f32),
 /// `topk_idx [pairs]` i32 (`kernels/gemv_fp8.cu`'s `EXPERT` contract).
@@ -4726,9 +4615,9 @@ pub enum B8Store<'r> {
     F32,
 }
 
-/// B8, the tensor-core decode GEMV in its production form (FP8 S8 T1, `kernels/gemv_fp8_tc.cu`;
-/// no tape launches it yet): up to 3 members off the e4m3 activation `q [a_rows, k]` and its
-/// per-row `a_scale [a_rows]` f32 (`quant_rows_fp8`'s bytes). Pair `p` of member `i` is
+/// B8, the tensor-core decode GEMV (FP8 S8 T1, T2, `kernels/gemv_fp8_tc.cu`): up to 3 members
+/// off the e4m3 activation `q [a_rows, k]` and its per-row `a_scale [a_rows]` f32
+/// (`quant_rows_fp8`'s bytes). Pair `p` of member `i` is
 /// `((q[p / row_div] · b_e[j, :]) · b_scale_e[j]) · a_scale[p / row_div]` over its `n` rows, `e`
 /// 0 dense or `topk_idx[p]` ([`B8Experts`]), stored as [`B8Store`] says into `c [pairs, n]`. Each
 /// member, each pair, is its own launch's bits: one CTA per 64-row tile over the whole K. One
@@ -4858,50 +4747,6 @@ pub unsafe fn act_quant_fp8(
     // SAFETY: the caller's contract; the launcher checks the shape and the nulls first.
     let code = unsafe { scratchy_cuda_act_quant_fp8(gate, up, q, scale, act, rows, n, op, stream) };
     check(code, KernelError::RowShape { rows, cols: n })
-}
-
-/// Test support for `tests/gemv_fp8_tc.rs` only (the ceiling probe, /tmp/d-cap.md §3 P-B):
-/// [`gemv_fp8_tc`] at instance `variant` (0 B1, [`gemv_fp8_tc`]'s own; 1 B2 `wait1`, the same
-/// bits; 2 B3 `k128`, `k` a multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, 5 B8 `swapab32` and 6 B9
-/// `swapab32sk`, `k` a multiple of 256), and with `main_only` (B5 `noreduce`) the
-/// stream-K kernel alone, `c` left unwritten. Refused with [`KernelError::GroupShape`] as
-/// [`gemv_fp8_tc`], or for `variant` above 6. Asynchronous.
-///
-/// # Safety
-///
-/// As [`gemv_fp8_tc`]'s.
-#[doc(hidden)]
-pub unsafe fn gemv_fp8_tc_variant(
-    (q, a_scale): Fp8Operand,
-    members: Fp8GroupOperands<'_>,
-    partials: *mut c_void,
-    k: u32,
-    (variant, main_only): (u32, bool),
-    stream: *mut c_void,
-) -> Result<(), KernelError> {
-    let ([b, s], c, n, refused) = fp8_group_parts("gemv_fp8_tc_variant", members, (1, k));
-    if members.is_empty() || members.len() > 3 {
-        return Err(refused);
-    }
-    // SAFETY: as above; the arrays are three long and the launcher checks the count, the variant
-    // and every member's shape before it reads a pointer.
-    let code = unsafe {
-        scratchy_cuda_gemv_fp8_tc_variant(
-            q,
-            a_scale,
-            b.as_ptr(),
-            s.as_ptr(),
-            c.as_ptr(),
-            n.as_ptr(),
-            members.len() as u32,
-            k,
-            partials,
-            variant,
-            u32::from(main_only),
-            stream,
-        )
-    };
-    check(code, refused)
 }
 
 /// The fp8 gate/up GEMV: `c [n] = bf16(act(g, u))`, `g` and `u` each [`gemv_fp8_abt`]'s value

@@ -144,12 +144,6 @@ required-features = ["nvcc"]
 name = "gemv_fp8"
 required-features = ["nvcc"]
 
-# FP8 S8: the tensor-core decode GEMV against S3's f64 bound and today's GEMV's time, on the GPU.
-# Not built without `nvcc`.
-[[test]]
-name = "gemv_fp8_tc"
-required-features = ["nvcc"]
-
 # FP8 S8 T1: B8 in production form and the one-row act + quantize, against S3's f64 bound,
 # `quant_rows_fp8`'s bytes and today's GEMV's time, at every row of the decode inventory, on the GPU.
 # Not built without `nvcc`.

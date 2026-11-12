@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! FP8 S3 on the H100: the per-token quantization (`kernels/quant_rows_fp8.cu`) against the host
-//! quantizer bit for bit, and the host e4m3 encoder itself.
+//! quantizer bit for bit, and the host e4m3 encoder itself; FP8 S8's F3 (the wide form) and Q1
+//! (the one-row form) against it.
 //!
 //! Built only under `nvcc` (`required-features`). No GPU fails rather than skips. A binary of its
 //! own, so a fault in an fp8 GEMM's test (`tests/gemm_fp8.rs`) cannot leave these without a
@@ -438,4 +439,134 @@ fn the_wide_quantize_times_are_recorded() {
             }
         }
     }
+}
+
+// ── FP8 S8 Q1: the one-row quantize ──────────────────────────────────────────────
+
+/// `quant_rows_fp8`'s tile: the quantized activation's rows (row 0 the GEMV's).
+const QROWS: usize = 16;
+
+/// A buffer of `len` copies of `byte`, at least 256 bytes.
+fn filled(device: &CudaDevice, len: usize, byte: u8) -> DeviceBuffer {
+    DeviceBuffer::upload_bytes(device, &vec![byte; len.max(256)]).expect("upload")
+}
+
+/// The activation `x [k]` bf16 as `quant_rows_fp8`'s 16-row input (rows 1..15 zero), and the
+/// buffers it quantizes into: `(x16, q [16, k], scale [16])`.
+struct Act {
+    x: DeviceBuffer,
+    q: DeviceBuffer,
+    s: DeviceBuffer,
+    k: u32,
+}
+
+impl Act {
+    fn new(device: &CudaDevice, x: &[u16]) -> Self {
+        let k = x.len();
+        let mut x16 = x.to_vec();
+        x16.resize(QROWS * k, 0);
+        Self {
+            x: DeviceBuffer::upload(device, &x16).expect("x"),
+            q: filled(device, QROWS * k, 0),
+            s: filled(device, QROWS * 4, 0),
+            k: k as u32,
+        }
+    }
+
+    /// The once-per-group quantization, asynchronous on the default stream.
+    fn quantize(&self) {
+        // SAFETY: `x` holds 16·k bf16, `q` 16·k bytes and `s` 16 f32, three allocations; null is
+        // the default stream.
+        unsafe {
+            quant_rows_fp8(
+                self.x.ptr().cast_const(),
+                (self.q.ptr(), self.s.ptr()),
+                (QROWS as u32, self.k),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("quant_rows_fp8 launch");
+    }
+}
+
+/// Q1 on `x` (`[1, k]` bf16): its e4m3 bytes and its scale's bits.
+fn quant_one(device: &CudaDevice, x: &[u16]) -> (Vec<u8>, u32) {
+    use scratchy_target_cuda::kernels::quant_row_fp8_one;
+    let k = x.len();
+    let xb = DeviceBuffer::upload(device, x).expect("x");
+    let q = filled(device, k, 0xEE);
+    let s = filled(device, 4, 0xEE);
+    // SAFETY: `xb` holds k bf16, `q` k bytes and `s` one f32, three allocations; null is the
+    // default stream, which the downloads wait for.
+    unsafe {
+        quant_row_fp8_one(
+            xb.ptr().cast_const(),
+            (q.ptr(), s.ptr()),
+            k as u32,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("quant_row_fp8_one launch");
+    let qb: Vec<u8> = q
+        .download()
+        .expect("q")
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .take(k)
+        .collect();
+    let sb: Vec<u8> = s
+        .download()
+        .expect("s")
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    (qb, u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]))
+}
+
+/// Q1 is `quant_rows_fp8`'s row 0 bit for bit (the bytes and the scale), at the 27B's 5,120 and
+/// 17,408 columns, Gemma's 2,816 and 2,112 (a partial last 256-column tile), 64 and 1,088, on
+/// random rows, a zero row (the minimum scale) and a row of one large value (the clamp).
+#[test]
+fn the_one_row_quantize_is_quant_rows_fp8_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for k in [5120usize, 17408, 2816, 2112, 64, 1088] {
+        let mut rows = vec![
+            ("random", bf16_inputs(k, 0x7A0 ^ k as u64)),
+            ("zero", vec![0u16; k]),
+        ];
+        let mut big = bf16_inputs(k, 0x7A1);
+        big[k / 2] = 0x7F00; // bf16 1.7e38
+        rows.push(("one_large", big));
+        for (what, x) in rows {
+            let act = Act::new(&device, &x);
+            act.quantize();
+            let want_q: Vec<u8> = act
+                .q
+                .download()
+                .expect("q")
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .take(k)
+                .collect();
+            let sb: Vec<u8> = act
+                .s
+                .download()
+                .expect("s")
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .collect();
+            let want_s = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+            let (got_q, got_s) = quant_one(&device, &x);
+            let bad = got_q.iter().zip(&want_q).filter(|(a, b)| a != b).count();
+            let ok = bad == 0 && got_s == want_s;
+            eprintln!(
+                "Q1_BITS k={k} {what}: mismatched_bytes={bad} scale={:#010x} want={want_s:#010x} {}",
+                got_s,
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "Q1 is not quant_rows_fp8's row 0");
 }
