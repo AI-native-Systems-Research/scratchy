@@ -2774,7 +2774,7 @@ impl SpyreWorker {
                     );
                     prefix_built.push((pmq as usize, ps));
                 }
-                let mut prefill_prefix = PrefixLadder::of_built(prefix_built);
+                let prefill_prefix = PrefixLadder::of_built(prefix_built);
                 if prefill_prefix.is_empty() {
                     warn!(
                         "[spyre-worker] sendnn: no prefix-capable prefill session built — continuation \
@@ -2798,65 +2798,63 @@ impl SpyreWorker {
                 // owner (see `decode_join` above); their prepare ran in the wave above, and the
                 // adoption below runs one thread per session, reading the owner only —
                 // refusals and "ready" logs land in ladder order on this thread.
-                let decode_adopted: Vec<(
-                    usize,
-                    scratchy_subtile::sdsc_abstract::RungWidth,
-                    (usize, usize),
-                    Result<SuperDscSession, String>,
-                )> = std::thread::scope(|scope| {
-                    let handles: Vec<_> = decode_jobs
-                        .into_iter()
-                        .zip(decode_prepared)
-                        .map(|(job, built)| {
-                            let ss = &ss;
-                            let spill = &spill_images;
-                            let rn = job.rn;
-                            let rung_width = job.rung_width;
-                            let logits = job.logits;
-                            scope.spawn(move || {
-                                (
-                                    rn,
-                                    rung_width,
-                                    (logits.rows, logits.width),
-                                    built.map_err(|(_, m)| m).and_then(|mut rs| {
-                                        adopt_from_owner(&mut rs, ss, spill)
-                                            .map_err(|e| {
-                                                format!(
-                                                    "decode batch rung seqs={rn}: {e} — \
+                let decode_adopted: Vec<(usize, usize, usize, Result<DecodeRung, String>)> =
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = decode_jobs
+                            .into_iter()
+                            .zip(decode_prepared)
+                            .map(|(job, built)| {
+                                let ss = &ss;
+                                let spill = &spill_images;
+                                let rn = job.rn;
+                                let rung_width = job.rung_width;
+                                let (lrows, lwidth) = (job.logits.rows, job.logits.width);
+                                scope.spawn(move || {
+                                    (
+                                        rn,
+                                        lrows,
+                                        lwidth,
+                                        built.map_err(|(_, m)| m).and_then(|mut rs| {
+                                            adopt_from_owner(&mut rs, ss, spill)
+                                                .map_err(|e| {
+                                                    format!(
+                                                        "decode batch rung seqs={rn}: {e} — \
                                                          every rung the bake shipped must load"
-                                                )
-                                            })
-                                            .map(|()| rs)
-                                    }),
-                                )
+                                                    )
+                                                })
+                                                .map(|()| DecodeRung {
+                                                    seqs: rung_width,
+                                                    // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY
+                                                    // MORE — both are per-BODY and this is
+                                                    // per-bundle; see `DecodeRung`. The launch
+                                                    // asks `sess.step_body(start)`, which is the
+                                                    // selector itself. And no `logits` — the
+                                                    // geometry's only runtime reader was the host
+                                                    // readback the submit/collect split deleted;
+                                                    // the load-time refusal above is what stays.
+                                                    sess: rs,
+                                                })
+                                        }),
+                                    )
+                                })
                             })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| match h.join() {
-                            Ok(r) => r,
-                            Err(p) => std::panic::resume_unwind(p),
-                        })
-                        .collect()
-                });
-                for (rn, rung_width, (lrows, lwidth), adopted) in decode_adopted {
-                    let rs = adopted.unwrap_or_else(|m| panic!("{m}"));
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(r) => r,
+                                Err(p) => std::panic::resume_unwind(p),
+                            })
+                            .collect()
+                    });
+                for (rn, lrows, lwidth, adopted) in decode_adopted {
+                    let rung = adopted.unwrap_or_else(|m| panic!("{m}"));
                     info!(
                         "[spyre-worker] sendnn: decode batch rung seqs={} ready \
                          (logits [{}, {}])",
                         rn, lrows, lwidth
                     );
-                    decode_ladder.push(DecodeRung {
-                        seqs: rung_width,
-                        // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
-                        // per-BODY and this is per-bundle; see `DecodeRung`. The launch
-                        // asks `sess.step_body(start)`, which is the selector itself.
-                        // And no `logits` — the geometry's only runtime reader was the
-                        // host readback the submit/collect split deleted; the load-time
-                        // refusal above is what stays.
-                        sess: rs,
-                    });
+                    decode_ladder.push(rung);
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
                 // ⭐ THE ACTIVATION SHADOWS' PAGES FAULT AT THE WRITE THAT FIRST TOUCHES THEM. The
