@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use flex_rs::iommu::PfIommuMapper;
@@ -3413,6 +3413,14 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // Heap copies of any `.rodata`-backed program bytes, kept alive until the async H2Ds have
         // been synchronized at the end of the loop. See the `Cow` match below for why.
         let mut pinnable: Vec<Vec<u8>> = Vec::new();
+        // ⭐ THE PROGRAM PATH'S CROSSINGS, TIMED SEPARATELY (`SCRATCHY_SDSC_PREP_TIME`, the same
+        //    flag as the prepare laps): the device alloc, the staging copy, the H2D send, and the
+        //    list's closing sync — each summed over the list's ops, printed per list. The
+        //    undivided `program-h2d` lap can say that a boot wave queues somewhere inside it
+        //    (tp/8: a 3.7 s wave against 0.0 ms tensor-segment allocs beside it) but not WHICH
+        //    crossing holds the queue, and the fix is a different batch for each answer.
+        let d = Diag::get();
+        let mut crossings = [Duration::ZERO; 4];
         let r = (|| -> Result<()> {
             for op in &mut ops {
                 // ⛔⛔⛔ THE IMAGE IS NOT ALWAYS AT THE HEAD OF ITS ALLOCATION. dxp's
@@ -3446,6 +3454,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         )
                     })?;
                 let head = img.bootstrap();
+                let t = Instant::now();
                 let addr = DevAddr::alloc(
                     self.card,
                     ByteSize(img.alloc_bytes()),
@@ -3458,6 +3467,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         img.image_bytes()
                     )
                 })?;
+                crossings[0] += t.elapsed();
                 // ⛔⛔⛔ DMA A PROGRAM OUT OF ANONYMOUS MEMORY, NEVER OUT OF THE EXECUTABLE.
                 //
                 // A BAKED program is `Cow::Borrowed(&'static [u8])`, which lives in the executable's
@@ -3480,6 +3490,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 // always pinnable); `Borrowed` is the executable's pages. So copy exactly the
                 // borrowed case. The staging buffers must outlive the ASYNC transfer, hence the sync
                 // below.
+                let t = Instant::now();
                 let staged: &[u8] = match &op.code.init_binary {
                     std::borrow::Cow::Owned(v) => v,
                     std::borrow::Cow::Borrowed(b) => {
@@ -3493,18 +3504,36 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 let dst = addr
                     .window(ByteOffset(head), ByteSize(op.code.init_binary.len() as u64))
                     .ok_or_else(|| anyhow!("program window at {head} B unaddressable"))?;
+                crossings[1] += t.elapsed();
+                let t = Instant::now();
                 self.stream_ref()?
                     .h2d(staged, &dst)
                     .map_err(|e| anyhow!("program H2D: {e}"))?;
+                crossings[2] += t.elapsed();
                 op.addr = Some(addr);
             }
             // ⛔ BEFORE `pinnable` DROPS. The H2Ds above are asynchronous, so the staging buffers
             // must still exist when the DMA reads them. Programs are uploaded once per list at
             // load, so this sync costs nothing per step.
             if !pinnable.is_empty() {
+                let t = Instant::now();
                 self.stream_ref()?
                     .synchronize()
                     .map_err(|e| anyhow!("program H2D sync: {e}"))?;
+                crossings[3] += t.elapsed();
+            }
+            if d.prep_time {
+                for (name, secs) in [
+                    ("prog-alloc", crossings[0]),
+                    ("prog-stage", crossings[1]),
+                    ("prog-send", crossings[2]),
+                    ("prog-sync", crossings[3]),
+                ] {
+                    eprintln!(
+                        "[sdsc-prep-time] {name:<16} {sel:?} {:.3}s",
+                        secs.as_secs_f64()
+                    );
+                }
             }
             // How much of a list is `.rodata`-backed says how much of the program set the copy above
             // is load-bearing for — 1-of-many and all-of-many are different stories about the bake,
