@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scratchy's Triton fp8 W8A8 matmul kernel — the weight-side fp8 half.
 
-BODY PROVENANCE: `crates/triton/test-fixtures/matmul_fp8.py` VERBATIM — the
+BODY PROVENANCE: `crates/targets/spyre/triton/test-fixtures/matmul_fp8.py` VERBATIM — the
 contract-verified fixture (`triton-ktir-superdsc/tests/matmul_fp8_contract.rs`
 pins its bake to exactly {1 tt.dot, 3 tt.descriptor_load, 1 arith.mulf, 1
 tt.descriptor_store} with the fused `fq_afp8_op`/`fq_dqw_op` chain present).

@@ -107,7 +107,7 @@ scratchy-target-spyre = { path = "../../targets/spyre", default-features = false
 # count from beside the program it describes. Already in the graph:
 # scratchy-target-spyre depends on it unconditionally, so this edge adds
 # no crate to any build.
-scratchy-triton-splice = { path = "../../triton/splice", optional = true }
+scratchy-triton-splice = { path = "../../targets/spyre/triton/splice", optional = true }
 # The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }

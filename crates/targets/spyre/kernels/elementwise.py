@@ -2,7 +2,7 @@
 """Scratchy's Triton elementwise kernels — Add / Mul / Sub / Silu / Gelu.
 
 BODY PROVENANCE: derived from `crates/targets/spyre/kernels/silumul.py`'s form (which
-is `crates/triton/test-fixtures/swiglu_mlp.py`'s activation body stated standalone) —
+is `crates/targets/spyre/triton/test-fixtures/swiglu_mlp.py`'s activation body stated standalone) —
 descriptor-loaded whole-region tiles, one arithmetic chain, one store. `SubOp::SiluMul`
 is the FUSED gate-up form; these entries are the SPLIT `SubOp::Elementwise` kinds.
 

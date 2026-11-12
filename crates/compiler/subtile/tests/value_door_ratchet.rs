@@ -3,8 +3,8 @@
 //! still becomes a type, counted from the source.
 //!
 //! #1094's goal is every shape constraint a bound rustc's type checker rejects. Two things still
-//! stand in for it, and this test counts both in the library code of the compiler, tensor, layer,
-//! target and triton crates (every `.rs` outside `tests/`, `benches/` and `examples/`; items under
+//! stand in for it, and this test counts both in the library code of the compiler, tensor, layer
+//! and target crates (every `.rs` outside `tests/`, `benches/` and `examples/`; items under
 //! `#[cfg(test)]` and `#[test]` functions are not library code):
 //!
 //! * **Law asserts**: an `assert!`, `assert_eq!`, `assert_ne!` or `panic!` in the body of a
@@ -31,7 +31,7 @@ const LAW_ASSERTS: usize = 31;
 const VALUE_DOORS: usize = 10;
 
 /// The crates scanned, under the workspace's `crates/`.
-const ROOTS: &[&str] = &["compiler", "tensors", "layers", "targets", "triton"];
+const ROOTS: &[&str] = &["compiler", "tensors", "layers", "targets"];
 
 /// The directories whose files are not library code.
 const SKIPPED_DIRS: &[&str] = &["tests", "benches", "examples", "target"];

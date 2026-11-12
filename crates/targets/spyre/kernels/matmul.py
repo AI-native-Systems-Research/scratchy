@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scratchy's Triton dense fp16 matmul kernel.
 
-BODY PROVENANCE: derived from `crates/triton/test-fixtures/swiglu_mlp.py`'s projection
+BODY PROVENANCE: derived from `crates/targets/spyre/triton/test-fixtures/swiglu_mlp.py`'s projection
 structure (deltas 2/3/4 there) — one `tl.dot` over descriptor-loaded tiles, which is
 the form `spyre-dot-to-linalg` rewrites to `linalg.matmul` and the emitter's
 `Program::Matmul` door is built for. The fixture's OWN three-dot fused MLP is NOT this

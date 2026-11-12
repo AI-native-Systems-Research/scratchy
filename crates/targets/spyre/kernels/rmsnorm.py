@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scratchy's Triton rmsnorm kernel — the FIRST SPLICED KERNEL.
 
-BODY PROVENANCE: `crates/triton/test-fixtures/rmsnorm.py`'s `rmsnorm_fwd`, verbatim
+BODY PROVENANCE: `crates/targets/spyre/triton/test-fixtures/rmsnorm.py`'s `rmsnorm_fwd`, verbatim
 EXCEPT the ceiling-safe pre-scale below (the fixture keeps the card-validated body
 verbatim — it is the ladder's own test surface). The card's emission is unchanged by
 the delta: the door re-assembles the exx2 sequence from the program's regions,
@@ -11,7 +11,7 @@ discriminator is "any spelling of the mean").
 WHY THIS FILE EXISTS SEPARATELY from the fixture: the fixture is the LADDER's test
 surface (its `constexprs()`/`inputs()`/`reference()` helpers are test code); this is
 the KERNEL a model runs, compiled at `#[forward]` expansion time by
-`crates/triton/splice` for every `SubOp::RmsNorm { gain: Scale }` node. The registry
+`crates/targets/spyre/triton/splice` for every `SubOp::RmsNorm { gain: Scale }` node. The registry
 row names this file; `test-fixtures/rmsnorm.py` stays the ladder's.
 
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kernel):
@@ -28,7 +28,7 @@ RUNS IN IS THE CARD'S. `LegalizeTypes` (SP-E2-03) erases EVERY `arith.extf`
 f16→f32 — Triton's auto-widening and a kernel's own `.to(tl.float32)` are the
 same op to it — and retypes the `tt.reduce` combiner to f16 with the rest of
 the island. This is not our port's drift: the C++ chain's own oracle
-(`crates/triton/test-experiment1/ktir/rmsnorm_granite.ktir.mlir`) records
+(`crates/targets/spyre/triton/test-experiment1/ktir/rmsnorm_granite.ktir.mlir`) records
 exactly this form — `x·x` f16, an `arith.addf : f16` combiner, `math.rsqrt`
 f16. A widening written into this file is dead on arrival. But an f16-TYPED
 reduce does not mean an IEEE-f16 ACCUMULATOR: on the card this reduce lowers to
