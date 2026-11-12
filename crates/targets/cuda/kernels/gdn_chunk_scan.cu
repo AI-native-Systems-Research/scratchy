@@ -17,8 +17,15 @@
 //
 // S as `[head_v, 128]`, as the slot holds it. The per-token rule `S ← S·exp(g)`, `u = β(v − S·k̂)`,
 // `S ← S + u ⊗ k̂`, `o = S·q̂` is this form at C = 1; at C = 64 its order and precision move: the
-// products are bf16 WGMMAs with f32 accumulation (q̂, k̂, v, T, W, P, V_new and the state rounded to
-// bf16 as operands, once a chunk), the state itself stays f32 in registers.
+// products are bf16 WGMMAs with f32 accumulation (q̂, k̂, T, W and the state rounded to bf16 as
+// operands, once a chunk), the state itself stays f32 in registers.
+//
+// THE SPLIT OPERANDS: the intra-chunk output `P·V_new` and its `V_new`'s `U = T·diag(β)·V` sum
+// terms that cancel on repeated keys (the delta rule takes back most of the earlier tokens'
+// values), so each term's bf16 rounding, relative to the term, is not relative to the small
+// result (F6 r2: 0.19% of o out of bound on q̂ = k̂ inputs). There, `V`, `T·diag(β)`, `P` and
+// `V_new` are each two bf16 operands, `hi = bf16(x)` and `lo = bf16(x − hi)`, and each product is
+// `hi·hi + hi·lo + lo·hi` (`store_split`): x to ~2⁻¹⁷.
 //
 // THE CTA: grid (head_v / 32, nv), as `gdn_scan`'s: 32 value rows of one head, so today's state slab
 // and slot layout. One warpgroup (4 warps); warp `w` holds tokens `16w .. 16w + 16` of every
@@ -144,7 +151,7 @@ struct chunk_globals {
     float scale;
 };
 
-constexpr size_t SMEM_USED = 4 * sizeof(tok_sq) + 5 * sizeof(tok_sq) + 2 * sizeof(tok_rows) +
+constexpr size_t SMEM_USED = 4 * sizeof(tok_sq) + 5 * sizeof(tok_sq) + 3 * sizeof(tok_rows) +
                              2 * sizeof(key_rows) + sizeof(diag_f) + sizeof(rows_f);
 // The allocator's 1024-byte alignment of the first tile.
 constexpr int SMEM_BYTES = int(SMEM_USED) + 1024;
@@ -185,6 +192,18 @@ __device__ inline void normalise_rows(sq_rt& a, sq_rt& b, float scale) {
     warp::mul_row(b, b, n);
 }
 
+// `x` (each warp its own rows) as the two bf16 operands `hi = bf16(x)` into `hi_t` and
+// `lo = bf16(x − hi)` into `lo_t`; `hi` read back from `hi_t`, exactly.
+template <typename RT, typename ST>
+__device__ inline void store_split(ST& hi_t, ST& lo_t, const RT& x) {
+    warpgroup::store(hi_t, x);
+    __syncwarp();
+    RT lo;
+    warpgroup::load(lo, hi_t);
+    warp::sub(lo, x, lo);
+    warpgroup::store(lo_t, lo);
+}
+
 // Every warp's operand stores visible to the next WGMMA: the async-proxy fence, then the barrier.
 __device__ inline void operands_ready() {
     warpgroup::mma_fence();
@@ -196,12 +215,15 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
     const __grid_constant__ chunk_globals g) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
-    // [0] K̂'s halves, [1] Q̂'s.
+    // [0] K̂'s halves, [1] Q̂'s; [1][0] then holds P's low half (after step 2).
     tok_sq(&kq)[2][2] = al.allocate<tok_sq, 2, 2>();
-    // The chain's operands: [0] N, then Y, then W's low half; [1] D, then W's high half; [2] M,
-    // then T·diag(β); [3] I − M, then I − M·(I − M), then T·diag(β·exp(G)); [4] P.
+    // The chain's operands: [0] N, then Y, then T·diag(β)'s low half, then W's low half; [1] D,
+    // then W's high half; [2] M, then T·diag(β)'s high half; [3] I − M, then I − M·(I − M), then
+    // T·diag(β·exp(G)); [4] P's high half.
     tok_sq(&bt)[5] = al.allocate<tok_sq, 5>();
+    // V's two halves; `vb` then holds V_new's low half (after U).
     tok_rows& vb = al.allocate<tok_rows>();
+    tok_rows& vb_lo = al.allocate<tok_rows>();
     tok_rows& vn = al.allocate<tok_rows>();
     key_rows(&stb)[2] = al.allocate<key_rows, 2>();
     diag_f& ad = al.allocate<diag_f>();
@@ -280,7 +302,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
             normalise_rows(q0, q1, g.scale);
             warpgroup::store(kq[1][0], q0);
             warpgroup::store(kq[1][1], q1);
-            warpgroup::store(vb, vt);
+            store_split(vb, vb_lo, vt);
         } else {
             for (int r = 0; r < WARP_TOKENS; ++r) {
                 const int tt = i0 + r;
@@ -319,6 +341,11 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
                 warp::store(kq[1][0], q0, {tt, 0});
                 warp::store(kq[1][1], q1, {tt, 0});
                 warp::store(vb, v, {tt, 0});
+                __syncwarp();
+                rv_fl<ROWS> v_hi;
+                warp::load(v_hi, vb, {tt, 0});
+                warp::sub(v, v, v_hi);
+                warp::store(vb_lo, v, {tt, 0});
             }
         }
         mark(1);
@@ -366,7 +393,9 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
             const int i = i0 + r;
             return c <= i ? x * scratchy::ops::exp_of::op<float>(gc[i] - gc[c]) : 0.0f;
         });
-        warpgroup::store(bt[4], qk);
+        // P's low half into Q̂'s low-half tile, which step 2's products no longer read.
+        __syncthreads();
+        store_split(bt[4], kq[1][0], qk);
         warp::apply(o, o, [&](int r, int, float x) {
             return x * scratchy::ops::exp_of::op<float>(gc[i0 + r]);
         });
@@ -444,7 +473,7 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
         // 5. T·diag(β) and T·diag(β·exp(G)); U = T·diag(β)·V and W = T·diag(β·exp(G))·K̂.
         sq_rt tw;
         warp::apply(tw, d, [&](int, int c, float x) { return x * bc[c]; });
-        warpgroup::store(bt[2], tw);
+        store_split(bt[2], bt[0], tw);
         warp::apply(tw, d, [&](int, int c, float x) {
             return x * bc[c] * scratchy::ops::exp_of::op<float>(gc[c]);
         });
@@ -453,6 +482,8 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
         rows_rt u;
         sq_rt w_lo, w_hi;
         warpgroup::mm_AB(u, bt[2], vb);
+        warpgroup::mma_AB(u, bt[2], vb_lo);
+        warpgroup::mma_AB(u, bt[0], vb);
         warpgroup::mm_AB(w_lo, bt[3], kq[0][0]);
         warpgroup::mm_AB(w_hi, bt[3], kq[0][1]);
         warpgroup::mma_async_wait();
@@ -469,12 +500,14 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
             warpgroup::mma_AB(ws, bt[1], stb[1]);
             warpgroup::mma_async_wait();
             warp::sub(u, u, ws);
-            warpgroup::store(vn, u);
+            store_split(vn, vb, u);
             operands_ready();
             mark(8);
 
             // 7. O += P·V_new, its real rows stored.
             warpgroup::mma_AB(o, bt[4], vn);
+            warpgroup::mma_AB(o, bt[4], vb);
+            warpgroup::mma_AB(o, kq[1][0], vn);
             warpgroup::mma_async_wait();
             warpgroup::store(rf, o);
             __syncwarp();
