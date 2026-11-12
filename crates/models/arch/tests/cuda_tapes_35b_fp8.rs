@@ -27,8 +27,9 @@ const ARCH: &str = "qwen3-5-moe";
 /// The decode tape's greedy argmax width (W7): the model's vocab, its whole logits row.
 const GREEDY_WIDTH: u32 = 248_320;
 
-const DECODE_STEPS: [(&str, usize); 21] = [
-    ("AddRmsNorm", 40),
+const DECODE_STEPS: [(&str, usize); 22] = [
+    ("AddRmsNorm", 30),
+    ("AddRmsNormQuantFp8", 10),
     ("AttnDecode", 10),
     ("Embed", 1),
     ("ExpertCombine", 40),
@@ -45,13 +46,13 @@ const DECODE_STEPS: [(&str, usize); 21] = [
     ("GemvGroupTcFp8", 10),
     ("GemvTcFp8", 50),
     ("MoeRoute", 40),
-    ("QuantRowsFp8", 60),
+    ("QuantRowsFp8", 50),
     ("RmsNorm", 61),
     ("RopeAppend", 10),
     ("RouterLogits", 40),
 ];
 /// The decode tape's quant writes and their readers (FP8 S8 T2).
-const DECODE_QUANTS: usize = 60;
+const DECODE_QUANTS: usize = 50;
 const DECODE_QUANT_READERS: usize = 180;
 const PREFILL_STEPS: [(&str, usize); 25] = [
     ("AddRmsNorm", 80),

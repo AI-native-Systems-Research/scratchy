@@ -26,7 +26,7 @@ const ARCH: &str = "gemma4-moe";
 /// The decode tape's greedy argmax width (W7): the model's vocab, its whole logits row.
 const GREEDY_WIDTH: u32 = 262_144;
 
-const DECODE_STEPS: [(&str, usize); 20] = [
+const DECODE_STEPS: [(&str, usize); 21] = [
     ("AttnDecode", 30),
     ("Embed", 1),
     ("ExpertCombine", 30),
@@ -39,8 +39,9 @@ const DECODE_STEPS: [(&str, usize); 20] = [
     ("LayerScale", 30),
     ("MoeRoute", 30),
     ("NormAdd", 90),
-    ("QuantRowsFp8", 120),
-    ("RmsNorm", 131),
+    ("QuantRowsFp8", 90),
+    ("RmsNorm", 101),
+    ("RmsNormQuantFp8", 30),
     ("RmsNormUnit", 5),
     ("RopeAppend", 30),
     ("RouterLogits", 30),
@@ -49,7 +50,7 @@ const DECODE_STEPS: [(&str, usize); 20] = [
     ("SoftCap", 1),
 ];
 /// The decode tape's quant writes and their readers (FP8 S8 T2).
-const DECODE_QUANTS: usize = 120;
+const DECODE_QUANTS: usize = 90;
 const DECODE_QUANT_READERS: usize = 180;
 const PREFILL_STEPS: [(&str, usize); 23] = [
     ("AttnPrefill", 30),
