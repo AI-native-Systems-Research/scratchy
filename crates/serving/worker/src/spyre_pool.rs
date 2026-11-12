@@ -36,11 +36,19 @@ pub(crate) fn flags() -> &'static Flags {
 }
 
 /// Index of the SMALLEST prefill rung that can hold `real` query rows per request and `live`
-/// requests. `rungs` is ascending by `(width, seqs)`, and the caller caps its chunk at the top
-/// rung's width, so this only returns `None` for an EMPTY ladder. A packed rung holds any live
-/// count at or below its `seqs` (an empty window is staged fully masked, page-0), so the first
-/// fit over the ascending list is the narrowest width and — at a tie — the SOLO rung, keeping a
-/// one-request launch byte-identical to the no-packing build.
+/// requests. `rungs` is ascending by `(width, seqs)`. A packed rung holds any live count at or
+/// below its `seqs` (an empty window is staged fully masked, page-0), so the first fit over the
+/// ascending list is the narrowest width and — at a tie — the SOLO rung, keeping a one-request
+/// launch byte-identical to the no-packing build.
+///
+/// ⛔ `None` IS THE HONEST ANSWER when no rung holds `(real, live)` — NEVER a fallback to the
+/// top rung. The fallback this replaced silently handed a wave the ladder holds nothing for
+/// (three 256-row chunks at PREFILL_PACK_SEQS=4: no `(256, s)` exists, so it returned the
+/// 512-wide solo rung) and deferred the mismatch to a RUNTIME card-launch refusal — a fact the
+/// bake knew, refused on the card. The wave-membership site checks rung existence as it builds
+/// the wave, so a packed caller that respects its own membership cannot see `None`; a solo
+/// caller's `(real, 1)` always fits some rung (every ladder width has a `(w, 1)` entry, widths
+/// ascend to the top, and the caller caps `real` at the top width).
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn prefill_rung_for(
     rungs: &[(usize, usize, SuperDscSession)],
@@ -50,7 +58,6 @@ pub(crate) fn prefill_rung_for(
     rungs
         .iter()
         .position(|(w, seqs, _)| *w >= real && *seqs >= live)
-        .or_else(|| rungs.len().checked_sub(1))
 }
 
 /// The decode-slot sentinel prefix the SuperDSC codegen stamps into

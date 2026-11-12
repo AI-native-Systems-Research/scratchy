@@ -369,27 +369,40 @@ impl Worker for SpyreWorker {
         // from position 0 and fits the top prefill rung, packed into ONE launch on the narrowest
         // `(width, seqs)` rung holding the widest chunk and the live count. Two or more only: a
         // lone prompt is the solo path's own case.
+        // ⛔ MEMBERSHIP IS THE LADDER'S OWN FACT, CHECKED AS THE WAVE IS BUILT: a request joins
+        // only while the ladder still holds a `(w, s)` rung with `w` at least the wave's widest
+        // chunk and `s` at least the wave's live count. A width with no packed rung (e.g. 256 at
+        // PREFILL_PACK_SEQS=4: 256·4 > prefill_m) can never join a 2-wave, so it stays on the
+        // solo path HERE — by construction, never as a card-launch refusal over the same fact.
         #[cfg(feature = "spyre-hw")]
         let wave: Vec<usize> = {
-            let top_m = {
+            let rungs: Vec<(usize, usize)> = {
                 let SendnnSession::SuperDsc(sb) = &model.session;
-                sb.prefill_rungs.last().map(|(m, _, _)| *m).unwrap_or(0)
+                sb.prefill_rungs.iter().map(|(m, s, _)| (*m, *s)).collect()
             };
-            let w: Vec<usize> = scheduler_output
-                .scheduled_new_reqs
-                .iter()
-                .enumerate()
-                .filter(|(_, nr)| {
-                    let n = scheduler_output
-                        .num_scheduled_tokens
-                        .get(&nr.req_id)
-                        .copied()
-                        .unwrap_or(0);
-                    nr.num_computed_tokens == 0 && n > 1 && n <= top_m
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if w.len() >= 2 { w } else { Vec::new() }
+            let top_m = rungs.last().map(|&(m, _)| m).unwrap_or(0);
+            let mut w: Vec<usize> = Vec::new();
+            let mut real = 0usize;
+            for (i, nr) in scheduler_output.scheduled_new_reqs.iter().enumerate() {
+                let n = scheduler_output
+                    .num_scheduled_tokens
+                    .get(&nr.req_id)
+                    .copied()
+                    .unwrap_or(0);
+                if nr.num_computed_tokens != 0 || n <= 1 || n > top_m {
+                    continue;
+                }
+                let live = w.len() + 1;
+                let wave_real = real.max(n);
+                if rungs.iter().any(|&(rw, rs)| rw >= wave_real && rs >= live) {
+                    w.push(i);
+                    real = wave_real;
+                } else if w.len() >= 2 {
+                    // The ladder holds no bigger wave at this width; the rest stay solo.
+                    break;
+                }
+            }
+            w
         };
         let mut results: Vec<Option<u32>> = vec![None; scheduler_output.scheduled_new_reqs.len()];
         #[cfg(feature = "spyre-hw")]
