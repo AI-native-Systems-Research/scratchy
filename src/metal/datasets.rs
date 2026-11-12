@@ -10,12 +10,12 @@ use crate::carbon::{
 };
 use crate::charts::{RATIO_STEPS, ScaleFit, ratio_ink, ratio_labels, ratio_scale, ratio_step};
 
+use super::buckets;
 use super::data::{At, Model, RequestTiming, Run, TaskCell};
 use super::numbers::{Engine, served};
-use super::buckets;
 use super::{
-    ECDF_COLUMN, Entry, HEAT_LABELS, MachineRuns, Series, Sweep, bar_chart, ecdf_chart, engine_key, grid_glance,
-    grid_maps, in_order, lineup, marks_key, over_time_charts, parity, parity_info,
+    ECDF_COLUMN, Entry, HEAT_LABELS, MachineRuns, Series, Sweep, bar_chart, ecdf_chart, engine_key,
+    grid_glance, grid_maps, in_order, lineup, marks_key, over_time_charts, parity, parity_info,
     previous_run, request_plots, runs_table, served_as, slug, sweep_part, tasks, users_at,
 };
 
@@ -348,7 +348,9 @@ impl<'a> Pairs<'a> {
                 let mut classes: Vec<&str> = l.classes.iter().map(|c| c.class.as_str()).collect();
                 let lineup_classes = classes.len();
                 for &(chip, ref ran_stems) in ran {
-                    let memory = machines[chip].runs[machines[chip].runs.len() - 1].machine.memory_gb;
+                    let memory = machines[chip].runs[machines[chip].runs.len() - 1]
+                        .machine
+                        .memory_gb;
                     for &class in &classes[..lineup_classes] {
                         // The run's own name for the class's model: the lineup's is borrowed from it.
                         let wanted = l.model(class, memory);
@@ -408,7 +410,11 @@ impl<'a> Pairs<'a> {
             }
         }
         match names.is_empty() {
-            true => self.models.get(class).cloned().unwrap_or_else(|| class.to_string()),
+            true => self
+                .models
+                .get(class)
+                .cloned()
+                .unwrap_or_else(|| class.to_string()),
             false => names.join(" / "),
         }
     }
@@ -418,7 +424,10 @@ impl<'a> Pairs<'a> {
         (self.chips.iter())
             .flat_map(|&c| self.classes.iter().map(move |&k| (c, k)))
             .find(|&(c, k)| self.stem(c, k).is_some())
-            .unwrap_or((self.chips[0], self.classes.first().copied().unwrap_or_default()))
+            .unwrap_or((
+                self.chips[0],
+                self.classes.first().copied().unwrap_or_default(),
+            ))
     }
 }
 
@@ -671,7 +680,10 @@ fn summary_map(
         let Entry { m, .. } = machines[chip].latest(stem)?;
         let rival = tasks::rival_of(m, dataset);
         let by = |e: Engine| -> BTreeMap<u32, &TaskCell> {
-            cells(m, e, dataset).into_iter().map(|c| (c.conc, c)).collect()
+            cells(m, e, dataset)
+                .into_iter()
+                .map(|c| (c.conc, c))
+                .collect()
         };
         Some(Pair {
             stem: m.stem.as_str(),
@@ -708,9 +720,13 @@ fn summary_map(
                 about: "Time per output token with 1 user: how fast the answer streams once it has started." });
         }
         for &u in users.iter().filter(|&&u| u > 1) {
-            rows.push(Row { label: format!("{u}u"), name: "End-to-end Latency", users: u,
+            rows.push(Row {
+                label: format!("{u}u"),
+                name: "End-to-end Latency",
+                users: u,
                 timing: RequestTiming::E2el,
-                about: "From sending a request to its last token, with that many users at once." });
+                about: "From sending a request to its last token, with that many users at once.",
+            });
         }
         rows
     };
@@ -727,26 +743,31 @@ fn summary_map(
         }
     }
     // A square's ratio, how many times faster scratchy is, or why it has none.
-    let ratio = |chip: &str, column: &str, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
-        let p = pair(chip, column).ok_or("not run")?;
-        let rival = p.rival.ok_or("scratchy alone so far")?;
-        let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
-        let (Some(ours), Some(theirs)) = (ours, theirs) else {
-            return Err("not run at this load");
+    let ratio =
+        |chip: &str, column: &str, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
+            let p = pair(chip, column).ok_or("not run")?;
+            let rival = p.rival.ok_or("scratchy alone so far")?;
+            let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
+            let (Some(ours), Some(theirs)) = (ours, theirs) else {
+                return Err("not run at this load");
+            };
+            if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
+                return Err("most requests failed");
+            }
+            let a = buckets::median_in(ours, row.timing, b);
+            let t = buckets::median_in(theirs, row.timing, b);
+            let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
+            let from = theirs
+                .borrowed_from
+                .as_ref()
+                .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
+            Ok((r, format!("{}{from}", rival.label())))
         };
-        if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
-            return Err("most requests failed");
-        }
-        let a = buckets::median_in(ours, row.timing, b);
-        let t = buckets::median_in(theirs, row.timing, b);
-        let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
-        let from = theirs.borrowed_from.as_ref()
-            .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
-        Ok((r, format!("{}{from}", rival.label())))
-    };
     let range = |chip: &str, row: &Row| -> Option<(f64, f64)> {
         (grid.columns.iter())
-            .flat_map(|&col| (0..n).filter_map(move |b| ratio(chip, col, row, b).ok().map(|(r, _)| r)))
+            .flat_map(|&col| {
+                (0..n).filter_map(move |b| ratio(chip, col, row, b).ok().map(|(r, _)| r))
+            })
             .fold(None, |acc, r| match acc {
                 None => Some((r, r)),
                 Some((lo, hi)) => Some((f64::min(lo, r), f64::max(hi, r))),
@@ -777,7 +798,11 @@ fn summary_map(
                 let step = ratio_step(r);
                 let shown = labelled.contains(&(chip, column, row.label.as_str(), b));
                 (
-                    format!("background: {}; color: {}", RATIO_STEPS[step], ratio_ink(step)),
+                    format!(
+                        "background: {}; color: {}",
+                        RATIO_STEPS[step],
+                        ratio_ink(step)
+                    ),
                     shown.then(|| format!("×{r:.1}")),
                     format!("×{r:.2} vs {vs}"),
                 )
@@ -808,7 +833,10 @@ fn summary_map(
             }
         }
     };
-    let template = format!("max-content max-content repeat({}, {SQUARE})", grid.columns.len() * n);
+    let template = format!(
+        "max-content max-content repeat({}, {SQUARE})",
+        grid.columns.len() * n
+    );
     rsx! {
         div { style: "display: flex; gap: 1.5rem; align-items: flex-start; overflow-x: auto",
             div { style: "display: grid; grid-template-columns: {template} max-content max-content; column-gap: 2px; row-gap: 2px; align-items: center",

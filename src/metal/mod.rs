@@ -269,8 +269,7 @@ fn borrow_earlier(runs: &mut [Run]) {
                                         c.num_tasks.is_some() && c.num_tasks == accuracy_tasks
                                     }
                                     (Some(a), Some(b)) => {
-                                        a.count(&c.workload, c.conc)
-                                            == b.count(&c.workload, c.conc)
+                                        a.count(&c.workload, c.conc) == b.count(&c.workload, c.conc)
                                     }
                                     _ => false,
                                 }
@@ -3227,8 +3226,14 @@ mod tests {
         assert!(at("rag-latency-machine-apple-m3-pro") < at("rag-latency-model-sliding-window"));
         // A pair a machine and class, in each of the latency tab and the detail: the lineup's
         // four classes, gpt-oss-20b the only one this machine ran.
-        assert_eq!(html.matches("<div id=\"rag-latency-apple-m3-pro-").count(), 4);
-        assert_eq!(html.matches("<div id=\"rag-detail-apple-m3-pro-").count(), 4);
+        assert_eq!(
+            html.matches("<div id=\"rag-latency-apple-m3-pro-").count(),
+            4
+        );
+        assert_eq!(
+            html.matches("<div id=\"rag-detail-apple-m3-pro-").count(),
+            4
+        );
         assert!(html.contains("Mamba-2 on Apple M3 Pro: not run yet."));
     }
 
@@ -3668,7 +3673,10 @@ mod tests {
         assert!(lent, "the quick run borrowed the full run's oMLX cells");
         // Prompt counts on both runs' RAG cells, so the summary has buckets to draw.
         for m in runs.iter_mut().map(|r| &mut r.models[0]) {
-            for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()].into_iter().flatten() {
+            for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()]
+                .into_iter()
+                .flatten()
+            {
                 for c in cells.iter_mut().filter(|c| c.workload == "rag") {
                     let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                     c.prompt_tokens = Some(vec![Some(3200); n]);
@@ -3772,22 +3780,35 @@ mod tests {
         // The fixture is from before cells kept prompt counts: give its RAG cells some, two
         // requests in the 2.55k+ bucket and the rest in 2.85k+.
         let m = &mut runs[0].models[0];
-        for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()].into_iter().flatten() {
+        for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()]
+            .into_iter()
+            .flatten()
+        {
             for c in cells.iter_mut().filter(|c| c.workload == "rag") {
                 let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
-                c.prompt_tokens = Some((0..n).map(|i| Some(if i < 2 { 2700 } else { 3200 })).collect());
+                c.prompt_tokens = Some(
+                    (0..n)
+                        .map(|i| Some(if i < 2 { 2700 } else { 3200 }))
+                        .collect(),
+                );
                 c.tpots_ms = Some(vec![Some(20.0); n]);
             }
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains("id=\"rag-summary-scale\""), "its own ratio scale");
+        assert!(
+            html.contains("id=\"rag-summary-scale\""),
+            "its own ratio scale"
+        );
         // The rows the random-token map has, for this machine's users counts.
         for row in [">P<", ">D<", ">2u<", ">4u<"] {
             assert!(html.contains(row), "no {row} row");
         }
         // The model's class, and under it the model, as the random-token map has them.
-        assert!(html.contains(">Sliding window<"), "the class over its model");
+        assert!(
+            html.contains(">Sliding window<"),
+            "the class over its model"
+        );
         assert!(html.contains(">gpt-oss-20b<"), "the model under its class");
         // A column a bucket under its model, the random-token map's four.
         for b in super::buckets::BUCKETS {
@@ -3900,12 +3921,18 @@ mod tests {
         let tab = |t: &str| at(&format!("target=\"rag-{}\"", super::slug(t)));
         assert!(tab("Summary") < tab("Latency distributions"));
         assert!(tab("Latency distributions") < tab("Over time"));
-        assert!(!html.contains("target=\"rag-detail\""), "the detail is no tab");
+        assert!(
+            !html.contains("target=\"rag-detail\""),
+            "the detail is no tab"
+        );
         // The latency tab chooses its own machine and model, inside it, as main's does.
         let latency = at("id=\"rag-latency-distributions\" data-panel");
         let over_time = at("id=\"rag-over-time\" data-panel");
         let picker = at("id=\"rag-latency-machines\"");
-        assert!(latency < picker && picker < over_time, "the latency tab's own buttons");
+        assert!(
+            latency < picker && picker < over_time,
+            "the latency tab's own buttons"
+        );
         assert!(at("id=\"rag-latency-models\"") < over_time);
         assert!(latency < at(" versus ") && at(" versus ") < over_time);
         // The detail below the tabs, its own buttons over it.
@@ -3941,18 +3968,34 @@ mod tests {
         // The M4 Max ran no MuSiQue: its pair says so.
         assert!(html.contains("not run yet"));
         // Each button names the model it shows, not its class: gpt-oss-20b, not Sliding window.
-        assert!(html.contains(">gpt-oss-20b</cds-tab>"), "a button named for its model");
-        assert!(!html.contains(">Sliding window</cds-tab>"), "a class name on a button");
+        assert!(
+            html.contains(">gpt-oss-20b</cds-tab>"),
+            "a button named for its model"
+        );
+        assert!(
+            !html.contains(">Sliding window</cds-tab>"),
+            "a class name on a button"
+        );
         // The script finds the pairs it hides and shows: every pair carries the attribute it
         // looks for, so choosing a button shows the pair it names and no other.
         for which in ["latency", "detail"] {
             // The script's selector, as the page writes it inside its script tag.
             let selector = format!("[data-pair=\"rag-{which}\"]");
-            assert!(html.contains(&selector), "the {which} script looks for {selector}");
+            assert!(
+                html.contains(&selector),
+                "the {which} script looks for {selector}"
+            );
             let attribute = format!("\" data-pair=\"rag-{which}\"");
-            assert_eq!(html.matches(&attribute).count(), 3 * 4, "every {which} pair carries it");
+            assert_eq!(
+                html.matches(&attribute).count(),
+                3 * 4,
+                "every {which} pair carries it"
+            );
         }
-        assert!(!html.contains("data-{which}"), "an attribute name left unformatted");
+        assert!(
+            !html.contains("data-{which}"),
+            "an attribute name left unformatted"
+        );
     }
 
     #[test]
@@ -4081,7 +4124,10 @@ mod tests {
         let m = &run.models[0];
         let g = super::ShapeGrid::of(m, &run, super::Slice::Answer(64)).expect("a map");
         assert!(g.measures(super::numbers::Metric::Ttft));
-        assert!(!g.measures(super::numbers::Metric::Energy), "no energy kept");
+        assert!(
+            !g.measures(super::numbers::Metric::Energy),
+            "no energy kept"
+        );
         // The same run, its cells with their energy.
         let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
         for c in v["models"][0]["scaling"].as_array_mut().unwrap() {
@@ -4280,16 +4326,25 @@ mod tests {
             old["generated_utc"] = "2026-10-24T12:00:00Z".into();
             let mut new: serde_json::Value = serde_json::from_str(&text).unwrap();
             new["config"]["scaling"]["task_sample"] = serde_json::json!(sample);
-            vec![serde_json::from_value(old).unwrap(), serde_json::from_value(new).unwrap()]
+            vec![
+                serde_json::from_value(old).unwrap(),
+                serde_json::from_value(new).unwrap(),
+            ]
         };
         let line = |runs: &[Run], dataset: &str| -> bool {
             let entries: Vec<super::Entry> = (runs.iter())
-                .map(|run| super::Entry { run, m: &run.models[0] })
+                .map(|run| super::Entry {
+                    run,
+                    m: &run.models[0],
+                })
                 .collect();
             super::task_timeline(&entries, dataset).is_some()
         };
         assert!(line(&two(None), "rag"), "one sampling, one line");
-        assert!(!line(&two(Some("musique-dev-by-hops")), "rag"), "one run since");
+        assert!(
+            !line(&two(Some("musique-dev-by-hops")), "rag"),
+            "one run since"
+        );
         // ShareGPT's tasks did not change, so its line runs on.
         assert!(line(&two(Some("musique-dev-by-hops")), "sharegpt"));
     }
@@ -5037,12 +5092,19 @@ mod tests {
         assert!(runs[0].models[0].scaling_omlx.as_ref().unwrap()[short].ttft_too_soon);
         // The Random section says why the square has no ratio.
         let machines = super::index(&runs);
-        let html = render(super::datasets::section(super::datasets::RANDOM, &machines, &machines));
+        let html = render(super::datasets::section(
+            super::datasets::RANDOM,
+            &machines,
+            &machines,
+        ));
         assert!(html.contains("first token timed sooner than its prompt can be read"));
         // A real one is untouched: every other cell of the run.
-        let others = (runs[0].models.iter().flat_map(|m| Engine::ALL.into_iter().flat_map(move |e| e.cells(m).iter())))
-            .filter(|c| c.ttft_too_soon)
-            .count();
+        let others = (runs[0]
+            .models
+            .iter()
+            .flat_map(|m| Engine::ALL.into_iter().flat_map(move |e| e.cells(m).iter())))
+        .filter(|c| c.ttft_too_soon)
+        .count();
         assert_eq!(others, 2, "the two set here, and no real one");
     }
 

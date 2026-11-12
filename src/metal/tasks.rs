@@ -685,7 +685,10 @@ mod tests {
         assert_eq!(joules(per_token(&ours)), "0.40");
         assert_eq!(joules(per_right(&ours)), "80.0");
         // A third less energy a request than the rival's: x1.50.
-        assert_eq!(energy_times(&ours, &cell(100.0, 60.0, Some(0.5))), Some(1.5));
+        assert_eq!(
+            energy_times(&ours, &cell(100.0, 60.0, Some(0.5))),
+            Some(1.5)
+        );
         // Answers of different lengths: no ratio, as for the total time.
         assert_eq!(energy_times(&ours, &cell(200.0, 60.0, Some(0.5))), None);
         // Not scored, or none right: no figure a right answer.
@@ -779,10 +782,26 @@ mod tests {
             energy: None,
         };
         assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
-        assert_eq!(total_times(&cell(100.0, 0), &cell(150.0, 0)), None, "longer");
-        assert_eq!(total_times(&cell(100.0, 0), &cell(100.0, 5)), None, "capped");
-        assert_eq!(ttft_times(&cell(100.0, 0), &cell(50.0, 0)), Some(1.0), "any length");
-        assert_eq!(ttft_times(&cell(100.0, 0), &cell(100.0, 5)), None, "a capped rival");
+        assert_eq!(
+            total_times(&cell(100.0, 0), &cell(150.0, 0)),
+            None,
+            "longer"
+        );
+        assert_eq!(
+            total_times(&cell(100.0, 0), &cell(100.0, 5)),
+            None,
+            "capped"
+        );
+        assert_eq!(
+            ttft_times(&cell(100.0, 0), &cell(50.0, 0)),
+            Some(1.0),
+            "any length"
+        );
+        assert_eq!(
+            ttft_times(&cell(100.0, 0), &cell(100.0, 5)),
+            None,
+            "a capped rival"
+        );
         let mut unknown = cell(100.0, 0);
         unknown.mean_output_tokens = None;
         assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");
@@ -816,7 +835,11 @@ mod tests {
         };
         assert_eq!(load_label(&cell(Some("base"), 0, None)), "1 user (base)");
         assert_eq!(load_label(&cell(Some("rate"), 2, Some(0.4152))), "0.42/s");
-        assert_eq!(load_label(&cell(None, 4, None)), "4 users", "a run from before rates");
+        assert_eq!(
+            load_label(&cell(None, 4, None)),
+            "4 users",
+            "a run from before rates"
+        );
         assert_eq!(load_label(&cell(None, 1, None)), "1 user");
     }
 
