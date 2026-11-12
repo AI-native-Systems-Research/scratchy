@@ -68,6 +68,8 @@ constexpr int WARP_ROWS = 16;
 // `step::GDN_GATING_NV_MULTIPLE` and `step::GDN_DECODE_MAX_HEADS`.
 constexpr int NV_CHUNK = 16;
 constexpr int MAX_HEADS = 4;
+// The one-value-head form's widest cluster (the portable cluster size): its key head's CTAs.
+constexpr uint32_t MAX_CLUSTER_HEADS = 8;
 // `step::GDN_CONV_KERNEL_RANGE`.
 constexpr uint32_t KMIN = 2;
 constexpr uint32_t KMAX = 8;
@@ -609,8 +611,9 @@ extern "C" int scratchy_cuda_gdn_decode_prepare(void) {
 // state.
 //
 // The four GDN launchers' rules at one row, and the kernel's own: `head_k` 128, `head_v` 128 or
-// 256, `nk` and `nv` non-zero, `nv` a multiple of `nk` and of 16, `heads = nv / nk` at most 4 and
-// dividing 16, `2 + heads · head_v / 128` at most 8 (the conv's warps), `kernel` in 2..=8,
+// 256, `nk` and `nv` non-zero, `nv` a multiple of `nk` and of 16, `heads = nv / nk` at most 8 (the
+// launcher's one-value-head form: a key head's CTAs one cluster; the one-key-head form, variant 0,
+// at most 4, dividing 16, and `2 + heads · head_v / 128` at most 8), `kernel` in 2..=8,
 // `conv_slot_elems` exactly `conv_dim · (kernel − 1)` and `ssm_slot_elems` exactly
 // `nv · head_v · 128` (`conv_dim = 2 · nk · 128 + nv · head_v`), `conv_dim · kernel` at most
 // INT_MAX, and `scale` and `eps` finite and above 0; all are checked before any pointer is
@@ -635,9 +638,14 @@ static int gdn_decode(const void* qkv, const void* a, const void* b, const void*
     }
     const uint32_t heads = nv / nk;
     const uint64_t conv_dim = 2 * uint64_t(nk) * HEAD_K + uint64_t(nv) * head_v;
-    if (heads > uint32_t(MAX_HEADS) || uint32_t(NV_CHUNK) % heads != 0 ||
-        2 + heads * head_v / uint32_t(GROUP) > uint32_t(WARPS) ||
-        conv_dim * kernel > uint64_t(INT_MAX) ||
+    // The one-key-head form's CTA owns its key head's value heads: at most 4, in one 16-head gating
+    // chunk, their v channels within its conv warps. The one-value-head form's CTA owns one value
+    // head (its own chunk, at most two conv warps of v) and its key head's CTAs are one cluster.
+    const bool takes = variant == 0
+                           ? heads <= uint32_t(MAX_HEADS) && uint32_t(NV_CHUNK) % heads == 0 &&
+                                 2 + heads * head_v / uint32_t(GROUP) <= uint32_t(WARPS)
+                           : heads <= MAX_CLUSTER_HEADS;
+    if (!takes || conv_dim * kernel > uint64_t(INT_MAX) ||
         conv_slot_elems != conv_dim * uint64_t(kernel - 1) ||
         ssm_slot_elems != uint64_t(nv) * head_v * HEAD_K) {
         return SCRATCHY_CUDA_ERR_SHAPE;

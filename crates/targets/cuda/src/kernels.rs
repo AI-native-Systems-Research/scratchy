@@ -3440,8 +3440,10 @@ pub struct GdnDecodeOperands {
 /// bits. `dims` is `(nk, nv, head_k, head_v, kernel)`. Asynchronous.
 ///
 /// Refused with [`KernelError::GdnDecodeShape`], before any pointer is touched, unless the four
-/// launchers take the geometry at one row, `head_v` is 128 or 256, `nv / nk` at most
-/// [`crate::step::GDN_DECODE_MAX_HEADS`] dividing 16, and `scale` and `eps` finite and positive.
+/// launchers take the geometry at one row, `head_v` is 128 or 256, `nv / nk` at most 8 (one CTA a
+/// value head, a key head's CTAs one cluster: FP8 S8 D1), and `scale` and `eps` finite and
+/// positive. The tapes choose it by `steps_from_tape`'s `gdn_decode_takes` (at most
+/// [`crate::step::GDN_DECODE_MAX_HEADS`] dividing 16, the one-key-head form's rule).
 ///
 /// # Safety
 ///
