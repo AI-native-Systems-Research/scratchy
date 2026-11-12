@@ -109,9 +109,10 @@ pub const SEG_MASK: SegIdx = SegIdx::known::<3>();
 /// (card-measured, `h2d_streams_probe`, 2026-11-10), so a 2.5 GiB weight shadow pins in
 /// ~10 ms THP-backed or over a second not. The pod's THP defrag mode is `madvise`, so an
 /// un-advised mapping's huge pages are best-effort; [`advise_huge_pages`] is what makes
-/// them reliable. Population is [`fault_in`]'s job, at prepare, value-preserving — staged
-/// bytes are already faulted by the staging walk's writes, and the pad extents fault as
-/// born zeros without disturbing them.
+/// them reliable. Population is the writer's own job: staged bytes are faulted by the
+/// staging walk's writes, and a boot send carries only that staged prefix — the pad
+/// extents past it are never faulted at all (the device fills its side of them; see
+/// `send_prefix_and_fill`).
 ///
 /// `len` is the LOGICAL length (the byte count every reader sees through `Deref`); the
 /// mapping itself is [`pages_of`]` (len)` — the page-rounded extent, whose tail bytes past
@@ -885,25 +886,6 @@ impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
 /// A launch sequence — a body rung, the prefix, the suffix, or a fold-fused twin.
 pub(crate) type Ops<T> = Vec<OpProg<T>>;
 
-/// The host-shadow slice covering the WHOLE of `addr` — the H2D source for a segment.
-///
-/// ⭐ RETURNING A SLICE IS THE POINT. [`Stream::h2d`] takes the transfer length FROM the slice, so
-/// the DMA cannot read past the shadow the way an independent `size: u64` argument could — which is
-/// exactly how `alloc_ops_at` came to pin past the end of a program binary. A shadow shorter than
-/// its region is a STAGING bug (`prepare` grows every shadow it sends to the region's extent), so it
-/// is reported here rather than becoming an out-of-bounds transfer.
-fn whole_shadow<'a>(shadow: &'a [u8], addr: &DevAddr, seg: usize) -> Result<&'a [u8]> {
-    let need = addr.total_size().as_u64() as usize;
-    shadow.get(..need).ok_or_else(|| {
-        anyhow!(
-            "seg{seg}: the host shadow is {} B but its device region is {need} B — this H2D would \
-             read past the shadow. `prepare` grows every shadow it sends to the region's extent; \
-             this one was not grown, so the segment was never meant to be sent from here.",
-            shadow.len()
-        )
-    })
-}
-
 /// ⭐ THE H2D WINDOW AN ACTIVATION AT `[offset, offset + len)` GOES OUT IN — `offset` down and the end
 /// up to [`H2D_ALIGN`]. Slicing to a bind's EXACT range was tried and tripped a DMA
 /// sub-address/alignment error; any alignment coarser than the hardware's is also legal, so this needs
@@ -947,8 +929,80 @@ fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`fill_zero_walk`] OVER THE BYTES PAST `skip` — the pad half of a host-owned slot's boot
+/// send (see `send_prefix_and_fill`). The walk keeps [`FILL_WINDOW`]'s own window shapes; the
+/// one window `skip` straddles is filled from its tail ([`DevAddr::shifted`]), never from its
+/// start, so the fill cannot zero bytes the prefix send already landed. A fill window never
+/// straddles a chunk (`windows` cuts them chunk-bounded), so the shifted tail is a legal
+/// single-chunk window of the same chunk.
+fn fill_zero_walk_from(stream: &Stream, addr: &DevAddr, skip: usize, what: &str) -> Result<()> {
+    let mut off = 0usize;
+    for w in addr.windows(FILL_WINDOW) {
+        let win = w.total_size().as_u64() as usize;
+        if off + win <= skip {
+            off += win;
+            continue;
+        }
+        if off < skip {
+            let tail = w.shifted(ByteSize((skip - off) as u64)).ok_or_else(|| {
+                anyhow!("{what}: the fill window past byte {skip} does not exist in its own chunk")
+            })?;
+            stream
+                .fill_zero(&tail)
+                .map_err(|e| anyhow!("{what}: {e}"))?;
+        } else {
+            stream.fill_zero(&w).map_err(|e| anyhow!("{what}: {e}"))?;
+        }
+        off += win;
+    }
+    Ok(())
+}
+
+/// ⭐ THE BOOT SEND OF ONE HOST-OWNED SLOT: the STAGED PREFIX by pre-mapped H2D, the region's
+/// remainder by the device's own zero fill. The bytes past a slot's staged extent are born
+/// zeros on the host — pages the staging walk never wrote — and pushing them through the host
+/// (grow the shadow to the region, fault every pad page, pin, DMA) is the slow way to say
+/// "zero": measured at tp/8, ~13 GB of pad faults at ~0.5 GB/s was 73% of the boot wave,
+/// where the card's fill door does the same bytes at ~62 GB/s. So the shadow stays at its
+/// staged size, its pad pages are never touched (a page a per-step bind later writes faults
+/// at the bind, on demand, exactly as `shadow_for_read` materializes a read), and the device
+/// region's boot state is byte-identical to what the whole-region send produced: the staged
+/// bytes, then zeros.
+///
+/// The prefix's end is rounded UP to a page so the DMA's sub-address law holds
+/// ([`HOST_PAGE`], the alignment [`h2d_run`] states for the plain door too); the bytes that
+/// rounding adds are the walk's own born zeros inside the shadow, so the device sees exactly
+/// the bytes it always did. `staged` is clamped to the shadow and the region first — the
+/// shadow covers its whole segment by `stage_weights`' sizing, and the region is the
+/// allocation of exactly that size, so the clamp is structural, not a check.
+fn send_prefix_and_fill<'a>(
+    stream: &'a Stream,
+    shadow: &'a [u8],
+    staged: usize,
+    addr: &DevAddr,
+    mapper: &std::sync::Arc<PfIommuMapper>,
+    alive: &mut Vec<H2dPin<'a>>,
+    what: &str,
+) -> Result<()> {
+    let region = addr.total_size().as_u64() as usize;
+    let send = staged.min(shadow.len()).min(region).div_ceil(HOST_PAGE) * HOST_PAGE;
+    if send > 0 {
+        let src = shadow.get(..send).ok_or_else(|| {
+            anyhow!(
+                "{what}: the {} B shadow cannot cover a {send} B prefix",
+                shadow.len()
+            )
+        })?;
+        send_premapped(stream, src, addr, mapper, alive, what)?;
+    }
+    if region > send {
+        fill_zero_walk_from(stream, addr, send, what)?;
+    }
+    Ok(())
+}
+
 /// ⭐ THE PRE-MAPPED SEND OF ONE WHOLE SHADOW — the boot-weight door's consumer side. The
-/// shadow's pages are faulted (value-preserving, by prepare's grow loop); here the buffer
+/// shadow's pages are faulted by the writes that staged them; here the buffer
 /// is pinned ONCE for its whole extent ([`Stream::pin_h2d`], which refuses a mapping that
 /// does not cover the shadow BY NAME — `PremappedH2dRefusal::ShortPin`) and the transfer
 /// goes out window by window through [`H2dPin::send_window`], each window's host slice AND
@@ -963,6 +1017,11 @@ fn fill_zero_walk(stream: &Stream, addr: &DevAddr, what: &str) -> Result<()> {
 /// [`Drop`] synchronizes the stream BEFORE it unpins, so an early return (a refused
 /// window, a failed sync, an unwind) retires the DMA too. The unpin never races a
 /// transfer, on any exit.
+///
+/// `src` may be a PREFIX of the region (`send_prefix_and_fill` sends only a slot's staged
+/// extent): the window walk stops at `src.len()`, the last window sending a part. The
+/// walk covers the region front-to-back, so a prefix send lands the first `src.len()` bytes
+/// wherever they fall.
 fn send_premapped<'a>(
     stream: &'a Stream,
     src: &'a [u8],
@@ -976,10 +1035,14 @@ fn send_premapped<'a>(
         .map_err(|e| anyhow!("{what}: pinning the {} B shadow: {e}", src.len()))?;
     let mut off = 0usize;
     for w in addr.windows(H2D_WINDOW) {
+        if off >= src.len() {
+            break;
+        }
         let win = w.total_size().as_u64() as usize;
-        pin.send_window(&w, off..off + win)
+        let take = win.min(src.len() - off);
+        pin.send_window(&w, off..off + take)
             .map_err(|e| anyhow!("{what}: pre-mapped window at byte {off}: {e}"))?;
-        off += win;
+        off += take;
     }
     assert_eq!(
         off,
@@ -995,6 +1058,11 @@ fn send_premapped<'a>(
 /// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
 /// whatever page size the host actually uses.
 const HOST_PAGE: usize = 4096;
+
+/// ⭐ THE STAGING WORTH OF ONE THREAD — the byte floor under a staging spawn (see
+/// `stage_weights`' thread count). Pinned, not tuned: it only has to sit far enough above a
+/// spawn's own cost that a walk smaller than it never pays one.
+const STAGE_THREAD_BYTES: usize = 16 << 20;
 
 /// ⭐ FAULT EVERY PAGE OF `buf` IN, LEAVING ITS BYTES AS THEY ARE: each page is written with the byte
 /// it already holds. A zeroed allocation is mapped on first WRITE (a read maps the shared zero page
@@ -1260,6 +1328,12 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     prepared: bool,
     staged_host: bool,
     n_weights_staged: usize,
+    /// ⭐ THE STAGED EXTENT OF EVERY SLOT (segments, then extra weight banks — `slot_of`'s
+    /// space): where the staging walk's output ENDS. This is the whole of a slot's host bytes
+    /// that `prepare` sends ([`send_prefix_and_fill`]); the bytes past it in the region are
+    /// born zeros the device fills for itself. Set by [`Self::stage_weights`] from the
+    /// disjointness split's own cursor, so it is exactly the walk's footprint, no more.
+    staged_extent: Vec<usize>,
     /// ⭐ TENSORDUMP STATE (`SCRATCHY_SDSC_TENSORDUMP`): this session's last-seen bytes per placed
     /// tensor, its program index (per-fingerprint, first-dumped order — see [`Diag::tensordump`]),
     /// and its own op counter. `None` unless the env gate is set.
@@ -1624,6 +1698,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
+            staged_extent: Vec::new(),
             dump: None,
             step_images: StepImageCache::default(),
             seat,
@@ -2424,6 +2499,13 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         self.binds_resident() && !self.seg_borrowed[SEG_WEIGHT.get()]
     }
 
+    /// A slot's staged extent — where [`Self::stage_weights`]'s walk ended. `0` before the
+    /// walk or for a slot it wrote nothing into, which is the whole truth a boot send needs:
+    /// nothing staged ⇒ the region is fill-only.
+    fn staged_extent_of(&self, slot: usize) -> usize {
+        self.staged_extent.get(slot).copied().unwrap_or(0)
+    }
+
     /// ⭐ WHETHER A SEGMENT'S HOST SIDE EXISTS AT ALL — the bundle's own statement, not a
     /// measurement of what staging wrote. `SegRole` names each segment's job; `WeightTail`
     /// names the one intermediate-colour slot that carries spilled weights (a bare role
@@ -2699,16 +2781,29 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                 cursor[it.slot] = it.offset + it.src.len();
                 tasks.push((it.src, dst, it.mode, it.slot, it.offset));
             }
+            // ⭐ THE CURSOR IS THE STAGED EXTENT — where the walk's output ends per slot.
+            // `prepare` sends exactly this and lets the device fill the rest of the region
+            // (see `staged_extent`), so it is recorded here, from the split's own arithmetic.
+            self.staged_extent = cursor;
         }
 
         // ── LPT deal across the cores: sort by size descending and deal round-robin, which is
         //    better balanced than equal chunking (weights differ by orders of magnitude) and needs
         //    no shared counter — the C++ used an atomic work-stealing index for the same reason.
         tasks.sort_by_key(|(src, _, _, _, _)| std::cmp::Reverse(src.len()));
+        // ⭐ THREADS SIZED BY THE WORK, NOT BY THE MACHINE: a staging thread is worth a
+        // [`STAGE_THREAD_BYTES`] of source bytes to walk, and never more than the cores or
+        // the tasks. One per core regardless (the old law) convoyed the ladder's fan-out
+        // measured at tp/8: 280 staging calls spawned 144 threads each — 40k thread spawns
+        // against 33 fan-out threads — and a 2 MiB walk of 2 ms summed work measured a 0.7 s
+        // wall waiting for its own spawn storm. A byte-sized cap keeps the owner's ~426 MiB
+        // walk wide and runs a rung's 2 MiB walk inline.
+        let staged_bytes: usize = tasks.iter().map(|(src, ..)| src.len()).sum();
         let nthreads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(tasks.len().max(1));
+            .min(tasks.len().max(1))
+            .min(staged_bytes.div_ceil(STAGE_THREAD_BYTES).max(1));
         let mut buckets: Vec<Vec<_>> = (0..nthreads).map(|_| Vec::new()).collect();
         for (i, t) in tasks.into_iter().enumerate() {
             buckets[i % nthreads].push(t);
@@ -2759,49 +2854,51 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             StageMode::Verbatim => ArmKind::Verbatim,
         };
 
-        std::thread::scope(|scope| {
-            for bucket in buckets {
-                let rows = &rows;
-                scope.spawn(move || {
-                    for (src, dst, mode, slot, offset) in bucket {
-                        let t0 = stage_diag.then(Instant::now);
-                        match mode {
-                            // ⭐ THE BAKE'S VERDICT DISPATCHES — no analysis at boot, for ANY
-                            // arm: each arm's own walker runs directly (no wildcard to re-slot,
-                            // no `stage_weight_tiled` to re-derive the walk's law), the
-                            // permutation arm playing the order the arm itself carries.
-                            StageMode::Retile(k, elem) => match &k.arm {
-                                WalkArm::Permutation { order } => {
-                                    stage_weight_permuted(src, dst, &k.axes, order, elem)
-                                }
-                                WalkArm::InnerContig => {
-                                    stage_weight_rows(src, dst, RetileWalk { axes: &k.axes }, elem)
-                                }
-                                WalkArm::PerElement => stage_weight_per_element(
-                                    src,
-                                    dst,
-                                    RetileWalk { axes: &k.axes },
-                                    elem,
-                                ),
-                            },
-                            StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
-                            StageMode::Verbatim => dst.copy_from_slice(src),
+        // ⭐ ONE BUCKET RUNS INLINE — a spawn for a walk this small is pure convoy (see
+        // `STAGE_THREAD_BYTES`); every larger deal fans as it always did.
+        let run_bucket = |bucket: Vec<StageTask<'_>>| {
+            for (src, dst, mode, slot, offset) in bucket {
+                let t0 = stage_diag.then(Instant::now);
+                match mode {
+                    // ⭐ THE BAKE'S VERDICT DISPATCHES — no analysis at boot, for ANY
+                    // arm: each arm's own walker runs directly (no wildcard to re-slot,
+                    // no `stage_weight_tiled` to re-derive the walk's law), the
+                    // permutation arm playing the order the arm itself carries.
+                    StageMode::Retile(k, elem) => match &k.arm {
+                        WalkArm::Permutation { order } => {
+                            stage_weight_permuted(src, dst, &k.axes, order, elem)
                         }
-                        if let Some(t0) = t0
-                            && let Ok(mut rows) = rows.lock()
-                        {
-                            rows.push(StageRow {
-                                slot,
-                                offset,
-                                arm: stage_arm(mode),
-                                bytes: src.len(),
-                                nanos: t0.elapsed().as_nanos() as u64,
-                            });
+                        WalkArm::InnerContig => {
+                            stage_weight_rows(src, dst, RetileWalk { axes: &k.axes }, elem)
                         }
-                    }
-                });
+                        WalkArm::PerElement => {
+                            stage_weight_per_element(src, dst, RetileWalk { axes: &k.axes }, elem)
+                        }
+                    },
+                    StageMode::Convert => sen_convert::ieee_to_sen_bytes(src, dst),
+                    StageMode::Verbatim => dst.copy_from_slice(src),
+                }
+                if let Some(t0) = t0
+                    && let Ok(mut rows) = rows.lock()
+                {
+                    rows.push(StageRow {
+                        slot,
+                        offset,
+                        arm: stage_arm(mode),
+                        bytes: src.len(),
+                        nanos: t0.elapsed().as_nanos() as u64,
+                    });
+                }
             }
-        });
+        };
+        match buckets.len() {
+            0 | 1 => run_bucket(buckets.into_iter().next().unwrap_or_default()),
+            _ => std::thread::scope(|scope| {
+                for bucket in buckets {
+                    scope.spawn(move || run_bucket(bucket));
+                }
+            }),
+        }
 
         if stage_diag {
             let rows = rows.into_inner().unwrap_or_default();
@@ -3027,51 +3124,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
 
         // ── Convert + stage weights into seg_host — a NO-OP if the caller already ran it off the
-        //    critical path. Then grow each HOST-OWNED seg_host to the device alloc's size
-        //    (alignment pad, zero) so the H2D copies a full region, and FAULT ITS PAGES IN —
-        //    value-preserving ([`fault_in`]), so the staged bytes cross untouched; what it
-        //    adds is residency for the extents the staging walk never wrote (the pad between
-        //    placements, a region's tail), which the pre-mapped pin below then walks as
-        //    THP-backed pages instead of faulting them itself at 4 KiB granularity.
-        //    Device-only slots never H2D their shadow — they have none, so a borrowed
-        //    segment (marked device-only at staging) faults nothing either. ──
+        //    critical path. The per-slot STAGED EXTENT (`staged_extent`) is all the host bytes
+        //    the sends below carry: the rest of every region is born zeros on the host, and the
+        //    device's own fill door states those bytes at ~62 GB/s where pushing them through
+        //    the host (grow + fault + pin) states them at ~0.5 GB/s (measured at tp/8: 13 GB of
+        //    pad faults was 73% of the boot wave). The shadow is therefore never grown to the
+        //    region at prepare, and its pad pages are never faulted — a page a per-step bind
+        //    later writes faults at the bind, on demand, exactly as [`Self::shadow_for_read`]
+        //    materializes a read. ──
         self.stage_weights()?;
         let reserve_only = !self.binds_resident();
-        for i in 0..NUM_SEGMENTS {
-            // Same rule as the staging shadow: skip only what an alias replaces, and grow only
-            // what this send loop is about to H2D in full.
-            if (reserve_only && is_resident_seg(i)) || !self.host_owned_seg(i) {
-                continue;
-            }
-            let need = self.seg_addr[i]
-                .as_ref()
-                .map_or(0, |a| a.total_size().as_u64()) as usize;
-            if let Some(v) = self.seg_host[i].host_buf_mut() {
-                if v.len() < need {
-                    v.resize(need)?;
-                }
-                if let Some(pages) = v.get_mut(..need) {
-                    fault_in(pages);
-                }
-            }
-        }
-        // The weight banks follow the weight segment's own session rule exactly
-        // ([`Self::stages_weights`]): grow to the device extent when this session stages.
-        if self.stages_weights() {
-            for b in 0..self.weight_bank_bytes.len() {
-                let need = self.weight_bank_addr[b]
-                    .as_ref()
-                    .map_or(0, |a| a.total_size().as_u64()) as usize;
-                if let Some(v) = self.weight_bank_host[b].host_buf_mut() {
-                    if v.len() < need {
-                        v.resize(need)?;
-                    }
-                    if let Some(pages) = v.get_mut(..need) {
-                        fault_in(pages);
-                    }
-                }
-            }
-        }
         let n_weights = self.n_weights_staged;
         lap("weight-convert", &mut t0);
 
@@ -3104,36 +3166,30 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             }
             let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
             let host_owned = self.host_owned_seg(i);
-            if d.prep_time {
-                eprintln!(
-                    "[sdsc-prep-time] seg{i}: region {} B → {}",
-                    addr.total_size().as_u64(),
-                    if host_owned {
-                        "pre-mapped H2D"
-                    } else {
-                        "device fill"
-                    }
-                );
-            }
             if !host_owned {
                 fill_zero_walk(stream, addr, &format!("prepare: seg{i} zero fill"))?;
                 continue;
             }
-            // The shadow was grown (and its pages faulted in) by the loop above, so this slice
-            // is the whole region — and taking it AS A SLICE is what proves the H2D cannot read
-            // past the shadow. `get` rather than `[..]`: a short shadow is a wiring bug to
-            // report, not a panic, and never a DMA over-read. A host-owned slot with no shadow
-            // is the same disagreement, refused.
-            let src = whole_shadow(
-                self.seg_host[i].host().ok_or_else(|| {
-                    anyhow!("prepare: seg{i} is host-owned but holds no host shadow")
-                })?,
-                addr,
-                i,
-            )?;
-            send_premapped(
+            // The staged prefix goes out by the pre-mapped door, the pad by the device's own
+            // fill (see `send_prefix_and_fill`). A host-owned slot with no shadow is the same
+            // role-statement disagreement it always was, refused.
+            let shadow = self.seg_host[i]
+                .host()
+                .ok_or_else(|| anyhow!("prepare: seg{i} is host-owned but holds no host shadow"))?;
+            let staged = self.staged_extent_of(i);
+            if d.prep_time {
+                eprintln!(
+                    "[sdsc-prep-time] seg{i}: region {} B → pre-mapped H2D {} B + device fill {} B",
+                    addr.total_size().as_u64(),
+                    staged,
+                    addr.total_size().as_u64() as usize
+                        - staged.min(addr.total_size().as_u64() as usize),
+                );
+            }
+            send_prefix_and_fill(
                 stream,
-                src,
+                shadow,
+                staged,
                 addr,
                 &mapper,
                 &mut pinned,
@@ -3142,7 +3198,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         }
         // ⭐ AND EVERY EXTRA WEIGHT BANK, under the weight segment's own session rule
         // ([`Self::stages_weights`]) — a bank holds only weights by construction, so it
-        // always follows the host-owned route when this session stages any.
+        // always follows the host-owned route when this session stages any: staged prefix by
+        // the pre-mapped door, pad by the device fill, same law as the segments above.
         if self.stages_weights() {
             for b in 0..self.weight_bank_bytes.len() {
                 let (stream, addr) = (
@@ -3151,19 +3208,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
                         .as_ref()
                         .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
                 );
-                let src = whole_shadow(
-                    self.weight_bank_host[b].host().ok_or_else(|| {
-                        anyhow!(
-                            "prepare: weight bank {} is host-owned but holds no host shadow",
-                            b + 1
-                        )
-                    })?,
-                    addr,
-                    NUM_SEGMENTS + b,
-                )?;
-                send_premapped(
+                let shadow = self.weight_bank_host[b].host().ok_or_else(|| {
+                    anyhow!(
+                        "prepare: weight bank {} is host-owned but holds no host shadow",
+                        b + 1
+                    )
+                })?;
+                send_prefix_and_fill(
                     stream,
-                    src,
+                    shadow,
+                    self.staged_extent_of(NUM_SEGMENTS + b),
                     addr,
                     &mapper,
                     &mut pinned,
@@ -6886,8 +6940,7 @@ mod tests {
         assert_eq!(pages_of(b.len()), 4 * HOST_PAGE);
 
         // Write, then grow: the prefix is carried, the tail is born zeros (Vec::resize's
-        // contract, which `shadow_for_read`'s mirror-growth and prepare's pad-growth both
-        // rely on).
+        // contract, which `shadow_for_read`'s mirror-growth relies on).
         b[..7].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
         b.resize(5 * HOST_PAGE).expect("growth by mremap or copy");
         assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);

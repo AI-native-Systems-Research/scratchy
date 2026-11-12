@@ -2757,24 +2757,42 @@ impl SpyreWorker {
                 decode_ladder.sort_by_key(|r| r.seqs);
                 // ⭐ FAULT THE CHUNK SESSIONS' ACTIVATION SHADOWS IN AT LOAD, so a request's first
                 // binds write into pages already mapped (see `materialize_activation_shadow`) — the
-                // sessions a first request runs on.
+                // sessions a first request runs on. ONE THREAD PER SESSION: the fault is pure
+                // host page-mapping work (GB-scale, ~1.4 GB/s a thread), so a serial loop
+                // would spend seconds the boot wave used to pay in parallel — the sessions
+                // are independent and the wave's own shape (a thread per session) is the
+                // parallelism this walks at.
                 {
                     let _t = std::time::Instant::now();
-                    let mut shadow_bytes = 0u64;
-                    let mut fault =
-                        |sess: &mut SuperDscSession, rows: usize| -> ExecutorResult<()> {
-                            shadow_bytes += sess.materialize_activation_shadow().map_err(|e| {
-                                werr(format!("the {rows}-row session's activation shadow: {e}"))
-                            })?;
-                            Ok(())
-                        };
-                    for (rows, sess) in prefill_ladder.iter_mut() {
-                        fault(sess, *rows)?;
-                    }
-                    for (rows, sess) in prefill_prefix.rungs_mut() {
-                        fault(sess, rows)?;
-                    }
-                    fault(&mut ss, 1)?;
+                    let mut jobs: Vec<(usize, &mut SuperDscSession)> = prefill_ladder
+                        .iter_mut()
+                        .map(|(rows, sess)| (*rows, sess))
+                        .collect();
+                    jobs.extend(prefill_prefix.rungs_mut().map(|(rows, sess)| (rows, sess)));
+                    jobs.push((1, &mut ss));
+                    let shadow_bytes: ExecutorResult<u64> = std::thread::scope(|scope| {
+                        let handles: Vec<_> = jobs
+                            .iter_mut()
+                            .map(|(rows, sess)| {
+                                scope.spawn(move || {
+                                    sess.materialize_activation_shadow().map_err(|e| {
+                                        werr(format!(
+                                            "the {rows}-row session's activation shadow: {e}"
+                                        ))
+                                    })
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| {
+                                h.join().map_err(|_| {
+                                    werr("an activation-shadow fault thread panicked".to_string())
+                                })
+                            })
+                            .sum()
+                    });
+                    let shadow_bytes = shadow_bytes?;
                     info!(
                         "[spyre-worker] sendnn: chunk sessions' activation shadows faulted in at load \
                          ({} KB, {:.0} ms)",
