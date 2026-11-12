@@ -2785,10 +2785,12 @@ impl SpyreWorker {
                             .collect();
                         handles
                             .into_iter()
-                            .map(|h| {
-                                h.join().map_err(|_| {
-                                    werr("an activation-shadow fault thread panicked".to_string())
-                                })
+                            .map(|h| match h.join() {
+                                Ok(Ok(bytes)) => Ok(bytes),
+                                Ok(Err(e)) => Err(e),
+                                Err(_) => Err(werr(
+                                    "an activation-shadow fault thread panicked".to_string(),
+                                )),
                             })
                             .sum()
                     });
