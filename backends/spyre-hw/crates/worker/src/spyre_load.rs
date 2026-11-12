@@ -1919,7 +1919,7 @@ impl SpyreWorker {
                                 &spill_tids,
                             )
                         }
-                        .map_err(|e| werr(format!("build SuperDSC PREFILL dxp session: {e}")))?;
+                        .map_err(|e| werr_chain("build SuperDSC PREFILL dxp session", &e))?;
                         info!(
                             "[spyre-worker] sendnn: SUPERDSC PREFILL session ready (bundle {}, \
                              m={prefill_m}, {:.2}s) — batched prompt prefill enabled",
@@ -2401,7 +2401,7 @@ impl SpyreWorker {
                     &pool_statics,
                     &spill_tids,
                 )
-                .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
+                .map_err(|e| werr_chain("build SuperDSC dxp session", &e))?;
                 // ⭐ THE LANDING SLOTS, ONCE THE OWNER'S WEIGHT SEGMENT EXISTS. The window is a
                 // placement in it, so where peers' sends land is the allocator's answer for THIS
                 // session's region — pointed before any step, and checked equal on every rank. The
