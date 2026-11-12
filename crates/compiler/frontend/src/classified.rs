@@ -872,7 +872,7 @@ impl Program {
 
 /// ⭐ THE PARTS OF A [`Program`] THAT NAME ITS WEIGHTS, AND NOTHING ELSE — no tokens among them, so
 /// this view can be read from any thread, which a `&Program` cannot: its `LocalTable` holds
-/// `proc_macro2::Ident`s. The spyre bake's rungs are lowered in parallel and name their weights here.
+/// `proc_macro2::Ident`s. A bake whose rungs are lowered in parallel names their weights here.
 #[derive(Clone, Copy)]
 pub struct WeightNaming<'p> {
     pub weights: &'p WeightTable,

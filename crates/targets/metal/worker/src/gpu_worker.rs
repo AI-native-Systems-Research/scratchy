@@ -9218,10 +9218,10 @@ impl Worker for MetalWorker {
             pooler_output,
             // ⛔ EMPTY, AND THE EMPTINESS IS THE STATEMENT. `kv_extent` reports a KV span that has run
             // ahead of a request's token count, which happens only where a batched write appends every
-            // row of a batch at ONE slot (the spyre pool). Here each request is written at its own
-            // `slot_mapping` position, so slot == token, the whole computed prefix is cacheable, and the
-            // scheduler's own arithmetic is already right — reporting would give it a second source for a
-            // number it can derive correctly.
+            // row of a batch at ONE slot (a collapsed-write paged pool). Here each request is written
+            // at its own `slot_mapping` position, so slot == token, the whole computed prefix is
+            // cacheable, and the scheduler's own arithmetic is already right — reporting would give it
+            // a second source for a number it can derive correctly.
             //
             // ⛔⛔ THIS FILE DID NOT COMPILE FOR FOUR COMMITS BECAUSE THE FIELD WAS ADDED WITHOUT IT.
             // `--features metal` was broken on this branch from cc9d77c1 while every check I ran was

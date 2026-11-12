@@ -14,8 +14,8 @@
 //!
 //! This is target-neutral tape substrate: [`wave_order`] lays a tape's ops out level by level, so
 //! a target whose barriers drain everything in flight runs independent branches between the same
-//! barriers; the spyre reroll can consume the same levels when its launch-group construction moves
-//! tape-side.
+//! barriers; a rerolling target can consume the same levels when its launch-group construction
+//! moves tape-side.
 
 use crate::handoff::LoweredDecode;
 use crate::lower::{ArchOp, InputRef, LoweringInput};

@@ -21,13 +21,6 @@ pub mod ops;
 pub mod fixtures;
 pub mod lower;
 /// The dataflow facts one persistent kernel needs to play a tape: waits, units, coherence.
-/// SubtileIR → KTIR (IBM Spyre target). The macro calls it under `-Fspyre`.
-/// ALSO needed by `-Fsuperdsc`: `emit_bundle` builds the source/dim manifest via
-/// `lower_graph_to_ktir`, which the sdsc bundle embeds — so gate on either.
-/// Off the SAME fused tape as the KTIR lowering; emits the TILE-LEVEL,
-/// work-divided SuperDSC (SDSC) bundle DeepTools' `dxp_standalone --bundle`
-/// compiles — the perf path that OWNS the 32-core work-division. (The old
-/// `lower_subtile_tape_to_sengraph` peer was DELETED — sengraph is a dead end.)
 /// The head-dim value→const door whose arms the build script generated from
 /// `crates/models/arch/*/configs/*.json`, typed on `scratchy_ir::model_facts::HeadDim`. Always
 /// compiled: the value side of the geometry is the facts' own [`Attention`], threaded from the

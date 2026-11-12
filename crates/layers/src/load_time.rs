@@ -112,7 +112,7 @@ pub fn record_alloc_copy(bytes: usize, start: Instant) {
 }
 
 /// The backend allocator's ALIAS of its source instead of a copy — the bytes
-/// already live where the backend wants them (a registered mmap under spyre's
+/// already live where the backend wants them (a registered mmap under a
 /// host-memory allocator), so the "allocation" is a keepalive handle and this
 /// records the bytes that DID NOT copy. A load where every weight views is a
 /// load whose `alloc-copy` line reads zero calls.

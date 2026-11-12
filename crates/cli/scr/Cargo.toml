@@ -112,7 +112,7 @@ rag = ["scratchy-serving-api?/rag"]
 # (`default-features = false` below) — naming zero is a build-time panic,
 # not a silently empty binary.
 
-# The shared commands, as a library a target's own binary (`spyre`) runs them through.
+# The shared commands, as a library a target's own binary runs them through.
 [lib]
 name = "scratchy_cli"
 path = "src/lib.rs"

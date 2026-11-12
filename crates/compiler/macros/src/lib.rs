@@ -518,9 +518,10 @@ impl std::fmt::Display for CarrierError {
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
 ///
-/// `dump_dir`: where a spyre bake writes each bundle's dxp input — the build script's own output
-/// directory when its build asked for the dump (`superdsc-dump`), else `None` (no dump). The caller
-/// is the one place that knows the directory, so the bake never reads the environment for it.
+/// `dump_dir`: where a dumping bake writes each bundle's backend-compiler input — the build
+/// script's own output directory when its build asked for the dump, else `None` (no dump). The
+/// caller is the one place that knows the directory, so the bake never reads the environment for
+/// it.
 ///
 /// `emitter`: the target this build compiles for ([`target::TargetEmitter`]) — what it emits for a
 /// model is its own.
@@ -763,11 +764,11 @@ pub fn compile_carrier(
     if quantizations_path.exists() {
         tracked_paths.insert(quantizations_path);
     }
-    // The Triton splice's kernels need NO entry here: the splice
-    // `include_str!`s every `.py` it compiles (its registry rows),
+    // A target's spliced kernels need NO entry here: the splice
+    // `include_str!`s every source it compiles (its registry rows),
     // which is cargo's own dependency edge — editing a kernel
-    // rebuilds the splice and every caller, on spyre builds only,
-    // with a missing kernel a compile error rather than a silent
+    // rebuilds the splice and every caller, on the builds that splice
+    // it, with a missing kernel a compile error rather than a silent
     // fs miss. (The read_dir block this replaces tracked the
     // directory for EVERY backend and could silently track nothing
     // on a read error — the stale-bake bug it existed to prevent.)
@@ -1970,9 +1971,9 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-tp inventory submission, into the target's own registry row (`MetalArchRegistration` /
-    // `SpyreArchRegistration`, each wrapping the shared `ArchRegistration` over its
-    // `dyn <Target>Weights`). Each closure passes its own tp constant into `Weights::load(...)`;
+    // Per-tp inventory submission, into the target's own registry row (`MetalArchRegistration`
+    // under metal), each wrapping the shared `ArchRegistration` over its
+    // `dyn <Target>Weights`. Each closure passes its own tp constant into `Weights::load(...)`;
     // the matching arm there walks only the tp-N variants. The submit! block is a static
     // initializer — N submissions at compile time, walked once at runtime by the target's
     // `try_load(arch_hint, tp_world_size)`.

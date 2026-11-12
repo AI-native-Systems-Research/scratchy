@@ -3,11 +3,11 @@
 //!
 //! Weights are stored as `GpuTensor` (raw GPU pointers / metadata only). The
 //! struct/enum definitions and their *pure* shape/accessor methods live here so
-//! both `targets/{metal,spyre}` can name them without a circular dependency. The
+//! every target crate can name them without a circular dependency. The
 //! kernel-calling `forward` passes live in the target crates as `*Ops`
 //! extension traits; the **backend-neutral** `GpuWeights`-bound `load_*` logic
 //! (which names only neutral `GpuWeights` access methods) lives here as shared
-//! free fns both targets delegate to — only genuinely backend-divergent loads
+//! free fns every target delegates to — only genuinely backend-divergent loads
 //! (metal direct-write packing, the RmsNorm keep-dtype split) stay in the target crates.
 
 use anyhow::Result;

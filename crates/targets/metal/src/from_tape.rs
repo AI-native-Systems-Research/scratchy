@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! METAL, LOWERED FROM THE SHARED `SubtileTape`.
 //!
-//! ⭐ ONE FRONT END. Metal reads the SAME artifact spyre lowers — the `SubtileTape` — so "one
-//! front end" names one object rather than one crate boundary.
+//! ⭐ ONE FRONT END. Metal reads the SAME artifact every target lowers — the `SubtileTape` —
+//! so "one front end" names one object rather than one crate boundary.
 //!
-//! ⛔ AND IT LIVES IN THE TARGET CRATE, not in `compiler/macros`. Spyre's emitter is
-//! `targets/spyre/src/lower_subtile_tape_to_superdsc.rs`; this is its metal counterpart. A
-//! `metal_*` module inside the shared compiler is target-specific code in a common crate, which
-//! is the arrangement this whole line of work exists to remove.
+//! ⛔ AND IT LIVES IN THE TARGET CRATE, not in `compiler/macros`. Each target's emitter lives
+//! in its own target crate; this is metal's. A `metal_*` module inside the shared compiler is
+//! target-specific code in a common crate, which is the arrangement this whole line of work
+//! exists to remove.
 //!
 //! ## What the tape gives
 //!
@@ -17,8 +17,8 @@
 //!
 //! ## Tiling is a target fact
 //!
-//! The graph is built with `nb = u32::MAX` — WHOLE ops. Spyre tiles to 128-column pages
-//! (`decompose_rmsnorm`, `head_tile_rope`) because its substrate requires it; metal's kernels
+//! The graph is built with `nb = u32::MAX` — WHOLE ops. A target whose substrate requires
+//! 128-column pages tiles to them (`decompose_rmsnorm`, `head_tile_rope`); metal's kernels
 //! take a whole `RmsNorm` and a whole rope. Same builder, same tape, different `nb`.
 
 use scratchy_subtile::subtile_ir::{SubtileIR, SubtileId, TensorId};
@@ -100,16 +100,16 @@ pub enum TapeItem {
     },
 }
 
-/// Build the graph metal lowers from, out of the same `LoweringInput` spyre starts from.
+/// Build the graph metal lowers from, out of the same `LoweringInput` every target starts from.
 ///
 /// ⛔ NO `fuse_silu_mul`, AND NOT BECAUSE IT IS HARD. That pass DROPS ops and renumbers the
 /// rest, so provenance would point at the fused list while metal's emitter indexes the original
-/// — every weight off by the number of fusions before it. It is also spyre's fusion: spyre has a
-/// SiluMul kernel, metal declares its own (`op_abi::METAL_FUSIONS`). WHICH FUSIONS TO APPLY IS A
+/// — every weight off by the number of fusions before it. It is also a fusion for a target with a
+/// SiluMul kernel; metal declares its own (`op_abi::METAL_FUSIONS`). WHICH FUSIONS TO APPLY IS A
 /// TARGET FACT; the builder underneath is the shared one.
 ///
-/// Likewise `nb = u32::MAX` — WHOLE ops. `decompose_rmsnorm` and `head_tile_rope` exist because
-/// spyre's substrate wants 128-column pages; metal's kernels take a whole RmsNorm and a whole
+/// Likewise `nb = u32::MAX` — WHOLE ops. `decompose_rmsnorm` and `head_tile_rope` exist for a
+/// substrate that wants 128-column pages; metal's kernels take a whole RmsNorm and a whole
 /// rope. Same builder, same tape, different `nb`.
 pub fn graph_for_metal(input: &scratchy_subtile::lower::LoweringInput) -> SubtileIR {
     let nb = std::num::NonZeroU32::MAX;

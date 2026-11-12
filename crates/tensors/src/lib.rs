@@ -7,7 +7,7 @@
 //! descriptor), [`TensorView`] (lifetime-checked borrow), [`DType`], and
 //! the [`DeviceAllocator`] host→device transfer trait. Pure metadata +
 //! traits — no device calls — so it compiles everywhere and gives the
-//! `targets/{metal,spyre}` crates a shared home that cannot name a backend.
+//! target crates a shared home that cannot name a backend.
 
 pub mod bundle_roles;
 pub mod compiler_ids;
@@ -30,8 +30,8 @@ pub use tensor::{GpuTensor, TensorView};
 pub use weight_path::{layer_weight_path_with_root, vision_block_weight_path};
 pub use weight_source::WeightSource;
 
-/// The stream a weight load queues its host→device copies on. Neither metal
-/// nor spyre has one, so it is `()`; the load signatures keep the parameter so
+/// The stream a weight load queues its host→device copies on. No backend
+/// has one, so it is `()`; the load signatures keep the parameter so
 /// they stay one shape across backends.
 pub type LoadStream = ();
 

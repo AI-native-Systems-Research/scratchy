@@ -3,8 +3,8 @@
 //!
 //! Weights are stored as `GpuTensor` (raw GPU pointers / metadata only). The
 //! struct/enum definitions and the pure `MoeRouting` borrow-bundle + the pure
-//! `select_moe_block_m` heuristic live here so both `targets/{metal,spyre}` can
-//! name them without a circular dependency. The `GpuWeights`-bound `load_*`
+//! `select_moe_block_m` heuristic live here so every target crate can name
+//! them without a circular dependency. The `GpuWeights`-bound `load_*`
 //! constructors live in the target crates as per-type `*Ops` extension traits —
 //! this crate names no backend.
 

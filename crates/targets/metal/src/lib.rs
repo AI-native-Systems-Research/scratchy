@@ -229,8 +229,8 @@ pub mod chain_advance;
 pub mod cpu_reference;
 pub mod device;
 pub mod dflash2;
-/// Metal lowered from the SHARED `SubtileTape` — the same artifact spyre lowers. Lives here,
-/// in the target crate, beside spyre's `lower_subtile_tape_to_superdsc`.
+/// Metal lowered from the SHARED `SubtileTape` — the same artifact every target lowers. Lives
+/// here, in the target crate: target-specific lowering never lives in the shared compiler.
 pub mod from_tape;
 pub mod grammar_mask;
 pub mod logprobs;

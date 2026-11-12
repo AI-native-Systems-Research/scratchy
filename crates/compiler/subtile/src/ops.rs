@@ -12,7 +12,7 @@
 //! Adding an op = adding its variant (with its prose docs) and ONE row here. Every generated
 //! match is exhaustive over the enum, so a variant without a row is a compile error at the
 //! generated site, not a silently-unhandled case nine files away. This exists because a previous
-//! attempt at the metal/spyre unification wrote each of these facts by hand at every site: one op
+//! attempt at a cross-target unification wrote each of these facts by hand at every site: one op
 //! touched nine files, and every slot bug of that branch traced to one site disagreeing with
 //! another.
 //!

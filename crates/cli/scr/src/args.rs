@@ -336,7 +336,7 @@ pub struct ServeArgs {
     pub max_model_len: Option<usize>,
 
     /// Maximum number of concurrent sequences. Unset lets the BACKEND choose:
-    /// its own batched-decode width where that is fixed at build time (Spyre's
+    /// its own batched-decode width where that is fixed at build time (a
     /// baked rung ladder), else a device-appropriate default. An explicit value
     /// is honoured, capped to what the backend can actually batch.
     #[arg(long)]

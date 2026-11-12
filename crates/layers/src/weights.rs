@@ -318,14 +318,14 @@ pub struct GpuWeights<A: DeviceAllocator> {
     /// on-disk dtype). Set once per model from `W::SCALE_DTYPE`;
     /// [`take_as_dtype`](Self::take_as_dtype) honors it, converting only when
     /// the on-disk gain dtype differs (so the mlx zero-copy path is preserved).
-    /// `None` leaves the gain at its on-disk dtype (spyre, which casts the
-    /// gain themselves, never set it).
+    /// `None` leaves the gain at its on-disk dtype (a backend that casts the
+    /// gain itself never sets it).
     rmsnorm_scale_dtype: Option<DType>,
     /// Reusable host scratch for casting a tensor before upload.
     /// Grows as needed, never shrinks.
     cast_scratch: Vec<u8>,
     /// Backend allocator: device memory + H2D primitive (`MetalAllocator`
-    /// under metal, `SpyreAllocator` under spyre).
+    /// under metal; each target supplies its own).
     allocator: A,
     /// Keep mmaps alive for the lifetime of GpuWeights.
     ///
@@ -800,15 +800,15 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     }
 
     /// The pinned RMSNorm gain dtype, if any. Metal's RMSNorm loader uses it
-    /// to decide whether the on-disk gain needs converting; `None` (spyre,
-    /// GGUF) means keep the on-disk dtype.
+    /// to decide whether the on-disk gain needs converting; `None` (a backend
+    /// that casts the gain itself, GGUF) means keep the on-disk dtype.
     pub fn rmsnorm_scale_dtype(&self) -> Option<DType> {
         self.rmsnorm_scale_dtype
     }
 
     // ---- Accessors for backend extension traits ------------------------------
     // GpuWeights itself is backend-neutral; the backend upload methods live in
-    // extension traits in `targets/{metal,spyre}` and reach the
+    // extension traits in the target crates and reach the
     // private loader state through these.
 
     /// The backend allocator (device memory + H2D primitive).
@@ -908,8 +908,8 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// Metal's RMSNorm gain load uses this: the `_s_<scale>_` kernel binds the
     /// gain through a `device const T_scale*` chosen at compile time from
     /// `W::SCALE_DTYPE`, so the gain buffer's dtype must match `T_scale`
-    /// regardless of what the checkpoint shipped. Spyre doesn't need it — it
-    /// casts the gain at load unconditionally.
+    /// regardless of what the checkpoint shipped. A backend that casts the gain
+    /// at load unconditionally doesn't need it.
     pub fn take_as_dtype(&mut self, name: &str, target: DType) -> Result<GpuTensor> {
         // Inspect the on-disk dtype without consuming the entry. GGUF dense
         // tensors are already device-resident in compute dtype — keep_dtype
@@ -1089,7 +1089,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// that need to be kept on CPU or uploaded to GPU as f32.
     /// Take a tensor's RAW typed bytes (no f32 conversion) + its dtype + shape —
     /// the zero-conversion ingest path for backends whose device dtype matches
-    /// the on-disk dtype (Spyre f16), or that narrow typed bytes themselves
+    /// the on-disk dtype (an f16 device), or that narrow typed bytes themselves
     /// (bf16→f16 on ingest). Destructive, like [`take_to_cpu_f32`]; copies the
     /// mmap'd bytes once into an owned `Vec<u8>`.
     pub fn take_to_cpu_bytes(&mut self, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {

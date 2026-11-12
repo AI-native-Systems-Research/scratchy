@@ -12,19 +12,19 @@
 //! target inherits it by construction rather than by re-deriving it.
 //!
 //! ⛔ WHY THIS EXISTS AT ALL. Without it the accessor set had one producer and
-//! it was target-locked: metal's instruction-stream bridge. Under spyre it is
-//! empty, so the emitted `Weights` struct carried NO weight fields — verified
+//! it was target-locked: metal's instruction-stream bridge. Under any other
+//! target it is empty, so the emitted `Weights` struct carried NO weight fields — verified
 //! in generated output:
 //!
 //! ```ignore
 //! pub struct Weights { pub rotary: RotaryCache }   // that is all
 //! ```
 //!
-//! and the spyre worker consequently re-found all 362 granite tensors at
+//! and that target's worker consequently re-found all 362 granite tensors at
 //! RUNTIME by string-formatting `"{disk}.weight"` off a JSON manifest. That
 //! string rule cannot express a bare `nn.Parameter` (gemma-4's `layer_scalar`,
 //! which has no `.weight` suffix) or a non-default decoder root
-//! (`model.language_model`), which is why gemma-4 could not run on spyre. The
+//! (`model.language_model`), which is why gemma-4 could not run there. The
 //! fix is not a better string rule; it is emitting the fields at all.
 
 use crate::classified::{Program, UnrollIndex, WeightId};
@@ -48,7 +48,7 @@ pub enum MlpPacking {
     /// ONE buffer holding both, named `{gate}__fused__{up}` — metal's fused-MLP kernel reads a
     /// single packed weight.
     Packed,
-    /// Two weights. Spyre's MLP is two matmuls plus a `SiluMul`, with no packed-buffer kernel.
+    /// Two weights: an MLP of two matmuls plus a `SiluMul`, with no packed-buffer kernel.
     Split,
 }
 
@@ -499,9 +499,9 @@ mod tests {
 
     /// ⭐⭐ THE ONE THING THE TWO PRODUCERS EVER DISAGREED ABOUT, AS A TEST.
     ///
-    /// Metal's kernel reads gate and up from ONE packed buffer; spyre binds two weights. That
-    /// is a target-ABI fact, so it is an ARGUMENT — and this pins both answers from one walk,
-    /// which is the whole reason the inline metal producer could be deleted.
+    /// Metal's kernel reads gate and up from ONE packed buffer; a split-MLP target binds two
+    /// weights. That is a target-ABI fact, so it is an ARGUMENT — and this pins both answers from
+    /// one walk, which is the whole reason the inline metal producer could be deleted.
     ///
     /// The packed name is load-bearing, not cosmetic: the emitted load body recovers the
     /// sources by splitting it on `__fused__`, so a different spelling is a field that resolves
@@ -587,7 +587,7 @@ mod tests {
 
     /// ⭐ THE PROPERTY THE WHOLE GENERATED LOADER RESTS ON: one field per
     /// DISTINCT `(weight, layer)`, and a weight bound by several ops is ONE
-    /// field. Before this walk existed the accessor set was empty under spyre
+    /// field. Before this walk existed the accessor set was empty off metal
     /// and the worker re-found every tensor by string, so "did we derive a
     /// field for each bound weight" is the invariant worth pinning.
     #[test]

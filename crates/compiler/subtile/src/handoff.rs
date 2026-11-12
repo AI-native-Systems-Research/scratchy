@@ -28,7 +28,7 @@ pub struct TileId(pub u32);
 /// [`SourceBinding::BundleTensor`] names.
 ///
 /// ⭐ THE SHARED SUBSET ONLY. A variant belongs here when MORE THAN ONE target binds that
-/// tensor off the bundle — spyre stages each as its own `BoundWeight` and metal reads it
+/// tensor off the bundle — a staging target binds each as its own weight and metal reads it
 /// through its own `WeightTensor` at lowering, so both must agree on the vocabulary. A
 /// tensor exactly one target reads (a shared-expert slab, a GDN table) stays that target's
 /// own enum and never appears here.

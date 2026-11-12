@@ -4,7 +4,7 @@
 //! Principle, not a file list: a backend is selected by which target crate the
 //! binary links (unconditional `dep:` + a feature on the *binary*), and dispatch
 //! happens through neutral trait/registry seams — NOT by sprinkling
-//! `#[cfg(feature = "metal")]` / `#[cfg(any(metal, spyre))]` through neutral code
+//! `#[cfg(feature = "metal")]` / `#[cfg(any(metal, cuda))]` through neutral code
 //! or even inside the target crates (which are unconditionally their target).
 //!
 //! These tests walk whole directory zones and fail listing every violation, so
@@ -164,7 +164,7 @@ fn no_target_cfg_in_tensors() {
     assert_zone_clean("crates/tensors");
 }
 
-// NOTE: `crates/targets/{metal,spyre}` are split per-target — they ARE a
+// NOTE: the crates under `crates/targets/` are split per-target — they ARE a
 // specific backend and may name it freely. They are deliberately
 // NOT in the agnostic zone list above. (A per-target crate must still pull its
 // deps unconditionally rather than cfg-gate them, but that is a Cargo concern,

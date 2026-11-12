@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "The models build driver: every selected arch's DSL carrier through the shared pipeline, for the target whose emitter the calling build script hands it"
 
-# A build-dependency of each target's models crate (`scratchy-models` for metal, the spyre models
-# crate for spyre). Target-neutral: the target is the `TargetEmitter` the caller passes.
+# A build-dependency of each target's models crate (`scratchy-models` for metal; every other target
+# has its own). Target-neutral: the target is the `TargetEmitter` the caller passes.
 [dependencies]
 scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
 scratchy-core-model = { workspace = true }

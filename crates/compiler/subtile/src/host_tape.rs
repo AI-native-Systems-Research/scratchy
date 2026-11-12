@@ -4,10 +4,10 @@
 //! A compiled bundle is not a program. It is a set of KERNELS. What actually
 //! runs a model is the host-side sequence between them: gather the embedding
 //! row, upload it, launch a device program, read the logits back, fill a mask,
-//! launch again. Today that sequence exists as hand-written control flow
-//! (`spyre_worker::superdsc_forward_chunk` — ~970 lines of `acts.push(...)`,
-//! `run_step(...)`, `read_tensor(...)` interleaved with `if` on facts the bake
-//! already decided). This module is that sequence as DATA.
+//! launch again. Hand-written, that sequence is control flow — hundreds of
+//! lines of `acts.push(...)`, `run_step(...)`, `read_tensor(...)` interleaved
+//! with `if` on facts the bake already decided. This module is that sequence
+//! as DATA.
 //!
 //! ⛔ NAMING, BECAUSE THIS REPO ALREADY HAS THREE "TAPE"S:
 //!   - `subtile_tape::SubtileTape` — the rerolled per-wavefront op tape (compiler IR)
@@ -131,7 +131,7 @@ pub struct HostTape<'a> {
 }
 
 /// What a target must provide. FOUR primitives, and every tape player in the
-/// system is the same loop over them — metal, spyre and cuda differ only here.
+/// system is the same loop over them — targets differ only here.
 ///
 /// ⛔ A GENERIC BOUND, NOT `dyn`. The player is monomorphised per target; there
 /// is no runtime dispatch and no plugin registry. scratchy generates and
@@ -212,8 +212,8 @@ mod tests {
 
     /// ⭐ THE SHAPE OF A REAL FORWARD, as the tape sees it: a CPU kernel
     /// produces the embedding row, a device kernel consumes it and writes
-    /// logits, and the logits come back. This is exactly the sequence
-    /// `superdsc_forward_chunk` spells as control flow.
+    /// logits, and the logits come back. This is exactly the sequence a
+    /// hand-written forward spells as control flow.
     ///
     /// What it pins: a HOST step performs NO transfer and NO launch (it is a
     /// direct call), and a DEVICE step moves only the operands that say so, in
@@ -326,8 +326,8 @@ mod tests {
 
     /// A baked CONSTANT (`0.5`, `±448`, the identity, the ones vector, the rope
     /// permutation) is the same shape as a weight load, and that is the whole
-    /// reason it can be hoisted: today those are rebuilt and re-uploaded on
-    /// EVERY forward inside `superdsc_forward_chunk`. As a step with a
+    /// reason it can be hoisted: written as control flow, those are rebuilt and
+    /// re-uploaded on EVERY forward. As a step with a
     /// `ToDevice` output it belongs to whichever tape it is placed on, and
     /// putting it on the LOAD tape uploads it once.
     #[test]

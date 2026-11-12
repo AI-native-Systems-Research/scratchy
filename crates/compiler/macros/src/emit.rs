@@ -25,8 +25,8 @@ pub fn weight_field_name(
     format_ident!("{}", weight_field_stem(&program.weights, id, index))
 }
 
-/// [`weight_field_name`]'s spelling as a plain `String` — for code that must not hold a token (the
-/// spyre bake's parallel rungs: a `proc_macro2::Ident` cannot cross threads).
+/// [`weight_field_name`]'s spelling as a plain `String` — for code that must not hold a token (a
+/// bake's parallel rungs: a `proc_macro2::Ident` cannot cross threads).
 pub fn weight_field_stem(
     weights: &crate::classified::WeightTable,
     id: WeightId,

@@ -14,7 +14,7 @@ default = []
 # `RowsExtern` — which host-staged buffer a `LoadRows` reads — is one type across every IR: the
 # `Instruction`, this crate's `SubOp`, the metal step. scratchy-ir never reaches back here.
 scratchy-ir = { path = "../ir" }
-# The tensor-parallel world as a type: `tensor_parallel::shard` is generic over it, and the spyre
+# The tensor-parallel world as a type: `tensor_parallel::shard` is generic over it, and a target's
 # collective protocol names the same type.
 scratchy-tp-world = { path = "../../core/tp-world" }
 scratchy-tensors = { path = "../../tensors" }

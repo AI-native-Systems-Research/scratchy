@@ -1390,10 +1390,11 @@ fn reroll_fingerprint(instr: &Instr, classes: &[u64]) -> u64 {
 /// `[start, start + period * iters)` is `iters` fingerprint-identical copies of a `period`-length
 /// body.
 ///
-/// [`reroll_subtile_tape`] uses it to build the rolled tape spyre lowers. A target that emits its
-/// own instruction stream — metal — asks for the same answer here and maps it through its own
-/// step→instruction spans, instead of re-searching its stream for a repeating run. ONE search,
-/// one answer, so the two targets cannot disagree about where the layer boundary is.
+/// [`reroll_subtile_tape`] uses it to build the rolled tape a looping target lowers. A target
+/// that emits its own instruction stream — metal — asks for the same answer here and maps it
+/// through its own step→instruction spans, instead of re-searching its stream for a repeating
+/// run. ONE search, one answer, so the two targets cannot disagree about where the layer
+/// boundary is.
 /// The per-instruction CLASS fingerprints [`find_layer_loop`] searches.
 ///
 /// Exposed so a target can split a detected run into per-layer classes without re-deriving the
@@ -1469,11 +1470,11 @@ pub enum RollPlan {
 
 /// ⭐ THE TAPE'S LAYERS AS SLICES — the shared half of every class-aware roll.
 ///
-/// [`layer_class_plan`] (metal) and [`reroll_layer_classes`] (spyre) both need the same answer:
-/// where each layer's steps live on the un-rolled tape, which ABSOLUTE layer it is, and where the
-/// pre-layer prefix / post-layer suffix start. Derived ONCE here so the two targets cannot disagree
-/// about where the layer boundary is — the same discipline as [`find_layer_loop`] being "one search,
-/// one answer" for the single-class roll.
+/// [`layer_class_plan`] (metal) and [`reroll_layer_classes`] (a looping target) both need the
+/// same answer: where each layer's steps live on the un-rolled tape, which ABSOLUTE layer it is,
+/// and where the pre-layer prefix / post-layer suffix start. Derived ONCE here so the two targets
+/// cannot disagree about where the layer boundary is — the same discipline as
+/// [`find_layer_loop`] being "one search, one answer" for the single-class roll.
 ///
 /// ⛔ A LAYER IS NAMED BY ITS KV WRITER. Every layer must hold exactly one step carrying a layer
 /// index, advancing by one constant stride. Anything else is `None`.
@@ -2238,7 +2239,7 @@ pub fn reroll_subtile_tape<F: crate::subtile_ir::RopeForm>(
 ///
 /// — sibling loops, OUT OF TRUE LAYER ORDER (all of class 0's layers, then all of class 1's). The
 /// true order is not lost: every body `Compute` carries its class's per-layer node table
-/// (`per_layer_out`, indexed by class-relative position), and the spyre lowering re-derives the
+/// (`per_layer_out`, indexed by class-relative position), and the target's lowering re-derives the
 /// launch sequence from those tables + the nodes' own layer indices. The loop-carried residual
 /// threads through ONE shared carried slot per carried value, seeded by the prefix and phi'd
 /// through EVERY loop, so linear SSA order is exactly the true dataflow.

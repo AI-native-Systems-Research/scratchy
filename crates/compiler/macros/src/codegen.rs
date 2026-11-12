@@ -228,8 +228,8 @@ enum FieldLoad {
     /// dequant: `Embedding::load_affine_dequant(gw, prefix, group_size, bits)`.
     /// Chosen when the embed ACCESSOR is a dense `Embedding` (not the metal
     /// `AffineQuantEmbedding`) yet the on-disk storage is Affine — the
-    /// storage-agnostic path `EmbedRefImpl` takes under spyre (the host worker
-    /// dequantizes the embed weight), so the loaded field type matches the
+    /// storage-agnostic path `EmbedRefImpl` takes on a host-dequant target (the
+    /// host worker dequantizes the embed weight), so the loaded field type matches the
     /// dense accessor. Distinct from [`Self::EmbeddingAffine`], which keeps the
     /// packed `AffineQuantEmbedding` for metal's fused gather+dequant kernel.
     EmbeddingAffineDequant {
@@ -982,7 +982,7 @@ fn storage_requirement_error(
 }
 
 /// Did the solver keep the `embed_tokens` of `accessors` as the packed `AffineQuantEmbedding`
-/// (metal's fused gather+dequant) or dequantize it to a dense `Embedding` (spyre/cuda host path)?
+/// (metal's fused gather+dequant) or dequantize it to a dense `Embedding` (the host-dequant path)?
 /// A tied `lm_head` follows that representation.
 fn embed_is_affine_repr(accessors: &[WeightAccessor]) -> bool {
     accessors.iter().any(|a| {
@@ -1029,7 +1029,7 @@ fn plan_field_load(
     manifest: &crate::weights_manifest::WeightsManifest,
     // Whether the `embed_tokens` accessor the solver picked is the packed
     // `AffineQuantEmbedding` representation (metal's fused gather+dequant) vs a
-    // dense `Embedding` (the host-dequant path spyre/cuda take). A tied `lm_head`
+    // dense `Embedding` (the host-dequant path). A tied `lm_head`
     // must follow the embedding's REPRESENTATION, not the raw on-disk storage:
     // when the embed is dense, the tied head reuses its dense weight; only when
     // the embed keeps the affine triple does the head read `scales`/`biases`.
@@ -1663,7 +1663,7 @@ fn plan_field_load(
             // built field matches the struct field. A metal `AffineQuantEmbedding`
             // accessor keeps the packed bundle (`EmbeddingAffine`); a dense
             // `Embedding` accessor with Affine storage — the storage-agnostic
-            // path `EmbedRefImpl` takes under spyre — dequantizes host-side.
+            // path `EmbedRefImpl` takes on a host-dequant target — dequantizes host-side.
             return if is_affine_quant_embedding {
                 FieldLoad::EmbeddingAffine {
                     prefix,
@@ -1744,7 +1744,7 @@ fn plan_field_load(
             // REPRESENTATION: only when the embed kept the affine triple
             // (`embed_is_affine_repr`, i.e. metal) does the tied head read
             // its `scales`/`biases`. When the embed was dequantized to a dense
-            // `Embedding` (spyre/cuda host path) the tied head reuses the dense
+            // `Embedding` (the host-dequant path) the tied head reuses the dense
             // weight, so `affine` stays `None`.
             let mut affine: Option<(u32, u32)> = None;
             if embed_is_affine_repr {
@@ -3638,8 +3638,8 @@ fn emit_weights_struct(
         })
     });
 
-    // The RoPE tables are `OnceLock`s: spyre builds them at load, metal when its pool is
-    // built (`build_rope_tables`), for the positions the KV cache's block table reaches.
+    // The RoPE tables are `OnceLock`s: a target builds them at load, or (metal) when its pool
+    // is built (`build_rope_tables`), for the positions the KV cache's block table reaches.
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::std::sync::OnceLock<crate::__gpu::rotary::RotaryCache>, }
     } else {
@@ -3715,7 +3715,7 @@ fn emit_weights_struct(
     // `max_model_len` (a chat context of 4-8K on Llama-3.2's 131072 builds
     // 16-32× fewer), capped by `__rope_rows`, the most a request can reach:
     // `max_position_embeddings`. Whatever builds the tables binds `__rope_rows`
-    // ahead of these loads: spyre's `load`, and metal's `build_rope_tables`,
+    // ahead of these loads: a target's `load`, or metal's `build_rope_tables`,
     // whose `max_model_len` is also capped at the block table's reach.
     let rope_rows: TokenStream = if uses_rotary || uses_rotary_local {
         let max_pos = *model
@@ -4054,7 +4054,7 @@ fn emit_weights_struct(
     // and ignores the layer arg.
     // Weight-getter `impl Weights` (reads `self.<field>`). Emitted unconditionally
     // for every target — `crate::__gpu` resolves the field types per backend
-    // (metal/spyre target crate, or `scratchy-layers` with no backend), so
+    // (the target crate, or `scratchy-layers` with no backend), so
     // the same accessors compile everywhere. No backend is special-cased.
     let accessor_methods = emit_weights_accessor_methods(&accessors, dims);
 
@@ -4117,10 +4117,10 @@ fn emit_weights_struct(
 
     // The `Weights` struct: one field per weight handle, emitted UNCONDITIONALLY
     // for every target. The field types are written through `crate::__gpu::…`,
-    // which each backend crate (metal/spyre) provides — and `scratchy-layers`
-    // provides in the no-backend default build. So the same struct compiles under
-    // every target with no backend special-cased: spyre carries the same real
-    // `Weights` metal does, differing only in which crate `__gpu` names.
+    // which each backend crate provides — and `scratchy-layers` provides in the
+    // no-backend default build. So the same struct compiles under every target
+    // with no backend special-cased: every target carries the same real
+    // `Weights`, differing only in which crate `__gpu` names.
     // The target's own fields on the canonical struct.
     let target_fields = emitter.weights_fields();
     let weights_def: TokenStream = match &mode {
@@ -5118,8 +5118,8 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             group_size,
             bits,
         } => {
-            // Dense `Embedding` accessor + Affine storage (spyre's storage-agnostic
-            // embed path): dequantize the affine triple host-side into a dense
+            // Dense `Embedding` accessor + Affine storage (the storage-agnostic
+            // host-dequant embed path): dequantize the affine triple host-side into a dense
             // embedding table so the loaded value matches the dense field type.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
@@ -8700,7 +8700,7 @@ fn emit_canonical_params_impl(
         // backend feature.
         impl ::scratchy_forward_compiler::CanonicalParams for Weights {
             const FACTS: ::scratchy_forward_compiler::model_facts::ModelFacts = #facts_tokens;
-            // The MLA dims: no fact covers them yet (no metal or spyre path reads them).
+            // The MLA dims: no fact covers them yet (no target path reads them).
             #mla_consts
         }
     }
@@ -8987,7 +8987,7 @@ pub fn emit_model(
         dims
     };
     // ⭐ THE MODEL'S FACTS (#1083), computed ONCE here and threaded to every consumer below:
-    // the bridge calls (the spyre weight struct, metal's tape fingerprint, metal's canonical
+    // the bridge calls (a target-derived weight struct, metal's tape fingerprint, metal's canonical
     // lowering) and the per-canonical `CanonicalParams` impl. Every fact is a field of this
     // one value; nothing below re-reads a config or a bound for a fact it states.
     let (model_facts, mla_consts) = fill_canonical_params(
@@ -9004,7 +9004,7 @@ pub fn emit_model(
         facts: &model_facts,
     };
 
-    // THE MODEL'S WEIGHTS STRUCT. A target that derives it itself (spyre: from its decode tape's
+    // THE MODEL'S WEIGHTS STRUCT. A target that derives it itself (e.g. from its decode tape's
     // weight bindings) hands it back; otherwise the accessor-less first pass, which the tape
     // re-emits below once the front-end swap has produced its accessors.
     let (weights, weights_affine_rows) = {
@@ -9041,8 +9041,9 @@ pub fn emit_model(
     // fn-pointer to) is preserved. Dedup runs over `(num_tokens,
     // sk_bucket)` 2-D points.
     //
-    // Spyre folds every point onto the FIRST point: its per-bucket host
-    // tapes are all empty (the model runs from the embedded KTIR bundle).
+    // A non-metal build folds every point onto the FIRST point: its
+    // per-bucket host tapes are all empty (the model runs from the target's
+    // embedded bundle).
     let bucket_points: Vec<WorkloadPoint> = workloads.iter().copied().collect();
     #[cfg(not(feature = "metal"))]
     let bucket_canonical: Vec<WorkloadPoint> =
@@ -9291,8 +9292,8 @@ pub fn emit_model(
     // + post-loop-compression, and the `(bucket, op_idx, slot)` triples must
     // match the very match table `emit_weight_accessors_impl` builds from this
     // same `canonical_lowered`.
-    // Wavefront-emitting builds only — spyre lowers the decode to a single
-    // fused KTIR/SuperDSC bundle. Plain metal dispatches per-op and skips
+    // Wavefront-emitting builds only — a bundle target lowers the decode to a
+    // single fused bundle. Plain metal dispatches per-op and skips
     // this; the expensive lowering + its hard panic on un-lowerable models
     // must not run for them.
 
@@ -12546,7 +12547,7 @@ mod fingerprint_tests {
     /// MLA variants of this pin left with their deepseek-v3 configs,
     /// #721.)
     // FP8-block presets are not claimable under metal (`quant_preset_active`), so no
-    // FP8-block variant exists to fingerprint there; the spyre build's test step runs this.
+    // FP8-block variant exists to fingerprint there; a non-metal build's test step runs this.
     #[cfg(not(feature = "metal"))]
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {

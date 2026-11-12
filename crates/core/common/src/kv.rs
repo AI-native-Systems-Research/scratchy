@@ -17,8 +17,8 @@
 //!
 //! The PROPERTY is what this module is about, not any one backend: a worker reports these two numbers or
 //! it reports nothing, and reporting nothing means "my keys are at their token positions" — which is what
-//! every budget-sized paged GPU pool means. (The backend that needs it today is the IBM Spyre paged pool,
-//! whose collapsed cache write is what makes one slot serve a whole batch.)
+//! every budget-sized paged GPU pool means. (The backend that needs it is a paged pool whose
+//! collapsed cache write is what makes one slot serve a whole batch.)
 //!
 //! ⛔ THESE TRAVEL TOGETHER, AS ONE VALUE. Sizing the allocation without capping the cache gives a
 //! later request a block hash pointing at keys for the wrong tokens; capping the cache without sizing
@@ -112,8 +112,8 @@ impl CacheableTokens {
 /// ```
 /// The scheduler computed the right reach and the tracker threw it away, for every allocation before the
 /// first report — which is exactly when a prompt is being chunked and the shared write slot is running
-/// ahead of the shallow rows. The hole pages that kept the spyre-specific KV structures alive came from
-/// there.
+/// ahead of the shallow rows. The hole pages that kept backend-specific KV structures alive came
+/// from there.
 ///
 /// A capability is a property of the backend, known before it runs; a report is a measurement of what it
 /// did. Reading the second as the first is what let a default of "token-addressed" apply to a backend
@@ -126,7 +126,7 @@ pub enum KvAddressing {
     ByToken,
     /// A batched step appends EVERY row at one shared slot, so a request shorter than its batch-mates has
     /// keys past its own token count and the host must allocate for the step's reach, not the request's
-    /// length. The spyre paged pool.
+    /// length. A paged pool whose collapsed cache write serves a whole batch at one slot.
     OneSharedWriteSlot,
 }
 

@@ -22,7 +22,7 @@ scratchy-core-common = { path = "../../core/common" }
 scratchy-layers = { path = "../../layers" }
 scratchy-quantizations = { path = "../../models/quantization" }
 scratchy-ir = { path = "../../compiler/ir", features = ["metal"] }
-# The SHARED front end. Metal lowers the same `SubtileTape` spyre lowers — see
+# The SHARED front end. Metal lowers the same `SubtileTape` every target lowers — see
 # `src/from_tape.rs`. Target-specific lowering lives in the TARGET crate, which is why
 # this edge exists rather than a `metal_*` module inside the compiler.
 scratchy-subtile = { path = "../../compiler/subtile" }

@@ -55,8 +55,8 @@ pub struct SubtileId(pub(crate) u32);
 
 impl SubtileId {
     /// The dense subtile index (read-only). Public for the same reason
-    /// `TensorId::index` is: the SDSC lowering that reads it now lives
-    /// in the spyre target crate, so it addresses nodes by index
+    /// `TensorId::index` is: a target lowering that reads it lives in
+    /// its own target crate, so it addresses nodes by index
     /// without the sealed field. Construction stays in-crate.
     pub fn index(&self) -> usize {
         self.0 as usize
@@ -2235,8 +2235,8 @@ fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId)
 
 // ── The chained head's laws (the constants every reader shares) ─────
 
-/// The chained head's index-stick width — the SENUINT32 stick (32 four-byte
-/// lanes), the format a gather's INDEX tensor carries on the spyre device.
+/// The chained head's index-stick width — the u32 index stick (32 four-byte
+/// lanes), the format a gather's INDEX tensor carries on a stick-laid-out device.
 /// The pick's own stick is [`SAMPLE_BLOCK`] (64 i32 lanes, the pick
 /// producer's output); the s/l sticks the chain reads are this NARROWER
 /// class because a staged table's gathered destination must be exactly one
@@ -2246,12 +2246,11 @@ fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId)
 /// reference's stick width.
 ///
 /// ⚠ ONE HONEST COPY, PINNED WHERE BOTH SIDES ARE VISIBLE: this value IS the
-/// ladder's `<SenUint32 as DataFormat>::ELEMS_PER_STICK`, but this crate is
-/// the LEAF and cannot depend on ktir-superdsc where that format table lives
-/// — so it is spelled here once and const-pinned equal to the ladder's
-/// derivation in `scratchy-target-spyre`'s wiring (both crates compile in
-/// one build, so a drift in either fails the build). The same shape as the
-/// senlib copies' pin.
+/// target's own u32 elems-per-stick, but this crate is the LEAF and cannot
+/// depend on the target crate where that format table lives — so it is
+/// spelled here once and const-pinned equal to the target's derivation in
+/// its own wiring (both crates compile in one build, so a drift in either
+/// fails the build).
 pub const CHAIN_IDX_BLOCK: u32 = 32;
 
 // ⭐ THE PICK'S OWN LAWS ARE THE SAMPLER'S, NEVER A SECOND COPY: the pad
@@ -2286,7 +2285,7 @@ pub fn sample_sentinel(vocab: u32) -> u32 {
 /// The chained slab's fp16 stick width — the `[hidden, 64]` slab's one-stick
 /// sub-rows. COINCIDENT with [`SAMPLE_BLOCK`] (both 64) but a DIFFERENT fact:
 /// this one is the fp16 elems-per-stick of the chained row's value operand on
-/// the spyre device, that one is the pick's idx-stick lane count. Stated
+/// a stick-laid-out device, that one is the pick's idx-stick lane count. Stated
 /// separately so neither reader silently borrows the other's law.
 pub const CHAIN_SLAB_STICK_ELEMS: u32 = 64;
 
@@ -2294,12 +2293,11 @@ pub const CHAIN_SLAB_STICK_ELEMS: u32 = 64;
 /// `floor((2 MiB − 64 KiB) × 0.2)`: the fraction `reserveFrontendLx` leaves
 /// for the scheduler to allocate ops into (the fence itself is the 0.8 carve
 /// from address 0; ProgramLayout.cpp:81-100). SPELLED HERE because this crate
-/// cannot see ktir-superdsc (the leaf-crate law: a third-party KTIR producer
-/// consumes the lowering without pulling scratchy in) while the mint and both
-/// reference arms — unconditional code in THIS crate — need the law. The same
-/// number lives beside its receipts as `VENDOR_LX_SCHED_BYTES` in
-/// ktir-superdsc's `superdsc_opspec.rs`; scratchy-target-spyre cross-pins the
-/// pair so a drift in either crate is a cargo-build failure.
+/// cannot see the target crate that owns the scheduler's facts (the leaf-crate
+/// law) while the mint and both reference arms — unconditional code in THIS
+/// crate — need the law. The same number lives beside its receipts in the
+/// target crate, which cross-pins the pair so a drift in either crate is a
+/// cargo-build failure.
 pub const CHAIN_SLAB_LX_BUDGET: u64 = 406_323;
 
 /// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S SLAB-GATHER ENTRY COUNT (#603) — how many
@@ -2308,7 +2306,7 @@ pub const CHAIN_SLAB_LX_BUDGET: u64 = 406_323;
 /// here) splits the `[hidden, CHAIN_SLAB_STICK_ELEMS]` slab into. ONE
 /// SPELLING, called at three sites — the mint (which states it into the
 /// node), the EmbedRowGather reference arm (which re-joins `s = word0/k`),
-/// and the spyre emitter — and one spelling called on the same `hidden`
+/// and the target's emitter — and one spelling called on the same `hidden`
 /// always answers the same k.
 ///
 /// THE LAW: the vendor scheduler charges a gathered op `4 × one entry's
@@ -2318,8 +2316,8 @@ pub const CHAIN_SLAB_LX_BUDGET: u64 = 406_323;
 /// `512 · (hidden/K)` B. K is the SMALLEST divisor of `hidden` with that
 /// charge ≤ [`CHAIN_SLAB_LX_BUDGET`] and `K ≤` [`CHAIN_IDX_BLOCK`] — the u32
 /// index stick's width, which is BOTH the lane pattern's home stick and the
-/// IBR entry ceiling (`CopyDims::ENTRIES_PER_OP`, the same 32 one layer up in
-/// ktir-superdsc; cross-pinned from scratchy-target-spyre). Smallest K ⇒
+/// IBR entry ceiling (the target's per-op entry ceiling, the same 32 one layer
+/// up; cross-pinned from the target crate). Smallest K ⇒
 /// largest page ⇒ the least core spread that fits. `K = 1` whenever
 /// `512 · hidden` itself fits (every hidden ≤ 793): the whole slab is ONE
 /// entry — today's geometry, and the fill's lane pattern degenerates to
@@ -2386,8 +2384,8 @@ const _: () = assert!(
 );
 
 /// ⭐ THE S-STICK SEED'S LANE PATTERN — the one spelling of the chain's s-seed
-/// law, shared by BOTH host halves that push it (the card path's `ChainSeed`
-/// steps in scratchy-target-spyre's forward_tape and the worker's dynamic
+/// law, shared by BOTH host halves that push it (the device path's `ChainSeed`
+/// steps in the target's forward tape and the worker's dynamic
 /// s-source push in scratchy-serving-worker): lane `i` of the stick carries
 /// `k·s + (i mod k)` — ENTRY `k·s + (i mod k)` of the slab gather's `k`-entry
 /// tile, the flat-address law's own addressing (the extra lanes repeat the
@@ -2402,7 +2400,7 @@ const _: () = assert!(
 /// spelling.
 ///
 /// `k ≥ 1` is the mint's stated law (asserted at the mint, guarded at the
-/// `chain_staged_tables` fill in scratchy-target-spyre); a `k` of `0` panics
+/// target's `chain_staged_tables` fill); a `k` of `0` panics
 /// the remainder here — loudly, never silently.
 pub fn chain_s_stick_pattern(k: u32, s: u32, lanes: usize) -> Vec<u32> {
     (0..lanes).map(|i| k * s + (i as u32 % k)).collect()
@@ -2420,7 +2418,7 @@ pub fn chain_s_stick_pattern(k: u32, s: u32, lanes: usize) -> Vec<u32> {
 /// occupies a stick of placement (the toy graphs the mint's surgery tests
 /// ride at sub-stick hiddens), so the count is `ceil(hidden/STICK_ELEMS)`
 /// entries over `ceil(·/CHAIN_IDX_BLOCK)` sticks. The ALIGNMENT law — hidden
-/// a whole number of fp16 sticks — is the RAMP'S and the SPYRE DOOR'S own
+/// a whole number of fp16 sticks — is the RAMP'S and the DEVICE DOOR'S own
 /// ([`chain_l_stick_ramp`] refuses a sub-stick hidden; the door's transpose
 /// leg requires both extents stick-aligned), never this count's: at every
 /// width those laws admit (every real model's hidden), the two spellings of
@@ -2462,8 +2460,8 @@ const _: () = assert!(
 );
 
 /// ⭐ THE L-STICK SEED'S LANE RAMP — the one spelling of the chain's l-seed
-/// law, shared by BOTH host halves that push it (the card path's `ChainSeed`
-/// steps in scratchy-target-spyre's forward_tape and the worker's dynamic
+/// law, shared by BOTH host halves that push it (the device path's `ChainSeed`
+/// steps in the target's forward tape and the worker's dynamic
 /// l-source push in scratchy-serving-worker) AND the l-tab's fill: word `j`
 /// of the index carries `STICK_ELEMS·(j mod entries) + l` — the SOURCE STICK
 /// NUMBER of the transposed slab's row `l`, entry `j mod entries` of the row
@@ -2703,10 +2701,10 @@ pub struct TiedEmbedWiden {
 /// an output-side widening created for the matmul's output — so the
 /// matmul's compute, its kernel manifest, and the worker's staging (all
 /// region-driven) are untouched: the reservation grows, the FLOPs do not.
-/// (On the spyre target that staging fact is stated in one place: the
-/// lowering's `gemm_weight_host_pairs`, the union of each gemm weight's
-/// matmul consumers' view regions, which the wiring's manifest shapes and
-/// the three-width-laws check both read as the host pair.) The pad columns
+/// (On a staging target that fact is stated in one place: the lowering's
+/// union of each gemm weight's matmul consumers' view regions, which the
+/// wiring's manifest shapes and the three-width-laws check both read as the
+/// host pair.) The pad columns
 /// past the worker's staged device width keep the segment's prepare-time
 /// zeros (weights stage once at load and are never reused), which makes
 /// `idx ≥ vocab` gather a ZERO row in value as well as in extent.
@@ -4510,8 +4508,8 @@ pub fn lower_region(
             // NAME, and an alias gives the two views two names, so no conflict is seen.
             //
             // A reshape needs a RESTICKIFY — a real copy re-laying out from the old stick
-            // layout to the new. Spyre already has that machinery; this pipeline just has no op
-            // for it yet.
+            // layout to the new. A stick-laid-out target already has that machinery; this pipeline
+            // just has no op for it yet.
             SubOp::Reshape { rows, cols } => SubOp::Reshape { rows, cols },
             // A row-broadcast bias (`EwKind::BiasAdd`) is exact at decode (m = 1, both rows);
             // m > 1 broadcasts its `[1, n]` source across the rows.
