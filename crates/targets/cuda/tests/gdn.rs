@@ -3155,14 +3155,6 @@ fn a_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
     );
 }
 
-/// Whether the one-key-head decode (variant 0, #1049's) takes geometry `d`: at most 4 value heads
-/// a key head, dividing 16, their v channels within its 8 warps (the 27B's 3 do not divide 16). The
-/// one-value-head form (variant 1, the launcher's) takes every `heads` up to 8.
-fn one_key_head_takes(d: GdnDims) -> bool {
-    let heads = d.nv / d.nk;
-    heads <= 4 && 16usize.is_multiple_of(heads) && 2 + heads * d.head_v / 128 <= 8
-}
-
 /// A one-row step's four launches (conv1d, gating, the recurrent scan, the gated norm) over
 /// buffers allocated once, so a graph can capture them: the 27B's decode today.
 struct FourLaunches {
@@ -3263,14 +3255,14 @@ impl DecodeCase {
         }
     }
 
-    /// The decode at `variant` over `pool`, `trace` its phases when not null, on `stream`.
+    /// The decode over `pool`, on `stream`.
     fn launch(
         &self,
         (d, bb): (GdnDims, &BundleBufs),
         pool: &Pool,
-        (variant, trace, stream): (u32, *mut std::ffi::c_void, *mut std::ffi::c_void),
+        stream: *mut std::ffi::c_void,
     ) -> Result<(), KernelError> {
-        use scratchy_target_cuda::kernels::{GdnDecodeOperands, gdn_decode_variant};
+        use scratchy_target_cuda::kernels::{GdnDecodeOperands, gdn_decode};
         let operands = GdnDecodeOperands {
             qkv: self.qkv.ptr(),
             a: self.a.ptr(),
@@ -3284,10 +3276,10 @@ impl DecodeCase {
         };
         let l = pool.layout;
         // SAFETY: as `run_step`'s at one row: every buffer holds what the launcher's contract
-        // names, the pool `SLOTS` slots of its layout and slot 3 below it, `q_len` 1; `trace`, when
-        // given, holds `nv · 8` f32; `stream` null or live.
+        // names, the pool `SLOTS` slots of its layout and slot 3 below it, `q_len` 1; `stream`
+        // null or live.
         unsafe {
-            gdn_decode_variant(
+            gdn_decode(
                 &operands,
                 (pool.conv.ptr(), l.conv_elems_per_slot() as u64),
                 (pool.ssm.ptr(), l.ssm_elems_per_slot() as u64),
@@ -3300,81 +3292,10 @@ impl DecodeCase {
                     d.conv_kernel as u32,
                 ),
                 (gdn_scale(d.head_k as u32), EPS),
-                (variant, trace, stream),
+                stream,
             )
         }
     }
-}
-
-/// FP8 S8 D1: the one-value-head decode (variant 1, the launcher's) is the four launches, bit for
-/// bit, at the 0.8B's, the 35B's (9b's) and the 27B's geometries (the 27B's three value heads a key
-/// head, which only this form takes), and so is the one-key-head decode (variant 0) where it takes
-/// the geometry; fresh (the pool NaN-poisoned) and continued from a slot the four launches filled
-/// with 300 tokens: the bf16 output, the conv ring and the state of the slot, and every other slot
-/// bit-unchanged.
-#[test]
-fn the_one_value_head_decode_is_the_one_key_head_decode_bit_for_bit() {
-    let device = h100();
-    let mut pass = true;
-    for d in [G08, G9, G27] {
-        let bu = bundle(d, 0xD1A0);
-        let bb = upload_bundle(&device, &bu);
-        for prior in [0usize, 300] {
-            let x = inputs(d, prior + 1, 0xD1A1 ^ (prior as u64) << 16);
-            let pools: Vec<Pool> = (0..3).map(|_| Pool::new(&device, d, NAN_F32)).collect();
-            if prior > 0 {
-                let c = chunk(&x, d, 0, prior, prior);
-                for p in &pools {
-                    run_step(&device, p, &bb, d, &c, (3, true)).expect("the prefix");
-                }
-            }
-            let fresh = prior == 0;
-            let tok = chunk(&x, d, prior, 1, 1);
-            let befores: Vec<_> = pools.iter().map(Pool::snapshot).collect();
-            let four = run_step(&device, &pools[0], &bb, d, &tok, (3, fresh)).expect("the four");
-            let mut outs = Vec::new();
-            for variant in [0u32, 1] {
-                if variant == 0 && !one_key_head_takes(d) {
-                    continue;
-                }
-                let c = DecodeCase::new(&device, d, &tok, fresh);
-                let p = &pools[1 + variant as usize];
-                c.launch(
-                    (d, &bb),
-                    p,
-                    (variant, std::ptr::null_mut(), std::ptr::null_mut()),
-                )
-                .expect("a decode launches");
-                outs.push((
-                    variant,
-                    c.out.download().expect("out"),
-                    p.conv_slot(3),
-                    p.ssm_slot(3),
-                    p.others_changed(&befores[1 + variant as usize], 3),
-                ));
-            }
-            let (want_out, want_ring, want_state) = (
-                four.out.clone(),
-                pools[0].conv_slot(3),
-                pools[0].ssm_slot(3),
-            );
-            for (variant, out, ring, state, others) in &outs {
-                let o = mismatched(out, &want_out);
-                let r = differing_bits(ring, &want_ring);
-                let s = differing_bits(state, &want_state);
-                let ok = o + r + s + others == 0;
-                eprintln!(
-                    "D1_BITS {} prior={prior} variant={variant} vs the four launches: \
-                     out_mismatched={o} ring_mismatched_bits={r} state_mismatched_bits={s} \
-                     other_slots_changed={others} {}",
-                    model(d),
-                    verdict(ok)
-                );
-                pass &= ok;
-            }
-        }
-    }
-    assert!(pass, "a GDN decode form differs from the four launches");
 }
 
 type CudaEvent = *mut std::ffi::c_void;
@@ -3467,15 +3388,11 @@ fn graph_per_node(launch: impl Fn(*mut std::ffi::c_void)) -> f64 {
 }
 
 /// Recorded, not asserted (D1's gate): the decode's µs per launch inside a captured graph of 10
-/// back-to-back nodes, today's decode against the one-value-head form (`one_value_head`),
-/// continued from a slot of 300 tokens, at the 35B's and the 27B's geometries, two rounds (A, B,
-/// A, B), as `D1_TIME` lines. Today's is the one-key-head form (`one_key_head`, #1049's) where it
-/// takes the geometry (the 35B), else the four launches at one row (`four_launches`, the 27B's
-/// decode tape today). Then one traced launch of each form that takes the geometry, its phases'
-/// cycles (the mean and the largest over the CTAs, thread 0's from its start at each phase's end),
-/// as `D1_PHASE` lines.
+/// back-to-back nodes, the four launches at one row (`four_launches`, the one-row GDN step's)
+/// against the one-launch decode (`one_value_head`, the tapes'), continued from a slot of 300
+/// tokens, at the 35B's and the 27B's geometries, two rounds (A, B, A, B), as `D1_TIME` lines.
 #[test]
-fn the_gdn_decode_graph_times_and_phases_are_recorded() {
+fn the_gdn_decode_graph_times_are_recorded() {
     let device = h100();
     for d in [G9, G27] {
         let bu = bundle(d, 0xD1B0);
@@ -3493,67 +3410,16 @@ fn the_gdn_decode_graph_times_and_phases_are_recorded() {
         .expect("prefix");
         let tok = chunk(&x, d, 300, 1, 1);
         let c = DecodeCase::new(&device, d, &tok, false);
-        let run = |variant: u32| {
-            graph_per_node(|s| {
-                c.launch((d, &bb), &pool, (variant, std::ptr::null_mut(), s))
-                    .expect("a decode launches")
-            })
-        };
-        let today = one_key_head_takes(d);
+        let one = || graph_per_node(|s| c.launch((d, &bb), &pool, s).expect("a decode launches"));
         let fl = FourLaunches::new(&device, d, &tok);
         let four = || graph_per_node(|s| fl.launch((d, &bb), &pool, s));
         for round in 1..=2 {
-            let (a, b) = (if today { run(0) } else { four() }, run(1));
+            let (a, b) = (four(), one());
             eprintln!(
-                "D1_TIME {} round {round}: {}={a:.2} us one_value_head={b:.2} us per launch \
-                 ({:.2}x)",
+                "D1_TIME {} round {round}: four_launches={a:.2} us one_value_head={b:.2} us per \
+                 launch ({:.2}x)",
                 model(d),
-                if today {
-                    "one_key_head"
-                } else {
-                    "four_launches"
-                },
                 a / b
-            );
-        }
-        let names: [&[&str]; 2] = [
-            &["conv", "gating", "barrier", "scan", "barrier", "norm"],
-            &[
-                "prefetch",
-                "conv_gating",
-                "cluster_barrier",
-                "qk_ring",
-                "scan",
-                "barrier",
-                "norm",
-            ],
-        ];
-        for variant in [0u32, 1] {
-            if variant == 0 && !today {
-                continue;
-            }
-            let ctas = if variant == 0 { d.nk } else { d.nv };
-            let trace = up_f32_bits(&device, ctas * 8, NAN_F32);
-            c.launch(
-                (d, &bb),
-                &pool,
-                (variant, trace.ptr(), std::ptr::null_mut()),
-            )
-            .expect("a traced decode launches");
-            let t = down_f32(&trace);
-            let phases: Vec<String> = (names[variant as usize].iter().enumerate())
-                .map(|(p, name)| {
-                    let col: Vec<f64> = (0..ctas).map(|i| f64::from(t[i * 8 + p])).collect();
-                    let mean = col.iter().sum::<f64>() / ctas as f64;
-                    let max = col.iter().copied().fold(0.0, f64::max);
-                    format!("{name}@{mean:.0}/{max:.0}")
-                })
-                .collect();
-            eprintln!(
-                "D1_PHASE {} {} ({ctas} CTAs): cycles at each phase's end, mean/max: {}",
-                model(d),
-                ["one_key_head", "one_value_head"][variant as usize],
-                phases.join(" ")
             );
         }
     }

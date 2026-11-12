@@ -7,29 +7,33 @@
 // four launches' bits; only the f32 intermediates stay in shared memory instead of the step's GDN
 // scratch.
 //
-// ONE CTA PER KEY HEAD, 8 warps, grid `nk`. A key head's `nv / nk` value heads (`heads`, 1 for the
-// 0.8B, 2 for the 9B and the 35B) read its q and k, so the CTA that owns the key head also owns its
-// value heads: every channel's conv ring and every state tile has one reader and one writer, in one
-// CTA. A CTA per value head would have two CTAs read and rewrite one key head's ring, a race no
-// single-writer rule closes (one may read the ring after the other rewrote it).
+// ONE CTA PER VALUE HEAD (FP8 S8 D1), 8 warps, grid `(heads, nk)`: a key head's `heads = nv / nk`
+// value heads (1 for the 0.8B, 2 for the 9B and the 35B, 3 for the 27B) read its q and k, so its
+// `heads` CTAs are one cluster. Every v channel's conv ring and every state tile has one reader and
+// one writer, its value head's CTA; the key head's q and k rings are read by every CTA of the
+// cluster, so only rank 0 rewrites them, after the cluster's barrier (`everyone::tma::cluster::sync`)
+// has seen every CTA's read.
 //
+//   0. Every load first: each warp's first state tile (zeroed without reading it on a fresh
+//      start), and warp 0's `z` and gain for the norm.
 //   1. The conv (`gdn_conv1d.cu`'s body at token 0 of block 0): warp 0 runs the key head's 128 q
-//      channels, warp 1 its k channels, warp `2 + i` the `i`-th 128 channels of the CTA's value
-//      heads' v. Each warp's taps and seed (the slot's ring, or `warp::zero` without reading it on
-//      a fresh start) by TK's `apply` over `gl::operator[]`, the token by `warp::load`, then
-//      `warp::mul` and the `rv_fma` gap's `fma_acc` taps in ascending order and
-//      `unary_op<silu>`; the result `warp::store`d (f32) into the CTA's shared q, k or v vector. The
-//      new ring is the seed shifted by one, the token last, written by the same `apply` form.
-//   2. The gating (`gdn_gating.cu`'s body): warp 0, after its conv, loads the 16-head chunk holding
-//      the CTA's value heads (`16 % heads == 0`, so they share one chunk) and computes `g` and `β`
-//      for the chunk, `warp::store`d (f32) into shared vectors.
+//      channels, warp 1 its k channels (each CTA of the cluster computes them, from the ring as it
+//      was), warp `2 + i` the `i`-th 128 channels of the CTA's value head's v. Each warp's taps and
+//      seed (the slot's ring, or `warp::zero` without reading it on a fresh start) by TK's `apply`
+//      over `gl::operator[]`, the token by `warp::load`, then `warp::mul` and the `rv_fma` gap's
+//      `fma_acc` taps in ascending order and `unary_op<silu>`; the result `warp::store`d (f32) into
+//      the CTA's shared q, k or v vector. The new ring is the seed shifted by one, the token last,
+//      written by the same `apply` form: the v channels' at once, the q and k channels' by rank 0
+//      after the cluster's barrier.
+//   2. The gating (`gdn_gating.cu`'s body), on the last warp in parallel with the conv: the 16-head
+//      chunk holding the CTA's value head, `g` and `β` `warp::store`d (f32) into shared vectors.
 //   3. The scan (`gdn_scan.cu`'s per-token body): every warp normalises q and k (each warp the
-//      same bits), and for each value head its 16-row state tiles `w, w + 8, …`: the tile loaded
-//      (or zeroed on a fresh start), decayed, corrected and updated, its `o` rows `warp::store`d
-//      (f32) into the head's shared `o` vector, the tile stored back.
-//   4. The gated norm (`gdn_rms_norm_gated.cu`'s body): warp `j` takes value head `j`, its `o` a
-//      naive `rv_fl<HV>` loaded from shared memory (the same lane-to-element map as the global
-//      load), then the norm, `SiLU(z)` and the gain, stored bf16.
+//      same bits), then the value head's 16-row state tiles `w, w + 8, …` (one a warp, two at
+//      `head_v` 256): the tile decayed, corrected and updated, its `o` rows `warp::store`d (f32)
+//      into the shared `o` vector, the tile stored back.
+//   4. The gated norm (`gdn_rms_norm_gated.cu`'s body): warp 0, its `o` a naive `rv_fl<HV>`
+//      loaded from shared memory (the same lane-to-element map as the global load), then the norm,
+//      `SiLU(z)` and the gain, stored bf16.
 // `__syncthreads` separates the stages. The token is row 0: the launcher's contract is the four
 // launchers' `1 ≤ q_len ≤ rows` at `rows = 1`, so `q_len` is 1. The sequence record (slot, q_len,
 // fresh) is read on the device from the tape's GDN sequence region, never a host argument.
@@ -65,22 +69,13 @@ constexpr int GROUP = 128;
 constexpr int WARPS = 8;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 constexpr int WARP_ROWS = 16;
-// `step::GDN_GATING_NV_MULTIPLE` and `step::GDN_DECODE_MAX_HEADS`.
+// `step::GDN_GATING_NV_MULTIPLE`.
 constexpr int NV_CHUNK = 16;
-constexpr int MAX_HEADS = 4;
-// The one-value-head form's widest cluster (the portable cluster size): its key head's CTAs.
+// `step::GDN_DECODE_MAX_HEADS`: the widest cluster (the portable cluster size), a key head's CTAs.
 constexpr uint32_t MAX_CLUSTER_HEADS = 8;
 // `step::GDN_CONV_KERNEL_RANGE`.
 constexpr uint32_t KMIN = 2;
 constexpr uint32_t KMAX = 8;
-// The traced phases (`TRACE`, test support): thread 0's `clock` cycles from its start at the end
-// of each. The one-key-head form: 0 the conv, 1 the gating, 2 the barrier, 3 the scan, 4 the
-// barrier, 5 the norm. The one-value-head form: 0 the prefetch issued, 1 the conv and gating, 2
-// the cluster barrier, 3 the q/k ring written, 4 the scan, 5 the barrier, 6 the norm.
-constexpr int PHASES = 8;
-// The conv width the traced instances take (every model's `conv_kernel`).
-constexpr uint32_t TRACE_K = 4;
-
 using chan_vec = rv_fl<GROUP>;
 using chunk_rv = rv_fl<NV_CHUNK>;
 using state_tile = rt_fl<WARP_ROWS, HEAD_K>;
@@ -121,8 +116,6 @@ struct decode_globals {
     seq_gl sequence;
     // `[nv, head_v]` bf16.
     x_gl out;
-    // `[CTAs, PHASES]` f32 (`TRACE` only): thread 0's cycles from its start at each phase's end.
-    f_gl trace;
     int nk;
     // The value heads per key head.
     int heads;
@@ -130,201 +123,8 @@ struct decode_globals {
     float eps;
 };
 
-template <int K, int HV, bool TRACE = false>
-__global__ __launch_bounds__(NUM_THREADS, 1) void gdn_decode_ker(
-    const __grid_constant__ decode_globals g) {
-    constexpr int STATE = K - 1;
-    // A value head's 128-channel vectors and its 16-row state tiles.
-    constexpr int V_VECS = HV / GROUP;
-    constexpr int TILES = HV / WARP_ROWS;
-    __shared__ sv_fl<HEAD_K> qs;
-    __shared__ sv_fl<HEAD_K> ks;
-    __shared__ sv_fl<HV> vs[MAX_HEADS];
-    __shared__ sv_fl<HV> os[MAX_HEADS];
-    __shared__ sv_fl<NV_CHUNK> gs;
-    __shared__ sv_fl<NV_CHUNK> bs;
-
-    const int kh = blockIdx.x;
-    const int w = kittens::warpid();
-    const int h0 = kh * g.heads;
-    const int key_dim = g.nk * HEAD_K;
-    const int slot = g.sequence[{0, 0, 0, 0}];
-    const bool fresh = g.sequence[{0, 0, 0, 2}] == 1;
-    // `TRACE`: thread 0's cycles since its start at the end of each phase.
-    const uint32_t t0 = TRACE ? uint32_t(clock()) : 0;
-    float marks[PHASES] = {};
-    const auto mark = [&](int p) {
-        if constexpr (TRACE) {
-            marks[p] = float(uint32_t(clock()) - t0);
-        }
-    };
-
-    // 1. The conv's one step, and the ring after it.
-    if (w < 2 + g.heads * V_VECS) {
-        const int group = w == 0   ? kh
-                          : w == 1 ? g.nk + kh
-                                   : (2 * key_dim + h0 * HV) / GROUP + (w - 2);
-        const int c0 = group * GROUP;
-        chan_vec taps[K];
-#pragma unroll
-        for (int j = 0; j < K; ++j) {
-            warp::apply(taps[j], taps[j], [&](int i, float) { return g.w[{0, 0, c0 + i, j}]; });
-        }
-        chan_vec seed[STATE];
-#pragma unroll
-        for (int j = 0; j < STATE; ++j) {
-            if (fresh) {
-                // A fresh start keeps the 0: the ring is not read.
-                warp::zero(seed[j]);
-            } else {
-                warp::apply(seed[j], seed[j], [&](int i, float) {
-                    return g.ring[{0, 0, slot, (c0 + i) * STATE + j}];
-                });
-            }
-        }
-        chan_vec xt, sum;
-        warp::load(xt, g.qkv, {0, 0, 0, group});
-        warp::mul(sum, taps[0], seed[0]);
-#pragma unroll
-        for (int j = 1; j < STATE; ++j) {
-            scratchy::ops::rv_fma<scratchy::ops::fma_acc>(sum, taps[j], seed[j], sum);
-        }
-        scratchy::ops::rv_fma<scratchy::ops::fma_acc>(sum, taps[STATE], xt, sum);
-        warp::unary_op<scratchy::ops::silu>(sum, sum);
-        if (w == 0) {
-            warp::store(qs, sum);
-        } else if (w == 1) {
-            warp::store(ks, sum);
-        } else {
-            const int v = w - 2;
-            warp::store(vs[v / V_VECS].template subvec<GROUP>(v % V_VECS), sum);
-        }
-        // The new ring: the seed shifted by one, the token last.
-#pragma unroll
-        for (int j = 0; j + 1 < STATE; ++j) {
-            chan_vec entry;
-            warp::copy(entry, seed[j + 1]);
-            warp::apply(entry, entry, [&](int i, float v) {
-                g.ring[{0, 0, slot, (c0 + i) * STATE + j}] = v;
-                return v;
-            });
-        }
-        warp::apply(xt, xt, [&](int i, float v) {
-            g.ring[{0, 0, slot, (c0 + i) * STATE + STATE - 1}] = v;
-            return v;
-        });
-    }
-
-    mark(0);
-    // 2. The gating of the 16-head chunk holding the CTA's value heads.
-    if (w == 0) {
-        const int c = h0 / NV_CHUNK;
-        chunk_rv av, bv, a_log, dt_bias;
-        warp::load(av, g.a, {0, 0, 0, c});
-        warp::load(bv, g.b, {0, 0, 0, c});
-        warp::load(a_log, g.a_log, {0, 0, 0, c});
-        warp::load(dt_bias, g.dt_bias, {0, 0, 0, c});
-        warp::add(av, av, dt_bias);
-        warp::bin_op<scratchy::ops::gdn_g>(av, av, a_log);
-        warp::unary_op<scratchy::ops::sigmoid>(bv, bv);
-        warp::store(gs, av);
-        warp::store(bs, bv);
-    }
-    mark(1);
-    __syncthreads();
-    mark(2);
-
-    // 3. The scan's token: q̂ and k̂, then each value head's tiles.
-    key_naive qn, kn, sq;
-    warp::load(qn, qs);
-    warp::load(kn, ks);
-    warp::mul(sq, kn, kn);
-    const float kk = warp::sum(sq);
-    warp::mul(sq, qn, qn);
-    const float qq = warp::sum(sq);
-    const float k_inv = scratchy::ops::l2_inv::op<float>(kk);
-    const float q_inv = scratchy::ops::l2_inv::op<float>(qq) * g.scale;
-    warp::mul(kn, kn, k_inv);
-    warp::mul(qn, qn, q_inv);
-    for (int hg = 0; hg < g.heads; ++hg) {
-        const int h = h0 + hg;
-        const float decay = scratchy::ops::exp_of::op<float>(gs[h % NV_CHUNK]);
-        const float beta = bs[h % NV_CHUNK];
-        for (int r = w; r < TILES; r += WARPS) {
-            const coord<state_tile> at = {slot, h, r, 0};
-            state_tile S, T;
-            if (fresh) {
-                // A select: the slot is not read.
-                warp::zero(S);
-            } else {
-                warp::load(S, g.ssm_state, at);
-            }
-            warp::mul(S, S, decay);
-            key_vec kv;
-            warp::copy(kv, kn);
-            warp::mul_col(T, S, kv);
-            row_vals sk;
-            warp::row_sum(sk, T);
-            row_naive vn;
-            warp::load(vn, vs[hg].template subvec<WARP_ROWS>(r));
-            row_vals u;
-            warp::copy(u, vn);
-            warp::sub(u, u, sk);
-            warp::mul(u, u, beta);
-            warp::broadcast_col(T, kv);
-            warp::row_map<base_ops::fma_AxCtB>(S, T, S, u);
-            warp::copy(kv, qn);
-            warp::mul_col(T, S, kv);
-            row_vals ov;
-            warp::row_sum(ov, T);
-            warp::store(os[hg].template subvec<WARP_ROWS>(r), ov);
-            warp::store(g.ssm_state, S, at);
-        }
-    }
-    mark(3);
-    __syncthreads();
-    mark(4);
-
-    // 4. The gated norm of value head `w`.
-    if (w < g.heads) {
-        const int h = h0 + w;
-        rv_fl<HV> v, sqv, z, gain;
-        warp::load(v, os[w]);
-        warp::mul(sqv, v, v);
-        const float m = warp::sum(sqv) / float(HV);
-        const float inv = scratchy::ops::rms_inv::op<float>(m, g.eps);
-        warp::load(z, g.z, {0, 0, h, 0});
-        warp::unary_op<scratchy::ops::silu>(z, z);
-        warp::load(gain, g.norm, {0, 0, 0, 0});
-        warp::mul(v, v, inv);
-        warp::mul(v, v, gain);
-        warp::mul(v, v, z);
-        warp::store(g.out, v, {0, 0, h, 0});
-    }
-    mark(5);
-    if constexpr (TRACE) {
-        if (threadIdx.x == 0) {
-#pragma unroll
-            for (int p = 0; p < PHASES; ++p) {
-                g.trace[{0, 0, int(blockIdx.x), p}] = marks[p];
-            }
-        }
-    }
-}
-
-// THE ONE-VALUE-HEAD FORM (FP8 S8 D1, the launcher's): `gdn_decode_ker`'s stages and ops in the same
-// order on the same values, so the same bits, over one CTA per value head instead of one per key
-// head (the 35B: 32 CTAs, not 16; the 27B: 48), the key head's `heads` CTAs one cluster:
-//   - every load issued first: each warp's first state tile, the norm's `z` and gain;
-//   - the conv: warps 0 and 1 the key head's q and k channels (each CTA of the cluster computes
-//     them, from the ring as it was), warps `2 ..` the CTA's own value head's v channels, whose
-//     ring the CTA alone owns and rewrites at once; the gating on the last warp, in parallel;
-//   - the cluster's barrier (`everyone::tma::cluster::sync`): every CTA has read the key head's q
-//     and k ring, so rank 0 alone rewrites it after (one reader-writer race the one-key-head form
-//     avoided by owning the key head in one CTA);
-//   - the scan of the one value head, a tile a warp (two at `head_v` 256), the first prefetched;
-//     then the gated norm by warp 0 on the prefetched `z` and gain.
-template <int K, int HV, bool TRACE = false>
+// The kernel: the stages above, for value head `kh · heads + rank` of the cluster `kh`.
+template <int K, int HV>
 __global__ __launch_bounds__(NUM_THREADS, 1) void gdn_decode_head_ker(
     const __grid_constant__ decode_globals g) {
     constexpr int STATE = K - 1;
@@ -346,13 +146,6 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gdn_decode_head_ker(
     const int key_dim = g.nk * HEAD_K;
     const int slot = g.sequence[{0, 0, 0, 0}];
     const bool fresh = g.sequence[{0, 0, 0, 2}] == 1;
-    const uint32_t t0 = TRACE ? uint32_t(clock()) : 0;
-    float marks[PHASES] = {};
-    const auto mark = [&](int p) {
-        if constexpr (TRACE) {
-            marks[p] = float(uint32_t(clock()) - t0);
-        }
-    };
 
     // 0. Every load first: the warp's first state tile; warp 0's `z` and gain.
     state_tile S;
@@ -369,10 +162,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gdn_decode_head_ker(
         warp::load(z, g.z, {0, 0, h, 0});
         warp::load(gain, g.norm, {0, 0, 0, 0});
     }
-    mark(0);
 
-    // 1. The conv's one step (`gdn_decode_ker`'s code), and the v channels' ring after it; the
-    //    gating of the 16-head chunk on its own warp.
+    // 1. The conv's one step, and the v channels' ring after it; the gating of the 16-head chunk
+    //    on its own warp.
     chan_vec seed[STATE], xt;
     int c0 = 0;
     if (w < 2 + V_VECS) {
@@ -445,18 +237,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gdn_decode_head_ker(
         warp::store(gs, av);
         warp::store(bs, bv);
     }
-    mark(1);
     // Every CTA of the key head has read its q and k ring (and its shared vectors are written):
     // rank 0 alone rewrites that ring after.
     everyone::tma::cluster::sync();
-    mark(2);
     if (hg == 0 && w < 2) {
         write_ring();
     }
-    mark(3);
 
-    // 3. The scan's token for value head `h`, `gdn_decode_ker`'s code; the warp's first tile is the
-    //    prefetched one.
+    // 3. The scan's token for value head `h`; the warp's first tile is the prefetched one.
     key_naive qn, kn, sq;
     warp::load(qn, qs);
     warp::load(kn, ks);
@@ -501,11 +289,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gdn_decode_head_ker(
         warp::store(os.template subvec<WARP_ROWS>(r), ov);
         warp::store(g.ssm_state, S, at);
     }
-    mark(4);
     __syncthreads();
-    mark(5);
 
-    // 4. The gated norm of value head `h`, `gdn_decode_ker`'s code on the prefetched `z` and gain.
+    // 4. The gated norm of value head `h`, on the prefetched `z` and gain.
     if (w == 0) {
         rv_fl<HV> v, sqv;
         warp::load(v, os);
@@ -518,28 +304,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gdn_decode_head_ker(
         warp::mul(v, v, z);
         warp::store(g.out, v, {0, 0, h, 0});
     }
-    mark(6);
-    if constexpr (TRACE) {
-        if (threadIdx.x == 0) {
-            const int cta = blockIdx.y * gridDim.x + blockIdx.x;
-#pragma unroll
-            for (int p = 0; p < PHASES; ++p) {
-                g.trace[{0, 0, cta, p}] = marks[p];
-            }
-        }
-    }
 }
 
-// The one-key-head form (`variant` 0) on `nk` CTAs, or the one-value-head form (1) on `heads ×
-// nk` CTAs, the key head's `heads` one cluster.
-template <int K, int HV, bool TRACE>
-int launch_decode(const decode_globals& G, uint32_t nk, uint32_t heads, uint32_t variant,
-                  cudaStream_t stream) {
-    if (variant == 0) {
-        void* args[] = {const_cast<decode_globals*>(&G)};
-        return static_cast<int>(cudaLaunchKernel(gdn_decode_ker<K, HV, TRACE>, dim3(nk),
-                                                 dim3(NUM_THREADS), args, 0, stream));
-    }
+// The kernel on `heads × nk` CTAs, the key head's `heads` one cluster.
+template <int K, int HV>
+int launch_decode(const decode_globals& G, uint32_t nk, uint32_t heads, cudaStream_t stream) {
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeClusterDimension;
     attr[0].val.clusterDim.x = heads;
@@ -552,38 +321,32 @@ int launch_decode(const decode_globals& G, uint32_t nk, uint32_t heads, uint32_t
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    return static_cast<int>(cudaLaunchKernelEx(&cfg, gdn_decode_head_ker<K, HV, TRACE>, G));
+    return static_cast<int>(cudaLaunchKernelEx(&cfg, gdn_decode_head_ker<K, HV>, G));
 }
 
 template <int HV>
 int launch_width(const decode_globals& G, uint32_t nk, uint32_t heads, uint32_t kernel,
-                 uint32_t variant, bool trace, cudaStream_t stream) {
-    if (trace) {
-        return launch_decode<int(TRACE_K), HV, true>(G, nk, heads, variant, stream);
-    }
+                 cudaStream_t stream) {
     switch (kernel) {
-        case 2: return launch_decode<2, HV, false>(G, nk, heads, variant, stream);
-        case 3: return launch_decode<3, HV, false>(G, nk, heads, variant, stream);
-        case 4: return launch_decode<4, HV, false>(G, nk, heads, variant, stream);
-        case 5: return launch_decode<5, HV, false>(G, nk, heads, variant, stream);
-        case 6: return launch_decode<6, HV, false>(G, nk, heads, variant, stream);
-        case 7: return launch_decode<7, HV, false>(G, nk, heads, variant, stream);
-        default: return launch_decode<8, HV, false>(G, nk, heads, variant, stream);
+        case 2: return launch_decode<2, HV>(G, nk, heads, stream);
+        case 3: return launch_decode<3, HV>(G, nk, heads, stream);
+        case 4: return launch_decode<4, HV>(G, nk, heads, stream);
+        case 5: return launch_decode<5, HV>(G, nk, heads, stream);
+        case 6: return launch_decode<6, HV>(G, nk, heads, stream);
+        case 7: return launch_decode<7, HV>(G, nk, heads, stream);
+        default: return launch_decode<8, HV>(G, nk, heads, stream);
     }
 }
 
-// `cudaFuncGetAttributes` of every instance at `HV` (both forms, every conv width, and the traced
-// ones): the first failure, else cudaSuccess.
+// `cudaFuncGetAttributes` of every instance at `HV` (every conv width): the first failure, else
+// cudaSuccess.
 template <int HV>
 cudaError_t load_width() {
     cudaFuncAttributes attr;
-    for (auto ker : {gdn_decode_ker<2, HV>, gdn_decode_ker<3, HV>, gdn_decode_ker<4, HV>,
-                     gdn_decode_ker<5, HV>, gdn_decode_ker<6, HV>, gdn_decode_ker<7, HV>,
-                     gdn_decode_ker<8, HV>, gdn_decode_ker<int(TRACE_K), HV, true>,
-                     gdn_decode_head_ker<2, HV>, gdn_decode_head_ker<3, HV>,
+    for (auto ker : {gdn_decode_head_ker<2, HV>, gdn_decode_head_ker<3, HV>,
                      gdn_decode_head_ker<4, HV>, gdn_decode_head_ker<5, HV>,
                      gdn_decode_head_ker<6, HV>, gdn_decode_head_ker<7, HV>,
-                     gdn_decode_head_ker<8, HV>, gdn_decode_head_ker<int(TRACE_K), HV, true>}) {
+                     gdn_decode_head_ker<8, HV>}) {
         if (const cudaError_t e = cudaFuncGetAttributes(&attr, ker); e != cudaSuccess) {
             return e;
         }
@@ -611,9 +374,8 @@ extern "C" int scratchy_cuda_gdn_decode_prepare(void) {
 // state.
 //
 // The four GDN launchers' rules at one row, and the kernel's own: `head_k` 128, `head_v` 128 or
-// 256, `nk` and `nv` non-zero, `nv` a multiple of `nk` and of 16, `heads = nv / nk` at most 8 (the
-// launcher's one-value-head form: a key head's CTAs one cluster; the one-key-head form, variant 0,
-// at most 4, dividing 16, and `2 + heads · head_v / 128` at most 8), `kernel` in 2..=8,
+// 256, `nk` and `nv` non-zero, `nv` a multiple of `nk` and of 16, `heads = nv / nk` at most 8 (a
+// key head's CTAs one cluster), `kernel` in 2..=8,
 // `conv_slot_elems` exactly `conv_dim · (kernel − 1)` and `ssm_slot_elems` exactly
 // `nv · head_v · 128` (`conv_dim = 2 · nk · 128 + nv · head_v`), `conv_dim · kernel` at most
 // INT_MAX, and `scale` and `eps` finite and above 0; all are checked before any pointer is
@@ -625,12 +387,14 @@ extern "C" int scratchy_cuda_gdn_decode_prepare(void) {
 // `scratchy_cuda_gdn_conv1d`, `_gating`, `_scan` and `_rms_norm_gated` at `rows = 1`.
 // `scratchy_cuda_gdn_decode_prepare` must have succeeded on the current device. The launch is
 // asynchronous on `stream`.
-static int gdn_decode(const void* qkv, const void* a, const void* b, const void* z, const void* w,
-                      const void* a_log, const void* dt_bias, const void* norm, void* conv_state,
-                      uint64_t conv_slot_elems, void* ssm_state, uint64_t ssm_slot_elems,
-                      const void* sequence, void* out, uint32_t nk, uint32_t nv, uint32_t head_k,
-                      uint32_t head_v, uint32_t kernel, float scale, float eps, uint32_t variant,
-                      void* trace, void* stream) {
+extern "C" int scratchy_cuda_gdn_decode(const void* qkv, const void* a, const void* b,
+                                        const void* z, const void* w, const void* a_log,
+                                        const void* dt_bias, const void* norm, void* conv_state,
+                                        uint64_t conv_slot_elems, void* ssm_state,
+                                        uint64_t ssm_slot_elems, const void* sequence, void* out,
+                                        uint32_t nk, uint32_t nv, uint32_t head_k,
+                                        uint32_t head_v, uint32_t kernel, float scale, float eps,
+                                        void* stream /* cudaStream_t; null = default stream */) {
     if (head_k != uint32_t(HEAD_K) || (head_v != 128 && head_v != 256) || nk == 0 || nv == 0 ||
         nv % nk != 0 || nv % uint32_t(NV_CHUNK) != 0 || kernel < KMIN || kernel > KMAX ||
         !std::isfinite(scale) || !(scale > 0.0f) || !std::isfinite(eps) || !(eps > 0.0f)) {
@@ -638,14 +402,9 @@ static int gdn_decode(const void* qkv, const void* a, const void* b, const void*
     }
     const uint32_t heads = nv / nk;
     const uint64_t conv_dim = 2 * uint64_t(nk) * HEAD_K + uint64_t(nv) * head_v;
-    // The one-key-head form's CTA owns its key head's value heads: at most 4, in one 16-head gating
-    // chunk, their v channels within its conv warps. The one-value-head form's CTA owns one value
-    // head (its own chunk, at most two conv warps of v) and its key head's CTAs are one cluster.
-    const bool takes = variant == 0
-                           ? heads <= uint32_t(MAX_HEADS) && uint32_t(NV_CHUNK) % heads == 0 &&
-                                 2 + heads * head_v / uint32_t(GROUP) <= uint32_t(WARPS)
-                           : heads <= MAX_CLUSTER_HEADS;
-    if (!takes || conv_dim * kernel > uint64_t(INT_MAX) ||
+    // A CTA owns one value head (its own gating chunk, at most two conv warps of v), and its key
+    // head's CTAs are one cluster.
+    if (heads > MAX_CLUSTER_HEADS || conv_dim * kernel > uint64_t(INT_MAX) ||
         conv_slot_elems != conv_dim * uint64_t(kernel - 1) ||
         ssm_slot_elems != uint64_t(nv) * head_v * HEAD_K) {
         return SCRATCHY_CUDA_ERR_SHAPE;
@@ -670,50 +429,12 @@ static int gdn_decode(const void* qkv, const void* a, const void* b, const void*
         seq_gl seqg{static_cast<int*>(const_cast<void*>(sequence)), nullptr, nullptr, nullptr,
                     size_t(4)};
         x_gl og{bf(out), nullptr, nullptr, size_t(nv), size_t(head_v)};
-        // With no trace the view is never written; `out` is a valid address for it.
-        const size_t ctas = variant == 0 ? size_t(nk) : size_t(nv);
-        f_gl tg{fl(trace != nullptr ? trace : out), nullptr, nullptr,
-                trace != nullptr ? ctas : size_t(1), trace != nullptr ? size_t(PHASES) : 1};
-        decode_globals G{qg, ag, bg, zg, wg, lg, dg, ng, rg, sg, seqg, og, tg,
+        decode_globals G{qg, ag, bg, zg, wg, lg, dg, ng, rg, sg, seqg, og,
                          int(nk), int(heads), scale, eps};
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
-        const bool traced = trace != nullptr;
-        return head_v == 128 ? launch_width<128>(G, nk, heads, kernel, variant, traced, s)
-                             : launch_width<256>(G, nk, heads, kernel, variant, traced, s);
+        return head_v == 128 ? launch_width<128>(G, nk, heads, kernel, s)
+                             : launch_width<256>(G, nk, heads, kernel, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
-}
-
-extern "C" int scratchy_cuda_gdn_decode(const void* qkv, const void* a, const void* b,
-                                        const void* z, const void* w, const void* a_log,
-                                        const void* dt_bias, const void* norm, void* conv_state,
-                                        uint64_t conv_slot_elems, void* ssm_state,
-                                        uint64_t ssm_slot_elems, const void* sequence, void* out,
-                                        uint32_t nk, uint32_t nv, uint32_t head_k,
-                                        uint32_t head_v, uint32_t kernel, float scale, float eps,
-                                        void* stream /* cudaStream_t; null = default stream */) {
-    return gdn_decode(qkv, a, b, z, w, a_log, dt_bias, norm, conv_state, conv_slot_elems,
-                      ssm_state, ssm_slot_elems, sequence, out, nk, nv, head_k, head_v, kernel,
-                      scale, eps, 1, nullptr, stream);
-}
-
-// Test support for `tests/gdn.rs` only (FP8 S8 D1): `scratchy_cuda_gdn_decode` at `variant` 0 (the
-// one-key-head form, #1049's) or 1 (the one-value-head form, the launcher's), the same bits; with
-// `trace` (`[CTAs, 8]` f32, the CTAs `nk` at variant 0 and `nv` at 1, CTA `y · heads + x`), the
-// traced instance's phase cycles (kernel 4 only). Refused as `scratchy_cuda_gdn_decode`, for
-// `variant` above 1, and for a `trace` at another `kernel`.
-extern "C" int scratchy_cuda_gdn_decode_variant(
-    const void* qkv, const void* a, const void* b, const void* z, const void* w,
-    const void* a_log, const void* dt_bias, const void* norm, void* conv_state,
-    uint64_t conv_slot_elems, void* ssm_state, uint64_t ssm_slot_elems, const void* sequence,
-    void* out, uint32_t nk, uint32_t nv, uint32_t head_k, uint32_t head_v, uint32_t kernel,
-    float scale, float eps, uint32_t variant, void* trace,
-    void* stream /* cudaStream_t; null = default stream */) {
-    if (variant > 1 || (trace != nullptr && kernel != TRACE_K)) {
-        return SCRATCHY_CUDA_ERR_SHAPE;
-    }
-    return gdn_decode(qkv, a, b, z, w, a_log, dt_bias, norm, conv_state, conv_slot_elems,
-                      ssm_state, ssm_slot_elems, sequence, out, nk, nv, head_k, head_v, kernel,
-                      scale, eps, variant, trace, stream);
 }
