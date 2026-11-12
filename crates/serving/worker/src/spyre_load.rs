@@ -510,23 +510,20 @@ pub(crate) fn stage_bound_weights(
     wiring: &scratchy_target_spyre::wiring::Wiring,
     // A rank of a sharded world stages its share of each tensor; `None` stages it whole.
     #[cfg(feature = "spyre-hw")] cut: Option<&RankCut>,
-    // The allocator that owns the bound tensors' buffers: staging TAKES each buffer
-    // (no copy) at its last binding instead of copying it while the original stays alive. `None`
-    // copies every buffer — a sharded world's earlier ranks, whose cut must leave the whole tensor
-    // for the ranks after them.
+    // The allocator that owns the bound tensors' buffers: staging SHARES each buffer — a VIEW
+    // clones its keepalive handle (free), an OWNED buffer copies. The share, never a take, is the
+    // LAW: a take removes the store's entry and the buffer frees at this binding, which is sound
+    // only if staging is that buffer's last reader — an ordering the serial rank walk once
+    // guaranteed and [`each_rank_parallel`] removed (every rank's walk reads the whole tensors at
+    // once). The share leaves the entry in the store, where it outlives every walk: the allocator
+    // drops with `gw`, after the fan-out joins. `None` copies every buffer — a sharded world's
+    // ranks other than the one whose input slot the allocator rides.
     mut alloc: Option<&mut SpyreAllocator>,
 ) -> ExecutorResult<Vec<StagedWeight>> {
     let _t_load = std::time::Instant::now();
     let mut weights: Vec<StagedWeight> = Vec::new();
     let _take_s = 0f64;
-    // The LAST binding of each buffer — a buffer two bindings share (a tied head, k=v) is
-    // copied for every binding but its last, which takes it.
-    let last_binding: std::collections::HashMap<*const u8, usize> = bound
-        .iter()
-        .enumerate()
-        .map(|(i, bw)| (gpu_tensor_bytes(&bw.tensor).as_ptr(), i))
-        .collect();
-    for (bi, bw) in bound.iter().enumerate() {
+    for bw in bound.iter() {
         let is_gemm = bw.is_gemm;
         let s_id = bw.id as usize;
         // ⭐⭐⭐ `[rows, cols]` COMES FROM THE BAKE, NOT FROM THE TENSOR'S OWN DIMS.
@@ -563,22 +560,17 @@ pub(crate) fn stage_bound_weights(
             let src = gpu_tensor_bytes(&bw.tensor);
             let (ptr, len) = (src.as_ptr(), src.len());
             match alloc.as_deref_mut() {
-                Some(alloc) if last_binding.get(&ptr) == Some(&bi) => {
-                    // SAFETY: this is the buffer's last binding and staging is its last reader
-                    // in the load — nothing reads through `bw.tensor` (or any tensor viewing
-                    // the same buffer) after this point. A VIEW take keeps the mmap alive, so
-                    // the tensor's readers stay valid anyway; an OWNED take is the move.
-                    unsafe { alloc.take(ptr, len) }
-                        .unwrap_or_else(|| HostBytes::Owned(src.to_vec()))
-                }
-                Some(alloc) => {
-                    // A shared buffer's earlier binding: a VIEW clones its keepalive handle
-                    // (two bindings of one mmap range — free); an OWNED buffer has no handle,
-                    // so this binding copies, as shared owned buffers always have.
-                    alloc
-                        .share(ptr, len)
-                        .unwrap_or_else(|| HostBytes::Owned(src.to_vec()))
-                }
+                // ⭐ SHARE, NEVER TAKE — the take removed the store's entry and freed an OWNED
+                // buffer at this binding, sound only while staging was the buffer's last
+                // reader, an ordering the serial rank walk once guaranteed. Under
+                // [`each_rank_parallel`] every rank's walk reads the whole tensors at once, so
+                // NOTHING may free one mid-fan-out: the share leaves the entry in the store,
+                // where it outlives every walk (the allocator drops with `gw`, after the join).
+                // A VIEW clones its keepalive handle — free; an OWNED buffer has no handle, so
+                // this binding copies (measured: one 16 MiB synthesized buffer per model, ~6 ms).
+                Some(alloc) => alloc
+                    .share(ptr, len)
+                    .unwrap_or_else(|| HostBytes::Owned(src.to_vec())),
                 None => HostBytes::Owned(src.to_vec()),
             }
         };
@@ -1070,10 +1062,11 @@ impl SpyreWorker {
                 // (`each_rank_parallel`): each rank's cut reads the whole checkpoint tensors and
                 // writes its own share into its own shadow, so the walks are independent (measured
                 // at tp/8: 4.0 s as eight sequential walks, each ~the single-card wall). The
-                // allocator rides the LAST rank's input slot — its staging is the final reader of
-                // the whole tensors, so IT takes each buffer at its last binding while the ranks
-                // before it copy — the one unique resource crossing the fan-out as exactly one
-                // rank's input, never a shared `&mut`.
+                // allocator rides the LAST rank's input slot — the one unique resource crossing
+                // the fan-out as exactly one rank's input, never a shared `&mut`. Its staging
+                // SHARES every buffer and never takes: a take could free a buffer under the other
+                // ranks' concurrent reads, so every walk reads buffers the store keeps alive
+                // past their join.
                 let mut alloc_slot = Some(gw.allocator_mut());
                 let inputs =
                     scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|me| {
