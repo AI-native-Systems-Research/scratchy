@@ -861,7 +861,8 @@ serve_up() { # log ready_path cmd...
     return 1
 }
 scratchy_up() { # the scratchy server every scratchy measurement after the ladder uses
-    serve_up "${RAW}/serve-${stem}.log" /v1/models "${model_bin}" serve "${id}" --port "${PORT}" \
+    # --enable-metrics: its /metrics, whose speculative-decoding counters each cell reads.
+    serve_up "${RAW}/serve-${stem}.log" /v1/models "${model_bin}" serve "${id}" --port "${PORT}" --enable-metrics \
         ${KV_CACHE_DTYPE:+--kv-cache-dtype "${KV_CACHE_DTYPE}"} ${SERVE_ARGS}
 }
 serve_down() {
@@ -1110,20 +1111,38 @@ footprint_bytes() { # pid -> bytes, or nothing if it has gone
 # "No ... recorded" notes), a CPU speed limit and warning levels on a throttled one. Taken around
 # every repeat, so a cell measured on a throttled Mac can be told from one that was not.
 # A pmset that fails prints "unread" instead, so it is not taken for a cool Mac.
-therm_now() { pmset -g therm 2>/dev/null || echo unread; }
+# Then the server's speculative-decoding counters, where it serves them (scratchy's /metrics, its
+# registry prefixing each with vllm_): draft tokens proposed and accepted so far, a line each. An
+# engine with no such counters adds none.
+therm_now() {
+    pmset -g therm 2>/dev/null || echo unread
+    curl -fsS -m 2 "http://127.0.0.1:${PORT}/metrics" 2>/dev/null \
+        | grep -E '^vllm_spec_decode_num_(draft|accepted)_tokens(_total)? ' || true
+}
 # Write a cell's thermal state into its JSON ($1), before ($2) and after ($3) it, as numbers, each
-# "Name = N" line: {} where pmset reports no warning, null where it could not be read.
+# "Name = N" line: {} where pmset reports no warning, null where it could not be read. Where the
+# server counted its speculative decoding, the cell's own draft tokens proposed and accepted (the
+# counters' rise over it) as "spec_decode", and their ratio.
 therm_record() { # json before after
     [[ -f "$1" ]] || return 0
     python3 - "$1" "$2" "$3" <<'PY' || true
 import json, re, sys
 p, before, after = sys.argv[1:4]
+SPEC = re.compile(r"^vllm_spec_decode_num_(draft|accepted)_tokens(?:_total)? (\d+(?:\.\d+)?)\s*$", re.M)
 def therm(text):
+    text = SPEC.sub("", text)
     if text.strip() == "unread":
         return None
     return {k.strip(): int(v) for k, v in re.findall(r"^\s*([A-Za-z0-9_ ]+?)\s*=\s*(\d+)\s*$", text, re.M)}
+def spec(text):
+    return {k: int(float(v)) for k, v in SPEC.findall(text)}
 j = json.load(open(p))
 j["thermal"] = {"before": therm(before), "after": therm(after)}
+a, b = spec(before), spec(after)
+if a.keys() == b.keys() == {"draft", "accepted"}:
+    drafted, accepted = b["draft"] - a["draft"], b["accepted"] - a["accepted"]
+    j["spec_decode"] = {"draft_tokens": drafted, "accepted_tokens": accepted,
+                        "acceptance": round(accepted / drafted, 4) if drafted > 0 else None}
 json.dump(j, open(p, "w"), indent=2)
 PY
 }
@@ -1743,7 +1762,8 @@ PY
         | awk -v c="${cap:-0}" 'NF && (c == 0 || $1 <= c)' | sort -nu | paste -sd, -)
     [[ -n "${GRID_CONC_LIST}" ]] || GRID_CONC_LIST=${BASE_CONC}
 
-    feats="metal,serve,bench-datasets,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
+    # metrics: scratchy's /metrics, whose speculative-decoding counters each cell reads (therm_now).
+    feats="metal,serve,metrics,bench-datasets,model/$(model_preset "${stem}")${quant:+,quant/${quant}}"
     build_secs=""; bytes=""; built=1
     if (( ! SKIP_BUILD )); then
         echo "--- build -F ${feats}"
@@ -1766,7 +1786,8 @@ PY
     # Every per-model file an earlier run into this directory left, a declined
     # engine's included: a decline is this run's finding, not a sticky one.
     # --resume keeps the scaling cells, the ones it is there to keep (run_cell).
-    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}" "${RAW}"/declined-*-"${stem}"
+    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}" "${RAW}"/declined-*-"${stem}" \
+        "${RAW}/serve-${stem}.log"
     (( RESUME )) || rm -f "${RAW}"/scale*-"${stem}".*.json
     cell_model=""; cell_tok=""
     for row in "${ENGINE_ROWS[@]}"; do IFS='|' read -r key _ _ <<<"${row}"; unset "M_${key}" "Q_${key}" "R_${key}"; done
@@ -1973,7 +1994,10 @@ KEEP = ["median_ttft_ms", "median_tpot_ms",
         # The Mac's thermal state around the cell (run_rep): {} where pmset reports no warning, a
         # CPU speed limit where the Mac was throttled. Over repeats, the first's before and the
         # last's after (pooled).
-        "thermal"]
+        "thermal",
+        # Scratchy's speculative decoding over the cell: draft tokens proposed and accepted, and
+        # their ratio (therm_record); absent where the server counted none. Over repeats, summed.
+        "spec_decode"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json$")
 def load(name):
     p = os.path.join(raw, name)
@@ -2028,6 +2052,11 @@ def pooled(reps):
     if any("thermal" in j for j in reps):
         m["thermal"] = {"before": (reps[0].get("thermal") or {}).get("before"),
                         "after": (reps[-1].get("thermal") or {}).get("after")}
+    if all("spec_decode" in j for j in reps):
+        drafted = sum(j["spec_decode"]["draft_tokens"] for j in reps)
+        accepted = sum(j["spec_decode"]["accepted_tokens"] for j in reps)
+        m["spec_decode"] = {"draft_tokens": drafted, "accepted_tokens": accepted,
+                            "acceptance": round(accepted / drafted, 4) if drafted > 0 else None}
     return m
 grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
 grid_inputs = {int(x) for x in env["SCALE_GRID_INPUT"].split(",") if x}
@@ -2085,6 +2114,27 @@ def tasks(engine):
             cell["energy"] = e
         cells.append(cell)
     return cells or None
+def spec_decode():
+    """What scratchy's server drafted with, from its own startup line: the drafter (dflash2,
+    mtp), its repo, and the tokens it drafts a step; or none, and why, where it said; null where
+    its log says nothing (a server from before it did, or one that never started)."""
+    p = os.path.join(raw, f"serve-{stem}.log")
+    if not os.path.exists(p):
+        return None
+    drafts = off = None
+    for line in open(p, errors="replace"):
+        if m := re.search(r"spec-decode: \S+ drafts (\d+) tokens a step with (.+?)\.\s*$", line):
+            drafts, off = m, None
+        elif "spec-decode:" in line and "serving without drafting" in line:
+            drafts, off = None, line.split("spec-decode:", 1)[1].strip()
+    if drafts:
+        source = drafts.group(2)
+        repo = source.rsplit(" ", 1)[-1] if " head " in source and "/" in source else None
+        kind = "dflash2" if "dflash" in source.lower() else "mtp"
+        return {"drafter": kind, "repo": repo, "drafts_per_step": int(drafts.group(1))}
+    if off:
+        return {"drafter": None, "why": off}
+    return None
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""
     p = os.path.join(raw, f"parity-{stem}.log")
@@ -2143,6 +2193,9 @@ d["models"].append({
                        if built == "1" and mlx_python and env.get("PARITY") != "1" else None),
     # The prompts that passed on near-ties, each with its tokens' logit gaps; null for none.
     "parity_ties": parity_ties(),
+    # What scratchy's server drafted with (speculative decoding): its drafter, repo and tokens a
+    # step, or none and why; each cell keeps its own acceptance ("spec_decode").
+    "spec_decode": spec_decode(),
     "footprint": {"build_seconds": int(secs) if secs else None,
                   "binary_bytes": int(size) if size else None,
                   "container_image_bytes": None,
