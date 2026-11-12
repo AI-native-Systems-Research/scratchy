@@ -113,6 +113,7 @@ fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
         run.mark_dead();
         run.mark_short();
         run.mark_mem_below_weights();
+        run.mark_ttft_too_soon();
         run.file = f;
         runs.push(run);
     }
@@ -1717,9 +1718,13 @@ fn why(c: Option<&Cell>, name: &str) -> String {
     match c {
         None => format!("no {name}"),
         Some(c) if c.dead => format!("{name}: {}", failed_note(Some(c))),
+        Some(c) if c.ttft_too_soon => format!("{name}: {TTFT_TOO_SOON}"),
         Some(_) => format!("{name}: {NO_STREAM}"),
     }
 }
+
+/// Why a cell marked [`Cell::ttft_too_soon`] has no TTFT or TPOT.
+const TTFT_TOO_SOON: &str = "first token timed sooner than its prompt can be read";
 
 /// One model's grid for one metric, coloured by scratchy against its rival.
 fn heat_map(g: &ShapeGrid, metric: Metric, title: &str, scale: &str) -> Element {
@@ -2748,6 +2753,8 @@ struct Square<'a> {
 struct GlanceGrid {
     rival: Engine,
     cells: Vec<(u32, u32, Option<f64>)>,
+    /// Each ratioless square's reason, where its cell gives one ([`why`]).
+    why: Vec<(u32, u32, String)>,
 }
 
 impl GlanceGrid {
@@ -2765,11 +2772,15 @@ impl GlanceGrid {
         let rival = g
             .rival
             .ok_or("scratchy alone so far: no engine to compare")?;
-        let cells = (users.iter())
-            .flat_map(|&u| prompts.iter().map(move |&i| (u, i)))
-            .map(|(u, i)| (u, i, g.versus(metric, (u, i), rival).0))
-            .collect();
-        Ok(GlanceGrid { rival, cells })
+        let (mut cells, mut why) = (Vec::new(), Vec::new());
+        for (u, i) in (users.iter()).flat_map(|&u| prompts.iter().map(move |&i| (u, i))) {
+            let (r, said) = g.versus(metric, (u, i), rival);
+            if r.is_none() && said.contains(TTFT_TOO_SOON) {
+                why.push((u, i, said));
+            }
+            cells.push((u, i, r));
+        }
+        Ok(GlanceGrid { rival, cells, why })
     }
 }
 
@@ -3166,9 +3177,11 @@ fn glance_of(machines: &BTreeMap<&str, MachineRuns>, grid_only: bool) -> Element
             let ratio = match &grids[&(chip, stem, gm.name)] {
                 Ok(g) => match g.cells.iter().find(|&&(cu, ci, _)| (cu, ci) == (u, i)) {
                     Some(&(_, _, Some(r))) => Ok((r, g.rival)),
-                    _ => Err("no ratio"),
+                    _ => Err((g.why.iter())
+                        .find(|(wu, wi, _)| (*wu, *wi) == (u, i))
+                        .map_or("no ratio".to_string(), |(_, _, w)| w.clone())),
                 },
-                Err(why) => Err(*why),
+                Err(why) => Err(why.to_string()),
             };
             let (fill, label, verdict) = match ratio {
                 Ok((r, rival)) => {
@@ -5795,6 +5808,46 @@ mod tests {
         let mut run: Run = serde_json::from_value(json).expect("a run");
         run.mark_mem_below_weights();
         (run, at)
+    }
+
+    /// A cell whose first token came sooner than its prompt can be read (under 10 ms, or 1 ms a
+    /// 100 prompt tokens: oMLX 0.7.3's prefill keepalive timed as the first token, before bench
+    /// serve's fix) has no TTFT or TPOT on the page; its end-to-end time stands.
+    #[test]
+    fn a_first_token_sooner_than_its_prompt_is_no_reading() {
+        use super::data::At;
+        use super::numbers::{Engine, Metric, timing};
+        let mut runs = fixtures(&["apple-m4-max-2026-10-29T013115Z-8385aba7.json"]);
+        let m = &mut runs[0].models[0];
+        let cells = m.scaling_omlx.as_mut().expect("oMLX's grid");
+        let at = (cells.iter())
+            .position(|c| matches!(c.at, At::Grid { input: 4096, .. }))
+            .expect("a 4096-token cell");
+        let e2el = cells[at].median_e2el_ms;
+        cells[at].median_ttft_ms = Some(17.0);
+        runs[0].mark_ttft_too_soon();
+        let c = &runs[0].models[0].scaling_omlx.as_ref().unwrap()[at];
+        assert!(c.ttft_too_soon, "17 ms for 4096 tokens");
+        assert_eq!(timing(Some(c), Metric::Ttft), None);
+        assert_eq!(timing(Some(c), Metric::Tpot), None);
+        assert_eq!(c.median_e2el_ms, e2el, "its whole time stands");
+        // A short prompt's too: 3 ms for 128 tokens is no prefill either.
+        let cells = runs[0].models[0].scaling_omlx.as_mut().unwrap();
+        let short = (cells.iter())
+            .position(|c| matches!(c.at, At::Grid { input: 128, .. }))
+            .expect("a 128-token cell");
+        cells[short].median_ttft_ms = Some(3.0);
+        runs[0].mark_ttft_too_soon();
+        assert!(runs[0].models[0].scaling_omlx.as_ref().unwrap()[short].ttft_too_soon);
+        // The Random section says why the square has no ratio.
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section(super::datasets::RANDOM, &machines, &machines));
+        assert!(html.contains("first token timed sooner than its prompt can be read"));
+        // A real one is untouched: every other cell of the run.
+        let others = (runs[0].models.iter().flat_map(|m| Engine::ALL.into_iter().flat_map(move |e| e.cells(m).iter())))
+            .filter(|c| c.ttft_too_soon)
+            .count();
+        assert_eq!(others, 2, "the two set here, and no real one");
     }
 
     /// Only an engine that serves the MLX checkpoint is judged against its weights: ollama,

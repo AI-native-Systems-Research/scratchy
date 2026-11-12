@@ -106,6 +106,40 @@ impl Run {
     }
 }
 
+/// The fewest milliseconds a prompt's prefill takes, a 100 of its tokens, and at all: a first token
+/// sooner than either was not the prompt's. On the published runs the fastest real reading is 21 ms
+/// (granite-4.2-3b, 128 prompt tokens, on the M5 Max), twice [`PREFILL_FLOOR_MS`]; oMLX 0.7.3's
+/// keepalive read 2 to 17 ms whatever the prompt.
+pub const PREFILL_FLOOR_MS_PER_100: f64 = 1.0;
+pub const PREFILL_FLOOR_MS: f64 = 10.0;
+
+impl Run {
+    /// Mark the cells whose first token came sooner than its prompt can be read: under
+    /// [`PREFILL_FLOOR_MS`], or [`PREFILL_FLOOR_MS_PER_100`] for its prompt tokens. A cell whose
+    /// requests answered with almost nothing reads so too, its first token its last. oMLX 0.7.3 streamed a prefill keepalive
+    /// that bench serve, before it learned to skip it, timed as the first token, so its TTFT read
+    /// milliseconds for thousands of tokens and its TPOT took the prefill in. Done as the run
+    /// loads, so every chart and table drops both numbers at once ([`Cell::ttft_too_soon`]); its
+    /// end-to-end time is the whole request's, and stands.
+    pub fn mark_ttft_too_soon(&mut self) {
+        let base = self.config.base().and_then(|b| b.input);
+        for m in &mut self.models {
+            for e in Engine::ALL {
+                for c in e.cells_mut(m) {
+                    let prompt = match c.at {
+                        At::Grid { input, .. } | At::Input(input) => Some(input),
+                        At::Conc(_) | At::Output(_) => base,
+                    };
+                    c.ttft_too_soon = c.median_ttft_ms.is_some_and(|ms| {
+                        let floor = prompt.map_or(0.0, |p| PREFILL_FLOOR_MS_PER_100 * f64::from(p) / 100.0);
+                        ms < PREFILL_FLOOR_MS.max(floor)
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// The only schema this page reads.
 #[derive(Deserialize)]
 #[serde(try_from = "u32")]
@@ -778,6 +812,10 @@ pub struct Cell {
     /// Whether its peak memory reads below the model's own weights ([`Run::mark_mem_below_weights`]),
     /// so it is no reading of the process.
     pub mem_below_weights: bool,
+    /// Whether its first token came sooner than its prompt can be read ([`Run::mark_ttft_too_soon`]),
+    /// so its TTFT, and the TPOT taken from it, are no reading of the engine.
+    #[serde(skip)]
+    pub ttft_too_soon: bool,
     /// The client never finished it (the run's `cell_timeout_s`), so every request counts as
     /// failed: too slow, not out of memory.
     pub timed_out: bool,
@@ -978,6 +1016,7 @@ impl TryFrom<RawCell> for Cell {
             total_output_tokens: c.total_output_tokens,
             dead: false,
             mem_below_weights: false,
+            ttft_too_soon: false,
             timed_out: c.timed_out,
             dead_server: c.dead_server,
             short: None,
