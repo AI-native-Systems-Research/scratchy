@@ -29,8 +29,7 @@ use common::numerics::{
 };
 use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_target_cuda::kernels::{
-    KernelError, gdn_chunk_scan, gdn_chunk_scan_part, gdn_conv1d, gdn_gating, gdn_rms_norm_gated,
-    gdn_scan,
+    KernelError, gdn_chunk_scan, gdn_conv1d, gdn_gating, gdn_rms_norm_gated, gdn_scan,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 use scratchy_target_cuda::step::gdn_scale;
@@ -2735,8 +2734,7 @@ fn a_decode_after_a_chunked_prefill_follows_the_recurrence() {
 }
 
 /// The chunked scan refuses exactly what the scan refuses (both refusal tests' scan cases), before
-/// it touches a pointer, its output and the state left as they were; its timing split refuses the
-/// same and a `part` above 2.
+/// it touches a pointer, its output and the state left as they were.
 #[test]
 fn the_chunked_scan_refuses_what_the_scan_refuses() {
     let device = h100();
@@ -2779,66 +2777,23 @@ fn the_chunked_scan_refuses_what_the_scan_refuses() {
             head_k: hk,
             head_v: hv,
         };
-        for part in [None, Some(0u32), Some(1), Some(2)] {
-            // SAFETY: refused before any pointer is touched; every buffer is a live allocation.
-            let got = unsafe {
-                match part {
-                    None => gdn_chunk_scan(
-                        (x.ptr(), x.ptr(), x.ptr()),
-                        (st.ptr(), se),
-                        seq.ptr(),
-                        out.ptr(),
-                        (rows, nk, nv),
-                        (hk, hv, sc),
-                        null,
-                    ),
-                    Some(p) => gdn_chunk_scan_part(
-                        (x.ptr(), x.ptr(), x.ptr()),
-                        (st.ptr(), se),
-                        seq.ptr(),
-                        out.ptr(),
-                        (rows, nk, nv),
-                        (hk, hv, sc),
-                        (p, null, null),
-                    ),
-                }
-            };
-            let (o, s) = (unchanged(&out), unchanged(&st));
-            let ok = got == Err(want) && o && s;
-            eprintln!(
-                "chunked refused part={part:?} rows={rows} nk={nk} nv={nv} head_k={hk} \
-                 head_v={hv} slot_elems={se} scale={sc}: {got:?} output_unchanged={o} \
-                 state_unchanged={s} {}",
-                verdict(ok)
-            );
-            pass &= ok;
-        }
-    }
-    // A shape it takes, at a part it does not (4), and the traced part with no trace (3).
-    let se = u64::from(nv9) * 128 * 128;
-    let want = KernelError::GdnScanShape {
-        rows: 4,
-        nk: 16,
-        nv: nv9,
-        head_k: 128,
-        head_v: 128,
-    };
-    for part in [4u32, 3] {
-        // SAFETY: as above.
+        // SAFETY: refused before any pointer is touched; every buffer is a live allocation.
         let got = unsafe {
-            gdn_chunk_scan_part(
+            gdn_chunk_scan(
                 (x.ptr(), x.ptr(), x.ptr()),
                 (st.ptr(), se),
                 seq.ptr(),
                 out.ptr(),
-                (4, 16, nv9),
-                (128, 128, scale),
-                (part, null, null),
+                (rows, nk, nv),
+                (hk, hv, sc),
+                null,
             )
         };
-        let ok = got == Err(want) && unchanged(&out) && unchanged(&st);
+        let (o, s) = (unchanged(&out), unchanged(&st));
+        let ok = got == Err(want) && o && s;
         eprintln!(
-            "chunked refused part={part} (no trace): {got:?} {}",
+            "chunked refused rows={rows} nk={nk} nv={nv} head_k={hk} head_v={hv} \
+             slot_elems={se} scale={sc}: {got:?} output_unchanged={o} state_unchanged={s} {}",
             verdict(ok)
         );
         pass &= ok;
@@ -2851,11 +2806,8 @@ fn the_chunked_scan_refuses_what_the_scan_refuses() {
 
 /// The chunked scan's time per launch (one GDN layer's scan) beside today's recurrent scan, at the
 /// 27B's (nv 48) and the 35B's (nv 32) geometries and `q_len` 128, 2048 and 4096, fresh, over one
-/// step's own conv_out, g and β; and its split: the launch with the solve skipped (T = I) and the
-/// launch stopped after the precompute. Each 20 launches after a warm-up, timed to the download
-/// that waits for them, in the order A, B, A, B (A today's, B the chunked and its parts). Printed
-/// as `F6_TIME` lines; then one traced launch's phase split (each CTA's thread 0's cycles per
-/// phase and chunk, averaged over the CTAs, and each phase's share) as an `F6_PHASE` line.
+/// step's own conv_out, g and β. Each 20 launches after a warm-up, timed to the download that
+/// waits for them, in the order A, B, A, B (A today's, B the chunked). Printed as `F6_TIME` lines.
 /// Recorded, not asserted.
 #[test]
 fn the_chunked_scan_time_is_recorded() {
@@ -2876,8 +2828,8 @@ fn the_chunked_scan_time_is_recorded() {
             );
             let o = up_f32_bits(&device, q_len * d.value_dim(), NAN_F32);
             let seq = up_u32(&device, &[0, q_len as u32, 1, 0]);
-            // `None` today's scan, `Some(part)` the chunked scan's.
-            let launch = |part: Option<u32>| {
+            // `false` today's scan, `true` the chunked scan.
+            let launch = |chunked: bool| {
                 let (rows, slot) = (
                     (q_len as u32, d.nk as u32, d.nv as u32),
                     (pool.ssm.ptr(), pool.layout.ssm_elems_per_slot() as u64),
@@ -2886,8 +2838,8 @@ fn the_chunked_scan_time_is_recorded() {
                 let null = std::ptr::null_mut();
                 // SAFETY: as `run_step`'s, for the scan alone over this step's own scratch.
                 unsafe {
-                    match part {
-                        None => gdn_scan(
+                    match chunked {
+                        false => gdn_scan(
                             (cv.ptr(), g.ptr(), beta.ptr()),
                             slot,
                             seq.ptr(),
@@ -2896,100 +2848,44 @@ fn the_chunked_scan_time_is_recorded() {
                             heads,
                             null,
                         ),
-                        Some(p) => gdn_chunk_scan_part(
+                        true => gdn_chunk_scan(
                             (cv.ptr(), g.ptr(), beta.ptr()),
                             slot,
                             seq.ptr(),
                             o.ptr(),
                             rows,
                             heads,
-                            (p, null, null),
+                            null,
                         ),
                     }
                 }
                 .expect("the scan launches");
             };
-            let time = |part: Option<u32>| {
-                launch(part);
+            let time = |chunked: bool| {
+                launch(chunked);
                 seq.download().expect("wait for the warm-up");
                 let start = std::time::Instant::now();
                 for _ in 0..LAUNCHES {
-                    launch(part);
+                    launch(chunked);
                 }
                 seq.download().expect("wait for the launches");
                 start.elapsed().as_secs_f64() * 1e6 / f64::from(LAUNCHES)
             };
-            let parts = [None, Some(0), Some(1), Some(2)];
-            let mut us = [0.0f64; 4];
+            let mut us = [0.0f64; 2];
             for _ in 0..2 {
-                for (k, &p) in parts.iter().enumerate() {
-                    us[k] += time(p) / 2.0;
+                for (k, chunked) in [false, true].into_iter().enumerate() {
+                    us[k] += time(chunked) / 2.0;
                 }
             }
-            let [today, full, no_solve, precompute] = us;
+            let [today, full] = us;
             eprintln!(
-                "F6_TIME {} L={q_len}: today={today:.1} us chunked={full:.1} us ({:.2}x) \
-                 no_solve={no_solve:.1} us precompute_only={precompute:.1} us solve_share={:.3} \
-                 sequential_share={:.3}",
+                "F6_TIME {} L={q_len}: today={today:.1} us chunked={full:.1} us ({:.2}x)",
                 model(d),
                 today / full,
-                (full - no_solve) / full,
-                (full - precompute) / full,
-            );
-            // The phase split: one traced launch, each CTA's thread 0's cycles per phase.
-            let ctas = (d.head_v / 32) * d.nv;
-            let trace = up_f32_bits(&device, ctas * (PHASES.len() + 1), NAN_F32);
-            // SAFETY: as `launch`'s; `trace` holds `ctas · 13` f32.
-            unsafe {
-                gdn_chunk_scan_part(
-                    (cv.ptr(), g.ptr(), beta.ptr()),
-                    (pool.ssm.ptr(), pool.layout.ssm_elems_per_slot() as u64),
-                    seq.ptr(),
-                    o.ptr(),
-                    (q_len as u32, d.nk as u32, d.nv as u32),
-                    (d.head_k as u32, d.head_v as u32, gdn_scale(d.head_k as u32)),
-                    (3, trace.ptr(), std::ptr::null_mut()),
-                )
-            }
-            .expect("the traced scan launches");
-            let t = down_f32(&trace);
-            let cols = PHASES.len() + 1;
-            let chunks = f64::from(t[cols - 1]);
-            let mean =
-                |p: usize| (0..ctas).map(|c| f64::from(t[c * cols + p])).sum::<f64>() / ctas as f64;
-            let total: f64 = (0..PHASES.len()).map(mean).sum();
-            let split: Vec<String> = (PHASES.iter().enumerate())
-                .map(|(p, name)| {
-                    let m = mean(p);
-                    format!("{name}={:.0} ({:.3})", m / chunks, m / total)
-                })
-                .collect();
-            eprintln!(
-                "F6_PHASE {} L={q_len}: chunks={chunks} cycles_per_chunk={:.0} {}",
-                model(d),
-                total / chunks,
-                split.join(" ")
             );
         }
     }
 }
-
-/// The chunked scan's traced phases (`kernels/gdn_chunk_scan.cu`'s `PHASES`), in order; its trace's
-/// last column is the chunk count.
-const PHASES: [&str; 12] = [
-    "state_load",
-    "rows",
-    "g_beta_G",
-    "kk_qk_qs",
-    "a_n_p",
-    "diag_solve",
-    "t_products",
-    "u_w",
-    "v_new",
-    "o",
-    "state_update",
-    "state_store",
-];
 
 /// Whether the one-launch decode (`gdn_decode`) takes geometry `d`: the decode tapes' rule
 /// (`steps_from_tape`'s `gdn_decode_takes`), else a one-row bucket's GDN step is the four launches

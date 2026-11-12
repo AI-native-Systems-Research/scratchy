@@ -954,24 +954,6 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
-    fn scratchy_cuda_gdn_chunk_scan_part(
-        conv_out: *const c_void,
-        g: *const c_void,
-        beta: *const c_void,
-        ssm_state: *mut c_void,
-        slot_elems: u64,
-        sequence: *const c_void,
-        o: *mut c_void,
-        rows: u32,
-        nk: u32,
-        nv: u32,
-        head_k: u32,
-        head_v: u32,
-        scale: f32,
-        part: u32,
-        trace: *mut c_void,
-        stream: *mut c_void,
-    ) -> i32;
     fn scratchy_cuda_gdn_rank_one_probe(
         s: *const c_void,
         t: *const c_void,
@@ -3347,44 +3329,6 @@ pub unsafe fn gdn_chunk_scan(
         scratchy_cuda_gdn_chunk_scan(
             conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
             scale, stream,
-        )
-    };
-    check(
-        code,
-        KernelError::GdnScanShape {
-            rows,
-            nk,
-            nv,
-            head_k,
-            head_v,
-        },
-    )
-}
-
-/// Test support for `tests/gdn.rs`'s timing split only: [`gdn_chunk_scan`] with `part` 0 (the
-/// kernel), 1 (the solve skipped, T = I), 2 (stopped after the precompute) or 3 (the kernel, its
-/// phases into `trace`: `[(head_v / 32) · nv, 13]` f32, each CTA's cycles per phase summed over
-/// its chunks, then the chunk count; `kernels/gdn_chunk_scan.cu`'s `PHASES`). Parts 1 and 2 are not
-/// a scan. No `CudaStep` uses it. Refused as [`gdn_chunk_scan`] is, at any other `part`, and at
-/// part 3 with a null `trace`.
-///
-/// # Safety
-///
-/// As [`gdn_scan`]'s; `trace`, at part 3, a device pointer to `(head_v / 32) · nv · 13` f32.
-pub unsafe fn gdn_chunk_scan_part(
-    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
-    (ssm_state, slot_elems): (*mut c_void, u64),
-    sequence: *const c_void,
-    o: *mut c_void,
-    (rows, nk, nv): (u32, u32, u32),
-    (head_k, head_v, scale): (u32, u32, f32),
-    (part, trace, stream): (u32, *mut c_void, *mut c_void),
-) -> Result<(), KernelError> {
-    // SAFETY: as `rms_norm_bf16`'s.
-    let code = unsafe {
-        scratchy_cuda_gdn_chunk_scan_part(
-            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
-            scale, part, trace, stream,
         )
     };
     check(

@@ -64,11 +64,6 @@
 //
 // Built with `--use_fast_math` (build.rs): `expf` is `__expf`, `rsqrtf` the approximate one,
 // subnormals flush to zero.
-//
-// TEST SUPPORT: `PART` instantiates the timing split (`scratchy_cuda_gdn_chunk_scan_part`): 1 skips
-// the solve (T = I), 2 stops after the precompute (no `V_new`, `O` or state update). Neither is a
-// correct scan; `PART` 0 is the kernel, and 3 is the kernel recording its phases: thread 0's
-// `clock` cycles in each phase, summed over the chunks, one row of `trace` per CTA.
 
 #include "kittens.cuh"
 #include "scratchy_ops.cuh"
@@ -98,16 +93,6 @@ constexpr int WARPS = 4;
 constexpr int WARP_TOKENS = CHUNK / WARPS;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 
-constexpr int PART_FULL = 0;
-constexpr int PART_NO_SOLVE = 1;
-constexpr int PART_PRECOMPUTE = 2;
-constexpr int PART_TRACE = 3;
-// The traced phases (`PART_TRACE`): 0 the state's load, 1 the rows' loads and normalisation, 2 g,
-// β and G, 3 K̂K̂ᵀ, Q̂K̂ᵀ and Q̂·Sᵀ, 4 A, N, P and O's first term, 5 the diagonal blocks' solve, 6
-// T's four products, 7 U and W, 8 V_new, 9 O and its store, 10 the state's update, 11 the state's
-// store; 12 the chunks.
-constexpr int PHASES = 13;
-
 // A `[64, 64]` bf16 operand: a K̂ or Q̂ half, A's strictly block-lower part, D, M, the chain's
 // factors, T's two scalings, W's halves, P.
 using tok_sq = st_bf<CHUNK, HALF>;
@@ -131,8 +116,6 @@ using row_gl = gl<float, 1, 1, -1, -1>;
 using state_gl = gl<float, -1, -1, -1, HEAD_K>;
 // `[slot, q_len, start, 0]`.
 using seq_gl = gl<int, 1, 1, 1, -1>;
-// `[CTAs, PHASES]` f32 cycles (`PART_TRACE`).
-using trace_gl = gl<float, 1, 1, -1, -1>;
 
 struct chunk_globals {
     // `[rows, conv_dim]`: `q | k | v`.
@@ -144,7 +127,6 @@ struct chunk_globals {
     row_gl o;
     state_gl ssm_state;
     seq_gl sequence;
-    trace_gl trace;
     int nk;
     int nv;
     int head_v;
@@ -210,7 +192,6 @@ __device__ inline void operands_ready() {
     __syncthreads();
 }
 
-template <int PART>
 __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
     const __grid_constant__ chunk_globals g) {
     extern __shared__ int __shm[];
@@ -246,27 +227,6 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
     const int q_len = g.sequence[{0, 0, 0, 1}];
     const bool fresh = g.sequence[{0, 0, 0, 2}] == 1;
 
-    // `PART_TRACE`: thread 0 adds the cycles since the last mark to phase `p`, in shared memory
-    // (`clock`, differences modulo 2³²; a launch's phase sums stay far below it): register
-    // counters took the traced instance past 255 registers.
-    __shared__ sv<int, 16> ph;
-    if constexpr (PART == PART_TRACE) {
-        if (threadIdx.x < 16) {
-            ph[threadIdx.x] = 0;
-        }
-        __syncthreads();
-    }
-    uint32_t last = PART == PART_TRACE ? uint32_t(clock()) : 0;
-    const auto mark = [&](int p) {
-        if constexpr (PART == PART_TRACE) {
-            const uint32_t now = uint32_t(clock());
-            if (threadIdx.x == 0) {
-                ph[p] = ph[p] + int(now - last);
-            }
-            last = now;
-        }
-    };
-
     // Sᵀ: [half] holds key lanes `64·half + 16w ..` of the CTA's 32 rows.
     rows_rt st[2];
     if (fresh) {
@@ -289,7 +249,6 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
     }
     warpgroup::store(stb[0], st[0]);
     warpgroup::store(stb[1], st[1]);
-    mark(0);
 
     for (int c0 = 0; c0 < q_len; c0 += CHUNK) {
         const int nt = min(CHUNK, q_len - c0);
@@ -358,7 +317,6 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
                 warp::store(vb_lo, v, {tt, 0});
             }
         }
-        mark(1);
         if (threadIdx.x < CHUNK) {
             const int tt = threadIdx.x;
             gc[tt] = tt < nt ? g.log_decay[{0, 0, c0 + tt, h}] : 0.0f;
@@ -374,7 +332,6 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
             }
         }
         operands_ready();
-        mark(2);
 
         // 2. K̂K̂ᵀ, Q̂K̂ᵀ, and Q̂·Sᵀ.
         sq_rt kk, qk;
@@ -386,7 +343,6 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
         warpgroup::mm_AB(o, kq[1][0], stb[0]);
         warpgroup::mma_AB(o, kq[1][1], stb[1]);
         warpgroup::mma_async_wait();
-        mark(3);
 
         // 3. A (its diagonal blocks f32, N its strictly block-lower part bf16), P, and the inter-
         //    chunk part of O, `exp(G_i) · (Q̂·Sᵀ)_i`.
@@ -409,82 +365,74 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
         warp::apply(o, o, [&](int r, int, float x) {
             return x * scratchy::ops::exp_of::op<float>(gc[i0 + r]);
         });
-        mark(4);
 
         // 4. T = (I + A)⁻¹ into `d`.
         sq_rt d;
-        if constexpr (PART == PART_NO_SOLVE) {
-            warp::zero(d);
-            warp::apply(d, d, [&](int r, int c, float) { return c == i0 + r ? 1.0f : 0.0f; });
-        } else {
-            // D: warp w's diagonal block, its rows `i0 ..` only, in registers (F6 r3: the shared-
-            // memory row steps were 66% of a chunk). With D_r = e_r − N_r, `B·D = I` row by row
-            // is N_r = A_r − Σ_{j<r} A_rj · N_j, A_r A's row (its entries from column r on are
-            // zero, A strictly lower): the loops fully unrolled, every N_j a register row, each
-            // row's A reads issued together ahead of its chain; then each row stored once, −N_r
-            // with its 1.
-            rv_fl<16> nr[WARP_TOKENS];
+        // D: warp w's diagonal block, its rows `i0 ..` only, in registers (F6 r3: the shared-
+        // memory row steps were 66% of a chunk). With D_r = e_r − N_r, `B·D = I` row by row
+        // is N_r = A_r − Σ_{j<r} A_rj · N_j, A_r A's row (its entries from column r on are
+        // zero, A strictly lower): the loops fully unrolled, every N_j a register row, each
+        // row's A reads issued together ahead of its chain; then each row stored once, −N_r
+        // with its 1.
+        rv_fl<16> nr[WARP_TOKENS];
 #pragma unroll
-            for (int r = 0; r < WARP_TOKENS; ++r) {
-                // Row r's A reads stay in row r (a shared-memory fence): the 120 hoisted at once
-                // took ptxas past 255 registers.
-                __syncwarp();
-                warp::load(nr[r], ad, {i0 + r, 0});
+        for (int r = 0; r < WARP_TOKENS; ++r) {
+            // Row r's A reads stay in row r (a shared-memory fence): the 120 hoisted at once
+            // took ptxas past 255 registers.
+            __syncwarp();
+            warp::load(nr[r], ad, {i0 + r, 0});
 #pragma unroll
-                for (int j = 0; j < r; ++j) {
-                    rv_fl<16> t;
-                    warp::mul(t, nr[j], ad[{i0 + r, j}]);
-                    warp::sub(nr[r], nr[r], t);
-                }
+            for (int j = 0; j < r; ++j) {
+                rv_fl<16> t;
+                warp::mul(t, nr[j], ad[{i0 + r, j}]);
+                warp::sub(nr[r], nr[r], t);
             }
-            __syncwarp();
-#pragma unroll
-            for (int r = 0; r < WARP_TOKENS; ++r) {
-                warp::mul(nr[r], nr[r], -1.0f);
-                warp::store(ad, nr[r], {i0 + r, 0});
-            }
-            __syncwarp();
-            if (warp::laneid() < WARP_TOKENS) {
-                ad[{i0 + warp::laneid(), warp::laneid()}] = 1.0f;
-            }
-            __syncwarp();
-            warpgroup::load(dg, ad);
-            warp::zero(d);
-            set_diag_block(d, dg, w);
-            warpgroup::store(bt[1], d);
-            operands_ready();
-            mark(5);
-            // M = D·N; then I − M.
-            sq_rt m;
-            warpgroup::mm_AB(m, bt[1], bt[0]);
-            warpgroup::mma_async_wait();
-            warpgroup::store(bt[2], m);
-            warp::apply(m, m, [&](int r, int c, float x) {
-                return (c == i0 + r ? 1.0f : 0.0f) - x;
-            });
-            warpgroup::store(bt[3], m);
-            operands_ready();
-            // I − M·(I − M).
-            warpgroup::mm_AB(m, bt[2], bt[3]);
-            warpgroup::mma_async_wait();
-            __syncthreads();
-            warp::apply(m, m, [&](int r, int c, float x) {
-                return (c == i0 + r ? 1.0f : 0.0f) - x;
-            });
-            warpgroup::store(bt[3], m);
-            operands_ready();
-            // Y = −M·(I − M·(I − M)).
-            warpgroup::mm_AB(m, bt[2], bt[3]);
-            warpgroup::mma_async_wait();
-            warp::mul(m, m, -1.0f);
-            warpgroup::store(bt[0], m);
-            operands_ready();
-            // T = D + Y·D.
-            warpgroup::mma_AB(d, bt[0], bt[1]);
-            warpgroup::mma_async_wait();
-            __syncthreads();
-            mark(6);
         }
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < WARP_TOKENS; ++r) {
+            warp::mul(nr[r], nr[r], -1.0f);
+            warp::store(ad, nr[r], {i0 + r, 0});
+        }
+        __syncwarp();
+        if (warp::laneid() < WARP_TOKENS) {
+            ad[{i0 + warp::laneid(), warp::laneid()}] = 1.0f;
+        }
+        __syncwarp();
+        warpgroup::load(dg, ad);
+        warp::zero(d);
+        set_diag_block(d, dg, w);
+        warpgroup::store(bt[1], d);
+        operands_ready();
+        // M = D·N; then I − M.
+        sq_rt m;
+        warpgroup::mm_AB(m, bt[1], bt[0]);
+        warpgroup::mma_async_wait();
+        warpgroup::store(bt[2], m);
+        warp::apply(m, m, [&](int r, int c, float x) {
+            return (c == i0 + r ? 1.0f : 0.0f) - x;
+        });
+        warpgroup::store(bt[3], m);
+        operands_ready();
+        // I − M·(I − M).
+        warpgroup::mm_AB(m, bt[2], bt[3]);
+        warpgroup::mma_async_wait();
+        __syncthreads();
+        warp::apply(m, m, [&](int r, int c, float x) {
+            return (c == i0 + r ? 1.0f : 0.0f) - x;
+        });
+        warpgroup::store(bt[3], m);
+        operands_ready();
+        // Y = −M·(I − M·(I − M)).
+        warpgroup::mm_AB(m, bt[2], bt[3]);
+        warpgroup::mma_async_wait();
+        warp::mul(m, m, -1.0f);
+        warpgroup::store(bt[0], m);
+        operands_ready();
+        // T = D + Y·D.
+        warpgroup::mma_AB(d, bt[0], bt[1]);
+        warpgroup::mma_async_wait();
+        __syncthreads();
 
         // 5. T·diag(β) and T·diag(β·exp(G)); U = T·diag(β)·V and W = T·diag(β·exp(G))·K̂.
         sq_rt tw;
@@ -507,60 +455,54 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
         warpgroup::store(bt[0], w_lo);
         warpgroup::store(bt[1], w_hi);
         operands_ready();
-        mark(7);
 
-        if constexpr (PART != PART_PRECOMPUTE) {
-            // 6. V_new = U − W·Sᵀ.
-            rows_rt ws;
-            warpgroup::mm_AB(ws, bt[0], stb[0]);
-            warpgroup::mma_AB(ws, bt[1], stb[1]);
-            warpgroup::mma_async_wait();
-            warp::sub(u, u, ws);
-            store_split(vn, vb, u);
-            operands_ready();
-            mark(8);
+        // 6. V_new = U − W·Sᵀ.
+        rows_rt ws;
+        warpgroup::mm_AB(ws, bt[0], stb[0]);
+        warpgroup::mma_AB(ws, bt[1], stb[1]);
+        warpgroup::mma_async_wait();
+        warp::sub(u, u, ws);
+        store_split(vn, vb, u);
+        operands_ready();
 
-            // 7. O += P·V_new, its real rows stored.
-            warpgroup::mma_AB(o, bt[4], vn);
-            warpgroup::mma_AB(o, bt[4], vb);
-            warpgroup::mma_AB(o, kq[1][0], vn);
-            warpgroup::mma_async_wait();
-            warpgroup::store(rf, o);
-            __syncwarp();
-            for (int r = 0; r < WARP_TOKENS; ++r) {
-                const int tt = i0 + r;
-                if (tt < nt) {
-                    rv_fl<ROWS> ov;
-                    warp::load(ov, rf, {tt, 0});
-                    warp::store(g.o, ov, {0, 0, c0 + tt, o_col / ROWS});
-                }
+        // 7. O += P·V_new, its real rows stored.
+        warpgroup::mma_AB(o, bt[4], vn);
+        warpgroup::mma_AB(o, bt[4], vb);
+        warpgroup::mma_AB(o, kq[1][0], vn);
+        warpgroup::mma_async_wait();
+        warpgroup::store(rf, o);
+        __syncwarp();
+        for (int r = 0; r < WARP_TOKENS; ++r) {
+            const int tt = i0 + r;
+            if (tt < nt) {
+                rv_fl<ROWS> ov;
+                warp::load(ov, rf, {tt, 0});
+                warp::store(g.o, ov, {0, 0, c0 + tt, o_col / ROWS});
             }
-            mark(9);
-
-            // 8. Sᵀ = exp(G_C)·Sᵀ + K̂ᵀ·(exp(G_C − G) ∘ V_new).
-            const float g_last = gc[CHUNK - 1];
-            warp::apply(u, u, [&](int r, int, float x) {
-                return x * scratchy::ops::exp_of::op<float>(g_last - gc[i0 + r]);
-            });
-            __syncthreads();
-            warpgroup::store(vn, u);
-            operands_ready();
-            // The increment in its own accumulator, then added: with the state itself a WGMMA
-            // accumulator, live across the loop, ptxas serializes every WGMMA of the kernel
-            // (C7514).
-            const float decay = scratchy::ops::exp_of::op<float>(g_last);
-            rows_rt ds[2];
-            warpgroup::mm_AtB(ds[0], kq[0][0], vn);
-            warpgroup::mm_AtB(ds[1], kq[0][1], vn);
-            warpgroup::mma_async_wait();
-            warp::mul(st[0], st[0], decay);
-            warp::mul(st[1], st[1], decay);
-            warp::add(st[0], st[0], ds[0]);
-            warp::add(st[1], st[1], ds[1]);
-            warpgroup::store(stb[0], st[0]);
-            warpgroup::store(stb[1], st[1]);
-            mark(10);
         }
+
+        // 8. Sᵀ = exp(G_C)·Sᵀ + K̂ᵀ·(exp(G_C − G) ∘ V_new).
+        const float g_last = gc[CHUNK - 1];
+        warp::apply(u, u, [&](int r, int, float x) {
+            return x * scratchy::ops::exp_of::op<float>(g_last - gc[i0 + r]);
+        });
+        __syncthreads();
+        warpgroup::store(vn, u);
+        operands_ready();
+        // The increment in its own accumulator, then added: with the state itself a WGMMA
+        // accumulator, live across the loop, ptxas serializes every WGMMA of the kernel
+        // (C7514).
+        const float decay = scratchy::ops::exp_of::op<float>(g_last);
+        rows_rt ds[2];
+        warpgroup::mm_AtB(ds[0], kq[0][0], vn);
+        warpgroup::mm_AtB(ds[1], kq[0][1], vn);
+        warpgroup::mma_async_wait();
+        warp::mul(st[0], st[0], decay);
+        warp::mul(st[1], st[1], decay);
+        warp::add(st[0], st[0], ds[0]);
+        warp::add(st[1], st[1], ds[1]);
+        warpgroup::store(stb[0], st[0]);
+        warpgroup::store(stb[1], st[1]);
         // The next chunk's rows overwrite what this one's products read.
         __syncthreads();
     }
@@ -576,25 +518,12 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gdn_chunk_scan_ker(
         }
         __syncthreads();
     }
-    mark(11);
-    if constexpr (PART == PART_TRACE) {
-        if (threadIdx.x == 0) {
-            const int cta = blockIdx.y * gridDim.x + blockIdx.x;
-            ph[PHASES - 1] = (q_len + CHUNK - 1) / CHUNK;
-#pragma unroll
-            for (int p = 0; p < PHASES; ++p) {
-                g.trace[{0, 0, cta, p}] = float(ph[p]);
-            }
-        }
-    }
 }
 
-// The launch shared by the kernel's launcher and the timing split's.
-template <int PART>
+// The launcher's checks and launch (`scratchy_cuda_gdn_chunk_scan`'s contract).
 int launch(const void* conv_out, const void* g, const void* beta, void* ssm_state,
            uint64_t slot_elems, const void* sequence, void* o, uint32_t rows, uint32_t nk,
-           uint32_t nv, uint32_t head_k, uint32_t head_v, float scale, void* trace,
-           void* stream) {
+           uint32_t nv, uint32_t head_k, uint32_t head_v, float scale, void* stream) {
     if (head_k != uint32_t(HEAD_K) || head_v == 0 || head_v % ROWS != 0 || head_v > HEAD_V_MAX ||
         nk == 0 || nv == 0 || nv % nk != 0 || rows == 0 || !std::isfinite(scale) ||
         !(scale > 0.0f)) {
@@ -620,14 +549,10 @@ int launch(const void* conv_out, const void* g, const void* beta, void* ssm_stat
         row_gl og{op, nullptr, nullptr, size_t(rows), size_t(nv) * head_v};
         state_gl sg{sp, size_t(1), size_t(nv), size_t(head_v), nullptr};
         seq_gl qg{qp, nullptr, nullptr, nullptr, size_t(4)};
-        // With no trace the view is never written; `o` is a valid address for it.
-        const size_t ctas = size_t(head_v / ROWS) * nv;
-        trace_gl tg{static_cast<float*>(trace != nullptr ? trace : o), nullptr, nullptr,
-                    trace != nullptr ? ctas : size_t(1), trace != nullptr ? size_t(PHASES) : 1};
-        chunk_globals G{cg, gg, bg, og, sg, qg, tg, int(nk), int(nv), int(head_v), scale};
+        chunk_globals G{cg, gg, bg, og, sg, qg, int(nk), int(nv), int(head_v), scale};
         void* args[] = {&G};
         const dim3 grid(head_v / ROWS, nv), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(gdn_chunk_scan_ker<PART>, grid, block, args,
+        return static_cast<int>(cudaLaunchKernel(gdn_chunk_scan_ker, grid, block, args,
                                                  SMEM_BYTES, static_cast<cudaStream_t>(stream)));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
@@ -636,28 +561,12 @@ int launch(const void* conv_out, const void* g, const void* beta, void* ssm_stat
 
 }  // namespace
 
-// The kernel's one-time setup, run once per device by `kernels::prepare_all`: allow each instance
-// `SMEM_BYTES` of dynamic shared memory (which also loads its module, so a graph capture never
-// loads a kernel mid-capture). 0 = done; any other value = the first failing cudaError_t.
+// The kernel's one-time setup, run once per device by `kernels::prepare_all`: allow it `SMEM_BYTES`
+// of dynamic shared memory (which also loads its module, so a graph capture never loads a kernel
+// mid-capture). 0 = done; any other value = the cudaError_t.
 extern "C" int scratchy_cuda_gdn_chunk_scan_prepare(void) {
-    cudaError_t e = cudaFuncSetAttribute(gdn_chunk_scan_ker<PART_FULL>,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-    if (e != cudaSuccess) {
-        return static_cast<int>(e);
-    }
-    e = cudaFuncSetAttribute(gdn_chunk_scan_ker<PART_NO_SOLVE>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-    if (e != cudaSuccess) {
-        return static_cast<int>(e);
-    }
-    e = cudaFuncSetAttribute(gdn_chunk_scan_ker<PART_PRECOMPUTE>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
-    if (e != cudaSuccess) {
-        return static_cast<int>(e);
-    }
-    return static_cast<int>(cudaFuncSetAttribute(gdn_chunk_scan_ker<PART_TRACE>,
-                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                 SMEM_BYTES));
+    return static_cast<int>(cudaFuncSetAttribute(
+        gdn_chunk_scan_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -680,39 +589,6 @@ extern "C" int scratchy_cuda_gdn_chunk_scan(const void* conv_out, const void* g,
                                             uint32_t nk, uint32_t nv, uint32_t head_k,
                                             uint32_t head_v, float scale,
                                             void* stream /* cudaStream_t; null = default */) {
-    return launch<PART_FULL>(conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv,
-                             head_k, head_v, scale, nullptr, stream);
-}
-
-// Test support for `tests/gdn.rs`'s timing split only: `scratchy_cuda_gdn_chunk_scan` with `part`
-// 0 (the kernel), 1 (the solve skipped, T = I), 2 (stopped after the precompute: no V_new, O
-// or state update) or 3 (the kernel, its phases into `trace`: `[(head_v / 32) · nv, 13]` f32,
-// CTA `y · (head_v / 32) + x`'s thread 0's cycles per phase summed over the chunks, then the
-// chunks). Parts 1 and 2 are not a scan; they time what they leave out. Any other `part`, or
-// part 3 with a null `trace`, is SCRATCHY_CUDA_ERR_SHAPE.
-extern "C" int scratchy_cuda_gdn_chunk_scan_part(const void* conv_out, const void* g,
-                                                 const void* beta, void* ssm_state,
-                                                 uint64_t slot_elems, const void* sequence,
-                                                 void* o, uint32_t rows, uint32_t nk, uint32_t nv,
-                                                 uint32_t head_k, uint32_t head_v, float scale,
-                                                 uint32_t part, void* trace, void* stream) {
-    switch (part) {
-        case uint32_t(PART_FULL):
-            return launch<PART_FULL>(conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows,
-                                     nk, nv, head_k, head_v, scale, nullptr, stream);
-        case uint32_t(PART_NO_SOLVE):
-            return launch<PART_NO_SOLVE>(conv_out, g, beta, ssm_state, slot_elems, sequence, o,
-                                         rows, nk, nv, head_k, head_v, scale, nullptr, stream);
-        case uint32_t(PART_PRECOMPUTE):
-            return launch<PART_PRECOMPUTE>(conv_out, g, beta, ssm_state, slot_elems, sequence, o,
-                                           rows, nk, nv, head_k, head_v, scale, nullptr, stream);
-        case uint32_t(PART_TRACE):
-            if (trace == nullptr) {
-                return SCRATCHY_CUDA_ERR_SHAPE;
-            }
-            return launch<PART_TRACE>(conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows,
-                                      nk, nv, head_k, head_v, scale, trace, stream);
-        default:
-            return SCRATCHY_CUDA_ERR_SHAPE;
-    }
+    return launch(conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k,
+                  head_v, scale, stream);
 }
