@@ -1699,8 +1699,10 @@ fn the_fused_rope_append_time_is_recorded() {
 /// heads × 256, 8 kv heads, the full-width rope, normed: RmsNorm(q), RmsNorm(k), RmsNormUnit(v),
 /// Rope, RopeAppend), its global one (16 × 512, 2 kv heads, `<128, true>`, unnormed and normed:
 /// two 256-column tiles a head view) and the 27B's
-/// and 35B's (`<64, false>`), at positions 0, 1, 191 and 8,191, 3 seeds: `mismatched_bits=0` on q's
-/// rope and k's rope, and 0 differing bytes over both whole caches (the written slot and every other
+/// and 35B's (`<64, false>`), at positions 0, 1, 63, 64, 191, 255, 4,095, 8,191 and 100,003 (the
+/// slot `position % 256`: block edges and the pool's last slot), and at the two slots that append
+/// nothing (`u32::MAX`, and block 4 of a 4-block pool), 3 seeds: `mismatched_bits=0` on q's rope
+/// and k's rope, and 0 differing bytes over both whole caches (the written slot and every other
 /// byte).
 #[test]
 fn the_normed_rope_is_its_chain_bit_for_bit() {
@@ -1708,14 +1710,21 @@ fn the_normed_rope_is_its_chain_bit_for_bit() {
     let mut pass = true;
     for sh in W4C_SHAPES {
         let (kvh, hd) = (sh.kv_heads, sh.head_dim);
-        for position in [0u32, 1, 191, 8191] {
+        let cases = [0u32, 1, 63, 64, 191, 255, 4095, 8191, 100_003]
+            .map(|p| (p, None))
+            .into_iter()
+            .chain([(191, Some(u32::MAX)), (191, Some(W4C_BLOCKS * 64))]);
+        for (position, slot) in cases {
             for seed in 0..3u64 {
-                let c = w4c_case(
+                let mut c = w4c_case(
                     &device,
                     sh,
                     position,
                     0x4C10 ^ seed << 8 ^ u64::from(position),
                 );
+                if let Some(s) = slot {
+                    c.slot = DeviceBuffer::upload_bytes(&device, &s.to_le_bytes()).expect("slot");
+                }
                 let (a, b) = (w4c_caches(&device, kvh, hd), w4c_caches(&device, kvh, hd));
                 let (cq, ck) = w4c_chain(&device, &c, sh.geom(), sh.norms, (&a.0, &a.1));
                 let (fq, fk) = w4c_fused(&device, &c, sh.geom(), sh.norms, (&b.0, &b.1));
@@ -1727,8 +1736,9 @@ fn the_normed_rope_is_its_chain_bit_for_bit() {
                 let bad_k = mismatched_bits(&fk, &ck);
                 let bad_cache = bytes(&a.0, &b.0) + bytes(&a.1, &b.1);
                 let ok = bad_q == 0 && bad_k == 0 && bad_cache == 0;
+                let slot = slot.map_or("position % 256".to_string(), |s| s.to_string());
                 eprintln!(
-                    "W4 rope append {} pos={position} seed={seed}: q mismatched_bits={bad_q} k \
+                    "W4 rope append {} pos={position} slot={slot} seed={seed}: q mismatched_bits={bad_q} k \
                      mismatched_bits={bad_k} cache mismatched_bytes={bad_cache} {}",
                     sh.what,
                     verdict(ok)
@@ -1742,17 +1752,16 @@ fn the_normed_rope_is_its_chain_bit_for_bit() {
 
 // ── FP8 S8 R1: the four-warp rope append (`rope_append_wide_ker`) ─────────────
 
-/// The rope append at `variant` (0 the one-warp kernel W4c built, 1 the four-warp kernel the
-/// launcher runs) on `stream`.
+/// The rope append (the four-warp kernel the launcher runs) on `stream`.
 fn r1_launch(
     c: &W4c,
     (qh, kvh, hd, rot, half): (u32, u32, u32, u32, bool),
     norms: bool,
     caches: (&DeviceBuffer, &DeviceBuffer),
     (qr, kr): (&DeviceBuffer, &DeviceBuffer),
-    (variant, stream): (u32, *mut std::ffi::c_void),
+    stream: *mut std::ffi::c_void,
 ) -> Result<(), KernelError> {
-    use scratchy_target_cuda::kernels::rope_append_fp8_variant;
+    use scratchy_target_cuda::kernels::rope_append_fp8;
     use scratchy_target_cuda::step::RopePairing;
     let pairing = if half {
         RopePairing::HalfHead
@@ -1768,91 +1777,16 @@ fn r1_launch(
     });
     // SAFETY: as `w4c_chain`'s; the outputs are their own allocations, `stream` live or null.
     unsafe {
-        rope_append_fp8_variant(
+        rope_append_fp8(
             (c.q.ptr(), qr.ptr(), c.k.ptr(), kr.ptr(), c.v.ptr()),
             (c.table.ptr(), c.slot.ptr()),
             (caches.0.ptr(), caches.1.ptr()),
             (qh, kvh, hd, rot, pairing),
             (64, W4C_BLOCKS),
             gains,
-            (variant, stream),
+            stream,
         )
     }
-}
-
-/// One variant's outputs on case `c`: q's and k's ropes (from sentinels) and both whole caches
-/// (from `0x5A`).
-fn r1_outputs(device: &CudaDevice, c: &W4c, sh: W4cShape, variant: u32) -> [Vec<u8>; 4] {
-    let caches = w4c_caches(device, sh.kv_heads, sh.head_dim);
-    let (qr, kr) = (
-        DeviceBuffer::upload(device, &vec![SENTINEL; c.qc]).expect("qr"),
-        DeviceBuffer::upload(device, &vec![SENTINEL; c.kc]).expect("kr"),
-    );
-    r1_launch(
-        c,
-        sh.geom(),
-        sh.norms,
-        (&caches.0, &caches.1),
-        (&qr, &kr),
-        (variant, std::ptr::null_mut()),
-    )
-    .expect("the rope append launches");
-    let bytes = |b: &DeviceBuffer| -> Vec<u8> {
-        (b.download().expect("download").iter())
-            .flat_map(|h| h.to_le_bytes())
-            .collect()
-    };
-    [bytes(&qr), bytes(&kr), bytes(&caches.0), bytes(&caches.1)]
-}
-
-/// FP8 S8 R1: the four-warp rope append is the one-warp kernel's bytes, at every W4c shape (Gemma
-/// sliding normed, Gemma global unnormed and normed, the 27B, the 35B), at positions 0, 1, 63, 64,
-/// 191, 255, 4,095, 8,191 and 100,003 (the slot `position % 256`: block edges and the pool's last
-/// slot), and at the two slots that append nothing (`u32::MAX`, and block 4 of a 4-block pool),
-/// 3 seeds each: 0 differing bytes in q's rope, k's rope and both whole caches.
-#[test]
-fn the_four_warp_rope_append_is_the_one_warp_kernels_bits() {
-    let device = h100();
-    let mut pass = true;
-    for sh in W4C_SHAPES {
-        let cases = [0u32, 1, 63, 64, 191, 255, 4095, 8191, 100_003]
-            .map(|p| (p, None))
-            .into_iter()
-            .chain([(191, Some(u32::MAX)), (191, Some(W4C_BLOCKS * 64))]);
-        for (position, slot) in cases {
-            for seed in 0..3u64 {
-                let mut c = w4c_case(
-                    &device,
-                    sh,
-                    position,
-                    0x0E1F_0000 ^ seed << 32 ^ u64::from(position),
-                );
-                if let Some(s) = slot {
-                    c.slot = DeviceBuffer::upload_bytes(&device, &s.to_le_bytes()).expect("slot");
-                }
-                let (a, b) = (
-                    r1_outputs(&device, &c, sh, 0),
-                    r1_outputs(&device, &c, sh, 1),
-                );
-                let differ = |x: &[u8], y: &[u8]| x.iter().zip(y).filter(|(p, q)| p != q).count();
-                let [q, k, kc, vc] = [0, 1, 2, 3].map(|i| differ(&a[i], &b[i]));
-                let ok = q + k + kc + vc == 0;
-                let slot = slot.map_or("position % 256".to_string(), |s| s.to_string());
-                eprintln!(
-                    "R1_BITS {} pos={position} slot={slot} seed={seed}: q_differing_bytes={q} \
-                     k_differing_bytes={k} k_cache_differing_bytes={kc} \
-                     v_cache_differing_bytes={vc} {}",
-                    sh.what,
-                    verdict(ok)
-                );
-                pass &= ok;
-            }
-        }
-    }
-    assert!(
-        pass,
-        "the four-warp rope append differs from the one-warp kernel"
-    );
 }
 
 const STREAM_BLOCKING: u32 = 0;
@@ -1922,8 +1856,8 @@ fn graph_per_node(launch: impl Fn(*mut std::ffi::c_void)) -> f64 {
 }
 
 /// Recorded, not asserted (R1's gate reads it): inside a captured graph of 10 back-to-back nodes,
-/// the one-warp rope append (`one_warp`) against the four-warp one (`four_warp`), at every W4c
-/// shape, two rounds (A, B, A, B), as `R1_TIME` lines.
+/// the rope append (`four_warp`, the launcher's kernel), at every W4c shape, two rounds, as
+/// `R1_TIME` lines.
 #[test]
 fn the_rope_append_graph_times_are_recorded() {
     let device = h100();
@@ -1932,7 +1866,7 @@ fn the_rope_append_graph_times_are_recorded() {
         let caches = w4c_caches(&device, sh.kv_heads, sh.head_dim);
         let buf = |n: usize| DeviceBuffer::upload(&device, &vec![0u16; n]).expect("buffer");
         let (qr, kr) = (buf(c.qc), buf(c.kc));
-        let run = |variant: u32| {
+        let run = || {
             graph_per_node(|s| {
                 r1_launch(
                     &c,
@@ -1940,18 +1874,16 @@ fn the_rope_append_graph_times_are_recorded() {
                     sh.norms,
                     (&caches.0, &caches.1),
                     (&qr, &kr),
-                    (variant, s),
+                    s,
                 )
                 .expect("the rope append launches");
             })
         };
         for round in 1..=2 {
-            let (a, b) = (run(0), run(1));
+            let b = run();
             eprintln!(
-                "R1_TIME {} round {round}: one_warp={a:.2} us four_warp={b:.2} us per node \
-                 ({:.2}x)",
-                sh.what,
-                a / b
+                "R1_TIME {} round {round}: four_warp={b:.2} us per node",
+                sh.what
             );
         }
     }

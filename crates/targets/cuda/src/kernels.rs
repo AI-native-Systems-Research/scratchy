@@ -153,29 +153,6 @@ unsafe extern "C" {
         eps: f32,
         stream: *mut c_void,
     ) -> i32;
-    fn scratchy_cuda_rope_append_fp8_variant(
-        q: *const c_void,
-        q_out: *mut c_void,
-        k: *const c_void,
-        k_out: *mut c_void,
-        v: *const c_void,
-        table: *const c_void,
-        slot_mapping: *const c_void,
-        k_cache: *mut c_void,
-        v_cache: *mut c_void,
-        q_heads: u32,
-        kv_heads: u32,
-        head_dim: u32,
-        rot_dim: u32,
-        pairing: u32,
-        block_size: u32,
-        num_blocks: u32,
-        q_gain: *const c_void,
-        k_gain: *const c_void,
-        eps: f32,
-        variant: u32,
-        stream: *mut c_void,
-    ) -> i32;
     // FP8 S8 W4a: the one-row GEMVs with the residual epilogue (`kernels/gemv_fp8.cu`,
     // `kernels/gemv_bf16.cu`).
     fn scratchy_cuda_gemv_fp8_residual(
@@ -4948,71 +4925,6 @@ pub unsafe fn rope_append_fp8(
             q_gain,
             k_gain,
             eps,
-            stream,
-        )
-    };
-    check(
-        code,
-        KernelError::KvAppendShape {
-            rows: 1,
-            kv_heads,
-            head_dim,
-            block_size,
-        },
-    )
-}
-
-/// Test support for `tests/rope_gate.rs` only (FP8 S8 R1): [`rope_append_fp8`] at `variant`, 0 the
-/// one-warp kernel W4c built and 1 [`rope_append_fp8`]'s own four-warp kernel, the same bits.
-/// Refused as [`rope_append_fp8`], or for `variant` above 1. Asynchronous.
-///
-/// # Safety
-///
-/// As [`rope_append_fp8`]'s.
-#[doc(hidden)]
-pub unsafe fn rope_append_fp8_variant(
-    (q, q_out, k, k_out, v): (
-        *const c_void,
-        *mut c_void,
-        *const c_void,
-        *mut c_void,
-        *const c_void,
-    ),
-    (table, slot_mapping): (*const c_void, *const c_void),
-    (k_cache, v_cache): (*mut c_void, *mut c_void),
-    (q_heads, kv_heads, head_dim, rot_dim, pairing): (u32, u32, u32, u32, RopePairing),
-    (block_size, num_blocks): (u32, u32),
-    norms: Option<(*const c_void, *const c_void, f32)>,
-    (variant, stream): (u32, *mut c_void),
-) -> Result<(), KernelError> {
-    let pairing_code = match pairing {
-        RopePairing::HalfRotated => 0,
-        RopePairing::HalfHead => 1,
-    };
-    let (q_gain, k_gain, eps) = norms.unwrap_or((std::ptr::null(), std::ptr::null(), 0.0));
-    // SAFETY: the caller upholds the contract above; the launcher checks every rule first.
-    let code = unsafe {
-        scratchy_cuda_rope_append_fp8_variant(
-            q,
-            q_out,
-            k,
-            k_out,
-            v,
-            table,
-            slot_mapping,
-            k_cache,
-            v_cache,
-            q_heads,
-            kv_heads,
-            head_dim,
-            rot_dim,
-            pairing_code,
-            block_size,
-            num_blocks,
-            q_gain,
-            k_gain,
-            eps,
-            variant,
             stream,
         )
     };
