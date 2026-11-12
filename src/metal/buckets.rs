@@ -7,14 +7,16 @@ use super::data::{RequestTiming, TaskCell};
 use super::numbers::median;
 
 /// Prompt-length buckets, in tokens: each its label and its upper bound, the last unbounded.
-/// MuSiQue's prompts run about 2k to 4.4k tokens (its 5th to 95th percentile), about 3k at the
-/// middle; these split them about evenly.
-pub const BUCKETS: [(&str, u32); 5] = [
-    ("<2k", 2048),
-    ("2–2.5k", 2560),
-    ("2.5–3k", 3072),
-    ("3–3.5k", 3584),
-    ("3.5k+", u32::MAX),
+/// Four, as the random-token map has four prompt sizes, at about the quartiles of MuSiQue's
+/// prompts (most run 2k to 3.3k tokens): split at round 512s, a quarter of the squares had no
+/// request; split here, about one in twenty.
+/// Each labelled by where it starts, as the random-token map labels a column by its one prompt
+/// size: a range would not fit over its square.
+pub const BUCKETS: [(&str, u32); 4] = [
+    ("<2.3k", 2300),
+    ("2.3k+", 2550),
+    ("2.55k+", 2850),
+    ("2.85k+", u32::MAX),
 ];
 
 /// The bucket a prompt of `tokens` falls in: its index in [`BUCKETS`].
@@ -74,10 +76,10 @@ mod tests {
     #[test]
     fn a_prompt_falls_in_one_bucket() {
         assert_eq!(bucket(1500), 0);
-        assert_eq!(bucket(2048), 1, "a bound starts the next bucket");
-        assert_eq!(bucket(2900), 2);
-        assert_eq!(bucket(3584), 4);
-        assert_eq!(bucket(9000), 4, "the last is unbounded");
+        assert_eq!(bucket(2300), 1, "a bound starts the next bucket");
+        assert_eq!(bucket(2700), 2);
+        assert_eq!(bucket(2850), 3);
+        assert_eq!(bucket(9000), 3, "the last is unbounded");
     }
 
     /// A bucket's median is over its own requests, those with a prompt count and a value: a
@@ -91,18 +93,18 @@ mod tests {
         );
         assert_eq!(median_in(&c, RequestTiming::Ttft, 0), Some(100.0));
         assert_eq!(
-            median_in(&c, RequestTiming::Ttft, 2),
+            median_in(&c, RequestTiming::Ttft, 3),
             Some(400.0),
             "300 and 500"
         );
         assert_eq!(
-            median_in(&c, RequestTiming::Tpot, 2),
+            median_in(&c, RequestTiming::Tpot, 3),
             Some(40.0),
             "20, 40 and 50"
         );
         assert_eq!(median_in(&c, RequestTiming::E2el, 0), Some(200.0));
         assert_eq!(
-            median_in(&c, RequestTiming::Ttft, 4),
+            median_in(&c, RequestTiming::Ttft, 1),
             None,
             "none that long"
         );
@@ -117,6 +119,6 @@ mod tests {
         }))
         .unwrap();
         assert!(!bucketed(&old));
-        assert!(in_bucket(&old, RequestTiming::Ttft, 2).is_empty());
+        assert!(in_bucket(&old, RequestTiming::Ttft, 0).is_empty());
     }
 }

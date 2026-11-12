@@ -142,6 +142,7 @@ fn build_chapter(site: &Site, c: &Chapter, assets: &Published) -> Result<(), Str
             og: None,
             root,
             libraries: &[Library::ZeroMd],
+            chart_data: None,
         },
         body,
     )?;

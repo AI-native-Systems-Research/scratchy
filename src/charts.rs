@@ -5,13 +5,13 @@
 //! metal.html and spyre.html render these with their own data; nothing here
 //! knows a page's own numbers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dioxus::prelude::*;
 use serde::Serialize;
 
-use crate::carbon::{Alignment, Definition, Layer, Stack, Tile};
+use crate::carbon::{Alignment, Definition, Layer, Stack, Tile, TipHeading};
 
 /// Draws every chart from its rendered spec.
 pub const CHARTS_JS: &str = include_str!("charts.js");
@@ -479,11 +479,45 @@ pub fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Ele
         .map(|w| format!("; width: {w}"))
         .unwrap_or_default();
     let height = &options.height;
-    rsx! {
-        div { role: "img", "aria-label": label, style: "{mount}{width}; height: {height}", "data-scale": scale,
-            "data-chart": serde_json::to_string(spec).unwrap_or_default(),
-        }
+    let json = serde_json::to_string(spec).unwrap_or_default();
+    // A page keeping its charts apart ([`keep_apart`]) carries only the spec's place in its
+    // side file; any other, the spec itself.
+    let id = KEPT.with(|k| {
+        k.borrow_mut().as_mut().map(|specs| {
+            specs.push(json.clone());
+            specs.len() - 1
+        })
+    });
+    match id {
+        Some(id) => rsx! {
+            div { role: "img", "aria-label": label, style: "{mount}{width}; height: {height}", "data-scale": scale,
+                "data-chart-id": "{id}",
+            }
+        },
+        None => rsx! {
+            div { role: "img", "aria-label": label, style: "{mount}{width}; height: {height}", "data-scale": scale,
+                "data-chart": json,
+            }
+        },
     }
+}
+
+thread_local! {
+    /// The specs of the page being built, where it keeps them apart from its HTML ([`keep_apart`]).
+    static KEPT: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Starts keeping each chart's spec apart from the page's HTML: [`chart`] then writes only the
+/// spec's id, and [`kept`] gives the specs for the page's side file. Per thread: a page is built
+/// on one.
+pub fn keep_apart() {
+    KEPT.with(|k| *k.borrow_mut() = Some(Vec::new()));
+}
+
+/// The specs kept since [`keep_apart`], in id order, as JSON; and stops keeping them, so the
+/// next page carries its own inline unless it keeps them apart too.
+pub fn kept() -> Vec<String> {
+    KEPT.with(|k| k.borrow_mut().take()).unwrap_or_default()
 }
 
 /// The overview's ratio scale.
@@ -774,6 +808,137 @@ pub fn ratio_step(r: f64) -> usize {
     let at = (log2_ratio(r) - RATIO_RANGE.min) / (RATIO_RANGE.max - RATIO_RANGE.min);
     // Truncation is the floor here: clamped to 0 first.
     ((at.max(0.0) * n as f64) as usize).min(n - 1)
+}
+
+/// The squares of a ratio map to write their factor in, `most` of them: each colour step's
+/// square furthest from ×1, spread evenly from the slowest to the fastest where there are more
+/// steps than labels, both ends always in. So the shades a map uses can be read apart.
+pub fn ratio_labels<K: Copy + Ord>(squares: &BTreeMap<K, f64>, most: usize) -> BTreeSet<K> {
+    let mut by_step: BTreeMap<usize, (K, f64)> = BTreeMap::new();
+    for (&at, &r) in squares {
+        let kept = by_step.entry(ratio_step(r)).or_insert((at, r));
+        if r.log2().abs() > kept.1.log2().abs() {
+            *kept = (at, r);
+        }
+    }
+    let used: Vec<K> = by_step.into_values().map(|(at, _)| at).collect();
+    if used.len() <= most || most < 2 {
+        return used.into_iter().take(most).collect();
+    }
+    (0..most)
+        .map(|k| used[k * (used.len() - 1) / (most - 1)])
+        .collect()
+}
+
+/// A label's ink on a ratio square of step `step`: light on the dark steps far from ×1, dark on
+/// the rest, in light mode; the reverse in dark mode.
+pub fn ratio_ink(step: usize) -> &'static str {
+    if step.abs_diff(RATIO_STEPS.len() / 2) >= 6 {
+        "light-dark(#ffffff, #161616)"
+    } else {
+        "light-dark(#161616, #ffffff)"
+    }
+}
+
+/// One engine's mark on a [`range_dots`] row: its series class (`s1`, `s2`, as the charts colour
+/// it), its name, and its value with its range on a 0 to 1 scale, the tooltip's lines; or, where
+/// it has none, why, written on its line instead.
+pub struct RangeMark {
+    pub class: &'static str,
+    pub name: String,
+    pub at: Result<(f64, f64, f64), String>,
+    pub tip: Vec<String>,
+}
+
+/// A [`range_dots`] group: its heading, and its rows, each a label and its engines' marks.
+pub type RangeGroup = (String, Vec<(String, Vec<RangeMark>)>);
+
+/// Values with their ranges on one 0 to 100% line a row, grouped: each group a heading, each row
+/// a label and a line an engine, its dot at the value and a bar over its range, so two engines'
+/// ranges read as overlapping or apart at a glance. The first series is a filled dot, the rest
+/// hollow, so they read apart without colour too. Plain HTML: no chart data to fetch.
+pub fn range_dots(groups: &[RangeGroup]) -> Element {
+    let grid = "light-dark(#e0e0e0, #393939)";
+    let pct = |v: f64| format!("{:.2}%", (v * 100.0).clamp(0.0, 100.0));
+    // The engines named in the legend, in their first row's order.
+    let mut legend: Vec<(&'static str, String)> = Vec::new();
+    for (_, rows) in groups {
+        for (_, marks) in rows {
+            for m in marks {
+                if !legend.iter().any(|(c, _)| *c == m.class) {
+                    legend.push((m.class, m.name.clone()));
+                }
+            }
+        }
+    }
+    let first = legend.first().map(|(c, _)| *c);
+    let dot = move |class: &str| {
+        let c = colour(class);
+        match Some(class) == first {
+            true => format!("background: {c}; border: 2px solid {c}"),
+            false => format!("background: light-dark(#ffffff, #161616); border: 2px solid {c}"),
+        }
+    };
+    // The axis a panel draws over its lines: 0 to 100% in quarters.
+    let axis = rsx! {
+        div {}
+        div { style: "position: relative; height: 1rem; font-size: 0.625rem; margin: 0 0.5rem",
+            for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                span { style: "position: absolute; left: {pct(t)}; transform: translateX(-50%)", "{t * 100.0:.0}%" }
+            }
+        }
+    };
+    rsx! {
+        Stack { gap: 3,
+            div { style: "display: flex; gap: 1.5rem; font-size: 0.75rem",
+                for (class, name) in &legend {
+                    span { style: "display: inline-flex; align-items: center; gap: 0.375rem",
+                        span { style: "width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; {dot(class)}" }
+                        "{name}"
+                    }
+                }
+            }
+            // A panel a group, side by side as the latency plots are, each with its own axis.
+            div { style: "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); gap: 1rem 1.5rem; align-items: start",
+                for (heading, rows) in groups {
+                    div { style: "display: grid; grid-template-columns: max-content minmax(0, 1fr); column-gap: 0.75rem; row-gap: 0.25rem; align-items: center",
+                        div { style: "grid-column: 1 / -1; font-weight: 600; font-size: 0.875rem; margin-bottom: 0.25rem", "{heading}" }
+                        {axis.clone()}
+                        for (label, marks) in rows {
+                            div { style: "font-size: 0.75rem; white-space: nowrap", "{label}" }
+                            div { style: "position: relative; height: calc({marks.len()} * 1rem + 0.25rem); margin: 0 0.5rem; background: linear-gradient(to right, {grid} 1px, transparent 1px) 0 0 / 25% 100%; border-right: 1px solid {grid}",
+                                for (k, m) in marks.iter().enumerate() {
+                                    {
+                                        let top = format!("calc({k} * 1rem + 0.625rem)");
+                                        match &m.at {
+                                            Ok((v, lo, hi)) => {
+                                                let c = colour(m.class);
+                                                rsx! {
+                                                    div { style: "position: absolute; top: {top}; left: {pct(*lo)}; width: calc({pct(*hi)} - {pct(*lo)}); height: 2px; transform: translateY(-50%); background: {c}" }
+                                                    cds-tooltip { "align": "top", style: "position: absolute; top: {top}; left: {pct(*v)}; transform: translate(-50%, -50%); display: flex",
+                                                        div { tabindex: "0", style: "width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; {dot(m.class)}" }
+                                                        cds-tooltip-content { style: "text-align: left",
+                                                            TipHeading { heading: m.name.clone() }
+                                                            for line in &m.tip { div { "{line}" } }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(why) => rsx! {
+                                                div { style: "position: absolute; top: {top}; left: 0.25rem; transform: translateY(-50%); font-size: 0.6875rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: calc(100% - 0.5rem)",
+                                                    "{m.name}: {why}"
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One side of a comparison chart: the name of its line, and of its fill

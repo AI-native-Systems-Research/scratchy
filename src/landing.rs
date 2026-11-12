@@ -344,6 +344,7 @@ pub fn page(assets: &Published) -> Result<String, String> {
             }),
             root: Root(0),
             libraries: &[],
+            chart_data: None,
         },
         body,
     )

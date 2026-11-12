@@ -50,7 +50,7 @@ const ASSETS: [&str; 2] = [STYLES, FAVICON];
 
 /// A file's published name: `<stem>.<hash>.<ext>`, the hash (64-bit FNV-1a)
 /// of its bytes, so the name changes exactly when the file does.
-fn hashed_name(name: &str, bytes: &[u8]) -> String {
+pub fn hashed_name(name: &str, bytes: &[u8]) -> String {
     let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
     });
