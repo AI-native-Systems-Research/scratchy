@@ -7,49 +7,8 @@ use crate::carbon::{Fold, Stack, Table, TableCell, TableRow};
 use crate::charts::{RangeGroup, RangeMark, range_dots};
 
 use super::data::{Model, RequestTiming, TaskCell};
+use super::datasets;
 use super::numbers::Engine;
-
-/// A workload's name on the page, and what it measures.
-pub fn workload_label(w: &str) -> (&'static str, &'static str) {
-    match w {
-        "sharegpt" => ("ShareGPT chat", "real chat prompts, one turn each"),
-        "rag" => (
-            "MuSiQue, timed",
-            "multi-document QA, MuSiQue: a question over its passages",
-        ),
-        "rag-spans" => (
-            "RAG, passage reuse",
-            "the RAG tasks through scratchy's span cache",
-        ),
-        "sharegpt-multi-turn" => (
-            "ShareGPT conversations",
-            "each turn with the turns before it",
-        ),
-        "longbench" => ("LongBench", "LongBench v2 short: long documents"),
-        "shared-prefix" => (
-            "Shared prompt",
-            "short questions sharing one long system prompt",
-        ),
-        "shared-prefix-control" => ("Shared prompt, no reuse", "the same, every prompt its own"),
-        "rag-accuracy" => (
-            "MuSiQue, scored",
-            "RAG over more tasks, for its accuracy alone: 100 on a quick run, 400 or the whole dev set on a full one",
-        ),
-        _ => ("dataset", ""),
-    }
-}
-
-/// The page's order: the quick run's workloads first.
-const ORDER: [&str; 8] = [
-    "sharegpt",
-    "rag",
-    "rag-spans",
-    "sharegpt-multi-turn",
-    "longbench",
-    "shared-prefix",
-    "shared-prefix-control",
-    "rag-accuracy",
-];
 
 /// The engine a model's `dataset` cells are set against: the first rival that measured any of
 /// them. None for scratchy alone.
@@ -69,11 +28,6 @@ pub fn request_ms(c: &TaskCell, t: RequestTiming) -> Vec<f64> {
         RequestTiming::Tpot => None,
     };
     kept.unwrap_or_default().iter().flatten().copied().collect()
-}
-
-/// A workload's place in the page's order; one the page does not know goes last.
-pub fn order(w: &str) -> usize {
-    ORDER.iter().position(|o| *o == w).unwrap_or(ORDER.len())
 }
 
 /// Fewer tasks than this and a cell's accuracy is indicative: at 8 a task is 12.5 points of it.
@@ -437,7 +391,7 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
     rsx! {
         Stack { gap: 2,
             // The dataset's own name, "MuSiQue accuracy": its scored cell's name is "MuSiQue, scored".
-            strong { "{workload_label(dataset).0.split(',').next().unwrap_or_default()} accuracy" }
+            strong { "{datasets::title(dataset).split(',').next().unwrap_or_default()} accuracy" }
             p { style: "font-size: 0.875rem",
                 "Each dot is an engine's accuracy on the same tasks, its bar the 95% range. Where two \
                  engines' bars overlap they are within noise of each other; where they do not, the gap \
@@ -541,10 +495,10 @@ pub fn detail_table(m: &Model, dataset: &str) -> Element {
     table(m, Some(dataset))
 }
 
-/// Whether a cell belongs in `dataset`'s table: its own, and for MuSiQue its accuracy cell too,
-/// MuSiQue over more tasks.
+/// Whether a cell belongs in `dataset`'s table: its own, and its scored cell's
+/// ([`datasets::Dataset::scored`]), for MuSiQue MuSiQue over more tasks.
 fn of_dataset(c: &TaskCell, dataset: &str) -> bool {
-    c.workload == dataset || (dataset == "rag" && c.workload == "rag-accuracy")
+    c.workload == dataset || datasets::of(dataset).and_then(|d| d.scored) == Some(&c.workload)
 }
 
 fn table(m: &Model, only: Option<&str>) -> Element {
@@ -555,8 +509,7 @@ fn table(m: &Model, only: Option<&str>) -> Element {
         return rsx! {};
     }
     let mut cells = ours;
-    let rank = |w: &str| ORDER.iter().position(|o| *o == w).unwrap_or(ORDER.len());
-    cells.sort_by_key(|c| (rank(&c.workload), c.conc));
+    cells.sort_by_key(|c| (datasets::order(&c.workload), c.conc));
     // The open-loop note, only where the run timed its cells open loop (`--open-loop`).
     let open_loop = cells.iter().any(|c| c.load.as_deref() == Some("rate"));
     let (headers, abouts) = columns();
@@ -566,7 +519,7 @@ fn table(m: &Model, only: Option<&str>) -> Element {
             abouts,
             for c in cells {
                 {
-                    let (name, _) = workload_label(&c.workload);
+                    let name = datasets::title(&c.workload);
                     let them = rival(m, &c.workload, c.conc);
                     let ttft = them.and_then(|(_, r)| ttft_times(c, r));
                     let total = them.and_then(|(_, r)| total_times(c, r));
@@ -628,7 +581,7 @@ pub fn workloads(m: &Model) -> Vec<&str> {
         .iter()
         .map(|c| c.workload.as_str())
         .collect();
-    ws.sort_by_key(|w| ORDER.iter().position(|o| o == w).unwrap_or(ORDER.len()));
+    ws.sort_by_key(|w| datasets::order(w));
     ws.dedup();
     ws
 }

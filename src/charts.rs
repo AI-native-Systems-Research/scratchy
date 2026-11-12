@@ -246,6 +246,29 @@ pub struct ChartOptions<'a> {
     pub toolbar: Enabled,
 }
 
+impl<'a> ChartOptions<'a> {
+    /// What every chart sets, its title, axes and height, with no toolbar: a chart sets the rest
+    /// it needs over this (`..ChartOptions::new(..)`).
+    pub fn new(title: String, axes: Axes<'a>, height: String) -> Self {
+        ChartOptions {
+            title,
+            axes,
+            color: None,
+            heatmap: None,
+            height,
+            width: None,
+            legend: None,
+            locale: None,
+            combo: None,
+            bounds: None,
+            bubble: None,
+            line: None,
+            hover: None,
+            toolbar: Enabled { enabled: false },
+        }
+    }
+}
+
 /// What hovering a chart shows: Carbon's tooltip, and on a line chart its ruler, the line at the
 /// pointer's step whose points the tooltip lists. Unset, Carbon shows both.
 #[derive(Serialize)]
@@ -471,6 +494,62 @@ impl Chart<'_> {
 /// once it nears the screen. Sized already as Carbon sizes it, to the
 /// options' height and any width, so a chart drawn late moves nothing.
 /// `scale` is the id of the ratio scale a heatmap's squares highlight on hover.
+/// A square with no ratio: struck through, on every summary map and grid.
+pub const STRIPED: &str = "background: repeating-linear-gradient(135deg, transparent 0 4px, \
+                           light-dark(#c6c6c6, #525252) 4px 5px)";
+
+/// A grouped bar chart: a bar per series at each of `keys`, in that order, its values from zero
+/// up, each series coloured by its `(name, colour)`. Carbon prints values as given, so each is
+/// rounded to the tables' one decimal.
+pub fn grouped_bars<'a>(
+    data: Vec<BarPoint<'a>>,
+    keys: Vec<String>,
+    series: impl IntoIterator<Item = (&'a str, Themed)>,
+    (title, xlabel, ylabel): (&str, &'a str, &'a str),
+    height: &str,
+    label: &str,
+) -> Element {
+    let data = (data.into_iter())
+        .map(|p| BarPoint {
+            value: p.value.map(|v| (v * 10.0).round() / 10.0),
+            ..p
+        })
+        .collect();
+    let spec = Chart::GroupedBar {
+        data,
+        options: ChartOptions {
+            color: Some(Colour::Scale {
+                scale: series.into_iter().collect(),
+            }),
+            ..ChartOptions::new(
+                title.to_string(),
+                Axes {
+                    bottom: Axis {
+                        maps_to: "key",
+                        title: xlabel,
+                        scale_type: Some("labels"),
+                        ticks: None,
+                        include_zero: None,
+                        visible: None,
+                        domain: Some(AxisDomain::Labels(keys)),
+                    },
+                    left: Axis {
+                        maps_to: "value",
+                        title: ylabel,
+                        scale_type: None,
+                        ticks: None,
+                        include_zero: Some(true),
+                        visible: None,
+                        domain: None,
+                    },
+                },
+                height.to_string(),
+            )
+        },
+    };
+    chart(&spec, label, "width: 100%", None)
+}
+
 pub fn chart(spec: &Chart, label: &str, mount: &str, scale: Option<&str>) -> Element {
     let options = spec.options();
     let width = options
@@ -659,8 +738,6 @@ pub fn mini_heatmap(
     let spec = Chart::Heatmap {
         data,
         options: ChartOptions {
-            title: String::new(),
-            axes: grid.axes(Some(false)),
             color: Some(Colour::Gradient {
                 gradient: Gradient {
                     colors: &RATIO_STEPS,
@@ -673,17 +750,11 @@ pub fn mini_heatmap(
                 },
                 color_domain: Some(RATIO_RANGE),
             }),
-            // Its box decides.
-            height: "100%".to_string(),
             width: Some("100%".to_string()),
             legend: Some(Enabled { enabled: false }),
             locale: Locale::total(total_label),
-            combo: None,
-            bounds: None,
-            bubble: None,
-            line: None,
-            hover: None,
-            toolbar: Enabled { enabled: false },
+            // Its box decides.
+            ..ChartOptions::new(String::new(), grid.axes(Some(false)), "100%".to_string())
         },
         ratio: true,
     };
@@ -1184,10 +1255,6 @@ pub fn sparkline(
         data: spark_points(pts, axes.better, scratchy, rival, carried),
         dashed: carried.into_iter().collect(),
         options: ChartOptions {
-            title: String::new(),
-            // Users, both lengths and model sizes grow by a factor per step:
-            // on a log axis the steps sit evenly.
-            axes: Axes { bottom, left },
             color: Some(Colour::Scale {
                 scale: [
                     (scratchy.line, colour("s1")),
@@ -1200,11 +1267,7 @@ pub fn sparkline(
                 .chain(carried.map(|id| (id, colour("s2"))))
                 .collect(),
             }),
-            heatmap: None,
-            height: height.to_string(),
-            width: None,
             legend: Some(Enabled { enabled: false }),
-            locale: None,
             // Carbon draws an area's bounds only when the layer holds one series.
             combo: Some(vec![
                 ComboLayer {
@@ -1227,10 +1290,9 @@ pub fn sparkline(
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
-            bubble: None,
-            line: None,
-            hover: None,
-            toolbar: Enabled { enabled: false },
+            // Users, both lengths and model sizes grow by a factor per step:
+            // on a log axis the steps sit evenly.
+            ..ChartOptions::new(String::new(), Axes { bottom, left }, height.to_string())
         },
     };
     chart(&spec, label, "width: 100%", None)

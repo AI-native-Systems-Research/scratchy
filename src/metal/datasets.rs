@@ -1,6 +1,6 @@
 //! The page by dataset: which datasets the shown runs measured, and one section a dataset.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dioxus::prelude::*;
 
@@ -8,9 +8,11 @@ use crate::carbon::{
     Alignment, ContentPanel, Definition, Heading, Section, Stack, TabItem, Tabs, TabsKind, Tile,
     TipHeading,
 };
-use crate::charts::{RATIO_STEPS, ScaleFit, ratio_ink, ratio_labels, ratio_scale, ratio_step};
+use crate::charts::{
+    RATIO_STEPS, STRIPED, ScaleFit, ratio_ink, ratio_labels, ratio_scale, ratio_step,
+};
 
-use super::buckets;
+use super::buckets::{self, Buckets};
 use super::data::{At, Model, RequestTiming, Run, TaskCell};
 use super::numbers::{Engine, served};
 use super::{
@@ -22,11 +24,128 @@ use super::{
 /// A summary square's side: the grid's, so one dataset's map is as small as the grid's are.
 const SQUARE: &str = "2.25rem";
 
-/// The accuracy cell's workload: MuSiQue again, over more tasks, for its accuracy alone.
-const ACCURACY: &str = "rag-accuracy";
-
 /// The random-token grid, read as one more dataset: its rows are the grid's prompt lengths.
 pub(super) const RANDOM: &str = "random";
+
+/// What the page knows of a dataset, one row each in [`DATASETS`].
+pub(super) struct Dataset {
+    /// Its key: its workload in the run file (`--dataset-name`), or [`RANDOM`].
+    pub key: &'static str,
+    /// Its name on the page.
+    pub label: &'static str,
+    /// What it measures.
+    pub about: &'static str,
+    /// The workload of its scored cell, a row of its table and not a section of its own:
+    /// MuSiQue's, over more tasks for its accuracy alone.
+    pub scored: Option<&'static str>,
+    /// Whether its tasks are MuSiQue's, drawn as the run's `task_sample` says: a change of
+    /// sampling is a change of its questions, and of no other dataset's.
+    pub sampled: bool,
+    /// The turns of each of its tasks: a conversation's, 1 for a single question.
+    pub turns: u32,
+    /// Its summary map's prompt-length columns.
+    pub buckets: Buckets,
+}
+
+/// A dataset of nothing but its name: one question a task, its prompts in one bucket.
+const fn plain(key: &'static str, label: &'static str, about: &'static str) -> Dataset {
+    Dataset {
+        key,
+        label,
+        about,
+        scored: None,
+        sampled: false,
+        turns: 1,
+        buckets: buckets::WHOLE,
+    }
+}
+
+/// Every dataset the page knows, in its order: the quick run's workloads first, the random-token
+/// grid last.
+const DATASETS: [Dataset; 9] = [
+    plain(
+        "sharegpt",
+        "ShareGPT chat",
+        "real chat prompts, one turn each",
+    ),
+    Dataset {
+        scored: Some("rag-accuracy"),
+        sampled: true,
+        buckets: buckets::MUSIQUE,
+        ..plain(
+            "rag",
+            "MuSiQue, timed",
+            "multi-document QA, MuSiQue: a question over its passages",
+        )
+    },
+    Dataset {
+        sampled: true,
+        buckets: buckets::MUSIQUE,
+        ..plain(
+            "rag-spans",
+            "RAG, passage reuse",
+            "the RAG tasks through scratchy's span cache",
+        )
+    },
+    Dataset {
+        turns: 4,
+        ..plain(
+            "sharegpt-multi-turn",
+            "ShareGPT conversations",
+            "each turn with the turns before it",
+        )
+    },
+    plain(
+        "longbench",
+        "LongBench",
+        "LongBench v2 short: long documents",
+    ),
+    plain(
+        "shared-prefix",
+        "Shared prompt",
+        "short questions sharing one long system prompt",
+    ),
+    plain(
+        "shared-prefix-control",
+        "Shared prompt, no reuse",
+        "the same, every prompt its own",
+    ),
+    Dataset {
+        sampled: true,
+        buckets: buckets::MUSIQUE,
+        ..plain(
+            "rag-accuracy",
+            "MuSiQue, scored",
+            "RAG over more tasks, for its accuracy alone: 100 on a quick run, 400 or the whole dev \
+             set on a full one",
+        )
+    },
+    plain(
+        RANDOM,
+        "Random tokens",
+        "random-token prompts at fixed lengths, the matrix's diagnostic grid (--random)",
+    ),
+];
+
+/// A dataset's row; None for one the page does not know yet.
+pub(super) fn of(key: &str) -> Option<&'static Dataset> {
+    DATASETS.iter().find(|d| d.key == key)
+}
+
+/// A dataset's place in the page's order; one the page does not know goes last.
+pub(super) fn order(key: &str) -> usize {
+    (DATASETS.iter().position(|d| d.key == key)).unwrap_or(DATASETS.len())
+}
+
+/// Whether `workload` is another dataset's scored cell ([`Dataset::scored`]).
+pub(super) fn is_scored(workload: &str) -> bool {
+    DATASETS.iter().any(|d| d.scored == Some(workload))
+}
+
+/// Whether `workload`'s tasks are drawn as the run's `task_sample` says ([`Dataset::sampled`]).
+pub(super) fn sampled(workload: &str) -> bool {
+    of(workload).is_some_and(|d| d.sampled)
+}
 
 /// Every dataset a shown model measured, in the page's order, then [`RANDOM`] if any shown model
 /// measured the random-token grid. A model counts by every run of it on each machine, in `all`,
@@ -46,31 +165,24 @@ pub(super) fn shown<'a>(
     };
     let mut shown: Vec<&'a str> = Vec::new();
     for e in every() {
-        // The accuracy cell is MuSiQue's, a row of its detail table, not a section of its own.
-        for w in tasks::workloads(e.m).into_iter().filter(|&w| w != ACCURACY) {
+        // A scored cell is its dataset's, a row of its detail table, not a section of its own.
+        for w in tasks::workloads(e.m).into_iter().filter(|&w| !is_scored(w)) {
             if !shown.contains(&w) {
                 shown.push(w);
             }
         }
     }
-    shown.sort_by_key(|w| tasks::order(w));
-    let grid = every().any(|e| ran_grid(e.m));
-    if grid {
+    if every().any(|e| ran_grid(e.m)) {
         shown.push(RANDOM);
     }
+    shown.sort_by_key(|w| order(w));
     shown
 }
 
 /// A dataset's name on the page: its label, or for a workload the page does not know yet its own
 /// name, so it keeps a link and section of its own.
 pub(super) fn title(dataset: &str) -> String {
-    match dataset {
-        RANDOM => "Random tokens".to_string(),
-        w => match tasks::workload_label(w).0 {
-            "dataset" => w.to_string(),
-            label => label.to_string(),
-        },
-    }
+    of(dataset).map_or(dataset, |d| d.label).to_string()
 }
 
 /// Whether a model's run measured the random-token grid.
@@ -140,9 +252,10 @@ fn ran<'a>(
 
 /// One dataset's section: its summary map, its timelines where two or more runs measured it, then
 /// one tab strip of machine and model, each pair its latency distributions, what its numbers came
-/// from, its numbers and its users curves. The random-token grid is laid out the same way, from its
-/// own cells ([`random`]). Each pair is its model's newest run that measured the dataset
-/// ([`measured`]). Nothing when no shown machine ran it.
+/// from, its numbers and its users curves. The random-token grid's is laid out the same way, from
+/// its own cells: its summary map, timelines, request plots and grid maps. Each pair is its
+/// model's newest run that measured the dataset ([`measured`]). Nothing when no shown machine ran
+/// it.
 pub(super) fn section(
     dataset: &str,
     machines: &BTreeMap<&str, MachineRuns>,
@@ -155,26 +268,58 @@ pub(super) fn section(
         return rsx! {};
     }
     let id = slug(dataset);
-    if dataset == RANDOM {
-        return random(&id, &ran, machines, all);
-    }
+    let random = dataset == RANDOM;
     let name = title(dataset);
-    let about = tasks::workload_label(dataset).1;
-    let chips: Vec<&str> = ran.iter().map(|&(c, _)| c).collect();
+    let about = of(dataset).map_or("", |d| d.about);
+    let timelines: Vec<(&str, Vec<(String, Element)>)> = (ran.iter())
+        .map(|&(chip, _)| match random {
+            true => (chip, over_time_charts(all, chip)),
+            false => (chip, dataset_timelines(dataset, all, chip, &ran)),
+        })
+        .filter(|(_, cs)| !cs.is_empty())
+        .collect();
+    let summary = match random {
+        true => grid_glance(&id, machines),
+        false => dataset_summary(dataset, &id, &ran, machines),
+    };
+    rsx! {
+        Section { id: "{id}", level: 2,
+            Stack { gap: 5,
+                Stack { gap: 2,
+                    Heading { "{name}" }
+                    p { "{about}" }
+                }
+                {tabbed(&id, &Pairs::of(&ran, machines), summary, over_time_panel(&timelines),
+                    |chip, stem| match random {
+                        true => grid_latency(&id, &machines[chip], stem, chip),
+                        false => pair_latency(dataset, &machines[chip], stem, chip),
+                    },
+                    |chip, stem| match random {
+                        true => grid_pair(&id, &machines[chip], stem, chip),
+                        false => pair_detail(dataset, &machines[chip], stem, chip),
+                    })}
+            }
+        }
+    }
+}
+
+/// A dataset's Summary tab: what its map shows, the map, then its accuracy where it is scored.
+fn dataset_summary(
+    dataset: &str,
+    id: &str,
+    ran: &[(&str, Vec<&str>)],
+    machines: &BTreeMap<&str, MachineRuns>,
+) -> Element {
     // The summary's columns: the lineup's classes, where the runs record one; else every model
     // shown, a column each.
-    let summary_columns = summary_grid(&ran, machines);
+    let summary_columns = summary_grid(ran, machines);
     // Each machine's models as the section reads them, for the accuracy table: in page order.
     let scored_pairs: Vec<(&str, &Model)> = (ran.iter())
         .flat_map(|(chip, stems)| {
             (stems.iter()).filter_map(move |stem| Some((*chip, machines[chip].latest(stem)?.m)))
         })
         .collect();
-    let timelines: Vec<(&str, Vec<(String, Element)>)> = (chips.iter())
-        .map(|&chip| (chip, dataset_timelines(dataset, all, chip, &ran)))
-        .filter(|(_, cs)| !cs.is_empty())
-        .collect();
-    let summary = rsx! {
+    rsx! {
         Stack { gap: 4,
             p { style: "contain: inline-size",
                 "Per machine, its rows: prefill (P) and decode (D) with 1 user, then end-to-end time \
@@ -185,21 +330,8 @@ pub(super) fn section(
                  did not run it, or most of its requests failed. Hover or focus a square for its \
                  ratio, the engine, and a borrowed rival's run."
             }
-            {summary_map(dataset, &id, &ran, machines, &summary_columns)}
+            {summary_map(dataset, id, ran, machines, &summary_columns)}
             {tasks::accuracy_table(dataset, &scored_pairs)}
-        }
-    };
-    rsx! {
-        Section { id: "{id}", level: 2,
-            Stack { gap: 5,
-                Stack { gap: 2,
-                    Heading { "{name}" }
-                    p { "{about}" }
-                }
-                {tabbed(&id, &Pairs::of(&ran, machines), summary, over_time_panel(&timelines),
-                    |chip, stem| pair_latency(dataset, &machines[chip], stem, chip),
-                    |chip, stem| pair_detail(dataset, &machines[chip], stem, chip))}
-            }
         }
     }
 }
@@ -504,36 +636,6 @@ fn tabbed(
 /// A section's tabs, in order.
 const TABS: [&str; 3] = ["Summary", "Latency distributions", "Over time"];
 
-/// The random-token grid's section, in [`section`]'s shape: the grid's summary map, its
-/// timelines, then the one tab strip of machine and model, each pair the grid's own maps, request
-/// plots and curves, under what its numbers came from.
-fn random(
-    id: &str,
-    ran: &[(&str, Vec<&str>)],
-    machines: &BTreeMap<&str, MachineRuns>,
-    all: &BTreeMap<&str, MachineRuns>,
-) -> Element {
-    let timelines: Vec<(&str, Vec<(String, Element)>)> = (ran.iter())
-        .map(|&(chip, _)| (chip, over_time_charts(all, chip)))
-        .filter(|(_, cs)| !cs.is_empty())
-        .collect();
-    rsx! {
-        Section { id: "{id}", level: 2,
-            Stack { gap: 5,
-                Stack { gap: 2,
-                    Heading { "{title(RANDOM)}" }
-                    p { "random-token prompts at fixed lengths, the matrix's diagnostic grid (--random)" }
-                }
-                {tabbed(id, &Pairs::of(ran, machines),
-                    grid_glance(machines),
-                    over_time_panel(&timelines),
-                    |chip, stem| grid_latency(id, &machines[chip], stem, chip),
-                    |chip, stem| grid_pair(id, &machines[chip], stem, chip))}
-            }
-        }
-    }
-}
-
 /// One machine and model's random-token detail: what its numbers came from, then the grid's maps,
 /// its request plots and its users and prompt curves, as its machine section drew them.
 fn grid_pair(id: &str, mr: &MachineRuns, stem: &str, chip: &str) -> Element {
@@ -661,12 +763,173 @@ fn grid_latency(id: &str, mr: &MachineRuns, stem: &str, chip: &str) -> Element {
     }
 }
 
-/// A dataset's summary as one map, the random-token map's look: per machine its rows (P and D,
-/// prefill and decode at 1 user, then end-to-end time at each users count above it, 2u, 4u), per
-/// summary column (a class, or a model) a column each for its prompt-length buckets
-/// ([`buckets::BUCKETS`]), each square scratchy's median against the pair's rival's over the
-/// requests of that bucket. Runs from before cells kept each request's prompt count have none to
-/// draw, and say so.
+/// A summary map's square: by its machine, row, column group and column, each counted from 0.
+pub(super) type MapAt = (usize, usize, usize, usize);
+
+/// One square of a summary map: how many times faster scratchy is and the engine it is set
+/// against ("oMLX (from Oct 27)"), or why it has no ratio; then its tooltip's lines.
+pub(super) struct MapSquare {
+    pub ratio: Result<(f64, String), String>,
+    pub tip: Vec<String>,
+}
+
+/// One row of a summary map: its label (P, D, 2u), its measure's name, and what it measures.
+pub(super) struct MapRow {
+    pub label: String,
+    pub name: String,
+    pub about: String,
+}
+
+/// A summary map, the random-token grid's and every dataset's: per machine its rows, per column
+/// group (a class, or a model) its columns (prompt sizes, or prompt-length buckets), a square
+/// each on the one ratio scale, which stands beside them, and each row's slowest and fastest
+/// ratio right of it.
+pub(super) struct SummaryMap<'a> {
+    /// Each column group's name, and under it the models it shows, a line each.
+    pub groups: Vec<(&'a str, Vec<String>)>,
+    /// The columns under every group.
+    pub columns: Vec<String>,
+    /// Each machine and its rows, top to bottom.
+    pub machines: Vec<(&'a str, Vec<MapRow>)>,
+    /// Each square drawn; a place with none is left empty.
+    pub squares: BTreeMap<MapAt, MapSquare>,
+    /// The squares with their factor written in them ([`SummaryMap::ratios`], [`ratio_labels`]).
+    pub labelled: BTreeSet<MapAt>,
+    /// A line under the map, where its columns need one.
+    pub legend: Option<String>,
+}
+
+impl SummaryMap<'_> {
+    /// Each square's ratio, where it has one.
+    pub fn ratios(&self) -> BTreeMap<MapAt, f64> {
+        (self.squares.iter())
+            .filter_map(|(&at, s)| Some((at, s.ratio.as_ref().ok()?.0)))
+            .collect()
+    }
+
+    /// The map, its ratio scale's id `scale`.
+    pub fn render(&self, scale: &str) -> Element {
+        let (groups, n) = (self.groups.len(), self.columns.len());
+        let col = |k: usize, c: usize| 3 + k * n + c;
+        // The grid's lines: three header lines (group, models, columns), then each machine's rows.
+        let mut lines: Vec<(usize, usize, &MapRow)> = Vec::new();
+        let mut spans: Vec<(&str, usize, usize)> = Vec::new();
+        for (m, (chip, rows)) in self.machines.iter().enumerate() {
+            let start = 3 + lines.len();
+            lines.extend(rows.iter().enumerate().map(|(r, row)| (m, r, row)));
+            if 3 + lines.len() > start {
+                spans.push((chip, start, 3 + lines.len() - 1));
+            }
+        }
+        let ratios = self.ratios();
+        let range = |m: usize, r: usize| -> Option<(f64, f64)> {
+            (ratios.iter())
+                .filter(|&(at, _)| (at.0, at.1) == (m, r))
+                .map(|(_, &v)| v)
+                .fold(None, |acc, v| match acc {
+                    None => Some((v, v)),
+                    Some((lo, hi)) => Some((f64::min(lo, v), f64::max(hi, v))),
+                })
+        };
+        // Over the map's first and last two columns the tooltip reaches inward, not off its edge.
+        let align = |k: usize, c: usize| match (k, c) {
+            (0, c) if c < 2 => "top-left",
+            (k, c) if k + 1 == groups && c + 2 >= n => "top-right",
+            _ => "top",
+        };
+        // Each square with Carbon's tooltip: the square is its trigger, focusable so a keyboard
+        // opens it too; the tooltip gives the ratio (or why there is none), then its lines.
+        let square = |at: MapAt, sq: &MapSquare, place: String| -> Element {
+            let (fill, label, verdict) = match &sq.ratio {
+                Ok((r, vs)) => {
+                    let step = ratio_step(*r);
+                    (
+                        format!(
+                            "background: {}; color: {}",
+                            RATIO_STEPS[step],
+                            ratio_ink(step)
+                        ),
+                        self.labelled.contains(&at).then(|| format!("×{r:.1}")),
+                        format!("×{r:.2} vs {vs}"),
+                    )
+                }
+                Err(why) => (STRIPED.to_string(), None, why.clone()),
+            };
+            rsx! {
+                // The grid's own cell, and a flex box: Carbon puts the trigger in an inline box in its
+                // shadow DOM, whose line would add room for text under every square.
+                cds-tooltip { "align": align(at.2, at.3), style: "{place}; display: flex",
+                    // Its own width: Carbon wraps the trigger in an inline box, so an empty square would
+                    // shrink to nothing.
+                    div { tabindex: "0", style: "width: {SQUARE}; height: {SQUARE}; {fill}; display: flex; align-items: center; justify-content: center; font-size: 0.625rem; font-weight: 600",
+                        if let Some(label) = label { "{label}" }
+                    }
+                    cds-tooltip-content { style: "text-align: left",
+                        TipHeading { heading: verdict }
+                        for line in &sq.tip { div { "{line}" } }
+                    }
+                }
+            }
+        };
+        let template = format!("max-content max-content repeat({}, {SQUARE})", groups * n);
+        rsx! {
+            div { style: "display: flex; gap: 1.5rem; align-items: flex-start; overflow-x: auto",
+                div { style: "display: grid; grid-template-columns: {template} max-content max-content; column-gap: 2px; row-gap: 2px; align-items: center",
+                    for (k, (group, models)) in self.groups.iter().enumerate() {
+                        div { style: "grid-row: 1; grid-column: {col(k, 0)} / span {n}; text-align: center; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0",
+                            "{group}"
+                        }
+                        div { style: "grid-row: 2; grid-column: {col(k, 0)} / span {n}; text-align: center; font-size: 0.75rem; min-width: 0",
+                            for name in models {
+                                div { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap", title: "{name}", "{name}" }
+                            }
+                        }
+                        for (c, label) in self.columns.iter().enumerate() {
+                            div { style: "grid-row: 3; grid-column: {col(k, c)}; text-align: center; font-size: 0.625rem; white-space: nowrap",
+                                "{label}"
+                            }
+                        }
+                    }
+                    for (i, &(m, r, row)) in lines.iter().enumerate() {
+                        div { style: "grid-row: {i + 4}; grid-column: 2; font-size: 0.875rem; font-weight: 600; text-align: right; padding-right: 0.5rem; white-space: nowrap",
+                            Definition { alignment: Alignment::BottomLeft, heading: row.name.clone(), definition: row.about.clone(), strong { "{row.label}" } }
+                        }
+                        for (&at, sq) in self.squares.range((m, r, 0, 0)..=(m, r, usize::MAX, usize::MAX)) {
+                            {square(at, sq, format!("grid-row: {}; grid-column: {}", i + 4, col(at.2, at.3)))}
+                        }
+                        if let Some((lo, hi)) = range(m, r) {
+                            div { style: "grid-row: {i + 4}; grid-column: {col(groups, 0) + 1}; font-size: 0.75rem; white-space: nowrap; padding-left: 1.5rem",
+                                "×{lo:.2}–×{hi:.2}"
+                            }
+                        }
+                    }
+                    for &(chip, start, end) in &spans {
+                        // A margin, not padding: the rotation would turn padding onto the label's far side.
+                        div { style: "grid-row: {start + 1} / {end + 2}; grid-column: 1; writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; font-weight: 600; font-size: 0.875rem; margin-right: 1rem",
+                            "{chip}"
+                        }
+                    }
+                    // The ratio scale right beside the squares, as tall as their rows: one cell over
+                    // all of them, so each row's range, a column further on, stays on its row.
+                    if let (Some(&(_, first, _)), Some(&(_, _, last))) = (spans.first(), spans.last()) {
+                        div { style: "grid-row: {first + 1} / {last + 2}; grid-column: {col(groups, 0)}; align-self: stretch; display: flex; padding-left: 0.5rem",
+                            {ratio_scale(ScaleFit::Fill, scale)}
+                        }
+                    }
+                }
+            }
+            if let Some(legend) = &self.legend {
+                p { style: "font-size: 0.75rem", "{legend}" }
+            }
+        }
+    }
+}
+
+/// A dataset's summary map ([`SummaryMap`]): per machine its rows (P and D, prefill and decode at
+/// 1 user, then end-to-end time at each users count above it, 2u, 4u), per summary column (a
+/// class, or a model) a column each for its prompt-length buckets ([`Dataset::buckets`]), each
+/// square scratchy's median against the pair's rival's over the requests of that bucket. Runs
+/// from before cells kept each request's prompt count have none to draw, and say so.
 fn summary_map(
     dataset: &str,
     id: &str,
@@ -730,166 +993,92 @@ fn summary_map(
         }
         rows
     };
-    let n = buckets::BUCKETS.len();
-    let col = |k: usize, b: usize| 3 + k * n + b;
-    // The grid's lines: three header lines (class, models, buckets), then each machine's rows.
-    let mut lines: Vec<Option<(&str, Row)>> = vec![None, None, None];
-    let mut spans: Vec<(&str, usize, usize)> = Vec::new();
-    for &(chip, _) in ran {
-        let start = lines.len();
-        lines.extend(rows_of(chip).into_iter().map(|r| Some((chip, r))));
-        if lines.len() > start {
-            spans.push((chip, start, lines.len() - 1));
+    let bs = of(dataset).map_or(buckets::WHOLE, |d| d.buckets);
+    // A square's ratio, how many times faster scratchy is, or why it has none.
+    let ratio = |p: Option<&Pair>, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
+        let p = p.ok_or("not run")?;
+        let rival = p.rival.ok_or("scratchy alone so far")?;
+        let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
+        let (Some(ours), Some(theirs)) = (ours, theirs) else {
+            return Err("not run at this load");
+        };
+        if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
+            return Err("most requests failed");
+        }
+        let a = buckets::median_in(ours, bs, row.timing, b);
+        let t = buckets::median_in(theirs, bs, row.timing, b);
+        let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
+        let from = (theirs.borrowed_from.as_ref())
+            .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
+        Ok((r, format!("{}{from}", rival.label())))
+    };
+    let mut squares = BTreeMap::new();
+    let mut map_machines = Vec::new();
+    for (m, &(chip, _)) in ran.iter().enumerate() {
+        let rows = rows_of(chip);
+        for (r, row) in rows.iter().enumerate() {
+            for (k, &column) in grid.columns.iter().enumerate() {
+                let p = pair(chip, column);
+                for (b, &(bucket, _)) in bs.iter().enumerate() {
+                    // How many requests each side's median is over: a cell sends few, so a square
+                    // of one or two can turn on a single answer, and says so.
+                    let over = p.as_ref().and_then(|p| {
+                        let n = |c: Option<&&TaskCell>| {
+                            c.map_or(0, |c| buckets::in_bucket(c, bs, row.timing, b).len())
+                        };
+                        let (a, t) = (n(p.ours.get(&row.users)), n(p.theirs.get(&row.users)));
+                        (a + t > 0).then(|| format!("over {a} and {t} requests"))
+                    });
+                    let stem = p.as_ref().map_or("", |p| p.stem);
+                    let tip = [
+                        Some(format!("{stem} on {chip}")),
+                        Some(format!(
+                            "{} · {bucket} prompt tokens · {}",
+                            row.name,
+                            users_at(row.users)
+                        )),
+                        over,
+                    ];
+                    squares.insert(
+                        (m, r, k, b),
+                        MapSquare {
+                            ratio: ratio(p.as_ref(), row, b).map_err(str::to_string),
+                            tip: tip.into_iter().flatten().collect(),
+                        },
+                    );
+                }
+            }
+        }
+        if !rows.is_empty() {
+            let rows = (rows.into_iter())
+                .map(|r| MapRow {
+                    label: r.label,
+                    name: r.name.to_string(),
+                    about: r.about.to_string(),
+                })
+                .collect();
+            map_machines.push((chip, rows));
         }
     }
-    // A square's ratio, how many times faster scratchy is, or why it has none.
-    let ratio =
-        |chip: &str, column: &str, row: &Row, b: usize| -> Result<(f64, String), &'static str> {
-            let p = pair(chip, column).ok_or("not run")?;
-            let rival = p.rival.ok_or("scratchy alone so far")?;
-            let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
-            let (Some(ours), Some(theirs)) = (ours, theirs) else {
-                return Err("not run at this load");
-            };
-            if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
-                return Err("most requests failed");
-            }
-            let a = buckets::median_in(ours, row.timing, b);
-            let t = buckets::median_in(theirs, row.timing, b);
-            let r = tasks::times(a, t, true).ok_or("no timing on one side")?;
-            let from = theirs
-                .borrowed_from
-                .as_ref()
-                .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
-            Ok((r, format!("{}{from}", rival.label())))
-        };
-    let range = |chip: &str, row: &Row| -> Option<(f64, f64)> {
-        (grid.columns.iter())
-            .flat_map(|&col| {
-                (0..n).filter_map(move |b| ratio(chip, col, row, b).ok().map(|(r, _)| r))
+    let mut map = SummaryMap {
+        groups: (grid.columns.iter())
+            .map(|&c| {
+                (
+                    c,
+                    grid.models_of(c).into_iter().map(str::to_string).collect(),
+                )
             })
-            .fold(None, |acc, r| match acc {
-                None => Some((r, r)),
-                Some((lo, hi)) => Some((f64::min(lo, r), f64::max(hi, r))),
-            })
-    };
-    let align = |k: usize, b: usize| match (k, b) {
-        (0, b) if b < 2 => "top-left",
-        (k, b) if k + 1 == grid.columns.len() && b + 2 >= n => "top-right",
-        _ => "top",
+            .collect(),
+        columns: bs.iter().map(|&(label, _)| label.to_string()).collect(),
+        machines: map_machines,
+        squares,
+        labelled: BTreeSet::new(),
+        legend: None,
     };
     // The squares to write their factor in, as the random-token map does: each colour step's
-    // square furthest from ×1, so its shades read apart ([`ratio_labels`]).
-    let mut ratios: BTreeMap<(&str, &str, &str, usize), f64> = BTreeMap::new();
-    for (chip, row) in lines.iter().flatten() {
-        for &column in &grid.columns {
-            for b in 0..n {
-                if let Ok((r, _)) = ratio(chip, column, row, b) {
-                    ratios.insert((chip, column, row.label.as_str(), b), r);
-                }
-            }
-        }
-    }
-    let labelled = ratio_labels(&ratios, HEAT_LABELS);
-    let square = |chip: &str, column: &str, row: &Row, b: usize, place: String| -> Element {
-        let stem = pair(chip, column).map_or("", |p| p.stem);
-        let (fill, label, verdict) = match ratio(chip, column, row, b) {
-            Ok((r, vs)) => {
-                let step = ratio_step(r);
-                let shown = labelled.contains(&(chip, column, row.label.as_str(), b));
-                (
-                    format!(
-                        "background: {}; color: {}",
-                        RATIO_STEPS[step],
-                        ratio_ink(step)
-                    ),
-                    shown.then(|| format!("×{r:.1}")),
-                    format!("×{r:.2} vs {vs}"),
-                )
-            }
-            Err(why) => (STRIPED.to_string(), None, why.to_string()),
-        };
-        let bucket = buckets::BUCKETS[b].0;
-        // How many requests each side's median is over: a cell sends few, so a square of one or two
-        // can turn on a single answer, and says so.
-        let over = pair(chip, column).and_then(|p| {
-            let n =
-                |c: Option<&&TaskCell>| c.map_or(0, |c| buckets::in_bucket(c, row.timing, b).len());
-            let (a, t) = (n(p.ours.get(&row.users)), n(p.theirs.get(&row.users)));
-            (a + t > 0).then(|| format!("over {a} and {t} requests"))
-        });
-        rsx! {
-            cds-tooltip { "align": align(grid.columns.iter().position(|c| *c == column).unwrap_or(0), b),
-                style: "{place}; display: flex",
-                div { tabindex: "0", style: "width: {SQUARE}; height: {SQUARE}; {fill}; display: flex; align-items: center; justify-content: center; font-size: 0.625rem; font-weight: 600",
-                    if let Some(label) = label { "{label}" }
-                }
-                cds-tooltip-content { style: "text-align: left",
-                    TipHeading { heading: verdict }
-                    div { "{stem} on {chip}" }
-                    div { "{row.name} · {bucket} prompt tokens · {users_at(row.users)}" }
-                    if let Some(over) = &over { div { "{over}" } }
-                }
-            }
-        }
-    };
-    let template = format!(
-        "max-content max-content repeat({}, {SQUARE})",
-        grid.columns.len() * n
-    );
-    rsx! {
-        div { style: "display: flex; gap: 1.5rem; align-items: flex-start; overflow-x: auto",
-            div { style: "display: grid; grid-template-columns: {template} max-content max-content; column-gap: 2px; row-gap: 2px; align-items: center",
-                for (k, column) in grid.columns.iter().enumerate() {
-                    div { style: "grid-row: 1; grid-column: {col(k, 0)} / span {n}; text-align: center; font-weight: 600; font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0",
-                        "{column}"
-                    }
-                    // Under its class the model it shows, as the random-token map has it, then its
-                    // prompt-length buckets.
-                    div { style: "grid-row: 2; grid-column: {col(k, 0)} / span {n}; text-align: center; font-size: 0.625rem; min-width: 0",
-                        for name in grid.models_of(column) {
-                            div { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap", title: "{name}", "{name}" }
-                        }
-                    }
-                    for (b, (label, _)) in buckets::BUCKETS.iter().enumerate() {
-                        div { style: "grid-row: 3; grid-column: {col(k, b)}; text-align: center; font-size: 0.5625rem; white-space: nowrap",
-                            "{label}"
-                        }
-                    }
-                }
-                for (i, line) in lines.iter().enumerate() {
-                    if let Some((chip, row)) = line {
-                        div { style: "grid-row: {i + 1}; grid-column: 2; font-size: 0.875rem; font-weight: 600; text-align: right; padding-right: 0.5rem; white-space: nowrap",
-                            Definition { alignment: Alignment::BottomLeft, heading: row.name.to_string(), definition: row.about.to_string(), strong { "{row.label}" } }
-                        }
-                        for (k, column) in grid.columns.iter().enumerate() {
-                            for b in 0..n {
-                                {square(chip, column, row, b, format!("grid-row: {}; grid-column: {}", i + 1, col(k, b)))}
-                            }
-                        }
-                        if let Some((lo, hi)) = range(chip, row) {
-                            div { style: "grid-row: {i + 1}; grid-column: {col(grid.columns.len(), 0) + 1}; font-size: 0.75rem; white-space: nowrap; padding-left: 1.5rem",
-                                "×{lo:.2}–×{hi:.2}"
-                            }
-                        }
-                    }
-                }
-                for &(chip, start, end) in &spans {
-                    div { style: "grid-row: {start + 1} / {end + 2}; grid-column: 1; writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; font-weight: 600; font-size: 0.875rem; margin-right: 1rem",
-                        "{chip}"
-                    }
-                }
-                // The ratio scale right beside the squares, as tall as their rows, the random-token
-                // map's: one cell over all of them, so each row's range, a column further on,
-                // stays on its row.
-                if let (Some(&(_, first, _)), Some(&(_, _, last))) = (spans.first(), spans.last()) {
-                    div { style: "grid-row: {first + 1} / {last + 2}; grid-column: {col(grid.columns.len(), 0)}; align-self: stretch; display: flex; padding-left: 0.5rem",
-                        {ratio_scale(ScaleFit::Fill, &format!("{id}-summary-scale"))}
-                    }
-                }
-            }
-        }
-    }
+    // square furthest from ×1, so its shades read apart.
+    map.labelled = ratio_labels(&map.ratios(), HEAT_LABELS);
+    map.render(&format!("{id}-summary-scale"))
 }
 
 /// One machine and model's cells of a dataset, scratchy's and its rival's, by users count.
@@ -909,10 +1098,6 @@ struct Row {
     timing: RequestTiming,
     about: &'static str,
 }
-
-/// A square with no ratio: struck through, as the grid's are.
-const STRIPED: &str = "background: repeating-linear-gradient(135deg, transparent 0 4px, \
-                       light-dark(#c6c6c6, #525252) 4px 5px)";
 
 /// The engines a pair of `dataset` is drawn for, scratchy then its rival, and every users count
 /// either measured: one scratchy failed still shows its rival's.

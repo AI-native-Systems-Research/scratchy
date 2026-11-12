@@ -70,6 +70,19 @@ fn publish(site: &Site, name: &str) -> Result<String, String> {
     Ok(published)
 }
 
+/// What a table or tooltip shows for a number that was not measured.
+pub const DASH: &str = "—";
+
+/// `text` as an id or file name: its letters and digits, lowercased, each run joined by a dash.
+pub fn slug(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let parts: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .collect();
+    parts.join("-")
+}
+
 /// `n` with thousands separators, `1,580`.
 pub fn thousands(n: usize) -> String {
     thousands_f(n as f64, 0)
