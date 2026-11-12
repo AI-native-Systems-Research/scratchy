@@ -71,12 +71,13 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
 `.github/workflows/rust.yml`: the **linux-workspace** job runs
 `cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct
 --exclude scratchy-target-metal --exclude scratchy-target-metal-compiler
+--exclude scratchy-target-metal-worker
 -- -D warnings` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
-check/clippy don't link the C++ shim). Both metal crates are excluded because
+check/clippy don't link the C++ shim). All three metal crates are excluded because
 they depend unconditionally on Apple-only `objc2` — the
-compiler crate via its own edge to scratchy-target-metal — and `--workspace`
+compiler and worker crates via their own edges to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
-one of the two still drags `objc2` onto Linux); the **macOS** job
+some of them still drags `objc2` onto Linux); the **macOS** job
 runs `cargo clippy -p scratchy-models --features metal,all,mtp,turboquant -- -D warnings`
 + kernel tests (`mtp` adds the multi-token-prediction head of every model whose
 checkpoint carries one: heads have no configs of their own, so `all` alone
@@ -93,7 +94,8 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
     rustup component add clippy >/dev/null 2>&1
     cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct \
       --exclude scratchy-target-metal \
-      --exclude scratchy-target-metal-compiler -- -D warnings'
+      --exclude scratchy-target-metal-compiler \
+      --exclude scratchy-target-metal-worker -- -D warnings'
 ```
 The macOS metal CI job runs locally via `scripts/act-local.sh` when present.
 

@@ -33,8 +33,8 @@ use std::path::Path;
 use crate::spyre_types::*;
 use scratchy_core_model::weight::HfModelConfig;
 
-use crate::error::ExecutorError;
-use crate::worker::{Worker, WorkerConfig};
+use scratchy_serving_worker::error::ExecutorError;
+use scratchy_serving_worker::worker::{Worker, WorkerConfig};
 
 pub(crate) fn werr(msg: impl Into<String>) -> ExecutorError {
     ExecutorError::WorkerExecution(msg.into())

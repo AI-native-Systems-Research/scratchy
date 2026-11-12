@@ -7,7 +7,6 @@ description = "Benchmarking tools for vLLM Rust inference engine"
 
 [features]
 default = []
-metal = ["scratchy-serving-api/metal"]
 # Parquet-backed RAG accuracy datasets (hotpotqa / multihop / msmarco).
 # Off by default so the ~18-crate arrow/parquet columnar subtree only
 # compiles when those three `scr bench` subcommands are needed.

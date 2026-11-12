@@ -18,11 +18,11 @@ use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::StepLogits;
 
-use crate::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
+use scratchy_serving_worker::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 
@@ -464,15 +464,17 @@ pub(crate) fn run_card_launch(
                 })?;
             let t_stage = std::time::Instant::now();
             *PRIOR_READ.lock().expect("the overlap probe's own lock") = Some(read.signal());
-            crate::step_segs::record_submit(crate::step_segs::SubmitSegs {
-                bind: t_submit.duration_since(t_bind),
-                submit: t_defer.duration_since(t_submit),
-                defer: t_stage.duration_since(t_defer),
-                stage: None,
-                total: t_bind.elapsed(),
-                depth,
-                busy: card_busy_at_submit,
-            });
+            scratchy_serving_worker::step_segs::record_submit(
+                scratchy_serving_worker::step_segs::SubmitSegs {
+                    bind: t_submit.duration_since(t_bind),
+                    submit: t_defer.duration_since(t_submit),
+                    defer: t_stage.duration_since(t_defer),
+                    stage: None,
+                    total: t_bind.elapsed(),
+                    depth,
+                    busy: card_busy_at_submit,
+                },
+            );
             return Ok(BatchOut::Deferred(SubmittedDecode {
                 read,
                 rows: seat_width,
@@ -1072,10 +1074,12 @@ pub(crate) fn collect_decode_tokens(
     );
     OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     let toks = toks?;
-    crate::step_segs::record_collect(crate::step_segs::CollectSegs {
-        fence: t_pick.duration_since(t_fence),
-        pick: t_pick.elapsed(),
-    });
+    scratchy_serving_worker::step_segs::record_collect(
+        scratchy_serving_worker::step_segs::CollectSegs {
+            fence: t_pick.duration_since(t_fence),
+            pick: t_pick.elapsed(),
+        },
+    );
     Ok(toks)
 }
 

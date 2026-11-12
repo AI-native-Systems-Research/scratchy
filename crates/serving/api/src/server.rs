@@ -327,7 +327,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 /// answer nothing again (#587). Used by [`serve`] as the `axum::serve`
 /// graceful-shutdown future so the server loop RETURNS on a catchable signal
 /// instead of being terminated by the default disposition — which lets the
-/// engine/worker teardown run (`InprocClient::Drop -> worker.shutdown()`), ending the Metal
+/// engine/worker teardown run (`InprocClient::Drop -> worker.shutdown()`), ending the device
 /// residency set and releasing system-wired GPU memory deterministically.
 ///
 /// Note: `kill -9` (SIGKILL) is uncatchable and bypasses this entirely — the

@@ -16,7 +16,7 @@ description = "Standalone `scr-tui` binary: terminal UI driving goose's core Age
 
 [features]
 # Backend is chosen at build time — the TUI itself is backend-agnostic.
-metal = ["scratchy-serving-api/metal"]
+metal = ["dep:scratchy-target-metal-worker"]
 
 [[bin]]
 name = "scr-tui"
@@ -37,6 +37,12 @@ scratchy-serving-api = { path = "../../serving/api", features = [
     "forward-telemetry",
     "sampler-telemetry",
     "live-stats",
+] }
+# The metal worker: links the `WorkerFactory` the engine resolves `--device metal` to, with the
+# telemetry hooks lit in the target.
+scratchy-target-metal-worker = { path = "../../targets/metal/worker", optional = true, features = [
+    "forward-telemetry",
+    "sampler-telemetry",
 ] }
 # Shared low-level types — the telemetry seams the TUI reads directly.
 scratchy-core-common = { path = "../../core/common", features = [

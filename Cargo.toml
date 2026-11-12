@@ -22,6 +22,7 @@ members = [
     "crates/targets/spyre",
     "crates/targets/spyre/bundle",
     "crates/targets/spyre/builder",
+    "crates/targets/spyre/worker",
     # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE from
     # the lowering rather than reached through a text round trip.
     "crates/targets/spyre/ktir/ktir-core",
@@ -52,6 +53,7 @@ members = [
     "crates/compiler/subtile",
     "crates/targets/metal",
     "crates/targets/metal/compiler",
+    "crates/targets/metal/worker",
 ]
 # scratchy-tui pulls goose from git (not published to crates.io) and stands
 # entirely on its own as the `scr-tui` binary — excluded so its resolution
@@ -210,6 +212,8 @@ scratchy-serving-scheduler = { path = "crates/serving/scheduler" }
 scratchy-serving-engine = { path = "crates/serving/engine" }
 scratchy-serving-api = { path = "crates/serving/api" }
 scratchy-serving-worker = { path = "crates/serving/worker" }
+scratchy-target-metal-worker = { path = "crates/targets/metal/worker" }
+scratchy-target-spyre-worker = { path = "crates/targets/spyre/worker" }
 scratchy-core-model = { path = "crates/core/model" }
 # We own Hub downloads (that crate's manifest says why). Do not reach for the
 # `hf-hub` crate to avoid it: 1.0 depends on hf-xet non-optionally — no

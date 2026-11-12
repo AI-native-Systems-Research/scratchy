@@ -401,7 +401,7 @@ cargo test -p scratchy-e2e --features e2e,metal --release \
     -- --ignored --test-threads=1
 ```
 
-No edits to `scratchy-serving-worker/src/gpu_worker.rs` are needed — the
+No edits to `crates/targets/metal/worker/src/gpu_worker.rs` are needed — the
 arch auto-registers via `inventory::submit!` from the umbrella.
 
 ## Building (which models/quants actually compile in)
@@ -423,6 +423,6 @@ aliases.
   `crates/compiler/frontend/src/weights_manifest.rs`. It's reserved for
   truly universal conventions (e.g. `embed_tokens`, `lm_head`) —
   everything arch-specific lives in the arch's `weights.json`.
-- **Don't** edit `scratchy-serving-worker/src/gpu_worker.rs` for a new arch.
+- **Don't** edit `crates/targets/metal/worker/src/gpu_worker.rs` for a new arch.
   Auto-registration covers it; arch-specific state lives on the
   emitted `Weights` type.

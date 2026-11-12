@@ -9,80 +9,52 @@
 // `scratchy_forward_compiler::try_load`. Without this, the linker gc's the
 // crate (no direct symbol references after the Phase B collapse)
 // and the inventory comes up empty.
-#[cfg(feature = "metal")]
 extern crate scratchy_models as _;
 
-#[cfg(feature = "metal")]
 use std::collections::HashMap;
-#[cfg(feature = "metal")]
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "metal")]
 use scratchy_core_common::SamplingParams;
-#[cfg(feature = "metal")]
 use scratchy_target_metal::interpreter::metal::{GuestArena, HostArena, TerminalReads};
 // Read only by the metal embeddings path below (it walks a
 // StorageModeShared arena slot via `buf.contents()`), so the import follows
 // that gate rather than being carried on every backend.
-#[cfg(feature = "metal")]
 use scratchy_core_common::engine_io::EmbeddingData;
-#[cfg(feature = "metal")]
 use scratchy_core_model::weight::HfModelConfig;
-#[cfg(feature = "metal")]
 use scratchy_serving_engine::executor::ModelRunnerOutput;
-#[cfg(feature = "metal")]
 use scratchy_serving_engine::spec_decode::{DraftBudget, Drafting};
-#[cfg(feature = "metal")]
 use scratchy_serving_scheduler::scheduler::SnapshotBudget;
-#[cfg(feature = "metal")]
 use scratchy_serving_scheduler::scheduler::output::{
     KvGranule, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
 };
-#[cfg(feature = "metal")]
 use tracing::info;
 
-#[cfg(feature = "metal")]
 use scratchy_forward_compiler::gdn_slot_allocator::{GdnRow, GdnSlotAllocator};
-#[cfg(feature = "metal")]
 use scratchy_serving_engine::worker_factory::VerifySeqs;
-#[cfg(feature = "metal")]
 use scratchy_target_metal::dtype::DType as GpuDType;
-#[cfg(feature = "metal")]
 use scratchy_target_metal::gdn_state::{GdnSave, GdnSlot, GdnStatePool};
-#[cfg(feature = "metal")]
 use scratchy_target_metal::kv_cache::KvCachePool;
 
-#[cfg(feature = "metal")]
 use scratchy_target_metal::OwnedTensor;
-#[cfg(feature = "metal")]
 use scratchy_target_metal::interpreter::metal::{
     Deferral, DeviceInput, ForwardError, ForwardReads as Reads, InFlight,
 };
-#[cfg(feature = "metal")]
 use std::sync::Arc;
 
 // Types used by metal lifecycle bodies. `GpuDevice` carries `device + queue +
 // allocator`; `MetalAllocator` is the metal-side `BackendAllocator`; `MetalMem` wraps `metal::Buffer`
 // for the metal arm of the KV/GDN pools.
-#[cfg(feature = "metal")]
 use ::objc2_metal::{MTLBuffer as _, MTLDevice as _};
-#[cfg(feature = "metal")]
 use scratchy_target_metal::MetalWeightsExt;
-#[cfg(feature = "metal")]
 use scratchy_target_metal::weights::GpuWeights;
-#[cfg(feature = "metal")]
 use scratchy_target_metal::{GpuDevice, GpuTensor, MetalAllocator, MetalMem, TensorView};
 
-#[cfg(feature = "metal")]
-use crate::error::{ExecutorError, ExecutorResult};
-#[cfg(feature = "metal")]
-use crate::input_batch::InputBatch;
-#[cfg(all(feature = "metal", feature = "vision"))]
-use crate::input_batch::PreparedInputs;
-#[cfg(feature = "metal")]
-use crate::worker::Worker;
-#[cfg(feature = "metal")]
-use crate::worker_factory::Draft;
+use scratchy_serving_worker::error::{ExecutorError, ExecutorResult};
+use scratchy_serving_worker::input_batch::InputBatch;
+#[cfg(feature = "vision")]
+use scratchy_serving_worker::input_batch::PreparedInputs;
+use scratchy_serving_worker::worker::Worker;
+use scratchy_serving_worker::worker_factory::Draft;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -91,7 +63,7 @@ use crate::worker_factory::Draft;
 // `WorkerCreateConfig` lives in the neutral `worker_factory` module so the
 // dispatch path compiles without a backend feature; re-exported here for the
 // gated worker code that constructs it.
-pub use crate::worker_factory::WorkerCreateConfig;
+pub use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
 
 /// Per-image MRoPE metadata in seq space, used by
 /// `build_mrope_positions_2d` to walk the entire seq for
@@ -101,7 +73,6 @@ pub use crate::worker_factory::WorkerCreateConfig;
 /// Tuple is `(seq_offset, length, grid_t, grid_h_merged, grid_w_merged)`
 /// where `seq_offset` is relative to the req's full sequence start (NOT
 /// batch start) — the same coordinate system as `PlaceholderRange.offset`.
-#[cfg(feature = "metal")]
 pub type SeqMmInfo = (u32, u32, u32, u32, u32);
 
 // ---------------------------------------------------------------------------
@@ -114,7 +85,7 @@ pub type SeqMmInfo = (u32, u32, u32, u32, u32);
 /// batch row each bitset masks (`rows`). Built in `execute_model` where
 /// the req_id -> batch-row mapping is known, then uploaded + dispatched
 /// before argmax in `forward_argmax_blocking`.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
+#[cfg(feature = "guided-decoding")]
 struct GrammarMaskHost {
     rows: Vec<u32>,
     allow_bits: Vec<u32>,
@@ -127,7 +98,7 @@ struct GrammarMaskHost {
 /// to the worker's `GrammarMaskKernels` (same `'static` trick the argmax
 /// path uses for `argmax_kernels`); valid for the synchronous duration of
 /// the forward call.
-#[cfg(all(feature = "metal", feature = "guided-decoding"))]
+#[cfg(feature = "guided-decoding")]
 struct GrammarMaskGpu {
     allow_bits: scratchy_target_metal::grammar_mask::Buffer,
     rows: scratchy_target_metal::grammar_mask::Buffer,
@@ -140,7 +111,6 @@ struct GrammarMaskGpu {
 
 /// A worker backed by the GPU runtime (metal) for
 /// zero-allocation inference.
-#[cfg(feature = "metal")]
 pub struct MetalWorker {
     // ---------------------------------------------------------------
     // Backend-neutral state (cfg-mutexed only by transitive types).
@@ -445,14 +415,12 @@ pub struct MetalWorker {
     /// first GPU touch — a multi-second stall on a long prefill. Deferring keeps
     /// back-to-back requests fast while still releasing memory when genuinely
     /// idle.
-    #[cfg(feature = "metal")]
     kv_idle_since: Option<std::time::Instant>,
 }
 
 /// How long the target KV batch must stay idle before the reactive shrink
 /// releases grown chunks back to the OS. Long enough that interactive,
 /// back-to-back requests never pay the re-fault cost.
-#[cfg(feature = "metal")]
 const KV_SHRINK_IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 // Safety: MetalWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -460,18 +428,16 @@ const KV_SHRINK_IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs
 // allocated on a single device and accessed exclusively from the worker
 // thread. Send is required because the worker is created on the main thread
 // and moved to its dedicated worker thread via the executor's spawn.
-#[cfg(feature = "metal")]
 unsafe impl Send for MetalWorker {}
 
 // `resolve_model_path` is backend-agnostic HF-hub plumbing; it lives in the
 // neutral `worker_factory` module and is re-exported here for the gated
 // worker load paths.
-pub use crate::worker_factory::resolve_model_path;
+pub use scratchy_serving_worker::worker_factory::resolve_model_path;
 
 /// MRoPE position builders — `build_mrope_positions_2d` is pure index math over
 /// `PreparedInputs` + per-req patch grids, and `build_per_req_mm_seq_info_metal`
 /// builds per-req seq-space MM info from the `MultimodalForward` handle.
-#[cfg(feature = "metal")]
 impl MetalWorker {
     /// Build `[3, n_tokens]` u32 MRoPE positions for an image-bearing
     /// batch. Mirrors Python vLLM's
@@ -562,7 +528,7 @@ impl MetalWorker {
     /// (the metal worker holds `self.mm: Option<Box<dyn MultimodalForward>>`). Same tuple/semantics: empty inner
     /// `Vec` for reqs without mm_data, all-empty outer `Vec` (caller
     /// falls back to 1D positions) for a text-only batch.
-    #[cfg(all(feature = "metal", feature = "vision"))]
+    #[cfg(feature = "vision")]
     fn build_per_req_mm_seq_info_metal(
         mm: &dyn scratchy_target_metal::MultimodalForward,
         mm_data_buffers: &HashMap<String, scratchy_core_common::MultimodalData>,
@@ -610,13 +576,11 @@ impl MetalWorker {
 /// any cached row.
 ///
 /// [`UNROTATED_BLOCK_BIT`]: scratchy_target_metal::UNROTATED_BLOCK_BIT
-#[cfg(feature = "metal")]
 struct StepSlotMapping {
     slots: Vec<u32>,
     written: std::collections::HashSet<u32>,
 }
 
-#[cfg(feature = "metal")]
 impl StepSlotMapping {
     const SKIP: u32 = u32::MAX;
 
@@ -652,7 +616,6 @@ impl StepSlotMapping {
 
 /// Bytes per element of a metal KV pool's dense rows: bf16 and f16 are both 2;
 /// int4 KV is unsupported.
-#[cfg(feature = "metal")]
 const METAL_KV_ELEM_BYTES: usize = 2;
 
 /// The most rows a step samples — and a decode or verify step brings — as the metal device
@@ -660,7 +623,6 @@ const METAL_KV_ELEM_BYTES: usize = 2;
 /// them: the most a head's budget drafts a step ([`DraftBudget::draft_rows`]), beside sequences
 /// that run plain in the same step, or an n-gram or draft model's every sequence's. The rows the
 /// TurboQuant decode split's partials, the sampler and the logits hold.
-#[cfg(feature = "metal")]
 fn decode_rows(
     verify_seqs: VerifySeqs,
     max_num_seqs: usize,
@@ -675,7 +637,6 @@ fn decode_rows(
 
 // A block drafter's step drafts the lanes the device's verify budget prices: the engine's lane cap
 // is the metal target's.
-#[cfg(feature = "metal")]
 const _: () = assert!(
     scratchy_serving_engine::spec_decode::BLOCK_LANES
         == scratchy_target_metal::dflash2::BUDGET_LANES
@@ -686,7 +647,6 @@ const _: () = assert!(
 
 /// The drafts a compiled head makes a step's sequences ([`DraftBudget`]): its registration's
 /// counts.
-#[cfg(feature = "metal")]
 fn draft_budget(head: &scratchy_forward_compiler::HeadRegistration) -> DraftBudget {
     DraftBudget {
         drafts: usize::from(head.drafts),
@@ -701,7 +661,6 @@ fn draft_budget(head: &scratchy_forward_compiler::HeadRegistration) -> DraftBudg
 /// theirs; the head drafts nothing for a sequence that finds every lane held — or one a sequence
 /// when an n-gram or draft model drafts for each. `None` when the run drafts nothing (or the
 /// target's kernels keep no draft state).
-#[cfg(feature = "metal")]
 fn gdn_draft_lanes(
     verify_seqs: VerifySeqs,
     cfg: &scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig,
@@ -719,7 +678,6 @@ fn gdn_draft_lanes(
 
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
 /// × [`METAL_KV_ELEM_BYTES`].
-#[cfg(feature = "metal")]
 fn kv_per_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
@@ -745,7 +703,6 @@ fn kv_per_block_bytes(
 /// `kv_bytes_per_token` at `model`'s pool geometry: every layer that holds KV
 /// ([`kv_pool_tensors`]), its KV heads and head_dim, `dense_elem_bytes` wide when
 /// `codec` is dense.
-#[cfg(feature = "metal")]
 fn pool_bytes_per_token(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     codec: scratchy_forward_compiler::KvCodec,
@@ -766,7 +723,6 @@ fn pool_bytes_per_token(
 /// positions (gemma4), else one per layer that holds KV — a recurrent hybrid's
 /// attention layers (`kv_cache_layers`), mapped by
 /// `compact_kv_layer_to_tensor` — else one per layer (`None` map).
-#[cfg(feature = "metal")]
 fn kv_pool_tensors(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     hybrid: Option<&scratchy_core_config::HybridKvLayout>,
@@ -788,7 +744,6 @@ fn kv_pool_tensors(
 /// page-differentiated case — the SAME trigger the scheduler's `hybrid_kv` uses
 /// in `init`, so the two never disagree on group count. `None` → one physical
 /// tensor per layer (the uniform pool).
-#[cfg(feature = "metal")]
 fn hybrid_kv_layout(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: scratchy_core_common::KvBlockTokens,
@@ -817,7 +772,6 @@ fn hybrid_kv_layout(
 /// fp16 pool is a one-chunk seed (`initialize_cache`). A hybrid model's
 /// TurboQuant global layers keep their codes BESIDE its fp16 pool, which the
 /// sliding layers read ([`target_block_bytes`] charges both).
-#[cfg(feature = "metal")]
 fn uniform_turboquant(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: scratchy_core_common::KvBlockTokens,
@@ -830,7 +784,6 @@ fn uniform_turboquant(
 /// its group-shared tensors plus, built with TurboQuant, the global layers'
 /// codes, norms and scratch; a uniform TurboQuant model's codes, norms and
 /// scratch; every other model's dense rows.
-#[cfg(feature = "metal")]
 fn target_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: scratchy_core_common::KvBlockTokens,
@@ -873,7 +826,6 @@ fn target_block_bytes(
 /// norms (its dense pool a one-chunk seed, as the target's: `initialize_draft_cache_metal`) and
 /// its fp16 scratch — none of the scratch when it stages through its target's
 /// ([`DraftScratch::Target`]).
-#[cfg(feature = "metal")]
 fn draft_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
@@ -895,7 +847,6 @@ fn draft_block_bytes(
 }
 
 /// One block's bytes in each store of a dense draft pool: one layer's K or V rows.
-#[cfg(feature = "metal")]
 fn draft_store_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
@@ -911,7 +862,6 @@ fn draft_store_block_bytes(
 /// worker applies them before each step's forward, and refuses a step that names memory it has not
 /// mapped — on Apple Silicon a GPU read of un-wired memory hangs the command buffer past the
 /// watchdog rather than faulting.
-#[cfg(feature = "metal")]
 struct SharedKv {
     budget: SnapshotBudget,
     /// The pool's blocks: the last granule ends with them.
@@ -925,7 +875,6 @@ struct SharedKv {
     turboquant: bool,
 }
 
-#[cfg(feature = "metal")]
 impl SharedKv {
     fn blocks(&self, g: KvGranule) -> std::ops::Range<usize> {
         let n = self.budget.kv_granule_blocks.get();
@@ -953,7 +902,6 @@ impl SharedKv {
 /// Where a TurboQuant draft stages its KV: its own fp16 scratch, or — a head, which runs after its
 /// target and never beside it, of the target's KV geometry — the target's
 /// (`HostArena::tq_scratch`).
-#[cfg(feature = "metal")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DraftScratch {
     Own,
@@ -971,18 +919,15 @@ pub use scratchy_serving_engine::gpu_budget::{
 
 /// The share of the headroom past what is resident a prefill bucket's activations may take; the
 /// KV cache takes the rest.
-#[cfg(feature = "metal")]
 const METAL_ARENA_FRACTION: f64 = 0.6;
 
 /// The bytes past the resident set and the activations the KV budget also subtracts: 64 MiB of
 /// runtime and staging buffers, 150 MiB of redundancy.
-#[cfg(feature = "metal")]
 const METAL_ACTIVATION_PAD: u64 = (64 + 150) * 1024 * 1024;
 
 /// What a pool pruned to one prefill bucket allocates beside its KV cache
 /// ([`MetalWorker::metal_bucket_prices`]): every arena that runs at the bucket, and the KV cap
 /// rungs' scratch at it.
-#[cfg(feature = "metal")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MetalBucketPrice {
     bucket_m: u32,
@@ -990,7 +935,6 @@ struct MetalBucketPrice {
     scratch: u64,
 }
 
-#[cfg(feature = "metal")]
 impl MetalBucketPrice {
     fn bytes(self) -> u64 {
         self.arena.saturating_add(self.scratch)
@@ -999,7 +943,6 @@ impl MetalBucketPrice {
 
 /// The memory a prefill bucket is selected under ([`MetalWorker::metal_select_bucket`]): the
 /// whole budget, and the bytes already resident in it.
-#[cfg(feature = "metal")]
 #[derive(Clone, Copy, Debug)]
 struct MetalBudget {
     total: usize,
@@ -1013,11 +956,9 @@ struct MetalBudget {
 // `gdn_slot_key` and the shared unset-`--max-num-seqs` resolver are
 // backend-neutral; they live in `scratchy-serving-engine` (cycle-free for
 // every worker) and are re-exported here.
-#[cfg(feature = "metal")]
 use scratchy_serving_engine::gpu_budget::MaxNumSeqsFacts;
 pub use scratchy_serving_engine::gpu_budget::{gdn_slot_key, resolve_default_max_num_seqs};
 
-#[cfg(feature = "metal")]
 impl MetalWorker {
     pub fn new(config: WorkerCreateConfig) -> Self {
         Self {
@@ -1051,7 +992,6 @@ impl MetalWorker {
             progress_callback: None,
             metal_device: None,
             gpu_device: None,
-            #[cfg(feature = "metal")]
             metal_prefill_bucket_max_m: None,
             resolved_max_num_seqs: None,
             model: None,
@@ -1109,7 +1049,6 @@ impl MetalWorker {
             kv_full_block_size: 0,
             kv_is_hybrid: false,
             draft_kv_stores: None,
-            #[cfg(feature = "metal")]
             kv_idle_since: None,
         }
     }
@@ -1599,7 +1538,6 @@ impl MetalWorker {
 // Inherent impl block for metal-only helpers that aren't on the
 // `Worker` trait — kept separate from the trait impl below so non-
 // trait methods don't get implicitly added to `Worker`.
-#[cfg(feature = "metal")]
 impl MetalWorker {
     /// Spans (rope-on-read): is it SAFE to OR bit 31 into the block_table
     /// / slot_mapping for this run? Only when the loaded model's kernels
@@ -2672,7 +2610,7 @@ impl MetalWorker {
     fn gdn_step(
         &mut self,
         scheduler_output: &SchedulerOutput,
-        prepared: &crate::input_batch::PreparedInputs,
+        prepared: &scratchy_serving_worker::input_batch::PreparedInputs,
     ) -> ExecutorResult<(Vec<i32>, Vec<u32>)> {
         let ops = &scheduler_output.recurrent_state;
         let attn = &prepared.attn_meta;
@@ -3353,7 +3291,6 @@ impl MetalWorker {
 /// `model.metal_chain_with_encoder`. After CB completion, host-reads
 /// the K argmax buffers and returns iter-major `[k][num_reqs]`
 /// argmax IDs.
-#[cfg(feature = "metal")]
 fn metal_chain_dispatch(
     model_ref: &dyn scratchy_forward_compiler::ScratchyWeights,
     kv_cache_ref: &KvCachePool,
@@ -3627,7 +3564,6 @@ fn metal_chain_dispatch(
     Ok(out)
 }
 
-#[cfg(feature = "metal")]
 impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
     fn forward_argmax_blocking(
         &mut self,
@@ -3825,7 +3761,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
     }
 }
 
-#[cfg(feature = "metal")]
 impl MetalWorker {
     /// The forward behind `SpecDecodeBackend::forward_argmax_blocking`; `hidden_rows` empty copies
     /// no hidden rows out. `then`: an MTP head's passes over the step, run in this forward's
@@ -4575,7 +4510,6 @@ impl MetalWorker {
 
 /// What [`MetalWorker::forward_argmax_then`] hands back: each row's token, the final hidden rows
 /// asked for, and an MTP head's drafts, `k` a drafting sequence.
-#[cfg(feature = "metal")]
 #[derive(Default)]
 struct Forwarded {
     tokens: Vec<u32>,
@@ -4584,7 +4518,6 @@ struct Forwarded {
 }
 
 /// A buffer an encoder hook was handed, kept past the hook.
-#[cfg(feature = "metal")]
 fn retained(
     buffer: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
 ) -> scratchy_target_metal::mtl4_dispatch::Buffer {
@@ -4600,7 +4533,6 @@ fn retained(
 
 /// Where an MTP head's chain ([`Chain`](::scratchy_serving_engine::spec_decode::Chain)) keeps
 /// what it reads and writes, in one pinned buffer: the host's tables, then the device's.
-#[cfg(feature = "metal")]
 #[derive(Clone)]
 struct ChainLayout {
     /// Drafting sequences.
@@ -4620,7 +4552,6 @@ struct ChainLayout {
     bytes: usize,
 }
 
-#[cfg(feature = "metal")]
 impl ChainLayout {
     const SEQS: usize = 0;
     const DRAFTED: usize = 1;
@@ -4763,7 +4694,6 @@ impl ChainLayout {
 
 /// What `target`'s pool shares with its MTP head, which runs in it: nothing until the target's
 /// first forward builds that pool.
-#[cfg(feature = "metal")]
 fn hosted_by(
     target: &dyn scratchy_forward_compiler::ScratchyWeights,
 ) -> Result<HostArena, ::scratchy_serving_engine::spec_decode::BackendError> {
@@ -4782,7 +4712,6 @@ fn hosted_by(
 /// drafts over (`kernels`, the head's bake): lent into the head's `weights` whole — the very
 /// tensors the target binds, same mmap, same zero-copy upload — checked against the bake, and
 /// bound where the target binds them, its codes read the way the target's binding stores them.
-#[cfg(feature = "metal")]
 fn vocab_suffix_draft(
     gpu_device: &GpuDevice,
     target: &dyn scratchy_forward_compiler::ScratchyWeights,
@@ -4870,7 +4799,6 @@ fn vocab_suffix_draft(
 /// An MTP head's passes over a step ([`HeadPasses`](::scratchy_serving_engine::spec_decode::HeadPasses)),
 /// encoded in its target's command buffer after the target's forward and argmax: pass 1, then each
 /// chained pass behind the device's pick of its inputs.
-#[cfg(feature = "metal")]
 struct HeadPassesEncoder<'a> {
     passes: &'a ::scratchy_serving_engine::spec_decode::HeadPasses,
     model: &'a dyn scratchy_forward_compiler::ScratchyWeights,
@@ -4896,7 +4824,6 @@ struct HeadPassesEncoder<'a> {
     behind: bool,
 }
 
-#[cfg(feature = "metal")]
 impl<'a> HeadPassesEncoder<'a> {
     /// Encode the passes onto `enc` after the target's forward, which picked its tokens into
     /// `tokens` (one `u32` a sampled row) and left its final hidden states in `hidden`.
@@ -5133,7 +5060,6 @@ impl<'a> HeadPassesEncoder<'a> {
 
 /// What a step runs after its target in its command buffer: an MTP head's passes, or a block
 /// drafter's ([`BlockStep`]).
-#[cfg(feature = "metal")]
 #[derive(Clone, Copy)]
 enum Then<'a> {
     Mtp(&'a ::scratchy_serving_engine::spec_decode::HeadPasses),
@@ -5143,7 +5069,6 @@ enum Then<'a> {
 /// A block drafter's passes over a step ([`BlockPasses`](::scratchy_serving_engine::spec_decode::BlockPasses)),
 /// with what the worker knows of the step's requests: each sequence's ring slot, each lane's
 /// verify — its policy and its last block's selection — and its next block's policy.
-#[cfg(feature = "metal")]
 struct BlockStep {
     passes: ::scratchy_serving_engine::spec_decode::BlockPasses,
     /// The rebuild's forwards, each at most the drafter's widest affordable bucket, with the ring
@@ -5174,7 +5099,6 @@ struct BlockStep {
 /// A lane's cycle between the step that drafts its block and the one that verifies it (Splash's
 /// one command a cycle, split across two steps here): the block's candidates and their
 /// probabilities, what a sampled lane's acceptance and correction read.
-#[cfg(feature = "metal")]
 struct Cycle {
     candidates: Vec<u32>,
     q_probs: Vec<f32>,
@@ -5183,13 +5107,11 @@ struct Cycle {
 /// A ring slot a request (Splash's `DFlashDraftRing` a lane): taken at its first step, given back
 /// when it finishes. A slot's ring holds what its last request committed; a request reads only
 /// the positions it committed itself.
-#[cfg(feature = "metal")]
 struct RingSlots {
     by_request: HashMap<String, u32>,
     free: Vec<u32>,
 }
 
-#[cfg(feature = "metal")]
 impl RingSlots {
     fn new(slots: u32) -> Self {
         Self {
@@ -5217,7 +5139,6 @@ impl RingSlots {
 /// Splash's DFlash2 drafter as the worker runs it: its planner, its acceptance, its target's
 /// policy over a cycle's sampled verify rows, its rings and a slot of them a request, and each
 /// request's cycle in flight.
-#[cfg(feature = "metal")]
 struct Dflash2 {
     drafter: ::scratchy_serving_engine::spec_decode::BlockDrafter,
     accept: scratchy_target_metal::dflash2::DraftAcceptKernel,
@@ -5245,7 +5166,6 @@ struct Dflash2 {
 /// The context windows of the prefix cache's state snapshots: the GDN state stores' last, a window
 /// a slot from the first snapshot slot's (`from`); `saved`: whether a slot's last save took its
 /// window, which a restore rebuilds rings from only then.
-#[cfg(feature = "metal")]
 struct SnapshotWindows {
     buffer: scratchy_target_metal::mtl4_dispatch::Buffer,
     from: usize,
@@ -5254,7 +5174,6 @@ struct SnapshotWindows {
 
 /// A snapshot's context window and the ring slot of the sequence it is taken from or given back
 /// to this step (its block in [`SnapshotWindows`]' store).
-#[cfg(feature = "metal")]
 #[derive(Clone, Copy)]
 struct WindowSnapshot {
     ring_slot: u32,
@@ -5262,7 +5181,6 @@ struct WindowSnapshot {
 }
 
 /// A snapshot's window, completed after a commit: its sequence's positions `[from, to)`.
-#[cfg(feature = "metal")]
 #[derive(Clone, Copy)]
 struct WindowSave {
     snapshot: WindowSnapshot,
@@ -5270,7 +5188,6 @@ struct WindowSave {
     to: u32,
 }
 
-#[cfg(feature = "metal")]
 impl Dflash2 {
     /// The seed request `req_id`'s kernels draw its uniforms from (`dflash2::draft_uniform`): the
     /// request's own (Splash's `SamplingConfig::seed`), or one of its id when it sets none.
@@ -5294,7 +5211,6 @@ impl Dflash2 {
 /// A block drafter's passes over a step ([`BlockStep`]), encoded in its target's command buffer
 /// after the target's forward and sampler: the target's policy over its sampled verify rows, the
 /// acceptance, the commit, then the block draft.
-#[cfg(feature = "metal")]
 struct BlockPassesEncoder<'a> {
     step: &'a BlockStep,
     model: &'a dyn scratchy_forward_compiler::ScratchyWeights,
@@ -5306,7 +5222,6 @@ struct BlockPassesEncoder<'a> {
     device: GpuDevice,
 }
 
-#[cfg(feature = "metal")]
 impl<'a> BlockPassesEncoder<'a> {
     fn rows(&self) -> usize {
         self.dflash2.drafter.budget.drafts + 1
@@ -5617,7 +5532,6 @@ impl<'a> BlockPassesEncoder<'a> {
 }
 
 /// A block draft's selection read back ([`BlockPassesEncoder::selection`]).
-#[cfg(feature = "metal")]
 #[derive(Default)]
 struct Selection {
     drafts: Vec<u32>,
@@ -5627,7 +5541,6 @@ struct Selection {
 }
 
 /// `values`' bytes.
-#[cfg(feature = "metal")]
 fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
     // SAFETY: `T: Copy` plain data, read as the bytes it occupies.
     unsafe {
@@ -5636,7 +5549,6 @@ fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
 }
 
 /// The passes a step runs after its target, as encoded in its command buffer.
-#[cfg(feature = "metal")]
 enum HeadEncoder<'a> {
     Mtp(Box<HeadPassesEncoder<'a>>),
     Block(BlockPassesEncoder<'a>),
@@ -5644,7 +5556,6 @@ enum HeadEncoder<'a> {
 
 /// What a step's passes after its target leave for the host: an MTP head's drafts, or a block
 /// drafter's selection and each lane's retained rows and accepted drafts.
-#[cfg(feature = "metal")]
 #[derive(Default)]
 struct HeadOutcome {
     drafts: Vec<u32>,
@@ -5654,7 +5565,6 @@ struct HeadOutcome {
     verified: Vec<(u32, u32)>,
 }
 
-#[cfg(feature = "metal")]
 impl<'a> HeadEncoder<'a> {
     fn encode(
         &mut self,
@@ -5703,7 +5613,6 @@ impl<'a> HeadEncoder<'a> {
 /// host's.
 /// A step's block ids by KV group: the full group's at its (page-unified) block size, and each
 /// sliding group's (gemma4 SWA) at the sliding one.
-#[cfg(feature = "metal")]
 #[derive(Clone, Copy)]
 struct StepBlocks<'a> {
     full: &'a [Vec<usize>],
@@ -5714,14 +5623,12 @@ struct StepBlocks<'a> {
 
 /// A step's sliding KV groups' block tables (gemma4 SWA), for a head that reads its target's KV:
 /// per group, `seqs` rows of `stride` entries.
-#[cfg(feature = "metal")]
 #[derive(Default)]
 struct StepTables {
     groups: Vec<Vec<u32>>,
     stride: usize,
 }
 
-#[cfg(feature = "metal")]
 impl StepTables {
     fn of(req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>) -> Self {
         Self {
@@ -5751,12 +5658,10 @@ impl StepTables {
 }
 
 /// Borrowed slices of `v`'s vectors.
-#[cfg(feature = "metal")]
 fn refs(v: &[Vec<u32>]) -> Vec<&[u32]> {
     v.iter().map(Vec::as_slice).collect()
 }
 
-#[cfg(feature = "metal")]
 fn head_ctx<'c>(
     kv_cache: &'c KvCachePool,
     req: &'c ::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'c>,
@@ -5819,7 +5724,6 @@ fn head_ctx<'c>(
 
 /// A step's logprobs entries ([`scratchy_target_metal::logprobs`]): the emitting rows of each
 /// request that asks for logprobs, in request order, each with its request's index.
-#[cfg(feature = "metal")]
 struct LogprobsStep {
     entries: Vec<(usize, u32)>,
     layout: scratchy_target_metal::logprobs::LogprobsLayout,
@@ -5827,7 +5731,6 @@ struct LogprobsStep {
 
 /// The step's logprobs pass (`step`'s entries' rows written into `buffer`, grown to hold them);
 /// `None` when no request of the step asks for logprobs.
-#[cfg(feature = "metal")]
 fn logprobs_pass(
     step: Option<&LogprobsStep>,
     kernels: Option<&scratchy_target_metal::logprobs::LogprobsKernels>,
@@ -5857,7 +5760,6 @@ fn logprobs_pass(
 
 /// The logprobs pass of a target's command buffer: scores its entries once the step's tokens are
 /// final, after the sampler.
-#[cfg(feature = "metal")]
 #[derive(Clone)]
 struct LogprobsPass {
     /// The worker's `LogprobsKernels`, alive for the forward (as the argmax kernels' address).
@@ -5872,7 +5774,6 @@ struct LogprobsPass {
     raw: Option<scratchy_target_metal::mtl4_dispatch::Buffer>,
 }
 
-#[cfg(feature = "metal")]
 impl LogprobsPass {
     /// This pass scoring its rows' raw logits, set aside in `raw` (grown to hold them).
     fn with_raw(
@@ -5929,7 +5830,6 @@ impl LogprobsPass {
 }
 
 /// An argument table binding `addresses`, in order.
-#[cfg(feature = "metal")]
 fn argument_table(
     device: &GpuDevice,
     addresses: &[u64],
@@ -5941,7 +5841,6 @@ fn argument_table(
 }
 
 /// [`argument_table`] on `device`.
-#[cfg(feature = "metal")]
 fn argument_table_on(
     device: &scratchy_target_metal::mtl4_dispatch::Device,
     addresses: &[u64],
@@ -5970,7 +5869,6 @@ fn argument_table_on(
 /// realign-copy). `drop` runs before the worker's device/buffer fields,
 /// so the writer's source stays valid; the drain is idempotent with the
 /// one in `shutdown()`. (regression: c54955a3)
-#[cfg(feature = "metal")]
 impl Drop for MetalWorker {
     fn drop(&mut self) {
         scratchy_target_metal::metal_allocator::join_sidecar_writers();
@@ -5988,12 +5886,10 @@ impl Drop for MetalWorker {
 /// runs the SAME idempotent `MetalResidencySet::shutdown()` the graceful path
 /// uses, so the wired memory is released deterministically instead. On a normal
 /// return `thread::panicking()` is false, so it's a no-op.
-#[cfg(feature = "metal")]
 struct ResidencyPanicGuard {
     sets: Vec<scratchy_target_metal::residency::MetalResidencySet>,
 }
 
-#[cfg(feature = "metal")]
 impl Drop for ResidencyPanicGuard {
     fn drop(&mut self) {
         if std::thread::panicking() {
@@ -6005,7 +5901,6 @@ impl Drop for ResidencyPanicGuard {
 }
 
 /// One step's greedy argmax: its output, a token per row, and the row count it reads.
-#[cfg(feature = "metal")]
 struct ArgmaxSlot {
     out: scratchy_target_metal::residency::Pinned,
     consts: scratchy_target_metal::residency::Pinned,
@@ -6013,13 +5908,10 @@ struct ArgmaxSlot {
 
 // SAFETY: as for `MetalWorker`, the markers objc2's buffers lack. The host reads `out` only once the
 // step that writes it is done (`InFlight::wait`), and writes `consts` only while no step reads it.
-#[cfg(feature = "metal")]
 unsafe impl Send for ArgmaxSlot {}
-#[cfg(feature = "metal")]
 unsafe impl Sync for ArgmaxSlot {}
 
 /// One of `slots` nothing else holds, with room for `rows` tokens — grown, or added, if none has.
-#[cfg(feature = "metal")]
 fn free_argmax_slot(
     slots: &mut Vec<Arc<ArgmaxSlot>>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -6050,7 +5942,6 @@ fn free_argmax_slot(
 
 /// A step committed without waiting for it: the tokens its rows sampled are on the device until it is
 /// resolved.
-#[cfg(feature = "metal")]
 struct InFlightStep {
     done: Arc<InFlight>,
     argmax: Arc<ArgmaxSlot>,
@@ -6065,7 +5956,6 @@ struct InFlightStep {
 
 /// A speculative step committed without waiting ([`SpecPipeline`]): its one request's rows, from
 /// `first`, and its chain — the drafts its head made, how many of its own it kept.
-#[cfg(feature = "metal")]
 #[derive(Clone)]
 struct SpecFlight {
     req_id: String,
@@ -6079,7 +5969,6 @@ struct SpecFlight {
     lead: Option<Arc<InFlight>>,
 }
 
-#[cfg(feature = "metal")]
 impl SpecFlight {
     /// Once its command buffer is done: its tokens (the target's at its rows up to the last kept
     /// draft's, and the next), and the drafts its head made.
@@ -6127,20 +6016,17 @@ impl SpecFlight {
 
 /// Why a speculative step's tokens could not be read: its command buffer failed, or its chain says
 /// it kept more drafts than the step has rows for, a word no chain pass that ran writes.
-#[cfg(feature = "metal")]
 enum SpecReadError {
     Forward(ForwardError),
     KeptPastRows { kept: usize, rows: usize },
 }
 
-#[cfg(feature = "metal")]
 impl From<ForwardError> for SpecReadError {
     fn from(e: ForwardError) -> Self {
         Self::Forward(e)
     }
 }
 
-#[cfg(feature = "metal")]
 impl std::fmt::Display for SpecReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -6157,7 +6043,6 @@ impl std::fmt::Display for SpecReadError {
 
 /// What a step behind a speculative one in flight reads from it on the device: its target's token
 /// a row (`argmax`), the drafts its head made and how many of its own it kept (`chain`).
-#[cfg(feature = "metal")]
 struct SpecTail {
     req_id: String,
     first: usize,
@@ -6170,19 +6055,15 @@ struct SpecTail {
 }
 
 /// A step's [`ChainLayout`] buffer.
-#[cfg(feature = "metal")]
 struct ChainBuffer(scratchy_target_metal::residency::Pinned);
 
 // SAFETY: as for `ArgmaxSlot`: the host writes a chain buffer only while no step holds it, and reads
 // it only once the step that wrote it is done.
-#[cfg(feature = "metal")]
 unsafe impl Send for ChainBuffer {}
-#[cfg(feature = "metal")]
 unsafe impl Sync for ChainBuffer {}
 
 /// A chain buffer of at least `bytes` no step holds: one of `slots`, or a new one replacing a free
 /// smaller one (or added).
-#[cfg(feature = "metal")]
 fn free_chain_buffer(
     slots: &mut Vec<Arc<ChainBuffer>>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -6207,7 +6088,6 @@ fn free_chain_buffer(
 
 /// The tokens at `rows` of a step's argmax, once its command buffer is done, and the lead's it is
 /// behind, whose words its first row was read from on the device.
-#[cfg(feature = "metal")]
 fn sampled(
     done: &InFlight,
     lead: Option<&InFlight>,
@@ -6228,7 +6108,6 @@ fn sampled(
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(feature = "metal")]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -6244,7 +6123,6 @@ fn reserve_pinned(
     true
 }
 
-#[cfg(feature = "metal")]
 impl Worker for MetalWorker {
     /// Kept for the grammar factory, which is built the first time a grammar request appears; one
     /// built before is dropped, to be built again ending on these. A build without
@@ -7673,7 +7551,6 @@ impl Worker for MetalWorker {
             self.resolve_oldest()?;
         }
 
-        #[cfg(feature = "metal")]
         if self.input_batch.num_active() == 0 {
             // Reactive KV (2c): batch fully idle → no live blocks. Defer the
             // shrink until the GPU has been idle for `KV_SHRINK_IDLE_AFTER`.
@@ -7752,7 +7629,6 @@ impl Worker for MetalWorker {
         // On metal-chunked pools this allocates chunks on demand; no-op
         // on single-buffer pools. Compute the max into a local so no
         // borrow of `attn` is held across the `&mut self` grow call.
-        #[cfg(feature = "metal")]
         {
             // Cover every block ID the shared pool is addressed with: the
             // sliding groups', and the full group's unless its KV lives in a
@@ -9488,7 +9364,7 @@ impl Worker for MetalWorker {
     /// highest block a step names, so the scheduler must hand out blocks already mapped before
     /// never-used ones, or distinct prompts one at a time map the pool far past what they hold.
     fn kv_backing(&self) -> scratchy_core_common::KvBacking {
-        if cfg!(feature = "metal") && self.gdn_snapshot_cap == 0 {
+        if self.gdn_snapshot_cap == 0 {
             scratchy_core_common::KvBacking::OnFirstUse
         } else {
             scratchy_core_common::KvBacking::Allocated
@@ -9530,11 +9406,9 @@ impl Worker for MetalWorker {
 /// registered with scratchy-target-metal would silently route to MLX and produce
 /// garbage from MLX-side bugs the user attributed to scratchy-target-metal. Now the
 /// fallback is a hard error pointing at exactly what to add.
-#[cfg(feature = "metal")]
 pub struct MetalWorkerFactory;
 
-#[cfg(feature = "metal")]
-impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
+impl scratchy_serving_worker::worker_factory::WorkerFactory for MetalWorkerFactory {
     fn matches(&self, device: &str) -> bool {
         matches!(device, "auto" | "metal")
     }
@@ -9542,11 +9416,11 @@ impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
     fn create(
         &self,
         worker_config: WorkerCreateConfig,
-        _progress: Option<crate::worker_factory::ProgressCallback>,
-    ) -> anyhow::Result<crate::worker_factory::WorkerCreationResult> {
+        _progress: Option<scratchy_serving_worker::worker_factory::ProgressCallback>,
+    ) -> anyhow::Result<scratchy_serving_worker::worker_factory::WorkerCreationResult> {
         use anyhow::Context as _;
 
-        use crate::error::ExecutorError;
+        use scratchy_serving_worker::error::ExecutorError;
 
         let mut worker = MetalWorker::new(worker_config);
         worker
@@ -9575,10 +9449,11 @@ impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
     }
 }
 
-#[cfg(feature = "metal")]
-inventory::submit!(&MetalWorkerFactory as &dyn crate::worker_factory::WorkerFactory);
+inventory::submit!(
+    &MetalWorkerFactory as &dyn scratchy_serving_worker::worker_factory::WorkerFactory
+);
 
-#[cfg(all(test, feature = "metal"))]
+#[cfg(test)]
 mod tests {
     use super::StepSlotMapping;
 

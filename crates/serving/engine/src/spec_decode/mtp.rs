@@ -64,7 +64,7 @@
 //!   greedy 0.96-1.06x at 4 (two rounds each); the M5 Max was not measured past one request.
 //!   Past 8 rows the budget does not rise until the verify-sized rungs do: a verify step of 3
 //!   sequences at 2 drafts runs 9 rows, past the 8-row bucket onto the 64-row prefill-shaped tape
-//!   (`METAL_VERIFY_ROWS`' TODO: derive the rungs from the budget). A verify step
+//!   (the target's verify-row rungs; TODO: derive them from the budget). A verify step
 //!   of `B` sequences runs `B * (k + 1)` rows, and a MoE target reads every distinct expert those
 //!   rows pick (Qwen3.6: 256 experts, 8 a row; at 8 sequences the verify step's 24 rows pick about
 //!   135, the plain step's 8 about 57, under uniform routing). So on the base M5 a verify step
@@ -72,8 +72,8 @@
 //!   a verify step. The budget wanted is, at each `B`, the drafts whose verify step and head passes
 //!   cost less than the plain steps of the tokens they produce. That is a comparison of two compiled
 //!   tapes' costs on a device, so it belongs at expansion: one budget per declared device profile
-//!   (`MetalTargetProfile`: bandwidth, fp16 peak), the worker picking its device's as it picks
-//!   kernels by GPU generation. Blocked on a metal tape cost model: a roofline from the profile
+//!   (the target's device profile: bandwidth, fp16 peak), the worker picking its device's as it picks
+//!   kernels by GPU generation. Blocked on a tape cost model for the target: a roofline from the profile
 //!   alone predicts 2.0x at 8 sequences against the measured 2.65x.
 //! - TODO: key the budget on the target, not the head arch. `spec_verify_rows` is the head arch's
 //!   bound default, so every target of `qwen3-5-mtp` shares it, but its cost is the target's: a dense
@@ -100,8 +100,8 @@
 //!   Gated-DeltaNet scan 10-12 ms, each sequence's rows and the kept rows it replays one after
 //!   another; attention 3; the rest about 6) plus the head's about 5, measured with 16- and
 //!   32-row verify-sized rungs. Those rungs cost short prompts their first token, and the budget
-//!   keeps verify steps within 8 rows, so they are gone (`METAL_VERIFY_ROWS`, 8): past 8 rows a
-//!   verify step runs the 64-row prefill-shaped tape until the rungs derive from the budget.
+//!   keeps verify steps within 8 rows, so they are gone (the target's verify-row rungs top out at
+//!   8): past 8 rows a verify step runs the 64-row prefill-shaped tape until the rungs derive from the budget.
 //! - TODO: a build with a head runs the steps that replay or record — a verify step and the step
 //!   after one — on Gated-DeltaNet kernels that cost more per row. A plain step runs what it runs
 //!   without the head (Qwen3.6's geometry: a decode step #265's one-command decode, a prefill #263's
@@ -145,12 +145,12 @@
 //!   pair: a cost quadratic in the pair count, and this target routes 22 of 512 experts a row,
 //!   so a 3-row verify's 66 live pairs blow past the mode's few-pairs precondition while its
 //!   saved reads stay the ~3 pairs that share an expert. Per-dispatch GPU time
-//!   (`SCRATCHY_METAL_KERNEL_TIME`, probe-inflated): the drafting step was 38.3 ms of verify
+//!   (the backend's per-kernel timing probe, probe-inflated): the drafting step was 38.3 ms of verify
 //!   plus 2.7 of head passes — the head is under 7% of it, innocent — and the verify's
 //!   `MoeGateUpAct` alone ran 17.3 ms against the plain step's 3.6, 4.8x for 3x the pairs where
 //!   the dense projections scaled 1.2x, while the same kernel at the prefill bucket's 594 pairs
 //!   runs 1.6 µs a pair against the verify bucket's 6.6. Running a gathered bake's pairs apart
-//!   past 64 baked pairs (`METAL_SHARED_EXPERTS_MAX_PAIRS`) took `MoeGateUpAct` to 4.7 ms —
+//!   past 64 baked pairs (the target's shared-experts pair cap) took `MoeGateUpAct` to 4.7 ms —
 //!   1.8 µs a pair, the prefill bucket's efficiency, 1.3x the plain step's cost for the ~63
 //!   distinct experts 3 rows draw (uniform routing; the plain step's 22) — and the step to
 //!   25.3 ms. The acceptance (2.31 tokens a step) clears it: those tokens' plain steps cost

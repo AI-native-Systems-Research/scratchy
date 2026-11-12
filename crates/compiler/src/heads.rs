@@ -130,6 +130,12 @@ pub fn head_of(target_arch: &str, shape: Option<TargetShape>) -> Option<HeadRegi
     )
 }
 
+/// Whether this build compiled any multi-token-prediction head at all. A build that compiled none
+/// has no default drafter for any target, so serving never looks one up.
+pub fn compiles_any_head() -> bool {
+    registered().next().is_some()
+}
+
 /// Every compiled head that drafts for a target whose checkpoint architecture is `target_arch`.
 pub fn heads_of(target_arch: &str) -> impl Iterator<Item = HeadRegistration> + '_ {
     registered()

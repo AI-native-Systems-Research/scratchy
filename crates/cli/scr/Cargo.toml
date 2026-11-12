@@ -31,7 +31,7 @@ default = ["chat", "model?/hf-completions"]
 
 # The in-process ENGINE (local model inference), no HTTP server: `scr chat`
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
-# feature, so no axum), which brings scratchy-serving-worker with it.
+# feature, so no axum). A backend feature adds the target's worker.
 chat = ["dep:scratchy-serving-api"]
 # The OpenAI/Anthropic HTTP server ON TOP of the engine: `scr serve` (and the
 # offline `batch` command). Adds axum/tower via scratchy-serving-api/serve.
@@ -76,13 +76,13 @@ bench-datasets = ["bench", "scratchy-bench/datasets"]
 #
 # `metal-base` alone builds the same engine with a dense KV cache and no MTP
 # heads; add `model/mtp-heads` back for drafting over a dense cache.
-metal-base = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
+metal-base = ["dep:scratchy-serving-api", "dep:scratchy-target-metal-worker", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
 metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
 # get something that can actually run a model.
-spyre = ["scratchy-serving-api/spyre"]
+spyre = ["dep:scratchy-serving-api", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/spyre", "model?/spyre"]
 # ANY CARD — the ONE card tier, the same name the api, worker and target crates use. This crate
 # REFERENCES it: `main.rs`'s `libc::_exit` (senlib's atexit resets the device, so the process must
 # not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never
@@ -90,12 +90,13 @@ spyre = ["scratchy-serving-api/spyre"]
 # `unexpected cfg value`. The emulator does not imply it.
 spyre-hw = [
   "spyre",
-  "scratchy-serving-api/spyre-hw",
+  "dep:scratchy-target-spyre-worker",
+  "scratchy-target-spyre-worker/spyre-hw",
   # `scr bundle run`: the executor and the bundle types, directly.
   "dep:scratchy-target-spyre",
   "scratchy-target-spyre/spyre-hw",
 ]
-spyre-emu = ["scratchy-serving-api/spyre-emu"]
+spyre-emu = ["spyre", "dep:scratchy-target-spyre-worker", "scratchy-target-spyre-worker/spyre-emu"]
 # The FFI link route is a property of the LINKED ARCHIVES, not a feature
 # of this crate: flex-rs's build script links libflex_shim.a and
 # libsenlib_oco.a statically from SENLIB_STATIC_LIB_DIR at build, so a
@@ -106,13 +107,13 @@ spyre-emu = ["scratchy-serving-api/spyre-emu"]
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
 # build grammar support into a non-`serve` binary.
-guided-decoding = ["scratchy-serving-api?/guided-decoding"]
+guided-decoding = ["scratchy-serving-api?/guided-decoding", "scratchy-target-metal-worker?/guided-decoding"]
 # Gates the real image-decode stack: scratchy-serving-api/multimodal makes
 # its `scratchy-vision`/`image` deps optional-and-on, forwards
-# `scratchy-forward-compiler/vision` + `scratchy-serving-worker/vision`
-# (which enables it on whichever backend target is active), so a plain
+# `scratchy-forward-compiler/vision`, and the metal worker's `vision`
+# when that target is linked, so a plain
 # `chat` build (no `multimodal`) never compiles image/png/zune-jpeg/etc.
-multimodal = ["scratchy-serving-api?/multimodal"]
+multimodal = ["scratchy-serving-api?/multimodal", "scratchy-target-metal-worker?/vision"]
 tls = ["scratchy-serving-api?/tls"]
 metrics = ["scratchy-serving-api?/metrics"]
 # EXPERIMENTAL, off by default, and deliberately not a `scr serve` flag: see
@@ -142,6 +143,10 @@ name = "scr"
 path = "src/main.rs"
 
 [dependencies]
+# The target's worker: the `WorkerFactory` the engine resolves `--device` to. The engine never names
+# a concrete worker, so `main.rs` anchors whichever is linked with an `extern crate ... as _`.
+scratchy-target-metal-worker = { workspace = true, optional = true }
+scratchy-target-spyre-worker = { workspace = true, optional = true }
 # `scr bundle run` ONLY. Every other spyre path in this binary goes through the serving crates;
 # launching a bundle this binary did not bake needs the executor and the bundle types directly, and
 # those live in the target crate. Optional, and reachable only under `spyre-hw`.

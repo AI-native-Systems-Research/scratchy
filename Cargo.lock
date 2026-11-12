@@ -3306,7 +3306,9 @@ dependencies = [
  "scratchy-quantizations",
  "scratchy-serving-api",
  "scratchy-spec",
+ "scratchy-target-metal-worker",
  "scratchy-target-spyre",
+ "scratchy-target-spyre-worker",
  "scratchy-tp",
  "serde_json",
  "tempfile",
@@ -3371,6 +3373,7 @@ dependencies = [
  "scratchy-core-common",
  "scratchy-serving-api",
  "scratchy-target-metal",
+ "scratchy-target-metal-worker",
  "serde",
  "serde_json",
  "spnl-core",
@@ -3605,30 +3608,14 @@ name = "scratchy-serving-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "half",
- "inventory",
- "objc2",
- "objc2-metal",
- "rand",
- "rayon",
  "safetensors",
- "scratchy-builder-spyre",
  "scratchy-core-common",
  "scratchy-core-config",
- "scratchy-core-model",
- "scratchy-forward-compiler",
- "scratchy-layers",
- "scratchy-models",
  "scratchy-serving-engine",
  "scratchy-serving-scheduler",
  "scratchy-serving-transport",
- "scratchy-subtile",
- "scratchy-target-metal",
- "scratchy-target-spyre",
- "scratchy-tensors",
  "serde",
  "serde_json",
- "tokenizers 0.23.2",
  "tokio",
  "tracing",
 ]
@@ -3715,6 +3702,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-target-metal-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "inventory",
+ "objc2",
+ "objc2-metal",
+ "rand",
+ "safetensors",
+ "scratchy-core-common",
+ "scratchy-core-config",
+ "scratchy-core-model",
+ "scratchy-forward-compiler",
+ "scratchy-models",
+ "scratchy-serving-engine",
+ "scratchy-serving-scheduler",
+ "scratchy-serving-worker",
+ "scratchy-target-metal",
+ "serde_json",
+ "tokenizers 0.23.2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "scratchy-target-spyre"
 version = "0.1.0"
 dependencies = [
@@ -3744,6 +3757,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-target-spyre-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "inventory",
+ "rayon",
+ "safetensors",
+ "scratchy-builder-spyre",
+ "scratchy-core-common",
+ "scratchy-core-model",
+ "scratchy-forward-compiler",
+ "scratchy-layers",
+ "scratchy-models",
+ "scratchy-serving-engine",
+ "scratchy-serving-scheduler",
+ "scratchy-serving-worker",
+ "scratchy-subtile",
+ "scratchy-target-spyre",
+ "scratchy-tensors",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "scratchy-tensors"
 version = "0.1.0"
 dependencies = [
@@ -3757,7 +3795,7 @@ name = "scratchy-tp"
 version = "0.1.0"
 dependencies = [
  "scratchy-models",
- "scratchy-serving-worker",
+ "scratchy-target-spyre-worker",
 ]
 
 [[package]]

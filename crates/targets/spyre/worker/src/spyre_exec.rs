@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 
-use crate::error::ExecutorResult;
 use crate::spyre_forward::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
-use crate::worker::Worker;
+use scratchy_serving_worker::error::ExecutorResult;
+use scratchy_serving_worker::worker::Worker;
 
 /// One scheduled token of a cached request is a DECODE step only when the request's
 /// prompt is already fully computed — the token this step runs sits at a GENERATED

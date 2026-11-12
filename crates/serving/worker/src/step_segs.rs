@@ -16,8 +16,8 @@
 //! step — because the worker cannot know bench-ness and a `Duration` add is
 //! noise. The PRINT is the only gated thing, and its gate (`--bench`) never
 //! leaves the CLI: [`step_segment_table`] hands the formatted table to whoever
-//! asks, `None` when no step ever recorded (every non-spyre backend, every
-//! non-decode run). No env toggles, no numerics touched.
+//! asks, `None` when no step ever recorded (every backend that records no steps,
+//! every non-decode run). No env toggles, no numerics touched.
 //!
 //! The `Timers`/`Diag` idiom (a process-wide static behind a mutex) because
 //! the step loop holds the session and `Shared` borrows a worker-field
@@ -35,9 +35,9 @@ use std::time::Duration;
 /// zero.
 ///
 /// `pub`, like the module's whole surface, and for a reason the tree states:
-/// the worker's spyre mods are cfg-gated in lib.rs, so `record_submit`'s only caller
-/// exists in spyre builds — a `pub(crate)` surface would be dead code in every plain
-/// (non-spyre) clippy leg of this crate. `pub` items of a lib crate are reachable by
+/// `record_submit`'s only caller is a target's worker crate, which a build may not
+/// link — a `pub(crate)` surface would be dead code in every clippy leg of this
+/// crate. `pub` items of a lib crate are reachable by
 /// type in every feature combination, which is the law this instrument is built
 /// under: no cfg, no allow, nothing dead.
 pub struct SubmitSegs {
@@ -211,7 +211,7 @@ pub fn record_collect(s: CollectSegs) {
 }
 
 /// The accumulated per-segment table, for the CLI to print under `--bench`.
-/// `None` when no step ever recorded — the answer every non-spyre backend
+/// `None` when no step ever recorded — the answer every backend that records no steps
 /// and every non-decode run must give, by type, not by empty string.
 pub fn step_segment_table() -> Option<String> {
     let t = stats();

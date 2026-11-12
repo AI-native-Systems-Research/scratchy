@@ -151,12 +151,12 @@ fn spilled_weight_spans(
     }
 }
 
-use crate::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
-use crate::worker_factory::resolve_model_path;
+use scratchy_serving_worker::error::ExecutorResult;
+use scratchy_serving_worker::worker_factory::resolve_model_path;
 
 /// Parsed per-program metadata + the owned manifest (kept alive for the shared
 /// session) + model-level dims. No weights, no session — the caller builds those

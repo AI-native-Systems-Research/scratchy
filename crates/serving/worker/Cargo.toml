@@ -7,70 +7,20 @@ description = "Worker/process management and distributed coordination for vLLM R
 
 [features]
 default = []
-# Observability seams — forwarded to the metal target (where the hooks live) +
-# core-common. Compiled into a plain engine build for none of it.
-forward-telemetry = ["scratchy-target-metal?/forward-telemetry", "scratchy-core-common/forward-telemetry"]
-sampler-telemetry = ["scratchy-target-metal?/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
-metal = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-metal", "dep:objc2", "dep:objc2-metal", "scratchy-forward-compiler/metal", "scratchy-models/metal"]
-# Multimodal capability, forwarded from `scr`'s `multimodal` feature via
-# scratchy-serving-api. No-op unless a backend that has one is also active.
-vision = ["scratchy-target-metal?/vision"]
-# IBM Spyre / KTIR: a host-only worker that runs the macro-emitted KTIR bundle
-# on the ktir-emulator (no GPU toolchain). The
-# neutral `GpuWeights` comes from scratchy-layers, the registry/`try_load` +
-# `ScratchyWeights` from the compiler, `DType` from scratchy-tensors, and the host
-# `SpyreAllocator` + bundle runner from target-spyre.
-spyre = ["dep:rayon", "dep:scratchy-target-spyre", "dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-layers", "dep:scratchy-tensors", "dep:scratchy-subtile", "scratchy-forward-compiler/spyre", "scratchy-models/spyre"]
-# A CARD, any revision — the SDK and the builder, over the shared machinery below. It does NOT pull
-# `spyre-emu`/ktir-emulator, whose `metal` feature drags in Apple-only objc2 and would break a Linux
-# card build.
-spyre-hw = ["spyre", "dep:scratchy-builder-spyre", "scratchy-builder-spyre/spyre-hw", "scratchy-target-spyre/spyre-hw", "scratchy-models/spyre-hw"]
-# THE EMULATOR — a SIBLING of the card, not its absence. Same bundles, same launch sequence; what
-# differs is the device underneath. Forwards into the models crate so the macro's bake-time
-# numeric gate runs on every emu build (see the macro crate's `spyre-emu`).
-spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu", "scratchy-models/spyre-emu"]
-# A W-RANK TENSOR-PARALLEL WORLD: the bake shards every model W ways (scratchy-models/tp-<W>) and
-# this worker runs every rank in one process, one card each, linked by device p2p RDMA. A build that
-# names no world serves one card. Reached from the CLI as `tp/<W>`.
-tp-2 = ["spyre-hw", "scratchy-models/tp-2", "scratchy-target-spyre/tp-2"]
-tp-4 = ["spyre-hw", "scratchy-models/tp-4", "scratchy-target-spyre/tp-4"]
-tp-8 = ["spyre-hw", "scratchy-models/tp-8", "scratchy-target-spyre/tp-8"]
 guided-decoding = ["scratchy-serving-engine/guided-decoding"]
 
+# Target-neutral: the `Worker` trait, the executors, and the `WorkerFactory` registry. Every
+# concrete worker lives in its target (`crates/targets/<target>/worker`) and registers itself.
 [dependencies]
-# The weight-load path fans the bf16→f16 narrowing across cores; pulled in by `spyre` (see the
-# feature above), absent from the host/metal builds.
-rayon = { workspace = true, optional = true }
-scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-serving-scheduler = { workspace = true }
 scratchy-serving-engine = { workspace = true }
 scratchy-serving-transport = { workspace = true }
-scratchy-core-model = { workspace = true }
-scratchy-forward-compiler = { path = "../../compiler", optional = true }
-scratchy-models = { path = "../../models/arch", optional = true, default-features = false }
-# Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
-# staged weight width == the emitted device width by construction. Optional; enabled by `spyre`.
-scratchy-subtile = { path = "../../compiler/subtile", optional = true, features = ["spyre"] }
-# Spyre rides the neutral seam directly: GpuWeights from
-# scratchy-layers, DType from scratchy-tensors.
-scratchy-layers = { path = "../../layers", optional = true }
-scratchy-tensors = { path = "../../tensors", optional = true }
-# Build-time bake on the CARD: pulled in by the worker's `spyre-hw`
-# feature (see the feature list above), so its build.rs runs at `cargo build` rather than at load.
-scratchy-builder-spyre = { path = "../../targets/spyre/builder", optional = true }
-scratchy-target-metal = { path = "../../targets/metal", optional = true }
-objc2 = { version = "0.6", optional = true }
-objc2-metal = { version = "0.3", optional = true, default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLCommandQueue", "MTLDevice", "MTLResource", "MTL4ArgumentTable"] }
-half = { workspace = true }
-tokenizers = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rand = { workspace = true }
-inventory = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

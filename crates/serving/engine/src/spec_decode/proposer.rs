@@ -593,7 +593,7 @@ impl Proposer for DraftModelProposer {
         }
 
         // Lockstep+K (Phase 8 friendly — lockstep can overlap with
-        // target verify on a separate Metal queue).
+        // target verify on a separate device queue).
         self.propose_lockstep_k(seed, sampled, backend, k, num_reqs)
     }
 }

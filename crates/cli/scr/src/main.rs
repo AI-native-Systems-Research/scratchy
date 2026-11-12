@@ -12,6 +12,14 @@ mod args;
 mod commands;
 mod http;
 
+// Anchor the target's worker crate into the link: the engine resolves `--device` through the
+// `WorkerFactory` registry and never names a concrete worker, so without this reference the
+// linker may drop the factory's `inventory::submit!`.
+#[cfg(feature = "metal-base")]
+extern crate scratchy_target_metal_worker as _;
+#[cfg(any(feature = "spyre-hw", feature = "spyre-emu"))]
+extern crate scratchy_target_spyre_worker as _;
+
 use clap::Parser;
 
 use crate::args::{Cli, Commands};

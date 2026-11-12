@@ -13,7 +13,7 @@ use scratchy_core_config::SchedulerConfig;
 /// LAST resort: a backend that knows its own batched-decode width answers
 /// first ([`Worker::max_num_seqs_override`]), and the device-tier table
 /// ([`SchedulerConfig::batch_defaults`]) answers before this on backends
-/// whose ladders track `max_num_seqs` (metal).
+/// whose ladders track `max_num_seqs`.
 ///
 /// [`Worker::max_num_seqs_override`]: crate::worker::Worker::max_num_seqs_override
 pub const BASE_MAX_NUM_SEQS: usize = SchedulerConfig::DEFAULT_MAX_NUM_SEQS;
@@ -33,8 +33,8 @@ pub const KV_FLOOR_BYTES: usize = 1 << 30;
 pub struct MaxNumSeqsFacts {
     /// Device total memory + name, when the backend can query them — feeds
     /// the device-tier table (`SchedulerConfig::batch_defaults`). `None`
-    /// means "no tier answer" and resolves to the base constant: metal
-    /// reports nothing (its factory has no `device_total_bytes_and_name`),
+    /// means "no tier answer" and resolves to the base constant: a backend
+    /// whose factory has no `device_total_bytes_and_name` reports nothing,
     /// so its default is the SAME 128 as before the memory-aware resolver
     /// existed. Any tier bump is a separate, measured decision.
     pub device_total_bytes: Option<u64>,
@@ -44,8 +44,8 @@ pub struct MaxNumSeqsFacts {
     /// `None` = "no budget to clamp against" (a caller that only wants the
     /// TIER half of the resolution) — the tier answer then survives as-is.
     pub device_budget_bytes: Option<usize>,
-    /// What this process already holds at the end of `load_model` (metal:
-    /// `currentAllocatedSize`).
+    /// What this process already holds at the end of `load_model` (e.g. the
+    /// device's current allocated size).
     pub allocated_bytes: usize,
     /// Peak activation estimate the OOM guard's flag-hint path uses — the
     /// prefill-bucket arena (or full-ladder peak), rung scratch, and the
@@ -105,7 +105,7 @@ pub fn resolve_default_max_num_seqs(facts: &MaxNumSeqsFacts, is_offline: bool) -
     let tier = match facts.device_total_bytes {
         // The name only downgrades a ≥70 GiB A100 back to the small tier
         // (large batched-token budgets regress it — Python vLLM PR #17885);
-        // a backend that reports no name (metal) can never be an A100, so
+        // a backend that reports no name can never be an A100, so
         // `unwrap_or("")` keeps the tier decision intact.
         Some(total) => {
             SchedulerConfig::batch_defaults(
@@ -129,7 +129,7 @@ pub enum ServedContext {
     Tokens(usize),
     /// The declaration cannot be funded. `declared` is what was asked (the flag, or the
     /// model's own limit when no flag was given); `affordable` is the number to lower
-    /// to. Each call site states its own knobs around it — the spyre pool veto also
+    /// to. Each call site states its own knobs around it — a fixed pool's veto also
     /// names `--max-num-seqs`, the engine's cap names its blocks.
     Refused { declared: usize, affordable: usize },
 }
@@ -145,7 +145,7 @@ pub enum ServedContext {
 /// the card's number is a decision, not a surprise (a WARN is for serving shorter
 /// than a client ASKED for — which the explicit branch now refuses instead).
 ///
-/// `affordable` is what the calling site's own arithmetic funds: the spyre worker
+/// `affordable` is what the calling site's own arithmetic funds: a fixed-pool worker
 /// passes what its KV byte budget buys per request across the launch rows (the exact
 /// inverse of its pool demand, so a resolved default is veto-proof by construction),
 /// and the engine passes what the cache it just built serves (the scheduler's blocks
@@ -200,7 +200,7 @@ pub struct PrefillBucketSelection {
     /// `max_num_batched_tokens` to it so a single forward never exceeds it.
     pub max_bucket_m: u32,
     /// Activation footprint of the selected bucket (the cost actually paid):
-    /// on Metal the colored arena bytes.
+    /// e.g. the colored arena bytes.
     pub arena_bytes: u64,
     /// Bytes left for the KV cache after the fixed allocations and the
     /// selected activation footprint.
@@ -211,15 +211,15 @@ pub struct PrefillBucketSelection {
 /// half of "target-reactive buckets". The forward macro emits the SAME
 /// candidate ladder for every backend; each backend supplies its own
 /// per-bucket activation cost (`bucket_costs`, `(bucket_m, bytes)`) and applies
-/// the result to its own mechanism (Metal: the pre-reserved colored arena that
+/// the result to its own mechanism (e.g. a pre-reserved colored arena that
 /// trades off against KV). The policy:
 /// the activation footprint may use up to `arena_fraction` of the headroom left
 /// after the fixed (weights + recurrent-state reserve + redundancy)
 /// allocations; the KV cache gets the rest. The smallest bucket is always kept
 /// so a memory-starved device still runs (it just chunks prefill harder).
 ///
-/// This is why nothing here is Apple-specific: a 24 GB 4090 vs an 80 GB H100
-/// reacts exactly like a 32 GB M-series vs a 192 GB Ultra.
+/// This is why nothing here is vendor-specific: a 24 GB 4090 vs an 80 GB H100
+/// reacts exactly like a 32 GB vs a 192 GB unified-memory part.
 pub fn select_prefill_bucket(
     budget_bytes: u64,
     fixed_bytes: u64,
@@ -274,7 +274,7 @@ mod max_num_seqs_default_tests {
     const MIB: usize = 1024 * 1024;
 
     /// The roomy baseline: every per-sequence and fixed term comfortably
-    /// covered, so the tier answer survives untouched. Metal-shaped (no
+    /// covered, so the tier answer survives untouched. A backend with (no
     /// device facts → the base constant, SAME 128 as before the resolver).
     fn roomy(over: impl FnOnce(&mut MaxNumSeqsFacts)) -> MaxNumSeqsFacts {
         let mut f = MaxNumSeqsFacts {
@@ -493,9 +493,9 @@ mod served_context_tests {
         );
     }
 
-    /// The TWO SITES AGREE on the spyre card shape, because the engine's own affordable input
+    /// The TWO SITES AGREE on the fixed-pool card shape, because the engine's own affordable input
     /// re-derives the worker's number rather than estimating beside it. The engine site runs the
-    /// law over `min(reach, pool_tokens)`; for spyre, `reach` IS the worker's answer
+    /// law over `min(reach, pool_tokens)`; for a fixed pool, `reach` IS the worker's answer
     /// (`served_context`), and `pool_tokens` is the scheduler's block allocator
     /// (`num_gpu_blocks × block_size`) after the override clamp — which, with the worker's real
     /// page stride as the block cost, lands exactly on the pool's host range. This pins that
@@ -505,7 +505,7 @@ mod served_context_tests {
     /// hands the engine the worker's number and the unset default resolves to the SAME 69,632
     /// at both sites.
     #[test]
-    fn the_engine_site_rederives_the_workers_number_on_the_spyre_card() {
+    fn the_engine_site_rederives_the_workers_number_on_a_pool_capped_worker() {
         let worker_affordable = 69_632;
         // The pool the worker cut for that answer: demand(69,632) = ceil(69,632/256) = 272
         // pages/row × 2 rows + 1 reserve page.
@@ -542,7 +542,7 @@ mod bucket_selection_tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
 
-    // The Qwen3.5-35B-A3B ladder costs measured on Metal (arena bytes per
+    // The Qwen3.5-35B-A3B ladder costs measured on a unified-memory GPU (arena bytes per
     // bucket): tiny for the decode buckets, then the prefill ramp.
     fn ladder() -> Vec<(u32, u64)> {
         vec![
@@ -641,7 +641,7 @@ mod bucket_selection_tests {
     }
 
     /// The KV-floor interaction `determine_available_memory` runs: a model
-    /// whose resident set fits Apple's recommended working set but not
+    /// whose resident set fits the device's recommended working set but not
     /// `util × working_set` (the 48 GiB gpt-oss-120b-3bit on a 64 GiB M5
     /// Max: raw budget 46.8 GiB < weights 48.2 GiB) must not collapse the
     /// prefill ladder to the fallback — the floor lifts the budget past the

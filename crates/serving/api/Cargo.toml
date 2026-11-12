@@ -10,8 +10,8 @@ default = []
 # Live observability seams for the TUI — forwarded down the engine stack.
 # `live-stats` also gates this crate's own additions (the per-token ITL ring +
 # the live-stats/decode_token accessors). A plain engine build has none of it.
-forward-telemetry = ["scratchy-serving-worker/forward-telemetry", "scratchy-core-common/forward-telemetry"]
-sampler-telemetry = ["scratchy-serving-worker/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
+forward-telemetry = ["scratchy-core-common/forward-telemetry"]
+sampler-telemetry = ["scratchy-core-common/sampler-telemetry"]
 live-stats = []
 # The OpenAI/Anthropic HTTP server (axum) that serves remote requests. The
 # in-process engine — `llm`/`init`/`engine` + the sync span-query path used by
@@ -19,16 +19,8 @@ live-stats = []
 # (`scr chat`) never pulls axum/tower/axum-server.
 serve = ["dep:axum", "dep:tower-http", "dep:http", "tokio/net"]
 otel = ["scratchy-core-common/otel"]
-metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
-spyre = ["scratchy-serving-worker/spyre"]
-# A card, and the emulator — siblings, forwarded to the worker's own tiers. Both also enable
-# the plain `spyre` above (mirroring the worker's own feature tree, where they are its
-# children): the api-side cfg that keys "a spyre backend" — e.g. init_cache's budget triage —
-# must see BOTH tiers, never only the card.
-spyre-hw = ["spyre", "scratchy-serving-worker/spyre-hw"]
-spyre-emu = ["spyre", "scratchy-serving-worker/spyre-emu"]
 guided-decoding = ["scratchy-serving-worker/guided-decoding"]
-multimodal = ["scratchy-core-model/multimodal", "dep:image", "dep:scratchy-vision", "scratchy-forward-compiler/vision", "scratchy-serving-worker/vision"]
+multimodal = ["scratchy-core-model/multimodal", "dep:image", "dep:scratchy-vision", "scratchy-forward-compiler/vision"]
 # axum-server is the TLS listener ONLY — the plain-HTTP path binds a
 # tokio TcpListener and runs `axum::serve`. Keeping it here (not in `serve`)
 # means a non-TLS server build never pulls tokio-rustls/arc-swap/fs-err.
@@ -82,7 +74,7 @@ rand = { workspace = true }
 # reason: the `scratchy-models` build script compiles its own copy of the stack
 # below `ureq`, which enables `http` WITHOUT `default`. Enabling `http/default`
 # in the binary too gives the two copies different feature sets, and cargo then
-# compiles every crate between them (scratchy-target-metal, -layers,
+# compiles every crate between them (the target backend crate, scratchy-layers,
 # -forward-compiler, -ir, -quantizations, -core-model, hf-hub-downloader) twice.
 http = { version = "1", optional = true }
 tokenizers = { workspace = true }

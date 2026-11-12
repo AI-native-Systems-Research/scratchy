@@ -9,10 +9,10 @@ description = "End-to-end tests for vLLM Rust inference engine"
 default = ["guided-decoding", "metrics", "multimodal", "tls"]
 e2e = []
 otel = ["scratchy-serving-api/otel", "scratchy-core-common/otel"]
-metal = ["scratchy-serving-api/metal", "dep:scratchy-target-metal"]
+metal = ["dep:scratchy-target-metal", "dep:scratchy-target-metal-worker"]
 rag = ["scratchy-serving-api/rag", "dep:spnl-core"]
-guided-decoding = ["scratchy-serving-api/guided-decoding"]
-multimodal = ["scratchy-serving-api/multimodal"]
+guided-decoding = ["scratchy-serving-api/guided-decoding", "scratchy-target-metal-worker?/guided-decoding"]
+multimodal = ["scratchy-serving-api/multimodal", "scratchy-target-metal-worker?/vision"]
 tls = ["scratchy-serving-api/tls"]
 metrics = ["scratchy-serving-api/metrics"]
 
@@ -43,6 +43,7 @@ scratchy-serving-api = { workspace = true }
 # Metal backend — used only to probe Metal 4 availability so GPU-only e2e tests
 # skip on hosted CI runners (paravirtual GPU without Metal 4).
 scratchy-target-metal = { path = "../targets/metal", optional = true }
+scratchy-target-metal-worker = { workspace = true, optional = true }
 spnl-core = { workspace = true, optional = true, features = ["rag"] }
 
 [dev-dependencies]

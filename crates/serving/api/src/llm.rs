@@ -223,7 +223,7 @@ impl LLMBuilder {
         }
     }
 
-    /// Set the device ("cpu", "metal", "spyre", "auto").
+    /// Set the device: the name the linked backend's worker matches, or "auto".
     pub fn device(mut self, device: impl Into<String>) -> Self {
         self.config.device = device.into();
         self
@@ -243,7 +243,7 @@ impl LLMBuilder {
     }
 
     /// Set the KV cache dtype ("auto", "fp16", "turboquant", "fp8_e4m3").
-    /// On metal the codec is fixed when the model is built (the `turboquant`
+    /// On a backend that bakes the codec it is fixed when the model is built (the `turboquant`
     /// feature): "auto" takes it, "fp16" / "turboquant" assert it and the
     /// engine refuses to start on a mismatch — assert "fp16" where a lossless
     /// KV cache is required (relocatable spans / rope-on-read transparency).
@@ -426,7 +426,7 @@ impl LLM {
     /// Internal constructor from a fully-specified config.
     fn from_config(mut config: VllmConfig) -> Result<Self> {
         // Disable prefix caching for any backend whose worker can't honor it
-        // (spyre keeps a per-request KV cache — see `WorkerFactory::
+        // (e.g. one that keeps a per-request KV cache — see `WorkerFactory::
         // supports_prefix_caching`). Otherwise the scheduler reports a cached
         // prefix the worker has no KV for and the forward desyncs. Done here,
         // before the scheduler/cache are built from `config`.
@@ -1065,7 +1065,7 @@ impl LLM {
 
         // TTFT ATTRIBUTION (SCRATCHY_TTFT_PHASE). `scr chat <model>` runs IN-PROCESS through here,
         // not through the HTTP server, so none of the server-side timers see it. The device side is
-        // priced to the microsecond by SCRATCHY_SDSC_PHASE_TIME; this prices everything around it, so
+        // priced to the microsecond by the worker's own phase timer; this prices everything around it, so
         // render+tokenize+submit+to_first_token accounts for the whole of the CLI's reported TTFT.
         let ttft_phase = std::env::var_os("SCRATCHY_TTFT_PHASE").is_some();
         let _t_render = std::time::Instant::now();
@@ -1172,7 +1172,7 @@ impl LLM {
                     first_token_at.get_or_insert(std::time::Instant::now());
                 }
                 if ttft_phase && all_token_ids.is_empty() && !output.new_token_ids.is_empty() {
-                    // `to_first_token` is queue + prefill forward(s) + sample; the SDSC phase lines
+                    // `to_first_token` is queue + prefill forward(s) + sample; the worker's phase lines
                     // sit inside it, so the difference is the engine/scheduler overhead around them.
                     eprintln!(
                         "[ttft-host] render={:.2}  tokenize={:.2}  submit={:.2}  to_first_token={:.2}  \
