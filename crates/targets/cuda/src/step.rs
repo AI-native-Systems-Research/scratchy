@@ -415,9 +415,10 @@ pub fn quant_chain(steps: &[CudaStep]) -> Result<(), QuantChainError> {
     }
 }
 
-/// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`): one CTA
-/// per key head owns its value heads, `nv / nk` of them; qwen3.5's are 1 (0.8B) and 2 (9B, 35B).
-pub const GDN_DECODE_MAX_HEADS: u32 = 4;
+/// The value heads per key head the one-launch GDN decode takes (`kernels/gdn_decode.cu`, FP8 S8
+/// D1): one CTA per value head, a key head's `nv / nk` CTAs one cluster, at most the portable
+/// cluster size; qwen3.5's are 1 (0.8B), 2 (9B, 35B) and 3 (27B).
+pub const GDN_DECODE_MAX_HEADS: u32 = 8;
 
 /// The activation a gate/up step applies (`kernels/scratchy_ops.cuh`'s op struct): SwiGLU's
 /// `silu_mul` or GeGLU's `gelu_tanh_mul`, the op of [`CudaStep::SiluMul`] or [`CudaStep::GeluMul`].

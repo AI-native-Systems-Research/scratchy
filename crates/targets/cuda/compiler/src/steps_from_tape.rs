@@ -1443,16 +1443,15 @@ pub fn gdn_bundle_layer(bindings: &[SourceBinding], s: &TapeStep<'_>) -> Option<
 }
 
 /// Whether the one-launch GDN decode takes `g`'s geometry (its launcher's rule, beyond the four
-/// launchers'): `head_v` 128 or 256, and one CTA per key head owning its `nv / nk` value heads,
-/// at most [`GDN_DECODE_MAX_HEADS`] of them, dividing a 16-head gating chunk, with the conv's
-/// `2 + heads · head_v / 128` channel warps at most 8.
+/// launchers'): `head_v` 128 or 256, and one CTA per value head, a key head's `nv / nk` CTAs one
+/// cluster, at most [`GDN_DECODE_MAX_HEADS`] of them, `nv` whole 16-head gating chunks (FP8 S8 D1:
+/// the 27B's three value heads a key head now take it).
 fn gdn_decode_takes(g: &GatedDeltaNetBf16) -> bool {
     let heads = g.num_v_heads / g.num_k_heads.max(1);
     (g.head_v == 128 || g.head_v == 256)
         && g.num_v_heads.is_multiple_of(g.num_k_heads.max(1))
         && (1..=GDN_DECODE_MAX_HEADS).contains(&heads)
-        && 16u32.is_multiple_of(heads)
-        && 2 + heads * g.head_v / 128 <= 8
+        && g.num_v_heads.is_multiple_of(16)
 }
 
 /// `GatedDeltaNet(qkv, z, a, b, bundle)` as one prefill chunk of the Gated-DeltaNet layer: four
