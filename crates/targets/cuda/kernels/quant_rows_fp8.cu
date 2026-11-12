@@ -172,7 +172,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void quant_rows_fp8_ker(
 // A narrow row leaves most of 8 warps idle (512 columns: 2 tiles, ~3× slower than the one-warp
 // form at 16,384 rows), so the kernel is generic over `BW`, the warps of a block: a CTA of 8 warps
 // holds `8 / BW` blocks, and the launcher takes the smallest of 1, 2, 4, 8 that is at least the
-// row's tiles (8 past that, `wide_warps`).
+// row's tiles (8 past that, `wide_warps`). Still, a narrow row's many blocks are the one-warp
+// form's: its 96 KiB CTAs fit two an SM, these 192 KiB ones one, so past 512 blocks (the experts'
+// 16,384 pair rows of a 2,048-token prefill) the one-warp form runs in one wave where this one
+// needs two (on the H100, 16,384 × 512: 28 µs against 35). The launcher takes it there
+// (`narrow_many`, from `rows` and `cols`, constants of each step).
 // Shared memory: 8 warps × 2 stages × (an 8 KiB bf16 tile and a 4 KiB e4m3 tile), plus slack.
 
 constexpr int WIDE_WARPS = 8;
@@ -180,6 +184,11 @@ constexpr int WIDE_THREADS = WIDE_WARPS * kittens::WARP_THREADS;
 constexpr size_t WIDE_SMEM_USED = WIDE_WARPS * STAGES * (sizeof(x_tile) + sizeof(q_tile));
 constexpr int WIDE_SMEM_BYTES = int(WIDE_SMEM_USED) + 1024;
 static_assert(WIDE_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
+
+// Whether `quant_rows_fp8_ker` takes a shape: a row of at most 4 tiles in more than 512 blocks.
+bool narrow_many(uint32_t row_blocks, int col_tiles) {
+    return col_tiles <= 4 && row_blocks > 512;
+}
 
 // The warps of a block for a row of `col_tiles` tiles.
 int wide_warps(int col_tiles) {
@@ -298,8 +307,8 @@ extern "C" int scratchy_cuda_quant_rows_fp8_prepare(void) {
 }
 
 // Test support: `scratchy_cuda_quant_rows_fp8` at `variant` (0 `quant_rows_fp8_ker`, one warp a
-// 16-row block, FP8 S3's form; 1 `quant_rows_fp8_wide_ker` at `wide_warps`, the launcher's), the
-// same bits.
+// 16-row block, FP8 S3's form; 1 the launcher's: `quant_rows_fp8_wide_ker` at `wide_warps`, or
+// FP8 S3's form at `narrow_many`), the same bits.
 extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void* scale,
                                                     uint32_t rows, uint32_t cols, uint32_t variant,
                                                     void* stream /* cudaStream_t */) {
@@ -320,7 +329,7 @@ extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void
         quant_globals G{xg, qg, sg, int(row_blocks), col_tiles};
         void* args[] = {&G};
         const cudaStream_t st = static_cast<cudaStream_t>(stream);
-        if (variant == 1) {
+        if (variant == 1 && !narrow_many(row_blocks, col_tiles)) {
             const int bw = wide_warps(col_tiles);
             const auto ker = bw == 1   ? quant_rows_fp8_wide_ker<1>
                              : bw == 2 ? quant_rows_fp8_wide_ker<2>
@@ -350,7 +359,8 @@ extern "C" int scratchy_cuda_quant_rows_fp8_variant(const void* x, void* q, void
 // to `rows` f32 (4-byte aligned), neither overlapping `x` nor each other.
 // `scratchy_cuda_quant_rows_fp8_prepare` must have succeeded on the current device. The launch is
 // asynchronous on `stream`; the caller owns it and synchronizes. It runs
-// `quant_rows_fp8_wide_ker` (F3), whose bits are `quant_rows_fp8_ker`'s.
+// `quant_rows_fp8_wide_ker` (F3), whose bits are `quant_rows_fp8_ker`'s, or `quant_rows_fp8_ker`
+// itself at `narrow_many`.
 extern "C" int scratchy_cuda_quant_rows_fp8(const void* x, void* q, void* scale, uint32_t rows,
                                             uint32_t cols,
                                             void* stream /* cudaStream_t; null = default */) {
