@@ -49,6 +49,23 @@ unsafe extern "C" {
     ) -> i32;
     // FP8 S3: the per-token quantization and the prefill fp8 GEMM family.
     fn scratchy_cuda_quant_rows_fp8_prepare() -> i32;
+    fn scratchy_cuda_quant_row_fp8_one_prepare() -> i32;
+    fn scratchy_cuda_quant_row_fp8_one(
+        x: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_quant_row_fp8_one_variant(
+        x: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        cols: u32,
+        variant: u32,
+        trace: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_quant_rows_fp8(
         x: *const c_void,
         q: *mut c_void,
@@ -172,6 +189,81 @@ unsafe extern "C" {
     ) -> i32;
     // FP8 S4: the decode fp8 GEMV family, one prepare for the file.
     fn scratchy_cuda_gemv_fp8_prepare() -> i32;
+    // FP8 S8: the tensor-core decode GEMV (`kernels/gemv_fp8_tc.cu`), no tape launches it yet.
+    fn scratchy_cuda_gemv_fp8_tc_prepare() -> i32;
+    fn scratchy_cuda_gemv_fp8_b8(
+        q: *const c_void,
+        a_scale: *const c_void,
+        a_rows: u32,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        residual: *const *const c_void,
+        n: *const u32,
+        count: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        topk_idx: *const c_void,
+        pairs: u32,
+        row_div: u32,
+        out_f32: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemv_fp8_b8_box_probe(
+        x: *const c_void,
+        rows: u32,
+        w: *const c_void,
+        n: u32,
+        k: u32,
+        row: u32,
+        tile: u32,
+        j: u32,
+        poison_x: *const c_void,
+        poison_w: *const c_void,
+        dump_x: *mut c_void,
+        dump_w: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_act_quant_fp8_prepare() -> i32;
+    fn scratchy_cuda_act_quant_fp8(
+        gate: *const c_void,
+        up: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        act: *mut c_void,
+        rows: u32,
+        n: u32,
+        op: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemv_fp8_tc_partial_bytes(n: *const u32, count: u32, k: u32) -> u64;
+    fn scratchy_cuda_gemv_fp8_tc(
+        q: *const c_void,
+        a_scale: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        count: u32,
+        k: u32,
+        partials: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gemv_fp8_tc_variant(
+        q: *const c_void,
+        a_scale: *const c_void,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        n: *const u32,
+        count: u32,
+        k: u32,
+        partials: *mut c_void,
+        variant: u32,
+        main_only: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_fp8_abt(
         a: *const c_void,
         b: *const c_void,
@@ -329,6 +421,19 @@ unsafe extern "C" {
         cols: u32,
         eps: f32,
         gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_rms_norm_one_row_variant(
+        x: *const c_void,
+        gain: *const c_void,
+        y: *mut c_void,
+        other: *const c_void,
+        sum: *mut c_void,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        form: u32,
+        variant: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_rms_norm_unit_bf16(
@@ -687,6 +792,41 @@ unsafe extern "C" {
         tile_row: u32,
         tile_col: u32,
         swizzled: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_tma_ring_probe(
+        b: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        k: u32,
+        variant: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_tma_consume_probe(
+        b: *const c_void,
+        a: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        k: u32,
+        consume: u32,
+        rows: u32,
+        ctas: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_tma_probe_occupancy(
+        variant: u32,
+        consume: u32,
+        rows: u32,
+        ctas: u32,
+        blocks: *mut i32,
+    ) -> i32;
+    fn scratchy_cuda_tc_stream_probe(
+        b: *const c_void,
+        a: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        k: u32,
+        variant: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_attn_decode_bf16_prepare() -> i32;
@@ -1314,12 +1454,15 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gate_up_gemm_bf16", scratchy_cuda_gate_up_gemm_bf16_prepare),
     // FP8 S3: the attribute on every instance of each file, which loads each.
     ("quant_rows_fp8", scratchy_cuda_quant_rows_fp8_prepare),
+    ("quant_row_fp8_one", scratchy_cuda_quant_row_fp8_one_prepare),
     ("gemm_fp8", scratchy_cuda_gemm_fp8_prepare),
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
     // FP8 S8 F6a: the attribute on every instance of the chunked scan.
     ("gdn_chunk_scan", scratchy_cuda_gdn_chunk_scan_prepare),
+    ("gemv_fp8_tc", scratchy_cuda_gemv_fp8_tc_prepare),
+    ("act_quant_fp8", scratchy_cuda_act_quant_fp8_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -1607,6 +1750,44 @@ pub unsafe fn rms_norm_unit_bf16(
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_rms_norm_unit_bf16(x, y, rows, cols, eps, stream) };
     check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Test support for `tests/row_ops.rs` only (FP8 S8 N1): one row of norm form `form` (0
+/// [`rms_norm_bf16`], 1 [`rms_norm_unit_bf16`], 2 [`add_rms_norm_bf16`], 3 [`norm_add_bf16`]) at
+/// `variant` 0, today's one-row kernel, or 1, the row kernel the launchers take, the same bits.
+/// No `CudaStep` uses it. Refused with [`KernelError::RowShape`] (`rows` 1) unless `cols` meets
+/// the row kernels' rule and is at most 17,408, and `form` and `variant` are codes. Asynchronous.
+///
+/// # Safety
+///
+/// Every pointer a 16-byte-aligned device pointer to `cols` bf16, valid for the whole kernel, the
+/// outputs `y` and `sum` overlapping no input nor each other. `stream` as [`rms_norm_bf16`]'s.
+#[doc(hidden)]
+pub unsafe fn rms_norm_one_row_variant(
+    (x, gain): (*const c_void, *const c_void),
+    (y, other, sum): (*mut c_void, *const c_void, *mut c_void),
+    cols: u32,
+    (eps, gain_offset): (f32, f32),
+    (form, variant): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape and the codes before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_rms_norm_one_row_variant(
+            x,
+            gain,
+            y,
+            other,
+            sum,
+            cols,
+            eps,
+            gain_offset,
+            form,
+            variant,
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows: 1, cols })
 }
 
 /// Launch the bf16 `out = 0.5 · gate · (1 + tanh(√(2/π) · (gate + 0.044715 · gate³))) · up` (GeGLU,
@@ -2470,6 +2651,108 @@ pub unsafe fn tma_box_probe_store(
         )
     };
     check(code, KernelError::RowShape { rows, cols })
+}
+
+// THE TMA RING PROBE (`kernels/tma_ring_probe.cu`): test support, for
+// `tests/gemv_fp8_ring_probe.rs` only (FP8 S8 W2c). No `CudaStep` and no lowering use it. It
+// streams an e4m3 weight through the fp8 GEMV's grid and rings with no dot product, at five sizes
+// of TMA operation, to tell whether that GEMV is bound by its TMA operation rate. It sets its own
+// shared-memory attribute per call, so it is not in `PREPARE`.
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only. Stream `b` (`[n, k]` e4m3) through the
+/// ring probe's variant `variant` (0: 256-byte vectors at 3 rows a warp; 1: 256-byte vectors;
+/// 2: 512-byte 2-row tiles; 3: 4 KB 16-row tiles per 4 warps; 4: 16 KB 16 × 1,024 tiles per 4
+/// warps) and store each thread's fold of the bytes it read into `out`. Refused with
+/// [`KernelError::RowShape`] (`rows` `n`, `cols` `k`) unless `n` and `k` are non-zero and at most
+/// `i32::MAX / 2`, `variant` at most 4, `k` a multiple of 256 (1,024 for variant 4) and, for
+/// variants 2 to 4, `n` a multiple of 32. Asynchronous.
+///
+/// # Safety
+///
+/// `b` must be a 16-byte-aligned device pointer to `n · k` bytes and `out` to `16 · n + 256` f32,
+/// valid for the whole kernel, not overlapping. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn tma_ring_probe(
+    (b, out): (*const c_void, *mut c_void),
+    (n, k): (u32, u32),
+    variant: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe { scratchy_cuda_tma_ring_probe(b, out, n, k, variant, stream) };
+    check(code, KernelError::RowShape { rows: n, cols: k })
+}
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only (the ceiling probe, /tmp/d-cap.md §3
+/// P-A). Stream `b` (`[n, k]` e4m3) in the tensor-core GEMV's geometry (132 CTAs, stream-K runs,
+/// one producer warp, one consumer warpgroup reading one byte per lane) as variant `variant`: 0
+/// A1 `b64` (`st<128, 64>` boxes), 1 A2 `b64+a` (plus a `[1, k]` A box from `a`), 2 A3 `b128`, 3
+/// A4 `b128+a`, 4 A5 `b256` (`st<64, 256>`), 5 A6 `b64x2cta` (A1 at 264 CTAs); each thread's fold
+/// into `out`. Refused with [`KernelError::RowShape`] (`rows` `n`, `cols` `k`) unless `n` is a
+/// non-zero multiple of the variant's box rows, `k` of its K step, both at most `i32::MAX / 2`,
+/// and `variant` at most 5. Asynchronous.
+///
+/// # Safety
+///
+/// `b` must be a 16-byte-aligned device pointer to `n · k` bytes, `a` to `k` bytes and `out` to
+/// `264 · 256` f32, valid for the whole kernel, `out` overlapping neither. `stream` as
+/// [`tma_ring_probe`]'s.
+#[doc(hidden)]
+pub unsafe fn tc_stream_probe(
+    (b, a, out): (*const c_void, *const c_void, *mut c_void),
+    (n, k): (u32, u32),
+    variant: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe { scratchy_cuda_tc_stream_probe(b, a, out, n, k, variant, stream) };
+    check(code, KernelError::RowShape { rows: n, cols: k })
+}
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only (FP8 S8 W2d). Stream `b` (`[n, k]` e4m3)
+/// through the consume probe's variant `consume` (0 wait, 1 every byte, 2 the widen, 3 the dot
+/// with the activation row `a` (`[1, k]` bf16), 4 the dot with the GEMV's quantizing prologue) at
+/// `rows` (3 or 4) rows a warp and exactly `ctas` (2 or 3) CTAs per SM, and store each thread's
+/// fold into `out` (int). Refused with [`KernelError::RowShape`] (`rows` `n`, `cols` `k`) unless
+/// `n` is non-zero and at most `i32::MAX / 2`, `k` a non-zero multiple of 256 at most 17,408 (at
+/// most 8,192 for variants 3 and 4 at 3 CTAs), and `consume`, `rows` and `ctas` in range.
+/// Asynchronous.
+///
+/// # Safety
+///
+/// `b` must be a 16-byte-aligned device pointer to `n · k` bytes, `a` to `k` bf16 and `out` to
+/// `11 · n + 256` i32, valid for the whole kernel, `out` overlapping neither input. `stream` as
+/// [`tma_ring_probe`]'s.
+#[doc(hidden)]
+pub unsafe fn tma_consume_probe(
+    (b, a, out): (*const c_void, *const c_void, *mut c_void),
+    (n, k): (u32, u32),
+    (consume, rows, ctas): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code =
+        unsafe { scratchy_cuda_tma_consume_probe(b, a, out, n, k, consume, rows, ctas, stream) };
+    check(code, KernelError::RowShape { rows: n, cols: k })
+}
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only: the CTAs per SM the CUDA runtime gives a
+/// probe instance on the current device: ring variant `variant` when `consume` is `None`, else
+/// consume variant `(consume, rows, ctas)` as [`tma_consume_probe`] takes it. It sets the
+/// instance's shared-memory attribute, so call it outside a capture.
+#[doc(hidden)]
+pub fn tma_probe_occupancy(
+    variant: u32,
+    consume: Option<(u32, u32, u32)>,
+) -> Result<i32, KernelError> {
+    let (c, rows, ctas) = consume.unwrap_or((5, 4, 2));
+    let mut blocks = 0i32;
+    // SAFETY: `blocks` is a live local the call writes once; no device pointer is passed.
+    let code = unsafe { scratchy_cuda_tma_probe_occupancy(variant, c, rows, ctas, &mut blocks) };
+    check(code, KernelError::RowShape { rows, cols: ctas }).map(|()| blocks)
 }
 
 /// Launch the GQA decode attention of one query row `q` (`[1, q_heads · 256]`) over one layer's
@@ -3817,6 +4100,52 @@ pub unsafe fn argmax_bf16(
     )
 }
 
+/// Test support for `tests/gemv_fp8_tc.rs` only (FP8 S8's Q1, no tape launches it yet):
+/// [`quant_rows_fp8`] of one row, `x [1, cols]` bf16 into `q [1, cols]` e4m3 and `scale [1]` f32,
+/// the bits of [`quant_rows_fp8`]'s row 0 for the same row, one CTA per 256 columns. Refused with
+/// [`KernelError::RowShape`] (`rows` 1) unless `cols` is a non-zero multiple of 64 at most 17,408.
+/// Asynchronous.
+///
+/// # Safety
+///
+/// As [`quant_rows_fp8`]'s at one row.
+#[doc(hidden)]
+pub unsafe fn quant_row_fp8_one(
+    x: *const c_void,
+    (q, scale): (*mut c_void, *mut c_void),
+    cols: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe { scratchy_cuda_quant_row_fp8_one(x, q, scale, cols, stream) };
+    check(code, KernelError::RowShape { rows: 1, cols })
+}
+
+/// Test support for `tests/gemv_fp8_tc.rs` only: [`quant_row_fp8_one`] at `variant` (0 its first
+/// form, which divides the tile's 15 zero-fill rows too; 1 the tile dividing row 0 only; 2
+/// [`quant_row_fp8_one`]'s own, one element a thread), and, when
+/// `trace` is not null, each CTA's phase cycles into `trace` (`[⌈cols / 256⌉, 8]` f32: entry,
+/// chunks arrived, amax shared, tile arrived, tile divided, stored). Refused as
+/// [`quant_row_fp8_one`], or for `variant` above 2. Asynchronous.
+///
+/// # Safety
+///
+/// As [`quant_row_fp8_one`]'s; `trace`, when not null, `⌈cols / 256⌉ · 8` f32 of device memory.
+#[doc(hidden)]
+pub unsafe fn quant_row_fp8_one_variant(
+    x: *const c_void,
+    (q, scale): (*mut c_void, *mut c_void),
+    cols: u32,
+    (variant, trace): (u32, *mut c_void),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_quant_row_fp8_one_variant(x, q, scale, cols, variant, trace, stream)
+    };
+    check(code, KernelError::RowShape { rows: 1, cols })
+}
+
 /// Launch the fp8 GEMM (`kernels/gemm_fp8.cu`): `c [m, n] = bf16((a · bᵀ) · b_scale[n] ·
 /// a_scale[m])`, accumulated in f32. At `col64` false on [`gemm_bf16_abt`]'s tile grid (`m`, `n`,
 /// `k` non-zero multiples of 128, 256 and 64), at `col64` true on [`gemm_col64_bf16_abt`]'s (128,
@@ -4121,6 +4450,254 @@ pub unsafe fn gemv_group_fp8_abt(
             k,
             sp.as_ptr(),
             count,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// The `partials` bytes [`gemv_fp8_tc`] needs for members of `n` rows each over `k`, or `None`
+/// when that launcher refuses the shape.
+pub fn gemv_fp8_tc_partial_bytes(n: &[u32], k: u32) -> Option<u64> {
+    let count = u32::try_from(n.len()).ok()?;
+    // SAFETY: `n` is `count` u32s; the function only reads them, after checking `count`.
+    let bytes = unsafe { scratchy_cuda_gemv_fp8_tc_partial_bytes(n.as_ptr(), count, k) };
+    (bytes != 0).then_some(bytes)
+}
+
+/// The tensor-core decode GEMV (`kernels/gemv_fp8_tc.cu`, FP8 S8, not yet in a tape): member `i`
+/// of `members` is `c [n] = bf16(((q · bᵀ) · b_scale) · a_scale)` off one quantized row `q [1, k]`
+/// e4m3 and its scale `a_scale` (one f32, `quant_rows_fp8`'s), 1 to 3 members, each `n` a non-zero
+/// multiple of 64 and `k` of 64. `partials` holds [`gemv_fp8_tc_partial_bytes`] bytes. Two launches,
+/// asynchronous; refused with [`KernelError::GroupShape`] before any pointer is touched.
+///
+/// # Safety
+///
+/// Every pointer is 16-byte-aligned device memory of its size; no output overlaps an input or
+/// another output; `stream` is a live stream or null.
+pub unsafe fn gemv_fp8_tc(
+    (q, a_scale): Fp8Operand,
+    members: Fp8GroupOperands<'_>,
+    partials: *mut c_void,
+    k: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemv_fp8_tc", members, (1, k));
+    if members.is_empty() || members.len() > 3 {
+        return Err(refused);
+    }
+    // SAFETY: as above; the arrays are three long and the launcher checks the count and every
+    // member's shape before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemv_fp8_tc(
+            q,
+            a_scale,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            members.len() as u32,
+            k,
+            partials,
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// B8's expert form (FP8 S8 T1): every member reads its first `n` rows of expert `topk_idx[p]`'s
+/// block of the bank `[experts, expert_rows, k]` e4m3 (its scales `[experts, expert_rows]` f32),
+/// `topk_idx [pairs]` i32 (`kernels/gemv_fp8.cu`'s `EXPERT` contract).
+#[derive(Clone, Copy, Debug)]
+pub struct B8Experts {
+    pub topk_idx: *const c_void,
+    pub experts: u32,
+    pub expert_rows: u32,
+}
+
+/// What B8 stores (FP8 S8 T1): each member's rows rounded once to bf16, with `residual[i] [pairs,
+/// n]` bf16 added as `scratchy::ops::with_residual` does when it is given (W4a's epilogue); or the
+/// scaled f32 sums, unrounded (`F32`, the gate/up members, for [`act_quant_fp8`]).
+#[derive(Clone, Copy, Debug)]
+pub enum B8Store<'r> {
+    Bf16 {
+        residual: Option<&'r [*const c_void]>,
+    },
+    F32,
+}
+
+/// B8, the tensor-core decode GEMV in its production form (FP8 S8 T1, `kernels/gemv_fp8_tc.cu`;
+/// no tape launches it yet): up to 3 members off the e4m3 activation `q [a_rows, k]` and its
+/// per-row `a_scale [a_rows]` f32 (`quant_rows_fp8`'s bytes). Pair `p` of member `i` is
+/// `((q[p / row_div] · b_e[j, :]) · b_scale_e[j]) · a_scale[p / row_div]` over its `n` rows, `e`
+/// 0 dense or `topk_idx[p]` ([`B8Experts`]), stored as [`B8Store`] says into `c [pairs, n]`. Each
+/// member, each pair, is its own launch's bits: one CTA per 64-row tile over the whole K. One
+/// launch, asynchronous.
+///
+/// Refused with [`KernelError::GroupShape`] (`m` the pairs) before any pointer is touched: 1 to 3
+/// members; `k` and every `n` non-zero multiples of 64; `pairs` 1 to 65,535 and `row_div` non-zero,
+/// every pair's row below `a_rows`; an expert bank's `expert_rows` at least every `n`; a residual
+/// for every member, none with `F32`.
+///
+/// # Safety
+///
+/// Every pointer 16-byte-aligned device memory holding its elements, no output overlapping an
+/// input; [`prepare_all`] has succeeded on the current device; `stream` a live `cudaStream_t` of
+/// it, or null.
+pub unsafe fn gemv_fp8_b8(
+    (q, a_scale, a_rows): (*const c_void, *const c_void, u32),
+    members: Fp8GroupOperands<'_>,
+    k: u32,
+    (pairs, row_div, experts): (u32, u32, Option<B8Experts>),
+    store: B8Store<'_>,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, _) = fp8_group_parts("gemv_fp8_b8", members, (pairs, k));
+    let refused = KernelError::GroupShape {
+        kernel: "gemv_fp8_b8",
+        m: pairs,
+        k,
+        n,
+    };
+    let (residual, out_f32) = match store {
+        B8Store::Bf16 { residual } => (residual, false),
+        B8Store::F32 => (None, true),
+    };
+    if members.is_empty() || members.len() > 3 || residual.is_some_and(|r| r.len() != members.len())
+    {
+        return Err(refused);
+    }
+    let mut r = [std::ptr::null(); 3];
+    for (slot, &p) in r.iter_mut().zip(residual.unwrap_or(&[])) {
+        *slot = p;
+    }
+    let e = experts.unwrap_or(B8Experts {
+        topk_idx: std::ptr::null(),
+        experts: 1,
+        expert_rows: 0,
+    });
+    // SAFETY: as above; the arrays are three long and the launcher checks the count, every shape
+    // and every null before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemv_fp8_b8(
+            q,
+            a_scale,
+            a_rows,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            if residual.is_some() {
+                r.as_ptr()
+            } else {
+                std::ptr::null()
+            },
+            n.as_ptr(),
+            members.len() as u32,
+            k,
+            e.experts,
+            e.expert_rows,
+            e.topk_idx,
+            pairs,
+            row_div,
+            u32::from(out_f32),
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// Test support for `tests/gemv_fp8_b8.rs` only (TK-1's R1 on B8's 128-byte-swizzled fp8 boxes):
+/// B8's activation box (`x [rows, 1, k]` e4m3, row `row`) and weight box (`w [n, k]` e4m3, tile
+/// `tile`) at K step `j`, each first TMA-loaded with its all-NaN poison (`poison_x [32, 256]`,
+/// `poison_w [64, 256]`), then TMA-stored to the exact-fit `dump_x`, `dump_w`. Refused with
+/// [`KernelError::RowShape`] (`rows`, `k`) for a zero or misaligned size, a coordinate past its
+/// array, or a null pointer. Asynchronous.
+///
+/// # Safety
+///
+/// As [`gemv_fp8_b8`]'s, for those buffers.
+#[doc(hidden)]
+pub unsafe fn gemv_fp8_b8_box_probe(
+    (x, rows, row): (*const c_void, u32, u32),
+    (w, n, tile): (*const c_void, u32, u32),
+    (k, j): (u32, u32),
+    (poison_x, poison_w): (*const c_void, *const c_void),
+    (dump_x, dump_w): (*mut c_void, *mut c_void),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller's contract; the launcher checks every size and null first.
+    let code = unsafe {
+        scratchy_cuda_gemv_fp8_b8_box_probe(
+            x, rows, w, n, k, row, tile, j, poison_x, poison_w, dump_x, dump_w, stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows, cols: k })
+}
+
+/// The one-row activation and its quantization (FP8 S8 T1, `kernels/act_quant_fp8.cu`): for each
+/// of `rows` rows, `act = bf16(OP(gate, up))` from the gate/up GEMV's f32 `gate`, `up [rows, n]`
+/// (`op` a [`crate::step::GatedOp`] code), then that row's `quant_rows_fp8` bytes into `q [rows, n]`
+/// e4m3 and its scale into `scale [rows]` f32, bit for bit; `act [rows, n]` bf16 too when it is
+/// not null. One CTA a row; asynchronous.
+///
+/// Refused with [`KernelError::RowShape`] when `rows` is 0 or above 65,535, `n` 0, off 64 or above
+/// 17,408, `op` neither SwiGLU's nor GeGLU's, or a pointer but `act` null.
+///
+/// # Safety
+///
+/// Every pointer 16-byte-aligned device memory holding its elements, no output overlapping an
+/// input; [`prepare_all`] has succeeded on the current device; `stream` a live `cudaStream_t` of
+/// it, or null.
+pub unsafe fn act_quant_fp8(
+    (gate, up): (*const c_void, *const c_void),
+    (q, scale, act): (*mut c_void, *mut c_void, *mut c_void),
+    (rows, n): (u32, u32),
+    op: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller's contract; the launcher checks the shape and the nulls first.
+    let code = unsafe { scratchy_cuda_act_quant_fp8(gate, up, q, scale, act, rows, n, op, stream) };
+    check(code, KernelError::RowShape { rows, cols: n })
+}
+
+/// Test support for `tests/gemv_fp8_tc.rs` only (the ceiling probe, /tmp/d-cap.md §3 P-B):
+/// [`gemv_fp8_tc`] at instance `variant` (0 B1, [`gemv_fp8_tc`]'s own; 1 B2 `wait1`, the same
+/// bits; 2 B3 `k128`, `k` a multiple of 128; 3 B4 `2cta`; 4 B6 `k256`, 5 B8 `swapab32` and 6 B9
+/// `swapab32sk`, `k` a multiple of 256), and with `main_only` (B5 `noreduce`) the
+/// stream-K kernel alone, `c` left unwritten. Refused with [`KernelError::GroupShape`] as
+/// [`gemv_fp8_tc`], or for `variant` above 6. Asynchronous.
+///
+/// # Safety
+///
+/// As [`gemv_fp8_tc`]'s.
+#[doc(hidden)]
+pub unsafe fn gemv_fp8_tc_variant(
+    (q, a_scale): Fp8Operand,
+    members: Fp8GroupOperands<'_>,
+    partials: *mut c_void,
+    k: u32,
+    (variant, main_only): (u32, bool),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, refused) = fp8_group_parts("gemv_fp8_tc_variant", members, (1, k));
+    if members.is_empty() || members.len() > 3 {
+        return Err(refused);
+    }
+    // SAFETY: as above; the arrays are three long and the launcher checks the count, the variant
+    // and every member's shape before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemv_fp8_tc_variant(
+            q,
+            a_scale,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            n.as_ptr(),
+            members.len() as u32,
+            k,
+            partials,
+            variant,
+            u32::from(main_only),
             stream,
         )
     };

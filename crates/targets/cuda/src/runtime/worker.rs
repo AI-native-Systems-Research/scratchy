@@ -39,12 +39,13 @@ use crate::kernels::{self, DecodeSplit, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
     ARGMAX_CHUNK, ATTN_D512_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16,
-    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGemmBf16, ExpertGemvBf16,
-    ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16, GateUpKernel,
-    GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8, RmsNormBf16, RmsNormUnitBf16,
-    RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
-    attn_decode_scratch_bytes, attn_decode_split, fp8_moe_layout, fp8_weight, gemv_splits,
+    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGateUpActBf16, ExpertGateUpTcFp8, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GateUpKernel, GateUpTcFp8, GatedDeltaNetBf16, GemmBf16, GroupMember, LayerScaleBf16,
+    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, NormAddBf16, PairRows, QuantRowsFp8,
+    RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16,
+    ScaleBf16, SiluMulBf16, SoftCapBf16, attn_decode_scratch_bytes, attn_decode_split,
+    fp8_moe_layout, fp8_weight, gemv_splits,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, GreedyArgmax,
@@ -1600,15 +1601,78 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     CudaStep::QuantRowsFp8(QuantRowsFp8 { x, q, rows, cols }) => {
                         let (q, scale) = Self::fp8_rows(slot, q, rows, cols);
                         // SAFETY: as above, for `x` (`rows*cols` bf16) and the quant scratch, which
-                        // holds `rows*cols` bytes then `rows` f32 at `scale_at` (`validate`).
+                        // holds `rows*cols` bytes then `rows` f32 at `scale_at` (`validate`). One
+                        // row (the tensor-core decode GEMV's input, FP8 S8 T2) is Q1's, the same
+                        // bytes and scale.
                         unsafe {
-                            kernels::quant_rows_fp8(
-                                slot(x),
-                                (q.cast_mut(), scale.cast_mut()),
-                                (rows, cols),
+                            match rows {
+                                1 => kernels::quant_row_fp8_one(
+                                    slot(x).cast_const(),
+                                    (q.cast_mut(), scale.cast_mut()),
+                                    cols,
+                                    stream.0,
+                                ),
+                                _ => kernels::quant_rows_fp8(
+                                    slot(x),
+                                    (q.cast_mut(), scale.cast_mut()),
+                                    (rows, cols),
+                                    stream.0,
+                                ),
+                            }
+                        }
+                    }
+                    // The tensor-core decode GEMVs (FP8 S8 T2, B8): `a` the quant scratch's row.
+                    CudaStep::GemvTcFp8(GemmBf16 {
+                        a,
+                        b,
+                        c,
+                        n,
+                        k,
+                        residual,
+                        ..
+                    }) => {
+                        let (q, scale) = Self::fp8_rows(slot, a, 1, k);
+                        let r = residual.map(|r| [slot(r).cast_const()]);
+                        // SAFETY: as the `GemvFp8` arm's, for the quantized row (`k` bytes then its
+                        // scale, the quant scratch) in place of the bf16 row.
+                        unsafe {
+                            kernels::gemv_fp8_b8(
+                                (q, scale, 1),
+                                &[(Self::fp8_weight(weights, b, n, k), slot(c), n)],
+                                k,
+                                (1, 1, None),
+                                kernels::B8Store::Bf16 {
+                                    residual: r.as_ref().map(|r| &r[..]),
+                                },
                                 stream.0,
                             )
                         }
+                    }
+                    CudaStep::GemvGroupTcFp8(g) => {
+                        let (q, scale) = Self::fp8_rows(slot, g.a, 1, g.k);
+                        let members: Vec<(kernels::Fp8Operand, *mut c_void, u32)> = (g.members())
+                            .iter()
+                            .flatten()
+                            .map(|m| (Self::fp8_weight(weights, m.b, m.n, g.k), slot(m.c), m.n))
+                            .collect();
+                        // SAFETY: as the `GemvTcFp8` arm's, each member's weight an fp8 buffer.
+                        unsafe {
+                            kernels::gemv_fp8_b8(
+                                (q, scale, 1),
+                                &members,
+                                g.k,
+                                (1, 1, None),
+                                kernels::B8Store::Bf16 { residual: None },
+                                stream.0,
+                            )
+                        }
+                    }
+                    CudaStep::GateUpTcFp8(t) => {
+                        Self::gate_up_tc(&t, slot, partials, weights, stream)
+                    }
+                    CudaStep::ExpertGemvTcFp8(g) => Self::expert_gemv_tc(&g, slot, weights, stream),
+                    CudaStep::ExpertGateUpTcFp8(t) => {
+                        Self::expert_gate_up_tc(&t, slot, partials, weights, stream)
                     }
                     CudaStep::GemmFp8(GemmBf16 {
                         a, b, c, m, n, k, ..
@@ -2908,6 +2972,154 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 slot(g.c),
                 (g.max_tiles, n, k, g.experts, expert_rows),
                 g.n_tile,
+                stream.0,
+            )
+        }
+    }
+
+    /// A tensor-core gate/up (FP8 S8 T2): B8's gate and up members off the quantized row, f32,
+    /// into the GEMV scratch (`GateUpTcFp8::gemv_scratch`: the gate's rows, the up's after them),
+    /// then the act + quantize of them into `out` and the quant scratch's second slot.
+    fn gate_up_tc(
+        t: &GateUpTcFp8,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        partials: *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let GemmBf16 { a, m, n, k, .. } = t.fold.gate;
+        let up_at = (u64::from(m) * u64::from(n) * 4).next_multiple_of(CUDA_ARENA_ALIGN) as usize;
+        let (gate, up) = (partials, partials.wrapping_byte_add(up_at));
+        let members = [
+            (Self::fp8_weight(weights, t.fold.gate.b, n, k), gate, n),
+            (Self::fp8_weight(weights, t.fold.up.b, n, k), up, n),
+        ];
+        let (q_act, s_act) = Self::fp8_rows(&slot, t.q_act, m, n);
+        // SAFETY: as the `GateUpAct` arm's: the quantized row (the quant scratch), both weights;
+        // the GEMV scratch holds both f32 rows (`validate` checked its bytes); `out` (`m*n` bf16)
+        // and the second slot (`m*n` bytes then `m` f32).
+        unsafe {
+            kernels::gemv_fp8_b8(
+                (
+                    Self::fp8_rows(&slot, a, m, k).0,
+                    Self::fp8_rows(&slot, a, m, k).1,
+                    m,
+                ),
+                &members,
+                k,
+                (m, 1, None),
+                kernels::B8Store::F32,
+                stream.0,
+            )?;
+            kernels::act_quant_fp8(
+                (gate.cast_const(), up.cast_const()),
+                (q_act.cast_mut(), s_act.cast_mut(), slot(t.fold.out)),
+                (m, n),
+                t.fold.act.code(),
+                stream.0,
+            )
+        }
+    }
+
+    /// A tensor-core expert GEMV (FP8 S8 T2): B8's expert form over the fp8 bank, the token row
+    /// (its `top_k` pairs) or the pairs' own rows, quantized in the quant scratch.
+    fn expert_gemv_tc(
+        g: &ExpertGemvBf16,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let (n, k) = g.n_k();
+        let refused = KernelError::MoeShape {
+            kernel: "gemv_fp8_b8",
+            dims: [g.m, g.top_k, n, k],
+        };
+        let Some((b, expert_rows)) = Self::fp8_expert_slab(
+            weights,
+            (g.bundle, g.weight),
+            g.proj,
+            (g.experts, g.hidden, g.inter),
+        ) else {
+            return Err(refused);
+        };
+        let pairs = g.m.checked_mul(g.top_k).ok_or(refused)?;
+        let (a_rows, row_div) = match g.rows {
+            PairRows::Token => (g.m, g.top_k),
+            PairRows::Pair => (pairs, 1),
+        };
+        let (q, scale) = Self::fp8_rows(&slot, g.a, a_rows, k);
+        let experts = kernels::B8Experts {
+            topk_idx: slot(g.topk_idx).cast_const(),
+            experts: g.experts,
+            expert_rows,
+        };
+        // SAFETY: as `expert_gemv`'s fp8 launch, with the quantized rows (the quant scratch) in
+        // place of the bf16 ones.
+        unsafe {
+            kernels::gemv_fp8_b8(
+                (q, scale, a_rows),
+                &[(b, slot(g.c), n)],
+                k,
+                (pairs, row_div, Some(experts)),
+                kernels::B8Store::Bf16 { residual: None },
+                stream.0,
+            )
+        }
+    }
+
+    /// A tensor-core expert gate/up (FP8 S8 T2): B8's expert form for the gate and the up (f32,
+    /// into the GEMV scratch), then the act + quantize of the pairs' rows, as `gate_up_tc`.
+    fn expert_gate_up_tc(
+        t: &ExpertGateUpTcFp8,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        partials: *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let g = t.fold.gate;
+        let (n, k) = g.n_k();
+        let refused = KernelError::MoeShape {
+            kernel: "gemv_fp8_b8",
+            dims: [g.m, g.top_k, n, k],
+        };
+        let slab = |p: &ExpertGemvBf16| {
+            Self::fp8_expert_slab(
+                weights,
+                (p.bundle, p.weight),
+                p.proj,
+                (p.experts, p.hidden, p.inter),
+            )
+        };
+        let (Some((gate_w, expert_rows)), Some((up_w, _))) = (slab(&g), slab(&t.fold.up)) else {
+            return Err(refused);
+        };
+        let pairs = g.m.checked_mul(g.top_k).ok_or(refused)?;
+        let up_at =
+            (u64::from(pairs) * u64::from(n) * 4).next_multiple_of(CUDA_ARENA_ALIGN) as usize;
+        let (gate, up) = (partials, partials.wrapping_byte_add(up_at));
+        let (q, scale) = Self::fp8_rows(&slot, g.a, g.m, k);
+        let (q_act, s_act) = Self::fp8_rows(&slot, t.q_act, pairs, n);
+        let experts = kernels::B8Experts {
+            topk_idx: slot(g.topk_idx).cast_const(),
+            experts: g.experts,
+            expert_rows,
+        };
+        // SAFETY: as `expert_gemv_tc`'s for the gate and the up (the GEMV scratch holds both f32
+        // rows, `validate` checked its bytes), then the act + quantize as `gate_up_tc`'s.
+        unsafe {
+            kernels::gemv_fp8_b8(
+                (q, scale, g.m),
+                &[(gate_w, gate, n), (up_w, up, n)],
+                k,
+                (pairs, g.top_k, Some(experts)),
+                kernels::B8Store::F32,
+                stream.0,
+            )?;
+            kernels::act_quant_fp8(
+                (gate.cast_const(), up.cast_const()),
+                (q_act.cast_mut(), s_act.cast_mut(), slot(t.fold.out)),
+                (pairs, n),
+                t.fold.act.code(),
                 stream.0,
             )
         }

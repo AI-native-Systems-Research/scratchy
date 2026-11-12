@@ -415,6 +415,22 @@ __device__ inline float2 fp8_quant_pre_nz::op<float2>(const float2& x, const flo
                   fp8_quant_pre_nz::op<float>(x.y, scale.y)};
 }
 
+// `fp8_quant_pre` on the rows a one-row tile holds (FP8 S8's Q1, `quant_rows_fp8.cu`): a row whose
+// scale is 0 is TMA zero fill, never stored, so it is 0 with no division. `__fdiv_rn` of a zero
+// takes its slow path (SASS `FCHK` then a `CALL`); a one-row tile's 15 zero rows made it ~20 µs.
+// A real row's scale is at least `fp8_scale::MIN_SCALE`, so its values are `fp8_quant_pre`'s.
+struct fp8_quant_pre_row {
+    template <typename T>
+    static __device__ inline T op(const T& x, const T& scale) {
+        return scale == T(0) ? T(0) : fp8_quant_pre::op<T>(x, scale);
+    }
+};
+template <>
+__device__ inline float2 fp8_quant_pre_row::op<float2>(const float2& x, const float2& scale) {
+    return float2{fp8_quant_pre_row::op<float>(x.x, scale.x),
+                  fp8_quant_pre_row::op<float>(x.y, scale.y)};
+}
+
 // One quantized element as the fp8 GEMV computes with it (FP8 S4, `gemv_fp8.cu`): `x` rounded to
 // e4m3 and widened back, `float(e4m3_satfinite(x))`. The cast is TK's scalar convertor
 // (`__nv_fp8_e4m3(float)`: round to nearest even, saturating to finite), the one byte S3's
@@ -425,6 +441,16 @@ struct fp8_round {
     static __device__ inline T op(const T& x) {
         return kittens::base_types::convertor<float, kittens::fp8e4m3>::convert(
             kittens::base_types::convertor<kittens::fp8e4m3, float>::convert(x));
+    }
+};
+
+// A 32-bit add modulo 2³² on `int` (FP8 S8 W2d's consume probe, `tma_ring_probe.cu`): TK's
+// `base_ops::sum` on `int` is a signed add, whose overflow is undefined. Exact, so a host can
+// check a fold of any words.
+struct wrap_add {
+    template <typename T>
+    static __device__ inline T op(const T& a, const T& b) {
+        return T(uint32_t(a) + uint32_t(b));
     }
 };
 
@@ -465,6 +491,23 @@ __device__ inline kittens::bf16 with_residual(float v, kittens::bf16 r) {
     const float stored = convertor<float, kittens::bf16>::convert(convertor<kittens::bf16, float>::convert(v));
     const float sum = kittens::base_ops::sum::op<float>(stored, convertor<float, kittens::bf16>::convert(r));
     return convertor<kittens::bf16, float>::convert(sum);
+}
+
+// The residual epilogue's first rounding on a vector (FP8 S8 T1, the tensor-core GEMV): `v` rounded
+// to bf16 as the GEMV stores it and widened back exactly, `with_residual`'s `stored`, so the
+// residual's f32 add and the store's one rounding after it are `with_residual`'s bits.
+struct round_bf16 {
+    template <typename T>
+    static __device__ inline T op(const T& v);
+};
+template <>
+__device__ inline float round_bf16::op<float>(const float& v) {
+    using kittens::base_types::convertor;
+    return convertor<float, kittens::bf16>::convert(convertor<kittens::bf16, float>::convert(v));
+}
+template <>
+__device__ inline float2 round_bf16::op<float2>(const float2& v) {
+    return float2{round_bf16::op<float>(v.x), round_bf16::op<float>(v.y)};
 }
 
 // TK-GAP(rv_fma) begin
