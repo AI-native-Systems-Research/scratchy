@@ -262,8 +262,8 @@ impl Metric {
 
     fn raw(self, c: &Cell) -> Option<f64> {
         match self {
-            Metric::Ttft => c.median_ttft_ms,
-            Metric::Tpot => c.median_tpot_ms,
+            Metric::Ttft => c.median_ttft_ms.filter(|_| !c.ttft_too_soon),
+            Metric::Tpot => c.median_tpot_ms.filter(|_| !c.ttft_too_soon),
             Metric::E2el => c.e2el_ms(),
             Metric::Throughput => c.output_throughput,
             Metric::PeakMem => c.server_mem_peak_mib.filter(|_| !c.mem_below_weights),
