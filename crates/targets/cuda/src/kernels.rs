@@ -2100,6 +2100,9 @@ pub unsafe fn kv_append_bf16(
 /// [`KernelError::HostException`] if building a tensor map throws, and the launch's own
 /// `cudaError_t` if it fails.
 ///
+/// Kept: no tape launches it (`cuda` builds FP8 models only), but
+/// `tests/attention_fp8kv.rs` checks the e4m3-cache kernels against it on the widened cache.
+///
 /// # Safety
 ///
 /// [`prepare_all`] must have succeeded on the current device. `q` and `out` must be
@@ -2139,6 +2142,8 @@ pub unsafe fn attn_prefill_bf16(
 ///
 /// Refused with [`KernelError::AttnShape`] as [`attn_prefill_bf16`], and also unless `window` is
 /// a multiple of 64 (`step::ATTN_WINDOW_MULTIPLE`).
+///
+/// Kept: as [`attn_prefill_bf16`], the e4m3-cache kernels' reference.
 ///
 /// # Safety
 ///
@@ -2195,6 +2200,8 @@ pub unsafe fn attn_prefill_windowed_bf16(
 ///
 /// Refused with [`KernelError::AttnShape`] as [`attn_prefill_windowed_bf16`], except that
 /// `head_dim` must be 512 (`step::ATTN_D512_BF16_HEAD_DIM`).
+///
+/// Kept: as [`attn_prefill_bf16`], the e4m3-cache kernels' reference.
 ///
 /// # Safety
 ///
@@ -2589,6 +2596,8 @@ pub unsafe fn gemv_split_bf16_abt(
 /// is not a multiple of 8, or a dimension or tile coordinate is at or above `i32::MAX / 64`.
 /// Asynchronous.
 ///
+/// Kept: it pins TK-1's R1 rule, which every TMA kernel's tail cites.
+///
 /// # Safety
 ///
 /// `src`, `poison` and `dump` must be 16-byte-aligned device pointers to `rows · cols`, 4096 and
@@ -2625,6 +2634,8 @@ pub unsafe fn tma_box_probe_load(
 /// Test support for `tests/tma_bounds.rs` only. TMA-load `pattern` (`[64, 64]` bf16) into a
 /// swizzled (`swizzled`) or plain shared tile, then TMA-store it at tile `(tile_row, tile_col)` of
 /// `dst` (`[rows, cols]` bf16). Refused as [`tma_box_probe_load`]. Asynchronous.
+///
+/// Kept: it pins TK-1's R1 rule, which every TMA kernel's tail cites.
 ///
 /// # Safety
 ///
@@ -2672,6 +2683,9 @@ pub unsafe fn tma_box_probe_store(
 /// `block_size` 64, `num_blocks` non-zero, and `scale` finite and above 0. Returns the launch's
 /// own `cudaError_t` if it fails.
 ///
+/// Kept: no tape launches it (`cuda` builds FP8 models only), but
+/// `tests/attention_fp8kv.rs` checks the e4m3-cache kernels against it on the widened cache.
+///
 /// # Safety
 ///
 /// [`prepare_all`] must have succeeded on the current device. `q` and `out` must be 16-byte-aligned device pointers to `q_heads · 256` bf16, `out`
@@ -2709,6 +2723,8 @@ pub unsafe fn attn_decode_bf16(
 ///
 /// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_bf16`], and also unless
 /// `window` is a multiple of 64 (`step::ATTN_WINDOW_MULTIPLE`).
+///
+/// Kept: as [`attn_decode_bf16`], the e4m3-cache kernels' reference.
 ///
 /// # Safety
 ///
@@ -2762,6 +2778,8 @@ pub unsafe fn attn_decode_windowed_bf16(
 ///
 /// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_windowed_bf16`], except that
 /// `head_dim` must be 512 (`step::ATTN_D512_BF16_HEAD_DIM`).
+///
+/// Kept: as [`attn_decode_bf16`], the e4m3-cache kernels' reference.
 ///
 /// # Safety
 ///
@@ -2960,6 +2978,9 @@ pub unsafe fn attn_prefill_d512_fp8kv(
 ///
 /// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_windowed_bf16`].
 ///
+/// Kept: the decode before W6b's split; `tests/attention_fp8kv.rs`
+/// checks that the split decode at one split equals it.
+///
 /// # Safety
 ///
 /// As [`attn_decode_windowed_bf16`]'s, but `k_cache` and `v_cache` hold `num_blocks · kv_heads ·
@@ -3008,6 +3029,9 @@ pub unsafe fn attn_decode_windowed_fp8kv(
 /// widened on read as [`attn_prefill_windowed_fp8kv`]. Asynchronous.
 ///
 /// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_d512_bf16`].
+///
+/// Kept: the decode before W6b's split; `tests/attention_fp8kv.rs`
+/// checks that the split decode at one split equals it.
 ///
 /// # Safety
 ///
@@ -3423,6 +3447,9 @@ pub unsafe fn gdn_decode(
 /// update, `warp::row_map<base_ops::fma_AxCtB>(S, T, S, u)` on its `rt_fl<16, 128>` state tile
 /// (`kernels/gdn_scan.cu`), `u` one value per row. No `CudaStep` uses it. Never refused: a failed
 /// launch returns its `cudaError_t`. Asynchronous.
+///
+/// Kept: `the_rank_one_update_is_t_times_u_plus_s` pins the kept scan's
+/// rank-1 order with it.
 ///
 /// # Safety
 ///
@@ -4001,6 +4028,9 @@ pub unsafe fn quant_rows_fp8(
 /// the FP8 S3 kernel (one warp a 16-row block) and 1 [`quant_rows_fp8`]'s own (eight warps a block),
 /// the same bits. Refused as [`quant_rows_fp8`], or for `variant` above 1. Asynchronous.
 ///
+/// Kept: both forms are production ([`quant_rows_fp8`] takes the
+/// one-warp form for many narrow rows).
+///
 /// # Safety
 ///
 /// As [`quant_rows_fp8`]'s.
@@ -4313,6 +4343,9 @@ pub unsafe fn gemm_narrow_group_fp8_abt(
 /// cutting `⌈k / 256⌉` chunks into non-empty runs (`step::gemv_split_chunks`), `partials` not null
 /// above one split, and `splits · n_pad` at most `i32::MAX`.
 ///
+/// Kept: its kernel is production (the residual, gate/up and expert forms); `tests/gemv_fp8.rs`'
+/// bound, split and group tests run through this plain form.
+///
 /// # Safety
 ///
 /// [`prepare_all`] must have succeeded on the current device. `a` (`k` bf16), `b` (`n·k` bytes)
@@ -4486,6 +4519,8 @@ pub unsafe fn gemv_fp8_b8(
 /// `poison_w [64, 256]`), then TMA-stored to the exact-fit `dump_x`, `dump_w`. Refused with
 /// [`KernelError::RowShape`] (`rows`, `k`) for a zero or misaligned size, a coordinate past its
 /// array, or a null pointer. Asynchronous.
+///
+/// Kept: it pins R1 on B8's swizzled boxes, which B8's K tail relies on.
 ///
 /// # Safety
 ///
@@ -4665,6 +4700,9 @@ pub unsafe fn expert_gate_up_gemv_fp8(
 /// into `out` (`⌈k / 256⌉ · 256` f32, 0 past `k`) and its scale into `scale[s]`. No `CudaStep`
 /// uses it. Refused with [`KernelError::GemvSplit`] (`n` 1) unless `k` and `splits` meet
 /// [`gemv_fp8_abt`]'s rule. Asynchronous.
+///
+/// Kept: it proves the GEMV prologue, still production (the a/b group,
+/// the gate/up and expert GEMVs), is `quant_rows_fp8`'s bytes.
 ///
 /// # Safety
 ///
