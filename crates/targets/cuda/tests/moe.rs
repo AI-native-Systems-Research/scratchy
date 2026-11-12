@@ -19,6 +19,9 @@ use scratchy_target_cuda::kernels::{
     KernelError, SortRegions, expert_gemm_bf16, expert_gemv_bf16, gate_scale_bf16, gemm_bf16_abt,
     gemv_bf16_abt, moe_combine_bf16, moe_route_bf16, moe_sort,
 };
+use scratchy_target_cuda::kernels::{
+    expert_act_quant_fp8, gelu_mul_bf16, moe_sort_fp8, quant_rows_fp8, silu_mul_bf16,
+};
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 use scratchy_target_cuda::step::sort_index_regions;
 use scratchy_target_cuda::tape::moe_tiles;
@@ -2676,4 +2679,405 @@ fn the_one_row_gate_scale_times_are_recorded() {
         );
     }
     eprintln!("{line}");
+}
+
+// ── FP8 S8 P1: the e4m3 scatter, and the act + quantize over live rows ───────
+
+/// One MoE geometry of the P1 tests: the experts, the hidden width, the expert intermediate width
+/// and the act (0 SwiGLU, 1 GeGLU, `step::GatedOp`'s codes).
+#[derive(Clone, Copy)]
+struct P1Shape {
+    name: &'static str,
+    experts: usize,
+    hidden: usize,
+    inter: usize,
+    op: u32,
+}
+
+/// The 35B's (Qwen3.6-35B-A3B) and Gemma 4 26B-A4B's routed experts.
+const P1_SHAPES: [P1Shape; 2] = [
+    P1Shape {
+        name: "35B",
+        experts: 256,
+        hidden: 2048,
+        inter: 512,
+        op: 0,
+    },
+    P1Shape {
+        name: "Gemma",
+        experts: 128,
+        hidden: 2816,
+        inter: 704,
+        op: 1,
+    },
+];
+
+/// The byte every e4m3 output holds before a launch.
+const P1_SENTINEL: u8 = 0xA5;
+
+fn up_bytes(device: &CudaDevice, host: &[u8]) -> DeviceBuffer {
+    DeviceBuffer::upload_bytes(device, host).expect("upload bytes")
+}
+
+fn down_bytes(b: &DeviceBuffer) -> Vec<u8> {
+    (b.download().expect("download").iter())
+        .flat_map(|h| h.to_le_bytes())
+        .collect()
+}
+
+/// `m` tokens' `TOP_K` distinct picks over `experts`, uniform from `seed`.
+fn p1_picks(m: usize, experts: usize, seed: u64) -> Vec<u32> {
+    let mut r = mix(seed);
+    let mut out = Vec::with_capacity(m * TOP_K);
+    for _ in 0..m {
+        let mut row: Vec<u32> = Vec::with_capacity(TOP_K);
+        for _ in 0..TOP_K {
+            let mut e = r() as usize % experts;
+            while row.contains(&(e as u32)) {
+                e = (e + 1) % experts;
+            }
+            row.push(e as u32);
+        }
+        out.extend(row);
+    }
+    out
+}
+
+/// `quant_rows_fp8` of `x [rows, cols]` into `q` (`rows · cols` bytes) and `scale` (`rows` f32).
+fn p1_quant(
+    x: &DeviceBuffer,
+    (q, scale): (&DeviceBuffer, &DeviceBuffer),
+    (rows, cols): (usize, usize),
+) {
+    // SAFETY: `x` holds rows·cols bf16, `q` rows·cols bytes and `scale` rows f32, each its own
+    // allocation; null is the default stream.
+    unsafe {
+        quant_rows_fp8(
+            x.ptr(),
+            (q.ptr(), scale.ptr()),
+            (rows as u32, cols as u32),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("quant_rows_fp8");
+}
+
+/// One sort's buffers at `shape`: the token rows `x`, their quantization, the picks, both sorts'
+/// index regions, today's bf16 sorted rows and their quantization, and the e4m3 sorted rows.
+struct P1Sort {
+    x: DeviceBuffer,
+    xq: DeviceBuffer,
+    xs: DeviceBuffer,
+    topk_idx: DeviceBuffer,
+    index: [DeviceBuffer; 2],
+    rows: DeviceBuffer,
+    rows_q: [DeviceBuffer; 2],
+    rows_s: [DeviceBuffer; 2],
+    regions: [usize; 6],
+    max_tiles: usize,
+    m: usize,
+    shape: P1Shape,
+}
+
+impl P1Sort {
+    fn new(device: &CudaDevice, shape: P1Shape, m: usize, topk_idx: &[u32], seed: u64) -> Self {
+        let (pairs, max_tiles, _) =
+            moe_tiles(m as u32, shape.experts as u32, TOP_K as u32).expect("tiles");
+        let regions = sort_index_regions(pairs, shape.experts as u32, max_tiles)
+            .expect("regions")
+            .map(|b| b as usize);
+        let capacity = max_tiles as usize * TILE_ROWS;
+        let h = shape.hidden;
+        let bytes = |n: usize| up_bytes(device, &vec![P1_SENTINEL; n]);
+        Self {
+            x: up(device, &bf16_inputs(m * h, seed)),
+            xq: bytes(m * h),
+            xs: bytes(m * 4),
+            topk_idx: up_u32(device, topk_idx),
+            index: [0, 1].map(|_| up_u32(device, &vec![u32::MAX; regions[5] / 4])),
+            rows: up(device, &vec![SENTINEL; capacity * h]),
+            rows_q: [0, 1].map(|_| bytes(capacity * h)),
+            rows_s: [0, 1].map(|_| bytes(capacity * 4)),
+            regions,
+            max_tiles: max_tiles as usize,
+            m,
+            shape,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.max_tiles * TILE_ROWS
+    }
+
+    fn regions(&self, side: usize) -> SortRegions {
+        let at = |i: usize| self.index[side].ptr().wrapping_byte_add(self.regions[i]);
+        SortRegions {
+            chunk_hist: at(0),
+            counts: at(1),
+            offsets: at(2),
+            tile_expert: at(3),
+            pos: at(4),
+        }
+    }
+
+    fn dims(&self) -> (u32, u32, u32, u32, u32) {
+        (
+            self.m as u32,
+            self.shape.experts as u32,
+            TOP_K as u32,
+            self.shape.hidden as u32,
+            self.max_tiles as u32,
+        )
+    }
+
+    /// Today's chain (side 0): the bf16 sort, then `quant_rows_fp8` over every capacity row.
+    fn today(&self) {
+        // SAFETY: as `launch_sort`'s, at this shape; null is the default stream.
+        unsafe {
+            moe_sort(
+                (self.x.ptr(), self.topk_idx.ptr()),
+                self.regions(0),
+                self.rows.ptr(),
+                self.dims(),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("moe_sort");
+        p1_quant(
+            &self.rows,
+            (&self.rows_q[0], &self.rows_s[0]),
+            (self.capacity(), self.shape.hidden),
+        );
+    }
+
+    /// P1's (side 1): `quant_rows_fp8` of the token rows, then the e4m3 sort.
+    fn p1(&self) {
+        p1_quant(&self.x, (&self.xq, &self.xs), (self.m, self.shape.hidden));
+        // SAFETY: as `today`'s, with the e4m3 buffers `m·hidden` and `capacity·hidden` bytes and
+        // their scales `m` and `capacity` f32.
+        unsafe {
+            moe_sort_fp8(
+                (self.xq.ptr(), self.xs.ptr(), self.topk_idx.ptr()),
+                self.regions(1),
+                (self.rows_q[1].ptr(), self.rows_s[1].ptr()),
+                self.dims(),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("moe_sort_fp8");
+    }
+
+    /// Side `side`'s offsets region, `[E + 1]`.
+    fn offsets(&self, side: usize) -> Vec<u32> {
+        down_u32(&self.index[side])[self.regions[2] / 4..][..self.shape.experts + 1].to_vec()
+    }
+}
+
+/// FP8 S8 P1: the e4m3 sort (the token rows' `quant_rows_fp8`, then the e4m3 scatter) is today's
+/// bf16 sort then `quant_rows_fp8` over its rows, byte for byte on every row of a live tile (pair
+/// rows and padding rows) and its scale; every index region the same; every e4m3 row past the live
+/// tiles never written. At both models' geometries, m = 512 and 2,048, uniform and skewed
+/// routings, as `P1_SORT` lines.
+#[test]
+fn the_e4m3_sort_is_the_bf16_sort_then_its_quantize_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for shape in P1_SHAPES {
+        for m in [512usize, 2048] {
+            let skewed: Vec<u32> = (0..m * TOP_K)
+                .map(|p| (shape.experts - 1 - p % TOP_K) as u32)
+                .collect();
+            for (case, topk_idx) in [
+                ("uniform", p1_picks(m, shape.experts, 0x0F31 ^ m as u64)),
+                ("skewed", skewed),
+            ] {
+                let b = P1Sort::new(&device, shape, m, &topk_idx, 0x0F30 ^ m as u64);
+                b.today();
+                b.p1();
+                let index = [down_u32(&b.index[0]), down_u32(&b.index[1])];
+                // The regions past chunk_hist (whose bases the scatter reads; it is scratch).
+                let same_index = index[0][b.regions[1] / 4..] == index[1][b.regions[1] / 4..];
+                let live = b.offsets(0)[shape.experts] as usize;
+                let h = shape.hidden;
+                let (q, s) = (
+                    [down_bytes(&b.rows_q[0]), down_bytes(&b.rows_q[1])],
+                    [down_bytes(&b.rows_s[0]), down_bytes(&b.rows_s[1])],
+                );
+                let bad_rows = (q[0][..live * h].iter().zip(&q[1][..live * h]))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let bad_scales = (s[0][..live * 4].iter().zip(&s[1][..live * 4]))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let untouched = q[1][live * h..b.capacity() * h]
+                    .iter()
+                    .all(|&v| v == P1_SENTINEL)
+                    && s[1][live * 4..b.capacity() * 4]
+                        .iter()
+                        .all(|&v| v == P1_SENTINEL);
+                let ok = same_index && bad_rows == 0 && bad_scales == 0 && untouched;
+                eprintln!(
+                    "P1_SORT {} m={m} {case}: live_rows={live} capacity={} mismatched_bytes={bad_rows} \
+                     mismatched_scale_bytes={bad_scales} same_index={same_index} \
+                     dead_rows_untouched={untouched} {}",
+                    shape.name,
+                    b.capacity(),
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "the e4m3 sort is not the bf16 sort then its quantize");
+}
+
+/// The act + quantize's buffers at `shape` over `rows` capacity rows: the gate and up (random, with
+/// a +0 row every 7 as a padding row), today's act and its quantization, and P1's quantization.
+struct P1Act {
+    gate: DeviceBuffer,
+    up: DeviceBuffer,
+    act: DeviceBuffer,
+    offsets: DeviceBuffer,
+    q: [DeviceBuffer; 2],
+    s: [DeviceBuffer; 2],
+    rows: usize,
+    shape: P1Shape,
+}
+
+impl P1Act {
+    fn new(device: &CudaDevice, shape: P1Shape, rows: usize, live: usize, seed: u64) -> Self {
+        let n = rows * shape.inter;
+        let mut gate = bf16_inputs(n, seed);
+        let mut upv = bf16_inputs(n, seed ^ 0x55);
+        for r in (0..rows).step_by(7) {
+            gate[r * shape.inter..(r + 1) * shape.inter].fill(0);
+            upv[r * shape.inter..(r + 1) * shape.inter].fill(0);
+        }
+        let mut offsets = vec![0u32; shape.experts + 1];
+        offsets[shape.experts] = live as u32;
+        let bytes = |n: usize| up_bytes(device, &vec![P1_SENTINEL; n]);
+        Self {
+            gate: up(device, &gate),
+            up: up(device, &upv),
+            act: up(device, &vec![SENTINEL; n]),
+            offsets: up_u32(device, &offsets),
+            q: [bytes(n), bytes(n)],
+            s: [bytes(rows * 4), bytes(rows * 4)],
+            rows,
+            shape,
+        }
+    }
+
+    /// Today's chain (side 0): the act over every row, then `quant_rows_fp8` over every row.
+    fn today(&self) {
+        let dims = (self.rows as u32, self.shape.inter as u32);
+        let null = std::ptr::null_mut();
+        // SAFETY: every buffer holds rows·inter elements of its type; null is the default stream.
+        let r = unsafe {
+            match self.shape.op {
+                0 => silu_mul_bf16(self.gate.ptr(), self.up.ptr(), self.act.ptr(), dims, null),
+                _ => gelu_mul_bf16(self.gate.ptr(), self.up.ptr(), self.act.ptr(), dims, null),
+            }
+        };
+        r.expect("the act");
+        p1_quant(
+            &self.act,
+            (&self.q[0], &self.s[0]),
+            (self.rows, self.shape.inter),
+        );
+    }
+
+    /// P1's (side 1): the act + quantize over the live rows.
+    fn p1(&self) {
+        // SAFETY: as `today`'s, `offsets` `[E + 1]` u32.
+        unsafe {
+            expert_act_quant_fp8(
+                (self.gate.ptr(), self.up.ptr(), self.offsets.ptr()),
+                (self.q[1].ptr(), self.s[1].ptr()),
+                (
+                    self.rows as u32,
+                    self.shape.inter as u32,
+                    self.shape.experts as u32,
+                ),
+                self.shape.op,
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("expert_act_quant_fp8");
+    }
+}
+
+/// FP8 S8 P1: the act + quantize over the live rows is today's act then `quant_rows_fp8`, byte for
+/// byte on every live row (+0 padding rows among them) and its scale; every row at or past the
+/// live count never written. At both models' geometries, live counts 0, a partial one and the
+/// whole capacity, as `P1_ACT` lines.
+#[test]
+fn the_act_quantize_on_live_rows_is_the_act_then_its_quantize_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for shape in P1_SHAPES {
+        let rows = 64 * TILE_ROWS;
+        for live in [0, 37 * TILE_ROWS, rows] {
+            let b = P1Act::new(&device, shape, rows, live, 0x0F40 ^ live as u64);
+            b.today();
+            b.p1();
+            let n = shape.inter;
+            let (q, s) = (
+                [down_bytes(&b.q[0]), down_bytes(&b.q[1])],
+                [down_bytes(&b.s[0]), down_bytes(&b.s[1])],
+            );
+            let bad = (q[0][..live * n].iter().zip(&q[1][..live * n]))
+                .filter(|(a, b)| a != b)
+                .count();
+            let bad_s = (s[0][..live * 4].iter().zip(&s[1][..live * 4]))
+                .filter(|(a, b)| a != b)
+                .count();
+            let untouched = q[1][live * n..rows * n].iter().all(|&v| v == P1_SENTINEL)
+                && s[1][live * 4..rows * 4].iter().all(|&v| v == P1_SENTINEL);
+            let ok = bad == 0 && bad_s == 0 && untouched;
+            eprintln!(
+                "P1_ACT {} live={live} rows={rows}: mismatched_bytes={bad} mismatched_scale_bytes={bad_s} \
+                 dead_rows_untouched={untouched} {}",
+                shape.name,
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "the act + quantize is not the act then its quantize");
+}
+
+/// Recorded, not asserted (P1's gate reads it): at both models' 2,048-token prefill (uniform
+/// routing, its real live rows), today's chain against P1's, as `P1_TIME` lines, two rounds (A, B,
+/// A, B): the sort and the gate/up's input quantize; the act and the down's input quantize.
+#[test]
+fn the_p1_moe_times_are_recorded() {
+    let device = h100();
+    for shape in P1_SHAPES {
+        let m = 2048;
+        let b = P1Sort::new(
+            &device,
+            shape,
+            m,
+            &p1_picks(m, shape.experts, 0x0F50),
+            0x0F51,
+        );
+        b.today();
+        let live = b.offsets(0)[shape.experts] as usize;
+        let a = P1Act::new(&device, shape, b.capacity(), live, 0x0F52);
+        for round in 1..=2 {
+            let (t0, t1) = (event_median(|| b.today()), event_median(|| b.p1()));
+            eprintln!(
+                "P1_TIME {} round={round} sort+quant: today {t0:.1} us p1 {t1:.1} us (live {live} of {} rows)",
+                shape.name,
+                b.capacity()
+            );
+            let (t0, t1) = (event_median(|| a.today()), event_median(|| a.p1()));
+            eprintln!(
+                "P1_TIME {} round={round} act+quant: today {t0:.1} us p1 {t1:.1} us (live {live} of {} rows)",
+                shape.name,
+                b.capacity()
+            );
+        }
+    }
 }

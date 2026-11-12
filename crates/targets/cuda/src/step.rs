@@ -75,6 +75,16 @@ pub enum CudaStep {
     /// `op_abi::CUDA_SORTED_PAIRS` pairs or more: three launches of a stable counting sort
     /// (`kernels/moe_sort.cu`).
     ExpertSort(ExpertSortBf16),
+    /// An fp8 bank's sort (FP8 S8 P1): [`Self::ExpertSort`] on the token rows' e4m3 quantization
+    /// (`x`, in the quant scratch, its [`QuantRowsFp8`]), each pair's sorted row its token's e4m3
+    /// row and scale (`rows`, e4m3 then the scales, `QuantRowsFp8`'s layout over the capacity rows),
+    /// which the bank's gate and up read as their quantized input (`kernels/moe_sort.cu`,
+    /// `scratchy_cuda_moe_sort_fp8`).
+    ExpertSortFp8(ExpertSortBf16),
+    /// An fp8 bank's act and its down's input quantization over the live rows in one launch (FP8 S8
+    /// P1), in place of the act over every sorted row and a [`Self::QuantRowsFp8`] of them
+    /// (`kernels/act_quant_fp8.cu`, `scratchy_cuda_expert_act_quant_fp8`).
+    ExpertActQuant(ExpertActQuantFp8),
     /// One projection of every sorted pair, lowered from `SubOp::ExpertMatmul` of a sorted bucket:
     /// one grouped GEMM over the expert-padded tiles (`kernels/expert_gemm_bf16.cu`).
     ExpertGemm(ExpertGemmBf16),
@@ -1663,6 +1673,31 @@ pub struct ExpertSortBf16 {
     pub max_tiles: u32,
 }
 
+/// The act of an fp8 bank's gate and up over its live rows (`offsets[experts]`, the sort's) and the
+/// quantization of the result into the quant scratch at `q_act` (FP8 S8 P1): the bits of `act`'s
+/// [`GatedOp`] step then a [`QuantRowsFp8`] of its `out`, on every live row; `act.out` itself is
+/// not written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertActQuantFp8 {
+    pub act: SiluMulBf16,
+    pub op: GatedOp,
+    pub offsets: ArenaOffset,
+    pub experts: u32,
+    pub q_act: ArenaOffset,
+}
+
+impl ExpertActQuantFp8 {
+    /// The quant write it equals: `act.out`'s rows.
+    pub const fn quant_write(&self) -> QuantRowsFp8 {
+        QuantRowsFp8 {
+            x: self.act.out,
+            q: self.q_act,
+            rows: self.act.rows,
+            cols: self.act.cols,
+        }
+    }
+}
+
 /// Which projection of a MoE bundle an expert step computes; its weights for expert `e` are
 /// `[n, k]` bf16 at [`ExpertProjection::slab`]'s bytes into the bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -2000,6 +2035,8 @@ impl CudaStep {
             | Self::GatedDeltaNet(_)
             | Self::MoeRoute(_)
             | Self::ExpertSort(_)
+            | Self::ExpertSortFp8(_)
+            | Self::ExpertActQuant(_)
             | Self::ExpertGemm(_)
             | Self::ExpertCombine(_)
             | Self::GateScale(_)
@@ -2067,6 +2104,8 @@ impl CudaStep {
             | Self::RouterLogits(_)
             | Self::MoeRoute(_)
             | Self::ExpertSort(_)
+            | Self::ExpertSortFp8(_)
+            | Self::ExpertActQuant(_)
             | Self::ExpertGemm(_)
             | Self::ExpertGemv(_)
             | Self::ExpertCombine(_)
@@ -2132,6 +2171,8 @@ impl CudaStep {
             | Self::RouterLogits(_)
             | Self::MoeRoute(_)
             | Self::ExpertSort(_)
+            | Self::ExpertSortFp8(_)
+            | Self::ExpertActQuant(_)
             | Self::ExpertGemm(_)
             | Self::ExpertGemv(_)
             | Self::ExpertCombine(_)
@@ -2158,20 +2199,17 @@ impl CudaStep {
     /// the quant scratch the [`Self::QuantRowsFp8`] before it wrote, which [`quant_chain`] checks.
     /// `None` for every other step, the one-row GEMV included.
     pub const fn quantized_input(&self) -> Option<(ArenaOffset, u32, u32)> {
-        if let Self::ExpertGemm(
-            g @ ExpertGemmBf16 {
-                weight: MoeWeight::Fp8Bundle | MoeWeight::Fp8Own,
-                ..
-            },
-        ) = *self
+        // An fp8 bank's down reads the quant scratch; its gate and up read the e4m3 sorted rows
+        // (FP8 S8 P1, [`Self::ExpertSortFp8`]), which its sort reads the quant scratch for.
+        if let Self::ExpertGemm(ExpertGemmBf16 {
+            proj: ExpertProjection::Down,
+            ..
+        }) = *self
         {
-            let rows = g
-                .max_tiles
-                .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS);
-            return match rows {
-                Some(rows) => Some((g.a, rows, g.n_k().1)),
-                None => None,
-            };
+            return self.fp8_expert_rows();
+        }
+        if let Self::ExpertSortFp8(s) = *self {
+            return Some((s.x, s.m, s.hidden));
         }
         // The tensor-core decode GEMVs (FP8 S8 T2): the expert form's token row or pairs' rows.
         if let Self::ExpertGemvTcFp8(g)
@@ -2208,12 +2246,35 @@ impl CudaStep {
         Some((g.a, g.m, g.k))
     }
 
+    /// An fp8 bank's grouped expert GEMM's e4m3 rows `(a, rows, k)`: the sorted capacity rows (its
+    /// gate's and up's, the sort's) or the activation rows (its down's, the quant scratch's), e4m3
+    /// then their scales; `None` for every other step.
+    pub const fn fp8_expert_rows(&self) -> Option<(ArenaOffset, u32, u32)> {
+        if let Self::ExpertGemm(
+            g @ ExpertGemmBf16 {
+                weight: MoeWeight::Fp8Bundle | MoeWeight::Fp8Own,
+                ..
+            },
+        ) = *self
+        {
+            let rows = g
+                .max_tiles
+                .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS);
+            return match rows {
+                Some(rows) => Some((g.a, rows, g.n_k().1)),
+                None => None,
+            };
+        }
+        None
+    }
+
     /// The quantization the step writes into the quant scratch, as the [`QuantRowsFp8`] it is or
     /// equals: a quant write's own, a tensor-core gate/up's act + quantize of its activation (at
     /// the scratch's second slot); `None` for every other step.
     pub const fn quant_write(&self) -> Option<QuantRowsFp8> {
         match *self {
             Self::QuantRowsFp8(q) => Some(q),
+            Self::ExpertActQuant(t) => Some(t.quant_write()),
             Self::GateUpTcFp8(t) => Some(t.quant_write()),
             Self::ExpertGateUpTcFp8(t) => t.quant_write(),
             _ => None,
@@ -2984,11 +3045,75 @@ impl CudaStep {
                     in_place: false,
                 })
             }
+            // The e4m3 sort: the quantized token rows and the picks; the sorted e4m3 rows and
+            // their scales, then the index regions.
+            Self::ExpertSortFp8(s) => {
+                let Some(l) = s.layout() else {
+                    return None;
+                };
+                let Some(capacity) = s
+                    .max_tiles
+                    .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS)
+                else {
+                    return None;
+                };
+                let xq = QuantRowsFp8 {
+                    x: s.x,
+                    q: s.x,
+                    rows: s.m,
+                    cols: s.hidden,
+                };
+                let rq = QuantRowsFp8 {
+                    x: s.rows,
+                    q: s.rows,
+                    rows: capacity,
+                    cols: s.hidden,
+                };
+                let (Some(xb), Some(rb)) = (xq.bytes(), rq.bytes()) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(s.x, xb)),
+                        Some(span(s.topk_idx, u32_bytes(l.pairs))),
+                        None,
+                        None,
+                    ],
+                    writes: span(s.rows, rb),
+                    second_write: Some(span(s.chunk_hist, l.index_bytes)),
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
+            // The gate and up rows and the sort's offsets; the quant write's span.
+            Self::ExpertActQuant(t) => {
+                let (Some(ab), Some(qb)) =
+                    (bf16_bytes(t.act.rows, t.act.cols), t.quant_write().bytes())
+                else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(t.act.gate, ab)),
+                        Some(span(t.act.up, ab)),
+                        Some(span(t.offsets, u32_bytes(t.experts + 1))),
+                        None,
+                    ],
+                    writes: span(t.q_act, qb),
+                    second_write: None,
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
             Self::ExpertGemm(g) => {
                 let rows = g.max_tiles as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
                 let (n, k) = g.n_k();
                 // An fp8 bank's rows are the quantized ones, e4m3 then their scales.
-                let ab = match self.quantized_input() {
+                let ab = match self.fp8_expert_rows() {
                     Some((a, rows, cols)) => QuantRowsFp8 {
                         x: a,
                         q: a,
@@ -3364,6 +3489,8 @@ impl CudaStep {
             | Self::AttnPrefill(_)
             | Self::AttnDecode(_)
             | Self::ExpertSort(_)
+            | Self::ExpertSortFp8(_)
+            | Self::ExpertActQuant(_)
             | Self::ExpertCombine(_)
             | Self::GateScale(_)
             | Self::Scale(_)

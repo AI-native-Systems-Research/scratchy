@@ -2053,6 +2053,27 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         }
                     },
                     CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
+                    CudaStep::ExpertSortFp8(sort) => Self::expert_sort_fp8(&sort, slot, stream),
+                    // FP8 S8 P1: the act over the live rows, quantized into the quant scratch.
+                    CudaStep::ExpertActQuant(t) => {
+                        let (q, scale) = Self::fp8_rows(slot, t.q_act, t.act.rows, t.act.cols);
+                        // SAFETY: as above, for `gate` and `up` (`rows*cols` bf16), the offsets
+                        // (`experts + 1` u32) and the quant scratch (`rows*cols` bytes then `rows`
+                        // f32 at `scale_at`, `validate`).
+                        unsafe {
+                            kernels::expert_act_quant_fp8(
+                                (
+                                    slot(t.act.gate).cast_const(),
+                                    slot(t.act.up).cast_const(),
+                                    slot(t.offsets).cast_const(),
+                                ),
+                                (q.cast_mut(), scale.cast_mut()),
+                                (t.act.rows, t.act.cols, t.experts),
+                                t.op.code(),
+                                stream.0,
+                            )
+                        }
+                    }
                     CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
                     CudaStep::ExpertGemv(g) => {
                         Self::expert_gemv(&g, slot, partials, weights, stream)
@@ -2882,6 +2903,47 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         }
     }
 
+    /// Enqueue the e4m3 sort (FP8 S8 P1, `kernels::moe_sort_fp8`): `x` the token rows' quantization
+    /// in the quant scratch, `rows` the sorted e4m3 rows, each e4m3 then its scales.
+    fn expert_sort_fp8(
+        s: &ExpertSortBf16,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let refused = KernelError::MoeShape {
+            kernel: "moe_sort_fp8",
+            dims: [s.m, s.top_k, s.hidden, s.max_tiles],
+        };
+        let (Some(_), Some(capacity)) = (
+            s.layout(),
+            s.max_tiles
+                .checked_mul(crate::op_abi::CUDA_EXPERT_TILE_ROWS),
+        ) else {
+            return Err(refused);
+        };
+        let regions = kernels::SortRegions {
+            chunk_hist: slot(s.chunk_hist),
+            counts: slot(s.counts),
+            offsets: slot(s.offsets),
+            tile_expert: slot(s.tile_expert),
+            pos: slot(s.pos),
+        };
+        let (xq, x_scale) = Self::fp8_rows(&slot, s.x, s.m, s.hidden);
+        let (rows, row_scale) = Self::fp8_rows(&slot, s.rows, capacity, s.hidden);
+        // SAFETY: as `expert_sort`'s, with `x` the quant scratch's `m*hidden` e4m3 bytes and `m`
+        // f32 (`validate`), and `rows` the sorted region's `capacity*hidden` bytes and `capacity`
+        // f32 (the e4m3 sort's extents, inside the region's bf16 bytes).
+        unsafe {
+            kernels::moe_sort_fp8(
+                (xq, x_scale, slot(s.topk_idx).cast_const()),
+                regions,
+                (rows.cast_mut(), row_scale.cast_mut()),
+                (s.m, s.experts, s.top_k, s.hidden, s.max_tiles),
+                stream.0,
+            )
+        }
+    }
+
     /// Expert 0's `[n, k]` of `proj` in the MoE bundle or expert bank `bundle` of `weights` (its
     /// layout `weight`'s: [`MoeWeight::experts`]), and the rows of each expert's block (the expert
     /// stride in rows of `k`), or `None` on overflow.
@@ -2941,7 +3003,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
-        if let Some((a, rows, k)) = CudaStep::ExpertGemm(*g).quantized_input() {
+        if let Some((a, rows, k)) = CudaStep::ExpertGemm(*g).fp8_expert_rows() {
             let Some((b, expert_rows)) = Self::fp8_expert_slab(
                 weights,
                 (g.bundle, g.weight),

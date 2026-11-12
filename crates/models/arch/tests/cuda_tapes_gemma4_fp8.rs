@@ -54,11 +54,11 @@ const DECODE_QUANT_READERS: usize = 180;
 const PREFILL_STEPS: [(&str, usize); 23] = [
     ("AttnPrefill", 30),
     ("Embed", 1),
+    ("ExpertActQuant", 30),
     ("ExpertCombine", 30),
     ("ExpertGemm", 90),
-    ("ExpertSort", 30),
+    ("ExpertSortFp8", 30),
     ("GateUpAct", 30),
-    ("GeluMul", 30),
     ("GatherLastRow", 1),
     ("Gemm", 1),
     ("GemmFp8", 60),
@@ -66,7 +66,7 @@ const PREFILL_STEPS: [(&str, usize); 23] = [
     ("LayerScale", 30),
     ("MoeRoute", 30),
     ("NormAdd", 90),
-    ("QuantRowsFp8", 180),
+    ("QuantRowsFp8", 150),
     ("RmsNorm", 181),
     ("RmsNormUnit", 30),
     ("Rope", 30),
@@ -76,17 +76,17 @@ const PREFILL_STEPS: [(&str, usize); 23] = [
     ("Scale", 1),
     ("SoftCap", 1),
 ];
-const QUANTS: usize = 180;
+const QUANTS: usize = 150;
 /// The quant writes' readers: every fp8 consumer, the expert up GEMM included.
-const QUANT_READERS: usize = 210;
+const QUANT_READERS: usize = 180;
 /// The `k`s quantized: the routed experts' down (704), the MLP's down (2112), the hidden (2816),
 /// the sliding and the global layers' o (4096, 8192).
-const QUANT_COLS: [u32; 5] = [704, 2112, 2816, 4096, 8192];
+const QUANT_COLS: [u32; 4] = [2112, 2816, 4096, 8192];
 const QUANT_SCRATCH: [(u32, u64, u64); 4] = [
-    (512, 662_354_688, 57_392_640),
-    (1024, 1_072_933_632, 68_943_360),
-    (2048, 1_894_091_776, 92_044_800),
-    (4096, 3_536_408_064, 138_247_680),
+    (512, 662_354_688, 4_196_352),
+    (1024, 1_072_933_632, 8_392_704),
+    (2048, 1_894_091_776, 16_785_408),
+    (4096, 3_536_408_064, 33_570_816),
 ];
 const EXPERT_WEIGHT: Option<MoeWeight> = Some(MoeWeight::Fp8Own);
 const TABLE_LEN: usize = 1051;

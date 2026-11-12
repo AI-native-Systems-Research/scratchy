@@ -207,3 +207,134 @@ extern "C" int scratchy_cuda_act_quant_fp8(const void* gate, const void* up, voi
         return SCRATCHY_CUDA_ERR_HOST;
     }
 }
+
+// ── P1: the MoE prefill's act + quantize over live rows (FP8 S8 P1) ──
+//
+// The expert down's input at prefill: for each row `r` below the sort's live rows (`offsets[E]`,
+// its padded total) of the gate's and the up's bf16 outputs `gate`, `up [rows, cols]` (the expert
+// GEMMs'),
+//
+//     act[r, c] = bf16(OP(gate[r, c], up[r, c]))       `silu_mul_bf16` / `gelu_mul_bf16`'s value
+//     q[r, :], scale[r] = quant_rows_fp8 of act[r, :]
+//
+// `OP` on the two widened bf16 values (exact) in f32, rounded once to bf16 (`round_bf16`, RNE, the
+// rounding the act kernel's store makes), the op struct `silu_mul_bf16_ker`'s map applies per
+// element (its float2 form is the float one on each half). Then `quant_rows_fp8`'s ops: the row's
+// max of absolute values (exact in any order), `fp8_scale`, and each element's `fp8_quant_pre`
+// with TK's scalar e4m3 convertor (Q1's). So the bytes and scales of every live row (padding rows
+// included: their gate and up are +0, so their act is +0) are today's act then quantize; a row at
+// or past `offsets[E]` is never written, and a CTA whose first row is past it exits at once.
+//
+// One warp per row, 8 rows per CTA; lane `l` takes columns `l, l + 32, …` through the `gl`
+// accessors (a row is at most 704 wide: 22 a lane), the row's max met through a per-warp
+// `sv_fl<32>` reduced by `warp::max`. The act is formed twice, for the max and for the bytes, from
+// the same two loads' values. No dynamic shared memory: its one-time setup only loads it.
+
+namespace {
+
+using expert_act_gl = gl<bf16, 1, 1, -1, -1>;
+using expert_idx_gl = gl<int, 1, 1, 1, -1>;
+
+struct expert_act_quant_globals {
+    expert_act_gl gate;
+    expert_act_gl up;
+    q_gl q;
+    scale_gl scale;
+    // The sort's `[1, E + 1]` offsets: entry `E` is the live rows.
+    expert_idx_gl offsets;
+    int rows;
+    int cols;
+    int experts;
+};
+
+template <typename OP>
+__global__ __launch_bounds__(THREADS, 1) void expert_act_quant_fp8_ker(
+    const __grid_constant__ expert_act_quant_globals g) {
+    __shared__ sv_fl<kittens::WARP_THREADS> amax_s[WARPS];
+    const int live = min(g.offsets[{0, 0, 0, g.experts}], g.rows);
+    const int w = kittens::warpid(), lane = warp::laneid();
+    const int r = int(blockIdx.x) * WARPS + w;
+    if (r >= live) {
+        return;
+    }
+    const auto act = [&](int c) {
+        const float gv = base_types::convertor<float, bf16>::convert(g.gate[{0, 0, r, c}]);
+        const float uv = base_types::convertor<float, bf16>::convert(g.up[{0, 0, r, c}]);
+        return scratchy::ops::round_bf16::op<float>(OP::template op<float>(gv, uv));
+    };
+    float amax = 0.0f;
+    for (int c = lane; c < g.cols; c += kittens::WARP_THREADS) {
+        amax = base_ops::max::op<float>(amax, base_ops::abs::op<float>(act(c)));
+    }
+    amax_s[w][lane] = amax;
+    __syncwarp();
+    rv_fl<kittens::WARP_THREADS> all;
+    warp::load(all, amax_s[w]);
+    const float scale = scratchy::ops::fp8_scale::op<float>(warp::max(all));
+    if (lane == 0) {
+        g.scale[{0, 0, 0, r}] = scale;
+    }
+    for (int c = lane; c < g.cols; c += kittens::WARP_THREADS) {
+        g.q[{0, 0, r, c}] = base_types::convertor<fp8e4m3, float>::convert(
+            scratchy::ops::fp8_quant_pre::op<float>(act(c), scale));
+    }
+}
+
+}  // namespace
+
+// The expert act + quantize's one-time setup: query both instances' attributes, which loads their
+// module. 0 = done; any other value = the first failing cudaError_t.
+extern "C" int scratchy_cuda_expert_act_quant_fp8_prepare(void) {
+    cudaFuncAttributes attr;
+    cudaError_t e = cudaFuncGetAttributes(&attr, expert_act_quant_fp8_ker<scratchy::ops::silu_mul>);
+    if (e != cudaSuccess) {
+        return static_cast<int>(e);
+    }
+    return static_cast<int>(
+        cudaFuncGetAttributes(&attr, expert_act_quant_fp8_ker<scratchy::ops::gelu_tanh_mul>));
+}
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// C++ exception was caught; any other value = the launch's cudaError_t.
+//
+// FP8 S8 P1: rows `r < offsets[experts]` of `act = bf16(OP(gate, up))` from `gate`, `up [rows,
+// cols]` bf16, quantized into `q [rows, cols]` e4m3 and `scale [rows]` f32, bit for bit
+// `silu_mul_bf16` / `gelu_mul_bf16` then `quant_rows_fp8` of those rows; the rows at or past it
+// are not written. `op` 0 SwiGLU, 1 GeGLU (`step::GatedOp`). Refused: `rows` zero, `cols` zero or
+// not a multiple of 64, `experts` zero, `op` another value, `rows · cols` above INT_MAX, a null
+// pointer. `gate`, `up` 2-byte aligned, `q` any, `scale` and `offsets` (`[experts + 1]` i32) 4-byte
+// aligned device pointers; no output overlapping an input. Asynchronous.
+extern "C" int scratchy_cuda_expert_act_quant_fp8(const void* gate, const void* up, void* q,
+                                                  void* scale, const void* offsets, uint32_t rows,
+                                                  uint32_t cols, uint32_t experts, uint32_t op,
+                                                  void* stream /* cudaStream_t; null = default */) {
+    if (rows == 0 || cols == 0 || cols % COL_MULTIPLE != 0 || experts == 0 ||
+        (op != ACT_SILU && op != ACT_GELU) || uint64_t(rows) * cols > uint64_t(INT_MAX) ||
+        gate == nullptr || up == nullptr || q == nullptr || scale == nullptr ||
+        offsets == nullptr) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const auto b = [](const void* p) { return static_cast<bf16*>(const_cast<void*>(p)); };
+        // No view carries a TMA type, so building them encodes nothing.
+        expert_act_quant_globals G{
+            expert_act_gl{b(gate), nullptr, nullptr, size_t(rows), size_t(cols)},
+            expert_act_gl{b(up), nullptr, nullptr, size_t(rows), size_t(cols)},
+            q_gl{static_cast<fp8e4m3*>(q), nullptr, nullptr, size_t(rows), size_t(cols)},
+            scale_gl{static_cast<float*>(scale), nullptr, nullptr, nullptr, size_t(rows)},
+            expert_idx_gl{static_cast<int*>(const_cast<void*>(offsets)), nullptr, nullptr, nullptr,
+                          size_t(experts) + 1},
+            int(rows),
+            int(cols),
+            int(experts)};
+        void* args[] = {&G};
+        const dim3 grid{(rows + uint32_t(WARPS) - 1) / uint32_t(WARPS)}, block{uint32_t(THREADS)};
+        const auto ker = op == ACT_SILU ? expert_act_quant_fp8_ker<scratchy::ops::silu_mul>
+                                        : expert_act_quant_fp8_ker<scratchy::ops::gelu_tanh_mul>;
+        return static_cast<int>(
+            cudaLaunchKernel(ker, grid, block, args, 0, static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}

@@ -134,6 +134,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "QuantRowsFp8",
                 "GateUpTcFp8",
                 "ExpertGateUpTcFp8",
+                "ExpertActQuantFp8",
             ],
         },
         ModuleRow {
@@ -666,7 +667,9 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         }) => Some((bundle, Role::Fp8ExpertBank([experts, hidden, inter]))),
-        CudaStep::QuantRowsFp8(_) => None,
+        CudaStep::QuantRowsFp8(_) | CudaStep::ExpertSortFp8(_) | CudaStep::ExpertActQuant(_) => {
+            None
+        }
         CudaStep::Add(_)
         | CudaStep::SiluMul(_)
         | CudaStep::Rope(_)
