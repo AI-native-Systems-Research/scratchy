@@ -47,9 +47,6 @@ syn = { version = "3", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 
-# The `sdsc_abstract` proof harnesses live with that module in `ktir-superdsc`
-# (crates/targets/spyre/ktir/ktir-superdsc) and run there: `KANI_PKG=ktir-superdsc`.
-#
 # The proof harnesses here compile only under the model checker, so `cfg(kani)` is a real name a normal
 # build never defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the proofs
 # hold" turned out to be vacuous — a normal build skipped the module and said nothing — and declaring it
