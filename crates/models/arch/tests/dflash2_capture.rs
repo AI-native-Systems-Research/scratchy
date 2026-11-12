@@ -5,7 +5,11 @@
 //! drafter then reads the layer's input plus its attention, not its output, and accepts a fraction
 //! of what Splash does. So no capture of any baked tape is followed by the add-and-norm that
 //! finishes the row it copies.
-#![cfg(all(feature = "metal", feature = "mtp-heads", feature = "qwen3.6-35b-a3b"))]
+//!
+//! A target captures rows only for a drafter compiled beside it, and DFlash2 is the default
+//! drafter of no target (its arch.json names no `published_as`): it compiles beside its targets
+//! under `mtp` (`spec/mtp`) alone, so this test runs there.
+#![cfg(all(feature = "metal", feature = "mtp", feature = "qwen3.6-35b-a3b"))]
 
 use scratchy_target_metal::tape::lowered::KernelId;
 
@@ -34,6 +38,6 @@ fn every_capture_copies_a_finished_layer_output() {
     }
     assert!(
         captures > 0,
-        "the target captures no rows: build it with a drafter beside it"
+        "the target captures no rows: build it with `mtp`, which compiles DFlash2 beside it"
     );
 }
