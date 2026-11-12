@@ -23,6 +23,7 @@ members = [
     "crates/targets/spyre/bundle",
     "crates/targets/spyre/builder",
     "crates/targets/spyre/worker",
+    "crates/targets/spyre/compiler",
     # The vendored KTIR crates — IBM's IR + emulator, in-tree so the IR types are CONSTRUCTIBLE from
     # the lowering rather than reached through a text round trip.
     "crates/targets/spyre/ktir/ktir-core",

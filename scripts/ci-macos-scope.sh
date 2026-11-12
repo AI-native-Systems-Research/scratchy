@@ -18,6 +18,7 @@ set -euo pipefail
 MACOS_UNBUILT='crates/targets/spyre
 crates/targets/spyre/builder
 crates/targets/spyre/bundle
+crates/targets/spyre/compiler
 crates/targets/spyre/flex-rs
 crates/targets/spyre/triton/splice
 crates/targets/spyre/triton/triton-frontend

@@ -19,6 +19,15 @@ use scratchy_forward_compiler_macro::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// The target this build compiles the models for: its emitter is what the shared pipeline calls
+/// at each point a model's emission is the target's own.
+#[cfg(feature = "spyre")]
+const EMITTER: &dyn scratchy_forward_compiler_macro::target::TargetEmitter =
+    &scratchy_target_spyre_compiler::Spyre;
+#[cfg(not(feature = "spyre"))]
+const EMITTER: &dyn scratchy_forward_compiler_macro::target::TargetEmitter =
+    &scratchy_forward_compiler_macro::target::Metal;
+
 // Gated on `hf-completions` (on by default for `scratchy-cli` builds; opt out
 // with `--no-default-features` for an air-gapped build). This module owns every
 // huggingface.co request the build makes, and its only dependency, `ureq`, is
@@ -167,13 +176,14 @@ fn emit_arch(
     // that knows it — so each baked bundle's dxp input lands beside the device images; any other
     // build writes no dump.
     let dump_dir = cfg!(feature = "superdsc-dump").then_some(out_dir);
-    let tokens =
-        compile_carrier(carrier, configs_dir, dump_dir, scope).unwrap_or_else(|e| match e {
+    let tokens = compile_carrier(carrier, configs_dir, dump_dir, scope, EMITTER).unwrap_or_else(
+        |e| match e {
             CarrierError::Config { stem, source } => {
                 panic!("forward pipeline ({mod_name}/{stem}): {source}")
             }
             CarrierError::Arch(source) => panic!("forward pipeline ({mod_name}): {source}"),
-        });
+        },
+    );
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
     let models = (metal_tape_models(&tokens).into_iter())

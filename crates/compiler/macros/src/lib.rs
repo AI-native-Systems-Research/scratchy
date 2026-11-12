@@ -33,17 +33,14 @@ use scratchy_forward_compiler_frontend::{
 };
 mod arch_spec;
 mod cfg;
-mod codegen;
-mod config;
-/// The baked program, as const tokens — see its own header.
-#[cfg(feature = "spyre")]
-mod ktir_tokens;
+pub mod codegen;
+pub mod config;
 pub use config::{Scope, selected_config_paths, total_models_emitted};
-mod emit;
-mod fuf;
+pub mod emit;
+pub mod fuf;
 mod interpreter_codegen;
 // The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
-mod quantization;
+pub mod quantization;
 /// The front end, exposed for the `scratchy-forwards` build driver in
 /// scratchy-models.
 pub use parse_python::{PythonCarrier, parse_python_file};
@@ -62,13 +59,18 @@ pub use render::render_tokens;
 pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
 #[cfg(test)]
 mod checkpoint_tests;
+/// Real-config fixtures for tests here and in the target compilers: an arch's configs, one
+/// `(stem, preset)` variant, and its program and fused graph through the real passes.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures;
 #[cfg(test)]
 mod frontend_tests;
 mod rows_lowering;
-mod shape;
-mod to_wavefront;
+pub mod shape;
+pub mod target;
+pub mod to_wavefront;
 mod tp_lowering;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod typed_bodies;
 mod typed_shapes;
 #[cfg(test)]
@@ -81,7 +83,7 @@ mod typed_shapes_tests;
 // second target in the build to compromise for. Packing gate/up into a single `__fused__`
 // buffer is metal's kernel ABI, so it arrives as a bool argument rather than a second walk.
 mod weight_bindings;
-mod weight_vocab;
+pub mod weight_vocab;
 
 mod vision_glue;
 mod workload;
@@ -527,11 +529,15 @@ impl std::fmt::Display for CarrierError {
 /// `dump_dir`: where a spyre bake writes each bundle's dxp input — the build script's own output
 /// directory when its build asked for the dump (`superdsc-dump`), else `None` (no dump). The caller
 /// is the one place that knows the directory, so the bake never reads the environment for it.
+///
+/// `emitter`: the target this build compiles for ([`target::TargetEmitter`]) — what it emits for a
+/// model is its own.
 pub fn compile_carrier(
     carrier: PythonCarrier,
     models_dir: &std::path::Path,
     dump_dir: Option<&std::path::Path>,
     scope: &Scope,
+    emitter: &dyn target::TargetEmitter,
 ) -> Result<proc_macro2::TokenStream, CarrierError> {
     let args = &ForwardArgs::from_carrier(&carrier);
     let mode = if carrier.vision {
@@ -1104,6 +1110,7 @@ pub fn compile_carrier(
             mode.emit_arch_dispatch,
             canonical_affine_rows,
             dump_dir,
+            emitter,
         );
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);

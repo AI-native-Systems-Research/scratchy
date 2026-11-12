@@ -603,6 +603,12 @@ jobs:
         run: |
           cargo test -p scratchy-forward-compiler-macro --features spyre --lib
           cargo clippy -p scratchy-forward-compiler-macro --features spyre --tests -- -D warnings
+      # Spyre's bake (the per-model emission the pipeline calls through `TargetEmitter`), and its
+      # pinned derivations on the checked-in configs.
+      - name: Spyre compiler tests
+        run: |
+          cargo test -p scratchy-target-spyre-compiler --features spyre-emu --lib
+          cargo clippy -p scratchy-target-spyre-compiler --features spyre-emu --tests -- -D warnings
       - name: Clippy (triton re-host crates, all targets)
         run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)

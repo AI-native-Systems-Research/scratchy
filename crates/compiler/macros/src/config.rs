@@ -1212,7 +1212,7 @@ pub(crate) fn carries_head(
 /// Load a single config.json as a dense-base ModelParams.
 ///
 /// Test-only: the macro reads configs through the directory walk, not one file at a time.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     let (_, json) = read_json_file(path)?;
     let stem = stem_of(path)?;
@@ -1282,7 +1282,7 @@ fn merge_variant_config(
 /// the base's `<stem>.overrides.json`, and a `DeclaredArchSpec::default()` drops
 /// arch-level facts like `decoder_safetensors_prefix`, either of which leaves a
 /// test asserting against something the build never produces.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn load_file_with_preset(
     config_path: &Path,
     preset_path: &Path,
@@ -1317,8 +1317,8 @@ pub fn load_file_declared(config_path: &Path) -> Result<ModelParams, ConfigError
 /// tensors. A well-formed refusal is asserted here and returned as `None`
 /// (the caller skips the config); any other error still fails the test
 /// loudly. Under a backend that lowers mixed-bit affine this never refuses.
-#[cfg(test)]
-pub(crate) fn assert_load_or_refuse_by_name(
+#[cfg(any(test, feature = "test-support"))]
+pub fn assert_load_or_refuse_by_name(
     stem: &str,
     result: Result<ModelParams, ConfigError>,
 ) -> Option<ModelParams> {

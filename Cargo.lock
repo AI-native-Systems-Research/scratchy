@@ -3414,7 +3414,6 @@ dependencies = [
 name = "scratchy-forward-compiler-macro"
 version = "0.1.0"
 dependencies = [
- "ktir-core",
  "proc-macro2",
  "quote",
  "rayon",
@@ -3424,9 +3423,7 @@ dependencies = [
  "scratchy-subtile",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
- "scratchy-target-spyre",
  "scratchy-tensors",
- "scratchy-triton-splice",
  "serde_json",
  "syn 3.0.9",
  "tracing",
@@ -3478,6 +3475,7 @@ dependencies = [
  "scratchy-quantizations",
  "scratchy-target-metal",
  "scratchy-target-spyre",
+ "scratchy-target-spyre-compiler",
  "scratchy-tensors",
  "scratchy-vision",
  "serde_json",
@@ -3754,6 +3752,26 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "triton-ktir-superdsc",
+]
+
+[[package]]
+name = "scratchy-target-spyre-compiler"
+version = "0.1.0"
+dependencies = [
+ "ktir-core",
+ "proc-macro2",
+ "quote",
+ "rayon",
+ "scratchy-forward-compiler-frontend",
+ "scratchy-forward-compiler-macro",
+ "scratchy-ir",
+ "scratchy-subtile",
+ "scratchy-target-spyre",
+ "scratchy-tp-world",
+ "scratchy-triton-splice",
+ "serde_json",
+ "syn 3.0.9",
+ "tracing",
 ]
 
 [[package]]

@@ -493,7 +493,7 @@ fn place_id_tokens(
         }
         PlaceId::OpLocal { of, role } => {
             let of = proc_macro2::Literal::u32_unsuffixed(of);
-            let r = crate::codegen::op_local_role_tokens(&role);
+            let r = crate::bake::op_local_role_tokens(&role);
             quote! { __KPlace::OpLocal { of: #of, role: #r } }
         }
     }

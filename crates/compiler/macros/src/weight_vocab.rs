@@ -70,7 +70,7 @@ pub use scratchy_subtile::handoff::SlotMap;
 /// `None`. Dense and quant-aware impls alike read this to decide
 /// whether the kernel they emit (cuBLAS / cutlass vs. Marlin) can
 /// legally consume the weight's storage.
-pub(crate) fn weight_storage_of(node: &FufNode) -> Option<&StorageFormat> {
+pub fn weight_storage_of(node: &FufNode) -> Option<&StorageFormat> {
     node.inputs.iter().find_map(|i| match i {
         FufInput::Weight { storage, .. } => Some(storage),
         _ => None,
