@@ -89,7 +89,7 @@ axum = "0.8"
 # tls-rustls-no-provider (not tls-rustls) so axum-server does NOT force
 # rustls/aws-lc-rs — server.rs supplies its own ServerConfig built with the
 # ring provider. Keeps the whole TLS build on ring (no aws-lc-sys C toolchain).
-axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 tower = "0.5"

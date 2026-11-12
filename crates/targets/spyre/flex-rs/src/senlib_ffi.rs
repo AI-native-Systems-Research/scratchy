@@ -129,17 +129,23 @@
 //! these plain names, so linking against a real build fails at `ld` with
 //! "undefined reference" for every one of them — not a runtime bug.
 //!
-//! The resolution, confirmed by reading the real headers on the pod:
-//! `cxx-shim/senlib_ffi.cpp` is the hand-written C++ shim TU that exports
-//! every one of these names as a plain `extern "C"` symbol, each a one-line
-//! marshal onto the real, PUBLIC `flex::DeviceHandle` /
+//! The resolution: every one of these names is a plain `extern "C"` symbol
+//! exported by `libflex_shim.a`, the FFI implementation archive built on
+//! card hosts from the internal tree — each a one-line marshal onto the
+//! real, PUBLIC `flex::DeviceHandle` /
 //! `senlib::ControlBlockInterface` / `senlib::ResponseBlockInterface`
-//! methods cited in each declaration's doc comment. It is compiled by
-//! flex-rs's `build.rs` unconditionally by default and links against the
-//! real senlib on the pod (`/opt/ibm/spyre/senlib/lib`, plus its own
-//! transitive deps); `SCRATCHY_SKIP_SENDNN_CXX=1` skips the compile for
-//! check/clippy on a machine without the SDK headers (a link then fails
-//! loudly).
+//! methods cited in each declaration's doc comment (the `cxx-shim/*.cpp`
+//! citations throughout this file are that implementation's C++ ancestry —
+//! the semantic reference the archive implements, not files in this tree).
+//! The archive is linked STATICALLY by flex-rs's `build.rs` from the
+//! directory named by `SENLIB_STATIC_LIB_DIR`, together with
+//! `libsenlib_oco.a` (the export-controlled OCO crate the FFI archive's own
+//! undefined symbols resolve against); a build without them refuses at the
+//! build script, naming exactly what is missing. The archives embed into
+//! the binary, so a card-host executable is itself the record of what ran —
+//! and an internal artifact. `SCRATCHY_SKIP_SENDNN_CXX=1` skips emitting
+//! the link directives for check/clippy on a machine without the archives
+//! (a link then fails loudly at `ld`).
 //!
 //! `flex_shim_cbi_for_pipeline`/`flex_shim_rbi_for_pipeline` are the shim
 //! entry points that turn a `PipelineId` into the actual

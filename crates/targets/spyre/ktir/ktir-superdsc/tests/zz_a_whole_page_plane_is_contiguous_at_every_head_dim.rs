@@ -215,7 +215,7 @@ fn the_four_coinciding_thirty_twos_are_four_different_quantities() {
             assert_eq!(
                 plane.lx_entries_per_op(),
                 (ktir_superdsc::superdsc_opspec::USABLE_LX_BYTES / (4 * plane.entry_bytes()))
-                    * ktir_superdsc::superdsc_opspec::MAX_CORES as u64,
+                    * <ktir_superdsc::device_gen::Gen1 as ktir_superdsc::device_gen::DeviceGen>::CORES as u64,
                 "nkvh={nkvh} hd={hd}: the LX ceiling is a PER-CORE budget times the cores"
             );
             assert!(

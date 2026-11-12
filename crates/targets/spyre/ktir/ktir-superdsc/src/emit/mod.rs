@@ -29,8 +29,8 @@ use crate::sdsc_abstract::{FlatTag, KindTag, RowBlockedTag, StickKind, StickLayo
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
-    IndirectRole, ItDim, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet,
-    StickExtent, TensorArg, USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
+    IndirectRole, ItDim, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet, StickExtent, TensorArg,
+    USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
 };
 use crate::wire::{
     AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs, LayoutInfo,
@@ -567,11 +567,11 @@ fn pointwise_opspec(
         },
     ];
     let n_operands = (in_names.len() + 1) as u32;
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
         dims,
-        df: Df::Fp16,
-    };
+        Df::Fp16,
+    );
     pointwise_opspec_from_tile(&tile_op, op, in_names, o_name, head_major, layout)
 }
 
@@ -979,17 +979,17 @@ pub fn reduce_fits_untiled(rows: u32, cols: u32) -> bool {
         is_stick,
         df: Df::Fp16,
     };
-    crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: vec![
+    crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        vec![
             dim("mb", rows, false, false),
             dim("out", stick.elems(), true, true),
             dim("y", 1, false, false),
         ],
-        df: Df::Fp16,
-    }
+        Df::Fp16,
+    )
     .tile(
-        crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
+        crate::device_gen::whole(),
         crate::work::distribute_cores,
         "out",
     )
@@ -1022,23 +1022,34 @@ pub fn pointwise_untiled_slice_bytes_divided(
         is_stick,
         df: Df::Fp16,
     };
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
             n_operands: n_inputs + 1,
         },
-        dims: vec![
+        vec![
             dim("mb", rows, false),
             dim("out", stick.elems(), true),
             dim("y", 1, false),
         ],
-        df: Df::Fp16,
-    };
+        Df::Fp16,
+    );
+    // The pin is sized under the budget its ops spend ([`crate::work::EwDivision::budget`]), or the
+    // slice it reserves and the slice each op's core walks are two different divisions.
+    //
+    // ⚠ THIS MINT IS UNWINDOWED BY CONSTRUCTION, and that is a LAW OF ITS SIGNATURE, not an
+    // oversight: the sizer takes `(rows, cols, n_inputs)` — no operand presentation — and the
+    // windowed fact is minted from the operand presentation at the ONE door that holds it
+    // (`pointwise_broadcast_opspec_from_tile`, via `TileOp::with_windowed`); this lookalike
+    // cannot state it. So the budget below is the byte law's (`for_bytes`), and it is only the
+    // right budget for an op whose operands are its own extents. A caller sizing a WINDOWED op
+    // through this function — a row band of a taller parent — would reserve the pin under a
+    // different division than the op's cores walk (the windowed-stick law's `of_cores(sticks)`),
+    // and the windowed refusal cannot fire here to catch it. No such caller exists in this tree
+    // today (the function has none at all); one that appears must thread the door-minted
+    // `TileOp` through instead of re-deriving the shape.
+    let division = division.resolve(true, true);
     tile_op
-        .tile(
-            crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
-            division.resolve(true, true).splitter(),
-            "out",
-        )
+        .tile(division.budget(&tile_op).ok()?, division.splitter(), "out")
         .ok()
         .filter(|t| t.time_tile.is_none())
         .map(|t| {
@@ -1107,11 +1118,11 @@ pub(crate) fn pointwise_broadcast_opspec_df(
         },
     ];
     let n_operands = (inputs.len() + 1) as u32;
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands },
         dims,
         df,
-    };
+    );
     pointwise_broadcast_opspec_from_tile(
         &tile_op,
         rows,
@@ -1159,7 +1170,7 @@ fn sfp_rank1_opspec(
         is_stick: true,
         df: Df::Fp16,
     }];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
+    let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), distribute_cores)?;
     let device_dims = plan.iter_syms(["out"]);
     let mk = |is_input: bool, name: &str| {
         TensorArg::<1>::new(
@@ -1627,9 +1638,9 @@ fn one_gathered_leg<T: crate::collective::Tp>(
     // moved. The tile is the program's statement of the axis NAMES the gather's pin resolves against
     // (which is why the caller passes a tile rather than `rows`/`cols`), so rebuilding one here would
     // be a second, unwitnessed declaration; overriding the one extent the cut changes is not.
-    let leg_tile = crate::ir::island::tile_op::TileOp {
-        kind: tile_op.kind,
-        dims: tile_op
+    let leg_tile = crate::ir::island::tile_op::TileOp::new(
+        tile_op.kind,
+        tile_op
             .dims
             .iter()
             .map(|d| {
@@ -1643,8 +1654,8 @@ fn one_gathered_leg<T: crate::collective::Tp>(
                 }
             })
             .collect(),
-        df: tile_op.df,
-    };
+        tile_op.df,
+    );
     // ⭐⭐⭐ THE LEG'S CORE SPLIT IS A `GatherSplit` — MINTED FROM THE LEG'S OWN FACTS, before any
     // operand is built. Only the entry axis (`mb`) may carry a split: dxp derives `skip_addr`
     // from the per-core extents of the unpinned dims, so a split elsewhere shrinks what one
@@ -1659,7 +1670,7 @@ fn one_gathered_leg<T: crate::collective::Tp>(
     // rather than inspected.
     let split = crate::work::GatherSplit::over_entries(
         &leg_tile.dims,
-        crate::superdsc_opspec::MAX_CORES,
+        crate::device_gen::BUILD_CORES,
         page.get(),
     )
     .map_err(|e| SuperDscError(format!("{op_name}: leg `{leg_name}`: {e}")))?;
@@ -2331,7 +2342,7 @@ fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpe
             df: Df::Fp16,
         },
     ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
+    let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), distribute_cores)?;
     let dd = plan.iter_syms(["mb", "out", "y"]);
     let mk = |is_input: bool, name: &str| {
         TensorArg::<3>::new(
@@ -3376,7 +3387,7 @@ pub fn emit_sdsc(
     // the ONE emission path so no future builder can route around it). LX is per-core
     // private: a consumer on core c reads only the copy core c's own producer pass
     // wrote, so the producer must run the WHOLE tensor on EVERY core
-    // (`WorkPlan::replicate`: all MAX_CORES, no splits) — and must not be time-tiled
+    // (`WorkPlan::replicate`: every core, no splits) — and must not be time-tiled
     // (a trip-sliced producer leaves rows unwritten in most cores' copies).
     // Violations are a build `Err` naming the law, never silently-unreadable LX bytes.
     // A CORE-LOCAL output is the one exception: its producer keeps its own division, which
@@ -3385,17 +3396,18 @@ pub fn emit_sdsc(
         && v.allocation.is_lx()
         && !v.allocation.is_core_local()
     {
-        let replicated =
-            op.iter.cores_used().get() == MAX_CORES && op.iter.splits().values().all(|&s| s == 1);
+        let replicated = op.iter.cores_used().get() == crate::device_gen::BUILD_CORES
+            && op.iter.splits().values().all(|&s| s == 1);
         if !replicated || op.time_tile().is_some() {
             return Err(SuperDscError(format!(
                 "op '{op_name}': its LX-resident output '{}' is produced by a non-replicated \
                  op — an LX-resident tensor must be produced by a REPLICATED op (all \
-                 {MAX_CORES} cores, no work-division splits, no time tiling), because each \
+                 {cores} cores, no work-division splits, no time tiling), because each \
                  core's LX is private and only holds what its own producer pass wrote. Declare \
                  the producer through the layout-consulted pointwise door \
                  (`apply_lx_residency`) or keep the tensor in HBM (`BundleLayout::synth`).",
-                v.name
+                v.name,
+                cores = crate::device_gen::BUILD_CORES,
             )));
         }
     }
@@ -4415,8 +4427,8 @@ pub fn emit_sdsc(
         coreletFoldProp_: corelet_fold,
         numCoresUsed_: cores,
         // coreIdToDsc_ MUST span exactly the cores the op USES (`cores`), NOT a fixed
-        // MAX_CORES — torch-spyre uses `range(num_cores)` (compute_ops.py:527). With
-        // MAX_CORES, an op using <32 cores lists phantom cores 18..31 here while
+        // core count — torch-spyre uses `range(num_cores)` (compute_ops.py:527). With
+        // every core listed, an op using <32 cores lists phantom cores 18..31 here while
         // coreIdToDscSchedule (below) covers only 0..cores, so the multi-op stitcher
         // derives units for cores absent from the schedule → DtException "expecting a
         // valid entry in core schedule" (ModuleStitcher.cpp:216). Keep them consistent.
@@ -4967,7 +4979,7 @@ fn convert_opspec(
             df: Df::Fp16,
         },
     ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
+    let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), distribute_cores)?;
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
     // ── STICK-MAJOR (SCRATCHY_SUPERDSC_STICKMAJOR) ── the SAME m>1 seam as the residual pointwise/matmul:
@@ -5491,13 +5503,13 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
     // ⛔ THE SPLITTER IS THIS OP'S OWN, NOT `distribute_cores`: the transpose's output is a grid of
     // 8×8 inter-slice blocks, so the division must cut BOTH axes at the block — the law measured
     // against the vendor golden (see `transpose_core_split`).
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: dims.clone(),
-        df: Df::Fp16,
-    };
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims.clone(),
+        Df::Fp16,
+    );
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, transpose_core_split, "out")
+        .tile(crate::device_gen::whole(), transpose_core_split, "out")
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     // ⛔⛔⛔ THE PER-CORE SLICE MUST BE WHOLE 8×8 OUTPUT BLOCKS. `transpose_core_split` GUARANTEES
@@ -5514,7 +5526,7 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
     // not a whole block — and the division was deliberately not guessed from one fixture point.
     // The division is now measured against that fixture (`transpose_core_split`: both axes at the
     // block, reproducing the golden's `{"out": 8, "mb": 4}` verbatim), so the shapes the old guard
-    // refused — the golden's own, and every stick-multiple `mb` below 8·MAX_CORES — bake. The guard
+    // refused — the golden's own, and every stick-multiple `mb` below 8 × the core count — bake. The guard
     // STAYS, stated over the built plan: a future splitter regression is a `cargo` error here,
     // never a descriptor whose cores collide.
     let (per_mb, per_out) = (plan.per_core_extent("mb"), plan.per_core_extent("out"));
@@ -5642,7 +5654,7 @@ mod transpose_tests {
 
     /// The module's representative row extent. ANY 64-multiple works since the division became the
     /// fixture-measured law ([`transpose_core_split`]) — 256 is kept for continuity with the tests
-    /// that were written while `distribute_cores` split `mb` alone and only `mb ≥ 8·MAX_CORES`
+    /// that were written while `distribute_cores` split `mb` alone and only `mb ≥ 8 ×` the core count
     /// landed on whole blocks.
     const MB: u32 = 256;
 
@@ -6414,13 +6426,13 @@ fn topk_opspec(
     // own tokens, so time-tiling is semantically free. ⛔ THE SPLITTER IS THE PAIR'S OWN
     // (`topk_core_split`), NOT `distribute_cores`: the ring-over-k law and the never-split-the-
     // scan law are both outside `distribute_cores`' vocabulary.
-    let tile_op = crate::ir::island::tile_op::TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
-        dims: dims.clone(),
-        df: Df::Fp16,
-    };
+    let tile_op = crate::ir::island::tile_op::TileOp::new(
+        crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims.clone(),
+        Df::Fp16,
+    );
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, topk_core_split, "y")
+        .tile(crate::device_gen::whole(), topk_core_split, "y")
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     // ⛔ THE MIN-DATASTAGE FOOTPRINT GUARD — a runtime allocation refusal is a
@@ -6569,7 +6581,7 @@ fn restickify_kt_opspec_2d(
             df: Df::Fp16,
         },
     ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
+    let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), distribute_cores)?;
     // INPUT: resident cache view `[y=cap, out=hd]` sticked on `out` (=hd, dim 1 = LAST, dxp-friendly) ⇒
     // device_size `[hd/64,cap,64]` = the SLAB-MAJOR store the cachewr writes (`dev_off([cap,hd],1,·)`) ⇒
     // reads K[slot][d] correctly at ANY head_dim (at hd==64 the single slab IS the flat `slot*hd+d`).
@@ -6772,10 +6784,11 @@ pub(crate) fn restickify_transpose_opspec_batched(
     let _rows_ext = StickExtent::<Fp16>::new(rows)?;
     let _cols_ext = StickExtent::<Fp16>::new(cols)?;
     // One batch a core, or past the cores, as many consecutive batches a core as divide evenly.
-    let cores = crate::work::core_split(batch, MAX_CORES);
+    let cores = crate::work::core_split(batch, crate::device_gen::BUILD_CORES);
     if batch <= 1 || cores <= 1 {
         return Err(format!(
-            "restickify transpose '{o_name}': a batch of {batch} divides over no cores of {MAX_CORES}"
+            "restickify transpose '{o_name}': a batch of {batch} divides over no cores of {cores}",
+            cores = crate::device_gen::BUILD_CORES
         ));
     }
     let dim = |name: &'static str, size: u32, is_stick: bool| ItDim {
@@ -6790,7 +6803,7 @@ pub(crate) fn restickify_transpose_opspec_batched(
         dim("y", rows, true),
         dim("out", cols, true),
     ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, |_, _| {
+    let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), |_, _| {
         BTreeMap::from([("mb", cores)])
     })?;
     let resident = 2
@@ -7584,11 +7597,11 @@ mod gather_cut {
             is_stick,
             df: Df::Fp16,
         };
-        TileOp {
-            kind: TileOpKind::PointwiseOrReduce { n_operands: 2 },
-            dims: vec![d("mb", rows, false), d("out", COLS, true), d("y", 1, false)],
-            df: Df::Fp16,
-        }
+        TileOp::new(
+            TileOpKind::PointwiseOrReduce { n_operands: 2 },
+            vec![d("mb", rows, false), d("out", COLS, true), d("y", 1, false)],
+            Df::Fp16,
+        )
     }
 
     /// The door, driven exactly as `scalarmul_at` drives it: the `[1,1]` scale first and the gathered
@@ -8360,8 +8373,12 @@ mod time_tiled_segment_law {
                 df: Df::Fp16,
             },
         ];
-        let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)
-            .expect("the plan divides");
+        let plan = WorkPlan::divide(
+            &dims,
+            crate::superdsc_opspec::CoreBudget::whole(),
+            distribute_cores,
+        )
+        .expect("the plan divides");
         let dd = plan.iter_syms(["mb", "out", "y"]);
         let time_tile = plan
             .time_tile_for_lx(|p, opt| pointwise_lx_resident(p, 3, opt, Df::Fp16), "out")

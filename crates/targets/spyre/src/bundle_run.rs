@@ -783,7 +783,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             Some((rows, cols)) => restick(&bytes, rows, cols, true),
             None => bytes,
         };
-        exec.bind_weight(ktir_superdsc::place::PlaceId::Act(*tid), bytes);
+        exec.bind_weight(
+            ktir_superdsc::place::PlaceId::Act(*tid),
+            crate::allocator::HostBytes::Owned(bytes),
+        );
     }
 
     exec.stage_weights()?;

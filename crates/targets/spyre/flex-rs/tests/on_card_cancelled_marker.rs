@@ -59,11 +59,10 @@ const DRAIN_BATCH: usize = 16;
 /// silent pass or vacuous skip.
 ///
 /// Run by name on a card host, from the repo root, WITHOUT
-/// `SCRATCHY_SKIP_SENDNN_CXX` (the shim must really compile and link):
+/// `SCRATCHY_SKIP_SENDNN_CXX` (the FFI archives must really link):
 ///
 /// ```text
-/// FLEX_RS_SPYRE_ROOT=<real spyre root, e.g. /opt/ibm/spyre> \
-/// BOOST_LIB=<dir holding libboost_*.so, e.g. /usr/lib64> \
+/// SENLIB_STATIC_LIB_DIR=<dir holding libflex_shim.a + libsenlib_oco.a> \
 /// cargo test -p flex-rs --test on_card_cancelled_marker -- --ignored --nocapture
 /// ```
 #[ignore = "on-card leg (#611/#653): needs a real Spyre card — run by name, see the test's doc for the invocation"]
@@ -75,8 +74,8 @@ fn cancelled_marker_on_card() {
         ncards > 0,
         "REFUSED (not silently passed): sen_pci_card_count() == {ncards} — no Spyre card is \
          visible on this host. `cancelled_marker_on_card` is the #611/#653 on-card confirmation \
-         leg and must run on a Spyre host against the REAL senlib link (no \
-         SCRATCHY_SKIP_SENDNN_CXX, real FLEX_RS_SPYRE_ROOT/BOOST_LIB)."
+         leg and must run on a Spyre host against the REAL FFI archive link (no \
+         SCRATCHY_SKIP_SENDNN_CXX, real SENLIB_STATIC_LIB_DIR)."
     );
 
     // ── Refusal guard 2: real senlib bring-up must succeed. ──

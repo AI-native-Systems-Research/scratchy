@@ -50,6 +50,9 @@ pub mod addr;
 /// TENSOR PARALLELISM'S BAKED VALUES — the world, the rank, the p2p payload and its stick-column
 /// fragments, the receive window, the sids, and the consume marker an [`emit::EmittedOp`] carries.
 pub mod collective;
+/// THE DEVICE GENERATION — the card facts a lowering reads (`CORES`, `BYTES_PER_CORE`,
+/// `UTIL_FLOOR_CORES`), per generation, read through the one name `Baked`.
+pub mod device_gen;
 /// ⭐ THE `dl16tofp32` LANE STAGGER as TARGET-ABI CONST TABLES — `ElementArrangement`, the
 /// 64-entry permutation, the opcode→arrangement table the bake-side propagation takes as input,
 /// and the one staging derivation every stager calls. See the module header for the measurement.

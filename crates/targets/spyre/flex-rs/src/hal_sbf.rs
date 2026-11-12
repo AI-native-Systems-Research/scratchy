@@ -1,13 +1,15 @@
-//! The R5/RDMA wire-door builders — flex-rs's semantic face over the
-//! cxx-shim `hal_sbf.cpp` doors (the r5-wire port).
+//! The R5/RDMA wire-door builders — flex-rs's semantic face over the FFI
+//! hal doors (the r5-wire port).
 //!
-//! THE LAW (the proprietary line — `cxx-shim/hal_sbf.cpp`'s own header
-//! carries it in full): the hal SBF headers are OCO-marked trade-secret
-//! source; their field maps, bit ranges, enum bit values, and packing logic
-//! live ONLY on the C++ side of the shim boundary. This module carries OUR
-//! vocabulary — modes by meaning, byte offsets, sids, masks — and hands
-//! those scalars to the shim's C-ABI doors, which return finished section
-//! words. No type, function, or test in this file knows where any bit sits.
+//! THE LAW (the proprietary line): the hal SBF headers are OCO-marked
+//! trade-secret source; their field maps, bit ranges, enum bit values, and
+//! packing logic live ONLY on the implementation side of the FFI boundary
+//! (historically the C++ shim TU cited throughout this crate; today the
+//! `libflex_shim.a` archive built from the internal tree). This module
+//! carries OUR vocabulary — modes by meaning, byte offsets, sids, masks —
+//! and hands those scalars to the C-ABI doors, which return finished
+//! section words. No type, function, or test in this file knows where any
+//! bit sits.
 //!
 //! These doors round out the crate's control-block surface:
 //! `control_block_wire.rs` hand-ports the graph-free compute/DMA/fill

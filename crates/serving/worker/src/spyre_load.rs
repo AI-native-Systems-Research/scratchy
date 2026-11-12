@@ -8,6 +8,7 @@
 
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_layers::weights::GpuWeights;
+use scratchy_target_spyre::HostBytes;
 use scratchy_target_spyre::SpyreAllocator;
 use scratchy_target_spyre::manifest::bytes_to_f32;
 // `--target sendnn` swaps the KTIR emulator runner for the on-silicon sendnn
@@ -28,7 +29,13 @@ use tracing::info;
 use tracing::{debug, warn};
 
 /// A weight staged for binding: its tensor id, bytes, dtype and shape.
-pub(crate) type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
+///
+/// ⭐ THE BYTES ARE BY PROVENANCE ([`HostBytes`]): a weight the load viewed off the page
+/// cache stays a `View` all the way into the executor's bound map — no private copy of the
+/// checkpoint exists between the store's mmap and the staging walk that reads it. A weight
+/// whose bytes are REWRITTEN before binding (a pad, a fold, a TP rank's cut) arrives
+/// `Owned`, the product of that rewrite.
+pub(crate) type StagedWeight = (usize, HostBytes, SDType, Vec<usize>);
 
 /// ⭐ THE RESIDENT SEGMENTS EVERY BORROWER ADOPTS, AS ONE LIST. Four sites alias these (the
 /// prefix-capable prefill, the prefill ladder rungs, the decode batch rungs, and the top prefill
@@ -352,6 +359,11 @@ fn apply_weight_scale_folds(
                      not stage — the wiring and the weight binding disagree about the sources"
                 ))
             })?;
+        // A byte-rewriting fold MATERIALIZES its operand — the mmap a `View` reads is a
+        // read-only mapping, so the product must be the weight's own buffer. On the card
+        // the narrowing pass has already materialized every float target; this copy is
+        // the emulator's alone.
+        let bytes = bytes.make_owned();
         // SAFETY-free elementwise scale: every branch below reinterprets the Vec's own bytes as
         // the dtype it already declares, so the length check is the whole of the guard.
         match *dt {
@@ -427,16 +439,27 @@ pub(crate) struct RankCut {
 
 #[cfg(feature = "spyre-hw")]
 impl RankCut {
-    fn cut(&self, id: u32, bytes: Vec<u8>, elem: usize, is_gemm: bool) -> ExecutorResult<Vec<u8>> {
+    fn cut(
+        &self,
+        id: u32,
+        bytes: HostBytes,
+        elem: usize,
+        is_gemm: bool,
+    ) -> ExecutorResult<HostBytes> {
         let &whole = self.whole.tensor_shapes.get(id as usize).ok_or_else(|| {
             werr(format!(
                 "source {id} has no one-rank shape to cut rank {}'s share from",
                 self.me.get()
             ))
         })?;
-        self.forward
-            .slice_source_bytes(self.me, id, bytes, elem, whole, is_gemm)
-            .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))
+        // The cut OWNS its product — the slicing laws build each rank's share as a fresh
+        // buffer — so a viewed source materializes here: ONE copy on a sharded leg (the
+        // load used to pay the alias's place twice — the take's copy and the cut's).
+        let cut = self
+            .forward
+            .slice_source_bytes(self.me, id, bytes.into_vec(), elem, whole, is_gemm)
+            .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))?;
+        Ok(HostBytes::Owned(cut))
     }
 }
 
@@ -487,23 +510,20 @@ pub(crate) fn stage_bound_weights(
     wiring: &scratchy_target_spyre::wiring::Wiring,
     // A rank of a sharded world stages its share of each tensor; `None` stages it whole.
     #[cfg(feature = "spyre-hw")] cut: Option<&RankCut>,
-    // The allocator that owns the bound tensors' buffers: staging TAKES each buffer
-    // (no copy) at its last binding instead of copying it while the original stays alive. `None`
-    // copies every buffer — a sharded world's earlier ranks, whose cut must leave the whole tensor
-    // for the ranks after them.
+    // The allocator that owns the bound tensors' buffers: staging SHARES each buffer — a VIEW
+    // clones its keepalive handle (free), an OWNED buffer copies. The share, never a take, is the
+    // LAW: a take removes the store's entry and the buffer frees at this binding, which is sound
+    // only if staging is that buffer's last reader — an ordering the serial rank walk once
+    // guaranteed and [`each_rank_parallel`] removed (every rank's walk reads the whole tensors at
+    // once). The share leaves the entry in the store, where it outlives every walk: the allocator
+    // drops with `gw`, after the fan-out joins. `None` copies every buffer — a sharded world's
+    // ranks other than the one whose input slot the allocator rides.
     mut alloc: Option<&mut SpyreAllocator>,
 ) -> ExecutorResult<Vec<StagedWeight>> {
     let _t_load = std::time::Instant::now();
     let mut weights: Vec<StagedWeight> = Vec::new();
     let _take_s = 0f64;
-    // The LAST binding of each buffer — a buffer two bindings share (a tied head, k=v) is
-    // copied for every binding but its last, which takes it.
-    let last_binding: std::collections::HashMap<*const u8, usize> = bound
-        .iter()
-        .enumerate()
-        .map(|(i, bw)| (gpu_tensor_bytes(&bw.tensor).as_ptr(), i))
-        .collect();
-    for (bi, bw) in bound.iter().enumerate() {
+    for bw in bound.iter() {
         let is_gemm = bw.is_gemm;
         let s_id = bw.id as usize;
         // ⭐⭐⭐ `[rows, cols]` COMES FROM THE BAKE, NOT FROM THE TENSOR'S OWN DIMS.
@@ -540,13 +560,18 @@ pub(crate) fn stage_bound_weights(
             let src = gpu_tensor_bytes(&bw.tensor);
             let (ptr, len) = (src.as_ptr(), src.len());
             match alloc.as_deref_mut() {
-                Some(alloc) if last_binding.get(&ptr) == Some(&bi) => {
-                    // SAFETY: this is the buffer's last binding and staging is its last reader
-                    // in the load — nothing reads through `bw.tensor` (or any tensor viewing
-                    // the same buffer) after this point.
-                    unsafe { alloc.take(ptr, len) }.unwrap_or_else(|| src.to_vec())
-                }
-                _ => src.to_vec(),
+                // ⭐ SHARE, NEVER TAKE — the take removed the store's entry and freed an OWNED
+                // buffer at this binding, sound only while staging was the buffer's last
+                // reader, an ordering the serial rank walk once guaranteed. Under
+                // [`each_rank_parallel`] every rank's walk reads the whole tensors at once, so
+                // NOTHING may free one mid-fan-out: the share leaves the entry in the store,
+                // where it outlives every walk (the allocator drops with `gw`, after the join).
+                // A VIEW clones its keepalive handle — free; an OWNED buffer has no handle, so
+                // this binding copies (measured: one 16 MiB synthesized buffer per model, ~6 ms).
+                Some(alloc) => alloc
+                    .share(ptr, len)
+                    .unwrap_or_else(|| HostBytes::Owned(src.to_vec())),
+                None => HostBytes::Owned(src.to_vec()),
             }
         };
         let dt = bw.tensor.dtype();
@@ -598,7 +623,9 @@ pub(crate) fn stage_bound_weights(
             // the re-tile reads it there, via `stride_map_disk_order`. That map resolves the same
             // logical element as the transposed one (proven in `sdsc_df_width`), so this deletes a
             // whole pass over the model -- 4.4s of the 6.94s `load_weights` on granite-3.1-8b, plus
-            // the full second copy it wrote.
+            // the full second copy it wrote. The bytes keep their provenance: a VIEW stays a view
+            // through every no-op below, and each pad — whose product is a fresh buffer —
+            // materializes only itself.
             let t = bytes;
             {
                 // DEVICE stick padding — the shared `bump_sticks_to_splittable` rule: round to a
@@ -629,9 +656,9 @@ pub(crate) fn stage_bound_weights(
                     // zero rows at the end -- `resize`, not a strided rebuild. (Transposed it was the
                     // inner axis and every row had to be copied to a wider stride.) Same padded bytes,
                     // and the only weight that needs any is lm_head.
-                    let mut padded = t;
+                    let mut padded = t.into_vec();
                     padded.resize(n_dev * rows * elem, 0);
-                    padded
+                    HostBytes::Owned(padded)
                 } else {
                     t
                 };
@@ -662,13 +689,14 @@ pub(crate) fn stage_bound_weights(
                         }
                         // Post-N-pad the buffer is `[n_dev, k]` row-major (k inner, `rows` = k).
                         let mut padded = vec![0u8; n_dev * k_pad as usize * elem];
+                        let n_padded = n_padded.as_slice();
                         for n_row in 0..n_dev {
                             let src_off = n_row * k * elem;
                             let dst_off = n_row * k_pad as usize * elem;
                             padded[dst_off..dst_off + k * elem]
                                 .copy_from_slice(&n_padded[src_off..src_off + k * elem]);
                         }
-                        (padded, vec![k_pad as usize, n_dev])
+                        (HostBytes::Owned(padded), vec![k_pad as usize, n_dev])
                     }
                     None => (n_padded, vec![rows, n_dev]),
                 }
@@ -695,12 +723,16 @@ pub(crate) fn stage_bound_weights(
     {
         use rayon::prelude::*;
         let _t_cvt = std::time::Instant::now();
-        // DIRECT bf16/f32 → f16, no intermediate f32 Vec (per /tmp/zoo). Cast the raw
-        // bytes to &[bf16]/&mut [f16] and convert with a SIMD-friendly parallel zip
-        // ACROSS ELEMENTS — so the two huge embed/lm_head tensors get all cores too,
-        // not one core each. Every `bytes` here is a freshly-allocated Vec<u8> (take_to
-        // _cpu_bytes / transpose output), hence ≥2-byte aligned; the host is LE, so the
-        // cast equals `from_le_bytes`. Byte-identical to half::f16::from_f32(x.to_f32()).
+        // DIRECT bf16/f32 → f16, no intermediate f32 Vec (per /tmp/zoo). The SOURCE is
+        // read byte-wise (`as_chunks` + `from_le_bytes`) and the DESTINATION is a fresh
+        // Vec, converted with a SIMD-friendly parallel zip ACROSS ELEMENTS — so the two
+        // huge embed/lm_head tensors get all cores too, not one core each. Byte-wise
+        // source reads are the law, not a nicety: a bf16 weight can be a VIEW of its
+        // mmap (the zero-copy load), whose tensor offsets carry no alignment guarantee;
+        // on LE the byte-wise read is the aligned cast, byte-identical. The rewrite
+        // MATERIALIZES (a transform's product is owned — a `View` cannot be written
+        // through), so every bf16 weight leaves this pass an `Owned` f16 buffer.
+        // Byte-identical to half::f16::from_f32(x.to_f32()).
         weights
             .par_iter_mut()
             .for_each(|(_, bytes, dt, _)| match *dt {
@@ -708,16 +740,16 @@ pub(crate) fn stage_bound_weights(
                 SDType::BF16 => {
                     let n = bytes.len() / 2;
                     let mut out = vec![0u8; n * 2];
-                    let src = unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr() as *const half::bf16, n)
-                    };
+                    let src = bytes.as_slice();
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut half::f16, n)
                     };
                     dst.par_iter_mut()
-                        .zip(src.par_iter())
-                        .for_each(|(o, &i)| *o = half::f16::from_f32(i.to_f32()));
-                    *bytes = out;
+                        .zip(src.as_chunks::<2>().0.par_iter())
+                        .for_each(|(o, c)| {
+                            *o = half::f16::from_f32(half::bf16::from_le_bytes(*c).to_f32());
+                        });
+                    *bytes = HostBytes::Owned(out);
                     *dt = SDType::F16;
                 }
                 // fp8 weight STAYS 1 byte — do NOT narrow to f16. The `other` arm's bytes_to_f32→f16
@@ -731,7 +763,7 @@ pub(crate) fn stage_bound_weights(
                     for &v in &f32v {
                         f16.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
                     }
-                    *bytes = f16;
+                    *bytes = HostBytes::Owned(f16);
                     *dt = SDType::F16;
                 }
             });
@@ -842,6 +874,9 @@ impl SpyreWorker {
         // metal uses — and the bundle, the weight binding and the embed
         // table are all read off THAT model.
         let _t_try = std::time::Instant::now();
+        // `SCRATCHY_LOAD_TIME`: arm before the load records, print after it —
+        // the whole instrument lives inside the pass this times.
+        scratchy_layers::load_time::arm();
         let model = scratchy_forward_compiler::try_load(
             &mut gw,
             (),
@@ -875,10 +910,18 @@ impl SpyreWorker {
         // `try_load` runs the GENERATED loader over every tensor, so it is a whole pass
         // across the checkpoint in its own right — timed apart from the raw byte extraction
         // that follows it.
+        let try_load_elapsed = _t_try.elapsed();
         tracing::debug!(
             "[timing] try_load ({arch}) took {:.2}s",
-            _t_try.elapsed().as_secs_f64()
+            try_load_elapsed.as_secs_f64()
         );
+        // `SCRATCHY_LOAD_TIME`: the same pass decomposed — cast, the allocator's
+        // zero-fill and copy, take_cpu's to_vec, transpose — plus the residual those
+        // leave (fingerprint match, store ops, struct building). The boot layer
+        // between "Using cached model" and the line above is this pass almost whole.
+        if scratchy_layers::load_time::enabled() {
+            eprintln!("{}", scratchy_layers::load_time::summary(try_load_elapsed));
+        }
         #[cfg(not(feature = "spyre-hw"))]
         let bundle: &'static KtirBundle = model
             .ktir_bundle()
@@ -1015,15 +1058,26 @@ impl SpyreWorker {
             Some(forward) => {
                 let last =
                     <World as scratchy_target_spyre::bundle_code::collective::World>::RANKS - 1;
-                scratchy_target_spyre::bundle_code::collective::PerRank::try_from_fn(|me| {
+                // ⭐ EVERY RANK'S STAGING WALK AT ONCE — one thread per rank
+                // (`each_rank_parallel`): each rank's cut reads the whole checkpoint tensors and
+                // writes its own share into its own shadow, so the walks are independent (measured
+                // at tp/8: 4.0 s as eight sequential walks, each ~the single-card wall). The
+                // allocator rides the LAST rank's input slot — the one unique resource crossing
+                // the fan-out as exactly one rank's input, never a shared `&mut`. Its staging
+                // SHARES every buffer and never takes: a take could free a buffer under the other
+                // ranks' concurrent reads, so every walk reads buffers the store keeps alive
+                // past their join.
+                let mut alloc_slot = Some(gw.allocator_mut());
+                let inputs =
+                    scratchy_target_spyre::bundle_code::collective::PerRank::from_fn(|me| {
+                        (me.get() == last).then(|| alloc_slot.take()).flatten()
+                    });
+                scratchy_target_spyre::sdsc_runner::each_rank_parallel(inputs, |me, alloc| {
                     let cut = RankCut {
                         forward,
                         me,
                         whole: &one_rank.decode,
                     };
-                    // The last rank TAKES each buffer at its last binding; the others copy, so
-                    // every rank's cut reads the whole checkpoint tensor.
-                    let alloc = (me.get() == last).then(|| gw.allocator_mut());
                     stage_bound_weights(&bound, &wirings.decode, Some(&cut), alloc)
                 })?
             }
@@ -1067,7 +1121,7 @@ impl SpyreWorker {
                     Some(_) => {}
                     None => {
                         staged.insert(tid, bytes.clone());
-                        weights.push((tid as usize, bytes, dt, shape.to_vec()));
+                        weights.push((tid as usize, HostBytes::Owned(bytes), dt, shape.to_vec()));
                     }
                 }
             }
@@ -1100,6 +1154,21 @@ impl SpyreWorker {
             );
             weights
         };
+        // ⭐ THE CHECKPOINT'S HOST TEARDOWN LEAVES THE BOOT PATH HERE. `gw`'s last read is the
+        // staging above; its drop unmaps the store's safetensors mappings and frees the
+        // allocator's buffers — a `munmap` pass measured as the WHOLE silent window between this
+        // load's last log and the engine's "Model:" line (SIGSTOP mid-gap on the frozen load
+        // thread, caught in `Arc<Mmap>::drop_slow` → `__munmap`; 2b fp8, nickm3, 2026-11-11:
+        // 105–160 ms). Nothing downstream observes the drop: every byte the sessions read is a
+        // view whose keepalive `Arc<Mmap>` outlives `gw` by the zero-copy load's law, so the
+        // teardown may run concurrently with the session and ladder work below. Detached — if
+        // the process exits first, the mapping dies with the address space; no order to keep.
+        // A spawn failure drops the closure (and `gw`) right here on this thread: the
+        // pre-change behavior, never a leak.
+        std::thread::Builder::new()
+            .name("checkpoint-drop".into())
+            .spawn(move || drop(gw))
+            .ok();
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
         // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
@@ -2037,6 +2106,313 @@ impl SpyreWorker {
                             .collect::<Vec<_>>()
                     })
                 };
+                // ── PREFIX-CAPABLE PREFILL LADDER ── the bundles a continuation chunk (start>0)
+                // runs on. Every ladder rung above is prefix-FREE, so these are the ONLY prefill
+                // bundles that can attend resident KV. Borrows seg1+seg2 like the rungs, and is
+                // built AFTER the decode session so it cannot affect decode's weight-region
+                // placement. A rung that fails to load is a LOAD ERROR — every rung the bake
+                // shipped must load.
+                // ⭐ THE FAN-OUT IS SPAWNED HERE, WITH THE PREFILL LADDER'S — a prefix rung is the
+                // same kind of build the prefill rungs are (an independent `new_borrowing` over a
+                // static bundle, after the owner's allocation and landing slots), so it shares the
+                // prefill fan-out's window instead of paying its own after that fan-out's join
+                // (MEASURED 2b fp8, nickm3, 2026-11-11: the three fan-outs ran sequentially —
+                // prefill 0.51 s, prefix 0.27 s, decode 0.09 s — a summed ~0.9 s of boot; fused,
+                // the wall is the slowest single build). The adoption and every refusal run on
+                // THIS thread at the join below, in ladder order.
+                // A validated, UNBUILT prefix rung: the static bundle the background build
+                // needs, held until the fan-out below. The sentinel refusal stays on THIS
+                // thread — it is a manifest/wiring fact, not a build result.
+                struct PrefixRungJob {
+                    pmq: u32,
+                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
+                }
+                let pool_for_prefix = prefill_pool_statics(wirings)?;
+                let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
+                for &(pmq, psent) in g0.prefill_prefix {
+                    if pmq <= 1 || psent.is_empty() {
+                        continue;
+                    }
+                    let pcode2 = psent
+                        .strip_prefix(SUPERDSC_SENTINEL)
+                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "prefix-capable prefill m={pmq}: sentinel did not resolve — \
+                                 every rung the bake shipped must load"
+                            )
+                        });
+                    prefix_jobs.push(PrefixRungJob { pmq, rcode: pcode2 });
+                }
+                // ── BUILD THE PREFIX RUNGS IN PARALLEL ── one thread per rung (a handful at
+                // most), inside a detached thread joined at the adoption site below. The jobs
+                // are independent `new_borrowing` builds over static bundles; `spill_tids` and
+                // the pool are CLONED into the thread — a detached spawn cannot borrow this
+                // frame.
+                let prefix_join = {
+                    let spill = spill_tids.clone();
+                    let pool = pool_for_prefix.clone();
+                    // The general mint's nine tables, each bundle's own seg3 copy.
+                    let prefix_consts = wirings
+                        .prefill
+                        .as_ref()
+                        .unwrap_or(&wirings.decode)
+                        .load_consts;
+                    std::thread::spawn(move || {
+                        let _t = std::time::Instant::now();
+                        // Spawn EVERY rung first, join in a second pass — a `map` that joins
+                        // inside the closure is lazy, so it would run each build to completion
+                        // before the next thread exists. The prefill ladder's own shape.
+                        let built: Vec<Result<SuperDscSession, (u32, String)>> =
+                            std::thread::scope(|scope| {
+                                let handles: Vec<_> = prefix_jobs
+                                    .iter()
+                                    .map(|job| {
+                                        let spill = spill.clone();
+                                        let pool = pool.clone();
+                                        scope.spawn(move || {
+                                            SuperDscSession::new_borrowing_with_consts(
+                                                cards,
+                                                job.rcode,
+                                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                                    vocab,
+                                                    kv_dim,
+                                                    num_blocks,
+                                                },
+                                                &[1, 2],
+                                                prefix_consts,
+                                                &pool,
+                                                &spill,
+                                            )
+                                            .map_err(|e| {
+                                                (
+                                                    job.pmq,
+                                                    format!(
+                                                        "prefix-capable prefill m={} session build \
+                                                         failed: {e} — every rung the bake shipped \
+                                                         must load",
+                                                        job.pmq
+                                                    ),
+                                                )
+                                            })
+                                        })
+                                    })
+                                    .collect();
+                                handles
+                                    .into_iter()
+                                    // A panicked rung thread re-panics with its own payload —
+                                    // the original message and location, not a replacement
+                                    // string. The join at the adoption site re-panics this
+                                    // thread's payload on the owning thread.
+                                    .map(|h| match h.join() {
+                                        Ok(r) => r,
+                                        Err(p) => std::panic::resume_unwind(p),
+                                    })
+                                    .collect()
+                            });
+                        info!(
+                            "[spyre-worker] sendnn: prefix rung fan-out: {} rung(s) built in {:.0} ms",
+                            prefix_jobs.len(),
+                            _t.elapsed().as_secs_f64() * 1e3
+                        );
+                        (prefix_jobs, built)
+                    })
+                };
+                // ── DECODE BATCH LADDER: one session per baked request count ──
+                // Same construction as the prefill ladder: each rung aliases the decode session's
+                // weights and page pool, so a rung costs its programs and its activations, never
+                // another copy of the model. A rung that fails to load is a LOAD ERROR — every
+                // rung the bake shipped must load, so a binary whose batch decode silently runs
+                // elsewhere can never serve. ⭐ Fanned out HERE, with the prefill ladder's, for
+                // the same reason the prefix rungs are (see `prefix_join` above); the adoption
+                // runs at the join below, on this thread.
+                // A validated, UNBUILT decode rung: everything the background build needs,
+                // held until the fan-out below. `rcode`/`rung_consts` are static bundle facts;
+                // the rest are this loop's own derived facts, refused above where they were
+                // derived.
+                struct DecodeRungJob {
+                    rn: usize,
+                    rung_width: scratchy_subtile::sdsc_abstract::RungWidth,
+                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
+                    rung_consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
+                    logits: LogitsGeom,
+                }
+                let mut decode_jobs: Vec<DecodeRungJob> = Vec::new();
+                // ⛔ THE MANIFEST'S `SweptCols` IS DELIBERATELY NOT BOUND. It is the CEILING body's sweep —
+                // one number per BATCH WIDTH — and the two host decisions that used to read it are
+                // per-BODY (see `DecodeRung`). Binding it to `_` rather than to a name is the point: a
+                // named ceiling sitting in this loop is what got copied onto the rung three times.
+                for (rung_n, _ceiling_swept, sentinel, rung_consts) in g0.decode_rungs {
+                    // ⛔ `RungSeqs::get`, so this reads a BATCH WIDTH and says so. The sibling ladder
+                    // (`sk_bucket_rungs`) is keyed by the SWEEP EXTENT `active_cap`; selecting over it with
+                    // `>= live` would bind a body baked for a 64-column sweep because four requests are
+                    // live, and the fold would cover `active_cap * pages` columns while the deepest row
+                    // needs `write_slot + 1`. Both keys were bare `u32` until now.
+                    let rn = rung_n.get() as usize;
+                    // The one-request rung IS the `decode` session already built and aliased above.
+                    if rn <= 1 {
+                        continue;
+                    }
+                    // The manifest's `RungSeqs` IS a baked row count — this is the one boundary where
+                    // it becomes the launch-width vocabulary everything below runs on.
+                    let Some(rung_width) =
+                        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
+                    else {
+                        continue;
+                    };
+                    let rcode = sentinel
+                        .as_str()
+                        .strip_prefix(SUPERDSC_SENTINEL)
+                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "decode batch rung seqs={rn}: sentinel names no bundle compiled \
+                                 into this binary — every rung the bake shipped must load"
+                            )
+                        });
+                    // The rung's own logits placement, read from the bundle it actually runs. Derived,
+                    // never assumed: the width is stick-PADDED above the vocab, and the row count is
+                    // this rung's `seqs`, so both differ per rung. A rung whose placement does not
+                    // describe `rn` whole rows is a LOAD ERROR — a gathered-from guess would read
+                    // rows nobody wrote.
+                    // ⭐ THE LOGITS TID IS THE SEAT'S `row` WHEN THE BAKE MINTED A DRAW. The
+                    // token-draw mint re-points the rung's RESULT to the idx stick, so
+                    // `dparsed.result_id` names the `[rows, BLOCK]` pick — the placement exists
+                    // but is not `seqs` rows of vocab, and reading it as logits refused every
+                    // rung at load. The wiring's `SampleSeat.row` is the Sample node's
+                    // inputs[0] — the logits row the mint deliberately keeps placed and
+                    // readable by tid — the same fact the solo launch reads the pick through.
+                    // A bake without a draw keeps the result AS the logits (the host-argmax
+                    // readback this front replaces), so `result_id` stays the fallback.
+                    let logits_tid = wirings
+                        .decode
+                        .sample_seat
+                        .map(|seat| seat.row)
+                        .unwrap_or(dparsed.result_id as u32);
+                    let logits = rcode
+                        .layout
+                        .place_of_tid(logits_tid)
+                        .and_then(|p| LogitsGeom::from_placement(p.size, rung_width, vocab));
+                    let logits = logits.unwrap_or_else(|| {
+                        panic!(
+                            "decode batch rung seqs={rn}: its baked logits placement (t{}) is \
+                             missing or is not {rn} whole rows of >= {vocab} — every rung the \
+                             bake shipped must load",
+                            dparsed.result_id
+                        )
+                    });
+                    // ⛔ THE RUNG'S OWN KINDS, AND EVERY KIND'S ROWS ARE THE RUNG'S OWN —
+                    // the auditor's Finding-1 refusal. A kind whose `rows` is
+                    // not this rung's width is a manifest that describes a
+                    // different rung than the one it rides (the mint's own
+                    // `rows` fact is the rung's bake width), and staging it
+                    // would leave some rows' stick heads reading ZERO — a
+                    // zero hash multiplier folds every row's noise to one
+                    // value. Refuse by name, never serve.
+                    // `rung_consts` arrives DOUBLE-referenced (the rungs loop
+                    // iterates `g0.decode_rungs` by reference, so the tuple's
+                    // `&[(u32, LoadConst)]` field re-borrows) — deref through
+                    // `.iter()`, the auditor's fix for the E0277 the chat leg's
+                    // pod build measured (this arm cannot compile on mac).
+                    for &(tid, kind) in rung_consts.iter() {
+                        // The rung-rows law is the SAMPLER tables' own — the
+                        // chain's decompose tables are functions of the vocab
+                        // alone (`chain_staged_tables`), never the rung's
+                        // width, so they carry no `rows` to check.
+                        if let scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                            rows, ..
+                        } = kind
+                            && rows != rung_n.get()
+                        {
+                            panic!(
+                                "decode batch rung seqs={rn}: its staged constant t{tid} \
+                                 carries rows={rows}, not the rung's own {rn} — the kind and \
+                                 the rung disagree about the bake width, and the short side's \
+                                 rows would read ZERO at their stick heads. REFUSING"
+                            );
+                        }
+                    }
+                    // FANNED OUT BELOW (the prefill ladder's shape): a rung's build is
+                    // ~0.2 s of per-BUNDLE work, and the rungs sit on the load's critical
+                    // path serially. The ADOPTION stays on this thread — aliasing is the
+                    // owner's, the same law as the prefill ladder's post-join
+                    // `alias_seg_from`.
+                    decode_jobs.push(DecodeRungJob {
+                        rn,
+                        rung_width,
+                        rcode,
+                        rung_consts,
+                        logits,
+                    });
+                }
+                // ── BUILD THE DECODE RUNGS IN PARALLEL ── one thread per rung, inside a
+                // detached thread joined at the adoption site below. The jobs are independent
+                // `new_borrowing` builds over static bundles; `spill_tids` is CLONED into the
+                // thread — a detached spawn cannot borrow this frame.
+                let decode_join = {
+                    let spill = spill_tids.clone();
+                    std::thread::spawn(move || {
+                        let _t = std::time::Instant::now();
+                        // Spawn EVERY rung first, join in a second pass — a `map` that joins
+                        // inside the closure is lazy, so it would run each build to completion
+                        // before the next thread exists. The prefill ladder's own shape.
+                        let built: Vec<Result<SuperDscSession, (usize, String)>> =
+                            std::thread::scope(|scope| {
+                                let handles: Vec<_> = decode_jobs
+                                    .iter()
+                                    .map(|job| {
+                                        let spill = spill.clone();
+                                        scope.spawn(move || {
+                                            SuperDscSession::new_borrowing_with_consts(
+                                                cards,
+                                                job.rcode,
+                                                scratchy_target_spyre::sdsc_runner::SessionDims {
+                                                    vocab,
+                                                    kv_dim,
+                                                    num_blocks,
+                                                },
+                                                &[1, 2],
+                                                job.rung_consts,
+                                                // A decode rung's rows are its requests', so its
+                                                // attention reads its pages through `chunk_page_ids`
+                                                // and stages no pool (`PagedStep::reads_kv_row_pool`).
+                                                &[],
+                                                &spill,
+                                            )
+                                            .map_err(|e| {
+                                                (
+                                                    job.rn,
+                                                    format!(
+                                                        "decode batch rung seqs={} FAILED to build \
+                                                         ({e}) — every rung the bake shipped must \
+                                                         load",
+                                                        job.rn
+                                                    ),
+                                                )
+                                            })
+                                        })
+                                    })
+                                    .collect();
+                                handles
+                                    .into_iter()
+                                    // A panicked rung thread re-panics with its own payload —
+                                    // the original message and location, not a replacement
+                                    // string. The join at the adoption site re-panics this
+                                    // thread's payload on the owning thread.
+                                    .map(|h| match h.join() {
+                                        Ok(r) => r,
+                                        Err(p) => std::panic::resume_unwind(p),
+                                    })
+                                    .collect()
+                            });
+                        info!(
+                            "[spyre-worker] sendnn: decode rung fan-out: {} rung(s) built in {:.0} ms",
+                            decode_jobs.len(),
+                            _t.elapsed().as_secs_f64() * 1e3
+                        );
+                        (decode_jobs, built)
+                    })
+                };
 
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
                 // prepare has staged and uploaded it. Every borrowing session gets a copy of this
@@ -2179,105 +2555,17 @@ impl SpyreWorker {
                     prefill_ladder.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
                     prefill_ladder.last().map(|(m, _)| *m).unwrap_or(0),
                 );
-                // ── PREFIX-CAPABLE PREFILL LADDER ── the bundles a continuation chunk (start>0) runs
-                // on. Every ladder rung above is prefix-FREE, so these are the ONLY prefill bundles
-                // that can attend resident KV. Borrows seg1+seg2 like the rungs, and is built AFTER
-                // the decode session so it cannot affect decode's weight-region placement. A rung
-                // that fails to load is a LOAD ERROR — every rung the bake shipped must load.
+                // ── PREFIX-CAPABLE PREFILL LADDER ── the join. The jobs and their fan-out were
+                // spawned with the prefill ladder's, right after the owner allocated (see
+                // `prefix_join` above); this waits for them and adopts, on this thread, in
+                // ladder order.
                 let mut prefix_built: Vec<(usize, SuperDscSession)> = Vec::new();
-                // A validated, UNBUILT prefix rung: the static bundle the background build
-                // needs, held until the fan-out below. The sentinel refusal stays on THIS
-                // thread — it is a manifest/wiring fact, not a build result.
-                struct PrefixRungJob {
-                    pmq: u32,
-                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
-                }
-                let pool_for_prefix = prefill_pool_statics(wirings)?;
-                let mut prefix_jobs: Vec<PrefixRungJob> = Vec::new();
-                for &(pmq, psent) in g0.prefill_prefix {
-                    if pmq <= 1 || psent.is_empty() {
-                        continue;
-                    }
-                    let pcode2 = psent
-                        .strip_prefix(SUPERDSC_SENTINEL)
-                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "prefix-capable prefill m={pmq}: sentinel did not resolve — \
-                                 every rung the bake shipped must load"
-                            )
-                        });
-                    prefix_jobs.push(PrefixRungJob { pmq, rcode: pcode2 });
-                }
-                // ── BUILD THE PREFIX RUNGS IN PARALLEL ── one scoped thread per rung (a
-                // handful at most). The jobs are independent `new_borrowing` builds over
-                // static bundles; `spill_tids` and the consts are borrowed for the scope's
-                // lifetime. The adoption and every refusal run on THIS thread after the
-                // join, in ladder order.
-                let _t_prefix_fanout = std::time::Instant::now();
-                let prefix_built_sessions: Vec<Result<SuperDscSession, (u32, String)>> =
-                    std::thread::scope(|scope| {
-                        let prefix_consts = wirings
-                            .prefill
-                            .as_ref()
-                            .unwrap_or(&wirings.decode)
-                            .load_consts;
-                        // Spawn EVERY rung first, join in a second pass — a `map` that joins
-                        // inside the closure is lazy, so it would run each build to completion
-                        // before the next thread exists. The prefill ladder's own shape.
-                        let handles: Vec<_> = prefix_jobs
-                            .iter()
-                            .map(|job| {
-                                let spill = &spill_tids;
-                                // PREFILL rungs: the pool's tables, per session
-                                // ([`prefill_pool_statics`]). Borrowed from outside the scope, as
-                                // `spill` is — a binding inside it would not outlive the spawn.
-                                let pool = &pool_for_prefix;
-                                scope.spawn(move || {
-                                    SuperDscSession::new_borrowing_with_consts(
-                                        cards,
-                                        job.rcode,
-                                        scratchy_target_spyre::sdsc_runner::SessionDims {
-                                            vocab,
-                                            kv_dim,
-                                            num_blocks,
-                                        },
-                                        &[1, 2],
-                                        // The general mint's nine tables, this bundle's
-                                        // own seg3 copy.
-                                        prefix_consts,
-                                        pool,
-                                        spill,
-                                    )
-                                    .map_err(|e| {
-                                        (
-                                            job.pmq,
-                                            format!(
-                                                "prefix-capable prefill m={} session build \
-                                                 failed: {e} — every rung the bake shipped \
-                                                 must load",
-                                                job.pmq
-                                            ),
-                                        )
-                                    })
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            // A panicked rung thread re-panics HERE with its own payload —
-                            // the original message and location, not a replacement string.
-                            .map(|h| match h.join() {
-                                Ok(r) => r,
-                                Err(p) => std::panic::resume_unwind(p),
-                            })
-                            .collect()
-                    });
-                info!(
-                    "[spyre-worker] sendnn: prefix rung fan-out: {} rung(s) built in {:.0} ms",
-                    prefix_jobs.len(),
-                    _t_prefix_fanout.elapsed().as_secs_f64() * 1e3
-                );
+                let (prefix_jobs, prefix_built_sessions) = match prefix_join.join() {
+                    Ok(v) => v,
+                    // A panicked fan-out thread re-panics HERE with its own payload — the
+                    // original message and location, not a replacement string.
+                    Err(p) => std::panic::resume_unwind(p),
+                };
                 for (job, built) in prefix_jobs.into_iter().zip(prefix_built_sessions) {
                     let mut ps = built.unwrap_or_else(|(_, m)| panic!("{m}"));
                     adopt_from_owner(&mut ps, &ss, &spill_images).unwrap_or_else(|e| {
@@ -2314,185 +2602,15 @@ impl SpyreWorker {
                 // rung the bake shipped must load, so a binary whose batch decode silently runs
                 // elsewhere can never serve.
                 let mut decode_ladder: Vec<DecodeRung> = Vec::new();
-                // A validated, UNBUILT decode rung: everything the background build needs,
-                // held until the fan-out below. `rcode`/`rung_consts` are static bundle facts;
-                // the rest are this loop's own derived facts, refused above where they were
-                // derived.
-                struct DecodeRungJob {
-                    rn: usize,
-                    rung_width: scratchy_subtile::sdsc_abstract::RungWidth,
-                    rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
-                    rung_consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
-                    logits: LogitsGeom,
-                }
-                let mut decode_jobs: Vec<DecodeRungJob> = Vec::new();
-                // ⛔ THE MANIFEST'S `SweptCols` IS DELIBERATELY NOT BOUND. It is the CEILING body's sweep —
-                // one number per BATCH WIDTH — and the two host decisions that used to read it are
-                // per-BODY (see `DecodeRung`). Binding it to `_` rather than to a name is the point: a
-                // named ceiling sitting in this loop is what got copied onto the rung three times.
-                for (rung_n, _ceiling_swept, sentinel, rung_consts) in g0.decode_rungs {
-                    // ⛔ `RungSeqs::get`, so this reads a BATCH WIDTH and says so. The sibling ladder
-                    // (`sk_bucket_rungs`) is keyed by the SWEEP EXTENT `active_cap`; selecting over it with
-                    // `>= live` would bind a body baked for a 64-column sweep because four requests are
-                    // live, and the fold would cover `active_cap * pages` columns while the deepest row
-                    // needs `write_slot + 1`. Both keys were bare `u32` until now.
-                    let rn = rung_n.get() as usize;
-                    // The one-request rung IS the `decode` session already built and aliased above.
-                    if rn <= 1 {
-                        continue;
-                    }
-                    // The manifest's `RungSeqs` IS a baked row count — this is the one boundary where
-                    // it becomes the launch-width vocabulary everything below runs on.
-                    let Some(rung_width) =
-                        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
-                    else {
-                        continue;
-                    };
-                    let rcode = sentinel
-                        .as_str()
-                        .strip_prefix(SUPERDSC_SENTINEL)
-                        .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "decode batch rung seqs={rn}: sentinel names no bundle compiled \
-                                 into this binary — every rung the bake shipped must load"
-                            )
-                        });
-                    // The rung's own logits placement, read from the bundle it actually runs. Derived,
-                    // never assumed: the width is stick-PADDED above the vocab, and the row count is
-                    // this rung's `seqs`, so both differ per rung. A rung whose placement does not
-                    // describe `rn` whole rows is a LOAD ERROR — a gathered-from guess would read
-                    // rows nobody wrote.
-                    // ⭐ THE LOGITS TID IS THE SEAT'S `row` WHEN THE BAKE MINTED A DRAW. The
-                    // token-draw mint re-points the rung's RESULT to the idx stick, so
-                    // `dparsed.result_id` names the `[rows, BLOCK]` pick — the placement exists
-                    // but is not `seqs` rows of vocab, and reading it as logits refused every
-                    // rung at load. The wiring's `SampleSeat.row` is the Sample node's
-                    // inputs[0] — the logits row the mint deliberately keeps placed and
-                    // readable by tid — the same fact the solo launch reads the pick through.
-                    // A bake without a draw keeps the result AS the logits (the host-argmax
-                    // readback this front replaces), so `result_id` stays the fallback.
-                    let logits_tid = wirings
-                        .decode
-                        .sample_seat
-                        .map(|seat| seat.row)
-                        .unwrap_or(dparsed.result_id as u32);
-                    let logits = rcode
-                        .layout
-                        .place_of_tid(logits_tid)
-                        .and_then(|p| LogitsGeom::from_placement(p.size, rung_width, vocab));
-                    let logits = logits.unwrap_or_else(|| {
-                        panic!(
-                            "decode batch rung seqs={rn}: its baked logits placement (t{}) is \
-                             missing or is not {rn} whole rows of >= {vocab} — every rung the \
-                             bake shipped must load",
-                            dparsed.result_id
-                        )
-                    });
-                    // ⛔ THE RUNG'S OWN KINDS, AND EVERY KIND'S ROWS ARE THE RUNG'S OWN —
-                    // the auditor's Finding-1 refusal. A kind whose `rows` is
-                    // not this rung's width is a manifest that describes a
-                    // different rung than the one it rides (the mint's own
-                    // `rows` fact is the rung's bake width), and staging it
-                    // would leave some rows' stick heads reading ZERO — a
-                    // zero hash multiplier folds every row's noise to one
-                    // value. Refuse by name, never serve.
-                    // `rung_consts` arrives DOUBLE-referenced (the rungs loop
-                    // iterates `g0.decode_rungs` by reference, so the tuple's
-                    // `&[(u32, LoadConst)]` field re-borrows) — deref through
-                    // `.iter()`, the auditor's fix for the E0277 the chat leg's
-                    // pod build measured (this arm cannot compile on mac).
-                    for &(tid, kind) in rung_consts.iter() {
-                        // The rung-rows law is the SAMPLER tables' own — the
-                        // chain's decompose tables are functions of the vocab
-                        // alone (`chain_staged_tables`), never the rung's
-                        // width, so they carry no `rows` to check.
-                        if let scratchy_target_spyre::wiring::LoadConst::SampleTable {
-                            rows, ..
-                        } = kind
-                            && rows != rung_n.get()
-                        {
-                            panic!(
-                                "decode batch rung seqs={rn}: its staged constant t{tid} \
-                                 carries rows={rows}, not the rung's own {rn} — the kind and \
-                                 the rung disagree about the bake width, and the short side's \
-                                 rows would read ZERO at their stick heads. REFUSING"
-                            );
-                        }
-                    }
-                    // FANNED OUT BELOW (the prefill ladder's shape): a rung's build is
-                    // ~0.2 s of per-BUNDLE work, and the rungs sit on the load's critical
-                    // path serially. The ADOPTION stays on this thread — aliasing is the
-                    // owner's, the same law as the prefill ladder's post-join
-                    // `alias_seg_from`.
-                    decode_jobs.push(DecodeRungJob {
-                        rn,
-                        rung_width,
-                        rcode,
-                        rung_consts,
-                        logits,
-                    });
-                }
-                // ── BUILD THE DECODE RUNGS IN PARALLEL ── one scoped thread per rung. The
-                // jobs are independent `new_borrowing` builds over static bundles;
-                // `spill_tids` is borrowed for the scope's lifetime. The adoption and every
-                // refusal run on THIS thread after the join, in ladder order.
-                let _t_decode_fanout = std::time::Instant::now();
-                let decode_built_sessions: Vec<Result<SuperDscSession, (usize, String)>> =
-                    std::thread::scope(|scope| {
-                        // Spawn EVERY rung first, join in a second pass — a `map` that joins
-                        // inside the closure is lazy, so it would run each build to completion
-                        // before the next thread exists. The prefill ladder's own shape.
-                        let handles: Vec<_> = decode_jobs
-                            .iter()
-                            .map(|job| {
-                                let spill = &spill_tids;
-                                scope.spawn(move || {
-                                    SuperDscSession::new_borrowing_with_consts(
-                                        cards,
-                                        job.rcode,
-                                        scratchy_target_spyre::sdsc_runner::SessionDims {
-                                            vocab,
-                                            kv_dim,
-                                            num_blocks,
-                                        },
-                                        &[1, 2],
-                                        job.rung_consts,
-                                        // A decode rung's rows are its requests', so its attention
-                                        // reads its pages through `chunk_page_ids` and stages no
-                                        // pool (`PagedStep::reads_kv_row_pool`).
-                                        &[],
-                                        spill,
-                                    )
-                                    .map_err(|e| {
-                                        (
-                                            job.rn,
-                                            format!(
-                                                "decode batch rung seqs={} FAILED to build \
-                                                 ({e}) — every rung the bake shipped must \
-                                                 load",
-                                                job.rn
-                                            ),
-                                        )
-                                    })
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            // A panicked rung thread re-panics HERE with its own payload —
-                            // the original message and location, not a replacement string.
-                            .map(|h| match h.join() {
-                                Ok(r) => r,
-                                Err(p) => std::panic::resume_unwind(p),
-                            })
-                            .collect()
-                    });
-                info!(
-                    "[spyre-worker] sendnn: decode rung fan-out: {} rung(s) built in {:.0} ms",
-                    decode_jobs.len(),
-                    _t_decode_fanout.elapsed().as_secs_f64() * 1e3
-                );
+                // The jobs and their fan-out were spawned with the prefill ladder's (see
+                // `decode_join` above); this is the join, and the adoption below runs on this
+                // thread, in ladder order.
+                let (decode_jobs, decode_built_sessions) = match decode_join.join() {
+                    Ok(v) => v,
+                    // A panicked fan-out thread re-panics HERE with its own payload — the
+                    // original message and location, not a replacement string.
+                    Err(p) => std::panic::resume_unwind(p),
+                };
                 for (job, built) in decode_jobs.into_iter().zip(decode_built_sessions) {
                     let mut rs = built.unwrap_or_else(|(_, m)| panic!("{m}"));
                     adopt_from_owner(&mut rs, &ss, &spill_images).unwrap_or_else(|e| {
@@ -2765,7 +2883,7 @@ mod weight_scale_fold_tests {
             })
             .collect();
         let dims = vec![1, vals.len()];
-        (id, bytes, dt, dims)
+        (id, HostBytes::Owned(bytes), dt, dims)
     }
 
     /// Decode staged bytes back to f32 (the payload already narrowed; widen for comparison).
@@ -2821,11 +2939,15 @@ mod weight_scale_fold_tests {
                     _ => v * 0.22,
                 })
                 .collect();
-            assert_eq!(decoded(dt, bytes), want, "t{id} ({dt:?}) kept one rounding");
+            assert_eq!(
+                decoded(dt, bytes.as_slice()),
+                want,
+                "t{id} ({dt:?}) kept one rounding"
+            );
         }
         let (_, bytes, _, _) = &weights[0];
         assert_eq!(
-            decoded(SDType::F16, bytes),
+            decoded(SDType::F16, bytes.as_slice()),
             vec![7.0, 8.0],
             "a tensor no fold names keeps its staged bytes"
         );
@@ -2843,14 +2965,19 @@ mod weight_scale_fold_tests {
             "the refusal names the tid: {err}"
         );
         // The staged tensor is untouched — a refusal leaves the bytes alone.
-        assert_eq!(decoded(SDType::F16, &weights[0].1), vec![1.0]);
+        assert_eq!(decoded(SDType::F16, weights[0].1.as_slice()), vec![1.0]);
     }
 
     /// An fp8 payload is a requantize, not a scale — the recognition refuses fp8 fold targets
     /// at BUILD time, so an fp8 fold reaching the runtime half can only be a desync. Refused.
     #[test]
     fn refuses_an_fp8_fold_target_as_a_desync() {
-        let mut weights = vec![(1usize, vec![0u8; 4], SDType::Fp8E4m3, vec![1, 4])];
+        let mut weights = vec![(
+            1usize,
+            HostBytes::Owned(vec![0u8; 4]),
+            SDType::Fp8E4m3,
+            vec![1, 4],
+        )];
         let err =
             apply_weight_scale_folds(&mut weights, &[(1u32, 2.0)]).expect_err("fp8 fold target");
         assert!(

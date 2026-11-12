@@ -221,14 +221,13 @@ impl FlexLogExtra {
 
     /// Port of `format_size`: append ` v<level>=<N><unit>` for each non-zero level.
     fn format_size(&self, out: &mut String, index: usize) {
-        for j in 0..=FOUT_MAX_LEVEL {
-            let n = self.fout_quantities[index][j];
-            if n == 0 {
+        for (j, n) in self.fout_quantities[index].iter().enumerate() {
+            if *n == 0 {
                 continue;
             }
-            if n <= 9999 {
+            if *n <= 9999 {
                 out.push_str(&format!(" v{j}={n}B"));
-            } else if n < 9_999_999 {
+            } else if *n < 9_999_999 {
                 out.push_str(&format!(" v{j}={}kiB", n / 1024));
             } else {
                 out.push_str(&format!(" v{j}={}MiB", n / 1024 / 1024));
