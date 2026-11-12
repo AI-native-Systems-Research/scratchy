@@ -53,4 +53,4 @@ scratchy-target-spyre-compiler = { path = "../compiler" }
 scratchy-quantizations = { path = "../../../models/quantization" }
 
 [dev-dependencies]
-scratchy-subtile = { path = "../../../compiler/subtile", features = ["spyre"] }
+scratchy-subtile = { path = "../../../compiler/subtile" }

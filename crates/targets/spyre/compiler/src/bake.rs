@@ -2097,7 +2097,7 @@ const SUB_BLOCKED_PREFILL_CEILING: u32 = 128;
 // build that has the pool (`spyre`: its `sdsc_abstract` is the Spyre target's).
 const _: () = assert!(
     PREFILL_RUNGS[PREFILL_RUNGS.len() - 1] as usize
-        == scratchy_subtile::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS,
+        == ktir_superdsc::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS,
     "PagedKvPool::PREFILL_CHUNK_SLOTS must equal the PREFILL_RUNGS ceiling — the pool's \
      WRITE_SLACK is derived from it, and a padded chunk write that overruns by more than the \
      slack corrupts the next kv head's keys"
@@ -2112,7 +2112,7 @@ const _: () = assert!(
 // every rung positive.
 const _: () = assert!(
     {
-        use scratchy_subtile::sdsc_abstract::PagedKvPool;
+        use ktir_superdsc::sdsc_abstract::PagedKvPool;
         let page = PagedKvPool::POOL_PAGE_SLOTS.get();
         let mut ok = true;
         let mut i = 0;
@@ -2180,7 +2180,7 @@ const _: () = assert!(
 // collision-free cap binds first); dense-only models → 31 (no fp8 gemm
 // constrains). Pinned by `emu_prefill_lx_width_pins_the_gemma4_rungs`.
 
-// Gated on `spyre`, with the one-home budget it reads: `scratchy_subtile::superdsc_opspec`
+// Gated on `spyre`, with the one-home budget it reads: `ktir_superdsc::superdsc_opspec`
 // is re-exported only under `spyre`, and the fn's one caller is the spyre bake block.
 fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 {
     use scratchy_forward_compiler_macro::shape::eval_closed_dim;
@@ -2252,7 +2252,7 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
         let w = prefix_len.min(r);
         if fp8_ns.iter().all(|&n| {
             scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n)
-                <= u128::from(scratchy_subtile::superdsc_opspec::LX_FUSION_BUDGET_BYTES)
+                <= u128::from(ktir_superdsc::superdsc_opspec::LX_FUSION_BUDGET_BYTES)
         }) {
             return w;
         }
@@ -2269,7 +2269,7 @@ fn emu_prefill_lx_width(fuf: &Fuf, model: &ModelParams, prefix_len: u32) -> u32 
         model.source_stem,
         scratchy_triton_splice::fp8_epilogue_peak_bytes(w, n),
         w,
-        u128::from(scratchy_subtile::superdsc_opspec::LX_FUSION_BUDGET_BYTES),
+        u128::from(ktir_superdsc::superdsc_opspec::LX_FUSION_BUDGET_BYTES),
         scratchy_triton_splice::FP8_EPILOGUE_LIVE_TILES,
     );
 }
@@ -2812,9 +2812,9 @@ pub(crate) fn dump_wavefront_mega(
                     (None, None) => (1u32, decode_rows),
                 };
                 let query_rows = (|| {
-                    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-                        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(per_request)?,
-                        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(requests)?,
+                    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+                        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(per_request)?,
+                        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(requests)?,
                     )
                 })()
                 .unwrap_or_else(|| {
@@ -2901,7 +2901,7 @@ pub(crate) fn dump_wavefront_mega(
                             // writes S logits rows and the draw serves exactly
                             // them.
                             scratchy_subtile::subtile_ir::SampleRows::Folded {
-                                requests: query_rows.requests(),
+                                requests: query_rows.requests().nonzero(),
                             }
                         } else {
                             scratchy_subtile::subtile_ir::SampleRows::All
@@ -3073,7 +3073,7 @@ pub(crate) fn dump_wavefront_mega(
                         // WITHOUT the frontend coarse-tile (time-tiling) pass — isolating
                         // "is the typed emitter's format dxp-valid?" from "does it tile
                         // large tiles?" (the latter = the coarse_tile port, next).
-                        use scratchy_subtile::sdsc_abstract::{
+                        use ktir_superdsc::sdsc_abstract::{
                             KernelTag, RowBlockedTag, StickLayout, Stk,
                         };
                         // Typed matmul operands (compile-time addressing): activation/output RowBlocked, weight Kernel.
@@ -4538,7 +4538,7 @@ pub(crate) fn dump_wavefront_mega(
             // ops at 32 requests, ~4 minutes alone), and dxp compiles groups in submission order, so
             // emitted last it started ~200 s into a granite-2b bake and WAS the bake's tail. Order is
             // free here: `decode_rung_lits` sorts the ladder by width before baking it.
-            for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS
+            for seqs in ktir_superdsc::sdsc_abstract::PagedKvPool::BATCH_RUNGS
                 .into_iter()
                 .rev()
             {
@@ -4622,15 +4622,15 @@ pub(crate) fn dump_wavefront_mega(
         // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
         // ERROR that names the model and its head_dim (the config's, typed at load).
         let prefill_head_width =
-            scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
+            ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
                 u64::from(model.text.head_dim.get()),
                 &model.name,
             );
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {
             r <= SUB_BLOCKED_PREFILL_CEILING
-                || scratchy_subtile::sdsc_abstract::NewBlockForm::of(r, prefill_head_width, false)
-                    == scratchy_subtile::sdsc_abstract::NewBlockForm::Chunk
+                || ktir_superdsc::sdsc_abstract::NewBlockForm::of(r, prefill_head_width, false)
+                    == ktir_superdsc::sdsc_abstract::NewBlockForm::Chunk
         };
         let admitted_ceiling = PREFILL_RUNGS
             .into_iter()
@@ -4999,9 +4999,9 @@ pub(crate) fn dump_wavefront_mega(
                 .iter()
                 .map(|(m, _)| *m)
                 .collect();
-            let window = scratchy_subtile::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
+            let window = ktir_superdsc::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
             if let Err(e) =
-                scratchy_subtile::sdsc_abstract::PagedKvPool::prefill_ladder_reaches_the_window(
+                ktir_superdsc::sdsc_abstract::PagedKvPool::prefill_ladder_reaches_the_window(
                     rung_admitted(window),
                     prefill_m,
                     &baked,
@@ -5033,7 +5033,7 @@ pub(crate) fn dump_wavefront_mega(
                 .iter()
                 .map(|(m, _)| *m)
                 .collect();
-            let asked = scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
+            let asked = ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
             for &m in &asked {
                 match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
                     fuf,
@@ -5108,7 +5108,7 @@ pub(crate) fn dump_wavefront_mega(
                 .map(|(m, _)| *m)
                 .collect();
             if let Err(e) =
-                scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
+                ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
                     &baked, &prefix,
                 )
             {
@@ -5117,7 +5117,7 @@ pub(crate) fn dump_wavefront_mega(
             // ⛔⛔⛔ AND EVERY RUNG BELOW THE TOP THAT WAS ASKED FOR MUST HAVE BAKED. A missing one is silent:
             // its chunks run on the next wider rung. See `PagedKvPool::prefix_ladder_bakes_every_rung`.
             if let Err(e) =
-                scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
+                ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
                     &asked,
                     &prefix,
                     &[],

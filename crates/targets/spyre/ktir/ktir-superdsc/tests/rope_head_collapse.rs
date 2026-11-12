@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! The RoPE head-major collapse is valid at ANY row count — the law batched decode now rests on.
 //!
 //! RoPE used to emit one block per (row, head): ~40 ops per op-type, ~150 a layer, and its own
@@ -13,7 +12,7 @@
 //! actually depends on it, because a drift in either is silent: the ops still emit, the bundle still
 //! bakes, and the rotation lands on the wrong head or the wrong position.
 
-use scratchy_subtile::sdsc_abstract::StickLayout;
+use ktir_superdsc::sdsc_abstract::StickLayout;
 
 const HD: usize = 64; // one fp16 stick — the collapse's precondition
 const HEADS: usize = 32;
@@ -74,11 +73,11 @@ fn the_staged_angles_land_where_the_collapsed_read_expects() {
 /// the emitter keeps the slab form for `hd > 64`.
 #[test]
 fn the_collapse_is_refused_above_one_stick_per_head() {
-    use scratchy_subtile::superdsc_opspec::Fp16;
+    use ktir_superdsc::superdsc_opspec::Fp16;
     assert!(
-        (64u32 == <Fp16 as scratchy_subtile::superdsc_opspec::DataFormat>::DF.elems_per_stick())
+        (64u32 == <Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::DF.elems_per_stick())
     );
     assert!(
-        !(128u32 == <Fp16 as scratchy_subtile::superdsc_opspec::DataFormat>::DF.elems_per_stick())
+        !(128u32 == <Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::DF.elems_per_stick())
     );
 }

@@ -25,8 +25,8 @@
 
 use ktir_superdsc::emit;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
-use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
-use scratchy_subtile::superdsc_opspec::{
+use ktir_superdsc::sdsc_abstract::{KernelTag, Stk};
+use ktir_superdsc::superdsc_opspec::{
     Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, OpFunc, Role, Scale, TensorArg,
     USABLE_LX_BYTES, WorkPlan,
 };
@@ -937,10 +937,10 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
             superdsc::ActiveCap::FULL,
             true,
             // The graph's own extent pair: 64 rows that are 64 requests — one row each.
-            scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-                scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+            ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+                ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
                     .expect("one row is nonzero"),
-                scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(64)
+                ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(64)
                     .expect("64 requests is nonzero"),
             )
             .expect("64 rows fit a u32"),
@@ -952,10 +952,10 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         superdsc::ActiveCap::FULL,
         true,
         // Same pair as the KTIR half above: 64 requests of one row.
-        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+        ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
                 .expect("one row is nonzero"),
-            scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(64)
+            ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(64)
                 .expect("64 requests is nonzero"),
         )
         .expect("64 rows fit a u32"),
@@ -1373,8 +1373,8 @@ fn dump_gate_bundles() {
     //     (broadcast read). Tests whether dxp accepts a broadcast operand.
     let bc = emit::assemble_broadcast_mul_gate::<ktir_superdsc::collective::TpWorld<1>>(
         "bcast_mul",
-        scratchy_subtile::sdsc_abstract::RowCount::of_token_rows(64),
-        scratchy_subtile::sdsc_abstract::BlockCols::of_feature_cols(256),
+        ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(64),
+        ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(256),
         "bc_x",
         "bc_v",
         "bc_o",

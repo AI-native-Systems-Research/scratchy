@@ -3535,6 +3535,12 @@ impl RungCap {
         self.0.get()
     }
 
+    /// The capacity as the nonzero count the shared IR's sampler fold takes
+    /// (`SampleRows::Folded`) — handed over, never re-minted.
+    pub const fn nonzero(self) -> NonZeroU32 {
+        self.0
+    }
+
     /// The sequence count as a host-side extent — the arithmetic exit.
     pub const fn count(self) -> usize {
         self.0.get() as usize

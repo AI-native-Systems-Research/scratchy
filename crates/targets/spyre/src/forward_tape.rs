@@ -902,14 +902,14 @@ mod tests {
             let x: Vec<f32> = (0..w).map(|i| (i * 7 % 13) as f32).collect();
             assert_eq!(stick_scatter(1, w, &x), x, "width {w}");
             assert!(
-                scratchy_subtile::sdsc_abstract::row_major_is_stick_major(1, w),
+                ktir_superdsc::sdsc_abstract::row_major_is_stick_major(1, w),
                 "one row coincides at every width"
             );
         }
         // One stick's worth of columns coincides at EVERY row count — the predicate's other arm.
         for r in [1usize, 2, 4, 8] {
             assert!(
-                scratchy_subtile::sdsc_abstract::row_major_is_stick_major(r, 64),
+                ktir_superdsc::sdsc_abstract::row_major_is_stick_major(r, 64),
                 "one-stick columns coincide at every row count"
             );
         }
@@ -923,7 +923,7 @@ mod tests {
         let got = stick_scatter(rows, width, &src);
         assert_ne!(got, src, "two rows must interleave");
         assert!(
-            !scratchy_subtile::sdsc_abstract::row_major_is_stick_major(rows, width),
+            !ktir_superdsc::sdsc_abstract::row_major_is_stick_major(rows, width),
             "past the coincidence the row-major staging is NOT the scattered bytes — the \
              chained head's leg 4 exists exactly here"
         );

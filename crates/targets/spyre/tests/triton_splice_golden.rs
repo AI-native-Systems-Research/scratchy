@@ -2855,7 +2855,7 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
     };
     let ir = attn_ir(s, 0.125f32);
     let attn = &ir.nodes[1];
-    let splice = |pair: scratchy_subtile::sdsc_abstract::QueryExtent| {
+    let splice = |pair: ktir_superdsc::sdsc_abstract::QueryExtent| {
         scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
             attn,
             &ir,
@@ -2866,10 +2866,10 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         )
     };
     // The S=2 mint: two requests of 64 rows over the 128-row graph.
-    let packed = scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(64)
+    let packed = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(64)
             .expect("the rung's width is nonzero"),
-        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(2)
+        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(2)
             .expect("the rung's capacity is nonzero"),
     )
     .expect("128 rows fit a u32");
@@ -2886,10 +2886,10 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         .unwrap_or_else(|e| panic!("the S=1 mint splices the same graph: {e}"));
     // ⛔ AND A MINT THAT DOES NOT DESCRIBE THE GRAPH IS REFUSED, BY NAME, with both extents
     // stated — never a silently-wrong `PADDED_QUERY_LEN`.
-    let mismatch = scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(64)
+    let mismatch = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(64)
             .expect("the rung's width is nonzero"),
-        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(3)
+        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(3)
             .expect("the rung's capacity is nonzero"),
     )
     .expect("192 rows fit a u32");
@@ -2921,11 +2921,11 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
 
 /// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows. Pure arithmetic,
 /// read by the door tests every build runs, so it is not behind the emulator.
-fn pair_of_one_request(mq: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
-    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(mq)
+fn pair_of_one_request(mq: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
+    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(mq)
             .expect("the shape's row count is nonzero"),
-        scratchy_subtile::sdsc_abstract::RungCap::ONE,
+        ktir_superdsc::sdsc_abstract::RungCap::ONE,
     )
     .expect("one request's rows fit a u32")
 }
@@ -2933,10 +2933,10 @@ fn pair_of_one_request(mq: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent 
 /// The extent pair a BATCH walk states: `rows` rows that are `rows` requests, one row
 /// each — the pair's held product is the graph's row count, which the batched kernel
 /// arm reads.
-fn batch_pair_of_one_row_each(rows: u32) -> scratchy_subtile::sdsc_abstract::QueryExtent {
-    scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
-        scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(rows)
+fn batch_pair_of_one_row_each(rows: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
+    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
+        ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(rows)
             .expect("the batch's sequence count is nonzero"),
     )
     .expect("the batch's rows fit a u32")

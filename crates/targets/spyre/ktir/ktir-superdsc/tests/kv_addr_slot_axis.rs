@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! THE POOL'S SLOT AXIS, AT ANY HEAD DIM — what the deleted request dimension turned into.
 //!
 //! ⛔⛔⛔ THIS FILE REPLACES `kv_addr_request_dim.rs`, WHICH HAD BEEN BREAKING THE WHOLE TEST BUILD.
@@ -16,16 +15,16 @@
 //! cannot be written down any more. What survives translation is the SLOT and FEATURE geometry, which is
 //! where the two plane families part company above head_dim 64.
 
-use scratchy_subtile::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
+use ktir_superdsc::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
 use std::num::NonZeroU32;
 
 /// The test pool: head count and width as the raw fixture numbers, minted through the pool's
 /// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
-fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
-    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
         std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
             .expect("a fixture pool has heads"),
-        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
             u32::try_from(hd).expect("a fixture head width fits a u32"),
         ),
     )

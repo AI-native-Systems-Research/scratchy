@@ -22,7 +22,7 @@ use ktir_superdsc::superdsc_opspec::{
     DataFormat, Df, EntryBase, Fp8, Fp16, GatherIndex, GatherRun, KernelAxis, PageExtent, Role,
     SdscFoldSet,
 };
-use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+use ktir_superdsc::sdsc_abstract::{KernelTag, Stk};
 use scratchy_target_spyre::dxp_cache::GroupDigest;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 use scratchy_target_spyre::superdsc_bake::{ChunkExplore, GroupId, SealedGroup};

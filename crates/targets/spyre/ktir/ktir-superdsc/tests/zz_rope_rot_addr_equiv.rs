@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! DOES THE `y`-BATCHED ROTATE ADDRESS THE SAME BYTES AS THE PER-HEAD ONE? Differenced out of the
 //! EMITTED per-core start addresses, never predicted — the rule this file exists to obey.
 //!
@@ -10,8 +9,8 @@
 //! bytes, and this says which — at hd=128, where a wrong slab or a transposed kernel coordinate is
 //! expressible, and at hd=64, where it is not.
 
-use scratchy_subtile::addr::{DevOff, Feat, Idx, Nest, Row};
-use scratchy_subtile::superdsc_opspec::Df;
+use ktir_superdsc::addr::{DevOff, Feat, Idx, Nest, Row};
+use ktir_superdsc::superdsc_opspec::Df;
 
 const HD: u32 = 128;
 const STK: u32 = 64;
@@ -27,7 +26,7 @@ fn p_nest() -> Nest {
 /// THE WORKER'S OWN FILL LAW, so the test compares against what is actually in the buffer:
 /// `stage_2d(StickLayout::kernel(hd,hd), |inn, o| rope_p_entry(hd, inn, o))`.
 fn p_value_at(inn: u32, o: u32) -> i8 {
-    scratchy_subtile::sdsc_abstract::rope_p_entry(HD as usize, inn as usize, o as usize)
+    ktir_superdsc::sdsc_abstract::rope_p_entry(HD as usize, inn as usize, o as usize)
 }
 
 /// ⭐ THE BLOCK THE `y`-BATCHED FORM READS for output slab `s`, and what is really in it. If the

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! THE DECODE LADDER AS TYPES — documentation of the law `PaddedMq::of_bundle` / `Rung<MQ>` carry.
 //!
 //! The load-bearing enforcement is the TYPE, not these tests: a non-ladder decode width cannot name
@@ -9,7 +8,7 @@
 //! accepts them separately. What CAN be exercised at runtime is the parse boundary itself — the one
 //! `match` from a runtime width to the consts — and that is what these pin.
 
-use scratchy_subtile::sdsc_abstract::{PaddedMq, PagedKvPool, Rung};
+use ktir_superdsc::sdsc_abstract::{PaddedMq, PagedKvPool, Rung};
 
 /// Every width the ladder bakes crosses the boundary, and comes out with the pad the pad law gives:
 /// one stick (64) at every rung — the single-window new-block form the card has accepted.

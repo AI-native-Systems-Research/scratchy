@@ -19,7 +19,7 @@ use std::num::NonZeroU32;
 
 use ktir_superdsc::ktir_node::ActiveCap;
 use scratchy_subtile::fixtures::mlp_sublayer;
-use scratchy_subtile::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
+use ktir_superdsc::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
 use scratchy_subtile::subtile_ir::lower_region;
 use scratchy_target_spyre::bundle_code::collective::{Rank, TpWorld};
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;

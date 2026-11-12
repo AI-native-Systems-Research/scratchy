@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! A BATCHED-DECODE logits row is not where a reader assumes it is.
 //!
 //! The lm-head tail of a batched-decode bundle runs unfolded at `m = requests`, so its output is a
@@ -13,7 +12,7 @@
 //! distribution. Fluent output, wrong token, no crash. These tests pin the law the worker's gather
 //! is derived from, at the real granite geometry.
 
-use scratchy_subtile::sdsc_abstract::StickLayout;
+use ktir_superdsc::sdsc_abstract::StickLayout;
 
 /// granite-3.1-2b: 49155 logical vocab, placed 51200 wide (the emitter pads the vocab axis to a whole
 /// number of sticks per core: 51200/64 = 800 sticks = 25 per core across 32 cores).

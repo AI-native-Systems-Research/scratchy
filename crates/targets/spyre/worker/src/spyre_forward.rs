@@ -177,7 +177,7 @@ pub(crate) struct SamplerLaws<'a> {
     // ONLY where the card cannot have: a request's first step on a rung session, a churned seat, a
     // rung switch. `SeedSource::OnCard` is that statement — a stable seating — and binds nothing.
     // A prompt chunk's rows are the prompt's own tokens, always `Host`.
-    pub(crate) seeds: scratchy_subtile::sdsc_abstract::SeedSource<'a>,
+    pub(crate) seeds: ktir_superdsc::sdsc_abstract::SeedSource<'a>,
     pub(crate) want_logits: LogitsWanted,
     // ⭐ THE SEAT LAWS THIS LAUNCH'S ROWS RUN UNDER — one law per row the suffix's sampler picks
     // for, staged before anything runs. A middle prompt chunk's suffix never runs, so the value it
@@ -203,7 +203,7 @@ pub(crate) fn run_card_launch(
     sh: &Shared<'_>,
     pf: &mut SuperDscSession,
     b: &BundleMeta,
-    width: scratchy_subtile::sdsc_abstract::RungWidth,
+    width: ktir_superdsc::sdsc_abstract::RungWidth,
     sampler: SamplerLaws<'_>,
 ) -> ExecutorResult<BatchOut> {
     let SamplerLaws {
@@ -267,7 +267,7 @@ pub(crate) fn run_card_launch(
     // `OnCard` launch binds none: its seeds are the card's own ChainStage writes, which only a
     // decode-phase bundle's tape reads.
     let tokens: Vec<usize> = match seeds {
-        scratchy_subtile::sdsc_abstract::SeedSource::Host(t) => {
+        ktir_superdsc::sdsc_abstract::SeedSource::Host(t) => {
             if t.len() != live {
                 return Err(werr(format!(
                     "card launch: {} seed token(s) for {live} live row(s) — one per live row",
@@ -276,7 +276,7 @@ pub(crate) fn run_card_launch(
             }
             (0..mq).map(|r| t[rows_in.live_of(r)]).collect()
         }
-        scratchy_subtile::sdsc_abstract::SeedSource::OnCard => {
+        ktir_superdsc::sdsc_abstract::SeedSource::OnCard => {
             if matches!(
                 b.wiring.phase,
                 scratchy_target_spyre::forward_tape::ForwardPhase::Prefill
@@ -298,7 +298,7 @@ pub(crate) fn run_card_launch(
     // The stick-padded row count the constants' tables are laid at — whole
     // fp16 sticks, the pool's own `POOL_STICK` (the emitter's own pad law),
     // never a literal 64.
-    let stick = scratchy_subtile::sdsc_abstract::POOL_STICK as usize;
+    let stick = ktir_superdsc::sdsc_abstract::POOL_STICK as usize;
     let mq_pad = mq.div_ceil(stick) * stick;
     if h % stick != 0 {
         return Err(werr(format!(
@@ -328,8 +328,8 @@ pub(crate) fn run_card_launch(
         // an `OnCard` launch passes `None` and the launcher's ChainSeed steps stage nothing. A
         // prompt chunk's tape has no ChainSeed step, so `Some` there is inert.
         chain_seeds: match seeds {
-            scratchy_subtile::sdsc_abstract::SeedSource::Host(_) => Some(&tokens[..]),
-            scratchy_subtile::sdsc_abstract::SeedSource::OnCard => None,
+            ktir_superdsc::sdsc_abstract::SeedSource::Host(_) => Some(&tokens[..]),
+            ktir_superdsc::sdsc_abstract::SeedSource::OnCard => None,
         },
         positions: &positions,
         consts: &consts,
@@ -1107,11 +1107,11 @@ fn decode_idx_stick(
         .collect();
     // The idx stick's own format decides the stride — the same law every device
     // tensor's host-side address takes (`dev_off_stk`), never a guessed row pitch.
-    let stk = <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+    let stk = <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
         as usize;
     (0..rows)
         .map(|r| {
-            let off = scratchy_subtile::sdsc_abstract::dev_off_stk(
+            let off = ktir_superdsc::sdsc_abstract::dev_off_stk(
                 &[rows, idx_row_words],
                 1,
                 &[r, 0],
@@ -1213,7 +1213,7 @@ fn log_seat_readback(
     // tables (inv_t): each row's word at its stick head. Derived from the
     // format's own stick (the ladder's one derivation), never spelled here.
     const FP32_ELEMS_PER_STICK: usize =
-        <scratchy_subtile::superdsc_opspec::Fp32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        <ktir_superdsc::superdsc_opspec::Fp32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
             as usize;
     let invt: Vec<f32> = match le_words(session, seat.invt, rows * FP32_ELEMS_PER_STICK) {
         Ok(ws) => (0..rows)
@@ -1232,7 +1232,7 @@ fn log_seat_readback(
     // that moved one and not the other must move its own reader, not both by
     // accident of a shared literal.
     const U32_ELEMS_PER_STICK: usize =
-        <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
             as usize;
     let mut hash = String::new();
     for (name, operand) in [("hc1", 10u8), ("hc2", 11), ("hc3", 12), ("c256", 13)] {
@@ -1284,7 +1284,7 @@ fn log_seat_readback(
     };
     let pad_v = seat.pad_vocab as usize;
     let vocab = seat.vocab as usize;
-    let stk = <scratchy_subtile::superdsc_opspec::Fp16 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+    let stk = <ktir_superdsc::superdsc_opspec::Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
         as usize;
     let mut argmax: Vec<(usize, u32)> = Vec::with_capacity(report.len());
     match session.read_tensor_raw(
@@ -1295,7 +1295,7 @@ fn log_seat_readback(
             for &r in &report {
                 let mut best = (0usize, f32::NEG_INFINITY);
                 for j in 0..vocab {
-                    let e = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                    let e = ktir_superdsc::sdsc_abstract::dev_off_stk(
                         &[rows, pad_v],
                         1,
                         &[r, j],
@@ -1432,7 +1432,7 @@ pub(crate) fn superdsc_forward_chunk(
             .collect::<ExecutorResult<Vec<usize>>>()?;
         let last = pos + real == end;
         let finishes = last && end >= tokens.prompt_len(id);
-        let rung = scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(width as u32)
+        let rung = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(width as u32)
             .ok_or_else(|| werr("superdsc prefill: the selected rung has zero rows".to_string()))?;
         let out = run_card_launch(
             LaunchRows::Sequence {
@@ -1449,7 +1449,7 @@ pub(crate) fn superdsc_forward_chunk(
             pmeta,
             rung,
             SamplerLaws {
-                seeds: scratchy_subtile::sdsc_abstract::SeedSource::Host(&chunk_toks),
+                seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&chunk_toks),
                 want_logits: if finishes {
                     LogitsWanted::LastRow
                 } else {
@@ -2351,12 +2351,12 @@ mod idx_stick_tests {
     /// readback reads.
     fn stick(picks: &[u32]) -> Vec<u8> {
         let rows = picks.len();
-        let stk = <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        let stk = <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
             as usize;
         let mut words = vec![0i32; rows * ROW_WORDS];
         for (r, &p) in picks.iter().enumerate() {
             for c in 0..ROW_WORDS {
-                let off = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                let off = ktir_superdsc::sdsc_abstract::dev_off_stk(
                     &[rows, ROW_WORDS],
                     1,
                     &[r, c],

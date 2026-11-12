@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 
 //! ⭐ THE PAGES A REQUEST HOLDS COME FROM THE HOST, AND THE CACHEABLE PREFIX STOPS AT THE FIRST HOLE.
 //!
@@ -13,7 +12,7 @@
 //!   masked hole and its keys stop being token-addressed there. Only the leading run may be hashed by a
 //!   token-indexed prefix cache.
 
-use scratchy_subtile::sdsc_abstract::{
+use ktir_superdsc::sdsc_abstract::{
     BatchSlot, BlockTable, KvHistory, PagedKvPool, PoolPages, PoolPartition, PoolRows, RowPages,
     SlotCount,
 };
@@ -98,10 +97,10 @@ fn coverage_is_pages_times_page_slots() {
     // The cap is built through the artifact's own path (`of_placement`) — the ceiling is a bake
     // fact read from a pmask placement, never a const, so the test derives it the way the worker
     // does: 16 blocks of one broadcast row, 2 B per slot over PAGE slots.
-    let ceiling = scratchy_subtile::sdsc_abstract::BakedMaskBlocks::of_placement(
+    let ceiling = ktir_superdsc::sdsc_abstract::BakedMaskBlocks::of_placement(
         16 * PAGE as u64 * 2,
         1,
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("width 1 is baked"),
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1).expect("width 1 is baked"),
         SlotCount::new(PAGE),
     )
     .expect("a 16-block cap from a 16-block placement");
@@ -181,7 +180,7 @@ fn a_prefill_records_one_run_so_a_whole_prompt_stays_cacheable() {
     while at < 700 {
         let n = 96u32.min(700 - at);
         let start = PagedKvPool::chunk_write_start(
-            scratchy_subtile::sdsc_abstract::KvSlot::new(at),
+            ktir_superdsc::sdsc_abstract::KvSlot::new(at),
             SlotCount::new(96),
         );
         h.record_chunk(start.wrote(SlotCount::new(n)));

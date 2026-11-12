@@ -676,11 +676,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
     /// bound keyed. A forward whose key equals it has nothing to bind for `id`.
     ///
-    /// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
+    /// [`CausalKey`]: ktir_superdsc::sdsc_abstract::CausalKey
     pub fn keyed_holds(
         &self,
         id: crate::bundle_code::PlaceId,
-    ) -> Option<scratchy_subtile::sdsc_abstract::CausalKey> {
+    ) -> Option<ktir_superdsc::sdsc_abstract::CausalKey> {
         self.ranks.first().keyed_holds(id)
     }
 
@@ -752,7 +752,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     pub fn bind_keyed(
         &mut self,
         id: crate::bundle_code::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: ktir_superdsc::sdsc_abstract::CausalKey,
         vals: &[f32],
     ) -> Result<()> {
         let bytes = f32_to_f16_le(vals);
@@ -775,7 +775,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
     pub fn stage_keyed(
         &mut self,
         id: crate::bundle_code::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: ktir_superdsc::sdsc_abstract::CausalKey,
         vals: &[f32],
     ) -> Result<u64> {
         let bytes = f32_to_f16_le(vals);

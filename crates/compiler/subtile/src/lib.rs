@@ -34,17 +34,6 @@ pub mod lower;
 /// bake, whatever the target (scratchy_ir::model_facts::Attention).
 pub mod model_geometry;
 pub mod subtile_ir;
-// ⭐ THE SuperDSC DEVICE FACTS, FROM THE `ktir-superdsc` LEAF CRATE: the typed SuperDSC IR
-// (`superdsc_opspec`/`superdsc_error`), `sdsc_abstract`, and the `addr` build-time address
-// interpreter that PROVES the emitted SDSC attention computes the SubtileIR math
-// (`softmax(q·kᵀ·scale+mask)·v`) over the real device addresses, so a translation bug is a
-// `cargo build` panic rather than an on-card discovery. Re-exported so the Spyre lowering and
-// worker name them as `scratchy_subtile::sdsc_abstract::…`.
-//
-// ⛔ GATED ON `spyre`, WITH THE DEPENDENCY. Nothing a metal or cuda build compiles names these, so
-// those builds leave the whole `ktir-superdsc`/`ktir-core` graph out.
-#[cfg(feature = "spyre")]
-pub use ktir_superdsc::{addr, sdsc_abstract, superdsc_error, superdsc_opspec};
 // ⛔ UNGATED, AND THAT IS THE POINT. The re-roll machinery (`reroll_subtile_tape` /
 // `lower_dag_to_tape` / the `OpenLoop`/`CloseLoop` tape) is THE shared artifact: the
 // SuperDSC emitter (which re-rolls the layer loop so dxp compiles ONE small body

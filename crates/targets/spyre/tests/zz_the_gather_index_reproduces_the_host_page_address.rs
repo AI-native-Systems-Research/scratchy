@@ -16,11 +16,11 @@
 
 /// The test pool: head count and width as the raw fixture numbers, minted through the pool's
 /// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
-fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
-    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
         std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
             .expect("a fixture pool has heads"),
-        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
             u32::try_from(hd).expect("a fixture head width fits a u32"),
         ),
     )
@@ -59,7 +59,7 @@ fn skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one() {
     const NKVH: u64 = 8;
     const HD: u64 = 64;
     const POOL_PAGE_SLOTS: u64 =
-        scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
+        ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
     const BYTES_PER_ELEM: u64 = 2; // fp16 KV
 
     // One layer's page, as the pool lays it out.
@@ -111,7 +111,7 @@ fn skip_addr_must_equal_one_layer_page_so_the_operand_must_span_one() {
 /// first, uniformly, silently. There is no safe default, so there is a `None`.
 #[test]
 fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
-    use scratchy_subtile::sdsc_abstract::gather_entries_per_page;
+    use ktir_superdsc::sdsc_abstract::gather_entries_per_page;
     let pool = pool(8, 64);
     assert!(
         gather_entries_per_page(pool.stick_block_bytes() + 1, pool).is_none(),
@@ -145,7 +145,7 @@ fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
 ///   one mask block. A pitch that disagrees gathers pass `p` from another pass's entries.
 #[test]
 fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
-    use scratchy_subtile::sdsc_abstract::{
+    use ktir_superdsc::sdsc_abstract::{
         GatherScratch, PAGE_MASK_COLS, POOL_STICK, PrefixMaskShape, QueryRowCount, SlotCount,
         SlotWindow, gather_entries_per_page, gather_index_table,
     };
@@ -171,7 +171,7 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
         .expect("a page that is a whole number of stick blocks");
     let pass_stride = PrefixMaskShape::<POOL_STICK, PAGE_MASK_COLS>::new(
         1,
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(2).expect("2 is a baked rung"),
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(2).expect("2 is a baked rung"),
     )
     .expect("one head is a shape")
     .pass_stride();
@@ -265,7 +265,7 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
 /// built at the ceiling is a strict SUPERSET of the narrow body's, at identical indices.
 #[test]
 fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds() {
-    use scratchy_subtile::sdsc_abstract::{
+    use ktir_superdsc::sdsc_abstract::{
         GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
         SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
     };
@@ -317,7 +317,7 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
             .expect("a page that is a whole number of stick blocks");
         let pass_stride = PrefixMaskShape::<POOL_STICK, PAGE_MASK_COLS>::new(
             32,
-            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(2).expect("a baked rung"),
+            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(2).expect("a baked rung"),
         )
         .expect("a shape")
         .pass_stride();

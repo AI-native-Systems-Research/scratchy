@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! MLP + RESIDUAL BRIDGE PROOF (staged-lowering verification, ≤3-fan-out).
 //!
 //! The symptom is the residual dominated by a linearly-growing channel (`ch247`), injected by the
@@ -13,7 +12,7 @@
 //! (no stick-pad aliasing) — the real on-card decode layout. Run:
 //!   cargo test -p scratchy-subtile --features spyre --test sdsc_mlp_layout
 
-use scratchy_subtile::sdsc_abstract::*;
+use ktir_superdsc::sdsc_abstract::*;
 
 const HIDDEN: usize = 64;
 const INTER: usize = 192;

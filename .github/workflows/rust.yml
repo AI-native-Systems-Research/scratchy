@@ -583,19 +583,14 @@ jobs:
       - name: Test (spyre ktir-superdsc + bundle)
         run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
       # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
-      # a missing initializer field kept the lib tests from compiling). Pure Rust, no device, on
-      # the ktir-superdsc build the step above leaves. Under `spyre`, which gates no test out; and
-      # featureless, the build metal links, whose test targets must compile too.
-      - name: Test (scratchy-subtile, spyre)
-        run: cargo test -p scratchy-subtile --features spyre
-      - name: Test (scratchy-subtile, featureless)
+      # a missing initializer field kept the lib tests from compiling). Pure Rust, no device.
+      - name: Test (scratchy-subtile)
         run: cargo test -p scratchy-subtile
       # The test targets of spyre-bundle and subtile at -D warnings: `cargo test` compiles
       # them but never lints them, so lint debt piles up in them unseen.
       - name: Clippy (spyre-bundle, scratchy-subtile, tests)
         run: |
           cargo clippy -p scratchy-spyre-bundle --tests -- -D warnings
-          cargo clippy -p scratchy-subtile --features spyre --tests -- -D warnings
           cargo clippy -p scratchy-subtile --tests -- -D warnings
       # The forward-compiler macro's lib under `spyre`: the leg its FP8-block fingerprint test runs
       # in (metal claims no FP8-block preset). The metal leg runs in the macOS job.

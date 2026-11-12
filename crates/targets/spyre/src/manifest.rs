@@ -371,7 +371,7 @@ pub fn attn_causal_mask_fill(mq: usize) -> Vec<f32> {
     let mut m = vec![0.0f32; mq * mq];
     for r in 0..mq {
         for c in 0..mq {
-            if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, r) {
+            if !ktir_superdsc::sdsc_abstract::prefill_causal_col_valid(c, r) {
                 m[r * mq + c] = -1.0e38;
             }
         }

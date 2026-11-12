@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! MODEL PARAMS DRIVE ADDRESSING — the property, not an instance of it.
 //!
 //! Every addressing bug this week was a stride written by hand from the one model that had ever run:
@@ -11,8 +10,8 @@
 //! head_dims, must produce each model's correct address. A test that passes at one head_dim and needs a
 //! branch at the other has reintroduced the special case.
 
-use scratchy_subtile::addr::{Idx, Rows, Shape, Slot};
-use scratchy_subtile::superdsc_opspec::Df;
+use ktir_superdsc::addr::{Idx, Rows, Shape, Slot};
+use ktir_superdsc::superdsc_opspec::Df;
 
 /// Slab count is DERIVED from (head_dim, format) -- never a constant, and never branched on. At one
 /// stick per head it degenerates to 1 and every slab term vanishes, which is exactly why hd=64 models
@@ -75,7 +74,7 @@ fn head_base_comes_from_the_nest_at_both_head_dims() {
         for kvh in 0..8u32 {
             let got = nest
                 .view()
-                .at(Idx::<scratchy_subtile::addr::Head>::n(kvh))
+                .at(Idx::<ktir_superdsc::addr::Head>::n(kvh))
                 .dev()
                 .into_raw_elems();
             assert_eq!(
@@ -135,7 +134,7 @@ fn the_collapse_identity_holds_exactly_where_the_predicate_says() {
 /// head_dim, and the coordinate inside must be unaffected by which block it is in.
 #[test]
 fn block_index_steps_by_the_blocks_own_footprint() {
-    use scratchy_subtile::addr::{Nest, Slot};
+    use ktir_superdsc::addr::{Nest, Slot};
     for hd in [64u32, 128] {
         let cap = 128u32;
         let blk = Nest::new(&["slot", "feat"], &[cap, hd], Df::Fp16);
@@ -164,14 +163,14 @@ fn block_index_steps_by_the_blocks_own_footprint() {
 #[test]
 #[should_panic(expected = "`row` is at index 1")]
 fn a_nest_that_names_row_out_of_the_row_slot_is_rejected() {
-    let _ = scratchy_subtile::addr::Nest::new(&["head", "row", "feat"], &[32, 31, 128], Df::Fp16);
+    let _ = ktir_superdsc::addr::Nest::new(&["head", "row", "feat"], &[32, 31, 128], Df::Fp16);
 }
 
 /// The orders the emitter actually uses must all still be accepted — including the transposed K caches,
 /// whose stick axis is `slot` rather than `feat`.
 #[test]
 fn the_orders_the_emitter_uses_are_all_legal() {
-    use scratchy_subtile::addr::Nest;
+    use ktir_superdsc::addr::Nest;
     let _ = Nest::new(&["row", "feat"], &[31, 4096], Df::Fp16);
     let _ = Nest::new(&["row", "head", "feat"], &[31, 32, 128], Df::Fp16);
     let _ = Nest::new(&["slot", "head", "feat"], &[128, 32, 128], Df::Fp16);

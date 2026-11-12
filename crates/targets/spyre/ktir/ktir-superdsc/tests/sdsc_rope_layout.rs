@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // The abstract interpreter (`sdsc_abstract`) is gated behind `scratchy-subtile/spyre`.
-#![cfg(feature = "spyre")]
 //! ROPE LOWERING PROOF (compile-time, via the abstract interpreter).
 //!
 //! The emitter lowers `RopeRotate` to the permutation-matmul form (`lower_rope_node`):
@@ -18,7 +17,7 @@
 //! `cargo test`. The negative test proves a wrong P provably diverges (the guard is real, not a tautology).
 //! Run: cargo test -p scratchy-subtile --features spyre --test sdsc_rope_layout
 
-use scratchy_subtile::sdsc_abstract::*;
+use ktir_superdsc::sdsc_abstract::*;
 
 const HEADS: usize = 3;
 const HD: usize = 64; // == stick: the real device head_dim (avoids the dev_off pad-aliasing artifact)

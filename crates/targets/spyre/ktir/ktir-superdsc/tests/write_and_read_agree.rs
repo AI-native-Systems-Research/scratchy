@@ -1,4 +1,3 @@
-#![cfg(feature = "spyre")]
 //! ⛔ ONE LAW OR TWO? The prefill WRITE and the fold READ must address the same byte.
 //!
 //! Isolated on the card 2026-08-09: 200 tokens of context reached by DECODING reads back correctly, while a
@@ -14,16 +13,16 @@
 //! Checked at hd=64 AND hd=128, because a stick width standing in for a head width is the other way this
 //! family of bugs shows up, and those two are equal only at 64.
 
-use scratchy_subtile::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot};
+use ktir_superdsc::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot};
 use std::num::NonZeroU32;
 
 /// The test pool: head count and width as the raw fixture numbers, minted through the pool's
 /// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
-fn pool(nkvh: usize, hd: usize) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
-    scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+fn pool(nkvh: usize, hd: usize) -> ktir_superdsc::sdsc_abstract::PagedKvPool {
+    ktir_superdsc::sdsc_abstract::PagedKvPool::new(
         std::num::NonZeroU32::new(u32::try_from(nkvh).expect("a fixture head count fits a u32"))
             .expect("a fixture pool has heads"),
-        scratchy_subtile::sdsc_abstract::HeadWidth::of_whole_sticks(
+        ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
             u32::try_from(hd).expect("a fixture head width fits a u32"),
         ),
     )

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 
 //! ⭐⭐⭐ REPLAY OF THE PARTIAL-CACHE-HIT SEQUENCE, THROUGH THE REAL PAGE MAP.
 //!
@@ -15,7 +14,7 @@
 //! ever resolves to the shared scratch page.** A page aliased to scratch is read fully-masked and never
 //! written, so putting a page with real keys there loses them silently.
 
-use scratchy_subtile::sdsc_abstract::{
+use ktir_superdsc::sdsc_abstract::{
     BatchSlot, BlockTable, KvHistory, KvSlot, PagedKvPool, PoolPages, PoolPartition, PoolRows,
     RowPages, SlotCount,
 };

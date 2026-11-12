@@ -480,7 +480,7 @@ impl Worker for SpyreWorker {
                     // The count the rung is selected FROM is the LIVE one; everything the launch
                     // then binds is sized by the rung's own baked width.
                     let SendnnSession::SuperDsc(sb) = &model.session;
-                    sb.decode_rung_for(scratchy_subtile::sdsc_abstract::LiveRows::of_scheduled(
+                    sb.decode_rung_for(ktir_superdsc::sdsc_abstract::LiveRows::of_scheduled(
                         decode_ids.len(),
                     ))
                 }
@@ -613,9 +613,9 @@ impl Worker for SpyreWorker {
                     seqs,
                     SamplerLaws {
                         seeds: if churned {
-                            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks)
+                            ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks)
                         } else {
-                            scratchy_subtile::sdsc_abstract::SeedSource::OnCard
+                            ktir_superdsc::sdsc_abstract::SeedSource::OnCard
                         },
                         want_logits: LogitsWanted::PerRequestDeferred,
                         laws: SeatLaws::Batch { draws: &draws },

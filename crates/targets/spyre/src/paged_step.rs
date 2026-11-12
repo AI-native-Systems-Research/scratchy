@@ -122,7 +122,7 @@ pub fn pool_slots(context_slots: u32, kv_slot_bytes: u64) -> Option<std::num::No
 
 /// The rows of one forward: `real` tokens at positions `start..start + real`, in a bundle
 /// [`PagedStep::rows`] wide. A row past the real ones repeats the last real token
-/// ([`scratchy_subtile::sdsc_abstract::ChunkRows::row_logical_pos`]'s law), so its forward, its
+/// ([`ktir_superdsc::sdsc_abstract::ChunkRows::row_logical_pos`]'s law), so its forward, its
 /// mask and its KV write are the last real token's.
 ///
 /// ⭐ `real` IS A COUNT, ONE OR MORE — a step of zero real rows is no step, and every reader that

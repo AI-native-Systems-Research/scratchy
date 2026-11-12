@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-#![cfg(feature = "spyre")]
 //! THE NEW-BLOCK MASK LAWS, and the fact that they are not interchangeable.
 //!
 //! Lives here rather than beside the functions as an integration test, which is also what keeps it
 //! honest about the PUBLIC surface: every law below is reached through `sdsc_abstract`'s exported
 //! types, so a lock cannot quietly come to depend on something the crate does not expose.
 
-const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get();
+const PER_PAGE: u32 = ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.get();
 
-use scratchy_subtile::sdsc_abstract::{
+use ktir_superdsc::sdsc_abstract::{
     BatchSlot, DeclaredFold, FoldPages, FoldWalker, HeadRequestRow, KvHistory, KvSlot,
     MaskBlockForm, MaskBlocks, MaskPassGrid, PrefixMaskShape, RungWidth, SlotCount, SlotRun,
     decode_batch_causal_col_valid, decode_batch_prefix_mask_f16, decode_prefix_col_valid,
@@ -100,12 +99,12 @@ fn reference_f32_then_narrow<const COLS: u32>(
 fn shape<const COLS: u32>(
     nqh: usize,
     mq: usize,
-) -> PrefixMaskShape<{ scratchy_subtile::sdsc_abstract::POOL_STICK }, COLS> {
+) -> PrefixMaskShape<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, COLS> {
     // `mq` here is the width the modelled bundle was baked at — the histories these tests stage are
     // always one per bound row, padding included, exactly as the worker's staging supplies them.
-    let width = scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(mq as u32)
+    let width = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(mq as u32)
         .expect("a modelled bundle has rows");
-    PrefixMaskShape::<{ scratchy_subtile::sdsc_abstract::POOL_STICK }, COLS>::new(nqh as u32, width)
+    PrefixMaskShape::<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, COLS>::new(nqh as u32, width)
         .expect("nonzero heads")
 }
 
@@ -240,7 +239,7 @@ fn batch(lens: &[usize], steps: usize) -> Vec<KvHistory> {
     for _ in 0..steps {
         let slot = BatchSlot::of(hs.iter());
         for h in &mut hs {
-            h.record(slot, scratchy_subtile::sdsc_abstract::SlotCount::new(1));
+            h.record(slot, ktir_superdsc::sdsc_abstract::SlotCount::new(1));
         }
     }
     hs
@@ -514,7 +513,7 @@ fn a_padding_row_replicates_live_0_in_both_masks() {
 }
 
 fn padding_row_replicates_live_0(real: usize) {
-    use scratchy_subtile::sdsc_abstract::{BatchRow, SeqPos, SlotMap};
+    use ktir_superdsc::sdsc_abstract::{BatchRow, SeqPos, SlotMap};
     const COLS: u32 = 64;
     let nqh = 4usize;
     let width = RungWidth::of_baked_rows(4).expect("a 4-row rung"); // the RUNG's baked width
@@ -543,7 +542,7 @@ fn padding_row_replicates_live_0(real: usize) {
         .expect("the builder never fails here");
     let rows = live
         .launch_rows(
-            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks),
+            ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks),
             width,
         )
         .expect("a live batch lays into its rung");
@@ -599,11 +598,11 @@ fn padding_row_replicates_live_0(real: usize) {
     // ── THE NEW-BLOCK (CAUSAL) MASK ROW ───────────────────────────────────────────────────────────
     // `[mq, mq_pad]` row-major, exactly as the worker stages it and the emitter reads it — built from
     // the launch's KEY, the only door the worker stages it through.
-    let cmask = scratchy_subtile::sdsc_abstract::CausalKey::batch(&rows)
+    let cmask = ktir_superdsc::sdsc_abstract::CausalKey::batch(&rows)
         .expect("a live batch has a key")
         .mask();
     assert_eq!(
-        scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG.to_bits(),
+        ktir_superdsc::sdsc_abstract::ATTN_MASK_NEG.to_bits(),
         mask_neg.to_bits(),
         "the key's mask carries this test's -inf"
     );
@@ -679,7 +678,7 @@ fn padding_row_replicates_live_0(real: usize) {
 /// instead of its position reads as that request drifting toward the longest request's topic. Fluent, no crash.
 #[test]
 fn a_sequence_position_and_a_kv_slot_diverge_exactly_when_a_batch_shares_a_write_slot() {
-    use scratchy_subtile::sdsc_abstract::SeqPos;
+    use ktir_superdsc::sdsc_abstract::SeqPos;
 
     // A short request: 225 tokens of its own, then it joins a batch whose shared write slot is 1449.
     let own_tokens = 225u32;
@@ -690,7 +689,7 @@ fn a_sequence_position_and_a_kv_slot_diverge_exactly_when_a_batch_shares_a_write
     let mut hist = KvHistory::contiguous(own_tokens as usize);
     hist.record(
         BatchSlot::of(std::iter::once(&hist)),
-        scratchy_subtile::sdsc_abstract::SlotCount::new(1),
+        ktir_superdsc::sdsc_abstract::SlotCount::new(1),
     );
     let _ = &hist;
 
@@ -802,7 +801,7 @@ fn report_fully_masked_rows_per_block() {
 /// is the write live 0 was already making into that cell.
 #[test]
 fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
-    use scratchy_subtile::sdsc_abstract::{BatchRow, SeqPos, SlotMap};
+    use ktir_superdsc::sdsc_abstract::{BatchRow, SeqPos, SlotMap};
     // 3 live requests on the 4-row rung — the exact shape the corruption ships under.
     let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
     let slots = SlotMap::of_live(3, width).expect("3 live rows fit a 4-row rung");
@@ -849,7 +848,7 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     let toks = [101usize, 202, 303];
     let rows = live
         .launch_rows(
-            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks),
+            ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks),
             width,
         )
         .expect("a live batch lays into its rung");
@@ -876,7 +875,7 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     // rung-width list is how a padding row came to be paired with some other slot's token.
     assert!(
         live.launch_rows(
-            scratchy_subtile::sdsc_abstract::SeedSource::Host(&[101, 202, 303, 303]),
+            ktir_superdsc::sdsc_abstract::SeedSource::Host(&[101, 202, 303, 303]),
             width
         )
         .is_none(),
@@ -884,7 +883,7 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     );
     assert!(
         live.launch_rows(
-            scratchy_subtile::sdsc_abstract::SeedSource::Host(&[101, 202]),
+            ktir_superdsc::sdsc_abstract::SeedSource::Host(&[101, 202]),
             width
         )
         .is_none(),
@@ -894,7 +893,7 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     let narrow = RungWidth::of_baked_rows(2).expect("a 2-row rung");
     assert!(
         live.launch_rows(
-            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks),
+            ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks),
             narrow
         )
         .is_none(),
@@ -910,7 +909,7 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
 /// the seed.
 #[test]
 fn an_on_card_launch_carries_no_token_and_keeps_the_row_laws() {
-    use scratchy_subtile::sdsc_abstract::{BatchRow, SeqPos, SlotMap};
+    use ktir_superdsc::sdsc_abstract::{BatchRow, SeqPos, SlotMap};
     let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
     let hists: Vec<_> = (0..3).map(|i| KvHistory::contiguous(8 + i)).collect();
     let live = SlotMap::of_live(3, width)
@@ -923,7 +922,7 @@ fn an_on_card_launch_carries_no_token_and_keeps_the_row_laws() {
         })
         .expect("the builder never fails here");
     let rows = live
-        .launch_rows(scratchy_subtile::sdsc_abstract::SeedSource::OnCard, width)
+        .launch_rows(ktir_superdsc::sdsc_abstract::SeedSource::OnCard, width)
         .expect("an OnCard batch lays into its rung");
     for slot in 0..4 {
         let r = rows.row(slot).expect("every bound slot runs something");

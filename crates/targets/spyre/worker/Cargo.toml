@@ -35,7 +35,10 @@ scratchy-forward-compiler = { path = "../../../compiler" }
 scratchy-target-spyre-models = { path = "../models" }
 # Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
 # staged weight width == the emitted device width by construction.
-scratchy-subtile = { path = "../../../compiler/subtile", features = ["spyre"] }
+scratchy-subtile = { path = "../../../compiler/subtile" }
+# The SuperDSC device facts (`sdsc_abstract`, `superdsc_opspec`): the laws the staging and the
+# session setters mint their values through.
+ktir-superdsc = { path = "../ktir/ktir-superdsc" }
 # Spyre rides the neutral seam directly: GpuWeights from scratchy-layers, DType from
 # scratchy-tensors.
 scratchy-layers = { path = "../../../layers" }

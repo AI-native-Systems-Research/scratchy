@@ -10,7 +10,7 @@
 
 use emit::In;
 use ktir_superdsc::emit;
-use scratchy_subtile::sdsc_abstract::{
+use ktir_superdsc::sdsc_abstract::{
     BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk,
 };
 /// The one-stick handle — the TRUE shape of a `[1,1]` const read in the scalar broadcast

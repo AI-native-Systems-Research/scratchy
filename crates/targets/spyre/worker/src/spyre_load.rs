@@ -2225,7 +2225,7 @@ impl SpyreWorker {
                 // derived.
                 struct DecodeRungJob {
                     rn: usize,
-                    rung_width: scratchy_subtile::sdsc_abstract::RungWidth,
+                    rung_width: ktir_superdsc::sdsc_abstract::RungWidth,
                     rcode: &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                     rung_consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
                     logits: LogitsGeom,
@@ -2249,7 +2249,7 @@ impl SpyreWorker {
                     // The manifest's `RungSeqs` IS a baked row count — this is the one boundary where
                     // it becomes the launch-width vocabulary everything below runs on.
                     let Some(rung_width) =
-                        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
+                        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
                     else {
                         continue;
                     };

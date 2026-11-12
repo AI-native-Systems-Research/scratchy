@@ -17,9 +17,8 @@
 //! against the public API alone, so the check is runnable TODAY instead of after that cleanup.
 //!
 //! Milliseconds. Every on-card trial of this profile costs ~5 minutes.
-#![cfg(feature = "spyre")]
 
-use scratchy_subtile::sdsc_abstract::*;
+use ktir_superdsc::sdsc_abstract::*;
 
 /// A VALID column is additive-zero (`0.0f16` == bytes `[0,0]`); anything else is masked. Comparing against
 /// zero avoids depending on the `half` crate for the mask_neg encoding, and zero is the value that matters:
@@ -61,7 +60,7 @@ fn a_pass_past_a_rows_own_pages_has_no_valid_column() {
         .map(|p| KvHistory::contiguous(p * PagedKvPool::POOL_PAGE_SLOTS.as_usize()))
         .collect();
 
-    let shape = PrefixMaskShape::<{ scratchy_subtile::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(
+    let shape = PrefixMaskShape::<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(
         nqh, rung,
     )
     .expect("block is whole sticks");
@@ -123,7 +122,7 @@ fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
     let nqh = 32u32;
     let shared = *lens.iter().max().unwrap(); // 1986 — the DEEPEST row's own end
 
-    let shape = PrefixMaskShape::<{ scratchy_subtile::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(
+    let shape = PrefixMaskShape::<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(
         nqh, rung,
     )
     .expect("whole sticks");
@@ -151,7 +150,7 @@ fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
         "the shared slot is the deepest row's end"
     );
     for h in hists.iter_mut() {
-        h.record(at, scratchy_subtile::sdsc_abstract::SlotCount::new(1));
+        h.record(at, ktir_superdsc::sdsc_abstract::SlotCount::new(1));
     }
     assert_eq!(
         hists[3].runs().len(),

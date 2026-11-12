@@ -1,4 +1,3 @@
-#![cfg(feature = "spyre")]
 //! ⛔⛔⛔ A PREFILL CHUNK'S RECORD MUST FOLLOW ITS WRITE ACROSS A PAGE BOUNDARY.
 //!
 //! THE SEAM THIS SPANS: `PagedKvPool::chunk_write_start` decides WHERE a chunk writes and may step it
@@ -20,7 +19,7 @@
 //! worker's chunk loop through the REAL placement functions, the history must end EXACTLY at the token
 //! count, and must call the last token's slot valid and the one past it not.
 
-use scratchy_subtile::sdsc_abstract::{BatchSlot, KvHistory, KvSlot, PagedKvPool, SlotCount};
+use ktir_superdsc::sdsc_abstract::{BatchSlot, KvHistory, KvSlot, PagedKvPool, SlotCount};
 
 /// Replay `crates/serving/worker/src/spyre_worker.rs`'s prefill chunk loop for a `total`-token prompt
 /// served in `cap_m`-wide chunks, and return the history it builds.

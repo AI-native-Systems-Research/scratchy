@@ -6,7 +6,7 @@
 //!
 //!   cargo run -p scratchy-subtile --features superdsc --example verify_span_overflow
 
-use scratchy_subtile::superdsc_opspec::{Df, ItDim};
+use ktir_superdsc::superdsc_opspec::{Df, ItDim};
 use scratchy_target_spyre::ir::bridge::span_overflow::{
     MAX_SPAN_BYTES, cheapest_split_clearing_span, physical_span_bytes, split_candidates_for_dim,
 };

@@ -67,13 +67,8 @@ scratchy-tp-world = { path = "../../../../core/tp-world" }
 # turned out to be vacuous — a normal build skipped the module and said nothing — and declaring it
 # keeps a typo in the name an error while stopping the lint complaining about the name itself.
 #
-# ⚠️ RUNNING THEM NO LONGER NEEDS `--features spyre`, AND THE OLD INSTRUCTION IS NOW WRONG TWICE OVER.
-# `scratchy-subtile`'s manifest says every harness here "LIVES BEHIND
-# `#[cfg(feature = "spyre")] pub mod sdsc_abstract;`" and that the invocation is
-# `KANI_PKG=scratchy-subtile … --features spyre`. That gate did not exist even before this move
-# (`lib.rs` declared the module unconditionally), and the harnesses are now in THIS crate, which has
-# no features at all. So the invocation is `KANI_PKG=ktir-superdsc … <harness>` with no flag. This
-# matters because all 11 superdsc proofs have been found unreachable once already.
+# Run them with `KANI_PKG=ktir-superdsc … <harness>`, no feature flag: this crate has none. All 11
+# superdsc proofs have been found unreachable once already.
 [dev-dependencies]
 ktir-superdsc = { path = ".", features = ["test-support"] }
 

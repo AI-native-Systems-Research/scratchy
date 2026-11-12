@@ -13,7 +13,7 @@ publish = false
 # the lowering.
 
 [dependencies]
-scratchy-subtile = { path = "../../../../compiler/subtile", features = ["spyre"] }
+scratchy-subtile = { path = "../../../../compiler/subtile" }
 scratchy-ir = { path = "../../../../compiler/ir" }
 ktir-core = { path = "../../ktir/ktir-core" }
 ktir-superdsc = { path = "../../ktir/ktir-superdsc" }

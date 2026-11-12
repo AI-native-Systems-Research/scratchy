@@ -12,10 +12,9 @@
 //!   (2) fp8 is a real 128-lane / 1-byte packed residency whose address actually differs ⇒ the width
 //!       bit reaches addressing (real substrate for W8A8, not a cosmetic field).
 //! Re-hardcoding the stick back to 64 makes the fp8 asserts go RED.
-#![cfg(feature = "spyre")]
 
-use scratchy_subtile::sdsc_abstract::{StickLayout, dev_off, dev_off_stk};
-use scratchy_subtile::superdsc_opspec::Df;
+use ktir_superdsc::sdsc_abstract::{StickLayout, dev_off, dev_off_stk};
+use ktir_superdsc::superdsc_opspec::Df;
 
 #[test]
 fn stick_width_is_derived_from_df() {
@@ -51,7 +50,7 @@ fn stick_width_is_derived_from_df() {
 /// disagree, the transpose is load-bearing after all and eliminating it corrupts weights.
 #[test]
 fn disk_order_stride_map_gathers_the_same_elements() {
-    use scratchy_subtile::superdsc_opspec::{DeviceTileLayout, Fp16};
+    use ktir_superdsc::superdsc_opspec::{DeviceTileLayout, Fp16};
     let (in_elems, out_elems) = (512usize, 256usize);
     let t =
         DeviceTileLayout::<Fp16>::new(&["in", "out"], "out", &[in_elems as u64, out_elems as u64])

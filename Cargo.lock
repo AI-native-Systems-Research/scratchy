@@ -3650,12 +3650,10 @@ name = "scratchy-subtile"
 version = "0.1.0"
 dependencies = [
  "half",
- "ktir-superdsc",
  "proc-macro2",
  "quote",
  "scratchy-forward-compiler",
  "scratchy-ir",
- "scratchy-spyre-bundle",
  "scratchy-tensors",
  "scratchy-tp-world",
  "serde_json",
@@ -3770,6 +3768,7 @@ name = "scratchy-target-spyre-compiler"
 version = "0.1.0"
 dependencies = [
  "ktir-core",
+ "ktir-superdsc",
  "proc-macro2",
  "quote",
  "rayon",
@@ -3809,6 +3808,7 @@ dependencies = [
  "anyhow",
  "half",
  "inventory",
+ "ktir-superdsc",
  "rayon",
  "safetensors",
  "scratchy-builder-spyre",

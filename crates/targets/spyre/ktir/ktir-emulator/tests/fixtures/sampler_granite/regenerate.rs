@@ -304,10 +304,10 @@ fn regenerate_sampler_fixture() {
     // The load-time tables, by the bake's own derivations: which tensor, which of the
     // sampler's operand tables, its dtype and shape, and its arrangement.
     // The graph's query extents: one request (the matmul is m=1), so (1 row, ONE request).
-    let query_rows = scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
-        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+    let query_rows = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+        ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
             .expect("one row is a baked width"),
-        scratchy_subtile::sdsc_abstract::RungCap::ONE,
+        ktir_superdsc::sdsc_abstract::RungCap::ONE,
     )
     .expect("the single-request graph's extents hold a u32");
     let staggered =

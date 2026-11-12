@@ -38,7 +38,10 @@ ktir-core = { path = "../ktir/ktir-core" }
 # The splice's own fp8-epilogue facts (`FP8_EPILOGUE_LIVE_TILES`, `fp8_epilogue_peak_bytes`) — the
 # emu prefill-width derivation reads the count from beside the program it describes.
 scratchy-triton-splice = { path = "../triton/splice" }
-scratchy-subtile = { path = "../../../compiler/subtile", features = ["spyre"] }
+scratchy-subtile = { path = "../../../compiler/subtile" }
+# The SuperDSC device facts the bake states its ladders and budgets in (`sdsc_abstract`,
+# `superdsc_opspec`).
+ktir-superdsc = { path = "../ktir/ktir-superdsc" }
 scratchy-ir = { path = "../../../compiler/ir" }
 scratchy-tp-world = { path = "../../../core/tp-world" }
 proc-macro2 = "1"

@@ -7,7 +7,7 @@
 
 use ktir_superdsc::emit::{In, assemble_pointwise_broadcast};
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_matmul;
-use scratchy_subtile::sdsc_abstract::{KernelTag, RowBlockedTag, StickLayout, Stk};
+use ktir_superdsc::sdsc_abstract::{KernelTag, RowBlockedTag, StickLayout, Stk};
 
 /// The example's one error type: every builder's refusal, and the dump's own reads of the JSON it
 /// is handed, end the run with their message instead of panicking at a named `expect`.
@@ -135,8 +135,8 @@ fn main() -> Result<()> {
         let e = assemble_pointwise_broadcast::<ktir_superdsc::collective::TpWorld<1>>(
             "PW",
             "multiply",
-            scratchy_subtile::sdsc_abstract::RowCount::of_token_rows(8),
-            scratchy_subtile::sdsc_abstract::BlockCols::of_feature_cols(2048),
+            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(8),
+            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(2048),
             &ops,
             &rbh("Tensor2", 8, 2048)?,
             &mut sib,

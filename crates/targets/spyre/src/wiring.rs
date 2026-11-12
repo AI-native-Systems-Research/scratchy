@@ -32,7 +32,7 @@ use scratchy_tensors::GpuTensor;
 // models crate (where `#[forward]` expands) names every wiring type through this crate's root,
 // and `PagedStep` carries the pair ([`PagedStep::extent`]) — so its literal needs the types in
 // reach through the same prefix every other wiring type uses.
-pub use scratchy_subtile::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
+pub use ktir_superdsc::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
 
 // ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
 // whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
@@ -518,10 +518,10 @@ impl RowCapacity {
     /// width against a wiring that no longer describes it, and a 2-row launch became
     /// *"forward tape asked for 2 row(s) from a bundle baked to hold 1"*.
     ///
-    /// Minted ONLY from a [`RungWidth`](scratchy_subtile::sdsc_abstract::RungWidth) — a width that
+    /// Minted ONLY from a [`RungWidth`](ktir_superdsc::sdsc_abstract::RungWidth) — a width that
     /// came from a manifest's own `RungSeqs`, i.e. from the artifact rather than from a host guess —
     /// so this cannot become a door for waving an arbitrary integer past the guard.
-    pub fn of_baked_rung(width: scratchy_subtile::sdsc_abstract::RungWidth) -> RowCapacity {
+    pub fn of_baked_rung(width: ktir_superdsc::sdsc_abstract::RungWidth) -> RowCapacity {
         RowCapacity(width.count())
     }
 }
@@ -2349,7 +2349,7 @@ impl ConstValues {
 /// only in the [`ConstantEnv`] they pass, which is DATA.
 pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     use crate::lower_subtile_tape_to_superdsc as sd;
-    use scratchy_subtile::sdsc_abstract::{rope_p_entry, stage_kernel_table};
+    use ktir_superdsc::sdsc_abstract::{rope_p_entry, stage_kernel_table};
     let mut out: Vec<(u32, ConstValues)> = Vec::new();
     let (hd, h) = (env.head_dim, env.hidden);
 
@@ -2740,7 +2740,7 @@ mod constant_tape_tests {
     #[test]
     fn a_hybrid_class_set_binds_one_table_per_class_at_its_own_tid() {
         use crate::lower_subtile_tape_to_superdsc as sd;
-        use scratchy_subtile::sdsc_abstract::{rope_p_entry, stage_kernel_table};
+        use ktir_superdsc::sdsc_abstract::{rope_p_entry, stage_kernel_table};
         let mut env = env(1);
         env.rope_class_hds = &[128, 64];
         env.attn_class_hds = &[128, 64];

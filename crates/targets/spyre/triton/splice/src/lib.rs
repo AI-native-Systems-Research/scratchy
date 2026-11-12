@@ -1450,7 +1450,7 @@ fn lower_prefill_lm_head_fold<
         node.id.index(),
         s,
         w,
-        scratchy_subtile::sdsc_abstract::selector_lastrow_col(w as usize) as u32,
+        ktir_superdsc::sdsc_abstract::selector_lastrow_col(w as usize) as u32,
         mq,
         hidden,
         last_hidden

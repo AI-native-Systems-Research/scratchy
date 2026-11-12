@@ -1006,10 +1006,10 @@ fn fault_in(buf: &mut [u8]) {
 /// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
 /// this step). See [`Executor::keyed`].
 ///
-/// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
+/// [`CausalKey`]: ktir_superdsc::sdsc_abstract::CausalKey
 #[derive(Clone, Copy, Debug)]
 struct Keyed {
-    key: scratchy_subtile::sdsc_abstract::CausalKey,
+    key: ktir_superdsc::sdsc_abstract::CausalKey,
     fresh: bool,
 }
 
@@ -1227,7 +1227,7 @@ pub struct Executor<'c, T: ktir_superdsc::collective::Tp> {
     raw_ids: BTreeSet<bundle::PlaceId>,
     /// ⭐ ACTIVATIONS STAGED BY KEY — the key their bytes are a function of, and whether this
     /// step re-bound them. Today exactly one: the new-block causal mask
-    /// ([`scratchy_subtile::sdsc_abstract::CausalKey`]).
+    /// ([`ktir_superdsc::sdsc_abstract::CausalKey`]).
     ///
     /// A keyed bind is written to the shadow and uploaded in the step that binds it, and NOT
     /// re-uploaded by a step that does not: segment 3, where every activation lives, is written by
@@ -2047,11 +2047,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// device are a function of — or `None` when `id` was never bound keyed. A launch whose key
     /// equals this binds nothing for `id`.
     ///
-    /// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
+    /// [`CausalKey`]: ktir_superdsc::sdsc_abstract::CausalKey
     pub fn keyed_holds(
         &self,
         id: bundle::PlaceId,
-    ) -> Option<scratchy_subtile::sdsc_abstract::CausalKey> {
+    ) -> Option<ktir_superdsc::sdsc_abstract::CausalKey> {
         self.keyed.get(&id).map(|k| k.key)
     }
 
@@ -2062,7 +2062,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     pub fn bind_input_keyed(
         &mut self,
         id: bundle::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: ktir_superdsc::sdsc_abstract::CausalKey,
         bytes: Vec<u8>,
     ) -> Result<()> {
         if !self.prepared {
@@ -2093,7 +2093,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     pub fn stage_keyed(
         &mut self,
         id: bundle::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: ktir_superdsc::sdsc_abstract::CausalKey,
         bytes: Vec<u8>,
     ) -> Result<u64> {
         let placed = self
@@ -6395,7 +6395,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     pub fn pmask_slots(&self) -> Option<usize> {
         let nm = bundle::PlaceId::Act(crate::lower_subtile_tape_to_superdsc::ATTN_MASK_TID);
         let slots = (self.places.get(&nm)?.size / 2) as usize;
-        let per_page = scratchy_subtile::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
+        let per_page = ktir_superdsc::sdsc_abstract::PagedKvPool::POOL_PAGE_SLOTS.as_usize();
         (slots != 0 && slots.is_multiple_of(per_page)).then_some(slots)
     }
 }
@@ -6932,7 +6932,7 @@ mod tests {
     /// new key re-binds it.
     #[test]
     fn a_keyed_bind_goes_out_once_and_an_unkeyed_one_every_step() {
-        use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
+        use ktir_superdsc::sdsc_abstract::{CausalKey, RungWidth};
         let key =
             CausalKey::chunk(RungWidth::of_baked_rows(512).expect("a width"), 512).expect("a key");
         let (mask, rope) = (bundle::PlaceId::Act(7), bundle::PlaceId::Act(8));

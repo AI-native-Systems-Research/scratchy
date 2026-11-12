@@ -1868,8 +1868,8 @@ pub enum SampleRows {
     /// Every result row is computed and drawn — the decode rungs.
     All,
     /// The folded lm-head rows alone — the prefill rungs, one per request
-    /// window: the rung's own request CAPACITY, the same `RungCap` the
-    /// attention's extent pair mints (never a division of the graph's rows).
+    /// window: the rung's own request CAPACITY, the count the emitter's
+    /// attention extent pair mints (never a division of the graph's rows).
     /// The Sample node reads the region the fold writes — the tail matmul's
     /// own `[S, vocab]` output window, rows `0..S` of the `[mq, vocab]`
     /// storage (the same window law the emitter's re-lowering keeps) — and
@@ -1879,14 +1879,11 @@ pub enum SampleRows {
     /// the readback never takes (it draws `rows().take(live)`, live off the
     /// launch's slot list).
     ///
-    /// ⛔ GATED ON `spyre`, LIKE THE `RungCap` IT CARRIES: the fold is the
-    /// spyre emitter's own law (metal's sampler never folds a prefill tail),
-    /// and the ktir graph — `sdsc_abstract`'s home — is out of every metal
-    /// and cuda build, so the count's one type lives past this gate with it.
-    #[cfg(feature = "spyre")]
+    /// A target whose sampler folds a prefill tail states it; the count arrives from that
+    /// target's own typed capacity, minted where its laws live.
     Folded {
         /// The rung's request capacity — the count the answer rows mint.
-        requests: crate::sdsc_abstract::RungCap,
+        requests: std::num::NonZeroU32,
     },
 }
 
@@ -1957,7 +1954,6 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
     let pad_vocab = sample_pad_vocab(vocab);
     let rows = match suffix {
         SampleRows::All => result_rows,
-        #[cfg(feature = "spyre")]
         SampleRows::Folded { requests } => requests.get(),
     };
     assert!(
@@ -2116,7 +2112,6 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
             // gather's block copies address a column block the same way at any total width
             // (stick-major places a column by its stick and row alone).
             SubOp::AllGather { .. } => {
-                #[cfg(feature = "spyre")]
                 if matches!(suffix, SampleRows::Folded { .. }) {
                     fold_gathered_tail(graph, t);
                 }
@@ -2151,7 +2146,6 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
     // states the fold). At S = 1 the window is row 0 alone, byte-identical.
     inputs.push(match suffix {
         SampleRows::All => whole(graph.result),
-        #[cfg(feature = "spyre")]
         SampleRows::Folded { .. } => TensorRegion {
             tensor: graph.result,
             region: Region {
@@ -2194,7 +2188,6 @@ pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) ->
 /// them is that row: the gather's operand is then a whole one-row tensor, contiguous, and the fold
 /// writes its m=1 product into exactly it. (A tail with no gather — every one-rank graph — keeps
 /// its declared rows: its row 0 is read locally, never sent.)
-#[cfg(feature = "spyre")]
 fn fold_gathered_tail<F: RopeForm>(graph: &mut SubtileIR<F>, gathered: TensorId) {
     let mut tail = vec![gathered];
     let mut t = graph
@@ -5466,7 +5459,6 @@ mod tests {
     /// arms consuming the per-K-chunk predecessor pages a tiled
     /// producer now emits — is the next frontier (Patch 1 step (f)).
     #[test]
-    #[cfg(feature = "spyre")]
     fn subtile_tape_nb128_builds_from_fixture() {
         use crate::lower::fuse_silu_mul;
         use crate::subtile_tape::lower_dag_to_tape;
@@ -5993,7 +5985,6 @@ mod tests {
     /// row of a taller stick-major tensor is not contiguous). A decode rung's every row is a
     /// request's, and its gather keeps them all. Shown on a 4-row rung both ways.
     #[test]
-    #[cfg(feature = "spyre")]
     fn a_folded_tail_gathers_its_one_row() {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let input = crate::lower::LoweringInput {
@@ -6046,7 +6037,7 @@ mod tests {
         // Folded: a whole one-row tensor all the way down — the gather's operand is contiguous.
         assert_eq!(
             rows_of_gather(SampleRows::Folded {
-                requests: crate::sdsc_abstract::RungCap::ONE
+                requests: std::num::NonZeroU32::MIN
             }),
             (1, 1, 1)
         );
@@ -6900,14 +6891,12 @@ mod sample_rows_tests {
     /// k = 1), and the result tensor's DECLARED shape stays [mq, vocab] — only
     /// the region states the fold. No count is special-cased: the k = 1 case is
     /// this same assertion at one.
-    #[cfg(feature = "spyre")]
     #[test]
     fn the_folded_mint_reads_the_rungs_request_count() {
-        use crate::sdsc_abstract::RungCap;
         let mq = 8u32;
         for k in [1u32, 2, 3] {
             let mut g = lm_head(mq);
-            let cap = RungCap::of_baked_seqs(k).expect("a nonzero request count");
+            let cap = std::num::NonZeroU32::new(k).expect("a nonzero request count");
             let mint = mint_sample(&mut g, SampleRows::Folded { requests: cap });
             assert_eq!(mint.rows, k, "the draw serves k = {k} rows");
             let sample = g

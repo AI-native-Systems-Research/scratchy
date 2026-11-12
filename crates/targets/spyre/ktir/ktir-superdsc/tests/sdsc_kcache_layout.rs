@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // The abstract interpreter (`sdsc_abstract`) is gated behind `scratchy-subtile/spyre`; without it this
 // whole test crate compiles to nothing (run with `--features spyre`).
-#![cfg(feature = "spyre")]
 //! K-CACHE PRODUCER/CONSUMER LAYOUT PROOF (the missing guard for the multi-day attention bug).
 //!
 //! The SuperDSC decode score matmul reads the resident K cache `kc` as a `[hd, cap]` **cap-sticked
@@ -21,7 +20,7 @@
 //! crate's feature-gated inline test modules, which do not build on a plain `cargo test` here. Run:
 //!   cargo test -p scratchy-subtile --test sdsc_kcache_layout
 
-use scratchy_subtile::sdsc_abstract::*;
+use ktir_superdsc::sdsc_abstract::*;
 
 /// Build + run the per-head attention op-DAG with K written at `producer_off(slot, d)` (element units,
 /// within one head). Returns the on-"card" out `[nqh*hd]` and the independent reference, for comparison.

@@ -21,8 +21,8 @@
 use ktir_superdsc::emit::{assemble_convert, rb};
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
-use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
-use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Role};
+use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
+use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16, Role};
 
 /// These probes emit decode-shaped projections: one token row, projection feature widths, no batch.
 fn mm(m: u32) -> MatM {
