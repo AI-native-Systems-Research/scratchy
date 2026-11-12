@@ -303,7 +303,6 @@ fn generate_vt_context(
 fn build_llm(args: &BenchRulerArgs) -> Result<LLM> {
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
     let mut builder = LLMBuilder::new(&model)
-        .device(&args.device)
         .dtype(&args.dtype)
         .gpu_memory_utilization(args.gpu_memory_utilization)
         .max_num_seqs(args.max_num_seqs)

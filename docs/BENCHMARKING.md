@@ -384,7 +384,7 @@ Any backend is named by `--child-cmd`, using the same shell-words convention as
 ```bash
 # scratchy, cold + warm, 3 reps each
 scr bench startup --exec -m "$MODEL" \
-    --child-cmd "scr serve $MODEL --device spyre --port 8731 --no-prefix-caching" \
+    --child-cmd "scr serve $MODEL --port 8731 --no-prefix-caching" \
     --scenarios cold,warm --reps 3 --output-json out/scratchy.json
 
 # the same measurement against vLLM — no new code, just a different child
@@ -394,7 +394,7 @@ scr bench startup --exec -m "$MODEL" \
 
 # FROZEN on Linux: evict the weights and the binary, and prove it happened
 scr bench startup --exec -m "$MODEL" \
-    --child-cmd "scr serve $MODEL --device spyre --port 8731" \
+    --child-cmd "scr serve $MODEL --port 8731" \
     --scenarios frozen,cold --reps 3 \
     --evict fadvise \
     --evict-path "$HF_HOME/hub/models--org--name/snapshots" \
@@ -403,7 +403,7 @@ scr bench startup --exec -m "$MODEL" \
 # FROZEN on macOS: `sudo -v` first, or the up-front check refuses to start
 sudo -v
 scr bench startup --exec -m "$MODEL" \
-    --child-cmd "target/release/scr serve $MODEL --device metal --port 8731 --no-prefix-caching" \
+    --child-cmd "target/release/scr serve $MODEL --port 8731 --no-prefix-caching" \
     --scenarios frozen,cold --reps 2 --evict purge
 
 # CLI mode needs {prompt}; add a blocking parity gate against mlx-lm.
@@ -412,7 +412,7 @@ scr bench startup --exec -m "$MODEL" \
 # needs --chat-template-config '{"enable_thinking":false}'.
 sudo -v
 scr bench startup --exec -m "$MODEL" --mode cli \
-    --child-cmd "target/release/scr chat -m $MODEL --device metal -q {prompt} --max-tokens {output_len}" \
+    --child-cmd "target/release/scr chat -m $MODEL -q {prompt} --max-tokens {output_len}" \
     --parity-cmd "python -m mlx_lm.generate --model $MODEL --prompt {prompt} --max-tokens {output_len}" \
     --scenarios frozen,cold --evict purge
 ```

@@ -695,7 +695,7 @@ mod tests {
             .split(";;")
             .next()
             .unwrap();
-        assert!(arm.contains("--device"), "flags missing: {arm}");
+        assert!(arm.contains("--dtype"), "flags missing: {arm}");
         assert!(arm.contains("--help"), "clap's own args missing: {arm}");
         assert!(arm.contains("model_opts=\"--model -m\""), "{arm}");
         assert!(arm.contains("positional=\"compiled\""), "{arm}");
@@ -759,7 +759,7 @@ mod tests {
         assert!(!arms.contains("model_opts="), "{arms}");
         assert!(!arms.contains("positional=\""), "{arms}");
         // The rest of the surface is unaffected.
-        assert!(arms.contains("--device"), "{arms}");
+        assert!(arms.contains("--dtype"), "{arms}");
         assert!(arms.contains("positional_values=\"bash zsh\""), "{arms}");
     }
 
@@ -840,7 +840,7 @@ mod tests {
     }
 
     /// The regression that motivated the rewrite: the prototype offered model
-    /// ids after every flag, so `--device <TAB>` suggested models. A
+    /// ids after every flag, so `--dtype <TAB>` suggested models. A
     /// value-taking flag with an open vocabulary must yield nothing and let
     /// bash fall back to filenames.
     #[test]
@@ -872,7 +872,7 @@ mod tests {
                 _scr_complete
                 echo "${{COMPREPLY[*]}}"
             }}
-            echo "device:$(probe chat --device)"
+            echo "dtype:$(probe chat --dtype)"
             echo "model:$(probe chat -m)"
             echo "positional:$(probe chat)"
             "#,
@@ -887,17 +887,17 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
 
         assert!(
-            stdout.contains("device:\n") || stdout.contains("device:"),
-            "no device line: {stdout}"
+            stdout.contains("dtype:\n") || stdout.contains("dtype:"),
+            "no dtype line: {stdout}"
         );
-        let device_line = stdout
+        let dtype_line = stdout
             .lines()
-            .find(|l| l.starts_with("device:"))
-            .expect("device line");
+            .find(|l| l.starts_with("dtype:"))
+            .expect("dtype line");
         assert_eq!(
-            device_line.trim(),
-            "device:",
-            "offered a value for --device, which has an open vocabulary: {stdout}"
+            dtype_line.trim(),
+            "dtype:",
+            "offered a value for --dtype, which has an open vocabulary: {stdout}"
         );
         // And the flag/positional that DO take a model still complete.
         for prefix in ["model:", "positional:"] {

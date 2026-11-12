@@ -29,7 +29,7 @@ pub enum Commands {
     Launch(LaunchArgs),
     /// Run benchmarks (latency, serving, throughput).
     #[cfg(feature = "bench")]
-    Bench(BenchCommand),
+    Bench(Box<BenchCommand>),
     /// Process a batch of OpenAI-compatible requests offline.
     #[cfg(any(feature = "chat", feature = "serve"))]
     Batch(BatchArgs),
@@ -106,10 +106,6 @@ pub struct LaunchClaudeArgs {
     /// Model to serve (alternative to the positional argument).
     #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
-
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
-    #[arg(long, default_value = "auto")]
-    pub device: String,
 
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
@@ -336,10 +332,6 @@ pub struct ServeArgs {
     /// Port to listen on.
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
-
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
-    #[arg(long, default_value = "auto")]
-    pub device: String,
 
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     /// "auto" reads torch_dtype from config.json (default).
@@ -587,10 +579,6 @@ pub struct ChatArgs {
     #[arg(long)]
     pub bench: bool,
 
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -687,10 +675,6 @@ pub struct BatchArgs {
     /// Output JSONL file for batch results.
     #[arg(short = 'o', long)]
     pub output: String,
-
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
-    #[arg(long, default_value = "auto")]
-    pub device: String,
 
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
@@ -915,18 +899,10 @@ mod tests {
     #[test]
     fn test_parse_serve_flag_model() {
         // Also supported: `scr serve --model meta-llama/Llama-3.2-1B`
-        let cli = Cli::parse_from([
-            "scr",
-            "serve",
-            "--model",
-            "meta-llama/Llama-3.2-1B",
-            "--device",
-            "cpu",
-        ]);
+        let cli = Cli::parse_from(["scr", "serve", "--model", "meta-llama/Llama-3.2-1B"]);
         match cli.command {
             Commands::Serve(args) => {
                 assert_eq!(args.resolved_model().unwrap(), "meta-llama/Llama-3.2-1B");
-                assert_eq!(args.device, "cpu");
             }
             _ => panic!("expected Serve command"),
         }
@@ -1046,7 +1022,6 @@ mod tests {
                 assert_eq!(args.resolved_model().unwrap(), "meta-llama/Llama-3.2-1B");
                 assert_eq!(args.input, "input.jsonl");
                 assert_eq!(args.output, "output.jsonl");
-                assert_eq!(args.device, "auto");
             }
             _ => panic!("expected Batch command"),
         }
@@ -1159,7 +1134,6 @@ mod tests {
                 assert!(args.quick.is_none());
                 assert!(args.prompt.is_empty());
                 assert!(!args.bench);
-                assert_eq!(args.device, "auto");
                 assert_eq!(args.dtype, "auto");
                 assert_eq!(args.max_tokens, None);
             }
@@ -1180,11 +1154,10 @@ mod tests {
 
     #[test]
     fn test_chat_inproc_flag_model() {
-        let cli = Cli::parse_from(["scr", "chat", "--model", "my-model", "--device", "cpu"]);
+        let cli = Cli::parse_from(["scr", "chat", "--model", "my-model"]);
         match cli.command {
             Commands::Chat(args) => {
                 assert_eq!(args.resolved_model().unwrap(), "my-model");
-                assert_eq!(args.device, "cpu");
             }
             _ => panic!("expected Chat command"),
         }
@@ -1257,8 +1230,6 @@ mod tests {
             "scr",
             "chat",
             "my-model",
-            "--device",
-            "metal",
             "--dtype",
             "float16",
             "--max-model-len",
@@ -1270,7 +1241,6 @@ mod tests {
         ]);
         match cli.command {
             Commands::Chat(args) => {
-                assert_eq!(args.device, "metal");
                 assert_eq!(args.dtype, "float16");
                 assert_eq!(args.max_model_len, Some(4096));
                 assert_eq!(args.gguf_file.as_deref(), Some("model.gguf"));
@@ -1358,15 +1328,12 @@ mod tests {
             "in.jsonl",
             "-o",
             "out.jsonl",
-            "--device",
-            "metal",
             "--dtype",
             "bfloat16",
         ]);
         match cli.command {
             Commands::RunBatch(args) => {
                 assert_eq!(args.resolved_model().unwrap(), "flag-model");
-                assert_eq!(args.device, "metal");
                 assert_eq!(args.dtype, "bfloat16");
             }
             _ => panic!("expected RunBatch command"),

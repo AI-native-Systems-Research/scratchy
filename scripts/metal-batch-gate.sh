@@ -74,7 +74,7 @@ PY
 
 run() { # $1 = label, rest = extra scr args
   local label="$1"; shift
-  "$BIN" batch -m "$MODEL" --device metal "$@" \
+  "$BIN" batch -m "$MODEL" "$@" \
       -i "$OUT/probe.jsonl" -o "$OUT/out_$label.jsonl" >"$OUT/log_$label" 2>&1
   local hits
   hits=$(grep -c "blocks hit, [1-9]" "$OUT/log_$label" 2>/dev/null || true)

@@ -176,7 +176,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
 
     let t0 = std::time::Instant::now();
 
-    let mut builder = LLM::builder(model).device(&args.device).dtype(&args.dtype);
+    let mut builder = LLM::builder(model).dtype(&args.dtype);
     // Chat is strictly sequential — one blocking chat_stream call at a
     // time (REPL, -q, multi-prompt, and --bench alike), so exactly one
     // sequence is ever running. Declare that instead of inheriting the

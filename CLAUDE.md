@@ -64,7 +64,7 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
   opt-in via the `multimodal` feature on `scratchy-cli` (on by default
   there) — a plain `chat`-only build never compiles image/png/zune-jpeg/etc.
 - List cached models with `scr model ls`; run a model in-process with
-  `scr chat -m <model> --device metal -q "..."` (no image arg — images need the
+  `scr chat -m <model> -q "..."` (no image arg — images need the
   HTTP server, i.e. the `serve` feature + `scr serve ... --kv-cache-dtype ...`).
 
 ## Verify like CI before opening a build / deps / codegen PR

@@ -49,9 +49,6 @@ pub use scratchy_serving_engine::worker_factory::DownloadObserver;
 pub struct VllmConfig {
     /// Model path or HuggingFace model ID (required).
     pub model: String,
-    /// Device: the name the linked backend's worker matches, or "auto" (the backend this binary was
-    /// built with).
-    pub device: String,
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     pub dtype: String,
     /// Maximum model context length (None = use config.json).
@@ -131,7 +128,6 @@ impl Default for VllmConfig {
     fn default() -> Self {
         Self {
             model: String::new(),
-            device: "auto".to_string(),
             dtype: "auto".to_string(),
             max_model_len: None,
             max_num_seqs: None,
@@ -234,9 +230,9 @@ fn resolve_num_layers(hf_config: &HfModelConfig) -> usize {
 /// [`Worker::kv_block_bytes`] — two mints of one value, a guard apiece. There is no second
 /// mint below the door now: `init_cache`, `compute_kv_blocks` and `Worker::kv_block_bytes`
 /// all take the type, so block == page holds because there is ONE value, not two mints of one.
-fn effective_block_size(configured: KvBlockTokens, device: &str) -> KvBlockTokens {
-    inventory::iter::<&dyn WorkerFactory>()
-        .find(|f| f.matches(device))
+fn effective_block_size(configured: KvBlockTokens) -> KvBlockTokens {
+    linked_factory()
+        .ok()
         .and_then(|f| f.required_block_size())
         .unwrap_or(configured)
 }
@@ -391,14 +387,13 @@ const TEMPLATE_TURN_TERMINATORS: &[&str] = &[
 // Worker creation result now lives in `scratchy-serving-worker` alongside
 // the `WorkerFactory` trait and `Box<dyn Worker>`/`HfModelConfig` it names.
 use scratchy_serving_worker::worker_factory::{
-    Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, WorkerFactory,
+    Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, linked_factory,
 };
 
 /// Create the appropriate worker via the `WorkerFactory` inventory registry.
 ///
-/// Builds the shared [`WorkerCreateConfig`] once, then selects the first
-/// registered backend factory whose `matches` accepts `config.device` and
-/// calls its `create`. The per-backend construct→init→load→extract logic
+/// Builds the shared [`WorkerCreateConfig`] once, then calls the `create` of the one factory this
+/// binary links ([`linked_factory`]). The per-backend construct→init→load→extract logic
 /// lives in each target's worker crate (its registered `WorkerFactory`);
 /// there are no `#[cfg]` backend arms here.
 ///
@@ -461,29 +456,7 @@ fn create_worker(
         }) as ProgressCallback
     });
 
-    // Empty registry — distinct from the per-device "no backend" error below,
-    // which means a backend IS registered but doesn't claim this device string.
-    // The common cause is simply a build with no GPU backend feature; the rarer
-    // cause is the linker GC'ing the registration.
-    if inventory::iter::<&dyn WorkerFactory>().next().is_none() {
-        anyhow::bail!(
-            "No inference backend is linked into this binary: no `WorkerFactory` is registered. \
-             A binary serves through the worker crate of its target, which it links and anchors \
-             with an `extern crate ... as _` so the linker keeps the factory's \
-             `inventory::submit!`."
-        );
-    }
-
-    let factory = inventory::iter::<&dyn WorkerFactory>()
-        .find(|f| f.matches(&config.device))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No backend linked into this binary serves device '{}'.",
-                config.device
-            )
-        })?;
-
-    factory.create(worker_config, progress_cb)
+    linked_factory()?.create(worker_config, progress_cb)
 }
 
 /// Initialize cache on the worker and compute block counts.
@@ -1131,7 +1104,9 @@ fn spec_decode_memory_budget_check(
 /// Recommended working-set size (bytes) from whichever backend factory is
 /// registered in this build, without naming a specific backend crate.
 fn backend_recommended_working_set_size() -> Option<u64> {
-    inventory::iter::<&dyn WorkerFactory>().find_map(|f| f.recommended_working_set_size())
+    linked_factory()
+        .ok()
+        .and_then(|f| f.recommended_working_set_size())
 }
 
 fn weight_bytes_on_disk(dir: &std::path::Path) -> u64 {
@@ -1197,10 +1172,7 @@ fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
 /// (`WorkerFactory::supports_prefix_caching`) — what the worker is created with,
 /// so it reserves recurrent-state snapshots only for an engine that will use them.
 fn requested_prefix_caching(config: &VllmConfig) -> bool {
-    config.enable_prefix_caching
-        && !inventory::iter::<&dyn scratchy_serving_engine::worker_factory::WorkerFactory>()
-            .find(|f| f.matches(&config.device))
-            .is_some_and(|f| !f.supports_prefix_caching())
+    config.enable_prefix_caching && !linked_factory().is_ok_and(|f| !f.supports_prefix_caching())
 }
 
 /// ⭐ THE ONE RULE FOR WHETHER THE ENGINE SERVES CACHED PREFIXES, at every `EngineCoreConfig` site.
@@ -1281,7 +1253,7 @@ fn prefix_caching(
         info!(
             "Prefix caching disabled: the {} backend's worker does not support it — the scheduler \
              would skip the prefill for a prefix the worker holds no KV for",
-            config.device
+            linked_factory().map_or("linked", |f| f.name())
         );
     }
     effective_prefix_caching(requested, hybrid, worker_snapshots.is_some())
@@ -1371,7 +1343,9 @@ fn resolve_max_num_seqs(
 /// Total device memory + name from whichever backend factory is registered in
 /// this build (exactly one backend links), without naming a specific backend crate.
 fn backend_device_total_bytes_and_name() -> Option<(u64, String)> {
-    inventory::iter::<&dyn WorkerFactory>().find_map(|f| f.device_total_bytes_and_name())
+    linked_factory()
+        .ok()
+        .and_then(|f| f.device_total_bytes_and_name())
 }
 
 /// Shared by [`initialize_stack`] (async server path) and
@@ -1429,7 +1403,7 @@ fn initialize_core(
     // The backend's own page size when it declares one, so the scheduler's block allocator
     // (slot = block_id * block_size + offset) addresses the same slots the pool uses. The same
     // resolved value reaches `create_worker`'s WorkerCreateConfig — one value, not two mints.
-    let block_size = effective_block_size(configured, &config.device);
+    let block_size = effective_block_size(configured);
 
     let (mut worker, hf_config, model_dir, model_dtype) =
         create_worker(config, speculation, model_path, progress, block_size)?;
@@ -2291,10 +2265,8 @@ mod tests {
     /// as asked.
     #[test]
     fn every_entry_point_decides_prefix_caching_by_one_rule() {
-        let config = VllmConfig {
-            device: "test-no-backend".to_string(),
-            ..VllmConfig::default()
-        };
+        // The unit-test binary links no worker, so no backend narrows what the config asks.
+        let config = VllmConfig::default();
         let hybrid = ["Qwen3_5ForConditionalGeneration".to_string()];
         let llama = ["LlamaForCausalLM".to_string()];
         let snapshots = scratchy_serving_scheduler::scheduler::SnapshotBudget {
@@ -2542,7 +2514,6 @@ mod tests {
     #[test]
     fn test_scratchy_core_config_default() {
         let config = VllmConfig::default();
-        assert_eq!(config.device, "auto");
         assert_eq!(config.dtype, "auto");
         assert_eq!(config.max_num_seqs, None);
         assert_eq!(config.block_size, 16);

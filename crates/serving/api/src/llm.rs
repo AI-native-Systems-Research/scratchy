@@ -223,12 +223,6 @@ impl LLMBuilder {
         }
     }
 
-    /// Set the device: the name the linked backend's worker matches, or "auto".
-    pub fn device(mut self, device: impl Into<String>) -> Self {
-        self.config.device = device.into();
-        self
-    }
-
     /// Set the drafts a speculative step proposes: with the target's compiled
     /// multi-token-prediction head, `0` turns it off.
     pub fn num_speculative_tokens(mut self, k: usize) -> Self {
@@ -431,9 +425,8 @@ impl LLM {
         // prefix the worker has no KV for and the forward desyncs. Done here,
         // before the scheduler/cache are built from `config`.
         if config.enable_prefix_caching
-            && inventory::iter::<&dyn scratchy_serving_engine::worker_factory::WorkerFactory>()
-                .find(|f| f.matches(&config.device))
-                .is_some_and(|f| !f.supports_prefix_caching())
+            && scratchy_serving_engine::worker_factory::linked_factory()
+                .is_ok_and(|f| !f.supports_prefix_caching())
         {
             config.enable_prefix_caching = false;
         }
@@ -1369,7 +1362,6 @@ mod tests {
     fn test_builder_defaults() {
         let builder = LLMBuilder::new("test-model");
         assert_eq!(builder.config.model, "test-model");
-        assert_eq!(builder.config.device, "auto");
         assert_eq!(builder.config.dtype, "auto");
         // Unset by default: the BACKEND decides the width (resolve_max_num_seqs), not a CLI literal.
         assert_eq!(builder.config.max_num_seqs, None);
@@ -1380,14 +1372,12 @@ mod tests {
     #[test]
     fn test_builder_chaining() {
         let builder = LLMBuilder::new("test-model")
-            .device("cpu")
             .dtype("float16")
             .max_model_len(2048)
             .max_num_seqs(32)
             .block_size(8)
             .gpu_memory_utilization(0.5);
 
-        assert_eq!(builder.config.device, "cpu");
         assert_eq!(builder.config.dtype, "float16");
         assert_eq!(builder.config.max_model_len, Some(2048));
         assert_eq!(builder.config.max_num_seqs, Some(32));

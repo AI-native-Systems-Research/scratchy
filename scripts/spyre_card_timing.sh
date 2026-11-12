@@ -653,20 +653,20 @@ for COMM in cargo rustc dxp_standalone; do
   fi
 done
 
-# An orphaned ' serve .*--device spyre' held a card once, so kill any leftover
+# An orphaned scratchy serve held a card once, so kill any leftover
 # first, then refuse if one survives or anything still holds a vfio device.
-LEFTOVER=$(pgrep -f ' serve .*--device spyre' || true)
+LEFTOVER=$(pgrep -f '(^|/)(scr|spyre) serve ' || true)
 if [ -n "$LEFTOVER" ]; then
   echo "killing leftover spyre serve: $LEFTOVER" >&2
   kill $LEFTOVER 2>/dev/null || true
   for _ in $(seq 1 30); do
-    LEFTOVER=$(pgrep -f ' serve .*--device spyre' || true)
+    LEFTOVER=$(pgrep -f '(^|/)(scr|spyre) serve ' || true)
     [ -z "$LEFTOVER" ] && break
     sleep 1
   done
 fi
-if [ -n "$(pgrep -f ' serve .*--device spyre' || true)" ]; then
-  echo "REFUSING: a ' serve .*--device spyre' process survived the kill; the card is not free" >&2
+if [ -n "$(pgrep -f '(^|/)(scr|spyre) serve ' || true)" ]; then
+  echo "REFUSING: a scratchy serve process survived the kill; the card is not free" >&2
   exit 67
 fi
 if ls -l /proc/[0-9]*/fd 2>/dev/null | grep -q 'vfio-device'; then
@@ -731,7 +731,7 @@ serve_up() {
   SRVLOG="$WORK/serve.$BOOTS.log"
   CUR_MML=$MML
   T0=$SECONDS
-  taskset -c "$CORES" "$CAND" serve --model "$M" --device spyre \
+  taskset -c "$CORES" "$CAND" serve --model "$M" \
     --host 0.0.0.0 --port "$PORT" --max-num-seqs "$MNS" --max-model-len "$MML" \
     --no-prefix-caching > "$SRVLOG" 2>&1 &
   SRV=$!

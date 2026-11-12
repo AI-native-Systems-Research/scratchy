@@ -38,7 +38,6 @@ async fn start_otel_server() -> (u16, String, OtelTestServer) {
     let model = scratchy_e2e::TestModels::SMOLLM;
     let config = scratchy_serving_api::init::VllmConfig {
         model: model.to_string(),
-        device: "auto".to_string(),
         dtype: "auto".to_string(),
         max_num_seqs: Some(16),
         block_size: 16,

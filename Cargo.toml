@@ -49,7 +49,7 @@ members = [
     "crates/models/vision",
     "crates/models/quantization",
     "crates/models/spec",
-    "crates/models/tp",
+    "crates/targets/spyre/tp",
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/frontend",

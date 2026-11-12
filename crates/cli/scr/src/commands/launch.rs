@@ -610,26 +610,6 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         );
     }
 
-    // Warn early if this build has no GPU backend: the server will run on CPU,
-    // and a multi-billion-parameter model prefilling Claude Code's large prompt
-    // (full system prompt + tool schemas, easily 10k+ tokens) can take tens of
-    // seconds per turn — long enough to hit the engine's 60s no-progress abort
-    // before the first token.
-    // A build with no compiled GPU backend (no `metal`) runs on CPU. macOS no
-    // longer auto-enables metal — you build `--features metal` explicitly — so
-    // the CLI crate's own `metal` feature is an accurate signal here on every
-    // platform.
-    let no_gpu_backend = !cfg!(feature = "metal");
-    if args.server_url.is_none()
-        && (args.device == "cpu" || (args.device == "auto" && no_gpu_backend))
-    {
-        eprintln!(
-            "Warning: no GPU backend is compiled into this binary, so the server will run on \
-             CPU and may be very slow. Rebuild with `--features metal` (Mac) and run that \
-             binary, or pass --device metal if your build supports it."
-        );
-    }
-
     // Only forward an explicit --tool-call-parser; when unset the served engine
     // auto-selects one from the model family in `initialize_stack`
     // (scratchy_serving_api::tool_parser::detect_tool_parser).
@@ -870,7 +850,6 @@ fn serve_argv(
     let mut argv = vec!["serve".to_string(), model.to_string()];
     pair(&mut argv, &taken, "--host", "127.0.0.1");
     pair(&mut argv, &taken, "--port", port);
-    pair(&mut argv, &taken, "--device", &args.device);
     pair(&mut argv, &taken, "--dtype", &args.dtype);
     // Defaults, not hard-codes: each carries a launch-specific opinion `scr serve`
     // does not share (see `LaunchClaudeArgs::max_num_seqs` for the batch-1 memory

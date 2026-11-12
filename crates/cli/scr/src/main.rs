@@ -119,7 +119,7 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         #[cfg(feature = "bench")]
-        Commands::Bench(cmd) => commands::bench::run_bench(cmd).await,
+        Commands::Bench(cmd) => commands::bench::run_bench(*cmd).await,
         #[cfg(any(feature = "chat", feature = "serve"))]
         Commands::Batch(args) | Commands::RunBatch(args) => commands::batch::run_batch(args).await,
         Commands::Chat(args) => commands::chat::run_chat(args).await,

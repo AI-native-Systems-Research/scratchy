@@ -381,7 +381,6 @@ fn evaluate(response: &str, expected: &str, debug: bool) -> f64 {
 fn build_llm(args: &BenchLongbenchArgs) -> Result<LLM> {
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
     let mut builder = LLMBuilder::new(&model)
-        .device(&args.device)
         .dtype(&args.dtype)
         .gpu_memory_utilization(args.gpu_memory_utilization)
         .max_num_seqs(args.max_num_seqs)

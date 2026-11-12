@@ -1880,7 +1880,7 @@ PY
         # from the checkpoint template `scr chat` renders.
         pconfig="$(mlx_parity_config "${stem}")"
         if "${BIN}" bench startup --model "${id}" --exec --mode cli --scenarios warm --port "${PORT}" \
-                --child-cmd "${model_bin} chat -m ${id} --device metal -q {prompt} --max-tokens {output_len} --temperature 0" \
+                --child-cmd "${model_bin} chat -m ${id} -q {prompt} --max-tokens {output_len} --temperature 0" \
                 --backend scratchy \
                 --parity-cmd "${MLX_PYTHON} -m mlx_lm.generate --model ${id} --prompt {prompt} --max-tokens {output_len} --temp 0${pconfig:+ --chat-template-config ${pconfig}}" \
                 --parity-backend mlx-lm \

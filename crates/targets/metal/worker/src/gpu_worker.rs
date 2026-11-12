@@ -9405,8 +9405,8 @@ impl Worker for MetalWorker {
 pub struct MetalWorkerFactory;
 
 impl scratchy_serving_worker::worker_factory::WorkerFactory for MetalWorkerFactory {
-    fn matches(&self, device: &str) -> bool {
-        matches!(device, "auto" | "metal")
+    fn name(&self) -> &'static str {
+        "metal"
     }
 
     fn create(

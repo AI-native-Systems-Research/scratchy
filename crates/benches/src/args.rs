@@ -55,10 +55,6 @@ pub struct BenchLatencyArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL", value_delimiter = ',')]
     pub models: Vec<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -187,10 +183,6 @@ pub struct BenchThroughputArgs {
     /// Path to a local model directory, or HuggingFace model ID.
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
-
-    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
-    #[arg(long, default_value = "auto")]
-    pub device: String,
 
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
@@ -625,10 +617,6 @@ pub struct BenchStartupArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -820,10 +808,6 @@ pub struct BenchSpansArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -920,10 +904,6 @@ pub struct BenchNiahArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -1006,10 +986,6 @@ pub struct BenchRulerArgs {
     /// Path to a local model directory, or HuggingFace model ID.
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
-
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
 
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
@@ -1133,10 +1109,6 @@ pub struct BenchRagcsvArgs {
     #[arg(long)]
     pub grading_model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -1220,10 +1192,6 @@ pub struct BenchMultihopArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -1306,10 +1274,6 @@ pub struct BenchMusiqueArgs {
     /// Path to a local model directory, or HuggingFace model ID.
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
-
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
 
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
@@ -1395,10 +1359,6 @@ pub struct BenchHotpotqaArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -1482,10 +1442,6 @@ pub struct BenchMsmarcoArgs {
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
-
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]
     pub dtype: String,
@@ -1568,10 +1524,6 @@ pub struct BenchLongbenchArgs {
     /// Path to a local model directory, or HuggingFace model ID.
     #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
     pub model: Option<String>,
-
-    /// Device: "cpu", "metal", "spyre", or "auto".
-    #[arg(long, default_value = "auto")]
-    pub device: String,
 
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     #[arg(long, default_value = "auto")]

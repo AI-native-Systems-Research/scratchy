@@ -4759,12 +4759,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "inventory",
- "objc2",
- "objc2-metal",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-tensors",
  "serde_json",
+]
+
+[[package]]
+name = "scratchy-forward-compiler-frontend"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "scratchy-tensors",
+ "serde_json",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -4775,10 +4783,12 @@ dependencies = [
  "quote",
  "rayon",
  "scratchy-forward-compiler",
+ "scratchy-forward-compiler-frontend",
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
+ "scratchy-tensors",
  "serde_json",
  "syn 3.0.4",
  "tracing",
@@ -4792,6 +4802,7 @@ dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
  "scratchy-tensors",
+ "scratchy-tp-world",
 ]
 
 [[package]]
@@ -4815,16 +4826,29 @@ name = "scratchy-models"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "hf-hub-downloader",
  "proc-macro2",
  "rayon",
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
+ "scratchy-models-build",
  "scratchy-quantizations",
  "scratchy-target-metal",
+ "scratchy-tensors",
  "scratchy-vision",
+ "serde_json",
+]
+
+[[package]]
+name = "scratchy-models-build"
+version = "0.1.0"
+dependencies = [
+ "hf-hub-downloader",
+ "proc-macro2",
+ "rayon",
+ "scratchy-core-model",
+ "scratchy-forward-compiler-macro",
  "serde_json",
 ]
 
@@ -4920,23 +4944,13 @@ name = "scratchy-serving-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "half",
- "inventory",
- "objc2",
- "objc2-metal",
- "rand 0.9.5",
  "scratchy-core-common",
  "scratchy-core-config",
- "scratchy-core-model",
- "scratchy-forward-compiler",
- "scratchy-models",
  "scratchy-serving-engine",
  "scratchy-serving-scheduler",
  "scratchy-serving-transport",
- "scratchy-target-metal",
  "serde",
  "serde_json",
- "tokenizers",
  "tracing",
 ]
 
@@ -4946,6 +4960,8 @@ version = "0.1.0"
 dependencies = [
  "half",
  "scratchy-ir",
+ "scratchy-tensors",
+ "scratchy-tp-world",
  "serde_json",
 ]
 
@@ -4957,6 +4973,7 @@ dependencies = [
  "block2",
  "dispatch2",
  "half",
+ "inventory",
  "libc",
  "memmap2",
  "objc2",
@@ -4987,8 +5004,32 @@ dependencies = [
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-metal",
+ "scratchy-tensors",
  "serde",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "scratchy-target-metal-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "inventory",
+ "objc2",
+ "objc2-metal",
+ "rand 0.9.5",
+ "scratchy-core-common",
+ "scratchy-core-config",
+ "scratchy-core-model",
+ "scratchy-forward-compiler",
+ "scratchy-models",
+ "scratchy-serving-engine",
+ "scratchy-serving-scheduler",
+ "scratchy-serving-worker",
+ "scratchy-target-metal",
+ "tokenizers",
+ "tracing",
 ]
 
 [[package]]
@@ -4997,7 +5038,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memmap2",
+ "typenum",
 ]
+
+[[package]]
+name = "scratchy-tp-world"
+version = "0.1.0"
 
 [[package]]
 name = "scratchy-tui"
@@ -5018,6 +5064,7 @@ dependencies = [
  "scratchy-models",
  "scratchy-quantizations",
  "scratchy-serving-api",
+ "scratchy-target-metal-worker",
  "serde_json",
  "syntect",
  "tokio",

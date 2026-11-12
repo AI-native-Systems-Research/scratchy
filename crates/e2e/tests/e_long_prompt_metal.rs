@@ -71,7 +71,6 @@ async fn start_metal_server() -> (TestServer, Client) {
     // >4096-token prompt fits (otherwise the engine bails before
     // chunking matters — finish_reason="length" with completion_tokens=0).
     let server = TestServer::builder(scratchy_e2e::TestModels::SMOLLM)
-        .with_device("metal")
         .with_args(&["--max-model-len", "8192"])
         .start()
         .await
@@ -88,7 +87,6 @@ async fn start_metal_server() -> (TestServer, Client) {
 /// pick one strong enough for a real needle assertion.
 async fn start_metal_server_max_batched(model: &str, max_batched: &str) -> (TestServer, Client) {
     let server = TestServer::builder(model)
-        .with_device("metal")
         .with_args(&[
             "--max-model-len",
             "8192",

@@ -30,15 +30,11 @@ pub async fn run_batch(args: BatchArgs) -> Result<()> {
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
 
     info!("vLLM Rust — batch mode");
-    info!(
-        "Model: {}, device: {}, dtype: {}",
-        model, args.device, args.dtype
-    );
+    info!("Model: {}, dtype: {}", model, args.dtype);
     info!("Input: {}, Output: {}", args.input, args.output);
 
     let config = VllmConfig {
         model,
-        device: args.device,
         dtype: args.dtype,
         gpu_memory_utilization: args.gpu_memory_utilization,
         max_num_seqs: args.max_num_seqs,

@@ -31,10 +31,6 @@ use tokio::task::JoinHandle;
 
 pub const PROVIDER_NAME: &str = "scratchy";
 pub const DEFAULT_MODEL: &str = "mlx-community/Qwen2.5-3B-Instruct-4bit";
-// `auto` lets the compiled-in backend factory claim it (metal / spyre both
-// match `auto`), so a spyre-only build serves the TUI without erroring on a
-// hard-coded `metal`. `GOOSE_SCRATCHY_DEVICE` overrides for explicit selection.
-const DEFAULT_DEVICE: &str = "auto";
 /// Fallback generation cap when the caller sets no `max_tokens`. Reasoning
 /// models spend far more than 1k tokens on a single turn (thinking + tool
 /// calls + answer), so a low cap truncates them mid-turn; keep it generous.
@@ -347,7 +343,6 @@ async fn ensure_engine(
 
         let config = VllmConfig {
             model: spec.to_string(),
-            device: env_or("GOOSE_SCRATCHY_DEVICE", DEFAULT_DEVICE),
             dtype: "auto".to_string(),
             // The TUI is strictly one conversation at a time — an explicit width, not a default.
             max_num_seqs: Some(1),

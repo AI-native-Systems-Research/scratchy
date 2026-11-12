@@ -4,10 +4,9 @@
 //! Backend-neutral worker construction via an `inventory` registry.
 //!
 //! Each backend registers a `WorkerFactory` with
-//! `inventory::submit!` in its target's worker crate. `create_worker`
-//! (in `scratchy-serving-api`) selects the first factory whose
-//! [`WorkerFactory::matches`] accepts the device string, then calls
-//! [`WorkerFactory::create`] — no `#[cfg]` arms in the dispatch.
+//! `inventory::submit!` in its target's worker crate, and a binary links exactly one target's
+//! worker, so [`linked_factory`] is THE factory: `create_worker` (in `scratchy-serving-api`) calls
+//! its [`WorkerFactory::create`] — no `#[cfg]` arms in the dispatch, and no device to select.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -128,14 +127,11 @@ pub type WorkerCreationResult = (Box<dyn Worker>, HfModelConfig, Option<PathBuf>
 /// A progress callback the factory may wire into the worker during load.
 pub type ProgressCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
-/// A backend's worker constructor, registered via `inventory::submit!`.
-///
-/// Exactly one backend factory compiles per build (the backend
-/// features are mutually exclusive), so `matches` overlap on `"auto"` carries no
-/// runtime ambiguity.
+/// A backend's worker constructor, registered via `inventory::submit!`. A binary links exactly
+/// one: the worker crate of its target ([`linked_factory`]).
 pub trait WorkerFactory: Sync {
-    /// Whether this backend handles the given device string.
-    fn matches(&self, device: &str) -> bool;
+    /// The target's name, for what the engine reports about its backend.
+    fn name(&self) -> &'static str;
 
     /// Construct → init → load → extract for this backend, returning the
     /// worker plus the metadata `initialize_core` needs.
@@ -188,6 +184,31 @@ pub trait WorkerFactory: Sync {
 }
 
 inventory::collect!(&'static dyn WorkerFactory);
+
+/// THE factory this binary serves through: the one its target's worker crate registered. A binary
+/// links exactly one target's worker, so there is no device to choose; none (a binary that anchors
+/// no worker crate, or a linker that dropped its registration) or several (two targets linked into
+/// one binary) is a build defect, reported as such.
+pub fn linked_factory() -> anyhow::Result<&'static dyn WorkerFactory> {
+    let mut linked = inventory::iter::<&dyn WorkerFactory>();
+    let Some(factory) = linked.next() else {
+        anyhow::bail!(
+            "No inference backend is linked into this binary: no `WorkerFactory` is registered. \
+             A binary serves through the worker crate of its target, which it links and anchors \
+             with an `extern crate ... as _` so the linker keeps the factory's \
+             `inventory::submit!`."
+        );
+    };
+    if let Some(other) = linked.next() {
+        anyhow::bail!(
+            "Two inference backends are linked into this binary (`{}` and `{}`): a binary links \
+             exactly one target's worker.",
+            factory.name(),
+            other.name()
+        );
+    }
+    Ok(*factory)
+}
 
 pub use scratchy_core_model::hub::DownloadObserver;
 

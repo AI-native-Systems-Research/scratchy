@@ -155,18 +155,13 @@ impl SpyreWorker {
 
 /// Spyre / KTIR backend factory. Registered with `inventory::submit!` so the
 /// backend-neutral `create_worker` (engine's `WorkerFactory` registry) finds it
-/// without naming `SpyreWorker` — the same seam metal registers through. In
-/// a spyre build (mutually exclusive with metal) `"auto"` resolves
-/// here, so `scr chat` without an explicit `--device` serves on spyre.
+/// without naming `SpyreWorker`: a spyre binary links this worker and no other, so it is the
+/// factory that binary serves through.
 pub struct SpyreWorkerFactory;
 
 impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFactory {
-    fn matches(&self, device: &str) -> bool {
-        // ⭐ ONE DEVICE NAME. The target is `spyre`; WHICH spyre — the card or the emulator — is a
-        // build-time fact (`spyre-hw` / `spyre-emu`), not something a runtime string selects,
-        // so there is no second name to accept. `auto` resolves to whichever backend this binary
-        // was built with.
-        device == "spyre" || device == "auto"
+    fn name(&self) -> &'static str {
+        "spyre"
     }
 
     /// ⭐ TRUE, AND THE TWO THINGS THAT MAKE IT TRUE. What a cache hit needs is that the reusing
