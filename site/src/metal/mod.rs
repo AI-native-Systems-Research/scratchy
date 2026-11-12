@@ -3656,7 +3656,7 @@ mod tests {
     fn a_datasets_summary_is_the_grid_maps_look_by_prompt_length() {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         // The fixture is from before cells kept prompt counts: give its RAG cells some, two
-        // requests in the 2.55k+ bucket and the rest in 2.85k+.
+        // requests in the 2.4k+ bucket and the rest in 3.4k+.
         let m = &mut runs[0].models[0];
         for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()]
             .into_iter()
@@ -3666,7 +3666,7 @@ mod tests {
                 let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                 c.prompt_tokens = Some(
                     (0..n)
-                        .map(|i| Some(if i < 2 { 2700 } else { 3200 }))
+                        .map(|i| Some(if i < 2 { 2500 } else { 3500 }))
                         .collect(),
                 );
                 c.tpots_ms = Some(vec![Some(20.0); n]);
@@ -3689,7 +3689,7 @@ mod tests {
         );
         assert!(html.contains(">gpt-oss-20b<"), "the model under its class");
         // A column a bucket under its model, the random-token map's four.
-        for b in super::buckets::MUSIQUE {
+        for b in super::buckets::BUCKETS {
             let label = b.0.replace('<', "&#60;");
             assert!(html.contains(&format!(">{label}<")), "no {} column", b.0);
         }
@@ -3701,14 +3701,55 @@ mod tests {
             "a ratio against its rival"
         );
         assert!(
-            html.contains("2.85k+ prompt tokens"),
+            html.contains("3.4k+ prompt tokens"),
             "its bucket in its tooltip"
         );
         // And how many requests each side's median is over, so a thin square says it is thin.
         assert!(
             html.contains("over 2 and 2 requests"),
-            "the 2.55k+ bucket's two a side"
+            "the 2.4k+ bucket's two a side"
         );
+        // A bucket neither engine sent a request to says so, not that one side has no timing.
+        assert!(html.contains("no requests this long"), "the <2.4k bucket");
+        assert!(!html.contains("no timing on one side"));
+    }
+
+    /// A summary square with no ratio says which engine it is missing: one that sent no request
+    /// that long, or one whose requests that long kept no timing.
+    #[test]
+    fn a_summary_square_names_the_side_with_no_timing() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let m = &mut runs[0].models[0];
+        // scratchy's RAG requests all at 1,600 prompt tokens; oMLX's all at 3,200.
+        for (cells, len) in [(m.tasks.as_mut(), 2700), (m.tasks_omlx.as_mut(), 3200)] {
+            for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                c.prompt_tokens = Some(vec![Some(len); n]);
+                c.tpots_ms = Some(vec![Some(20.0); n]);
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("oMLX sent no request this long"), "2.4k+");
+        assert!(html.contains("scratchy sent no request this long"), "2.9k+");
+        // Requests that long, none of whose decode was timed: a one-token answer has no TPOT.
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let m = &mut runs[0].models[0];
+        let both = [m.tasks.as_mut(), m.tasks_omlx.as_mut()];
+        for c in both.into_iter().flatten().flatten() {
+            let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+            if c.workload == "rag" {
+                c.prompt_tokens = Some(vec![Some(3200); n]);
+                c.tpots_ms = Some(vec![Some(20.0); n]);
+            }
+        }
+        let omlx = m.tasks_omlx.iter_mut().flatten();
+        for c in omlx.filter(|c| c.workload == "rag" && c.conc == 1) {
+            c.tpots_ms = Some(vec![None; c.ttfts_ms.as_ref().map_or(0, Vec::len)]);
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        assert!(html.contains("oMLX timed none of its"), "decode at 3k+");
     }
 
     /// A run from before cells kept prompt counts has no buckets to draw: its summary says so,
