@@ -541,10 +541,7 @@ fn padding_row_replicates_live_0(real: usize) {
         })
         .expect("the builder never fails here");
     let rows = live
-        .launch_rows(
-            ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks),
-            width,
-        )
+        .launch_rows(ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks), width)
         .expect("a live batch lays into its rung");
     assert_eq!(
         rows.live(),
@@ -847,10 +844,7 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     // launch position, so "took live 0's" is distinguishable from every wrong answer that has shipped.
     let toks = [101usize, 202, 303];
     let rows = live
-        .launch_rows(
-            ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks),
-            width,
-        )
+        .launch_rows(ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks), width)
         .expect("a live batch lays into its rung");
     let pad = rows.row(3).expect("every bound slot runs something");
     let live0 = rows.row(0).expect("live 0");

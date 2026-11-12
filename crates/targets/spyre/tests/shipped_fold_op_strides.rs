@@ -12,9 +12,9 @@
 //! on either of my two readings. Recording the numbers here so the next attempt starts from measured
 //! semantics instead of a comment.
 
+use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
-use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::sdsc_abstract::{
     BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, QueryRowCount,
     RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
@@ -149,9 +149,7 @@ fn print_what_the_shipped_fold_score_op_addresses() {
         "sc_shipped",
         MatM::of_query_rows(QueryRowCount::of_mq(MQ)),
         MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatK::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(
-            HD,
-        )),
+        MatK::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(HD)),
         // The batch axis carries both operands' head strides, so the head-outermost walk it derives
         // (`mb_dev * in` for the read, `mb_dev * out` for the write) is checked against where the heads
         // really are: `qs` is the token stream (`mq*hd` apart) and `sc` is head-major (`mq*stick`).

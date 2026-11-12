@@ -60,10 +60,9 @@ fn a_pass_past_a_rows_own_pages_has_no_valid_column() {
         .map(|p| KvHistory::contiguous(p * PagedKvPool::POOL_PAGE_SLOTS.as_usize()))
         .collect();
 
-    let shape = PrefixMaskShape::<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(
-        nqh, rung,
-    )
-    .expect("block is whole sticks");
+    let shape =
+        PrefixMaskShape::<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(nqh, rung)
+            .expect("block is whole sticks");
     // ⭐ THROUGH `FoldPages`, from the batch's write slot — the only door. A test that named its own page
     // count could pin a geometry the fold never walks, which is the drift `FoldPages` exists to close.
     // The deepest row here ends at `8 * POOL_PAGE_SLOTS`, so the slot appended at is that, and `covering`
@@ -122,10 +121,9 @@ fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
     let nqh = 32u32;
     let shared = *lens.iter().max().unwrap(); // 1986 — the DEEPEST row's own end
 
-    let shape = PrefixMaskShape::<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(
-        nqh, rung,
-    )
-    .expect("whole sticks");
+    let shape =
+        PrefixMaskShape::<{ ktir_superdsc::sdsc_abstract::POOL_STICK }, PER_PAGE>::new(nqh, rung)
+            .expect("whole sticks");
 
     // AFTER the step: each row recorded one slot at the shared write slot. The deepest row's run EXTENDS
     // (contiguous); the others gain a second run.

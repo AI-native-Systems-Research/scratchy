@@ -24,10 +24,8 @@ use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 
 const DECODE: &str = include_str!("../../../kernels/page_attn_head_major_decode.py");
-const PREFILL: &str =
-    include_str!("../../../kernels/page_attn_head_major_prefill.py");
-const KV_WRITE: &str =
-    include_str!("../../../kernels/reshape_and_cache_head_major.py");
+const PREFILL: &str = include_str!("../../../kernels/page_attn_head_major_prefill.py");
+const KV_WRITE: &str = include_str!("../../../kernels/reshape_and_cache_head_major.py");
 const BATCHED: &str = include_str!("../../../kernels/batched_decode_head_major.py");
 
 /// A kernel through the whole ladder to the emulator's IR.

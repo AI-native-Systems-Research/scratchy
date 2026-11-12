@@ -14,12 +14,12 @@
 use emit::In;
 use ktir_superdsc::addr::OutCorner;
 use ktir_superdsc::emit;
-use ktir_superdsc::work::EwDivision;
 use ktir_superdsc::sdsc_abstract::{
     BlockCols, KernelTag, RowBlockedTag, RowCount, SpyreTensorLayout, Staged, StickKind,
     StickLayout, Stk, stage_2d,
 };
 use ktir_superdsc::superdsc_opspec::Df;
+use ktir_superdsc::work::EwDivision;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 
 /// Typed matmul operands — the compile-time addressing guard: a matmul's A/O are RowBlocked, W is a

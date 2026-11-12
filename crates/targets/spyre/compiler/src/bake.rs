@@ -4621,11 +4621,10 @@ pub(crate) fn dump_wavefront_mega(
 
         // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
         // ERROR that names the model and its head_dim (the config's, typed at load).
-        let prefill_head_width =
-            ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
-                u64::from(model.text.head_dim.get()),
-                &model.name,
-            );
+        let prefill_head_width = ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks_at_bake(
+            u64::from(model.text.head_dim.get()),
+            &model.name,
+        );
         // The rungs THIS model bakes, by the same law the emitter forms the causal block with.
         let rung_admitted = |r: u32| {
             r <= SUB_BLOCKED_PREFILL_CEILING
@@ -5107,11 +5106,9 @@ pub(crate) fn dump_wavefront_mega(
                 .iter()
                 .map(|(m, _)| *m)
                 .collect();
-            if let Err(e) =
-                ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
-                    &baked, &prefix,
-                )
-            {
+            if let Err(e) = ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_ladder_tops_the_ladder(
+                &baked, &prefix,
+            ) {
                 panic!("[spyre-superdsc] {stem}: {e}");
             }
             // ⛔⛔⛔ AND EVERY RUNG BELOW THE TOP THAT WAS ASKED FOR MUST HAVE BAKED. A missing one is silent:

@@ -74,9 +74,7 @@ fn the_staged_angles_land_where_the_collapsed_read_expects() {
 #[test]
 fn the_collapse_is_refused_above_one_stick_per_head() {
     use ktir_superdsc::superdsc_opspec::Fp16;
-    assert!(
-        (64u32 == <Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::DF.elems_per_stick())
-    );
+    assert!((64u32 == <Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::DF.elems_per_stick()));
     assert!(
         !(128u32 == <Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::DF.elems_per_stick())
     );

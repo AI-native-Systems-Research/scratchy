@@ -10,9 +10,7 @@
 
 use emit::In;
 use ktir_superdsc::emit;
-use ktir_superdsc::sdsc_abstract::{
-    BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk,
-};
+use ktir_superdsc::sdsc_abstract::{BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk};
 /// The one-stick handle — the TRUE shape of a `[1,1]` const read in the scalar broadcast
 /// mode (one RedStick IS its whole swept window).
 fn h(n: &str) -> Stk<RowBlockedTag> {

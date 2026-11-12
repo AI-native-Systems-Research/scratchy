@@ -69,8 +69,8 @@ pub use crate::lower_subtile_tape_to_ktir::{
 // the generated path must resolve through here. `KtirNode` is NOT re-exported: its only callers are in
 // this crate and they name the leaf directly.
 pub use ktir_superdsc::ktir_node::ActiveCap;
-use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR};
 use ktir_superdsc::superdsc_opspec::DataFormat;
+use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR};
 use std::collections::BTreeMap;
 
 // Re-export the hardware constants from the typed core so the whole emitter

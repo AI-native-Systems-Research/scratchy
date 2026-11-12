@@ -1111,12 +1111,8 @@ fn decode_idx_stick(
         as usize;
     (0..rows)
         .map(|r| {
-            let off = ktir_superdsc::sdsc_abstract::dev_off_stk(
-                &[rows, idx_row_words],
-                1,
-                &[r, 0],
-                stk,
-            );
+            let off =
+                ktir_superdsc::sdsc_abstract::dev_off_stk(&[rows, idx_row_words], 1, &[r, 0], stk);
             token_of_idx_word(r, words.get(off).copied().unwrap_or(-1), vocab)
         })
         .collect()
@@ -1295,12 +1291,8 @@ fn log_seat_readback(
             for &r in &report {
                 let mut best = (0usize, f32::NEG_INFINITY);
                 for j in 0..vocab {
-                    let e = ktir_superdsc::sdsc_abstract::dev_off_stk(
-                        &[rows, pad_v],
-                        1,
-                        &[r, j],
-                        stk,
-                    );
+                    let e =
+                        ktir_superdsc::sdsc_abstract::dev_off_stk(&[rows, pad_v], 1, &[r, j], stk);
                     let o = e * 2;
                     if let Some(v) = b.get(o..o + 2) {
                         let x = half::f16::from_le_bytes([v[0], v[1]]).to_f32();
@@ -2356,12 +2348,8 @@ mod idx_stick_tests {
         let mut words = vec![0i32; rows * ROW_WORDS];
         for (r, &p) in picks.iter().enumerate() {
             for c in 0..ROW_WORDS {
-                let off = ktir_superdsc::sdsc_abstract::dev_off_stk(
-                    &[rows, ROW_WORDS],
-                    1,
-                    &[r, c],
-                    stk,
-                );
+                let off =
+                    ktir_superdsc::sdsc_abstract::dev_off_stk(&[rows, ROW_WORDS], 1, &[r, c], stk);
                 words[off] = p as i32;
             }
         }

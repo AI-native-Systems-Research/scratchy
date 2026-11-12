@@ -19,9 +19,9 @@ use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
 use ktir_superdsc::sdsc_abstract::QueryExtent;
+use ktir_superdsc::superdsc_opspec::{DataFormat, DeviceTileLayout};
 use scratchy_subtile::subtile_ir::chain_slab_entries;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
-use ktir_superdsc::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
 /// reconnaissance set. These ops never become SuperDSC tiles — the host threads

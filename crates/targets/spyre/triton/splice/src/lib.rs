@@ -3891,14 +3891,10 @@ mod production_ktir_dump {
     //! production emits.
     use super::*;
 
-    const PAGED_DECODE: &str =
-        include_str!("../../../kernels/page_attn_head_major_decode.py");
-    const PAGED_PREFILL: &str =
-        include_str!("../../../kernels/page_attn_head_major_prefill.py");
-    const PAGED_KV_WRITE: &str =
-        include_str!("../../../kernels/reshape_and_cache_head_major.py");
-    const BATCHED_DECODE: &str =
-        include_str!("../../../kernels/batched_decode_head_major.py");
+    const PAGED_DECODE: &str = include_str!("../../../kernels/page_attn_head_major_decode.py");
+    const PAGED_PREFILL: &str = include_str!("../../../kernels/page_attn_head_major_prefill.py");
+    const PAGED_KV_WRITE: &str = include_str!("../../../kernels/reshape_and_cache_head_major.py");
+    const BATCHED_DECODE: &str = include_str!("../../../kernels/batched_decode_head_major.py");
     const ELEMENTWISE: &str = include_str!("../../../kernels/elementwise.py");
     const LMLAST: &str = include_str!("../../../kernels/lmlast.py");
     const MATMUL: &str = include_str!("../../../kernels/matmul.py");

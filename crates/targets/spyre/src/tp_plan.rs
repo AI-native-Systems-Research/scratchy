@@ -12,8 +12,8 @@
 //! ⭐ THE WORLD IS THE TYPE `T` — one world, named once by the build's `tp/N`, for the analysis that
 //! sharded the forward and for every bundle that runs it. Nothing here reads a world back.
 
-use scratchy_subtile::lower::LoweringInput;
 use ktir_superdsc::superdsc_opspec::{DataFormat, Fp16};
+use scratchy_subtile::lower::LoweringInput;
 use scratchy_subtile::tensor_parallel::{self, ShardRefusal, ShardedForward, SplitGranule};
 
 use crate::bundle_code::collective::{

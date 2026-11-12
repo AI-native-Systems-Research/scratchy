@@ -953,8 +953,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         true,
         // Same pair as the KTIR half above: 64 requests of one row.
         ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
-                .expect("one row is nonzero"),
+            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
             ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(64)
                 .expect("64 requests is nonzero"),
         )
