@@ -196,9 +196,9 @@ impl HostBuf {
 
     /// A page-aligned, zero-filled buffer of `len` bytes. "Zero-filled" is the mapping's
     /// own semantics (anonymous `mmap` reads as zeros until written), so nothing is memset:
-    /// the staging walk's writes fault the pages it touches and [`fault_in`] faults the
-    /// rest at prepare — the kernel zeroes each page exactly once, on first touch, either
-    /// way.
+    /// the staging walk's writes fault the pages it touches, and every other page faults at
+    /// the write that first touches it — the kernel zeroes each page exactly once, on first
+    /// touch, either way.
     pub(crate) fn zeroed(len: usize) -> Result<Self, HostBufError> {
         if len == 0 {
             return Ok(Self::empty());
@@ -1081,16 +1081,6 @@ const HOST_PAGE: usize = 4096;
 /// `stage_weights`' thread count). Pinned, not tuned: it only has to sit far enough above a
 /// spawn's own cost that a walk smaller than it never pays one.
 const STAGE_THREAD_BYTES: usize = 16 << 20;
-
-/// ⭐ FAULT EVERY PAGE OF `buf` IN, LEAVING ITS BYTES AS THEY ARE: each page is written with the byte
-/// it already holds. A zeroed allocation is mapped on first WRITE (a read maps the shared zero page
-/// and commits nothing), so this is what moves those faults to the caller's moment. The value goes
-/// through `black_box`, so the store cannot be proven redundant and dropped.
-fn fault_in(buf: &mut [u8]) {
-    for b in buf.iter_mut().step_by(HOST_PAGE) {
-        *b = std::hint::black_box(*b);
-    }
-}
 
 /// One keyed activation's state: the [`CausalKey`] its staged bytes are a function of, and whether
 /// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
@@ -2211,36 +2201,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             .synchronize()
             .map_err(|e| anyhow!("stage_keyed('{id}'): sync: {e}"))?;
         Ok(sent)
-    }
-
-    /// ⭐ MATERIALIZE THE ACTIVATION SEGMENT'S HOST SHADOW — fault every page of it in now, at load,
-    /// so a request's first bind into it does not.
-    ///
-    /// The ACTIVATION segment is the one segment the host writes on a step: the placement pass puts
-    /// every per-step input there (`SegRole::Activation` — embeddings, rotary tables, both masks, the
-    /// gather index, the constants), and the same law names it here. Prepare allocates its shadow
-    /// zeroed, which the allocator satisfies with pages mapped on first write, so before this the
-    /// first request faulted in every page its binds touched, inside its TTFT. The other segments'
-    /// shadows are left alone: the intermediates are device-written and the host never touches them,
-    /// so committing them would be RSS for nothing.
-    ///
-    /// Contents unchanged ([`fault_in`]): bytes already staged there, such as a causal mask
-    /// `stage_keyed` put in, stay exactly as they are, and the device is not touched. Only WHERE the
-    /// faults land moves. Returns the shadow's length — the RSS this commits.
-    pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
-        if !self.prepared {
-            bail!("materialize_activation_shadow before prepare — the shadow is sized at prepare");
-        }
-        let seg =
-            scratchy_target_spyre::lower_subtile_tape_to_superdsc::SegRole::Activation.segment();
-        let shadow = self
-            .seg_host
-            .get_mut(seg)
-            .ok_or_else(|| anyhow!("the activation segment {seg} is not a tensor segment"))?
-            .host_buf_mut()
-            .ok_or_else(|| anyhow!("the activation segment {seg} is DEVICE-ONLY"))?;
-        fault_in(shadow);
-        Ok(shadow.len() as u64)
     }
 
     /// ⭐⭐⭐⭐⭐ MINT THE ONLY VALUE [`Self::bind_input_raw`] ACCEPTS — the payload measured against
@@ -6946,8 +6906,7 @@ mod tests {
     /// ⭐ THE SHADOW BUFFER'S OWN LAWS — everything the pre-mapped send rests on that a card
     /// is not needed for: page alignment (the vendor's pre-mapped contract), born zeros
     /// (mmap semantics — the pad extents a staging walk never touches still read as zero),
-    /// `Vec::resize`'s grow/shrink contract, and [`fault_in`] preserving written bytes while
-    /// it populates the rest.
+    /// and `Vec::resize`'s grow/shrink contract.
     #[test]
     fn a_host_buf_is_page_aligned_born_zero_and_resizes_like_a_vec() {
         let mut b = HostBuf::zeroed(3 * HOST_PAGE + 100).expect("mmap of a few pages");
@@ -6975,14 +6934,6 @@ mod tests {
         assert_eq!(&b[..7], &[1, 2, 3, 4, 5, 6, 7]);
         b.resize(2 * HOST_PAGE).expect("regrow");
         assert!(b[HOST_PAGE..].iter().all(|&x| x == 0));
-
-        // The fault sweep is value-preserving: staged bytes survive it byte for byte.
-        for (i, x) in b.iter_mut().enumerate() {
-            *x = (i % 251) as u8;
-        }
-        let before = b.to_vec();
-        fault_in(&mut b[..]);
-        assert_eq!(&b[..], &before[..]);
 
         // The empty buffer is a value like any other: no mapping, reads as empty, and a
         // resize out of it is a fresh born-zero buffer.
@@ -7112,22 +7063,6 @@ mod tests {
                 "offset {offset} n {n}: the window's bytes differ"
             );
         }
-    }
-
-    /// ⭐ FAULTING A SHADOW IN CHANGES NONE OF ITS BYTES — the property that lets the load-time
-    /// materialize run after `stage_keyed` (or in any order with it): the keyed bytes already in
-    /// the shadow are the ones a later aligned H2D window may re-send. Over a length that is not a
-    /// whole number of pages, so the last partial page is covered too.
-    #[test]
-    fn faulting_a_shadow_in_changes_none_of_its_bytes() {
-        let n = 5 * HOST_PAGE + 123;
-        let want: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
-        let mut got = want.clone();
-        fault_in(&mut got);
-        assert!(got == want, "a byte moved");
-        let mut zeros = vec![0u8; n];
-        fault_in(&mut zeros);
-        assert!(zeros.iter().all(|&b| b == 0), "a zeroed shadow stays zero");
     }
 
     /// Two steps on ONE image key: the first derives, the second hits the cache —

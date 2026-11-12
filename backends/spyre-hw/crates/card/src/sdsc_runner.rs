@@ -851,15 +851,6 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
             .map(|_| ())
     }
 
-    /// Fault the activation segment's host shadow in now, at load, so a request's first bind does
-    /// not (see `Executor::materialize_activation_shadow`). Returns the shadow's bytes.
-    pub fn materialize_activation_shadow(&mut self) -> Result<u64> {
-        Ok(self
-            .each(Executor::materialize_activation_shadow)?
-            .into_iter()
-            .sum())
-    }
-
     /// [`Self::bind_keyed`], uploaded NOW rather than by the next step — a session's load-time
     /// staging of what its first launch would bind (see `Executor::stage_keyed`). Returns the bytes
     /// sent.

@@ -2755,53 +2755,18 @@ impl SpyreWorker {
                     });
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
-                // ⭐ FAULT THE CHUNK SESSIONS' ACTIVATION SHADOWS IN AT LOAD, so a request's first
-                // binds write into pages already mapped (see `materialize_activation_shadow`) — the
-                // sessions a first request runs on. ONE THREAD PER SESSION: the fault is pure
-                // host page-mapping work (GB-scale, ~1.4 GB/s a thread), so a serial loop
-                // would spend seconds the boot wave used to pay in parallel — the sessions
-                // are independent and the wave's own shape (a thread per session) is the
-                // parallelism this walks at.
-                {
-                    let _t = std::time::Instant::now();
-                    let mut jobs: Vec<(usize, &mut SuperDscSession)> = prefill_ladder
-                        .iter_mut()
-                        .map(|(rows, sess)| (*rows, sess))
-                        .collect();
-                    jobs.extend(prefill_prefix.rungs_mut().map(|(rows, sess)| (rows, sess)));
-                    jobs.push((1, &mut ss));
-                    let shadow_bytes: ExecutorResult<u64> = std::thread::scope(|scope| {
-                        let handles: Vec<_> = jobs
-                            .iter_mut()
-                            .map(|(rows, sess)| {
-                                scope.spawn(move || {
-                                    sess.materialize_activation_shadow().map_err(|e| {
-                                        werr(format!(
-                                            "the {rows}-row session's activation shadow: {e}"
-                                        ))
-                                    })
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| match h.join() {
-                                Ok(Ok(bytes)) => Ok(bytes),
-                                Ok(Err(e)) => Err(e),
-                                Err(_) => Err(werr(
-                                    "an activation-shadow fault thread panicked".to_string(),
-                                )),
-                            })
-                            .sum()
-                    });
-                    let shadow_bytes = shadow_bytes?;
-                    info!(
-                        "[spyre-worker] sendnn: chunk sessions' activation shadows faulted in at load \
-                         ({} KB, {:.0} ms)",
-                        shadow_bytes >> 10,
-                        _t.elapsed().as_secs_f64() * 1e3,
-                    );
-                }
+                // ⭐ THE ACTIVATION SHADOWS' PAGES FAULT AT THE WRITE THAT FIRST TOUCHES THEM. The
+                // load faults only what it wrote (the staging walks, the keyed binds); a request's
+                // first bind faults its own pages at its own moment, and only those. The eager door
+                // that used to live here (#673) faulted every chunk session's WHOLE shadow at load —
+                // born at 18-38 ms over 115-160 MB, but the ladder's reservations grew ~12x and
+                // rank with the world: measured 2026-11-12 on nickm5, 1.3 GB / 642 ms at k=1 and
+                // 10.9 GB / 3.5 s at tp/8, 86% of it per-request bind space no load-time write ever
+                // touches — and the host fault path is SERIALIZED at ~2 GB/s no matter the thread
+                // count (a 36-thread fault of 10 GB ran at the same 1.5 GB/s one thread does), so
+                // the bytes cannot be faulted faster, only fewer. A first ~1k request binds ~3-5 MB
+                // per session — milliseconds of demand faults — against seconds of every boot and
+                // 10.9 GB of RSS the door cost at tp/8.
                 let sb = SuperDscBundle {
                     decode: ss,
                     decode_rungs: decode_ladder,
