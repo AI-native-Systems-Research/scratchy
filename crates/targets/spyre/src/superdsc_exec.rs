@@ -3350,8 +3350,8 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         for c in 0..self.body_ops.len() {
             sels.push(ListSel::Body(c));
         }
-        for i in 0..self.body_rungs.len() {
-            for c in 0..self.body_rungs[i].1.len() {
+        for (i, rung) in self.body_rungs.iter().enumerate() {
+            for c in 0..rung.1.len() {
                 sels.push(ListSel::Rung(i, c));
             }
         }

@@ -864,16 +864,16 @@ module {
         let mut pass_corners: Vec<Option<(i64, i64)>> = Vec::new();
         for o in body.iter() {
             if o.kind == triton_ktir::ir::OpKind::KtdpConstructAccessTile {
-                for slot in 1..o.operands.len() {
-                    pass_corners.push(shipped.get(&o.operands[slot]).map(|u| (u.stride, u.base)));
+                for operand in &o.operands[1..] {
+                    pass_corners.push(shipped.get(operand).map(|u| (u.stride, u.base)));
                 }
             }
         }
         let mut door_corners: Vec<Option<(i64, i64)>> = Vec::new();
         for o in node.func.operations.iter() {
             if o.op_type == ktir_core::opkind::OpKind::KtdpConstructAccessTile {
-                for slot in 1..o.operands.len() {
-                    door_corners.push(door.get(&o.operands[slot]).map(|u| (u.stride, u.base)));
+                for operand in &o.operands[1..] {
+                    door_corners.push(door.get(operand).map(|u| (u.stride, u.base)));
                 }
             }
         }

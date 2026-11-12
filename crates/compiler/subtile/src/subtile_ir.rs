@@ -5640,8 +5640,8 @@ mod tests {
             "post-decompose: 1 reduce + 3 apply + 3 mul tiles"
         );
         assert!(matches!(g.nodes[0].op, SubOp::RmsNormReduce { .. }));
-        for i in 1..4 {
-            assert!(matches!(g.nodes[i].op, SubOp::RmsNormApply { .. }));
+        for node in &g.nodes[1..4] {
+            assert!(matches!(node.op, SubOp::RmsNormApply { .. }));
         }
         // Reduce reads only sources (x).
         assert!(preds[0].is_empty(), "RmsNormReduce reads only sources");
