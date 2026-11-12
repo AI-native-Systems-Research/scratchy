@@ -57,9 +57,10 @@ const PREFILL_STEPS: [(&str, usize); 24] = [
     ("AddRmsNorm", 80),
     ("AttnPrefill", 10),
     ("Embed", 1),
+    ("ExpertActQuant", 40),
     ("ExpertCombine", 40),
     ("ExpertGemm", 120),
-    ("ExpertSort", 40),
+    ("ExpertSortFp8", 40),
     ("GateApply", 10),
     ("GateScale", 40),
     ("GateSplit", 10),
@@ -72,28 +73,27 @@ const PREFILL_STEPS: [(&str, usize); 24] = [
     ("GemmNarrow", 40),
     ("GemmNarrowGroup", 30),
     ("MoeRoute", 40),
-    ("QuantRowsFp8", 180),
+    ("QuantRowsFp8", 100),
     ("RmsNorm", 21),
     ("Rope", 10),
     ("RopeAppend", 10),
     ("RouterLogits", 40),
-    ("SiluMul", 40),
 ];
 /// The quant writes of a prefill tape: one per fp8 consumer, the expert up GEMM's shared with its
 /// gate's.
-const QUANTS: usize = 180;
+const QUANTS: usize = 100;
 /// The quant writes' readers: every fp8 consumer, the expert up GEMM included.
-const QUANT_READERS: usize = 220;
+const QUANT_READERS: usize = 180;
 /// The `k`s quantized: the shared expert's down (512), the hidden (2048), attention's o (4096),
 /// and the routed experts' (512 down, 2048 gate/up).
 const QUANT_COLS: [u32; 3] = [512, 2048, 4096];
 /// Per prefill bucket: the quant scratch's offset (the bf16 tape's arena total) and bytes (the
 /// largest expert write, `[max_tiles·128, 2048]` e4m3 then its f32 scales).
 const QUANT_SCRATCH: [(u32, u64, u64); 4] = [
-    (512, 772_613_632, 75_119_616),
-    (1024, 1_179_007_488, 83_524_608),
-    (2048, 1_991_795_456, 100_334_592),
-    (4096, 3_617_371_392, 133_954_560),
+    (512, 772_613_632, 2_099_200),
+    (1024, 1_179_007_488, 4_198_400),
+    (2048, 1_991_795_456, 8_396_800),
+    (4096, 3_617_371_392, 16_793_600),
 ];
 const EXPERT_WEIGHT: Option<MoeWeight> = Some(MoeWeight::Fp8Bundle);
 const TABLE_LEN: usize = 707;

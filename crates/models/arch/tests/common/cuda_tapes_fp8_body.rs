@@ -262,20 +262,22 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
             cols.insert(q.cols);
             most = most.max(q.bytes().expect("fits"));
         }
-        // The last write, and whether a step wrote its bf16 rows since (a step reads, then writes).
-        let mut live: Option<(QuantRowsFp8, bool)> = None;
+        // Per slot, the last write, and whether a step wrote its bf16 rows since (a step reads,
+        // then writes): a quant write's, or an act + quantize's (FP8 S8 P1, the expert down's).
+        let mut live: Vec<(QuantRowsFp8, bool)> = Vec::new();
         for (i, s) in tape.steps.iter().enumerate() {
-            if let CudaStep::QuantRowsFp8(q) = *s {
-                live = Some((q, false));
-                continue;
-            }
             if let Some(read) = s.quantized_input() {
                 assert!(
-                    matches!(live, Some((q, false)) if (q.q, q.rows, q.cols) == read),
+                    live.iter().any(|&(q, stale)| !stale && (q.q, q.rows, q.cols) == read),
                     "m={m} step {i}: a reader with no write before it reads the live quantization"
                 );
             }
-            if let Some((q, stale)) = &mut live {
+            if let Some(q) = s.quant_write() {
+                live.retain(|(l, _)| l.q != q.q);
+                live.push((q, false));
+                continue;
+            }
+            for (q, stale) in &mut live {
                 let rows = ArenaSpan {
                     offset: q.x,
                     bytes: u64::from(q.rows) * u64::from(q.cols) * CUDA_ACT_BYTES,
@@ -290,7 +292,12 @@ fn every_quant_write_sits_before_its_fp8_gemm() {
         assert_eq!(cols.into_iter().collect::<Vec<_>>(), QUANT_COLS, "m={m}");
         assert_eq!(most, bytes, "m={m}: the scratch is the largest write");
         assert!(at.is_multiple_of(CUDA_ARENA_ALIGN), "m={m}: aligned");
-        let end = at + bytes.next_multiple_of(CUDA_ARENA_ALIGN);
+        // The quant scratch ends the arena: its last slot's end (the act + quantize's, after the
+        // quant writes' slot, when the tape has one).
+        let end = (tape.steps.iter().filter_map(CudaStep::quant_write))
+            .map(|q| q.q.0 + q.bytes().expect("fits").next_multiple_of(CUDA_ARENA_ALIGN))
+            .max()
+            .unwrap_or(at + bytes.next_multiple_of(CUDA_ARENA_ALIGN));
         assert_eq!(end, tape.arena.total_bytes, "m={m}: the arena's last region");
     }
 }
