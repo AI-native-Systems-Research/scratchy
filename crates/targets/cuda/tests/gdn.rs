@@ -2987,3 +2987,143 @@ const PHASES: [&str; 12] = [
     "state_update",
     "state_store",
 ];
+
+/// FP8 S8 F6-2, decode after a chunked prefill at the real tapes' shapes: the 35B's and 27B's GDN
+/// geometries, a prefill bucket of 512 and of 2,048 rows holding `rows − 37` real tokens (the
+/// rest padding) by the chunked scan, then 8 decodes by the one-launch decode kernel the decode
+/// tapes run (`gdn_decode`), each from the slot the last left. The slot's state after the decodes
+/// within the chunked state bound of the f64 recurrence over the whole sequence (the prefill's own
+/// conv_out, g and β, then the decode tokens' from the CPU conv and gating, from the ring the
+/// prefill left), and every decode's output finite.
+#[test]
+fn a_one_launch_decode_after_a_chunked_prefill_bucket_follows_the_recurrence() {
+    use scratchy_target_cuda::kernels::{GdnDecodeOperands, gdn_decode};
+    const DECODES: usize = 8;
+    let device = h100();
+    let mut pass = true;
+    for d in [G9, G27] {
+        let bu = bundle(d, 0xF680);
+        let bb = upload_bundle(&device, &bu);
+        for rows in [512usize, 2048] {
+            let q_len = rows - 37;
+            let x = inputs(d, q_len + DECODES, 0xF681 ^ rows as u64);
+            let pool = Pool::new(&device, d, NAN_F32);
+            let pre = run_step_with(
+                &device,
+                &pool,
+                &bb,
+                d,
+                &chunk(&x, d, 0, q_len, rows),
+                (1, true),
+                Scan::Chunked,
+            )
+            .expect("the prefill");
+            let ring = to_f64(&pool.conv_slot(1));
+            let l = pool.layout;
+            let dims = (
+                d.nk as u32,
+                d.nv as u32,
+                d.head_k as u32,
+                d.head_v as u32,
+                d.conv_kernel as u32,
+            );
+            let mut finite = true;
+            for t in q_len..q_len + DECODES {
+                let tok = chunk(&x, d, t, 1, 1);
+                let seq = up_u32(&device, &[1, 1, 0, 0]);
+                let (qkv, a, b, z) = (
+                    up(&device, &tok.qkv),
+                    up(&device, &tok.a),
+                    up(&device, &tok.b),
+                    up(&device, &tok.z),
+                );
+                let out = up(&device, &vec![NAN_BF16; d.value_dim()]);
+                let operands = GdnDecodeOperands {
+                    qkv: qkv.ptr(),
+                    a: a.ptr(),
+                    b: b.ptr(),
+                    z: z.ptr(),
+                    w: bb.w.ptr(),
+                    a_log: bb.a_log.ptr(),
+                    dt_bias: bb.dt_bias.ptr(),
+                    norm: bb.norm.ptr(),
+                    out: out.ptr(),
+                };
+                // SAFETY: as `run_step`'s at one row: every buffer holds what the launcher's
+                // contract names, the pool `SLOTS` slots of its layout and slot 1 below it, `q_len`
+                // 1; null is the default stream, which the downloads below wait for.
+                unsafe {
+                    gdn_decode(
+                        &operands,
+                        (pool.conv.ptr(), l.conv_elems_per_slot() as u64),
+                        (pool.ssm.ptr(), l.ssm_elems_per_slot() as u64),
+                        seq.ptr(),
+                        dims,
+                        (gdn_scale(d.head_k as u32), EPS),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("a decode launches");
+                let got = out.download().expect("download out");
+                finite &= got.iter().all(|&h| (h & 0x7F80) != 0x7F80);
+            }
+            let (cd, nv) = (d.conv_dim(), d.nv);
+            let span = |v: &[u16], cols: usize| widen(&v[q_len * cols..(q_len + DECODES) * cols]);
+            let (conv_ref, _) = gdn_conv_reference(
+                &span(&x.qkv, cd),
+                &to_f64(&bu.w),
+                &ring,
+                (DECODES, cd, d.conv_kernel),
+                false,
+            );
+            let (g_ref, beta_ref) = gdn_gating_reference(
+                &span(&x.a, nv),
+                &span(&x.b, nv),
+                &to_f64(&bu.a_log),
+                &to_f64(&bu.dt_bias),
+                nv,
+                true,
+            );
+            let mut conv_out = to_f64(&pre.conv_out[..q_len * cd]);
+            conv_out.extend(conv_ref.iter().map(|p| p.0));
+            let mut g = to_f64(&pre.g[..q_len * nv]);
+            g.extend(g_ref);
+            let mut beta = to_f64(&pre.beta[..q_len * nv]);
+            beta.extend(beta_ref);
+            let (_, state) = zeros(d);
+            let r = gdn_scan_reference(
+                &ScanInputs {
+                    conv_out: &conv_out,
+                    g: &g,
+                    beta: &beta,
+                    state: &state,
+                    smax: None,
+                    t0: 0,
+                    q_len: q_len + DECODES,
+                },
+                d,
+                ScanVariant::Real,
+            );
+            let hk = d.head_k;
+            let st = compare_f32(
+                &pool.ssm_slot(1),
+                &r.state,
+                |i| chunk_state_bound(&r, i, hk),
+                |_| true,
+            );
+            let ok = st.pass() && finite;
+            eprintln!(
+                "decode by gdn_decode after a chunked prefill bucket {} rows={rows} q_len={q_len} \
+                 + {DECODES}: state {} outputs_finite={finite} {}",
+                model(d),
+                st.line(),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "a one-launch decode after a chunked prefill bucket left the recurrence's bound"
+    );
+}

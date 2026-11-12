@@ -2802,7 +2802,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (g.rows, g.num_v_heads),
                 stream.0,
             )?;
-            kernels::gdn_scan(
+            // The chunked scan (FP8 S8 F6a, `kernels/gdn_chunk_scan.cu`): every `GatedDeltaNet`
+            // step is a prefill bucket's (a one-row bucket's GDN step is `GdnDecode` wherever the
+            // decode kernel takes its geometry), the same contract as `gdn_scan`'s.
+            kernels::gdn_chunk_scan(
                 (conv_out.cast_const(), gate.cast_const(), beta.cast_const()),
                 (ssm_state, layout.ssm_elems_per_slot() as u64),
                 seq,
