@@ -2556,14 +2556,17 @@ impl SpyreWorker {
                     // the original message and location, not a replacement string.
                     Err(p) => std::panic::resume_unwind(p),
                 };
+                let _t_ladder_join = _t_wave.elapsed();
                 let (prefix_jobs, prefix_built_sessions) = match prefix_join.join() {
                     Ok(v) => v,
                     Err(p) => std::panic::resume_unwind(p),
                 };
+                let _t_prefix_join = _t_wave.elapsed();
                 let (decode_jobs, decode_built_sessions) = match decode_join.join() {
                     Ok(v) => v,
                     Err(p) => std::panic::resume_unwind(p),
                 };
+                let _t_joins = _t_wave.elapsed();
                 let (ladder_prepared, prefix_prepared, decode_prepared) =
                     std::thread::scope(|scope| {
                         fn joined<R>(hs: Vec<std::thread::ScopedJoinHandle<'_, R>>) -> Vec<R> {
@@ -2632,11 +2635,17 @@ impl SpyreWorker {
                             .collect();
                         (joined(hl), joined(hp), joined(hd))
                     });
+                let _t_all = _t_wave.elapsed();
                 info!(
                     "[spyre-worker] sendnn: ladder device half: {} session(s) prepared in {:.0} ms \
-                     (their host halves built during the owner's session above)",
+                     (joins: ladder {:.0} / prefix {:.0} / decode {:.0} + prepare scope {:.0} ms — \
+                     join time past zero is host halves that outran the owner's window)",
                     ladder_prepared.len() + prefix_prepared.len() + decode_prepared.len(),
-                    _t_wave.elapsed().as_secs_f64() * 1e3
+                    _t_all.as_secs_f64() * 1e3,
+                    _t_ladder_join.as_secs_f64() * 1e3,
+                    _t_prefix_join.as_secs_f64() * 1e3,
+                    _t_joins.as_secs_f64() * 1e3,
+                    (_t_all - _t_joins).as_secs_f64() * 1e3,
                 );
                 // ADOPTION: alias each onto the decode session's regions here, on the thread
                 // that owns `ss`.
