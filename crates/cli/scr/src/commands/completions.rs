@@ -26,9 +26,9 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use clap::{Command, CommandFactory};
+use clap::Command;
 
-use crate::args::{Cli, CompletionShell};
+use crate::args::CompletionShell;
 
 /// Arg ids whose value is a model, and so completes from `model names`.
 ///
@@ -60,21 +60,25 @@ const SOURCE_OVERRIDES: &[(&str, &str, &str)] = &[
     ("model info", "filters", "stems"),
 ];
 
-pub fn run_completions(shell: CompletionShell, install: bool) -> anyhow::Result<()> {
+pub fn run_completions(
+    mut cmd: Command,
+    shell: CompletionShell,
+    install: bool,
+) -> anyhow::Result<()> {
     // `build()` is what materializes the auto-generated `--help` / `--version`
     // args and propagates globals. Without it the tree is introspectable but
     // incomplete, and the scripts would omit `--help` everywhere.
-    let mut cmd = Cli::command();
     cmd.build();
+    let bin = Bin::new(cmd.get_name());
     let nodes = flatten(&cmd);
     let has_helper = has_names_helper(&cmd);
     let script = match shell {
-        CompletionShell::Bash => bash_script(&nodes, has_helper),
-        CompletionShell::Zsh => zsh_script(&nodes, has_helper),
+        CompletionShell::Bash => bash_script(&nodes, has_helper, &bin),
+        CompletionShell::Zsh => zsh_script(&nodes, has_helper, &bin),
     };
 
     if install {
-        install_completion(shell, &script)
+        install_completion(shell, &script, &bin)
     } else {
         print!("{script}");
         Ok(())
@@ -84,8 +88,23 @@ pub fn run_completions(shell: CompletionShell, install: bool) -> anyhow::Result<
 /// `~/.bashrc` / `~/.zshrc`'s own sourcing block, delimited by a marker so a
 /// re-run (after a rebuild that changed the compiled feature set) rewrites the
 /// script in place rather than piling up duplicate blocks.
-const RC_MARKER_BEGIN: &str = "# >>> scr completions (scr completions --install) >>>";
-const RC_MARKER_END: &str = "# <<< scr completions <<<";
+/// The binary completions are generated for and installed under, and the markers delimiting its
+/// sourcing block in the shell's rc file.
+pub(crate) struct Bin {
+    name: String,
+    begin: String,
+    end: String,
+}
+
+impl Bin {
+    pub(crate) fn new(name: &str) -> Bin {
+        Bin {
+            name: name.to_string(),
+            begin: format!("# >>> {name} completions ({name} completions --install) >>>"),
+            end: format!("# <<< {name} completions <<<"),
+        }
+    }
+}
 
 fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
@@ -108,11 +127,11 @@ fn home_dir() -> PathBuf {
 ///   before the first existing `compinit` call it finds, rather than simply
 ///   appending — appending would silently produce a script that looks
 ///   installed but never completes anything.
-fn install_completion(shell: CompletionShell, script: &str) -> anyhow::Result<()> {
+fn install_completion(shell: CompletionShell, script: &str, bin: &Bin) -> anyhow::Result<()> {
     let home = home_dir();
     match shell {
-        CompletionShell::Bash => install_bash(&home, script),
-        CompletionShell::Zsh => install_zsh(&home, script),
+        CompletionShell::Bash => install_bash(&home, script, bin),
+        CompletionShell::Zsh => install_zsh(&home, script, bin),
     }
 }
 
@@ -120,16 +139,17 @@ fn install_completion(shell: CompletionShell, script: &str) -> anyhow::Result<()
 /// can point it at a sandboxed directory instead of mutating the real `$HOME`
 /// — a global that every test in the binary shares, including ones running
 /// concurrently in other threads.
-fn install_bash(home: &std::path::Path, script: &str) -> anyhow::Result<()> {
-    let script_path = home.join(".local/share/scr/completions.bash");
+fn install_bash(home: &std::path::Path, script: &str, bin: &Bin) -> anyhow::Result<()> {
+    let script_path = home.join(format!(".local/share/{}/completions.bash", bin.name));
+    let (begin, end) = (&bin.begin, &bin.end);
     write_script(&script_path, script)?;
 
     let rc_path = home.join(".bashrc");
     let block = format!(
-        "{RC_MARKER_BEGIN}\n[ -f \"{path}\" ] && source \"{path}\"\n{RC_MARKER_END}\n",
+        "{begin}\n[ -f \"{path}\" ] && source \"{path}\"\n{end}\n",
         path = script_path.display(),
     );
-    let rc_changed = ensure_rc_block(&rc_path, &block)?;
+    let rc_changed = ensure_rc_block(&rc_path, &block, bin)?;
 
     println!("Wrote {}", script_path.display());
     if rc_changed {
@@ -149,9 +169,10 @@ fn install_bash(home: &std::path::Path, script: &str) -> anyhow::Result<()> {
 
 /// See [`install_bash`] for why `home` is a parameter rather than a call to
 /// [`home_dir`].
-fn install_zsh(home: &std::path::Path, script: &str) -> anyhow::Result<()> {
+fn install_zsh(home: &std::path::Path, script: &str, bin: &Bin) -> anyhow::Result<()> {
     let completions_dir = home.join(".zsh/completions");
-    let script_path = completions_dir.join("_scr");
+    let script_path = completions_dir.join(format!("_{}", bin.name));
+    let (begin, end) = (&bin.begin, &bin.end);
     write_script(&script_path, script)?;
 
     let rc_path = home.join(".zshrc");
@@ -159,7 +180,7 @@ fn install_zsh(home: &std::path::Path, script: &str) -> anyhow::Result<()> {
     let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
     let had_compinit = existing.lines().any(|l| l.contains("compinit"));
 
-    let rc_changed = if existing.contains(RC_MARKER_BEGIN) {
+    let rc_changed = if existing.contains(begin.as_str()) {
         false
     } else if let Some(compinit_line) = existing
         .lines()
@@ -170,7 +191,7 @@ fn install_zsh(home: &std::path::Path, script: &str) -> anyhow::Result<()> {
         let mut lines: Vec<&str> = existing.lines().collect();
         lines.splice(
             compinit_line..compinit_line,
-            [RC_MARKER_BEGIN, fpath_line.as_str(), RC_MARKER_END],
+            [begin.as_str(), fpath_line.as_str(), end.as_str()],
         );
         let mut new_contents = lines.join("\n");
         new_contents.push('\n');
@@ -179,9 +200,7 @@ fn install_zsh(home: &std::path::Path, script: &str) -> anyhow::Result<()> {
     } else {
         // No compinit call at all yet — nothing will ever load completions
         // for ANY command until one exists, so add both together.
-        let block = format!(
-            "{RC_MARKER_BEGIN}\n{fpath_line}\nautoload -Uz compinit && compinit\n{RC_MARKER_END}\n"
-        );
+        let block = format!("{begin}\n{fpath_line}\nautoload -Uz compinit && compinit\n{end}\n");
         append_block(&rc_path, &block)?;
         true
     };
@@ -216,14 +235,17 @@ fn write_script(path: &std::path::Path, script: &str) -> anyhow::Result<()> {
 }
 
 /// Ensure `rc_path` contains exactly one copy of `block` (delimited by
-/// [`RC_MARKER_BEGIN`]/[`RC_MARKER_END`]), replacing an existing one so a
+/// the binary's markers, [`Bin`]), replacing an existing one so a
 /// re-run after a rebuild picks up the new script path/content without
 /// leaving a stale duplicate behind. Returns whether the file changed.
-fn ensure_rc_block(rc_path: &std::path::Path, block: &str) -> anyhow::Result<bool> {
+fn ensure_rc_block(rc_path: &std::path::Path, block: &str, bin: &Bin) -> anyhow::Result<bool> {
     let existing = std::fs::read_to_string(rc_path).unwrap_or_default();
-    if existing.contains(RC_MARKER_BEGIN) {
-        let before = existing.split(RC_MARKER_BEGIN).next().unwrap_or_default();
-        let after = existing.split(RC_MARKER_END).nth(1).unwrap_or_default();
+    if existing.contains(bin.begin.as_str()) {
+        let before = existing
+            .split(bin.begin.as_str())
+            .next()
+            .unwrap_or_default();
+        let after = existing.split(bin.end.as_str()).nth(1).unwrap_or_default();
         // `block` already supplies the newline that separates it from whatever
         // follows; `after` starts with that same newline (it's everything past
         // the END marker LINE), so keeping both would grow the file by one
@@ -474,28 +496,29 @@ fn path_walk(
     )
 }
 
-fn bash_script(nodes: &[Node], has_helper: bool) -> String {
+fn bash_script(nodes: &[Node], has_helper: bool, bin: &Bin) -> String {
+    let bin = &bin.name;
     let paths = paths_literal(nodes);
     let arms = case_arms(nodes, has_helper);
     let walk = path_walk(&paths, 1, "COMP_CWORD", &|i| {
         format!("\"${{COMP_WORDS[{i}]}}\"")
     });
     format!(
-        r#"# scr(1) bash completion                            -*- shell-script -*-
+        r#"# {bin}(1) bash completion                            -*- shell-script -*-
 #
-# Generated by `scr completions bash` from this binary's own clap command tree,
+# Generated by `{bin} completions bash` from this binary's own clap command tree,
 # so the subcommands and flags below are exactly the ones it was compiled with.
 # Regenerate after rebuilding with a different feature set.
 #
-# Install: scr completions bash > /usr/local/etc/bash_completion.d/scr
+# Install: {bin} completions bash > /usr/local/etc/bash_completion.d/{bin}
 #          (or source it from ~/.bashrc)
-_scr_complete() {{
+_{bin}_complete() {{
     local cur prev scr path candidate w i vals
     local subs opts value_opts model_opts model_source positional positional_values enum_map
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev=""
     [ "$COMP_CWORD" -gt 0 ] && prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    # Call back into the binary the user actually invoked, not a bare `scr`:
+    # Call back into the binary the user actually invoked, not a bare `{bin}`:
     # completions must work for a binary that is not on PATH under that name.
     scr="${{COMP_WORDS[0]}}"
     COMPREPLY=()
@@ -538,31 +561,32 @@ _scr_complete() {{
         COMPREPLY+=( $(compgen -W "$("$scr" model names --source "$positional" -- "$cur" 2>/dev/null)" -- "$cur") )
     fi
 }}
-complete -o default -F _scr_complete scr
+complete -o default -F _{bin}_complete {bin}
 "#
     )
 }
 
-fn zsh_script(nodes: &[Node], has_helper: bool) -> String {
+fn zsh_script(nodes: &[Node], has_helper: bool, bin: &Bin) -> String {
+    let bin = &bin.name;
     let paths = paths_literal(nodes);
     let arms = case_arms(nodes, has_helper);
     let walk = path_walk(&paths, 2, "CURRENT", &|i| format!("\"${{words[{i}]}}\""));
     format!(
-        r#"#compdef scr
-# scr(1) zsh completion
+        r#"#compdef {bin}
+# {bin}(1) zsh completion
 #
-# Generated by `scr completions zsh` from this binary's own clap command tree,
+# Generated by `{bin} completions zsh` from this binary's own clap command tree,
 # so the subcommands and flags below are exactly the ones it was compiled with.
 # Regenerate after rebuilding with a different feature set.
 #
-# Install: scr completions zsh > ~/.zsh/completions/_scr   (dir must be on $fpath)
-_scr() {{
+# Install: {bin} completions zsh > ~/.zsh/completions/_{bin}   (dir must be on $fpath)
+_{bin}() {{
     local cur prev scr path candidate w i vals
     local subs opts value_opts model_opts model_source positional positional_values enum_map
     cur="${{words[CURRENT]}}"
     prev=""
     [ "$CURRENT" -gt 1 ] && prev="${{words[CURRENT-1]}}"
-    # Call back into the binary the user actually invoked, not a bare `scr`.
+    # Call back into the binary the user actually invoked, not a bare `{bin}`.
     scr="${{words[1]}}"
 
 {walk}
@@ -573,7 +597,7 @@ _scr() {{
 
     # Model names, in the order they come (most downloaded first): an unsorted group.
     if [ -n "$model_opts" ] && [[ " $model_opts " == *" $prev "* ]]; then
-        compadd -V scr-models -- ${{(f)"$("$scr" model names --source "$model_source" -- "$cur" 2>/dev/null)"}}
+        compadd -V {bin}-models -- ${{(f)"$("$scr" model names --source "$model_source" -- "$cur" 2>/dev/null)"}}
         return
     fi
     if [ -n "$enum_map" ] && [[ "$enum_map" == *"|$prev:"* ]]; then
@@ -593,9 +617,9 @@ _scr() {{
     fi
     [ -n "$subs" ] && compadd -- ${{=subs}}
     [ -n "$positional_values" ] && compadd -- ${{=positional_values}}
-    [ -n "$positional" ] && compadd -V scr-models -- ${{(f)"$("$scr" model names --source "$positional" -- "$cur" 2>/dev/null)"}}
+    [ -n "$positional" ] && compadd -V {bin}-models -- ${{(f)"$("$scr" model names --source "$positional" -- "$cur" 2>/dev/null)"}}
 }}
-_scr "$@"
+_{bin} "$@"
 "#
     )
 }
@@ -603,6 +627,8 @@ _scr "$@"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::Cli;
+    use clap::CommandFactory;
 
     fn built() -> Command {
         let mut cmd = Cli::command();
@@ -615,8 +641,8 @@ mod tests {
         let nodes = flatten(&cmd);
         let has_helper = has_names_helper(&cmd);
         match shell {
-            CompletionShell::Bash => bash_script(&nodes, has_helper),
-            CompletionShell::Zsh => zsh_script(&nodes, has_helper),
+            CompletionShell::Bash => bash_script(&nodes, has_helper, &Bin::new("scr")),
+            CompletionShell::Zsh => zsh_script(&nodes, has_helper, &Bin::new("scr")),
         }
     }
 
@@ -919,16 +945,18 @@ mod tests {
     /// the newline the block itself supplies.
     #[test]
     fn ensure_rc_block_is_byte_stable_across_reinstalls() {
+        let bin = Bin::new("scr");
+        let (begin, end) = (&bin.begin, &bin.end);
         let dir = tempfile::tempdir().expect("tempdir");
         let rc_path = dir.path().join("rc");
         std::fs::write(&rc_path, "# existing content\nalias g=git\n").expect("seed rc");
-        let block = format!("{RC_MARKER_BEGIN}\nsource /some/path\n{RC_MARKER_END}\n");
+        let block = format!("{begin}\nsource /some/path\n{end}\n");
 
-        assert!(ensure_rc_block(&rc_path, &block).expect("first install"));
+        assert!(ensure_rc_block(&rc_path, &block, &bin).expect("first install"));
         let after_first = std::fs::read_to_string(&rc_path).expect("read");
 
         for _ in 0..3 {
-            let changed = ensure_rc_block(&rc_path, &block).expect("reinstall");
+            let changed = ensure_rc_block(&rc_path, &block, &bin).expect("reinstall");
             assert!(!changed, "reported a change on an unchanged block");
             let contents = std::fs::read_to_string(&rc_path).expect("read");
             assert_eq!(
@@ -938,7 +966,7 @@ mod tests {
         }
 
         assert!(after_first.starts_with("# existing content\nalias g=git\n"));
-        assert_eq!(after_first.matches(RC_MARKER_BEGIN).count(), 1);
+        assert_eq!(after_first.matches(begin.as_str()).count(), 1);
     }
 
     /// Rebuilding with a different feature set changes the script content
@@ -946,27 +974,31 @@ mod tests {
     /// re-run must replace the block in place, not leave the stale one behind.
     #[test]
     fn ensure_rc_block_replaces_a_changed_block_in_place() {
+        let bin = Bin::new("scr");
+        let (begin, end) = (&bin.begin, &bin.end);
         let dir = tempfile::tempdir().expect("tempdir");
         let rc_path = dir.path().join("rc");
         std::fs::write(&rc_path, "alias g=git\n").expect("seed rc");
 
-        let old_block = format!("{RC_MARKER_BEGIN}\nsource /old/path\n{RC_MARKER_END}\n");
-        let new_block = format!("{RC_MARKER_BEGIN}\nsource /new/path\n{RC_MARKER_END}\n");
+        let old_block = format!("{begin}\nsource /old/path\n{end}\n");
+        let new_block = format!("{begin}\nsource /new/path\n{end}\n");
 
-        ensure_rc_block(&rc_path, &old_block).expect("first install");
-        let changed = ensure_rc_block(&rc_path, &new_block).expect("update");
+        ensure_rc_block(&rc_path, &old_block, &bin).expect("first install");
+        let changed = ensure_rc_block(&rc_path, &new_block, &bin).expect("update");
         assert!(changed);
 
         let contents = std::fs::read_to_string(&rc_path).expect("read");
         assert!(contents.contains("/new/path"));
         assert!(!contents.contains("/old/path"));
-        assert_eq!(contents.matches(RC_MARKER_BEGIN).count(), 1);
+        assert_eq!(contents.matches(begin.as_str()).count(), 1);
     }
 
     /// `install_bash` end to end against a sandboxed `$HOME`: writes the
     /// script, wires `.bashrc`, and is idempotent.
     #[test]
     fn install_bash_writes_script_and_wires_bashrc_idempotently() {
+        let bin = Bin::new("scr");
+        let (begin, end) = (&bin.begin, &bin.end);
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join(".local/share/scr/completions.bash");
         let rc_path = dir.path().join(".bashrc");
@@ -974,12 +1006,12 @@ mod tests {
 
         write_script(&script_path, "# a completion script\n").expect("write");
         let block = format!(
-            "{RC_MARKER_BEGIN}\n[ -f \"{p}\" ] && source \"{p}\"\n{RC_MARKER_END}\n",
+            "{begin}\n[ -f \"{p}\" ] && source \"{p}\"\n{end}\n",
             p = script_path.display()
         );
-        assert!(ensure_rc_block(&rc_path, &block).expect("install"));
+        assert!(ensure_rc_block(&rc_path, &block, &bin).expect("install"));
         assert!(
-            !ensure_rc_block(&rc_path, &block).expect("reinstall"),
+            !ensure_rc_block(&rc_path, &block, &bin).expect("reinstall"),
             "not idempotent"
         );
 
@@ -1009,7 +1041,12 @@ mod tests {
         )
         .expect("seed rc");
 
-        install_zsh(dir.path(), "#compdef scr\n_scr() { :; }\n_scr \"$@\"\n").expect("install");
+        install_zsh(
+            dir.path(),
+            "#compdef scr\n_scr() { :; }\n_scr \"$@\"\n",
+            &Bin::new("scr"),
+        )
+        .expect("install");
 
         let rc = std::fs::read_to_string(&rc_path).expect("read");
         let fpath_pos = rc.find("fpath=(").expect("fpath line present");
@@ -1031,7 +1068,12 @@ mod tests {
         let rc_path = dir.path().join(".zshrc");
         std::fs::write(&rc_path, "export EDITOR=vim\n").expect("seed rc");
 
-        install_zsh(dir.path(), "#compdef scr\n_scr() { :; }\n_scr \"$@\"\n").expect("install");
+        install_zsh(
+            dir.path(),
+            "#compdef scr\n_scr() { :; }\n_scr \"$@\"\n",
+            &Bin::new("scr"),
+        )
+        .expect("install");
 
         let rc = std::fs::read_to_string(&rc_path).expect("read");
         assert!(rc.contains("compinit"), "no compinit added:\n{rc}");

@@ -69,7 +69,7 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
 
 ## Verify like CI before opening a build / deps / codegen PR
 `.github/workflows/rust.yml`: the **linux-workspace** job runs
-`cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct
+`cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct
 --exclude scratchy-target-metal --exclude scratchy-target-metal-compiler
 --exclude scratchy-target-metal-worker
 -- -D warnings` with `SCRATCHY_SKIP_SENDNN_CXX=1` (the runner has no Spyre SDK;
@@ -92,7 +92,7 @@ not the CI arch):
 docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
   -e SCRATCHY_SKIP_SENDNN_CXX=1 rust:1-bookworm bash -c '
     rustup component add clippy >/dev/null 2>&1
-    cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct \
+    cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
       --exclude scratchy-target-metal \
       --exclude scratchy-target-metal-compiler \
       --exclude scratchy-target-metal-worker -- -D warnings'

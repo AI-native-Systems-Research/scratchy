@@ -61,8 +61,8 @@ jobs:
       # metal crates depend unconditionally on `objc2` (Apple-only) and can't
       # compile on Linux — exclude them.
       #
-      # BOTH of them: every consumer's edge to metal is already `optional` and
-      # gated on a `metal` feature, so `-Fspyre` pulls in neither via the
+      # EVERY one of them: every consumer's edge to metal is already `optional` and
+      # gated on a `metal` feature, so the spyre crates pull in none via the
       # dependency graph. `--workspace` is what reaches them — it builds every
       # MEMBER as its own root, before features are ever consulted. Listing
       # only `scratchy-target-metal` left `scratchy-target-metal-compiler` (a
@@ -70,7 +70,7 @@ jobs:
       # depends unconditionally on `scratchy-target-metal`, so `objc2` came
       # back in through the side door.
       #
-      # One model, not `scratchy-models/all`: under `spyre` the build script bakes a
+      # One model, not `scratchy-models/all`: spyre's models crate (a workspace member) bakes a
       # card bundle for every selected config, and an arch whose ops have no spyre
       # lowering fails the build AT THE FIRST SUCH OP, by name — the law working,
       # and the error is the worklist. The one-model scope stays for bake time and
@@ -78,7 +78,7 @@ jobs:
       # build `model/all` to test one thing. Every arch's forward is linted by the
       # macOS job; granite is the one the card builds use.
       - name: Clippy
-        run: cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct
+        run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct
           --exclude scratchy-target-metal
           --exclude scratchy-target-metal-compiler
           --exclude scratchy-target-metal-worker
@@ -100,11 +100,11 @@ jobs:
           --test e_otel -- -D warnings
 
       # scratchy-cli's own test targets (its unit tests and
-      # tests/arch_feature_passthrough.rs), type-checked and linted: no other
-      # step builds them. None is backend-specific, so they're linted here
+      # tests/arch_feature_passthrough.rs), and the `spyre` binary over them, type-checked and
+      # linted: no other step builds them. None is backend-specific, so they're linted here
       # rather than on macOS, whose tests job is the longer one.
-      - name: Lint scratchy-cli's test targets
-        run: cargo clippy -p scratchy-cli --features spyre,claude,model/granite-3.1-8b-instruct
+      - name: Lint scratchy-cli's test targets and the spyre binary
+        run: cargo clippy -p scratchy-cli -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct
           --all-targets -- -D warnings
 
       # The multi-node control plane, the rank rendezvous and the channel
@@ -592,12 +592,13 @@ jobs:
         run: |
           cargo clippy -p scratchy-spyre-bundle --tests -- -D warnings
           cargo clippy -p scratchy-subtile --tests -- -D warnings
-      # The forward-compiler macro's lib under `spyre`: the leg its FP8-block fingerprint test runs
-      # in (metal claims no FP8-block preset). The metal leg runs in the macOS job.
-      - name: Forward-compiler macro tests (spyre)
+      # The forward-compiler macro's lib without metal's emission — the build a spyre models crate
+      # runs it in, and the leg its FP8-block fingerprint test runs in (metal claims no FP8-block
+      # preset). The metal leg runs in the macOS job.
+      - name: Forward-compiler macro tests (no metal)
         run: |
-          cargo test -p scratchy-forward-compiler-macro --features spyre --lib
-          cargo clippy -p scratchy-forward-compiler-macro --features spyre --tests -- -D warnings
+          cargo test -p scratchy-forward-compiler-macro --lib
+          cargo clippy -p scratchy-forward-compiler-macro --tests -- -D warnings
       # Spyre's bake (the per-model emission the pipeline calls through `TargetEmitter`), and its
       # pinned derivations on the checked-in configs.
       - name: Spyre compiler tests
