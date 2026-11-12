@@ -12,6 +12,17 @@ use super::datasets;
 use super::kept;
 use super::numbers::Engine;
 
+/// A cell's name in a table row: its dataset's, MuSiQue's saying how its answers ran. Its 1-user
+/// cell answers on its own, for the decode it times; above 1 user they are forced to one length,
+/// for their total time (#1208).
+pub fn cell_label(c: &TaskCell) -> String {
+    match (c.workload.as_str(), c.timed_answers) {
+        ("rag", true) => "MuSiQue, timed".to_string(),
+        ("rag", false) => "MuSiQue, natural answers".to_string(),
+        (w, _) => datasets::title(w),
+    }
+}
+
 /// The engine a model's `dataset` cells are set against: the first rival that measured any of
 /// them. None for scratchy alone.
 pub fn rival_of(m: &Model, dataset: &str) -> Option<Engine> {
@@ -363,7 +374,7 @@ pub fn accuracy_table(dataset: &str, pairs: &[(&str, &Model)]) -> Element {
             engines.extend(rival_of(m, dataset));
             engines.into_iter().flat_map(move |e| {
                 (e.tasks(m).iter())
-                    .filter(|c| of_dataset(c, dataset) && !c.timed_answers && c.accuracy.is_some())
+                    .filter(|c| accuracy_cell(c, dataset))
                     .map(move |c| (format!("{} on {chip}", m.stem), e.label(), c))
             })
         })
@@ -469,8 +480,7 @@ fn accuracy_dots(dataset: &str, pairs: &[(&str, &Model)]) -> Vec<RangeGroup> {
         engines.extend(rival_of(m, dataset));
         let marks: Vec<RangeMark> = (engines.iter().zip(["s1", "s2"]))
             .filter_map(|(&e, class)| {
-                let c = (e.tasks(m).iter())
-                    .find(|c| of_dataset(c, dataset) && !c.timed_answers && c.accuracy.is_some())?;
+                let c = (e.tasks(m).iter()).find(|c| accuracy_cell(c, dataset))?;
                 let at = match (accuracy(c), range(c)) {
                     (Some(a), Some(r)) => Ok((a, a - r / 100.0, a + r / 100.0)),
                     (Some(a), None) => Ok((a, a, a)),
@@ -516,6 +526,18 @@ fn of_dataset(c: &TaskCell, dataset: &str) -> bool {
     c.workload == dataset || datasets::of(dataset).and_then(|d| d.scored) == Some(&c.workload)
 }
 
+/// Whether a cell's accuracy is one of `dataset`'s accuracy rows: scored, its answers its own,
+/// and where the dataset has a cell run for its accuracy ([`datasets::Dataset::scored`]), that
+/// one: MuSiQue's 1-user timing cell, scored along the way over a handful of tasks, is no
+/// accuracy row (#1208).
+fn accuracy_cell(c: &TaskCell, dataset: &str) -> bool {
+    let scored = datasets::of(dataset).and_then(|d| d.scored);
+    of_dataset(c, dataset)
+        && !c.timed_answers
+        && c.accuracy.is_some()
+        && scored.is_none_or(|s| c.workload == s)
+}
+
 fn table(m: &Model, only: Option<&str>) -> Element {
     let ours: Vec<&TaskCell> = (Engine::Scratchy.tasks(m).iter())
         .filter(|c| only.is_none_or(|w| of_dataset(c, w)))
@@ -536,7 +558,7 @@ fn table(m: &Model, only: Option<&str>) -> Element {
             abouts,
             for c in cells {
                 {
-                    let name = datasets::title(&c.workload);
+                    let name = cell_label(c);
                     let them = rival(m, &c.workload, c.conc);
                     let ttft = them.and_then(|(_, r)| ttft_times(c, r));
                     let total = them.and_then(|(_, r)| total_times(c, r));
