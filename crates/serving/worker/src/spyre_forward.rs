@@ -101,12 +101,9 @@ impl LaunchRows<'_> {
     /// reaching `p + 1` positions, so `p` is the last position any row of the launch reaches.
     fn last_pos(&self) -> usize {
         match self {
-            LaunchRows::Sequence { reqs } => reqs
-                .iter()
-                .map(|q| q.rows.end())
-                .max()
-                .unwrap_or(1)
-                - 1,
+            LaunchRows::Sequence { reqs } => {
+                reqs.iter().map(|q| q.rows.end()).max().unwrap_or(1) - 1
+            }
             LaunchRows::Batch { seqs } => seqs.iter().map(|q| q.pos).max().unwrap_or(0),
         }
     }
@@ -198,11 +195,7 @@ impl SeatWidth {
     /// one row, and a packed rung's bundle placed its own seat at its own S.
     /// `baked_reqs` is that count — the rung's own pair, the same value the
     /// launch's extent states.
-    fn of_launch(
-        rows_in: &LaunchRows<'_>,
-        baked_reqs: u32,
-        mq: usize,
-    ) -> Self {
+    fn of_launch(rows_in: &LaunchRows<'_>, baked_reqs: u32, mq: usize) -> Self {
         Self(match rows_in {
             LaunchRows::Batch { .. } => mq,
             LaunchRows::Sequence { .. } => baked_reqs as usize,
@@ -385,9 +378,7 @@ pub(crate) fn run_card_launch(
         // this rung's graph at (`width · requests`, the extent's held
         // `graph_rows`), never the wiring representative's row count: a packed
         // rung runs `w · S` rows through a wiring that states the solo shape.
-        scratchy_target_spyre::wiring::RowCapacity::of_baked_rung(
-            step.extent.graph_rows(),
-        ),
+        scratchy_target_spyre::wiring::RowCapacity::of_baked_rung(step.extent.graph_rows()),
         launch_rows,
         Some(step),
         consts.len(),
@@ -1398,13 +1389,7 @@ fn log_seat_readback(
                     }
                 }
                 argmax.push((r, best.0 as u32));
-                top2.push((
-                    r,
-                    best.0 as u32,
-                    second.0 as u32,
-                    best.1,
-                    best.1 - second.1,
-                ));
+                top2.push((r, best.0 as u32, second.0 as u32, best.1, best.1 - second.1));
             }
         }
         Err(e) => {
@@ -1431,8 +1416,7 @@ fn log_seat_readback(
                 am,
                 pick == am,
                 // `#?` on a plain tuple: the two lanes, their values, the margin.
-                top2
-                    .iter()
+                top2.iter()
                     .find(|(tr, _, _, _, _)| *tr == r)
                     .map(|(_, a, b, va, m)| format!("({a},{b},{va:.4},m={m:.4})"))
                     .unwrap_or_else(|| "-".to_string())
@@ -1703,10 +1687,7 @@ pub(crate) fn run_packed_request_step(
                         .to_string(),
                 )
             })?;
-            Ok(SeqChunk {
-                blocks: b,
-                rows,
-            })
+            Ok(SeqChunk { blocks: b, rows })
         })
         .collect::<ExecutorResult<Vec<_>>>()?;
     // ⭐ THE WAVE'S OWN PICK LAW: the suffix runs iff any request finishes — a non-finishing
@@ -1722,8 +1703,10 @@ pub(crate) fn run_packed_request_step(
     } else {
         LogitsWanted::None
     };
-    let rung = scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(w as u32)
-        .ok_or_else(|| werr("superdsc packed prefill: the selected rung has zero rows".to_string()))?;
+    let rung =
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(w as u32).ok_or_else(|| {
+            werr("superdsc packed prefill: the selected rung has zero rows".to_string())
+        })?;
     let out = run_card_launch(
         LaunchRows::Sequence { reqs: &reqs },
         &sh,

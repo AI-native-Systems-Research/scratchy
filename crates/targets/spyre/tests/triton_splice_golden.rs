@@ -2894,9 +2894,18 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         let want_mask = ktir_superdsc::reserved_tids::paged_window_tid(r as u32, 2);
         let want_pages = ktir_superdsc::reserved_tids::paged_window_tid(r as u32, 1);
         let want_rows = ktir_superdsc::reserved_tids::paged_window_tid(r as u32, 0);
-        assert!(bound.contains(&want_mask), "window {r} binds its own mask stack");
-        assert!(bound.contains(&want_pages), "window {r} binds its own page table");
-        assert!(bound.contains(&want_rows), "window {r} binds its own query rows");
+        assert!(
+            bound.contains(&want_mask),
+            "window {r} binds its own mask stack"
+        );
+        assert!(
+            bound.contains(&want_pages),
+            "window {r} binds its own page table"
+        );
+        assert!(
+            bound.contains(&want_rows),
+            "window {r} binds its own query rows"
+        );
         for other in 0..2u32 {
             if other != r as u32 {
                 assert!(

@@ -1029,7 +1029,7 @@ mod tests {
                         s.paged_rows,
                         rung.active_cap.get(),
                     )
-                        .is_none()
+                    .is_none()
                 {
                     return Err(format!("{p}"));
                 }
@@ -1436,7 +1436,8 @@ mod tests {
             }
         }
         assert_ne!(
-            got, &logical[..],
+            got,
+            &logical[..],
             "two sticks a row: not the row-major bytes"
         );
         let b = PagedStep {
@@ -1678,7 +1679,11 @@ mod tests {
         };
         for (r, blocks) in [(0u32, &a[..]), (1, &b[..])] {
             let table = ints(card.words(pages_of(r)).unwrap());
-            assert_eq!(table.len(), 4 * trip / 4, "window {r}'s table is the solo shape");
+            assert_eq!(
+                table.len(),
+                4 * trip / 4,
+                "window {r}'s table is the solo shape"
+            );
             for i in 0..4 {
                 let want = blocks.get(i).copied().unwrap_or(0) as i32;
                 assert_eq!(table[i * trip / 4], want, "window {r} block {i}");
@@ -1720,7 +1725,10 @@ mod tests {
             "window 0's rows"
         );
         assert_eq!(
-            ints(card.words(paged_window_tid(1, PAGED_WINDOW_QUERY_ROWS)).unwrap()),
+            ints(
+                card.words(paged_window_tid(1, PAGED_WINDOW_QUERY_ROWS))
+                    .unwrap()
+            ),
             vec![3, 4, 5],
             "window 1's rows"
         );
@@ -1780,9 +1788,14 @@ mod tests {
             }],
         )
         .unwrap();
-        use ktir_superdsc::reserved_tids::{PAGED_WINDOW_MASK, PAGED_WINDOW_PAGE_TABLE, paged_window_tid};
+        use ktir_superdsc::reserved_tids::{
+            PAGED_WINDOW_MASK, PAGED_WINDOW_PAGE_TABLE, paged_window_tid,
+        };
         // The empty window's page table rows are zero — page 0, the null page.
-        let table = ints(card.words(paged_window_tid(1, PAGED_WINDOW_PAGE_TABLE)).unwrap());
+        let table = ints(
+            card.words(paged_window_tid(1, PAGED_WINDOW_PAGE_TABLE))
+                .unwrap(),
+        );
         for i in 0..4 {
             assert_eq!(table[i * trip / 4], 0, "empty window block {i}");
         }
@@ -1896,7 +1909,11 @@ mod tests {
                 .unwrap()
         };
         for t in [packed.page_table, packed.mask, packed.query_rows] {
-            assert_eq!(own(&packed, t), own(&one, t), "window 0's t{t} is the solo size");
+            assert_eq!(
+                own(&packed, t),
+                own(&one, t),
+                "window 0's t{t} is the solo size"
+            );
         }
         for (table, solo_t) in [
             (PAGED_WINDOW_PAGE_TABLE, packed.page_table),

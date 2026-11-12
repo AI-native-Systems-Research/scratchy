@@ -389,14 +389,9 @@ impl Worker for SpyreWorker {
                 })
                 .map(|(i, _)| i)
                 .collect();
-            if w.len() >= 2 {
-                w
-            } else {
-                Vec::new()
-            }
+            if w.len() >= 2 { w } else { Vec::new() }
         };
-        let mut results: Vec<Option<u32>> =
-            vec![None; scheduler_output.scheduled_new_reqs.len()];
+        let mut results: Vec<Option<u32>> = vec![None; scheduler_output.scheduled_new_reqs.len()];
         #[cfg(feature = "spyre-hw")]
         if !wave.is_empty() {
             let ids: Vec<&str> = wave

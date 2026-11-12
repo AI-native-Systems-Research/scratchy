@@ -901,9 +901,10 @@ impl PagedStep {
         // row count every whole-graph table (the KV write index above all) is sized by.
         let rows = per_request.checked_mul(requests)?;
         let extent = match paged_rows {
-            crate::paged_step::PagedRows::Sequence => {
-                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(per_request)?, RungCap::of_baked_seqs(requests)?)?
-            }
+            crate::paged_step::PagedRows::Sequence => QueryExtent::of_baked_rung(
+                RungWidth::of_baked_rows(per_request)?,
+                RungCap::of_baked_seqs(requests)?,
+            )?,
             crate::paged_step::PagedRows::Batch => {
                 QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(requests)?)?
             }

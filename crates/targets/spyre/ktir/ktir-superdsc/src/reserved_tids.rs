@@ -595,7 +595,10 @@ pub const PAGED_WINDOW_QUERY_ROWS: u32 = 0;
 pub const PAGED_WINDOW_PAGE_TABLE: u32 = 1;
 pub const PAGED_WINDOW_MASK: u32 = 2;
 pub const fn paged_window_tid(window: u32, table: u32) -> u32 {
-    assert!(table < 3, "a prefill window binds three tables (query rows, page table, mask)");
+    assert!(
+        table < 3,
+        "a prefill window binds three tables (query rows, page table, mask)"
+    );
     if window == 0 {
         // ⭐ DOCUMENTED WHY: window 0 IS the solo prefill's tid, for all three tables. Keeping
         // them there is what makes a solo rung's ops name the sentinels exactly as before —

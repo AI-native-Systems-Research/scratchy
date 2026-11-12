@@ -13540,7 +13540,7 @@ fn dump_wavefront_mega(
             prefix_len.get(),
             None, // KTIR decode is m=1; its sengraph is replaced by the CB one below
             None, // decode path (Store + PagedAttnCompute) -- no prefill width
-            1, // decode: no prefill rung, no request count
+            1,    // decode: no prefill rung, no request count
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
             primary_m,
         );
@@ -14000,49 +14000,50 @@ fn dump_wavefront_mega(
         // (the graph's own extent); the PAIR is the rung's identity — what the extent mint, the
         // splice's window unroll and the worker's rung selection all key on, never a division of
         // the rows.
-        let prefill_rung_pairs: Vec<(u32, u32)> = if sendnn_superdsc && cfg!(feature = "spyre-lower")
-        {
-            let mut v: Vec<u32> = PREFILL_RUNGS
-                .into_iter()
-                .filter(|&r| r > 1 && r <= prefill_m && rung_admitted(r))
-                .collect();
-            // An explicit KTIR_PREFILL_LEN that is not itself a rung still gets baked, as the top.
-            if v.last() != Some(&prefill_m) && prefill_m > 1 {
-                v.push(prefill_m);
-            }
-            let mut pairs: Vec<(u32, u32)> = v.iter().map(|&w| (w, 1u32)).collect();
-            // ⭐ THE PACKED RUNGS — the S axis, graded: every capacity 2..=PREFILL_PACK_SEQS, so a
-            // wave rides a rung that stages its own live count's rows (a launch stages its rung's
-            // whole baked rows, so an ungraded ladder would charge a 2-live wave the 4-wide cost).
-            // ⛔ EVERY CAPACITY SHARES ONE WIDTH CEILING — the widest capacity's own `w·S ≤
-            // prefill_m`, never a per-capacity `w·s ≤ prefill_m`: past that bound a window's
-            // page-table gather enters the walk body, where the relaunch shifts the activation
-            // segment per trip and only the step's own four tables ride it — window 1's tables do
-            // not (measured: (192, 2) and (256, 2) refuse exactly there, while every width the
-            // widest capacity proved bakes at every capacity). The top solo width is never packed
-            // (w·S would exceed the ceiling by construction), so the solo top stays the ladder's
-            // last entry and `superdsc_prefill_fp`'s ceiling law is unchanged.
-            for &w in &v {
-                if w < PREFILL_PACK_WIDTH_FLOOR {
-                    continue;
+        let prefill_rung_pairs: Vec<(u32, u32)> =
+            if sendnn_superdsc && cfg!(feature = "spyre-lower") {
+                let mut v: Vec<u32> = PREFILL_RUNGS
+                    .into_iter()
+                    .filter(|&r| r > 1 && r <= prefill_m && rung_admitted(r))
+                    .collect();
+                // An explicit KTIR_PREFILL_LEN that is not itself a rung still gets baked, as the top.
+                if v.last() != Some(&prefill_m) && prefill_m > 1 {
+                    v.push(prefill_m);
                 }
-                if !w.checked_mul(PREFILL_PACK_SEQS)
-                    .is_some_and(|m| m <= prefill_m)
-                {
-                    continue;
+                let mut pairs: Vec<(u32, u32)> = v.iter().map(|&w| (w, 1u32)).collect();
+                // ⭐ THE PACKED RUNGS — the S axis, graded: every capacity 2..=PREFILL_PACK_SEQS, so a
+                // wave rides a rung that stages its own live count's rows (a launch stages its rung's
+                // whole baked rows, so an ungraded ladder would charge a 2-live wave the 4-wide cost).
+                // ⛔ EVERY CAPACITY SHARES ONE WIDTH CEILING — the widest capacity's own `w·S ≤
+                // prefill_m`, never a per-capacity `w·s ≤ prefill_m`: past that bound a window's
+                // page-table gather enters the walk body, where the relaunch shifts the activation
+                // segment per trip and only the step's own four tables ride it — window 1's tables do
+                // not (measured: (192, 2) and (256, 2) refuse exactly there, while every width the
+                // widest capacity proved bakes at every capacity). The top solo width is never packed
+                // (w·S would exceed the ceiling by construction), so the solo top stays the ladder's
+                // last entry and `superdsc_prefill_fp`'s ceiling law is unchanged.
+                for &w in &v {
+                    if w < PREFILL_PACK_WIDTH_FLOOR {
+                        continue;
+                    }
+                    if !w
+                        .checked_mul(PREFILL_PACK_SEQS)
+                        .is_some_and(|m| m <= prefill_m)
+                    {
+                        continue;
+                    }
+                    for s in 2..=PREFILL_PACK_SEQS {
+                        pairs.push((w, s));
+                    }
                 }
-                for s in 2..=PREFILL_PACK_SEQS {
-                    pairs.push((w, s));
-                }
-            }
-            pairs
-        } else {
-            Some(prefill_m)
-                .filter(|&v| v > 1)
-                .map(|w| (w, 1u32))
-                .into_iter()
-                .collect()
-        };
+                pairs
+            } else {
+                Some(prefill_m)
+                    .filter(|&v| v > 1)
+                    .map(|w| (w, 1u32))
+                    .into_iter()
+                    .collect()
+            };
         type PrefillPick = BakeOut;
         let mut prefill: Option<PrefillPick> = None;
         // ⭐ THE RUNGS ARE BAKED IN PARALLEL AND COMMITTED IN ORDER. Each rung is a whole-model lowering

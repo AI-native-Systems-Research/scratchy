@@ -2352,7 +2352,12 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         } else {
             format!("attn_s{}_w{}", node.id.index(), r)
         };
-        let k = rebind(&positional, name.clone(), bindings, Some(BufferId::new(mask_tid)))?;
+        let k = rebind(
+            &positional,
+            name.clone(),
+            bindings,
+            Some(BufferId::new(mask_tid)),
+        )?;
         let mut e = EmittedOp::bare(name);
         e.ktir = Some(k);
         ops.push(e);
