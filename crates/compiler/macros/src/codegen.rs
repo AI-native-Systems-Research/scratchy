@@ -11158,6 +11158,7 @@ const PREFILL_RUNGS: [u32; 27] = [
 /// window's page-table gather enters the walk body, whose per-trip segment shift carries only the
 /// step's own four tables (measured: widths past the bound refuse at the walk check). A packed
 /// rung's row count is a row count the solo ladder already proved the model holds.
+#[cfg(feature = "spyre")]
 const PREFILL_PACK_SEQS: u32 = 4;
 /// ⛔ THE PACKED RUNG'S WIDTH FLOOR — the kernel's own contract, not a tuning knob:
 /// `page_attn_head_major_prefill.py` reads and writes a window's rows through the
@@ -11167,6 +11168,7 @@ const PREFILL_PACK_SEQS: u32 = 4;
 /// index's first entry, a staged value the whole-function door cannot address per window. A
 /// packed rung's windows carry absolute, non-zero-based rows, so it bakes only where the kernel
 /// takes the descriptor path. The ladder's widths below 8 (7) stay solo.
+#[cfg(feature = "spyre")]
 const PREFILL_PACK_WIDTH_FLOOR: u32 = 8;
 /// The widest rung a SUB-BLOCKED causal block is baked at (see [`PREFILL_RUNGS`]). Read only by
 /// the `#[cfg(feature = "spyre")]` ladder in `dump_wavefront_mega` — no test reads it, so it is
