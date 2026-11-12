@@ -2999,9 +2999,8 @@ fn emit_fingerprint_check(
         /// Per-variant compile-time fingerprint check. See
         /// macro's `emit_fingerprint_check` for the rules.
         /// Backend-neutral — `gw` reads tensor shapes via the
-        /// shared `GpuWeights` API, so the same body sniffs cuda,
-        /// metal, and spyre (host) checkpoints identically.
-        #[cfg(any(feature = "metal", feature = "spyre"))]
+        /// shared `GpuWeights` API, so the same body sniffs every target's checkpoints
+        /// identically.
         pub fn fingerprint_matches(
             gw: &crate::__gpu::weights::GpuWeights,
             hf: ::scratchy_forward_compiler::HfFingerprint<'_>,
@@ -3106,6 +3105,7 @@ fn emit_weights_struct(
     tp_world_size: u8,
     emit_fingerprint: bool,
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
+    emitter: &dyn crate::target::TargetEmitter,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
     let accessors: Vec<WeightAccessor> = tape_accessors.map(<[_]>::to_vec).unwrap_or_default();
 
@@ -4121,6 +4121,8 @@ fn emit_weights_struct(
     // provides in the no-backend default build. So the same struct compiles under
     // every target with no backend special-cased: spyre carries the same real
     // `Weights` metal does, differing only in which crate `__gpu` names.
+    // The target's own fields on the canonical struct.
+    let target_fields = emitter.weights_fields();
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
             /// Every weight the forward needs, packed for the solver-picked Impls.
@@ -4130,27 +4132,7 @@ fn emit_weights_struct(
                 #rotary_field
                 #rotary_local_field
                 #rope_context_field
-                /// Lazy-initialized `MetalWorkerPool<Self>` used by
-                /// the metal `forward` body. Constructed on the
-                /// first call (caller-passed `ctx.kv_cache` provides
-                /// the per-layer KV buffers the runtime_factory
-                /// closure captures); after that every forward
-                /// reuses the same pool. The `OnceLock` lets the
-                /// pool live as a field on `Weights` without an
-                /// `Arc`-cycle — it borrows `&Weights` for each
-                /// `pool.forward(weights, ...)` call instead.
-                #[cfg(feature = "metal")]
-                pub metal_pool: ::std::sync::OnceLock<
-                    ::scratchy_target_metal::interpreter::metal::MetalWorkerPool<Self>,
-                >,
-                /// The arena of the model whose forwards follow this one's on its command buffer
-                /// (its MTP head), which `metal_pool` holds in its own: set before the pool is
-                /// built (`ScratchyWeights::metal_host`), a fact of this model, not of the device
-                /// it shares with other models' pools.
-                #[cfg(feature = "metal")]
-                pub metal_guest: ::std::sync::OnceLock<
-                    ::scratchy_target_metal::interpreter::metal::GuestArena,
-                >,
+                #target_fields
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
@@ -4169,6 +4151,24 @@ fn emit_weights_struct(
             return (quote! { compile_error!(#msg); }, Vec::new());
         }
     };
+
+    // The target's canonical `load`, over the shared per-accessor load plans.
+    let target_load = emitter.load_fn(&crate::target::LoadCx {
+        weights_ctor: &weights_ctor,
+        lets: &lets,
+        field_shorthand: &field_shorthand,
+        packed_splits_prelude: &packed_splits_prelude,
+        marlin_prelude: &marlin_prelude,
+        bnb4_prelude: &bnb4_prelude,
+        fp8_prelude: &fp8_prelude,
+        rope_rows: &rope_rows,
+        rotary_load: &rotary_load_metal,
+        rotary_local_load: &rotary_local_load_metal,
+        rotary_init: &rotary_init,
+        rotary_local_init: &rotary_local_init,
+        rotary_deferred_init: &rotary_deferred_init,
+        rope_context_init: &rope_context_init,
+    });
 
     // Canonical emits the full `load_with(marlin_storage)` body +
     // a thin `load()` wrapper that passes this variant's Marlin
@@ -4192,138 +4192,15 @@ fn emit_weights_struct(
 
             #fingerprint_method
 
-            /// Metal entry — same signature as the shared `load` so the
-            /// top-level dispatching `Weights::load` walks every
-            /// backend through the same arms. `stream` is an alias
-            /// for `()` under metal (`CUstream`)
-            /// and is unused; the body shares the canonical's `lets`
-            /// and `field_shorthand` — `LinearConcat` arms route
-            /// through `LinearLayer::load_dense_concat_packed`. The
-            /// RoPE tables are not built here but with the pool
-            /// (`build_rope_tables`), once the KV cache is sized.
-            #[cfg(feature = "metal")]
-            #[allow(clippy::too_many_lines, unused_variables)]
-            pub fn load(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::CUstream,
-                max_model_len: usize,
-                tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
-                // Bring the relocated `load*` extension traits into scope so
-                // the path-syntax `LinearLayer::load_dense_or_ggml(...)`,
-                // `RmsNorm::load(...)`, `Embedding::load(...)`,
-                // `AffineQuantEmbedding::load(...)`, … calls the metal body
-                // emits below resolve. The LinearLayer/Embedding/RmsNorm/
-                // LayerNorm/GatedDeltaNet loaders live in targets/cuda's
-                // `*Ops`; the affine-embedding loader is a metal-local trait.
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _, MetalAffineEmbedOps as _, MetalLinearLayerOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    FusedMoEOps as _, SharedFusedMoEOps as _, DeepSeekV2MoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                    GptOssMoEOps as _,
-                };
-                // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
-                // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
-                // dtype). `RmsNorm::load`'s `take_as_dtype` then converts the
-                // gain only when a checkpoint ships a different dtype (e.g. a
-                // standard HF bf16 export feeding an `_s_f16_` Llama arm) — the
-                // mlx zero-copy gain path is preserved on the matching case.
-                gw.set_rmsnorm_scale_dtype(
-                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.scale_dtype(),
-                );
-                #packed_splits_prelude
-                #(#lets)*
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_deferred_init
-                    #rope_context_init
-                    #[cfg(feature = "metal")]
-                    metal_pool: ::std::sync::OnceLock::new(),
-                    #[cfg(feature = "metal")]
-                    metal_guest: ::std::sync::OnceLock::new(),
-                })
-            }
-
-            /// Spyre load — same shape as the metal `load`: it builds the
-            /// real `Weights` through `crate::__gpu`'s loader `*Ops`, which
-            /// `scratchy-target-spyre` provides (backed by the neutral
-            /// allocator-generic loaders + `SpyreAllocator`). `stream` is `()`
-            /// (`LoadStream`); rotary loads from `GpuWeights` (no stream), the
-            /// same constructor the metal `load` uses.
-            #[cfg(feature = "spyre")]
-            #[allow(clippy::too_many_lines, unused_variables)]
-            pub fn load(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::LoadStream,
-                max_model_len: usize,
-                tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _,
-                };
-                use crate::__gpu::layers_quant::{
-                    MarlinLoadOps as _, Fp8LoadOps as _, Fp8BlockLoadOps as _, Bnb4bitLoadOps as _,
-                    AffineQuantEmbeddingOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    DeepSeekV2MoEOps as _, DeepSeekV2Fp8BlockMoEOps as _,
-                    DeepSeekV2GgmlMoEOps as _, FusedMoEOps as _, SharedFusedMoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                };
-                use crate::__gpu::rotary::CudaRotaryExt as _;
-                #packed_splits_prelude
-                // ⛔ THE SAME QUANT PRELUDES THE SHARED BODY GETS, because the
-                // `#lets` below are the SAME per-accessor load plans and they
-                // REFERENCE these bindings (`__fp8_dtype`, `__marlin_ws`,
-                // `__bnb_code`). Omitting them here does not disable quant on
-                // spyre — it emits a load body that names an undefined local,
-                // which only stayed invisible while spyre's `Weights` had no
-                // weight fields at all and this body was therefore empty.
-                // Each prelude elides itself when the model has no accessor of
-                // that kind, so a dense model is unaffected.
-                #marlin_prelude
-                #bnb4_prelude
-                #fp8_prelude
-                #(#lets)*
-                #rope_rows
-                #rotary_load_metal
-                #rotary_local_load_metal
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_init
-                    #rotary_local_init
-                    #rope_context_init
-                })
-            }
+            #target_load
         },
         WeightsEmitMode::Shim { canonical } => quote! {
             #weights_def
 
             #fingerprint_method
 
-            /// Metal shim — delegates to canonical's metal `load`.
-            /// Same signature as cuda's shim above; `stream` is `()`
-            /// under metal and is forwarded to the canonical's
-            /// `load` (which also ignores it).
-            #[cfg(feature = "metal")]
+            /// Shim — delegates to its canonical's `load`.
             #[inline]
-            pub fn load(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::CUstream,
-                max_model_len: usize,
-                tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
-                super::#canonical::load(gw, stream, max_model_len, tp_rank)
-            }
-
-            /// Spyre shim — delegates to canonical's spyre marker load.
-            #[cfg(feature = "spyre")]
-            #[inline]
-            #[allow(unused_variables)]
             pub fn load(
                 gw: &mut crate::__gpu::weights::GpuWeights,
                 stream: crate::__gpu::LoadStream,
@@ -4362,7 +4239,7 @@ fn accessor_base_layer(acc: &WeightAccessor) -> (String, Option<UnrollIndex>) {
 /// One row in the per-arch `Weights` shape. The field/struct emit,
 /// the `impl Weights` accessor methods, and the `load_with` body
 /// all walk the same group list so they stay in sync.
-pub(crate) struct AccessorGroup<'a> {
+pub struct AccessorGroup<'a> {
     /// Field name on `Weights` — the accessor's stem with the
     /// `_<layer>` suffix stripped. Stays a plain `String` because
     /// callers also need it as a runtime format-string fragment.
@@ -4387,7 +4264,7 @@ pub(crate) struct AccessorGroup<'a> {
 /// real-world archs with conditional-per-layer accessors (e.g.
 /// DeepSeek-V2's `moe` is layers 1..N — layer 0 is dense FFN) take
 /// the legacy per-layer-fields fallback.
-pub(crate) enum AccessorGroupKind {
+pub enum AccessorGroupKind {
     /// Single field, no layer arg. Field type is `T`. Accessor
     /// method ignores its `layer` arg and returns `&self.<base>`.
     Unindexed,
@@ -5004,7 +4881,7 @@ fn dim_type<F: FnMut(&str) -> Result<TokenStream, String>>(
 /// Panics on:
 /// - a base mixing layered and unindexed entries;
 /// - a base whose entries declare conflicting `rust_type`s.
-pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<AccessorGroup<'_>> {
+pub fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<AccessorGroup<'_>> {
     use std::collections::BTreeMap;
 
     struct Bucket<'a> {
@@ -9057,6 +8934,7 @@ pub fn emit_model(
             tp_world_size,
             emit_fingerprint,
             canonical_affine_rows,
+            emitter,
         );
     }
     // The struct emitter. Metal calls it twice: once with no accessors
@@ -9076,6 +8954,7 @@ pub fn emit_model(
             tp_world_size,
             emit_fingerprint,
             None,
+            emitter,
         )
     };
     #[cfg(feature = "metal")]
@@ -9107,8 +8986,6 @@ pub fn emit_model(
         dims.declare_tile_bounds(fuf, model);
         dims
     };
-    #[cfg(feature = "metal")]
-    let (mut weights, mut weights_affine_rows) = emit_struct(None, &model_dims(None));
     // ⭐ THE MODEL'S FACTS (#1083), computed ONCE here and threaded to every consumer below:
     // the bridge calls (the spyre weight struct, metal's tape fingerprint, metal's canonical
     // lowering) and the per-canonical `CanonicalParams` impl. Every fact is a field of this
@@ -9121,103 +8998,39 @@ pub fn emit_model(
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
     );
     // The config params and the typed facts are ONE model — the bridge takes them together.
-    // (Its readers below are the metal/spyre bridge calls; a cuda-only build lowers no tape.)
-    #[cfg(any(feature = "metal", feature = "spyre"))]
+    #[cfg(feature = "metal")]
     let bridge_model = crate::to_wavefront::BridgeModel {
         params: model,
         facts: &model_facts,
     };
-    // THE MODEL'S WEIGHT BINDING, from the tape both backends lower.
-    //
-    // `accessors_from_tape` reads only `LoweredDecode.bindings` + the op that
-    // consumes each one, so it is a fact about the MODEL. The struct it feeds
-    // is already target-neutral (`crate::__gpu::layers::*`, where `__gpu` is
-    // the per-target alias), so the same fields compile and load on any
-    // backend.
-    #[cfg(all(feature = "spyre", not(feature = "metal")))]
+
+    // THE MODEL'S WEIGHTS STRUCT. A target that derives it itself (spyre: from its decode tape's
+    // weight bindings) hands it back; otherwise the accessor-less first pass, which the tape
+    // re-emits below once the front-end swap has produced its accessors.
     let (weights, weights_affine_rows) = {
-        let lowered = workloads
+        let decode_point = workloads
             .iter()
             .find(|w| w.num_tokens == 1)
             .or_else(|| workloads.iter().next())
             .copied()
-            .and_then(|wp| {
-                let bounds = bounds_for_wp(model, wp, tp_world_size);
-                crate::to_wavefront::lower_decode_to_wavefront(
-                    fuf,
-                    inferred,
-                    &bounds,
-                    &bridge_model,
-                    crate::to_wavefront::PrefixCapacity::new(
-                        std::num::NonZeroU32::new(8192).expect("8192 != 0"),
-                    ),
+            .map(|wp| {
+                (
+                    bounds_for_wp(model, wp, tp_world_size),
                     wp.num_tokens as u32,
                 )
-                .ok()
             });
-        let tw = lowered.as_ref().map(|l| {
-            crate::weight_bindings::from_tape(
-                l,
+        let struct_of = |accs: Option<&[WeightAccessor]>| emit_struct(accs, &model_dims(accs));
+        emitter
+            .weights_struct(&crate::target::StructCx {
                 program,
-                crate::weight_bindings::WeightAbi {
-                    // Two matmuls plus a SiluMul — no packed-buffer kernel to read one.
-                    mlp: crate::weight_bindings::MlpPacking::Split,
-                    // ⛔ DERIVED, NOT ASSUMED. This was a hardcoded `Dense`, which is what the
-                    // path did before these facts were arguments — and hardcoding it is the same
-                    // shape of bug as the `"{disk}.weight"` naming rule: right for the models in
-                    // front of you, silently wrong for the next one. Read from the FUF, exactly
-                    // as the metal bridge reads it, so the two cannot disagree about one model.
-                    embed: match fuf.nodes.iter().find_map(|n| {
-                        (n.op == OpKind::Embed)
-                            .then(|| crate::weight_vocab::weight_storage_of(n))
-                            .flatten()
-                    }) {
-                        Some(crate::quantization::StorageFormat::Affine { .. }) => {
-                            crate::weight_bindings::EmbedStorage::AffineQuant
-                        }
-                        _ => crate::weight_bindings::EmbedStorage::Dense,
-                    },
-                },
-            )
-            .unwrap_or_else(|e| panic!("[weight-bindings] {}: {e}", model.source_stem))
-        });
-        eprintln!(
-            "[weight-bindings] {}: {} weight accessors from the tape",
-            model.source_stem,
-            tw.as_ref().map(|t| t.accessors.len()).unwrap_or(0),
-        );
-        let dims = model_dims(tw.as_ref().map(|t| t.accessors.as_slice()));
-        let (struct_tokens, struct_affine_rows) =
-            emit_struct(tw.as_ref().map(|t| t.accessors.as_slice()), &dims);
-        // The id → FIELD binding, emitted INTO THE SAME MODULE as the struct so
-        // its arms can name `w.self_attn_q_proj[3]` directly. This is what the
-        // worker's `"{disk}.weight"` lookup is replaced by; only generated code
-        // can name a generated field.
-        let bindings = match (lowered.as_ref(), tw.as_ref()) {
-            (Some(l), Some(t)) => crate::weight_bindings::emit_weight_bindings(l, program, t)
-                .unwrap_or_else(|e| panic!("[weight-bindings] {}: {e}", model.source_stem)),
-            // ⛔ THE FN IS ALWAYS EMITTED, AND IT REFUSES. The dispatcher's
-            // `superdsc_weights` override names it per variant, so omitting it
-            // is a confusing compile error in generated code — but emitting an
-            // EMPTY binding would be worse: a model that silently loads zero
-            // weights and produces garbage. A model whose decode point did not
-            // lower has no binding to give, and says so.
-            _ => {
-                let stem = model.source_stem.as_str();
-                quote! {
-                    pub fn superdsc_weights(
-                        _w: &Weights,
-                    ) -> ::anyhow::Result<::std::vec::Vec<::scratchy_target_spyre::BoundWeight>> {
-                        ::anyhow::bail!(
-                            "{}: no weight binding was generated — the decode point did not lower, \
-                             so this model cannot be launched on spyre",
-                            #stem,
-                        )
-                    }
-                }
-            }
-        };
-        (quote! { #struct_tokens #bindings }, struct_affine_rows)
+                model,
+                facts: &model_facts,
+                fuf,
+                inferred,
+                decode_point: decode_point.as_ref().map(|(b, m)| (b, *m)),
+                struct_of: &struct_of,
+            })
+            .unwrap_or_else(|| struct_of(None))
     };
 
     // Group workload points by TAPE fingerprint. Buckets that lower to
@@ -9693,11 +9506,10 @@ pub fn emit_model(
     // Re-emitted HERE because the tape accessors only exist after the
     // front-end swap has lowered the canonical.
     #[cfg(feature = "metal")]
-    if let Some(tape_accs) = tape_accessors_for_struct.as_ref() {
-        let (w, r) = emit_struct(Some(tape_accs), &dims);
-        weights = w;
-        weights_affine_rows = r;
-    }
+    let (weights, weights_affine_rows) = match tape_accessors_for_struct.as_ref() {
+        Some(tape_accs) => emit_struct(Some(tape_accs), &dims),
+        None => (weights, weights_affine_rows),
+    };
 
     // The target's own baked program for this model, at the decode (num_tokens=1) point's
     // bounds — spliced into the per-model module; empty for a target that bakes none this way.
@@ -11764,6 +11576,7 @@ fn emit_shim_model(
     // The canonical's affine rows — the fallback for this shim's
     // fingerprint gate when its own accessor set yields none.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
+    emitter: &dyn crate::target::TargetEmitter,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
     let (weights, shim_affine_rows) = emit_weights_struct(
         program,
@@ -11776,6 +11589,7 @@ fn emit_shim_model(
         tp_world_size,
         emit_fingerprint,
         canonical_affine_rows,
+        emitter,
     );
 
     // Per-tape_index fn surfaces are gone — dispatch lives on the
@@ -11784,18 +11598,12 @@ fn emit_shim_model(
     // canonical's `METAL_BUCKETS` static + `metal_pool()` constructor
     // — variant-specific differences (quant format, fingerprint) are
     // load-time only; static tape_index plans are byte-identical.
+    let target_shim_items = emitter.shim_items(canonical);
     let tokens = quote! {
         #weights
 
-        // Spyre: shim variants share the canonical's solve, so the
-        // canonical owns the embedded `KTIR_BUNDLE` AND `SENGRAPH_BUNDLE`.
-        // Re-export BOTH so this shim module's `ScratchyWeights::ktir_bundle()`
-        // AND `sengraph_bundle()` arms resolve symmetrically (the registry
-        // accessor in macros/src/lib.rs names `<first_model>::SENGRAPH_BUNDLE`,
-        // which is a shim module when the first arch variant is non-canonical —
-        // re-exporting only KTIR_BUNDLE left `--target sendnn` unresolvable there).
-        #[cfg(feature = "spyre")]
-        pub use super::#canonical::{KTIR_BUNDLE, SENGRAPH_BUNDLE};
+        // What the target re-exports from the canonical a shim shares its solve with.
+        #target_shim_items
 
         // `dump` is the per-variant `scr model info` accessor —
         // available under either backend so shim variants register

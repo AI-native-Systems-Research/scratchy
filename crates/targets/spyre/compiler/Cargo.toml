@@ -28,7 +28,7 @@ tp-8 = ["scratchy-target-spyre/tp-8"]
 [dependencies]
 # The shared pipeline this crate's emitter plugs into (`target::TargetEmitter`), and the passes the
 # bake reads (`to_wavefront`, `shape`, `config`, ...).
-scratchy-forward-compiler-macro = { path = "../../../compiler/macros", features = ["spyre"] }
+scratchy-forward-compiler-macro = { path = "../../../compiler/macros" }
 scratchy-forward-compiler-frontend = { path = "../../../compiler/frontend" }
 # The target: the lowering the bake drives, and the types the baked program is rendered as.
 scratchy-target-spyre = { path = "..", default-features = false }
@@ -50,4 +50,4 @@ serde_json = { workspace = true }
 
 # The pipeline's real-config fixtures, for the bake's tests on checked-in models.
 [dev-dependencies]
-scratchy-forward-compiler-macro = { path = "../../../compiler/macros", features = ["spyre", "test-support"] }
+scratchy-forward-compiler-macro = { path = "../../../compiler/macros", features = ["test-support"] }

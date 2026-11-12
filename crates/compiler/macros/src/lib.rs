@@ -17,11 +17,6 @@
 //! constants, proving the pipeline actually executes at compile
 //! time.
 
-use std::path::Path;
-
-#[cfg(all(feature = "metal", feature = "spyre"))]
-compile_error!("features 'metal' and 'spyre' are mutually exclusive — enable exactly one backend");
-
 use proc_macro2::Span;
 use quote::quote;
 use syn::Ident;
@@ -75,14 +70,11 @@ mod typed_bodies;
 mod typed_shapes;
 #[cfg(test)]
 mod typed_shapes_tests;
-// ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target.
-//
-// It used to be gated `all(feature = "spyre", not(feature = "metal"))` because metal derived
-// the same set inline from `tape_groups` — a cfg that selects between two bodies, which keeps
-// both. The target being a compile-time singleton is what makes ONE body viable: there is no
-// second target in the build to compromise for. Packing gate/up into a single `__fused__`
+// ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target: one body, since
+// the target is a compile-time singleton — there is no second target in the build to
+// compromise for. Packing gate/up into a single `__fused__`
 // buffer is metal's kernel ABI, so it arrives as a bool argument rather than a second walk.
-mod weight_bindings;
+pub mod weight_bindings;
 pub mod weight_vocab;
 
 mod vision_glue;
@@ -748,11 +740,6 @@ pub fn compile_carrier(
             )
         })
         .map_err(CarrierError::Arch)?;
-
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    compile_error!(
-        "scratchy-forward-compiler-macro requires a backend feature: 'cuda', 'metal', or 'spyre'"
-    );
 
     // Stable rebuild-on-JSON-change: emit `const _: &str =
     // include_str!("<abs path>");` for every file the macro read.
@@ -1559,14 +1546,25 @@ pub fn compile_carrier(
             #head_tokens
         };
 
+        let gguf_spec = config::load_gguf_spec(models_dir)
+            .map_err(|e| {
+                syn::Error::new(
+                    name_span,
+                    format!(
+                        "quantizations.json gguf spec in {}: {e}",
+                        models_dir.display()
+                    ),
+                )
+            })
+            .map_err(CarrierError::Arch)?;
         emit_arch_dispatcher(
             &arch_ident,
             &hf_arches,
             &arch_dispatch_arms,
-            models_dir,
-            name_span,
+            gguf_spec.as_ref(),
             gdn_runtime_config_tokens,
             head_registration,
+            emitter,
         )
         .map_err(CarrierError::Arch)?
     } else {
@@ -1581,19 +1579,11 @@ pub fn compile_carrier(
     // `#[forward] fn llama() { ... }`, the caller accesses
     // `scratchy_models::llama::Weights` directly (no
     // `::arch::` / `::llama::` / etc.).
+    let facade = emitter.facade();
     Ok(quote! {
-        #[cfg(feature = "metal")]
+        // The target's runtime crate, which the emitted code names its types through.
         #[allow(unused_imports)]
-        use ::scratchy_target_metal as __gpu;
-        // Spyre: the host target re-exports the neutral surface (`weights`
-        // defaulted to `SpyreAllocator`, `LoadStream`, `BackendAllocator`) the
-        // emitted load/fingerprint code names through `crate::__gpu::…`.
-        #[cfg(feature = "spyre")]
-        #[allow(unused_imports)]
-        use ::scratchy_target_spyre as __gpu;
-        #[cfg(not(any(feature = "metal", feature = "spyre")))]
-        #[allow(unused_imports)]
-        use ::scratchy_layers as __gpu;
+        use #facade as __gpu;
 
         // Rebuild-on-change for every JSON the macro read.
         #(#tracked)*
@@ -1683,10 +1673,11 @@ fn emit_arch_dispatcher(
     arch_ident: &Ident,
     hf_arches: &[String],
     arms: &[DispatchArm],
-    models_dir: &Path,
-    error_span: Span,
+    // The arch's `quantizations.json` GGUF spec (`config::load_gguf_spec`).
+    gguf_spec: Option<&config::GgufSpec>,
     gdn_runtime_config_tokens: proc_macro2::TokenStream,
     head_registration: proc_macro2::TokenStream,
+    emitter: &dyn target::TargetEmitter,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if arms.is_empty() {
         return Ok(quote! {});
@@ -1728,89 +1719,6 @@ fn emit_arch_dispatcher(
     };
     let kv_codec_arms = canonical_const_arms(quote! { KV_CODEC });
     let kv_cache_layers_arms = canonical_const_arms(quote! { KV_CACHE_LAYERS });
-
-    // Per-variant spyre arms for `ScratchyWeights::ktir_bundle()`: each variant
-    // returns its module's embedded `KTIR_BUNDLE` const as a neutral `&dyn Any`
-    // (the worker downcasts it). Emitted inside the `#[cfg(feature = "spyre")]`
-    // `ktir_bundle` override, so under metal these tokens are cfg'd out.
-    let ktir_bundle_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::KTIR_BUNDLE
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
-
-    // Per-variant arms for `ScratchyWeights::superdsc_weights()` — the
-    // GENERATED source-id → `Weights` FIELD binding. Unlike `ktir_bundle`
-    // these arms BIND the inner weights (`(w)`, not `(_)`): the whole point is
-    // to reach real fields, which is why this cannot be a lookup table in the
-    // worker.
-    let superdsc_weight_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(w) => #model_ident::superdsc_weights(w),
-            }
-        })
-        .collect();
-
-    // Per-variant arms for `ScratchyWeights::sengraph_bundle()` — the same
-    // per-variant const the registration fn-pointer serves, reachable from the
-    // LOADED model so the bundle and the weights cannot come from two
-    // different variant matches.
-    let superdsc_embed_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(w) => #model_ident::superdsc_embed(w),
-            }
-        })
-        .collect();
-
-    let superdsc_wiring_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::SUPERDSC_WIRINGS
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
-
-    let superdsc_tp_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::SUPERDSC_TP
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
-
-    let sengraph_bundle_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => &#model_ident::SENGRAPH_BUNDLE
-                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
-            }
-        })
-        .collect();
 
     // Distinct tp values across all arms, in ascending order. One
     // `inventory::submit!` per value; one match arm in `Weights::load`
@@ -2029,16 +1937,7 @@ fn emit_arch_dispatcher(
     //     the canonical owner per gguf_arch tag — `register_spec=false`
     //     opts out for non-canonical claimants like Mistral or
     //     deepseek-v3-flat).
-    let gguf_spec = config::load_gguf_spec(models_dir).map_err(|e| {
-        syn::Error::new(
-            error_span,
-            format!(
-                "quantizations.json gguf spec in {}: {e}",
-                models_dir.display()
-            ),
-        )
-    })?;
-    let gguf_arch_lits: Vec<proc_macro2::Literal> = match &gguf_spec {
+    let gguf_arch_lits: Vec<proc_macro2::Literal> = match gguf_spec {
         Some(spec) => vec![proc_macro2::Literal::string(
             spec.gguf_arch
                 .clone()
@@ -2107,19 +2006,33 @@ fn emit_arch_dispatcher(
         .map(|tp| {
             let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
             let metal_row = arch_row(&tp_lit, quote! { ::scratchy_target_metal::MetalWeights });
-            let spyre_row = arch_row(&tp_lit, quote! { ::scratchy_target_spyre::SpyreWeights });
             quote! {
                 #[cfg(feature = "metal")]
                 ::scratchy_forward_compiler::inventory::submit! {
                     ::scratchy_target_metal::MetalArchRegistration(#metal_row)
                 }
-                #[cfg(feature = "spyre")]
-                ::scratchy_forward_compiler::inventory::submit! {
-                    ::scratchy_target_spyre::SpyreArchRegistration(#spyre_row)
-                }
             }
         })
         .collect();
+    // The target's loaded-model surface: its trait impl for `Weights`, and its registry rows.
+    let dispatch_variants: Vec<(Ident, Ident)> = arms
+        .iter()
+        .map(|a| (pascal_case(&a.model_ident), a.model_ident.clone()))
+        .collect();
+    let target_loaded_model = emitter.loaded_model(&target::DispatchCx {
+        variants: &dispatch_variants,
+        arch_rows: &|weights_trait| {
+            tp_values
+                .iter()
+                .map(|tp| {
+                    arch_row(
+                        &proc_macro2::Literal::u8_unsuffixed(*tp),
+                        weights_trait.clone(),
+                    )
+                })
+                .collect()
+        },
+    });
     // The arch's target-neutral facts — one row whatever target compiled it.
     let arch_facts = quote! {
         ::scratchy_forward_compiler::inventory::submit! {
@@ -2137,12 +2050,10 @@ fn emit_arch_dispatcher(
         /// backends — the variant's per-canonical `Weights` struct
         /// itself is cfg-mutex'd internally (metal fields gated
         /// `cfg(feature = "metal")`).
-        #[cfg(any(feature = "metal", feature = "spyre"))]
         pub enum Weights {
             #(#variants),*
         }
 
-        #[cfg(any(feature = "metal", feature = "spyre"))]
         impl Weights {
             #(#accessor_methods)*
 
@@ -2268,7 +2179,6 @@ fn emit_arch_dispatcher(
         // `inventory::submit!` adds this arch to the global registry.
         // No hand-written central list anywhere.
 
-        #[cfg(any(feature = "metal", feature = "spyre"))]
         impl ::scratchy_forward_compiler::ScratchyWeights for Weights {
             fn arch_name(&self) -> &'static str { #arch_name_lit }
             fn num_hidden_layers(&self) -> u64 { self.num_hidden_layers() }
@@ -2411,76 +2321,6 @@ fn emit_arch_dispatcher(
             }
         }
 
-        #[cfg(feature = "spyre")]
-        impl ::scratchy_target_spyre::SpyreWeights for Weights {
-            // Spyre: hand the host worker the embedded KTIR bundle for the
-            // fingerprint-matched variant — each variant names its module's
-            // `KTIR_BUNDLE` const (baked into the binary by the macro). Returned
-            // as a neutral `&dyn Any` (the cfg-free trait can't name the spyre
-            // `KtirBundle`); the worker downcasts it back. No disk read.
-            fn ktir_bundle(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#ktir_bundle_arms)*
-                })
-            }
-
-            // Spyre: the generated source-id → weight-field binding. Emitted
-            // per model because only generated code can name a generated
-            // field — the same reason metal's forward reads `wm.q_proj`
-            // instead of resolving a string.
-            fn superdsc_weights(
-                &self,
-            ) -> Option<::anyhow::Result<Vec<::scratchy_target_spyre::BoundWeight>>> {
-                Some(match self {
-                    #(#superdsc_weight_arms)*
-                })
-            }
-
-            // Spyre: the launch wiring, emitted as a static instead of a JSON
-            // string the worker parses back into the same shape.
-            fn superdsc_wiring(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#superdsc_wiring_arms)*
-                })
-            }
-
-            // Spyre: the sharded worlds, beside the one-rank wiring — a `&'static [TpForward]`.
-            fn superdsc_tp(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#superdsc_tp_arms)*
-                })
-            }
-
-            // Spyre: the embedding table, taken out of the weight store by the
-            // generated loader and therefore only reachable from the field.
-            fn superdsc_embed(
-                &self,
-            ) -> Option<::anyhow::Result<::scratchy_target_spyre::GpuTensor>> {
-                Some(match self {
-                    #(#superdsc_embed_arms)*
-                })
-            }
-
-            // Spyre: the embedded sendnn bundle for THIS loaded variant — so
-            // the bundle and the weights come from one match, not two walks.
-            fn sengraph_bundle(
-                &self,
-            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
-            {
-                Some(match self {
-                    #(#sengraph_bundle_arms)*
-                })
-            }
-        }
 
         // One target registry row per distinct tp value across
         // the compiled (variant, tp) tuples. Each closure passes its
@@ -2489,6 +2329,7 @@ fn emit_arch_dispatcher(
         // emitted, so this expands to a single submission with
         // `tp_world_size: 1u8`.
         #(#inventory_submits)*
+        #target_loaded_model
         #arch_facts
 
         // One `BackboneDumpRegistration` per arch, fanning out over

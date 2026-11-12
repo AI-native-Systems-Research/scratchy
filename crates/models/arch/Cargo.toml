@@ -733,7 +733,6 @@ tp-2 = ["spyre", "scratchy-target-spyre-compiler/tp-2", "scratchy-target-spyre/t
 tp-4 = ["spyre", "scratchy-target-spyre-compiler/tp-4", "scratchy-target-spyre/tp-4"]
 tp-8 = ["spyre", "scratchy-target-spyre-compiler/tp-8", "scratchy-target-spyre/tp-8"]
 spyre = [
-    "scratchy-forward-compiler-macro/spyre",
     "dep:scratchy-target-spyre",
     "dep:scratchy-target-spyre-compiler",
 ]
