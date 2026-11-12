@@ -30,6 +30,7 @@ unsafe extern "C" {
     fn scratchy_cuda_gdn_gating_prepare() -> i32;
     fn scratchy_cuda_gdn_rms_norm_gated_prepare() -> i32;
     fn scratchy_cuda_gdn_scan_prepare() -> i32;
+    fn scratchy_cuda_gdn_chunk_scan_prepare() -> i32;
     fn scratchy_cuda_kv_append_bf16_prepare() -> i32;
     fn scratchy_cuda_kv_append_fp8_prepare() -> i32;
     fn scratchy_cuda_moe_combine_bf16_prepare() -> i32;
@@ -857,6 +858,39 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gdn_chunk_scan(
+        conv_out: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        ssm_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        o: *mut c_void,
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_chunk_scan_part(
+        conv_out: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        ssm_state: *mut c_void,
+        slot_elems: u64,
+        sequence: *const c_void,
+        o: *mut c_void,
+        rows: u32,
+        nk: u32,
+        nv: u32,
+        head_k: u32,
+        head_v: u32,
+        scale: f32,
+        part: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gdn_rank_one_probe(
         s: *const c_void,
         t: *const c_void,
@@ -1283,6 +1317,8 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
+    // FP8 S8 F6a: the attribute on every instance of the chunked scan.
+    ("gdn_chunk_scan", scratchy_cuda_gdn_chunk_scan_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -3063,6 +3099,80 @@ pub unsafe fn gdn_scan(
         scratchy_cuda_gdn_scan(
             conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
             scale, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k,
+            head_v,
+        },
+    )
+}
+
+/// Launch the GDN chunked gated delta-rule scan (FP8 S8 F6a, `kernels/gdn_chunk_scan.cu`):
+/// [`gdn_scan`]'s recurrence, arguments, buffers and refusals, computed 64 tokens at a time with
+/// bf16 WGMMAs and f32 accumulation, the state f32 between chunks. No `CudaStep` launches it yet.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::GdnScanShape`] exactly where [`gdn_scan`] is, before any pointer is
+/// touched.
+///
+/// # Safety
+///
+/// As [`gdn_scan`]'s.
+pub unsafe fn gdn_chunk_scan(
+    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
+    (ssm_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    o: *mut c_void,
+    (rows, nk, nv): (u32, u32, u32),
+    (head_k, head_v, scale): (u32, u32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_chunk_scan(
+            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
+            scale, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::GdnScanShape {
+            rows,
+            nk,
+            nv,
+            head_k,
+            head_v,
+        },
+    )
+}
+
+/// Test support for `tests/gdn.rs`'s timing split only: [`gdn_chunk_scan`] with `part` 0 (the
+/// kernel), 1 (the solve skipped, T = I) or 2 (stopped after the precompute). Parts 1 and 2 are not
+/// a scan. No `CudaStep` uses it. Refused as [`gdn_chunk_scan`] is, and at any other `part`.
+///
+/// # Safety
+///
+/// As [`gdn_scan`]'s.
+pub unsafe fn gdn_chunk_scan_part(
+    (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
+    (ssm_state, slot_elems): (*mut c_void, u64),
+    sequence: *const c_void,
+    o: *mut c_void,
+    (rows, nk, nv): (u32, u32, u32),
+    (head_k, head_v, scale): (u32, u32, f32),
+    (part, stream): (u32, *mut c_void),
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_gdn_chunk_scan_part(
+            conv_out, g, beta, ssm_state, slot_elems, sequence, o, rows, nk, nv, head_k, head_v,
+            scale, part, stream,
         )
     };
     check(
