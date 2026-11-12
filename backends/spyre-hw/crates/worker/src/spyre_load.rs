@@ -453,11 +453,13 @@ impl RankCut {
             ))
         })?;
         // The cut OWNS its product — the slicing laws build each rank's share as a fresh
-        // buffer — so a viewed source materializes here: ONE copy on a sharded leg (the
-        // load used to pay the alias's place twice — the take's copy and the cut's).
+        // buffer — and reads the VIEW to build it: only the rank's share is ever copied, so
+        // a sharded leg stages 1/world of the checkpoint per rank instead of materializing
+        // the whole model once per rank (measured at tp/8: the whole-tensor materialization
+        // was 8 full-model host copies, ~1 s of boot, all bandwidth-bound and serialized).
         let cut = self
             .forward
-            .slice_source_bytes(self.me, id, bytes.into_vec(), elem, whole, is_gemm)
+            .slice_source_bytes(self.me, id, bytes.as_slice(), elem, whole, is_gemm)
             .map_err(|e| werr(format!("rank {}: {e}", self.me.get())))?;
         Ok(HostBytes::Owned(cut))
     }
