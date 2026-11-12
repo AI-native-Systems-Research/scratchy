@@ -11143,16 +11143,21 @@ const PREFILL_RUNGS: [u32; 27] = [
     7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112, 128,
     192, 256, 384, 512,
 ];
-/// ⭐ THE PACKED PREFILL CAPACITY — the request count S of the packed rungs, the S axis of
-/// concurrent prefill. A packed rung is the SAME ladder width baked at w·S rows: every op outside
-/// attention runs over the whole w·S-row graph (the batched compute concurrent prefill exists for),
-/// and the attention splice unrolls the packed node into S one-sequence programs of ONE kernel,
-/// each window binding its own host-staged tables at its own tids. Like `MQ_DEM_SAFE` this is a
-/// bake-time knob as a const — the worker packs at most this many prompt-state requests into one
-/// launch, and a rung holds any live count at or below it (empty windows are fully masked, staged
-/// page-0). A packed rung bakes only where its whole graph fits the ladder's ceiling
-/// (`w * PREFILL_PACK_SEQS <= prefill_m`), so its row count is a row count the solo ladder
-/// already proved the model holds.
+/// ⭐ THE PACKED PREFILL CAPACITY — the request count S of the widest packed rungs, the S
+/// axis of concurrent prefill. A packed rung is the SAME ladder width baked at w·s rows: every op
+/// outside attention runs over the whole w·s-row graph (the batched compute concurrent prefill
+/// exists for), and the attention splice unrolls the packed node into s one-sequence programs of
+/// ONE kernel, each window binding its own host-staged tables at its own tids. Like `MQ_DEM_SAFE`
+/// this is a bake-time knob as a const — the worker packs at most this many prompt-state requests
+/// into one launch, and a rung holds any live count at or below it (empty windows are fully
+/// masked, staged page-0). The bake mints EVERY capacity `2..=S`, not just the top: a launch
+/// stages its rung's whole baked rows however many requests ride it (the folded lm-head reads
+/// every window's answer row), so a 2-live wave on a 4-wide rung would pay 4-wide rows — the
+/// graded ladder is what makes the wave cost its own live count. Every capacity shares ONE width
+/// ceiling — the widest capacity's `w * PREFILL_PACK_SEQS <= prefill_m` — because past it a
+/// window's page-table gather enters the walk body, whose per-trip segment shift carries only the
+/// step's own four tables (measured: widths past the bound refuse at the walk check). A packed
+/// rung's row count is a row count the solo ladder already proved the model holds.
 const PREFILL_PACK_SEQS: u32 = 4;
 /// ⛔ THE PACKED RUNG'S WIDTH FLOOR — the kernel's own contract, not a tuning knob:
 /// `page_attn_head_major_prefill.py` reads and writes a window's rows through the
@@ -13987,11 +13992,12 @@ fn dump_wavefront_mega(
         // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (25 now, to 256) — the generated
         // model source and rustc's single-threaded pass over it both paid for all of them.
         // ⭐ THE RUNG IS A PAIR `(width, seqs)`. Every solo rung is `(w, 1)` — a prompt chunk is one
-        // request — and beside them, on the card, the PACKED rungs `(w, PREFILL_PACK_SEQS)`: the
-        // same widths the solo ladder bakes, at w·S rows, where that whole graph fits the ceiling
-        // the solo ladder already proved. The tape lowers at w·S ROWS (the graph's own extent);
-        // the PAIR is the rung's identity — what the extent mint, the splice's window unroll and
-        // the worker's rung selection all key on, never a division of the rows.
+        // request — and beside them, on the card, the PACKED rungs `(w, s)` for every capacity
+        // `2..=PREFILL_PACK_SEQS`: the same widths the solo ladder bakes, at w·s rows, where that
+        // whole graph fits the ceiling the solo ladder already proved. The tape lowers at w·s ROWS
+        // (the graph's own extent); the PAIR is the rung's identity — what the extent mint, the
+        // splice's window unroll and the worker's rung selection all key on, never a division of
+        // the rows.
         let prefill_rung_pairs: Vec<(u32, u32)> = if sendnn_superdsc && cfg!(feature = "spyre-lower")
         {
             let mut v: Vec<u32> = PREFILL_RUNGS
@@ -14003,18 +14009,30 @@ fn dump_wavefront_mega(
                 v.push(prefill_m);
             }
             let mut pairs: Vec<(u32, u32)> = v.iter().map(|&w| (w, 1u32)).collect();
-            // ⭐ THE PACKED RUNGS — the S axis. The top solo width is never packed (w·S would
-            // exceed the ceiling by construction), so the solo top stays the ladder's last entry
-            // and `superdsc_prefill_fp`'s ceiling law is unchanged.
-            pairs.extend(
-                v.iter()
-                    .filter(|&&w| {
-                        w >= PREFILL_PACK_WIDTH_FLOOR
-                            && w.checked_mul(PREFILL_PACK_SEQS)
-                                .is_some_and(|m| m <= prefill_m)
-                    })
-                    .map(|&w| (w, PREFILL_PACK_SEQS)),
-            );
+            // ⭐ THE PACKED RUNGS — the S axis, graded: every capacity 2..=PREFILL_PACK_SEQS, so a
+            // wave rides a rung that stages its own live count's rows (a launch stages its rung's
+            // whole baked rows, so an ungraded ladder would charge a 2-live wave the 4-wide cost).
+            // ⛔ EVERY CAPACITY SHARES ONE WIDTH CEILING — the widest capacity's own `w·S ≤
+            // prefill_m`, never a per-capacity `w·s ≤ prefill_m`: past that bound a window's
+            // page-table gather enters the walk body, where the relaunch shifts the activation
+            // segment per trip and only the step's own four tables ride it — window 1's tables do
+            // not (measured: (192, 2) and (256, 2) refuse exactly there, while every width the
+            // widest capacity proved bakes at every capacity). The top solo width is never packed
+            // (w·S would exceed the ceiling by construction), so the solo top stays the ladder's
+            // last entry and `superdsc_prefill_fp`'s ceiling law is unchanged.
+            for &w in &v {
+                if w < PREFILL_PACK_WIDTH_FLOOR {
+                    continue;
+                }
+                if !w.checked_mul(PREFILL_PACK_SEQS)
+                    .is_some_and(|m| m <= prefill_m)
+                {
+                    continue;
+                }
+                for s in 2..=PREFILL_PACK_SEQS {
+                    pairs.push((w, s));
+                }
+            }
             pairs
         } else {
             Some(prefill_m)
@@ -14124,7 +14142,11 @@ fn dump_wavefront_mega(
                     }
                     let bake_rung = bake_rung_with!(emit_bundle_deferred);
                     let bake_rung_sharded = bake_rung_with!(emit_bundle_deferred_sharded);
-                    let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
+                    let (r, fx) = bake_rung(
+                        &lwd_p,
+                        format!("ktir_prefill_{stem_id} rung=({w}, {s})"),
+                        None,
+                    );
                     // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
                     // world ships whole or not at all.
                     let tp2 = tp_sources.as_deref().map(|decode_cuts| {
