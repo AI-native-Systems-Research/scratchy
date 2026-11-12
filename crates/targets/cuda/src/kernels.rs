@@ -1045,6 +1045,37 @@ unsafe extern "C" {
         max_tiles: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_moe_sort_fp8(
+        xq: *const c_void,
+        x_scale: *const c_void,
+        topk_idx: *const c_void,
+        chunk_hist: *mut c_void,
+        counts: *mut c_void,
+        offsets: *mut c_void,
+        tile_expert: *mut c_void,
+        pos: *mut c_void,
+        rows: *mut c_void,
+        row_scale: *mut c_void,
+        m: u32,
+        experts: u32,
+        top_k: u32,
+        hidden: u32,
+        max_tiles: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_expert_act_quant_fp8_prepare() -> i32;
+    fn scratchy_cuda_expert_act_quant_fp8(
+        gate: *const c_void,
+        up: *const c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        offsets: *const c_void,
+        rows: u32,
+        cols: u32,
+        experts: u32,
+        op: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_expert_gemm_bf16_prepare() -> i32;
     fn scratchy_cuda_expert_gemm_e128_bf16_prepare() -> i32;
     fn scratchy_cuda_expert_gemm_e128_col64_bf16_prepare() -> i32;
@@ -1426,6 +1457,10 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
     ("gemv_fp8_tc", scratchy_cuda_gemv_fp8_tc_prepare),
     ("act_quant_fp8", scratchy_cuda_act_quant_fp8_prepare),
+    (
+        "expert_act_quant_fp8",
+        scratchy_cuda_expert_act_quant_fp8_prepare,
+    ),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
     // capture. Every kernel a tape can launch is loaded here, when the device opens.
@@ -3706,6 +3741,84 @@ pub unsafe fn moe_sort(
             dims: [m, top_k, hidden, max_tiles],
         },
     )
+}
+
+/// [`moe_sort`] with the e4m3 scatter (FP8 S8 P1, `kernels/moe_sort.cu`): the token rows already
+/// quantized (`xq [m, hidden]` e4m3 then `x_scale [m]` f32, [`quant_rows_fp8`]'s), and each pair's
+/// sorted row their e4m3 row and scale (`rows [max_tiles · 128, hidden]` e4m3, `row_scale
+/// [max_tiles · 128]` f32), each live tile's padding row +0 bytes with the zero row's scale:
+/// [`quant_rows_fp8`] of [`moe_sort`]'s rows, bit for bit, on every row of a live tile. The
+/// indices are [`moe_sort`]'s. Refused as [`moe_sort`] (`kernel: "moe_sort_fp8"`), and unless
+/// `hidden` is a multiple of 16.
+///
+/// # Safety
+///
+/// As [`moe_sort`]'s, with `xq` `m · hidden` bytes and `rows` `max_tiles · 128 · hidden` bytes,
+/// each 16-byte aligned, and the two scales 4-byte-aligned f32 rows of `m` and `max_tiles · 128`.
+pub unsafe fn moe_sort_fp8(
+    (xq, x_scale, topk_idx): (*const c_void, *const c_void, *const c_void),
+    regions: SortRegions,
+    (rows, row_scale): (*mut c_void, *mut c_void),
+    (m, experts, top_k, hidden, max_tiles): (u32, u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_moe_sort_fp8(
+            xq,
+            x_scale,
+            topk_idx,
+            regions.chunk_hist,
+            regions.counts,
+            regions.offsets,
+            regions.tile_expert,
+            regions.pos,
+            rows,
+            row_scale,
+            m,
+            experts,
+            top_k,
+            hidden,
+            max_tiles,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "moe_sort_fp8",
+            dims: [m, top_k, hidden, max_tiles],
+        },
+    )
+}
+
+/// The MoE prefill's act + quantize over its live rows (FP8 S8 P1, `kernels/act_quant_fp8.cu`):
+/// rows `r < offsets[experts]` of `bf16(OP(gate, up))` (`gate`, `up [rows, cols]` bf16, the expert
+/// GEMMs' outputs), quantized into `q [rows, cols]` e4m3 and `scale [rows]` f32: [`silu_mul_bf16`]
+/// (or [`gelu_mul_bf16`]) then [`quant_rows_fp8`] of those rows, bit for bit; no other row written.
+/// `op` a [`crate::step::GatedOp`] code. Refused with [`KernelError::RowShape`] unless `rows` and
+/// `experts` are non-zero, `cols` a non-zero multiple of 64, `rows · cols` at most `i32::MAX`, `op`
+/// a code and no pointer null. Asynchronous.
+///
+/// # Safety
+///
+/// `gate` and `up` must be device pointers to `rows · cols` bf16, `q` to `rows · cols` bytes,
+/// `scale` to `rows` f32 and `offsets` to `experts + 1` i32 (the sort's), valid for the whole
+/// kernel, no output overlapping an input. `stream` as [`rms_norm_bf16`]'s.
+pub unsafe fn expert_act_quant_fp8(
+    (gate, up, offsets): (*const c_void, *const c_void, *const c_void),
+    (q, scale): (*mut c_void, *mut c_void),
+    (rows, cols, experts): (u32, u32, u32),
+    op: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_expert_act_quant_fp8(
+            gate, up, q, scale, offsets, rows, cols, experts, op, stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows, cols })
 }
 
 /// Launch the grouped expert GEMM (`kernels/expert_gemm_bf16.cu`) on 256-column blocks:
