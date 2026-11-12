@@ -80,9 +80,13 @@ impl Run {
             for e in Engine::ALL {
                 for c in e.cells_mut(m) {
                     c.short = (c.delivered(base)).filter(|&share| !c.dead && share < FULL_SHARE);
-                    c.answered_e2el_ms = (c.asked(base).zip(c.requests.as_ref()))
-                        .and_then(|(asked, rs)| {
-                            median(rs.answered(RequestTiming::E2el, asked).filter_map(|(_, v)| v).collect())
+                    c.answered_e2el_ms =
+                        (c.asked(base).zip(c.requests.as_ref())).and_then(|(asked, rs)| {
+                            median(
+                                rs.answered(RequestTiming::E2el, asked)
+                                    .filter_map(|(_, v)| v)
+                                    .collect(),
+                            )
                         });
                 }
             }
@@ -131,7 +135,8 @@ impl Run {
                         At::Conc(_) | At::Output(_) => base,
                     };
                     c.ttft_too_soon = c.median_ttft_ms.is_some_and(|ms| {
-                        let floor = prompt.map_or(0.0, |p| PREFILL_FLOOR_MS_PER_100 * f64::from(p) / 100.0);
+                        let floor =
+                            prompt.map_or(0.0, |p| PREFILL_FLOOR_MS_PER_100 * f64::from(p) / 100.0);
                         ms < PREFILL_FLOOR_MS.max(floor)
                     });
                 }
