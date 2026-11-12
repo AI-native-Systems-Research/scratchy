@@ -1019,9 +1019,11 @@ fn send_prefix_and_fill<'a>(
 /// transfer, on any exit.
 ///
 /// `src` may be a PREFIX of the region (`send_prefix_and_fill` sends only a slot's staged
-/// extent): the window walk stops at `src.len()`, the last window sending a part. The
-/// walk covers the region front-to-back, so a prefix send lands the first `src.len()` bytes
-/// wherever they fall.
+/// extent): the window walk stops at `src.len()`, and the window the prefix ends inside is
+/// CUT to the bytes it still carries — the pairing law below is why; a partial slice into a
+/// full window is refused, so the window itself is sized to the part. The walk covers the
+/// region front-to-back, so a prefix send lands the first `src.len()` bytes wherever they
+/// fall.
 fn send_premapped<'a>(
     stream: &'a Stream,
     src: &'a [u8],
@@ -1040,7 +1042,23 @@ fn send_premapped<'a>(
         }
         let win = w.total_size().as_u64() as usize;
         let take = win.min(src.len() - off);
-        pin.send_window(&w, off..off + take)
+        // ⭐ THE PAIRING LAW HOLDS ON THE PREFIX PATH TOO: `send_window` refuses a slice that
+        // is not its window's extent (the pool's `copyRaw` law, `PremappedH2dRefusal::
+        // LengthMismatch`) — a WHOLE-shadow send satisfies it structurally because every
+        // window's extent is the shadow slice over the same range, but a prefix's last window
+        // carries fewer bytes than the region shows past it. So that window is CUT to the
+        // bytes it still carries (`DevAddr::window`, the same single-chunk shape `windows`
+        // yields), and the full windows go as they are. The tp/8 boot of 2026-11-12 died on
+        // every rank at exactly this refusal: seg3's 2,162,688 B prefix sent into a
+        // 4,940,416 B window.
+        let target = if take == win {
+            w
+        } else {
+            w.window(ByteOffset(0), ByteSize(take as u64)).ok_or_else(|| {
+                anyhow!("{what}: the prefix's last window of {take} B does not exist in its own chunk")
+            })?
+        };
+        pin.send_window(&target, off..off + take)
             .map_err(|e| anyhow!("{what}: pre-mapped window at byte {off}: {e}"))?;
         off += take;
     }
