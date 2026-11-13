@@ -152,7 +152,7 @@ fn spilled_weight_spans(
 }
 
 #[cfg(feature = "spyre-hw")]
-use crate::spyre_pool::*;
+use crate::card::pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
 use scratchy_serving_worker::error::ExecutorResult;

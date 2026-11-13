@@ -12,7 +12,7 @@
 //! | [`crate::spyre_types`] | the nouns — `BundleMeta`, `Loaded`, `ReqState` |
 //! | [`crate::spyre_load`] | resolve the generated wiring, stage the generated weights |
 //! | [`crate::spyre_forward`] | play the forward tape — one chunk or one step |
-//! | [`crate::spyre_pool`] | cut the paged KV pool, bind a request's pages |
+//! | `card::pool` (card) | cut the paged KV pool, bind a request's pages |
 //! | [`crate::spyre_exec`] | the `Worker` trait: scheduling and the step loop |
 //!
 //! It was 7,148 lines when they were all one file. The split is not cosmetic:
@@ -36,24 +36,6 @@ use scratchy_serving_worker::worker::{Worker, WorkerConfig};
 
 pub(crate) fn werr(msg: impl Into<String>) -> ExecutorError {
     ExecutorError::WorkerExecution(msg.into())
-}
-
-/// ⭐ #32 (c4) — ONE SUBMITTED, UNCOLLECTED BATCHED DECODE STEP. The drain pops this and owns
-/// the whole collect half: the fence (`collect_decode_tokens`), the per-request bookkeeping,
-/// and the cell fill. `rows` is per LIVE request in `decode_ids` order — the request, its pool
-/// start, and the launch slot its token comes back in — so the drain never re-derives the
-/// step's slot map.
-#[cfg(feature = "spyre-hw")]
-pub(crate) struct InFlightDecode {
-    /// The cell this step's deferred output parks on; filled by whichever drain pops this.
-    pub(crate) cell: std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
-    /// The submitted step: its deferred idx-stick read and the decode law's inputs.
-    pub(crate) sub: crate::spyre_forward::SubmittedDecode,
-    /// Which rung's session owns this step's executor — every rung is its own session/stream,
-    /// and only the submitting session can finish the read. `Owner` = the W=1 decode session.
-    pub(crate) rung: crate::spyre_types::RungId,
-    /// Per live row, in `decode_ids` order: `(request id, position, launch slot)`.
-    pub(crate) rows: Vec<(String, usize, usize)>,
 }
 
 /// Host-only KTIR serving worker.
@@ -225,3 +207,6 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
 inventory::submit!(
     &SpyreWorkerFactory as &dyn scratchy_serving_engine::worker_factory::WorkerFactory
 );
+
+#[cfg(feature = "spyre-hw")]
+pub(crate) use crate::card::exec::InFlightDecode;
